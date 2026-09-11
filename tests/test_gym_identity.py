@@ -30,10 +30,11 @@ class _Resp:
 class _Http:
     """Fake shared plane. `roster` maps base->gym_id; `gyms` is the row it points at."""
 
-    def __init__(self, roster=None, gym_row=None, fail=None):
+    def __init__(self, roster=None, gym_row=None, fail=None, client_row=None):
         self.roster = roster if roster is not None else [
             {"gym_id": "uuid-1", "echo_account_key": "pierce"}]
         self.gym_row = gym_row
+        self.client_row = client_row
         self.fail = fail or set()
         self.calls = []
 
@@ -47,6 +48,10 @@ class _Http:
             if "gyms" in self.fail:
                 return _Resp(None, 500)
             return _Resp([self.gym_row] if self.gym_row else [])
+        if url.endswith("/clients"):
+            if "clients" in self.fail:
+                return _Resp(None, 500)
+            return _Resp([self.client_row] if self.client_row else [])
         return _Resp([])
 
 
@@ -148,3 +153,41 @@ def test_the_cache_returns_a_COPY_so_a_caller_cannot_poison_it():
     first = gi.tokens_for("pierce", http=http)
     first.append("INJECTED")
     assert gi.tokens_for("pierce", http=http) == ["Pierce Fitness", "Carmel"]
+
+
+# ---- submitter_label_for: owner + gym name for a support-ticket card (2026-09-07) ---
+
+def test_submitter_label_has_both_owner_and_gym_name():
+    http = _Http(
+        gym_row={"name": "CrossFit Reverb", "owner_client_id": "client-1"},
+        client_row={"name": "Dean Holcomb"},
+    )
+    assert gi.submitter_label_for("crossfitreverb30b5b2", http=http) == (
+        "Dean Holcomb, CrossFit Reverb"
+    )
+
+
+def test_submitter_label_falls_back_to_whichever_name_exists():
+    http = _Http(gym_row={"name": "CrossFit Reverb", "owner_client_id": ""})
+    assert gi.submitter_label_for("crossfitreverb30b5b2", http=http) == "CrossFit Reverb"
+
+
+def test_submitter_label_empty_for_an_unmapped_account():
+    http = _Http(roster=[])
+    assert gi.submitter_label_for("some_lasso_internal_key", http=http) == ""
+
+
+def test_submitter_label_never_raises_on_a_lookup_failure():
+    http = _Http(fail={"gyms"})
+    assert gi.submitter_label_for("crossfitreverb30b5b2", http=http) == ""
+
+
+def test_submitter_label_is_cached():
+    http = _Http(
+        gym_row={"name": "CrossFit Reverb", "owner_client_id": "client-1"},
+        client_row={"name": "Dean Holcomb"},
+    )
+    gi.submitter_label_for("crossfitreverb30b5b2", http=http)
+    calls = len(http.calls)
+    gi.submitter_label_for("crossfitreverb30b5b2", http=http)
+    assert len(http.calls) == calls

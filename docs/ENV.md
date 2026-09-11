@@ -66,7 +66,7 @@ before this file existed.
 
 | Var | Default | Owner | Notes |
 |---|---|---|---|
-| AGENT_VOICE_DOC_PATH | brand_voice/lasso_voice.md | code | Global bible; clients set Account.voice_doc. |
+| AGENT_VOICE_DOC_PATH | brand_voice/lasso_voice.md | code | Global bible; clients set Account.voice_doc. A bible whose first line carries `<!-- echo:auto-drafted -->` (what website auto-intake writes) is machine-written and approved by nobody: `voice.load_voice` sets `auto_drafted=True` and `drafter._output_claims_cleared` refuses to clear a caption's figures against it. Delete that line when a human has reviewed the doc, and it counts as approved again. |
 | AGENT_SOURCE_DOC_PATH | brand_voice/lasso_now.md | code | |
 | AGENT_SOCIAL_PROOF_PATH | brand_voice/social_proof.md | code | |
 | AGENT_SOCIAL_PROOF_ENABLED | false | BLAKE | |
@@ -94,19 +94,71 @@ before this file existed.
 | AGENT_SOCIAL_INTAKE_SYNC | false | BLAKE | Sweeper that routes captured-but-unforwarded portal intakes into Echo. OFF means a cold Stripe buyer's intake sits in Supabase indefinitely with no alert. |
 | AGENT_CONNECTION_WATCH | false | BLAKE | Alerts on a gym whose social connections are partly missing. OFF means nobody is told a connect silently failed. Skips 0-of-3 by design, so a gym that connected nothing never alerts either way. |
 | AGENT_DYNAMIC_ACCOUNTS | false | BLAKE | Auto-provisions the Account record for a newly onboarded gym. OFF means a new gym needs its record added by hand before anything drafts. |
+| AGENT_GYM_DEEP_BRAIN | false | BLAKE | PRE-ONBOARD per-gym deep brain (`python -m agent gym-deep-brain --account <base>`). Reads a gym's OWN public website (robots.txt respected, min gap per host, page/byte capped, non-business emails and phone numbers redacted) and its OWN public Instagram feed (FORM only: caption length, hook shape, emoji/hashtag habits, cadence, ask rate; comments and commenter identities never read) into a per-gym artifact. Every fact carries the page URL it came from and lands in client_sources as PENDING, never auto-approved. Missing domain, handle, robots permission, page or social read BLOCKS with no artifact. OFF = nothing fetched, nothing written. Manual only, there is no automatic sweep. **Writes exactly two things: the per-gym artifact and the PENDING rows. It NEVER writes the brand bible / voice doc** (changed 2026-09-06): it used to auto-draft one from the same scraped bundle into the ACTIVE voice slot, where the anti-fabrication gate read it as approved material, so a scraped figure could clear the gate that exists to block unapproved figures. A robots.txt answering 5xx (or unreachable) now DENIES the whole host; only an explicit 4xx means "no restriction stated". A redirect onto a different host is re-checked against that host's robots.txt. One response is capped at `MAX_PAGE_BYTES` (500 KB, streamed and abandoned at the line) on top of the cumulative per-gym budget. |
+| AGENT_GYM_DEEP_BRAIN_CRAWL_DELAY | 2.0 | code | Minimum seconds between two deep-brain requests to the same host. A robots.txt Crawl-delay larger than this always wins; this is a floor, never a ceiling. |
+| AGENT_GYM_DEEP_BRAIN_DIR | `<DATA_DIR>/deep_brains` | code | Where per-gym deep-brain artifacts land. Deliberately NOT `<DATA_DIR>/brains` (tenant_brain's append-only learning log) and never `~/LASSO/lasso-brain` (the READ-ONLY shared corpus). |
+| AGENT_CTA_VARIETY | false | BLAKE | Closing-ask variety + the ask RATE. ON: every CTA candidate must pass `copy_gate.is_cta_shaped` (a question or an FAQ heading is rejected); grade_fix ROTATES the gym's whole approved CTA pool instead of stapling one line onto every day; the book targets `AGENT_CAPTION_ASK_RATE` of its POSTS rather than an ask on all of them; a book ABOVE that target has the stapled closing ask TRIMMED back down to it; and calendar_grade scores the ask rule as a BAND (at or above target costs nothing) instead of demanding an ask on every post, with `no_ask` no longer double counted as a caption_craft soft flag. OFF = byte-for-byte the old behavior on every one of those lines. Dean Holcomb / CrossFit Reverb ticket 4941e162. |
+| AGENT_CAPTION_ASK_RATE | 0.33 | BLAKE | Share of a book's POSTS that should carry an ask. Read by BOTH the repair (`grade_fix._ask_target_posts`) and the grader (`calendar_grade._path`), so the target cannot drift from what is scored. Clamped to (0, 1]; anything else falls back to 0.33. Only consulted while AGENT_CTA_VARIETY is armed. Blake, 2026-09-06: "every post shold not have an ask make it 33% of post". |
+| AGENT_CAPTION_VARIETY_WINDOW | 10 | code | How many POSTS back the anti-repetition rail looks when deciding whether a closing line collides. Roughly what a reader sees scrolling a gym's recent grid. Only consulted while AGENT_CTA_VARIETY is armed. |
+| AGENT_CAPTION_FORM_PLAN | false | BLAKE | Per-post caption SHAPE planning. ON: every post is handed a concrete form (an opening move out of six, a sentence/character band out of three) instead of the identical soft "VARY the ENTRY POINT" instruction on all of them. STYLE ONLY: a plan carries no fact, no topic and no copy, and every fabrication, figure, banned-word and no-dash gate still runs unchanged. OFF = the SB7 prompt is byte-for-byte today's, including its fixed "Max 260 characters". |
+| AGENT_CROSS_GYM_BRAIN | false | BLAKE | Fleet FORM rollup into the `cross_gym_brain` table, plus the `cross_gym_guidance.guidance_for()` read side. FORM ONLY: findings and guidance carry lever names, lever value tokens and numbers, and the writer REFUSES to write when any string is not a known token. No caption text, stat, offer, member name, handle or gym_id is ever stored. Guidance is identical for every gym by construction, which is the isolation guarantee. REQUIRES `migrations/cross_gym_brain_20260906.sql` to be hand-applied first; armed without it the writer fails loud (ok=False) and the reader returns empty guidance. |
 
-## Creative studio (Gemini)
+## Image engine (Astra default, Gemini fallback)
+
+ChatGPT-6 Astra (`gpt-image-2.5`) is the DEFAULT image/infographic generator.
+Gemini / Nano Banana is unchanged and demoted to the fallback rung. The chain is
+`Astra -> retry once with backoff -> Gemini -> mark "needs human"`; the last rung
+fires an ops alert AND writes an `image_needs_human` audit row, so a calendar
+slot can never fail silently. Nothing here changes publishing: every generated
+asset still lands in the same approval queue as uploaded creative.
+
+The spec env names are UNPREFIXED. Each also accepts an `AGENT_`-prefixed alias
+(`AGENT_IMAGE_ENGINE`, `AGENT_ASTRA_IMAGE_MODEL`, ...) so the repo's env
+conventions still reach it; the unprefixed name wins when both are set.
 
 | Var | Default | Owner | Notes |
 |---|---|---|---|
-| AGENT_NANO_ENABLED | false | BLAKE | Infographic generation. |
+| OPENAI_API_KEY | (unset) | BLAKE | OpenAI key for the Astra Responses call. Read lazily by name, never stored on an object, never logged. **Absent = boot with `engine=gemini` and ONE warning** (no crash, no silent drop). |
+| IMAGE_ENGINE | astra | code | Primary engine: `astra` (default) or `gemini`. `gemini` skips Astra entirely. Gemini is ALWAYS the last rung when Astra is primary. |
+| ASTRA_BRIEF_MODEL | gpt-6-astra | code | The Responses-API model that reads the creative brief and calls the image tool. |
+| ASTRA_IMAGE_MODEL | gpt-image-2.5-sunburst | code | Sunburst: infographics, carousels, and ANY asset with text overlays. |
+| ASTRA_IMAGE_MODEL_FLARE | gpt-image-2.5-flare | code | Flare: story-format quick graphics that render no text. A story card WITH a rendered headline is a text asset and stays on Sunburst. |
+| AGENT_ASTRA_RESPONSES_URL | https://api.openai.com/v1/responses | code | Endpoint override for a proxy / gateway. Never for swapping providers. |
+
+**Sizes are SNAPPED before the call.** Verified against the live API 2026-09-10:
+the image tool rejects any size whose width or height is not divisible by 16
+(`HTTP 400 "Invalid size '1080x1350'. Width and height must both be divisible by
+16."`). Both Echo targets fail that rule on width, so `image_engine.snap_size`
+converts them to the same aspect with both dimensions divisible by 16 before the
+request, and the result is scaled back to the target afterwards:
+
+| target | sent to Astra | back to |
+|---|---|---|
+| 1080x1350 (4:5 feed) | 1024x1280 | 1080x1350 |
+| 1080x1920 (9:16 story) | 1152x2048 | 1080x1920 |
+
+Without the snap every Astra call 400s and the chain lives on the Gemini rung by
+accident, which looks identical to working.
+| AGENT_ASTRA_COST_SUNBURST_USD | 0.19 | code | ESTIMATED USD per Sunburst image (logging only, never a billing read). |
+| AGENT_ASTRA_COST_FLARE_USD | 0.04 | code | ESTIMATED USD per Flare image. |
+| AGENT_GEMINI_COST_PER_IMAGE_USD | 0.039 | code | ESTIMATED USD per Gemini image. |
+| AGENT_IMAGE_DAILY_COST_ALERT_USD | 10.00 | code | One ops alert per day once estimated image spend crosses this. |
+| AGENT_IMAGE_URL_FOOTER | LASSOFRAMEWORK.COM | code | The URL rendered in the brief's footer block. |
+
+## Creative studio (Gemini)
+
+Now the FALLBACK engine. Everything below is unchanged.
+
+| Var | Default | Owner | Notes |
+|---|---|---|---|
+| AGENT_NANO_ENABLED | false | BLAKE | Infographic generation. Still the master switch for BOTH engines: off = no image is drawn by anyone. |
 | AGENT_NANO_API_KEY | (unset) | BLAKE | Gemini key. Never logged. |
 | AGENT_NANO_MODEL | gemini-3-pro-image | code | Image GENERATION model (Nano Banana). Returns image parts, not text. |
 | AGENT_OCR_MODEL | gemini-3.5-flash | code | Vision READ model (image to text) for OCR / autotag / the pixel fabrication gate. MUST be a vision-capable TEXT model, NOT a `*-image` generation model (those cannot transcribe text out of an image). Uses the same AGENT_NANO_API_KEY. NOTE: `gemini-2.5-flash` was retired for new accounts (returns 404 / "no longer available"); `gemini-3.5-flash` is the current default flash. A model-not-found error posts ONE loud ops warning naming the bad model and cards with rendered pixels BLOCK fail-closed until it is fixed. |
 | AGENT_IMAGE_ASPECT / AGENT_IMAGE_PIXELS | 4:5 / 1080x1350 | code | Feed target. |
 | AGENT_STORY_ASPECT / AGENT_STORY_PIXELS | 9:16 / 1080x1920 | code | Story target. |
-| AGENT_SPEND_CAP_ENABLED | false | BLAKE | Per-account daily generation cap. |
-| AGENT_GEMINI_DAILY_CAP | 40 | code | Calls/day/account under the cap. |
+| AGENT_SPEND_CAP_ENABLED | false | BLAKE | Per-account daily generation cap. Now covers BOTH engines: it gates `creative_studio.generate` before any engine is chosen, so an Astra render counts against it exactly like a Gemini one. The bucket name (`gemini_calls:<account>`) is historical. |
+| AGENT_GEMINI_DAILY_CAP | 40 | code | Generation calls/day/account under the cap, either engine. |
 | AGENT_OCR_CHECK_ENABLED | false | BLAKE | Headline OCR warning (never blocks). |
 | AGENT_AUTOTAG_ENABLED | false | BLAKE | DAM auto-tag on ingest. |
 | AGENT_CONSENT_GUARD_ENABLED | false | BLAKE | People=consent gate. |
@@ -207,6 +259,16 @@ before this file existed.
 
 Per-account routing is NOT an env var: it is the `publish_route` field on the
 Account record in `agent/accounts.py` ("meta_direct" default, or "socialapi").
+
+## Cross-day media repeats (one photo must not sit on several days)
+
+| Var | Default | Owner | Notes |
+|---|---|---|---|
+| AGENT_MEDIA_CROSS_DAY_GUARD | true | code | STAGE-time guard (`agent/media_guard.py`): a photo already on the gym's forward book is never planned onto another day. OFF restores pre-guard behavior (emergency only). |
+| AGENT_MEDIA_REPEAT_WINDOW_DAYS | 30 | code | Trailing PUBLISHED window the guard also blocks against. Clamped 0..120. |
+| AGENT_MEDIA_REPEAT_SWEEP | true | code | The nightly counterpart (`agent/jobs/media_repeat_sweep.py`) for rows ALREADY on the book. Never touches published/publishing, never swaps an APPROVED row. |
+| AGENT_MEDIA_REPEAT_SWEEP_DRIVE | false | BLAKE | Lets that sweep replace a repeat from the gym's CONNECTED DRIVE POOL, not just its local uploads. Without it a gym whose stills are all on the book is reported "small library" and its repeats are left standing even with hundreds of unused Drive clips (John Weeks / Tough Temple, 2026-09-11). Arm by hand. |
+| AGENT_MEDIA_REPEAT_REPORT | false | BLAKE | Raises ONE client-readable line per gym per month naming the repeats the sweep deliberately did NOT fix. Arm by hand. |
 
 ## Previously read in code but documented nowhere (now closed)
 

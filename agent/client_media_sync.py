@@ -398,6 +398,99 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     return {"synced": synced, "skipped": skipped}
 
 
+def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
+    """RECOVERY LANE (2026-09-07): repopulate content_library/<base> from media that
+    is ALREADY DURABLY HOSTED in R2 under echo/<base>/<sha1-16>/<filename> (the key
+    media_host.host_media() uploads to at post time), for the case where the LOCAL
+    top-level library copies are gone (e.g. a disk/volume loss) even though the
+    gym's real photos are still safely in the bucket.
+
+    sync_uploads() cannot recover this on its own: it only re-lists the INTAKE
+    prefixes (pending_caption/incoming/), never the post-hosting echo/ prefix, so
+    once a photo has been hosted (moved past intake) and its local copy is lost,
+    sync_uploads() has no way to ever see it again — the gym silently stays
+    "awaiting media" (client_month_run._client_media_count reads 0) even though
+    real, previously-approved photos sit right there in the bucket.
+
+    Found 2026-09-07 auditing grade_fix "not A+: no media (empty creative url)"
+    failures on hillcountry/train7164ae502: both had 0 top-level local files but
+    86/40 real hosted originals in echo/<base>/ respectively — and the SAME defect
+    class hit crossfitlocal (54), crossfitreverb30b5b2 (118), and toughtemple52040e
+    (15). A general bug, not a single-gym fluke; this lane is the general fix.
+
+    Local filename: '<sha1-16>_<original basename>' (the R2 key's own hash segment
+    prefixed onto the original name), so two different shoots that happen to reuse
+    a filename (e.g. two 'IMG_0001.jpg') can never collide locally. sync_uploads
+    can use the bare basename because intake enforces uniqueness upstream; this
+    lane cannot assume that, so it carries its own uniqueness guarantee. Idempotent:
+    an already-recovered file is skipped, never re-downloaded.
+
+    Returns {"recovered": n_new, "skipped": n_already_present}. Never raises: a
+    listing/HTTP failure or per-file error is logged and the rest continue."""
+    log = logger or (lambda m: print(f"[client-media-sync] {m}"))
+    base_key = (base_key or "").strip()
+    if not base_key:
+        return {"recovered": 0, "skipped": 0}
+
+    r2 = r2 if r2 is not None else _default_r2()
+    if r2 is None:
+        log(f"{base_key}: R2 not configured; hosted-media recovery skipped")
+        return {"recovered": 0, "skipped": 0}
+
+    prefix = f"echo/{base_key}/"
+    try:
+        keys = list(r2.list_keys(prefix) or [])
+    except Exception as exc:  # noqa: BLE001
+        log(f"{base_key}: hosted-media list failed: {type(exc).__name__}")
+        return {"recovered": 0, "skipped": 0}
+    if not keys:
+        return {"recovered": 0, "skipped": 0}
+
+    lib_dir = _library_dir(base_key, out_dir)
+    os.makedirs(lib_dir, exist_ok=True)
+
+    recovered = 0
+    skipped = 0
+    for key in keys:
+        if not _is_media_key(key):
+            continue
+        # echo/<base>/<sha1-16>/<filename> — need the hash segment + filename.
+        parts = key.split("/")
+        if len(parts) < 4:
+            continue
+        content_hash = parts[2]
+        filename = parts[-1]
+        local_name = f"{content_hash}_{filename}"
+        target = os.path.join(lib_dir, local_name)
+        if os.path.exists(target):
+            skipped += 1
+            continue
+        try:
+            data = r2.get_bytes(key)
+        except Exception as exc:  # noqa: BLE001
+            log(f"{base_key}: hosted-media download failed for one object: "
+                f"{type(exc).__name__}")
+            continue
+        if not data:
+            continue
+        try:
+            with open(target, "wb") as fh:
+                fh.write(data)
+        except OSError as exc:
+            log(f"{base_key}: hosted-media write failed for one object: {type(exc).__name__}")
+            continue
+        # The photo is ALREADY hosted at this exact key: the sidecar's public_url is
+        # known outright (no re-hosting, no fresh upload). No client note/caption is
+        # recoverable from the hosted object alone, so none is fabricated here.
+        _write_sidecar(lib_dir, local_name, key, "", log)
+        recovered += 1
+
+    if recovered or skipped:
+        log(f"{base_key}: recovered {recovered} hosted photo(s) missing locally, "
+            f"{skipped} already present")
+    return {"recovered": recovered, "skipped": skipped}
+
+
 def _read_context_consent(r2, prefixes, log, keys=None):
     """({basename: client_context}, {basename: consent_bool}) from the batch upload
     sidecars (§8). Mirrors the batch read in _read_captions; malformed sidecars are
@@ -523,7 +616,13 @@ def _client_bases(clients=None):
         base = _base_of(key)
         if base and base not in bases:
             bases.append(base)
-    return bases
+    # ECHO CLIENTS ONLY (2026-09-11 incident): the dynamic registry is NOT a list of
+    # Echo clients -- onboarding_watch.autoregister filled it from echo_intake_tokens,
+    # which the portal mints for EVERY gym, so ~110 ads-only gyms landed here and were
+    # scanned, alerted on ("no_account", "no_voice") and website-intaken. A dynamic
+    # base must have an echo_gym_settings row; hardcoded ACCOUNTS are trusted as-is.
+    from . import echo_clients
+    return echo_clients.only_client_bases(bases)
 
 
 def _base_of(key):
@@ -729,6 +828,21 @@ def _maybe_seed_onboarding_demo(base_key, store, log):
         log(f"{base_key}: onboarding sample skipped ({type(exc).__name__})")
 
 
+def _maybe_seed_no_media_astra(base_key, account, store, log):
+    """Draft gym-specific Astra infographic cards from the gym's OWN scraped
+    website + Instagram (no_media_astra_seed.py), for a gym that has neither
+    approved sources nor any real uploaded media. Best effort: a scrape/generate
+    failure must never sink or slow the scan; the generic onboarding sample
+    (seeded just above this call site) still covers the gym either way."""
+    try:
+        from . import no_media_astra_seed
+        if not no_media_astra_seed.enabled():
+            return
+        no_media_astra_seed.seed_gaps(base_key, account, store, log=log)
+    except Exception as exc:  # noqa: BLE001
+        log(f"{base_key}: no-media Astra seed skipped ({type(exc).__name__})")
+
+
 def _alert_stall(base_key, stage, detail, log):
     """A NEW-GYM STALL is never silent (audit 2026-08-25 MAJOR): every state where a
     gym's pipeline cannot advance (no registry account, no approved sources, no voice
@@ -837,6 +951,24 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             sync = sync_uploads(base, r2=r2, logger=log)
             synced_total += sync.get("synced", 0)
 
+            # RECOVERY LANE (2026-09-07): sync_uploads only ever re-lists the
+            # INTAKE prefixes (pending_caption/incoming), never the
+            # post-hosting echo/ prefix, so a gym whose LOCAL top-level
+            # library was lost (disk/volume loss) after its photos were
+            # already hosted can never self-heal through the normal sync —
+            # found on hillcountry/train7164ae502/crossfitlocal/
+            # crossfitreverb30b5b2/toughtemple52040e: 0 local top-level
+            # files, but 86/40/54/118/15 real hosted originals respectively
+            # sitting in R2 under echo/<base>/. Best-effort, only when the
+            # local library is genuinely empty (never runs on a gym whose
+            # library is fine, so this costs nothing on the common path).
+            if _client_media_count(_library_dir(base)) <= 0:
+                recovery = sync_hosted_media(base, r2=r2, logger=log)
+                if recovery.get("recovered"):
+                    log(f"{base}: recovered {recovery['recovered']} "
+                        "already-hosted photo(s) from R2 into the local "
+                        "library (local copies had gone missing)")
+
             account = _account_for_base(base)
             if account is None:
                 _alert_stall(base, "no_account",
@@ -862,6 +994,17 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # clearly-labelled sample so the client sees the shape of what they
                 # bought. Refuses if any real row exists; samples can never publish.
                 _maybe_seed_onboarding_demo(base, store, log)
+                # NO-MEDIA ASTRA SEED (AGENT_NO_MEDIA_ASTRA_SEED, default OFF; Blake
+                # 2026-09-11): a gym with NEITHER approved sources NOR any real
+                # uploaded media (CrossFit Chateau's exact state) sits on the generic
+                # fact-free SAMPLE above forever otherwise. Scrape its own site + IG
+                # (gym_deep_brain) and draft gym-specific Astra infographic cards from
+                # what it actually says about itself — still 'pending', still gated
+                # on the same human approval as every other post. A gym with uploaded
+                # media (media_count > 0) is left alone: it already has real
+                # collateral and this must never compete with it (see module docstring).
+                if _client_media_count(lib_dir) <= 0:
+                    _maybe_seed_no_media_astra(base, account, store, log)
                 results.append({"base": base, "status": "no_sources",
                                 "synced": sync.get("synced", 0)})
                 continue

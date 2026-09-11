@@ -78,7 +78,8 @@ _HEIC_EXTS = (".heic", ".heif")
 _HEVC_HINT_EXTS = (".mov",)          # iPhone .mov is usually HEVC; probed to confirm
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".heic",
                ".heif")
-_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv", ".hevc")
+from .media_types import (VIDEO_EXTS as _VIDEO_EXTS,           # ONE definition (audit D1)
+                          is_publishable_video as _is_publishable_video)
 
 
 def _ext(title):
@@ -148,16 +149,22 @@ def image_dims(path):
         return None
 
 
-def probe_video(path, runner=None):
+PROBE_TIMEOUT_SEC = 120
+
+
+def probe_video(path, runner=None, timeout=PROBE_TIMEOUT_SEC):
     """{'duration_sec','width','height','codec'} via ffprobe, or None when ffprobe
     is missing/fails (the asset then stays unprobed -> not selectable, fail
-    closed). codec lets the caller decide whether an HEVC transcode is needed."""
+    closed). codec lets the caller decide whether an HEVC transcode is needed.
+    `timeout` (seconds, default 120) lets a caller under a request deadline hand in
+    min(120, time left)."""
     run = runner or subprocess.run
     try:
         proc = run(
             ["ffprobe", "-v", "error", "-print_format", "json",
              "-show_format", "-show_streams", str(path)],
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True,
+            timeout=max(1.0, min(float(PROBE_TIMEOUT_SEC), float(timeout))))
         data = json.loads(proc.stdout or "{}")
     except Exception as e:  # noqa: BLE001 - a probe failure is a skip, not a crash
         print(f"[gym-media] ffprobe failed for {path}: {type(e).__name__}: {e}")
@@ -324,6 +331,60 @@ class ConversionUnavailable(Exception):
     asset not-eligible with REJECT_CONVERT_UNAVAILABLE — never a crash."""
 
 
+class RenditionTimeout(Exception):
+    """One transcode ran past its per-clip budget (RENDITION_TIMEOUT_SEC). TRANSIENT:
+    the asset stays eligible, is noted rendition_missing, and the nightly pre-render
+    pass (sync_gym_media) gets another go. Never marks an asset not-eligible."""
+
+
+class RenditionBudgetExhausted(Exception):
+    """This build / request has already spent its transcode budget (RenditionBudget).
+    The caller moves on to an already-renditioned video or a photo; the asset stays
+    eligible for the nightly pre-render pass."""
+
+
+class RenditionBudget:
+    """A per-build / per-request cap on the number of TRANSCODES (audit R-D1 #3).
+    libx264 at source resolution inside the month build was unbounded: 56 unrenditioned
+    HEVC clips meant 56 synchronous encodes on the build path. Each take() spends one;
+    once spent, callers prefer already-renditioned videos, then photos."""
+
+    def __init__(self, limit):
+        self.limit = max(0, int(limit or 0))
+        self.used = 0
+
+    def take(self):
+        if self.used >= self.limit:
+            return False
+        self.used += 1
+        return True
+
+    @property
+    def spent(self):
+        return self.used >= self.limit
+
+
+REJECT_RENDITION_MISSING = "rendition_missing"    # HEVC / odd container, no .mp4 yet
+HEVC_CODECS = ("hevc", "h265", "h.265")
+RENDITION_TIMEOUT_SEC = 180          # per clip, inside a build
+RENDITION_MAX_LONG_EDGE = 1080       # IG/FB never need more; halves encode time
+
+
+def needs_rendition(asset, info=None):
+    """Does this asset need a converted rendition before it can be served? A photo:
+    HEIC. A video: an HEVC/H.265 stream (from the ffprobe `codec`, checked for EVERY
+    video regardless of extension: an HEVC .mp4 is as unplayable on the web as an
+    HEVC .mov) or a container Zernio cannot carry. Raw HEVC is never hosted."""
+    a = asset or {}
+    title, mime = a.get("title") or "", a.get("mime_type") or ""
+    if a.get("kind") == KIND_PHOTO:
+        return is_heic(title, mime)
+    if a.get("kind") != KIND_VIDEO:
+        return False
+    codec = str((info or {}).get("codec") or "").lower()
+    return codec in HEVC_CODECS or not _is_publishable_video(title)
+
+
 def heic_to_jpeg(src_path, dest_path):
     """Convert a HEIC/HEIF file to JPEG at dest_path via pillow-heif. Raises
     ConversionUnavailable when pillow-heif/Pillow is absent (degrade gracefully).
@@ -340,22 +401,46 @@ def heic_to_jpeg(src_path, dest_path):
     return dest_path
 
 
-def hevc_to_h264(src_path, dest_path, runner=None):
-    """Transcode an HEVC/H.265 video to H.264 (yuv420p) at dest_path via ffmpeg.
-    Raises ConversionUnavailable when ffmpeg is missing or the transcode fails
-    (degrade gracefully). Returns dest_path."""
+def hevc_to_h264(src_path, dest_path, runner=None, timeout=RENDITION_TIMEOUT_SEC):
+    """Transcode a video to a web-playable H.264 .mp4 at dest_path via ffmpeg: libx264
+    `-preset veryfast -crf 23`, scaled so the LONG edge is at most 1080 (even dims),
+    aac audio, faststart, bounded by `timeout` seconds (audit R-D1 #2: an unbounded
+    source-resolution encode with a 600 s timeout ran inside the month build).
+    Raises RenditionTimeout when the clip runs past its budget (transient, the asset
+    stays eligible), ConversionUnavailable when ffmpeg is missing or the transcode
+    fails. Returns dest_path."""
     run = runner or subprocess.run
+    scale = (f"scale='min({RENDITION_MAX_LONG_EDGE},iw)':'min({RENDITION_MAX_LONG_EDGE},ih)'"
+             ":force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2")
     try:
         proc = run(
             ["ffmpeg", "-y", "-i", str(src_path),
-             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-vf", scale,
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-movflags", "+faststart", str(dest_path)],
-            capture_output=True, text=True, timeout=600)
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise RenditionTimeout(f"ffmpeg ran past {timeout}s") from e
     except Exception as e:  # noqa: BLE001 - missing ffmpeg reads as unavailable
         raise ConversionUnavailable(f"ffmpeg unavailable: {type(e).__name__}") from e
     if getattr(proc, "returncode", 1) != 0 or not os.path.exists(dest_path):
         raise ConversionUnavailable("ffmpeg transcode failed")
     return dest_path
+
+
+def _call_transcoder(fn, src_path, out_path, timeout):
+    """Call an injected transcoder with the per-clip timeout when it accepts one
+    (hevc_to_h264 does); older injected stubs without the parameter still work."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+        accepts = "timeout" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        accepts = False
+    if accepts:
+        return fn(src_path, out_path, timeout=timeout)
+    return fn(src_path, out_path)
 
 
 def rendition_key(gym_id, content_hash, ext):
@@ -368,11 +453,22 @@ def rendition_key(gym_id, content_hash, ext):
 
 
 def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=None,
-                     public_url_fn=None, heic_fn=None, hevc_fn=None, probe_fn=None):
-    """Produce (or reuse) a playable/serveable rendition for a HEIC photo or HEVC
-    video and return its public url. Cache is keyed by content_hash under
-    gym_id/... in Echo's bucket, so a SECOND use is a pure cache hit (no
-    re-transcode). The Drive original is never touched.
+                     public_url_fn=None, heic_fn=None, hevc_fn=None, probe_fn=None,
+                     probe_info=None, budget=None, timeout=RENDITION_TIMEOUT_SEC):
+    """Produce (or reuse) a playable/serveable rendition for a HEIC photo or an
+    HEVC / odd-container video and return its public url. Cache is keyed by
+    content_hash under gym_id/... in Echo's bucket, so a SECOND use is a pure cache
+    hit (no re-transcode). The Drive original is never touched.
+
+    EVERY video is probed for its codec (probe_info when the caller already probed,
+    else probe_fn), regardless of extension: an HEVC .mp4 was never probed before
+    (the hint list was ('.mov',)) and shipped raw (audit R-D1 #1).
+
+    budget: a RenditionBudget; when a NEW transcode is needed and the budget is spent
+    -> raises RenditionBudgetExhausted (nothing encoded). timeout: per-clip seconds
+    for the transcode; past it -> raises RenditionTimeout. Both are transient: the
+    caller skips the asset (reject_reason rendition_missing, still eligible) and the
+    nightly pre-render pass catches up.
 
     Returns (public_url, converted): public_url is None when no conversion is
     needed (a plain JPEG/H.264 asset — caller uses the original) OR when a
@@ -388,7 +484,6 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
     hevc_fn = hevc_fn or hevc_to_h264
 
     title = asset.get("title") or ""
-    mime = asset.get("mime_type") or ""
     gym_id = asset.get("gym_id")
     content_hash = asset.get("content_hash")
 
@@ -396,16 +491,12 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
     if asset.get("rendition_url"):
         return asset["rendition_url"], False
 
-    needs_heic = asset.get("kind") == KIND_PHOTO and is_heic(title, mime)
-    needs_hevc = False
-    if asset.get("kind") == KIND_VIDEO:
-        codec = ""
-        if probe_fn and _ext(title) in _HEVC_HINT_EXTS:
-            info = probe_fn(src_path) or {}
-            codec = str(info.get("codec") or "").lower()
-        needs_hevc = codec in ("hevc", "h265", "h.265")
-    if not needs_heic and not needs_hevc:
+    info = probe_info
+    if asset.get("kind") == KIND_VIDEO and info is None and probe_fn:
+        info = probe_fn(src_path) or {}
+    if not needs_rendition(asset, info):
         return None, False               # plain asset: caller uses the original
+    needs_heic = asset.get("kind") == KIND_PHOTO
 
     ext = ".jpg" if needs_heic else ".mp4"
     key = rendition_key(gym_id, content_hash, ext)
@@ -418,6 +509,9 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
     except Exception:  # noqa: BLE001 - a cache probe failure just re-converts
         pass
 
+    if budget is not None and not budget.take():
+        raise RenditionBudgetExhausted(f"transcode budget spent before {title!r}")
+
     tmp_dir = tempfile.mkdtemp(prefix="gymrend_")
     out_path = Path(tmp_dir) / os.path.basename(key)
     try:
@@ -425,7 +519,7 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
             if needs_heic:
                 heic_fn(src_path, out_path)
             else:
-                hevc_fn(src_path, out_path)
+                _call_transcoder(hevc_fn, src_path, out_path, timeout)
         except ConversionUnavailable as e:
             print(f"[gym-media] rendition skipped for {title!r}: {e}")
             return None, False           # caller marks not-eligible, never crashes
@@ -433,7 +527,11 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
         if not url:
             print(f"[gym-media] rendition upload returned no url for {title!r}")
             return None, False
-        _persist_rendition(store, asset, key, url)
+        # Persist the REAL object key the host wrote (echo/<tenant>/<sha1>/<name>),
+        # not the content-hash lookup key (audit R-D1: rendition_key held a key that
+        # did not exist in R2).
+        real_key = _mh._key_from_public_url(url) or key
+        _persist_rendition(store, asset, real_key, url)
         return url, True
     finally:
         try:

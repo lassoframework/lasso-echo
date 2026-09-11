@@ -388,6 +388,112 @@ def test_polluted_ledger_still_places_distinct_photos(tmp_path, monkeypatch):
     assert len(set(urls)) == 5, "a photo was reused across feeds"
 
 
+# ---- 9b. a stale repeat is left for a CONNECTED Drive pool instead of placed -----
+def test_stale_reuse_skipped_when_drive_pool_connected(tmp_path, monkeypatch):
+    """Same exhausted-library setup as the polluted-ledger test above, but this gym
+    has an active Drive connection (Pete/Zanshin, Dean/Reverb, 2026-09-07): the
+    uploaded-media loop must NOT place a stale repeat -- it leaves the day uncovered
+    so append_gym_drive_drafts gets the chance instead, rather than a small stale
+    library silently claiming every day forever."""
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    # The pool gate (2026-09-10): the flags alone no longer decide; the gym's Drive
+    # pool must actually hold a pickable asset. Stub the pool read as "one video
+    # ready" so no store is touched.
+    from agent import gym_media_selector as _sel
+    client_content.clear_drive_pool_cache()
+    monkeypatch.setattr(_sel, "pickable",
+                        lambda *a, **k: [{"id": "v1", "kind": "video", "gym_id": "gritx"}])
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=5)
+    served = [{"key": f"photo_{i:02d}.jpg", "date": f"2026-08-{15 + i:02d}",
+               "pillar": "service"} for i in range(5)]
+    monkeypatch.setattr(client_content.rotation, "load_served",
+                        lambda: {"gritx_ig": list(served)})
+    store = _FakeStore()
+    logs = []
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
+        library_path=lib, store=store, banned_words=(), logger=logs.append)
+    assert out["ok"] is True
+    # Every day was DEFERRED to the Drive pool by Lane A (no stale repeat placed in
+    # the main loop)...
+    deferred = [m for m in logs if "leaving the day for the connected Drive pool" in m]
+    assert len(deferred) == 5, deferred
+    # ...but no Drive builder is wired into this fake store, so the Drive lane covered
+    # nothing, and the NO-EMPTY-DAY fallback (audit 2c, 2026-09-10) then placed a
+    # spaced repeat on each day: never 5 empty days.
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(feed_ig) == 5, f"expected 5 fallback repeats, got {len(feed_ig)}"
+    assert len({r["image_url"] for r in feed_ig}) == 5, "repeats spread across photos"
+    assert sum("placed a spaced repeat" in m for m in logs) == 5
+    client_content.clear_drive_pool_cache()
+
+
+def test_stale_reuse_still_placed_when_drive_pool_is_empty(tmp_path, monkeypatch):
+    """Both Drive flags ON (the live posture: GYM_DRIVE_CONNECT=true globally) but
+    this gym's pool has NOTHING pickable (no source, or everything on cooldown). The
+    flags used to be the whole gate, so every such gym's stale repeat became an EMPTY
+    day. A gym with no other source keeps its repeat (John Weeks / Tough Temple fix,
+    2026-09-10)."""
+    monkeypatch.setenv("GYM_DRIVE_CONNECT", "true")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    from agent import gym_media_selector as _sel
+    client_content.clear_drive_pool_cache()
+    monkeypatch.setattr(_sel, "pickable", lambda *a, **k: [])
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=5)
+    served = [{"key": f"photo_{i:02d}.jpg", "date": f"2026-08-{15 + i:02d}",
+               "pillar": "service"} for i in range(5)]
+    monkeypatch.setattr(client_content.rotation, "load_served",
+                        lambda: {"gritx_ig": list(served)})
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(feed_ig) == 5, (
+        f"an empty Drive pool cannot fill anything; the stale repeat must still place, "
+        f"got {len(feed_ig)} feed day(s)")
+    client_content.clear_drive_pool_cache()
+
+
+def test_stale_reuse_still_placed_when_drive_connected_but_not_staged(tmp_path, monkeypatch):
+    """Independent-review finding, 2026-09-07: GYM_DRIVE_CONNECT and GYM_DRIVE_STAGE
+    are two independent flags. A gym can be Drive-CONNECTED (its media is indexed)
+    while GYM_DRIVE_STAGE is globally off (the planner isn't pulling from ANY gym's
+    Drive pool yet) -- append_gym_drive_drafts is gated on both flags together and
+    never runs in that case. Skipping the stale placement on connect-only, without
+    also checking staging, would turn a stale repeat into a genuinely EMPTY day:
+    strictly worse than the bug this fix exists to solve. With GYM_DRIVE_STAGE left
+    off, the stale repeat must still place, exactly like the no-Drive-connection
+    baseline."""
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.delenv("GYM_DRIVE_STAGE", raising=False)
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=5)
+    served = [{"key": f"photo_{i:02d}.jpg", "date": f"2026-08-{15 + i:02d}",
+               "pillar": "service"} for i in range(5)]
+    monkeypatch.setattr(client_content.rotation, "load_served",
+                        lambda: {"gritx_ig": list(served)})
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    urls = [r["image_url"] for r in feed_ig]
+    assert len(urls) == 5, (
+        f"GYM_DRIVE_STAGE off means the Drive lane can never fill the gap -- the "
+        f"stale repeat must still place rather than leaving the day empty, got "
+        f"{len(urls)} feed day(s)"
+    )
+
+
 # ---- 10. locked (approved) days are skipped; their photos never re-picked --------
 class _LockedStore(_FakeStore):
     """FakeStore that also reports existing rows, like the live list_month."""
@@ -593,6 +699,190 @@ def test_deny_backfill_replaces_denied_feed_with_reused_photo(monkeypatch, tmp_p
     assert ig_feed[0]["caption"].strip()
 
 
+# ---- 9c. denied-slot backfill tries the connected Drive pool FIRST (2026-09-07) ----
+
+def test_deny_backfill_prefers_a_connected_drive_pool_over_local_reuse(monkeypatch, tmp_path):
+    """Pete/Zanshin, 2026-09-07: a denied slot used to go straight to reusing a local
+    photo even for a gym with a connected Drive pool full of fresh, unused material --
+    the exact "I deny a photo and a repeat comes back" experience Pete reported.
+    Both flags on -> the Drive builder is tried first and its draft is used, never
+    falling through to local reuse."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+
+    from agent.drafter import Draft, DraftStatus
+    drive_draft = Draft(
+        draft_id="drive-1", account_key="gritx_ig", platform="instagram",
+        caption="A fresh Drive-sourced caption, grounded in an approved source.",
+        hashtags=[], creative_path="/tmp/drive_asset.jpg",
+        creative_public_url="https://cdn.example.com/drive_asset.jpg",
+        scheduled_for="2026-08-19T11:30:00+00:00", status=DraftStatus.PENDING,
+        source_media_asset_id="drive-asset-42")
+
+    called = []
+
+    def fake_build(account, day_key, pillar, voice, source, **kw):
+        called.append((day_key, pillar))
+        return drive_draft
+
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft", fake_build)
+    # If the Drive builder is preferred correctly, local reuse must never be tried.
+    monkeypatch.setattr(cmr, "_clean_draft_for_day",
+                       lambda *a, **kw: (_ for _ in ()).throw(
+                           AssertionError("local reuse must not run when Drive covers it")))
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    assert out["backfilled"] == 1
+    assert called and called[0][0] == "2026-08-19"
+    ig_feed = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 1
+    assert "drive_asset" in ig_feed[0]["image_url"]
+
+
+def test_deny_backfill_excludes_the_denied_posts_own_drive_asset(monkeypatch, tmp_path):
+    """Independent audit, 2026-09-08: the denied row's own source_media_asset_id (and
+    every asset already live elsewhere in the book) must be threaded into the Drive
+    builder call as exclude_ids -- without it, the exact photo just denied could come
+    right back as its own "fresh" replacement (gym_media_selector.rollback_use resets
+    its used_count the moment it's denied, making it the pool's least-used candidate
+    again)."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    denied_row = _denied_feed_row("2026-08-19")
+    denied_row["source_media_asset_id"] = "denied-drive-asset-9"
+    live_row = {"gym_id": "gritx", "account": "instagram", "format": "feed",
+               "post_date": "2026-08-05", "status": "approved",
+               "caption": "already live", "image_url": "https://gritx.media/live.jpg",
+               "source_media_asset_id": "live-drive-asset-7"}
+    store = _FakeStoreLM({("gritx", "2026-08"): [denied_row, live_row]})
+
+    from agent.drafter import Draft, DraftStatus
+    drive_draft = Draft(
+        draft_id="drive-1", account_key="gritx_ig", platform="instagram",
+        caption="A fresh Drive-sourced caption, grounded in an approved source.",
+        hashtags=[], creative_path="/tmp/drive_asset.jpg",
+        creative_public_url="https://cdn.example.com/drive_asset.jpg",
+        scheduled_for="2026-08-19T11:30:00+00:00", status=DraftStatus.PENDING,
+        source_media_asset_id="drive-asset-42")
+
+    seen_exclude_ids = []
+
+    def fake_build(account, day_key, pillar, voice, source, *, exclude_ids=(), **kw):
+        seen_exclude_ids.append(set(exclude_ids))
+        return drive_draft
+
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft", fake_build)
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    assert seen_exclude_ids, "the Drive builder must have been called"
+    excl = seen_exclude_ids[0]
+    assert "denied-drive-asset-9" in excl, "the denied post's own asset must be excluded"
+    assert "live-drive-asset-7" in excl, "an asset already live elsewhere must be excluded"
+
+
+def test_deny_backfill_drive_draft_still_clears_the_banned_word_gate(monkeypatch, tmp_path):
+    """Independent audit, 2026-09-08: backfill_denied_slots's own docstring promises
+    "every replacement clears the same A+/banned-word/fabrication gates as a normal
+    build" -- true for local reuse, but a Drive-sourced draft skipped the check
+    entirely. A banned-word Drive draft must be refused, falling back to local
+    reuse, not silently placed just because it came from a different lane."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+
+    from agent.drafter import Draft, DraftStatus
+    bad_draft = Draft(
+        draft_id="drive-bad", account_key="gritx_ig", platform="instagram",
+        caption="This caption mentions our forbidden word explicitly.",
+        hashtags=[], creative_path="/tmp/drive_asset.jpg",
+        creative_public_url="https://cdn.example.com/drive_asset.jpg",
+        scheduled_for="2026-08-19T11:30:00+00:00", status=DraftStatus.PENDING,
+        source_media_asset_id="drive-asset-42")
+
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft",
+                       lambda *a, **kw: bad_draft)
+    monkeypatch.setattr(cmr.config, "sb7_enabled", lambda: False)
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=("forbidden",))
+    assert out["ok"] is True
+    assert out["backfilled"] == 1, "must still fall back to a clean local-reuse replacement"
+    ig_feed = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 1
+    assert "forbidden" not in ig_feed[0]["caption"]
+    assert "drive_asset" not in ig_feed[0]["image_url"], (
+        "the banned-word Drive draft must never be the one placed"
+    )
+
+
+def test_deny_backfill_falls_back_to_local_reuse_when_drive_declines(monkeypatch, tmp_path):
+    """Both Drive flags on, but the Drive builder itself declines (no fresh Drive
+    asset fit the slot, or the lane is unarmed underneath) -- must fall through to
+    the existing local-reuse path exactly as before this fix, never leave the slot
+    empty just because Drive was tried first."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft",
+                       lambda *a, **kw: None)
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    assert out["backfilled"] == 1, "must still fall back to a local-reuse replacement"
+    ig_feed = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 1
+    assert "photo_00" not in ig_feed[0]["image_url"]
+
+
+def test_deny_backfill_ignores_drive_when_flags_off(monkeypatch, tmp_path):
+    """No Drive flags armed (the ordinary case for most gyms tonight) -- the Drive
+    builder must never even be called; byte-for-byte the pre-existing local-reuse
+    behavior."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.delenv("GYM_DRIVE_CONNECT_GYMS", raising=False)
+    monkeypatch.delenv("GYM_DRIVE_STAGE", raising=False)
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+
+    called = []
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft",
+                       lambda *a, **kw: called.append(1))
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    assert out["backfilled"] == 1
+    assert not called, "the Drive builder must never be invoked with both flags off"
+
+
 def test_deny_backfill_idempotent_on_the_same_denied_row(monkeypatch, tmp_path):
     """ALWAYS 1:1 (Blake, 2026-09-05): idempotency is now per DENIED ROW (a kv marker
     keyed by that row's own id), not per day -- a day already having some OTHER active
@@ -643,6 +933,63 @@ def test_deny_backfill_replaces_a_denied_row_even_when_another_post_covers_its_d
     assert ig_feed[0]["post_date"] == "2026-08-19"
     # Never re-placed the day's OTHER, already-live photo.
     assert "photo_01" not in ig_feed[0]["image_url"]
+
+
+def test_deny_backfill_spreads_multiple_denied_rows_off_the_same_day(monkeypatch, tmp_path):
+    """Pete/Zanshin, 2026-09-08: two DIFFERENT denied rows that happened to share an
+    original post_date each got their own 1:1 replacement (correct per the 2026-09-05
+    ALWAYS 1:1 fix) -- but nothing capped how many of those replacements could land on
+    that SAME day, so they stacked (reproduced live: up to 4 independent captions all
+    target-dated to one day). This must NOT regress the Dale/ENG case just above (an
+    UNRELATED active post never blocks a replacement) -- only TWO backfill replacements
+    landing on the same day should spread, one rolling forward to the next open day."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    row1 = _denied_feed_row("2026-08-19", photo="photo_00.jpg")
+    row1["id"] = "denied-row-A"
+    row2 = _denied_feed_row("2026-08-19", photo="photo_01.jpg")
+    row2["id"] = "denied-row-B"
+    store = _FakeStoreLM({("gritx", "2026-08"): [row1, row2]})
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    ig_feed = [r for r in store.inserted
+              if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 2, "both denied rows must still get their own replacement"
+    post_dates = sorted(r["post_date"] for r in ig_feed)
+    assert post_dates == ["2026-08-19", "2026-08-20"], (
+        f"the second replacement must roll forward to the next open day instead of "
+        f"stacking onto 2026-08-19 with the first, got {post_dates}")
+    assert out["backfilled"] == 2, "two distinct days' worth of backfill, not one"
+
+
+def test_deny_backfill_second_pass_still_spreads_a_previously_used_day(monkeypatch, tmp_path):
+    """The day-used marker must be DURABLE across separate runs, not just this pass's
+    in-memory set -- a real gym accumulates denied rows over many days/cron runs, not
+    all in one batch. Simulate a prior run having already placed a backfill replacement
+    on 2026-08-19 (the marker this fix sets), then a NEW denied row also originally
+    dated 2026-08-19 arrives in a later run -- it must roll forward, not stack."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    from agent import db as _db
+    _db.kv_set("denybf_dayused_gritx_2026-08-19", "1")
+    row = _denied_feed_row("2026-08-19", photo="photo_00.jpg")
+    row["id"] = "denied-row-C"
+    store = _FakeStoreLM({("gritx", "2026-08"): [row]})
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    ig_feed = [r for r in store.inserted
+              if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 1
+    assert ig_feed[0]["post_date"] == "2026-08-20", (
+        "a day already used by a PRIOR run's backfill must roll this one forward too")
 
 
 def test_deny_backfill_never_reuses_a_live_photo(monkeypatch, tmp_path):

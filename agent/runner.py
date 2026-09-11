@@ -235,10 +235,7 @@ def _autonomous_publish(draft, store, poster):
     if not getattr(result, "ok", False):
         # e.g. media not ready / not authorized: NOTHING published, so release the claim
         # for a clean retry, then hold PENDING. Never fake success.
-        try:
-            _db.socialapi_claim_release(draft.draft_id, account_key)
-        except Exception:  # noqa: BLE001
-            pass
+        _release_claim(draft.draft_id, account_key, "publish returned not-ok")
         return False
     detail = str(getattr(result, "detail", "") or "")
     if detail.startswith("published"):
@@ -249,10 +246,7 @@ def _autonomous_publish(draft, store, poster):
     else:
         # would_publish: the dry run sent nothing, so the claim must not stand or the
         # post could never go out once publishing is armed.
-        try:
-            _db.socialapi_claim_release(draft.draft_id, account_key)
-        except Exception:  # noqa: BLE001
-            pass
+        _release_claim(draft.draft_id, account_key, "dry run, nothing sent")
     # handle_action set draft.status to APPROVED on success; persist that record.
     store.put(draft)
     from . import db
@@ -391,6 +385,37 @@ def _claimed_meta_publish(draft, acct):
         # would_publish: no network call happened; release so an armed run can send.
         db.socialapi_claim_release(draft.draft_id, acct.key)
     return ("published", result)
+
+
+def _release_claim(draft_id, account_key, why):
+    """Release a publish claim, and NEVER swallow the failure.
+
+    AUD-107, 2026-09-05. Both release paths sat inside `except Exception: pass`. A claim
+    that fails to release is not a cosmetic problem: the row stays claimed, the publish
+    lane skips it forever, and the client's approved post silently never goes out. The
+    intended backstop (a claim_hold_alerted_* watchdog) had never fired once, because a
+    swallowed release leaves nothing for it to see. Production at the time of the fix:
+    socialapi_claims held an in_flight row for welcf_64fbd8ce8368 / lasso_ig claimed
+    2026-09-01 12:29:55, four days stale, with zero claim_hold_alerted_* keys anywhere.
+
+    Same shape as the four safety nets that shipped inert: a component that logs nothing,
+    raises nothing, and does nothing. A release failure now logs loudly AND raises one ops
+    alert so it is visible, while still never taking the publish pass down with it."""
+    from . import db as _db
+    try:
+        _db.socialapi_claim_release(draft_id, account_key)
+        return True
+    except Exception as e:  # noqa: BLE001 - never break the publish pass
+        msg = (f"claim release FAILED for {account_key} draft {draft_id} ({why}): "
+               f"{type(e).__name__}: {e}. The row stays CLAIMED, so the publish lane will "
+               f"skip it on every future pass and the post can never go out. Release it by "
+               f"hand or the client's approved post is stranded.")
+        print(f"[runner] {msg}")
+        try:
+            ops_alerts.alert(msg)
+        except Exception:  # noqa: BLE001 - alerting must not break publishing either
+            pass
+        return False
 
 
 def _post_and_save(draft, store, poster, idempotent):
@@ -999,7 +1024,7 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 _record_cap(account.key, draft.draft_type or "feed", day_key)
 
             existing = None
-            if idempotent:
+            if idempotent and draft is not None:
                 draft, existing = _reconcile(draft, day_key, "feed", store, poster)
                 if draft is None:
                     # Re-run, nothing new: the existing PENDING draft IS the result.
@@ -1307,6 +1332,52 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         ops_alerts.alert(f"metrics sync failed: {type(e).__name__}: {e}. "
                          "The draft run is unaffected.")
 
+    # CROSS GYM BRAIN (AGENT_CROSS_GYM_BRAIN, default OFF -> no-op): the WEEKLY
+    # fleet rollup of every gym's matured post_metrics into FORM statistics —
+    # which hook shape, caption length, structure, pillar, ask, slot and format
+    # actually correlate with engagement ACROSS gyms, plus the BEST POST DIGEST
+    # (what the fleet's top decile of posts share in FORM, Fisher exact, or an
+    # honest "not distinguishable"). Each finding carries its per cell n, effect
+    # size, p value and Benjamini Hochberg q value. Only a finding that clears
+    # the sample floor on BOTH sides, draws on >= 2 distinct gyms on BOTH sides,
+    # survives the FDR correction and clears the effect floor becomes guidance;
+    # everything else is reported as insufficient_data / not_significant /
+    # directional and changes nothing. external and is_ad rows never train (the
+    # monthly_retro rail). READ ONLY apart from the append only cross_gym_brain
+    # row; the output is FORM ONLY by whitelist, so no caption text or client
+    # content can cross between gyms.
+    #
+    # CADENCE (Blake, 2026-09-06: "digest weekly"): this block ticks NIGHTLY but
+    # calls run_weekly, which fires the job at most ONCE per ISO week and is a
+    # true no-op the other six nights (no store, no fleet read, no write). Do not
+    # swap this back to jobs.cross_gym_brain.run — that is the nightly entry
+    # point and it has no cadence gate of its own.
+    # Isolated: a brain failure never blocks the draft run.
+    try:
+        from .jobs.cross_gym_brain import run_weekly as _cross_gym_brain_weekly
+        _cgb = _cross_gym_brain_weekly()
+        if _cgb.get("ok") and _cgb.get("ran"):
+            print(f"[cross-gym-brain] {len(_cgb.get('findings') or [])} finding(s), "
+                  f"{len(_cgb.get('guidance') or [])} cleared the bar")
+        elif _cgb.get("failed"):
+            # A REAL failure the job caught and reported rather than raised: the
+            # rollup write 400'd, the form only whitelist refused the artifact,
+            # or the cadence marker is unreadable. This branch exists because the
+            # except below could never see any of them — the job swallows its own
+            # exceptions one frame earlier — so before it, a genuine write failure
+            # printed "skipped" and alerted NOBODY, indistinguishable from a
+            # dormant flag. Most likely cause after arming: the top_posts column
+            # migration has not been hand-applied yet.
+            print(f"[cross-gym-brain] FAILED: {_cgb.get('reason')}")
+            ops_alerts.alert(f"cross gym brain: {_cgb.get('reason')}. "
+                             "The draft run is unaffected.")
+        else:
+            print(f"[cross-gym-brain] skipped: {_cgb.get('reason')}")
+    except Exception as e:
+        print(f"[cross-gym-brain] failed: {type(e).__name__}: {e}")
+        ops_alerts.alert(f"cross gym brain failed: {type(e).__name__}: {e}. "
+                         "The draft run is unaffected.")
+
     # GYM MEDIA DRIVE SYNC (gym_media_drive): nightly walk of each connected gym's
     # shared Drive folder into media_asset — MIME filter, content_hash dedupe,
     # eligibility gate, budgeted ffprobe, removed/revoked handling, deny sweep, a
@@ -1314,6 +1385,28 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     # Pierce first). POSTS NOTHING to social; STAGE governs the planner pull. Inert
     # without a GOOGLE_DRIVE_SA_JSON key + Supabase creds. Isolated: a sync failure
     # never blocks the draft run.
+    # CLIENT-DM SUPPORT LANE (AGENT_CLIENT_DM_AUTOFIX, default OFF): a client's own
+    # Slack message is measured against a closed set of enumerated conditions; at most
+    # a per-gym Drive media sync runs; a human is carded every single time. On its own
+    # this flag sends a client NOTHING -- a reply needs AGENT_CLIENT_DM_CLIENT_REPLY
+    # and a runtime-derived AGENT_CLIENT_DM_LIVE_ACK as well. Isolated: a failure here
+    # never blocks the draft run.
+    if config.client_dm_autofix_enabled():
+        try:
+            # GAP 1 fix: run_once_all_identities loops every bot identity that can
+            # carry a client's Slack conversation (echo, ranger, scout, wrangler),
+            # not just 'echo'. See client_dm_support/lane.py's own docstring on
+            # run_once_all_identities for why a single identity was invisible to
+            # most of this system's real client traffic.
+            from .client_dm_support.lane import run_once_all_identities as _client_dm_run
+            _cdsum = _client_dm_run()
+            if not _cdsum.get("ok"):
+                print(f"[client-dm] not ok: {_cdsum.get('reason', '')}")
+        except Exception as e:
+            print(f"[client-dm] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"client DM support lane failed: {type(e).__name__}: {e}. "
+                             "No client was replied to and the draft run is unaffected.")
+
     if config.gym_drive_connect_enabled() or config.gym_drive_connect_gyms():
         try:
             from .jobs.sync_gym_media import run as _gym_media_sync_run

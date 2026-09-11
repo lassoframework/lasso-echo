@@ -1225,15 +1225,56 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
             _remediate(_grade_rows, grade.defects)
             grade = grade_month(_grade_rows, profile=_profile)
         if grade.total < _AT:
-            ops_alerts.alert(
-                f"calendar grade gate: {account_key} scored {grade.total} "
-                f"({grade.letter}) after 4 remediation passes. Top defects: "
-                f"{[d[2] for d in grade.defects[:3]]}. NOT STAGING — human decision needed."
-            )
-            return {"ok": False,
-                    "reason": f"calendar grade gate: scored {grade.total} ({grade.letter}) after 4 passes",
-                    "grade": grade.total, "letter": grade.letter,
-                    "upserted": 0, "deleted": 0}
+            # PARTIAL STAGE (Blake, 2026-09-07): an all-or-nothing gate meant one
+            # unfixable day (source material too thin to rewrite honestly) blocked
+            # the WHOLE month, including every clean day remediation already
+            # produced. defects' row_ref is a YYYY-MM-DD for every PER-DAY rule
+            # (consistency gaps, duplicate captions, per-day craft/audience
+            # flags); a handful of rules are month-wide aggregates with no date
+            # (row_ref "") and cannot be isolated to a single day. Drop just the
+            # named dates and re-grade what remains: if the reduced book clears
+            # the bar, stage it and leave the dropped dates as gaps (nothing is
+            # invented to fill them; preserve_and_prune below still protects any
+            # already-approved/published row on those dates; the next fill pass
+            # covers the gap same as any other unfillable day). If dropping the
+            # named dates still cannot clear the bar, the failure is not
+            # isolated to any single day (an aggregate defect, or every day is
+            # bad) and this stays a real HELD — never force fabricated content
+            # through to hit a grade.
+            _bad_dates = {
+                ref for (_leg, ref, _reason) in grade.defects
+                if isinstance(ref, str) and len(ref) == 10
+                and ref[4:5] == "-" and ref[7:8] == "-"
+            }
+            _reduced_grade = None
+            if _bad_dates:
+                _reduced_rows = [r for r in _grade_rows
+                                 if r.get("post_date") not in _bad_dates]
+                if _reduced_rows:
+                    _reduced_grade = grade_month(_reduced_rows, profile=_profile)
+            if _reduced_grade is not None and _reduced_grade.total >= _AT:
+                ops_alerts.alert(
+                    f"calendar grade gate: {account_key} scored {grade.total} "
+                    f"({grade.letter}) after 4 remediation passes. Held "
+                    f"{len(_bad_dates)} date(s) {sorted(_bad_dates)} as gaps "
+                    f"(top defects: {[d[2] for d in grade.defects[:3]]}) and "
+                    f"staged the rest at {_reduced_grade.total} "
+                    f"({_reduced_grade.letter}). PARTIAL STAGE — held dates are "
+                    f"gaps, not lost; next fill pass covers them."
+                )
+                drafts = [d for d in (drafts or [])
+                          if getattr(d, "post_date", None) not in _bad_dates]
+                grade = _reduced_grade
+            else:
+                ops_alerts.alert(
+                    f"calendar grade gate: {account_key} scored {grade.total} "
+                    f"({grade.letter}) after 4 remediation passes. Top defects: "
+                    f"{[d[2] for d in grade.defects[:3]]}. NOT STAGING — human decision needed."
+                )
+                return {"ok": False,
+                        "reason": f"calendar grade gate: scored {grade.total} ({grade.letter}) after 4 passes",
+                        "grade": grade.total, "letter": grade.letter,
+                        "upserted": 0, "deleted": 0}
         # Attach grade summary to the result below
         _grade_summary = f"Grade: {grade.letter} ({grade.total}/100)"
     else:
@@ -1274,6 +1315,31 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
         # PRESERVE APPROVALS: never overwrite a slot a human already approved/published.
         from .portal_calendar_store import preserve_and_prune
         rows, _locked = preserve_and_prune(sb_store, account_key, months, rows)
+        # DAY SHAPE ASSERTION (ECHO_DAY_SHAPE_ASSERT, default ON). On the exact rows
+        # about to be inserted, after the human owned slots are pruned and BEFORE the
+        # first delete: two rows on one (gym_id, account, post_date, format) must
+        # differ in BOTH caption and image_url. Measured on production 2026-09-05,
+        # this lane's own output has lasso 2026-09-16 carrying two facebook feed rows
+        # with one identical platform caption. A violation FAILS the pass and nothing
+        # is deleted or written: the same post twice on one account is the defect that
+        # published Tough Temple six times in forty seconds.
+        from . import day_shape as _day_shape
+        try:
+            _day_shape.assert_day_distinct(
+                rows, enabled=config.day_shape_assert_enabled())
+        except _day_shape.DayShapeViolation as exc:
+            try:
+                from agent import ops_alerts as _oa
+                _oa.alert(f"{account_key}: month plan STOPPED and wrote nothing. "
+                          f"{len(exc.violations)} day(s) would have put the same "
+                          f"post twice on one account. "
+                          f"First: {exc.violations[0].message()}")
+            except Exception:  # noqa: BLE001 - the alert never sinks the report
+                pass
+            return {"ok": False,
+                    "reason": "day shape: same post twice in one day",
+                    "day_shape_violations": [v.message() for v in exc.violations],
+                    "upserted": 0, "deleted": 0}
         delete_month = getattr(sb_store, "delete_month", None)
         for month in months:
             if delete_month is not None:

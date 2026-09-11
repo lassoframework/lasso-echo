@@ -138,20 +138,33 @@ def _accounts_starved_on(day):
         return None
 
 
-def _gyms_short_on(day):
+def _gyms_short_on(day, bases=None):
     """Registry gyms with ZERO calendar rows dated `day`. Returns None when coverage
     cannot be read, so the caller can say "unknown" rather than imply "fine".
 
     Best effort by design: this only ever decides how LOUD an alert is, never whether
-    content is published, so a read failure must degrade to the noisier branch."""
+    content is published, so a read failure must degrade to the noisier branch.
+
+    THE SET IS THE ACCOUNT REGISTRY, NOT THE gyms TABLE (2026-09-10). This iterated
+    db.gym_list(), which was ACCIDENTALLY almost the right set: the worker's local
+    SQLite only ever held the ~20 gyms someone had touched on THAT volume, which
+    happened to track the registry. Closing the echo.db split brain makes every
+    self-serve-onboarded gym visible here (139 rows and climbing, most of them
+    onboarding stubs with no registry entry and therefore no content lane at all), so
+    the old loop would have made ~140 Supabase round trips per alert and named ~119
+    stubs as "have NO rows" inside an already alarming line. "Registry gym" is what
+    this alert's own text has always promised, and client_gym_bases() is the exact set
+    the autopublish lane actually draws for. `bases` is injectable for tests."""
     try:
-        from . import db
         from .portal_calendar_store import SupabaseCalendarStore
+        if bases is None:
+            from .calendar_autopublish import client_gym_bases
+            bases = client_gym_bases()
         store = SupabaseCalendarStore()
         short = []
         checked = 0
-        for gym in (db.gym_list() or []):
-            base = str(gym.get("account_key") or "").strip()
+        for base in (bases or []):
+            base = str(base or "").strip()
             if not base:
                 continue
             rows = store.list_month(base, str(day)[:7]) or []
@@ -429,6 +442,10 @@ def _print_scheduled_lanes():
         ("nightly backup", config.backup_enabled(), "AGENT_BACKUP_ENABLED"),
         ("portal echo ticket bridge", config.portal_echo_tickets_enabled(),
          "AGENT_PORTAL_ECHO_TICKETS_ENABLED"),
+        ("cross gym brain (weekly)", config.cross_gym_brain_enabled(),
+         "AGENT_CROSS_GYM_BRAIN"),
+        ("brains feed captions", config.brain_feeds_captions_enabled(),
+         "AGENT_BRAIN_FEEDS_CAPTIONS"),
     ]
     for name, armed, env in lanes:
         state = "ARMED" if armed else f"dormant ({env} off)"
@@ -634,7 +651,19 @@ def _daily_scheduler(store):
                 _etw.intake_pass(deps.bus, **deps.intake_kwargs)
                 _etw.fixed_pass(deps.bus, **deps.fixed_kwargs)
             except Exception as e:
-                print(f"[echo-ticket-worker] pass failed: {type(e).__name__}: {e}")
+                # M4, corrected by finding 8 (audit 3): raising HERE was worse than the bug
+                # it fixed. This runs inside _daily_scheduler's `while True`, on a daemon
+                # thread, so a raise killed the ENTIRE daily scheduler -- catchup report,
+                # welcome digest, intake ingest, media sync, social sync -- silently, with
+                # the process still reporting healthy. "Refuse to start" belongs at boot,
+                # where it crashes the deploy visibly; here the same misconfiguration is
+                # made LOUD on every cycle instead, and the other jobs keep running.
+                from .slack_convo.listener_wiring import NotWiredError as _NotWired
+                if isinstance(e, _NotWired):
+                    print(f"[echo-ticket-worker] CRITICAL not wired, portal tickets are NOT "
+                          f"being processed this cycle: {e}")
+                else:
+                    print(f"[echo-ticket-worker] pass failed: {type(e).__name__}: {e}")
             # D47: product='portal' tickets (the generic Website tab form's default,
             # not Echo-specific) route to Scout per the identity map, never to
             # Ranger's ad-engine-only fixer-lane.ts, which has no reason to see them.
@@ -648,7 +677,14 @@ def _daily_scheduler(store):
                 _etw.intake_pass(scout_deps.bus, **scout_deps.intake_kwargs)
                 _etw.fixed_pass(scout_deps.bus, **scout_deps.fixed_kwargs)
             except Exception as e:
-                print(f"[echo-ticket-worker/scout] pass failed: {type(e).__name__}: {e}")
+                # Finding 8 (audit 3): the two legs must behave identically -- this one
+                # swallowed NotWiredError with a plain print while the Echo leg above raised.
+                from .slack_convo.listener_wiring import NotWiredError as _NotWired
+                if isinstance(e, _NotWired):
+                    print(f"[echo-ticket-worker/scout] CRITICAL not wired, portal tickets "
+                          f"are NOT being processed this cycle: {e}")
+                else:
+                    print(f"[echo-ticket-worker/scout] pass failed: {type(e).__name__}: {e}")
         # CLIENT MEDIA SYNC frequent lane: dormant unless AGENT_CLIENT_MEDIA_SYNC.
         # Picks up a client gym's fresh R2 upload PROMPTLY (throttled to
         # AGENT_CLIENT_MEDIA_SYNC_MINUTES, default 5) and auto-builds its DRAFT
@@ -804,6 +840,39 @@ def _daily_scheduler(store):
         time.sleep(60)
 
 
+def _chat_message_is_from_approver(message) -> bool:
+    """Bolt-level MATCHER (not a body check inside the listener) for on_chat_message
+    below: a Slack Bolt App only ever runs the FIRST listener in registration order
+    whose matcher returns True for a given event -- it does NOT run every listener
+    that would match (see ThreadListenerRunner.run: the auto-ack fires and
+    App.dispatch() returns as soon as ONE listener matches, before any later listener
+    in self._listeners is even checked). This is the root cause of the 2026-09-06 Chad
+    Edwards / John Weeks gap: `@app.message("")` used to have no matchers at all, and
+    an empty keyword matches virtually every plain human message (empty keyword + the
+    default subtype constraint covers a plain message). Because on_chat_message was
+    registered ABOVE _convo.attach(app, "echo") a few lines down, it silently swallowed
+    100% of real client Slack messages on Echo's identity, for every gym, for the
+    entire life of this project -- slack_convo's own `@app.event("message")` listener
+    (registered after) was never even reached, so it could never create a
+    support_tickets row, no matter how correct its own code was in isolation. The
+    function body's own `actor != APPROVER_SLACK_ID: return` check was always too
+    late: by the time it ran, Bolt had already committed to this listener and would
+    never fall through to slack_convo's.
+
+    Moving the actor check UP into this matcher fixes it structurally: for anyone but
+    Blake, this listener now doesn't match at all, so Bolt proceeds to the next
+    listener in self._listeners exactly as it always should have -- letting
+    slack_convo's own message listener (registered below) see every client message for
+    the first time. Verified live (2026-09-06/07): a real Slack message sent into Chad
+    Edwards's mpim channel (C0BUNHG49EH), where Echo is a verified member with
+    message.mpim/message.im subscribed, produced a health-line event count of
+    events={'message:mpim': 0} for the ENTIRE life of the prior deployment -- proof the
+    event reached Slack's dispatch to this bot but never reached slack_convo's counter.
+    Module-level (not nested in run_listener) so tests/test_listener_chat_message_
+    matcher.py can import and exercise the real function directly, not a copy of it."""
+    return message.get("user", "") == config.APPROVER_SLACK_ID
+
+
 def run_listener():
     # Startup config hygiene: placeholder AGENT_OPUS_PROJECT_IDS values (P1
     # pattern / under 6 chars) get ONE warning naming each bad value and are
@@ -817,6 +886,11 @@ def run_listener():
     # 404s. Same class of self-announcing guard as the OCR model check.
     from . import creative_studio as _cs
     _cs.validate_generation_models()
+    # Image engine announcement: which engine is actually in force this boot.
+    # Astra (gpt-image-2.5) is the default; with no OPENAI_API_KEY the chain
+    # boots on Gemini and says so ONCE, so the demotion is never a silent one.
+    from . import image_engine as _ie
+    _ie.announce_boot()
     # Facebook connect page: a small HTTP surface INSIDE this process (it needs
     # the /data store for the page token). Dormant unless AGENT_CONNECT_ENABLED;
     # while off, no thread starts and the routes would 404 anyway.
@@ -929,12 +1003,17 @@ def run_listener():
         out = run_daily(store=store)
         respond(f"Drafting: {out['status']} ({len(out.get('drafts', []))} card(s)) -> #echoclaude")
 
-    @app.message("")
+    @app.message("", matchers=[_chat_message_is_from_approver])
     def on_chat_message(message, say):
         """Free-text chat: Blake can publish LASSO accounts directly (explicit verb),
         client accounts only draft. Inert unless AGENT_CHAT_PUBLISH_ENABLED. Stays
         SILENT on anything that is not an actionable publish/undo command so it never
-        spams the channel."""
+        spams the channel.
+
+        The matcher above (not this body) is what keeps this listener from ever
+        intercepting another human's message -- see its docstring. This function
+        still re-checks bot_id/subtype/actor defensively (belt and suspenders; a
+        matcher change elsewhere must never silently widen who this replies to)."""
         if not config.chat_publish_enabled():
             return
         # ignore bot / edited / non-user events
@@ -976,6 +1055,17 @@ def run_listener():
         _convo.attach(app, "echo")
         _convo.start_additional_identities()
     except Exception as _ce:  # noqa: BLE001 - the adapter must never take the listener down
+        # M4 (2026-09-05 audit 2): a NotWiredError caught HERE was the worst possible outcome
+        # of the "refuse to boot" assertion -- attach() and start_additional_identities()
+        # would both be skipped, all four bot identities would go silently dark, and the
+        # listener would report healthy. That is the exact "ships inert" pattern the
+        # assertion exists to kill, one level up. A misconfiguration this specific is a
+        # deployment fault and must be LOUD: it re-raises, the process fails to start, and
+        # Railway shows a crashed deploy instead of a quiet lobotomy.
+        from .slack_convo.listener_wiring import NotWiredError as _NotWired
+        if isinstance(_ce, _NotWired):
+            print(f"[slack-convo] REFUSING TO START: {_ce}")
+            raise
         print(f"[slack-convo] attach failed: {type(_ce).__name__}: {_ce}")
 
     if str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}:

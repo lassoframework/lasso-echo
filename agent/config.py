@@ -79,6 +79,24 @@ NANO_MODEL_FLASH = os.environ.get("AGENT_NANO_MODEL_FLASH", "gemini-3.1-flash-im
 # in this document. Code constants in creative_studio.py must match section 8.
 HOUSE_STYLE_PATH = os.environ.get("AGENT_HOUSE_STYLE_PATH",
                                   "brand_voice/lasso_house_style.md")
+
+# ---- Image engine: Astra is the DEFAULT, Gemini is the fallback --------------
+# ChatGPT-6 Astra (gpt-image-2.5) draws every image first; the Gemini / Nano
+# Banana path above is UNCHANGED and demoted to the fallback rung. The engine and
+# the model ids are read fresh from env in image_engine.py (spec names
+# IMAGE_ENGINE / ASTRA_IMAGE_MODEL, with AGENT_-prefixed aliases); the constants
+# below are only the DEFAULTS that apply when neither env name is set.
+#
+# The OpenAI key is read lazily BY NAME at the moment of use — never stored on an
+# object, never logged. Absent key = boot with engine=gemini and one warning.
+OPENAI_API_KEY_ENV = "OPENAI_API_KEY"  # name of the env var, not the value
+# The Responses-API model that reads the creative brief and calls the image tool.
+ASTRA_BRIEF_MODEL = os.environ.get("ASTRA_BRIEF_MODEL", "gpt-6-astra")
+# Sunburst: infographics, carousels, and any asset with text overlays.
+ASTRA_IMAGE_MODEL = os.environ.get("ASTRA_IMAGE_MODEL", "gpt-image-2.5-sunburst")
+# Flare: story-format quick graphics that render no text.
+ASTRA_IMAGE_MODEL_FLARE = os.environ.get("ASTRA_IMAGE_MODEL_FLARE",
+                                         "gpt-image-2.5-flare")
 # VISION READ model (image -> text), SEPARATE from the generation model above.
 # The *-image models (Nano Banana family: gemini-3-pro-image, gemini-3.1-flash-image)
 # GENERATE images and return image parts, not text, so they cannot transcribe text
@@ -158,6 +176,73 @@ def social_baseline_enabled() -> bool:
     after-pull per gym per month.
     """
     return _truthy(os.environ.get("AGENT_SOCIAL_BASELINE", "false"))
+
+
+def social_metrics_daily_enabled() -> bool:
+    """
+    The DAILY follower series pull into gym_social_metrics_daily
+    (AGENT_SOCIAL_METRICS_DAILY, default OFF).
+
+    Gates agent/social_metrics_daily.py. Reads Zernio /v1/accounts/follower-stats
+    (one request for the whole org) and upserts one row per gym per account per day.
+    Read-only against Zernio; the only write is the metrics table. OFF by default:
+    nothing this track builds arms itself.
+
+    Fixes AUD-007 / D1: gym_social_metrics_daily has 0 rows because nothing has ever
+    written to it.
+    """
+    return _truthy(os.environ.get("AGENT_SOCIAL_METRICS_DAILY", "false"))
+
+
+def social_metrics_backfill_days() -> int:
+    """How far back a single social-metrics run will write, in days
+    (AGENT_SOCIAL_METRICS_BACKFILL_DAYS, default 90).
+
+    Zernio's follower-stats endpoint ignores every date parameter and returns its full
+    history, so the window is applied by Echo, not asked for. 0 or a negative value means
+    no limit: take everything Zernio holds.
+    """
+    try:
+        return int(os.environ.get("AGENT_SOCIAL_METRICS_BACKFILL_DAYS", "90"))
+    except (TypeError, ValueError):
+        return 90
+
+
+def gbp_failed_retry_enabled() -> bool:
+    """
+    Retry + re-alert for Google Business rows stuck in failed
+    (AGENT_GBP_FAILED_RETRY, default OFF).
+
+    Fixes AUD-003: a failed googlebusiness row is never retried and never alerted a
+    second time, so lasso sat failed from 2026-08-20 (16 days) and crossfitnine7f7dadc
+    from 2026-09-03 with nobody told. Gates the retry sweep in agent/gbp_failed_retry.py.
+    """
+    return _truthy(os.environ.get("AGENT_GBP_FAILED_RETRY", "false"))
+
+
+def apify_social_backfill_enabled() -> bool:
+    """
+    The Apify BEFORE-WINDOW backfill lane (AGENT_APIFY_SOCIAL_BACKFILL, default OFF).
+
+    One run per gym at onboarding to capture the public feed from BEFORE Echo took over.
+    Zernio owns the ongoing series; this lane must NEVER run daily. Also needs APIFY_TOKEN
+    in env; without it the lane reports the absence and does nothing, never a crash.
+
+    Every number it writes carries actor id, build id and run id (see
+    docs/METRICS_DATA_CONTRACT.md s3). A scraped number with no run id is not admissible.
+    """
+    return _truthy(os.environ.get("AGENT_APIFY_SOCIAL_BACKFILL", "false"))
+
+
+def apify_run_ceiling() -> int:
+    """Hard cap on Apify actor runs a single process may start
+    (AGENT_APIFY_RUN_CEILING, default 20). FAIL CLOSED: at the ceiling the lane stops
+    and reports, it does not keep spending. A 0 or negative value means no run is
+    permitted at all, which is the safe reading of a misconfigured ceiling."""
+    try:
+        return int(os.environ.get("AGENT_APIFY_RUN_CEILING", "20"))
+    except (TypeError, ValueError):
+        return 20
 
 
 def socialapi_enabled() -> bool:
@@ -318,9 +403,12 @@ def onboarding_watch_enabled() -> bool:
     a different key, no approved sources, no Zernio profile, zero connected platforms,
     or Facebook connected with no page selected.
 
-    It audits against echo_intake_tokens rather than Echo's own registry, because every
+    It audits against the portal's roster rather than Echo's own registry, because every
     failure of this class has arrived as a gym MISSING from that registry — which is
     exactly why connection_watch never saw Hill Country, the gym it was built for.
+    THE ROSTER IS ECHO CLIENTS ONLY (2026-09-11): echo_intake_tokens rows for gyms with
+    an echo_gym_settings row, via agent/echo_clients.py. The token table alone is the
+    whole LASSO ads fleet, and sweeping it DMed 36 non-clients a connect link.
     Read-only apart from its dedup stamps; it never registers, connects or approves
     anything. Arm by hand in Railway env.
     """
@@ -698,6 +786,27 @@ def gym_drive_sync_max_depth() -> int:
         return max(1, int(os.environ.get("GYM_DRIVE_SYNC_MAX_DEPTH", "4")))
     except (TypeError, ValueError):
         return 4
+
+
+def rendition_max_per_build() -> int:
+    """Transcodes (HEVC / odd-container video -> H.264 .mp4) ONE month build may run
+    synchronously (audit R-D1 #3). Env RENDITION_MAX_PER_BUILD, default 8. Once spent
+    the build prefers already-renditioned videos, then photos; the nightly pre-render
+    pass (rendition_max_per_sync) renders the rest."""
+    try:
+        return max(0, int(os.environ.get("RENDITION_MAX_PER_BUILD", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def rendition_max_per_sync() -> int:
+    """Transcodes the nightly Drive sync (sync_gym_media) may run per source per run
+    to pre-render eligible HEVC videos that lack a rendition_url (audit R-D1 #5). Env
+    RENDITION_MAX_PER_SYNC, default 12 (converges across nights)."""
+    try:
+        return max(0, int(os.environ.get("RENDITION_MAX_PER_SYNC", "12")))
+    except (TypeError, ValueError):
+        return 12
 
 
 def gym_drive_probe_max_per_run() -> int:
@@ -1110,6 +1219,173 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+def reply_engine_watch_enabled() -> bool:
+    """AGENT_REPLY_ENGINE_WATCH, default OFF. The watchdog over the comment reply
+    engine (AUD-008 / AUD-105).
+
+    Verified live 2026-09-05: echo_reply_accounts holds 6 rows covering eng and
+    topfuel ONLY, echo_reply_settings holds 2, and echo_reply_queue holds 10 rows
+    that were ALL created 2026-08-31T14:27:20 (five days of zero ingest), while
+    gym_social_accounts holds 42 accounts and 26 instagram/facebook accounts across
+    13 gyms have no mapping at all. The portal's reply webhook answers HTTP 200
+    with ignored='account not mapped to a gym' (or 'gym disabled'), and a 200 is
+    an error to nobody, so those gyms drop every comment in silence.
+
+    Nothing noticed because the REPLY NEEDED cards come from inbox_alerts.py, which
+    reads the Zernio inbox directly; no code in this package has ever read
+    echo_reply_queue. Two systems that disagree, and the one that can actually reply
+    is the empty one.
+
+    ON: a daily READ ONLY comparison of the four tables, kv-deduped, that names the
+    unmapped gyms and a stalled ingest. It NEVER writes a mapping or enables a gym:
+    mapping a gym arms replying on that client's behalf, which is a person's call.
+    OFF (default): a no-op that reads nothing.
+    """
+    return _truthy(os.environ.get("AGENT_REPLY_ENGINE_WATCH", "false"))
+
+
+def media_repeat_report_enabled() -> bool:
+    """AGENT_MEDIA_REPEAT_REPORT, default OFF. Say out loud what the nightly
+    cross-day photo sweep deliberately did NOT fix (B5).
+
+    Measured live 2026-09-05 with the guard armed and the sweep running nightly:
+    zanshin had 5 photo repeats, dates_fixed 0, approved_left 5, small library --
+    one photo on 09-03 (live), 09-08 (approved) and 09-09 (approved), the same
+    picture three times inside seven days. LASSO had 28 repeats, dates_fixed 0.
+
+    The sweep is RIGHT to refuse both cases: it never swaps an APPROVED row's media
+    (the gym approved that exact card) and never fabricates media for a small
+    library. Recording those refusals as an integer on a stdout table is the defect
+    -- approved_left has been counted since the job was written and has never
+    reached a person, so the photos repeated for weeks while the machine reported
+    itself working.
+
+    ON: one kv-deduped sentence per gym per month (and again when it gets worse)
+    naming the photo, the dates, and which repeats fall inside 7 days. It changes
+    NO write behavior. OFF (default): byte for byte today, no extra kv read.
+    """
+    return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_REPORT", "false"))
+
+
+def grade_stuck_escalation_enabled() -> bool:
+    """ECHO_GRADE_STUCK_ESCALATION, default OFF. The named-human escalation for a
+    calendar book that the remediation loop cannot fix (C7).
+
+    The loop is bounded (grade_sweep._MAX_FIX_PASSES = 3, the planner gate 4) and its
+    pass count lives only in memory for one sweep, so "stuck at B for four nights" is
+    not a thing the system can currently know. Worse, the held alert is deduped on
+    (score, defect set), so a gym stuck in EXACTLY the same way goes SILENT after the
+    first night -- precisely when it needs a person.
+
+    ON: consecutive held nights are counted in kv, and at grade_stuck_nights() the
+    sweep raises a GRADE-STUCK alert that names the approver and states the decision
+    being asked for. OFF (default): not one extra kv read, not one extra alert.
+    """
+    return _truthy(os.environ.get("ECHO_GRADE_STUCK_ESCALATION", "false"))
+
+
+def grade_stuck_nights() -> int:
+    """Consecutive nights a forward book may sit below A before C7 escalates to a
+    named human (ECHO_GRADE_STUCK_NIGHTS, default 3, floor 1)."""
+    try:
+        return max(1, int(os.environ.get("ECHO_GRADE_STUCK_NIGHTS", "3") or 3))
+    except (TypeError, ValueError):
+        return 3
+
+
+def media_swap_free_enabled() -> bool:
+    """ECHO_MEDIA_SWAP_FREE, default OFF. The client-initiated FREE photo swap (B6).
+
+    A gym gets 15 recreates a month. The portal's only levers are approve / edit /
+    deny / kill, so "use a different photo" and "the caption needs work" are both a
+    deny and both burn one of the 15. Pete (zanshin) ran out of recreates swapping
+    PHOTOS. The counter was never wrong; the two actions were never separated.
+
+    ON: a media swap is FREE and unlimited (the caption Echo wrote is kept, only the
+    pixels change, so nothing is regenerated and nothing is spent). A caption
+    recreate still costs one of 15. OFF (default): byte-for-byte today's behavior --
+    the swap endpoint 403s and every deny charges the budget.
+
+    NEW client capability, so it ships dark. Arm by hand: ECHO_MEDIA_SWAP_FREE=true.
+    """
+    return _truthy(os.environ.get("ECHO_MEDIA_SWAP_FREE", "false"))
+
+
+def caption_recreate_scoped_enabled() -> bool:
+    """ECHO_CAPTION_RECREATE_SCOPED, default OFF. The client-initiated SCOPED caption
+    recreate (partial-regen, piece 1/2 of "rotate only copy or image" — Blake,
+    2026-09-07).
+
+    media_swap_free_enabled (above) already split "the photo is wrong" into a FREE,
+    photo-only swap that keeps the caption untouched. This is the OTHER half: "the
+    caption is wrong" rewrites ONLY the copy on the gym's EXACT SAME photo, instead
+    of today's deny -> full recreate, which can (and often does) hand the gym a
+    DIFFERENT photo too even though the coach only disliked the words. People like
+    one or the other; changing both when only one was wrong is the bug.
+
+    ON: caption-only recreate rewrites the caption via the same SB7 path every build
+    uses (client_content.make_caption), re-verifies the photo/caption pairing via
+    the vision grounding gate exactly like a normal build, and keeps the SAME photo.
+    It still costs one of the monthly 15 recreates -- regenerating copy is the
+    expensive act (media_swap_free_enabled's own docstring); this flag changes WHAT
+    gets regenerated, never the budget. OFF (default): byte-for-byte today's
+    behavior -- the caption-only endpoint 403s and a caption deny falls through to
+    the existing full recreate.
+
+    NEW client capability, so it ships dark. Arm by hand:
+    ECHO_CAPTION_RECREATE_SCOPED=true.
+    """
+    return _truthy(os.environ.get("ECHO_CAPTION_RECREATE_SCOPED", "false"))
+
+
+def variant_pairing_enabled() -> bool:
+    """ECHO_VARIANT_PAIRING, default OFF. The Astra "v2 creative" pairing feature
+    (migration 0318): regenerate an existing scheduled post's IMAGE as a linked
+    'candidate' content_calendar row (variant_of the original), review it side by
+    side with the live creative, and PICK one atomically via
+    content_calendar_swap_variant. Neither row's approval status is touched by any
+    of this -- a variant becoming active still goes through the exact same
+    publish-approval gate as any normal post.
+
+    This is a prerequisite for a queued fleet-wide regeneration sweep (~1,000+
+    September posts), so it ships gated OFF until verified end-to-end against a
+    real gym, same pattern as ECHO_MEDIA_SWAP_FREE / ECHO_CAPTION_RECREATE_SCOPED.
+    Arm by hand: ECHO_VARIANT_PAIRING=true.
+    """
+    return _truthy(os.environ.get("ECHO_VARIANT_PAIRING", "false"))
+
+
+def lasso_astra_default_enabled() -> bool:
+    """AGENT_LASSO_ASTRA_DEFAULT, default OFF. Blake (2026-09-11): "For Lasso, I
+    want [Astra infographics] to be the default when we're not using any videos
+    or anything like that." b2b was the one LASSO pillar still library-first
+    (rotation.py cycles content_library photos alongside a generated Nano/Astra
+    card as co-equal sources, never Astra-preferred). ON makes the b2b builder
+    try the SAME Astra-first daily_studio infographic builder every other
+    non-video LASSO pillar (platform, doctrine) already uses FIRST, falling back
+    to the existing library rotation only when that returns None (no fabrication
+    -- a day is never blanked). OFF -> byte-for-byte today's rotation-first b2b
+    behavior. Arm by hand: AGENT_LASSO_ASTRA_DEFAULT=true."""
+    return _truthy(os.environ.get("AGENT_LASSO_ASTRA_DEFAULT", "false"))
+
+
+def portal_show_rejected() -> bool:
+    """ESCAPE HATCH for the client-calendar rejection filter (B12), default OFF.
+
+    Default OFF means the guard is ARMED: a post the gym owner already denied or
+    killed, and a row that was deleted, no longer comes back to them as a card on
+    their own calendar (agent/portal_social._client_visible). Measured on production
+    2026-09-05, that was 45% of LASSO's September rows, 40% of ENG's, 34% of pierce's
+    and 33% of zanshin's -- one card in three was content the client had rejected.
+
+    Set ECHO_PORTAL_SHOW_REJECTED=true to restore the historical payload byte for
+    byte (only 'coach_review' hidden). Nothing is deleted or re-statused either way:
+    the rows stay in content_calendar for audit and the publisher's own exclusions
+    (portal_calendar_store.due_rows) are untouched.
+    """
+    return _truthy(os.environ.get("ECHO_PORTAL_SHOW_REJECTED", "false"))
+
+
 def social_billing_delegated() -> bool:
     """The LASSO portal now owns the $99.99/mo social subscription and enforces
     entitlement (isSocialEntitled) BEFORE it ever calls Echo. When this flag is ON,
@@ -1159,6 +1435,42 @@ def portal_calendar_supabase_enabled() -> bool:
     present = use Supabase; creds absent = the existing SQLite behavior, unchanged.
     """
     return bool(supabase_url()) and bool(supabase_service_key())
+
+
+def gym_shared_store_enabled() -> bool:
+    """
+    Mirror the per gym `gyms` row to the SHARED Supabase `echo_gyms` table so the
+    `echo` worker and the `echo-intake-web` service stop keeping two disagreeing
+    copies of it on two separate Railway volumes (the 2026-09-10 split brain: 113
+    gym rows on web, 21 on the worker).
+
+    Same shape as portal_calendar_supabase_enabled: creds present = the shared
+    record is used; creds absent = purely local SQLite, behaviour unchanged (which
+    is every test and every dev checkout). AGENT_GYM_SHARED_STORE=false is an
+    explicit kill switch that turns the mirror off even WITH creds, so the change
+    is reversible from Railway env without a deploy. This is a storage correctness
+    fix, not a new capability, so it does not ship behind a default OFF flag: a
+    default OFF flag here would simply leave the split brain in place.
+    """
+    if not _truthy(os.environ.get("AGENT_GYM_SHARED_STORE", "true")):
+        return False
+    return bool(supabase_url()) and bool(supabase_service_key())
+
+
+def slack_cancel_post_enabled() -> bool:
+    """
+    Slack "cancel my post" / "skip today's post" master switch. OFF by default: the
+    slack_convo classifier never emits CANCEL_POST and the adapter's cancel branch is
+    never reached, so the conversational adapter is byte-for-byte its current self.
+
+    When ON, a CLIENT identity's Slack message asking to cancel/skip a scheduled post
+    resolves to the client's OWN next eligible content_calendar row (pending or approved,
+    never published/publishing) and denies it through THE SAME path the portal's own
+    Cancel button uses (portal_social.handle_deny -> the 30/month budgeted, token
+    isolated, publish safe write). No new state machine, no new publish path, no
+    elevated action: this only ever flips one row of the caller's own gym to 'denied'.
+    """
+    return _truthy(os.environ.get("AGENT_SLACK_CANCEL_POST_ENABLED", "false"))
 
 
 # Zernio social-connect. The key was set in Railway as ZERNIO_API_KEY (no AGENT_ prefix), so we read
@@ -1864,6 +2176,23 @@ def alert_repeat_gate_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ALERT_REPEAT_GATE", "false"))
 
 
+def slot_dedupe_enabled() -> bool:
+    """AGENT_SLOT_DEDUPE — the calendar slot idempotency belt. DEFAULT ON.
+
+    Default-on is deliberate and matches the plan-horizon belt: this PREVENTS damage
+    rather than adding a capability. On 2026-09-05 the fleet held 155 genuine duplicate
+    future slots across 14 gyms and the number was still climbing hour over hour, because
+    a re-plan appended instead of replacing. Shipping the guard OFF would have left the
+    leak open.
+
+    A slot is (account, post_date, time_slot, format). Date alone is NOT a slot: a gym
+    running 2x a day plus a story legitimately owns three rows on one date, and keying on
+    the date alone called 441 rows duplicates when only 155 were.
+
+    Set AGENT_SLOT_DEDUPE=false as an emergency escape hatch."""
+    return _truthy(os.environ.get("AGENT_SLOT_DEDUPE", "true"))
+
+
 def alert_repeat_window_hours() -> float:
     """How long an unchanged NEEDS_TRIAGE alert stays quiet. 72h by default: long enough
     that human onboarding work (a gym owner clicking a connect link) gets a working week
@@ -1916,6 +2245,108 @@ def slack_convo_staff_reply_armed(identity: str) -> bool:
     """SLACK_CONVO_<IDENTITY>_STAFF_REPLY — may this bot post replies to LASSO staff in a
     thread directly? OFF by default."""
     return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_STAFF_REPLY", "false"))
+
+
+def slack_convo_classifier_llm_enabled(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_CLASSIFIER_LLM — may this bot consult the model for the
+    ambiguous middle of classification? OFF by default (every new capability ships behind a
+    flag that defaults OFF).
+
+    Found live 2026-09-05: listener_wiring.live_deps() passed classify_llm=None
+    unconditionally, so the LLM fallback slack_convo_model()'s docstring has always promised
+    did not exist in production at all. With this flag off, behaviour is byte for byte what
+    it was: deterministic rules, then escalate. With it on, the model is consulted ONLY after
+    every deterministic rule has declined, and only to pick one of the fixed labels."""
+    if not slack_convo_identity_enabled(identity):
+        return False
+    return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_CLASSIFIER_LLM", "false"))
+
+
+def slack_convo_auto_answer_armed(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_AUTO_ANSWER — may this bot SEND a grounded answer to a client
+    with no human tap? OFF by default, and narrower than CLIENT_REPLY in every direction.
+
+    It gates exactly one path: a message classified answerable_question whose answer_lane
+    reply came back with a grounding snapshot. Everything else still holds for a tap no
+    matter what this flag says -- code fixes, action requests, anything the classifier was
+    unsure about, and the hard-line topics in adapter.AUTO_ANSWER_FORBIDDEN (billing and
+    price, refunds, hours and schedule changes, injuries and liability). Those are not
+    tunable; they are re-checked at draft time and again at post time."""
+    if not slack_convo_identity_enabled(identity):
+        return False
+    if not slack_convo_client_reply_armed(identity):
+        return False
+    if not _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_AUTO_ANSWER", "false")):
+        return False
+    # ARMING LOCK (2026-09-05, after nine independent audits).
+    #
+    # Nine rounds found twelve CRITICALs. Rounds 8 and 9 both found the same one, in
+    # different clothes: Blake's named hard lines -- billing, gym hours, class-schedule
+    # changes, injuries, liability -- DO NOT HOLD. Round 8 measured 8/10 injury messages
+    # auto-sending; round 9, after the structural rewrite meant to fix exactly that, measured
+    # 15 of 16 must-hold messages still posting to a client ("we open at 5 now, does the
+    # calendar know?", "can you cancel the story scheduled for tonight?").
+    #
+    # Four separate attempts to gate this by classifying the QUESTION -- topic denylists,
+    # allowlists, publish-request shapes, message shape -- have each closed the cases they
+    # were measured against and left a new set open. The conclusion this lock encodes is that
+    # the approach is wrong, not that the regex needs one more pass: a safe auto-answer gate
+    # has to be grounded in what the ANSWER is derived from (a small enumerated set of fact
+    # keys, restating them and nothing else), not in guessing a free-text question's subject.
+    # That is a design decision, and it is Blake's, not a thing to keep patching at 3am.
+    #
+    # So the flag alone can no longer arm this. Setting it without the override logs what is
+    # known to be broken and refuses. The override exists so Blake can say "I have read the
+    # finding and I want it on anyway" in one deliberate act, rather than discovering that a
+    # flag he set weeks ago quietly means something he never reviewed.
+    if not _truthy(os.environ.get("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "false")):
+        print(f"[slack-convo/{identity}] AUTO_ANSWER is set but REFUSED: the hard-line gate "
+              f"has a known open CRITICAL (audits 8 and 9 -- billing, hours, schedule "
+              f"changes and injury messages reach a client with no tap). See DECISIONS.md "
+              f"D67. Set SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE=true only if you have "
+              f"read that entry and accept it.")
+        return False
+    return True
+
+
+def client_dm_autofix_enabled() -> bool:
+    """AGENT_CLIENT_DM_AUTOFIX — master for the client-DM support lane
+    (agent/client_dm_support). OFF by default. Off = the lane returns before reading a
+    single ticket; nothing is polled, diagnosed, fixed, written or sent.
+
+    ON, AND ON ITS OWN, THIS SENDS A CLIENT NOTHING. It lets the lane poll, measure,
+    run a per-gym Drive media sync when that is the measured condition, and write a
+    card to the fixer channel for a human. Composing a client-facing reply needs
+    AGENT_CLIENT_DM_CLIENT_REPLY as well, and DELIVERING one needs a third setting,
+    AGENT_CLIENT_DM_LIVE_ACK, whose required value is derived at runtime from the
+    current value of SLACK_CONVO_<IDENTITY>_CLIENT_REPLY. See
+    agent/client_dm_support/arming.py for why one flag is deliberately not enough.
+
+    This flag never touches the #fixer bus's own auto-answer gate (D67, still locked),
+    ad spend, targeting, campaigns, billing, pixel/CAPI, secrets, schema, feature
+    flags, or any gym but the one whose ticket is being read."""
+    return _truthy(os.environ.get("AGENT_CLIENT_DM_AUTOFIX", "false"))
+
+
+def client_dm_client_reply_enabled() -> bool:
+    """AGENT_CLIENT_DM_CLIENT_REPLY — may the client-DM support lane COMPOSE a
+    client-facing reply at all? OFF by default. Off = every outcome, including a
+    successful verified fix, goes to a human card and the client is told nothing by
+    this lane.
+
+    On its own (master off) it does nothing whatsoever, and even with the master on it
+    is not sufficient to deliver: see AGENT_CLIENT_DM_LIVE_ACK."""
+    return _truthy(os.environ.get("AGENT_CLIENT_DM_CLIENT_REPLY", "false"))
+
+
+def slack_convo_cross_product_routing_enabled(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_CROSS_PRODUCT — may a CONFIDENT website question that arrived
+    on this identity be drafted with the website identity's knowledge and voice (D50)? OFF by
+    default. This never moves the ticket, the channel, the gym, or the delivery surface; it
+    only changes which product's knowledge drafts the answer."""
+    if not slack_convo_identity_enabled(identity):
+        return False
+    return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_CROSS_PRODUCT", "false"))
 
 
 def slack_convo_daily_ticket_cap() -> int:
@@ -3290,6 +3721,33 @@ def learning_loop_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_LEARNING_LOOP", "false"))
 
 
+def cross_gym_brain_enabled() -> bool:
+    """
+    Cross gym brain switch (AGENT_CROSS_GYM_BRAIN). OFF by default = zero behavior
+    change: agent/jobs/cross_gym_brain.py is a no-op (no store constructed, nothing
+    read, nothing written) and agent/cross_gym_guidance.guidance_for() returns an
+    empty result. When ON, a nightly READ ONLY job pools every gym's matured
+    post_metrics (the Zernio ingestion lane), scores each post with the same
+    learning_score scorer the per gym monthly retro uses, and tests each FORM lever
+    (hook_family, caption length band, sentence band, pillar, ask presence and
+    type, time slot, format, media product type, member face) with Welch's t test
+    on log1p engagement plus a Benjamini Hochberg false discovery correction across
+    the run. A finding needs BOTH cells at or above the sample floor (6), BOTH
+    cells drawn from at least 2 DISTINCT gyms, survival of the FDR correction, and
+    an effect size at or above 0.30 before it becomes guidance; everything else is
+    reported honestly as insufficient_data / not_significant / directional and
+    produces NO guidance. external=true and is_ad=true rows never train anything
+    (the monthly_retro rail); Apify social_baseline is reporting context only.
+    Output is FORM ONLY, enforced by a whitelist of lever names and lever values,
+    so no caption fragment, stat, offer, member name, or handle can ever reach the
+    artifact or cross from one gym to another. The only write is the append only
+    cross_gym_brain row. Nothing here publishes, approves, or touches any social
+    account, and the approval gate is untouched. Arm by hand:
+    AGENT_CROSS_GYM_BRAIN=true (Railway env). HUMAN TAP REQUIRED.
+    """
+    return _truthy(os.environ.get("AGENT_CROSS_GYM_BRAIN", "false"))
+
+
 def mentions_enabled() -> bool:
     """
     Caption @mention tagging switch (AGENT_MENTIONS). OFF by default = zero behavior
@@ -3301,6 +3759,113 @@ def mentions_enabled() -> bool:
     never tags a member without explicit consent. Arm by hand: AGENT_MENTIONS=true.
     """
     return _truthy(os.environ.get("AGENT_MENTIONS", "false"))
+
+
+def cta_variety_enabled() -> bool:
+    """
+    Closing-ask variety and CTA shape validation (AGENT_CTA_VARIETY). OFF by
+    default = zero behavior change: grade_fix picks exactly the CTA it picked
+    before and appends it to every craft-flagged day, and an ask-less caption
+    still fails the craft bar.
+
+    Armed, three things change, all of them from Dean Holcomb's CrossFit Reverb
+    ticket 4941e162 (2026-09-05, "All the captions are almost the same as one
+    another. Also, they all end with 'How do I get started with training at
+    CrossFit Reverb?' which doesn't make sense."):
+
+      1. SHAPE. Every CTA candidate must pass copy_gate.is_cta_shaped, which
+         rejects questions and headings. Reverb's line was an FAQ heading out
+         of his own source doc that matched ASK_RE because it contains the
+         phrase "get started". It is now rejected as cta_is_question.
+      2. ROTATION. grade_fix rotates over the gym's whole approved CTA pool
+         instead of stapling one string onto every day, and skips a CTA whose
+         closing signature is already used inside the anti-repetition window.
+         Measured before: 90 of Reverb's 93 rows shared one closing line.
+      3. ASK RATE. The booking CTA is appended only while the book is short of
+         its booking-ask floor. Once the floor is met, a repaired caption with
+         NO ask passes the craft bar. Not every post should end in an ask;
+         Dean was right that an ask on all of them reads wrong.
+
+    Never invents a CTA. Everything in the pool is copy the gym already
+    approved, and a gym with no usable CTA still gets an honest skip.
+    Arm by hand: AGENT_CTA_VARIETY=true.
+    """
+    return _truthy(os.environ.get("AGENT_CTA_VARIETY", "false"))
+
+
+def caption_form_plan_enabled() -> bool:
+    """
+    Per-post caption SHAPE planning (AGENT_CAPTION_FORM_PLAN). OFF by default =
+    zero behavior change: the SB7 prompt is byte-for-byte today's, including its
+    fixed "Max 260 characters".
+
+    Armed, every post is handed a concrete shape from caption_variety.form_plan
+    (an opening move out of six, and a sentence/character band out of three)
+    instead of the identical soft "VARY the ENTRY POINT" instruction on all of
+    them. A soft instruction repeated 31 times produced 31 similar captions:
+    measured on the live fleet, 90.3% of CrossFit Reverb's captions opened
+    "You + problem", 100% of rows sat in one caption_len_band, and sentence
+    count sd was 1.3 on a mean of 4.9.
+
+    STYLE ONLY. A form plan carries no fact, no topic and no copy; every claim
+    still comes from the approved source and the figure/fabrication gates,
+    banned-word gate and no-dash law all still run on the output unchanged.
+    Arm by hand: AGENT_CAPTION_FORM_PLAN=true.
+    """
+    return _truthy(os.environ.get("AGENT_CAPTION_FORM_PLAN", "false"))
+
+
+def caption_variety_window() -> int:
+    """
+    How many POSTS back the caption anti-repetition rail looks (AGENT_CAPTION_
+    VARIETY_WINDOW, default 10). Only consulted while AGENT_CTA_VARIETY is
+    armed. 10 posts is roughly what a reader sees scrolling a gym's recent grid.
+    """
+    try:
+        n = int(os.environ.get("AGENT_CAPTION_VARIETY_WINDOW", "10"))
+    except (TypeError, ValueError):
+        return 10
+    return n if n > 0 else 10
+
+
+# The share of a book's POSTS that should carry a closing ask. Blake, 2026-09-06:
+# "every post should not have an ask, make it 33% of post."
+CAPTION_ASK_RATE_DEFAULT = 0.33
+
+
+def caption_ask_rate_target() -> float:
+    """
+    Target share of a book's POSTS that carry an ask (AGENT_CAPTION_ASK_RATE,
+    default 0.33). ONE number, read by both sides of the loop, which is the
+    whole point of it living here:
+
+      * jobs/grade_fix._booking_deficit sizes the REPAIR to it (how many posts
+        the booking CTA is appended to), and
+      * calendar_grade._path SCORES against it (a book at or above the target
+        loses nothing on the ask rule).
+
+    Before this, the repair targeted `min(5, n)` -- 5 of 31 posts, 16.1% -- while
+    the grader still demanded an ask on EVERY post and deducted the ask rule
+    TWICE (`no_ask` was also a caption_craft soft flag). A book repaired exactly
+    as intended therefore scored as 84% defective: the system fighting itself.
+    Both readers now come from this function, so the target cannot drift apart
+    from what is graded.
+
+    Only consulted while AGENT_CTA_VARIETY is armed; with the flag off the
+    repair still targets `min(5, n)` and the grader still wants an ask on every
+    post, byte for byte.
+
+    Clamped to (0, 1]: a target of 0 would mean "never ask", which no gym wants,
+    and above 1 is not a share.
+    """
+    try:
+        r = float(os.environ.get("AGENT_CAPTION_ASK_RATE",
+                                 str(CAPTION_ASK_RATE_DEFAULT)))
+    except (TypeError, ValueError):
+        return CAPTION_ASK_RATE_DEFAULT
+    if not (0.0 < r <= 1.0):
+        return CAPTION_ASK_RATE_DEFAULT
+    return r
 
 
 def calendar_grade_enabled_for(gym_id: str) -> bool:
@@ -3340,6 +3905,211 @@ def cadence_2x_enabled() -> bool:
     Arm by hand: ECHO_CADENCE_2X_ENABLED=true.
     """
     return _truthy(os.environ.get("ECHO_CADENCE_2X_ENABLED", "false"))
+
+
+def day_shape_assert_enabled() -> bool:
+    """
+    The DAY SHAPE guard (ECHO_DAY_SHAPE_ASSERT, default ON).
+
+    At plan time, before a single row reaches content_calendar, two rows on the
+    same (gym_id, account, post_date, format) must differ in BOTH caption and
+    image_url. A violation FAILS the plan pass and the build writes nothing.
+
+    This is the assertion that was missing on 2026-08-30, when a piercefitness
+    build wrote slot_index 0 and slot_index 1 of 2026-09-27 with one identical
+    caption, and on 2026-09-04, when Tough Temple published six times in forty
+    seconds off a plan exactly like it.
+
+    Armed by DEFAULT because it only ever PREVENTS a write that would repeat a
+    paying client's post on their own account. It can never cause a publish, and
+    it can never publish something new. Escape hatch, restoring the old silent
+    behavior exactly: ECHO_DAY_SHAPE_ASSERT=false.
+    """
+    return _truthy(os.environ.get("ECHO_DAY_SHAPE_ASSERT", "true"))
+
+
+def deny_streak_alarm_enabled() -> bool:
+    """
+    The DENY STREAK ALARM (AGENT_DENY_STREAK_ALARM, default ON).
+
+    Three (deny_streak_threshold()) consecutive coach denials on one
+    (gym_id, account), uninterrupted by an approval, posts ONE ops alert per
+    streak-ending date. Blake, 2026-09-06: "Tough Temple told us with the deny
+    button for a week and nobody read it." This is the detection this repo
+    never had -- purely informational, cannot block a write or change a post,
+    so it may default ON under the same "can only add a signal" doctrine as
+    day-shape and the CTA gate.
+
+    Escape hatch: AGENT_DENY_STREAK_ALARM=false.
+    """
+    return _truthy(os.environ.get("AGENT_DENY_STREAK_ALARM", "true"))
+
+
+def deny_streak_threshold() -> int:
+    """DENY_STREAK_THRESHOLD (default 3): consecutive denials on one account
+    that count as a content alarm. See agent.jobs.deny_streak_alarm."""
+    try:
+        return int(os.environ.get("DENY_STREAK_THRESHOLD", "3"))
+    except (TypeError, ValueError):
+        return 3
+
+
+def stale_escalation_reminder_enabled() -> bool:
+    """
+    The STALE ESCALATION REMINDER (AGENT_STALE_ESCALATION_REMINDER, default ON).
+
+    A ticket sitting in status='hold', escalated=True, unresolved past
+    stale_hold_hours() gets ONE re-fire reminder posted to #fixer per calendar
+    day it remains unresolved, naming its age. Checked against production
+    2026-09-06: the escalation path itself was never broken (Dean's ticket
+    posted to #fixer and acked within 5 seconds) -- what read as "parked" was
+    silence AFTER that single post, while the ticket sat unresolved for hours.
+    Same doctrine as day-shape and the ledger-key claim: a guard that can only
+    ADD a reminder, never silence one, may default ON.
+
+    Escape hatch, restoring today's silent-after-one-post behavior exactly:
+    AGENT_STALE_ESCALATION_REMINDER=false.
+    """
+    return _truthy(os.environ.get("AGENT_STALE_ESCALATION_REMINDER", "true"))
+
+
+def stale_hold_hours() -> float:
+    """
+    STALE_HOLD_HOURS (default 4.0): how long a ticket may sit in
+    status='hold', escalated=True before agent.jobs.stale_escalation_reminder
+    considers it stale and re-fires. Long enough that a human triaging #fixer
+    is not nagged every poll cycle for a ticket they are actively working; not
+    so long that a client's content complaint waits a full day for anyone to
+    notice it never got a second look.
+    """
+    try:
+        return float(os.environ.get("STALE_HOLD_HOURS", "4.0"))
+    except (TypeError, ValueError):
+        return 4.0
+
+
+def day_shape_block_alarm_enabled() -> bool:
+    """
+    The DAY SHAPE BLOCK ALARM (AGENT_DAY_SHAPE_BLOCK_ALARM, default ON).
+
+    Purely additive to the existing day_shape.py alert: adds the gym's
+    remaining runway to the message, and posts ONE extra SOCIAL escalation
+    the day a gym's consecutive-blocked streak first reaches
+    day_shape_escalate_days(). Cannot block or change a write -- same
+    "can only add a signal" doctrine as the other alarms shipped 2026-09-06.
+
+    Escape hatch: AGENT_DAY_SHAPE_BLOCK_ALARM=false.
+    """
+    return _truthy(os.environ.get("AGENT_DAY_SHAPE_BLOCK_ALARM", "true"))
+
+
+def day_shape_escalate_days() -> int:
+    """DAY_SHAPE_ESCALATE_DAYS (default 3): consecutive day-shape-blocked days
+    for one gym that trigger the SOCIAL content-review escalation. See
+    agent.jobs.day_shape_block_alarm."""
+    try:
+        return int(os.environ.get("DAY_SHAPE_ESCALATE_DAYS", "3"))
+    except (TypeError, ValueError):
+        return 3
+
+
+def cta_self_question_gate_enabled() -> bool:
+    """
+    The CTA SELF-QUESTION guard (ECHO_CTA_SELF_QUESTION_GATE, default ON).
+
+    At plan time, alongside the day-shape assertion and before a single row
+    reaches content_calendar, no caption may carry the banned Reverb FAQ line
+    verbatim, and no caption's closing line may be an FAQ-mined self-question CTA
+    (a question naming the gym's own display name asking how to get started/
+    join/sign up/begin at itself). A violation FAILS the plan pass and the build
+    writes nothing. See agent/cta_self_question_gate.py.
+
+    This is the CONTENT rule sitting next to caption_variety.py's measured fix
+    (PR #54, which stopped that exact line from being selected as the shortest
+    "qualifying sentence") -- this module blocks the shape at plan time so it
+    cannot be written again by a different route.
+
+    Armed by DEFAULT because it only ever PREVENTS a write, never causes one.
+    Escape hatch, restoring the old silent behavior exactly:
+    ECHO_CTA_SELF_QUESTION_GATE=false.
+    """
+    return _truthy(os.environ.get("ECHO_CTA_SELF_QUESTION_GATE", "true"))
+
+
+def day_shape_roles_enabled() -> bool:
+    """
+    The DAY SHAPE producer (ECHO_DAY_SHAPE_ROLES, default OFF).
+
+    The content half of the two post day (agent/day_shape.py): slot 0 in the
+    morning carries PROOF (story led, a real member moment, a soft ask) and slot
+    1 in the evening carries the INVITATION (offer led, a named next step, a hard
+    ask), drawing from different pillar pools and different SB7 entry angles.
+
+    Without this, the day shape guard keeps a 2x gym SAFE but leaves it thin: the
+    second slot is a fallback concept and a repeat is dropped rather than
+    replaced, so the gym reliably receives one post a day on a two post cadence
+    (Dale's B8). With it, the second slot is asked for a genuinely different post.
+
+    A NEW capability, so it ships OFF. Arm by hand: ECHO_DAY_SHAPE_ROLES=true.
+    """
+    return _truthy(os.environ.get("ECHO_DAY_SHAPE_ROLES", "false"))
+
+
+def opening_formula_cap_enabled() -> bool:
+    """
+    The OPENING FORMULA cap (ECHO_OPENING_FORMULA_CAP, default OFF).
+
+    drafter.openings_collide compares the first four words of two captions, so it
+    cannot see a gym whose every caption opens on the same FRAME with different
+    words. Measured on production 2026-09-05, Tough Temple had fifteen consecutive
+    captions all opening on the second person pronoun ("You walk in ...", "You
+    showed up ...", "You've been ...", "You're holding ..."). Not one pair collided.
+    The client denied 13 rows across five straight days (2026-09-09 to
+    2026-09-13, both accounts), every reject_reason NULL.
+
+    Armed, a build refuses to accept a caption that would extend an unbroken run of
+    opening_formula_max_run() posts sharing one opening formula, and walks the
+    neighbouring days for a genuinely different frame. It NEVER drops a day for this:
+    if no alternative varies the frame, the best available post is still placed, so
+    the cap can only improve variety and can never thin a calendar.
+
+    A NEW capability, so it ships OFF. Arm by hand: ECHO_OPENING_FORMULA_CAP=true.
+    """
+    return _truthy(os.environ.get("ECHO_OPENING_FORMULA_CAP", "false"))
+
+
+def opening_formula_max_run() -> int:
+    """
+    How many consecutive posts may share one opening formula before the next must
+    vary (ECHO_OPENING_FORMULA_MAX_RUN, default 3). A run of three second person
+    opens reads as a voice; a run of fifteen reads as a template. 0 or less
+    disables the run check even when the cap flag is armed.
+    """
+    raw = os.environ.get("ECHO_OPENING_FORMULA_MAX_RUN", "")
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 3
+
+
+def gym_ask_coverage_enabled() -> bool:
+    """
+    Ask coverage on a CLIENT GYM month (ECHO_GYM_ASK_COVERAGE, default OFF).
+
+    agent/ask_coverage.py has enforced one clear ask per reel and a month wide
+    coverage floor since 2026-08-28, but its only call site guards on the B2B
+    profile, so it has never once run on a gym. Measured on production
+    2026-09-05 with the real grader: Tough Temple scores path_to_join 0 out of
+    10 with 'no ask in caption' on every eligible post, and it is not alone
+    (crossfitnine7f7dadc is also 0).
+
+    Armed, a gym month runs the same lane using the gym's OWN approved CTA from
+    its voice doc. A gym whose voice doc carries no CTA that reads as exactly one
+    ask family is SKIPPED rather than given an invented ask.
+
+    A NEW capability, so it ships OFF. Arm by hand: ECHO_GYM_ASK_COVERAGE=true.
+    """
+    return _truthy(os.environ.get("ECHO_GYM_ASK_COVERAGE", "false"))
 
 
 def cadence_slot_times() -> tuple:
@@ -3489,6 +4259,34 @@ def media_repeat_sweep_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_SWEEP", "true"))
 
 
+def media_repeat_sweep_drive_enabled() -> bool:
+    """The nightly repeat sweep may replace a repeat from the gym's CONNECTED DRIVE
+    POOL, not only from its local uploads (AGENT_MEDIA_REPEAT_SWEEP_DRIVE, default OFF).
+
+    John Weeks / Tough Temple, 2026-09-11. PR #98 taught the MONTH BUILD to stage from
+    the Drive pool, so new months stopped repeating. The nightly sweep
+    (agent/jobs/media_repeat_sweep.py) was never taught the same pool: its replacement
+    picker (_fresh_photo) reads the LOCAL library only, images only. A gym whose local
+    stills are all on the book is therefore reported as a SMALL LIBRARY and its repeats
+    are left in place -- while 57 eligible, never-used Drive clips sit unused. That is
+    why rows already on Tough Temple's calendar still repeated after the build fix
+    merged: the build never touches a row it did not just create, and the sweep that
+    exists for exactly those rows could not reach the media.
+
+    ON: when no unused local image is left, the sweep asks the SAME engine the portal's
+    edit-image button uses (media_swap.pick_replacement), which draws from the local
+    library AND the Drive pool with every guard already in place -- eligibility, the
+    90-day cooldown, tenant isolation, nothing already on the book. The sweep's own
+    rails are untouched: published / publishing rows are never touched, an APPROVED
+    row's media is never swapped (the gym approved that exact card), the write is still
+    the status-guarded swap_media, and a gym with neither a local photo nor a Drive
+    asset is still reported as a small library rather than given fabricated media.
+
+    Default OFF because reaching a new media pool is a new capability. Arm by hand:
+    AGENT_MEDIA_REPEAT_SWEEP_DRIVE=true."""
+    return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "false"))
+
+
 def plan_horizon_sweep_enabled() -> bool:
     """The RETIREMENT counterpart of the planning-horizon cap
     (AGENT_PLAN_HORIZON_SWEEP, default ON).
@@ -3574,3 +4372,68 @@ def portal_echo_tickets_poll_minutes() -> int:
         return max(1, int(os.environ.get("AGENT_PORTAL_ECHO_TICKETS_POLL_MINUTES", "3")))
     except ValueError:
         return 3
+
+
+def gym_deep_brain_enabled() -> bool:
+    """PER-GYM DEEP BRAIN (AGENT_GYM_DEEP_BRAIN, Blake 2026-09-06: "create a deeper
+    brain for each gym scraping their website and all their social media prior to
+    starting with us").
+
+    OFF by default = zero behavior change: agent/gym_deep_brain.py fetches nothing,
+    writes no artifact, lands no client_sources row, and every entry point returns a
+    blocked result naming this flag. Nothing in the draft path reads the artifact
+    while the flag is off. Arm by hand: AGENT_GYM_DEEP_BRAIN=true."""
+    return _truthy(os.environ.get("AGENT_GYM_DEEP_BRAIN", "false"))
+
+
+def gym_deep_brain_crawl_delay() -> float:
+    """Minimum seconds between two requests to the SAME host during a deep-brain
+    scrape (AGENT_GYM_DEEP_BRAIN_CRAWL_DELAY, default 2.0). A robots.txt Crawl-delay
+    LARGER than this always wins; this is the floor, never a ceiling. Values below
+    0.0 or unparseable values fall back to the default."""
+    try:
+        v = float(os.environ.get("AGENT_GYM_DEEP_BRAIN_CRAWL_DELAY", "2.0"))
+    except ValueError:
+        return 2.0
+    return v if v >= 0.0 else 2.0
+
+
+def gym_deep_brain_dir() -> str:
+    """The DURABLE root for per-gym DEEP BRAIN artifacts: <DATA_DIR>/deep_brains.
+
+    Deliberately NOT <DATA_DIR>/brains (tenant_brain's append-only learning log, a
+    different format and a different lifecycle) and emphatically never
+    ~/LASSO/lasso-brain, which is the READ-ONLY shared LASSO corpus. Override with
+    AGENT_GYM_DEEP_BRAIN_DIR for a custom mount / tests."""
+    override = os.environ.get("AGENT_GYM_DEEP_BRAIN_DIR", "").strip()
+    if override:
+        return override
+    return os.path.join(data_dir(), "deep_brains")
+
+
+def brain_feeds_captions_enabled() -> bool:
+    """BRAINS FEED CAPTIONS (AGENT_BRAIN_FEEDS_CAPTIONS, Blake 2026-09-06: "i want
+    echo to build a brain for all gyms it digest weekly the best post ... see trends
+    on what is working and use that + the gyms brain to create the best post").
+
+    OFF by default = zero behavior change: agent/drafter.py's SB7 prompt is
+    byte-for-byte today's prompt, cross_gym_guidance is never called from the draft
+    path, and no rollup is read at caption time. When ON, the WEEKLY cross gym
+    rollup's FORM guidance (agent/cross_gym_guidance.prompt_lines, itself gated by
+    AGENT_CROSS_GYM_BRAIN, so BOTH flags must be armed for anything to appear) is
+    appended to the caption prompt as FORM HINTS ONLY, BELOW the brand voice doc and
+    BELOW the approved source, and never as a content instruction.
+
+    THE SPLIT IS RIGID AND STRUCTURAL. Cross gym learning shapes FORM; the gym's OWN
+    material supplies CONTENT and VOICE, and it already does so through the unchanged
+    approval gate (client_sources.approved_sources -> client_content -> the client
+    note the drafter prompts on). The hint lines are rendered from cross_gym_brain's
+    whitelisted lever NAME and lever VALUE tokens plus integers only, so there is no
+    branch along which one gym's caption text, offer, stat, member name or handle
+    could become another gym's content. Nothing here weakens the figure gate, the
+    fabrication gate or the human approval gate.
+
+    Arm by hand: AGENT_BRAIN_FEEDS_CAPTIONS=true. HUMAN TAP REQUIRED, and it does
+    nothing on its own without AGENT_CROSS_GYM_BRAIN also armed and the weekly
+    rollup's top_posts migration applied."""
+    return _truthy(os.environ.get("AGENT_BRAIN_FEEDS_CAPTIONS", "false"))

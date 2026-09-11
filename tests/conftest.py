@@ -39,6 +39,12 @@ _CRED_PREFIXES = (
     # is GOOGLE_DRIVE_SA_JSON — strip both families so an armed container can
     # never hand a test a live Drive key or a flipped stage flag.
     "PODCAST_", "GOOGLE_DRIVE_",
+    # IMAGE ENGINE (Astra default): the spec env names are UNPREFIXED
+    # (IMAGE_ENGINE, ASTRA_IMAGE_MODEL, ASTRA_BRIEF_MODEL), so the AGENT_ sweep
+    # above does not reach them. A container with IMAGE_ENGINE armed would
+    # otherwise hand the suite live routing state. OPENAI_ is already stripped
+    # above, which is what keeps the Astra engine out of an offline test run.
+    "IMAGE_ENGINE", "ASTRA_",
 )
 
 
@@ -82,6 +88,36 @@ def _isolated_db(tmp_path, monkeypatch):
         monkeypatch.setattr(_config, "SLACK_CHANNEL_ID", "", raising=False)
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _echo_client_universe_allow_all():
+    """ECHO CLIENT UNIVERSE (2026-09-11 incident): every fleet lane now passes through
+    agent.echo_clients.is_echo_client, which reads echo_gym_settings off the shared
+    plane and FAILS CLOSED (unknown = not a client). The suite runs offline with the
+    creds stripped above, so the honest live answer in a test is always "not a client"
+    and every lane would do nothing -- which is not what the hundreds of lane tests
+    written before the gate existed are testing. Install an allow-all override for the
+    suite; the gate's OWN tests (tests/test_echo_clients*.py, the lane-gate tests) call
+    `echo_clients.set_test_override(None)` or use `real_echo_clients` to test the real
+    predicate with fake readings."""
+    from agent import echo_clients as _ec
+    _ec.set_test_override(lambda ident: True)
+    _ec.reset_cache()
+    yield
+    _ec.set_test_override(None)
+    _ec.reset_cache()
+
+
+@pytest.fixture
+def real_echo_clients():
+    """Opt OUT of the allow-all override: the live predicate, over whatever `_load`
+    (or a monkeypatched `_load`) returns. Cache is cleared on entry and exit."""
+    from agent import echo_clients as _ec
+    _ec.set_test_override(None)
+    _ec.reset_cache()
+    yield _ec
+    _ec.reset_cache()
 
 
 @pytest.fixture(autouse=True)

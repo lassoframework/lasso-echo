@@ -19,16 +19,47 @@ def test_detect_prereqs_returns_required_keys():
         assert k in result
 
 
-def test_detect_prereqs_ffmpeg_present():
+# ENVIRONMENT-INDEPENDENT (audit round 4 addendum): these used to assert the HOST's
+# state (ffmpeg on PATH, faster_whisper NOT importable), so `pytest -q -x` was red on
+# any machine with faster_whisper installed (the canonical .venv on Blake's Mac) and
+# CI had to --deselect one of them. detect_prereqs reads through clipper.shutil.which
+# and clipper.importlib.import_module at CALL time precisely so both branches can be
+# exercised by stubbing those seams, whatever is installed.
+
+def _stub_whisper(monkeypatch, present):
+    real = clipper.importlib.import_module
+
+    def fake_import(name, *a, **k):
+        if name == "faster_whisper":
+            if present:
+                return object()
+            raise ImportError("faster_whisper not installed (stubbed)")
+        return real(name, *a, **k)
+    monkeypatch.setattr(clipper.importlib, "import_module", fake_import)
+
+
+def test_detect_prereqs_ffmpeg_present(monkeypatch):
+    monkeypatch.setattr(clipper.shutil, "which",
+                        lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
     result = clipper.detect_prereqs()
     assert result["HAS_FFMPEG"] is True
-    assert result["FFMPEG_PATH"] is not None
-    assert "ffmpeg" in (result["FFMPEG_PATH"] or "")
+    assert result["FFMPEG_PATH"] == "/usr/bin/ffmpeg"
 
 
-def test_detect_prereqs_faster_whisper_absent():
+def test_detect_prereqs_ffmpeg_absent(monkeypatch):
+    monkeypatch.setattr(clipper.shutil, "which", lambda name: None)
     result = clipper.detect_prereqs()
-    assert result["HAS_FASTER_WHISPER"] is False
+    assert result["HAS_FFMPEG"] is False and result["FFMPEG_PATH"] is None
+
+
+def test_detect_prereqs_faster_whisper_absent(monkeypatch):
+    _stub_whisper(monkeypatch, present=False)
+    assert clipper.detect_prereqs()["HAS_FASTER_WHISPER"] is False
+
+
+def test_detect_prereqs_faster_whisper_present(monkeypatch):
+    _stub_whisper(monkeypatch, present=True)
+    assert clipper.detect_prereqs()["HAS_FASTER_WHISPER"] is True
 
 
 def test_detect_prereqs_api_key_absent(monkeypatch):

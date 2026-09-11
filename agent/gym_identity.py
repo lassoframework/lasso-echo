@@ -97,6 +97,71 @@ def tokens_for(base_key, *, http=None, use_cache=True):
     return tokens
 
 
+_LABEL_CACHE: dict[str, str] = {}
+
+
+def submitter_label_for(base_key, *, http=None, use_cache=True):
+    """"Owner Name, Gym Name" for a support-ticket card, or "" when unknowable
+    (Blake, 2026-09-07: "this needs the gym owners name and gym in it so i know
+    who submitted it" -- the fixer/client-DM cards showed only a raw slack id and
+    account key).
+
+    This is NOT the RT-C1/RT-m3 case those cards' own comments warn about ("no
+    display names"): that rule is about a Slack-asserted, user-editable display
+    name riding into a card as if it were trusted operator context. This is the
+    opposite direction -- OUR OWN gyms/clients rows, resolved server-side from
+    the account_key the card already trusts, never anything the submitter typed
+    or set themselves. A gym or owner with no name on file resolves to "" and the
+    card falls back to the account key alone, same as before this existed.
+
+    Two hops, same roster join tokens_for() already uses: base key -> gym_id
+    (echo_intake_tokens) -> gyms row (name, owner_client_id) -> clients row
+    (name). Never raises -- a lookup failure must not sink a card."""
+    base = str(base_key or "").strip()
+    if not base:
+        return ""
+    if use_cache and base in _LABEL_CACHE:
+        return _LABEL_CACHE[base]
+
+    if http is None:
+        import requests  # lazy
+        http = requests
+
+    roster = _rest(http, "echo_intake_tokens",
+                   {"select": "gym_id,echo_account_key",
+                    "echo_account_key": f"eq.{base}"})
+    gym_id = ""
+    for row in (roster or []):
+        gym_id = str((row or {}).get("gym_id") or "").strip()
+        if gym_id:
+            break
+    if not gym_id:
+        if use_cache:
+            _LABEL_CACHE[base] = ""
+        return ""
+
+    gyms = _rest(http, "gyms", {"select": "name,owner_client_id", "id": f"eq.{gym_id}"})
+    gym_row = (gyms or [{}])[0] if gyms else {}
+    gym_name = str(gym_row.get("name") or "").strip()
+    owner_client_id = str(gym_row.get("owner_client_id") or "").strip()
+
+    owner_name = ""
+    if owner_client_id:
+        clients = _rest(http, "clients",
+                        {"select": "name", "id": f"eq.{owner_client_id}"})
+        client_row = (clients or [{}])[0] if clients else {}
+        owner_name = str(client_row.get("name") or "").strip()
+
+    if owner_name and gym_name:
+        label = f"{owner_name}, {gym_name}"
+    else:
+        label = owner_name or gym_name or ""
+    if use_cache:
+        _LABEL_CACHE[base] = label
+    return label
+
+
 def reset_cache():
     """Tests and a re-arm: drop the per-process cache."""
     _CACHE.clear()
+    _LABEL_CACHE.clear()

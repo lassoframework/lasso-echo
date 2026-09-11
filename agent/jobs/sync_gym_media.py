@@ -25,6 +25,16 @@ the per-gym pilot allowlist). For each ACTIVE, gym-drive media_source, staggered
 Degrades cleanly: no SA key / no Supabase creds -> one log line, no-op. Nothing
 here stages, publishes, or writes calendar rows (beyond flipping a pending row
 whose media vanished). NOTHING here logs a secret.
+
+GAP 3 (audit of PR #68, client_dm_support): "the coach channel" in steps 1 and 7
+above is a CLIENT-FACING Slack channel, and this module used to post straight to
+it with no reference to conditions.compose(), the outbox, or the client_dm_support
+three-flag interlock at all -- reachable via the nightly cron with NO
+client_dm_support flag involved, and independently via the gym_drive_sync action
+(gated on AGENT_CLIENT_DM_AUTOFIX alone). `_client_channel_if_armed(gym_id)` now
+gates every one of these on `config.slack_convo_client_reply_armed('echo')` -- the
+SAME flag every other client-facing send in this repo already requires -- falling
+back to the existing internal `#ops` channel when it is not armed.
 """
 from __future__ import annotations
 
@@ -214,6 +224,36 @@ def _coach_channel(gym_id):
         return ""
 
 
+def _client_channel_if_armed(gym_id):
+    """_coach_channel(gym_id), but ONLY when this identity's client-reply flag is
+    armed -- the SAME gate every other client-facing reply in this repo requires
+    (config.slack_convo_client_reply_armed). Not armed -> '' -> the caller's
+    _post_digest falls back to the internal #ops channel, exactly like "no channel
+    configured" always has.
+
+    GAP 3 (audit of PR #68): a Drive-revoked notice and the new-media/sort-queue
+    digests used to post STRAIGHT to _coach_channel(gym_id) -- a client-facing Slack
+    channel -- with no reference to conditions.compose(), the outbox, or the
+    three-flag client_dm_support interlock at all. Reachable on
+    AGENT_CLIENT_DM_AUTOFIX alone (the gym_drive_sync action calls sync_source,
+    which calls this), and ALSO reachable with no client_dm_support flag set at all,
+    since the nightly gym_drive_connect cron calls the exact same code path. No gym
+    has slack_channel configured yet (audit, 2026-09-07), so every call has actually
+    landed on #ops -- this closes the bypass before one does, rather than after.
+    This does not make the notice pass through compose()'s grounded-reply gate (it
+    is a fixed, factual, non-conditional string, not a claim assembled from a
+    Reading), but it can no longer reach a client on any weaker condition than every
+    other client-facing send in this system already requires.
+    """
+    try:
+        from .. import config as _config
+        if not _config.slack_convo_client_reply_armed("echo"):
+            return ""
+    except Exception:  # noqa: BLE001 - a config read failure fails closed (internal only)
+        return ""
+    return _coach_channel(gym_id)
+
+
 def _flip_pending_for_missing(gym_id, asset_ids, log):
     """When an asset a PENDING calendar row is using disappears from Drive, pull that
     row off it (spec §4). Best effort: no creds -> no-op.
@@ -258,8 +298,78 @@ def _flip_pending_for_missing(gym_id, asset_ids, log):
     return flipped
 
 
+def _prerender_pass(gym_id, drive, store, merged, seen_ids, probe_fn, log, *,
+                    budget_n, host_fn=None):
+    """Render (or pre-host) up to the budget's worth of eligible videos that carry no
+    rendition_url yet. Returns (rendered, prehosted, skipped). Never raises: one bad
+    file never sinks the sync; a spent budget or a timed-out clip ends the pass."""
+    from .. import media_host as _mh
+    host_fn = host_fn or _mh.host_media
+    probe_fn = probe_fn or _idx.probe_video
+    if budget_n <= 0:
+        return 0, 0, 0
+    cands = [a for a in merged.values()
+             if a["id"] in seen_ids
+             and a.get("kind") == _idx.KIND_VIDEO
+             and a.get("eligible") is True
+             and not a.get("rendition_url")]
+    cands.sort(key=lambda a: (int(a.get("used_count") or 0), str(a.get("id"))))
+    budget = _idx.RenditionBudget(budget_n)
+    rendered = prehosted = skipped = 0
+    for asset in cands[: budget_n * 2]:
+        # STOP AT BUDGET SPENT (audit round 4 #5): no further download or probe once
+        # the transcode budget is gone; the rest of the list waits for tomorrow.
+        if budget.spent:
+            break
+        tmp_dir = tempfile.mkdtemp(prefix="gymrender_")
+        tmp_path = Path(tmp_dir) / os.path.basename(asset.get("title") or "clip.bin")
+        try:
+            drive.download(asset["id"], tmp_path)
+            info = probe_fn(tmp_path)
+            if not info:
+                skipped += 1
+                continue
+            if _idx.needs_rendition(asset, info):
+                url, _conv = _idx.ensure_rendition(asset, tmp_path, store=store,
+                                                   probe_info=info, budget=budget,
+                                                   host_fn=host_fn)
+                if url:
+                    rendered += 1
+                    log(f"pre-rendered {asset.get('title')!r} for {gym_id}")
+                else:
+                    skipped += 1        # converter unavailable: builder marks it
+            else:
+                url = host_fn(str(tmp_path), gym_id)
+                if url:
+                    key = _mh._key_from_public_url(url) or _idx.rendition_key(
+                        gym_id, asset.get("content_hash"), _idx._ext(asset.get("title")))
+                    _idx._persist_rendition(store, asset, key, url)
+                    prehosted += 1
+                else:
+                    skipped += 1
+        except _idx.RenditionBudgetExhausted:
+            skipped += 1                    # waits for tomorrow's budget
+        except _idx.RenditionTimeout as e:
+            skipped += 1
+            log(f"pre-render timed out for {asset.get('title')!r}: {e}")
+        except Exception as e:  # noqa: BLE001 - one bad file never sinks the pass
+            skipped += 1
+            log(f"pre-render failed for {asset.get('title')!r}: {type(e).__name__}: {e}")
+        finally:
+            try:
+                for name in os.listdir(tmp_dir):
+                    os.unlink(os.path.join(tmp_dir, name))
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+    if rendered or prehosted or skipped:
+        log(f"{gym_id}: pre-render pass rendered {rendered}, pre-hosted {prehosted}, "
+            f"skipped {skipped} (budget {budget_n})")
+    return rendered, prehosted, skipped
+
+
 def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
-                now_iso=None, probe_budget=None):
+                now_iso=None, probe_budget=None, render_budget=None, host_fn=None):
     """Sync ONE media_source. Returns a per-source summary dict. Never raises out of
     a normal degrade path; a 403 on the walk marks the source revoked_externally and
     returns a revoked summary."""
@@ -272,6 +382,18 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
     gym_id = source.get("gym_id")
     source_id = source.get("id")
     folder_id = source.get("folder_id")
+    # STALE-KEY RESOLUTION HERE TOO (audit round 5 MAJOR 2): run() remaps a source's
+    # stale gym_id (a portal link minted before a re-key) before calling this, but a
+    # direct caller (the Tough Temple re-stage recipe: media_source under
+    # toughtemple086f51, media_asset under toughtemple52040e) got the raw row, listed
+    # ZERO existing assets under the stale key, re-inserted every file, hit the PK and
+    # rendered nothing. Same resolver, same rule, so the recipe cannot be wrong again.
+    from .. import gym_media_routes as _gm_routes
+    resolved = _gm_routes._resolve_stale_fingerprint(gym_id)
+    if resolved != gym_id:
+        log(f"source {source_id} carries stale key {gym_id!r}; resolved to {resolved!r} "
+            "for this sync (the media_source row itself was NOT rewritten)")
+        gym_id = resolved
 
     # 1. walk (403 -> revoked_externally + notify, no crash)
     try:
@@ -287,7 +409,7 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             msg = (f"Google Drive access for {gym_id} was revoked (the shared "
                    f"folder is no longer shared to Echo). Reconnect it in the "
                    f"portal to resume pulling photos. Nothing was lost.")
-            _post_digest(msg, channel=_coach_channel(gym_id))
+            _post_digest(msg, channel=_client_channel_if_armed(gym_id))
             log(f"source {source_id} for {gym_id} revoked_externally (Drive {status})")
             return {"ok": False, "revoked": True, "gym_id": gym_id}
         log(f"walk failed for {gym_id}: {type(e).__name__}: {e}")
@@ -423,6 +545,19 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
         if r.get("eligible") is False and r.get("reject_reason"):
             reject_counts[r["reject_reason"]] += 1
 
+    # 5b. budgeted PRE-RENDER pass (audit R-D1 #5): eligible videos with no
+    # rendition_url are downloaded, probed for codec, and either transcoded to an
+    # H.264 .mp4 (HEVC / odd container, counts against RENDITION_MAX_PER_SYNC) or,
+    # when already web-playable, hosted as-is and persisted as their own rendition so
+    # the month build never re-hosts them and this pass never re-downloads them.
+    # Bounded: at most 2x the transcode budget in candidates per source per run;
+    # converges across nights. Runs on the same synced-asset view as the probe pass.
+    rendered, prehosted, render_skipped = _prerender_pass(
+        gym_id, drive, store, merged, seen_ids, probe_fn, log,
+        budget_n=(config.rendition_max_per_sync() if render_budget is None
+                  else int(render_budget)),
+        host_fn=host_fn)
+
     # 6b. STORY_CLASSIFIER sort (default ON, spec §0): tag freshly-seen assets raw /
     # finished / ambiguous. AMBIGUOUS queues for a human (or auto-sorts); a
     # CONFIDENT FINISHED verdict is quarantined out of the raw pool (see
@@ -443,7 +578,8 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
         "updated": updated, "probed": probed, "newly_eligible": newly_eligible,
         "removed": removed, "skipped": len(skipped),
         "rejected": dict(reject_counts), "new_rows": len(new_rows),
-        "queued_ambiguous": queued_ambiguous}
+        "queued_ambiguous": queued_ambiguous,
+        "rendered": rendered, "prehosted": prehosted, "render_skipped": render_skipped}
     # 7. per-gym new-asset digest (only when something new arrived)
     if inserted:
         rejected_txt = ", ".join(f"{k} x{v}" for k, v in sorted(reject_counts.items())) \
@@ -453,21 +589,21 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             f"({photos} photos, {videos} videos this scan), {newly_eligible} newly "
             f"ready to use, rejected: {rejected_txt}. Review or hide any in the "
             f"portal media tab.",
-            channel=_coach_channel(gym_id))
+            channel=_client_channel_if_armed(gym_id))
     # "Sort these" coach digest (spec §0.3): fires ONLY when the queue is non-empty.
     # story_sort_queue.post_digest is a no-op on an empty queue, so this never
     # storms the channel. Best effort: a digest failure never sinks the sync.
     if config.story_classifier_enabled():
         try:
             from .. import story_sort_queue as _q
-            _q.post_digest(gym_id, channel=_coach_channel(gym_id))
+            _q.post_digest(gym_id, channel=_client_channel_if_armed(gym_id))
         except Exception as e:  # noqa: BLE001
             log(f"sort-queue digest skipped for {gym_id}: {type(e).__name__}: {e}")
     return summary
 
 
 def run(drive=None, store=None, probe_fn=None, log=None, now_iso=None,
-        sleep=None, probe_budget=None):
+        sleep=None, probe_budget=None, render_budget=None):
     """One sync pass over every active gym-drive source the lane is armed for.
     Returns a roll-up summary; never raises out of a normal degrade path."""
     log = log or (lambda m: print(f"[gym-media] {m}"))
@@ -521,7 +657,8 @@ def run(drive=None, store=None, probe_fn=None, log=None, now_iso=None,
         try:
             results.append(sync_source(
                 source, drive=drive, store=store, probe_fn=probe_fn, log=log,
-                now_iso=now_iso, probe_budget=probe_budget))
+                now_iso=now_iso, probe_budget=probe_budget,
+                render_budget=render_budget))
         except Exception as e:  # noqa: BLE001 - one source never sinks the run
             log(f"source {source.get('id')} failed: {type(e).__name__}: {e}")
             results.append({"ok": False, "error": type(e).__name__,

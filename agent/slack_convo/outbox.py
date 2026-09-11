@@ -72,6 +72,11 @@ from datetime import datetime, timezone
 from . import adapter as _a
 from .. import config
 
+# Surfaces where a reply goes TOP LEVEL rather than in a thread: DMs and group DMs (people do
+# not thread there), and a portal-bridge ticket, whose Slack home is the group DM this system
+# opened for it.
+TOP_LEVEL_SURFACES = frozenset({"im", "mpim", "portal_ticket_bridge"})
+
 STALE_AFTER_SECONDS = 6 * 3600
 RELEASE_ACTION_ID = "slack_convo_release"
 RESOLVE_ACTION_ID = "slack_convo_resolve"
@@ -105,6 +110,40 @@ def _channel_for(kind, identity):
     if kind == _a.KIND_FIXER_REQUEST:
         return config.ops_fix_channel_id()
     return identity.fixer_channel() or config.fixer_channel_id()
+
+
+def _person_for_card(bus, ticket, identity):
+    """m2: a post-time hold card names the person and gym in words, like a draft-time one.
+
+    The outbox has no identity_gate result to hand (it runs long after resolution), so this
+    reconstructs the same line from the ticket row itself -- reporter, gym, identity kind --
+    rather than falling back to a bare Slack id, which is exactly the unreadable card D53
+    was written to get rid of."""
+    t = ticket or {}
+    uid = str(t.get("slack_user_id") or "") or "?"
+    kind = str(t.get("identity_kind") or "unknown")
+    email = str(t.get("reporter") or "").strip()
+    gym = str(t.get("client_id") or "").strip()
+    label = ""
+    try:
+        if gym:
+            rows = bus._get("gyms", {"id": f"eq.{gym}", "select": "name", "limit": "1"})
+            label = str((rows or [{}])[0].get("name") or "").strip()
+    except Exception:  # noqa: BLE001 - a name lookup never blocks a card
+        label = ""
+    bits = [f"{kind} {_a._slack_escape(uid)}"]
+    if email:
+        bits.append(_a._slack_escape(email))
+    bits.append(f"gym {_a._slack_escape(label or gym or 'not resolved')}")
+    return ", ".join(bits)
+
+
+def _client_dm_lane_meta_key():
+    """The attachments key client_dm_support stamps on every row it writes
+    (lane.py's LANE_META), imported by name rather than duplicated as a magic
+    string here so the two can never drift apart."""
+    from ..client_dm_support.lane import LANE_META
+    return LANE_META
 
 
 def _recipient_armed(identity, recipient_kind):
@@ -314,7 +353,16 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
             blocks = escalation_blocks(row, ticket)
         else:
             blocks = None
-        ts = post(channel, row["body"], thread_ts=None, blocks=blocks)
+        try:
+            ts = post(channel, row["body"], thread_ts=None, blocks=blocks)
+        except Exception as e:  # noqa: BLE001
+            # Audit 4, finding 2: a hold card or escalation that fails to post is the case
+            # where a human never learns anything -- while the client may already have been
+            # acknowledged. It must be LOUD; silence here is the whole failure mode.
+            log(f"[slack-convo/outbox] CRITICAL internal {kind} FAILED to reach "
+                f"{channel} for ticket {ticket['id']}: {type(e).__name__}: {e}. "
+                f"Nobody has been told about this ticket.")
+            raise
         bus.mark_message(row["id"], "posted", slack_ts=ts)
         summary["posted"] += 1
         return
@@ -344,6 +392,78 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
     # 5. trust ladder, re-checked at post time; held rows always get a card (V-M8). A row
     # Blake has explicitly released is the one exception: his tap already IS the approval.
     recipient_kind = att.get("recipient_kind") or ticket.get("identity_kind") or "client"
+    # 5a. D54 hard lines, re-checked at POST time (a flag can flip, and a row can be written
+    # by an older process). A substantive ANSWER to a client posts on its own ONLY with that
+    # identity's AUTO_ANSWER flag armed, and NEVER when the draft-time check marked it
+    # forbidden. Blake's release tap is still the way any of these actually go out.
+    if kind == _a.KIND_ANSWER and recipient_kind not in ("staff", "coach") \
+            and not att.get("released_by"):
+        # M2 (audit 2): this used to trust the stored marker alone, so a row written by any
+        # writer that omits it -- a pre-D54 process, a future one -- posted a hard-line
+        # answer to a client with no tap. The body is re-read here, which is what "checked
+        # again at post time" has to mean for a rule that is about content.
+        # Audit 4, finding 4: this re-read only the DENYLIST against the body, so the claim
+        # "both are checked at draft time AND at post time" was false and the whole point of
+        # the single may_auto_answer decision (that no path enforces half the rule) did not
+        # hold for the post-time path. The ticket carries the question -- raw_text -- so the
+        # identical decision can be, and now is, made here too.
+        if (att.get("auto_answer_forbidden")
+                or not _a.may_auto_answer(ticket.get("raw_text") or "", row.get("body"))):
+            bus.mark_message(row["id"], "held",
+                             meta_update={"held_why": "hard line: never auto answered"})
+            summary["held"] += 1
+            _a.write_hold_notice(
+                bus, ident_name=identity.name, tid=ticket["id"],
+                recipient_kind=recipient_kind, user=ticket.get("slack_user_id") or "?",
+                account_key=None, kind=kind, body=row.get("body") or "",
+                held_message_id=row["id"], surface=att.get("surface") or "",
+                person=_person_for_card(bus, ticket, identity),
+                why="hard line (billing, hours or schedule, injury or liability): this never "
+                    "auto answers, whatever the flags say")
+            return
+        if not config.slack_convo_auto_answer_armed(identity.name):
+            bus.mark_message(row["id"], "held",
+                             meta_update={"held_why": "auto answer not armed"})
+            summary["held"] += 1
+            _a.write_hold_notice(
+                bus, ident_name=identity.name, tid=ticket["id"],
+                recipient_kind=recipient_kind, user=ticket.get("slack_user_id") or "?",
+                account_key=None, kind=kind, body=row.get("body") or "",
+                held_message_id=row["id"], surface=att.get("surface") or "",
+                person=_person_for_card(bus, ticket, identity),
+                why=f"SLACK_CONVO_{identity.name.upper()}_AUTO_ANSWER is off: a grounded "
+                    "answer needs your tap")
+            return
+    # 5b. GAP 2 (audit of PR #68): a row THIS SPECIFIC LANE wrote must re-verify that
+    # lane's OWN full three-flag interlock at dispatch time, not only the general
+    # _recipient_armed check above. arming.preflight() checks AGENT_CLIENT_DM_AUTOFIX,
+    # AGENT_CLIENT_DM_CLIENT_REPLY and a runtime-derived AGENT_CLIENT_DM_LIVE_ACK --
+    # none of which _recipient_armed (SLACK_CONVO_<ID>_CLIENT_REPLY alone) has ever
+    # read. Without this, a row written while the lane was briefly LIVE stays in
+    # 'ready' after AGENT_CLIENT_DM_AUTOFIX is later revoked (or the ack goes stale),
+    # and this same _recipient_armed check -- true the whole time, since it is a
+    # different, pre-existing, already-armed flag -- would still release it with zero
+    # awareness this lane, or its revocation, exists. Scoped to rows carrying this
+    # lane's own provenance marker, so no other identity's or lane's delivery changes.
+    if not att.get("released_by") and att.get(_client_dm_lane_meta_key()):
+        from ..client_dm_support import arming as _cdm_arm
+        lane_arm = _cdm_arm.preflight(identity.name)
+        if lane_arm.mode != _cdm_arm.MODE_LIVE:
+            bus.mark_message(row["id"], "held",
+                             meta_update={"held_why": "client_dm_support lane no longer "
+                                                       f"live at dispatch time: "
+                                                       f"{lane_arm.reason}"})
+            summary["held"] += 1
+            _a.write_hold_notice(
+                bus, ident_name=identity.name, tid=ticket["id"],
+                recipient_kind=recipient_kind, user=ticket.get("slack_user_id") or "?",
+                account_key=None, kind=kind, body=row.get("body") or "",
+                held_message_id=row["id"], surface=att.get("surface") or "",
+                person=_person_for_card(bus, ticket, identity),
+                why=f"client_dm_support's own arming no longer holds at dispatch "
+                    f"time (re-checked independently of SLACK_CONVO_"
+                    f"{identity.name.upper()}_CLIENT_REPLY): {lane_arm.reason}")
+            return
     if not att.get("released_by") and not _recipient_armed(identity, recipient_kind):
         bus.mark_message(row["id"], "held", meta_update={"held_why": "flag off at post time"})
         summary["held"] += 1
@@ -360,7 +480,14 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
     # 7. destination
     channel = ticket.get("slack_channel_id")
     surface = att.get("surface") or ""
-    thread_ts = None if surface in (_a.SURFACE_IM, _a.SURFACE_MPIM) else ticket.get("slack_thread_ts")
+    # F1 (audit 8, MAJOR): the audit-7 fix read the surface off the ticket's own inbound row
+    # instead of its source -- and a portal ticket's inbound row carries
+    # 'portal_ticket_bridge', which is not in this tuple, so the notice STILL posted as a
+    # thread reply inside the group DM. Byte-identical behaviour to the bug it replaced, and
+    # its test asserted the helper on a Slack MPIM ticket, never the portal case it was for.
+    # People do not thread in a DM whatever brought the ticket there.
+    thread_ts = (None if surface in TOP_LEVEL_SURFACES
+                 else ticket.get("slack_thread_ts"))
     if not channel:
         # D48: no Slack thread is not automatically a dead end. A portal-submitted ticket
         # is delivered to the thread the person wrote it in; only a ticket with neither
@@ -374,19 +501,101 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
             return
         bus.mark_message(row["id"], "posted", meta_update={"delivered_via": "portal_thread"})
         summary["posted"] += 1
-        _resolve_on_answer(bus, ticket, kind, summary)
+        _resolve_on_answer(bus, ticket, kind, summary, att)
+        # m4: no Slack call happens on this branch -- "posted" here means migration 0310 now
+        # lets the client read it in the thread they wrote from. The receipt says exactly
+        # that rather than claiming a message was pushed to them.
+        _receipt(bus, ticket, row, identity, kind, att,
+                 where="released into the portal support thread they wrote from",
+                 summary=summary)
         return
     ts = post(channel, row["body"], thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
-    _resolve_on_answer(bus, ticket, kind, summary)
+    _resolve_on_answer(bus, ticket, kind, summary, att)
+    _receipt(bus, ticket, row, identity, kind, att, where=f"Slack {channel}", summary=summary)
 
 
-def _resolve_on_answer(bus, ticket, kind, summary):
-    """V-M4: the ticket closes when the person HAS the answer, not when we drafted it."""
+# Kinds worth a receipt in #fixer. An `ack` ("checking that for you now") is noise; what
+# Blake asked to see is anything SUBSTANTIVE that reached the client without him: the answer
+# itself, the honest no-draft template, and the resolution notice that closes a ticket.
+RECEIPT_KINDS = frozenset({_a.KIND_ANSWER, _a.KIND_TEMPLATE, _a.KIND_STATUS})
+
+
+def write_receipt(bus, ticket, *, identity, body, kind, where, auto, extra=None):
+    """The shared receipt writer, so every path that tells a client something -- this
+    module's outbox AND the portal bridge's direct-outreach path (M1) -- produces the same
+    card. Written only AFTER a delivery actually succeeded."""
+    from datetime import datetime as _dt, timezone as _tz
+    sent_at = _dt.now(_tz.utc).isoformat()
+    how = "SENT AUTOMATICALLY (no tap)" if auto else "sent"
+    meta = {"identity": getattr(identity, "name", ""), "receipt": True,
+            "receipt_kind": kind, "auto_answer": bool(auto), "sent_at": sent_at}
+    if extra:
+        meta.update(extra)
+    return bus.record_outbound(
+        ticket_id=ticket["id"], author_type="system",
+        body=(f"RECEIPT: the client was told this, {how}.\n"
+              f"BOT: {getattr(identity, 'name', '?')}   TICKET: {ticket['id']}   "
+              f"KIND: {kind}\nWHERE: {where}   WHEN: {sent_at}\n"
+              f"STATUS NOW: {(bus.ticket(ticket['id']) or ticket).get('status') or '?'}\n\n"
+              f"{body or ''}"),
+        delivery_status="ready", kind=_a.KIND_ESCALATION, meta=meta)
+
+
+def _receipt(bus, ticket, row, identity, kind, att, *, where, summary):
+    """D55: a receipt of what the client was ACTUALLY told, posted to #fixer.
+
+    Blake, 2026-09-05: "so Blake never has to wonder whether a ticket actually landed with
+    the client". This is written only AFTER the row is marked posted, and it quotes the real
+    body that went out with the real timestamp, so it can never claim a delivery that did not
+    happen. It is an internal kind: it goes to the fixer channel and never into the person's
+    thread. A failure here never fails the post that already succeeded."""
+    if kind not in RECEIPT_KINDS:
+        return
+    if (att or {}).get("recipient_kind") in ("staff", "coach"):
+        return  # staff can see their own thread; a receipt would just be an echo
+    try:
+        sent_at = datetime.now(timezone.utc).isoformat()
+        # m4: re-read the ticket so STATUS NOW is the status now, not the one captured
+        # before _resolve_on_answer ran a line earlier.
+        fresh = None
+        try:
+            fresh = bus.ticket(ticket["id"])
+        except Exception:  # noqa: BLE001
+            fresh = None
+        status_now = (fresh or ticket).get("status") or "?"
+        auto = bool(kind == _a.KIND_ANSWER and not (att or {}).get("released_by"))
+        how = ("SENT AUTOMATICALLY (no tap)" if auto else
+               ("sent after your tap" if (att or {}).get("released_by") else "sent"))
+        bus.record_outbound(
+            ticket_id=ticket["id"], author_type="system",
+            body=(f"RECEIPT: the client was told this, {how}.\n"
+                  f"BOT: {identity.name}   TICKET: {ticket['id']}   KIND: {kind}\n"
+                  f"WHERE: {where}   WHEN: {sent_at}\n"
+                  f"STATUS NOW: {status_now}\n\n{row.get('body') or ''}"),
+            # C3: an ESCALATION row, because that is a kind the portal already hides from
+            # clients. attachments.receipt marks it as a receipt for everything on this side.
+            delivery_status="ready", kind=_a.KIND_ESCALATION,
+            meta={"identity": identity.name, "receipt_for": row["id"], "receipt": True,
+                  "receipt_kind": kind, "auto_answer": auto, "sent_at": sent_at})
+    except Exception:  # noqa: BLE001 - never undo a successful post over a receipt
+        pass
+
+
+def _resolve_on_answer(bus, ticket, kind, summary, att=None):
+    """V-M4: the ticket closes when the person HAS the message, not when we drafted it.
+
+    Two rows close a ticket: the ANSWER that answered it, and the resolve NOTICE a human
+    tapped (MINOR 5, audit 7 -- resolve_and_notify used to stamp the ticket itself, before
+    delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
     if kind == _a.KIND_ANSWER and ticket.get("status") == "verification":
         bus.set_ticket(ticket["id"], status="resolved")
         summary["resolved"] += 1
+    elif kind == _a.KIND_STATUS and (att or {}).get("resolve_notice"):
+        if ticket.get("status") != "resolved":
+            bus.set_ticket(ticket["id"], status="resolved")
+            summary["resolved"] += 1
 
 
 def release_held(bus, message_id, *, approved_by, identity=None, log=print):
@@ -440,16 +649,98 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         return False
     if ticket.get("status") == "resolved":
         return False
+    # MINOR 5's fix moved the resolved stamp to delivery time, which quietly broke what the
+    # status check had been doing double duty for: idempotence. A second tap before the
+    # notice posts would have written a SECOND notice. The notice row itself is the record of
+    # "this tap already happened", so that is what is checked.
+    if _resolve_notice_exists(bus, ticket_id):
+        return False
     if not portal_deliverable(ticket) and not ticket.get("slack_channel_id"):
         log(f"[slack-convo/outbox] resolve refused: ticket {ticket_id} has no delivery "
             "surface (no portal thread, no group DM)")
         return False
+    # Audit 4, finding 9: this marked the ticket resolved and returned True even when the
+    # notice would be HELD by the trust ladder -- Blake taps "Resolved, tell them", the tap
+    # reports ok, the ticket reads resolved, and the client is never told. If we cannot
+    # deliver the notice, we do not claim the resolution.
+    recipient_kind = ticket.get("identity_kind") or "client"
+    if not _recipient_armed(identity, recipient_kind):
+        # Audit 5, finding 4: refusing silently is its own version of the dead button this
+        # whole path exists to fix -- Blake taps "Resolved, tell them" and gets nothing at
+        # all. The refusal is written back to the fixer channel, naming the flag to flip.
+        flag = ("STAFF_REPLY" if recipient_kind in ("staff", "coach") else "CLIENT_REPLY")
+        why = (f"Resolve tap on ticket {ticket_id} did NOT go through: the notice to the "
+               f"{recipient_kind} would be held because SLACK_CONVO_"
+               f"{getattr(identity, 'name', '?').upper()}_{flag} is off, and marking a "
+               f"ticket resolved that the person was never told about is the lie this "
+               f"button exists to prevent. Arm that flag, or reply to them directly and "
+               f"close it by hand. The ticket is unchanged.")
+        log(f"[slack-convo/outbox] {why}")
+        try:
+            bus.record_outbound(
+                ticket_id=ticket_id, author_type="system", body=why,
+                delivery_status="ready", kind=_a.KIND_ESCALATION,
+                meta={"identity": getattr(identity, "name", ""), "resolve_refused": True})
+        except Exception:  # noqa: BLE001 - the refusal itself already stands
+            pass
+        return False
+    # MINOR 4 (audit 7): `surface` was the ticket's SOURCE ("website_tab"), which is not one
+    # of the surfaces gate 7 knows, so the notice was posted as a THREAD REPLY inside a DM --
+    # a place people do not look. The real surface is on the ticket's own inbound rows.
+    surface = _surface_of(bus, ticket_id) or (ticket.get("source") or "")
     bus.record_outbound(
         ticket_id=ticket_id, author_type=getattr(identity, "name", "system"),
         body=RESOLVED_NOTICE, delivery_status="ready", kind=_a.KIND_STATUS,
-        meta={"identity": getattr(identity, "name", ""), "recipient_kind": "client",
-              "surface": (ticket.get("source") or ""), "resolved_by": approved_by})
-    bus.set_ticket(ticket_id, status="resolved", approved_by=approved_by,
-                   approved_via="slack_button",
+        # Audit 5, finding 3: this hardcoded "client" while the gate above read the ticket's
+        # own identity_kind, so a staff ticket with STAFF_REPLY on and CLIENT_REPLY off
+        # passed the gate and then held the row -- the exact lie the gate was added to close.
+        meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
+              "surface": surface, "resolved_by": approved_by, "resolve_notice": True})
+    # MINOR 5 (audit 7): the ticket used to be stamped resolved HERE, before the notice had
+    # been delivered -- so a post failure left a ticket permanently asserting it was resolved
+    # over a row marked failed. Same rule as an answer (V-M4): the ticket closes when the
+    # person HAS the message. _resolve_on_answer closes it when this row posts.
+    bus.set_ticket(ticket_id, approved_by=approved_by, approved_via="slack_button",
                    approved_at=datetime.now(timezone.utc).isoformat())
     return True
+
+
+def _recent(bus, ticket_id, limit=200):
+    """The NEWEST rows on a ticket, newest first.
+
+    MINOR 1 (audit 8): bus.messages orders created_at.asc, so a client-side scan of its first
+    200 rows reads the OLDEST 200 -- the exact bug count_escalation_cards_since was added to
+    fix, reintroduced by hand in three helpers at once. For _resolve_notice_exists the
+    failure direction was a DUPLICATE resolve notice to a client."""
+    try:
+        return bus.recent_messages(ticket_id, limit=limit)
+    except AttributeError:
+        rows = bus.messages(ticket_id, limit=limit) or []
+        return list(reversed(rows))
+
+
+def _resolve_notice_exists(bus, ticket_id):
+    """True once a resolve notice has been written for this ticket, in any delivery state.
+    Fails CLOSED (True) on a read failure: a duplicate notice to a client is worse than a
+    tap that reports nothing happened."""
+    try:
+        for m in _recent(bus, ticket_id) or []:
+            att = m.get("attachments") or {}
+            if m.get("direction") == "outbound" and att.get("resolve_notice"):
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _surface_of(bus, ticket_id):
+    """The surface this ticket's human actually spoke on, from its own inbound rows."""
+    try:
+        for m in _recent(bus, ticket_id) or []:
+            if m.get("direction") == "inbound":
+                s = ((m.get("attachments") or {}).get("surface") or "").strip()
+                if s:
+                    return s
+    except Exception:  # noqa: BLE001
+        pass
+    return ""

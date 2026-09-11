@@ -228,13 +228,22 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None):
         # else logged it either, so the cause was unrecoverable after the fact.
         # scrub() is what makes this safe to surface: a provider error can quote the
         # credential it rejected.
-        from .ops_alerts import scrub
-        detail = scrub(f"{type(e).__name__}: {e}")[:900]
+        # C14: carry the STRUCTURE, not just the message. A bare "ZernioError" (the
+        # live crossfitnine7f7dadc failure, row 333f90a3) names the exception class and
+        # discards the status code, the endpoint, the account and whether trying again
+        # could ever help. describe_error unwraps all four, and the retry sweep
+        # (agent/gbp_failed_retry.py) reads `retryable` to decide whether this row is
+        # worth another attempt or is waiting on a human.
+        from .zernio import describe_error, error_summary
+        desc = describe_error(e, endpoint="/v1/gmb-media",
+                              account_id=connection.get("zernio_account_id"))
+        summary = error_summary(desc)
         if alert:
             alert(f"GBP photo drop failed for {row.get('gym_id')} "
-                  f"row {row.get('id')}: {detail}")
+                  f"row {row.get('id')}: {summary}")
         return {"ok": False, "status": "failed", "late_post_id": "",
-                "reject_reason": f"photo upload: {detail}"[:400], "mode": ""}
+                "reject_reason": f"photo upload: {summary}"[:400], "mode": "",
+                "error": desc}
     from .zernio import post_id_of
     return {"ok": True, "status": "published", "late_post_id": post_id_of(resp),
             "reject_reason": "", "mode": "live"}

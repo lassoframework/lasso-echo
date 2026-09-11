@@ -27,6 +27,7 @@ import re
 QUESTION = "answerable_question"
 CODE_FIX = "code_fix"
 ACTION_REQUEST = "action_request"
+CANCEL_POST = "cancel_post"
 FOLLOW_UP = "follow_up"
 ESCALATE = None
 
@@ -37,7 +38,56 @@ _BREAKAGE_RE = re.compile(
     r"wont|can't|cant|cannot|error|errors|erroring|failed|failing|fails|crash|crashed|"
     r"stuck|still (?:not|broken|failing|down)|bug|glitch|won't load|not loading|"
     r"didn't (?:post|publish|go out|send)|didnt (?:post|publish|go out|send)|"
-    r"never (?:posted|published|went out)|404|500)\b", re.IGNORECASE)
+    r"never (?:posted|published|went out)|404|500|"
+    # RTF-1 (2026-09-05): the live gap. Every phrasing below was a real client sentence
+    # shape that the list above missed, so it fell past CODE_FIX to ESCALATE with "the
+    # classifier did not decide". Present-progressive negation ("are not going out") and
+    # the "stopped / no longer / wrong" family were simply absent. Widening is safe here
+    # because CODE_FIX still requires a _DOMAIN_RE noun in the same message (RT-M2): a bare
+    # "I am not going to make it" has no Echo-domain noun and still escalates.
+    r"(?:are|is|isn't|isnt|aren't|arent|has|hasn't|hasnt|have|haven't|havent|was|were|"
+    r"still)?\s*not (?:going out|posting|publishing|showing|showing up|appearing|"
+    r"updating|syncing|loading|connecting|sending|working)|"
+    r"stopped (?:working|posting|publishing|showing|syncing|updating|going out|sending)|"
+    r"no longer (?:working|posts|posting|publishing|showing|syncing|updating)|"
+    r"(?:showing|shows|showing up with|displaying|displays) the wrong|"
+    r"(?:wrong|incorrect|out of date|outdated) (?:hours|address|phone|number|info|"
+    r"information|schedule|times|link|price)|"
+    r"nothing (?:posted|published|went out|happened|shows|showed up)|"
+    r"(?:still|yet) nothing|"
+    r"keeps? (?:failing|erroring|crashing|logging me out)|"
+    r"(?:has|have|had)(?:n't|nt)? (?:posted|published|gone out|updated|synced|recreated|"
+    r"regenerated|shown up|come through)|"
+    r"nothing (?:was |has been |ever |got )?(?:recreated|regenerated|generated|created|"
+    r"posted|published|sent|updated|synced)|"
+    r"won't (?:post|publish|go out|send|load|connect|update)|"
+    r"wont (?:post|publish|go out|send|load|connect|update))", re.IGNORECASE)
+
+# WRONG OUTPUT, not a dead machine (John Weeks / Tough Temple, 2026-09-11).
+#
+# Every pattern in _BREAKAGE_RE describes something NOT HAPPENING: not posting, not
+# going out, broken, error, failed. Echo's most common real client complaint is the
+# OPPOSITE shape -- it is running fine and producing the WRONG THING. John's
+# "9/14-9/16 are still repeat images" matched nothing above, so it classified ESCALATE
+# and the fixer lane never saw it. He reported the same defect twice and a human
+# carried the whole ticket both times.
+#
+# Kept as its OWN regex rather than widened into _BREAKAGE_RE for one reason: unlike a
+# dead machine, this family collides with ordinary QUESTIONS ("how often do posts
+# repeat?"), and _BREAKAGE_RE is deliberately checked BEFORE _QUESTION_RE. classify()
+# therefore checks this one AFTER the question rule, so an owner ASKING about repeats
+# still reaches the answer lane. _BREAKAGE_RE's own ordering is untouched.
+#
+# Still gated by _DOMAIN_RE (RT-M2): "same old same old" and "my duplicate gym keys"
+# carry no Echo noun and still escalate.
+_REPEAT_RE = re.compile(
+    r"\b(?:repeat|repeats|repeated|repeating|duplicate|duplicates|duplicated|"
+    r"duplicating|reuse|reuses|reused|reusing|re-used|re-using|recycled|recycling)\b|"
+    r"\b(?:same|identical) (?:photo|photos|image|images|picture|pictures|pic|pics|"
+    r"video|videos|clip|clips|post|posts|shot|shots|footage|thing)\b|"
+    r"\b(?:over and over|again and again|twice in a row|multiple times|"
+    r"more than once|(?:\d+|two|three|four|five|several) (?:days|times|weeks) in a row)"
+    r"\b", re.IGNORECASE)
 
 _QUESTION_RE = re.compile(
     r"(\?\s*$)|^\s*(how|what|when|where|why|who|which|can you|could you|do you|does|is it|"
@@ -49,6 +99,22 @@ _ACTION_RE = re.compile(
     r"budget|spend|launch|relaunch|target(?:ing)?|audience|duplicate|kill|stop the ad|"
     r"start the ad)\b", re.IGNORECASE)
 
+# A client asking to cancel/skip a scheduled content_calendar post. Two shapes:
+#   1. a cancel verb, then (not immediately, within a short gap) a post-ish noun --
+#      "cancel my post today", "can you skip tomorrow's scheduled post".
+#   2. the "don't/won't post" negation, which already carries its own noun --
+#      "please don't post today", "don't post tomorrow".
+# Deliberately narrow (post/story/reel/schedule only) so "cancel my membership" or
+# "stop calling me" never matches; this is content_calendar cancellation only, never
+# billing, ads, or anything else "cancel"/"stop"/"kill" could mean elsewhere in Echo.
+_CANCEL_NOUN = r"post|posts|posting|story|stories|reel|reels|schedule|scheduled"
+_CANCEL_POST_RE = re.compile(
+    rf"\b(?:cancel|skip|stop|pull|remove|kill|hold off on)\b"
+    rf"(?:(?!\b(?:{_CANCEL_NOUN})\b).){{0,40}}"
+    rf"\b(?:{_CANCEL_NOUN})\b"
+    rf"|\b(?:don'?t|do not|won'?t)\s+post\b",
+    re.IGNORECASE)
+
 # Ranger request_type vocabulary (migration 0303), best effort from the text.
 _REQUEST_TYPE_RULES = (
     ("pause_resume", re.compile(r"\b(pause|resume|unpause|turn (?:off|on)|stop|start)\b", re.I)),
@@ -57,7 +123,7 @@ _REQUEST_TYPE_RULES = (
     ("targeting",    re.compile(r"\b(target(?:ing)?|audience|geo|radius|age)\b", re.I)),
 )
 
-_VALID = frozenset({QUESTION, CODE_FIX, ACTION_REQUEST, FOLLOW_UP})
+_VALID = frozenset({QUESTION, CODE_FIX, ACTION_REQUEST, CANCEL_POST, FOLLOW_UP})
 
 # RT-M2: a breakage word alone is a hair trigger ("I can't make Thursday", "my bad, my
 # error"). A code fix needs the breakage to be ABOUT something we run. Word-bounded.
@@ -66,7 +132,20 @@ _DOMAIN_RE = re.compile(
     r"caption|captions|calendar|schedule|scheduled|instagram|ig|facebook|fb|page|google|"
     r"gbp|business profile|connect|connection|connected|connecting|link|upload|uploads|"
     r"photo|photos|video|videos|media|approve|approval|approvals|portal|login|log in|"
-    r"sign in|echo|dashboard|reply|replies|comment|comments|drive|folder)\b", re.IGNORECASE)
+    # "image / images / picture / pictures / clip / clips / footage / shot": the words a
+    # gym owner actually types for the same things. "photo" and "video" were here;
+    # "image" was not, so "9/14-9/16 are still repeat images" failed the domain check
+    # even once the breakage side matched (John Weeks / Tough Temple, 2026-09-11).
+    r"image|images|picture|pictures|pic|pics|clip|clips|footage|shot|shots|"
+    r"sign in|echo|dashboard|reply|replies|comment|comments|drive|folder|"
+    # RTF-1: the website product's nouns, which were missing entirely -- every
+    # Wrangler-shaped breakage report ("the website is showing the wrong hours") failed
+    # RT-M2's domain check and escalated. Bare "site" is deliberately NOT here: the existing
+    # RT-M2 guard case "the site crashed my brain lol" is exactly the figurative use that
+    # word invites, and every real report of ours says website / homepage / page, or names
+    # the thing that is wrong (hours, address, form).
+    r"website|websites|web site|homepage|home page|landing page|web page|webpage|"
+    r"url|domain|form|forms|booking|book now|hours|address)\b", re.IGNORECASE)
 
 # V-m4: greetings, thanks, acknowledgements. Never a ticket, never a page.
 _CHATTER_RE = re.compile(
@@ -90,8 +169,132 @@ def request_type_for(text):
     return "other"
 
 
-def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=None):
+# ---- cross-product routing (D50, 2026-09-05) -------------------------------------------
+# Blake: "a website question should reach the identity that can actually answer it,
+# regardless of entry point, WHEN the classifier is confident about the content; low
+# confidence stays with the entry-point agent."
+#
+# This decides WHICH BOT'S KNOWLEDGE AND VOICE drafts the answer. It never changes the
+# ticket's channel, its client_id/gym, its bot_identity, or who the reply is delivered to --
+# see adapter._answer_product / outbox delivery, which are untouched by this. A website
+# question about Gym A is still answered in Gym A's own conversation by Gym A's own ticket;
+# only the product knowledge used to draft it moves. That containment is the whole Frame 2
+# safety argument, and tests assert it directly.
+_WEBSITE_RE = re.compile(
+    r"\b(website|web site|websites|homepage|home page|landing page|web page|webpage|"
+    r"our site|my site|the site|your site|site's|sites)\b", re.IGNORECASE)
+# Terms that mean the message is really about the OTHER products. Any of these present and
+# the website signal is no longer unambiguous, so confidence drops and routing does not fire.
+_NOT_WEBSITE_RE = re.compile(
+    r"\b(instagram|ig|facebook|fb|reel|reels|story|stories|caption|captions|post|posts|"
+    r"posting|publish|published|calendar|ad|ads|adset|ad set|campaign|budget|spend|"
+    r"targeting|audience|cpl|lead|leads)\b", re.IGNORECASE)
+
+CONFIDENT = "confident"
+UNSURE = "unsure"
+
+
+def product_hint(text):
+    """(product, confidence) for cross-product routing, or (None, UNSURE).
+
+    Deterministic and deliberately narrow: an unmistakable website noun with no competing
+    product noun in the same message is CONFIDENT; anything else is UNSURE, which the
+    adapter treats as "stay with the entry-point identity", the unchanged behaviour."""
+    t = (text or "").strip()
+    if not t:
+        return None, UNSURE
+    if _WEBSITE_RE.search(t) and not _NOT_WEBSITE_RE.search(t):
+        return "websites", CONFIDENT
+    return None, UNSURE
+
+
+# ---- the LLM fallback, wired for real (D51, 2026-09-05) ---------------------------------
+
+_LLM_SYSTEM = """You label one inbound support message for a LASSO support bot. Reply with
+EXACTLY ONE of these tokens and nothing else:
+
+answerable_question  - the person is asking something that could be answered from their own
+                       account state (is X connected, what is scheduled, what happened to Y).
+code_fix             - the person is reporting that something we run is broken or not doing
+                       what it should.
+action_request       - the person is asking us to CHANGE something on their ads.
+UNSURE               - anything else, or you are not confident. Choose this freely; a wrong
+                       label sends a client a wrong answer, UNSURE only asks a human to look.
+
+Never explain. Never output any other text."""
+
+
+def default_classify_llm(model=None):
+    """A real LLM classifier for the ambiguous middle, or None when no key is configured.
+
+    THE BUG THIS CLOSES (found live 2026-09-05): listener_wiring.live_deps() hardcoded
+    `classify_llm=None`, so in production classify() could only ever reach the deterministic
+    rules -- config.slack_convo_model()'s own docstring has promised "the LLM fallback of the
+    classifier" since the day it was written, and nothing was ever wired to it. Every message
+    the regexes did not recognise fell to ESCALATE by construction, which is exactly the
+    "the classifier did not decide" flood in #fixer.
+
+    Returns a callable (text) -> label | None, or None when there is no key to call with.
+
+    C1 (2026-09-05 audit, CRITICAL): this used to build and return the closure
+    unconditionally, because the ANTHROPIC_API_KEY check lived inside answer_lane.default_llm
+    at CALL time. So build_classify_llm could never see a failure, its NotWiredError branches
+    were unreachable, and a keyless deployment booted while LOGGING "classifier LLM wired" --
+    then escalated every message, because each call raised and classify() turned that into
+    ESCALATE. That is the D51 flood wearing the badge of the fix for it. The key is now
+    checked HERE, at build time, which is the only place a boot assertion can see it.
+
+    The returned callable NEVER raises out to the caller: classify() already treats an
+    exception as ESCALATE, and this returns None on anything unexpected, so the deterministic
+    behaviour is the floor and the model can only ever fill the middle."""
+    import os
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return None
+    try:
+        import anthropic  # noqa: F401 - m1 (audit 2): a key with no client library is still
+        # "flagged on with nothing behind it". Imported HERE so the boot assertion sees it,
+        # not at first call where the failure is indistinguishable from "nothing to say".
+    except Exception:  # noqa: BLE001
+        return None
+
+    # Finding 4 (2026-09-05 audit 3): a PRESENT BUT INVALID key (revoked, typo'd, wrong
+    # project) builds fine and cannot be detected without a network call, so the boot
+    # assertion can never catch it. What it can do is refuse to be SILENT: classify() catches
+    # every exception and returns ESCALATE with no log, which is byte-for-byte
+    # indistinguishable from a healthy classifier that had nothing to say -- the D51 flood
+    # again. So the closure logs each failure loudly and counts consecutive ones, and the
+    # count is surfaced on the wiring health line. A dead key now looks like a dead key.
+    state = {"consecutive_failures": 0}
+
+    def _llm(text):
+        from . import answer_lane as _al
+        try:
+            raw = _al.default_llm(_LLM_SYSTEM, str(text or "")[:4000], model=model)
+        except Exception as e:  # noqa: BLE001 - re-raised after being made visible
+            state["consecutive_failures"] += 1
+            n = state["consecutive_failures"]
+            level = "CRITICAL" if n >= 3 else "WARNING"
+            print(f"[slack-convo/classifier] {level} model call failed "
+                  f"({type(e).__name__}: {str(e)[:200]}); this is the "
+                  f"{n}{'st' if n == 1 else 'nd' if n == 2 else 'rd' if n == 3 else 'th'} "
+                  f"consecutive failure. Every message is escalating to a person while this "
+                  f"lasts. Check ANTHROPIC_API_KEY on this service.")
+            raise
+        state["consecutive_failures"] = 0
+        verdict = (raw or "").strip().splitlines()[0].strip() if raw else ""
+        return verdict if verdict in _VALID else None
+
+    _llm.failure_state = state
+    return _llm
+
+
+def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=None,
+            cancel_post_enabled=False):
     """One label from the fixed set, or None (escalate). Never raises.
+
+    cancel_post_enabled (AGENT_SLACK_CANCEL_POST_ENABLED, default False): the ONLY gate
+    on the CANCEL_POST rule below. False is byte identical to before this label existed --
+    the rule is never checked and this function's behavior is unchanged.
 
     llm(text) -> one of the labels, or anything else (ignored). Only consulted when the
     rules do not decide; a wrong label from it cannot widen the set.
@@ -110,20 +313,37 @@ def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=No
         return FOLLOW_UP
     if identity_product == "ranger" and _ACTION_RE.search(t):
         return ACTION_REQUEST
+    # Checked before breakage/question so "cancel my post" and "can you skip tomorrow's
+    # post" never fall through to CODE_FIX or QUESTION (the latter's answer lane refuses
+    # ANY message containing "cancel my" as a billing question -- see answer_lane.py's
+    # _BILLING_RE -- which is exactly the escalate-with-no-help pattern this classification
+    # exists to avoid).
+    if cancel_post_enabled and _CANCEL_POST_RE.search(t):
+        return CANCEL_POST
     # RT-M2: breakage AND an Echo-domain noun. Breakage alone escalates to a human.
     if _BREAKAGE_RE.search(t) and _DOMAIN_RE.search(t):
         return CODE_FIX
     if _QUESTION_RE.search(t):
         return QUESTION
+    # WRONG-OUTPUT reports ("still repeat images", "the same photo three days in a
+    # row"). Checked AFTER the question rule on purpose -- see _REPEAT_RE -- so an owner
+    # ASKING about repeats reaches the answer lane, while an owner REPORTING them
+    # reaches the fixer. Same _DOMAIN_RE gate every code_fix carries (RT-M2).
+    if _REPEAT_RE.search(t) and _DOMAIN_RE.search(t):
+        return CODE_FIX
+    # CANCEL_POST is gated on cancel_post_enabled even from a brain hint or the LLM
+    # fallback: the flag is the ONE switch for this whole capability, so a learned
+    # phrase or a model guess can never turn it on when it is off.
+    allowed = _VALID if cancel_post_enabled else (_VALID - {CANCEL_POST})
     if brain_hint is not None:
         hinted = brain_hint.classification_hint_for(t)
-        if hinted in _VALID and hinted != FOLLOW_UP:
+        if hinted in allowed and hinted != FOLLOW_UP:
             return hinted
     if llm is not None:
         try:
             verdict = llm(t)
         except Exception:  # noqa: BLE001 - a model fault escalates, never dispatches
             return ESCALATE
-        if verdict in _VALID and verdict != FOLLOW_UP:
+        if verdict in allowed and verdict != FOLLOW_UP:
             return verdict
     return ESCALATE

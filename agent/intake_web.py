@@ -69,6 +69,31 @@ def _rate_per_minute():
     return int(os.environ.get("AGENT_INTAKE_RATE_PER_MINUTE", "10"))
 
 
+# The per-post actions Echo routes at /portal/<token>/posts/<id>/<action>.
+#
+# THIS IS A CROSS REPO CONTRACT (P-11). The portal relays to exactly
+#   `${base}/portal/${token}/posts/${postId}/${action}`
+# in src/lib/echo/portal-content.ts (postPostAction), so an action the portal can
+# offer must exist HERE first. "swap-media" is the free photo swap (B6): the portal
+# could not build "use a different photo" as its own button because Echo had only
+# approve / edit / deny / kill, which left deny as the single lever and made a photo
+# change cost one of the gym's 15 monthly recreates. "recreate-caption" (partial-
+# regen, 2026-09-07) is the missing other half: "the caption is wrong" rewrites ONLY
+# the copy on the SAME photo instead of a full recreate that can swap the photo too.
+# "deny-day" (Dean/Reverb, 2026-09-10) is a day-wide rework: one day's feed/story/FB/
+# GBP rows are one concept rendered per format, and denying them one click at a time
+# left a day mixing a freshly-reworked format with stale siblings still carrying the
+# rejected photo+caption. This denies every same-day denyable row together.
+PORTAL_POST_ACTIONS = ("approve", "edit", "deny", "kill", "swap-media",
+                       "recreate-caption", "deny-day",
+                       # 0318 variant pairing (ECHO_VARIANT_PAIRING, default OFF):
+                       # regen-variant generates a v2 candidate FOR <id> without
+                       # touching it; pick-variant promotes <id> (itself the
+                       # candidate) to active. "variants" is a GET, not a POST
+                       # action, and is routed separately below.
+                       "regen-variant", "pick-variant")
+
+
 def client_for_token(token):
     """The client key a token authenticates, or None. A SIGNED token verifies
     against the shared secret (no per-gym env var needed); a legacy per-client env
@@ -895,6 +920,23 @@ def handle_portal_gym_status(account_key, r2=None):
 _ONBOARD_KEY_RE = re.compile(r"^[a-z0-9]+$")
 
 
+def _valid_iana_timezone(tz):
+    """True when `tz` is a real, loadable IANA zone name. Uses zoneinfo (stdlib, Python
+    3.9+) so this can never accept a shape that merely LOOKS like a zone -- a forged or
+    misspelled value must fail closed (dropped by the caller), never stored."""
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    except Exception:  # noqa: BLE001 - no tzdata available: refuse rather than guess
+        return False
+    try:
+        ZoneInfo(tz)
+        return True
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        return False
+    except Exception:  # noqa: BLE001 - any other failure: refuse, never crash the onboard call
+        return False
+
+
 def handle_portal_onboard(body):
     """
     The LASSO portal's self-serve onboard call, pure and offline-testable.
@@ -902,8 +944,14 @@ def handle_portal_onboard(body):
     BEFORE this runs. Returns (status_code, response_dict).
 
     Request body (already-parsed JSON):
-      account_key   - lowercase [a-z0-9] slug (rejected otherwise -> 400)
-      display_name  - required, non-empty gym name
+      account_key      - lowercase [a-z0-9] slug (rejected otherwise -> 400)
+      display_name     - required, non-empty gym name
+      posting_timezone - OPTIONAL onboarding-time hint (an IANA zone name, e.g.
+                         "America/New_York"), used ONLY as a same-day default when the
+                         gym has none set yet. A malformed value is IGNORED (never a 400
+                         for an optional field), never fabricated, and never overwrites a
+                         value a human or the posting-tz backfill watchdog already wrote
+                         (see onboard.run's posting_timezone handling).
 
     On success returns 200 with:
       account_key  - the CANONICAL slug onboard.run actually stood the gym up under
@@ -942,6 +990,13 @@ def handle_portal_onboard(body):
     if not display_name:
         return 400, {"error": "display_name is required"}
 
+    # OPTIONAL, best-effort only: a malformed/absent value is silently dropped rather than
+    # rejecting the whole onboard call over a hint field. onboard.run() itself refuses to
+    # overwrite an existing value, so passing a bad guess here can never clobber real data.
+    posting_timezone = str(body.get("posting_timezone") or "").strip()
+    if posting_timezone and not _valid_iana_timezone(posting_timezone):
+        posting_timezone = ""
+
     # Force automint FOR THIS CALL ONLY so a token is minted the same way the CLI
     # does when AGENT_ONBOARD_AUTOMINT is armed. The signing secret must exist for
     # a real token; onboard.run() mints deterministically when it does. We restore
@@ -951,7 +1006,8 @@ def handle_portal_onboard(body):
     _prev = os.environ.get(_AUTOMINT)
     os.environ[_AUTOMINT] = "true"
     try:
-        result = _onboard.run(account_key, display_name, base_url=_upload_base_url())
+        result = _onboard.run(account_key, display_name, base_url=_upload_base_url(),
+                               posting_timezone=posting_timezone or None)
     except Exception as exc:
         # Generic failure: no token, no secret, no internals leaked to the portal.
         print(f"[portal] onboard failed for {account_key}: {type(exc).__name__}")
@@ -2007,14 +2063,33 @@ def build_server(port=None):
             )
             return m.group(1) if m else None
 
+        def _portal_post_variants_route(self):
+            """GET /portal/<token>/posts/<id>/variants (0318). Returns
+            (token, post_id), else (None, None). A separate route from
+            _portal_post_action_route on purpose: it is a READ (GET), and
+            listing is not itself gated by ECHO_VARIANT_PAIRING (see
+            handle_list_variants's docstring)."""
+            m = re.match(
+                r"^/portal/([A-Za-z0-9_.-]{8,})/posts/([A-Za-z0-9_-]+)/variants$",
+                self.path.split("?")[0],
+            )
+            if m:
+                return m.group(1), m.group(2)
+            return None, None
+
         def _portal_post_action_route(self):
             """Part B token-scoped client-social ACTION routes.
             Returns (token, post_id, action) for
-            /portal/<token>/posts/<id>/{approve|edit|deny|kill}, else (None,None,None).
-            Gated by AGENT_PORTAL_SOCIAL_ENABLED at the handler; a disabled route 404s."""
+            /portal/<token>/posts/<id>/{approve|edit|deny|kill|swap-media|
+            recreate-caption|regen-variant|pick-variant}, else (None,None,None).
+            Gated by AGENT_PORTAL_SOCIAL_ENABLED at the handler; a disabled route 404s.
+            swap-media (B6) is additionally gated by ECHO_MEDIA_SWAP_FREE,
+            recreate-caption by ECHO_CAPTION_RECREATE_SCOPED, and regen-variant /
+            pick-variant (0318) by ECHO_VARIANT_PAIRING -- all default OFF: the
+            route exists but the handler 403s until armed."""
             m = re.match(
                 r"^/portal/([A-Za-z0-9_.-]{8,})/posts/([A-Za-z0-9_-]+)/"
-                r"(approve|edit|deny|kill)$",
+                r"(" + "|".join(PORTAL_POST_ACTIONS) + r")$",
                 self.path.split("?")[0],
             )
             if m:
@@ -2208,6 +2283,18 @@ def build_server(port=None):
                     status, body = _pr.handle_portal_report(account_key, days)
                 else:
                     status, body = _pr.handle_portal_library(account_key)
+                return self._send_json(body, status)
+
+            # Variant pairing (0318): GET /portal/<token>/posts/<id>/variants.
+            # Token->account_key; revoked = 404. actor_id is not required for a
+            # read (only mutating actions need an attributable actor).
+            vr_token, vr_post_id = self._portal_post_variants_route()
+            if vr_token is not None:
+                account_key = client_for_token(vr_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                status, body = _ps.handle_list_variants(account_key, vr_post_id,
+                                                        "portal-variants-read")
                 return self._send_json(body, status)
 
             # Self-serve Events & Promos LIST: GET /portal/<token>/events.
@@ -2852,8 +2939,30 @@ def build_server(port=None):
                     status, resp = _ps.handle_edit(account_key, ps_post_id, actor_id,
                                                    note=note, store=store, reason=reason)
                 elif ps_action == "deny":
+                    # B6: intent="media" routes the "Use a different photo" chip to the
+                    # FREE swap instead of charging one of the 15 recreates. Ignored
+                    # while ECHO_MEDIA_SWAP_FREE is off, so today's behavior is unchanged.
+                    _intent = str(body.get("intent", "") or "").strip()
+                    # Only PASS the kwarg when the client actually sent one, so the
+                    # default call shape stays byte for byte what it has always been.
+                    _extra = {"intent": _intent} if _intent else {}
                     status, resp = _ps.handle_deny(account_key, ps_post_id, actor_id,
-                                                   note=note, store=store)
+                                                   note=note, store=store, **_extra)
+                elif ps_action == "swap-media":
+                    status, resp = _ps.handle_swap_media(account_key, ps_post_id,
+                                                         actor_id)
+                elif ps_action == "recreate-caption":
+                    status, resp = _ps.handle_recreate_caption(account_key, ps_post_id,
+                                                               actor_id)
+                elif ps_action == "regen-variant":
+                    status, resp = _ps.handle_regen_variant(account_key, ps_post_id,
+                                                            actor_id)
+                elif ps_action == "pick-variant":
+                    status, resp = _ps.handle_pick_variant(account_key, ps_post_id,
+                                                           actor_id)
+                elif ps_action == "deny-day":
+                    status, resp = _ps.handle_deny_day(account_key, ps_post_id, actor_id,
+                                                       note=note, store=store)
                 else:  # kill
                     status, resp = _ps.handle_kill(account_key, ps_post_id, actor_id,
                                                    confirm=confirm, store=store)

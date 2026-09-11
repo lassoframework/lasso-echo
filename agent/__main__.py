@@ -165,6 +165,7 @@ def _status():
     print(f"  onboarding_autoreg: {config.onboarding_autoregister_enabled()}  (env AGENT_ONBOARDING_AUTOREGISTER; lets that watch ACT on not_registered — adds the gym to the dynamic registry under the portal's own key, using its REAL name only; inactive record, no tokens/connection/publish)")
     print(f"  intake_autoapp : {config.intake_auto_approve()}  (env AGENT_INTAKE_AUTO_APPROVE; a gym's own intake answers land approved, not queued)")
     print(f"  website_intake : {config.website_auto_intake_enabled()}  (env AGENT_WEBSITE_AUTO_INTAKE; a client gym with ZERO client_sources gets a CITED source bundle read off its OWN website — verbatim facts with page-URL citations, invented numbers dropped by the caption digit gate — landed via the standard intake path (pending unless AGENT_INTAKE_AUTO_APPROVE) plus a durable voice doc when none exists; a gym with any sources is skipped; no publish)")
+    print(f"  gym_deep_brain : {config.gym_deep_brain_enabled()}  (env AGENT_GYM_DEEP_BRAIN; PRE-ONBOARD per-gym deep brain — reads a gym's OWN public website (robots.txt respected, {config.gym_deep_brain_crawl_delay()}s min gap per host, page/byte capped, non-business emails and phone numbers redacted) and its OWN public Instagram feed (FORM only, comments never read) into {config.gym_deep_brain_dir()}/<base>.md; every fact carries the page URL it came from and lands PENDING, never auto-approved; missing domain/handle/permission BLOCKS with no artifact; manual only, no sweep, no publish)")
     print(f"  event_lead_days: {config.event_lead_days()}  (env AGENT_EVENT_LEAD_DAYS; how many days before an event its promo arc opens)")
     print(f"  onboarding_demo: {config.onboarding_demo_enabled()}  (env AGENT_ONBOARDING_DEMO; SAMPLE month for a gym whose intake is not done, never publishes)")
     print(f"  portal_social  : {config.portal_social_enabled()}  (env AGENT_PORTAL_SOCIAL_ENABLED; per-gym calendar engine + collision-shift + approval-surface routing + Part B token-scoped portal endpoints)")
@@ -173,6 +174,7 @@ def _status():
     print(f"  real_cal_mirror: {config.real_calendar_mirror_enabled()}  (env AGENT_REAL_CALENDAR_MIRROR; fold a real gym's real drafts into the shared content_calendar, clear demo rows off real gyms; needs Supabase creds; no publish)")
     print(f"  cal_autopublish: {config.calendar_autopublish_enabled()}  (env AGENT_CALENDAR_AUTOPUBLISH; scheduled auto-publisher reads THAT day's content_calendar rows for gym_id='lasso' and posts each unpublished row to live IG/FB EXACTLY ONCE via an atomic status claim; ALSO needs AGENT_PUBLISH_ENABLED; OFF => nothing is read or published)")
     print(f"  real_month_plan: {config.real_month_plan_enabled()}  (env AGENT_REAL_MONTH_PLAN; assemble a full month of REAL LASSO drafts, 2/day feed+9:16 story, into content_calendar for gym_id='lasso' and clear ALL demo rows off that gym; reuses existing builders, skips missing sources; no publish)")
+    print(f"  gym_shared_store: {config.gym_shared_store_enabled()}  (env AGENT_GYM_SHARED_STORE, default ON when Supabase creds are set; mirror the per-gym gyms row to the shared Supabase echo_gyms table so the echo worker and echo-intake-web stop keeping two disagreeing copies on two separate volumes; read-through hydrates a local miss; reconcile with `python -m agent gym-store-sync --apply`; OFF => purely local SQLite, i.e. the split brain; never mirrors token material)")
     print(f"  zernio_analytics: {config.zernio_analytics_enabled()}  (env AGENT_ZERNIO_ANALYTICS_ENABLED; Part C metrics pull; OFF => portal metrics return the shape with null values)")
     print(f"  monthly_report : {config.monthly_report_enabled()}  (env AGENT_MONTHLY_REPORT_ENABLED; Part D before/after story; OFF => report shape only, gaps never zeros)")
     print(f"  chat_publish   : {config.chat_publish_enabled()}  (env AGENT_CHAT_PUBLISH_ENABLED; LASSO accts direct, clients draft-only)")
@@ -208,6 +210,10 @@ def _status():
     print(f"  alert_noise_flt: {config.ops_alerts_noise_filter_enabled()}  "
           f"(env AGENT_OPS_ALERTS_NOISE_FILTER; an alert ops_triage calls NOISE is not "
           f"posted to Slack, still audited)")
+    print(f"  slot_dedupe    : {config.slot_dedupe_enabled()}  "
+          f"(env AGENT_SLOT_DEDUPE, DEFAULT ON; a calendar slot is (account, post_date, "
+          f"time_slot, format) and a slot already taken -- in the same batch or already "
+          f"live in the DB -- is never staged twice. Set false as an escape hatch)")
     print(f"  alert_repeat   : {config.alert_repeat_gate_enabled()}  "
           f"(env AGENT_ALERT_REPEAT_GATE, window {config.alert_repeat_window_hours()}h via "
           f"AGENT_ALERT_REPEAT_WINDOW_HOURS; an unchanged NEEDS_TRIAGE alert already told "
@@ -221,6 +227,24 @@ def _status():
               f"client_reply={config.slack_convo_client_reply_armed(_ident)} "
               f"staff_reply={config.slack_convo_staff_reply_armed(_ident)}  "
               f"(env SLACK_CONVO_{_ident.upper()}_ENABLED / _CLIENT_REPLY / _STAFF_REPLY)")
+    print(f"    cancel_post : {config.slack_cancel_post_enabled()}  (env "
+          f"AGENT_SLACK_CANCEL_POST_ENABLED; a CLIENT's 'cancel my post'/'skip today's "
+          f"post' message denies THEIR next eligible content_calendar row through the "
+          f"same path as the portal's own Cancel button, no new state machine)")
+    print(f"  client_dm      : {config.client_dm_autofix_enabled()}  (env AGENT_CLIENT_DM_AUTOFIX; "
+          f"the client-DM support lane: measure one enumerated condition, run at most a "
+          f"per-gym Drive media sync, card a human every time. On its own it sends a client "
+          f"NOTHING)")
+    try:
+        from .client_dm_support import arming as _cdm_arm
+        _cdm = _cdm_arm.preflight("echo")
+        print(f"    arming      : mode={_cdm.mode} may_reply={_cdm.may_reply_to_clients}  "
+              f"({_cdm.reason})")
+        if _cdm.mode != _cdm_arm.MODE_LIVE:
+            print(f"    to arm      : set AGENT_CLIENT_DM_CLIENT_REPLY=true and "
+                  f"AGENT_CLIENT_DM_LIVE_ACK={_cdm.required_ack}")
+    except Exception as _e:  # noqa: BLE001
+        print(f"    arming      : UNREADABLE ({type(_e).__name__}: {_e})")
     print(f"  auto_connect  : {config.auto_connect_link_enabled()}  (env AGENT_AUTO_CONNECT_LINK; "
           f"a newly auto-registered gym's connect link is sent as an Echo Slack DM to its "
           f"owner, once, resolved from the portal's own client_owner record)")
@@ -250,7 +274,11 @@ def _status():
     print(f"  zernio_publish : {config.zernio_publish_enabled()}  (env AGENT_ZERNIO_PUBLISH)")
     print(f"  lasso_via_zernio: {config.lasso_via_zernio_enabled()}  (env AGENT_LASSO_VIA_ZERNIO; LASSO's own calendar rows publish through the SAME Zernio lane as the client gyms and the Meta-direct calendar lanes stand down, so exactly ONE lane owns a lasso row — kills the second-publisher taint in Zernio analytics (metrics_sync learning loop); needs 'python -m agent lasso-zernio-setup' first + AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED + AGENT_ZERNIO_PUBLISH; missing setup => HOLD with one deduped alert, never a Meta-direct fallback; OFF => byte-for-byte today's Meta-direct routing)")
     print(f"  lasso_video_mix: {config.lasso_video_mix_enabled()}  (env AGENT_LASSO_VIDEO_MIX; weave podcast VIDEO clips into LASSO's non-sprint rotation — thu/sun prefer a real Drive clip + a cap-safe Wed video slot — to move the grid off all-text-cards toward the >=40%-with-a-human target, at or under the 25% podcast cap; summit 10-day sprints untouched; rebuild with 'python -m agent lasso-remap --write'; OFF => byte-for-byte today's rotation)")
+    print(f"  lasso_astra_default: {config.lasso_astra_default_enabled()}  (env AGENT_LASSO_ASTRA_DEFAULT; LASSO's b2b pillar tries the Astra-first daily_studio infographic builder FIRST, falling back to library rotation only when it returns None — matches platform/doctrine, which already default to Astra; rework the existing calendar with 'python -m agent lasso-astra-rework --write'; OFF => byte-for-byte today's rotation-first b2b behavior)")
     print(f"  social_baseline: {config.social_baseline_enabled()}  (env AGENT_SOCIAL_BASELINE; BEFORE/AFTER social metrics from the PUBLIC Instagram feed via Apify — once-only immutable pre-Echo baseline + fresh last-90 after-pull, the social-before-after CLI, and the SINCE ECHO STARTED block in the monthly retro digest; needs APIFY_TOKEN (inert without it, clear reason, never a crash); read-only, nothing publishes; Apify is pay-per-result ~$1.50-2.70/1000 items, a 90-day gym pull is cents)")
+    print(f"  social_metrics_daily: {config.social_metrics_daily_enabled()}  (env AGENT_SOCIAL_METRICS_DAILY; the DAILY follower series pull into gym_social_metrics_daily from Zernio /v1/accounts/follower-stats, one request for the whole org; fixes AUD-007/D1 where that table had 0 rows; read-only against Zernio, the only write is the metrics table; window AGENT_SOCIAL_METRICS_BACKFILL_DAYS default 90)")
+    print(f"  gbp_failed_retry: {config.gbp_failed_retry_enabled()}  (env AGENT_GBP_FAILED_RETRY; retry + RE-ALERT for Google Business rows stuck in failed; fixes AUD-003 where a failed row was never retried and never alerted twice, so lasso sat failed 16 days with nobody told; bounded attempts, never retries a permanent error)")
+    print(f"  apify_social_backfill: {config.apify_social_backfill_enabled()}  (env AGENT_APIFY_SOCIAL_BACKFILL; the BEFORE-WINDOW public-feed backfill, ONE run per gym at onboarding, NEVER daily — Zernio owns the ongoing series; needs APIFY_TOKEN, inert without it; every number carries actor/build/run id; run ceiling AGENT_APIFY_RUN_CEILING default 20, fails closed)")
     print(f"  catchup_report : {config.catchup_report_enabled()}  (env AGENT_CATCHUP_REPORT)")
     print(f"  welcome_digest : {config.welcome_digest_enabled()}  (env AGENT_WELCOME_DIGEST)")
     print(f"  welcome_autopub: {config.welcome_autopublish_enabled()}  (env AGENT_WELCOME_AUTOPUBLISH)")
@@ -288,15 +316,33 @@ def _status():
     print(f"  reels_floor    : {config.lasso_reels_floor_enabled()}  (env AGENT_LASSO_REELS_FLOOR; LASSO month plan >= {config.lasso_reels_floor_pct()}% video feed posts (AGENT_LASSO_REELS_FLOOR_PCT), sprints + thu/sun podcast untouched; default OFF)")
     print(f"  testimonial    : {config.lasso_testimonial_pillar_enabled()}  (env AGENT_LASSO_TESTIMONIAL_PILLAR; owner-voice proof pillar on alternate Tuesdays, approved social-proof doc ONLY, falls back when nothing approved; default OFF)")
     print(f"  mentions       : {config.mentions_enabled()}  (env AGENT_MENTIONS; Wave 4 tag_allowlist @mention tagging, default OFF)")
+    print(f"  caption form   : {config.caption_form_plan_enabled()}  (env AGENT_CAPTION_FORM_PLAN; per-post caption SHAPE planning, style only, default OFF)")
+    print(f"  cta variety    : {config.cta_variety_enabled()}  (env AGENT_CTA_VARIETY; CTA shape gate + rotation + ask-rate band, window {config.caption_variety_window()} posts via AGENT_CAPTION_VARIETY_WINDOW, target ask rate {config.caption_ask_rate_target():.0%} via AGENT_CAPTION_ASK_RATE, default OFF)")
     print(f"  metrics_sync   : {config.metrics_sync_enabled()}  (env AGENT_METRICS_SYNC; Wave 7 nightly Zernio analytics -> post_metrics snapshots, read only, default OFF)")
     print(f"  learning_loop  : {config.learning_loop_enabled()}  (env AGENT_LEARNING_LOOP; Wave 7 lever stamping + gym_playbook consumption + monthly retro, default OFF)")
+    print(f"  cross_gym_brain: {config.cross_gym_brain_enabled()}  (env AGENT_CROSS_GYM_BRAIN; WEEKLY fleet rollup of post_metrics into FORM statistics (Welch t + Benjamini Hochberg, sample floor 6, >= 2 gyms per cell) plus the BEST POST digest (top decile, Fisher exact, or an honest 'not distinguishable'), read only + append only cross_gym_brain row, form only by whitelist, default OFF)")
     print(f"  horizon_sweep  : {config.plan_horizon_sweep_enabled()}  (env AGENT_PLAN_HORIZON_SWEEP; nightly retirement of pending rows already past today+{config.plan_horizon_days()} — the belt's retroactive counterpart, exempt dated lanes kept, default ON)")
     print(f"  media_repeat   : {config.media_repeat_sweep_enabled()}  (env AGENT_MEDIA_REPEAT_SWEEP; nightly cross-day same-photo sweep, published/approved rows never touched, default ON)")
+    print(f"  repeat_drive   : {config.media_repeat_sweep_drive_enabled()}  (env AGENT_MEDIA_REPEAT_SWEEP_DRIVE; that sweep may replace a repeat from the gym's CONNECTED DRIVE POOL, not just local uploads, default OFF)")
+    print(f"  media_rpt_left : {config.media_repeat_report_enabled()}  (env AGENT_MEDIA_REPEAT_REPORT; say out loud the cross-day photo repeats the sweep deliberately LEAVES (approved rows, small library) instead of only counting them, default OFF)")
+    print(f"  reply_watch    : {config.reply_engine_watch_enabled()}  (env AGENT_REPLY_ENGINE_WATCH; read-only watchdog over echo_reply_accounts / settings / queue vs gym_social_accounts, names unmapped gyms + stalled ingest, writes nothing, default OFF)")
+    print(f"  media_swap_free: {config.media_swap_free_enabled()}  (env ECHO_MEDIA_SWAP_FREE; a client photo swap is FREE and unlimited, only a caption recreate costs one of 15, default OFF)")
+    print(f"  grade_stuck    : {config.grade_stuck_escalation_enabled()}  (env ECHO_GRADE_STUCK_ESCALATION; escalate a book held below A for {config.grade_stuck_nights()} nights to a NAMED human, default OFF)")
+    print(f"  portal_rejected: {config.portal_show_rejected()}  (env ECHO_PORTAL_SHOW_REJECTED; escape hatch that puts denied/killed/deleted rows BACK on the client calendar, default OFF = they stay hidden)")
+    print(f"  day_shape_guard: {config.day_shape_assert_enabled()}  (env ECHO_DAY_SHAPE_ASSERT; FAIL a plan pass whose two slots on one day share a caption or a photo, nothing is written, default ON)")
+    print(f"  cta_self_q_gate: {config.cta_self_question_gate_enabled()}  (env ECHO_CTA_SELF_QUESTION_GATE; FAIL a plan pass carrying the banned Reverb FAQ line or an FAQ-mined self-question closing CTA naming the gym itself, default ON)")
+    print(f"  stale_escalation: {config.stale_escalation_reminder_enabled()}  (env AGENT_STALE_ESCALATION_REMINDER; re-fire one #fixer reminder per day for a ticket sitting hold+escalated past {config.stale_hold_hours()}h unresolved, default ON)")
+    print(f"  deny_streak_alarm: {config.deny_streak_alarm_enabled()}  (env AGENT_DENY_STREAK_ALARM; alert once per streak-ending date when a coach denies {config.deny_streak_threshold()}+ posts in a row on one account, default ON)")
+    print(f"  day_shape_block_alarm: {config.day_shape_block_alarm_enabled()}  (env AGENT_DAY_SHAPE_BLOCK_ALARM; add remaining runway to the day-shape alert, escalate to SOCIAL once a gym's blocked streak first reaches {config.day_shape_escalate_days()} consecutive days, default ON)")
+    print(f"  day_shape_roles: {config.day_shape_roles_enabled()}  (env ECHO_DAY_SHAPE_ROLES; a 2x day is PROOF in the morning and the INVITATION in the evening, different pillars and angles per slot, default OFF)")
+    print(f"  opening_formula: {config.opening_formula_cap_enabled()}  (env ECHO_OPENING_FORMULA_CAP; no more than {config.opening_formula_max_run()} posts in a row may share one opening FRAME, never drops a day, default OFF)")
+    print(f"  gym_ask_cover  : {config.gym_ask_coverage_enabled()}  (env ECHO_GYM_ASK_COVERAGE; run ask_coverage on a CLIENT GYM month using the gym's own approved CTA, skipped when it has none, default OFF)")
     print(f"  posting_tz     : {config.posting_tz_watch_enabled()}  (env AGENT_POSTING_TZ_WATCH; backfill gyms.posting_timezone from GBP/brand-bible evidence + alert on any gym still without one, default ON)")
     print(f"  vision_drift   : {config.vision_allowlist_watch_enabled()}  (env AGENT_VISION_ALLOWLIST_WATCH; read-only report when AGENT_VISION_GYMS and the gyms actually burning vision calls disagree, default ON)")
     print(f"  inbox_alerts   : {config.inbox_alerts_enabled()}  (env AGENT_INBOX_ALERTS; daily read-only comments/mentions/reviews sweep -> one coach card per gym per day, default OFF)")
     print(f"  audience_demos : {config.audience_demographics_enabled()}  (env AGENT_AUDIENCE_DEMOGRAPHICS; weekly IG follower + engaged demographics -> gym_audience_demographics, read only, default OFF)")
     print(f"  cadence_2x     : {config.cadence_2x_enabled()}  (env ECHO_CADENCE_2X_ENABLED; per-gym posts_per_day toggle honored at 2x, slot times {config.cadence_slot_times()}, default OFF)")
+    print(f"  brains->captions: {config.brain_feeds_captions_enabled()}  (env AGENT_BRAIN_FEEDS_CAPTIONS; the WEEKLY cross gym rollup's FORM guidance appended to the SB7 prompt as form hints ONLY, below the brand bible and below the approved source, never as content; needs AGENT_CROSS_GYM_BRAIN armed too; default OFF)")
     # sources & paths (where the drafting content actually comes from)
     print("  -- sources & paths --")
     print(f"  source doc     : {config.SOURCE_DOC_PATH}  (env AGENT_SOURCE_DOC_PATH)")
@@ -852,15 +898,21 @@ _COMMANDS = {
         ("onboard", "stand up a new gym end to end"),
         ("onboard-client / add-client", "scaffold a new client account"),
         ("onboard-verify", "check onboarding completeness for one or all gyms"),
-        ("onboarding-audit", "fleet readiness: every gym the PORTAL knows, and what blocks it posting"),
+        ("gym-store-sync", "reconcile this service's gyms table with the shared echo_gyms record (--apply)"),
+        ("onboarding-audit", "fleet readiness: every ECHO CLIENT gym the portal knows, and what blocks it posting"),
+        ("echo-clients", "the Echo client universe (echo_gym_settings): counts + every client key/alias; NOT echo_intake_tokens"),
+        ("echo-clients-cleanup", "list (default) or archive (--apply) registry rows, brand_voice/<key>, content_library/<key>, echo_gyms + local gyms rows that are NOT Echo clients; --keep a,b protects extra bases; refuses when the client universe is unreadable"),
         ("onboard-dryrun", "30-day dryrun: plan + draft, no publish, no live tokens"),
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
         ("approve-sources", "list/approve a gym's PENDING client sources (--account, --all or --id)"),
         ("website-intake", "auto-intake a gym's sources from its OWN website (--account <base> [--domain x.com] [--force])"),
+        ("gym-deep-brain", "PRE-ONBOARD deep brain: scrape a gym's OWN website (robots-respecting, rate-limited, PII-scrubbed) + its OWN public Instagram feed into a per-gym voice/grounding artifact; facts land PENDING (AGENT_GYM_DEEP_BRAIN) -- (--account <base> [--domain x.com] [--handle <ig>] [--dry-run])"),
+        ("no-media-astra-seed", "by-hand/verification run of the automatic no-media Astra fallback for ONE named gym with zero approved sources + zero real media (AGENT_NO_MEDIA_ASTRA_SEED); the recurring scan already calls this itself for every qualifying gym -- (--account <base> [--limit N])"),
         ("set-timezone", "set one gym's posting timezone (--account <base> --tz America/Denver); unset = global"),
         ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
         ("social-intake-sync", "map un-routed social intakes into Echo (--all | --base <slug>)"),
+        ("backfill-section7", "recover CTA/hashtag section 7 for already-onboarded gyms (--bases a,b=intake_key,c)"),
         ("welcome-kit", "client welcome kit PDF"),
         ("draft-bible", "draft a brand bible from an intake doc"),
         ("intake-doc", "turn a client PDF into held draft posts"),
@@ -903,6 +955,11 @@ _COMMANDS = {
         ("dam-scan", "scan/tag the library"),
         ("contact-sheet", "creative contact sheet"),
         ("backfill-insights", "pull insights for published posts"),
+        ("vision-backfill", "ECHO_VISION_SPEC: analyze a gym's EXISTING library images "
+                            "before adding it to AGENT_VISION_GYMS (--account <key> "
+                            "[--force]); a gym flipped on with an unanalyzed library "
+                            "auto-picks NOTHING (pick_image's vision branch returns None "
+                            "with zero candidates) rather than falling back to legacy"),
     ],
     "podcast & opus": [
         ("podcast-draft / podcast-status / podcast-transcript / podcast-cards "
@@ -930,6 +987,7 @@ _COMMANDS = {
         ("account-key-doctor", "early-warning coverage check: for every social-product gym base, assert it resolves to exactly one live gym (+ Zernio profile); flag UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY stranding risks (read-only; --alert fires throttled ops alerts) [--base <base>]"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
+        ("lasso-astra-rework", "regenerate the IMAGE (never the schedule) on LASSO's existing non-video, non-published calendar slots as linked Astra v2 candidates (ECHO_VARIANT_PAIRING); same dates/times/count untouched, nothing publishes; [--months YYYY-MM,...] [--limit N] [--write]"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
         ("ops-triage-classify", "classify one ops-alert line as noise/needs_triage (agent/ops_triage.py); prints exactly that word. Arg or stdin: python -m agent ops-triage-classify \"<alert text>\""),
     ],
@@ -1747,6 +1805,16 @@ def main(argv=None):
         else:
             regen_run(only=only, dry_run=dry_run, set_name=set_name,
                       nano_client=_nano_default(), s3_client=_s3_default())
+    elif cmd == "gym-store-sync":
+        # Reconcile THIS service's local gyms table against the shared Supabase
+        # echo_gyms record (the 2026-09-10 split-brain heal). Report only unless
+        # --apply is passed; --apply moves only MISSING rows in either direction and
+        # never resolves a field disagreement. Idempotent, safe to re-run.
+        _apply = "--apply" in argv[1:]
+        from . import gym_store_sync as _gss
+        _report = _gss.sync(apply=_apply)
+        print(_gss.format_report(_report))
+
     elif cmd == "onboard":
         # Autonomous onboard (Stage 2 T2): gym row, voice file, brain file,
         # trust + publish records. Token minting is behind AGENT_ONBOARD_AUTOMINT
@@ -1767,10 +1835,17 @@ def main(argv=None):
             base_url_arg = os.environ.get("AGENT_UPLOAD_BASE_URL") or None
         if not account_key or not display_name:
             print('usage: python -m agent onboard --account <key> --name "<Gym Name>" '
-                  '[--base-url <url>]')
+                  '[--base-url <url>] [--force]')
         else:
-            from .onboard import run as _onboard_run
-            r = _onboard_run(account_key, display_name, base_url=base_url_arg)
+            from .onboard import run as _onboard_run, OnboardRefused as _Refused
+            try:
+                r = _onboard_run(account_key, display_name, base_url=base_url_arg,
+                                 force="--force" in args_rest)
+            except _Refused as exc:
+                # ECHO CLIENTS ONLY (D73): no marker, nothing written. --force is the
+                # by-hand override for a human who knows the gym bought Echo.
+                print(f"onboard REFUSED: {exc}")
+                sys.exit(2)
             print(f"GYM: {r['account_key']} ({r['display_name']})")
             if r["token_minted"] is None:
                 print("Token: PENDING (set AGENT_ONBOARD_AUTOMINT=true by hand)")
@@ -1817,6 +1892,43 @@ def main(argv=None):
                           f"{r['sources_created']} source(s), routed={r['marked_routed']}")
                 else:
                     print(f"  {r['base']}: SKIPPED ({r.get('reason')})")
+    elif cmd == "backfill-section7":
+        # MANUAL, one-time recovery for gyms onboarded BEFORE the section-7
+        # (CTA/hashtag) intake bridge bug was fixed: their lasso_voice.md was
+        # already written (write_brand_docs never overwrites), so fixing
+        # _build_intake_text alone only helps NEW onboardings. This re-derives
+        # section 7 from each gym's OWN real intake and patches ONLY the
+        # CTA-rotation / hashtag-strategy blocks that still hold the literal
+        # machine TODO -- anything already filled (a human edit, a generic
+        # fallback CTA, prior real content) is left untouched. Caller supplies
+        # the exact base-key list explicitly: this never auto-discovers or
+        # guesses which gyms are eligible (orphaned/duplicate account keys from
+        # the account-key split-brain issue are a judgment call, not a scan).
+        from . import social_intake_reader as _sir
+        args_rest = argv[1:]
+        bases = []
+        for i, a in enumerate(args_rest):
+            if a == "--bases" and i + 1 < len(args_rest):
+                bases = [b.strip() for b in args_rest[i + 1].split(",") if b.strip()]
+        if not bases:
+            print("usage: python -m agent backfill-section7 --bases "
+                  "<base1,base2=intake_client_key,...>\n"
+                  "  (base=intake_client_key for a self-serve gym whose "
+                  "echo_social_intake row is keyed by the portal's raw UUID)")
+        else:
+            results = _sir.backfill_section7_many(bases)
+            for r in results:
+                if not r.get("ok"):
+                    print(f"  {r['base']}: SKIPPED ({r.get('reason')})")
+                elif not r.get("had_recoverable_data"):
+                    print(f"  {r['base']}: no recoverable data -- {r.get('note')}")
+                elif r["changed"]["cta"] or r["changed"]["hashtags"]:
+                    print(f"  {r['base']}: PATCHED (cta={r['changed']['cta']}, "
+                          f"hashtags={r['changed']['hashtags']}) -> {r['bible_path']}")
+                else:
+                    print(f"  {r['base']}: recoverable data exists but the bible's "
+                          "CTA/hashtag block was already filled by something else "
+                          "(left untouched)")
     elif cmd == "onboard-client":
         # ONE-COMMAND Stage 3 onboarding from a completed intake. Missing fields
         # block with the list; touches no env, arms nothing.
@@ -1857,6 +1969,19 @@ def main(argv=None):
             results = verify_all()
             if not results:
                 print("onboard-verify: no gyms found in the gyms table.")
+            # PER-SERVICE FILES, SHARED ROWS (2026-09-10). The gyms ROW is now the shared
+            # echo_gyms record, so --all enumerates every gym either Echo service knows.
+            # The scaffold voice/brain FILES are not shared: they live on whichever
+            # service's /data volume onboard.run ran on, and Railway cannot mount one
+            # volume on two services. So a self-serve-onboarded gym verified from the
+            # `echo` worker honestly reports its voice/brain file as missing -- the file
+            # is on echo-intake-web. Say so, rather than letting the tool imply the gym
+            # is broken.
+            if results and config.gym_shared_store_enabled():
+                print("NOTE: gym ROWS are shared across both Echo services, but the "
+                      "scaffold voice/brain FILES are per-service (separate volumes). "
+                      "A gym onboarded through /portal/onboard has its files on "
+                      "echo-intake-web; verify those there.")
             for r in results:
                 for line in format_result(r):
                     print(line)
@@ -1864,12 +1989,41 @@ def main(argv=None):
             r = verify_gym(acct_key)
             for line in format_result(r):
                 print(line)
+    elif cmd == "echo-clients-cleanup":
+        # The 2026-09-11 incident's registry cleanup. Dry run prints a table; --apply
+        # archives REMOVE rows to <DATA_DIR>/_trash/<date>/ (never deletes a client,
+        # never touches an UNKNOWN row, refuses when the client universe is unreadable).
+        from . import echo_clients_cleanup as _ecc
+        sys.exit(_ecc.main(argv[1:]))
+    elif cmd == "echo-clients":
+        # The ONE predicate, on screen: who Echo's clients are (echo_gym_settings), by
+        # gym and by every key/alias the gate accepts. Read-only.
+        from . import echo_clients as _ec
+        _snap = _ec.snapshot(fresh=True)
+        if not _snap.ok:
+            print(f"echo-clients: client universe UNREADABLE ({_snap.error}); every fleet "
+                  "lane is failing closed (doing nothing) until this reads.")
+            sys.exit(2)
+        _per_marker = {m: sum(1 for ms in _snap.markers.values() if m in ms)
+                       for m in _ec.MARKERS}
+        print(f"Echo clients: {len(_snap.gym_ids)} gyms. Markers: "
+              + ", ".join(f"{m} {n}" for m, n in _per_marker.items())
+              + f". echo_intake_tokens is NOT a marker: {len(_snap.other_keys)} portal "
+              "keys there belong to gyms that are not Echo clients.")
+        print()
+        for _gid in sorted(_snap.gym_ids, key=lambda g: _snap.names.get(g, g)):
+            _aliases = sorted(k for k, v in _snap.key_to_gym.items() if v == _gid)
+            print(f"  {_snap.names.get(_gid, '?'):<32} {_gid}")
+            print(f"    markers: {', '.join(sorted(_snap.markers.get(_gid, ())))}")
+            print(f"    keys: {', '.join(_aliases)}")
     elif cmd == "onboarding-audit":
-        # READ ONLY fleet readiness. Sweeps the PORTAL roster (echo_intake_tokens),
-        # not Echo's registry, because every failure of this class has arrived as a
-        # gym MISSING from the registry. Sends NO alerts and writes NO dedup stamps:
-        # this is the on-demand human view, runner.py owns the alerting pass. At 100
-        # gyms this is the one screen that answers "who cannot post today".
+        # READ ONLY fleet readiness. Sweeps the PORTAL roster of ECHO CLIENTS
+        # (echo_intake_tokens rows for gyms in echo_gym_settings; the token table
+        # alone is the whole LASSO fleet -- the 2026-09-11 incident), not Echo's
+        # registry, because every failure of this class has arrived as a gym MISSING
+        # from the registry. Sends NO alerts and writes NO dedup stamps: this is the
+        # on-demand human view, runner.py owns the alerting pass. At 100 gyms this is
+        # the one screen that answers "who cannot post today".
         from . import onboarding_watch as _ow
         _deps = _ow._live_deps()  # noqa: SLF001
         _roster = _deps["roster"](None)
@@ -1889,8 +2043,8 @@ def main(argv=None):
                                                    bases=_bases, deps=_deps)))
             except Exception as exc:  # noqa: BLE001 - one gym never blocks the sweep
                 _rows.append((_base, [f"check_failed:{type(exc).__name__}"]))
-        print(f"portal roster: {len(_roster)} gyms   client gyms audited: {len(_rows)}"
-              f"   registry bases: {len(_bases)}")
+        print(f"portal roster (Echo clients only): {len(_roster)} gyms   client gyms "
+              f"audited: {len(_rows)}   registry bases: {len(_bases)}")
         print()
         for _base, _issues in _rows:
             print(f"  {_base:28s} {'ready' if not _issues else ', '.join(_issues)}")
@@ -1905,6 +2059,25 @@ def main(argv=None):
             if _hit:
                 print(f"  {_reason}: {', '.join(_hit)}")
                 print(f"    fix: {_ow._FIX[_reason]}")  # noqa: SLF001
+        # THE BLIND SPOT (2026-09-10, Empire Training Academy): every row above comes
+        # from `_roster`, i.e. echo_intake_tokens. A gym with ZERO such rows never
+        # entered that loop at all, so it is invisible to everything printed above no
+        # matter what is wrong with it. Report it separately, straight off the portal's
+        # gyms table.
+        try:
+            _known_ids = {_gid for _gid, _ in _roster}
+            _missing = _ow.zero_token_gyms(_known_ids)
+        except Exception as exc:  # noqa: BLE001 - never break the audit over this
+            _missing = []
+            print(f"  (zero-token sweep failed: {type(exc).__name__}: {exc})")
+        _missing = [(g, n, s) for g, n, s in _missing if _ow.is_client_gym(s or n or g)]
+        if _missing:
+            print()
+            print(f"ECHO CLIENTS THAT NEVER ENTERED THE SWEEP ABOVE (no echo_intake_tokens "
+                  f"row at all): {len(_missing)}")
+            for _gid, _name, _slug in _missing:
+                print(f"  {_name or _slug or _gid} ({_gid})")
+            print(f"    fix: {_ow._FIX[_ow.REASON_NO_INTAKE_TOKEN]}")  # noqa: SLF001
     elif cmd == "add-client":
         # MANUAL onboarding scaffold: config entry + voice/proof templates +
         # library folder + the by-hand checklist. Touches no env, arms nothing.
@@ -2064,6 +2237,41 @@ def main(argv=None):
         else:
             from .backfill import backfill_insights
             backfill_insights(acct_f, since, dry=dry)
+    elif cmd == "vision-backfill":
+        # ECHO_VISION_SPEC §9 precondition: analyze_and_store never runs on a daily
+        # schedule (there is no job wired to it), so a gym added to AGENT_VISION_GYMS
+        # with an unanalyzed library gets ZERO vision candidates -- pick_image's vision
+        # branch returns None outright (no legacy fallback once a pillar is scored), so
+        # a gym flipped on cold stalls into "needs-media" instead of picking better
+        # photos. Run this BEFORE adding a gym's base key to AGENT_VISION_GYMS.
+        acct_f, force, args = "", False, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--account" and i + 1 < len(args):
+                acct_f = args[i + 1]; i += 2; continue
+            if args[i] == "--force":
+                force = True
+            i += 1
+        if not acct_f:
+            print("usage: python -m agent vision-backfill --account <key> [--force]")
+        else:
+            from .accounts import get_account
+            from . import vision
+            account = get_account(acct_f)
+            if account is None:
+                print(f"vision-backfill: unknown account {acct_f!r}")
+            else:
+                library_path = account.library_path()
+                base = config._vision_base(acct_f)
+                print(f"vision-backfill: analyzing {library_path} for {acct_f} "
+                     f"(gym={base}, force={force}) ...")
+                counts = vision.analyze_library(library_path, force=force, gym=base)
+                print(f"vision-backfill: {counts}")
+                if counts.get("failed"):
+                    print("vision-backfill: some images did not analyze cleanly (spend "
+                         "cap, missing key, or a repeated read failure) -- re-run this "
+                         "command; only a clean sweep (0 failed) means the gym is ready "
+                         "for AGENT_VISION_GYMS.")
     elif cmd == "monthly-review":
         # The 30 day loop: digest + PDF per account (AGENT_MONTHLY_REVIEW_ENABLED).
         # --dry is READ ONLY: prints everything, posts/writes nothing, and runs
@@ -2585,6 +2793,84 @@ def main(argv=None):
                           f"--account {_acct}_ig --all")
             else:
                 print(f"{_acct}: not intaken: {out.get('reason')}")
+    elif cmd == "gym-deep-brain":
+        # PER-GYM DEEP BRAIN, one gym by hand. (AGENT_NO_MEDIA_ASTRA_SEED, when
+        # armed, also calls build_deep_brain automatically — but ONLY for a gym
+        # client_media_sync.scan_and_generate finds with ZERO approved sources
+        # AND zero real uploaded media; see agent/no_media_astra_seed.py. This
+        # command remains the by-hand entry point for every other case.)
+        # Read the gym's OWN public website (robots.txt respected, rate limited,
+        # PII scrubbed, page/byte capped) plus its OWN public Instagram feed, and
+        # compile the per-gym voice + grounding artifact. Every fact carries the
+        # URL it came from and lands PENDING; a scrape is never auto-approved.
+        # Blocks honestly (no artifact, no rows) when a domain, a handle, robots
+        # permission, a readable page, or the social read is missing.
+        from . import gym_deep_brain as _gdb
+        _args = argv[1:]
+        _acct, _dom, _handle = "", None, None
+        _dry = "--dry-run" in _args
+        i = 0
+        while i < len(_args):
+            if _args[i] == "--account" and i + 1 < len(_args):
+                _acct = _args[i + 1]; i += 2; continue
+            if _args[i] == "--domain" and i + 1 < len(_args):
+                _dom = _args[i + 1]; i += 2; continue
+            if _args[i] == "--handle" and i + 1 < len(_args):
+                _handle = _args[i + 1]; i += 2; continue
+            i += 1
+        if not _acct:
+            print("usage: python -m agent gym-deep-brain --account <base> "
+                  "[--domain x.com] [--handle <ig>] [--dry-run]")
+        else:
+            out = _gdb.build_deep_brain(_acct, domain=_dom, handle=_handle,
+                                        dry_run=_dry)
+            if not out.get("ok"):
+                print(f"{_acct}: BLOCKED, no artifact written: {out.get('reason')}")
+            elif out.get("dry_run"):
+                print(f"{_acct}: dry run over {out['domain']} + @{out['handle']} "
+                      f"— {out['facts']} attributed fact(s), {out['voice']} voice "
+                      f"observation(s), {out['top_posts']} top post(s). "
+                      "Nothing written.")
+                print(out.get("markdown", ""))
+            else:
+                print(f"{_acct}: deep brain from {out['domain']} + @{out['handle']}")
+                print(f"  artifact: {out['artifact']}")
+                print(f"  {out['facts']} attributed fact(s) landed PENDING, "
+                      f"{out['voice']} voice observation(s), "
+                      f"{out['top_posts']} top post(s)")
+                print(f"  {out['bible']}")
+                for _n in out.get("notes", []):
+                    print(f"  note: {_n}")
+                print(f"  a human must approve before Echo may draft from these: "
+                      f"python -m agent approve-sources --account {_acct}_ig")
+    elif cmd == "no-media-astra-seed":
+        # By-hand / verification entry point for the automatic no-media Astra
+        # fallback (agent/no_media_astra_seed.py). The recurring job
+        # (client_media_sync.scan_and_generate) calls this itself for any gym
+        # it finds with zero approved sources AND zero real media; this command
+        # exists to prove/verify the pipeline against one named gym on demand,
+        # never to run it as a sweep across the fleet.
+        #   python -m agent no-media-astra-seed --account <base> [--limit N]
+        from . import no_media_astra_seed as _nmas
+        from .accounts import get_account as _get_acct
+        from . import portal_calendar_store as _pcs
+        _args = argv[1:]
+        _acct, _limit = "", _nmas.SEED_MAX_PER_RUN
+        i = 0
+        while i < len(_args):
+            if _args[i] == "--account" and i + 1 < len(_args):
+                _acct = _args[i + 1]; i += 2; continue
+            if _args[i] == "--limit" and i + 1 < len(_args):
+                _limit = int(_args[i + 1]); i += 2; continue
+            i += 1
+        if not _acct:
+            print("usage: python -m agent no-media-astra-seed --account <base> [--limit N]")
+        else:
+            account = _get_acct(f"{_acct}_ig") or _get_acct(_acct)
+            store = _pcs.SupabaseCalendarStore()
+            n = _nmas.seed_gaps(_acct, account, store, max_rows=_limit)
+            print(f"{_acct}: {n} grounded infographic draft(s) inserted "
+                 "(status='pending'; nothing published)")
     elif cmd == "intake-onboard":
         from .intake_onboard import cli as intake_onboard_cli
         intake_onboard_cli(argv[1:])
@@ -3049,6 +3335,13 @@ def main(argv=None):
         #   python -m agent lasso-remap [--month YYYY-MM] [--gym lasso] [--write]
         from .lasso_remap import cli as _lasso_remap_cli
         _lasso_remap_cli(argv[1:])
+    elif cmd == "lasso-astra-rework":
+        # Regenerate the IMAGE (never the schedule) on LASSO's existing non-video,
+        # non-published slots as linked Astra v2 candidates. Same dates/times/count
+        # untouched; nothing publishes; a human picks in the portal.
+        #   python -m agent lasso-astra-rework [--months YYYY-MM,...] [--limit N] [--write]
+        from .lasso_astra_rework import cli as _lasso_astra_rework_cli
+        _lasso_astra_rework_cli(argv[1:])
     elif cmd == "ops-triage-classify":
         # Classify one ops-alert line as noise/needs_triage. Argument or stdin; prints
         # exactly "noise" or "needs_triage". The shell-out seam for scout-listener's

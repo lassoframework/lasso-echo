@@ -25,7 +25,7 @@ from agent.trust import TrustLevel  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def _run(tmp_path, account_key="testgym", display_name="Test Gym",
-         base_url=None, monkeypatch=None, automint=False):
+         base_url=None, monkeypatch=None, automint=False, posting_timezone=None):
     """Helper: run onboard.run() with isolated file dirs from tmp_path."""
     voice_dir = str(tmp_path / "brand_voice")
     brains_dir = str(tmp_path / "brains")
@@ -37,6 +37,7 @@ def _run(tmp_path, account_key="testgym", display_name="Test Gym",
         voice_dir=voice_dir,
         brains_dir=brains_dir,
         base_url=base_url,
+        posting_timezone=posting_timezone,
     )
 
 
@@ -295,3 +296,65 @@ def test_onboard_base_url_from_env(tmp_path, monkeypatch):
                          voice_dir=voice_dir, brains_dir=brains_dir)
     assert result["upload_link"] is not None
     assert result["upload_link"].startswith("https://upload.lasso.test/u/")
+
+
+# ---------------------------------------------------------------------------
+# Onboarding-time posting_timezone hint (root-cause fix, 2026-09-10)
+# ---------------------------------------------------------------------------
+
+def test_onboard_applies_posting_timezone_hint_on_fresh_gym(tmp_path):
+    """A fresh gym with a valid timezone hint gets it stored."""
+    _run(tmp_path, "gymtz1", "TZ Gym One", posting_timezone="America/New_York")
+    row = db.gym_get("gymtz1")
+    assert row.get("posting_timezone") == "America/New_York"
+
+
+def test_onboard_never_overwrites_an_existing_posting_timezone(tmp_path):
+    """A gym that already has a posting_timezone (set by hand, or by the posting_tz
+    backfill watchdog) keeps it, no matter what hint a re-run passes."""
+    db.gym_upsert("gymtz2", display_name="TZ Gym Two")
+    db.gym_upsert("gymtz2", posting_timezone="America/Los_Angeles")
+    _run(tmp_path, "gymtz2", "TZ Gym Two", posting_timezone="America/Chicago")
+    row = db.gym_get("gymtz2")
+    assert row.get("posting_timezone") == "America/Los_Angeles"
+
+
+def test_onboard_with_no_timezone_hint_leaves_column_empty(tmp_path):
+    """No hint passed -> posting_timezone stays unset, ready for the backfill watchdog."""
+    _run(tmp_path, "gymtz3", "TZ Gym Three")
+    row = db.gym_get("gymtz3")
+    assert not (row.get("posting_timezone") or "").strip()
+
+
+def test_onboard_idempotent_rerun_with_timezone_hint_each_time(tmp_path):
+    """Re-onboarding an already-timezoned gym with the SAME hint twice never errors and
+    never duplicates anything -- pure idempotency check for the new code path."""
+    _run(tmp_path, "gymtz4", "TZ Gym Four", posting_timezone="America/Denver")
+    _run(tmp_path, "gymtz4", "TZ Gym Four", posting_timezone="America/Denver")
+    row = db.gym_get("gymtz4")
+    assert row.get("posting_timezone") == "America/Denver"
+
+
+# ---------------------------------------------------------------------------
+# Durable storage defaults (2026-09-10 storage-risk fix)
+# ---------------------------------------------------------------------------
+
+def test_default_voice_and_brain_dirs_resolve_under_the_data_volume(tmp_path, monkeypatch):
+    """This is the production shape: /portal/onboard -> onboard.run() with NO voice_dir
+    / brains_dir override. On the echo-intake-web Railway service, a bare cwd-relative
+    "brand_voice" / "brains" is the ephemeral container image, wiped on that service's
+    own next deploy. The default must resolve through config.client_voice_dir() /
+    config.tenant_brain_dir() -- the same durable <AGENT_DATA_DIR>/brand_voice and
+    .../brains roots the `echo` worker itself uses -- so the scaffold survives THIS
+    service's redeploys."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    volume = tmp_path / "fake_volume"
+    volume.mkdir()
+    monkeypatch.setenv("AGENT_DATA_DIR", str(volume))
+    r = onboard.run("durablegym", "Durable Gym")
+    assert r["voice_path"] == os.path.join(str(volume), "brand_voice", "durablegym.md")
+    assert r["brain_path"] == os.path.join(str(volume), "brains", "durablegym.md")
+    assert os.path.exists(r["voice_path"])
+    assert os.path.exists(r["brain_path"])
+    # never wrote to the ephemeral cwd-relative paths
+    assert not os.path.exists(os.path.join(os.getcwd(), "brand_voice", "durablegym.md"))

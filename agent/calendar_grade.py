@@ -53,7 +53,7 @@ import statistics
 from dataclasses import dataclass, field
 from typing import List
 
-from agent import copy_gate
+from agent import caption_variety, copy_gate
 from agent.caption_ledger import caption_hash
 
 WEIGHTS = {
@@ -82,6 +82,49 @@ _ATHLETE_WORDS = re.compile(
 def _athlete_rail_on() -> bool:
     from . import config
     return config.avatar_athlete_rail_enabled()
+
+
+def _gym_cta_pool_size(rows):
+    """How many approved CTAs this book's gym has that pass the shape gate.
+
+    Returns None when it cannot be determined, which every caller must treat as
+    "grade exactly as before".
+
+    The gym id comes off the rows, so every existing grade_month caller keeps
+    working unchanged. Lazily imported for the same reason _athlete_rail_on is:
+    jobs.grade_fix imports from THIS module at module scope, so the reverse
+    import has to happen inside the call.
+
+    FAILS OPEN (returns None) on any error or when the gym cannot be identified.
+    An exemption is a relaxation of the rule, and a relaxation must never be
+    granted by accident -- if we cannot read the pool, the gym is graded exactly
+    as it was before.
+    """
+    gym_id = ""
+    for r in rows or []:
+        gym_id = str((r or {}).get("gym_id") or "").strip()
+        if gym_id:
+            break
+    if not gym_id:
+        return None
+    try:
+        from agent.jobs import grade_fix
+        return len(grade_fix._booking_cta_pool(gym_id, lambda _m: None) or [])
+    except Exception:  # noqa: BLE001 - never let a grade fail on a pool read
+        return None
+
+
+def _variety_window() -> int:
+    from . import config
+    return config.caption_variety_window()
+
+
+def _ask_rate_rail() -> tuple:
+    """(armed, target share) for the ask-rate rule. Lazily imported like
+    _athlete_rail_on, for the same reason: agent.config must not be imported at
+    module scope here."""
+    from . import config
+    return config.cta_variety_enabled(), config.caption_ask_rate_target()
 # Hook-intent mismatch: elite language
 _ELITE_WORDS = re.compile(r"\b(elite|advanced athlete)\b", re.I)
 
@@ -380,9 +423,19 @@ def _caption_craft(rows, defects, exempt=None) -> int:
     # Soft flags, scored PER POST at a RATE (see module docstring). A book where
     # every post is flagged lands on the same floor of 8 it always did; a book
     # that repaired most of its posts now scores like it.
+    # ONE RULE, ONE OWNER (2026-09-06). `no_ask` was scored on BOTH legs: here
+    # as a soft flag worth up to 12, and again on path_to_join as the ask rule
+    # worth up to 7. That double count was survivable while the doctrine was
+    # "every post asks", because a compliant book tripped neither. Under the
+    # 33% target two thirds of a CORRECT book carry no ask, and leaving `no_ask`
+    # here would take up to 8 points off caption_craft for doing exactly what
+    # was asked. path_to_join owns the ask rule now; this leg scores craft.
+    ask_rail_on, _target = _ask_rate_rail()
     flagged = 0
     for (day, _h), grp in eligible:
         flags = copy_gate.soft_flags(grp[0].get("caption") or "")
+        if ask_rail_on:
+            flags = [f for f in flags if f != "no_ask"]
         if flags:
             flagged += 1
             for f in flags:
@@ -525,29 +578,100 @@ def _path(rows, profile, defects, exempt=None) -> int:
     if not n:
         return score
 
-    # Every post carries an ask. Scored at a RATE so repairing most of a book
-    # actually moves the leg (see module docstring); a book where NO post asks
-    # still loses the same worst case it always did.
-    missing = 0
-    for (day, _h), grp in eligible:
-        cap = grp[0].get("caption") or ""
-        if not copy_gate.ASK_RE.search(cap):
-            defects.append(("path_to_join", day, "no ask in caption"))
-            missing += 1
-    score -= int(round(_ASK_MAX_PENALTY * missing / n))
+    # THE ASK RULE.
+    #
+    # FLAG OFF: every post carries an ask, scored at a RATE so repairing most of
+    # a book actually moves the leg (see module docstring); a book where NO post
+    # asks still loses the same worst case it always did.
+    #
+    # AGENT_CTA_VARIETY ARMED (Blake, 2026-09-06: "every post should not have an
+    # ask, make it 33% of post"): the leg wants a SHARE of the book to close on
+    # an ask, not all of it, and the share is the same number the repair loop
+    # sizes itself to (config.caption_ask_rate_target, read by both sides so
+    # they cannot drift). At or above the target the rule costs nothing and
+    # names no defect; below it, the deduction scales with the SHORTFALL, so a
+    # book with no asks at all still loses the full _ASK_MAX_PENALTY exactly as
+    # it always did. Only the shortfall is named as defects, in date order, so
+    # the digest lists days that actually need repairing instead of listing 21
+    # perfectly good ask-less posts as broken.
+    ask_less = [(day, grp) for (day, _h), grp in eligible
+                if not copy_gate.ASK_RE.search(grp[0].get("caption") or "")]
+    ask_rail_on, ask_rate_target = _ask_rate_rail()
 
-    # GYM: >= 5 posts pointing at booking-specific terms
+    # THE NO-FORCED-ASK LANE (Blake, 2026-09-06). A gym with no approved CTA
+    # that passes the shape gate is SUPPOSED to publish ask-less captions --
+    # "good copy, no ask" -- so neither ask rule may mark it down. Both the RATE
+    # rule below and the booking-term rule further down are exempted together,
+    # because they are two halves of one question the gym has no way to answer.
+    # Computed once: the pool read touches the voice doc and client_sources.
+    pool_size = _gym_cta_pool_size(rows) if ask_rail_on else None
+    no_cta_lane = pool_size == 0
+    if no_cta_lane and exempt is not None:
+        exempt["path_to_join: no approved CTA to ask with"] = n
+
+    # THE HONEST CEILING (Blake, 2026-09-06: "No fake/generic/repeated CTA just
+    # to hit a target"). A gym with one approved CTA cannot ask more than once
+    # per anti-repetition window, so a third of its book is a target it can only
+    # reach by repeating -- the very thing the ruling forbids. Both ask rules
+    # are scored against min(target, ceiling), the SAME cap the repair loop
+    # sizes itself to (grade_fix._ask_target_posts). Measured on the live fleet:
+    # only 2 of 18 gyms have a ceiling at or above 33%, so without this 11 gyms
+    # would be marked down nightly for a number no code can reach for them.
+    ceiling = None
+    if ask_rail_on and pool_size:
+        ceiling = caption_variety.honest_ask_ceiling(
+            n, pool_size, _variety_window())
+        if ceiling < max(1, min(n, int(round(ask_rate_target * n)))) and exempt is not None:
+            exempt["path_to_join: ask target capped by the gym's approved CTA pool"] = ceiling
+
+    if no_cta_lane:
+        pass                        # exempt: scored on neither ask rule
+    elif ask_rail_on:
+        want = max(1, min(n, int(round(ask_rate_target * n))))
+        if ceiling is not None:
+            want = max(1, min(want, ceiling))
+        short = max(0, want - (n - len(ask_less)))
+        for day, _grp in sorted(ask_less, key=lambda item: item[0])[:short]:
+            defects.append(("path_to_join", day, "no ask in caption"))
+        score -= int(round(_ASK_MAX_PENALTY * short / want))
+    else:
+        for day, _grp in ask_less:
+            defects.append(("path_to_join", day, "no ask in caption"))
+        score -= int(round(_ASK_MAX_PENALTY * len(ask_less) / n))
+
+    # GYM: >= 5 posts pointing at booking-specific terms.
+    #
+    # EXEMPT WHEN THE GYM HAS NOTHING TO ASK WITH (Blake, 2026-09-06: "If a
+    # gym's CTA pool is empty or too thin to supply a real ask, DO NOT force one
+    # in ... write the caption with no booking ask at all"). Five of eighteen
+    # live gyms have NO usable approved CTA once the shape gate rejects
+    # questions and headings, and their voice-doc CTA rotation is an unfilled
+    # onboarding TODO. Deducting five points from those gyms every night marks
+    # them down for obeying the rule, and grade_sweep then re-attempts the same
+    # unfixable days forever, burning LLM budget on a defect no code can clear.
+    # That is precisely the "invents defects that no repair can ever clear"
+    # failure this module's own docstring warns about for caption-less posts,
+    # and it gets the same answer: EXEMPT and COUNT it, never silently drop it.
+    # The moment a human fills that gym's CTA section the exemption disappears
+    # on its own, because the pool stops being empty.
     if profile != "B2B":
-        want_booking = min(5, n)
-        booking_posts = sum(
-            1 for _k, grp in eligible
-            if _BOOKING_RE.search(grp[0].get("caption") or "")
-        )
-        missing_booking = max(0, want_booking - booking_posts)
-        for _ in range(missing_booking):
-            defects.append(("path_to_join", "",
-                            "not enough booking-specific asks"))
-            score -= 1
+        if no_cta_lane:
+            pass                    # exempt, recorded once above
+        else:
+            want_booking = min(5, n)
+            if ceiling is not None:
+                # Same cap: a gym cannot carry 5 booking asks if its pool can
+                # only honestly cover 2 of them.
+                want_booking = min(want_booking, ceiling)
+            booking_posts = sum(
+                1 for _k, grp in eligible
+                if _BOOKING_RE.search(grp[0].get("caption") or "")
+            )
+            missing_booking = max(0, want_booking - booking_posts)
+            for _ in range(missing_booking):
+                defects.append(("path_to_join", "",
+                                "not enough booking-specific asks"))
+                score -= 1
 
     # B2B: >= 12 posts with call ask
     if profile == "B2B":

@@ -49,11 +49,12 @@ from . import rotation as _rotation
 from .drafter import DraftStatus
 
 
-# The server-enforced recreate budget: 15 denies per calendar month per gym. This is
-# NOT read from tenant data (which can default to zero); Part B guarantees every
-# social gym the same 15. A deny burns one unit; the 16th deny in a month is refused
-# with 409 so the gym asks for a fresh concept instead of burning the queue.
-MONTHLY_RECREATE_BUDGET = 15
+# The server-enforced recreate budget: 30 denies per calendar month per gym (raised
+# from 15, Blake 2026-09-08). This is NOT read from tenant data (which can default
+# to zero); Part B guarantees every social gym the same 30. A deny burns one unit;
+# the 31st deny in a month is refused with 409 so the gym asks for a fresh concept
+# instead of burning the queue.
+MONTHLY_RECREATE_BUDGET = 30
 
 
 # ==========================================================================
@@ -333,7 +334,7 @@ def _content_calendar_post(row, is_lasso=False):
     return _with_display_image(post, tenant=row.get("gym_id"))
 
 
-_VIDEO_URL_EXTS = (".mp4", ".mov", ".m4v", ".webm")
+from .media_types import VIDEO_EXTS as _VIDEO_URL_EXTS   # ONE definition (audit D1)
 
 
 def _media_kind(url):
@@ -406,6 +407,40 @@ def _base_of_account(account_key):
     return key
 
 
+# ---- B12: a post the client already rejected must leave their calendar ----------
+# THE DEFECT: a client denies a post, Echo issues a replacement (deny backfill,
+# client_month_run.backfill_denied_slots), and the ORIGINAL row stays on the calendar
+# forever. backfill_denied_slots is INSERT ONLY and nothing anywhere transitions a
+# denied row out of 'denied' -- portal_calendar_store._WIPEABLE_STATUSES deliberately
+# treats it as human owned so a rebuild cannot destroy it. Meanwhile the client render
+# carried exactly ONE status filter, `!= "coach_review"`, so denied / killed / deleted
+# rows were mapped into cards and shipped to the owner beside their replacements.
+#
+# MEASURED ON PRODUCTION 2026-09-05, September book: LASSO 45% of rows, ENG 40%,
+# pierce 34%, zanshin 33% were denied or deleted. One in three cards on a client's
+# calendar was content they had already rejected or that had been removed.
+#
+# THIS IS A GUARD, SO IT DEFAULTS ON, with a named escape hatch
+# (ECHO_PORTAL_SHOW_REJECTED=true restores the old payload byte for byte). Rows are
+# never deleted or re-statused by this -- they stay in content_calendar for audit, the
+# publisher still excludes them (portal_calendar_store.due_rows), and every derived
+# signal (low_creative, days_remaining, awaiting_media, recreate_budget) is computed
+# from the SAME row set as before so no banner changes behavior.
+_CLIENT_HIDDEN_STATUSES = ("coach_review", "denied", "killed", "deleted")
+
+
+def _client_visible(rows):
+    """The rows a gym owner should see on their own calendar. Hides content they have
+    already rejected (denied / killed), content that was removed (deleted), and content
+    a coach has not released yet (coach_review, the pre-existing rule)."""
+    from . import config as _cfg
+    hidden = _CLIENT_HIDDEN_STATUSES
+    if getattr(_cfg, "portal_show_rejected", None) and _cfg.portal_show_rejected():
+        hidden = ("coach_review",)          # escape hatch: the historical behavior
+    return [r for r in (rows or [])
+            if str((r or {}).get("status") or "").strip().lower() not in hidden]
+
+
 def _handle_social_supabase(account_key, month, now=None):
     """/social from the SHARED content_calendar table (the live portal data plane).
     Reads every row for THIS gym in the month via the same SupabaseCalendarStore that
@@ -425,7 +460,12 @@ def _handle_social_supabase(account_key, month, now=None):
             str((r or {}).get("status") or "").lower() == "coach_review" for r in rows)
         rows = [r for r in rows
                 if str((r or {}).get("status") or "").lower() != "coach_review"]
-        posts = [_content_calendar_post(r, is_lasso=_is_lasso_gym(account_key)) for r in rows]
+        # B12: the CARDS drop rejected/removed content; `rows` (and therefore
+        # low_creative) stays exactly what it was, so no banner flips behind this.
+        posts = [_content_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                 for r in _client_visible(rows)]
+        signal_posts = [_content_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                        for r in rows]
     except Exception as exc:
         return 500, {"error": f"store error: {type(exc).__name__}"}
 
@@ -435,7 +475,9 @@ def _handle_social_supabase(account_key, month, now=None):
     low_creative = not any((r.get("image_url") or "").strip() for r in rows)
     _, days_remaining = _low_creative_and_days(
         account_key, month, today=(now.date() if now else None))
-    awaiting_media, upload_url = _awaiting_media_signal(account_key, posts)
+    # Signal on the UNFILTERED set: a month that is entirely denied is still a BUILT
+    # month, and must not raise the red "Echo is waiting on your uploads" banner.
+    awaiting_media, upload_url = _awaiting_media_signal(account_key, signal_posts)
     if has_withheld_calendar:
         awaiting_media = False        # built + coach-screened is NOT "waiting on uploads"
     return 200, {
@@ -488,13 +530,17 @@ def handle_social(account_key, month, reader=None, now=None):
                 "SELECT * FROM gym_calendar_queue WHERE account_key=? AND day_key LIKE ? "
                 "ORDER BY day_key",
                 (account_key, prefix + "%")).fetchall()
-        posts = [_calendar_post(dict(r), is_lasso=_is_lasso_gym(account_key)) for r in rows]
+        all_rows = [dict(r) for r in rows]
+        posts = [_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                 for r in _client_visible(all_rows)]
+        signal_posts = [_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                        for r in all_rows]
     except Exception as exc:
         return 500, {"error": f"db error: {type(exc).__name__}"}
 
     low_creative, days_remaining = _low_creative_and_days(account_key, month,
                                                           today=(now.date() if now else None))
-    awaiting_media, upload_url = _awaiting_media_signal(account_key, posts)
+    awaiting_media, upload_url = _awaiting_media_signal(account_key, signal_posts)
     return 200, {
         "account_key": account_key,
         "month": month,
@@ -877,6 +923,460 @@ def _handle_deny_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
                  "recreate_budget": _budget_state(account_key)}
 
 
+# ==========================================================================
+# POST /portal/<token>/posts/<id>/swap-media  (B6: FREE, never charges the budget)
+#
+# THE BUDGET DESIGN BUG (Pete, zanshin): the portal's only levers are approve /
+# edit / deny / kill, so "use a different photo" and "the caption needs work" are
+# BOTH a deny and both burn one of the 15 monthly recreates. Pete ran out of
+# recreates swapping PHOTOS and then could not fix a caption. The counter was never
+# wrong -- the two actions were never separated.
+#
+# THE SPLIT: swapping the pixels regenerates nothing, so it is free and unlimited.
+# Regenerating COPY still costs one of 15. The write goes through
+# SupabaseCalendarStore.swap_media, which is status-guarded server-side to
+# pending / coach_review, so an approved or live post can never be repointed and
+# the gym's approval always keeps exactly the pixels it approved.
+# ==========================================================================
+
+def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=None,
+                      picker=None):
+    """Swap this post's photo for a fresh one. FREE and unlimited: the budget is
+    neither read nor charged, and the response echoes the UNCHANGED budget so the
+    client can see it cost nothing. The caption is untouched.
+
+    Flag: config.media_swap_free_enabled() (ECHO_MEDIA_SWAP_FREE, default OFF).
+    Flag off -> 403 and not one store read is issued."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import media_swap as _ms
+    if not _ms.enabled():
+        return 403, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                     "error": "photo swap is not enabled for this gym"}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                     "error": "photo swap needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "swap-media", draft_id)
+        if final is not None:
+            return final
+        # SIBLINGS MOVE WITH THE CLICKED ROW (audit 3c): the FB mirror and the paired
+        # story of this post share its media. Swapping only the clicked row left
+        # Facebook publishing the rejected still. Read the day's rows once, find the
+        # same-post siblings, and have the picker shape the SAME new creative for each
+        # (a story sibling is re-burned with its own caption).
+        month_rows = _month_rows_for(sb_store, account_key, row)
+        # Only siblings that CAN move are asked for (pending / coach_review); an
+        # approved or live sibling keeps the pixels the gym approved and is reported
+        # below. Every requested variant is computed by the picker BEFORE any write
+        # (all or nothing): one failed variant is a 409 and nothing changes.
+        all_siblings = _ms.sibling_rows(row, month_rows or [],
+                                        lib=_ms.library_path_for(account_key))
+        siblings = [s for s in all_siblings
+                    if str(s.get("status") or "").lower() in ("pending", "coach_review")]
+        locked_siblings = [str(s.get("id") or "") for s in all_siblings if s not in siblings]
+        pick = (picker or _ms.pick_replacement)(account_key, row, store=sb_store,
+                                                 siblings=siblings)
+        if not pick.get("ok"):
+            # A swap that cannot happen is a 409 the client can read, NOT a charge.
+            return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": _ms.client_message(pick.get("reason")),
+                         "reason": pick.get("reason"),
+                         "failed_sibling": pick.get("failed_sibling"),
+                         "recreate_budget": _budget_state(account_key)}
+        variants = pick.get("siblings") or {}
+        missing = [str(s.get("id")) for s in siblings
+                   if not (variants.get(str(s.get("id"))) or {}).get("ok")]
+        if missing:
+            # A picker that could not shape one sibling: nothing is written.
+            return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": _ms.client_message(_ms.REASON_STORY_REBURN),
+                         "reason": _ms.REASON_STORY_REBURN, "failed_sibling": missing[0],
+                         "recreate_budget": _budget_state(account_key)}
+        # The media identity travels WITH the pixels (2026-09-10): a video's poster
+        # frame (or a cleared poster when a video row becomes a photo) and the Drive
+        # asset id now on the row (or None when it left the Drive pool).
+        updated = sb_store.swap_media(account_key, draft_id, pick["image_url"],
+                                      source_media_url=pick.get("source_media_url"),
+                                      extra_fields=_ms.swap_fields(pick))
+        if updated is None:
+            # swap_media filters to pending / coach_review server-side: a row that
+            # matched nothing was approved or live between the read and the write.
+            return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": ("This post is already approved or live, so its "
+                                   "photo is locked. Deny it if you want it redone."),
+                         "recreate_budget": _budget_state(account_key)}
+        # Same-post siblings, one operation, the SAME per-row server-side status guard
+        # (a sibling approved between the read and this write matches nothing and is
+        # reported as left).
+        swapped, left = [draft_id], list(locked_siblings)
+        for sib in siblings:
+            sid = str(sib.get("id") or "")
+            var = variants[sid]
+            try:
+                done = sb_store.swap_media(account_key, sid, var["image_url"],
+                                           source_media_url=var.get("source_media_url"),
+                                           extra_fields=_ms.swap_fields(var))
+            except Exception as exc:  # noqa: BLE001 - one sibling never undoes the swap
+                print(f"[portal-social] sibling swap failed for {sid}: {type(exc).__name__}")
+                done = None
+            (swapped if done is not None else left).append(sid)
+        # The write landed: settle the Drive usage ledger + the served ledger so the
+        # asset now on the row cools down, and the one it replaced returns to the pool
+        # ONLY when no remaining row on the book still carries it. A failed re-read
+        # is None = unknown = leave it stamped (never [] = "nothing carries it").
+        _ms.after_swap(account_key, row, pick,
+                       book_rows=_month_rows_for(sb_store, account_key, row),
+                       swapped_ids=swapped)
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,
+                 "siblings_swapped": [s for s in swapped if s != draft_id],
+                 "siblings_left": left,
+                 # Display url: a video row's poster frame, else the media itself (the
+                 # same rule _post_from_row applies for the calendar card).
+                 "image_public_url": (updated.get("thumbnail_url")
+                                      or updated.get("image_url", "")),
+                 "media_kind": _media_kind(updated.get("image_url", "")),
+                 "video_url": (updated.get("image_url", "")
+                               if _media_kind(updated.get("image_url", "")) == "video"
+                               else None),
+                 "caption": updated.get("caption", ""),
+                 "status": updated.get("status", "pending"),
+                 "day_key": updated.get("post_date", ""),
+                 "free": True,
+                 "recreate_budget": _budget_state(account_key)}
+
+
+def _month_rows_for(sb_store, account_key, row):
+    """The gym's rows for the clicked row's month (the sibling search space + the
+    post-swap book read). None on any failure = UNKNOWN: no sibling is swapped and
+    media_swap.after_swap leaves the old asset stamped (an empty LIST would read as
+    "nothing else carries it" and roll the asset back; audit 3c residual)."""
+    lister = getattr(sb_store, "list_month", None)
+    month = str((row or {}).get("post_date") or "")[:7]
+    if lister is None or len(month) != 7:
+        return None
+    try:
+        return [r for r in (lister(account_key, month) or []) if isinstance(r, dict)]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _account_for(account_key):
+    """Best-effort Account for a gym's generation account (_ig, else base). Never
+    raises; None when the registry has nothing for this key."""
+    try:
+        from .accounts import get_account
+        return get_account(f"{account_key}_ig") or get_account(account_key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _voice_for(account_key, account=None):
+    """The gym's loaded VoiceDoc, via the SAME durable-first resolution every other
+    build-time caller uses (client_media_sync._resolve_client_voice_path). None when
+    the account or its bible is missing -- callers must treat that as 'cannot draft'."""
+    account = account if account is not None else _account_for(account_key)
+    if account is None:
+        return None
+    try:
+        from . import client_media_sync as _cms
+        from .voice import load_voice
+        return load_voice(
+            _cms._resolve_client_voice_path(account_key, account.voice_doc_path()))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ==========================================================================
+# POST /portal/<token>/posts/<id>/recreate-caption
+#
+# THE MISSING HALF OF B6 (partial-regen, Blake, 2026-09-07): swap-media (above) made
+# "the photo is wrong" free by keeping the caption and changing only the pixels. This
+# is the other half -- "the caption is wrong" -- and rewrites ONLY the copy on the
+# gym's EXACT SAME photo, instead of today's full deny/recreate, which regenerates
+# BOTH and can hand back a different photo even when only the words were the
+# problem. Unlike swap-media this STILL charges the budget: regenerating copy is the
+# expensive act (see media_swap.py's own docstring). The write goes through
+# SupabaseCalendarStore.patch_caption -- the SAME call a human caption edit already
+# uses -- so an approved or live post can never have its caption silently rewritten.
+# ==========================================================================
+
+def handle_recreate_caption(account_key, draft_id, actor_id, reader=None,
+                            sb_store=None):
+    """Rewrite ONLY this post's caption, on its EXACT SAME photo. Costs one of the
+    monthly 15 recreates. Flag: config.caption_recreate_scoped_enabled()
+    (ECHO_CAPTION_RECREATE_SCOPED, default OFF -> 403, no store read)."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import caption_swap as _cs
+    if not _cs.enabled():
+        return 403, {"ok": False, "action": "recreate-caption", "draft_id": draft_id,
+                     "error": "caption-only recreate is not enabled for this gym"}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "recreate-caption", "draft_id": draft_id,
+                     "error": "caption recreate needs the shared calendar plane"}
+    if recreate_remaining(account_key) <= 0:
+        return 409, {"ok": False, "action": "recreate-caption", "draft_id": draft_id,
+                     "error": "recreate budget for this month is used up",
+                     "reason": "budget_exhausted",
+                     "recreate_budget": _budget_state(account_key)}
+    account = _account_for(account_key)
+    voice = _voice_for(account_key, account)
+    if account is None or voice is None:
+        return 500, {"ok": False, "action": "recreate-caption", "draft_id": draft_id,
+                     "error": "this gym's voice doc is not configured"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "recreate-caption", draft_id)
+        if final is not None:
+            return final
+        from . import client_media_sync as _cms
+        result = _cs.recreate_caption(
+            account_key, row, account=account, voice=voice,
+            banned_words=_cms._banned_words_for(account_key))
+        if not result.get("ok"):
+            # A scoped attempt that could not produce a clean result is a 409 the
+            # client can read, NOT a charge -- the post's caption is unchanged.
+            return 409, {"ok": False, "action": "recreate-caption",
+                         "draft_id": draft_id,
+                         "error": _cs.client_message(result.get("reason")),
+                         "reason": result.get("reason"),
+                         "recreate_budget": _budget_state(account_key)}
+        updated = sb_store.patch_caption(account_key, draft_id, result["caption"])
+        if updated is None:
+            # patch_caption filters to status NOT IN (publishing, published): a row
+            # that matched nothing went live between the read and the write.
+            return 409, {"ok": False, "action": "recreate-caption",
+                         "draft_id": draft_id,
+                         "error": ("This post is already approved or live, so its "
+                                   "caption is locked. Deny it if you want it "
+                                   "redone."),
+                         "recreate_budget": _budget_state(account_key)}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    # STORY RE-BURN (independent audit, 2026-09-08): a story's caption is burned
+    # into the media itself, not read as text -- PR #597's UI hides this button for
+    # story-format posts, but that is client-side only, and every OTHER invariant
+    # in this file (ownership, published-is-final, budget) is enforced server-side
+    # regardless of what the client does. Without this, a direct call on a story
+    # row (curl, a retried request, a future UI regression) would patch the DB
+    # caption while the live image kept showing the OLD burned-in text -- DB and
+    # pixels silently diverge. Same call `_handle_edit_supabase` already makes;
+    # `maybe_reburn_story` is itself gated on `story_reburn.should_reburn(row)` and
+    # is a no-op for a feed row, so this is always safe to call unconditionally.
+    reburned = maybe_reburn_story(account_key, row, result["caption"], sb_store)
+    # Charge the budget only after a successful, persisted recreate.
+    spend_recreate(account_key)
+    return 200, {"ok": True, "action": "recreate-caption", "draft_id": draft_id,
+                 "caption": updated.get("caption", ""),
+                 "status": updated.get("status", "pending"),
+                 "day_key": updated.get("post_date", ""),
+                 "story_reburned": bool(reburned),
+                 "free": False,
+                 "recreate_budget": _budget_state(account_key)}
+
+
+# ==========================================================================
+# Variant pairing (0318): "regenerate this photo" produces a v2 CANDIDATE
+# side by side with the live creative, instead of overwriting it. A human
+# picks between them via pick-variant, which does not touch approval status.
+#
+# GET  /portal/<token>/posts/<id>/variants      -- list the group (active + candidates)
+# POST /portal/<token>/posts/<id>/regen-variant -- generate a new candidate FOR <id>
+# POST /portal/<token>/posts/<id>/pick-variant  -- <id> IS the candidate; promote it
+#
+# Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF).
+# ==========================================================================
+
+def handle_list_variants(account_key, draft_id, actor_id, reader=None, sb_store=None):
+    """The variant group (active + candidates) `draft_id` belongs to. Read-only,
+    so NOT gated behind the ECHO_VARIANT_PAIRING flag -- there is nothing to
+    show if no candidate was ever created (create is gated), and a client
+    reading their own already-scoped calendar is never a new capability."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "variants", "draft_id": draft_id,
+                     "error": "variant listing needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        group = sb_store.get_variant_group(account_key, draft_id)
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    if not group:
+        return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+    return 200, {"ok": True, "action": "variants", "draft_id": draft_id,
+                 "variants": [{
+                     "id": v.get("id"), "variant_status": v.get("variant_status"),
+                     "image_url": v.get("image_url"), "caption": v.get("caption"),
+                     "status": v.get("status"), "thumbnail_url": v.get("thumbnail_url"),
+                 } for v in group]}
+
+
+def handle_regen_variant(account_key, draft_id, actor_id, reader=None, sb_store=None,
+                         regen_fn=None):
+    """Generate a NEW image for the logical post `draft_id` represents and store
+    it as a linked 'candidate' row, WITHOUT touching `draft_id` itself. The
+    live creative stays exactly what it was; the candidate awaits a pick.
+
+    Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF
+    -> 403, no store read, no Astra call)."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import variant_regen as _vr
+    if not _vr.enabled():
+        return 403, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                     "error": "variant regeneration is not enabled for this gym"}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                     "error": "variant regeneration needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "regen-variant", draft_id)
+        if final is not None:
+            return final
+        gen = regen_fn or _vr.generate_variant_image
+        result = gen(row, account_key)
+        if not result.get("ok"):
+            return 409, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                         "error": _vr.client_message(result.get("reason")),
+                         "reason": result.get("reason")}
+        candidate = sb_store.create_variant_candidate(
+            account_key, row, result["image_url"])
+        if candidate is None:
+            return 500, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                         "error": "the new image could not be saved as a candidate"}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    return 200, {"ok": True, "action": "regen-variant", "draft_id": draft_id,
+                 "candidate": {"id": candidate.get("id"),
+                              "image_url": candidate.get("image_url"),
+                              "caption": candidate.get("caption"),
+                              "variant_status": candidate.get("variant_status")}}
+
+
+def handle_regen_variant_from_brief(account_key, draft_id, actor_id, brief,
+                                    reader=None, sb_store=None, regen_fn=None):
+    """Generate a NEW image for the logical post `draft_id` represents FROM A
+    HUMAN-TYPED BRIEF, and store it as a linked 'candidate' row, WITHOUT
+    touching `draft_id` itself. Companion to handle_regen_variant: that button
+    regenerates from the post's own existing pillar/caption with no new input;
+    this one is the "type what you want" button next to it — a deliberate,
+    per-request ask, grounded in the gym's own on-file brand material
+    (variant_regen_brief._brand_brain_facts), never invented. Human-initiated
+    every time: there is no path that reaches this handler except an explicit
+    call carrying a non-empty `brief` a person typed that turn.
+
+    Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF
+    -> 403, no store read, no Astra call) — same gate handle_regen_variant uses."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import variant_regen_brief as _vrb
+    if not _vrb.enabled():
+        return 403, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
+                     "error": "variant regeneration is not enabled for this gym"}
+    brief_text = str(brief or "").strip()
+    if not brief_text:
+        return 400, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
+                     "error": _vrb.client_message(_vrb.REASON_NO_BRIEF),
+                     "reason": _vrb.REASON_NO_BRIEF}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
+                     "error": "variant regeneration needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "regen-variant-brief", draft_id)
+        if final is not None:
+            return final
+        gen = regen_fn or _vrb.generate_variant_from_brief
+        result = gen(row, account_key, brief_text)
+        if not result.get("ok"):
+            return 409, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
+                         "error": _vrb.client_message(result.get("reason")),
+                         "reason": result.get("reason")}
+        candidate = sb_store.create_variant_candidate(
+            account_key, row, result["image_url"])
+        if candidate is None:
+            return 500, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
+                         "error": "the new image could not be saved as a candidate"}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    return 200, {"ok": True, "action": "regen-variant-brief", "draft_id": draft_id,
+                 "candidate": {"id": candidate.get("id"),
+                              "image_url": candidate.get("image_url"),
+                              "caption": candidate.get("caption"),
+                              "variant_status": candidate.get("variant_status")}}
+
+
+def handle_pick_variant(account_key, draft_id, actor_id, reader=None, sb_store=None):
+    """Promote the candidate `draft_id` to 'active' for its group. `draft_id`
+    here IS the candidate's own row id (the id the client is looking at in
+    the side-by-side picker) -- ownership is still proven the same way every
+    other action proves it (get_row is gym-scoped), and the actual atomic
+    work happens server-side in content_calendar_swap_variant so this handler
+    never has a read-then-write race window of its own.
+
+    Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF
+    -> 403, no store read)."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import variant_regen as _vr
+    if not _vr.enabled():
+        return 403, {"ok": False, "action": "pick-variant", "draft_id": draft_id,
+                     "error": "variant picking is not enabled for this gym"}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "pick-variant", "draft_id": draft_id,
+                     "error": "variant picking needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        # Ownership check up front, same 404-on-cross-gym contract as every
+        # other action -- the RPC ALSO re-checks gym_id itself (belt and
+        # braces: the RPC is the true authority, this is just consistent UX).
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        result = sb_store.swap_variant(account_key, draft_id, actor=actor_id)
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    if not result.get("ok"):
+        error = result.get("error", "unknown")
+        status = 409
+        if error == "not_found":
+            status = 404
+        return status, {"ok": False, "action": "pick-variant", "draft_id": draft_id,
+                        "error": error}
+    return 200, {"ok": True, "action": "pick-variant", "draft_id": draft_id,
+                 "active_id": result.get("active_id"),
+                 "archived_previous_active": result.get("archived_previous_active")}
+
+
 def _handle_kill_supabase(account_key, draft_id, actor_id, confirm, reader, sb_store):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:
@@ -961,12 +1461,46 @@ def handle_edit(account_key, draft_id, actor_id, note="", store=None, reader=Non
 # POST /portal/<token>/posts/<id>/deny  (decrements the 15/month budget -> 409)
 # ==========================================================================
 
-def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=None, sb_store=None):
+def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=None,
+                sb_store=None, intent=""):
     """Deny a post with a reason. Each deny burns one unit of the server-enforced
     15/month recreate budget; the 16th deny in a month is refused with 409 (the gym
     asks for a fresh concept instead). The budget is spent ONLY when the underlying
     deny succeeds, so a failed deny never costs the gym a unit. With Supabase creds
-    present, a successful deny flips the shared row's status to 'denied' (NO publish)."""
+    present, a successful deny flips the shared row's status to 'denied' (NO publish).
+
+    intent (B6): the portal's deny reason chips are "Use a different photo" and
+    "Caption needs work", and both used to land here and charge. intent="media"
+    routes the photo chip to the FREE swap instead, so a gym can never run out of
+    recreates fixing pixels. intent="caption" (partial-regen, 2026-09-07) routes the
+    "Caption needs work" chip to a SCOPED caption-only recreate (caption_swap.py) that
+    keeps the gym's EXACT SAME photo instead of today's full recreate, which can (and
+    often does) hand back a different photo too even though only the words were
+    wrong -- symmetric to the media chip's fix, and it still charges the budget
+    (regenerating copy is the expensive act; see caption_swap.py). Gated on
+    ECHO_CAPTION_RECREATE_SCOPED: with the flag off (or the scoped attempt itself
+    refusing, e.g. no approved source left) this falls straight through to today's
+    full deny/recreate, so a gym is never left with no path forward. Any other intent
+    value (including the default) is the full recreate, charges exactly as before."""
+    if str(intent or "").strip().lower() == "media":
+        from . import media_swap as _ms
+        if _ms.enabled():
+            return handle_swap_media(account_key, draft_id, actor_id, reader=reader,
+                                     sb_store=sb_store)
+    if str(intent or "").strip().lower() == "caption":
+        from . import caption_swap as _cs
+        if _cs.enabled():
+            status, body = handle_recreate_caption(
+                account_key, draft_id, actor_id, reader=reader, sb_store=sb_store)
+            # A scoped attempt that could not produce a clean caption-only result
+            # (no approved source, photo unreachable, gate exhausted, budget) falls
+            # through to the full recreate below rather than dead-ending the coach —
+            # EXCEPT a budget-exhausted 409, which must stay a 409 (falling through
+            # would double-spend nothing, since deny below re-checks the same budget
+            # and correctly still refuses).
+            if status == 200 or (isinstance(body, dict)
+                                 and body.get("reason") == "budget_exhausted"):
+                return status, body
     if config.portal_calendar_supabase_enabled():
         return _handle_deny_supabase(account_key, draft_id, actor_id, note, reader,
                                      sb_store or _pcs.SupabaseCalendarStore())
@@ -984,6 +1518,107 @@ def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=Non
     spend_recreate(account_key)
     result["recreate_budget"] = _budget_state(account_key)
     return 200, result
+
+
+# ==========================================================================
+# POST /portal/<token>/posts/<id>/deny-day  (Dean/Reverb, 2026-09-10)
+#
+# THE COMPLAINT: "one day of posts consists of the same picture + caption across
+# 3-4 formats for post/story/GMB/etc, and I apparently have to click on each format
+# and deny and request a re-work on each one? ... It seems like it will then return
+# different caption+pictures across different formats on the same day." Denying one
+# format at a time regenerated JUST that row, so a day could end up mixing a brand
+# new rework on one format with the ORIGINAL rejected concept still sitting pending
+# on the others. This is a day-wide action: find every same-day row for this gym
+# still in a denyable status (pending/coach_review) -- feed, story, Facebook, AND
+# Google Business, every format Dean named -- and deny them together, so the whole
+# day reworks as ONE consistent concept instead of a patchwork.
+# ==========================================================================
+
+def handle_deny_day(account_key, draft_id, actor_id, note="", store=None, reader=None,
+                    sb_store=None):
+    """Deny every denyable same-day row for this gym together (one action instead of
+    one click per format). Charges the recreate budget EXACTLY ONCE for the whole
+    day, not once per format -- the day is one concept, not N separate recreates.
+
+    DOUBLE-CHARGE GUARD (independent audit, 2026-09-10): a naive check-then-act
+    (read budget, write N rows, spend once) still double-charges if two deny-day
+    calls race on the SAME set of rows (a double-click, a client retry) -- both
+    read the budget before either spends, both successfully re-PATCH the same
+    already-pending rows (idempotent at the DB layer), and both then charge. The
+    charge is deduped on a kv stamp keyed by the EXACT sorted set of target row
+    ids: a genuine repeat call denying the SAME rows shares the key and is
+    skipped; a LATER, legitimate deny-day on that day's NEXT rework (a fresh set
+    of row ids after a rebuild) hashes differently and still charges. This
+    narrows the race to a single local kv read+write (serialized by db.py's own
+    lock within one process) rather than eliminating cross-process races
+    entirely -- the same tolerance level as every other kv-stamped dedup in this
+    codebase, never a distributed lock.
+
+    Supabase-only (the shared content_calendar plane is what carries a day's other
+    formats); 503s on the local-drafts plane, which has no day-spanning book."""
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "deny-day", "draft_id": draft_id,
+                     "error": "deny-day needs the shared calendar plane"}
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "deny-day", draft_id)
+        if final is not None:
+            return final
+        day_key = str(row.get("post_date") or "")[:10]
+        month_rows = _month_rows_for(sb_store, account_key, row) or [row]
+        denyable_statuses = {"pending", "coach_review"}
+        targets = [r for r in month_rows
+                  if str(r.get("post_date") or "")[:10] == day_key
+                  and str(r.get("status") or "").lower() in denyable_statuses]
+        if not targets:
+            # Already denied/approved/published elsewhere: report the clicked row's
+            # own state rather than a 404 -- the day may be clean by now.
+            return 200, {"ok": True, "action": "deny-day", "draft_id": draft_id,
+                         "detail": "Nothing left to deny for this day.",
+                         "idempotent": True, "day_key": day_key,
+                         "recreate_budget": _budget_state(account_key)}
+        if recreate_remaining(account_key) <= 0:
+            return 409, {"ok": False, "action": "deny-day", "draft_id": draft_id,
+                         "error": "recreate budget for this month is used up",
+                         "recreate_budget": _budget_state(account_key)}
+        # Stamp keyed to the EXACT target set, computed BEFORE any write, so the
+        # dedupe check happens as early as possible (narrowest race window).
+        import hashlib
+        target_ids = sorted(str(r.get("id") or "") for r in targets if r.get("id"))
+        charge_key = ("denyday_charged_" + account_key + "_" + day_key + "_"
+                     + hashlib.sha256("|".join(target_ids).encode()).hexdigest()[:16])
+        from . import db as _db
+        already_charged = bool(_db.kv_get(charge_key))
+        if not already_charged:
+            _db.kv_set(charge_key, "1")
+        denied_ids = []
+        for r in targets:
+            rid = str(r.get("id") or "")
+            if not rid:
+                continue
+            updated = sb_store.set_status(account_key, rid, _pcs.action_status("deny"))
+            if updated is not None:
+                denied_ids.append(rid)
+        if not denied_ids:
+            return 404, {"ok": False, "error": "no denyable rows found",
+                         "draft_id": draft_id}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    # ONE unit for the whole day (Dean's actual complaint: N clicks, N charges today) --
+    # skipped when a raced duplicate call already charged for this exact row set.
+    if not already_charged:
+        spend_recreate(account_key)
+    return 200, {"ok": True, "action": "deny-day", "draft_id": draft_id,
+                "day_key": day_key, "denied_ids": denied_ids,
+                "recreate_budget": _budget_state(account_key)}
 
 
 # ==========================================================================

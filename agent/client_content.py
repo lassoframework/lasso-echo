@@ -73,8 +73,80 @@ def _source_for_day(account_key, day_key, category, present):
     return items[cycle % len(items)]
 
 
+def _form_plan_for_day(day_key):
+    """This day's caption SHAPE (AGENT_CAPTION_FORM_PLAN, default OFF -> None).
+
+    Keyed on the day ordinal, the same rotation index category_for_day and
+    _source_for_day already use, so the shape advances with the book and a
+    replan is deterministic. STYLE ONLY: carries no fact and never overrides
+    the approved source. Dean Holcomb / CrossFit Reverb, 2026-09-05: every post
+    was being asked for the same shape, so every post came back the same shape.
+    """
+    if not config.caption_form_plan_enabled():
+        return None
+    from . import caption_variety
+    return caption_variety.form_plan(_day_ordinal(day_key))
+
+
 def _image_key(creative):
     return os.path.basename(creative.path)
+
+
+# drive_pool_can_fill's per-gym answer cache: {base: (monotonic_expiry, bool)}. A month
+# build asks once per day-slot; without this a 30-day build is 30 identical Supabase
+# reads of the same pool. Short TTL so a pool that fills mid-run is seen within a run
+# or two; tests clear it via clear_drive_pool_cache().
+_DRIVE_POOL_CACHE = {}
+_DRIVE_POOL_TTL_SEC = 120.0
+
+
+def clear_drive_pool_cache():
+    _DRIVE_POOL_CACHE.clear()
+
+
+def drive_pool_has_video(account_key, *, store=None, now=None):
+    """True when the Drive lane is armed for this gym AND its pool holds at least one
+    pickable VIDEO (audit round 5 MAJOR 1): the month build then hands video-beat days
+    to the Drive lane BEFORE Lane A, so a big fresh local still library can no longer
+    make the video mix inert. Never raises; a read failure answers False."""
+    try:
+        if not drive_pool_can_fill(account_key, store=store, now=now):
+            return False
+        from . import gym_media_selector as _sel
+        return "video" in _sel.pool_kinds(_sel.base_gym_key(account_key), store=store,
+                                          now=now)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def drive_pool_can_fill(account_key, *, store=None, now=None):
+    """True when the connected Drive lane could fill a slot for this gym RIGHT NOW:
+    GYM_DRIVE_STAGE is on, the gym is armed for GYM_DRIVE_CONNECT, AND its Drive pool
+    holds at least one pickable asset (eligible, not hidden, outside the 90-day
+    cooldown; gym_media_selector.pickable, any kind).
+
+    THE ONE GATE for "leave the day to Drive instead of placing a repeat". The month
+    run's 2026-09-07 skip keyed on the two FLAGS alone, and with GYM_DRIVE_CONNECT=true
+    globally (live since 2026-09) every gym answered yes, including gyms with no Drive
+    source at all, whose stale repeat then became an empty day. A gym with no other
+    source keeps its stale repeat; a gym whose pool is exhausted on cooldown also keeps
+    it (an empty pool cannot fill anything). Never raises; a read failure answers False
+    so a flaky store never empties a month."""
+    try:
+        if not (config.gym_drive_stage_enabled()
+                and config.gym_drive_connect_active_for(account_key)):
+            return False
+        from . import gym_media_selector as _sel
+        base = _sel.base_gym_key(account_key)
+        import time as _time
+        hit = _DRIVE_POOL_CACHE.get(base)
+        if hit and hit[0] > _time.monotonic():
+            return hit[1]
+        answer = bool(_sel.pickable(base, store=store, now=now))
+        _DRIVE_POOL_CACHE[base] = (_time.monotonic() + _DRIVE_POOL_TTL_SEC, answer)
+        return answer
+    except Exception:  # noqa: BLE001 - never let the gate itself empty a month
+        return False
 
 
 def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
@@ -95,10 +167,20 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     exclude_keys: creative basenames that must NOT be picked (photos already on the gym's
     approved/published rows + this build's placements).
 
-    allow_reuse (denied-slot backfill only): when True, the §3 per-platform reuse window is
-    IGNORED for the vision branch, so a photo still inside its reuse window is a valid pick.
-    This is the ONE case a photo may be reused — replacing a human-denied slot for a gym at
-    its creative cap. Default False = the reuse window is enforced exactly as before."""
+    allow_reuse (denied-slot backfill only): a LAST RESORT, not a blend. The vision branch
+    always tries the pool with the §3 reuse window ENFORCED first; a fresh photo always wins
+    when one exists. Only when that pool is empty (the gym genuinely has no fresh creative
+    left) does allow_reuse=True fall back to a second pass with the window lifted, so a
+    recently-served photo becomes eligible. Default False = no fallback pass at all (a denied
+    slot with no fresh option returns None, same as before this fallback existed).
+
+    FIX (Pete/CrossFit Zanshin, 2026-09-07): this used to lift the reuse window BEFORE
+    scoring, so fresh and recently-denied photos were scored in the same pool together —
+    recency was only a minor nudge inside content_score, not a hard preference, so a
+    strong-scoring recently-denied photo could out-score an available fresh one and get
+    picked right back into the slot it was just denied from. "Replacing a human-denied slot
+    for a gym at its creative cap" only describes the fallback pass; it was never gated on
+    the gym actually being at that cap."""
     from . import dam
     imgs = [c for c in list_creatives(library_path)
             if c.media_type in ("image", "video")]
@@ -120,22 +202,33 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
 
     if config.vision_enabled_for(account_key) and pillar:
         from . import vision
-        cands = []
-        for c in imgs:
-            if c.media_type != "image":
-                continue                   # §2.1: videos are out of scope for vision auto-pick
-            analysis = vision.stored_analysis(c.path)
-            ok, _ = vision.auto_plannable(analysis)
-            if not ok:
-                continue                   # guardrail 13: flagged/unanalyzed never auto-planned
-            rk = _rkey(c)
-            if not allow_reuse and rotation.reuse_blocked(
-                    rk, account_key, day_key, served={account_key: served}):
-                continue                   # §3 per-platform reuse window (skipped on backfill)
-            recency = 1.0 if last_served.get(rk, "") < window_start else 0.2
-            score, ok_slot = vision.content_score(analysis, pillar, recency=recency)
-            if ok_slot:
-                cands.append((score, rk, _image_key(c), c))
+
+        def _vision_cands(*, enforce_window):
+            out = []
+            for c in imgs:
+                if c.media_type != "image":
+                    continue               # §2.1: videos are out of scope for vision auto-pick
+                analysis = vision.stored_analysis(c.path)
+                ok, _ = vision.auto_plannable(analysis)
+                if not ok:
+                    continue               # guardrail 13: flagged/unanalyzed never auto-planned
+                rk = _rkey(c)
+                if enforce_window and rotation.reuse_blocked(
+                        rk, account_key, day_key, served={account_key: served}):
+                    continue               # §3 per-platform reuse window
+                recency = 1.0 if last_served.get(rk, "") < window_start else 0.2
+                score, ok_slot = vision.content_score(analysis, pillar, recency=recency)
+                if ok_slot:
+                    out.append((score, rk, _image_key(c), c))
+            return out
+
+        # PASS 1: reuse window always enforced. A fresh photo always wins when one exists,
+        # whether or not the caller asked for allow_reuse.
+        cands = _vision_cands(enforce_window=True)
+        # PASS 2 (fallback, allow_reuse only): the gym genuinely has no fresh creative left.
+        # Only now does a recently-served photo become eligible.
+        if not cands and allow_reuse:
+            cands = _vision_cands(enforce_window=False)
         if not cands:
             return None
         cands.sort(key=lambda t: (-t[0], t[1], t[2]))   # high score, deterministic tie-break
@@ -148,9 +241,36 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
         return best
 
     fresh = [c for c in imgs if last_served.get(_rkey(c), "") < window_start]
+    if not fresh and not allow_reuse and drive_pool_can_fill(account_key):
+        # NO REPEAT WHEN DRIVE CAN FILL THE DAY (John Weeks / Tough Temple,
+        # 2026-09-10): every local creative is inside the repeat window and the gym
+        # has a connected Drive pool with pickable assets (57 eligible videos in his
+        # case). Returning no pick leaves the day uncovered so the Drive lane
+        # (client_month_run.append_gym_drive_drafts) fills it with something the
+        # follower has not seen, instead of this branch placing "the same nine
+        # stills" for the third week running. allow_reuse=True (the denied-slot
+        # backfill's explicit LAST RESORT, which already tried Drive first) keeps
+        # the stale pick below so a denied slot is never left empty.
+        return None
     pool = fresh if fresh else imgs
     pool.sort(key=lambda c: (last_served.get(_rkey(c), ""), _image_key(c)))
     legacy = pool[0]
+    if not fresh:
+        # STALE REUSE (Pete/Zanshin, Dean/Reverb, 2026-09-07): the library is
+        # exhausted within its 14-day window, so this pick is a repeat, not a fresh
+        # photo. A day is still filled here (a polluted served ledger — every photo
+        # re-recorded with a bogus future date — must never collapse a whole month
+        # to zero content; see test_polluted_ledger_still_places_distinct_photos),
+        # but the pick is flagged so the CALLER can choose not to treat the day as
+        # "covered": client_month_run.append_gym_drive_drafts only fills days the
+        # uploaded-media loop left uncovered, so without this flag a small stale
+        # library silently claimed every day forever and a gym's connected Drive
+        # pool (hundreds of fresh, unused photos in both reported cases) never got
+        # a chance to fill it with something better instead.
+        try:
+            legacy.stale_reuse = True
+        except Exception:  # noqa: BLE001 - a frozen creative never blocks the pick
+            pass
     # §9.4 SHADOW: for a shadow (not enabled) gym, compute what vision WOULD pick and log the
     # diff, but SHIP the legacy pick unchanged. A plumbing smoke test, zero effect on posts.
     if pillar and config.vision_shadow_for(account_key):
@@ -294,7 +414,8 @@ def _grounded_hint(base_hint, verified):
 
 
 def make_caption(account, source, voice, creative_key, creative=None,
-                 avoid_openings=(), verified=None, angle="", avoid_angles=()):
+                 avoid_openings=(), verified=None, angle="", avoid_angles=(),
+                 form_plan=None):
     """The day's caption + hashtags. When AGENT_SB7_ENABLED, write a real StoryBrand
     caption via the SB7 generator (problem-first, gym-as-guide, grounded ONLY in the
     gym's voice doc + this source, fabrication-gated on figures) instead of dumping the
@@ -332,10 +453,28 @@ def make_caption(account, source, voice, creative_key, creative=None,
             cap, tags, _frags = StoryBrandGenerator().build(
                 voice, _SourceCreative(source, creative_key, photo_hint=hint),
                 account=account, avoid_openings=avoid_openings,
-                angle=angle, avoid_angles=avoid_angles)
+                angle=angle, avoid_angles=avoid_angles,
+                # Passed ONLY when a plan exists. With AGENT_CAPTION_FORM_PLAN
+                # off this call is byte-for-byte the one it has always been,
+                # which also keeps every existing build() stub working.
+                **({"form_plan": form_plan} if form_plan else {}))
             cap = (cap or "").strip()
             if cap and cap.lower() != (getattr(source, "text", "") or "").strip().lower():
-                return filter_platform_copy(cap).strip(), tags
+                cleaned = filter_platform_copy(cap).strip()
+                # OUTPUT-SIDE GATE (Dean/Reverb, 2026-09-10): is_gate_clean only ever
+                # checked the SOURCE sentence, which is an approved claim by construction
+                # and so always passed -- the LLM's own caption was never re-checked. A
+                # caption that invents an enrollment/urgency frame not in the source, or
+                # personalizes a child onto an ungrounded photo, is a fabrication and
+                # falls back to compose_caption (the deterministic, source-verbatim,
+                # always-safe baseline) instead of shipping.
+                if rotation.caption_output_gate_clean(
+                        cleaned, getattr(source, "text", ""), verified=verified,
+                        photo_hint=hint):
+                    return cleaned, tags
+                print(f"[client-caption] SB7 output failed the fabrication gate for "
+                      f"{account.key} (invented urgency/enrollment or an ungrounded "
+                      "child claim); using the baseline")
         except Exception as exc:  # noqa: BLE001 - never block on the LLM
             print(f"[client-caption] SB7 failed for {account.key} "
                   f"({type(exc).__name__}); using the baseline")
@@ -557,7 +696,8 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         caption, hashtags = make_caption(account, source, voice,
                                          _image_key(image), creative=image,
                                          avoid_openings=avoid_openings, verified=verified,
-                                         angle=angle, avoid_angles=avoid_angles)
+                                         angle=angle, avoid_angles=avoid_angles,
+                                         form_plan=_form_plan_for_day(day_key))
         public_url = getattr(image, "public_url", "")
         if config.hosting_enabled():
             hosted = media_host.host_media(image.path, account.key)
@@ -595,6 +735,17 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
                 pass
             print(f"[vision] weak_match pick for {account.key} {day_key} "
                   f"(pillar {category}) -> coach review")
+        # stale_reuse: the legacy branch's library was exhausted within the reuse
+        # window, so this photo is a repeat, not fresh (Pete/Zanshin, Dean/Reverb,
+        # 2026-09-07). Carried onto the draft so client_month_run can leave the day
+        # off covered_days — a gym's connected Drive pool then gets a chance to fill
+        # it with something fresher instead of the day silently staying "claimed" by
+        # a stale small library forever.
+        if getattr(image, "stale_reuse", False):
+            try:
+                draft.stale_reuse = True
+            except Exception:
+                pass
         # §5: carry the grounding context so the A+ gate can reject a caption that
         # CONTRADICTS the crop-verified image (a contradiction is not A+ -> the month
         # builder walks alternatives = the §7 regen/swap; exhausted -> the day drops).
@@ -605,10 +756,19 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
                 pass
         return draft
 
+    # DEFERRED TO THE DRIVE POOL (2026-09-10): pick_image returned no pick because
+    # every local creative is inside its repeat window and the gym's Drive pool can
+    # fill the day. That is not a thin library: no needs-media card, no "add photos"
+    # alert. The day goes back to client_month_run uncovered so the Drive lane (and,
+    # if the pool runs out, the no-empty-day fallback) owns it.
+    if not allow_reuse and drive_pool_can_fill(account.key):
+        return None
+
     # THIN-LIBRARY GRACE: caption is ready, but there is no image.
     caption, hashtags = make_caption(account, source, voice, f"src_{source.id}",
                                      avoid_openings=avoid_openings,
-                                     angle=angle, avoid_angles=avoid_angles)
+                                     angle=angle, avoid_angles=avoid_angles,
+                                     form_plan=_form_plan_for_day(day_key))
     # Option A: a source-backed template card, when a generator is wired + armed.
     template_url = template_fn(account, source, day_key) if template_fn else None
     if template_url:

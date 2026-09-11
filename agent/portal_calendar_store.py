@@ -58,6 +58,10 @@ _ACTION_STATUS = {
 # leaves anything approved / denied / killed / published / publishing / failed in place.
 _WIPEABLE_STATUSES = ("pending", "draft", "queued")
 
+# The only columns swap_media may carry besides image_url / source_media_url: the
+# media identity that must travel with a swapped creative (see swap_media).
+_SWAP_EXTRA_COLUMNS = ("thumbnail_url", "source_media_asset_id")
+
 
 def _slot_key(row):
     """The (post_date, account, format) a row occupies, normalized. Two rows with the
@@ -140,6 +144,37 @@ def _containment_match(target, slug_norm, slug_raw="", name_raw=""):
     return False
 
 
+#: The content_calendar `account` value for the Google Business lane.
+_GBP_ACCOUNT = "googlebusiness"
+
+
+def _column_missing(resp, column):
+    """True iff `resp` is PostgREST refusing a write because `column` does not exist.
+
+    Deliberately narrow: it must match the undefined-column error and NOTHING else, so a
+    permissions failure, a constraint violation or an outage is never silently downgraded
+    into "the column is missing" and retried into a quiet data loss. PostgREST surfaces
+    Postgres SQLSTATE 42703 with a message of the form:
+        column "late_account_id" of relation "echo_social_connections" does not exist
+    """
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    text = ""
+    if isinstance(body, dict):
+        text = " ".join(str(body.get(k) or "") for k in ("message", "code", "details", "hint"))
+    if not text:
+        try:
+            text = str(resp.text or "")
+        except Exception:  # noqa: BLE001
+            text = ""
+    low = text.lower()
+    if "42703" in low:
+        return True
+    return f'"{column}"' in low and "does not exist" in low and "column" in low
+
+
 class PortalStoreError(Exception):
     """A Supabase call failed. Detail is scrubbed of any secret before raising."""
 
@@ -147,6 +182,12 @@ class PortalStoreError(Exception):
         self.status = status
         self.detail = detail
         super().__init__(f"supabase {status}: {detail}")
+
+
+# The learning-lever columns patch_pending_plan is allowed to re-stamp when a
+# repair changes a caption. An explicit allowlist, so this lane can never be
+# used to write an arbitrary column.
+_LEVER_COLUMNS = ("hook_family", "ask_type", "caption_len_band")
 
 
 class SupabaseCalendarStore:
@@ -157,6 +198,11 @@ class SupabaseCalendarStore:
         self._url = (url if url is not None else config.supabase_url())
         self._key = (service_key if service_key is not None else config.supabase_service_key())
         self._http = http
+
+    #: Set once when a write proves echo_social_connections.late_account_id is not
+    #: deployed on this environment, so the sweep stops re-attempting it every gym.
+    #: Class level (not instance) because the store is constructed per call.
+    _late_account_id_column_absent = False
 
     def _client(self):
         if self._http is not None:
@@ -192,6 +238,13 @@ class SupabaseCalendarStore:
         params = {
             "gym_id": f"eq.{account_key}",
             "post_date": [f"gte.{first}", f"lte.{last}"],
+            # 0318 (variant rows): a candidate/archived row shares a slot with its
+            # group's active row. Every caller of list_month treats the return as
+            # "one row per logical post" (counts, slot-locking, the client feed) --
+            # without this filter a pending Astra-v2 candidate would double-count
+            # the slot and could even get published by a rebuild that doesn't know
+            # to skip it. See PROGRESS.md / the variant-pairing audit.
+            "variant_status": "eq.active",
             "order": "post_date",
         }
         r = self._client().get(
@@ -210,6 +263,10 @@ class SupabaseCalendarStore:
         gym with none is in its FIRST, not-yet-released month; a gym with any is established
         and grandfathered (never re-withheld on a rebuild)."""
         params = {"gym_id": f"eq.{account_key}", "status": "neq.coach_review",
+                  # 0318: a 'candidate' row (an unchosen Astra v2, never itself
+                  # owner-visible in the review sense this gate cares about)
+                  # must not count as "the gym already has a released month".
+                  "variant_status": "eq.active",
                   "select": "id", "limit": "1"}
         r = self._client().get(self._rest(_TABLE), params=params,
                                headers=self._headers(), timeout=30)
@@ -338,7 +395,8 @@ class SupabaseCalendarStore:
                 return row
         return None
 
-    def swap_media(self, account_key, row_id, image_url, source_media_url=None):
+    def swap_media(self, account_key, row_id, image_url, source_media_url=None,
+                   extra_fields=None):
         """CROSS-DAY MEDIA GUARD sweep (Blake, 2026-08-31): re-point a WAITING row's
         media to a fresh photo because its current photo already sits on another day
         of the gym's book. STATUS-GUARDED SERVER-SIDE: the PATCH itself is filtered to
@@ -347,10 +405,21 @@ class SupabaseCalendarStore:
         live keep exactly the pixels they had. Caption, status and date are untouched.
         source_media_url (when given) is updated too, so a later edited-caption story
         re-burn burns onto the NEW photo, not the replaced duplicate. id+gym_id
-        isolation. Returns the updated row, or None when nothing matched."""
+        isolation. Returns the updated row, or None when nothing matched.
+
+        extra_fields (2026-09-10, the video-capable portal swap): the media identity
+        columns that must move WITH the pixels, limited to thumbnail_url (a video's
+        poster frame; None clears a stale poster when a video row becomes a photo)
+        and source_media_asset_id (the Drive asset now on the row; None clears it when
+        a Drive row becomes a local-library row, so the hide / removed-from-Drive
+        sweeps stop tracking an asset the row no longer carries). Any other key is
+        ignored: this method never becomes a general row editor."""
         payload = {"image_url": image_url}
         if source_media_url is not None:
             payload["source_media_url"] = source_media_url
+        for col in _SWAP_EXTRA_COLUMNS:
+            if col in (extra_fields or {}):
+                payload[col] = extra_fields[col]
         r = self._client().patch(
             self._rest(_TABLE),
             params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
@@ -364,6 +433,107 @@ class SupabaseCalendarStore:
             if str(row.get("gym_id")) == str(account_key):
                 return row
         return None
+
+    # ---- variant pairing (0318): v2 creative candidates -----------------------
+    # A "logical post" can have MORE THAN ONE content_calendar row once this
+    # ships: exactly one 'active' row (the live/publishing creative) plus zero
+    # or more 'candidate' rows (alternate not-yet-picked creative, e.g. an
+    # Astra v2 regen) and 'archived' rows (superseded actives / rejected
+    # candidates, kept for audit, never deleted). Group membership for row R
+    # is coalesce(R.variant_of, R.id) -- see the migration's header comment.
+
+    def get_variant_group(self, account_key, row_id):
+        """The full variant group (active + candidates, NOT archived) for the
+        logical post `row_id` belongs to, gym-scoped. `row_id` may be the
+        anchor (original) row OR any candidate/active row in the group --
+        the anchor is resolved from whichever row is fetched first. Returns
+        [] when the row does not exist / belongs to another gym. The list is
+        NOT itself the 'one row per post' read path (list_month is); this is
+        the review-surface read that WANTS to see every candidate."""
+        seed = self.get_row(account_key, row_id)
+        if seed is None:
+            return []
+        anchor = seed.get("variant_of") or seed.get("id")
+        r = self._client().get(
+            self._rest(_TABLE),
+            params={
+                "gym_id": f"eq.{account_key}",
+                "or": f"(id.eq.{anchor},variant_of.eq.{anchor})",
+                "variant_status": "in.(active,candidate)",
+                "order": "variant_status.desc,created_at",
+            },
+            headers=self._headers(), timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return [row for row in (r.json() or [])
+                if str(row.get("gym_id")) == str(account_key)]
+
+    def create_variant_candidate(self, account_key, anchor_row, image_url,
+                                 caption=None, thumbnail_url=None,
+                                 source_media_asset_id=None, prompt_used=None):
+        """INSERT a new 'candidate' row linked to `anchor_row` (a dict, the row the
+        candidate is an alternate FOR). Copies the slot identity (post_date,
+        account, format, pillar, gbp_* fields) so the candidate is a genuine
+        alternate for the SAME logical post, never a floating duplicate. status
+        is always 'pending' (a candidate is never pre-approved by existing) --
+        it must clear the same review gate as any post once/if it becomes
+        active. variant_of is the ANCHOR's own id: if `anchor_row` is itself
+        already a candidate/archived member of a group, its OWN variant_of
+        (never re-derived) is used so every candidate in a group points at the
+        same stable anchor. gym_id is always account_key (never trusted from
+        the caller-supplied anchor_row) -- this is the ownership guarantee.
+        Returns the inserted row."""
+        anchor_id = anchor_row.get("variant_of") or anchor_row.get("id")
+        payload = {
+            "gym_id": account_key,
+            "account": anchor_row.get("account"),
+            "post_date": anchor_row.get("post_date"),
+            "format": anchor_row.get("format"),
+            "pillar": anchor_row.get("pillar"),
+            "caption": caption if caption is not None else anchor_row.get("caption"),
+            "image_url": image_url,
+            "status": "pending",
+            "variant_of": anchor_id,
+            "variant_status": "candidate",
+        }
+        if thumbnail_url is not None:
+            payload["thumbnail_url"] = thumbnail_url
+        if source_media_asset_id is not None:
+            payload["source_media_asset_id"] = source_media_asset_id
+        r = self._client().post(
+            self._rest(_TABLE),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=[payload], timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
+
+    def swap_variant(self, account_key, candidate_id, actor=""):
+        """THE atomic pick: promote `candidate_id` to 'active' for its group,
+        archiving the previously-active row and every other candidate in the
+        SAME transaction (content_calendar_swap_variant, migration 0318).
+        Calls the Postgres function via PostgREST rpc/ rather than issuing
+        the reads+writes from here, because the atomicity guarantee (no
+        window where two rows are both active, no window a publisher could
+        observe an inconsistent group) requires ONE transaction with the
+        whole group row-locked -- something a sequence of separate PostgREST
+        calls from Python cannot provide. Returns the function's jsonb result
+        dict: {"ok": true, "active_id": ..., ...} or {"ok": false, "error":
+        one of "not_found"/"not_a_candidate"/"published_final"}."""
+        r = self._client().post(
+            self._rest("rpc/content_calendar_swap_variant"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"p_gym_id": account_key, "p_candidate_id": candidate_id,
+                 "p_actor": (actor or None)},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or {"ok": False, "error": "empty_response"}
 
     def patch_gbp_fields(self, account_key, row_id, fields):
         """G1: persist edited GBP structured columns (already normalized to gbp_* names)
@@ -528,6 +698,10 @@ class SupabaseCalendarStore:
             "published_at": "is.null",
             "image_url": "not.is.null",
             "account": "in.(instagram,facebook)",
+            # 0318: never let a candidate variant (an unchosen Astra v2 sitting
+            # beside its slot's real active row) get claimed and published --
+            # only the active row for a slot is ever eligible.
+            "variant_status": "eq.active",
             "order": "post_date.desc,created_at",
         }
         r = self._client().get(
@@ -1034,6 +1208,9 @@ class SupabaseCalendarStore:
             "select": "post_date",
             "order": "post_date.asc",
             "limit": "1",
+            # 0318: a candidate row must never set the "before Echo" reference
+            # date — it is an unchosen alternate, not a real planned/published post.
+            "variant_status": "eq.active",
         }
         if status:
             params["status"] = f"eq.{status}"
@@ -1070,7 +1247,7 @@ class SupabaseCalendarStore:
         return h or None
 
     def rewrite_social_connection(self, gym_slug, platform, state, handle=None,
-                                  mark_ever_connected=False):
+                                  mark_ever_connected=False, late_account_id=None):
         """RE-VERIFY SWEEP writer: set echo_social_connections.state (+ handle) for a
         gym's platform to the TRUE Zernio state, overwriting the poisoned not_connected
         the 6h cron wrote, and bump last_verified_at. When a platform is genuinely
@@ -1103,19 +1280,171 @@ class SupabaseCalendarStore:
         had_first = bool(crows and (crows[0] or {}).get("first_connected_at"))
         body = {"gym_id": gym_uuid, "platform": platform, "state": state,
                 "handle": handle, "last_verified_at": now_iso}
+        # AUD-005: stamp the Zernio account id on the SOURCE OF TRUTH row. This is the one
+        # thing the legacy gym_social_accounts table still carried that this table did not,
+        # and the only reason anything had to read two disagreeing pictures of the same
+        # fact. Omitted (not written as null) when we do not have one, so a transient read
+        # that could not resolve the id never erases a good one already stamped.
+        if late_account_id and not type(self)._late_account_id_column_absent:
+            body["late_account_id"] = str(late_account_id)
         # Stamp first_connected_at only for a genuinely-connected platform that has none yet;
         # never overwrite an existing original connect time (omitted -> merge-duplicates
         # leaves it untouched).
         if mark_ever_connected and not had_first:
             body["first_connected_at"] = now_iso
-        r = self._client().post(
-            self._rest("echo_social_connections"),
-            params={"on_conflict": "gym_id,platform"},
-            headers=self._headers({
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates,return=representation",
-            }),
-            json=body,
+        def _write(payload):
+            return self._client().post(
+                self._rest("echo_social_connections"),
+                params={"on_conflict": "gym_id,platform"},
+                headers=self._headers({
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=representation",
+                }),
+                json=payload,
+                timeout=30,
+            )
+
+        r = _write(body)
+        # DEGRADE, DO NOT BREAK, when late_account_id is not deployed yet. This writer runs
+        # on the 6h reverify sweep, which is the ONLY thing keeping the connection cache
+        # true. Migration social_metrics_daily_provenance_20260905 adds the column, but code
+        # and migrations do not land in the same instant, and this repo has been burned
+        # before by writing a column that did not exist (the ever_connected regression, and
+        # the echo_gym_settings.zernio_profile_id phantom). If the column is missing, the
+        # unstamped write still has to land: a stale connection cache is a client ticket per
+        # gym. Retried ONCE, without the new field, and remembered for this process so the
+        # fleet does not pay a doubled request per gym per sweep.
+        if (r.status_code >= 400 and "late_account_id" in body
+                and _column_missing(r, "late_account_id")):
+            type(self)._late_account_id_column_absent = True
+            body.pop("late_account_id", None)
+            r = _write(body)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
+
+    def social_connection_rows(self, state="connected"):
+        """READ-ONLY: every echo_social_connections row, optionally filtered to one state.
+
+        This is the AUD-005 source of truth for who is connected on what. Returns raw rows
+        [{gym_id, platform, state, handle, late_account_id, last_verified_at}]. Fleet-wide
+        (not gym-scoped) on purpose: the daily metrics pull is a fleet sweep, and paging it
+        per gym would turn one read into one per gym.
+
+        PAGED EXPLICITLY: PostgREST caps a response at 1000 rows and does so SILENTLY, so a
+        single unpaged read would quietly truncate the fleet the day it grew past the cap.
+        """
+        out = []
+        offset, page = 0, 1000
+        while True:
+            params = {"select": "gym_id,platform,state,handle,late_account_id,"
+                                "last_verified_at",
+                      "limit": str(page), "offset": str(offset),
+                      "order": "gym_id.asc"}
+            if state:
+                params["state"] = f"eq.{state}"
+            r = self._client().get(self._rest("echo_social_connections"), params=params,
+                                   headers=self._headers(), timeout=30)
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            rows = r.json() or []
+            out.extend(rows)
+            if len(rows) < page:
+                return out
+            offset += page
+
+    def upsert_social_metric_days(self, rows):
+        """Write daily metric rows into gym_social_metrics_daily. Returns the count written.
+
+        UPSERT on the LIVE unique constraint (late_account_id, metric_date), so a re-pull
+        of the same day UPDATES rather than appending a second point. Without that the
+        series silently doubles and every growth number computed off it is wrong.
+
+        That target is not a guess: it was probed against production on 2026-09-05.
+        (late_account_id, metric_date) resolved; (gym_id, late_account_id, metric_date)
+        came back 42P10 "there is no unique or exclusion constraint matching the ON
+        CONFLICT specification", which would have been a 400 on every write.
+
+        NULL MEANS NULL, enforced here and not merely documented: a metric key whose value
+        is None is REMOVED from the payload rather than sent. PostgREST merge-duplicates
+        would otherwise overwrite a real measurement with an explicit null on a later
+        partial pull, and no caller can turn a missing metric into a 0 through this method
+        because a 0 has to be an actual int to survive the filter below.
+        """
+        if not rows:
+            return 0
+        _METRICS = ("followers", "reach", "impressions", "engagement", "profile_views")
+        payload = []
+        for row in rows:
+            body = {k: row[k] for k in ("gym_id", "late_account_id", "metric_date",
+                                        "platform", "source", "raw", "pulled_at")
+                    if row.get(k) is not None}
+            for k in _METRICS:
+                v = row.get(k)
+                if v is None:
+                    continue  # not measured. NEVER written as 0.
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    continue
+                body[k] = int(v)
+            if body.get("gym_id") and body.get("metric_date"):
+                payload.append(body)
+        if not payload:
+            return 0
+        written = 0
+        for i in range(0, len(payload), 500):
+            chunk = payload[i:i + 500]
+            r = self._client().post(
+                self._rest("gym_social_metrics_daily"),
+                params={"on_conflict": "late_account_id,metric_date"},
+                headers=self._headers({
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                }),
+                json=chunk, timeout=60,
+            )
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            written += len(chunk)
+        return written
+
+    def failed_gbp_rows(self):
+        """READ-ONLY: every content_calendar row stuck in status='failed' on the
+        googlebusiness lane (AUD-003). Fleet wide; the retry sweep is a fleet sweep.
+
+        Selects only columns that exist. A select naming a column the table does not
+        have returns a 400, and the shared reader in this repo swallows a failure into
+        an empty list, so a typo here would read as "no failed rows" forever. That is
+        exactly how this defect stayed invisible.
+        """
+        params = {"status": "eq.failed", "account": f"eq.{_GBP_ACCOUNT}",
+                  "select": "id,gym_id,account,post_date,status,reject_reason,"
+                            "late_post_id,updated_at",
+                  "limit": "1000", "order": "post_date.asc"}
+        r = self._client().get(self._rest(_TABLE), params=params,
+                               headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
+    def requeue_failed_row(self, row_id):
+        """Move ONE failed googlebusiness row back to 'approved' so the ordinary
+        gbp_worker picks it up. Returns the updated row, or None if nothing matched.
+
+        THE GUARD IS IN THE FILTER, not in the caller. The PATCH matches on
+        status='failed' AND account='googlebusiness' AND late_post_id is null as well as
+        the id, so even a mistaken call cannot move a published row, a row on another
+        lane, or a row that already carries a post id. If the row changed underneath us
+        between the read and this write, the filter simply matches nothing and the
+        method reports that honestly instead of forcing the transition.
+        """
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "status": "eq.failed",
+                    "account": f"eq.{_GBP_ACCOUNT}", "late_post_id": "is.null"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"status": "approved", "reject_reason": None},
             timeout=30,
         )
         if r.status_code >= 400:
@@ -1131,6 +1460,11 @@ class SupabaseCalendarStore:
         params = {
             "status": "eq.publishing",
             "published_at": "is.null",
+            # 0318: a candidate/archived row can never legitimately be
+            # 'publishing' (only an active row is ever claimed by mark_publishing),
+            # but the filter is added anyway so a future bug elsewhere can never
+            # turn this into a false stale-claim alert on a variant row.
+            "variant_status": "eq.active",
             "select": "id,gym_id,account,post_date",
         }
         r = self._client().get(
@@ -1186,6 +1520,10 @@ class SupabaseCalendarStore:
             # for the same reason, so counting them here would fire false "can never
             # publish" alerts on healthy rows.
             "account": "neq.googlebusiness",
+            # 0318: an unchosen candidate must never fire a false "N approved
+            # posts can never publish" alert — only the group's active row is
+            # actually due to publish.
+            "variant_status": "eq.active",
             "select": "id,gym_id,account,post_date,status",
             "order": "post_date.asc",
         }
@@ -1359,6 +1697,29 @@ class SupabaseCalendarStore:
         # wired into exactly TWO of them. This door is the one every staging lane walks
         # through, so the rule lives here too. See _media_stage_belt.
         payload = _media_stage_belt(self, account_key, payload)
+        # SLOT IDEMPOTENCY BELT (AUD-001, 2026-09-05; default ON because it PREVENTS
+        # damage, same posture as the plan-horizon belt. AGENT_SLOT_DEDUPE=false is the
+        # escape hatch).
+        #
+        # The docstring above says "apply is delete-then-insert, so a plain insert is
+        # correct and idempotent". Production disagreed: on 2026-09-05 the fleet carried
+        # 155 genuine duplicate slots across 14 gyms, and the forward book was still
+        # growing hour over hour. Two distinct causes, both closed here because this is
+        # the single door every staging lane walks through:
+        #
+        #   1. 94 of them were written TWICE IN THE SAME SECOND by one run, so the batch
+        #      itself already held the row twice before the POST. No caller-side fix
+        #      catches every lane; a batch that contains one slot twice is never correct.
+        #   2. 61 spanned different runs. delete_month deliberately PRESERVES human-owned
+        #      rows (an approved row is a client decision), so a re-plan legitimately
+        #      skips deleting that slot and then inserts a fresh row on top of it.
+        #
+        # The slot key is (account, post_date, time_slot, format), NOT (account,
+        # post_date). That distinction is the whole point: a gym posting 2x a day plus a
+        # story has three legitimate rows on one date. Keying on the date alone called
+        # 441 rows duplicates when only 155 were, and superseding on it would have
+        # destroyed live client content.
+        payload = _dedupe_slots(self, account_key, payload)
         if not payload:
             return []
         all_keys = set()
@@ -1426,6 +1787,14 @@ class SupabaseCalendarStore:
         params = {
             "gym_id": f"eq.{account_key}",
             "post_date": post_date_filter,
+            # 0318: NEVER delete a candidate (an unchosen alternate awaiting a
+            # human pick) or an archived row (kept for audit, by design, not
+            # deletable). A rebuild must only ever touch the plain active row
+            # a slot already had -- deleting an archived row would silently
+            # break the "kept, not deleted" guarantee the swap feature makes,
+            # and deleting a pending candidate would destroy an in-flight pick
+            # the moment the nightly job ran.
+            "variant_status": "eq.active",
         }
         if preserve_human:
             # delete only the never-touched drafts: status IS NULL OR status IN wipeable.
@@ -1481,7 +1850,8 @@ class SupabaseCalendarStore:
                 return row
         return None
 
-    def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None):
+    def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None,
+                           levers=None):
         """PATCH a WIPEABLE row's caption and/or pillar (the grade self-fix lane,
         AGENT_GRADE_SELF_FIX), filtered by id AND gym_id AND a server-side
         status IN (pending,draft,queued) guard, so a human-owned row (approved /
@@ -1490,12 +1860,29 @@ class SupabaseCalendarStore:
         that self-remediation only ever rewrites fresh machine drafts. Status
         stays 'pending' (the approval gate is untouched: the row remains in the
         owner's approval queue; nothing is auto-approved). Returns the updated
-        row dict, or None when zero rows matched."""
+        row dict, or None when zero rows matched.
+
+        LEVER RE-STAMP (Dean Holcomb / CrossFit Reverb, 2026-09-05). The learning
+        levers (hook_family, ask_type, caption_len_band) are stamped at STAGE time
+        against the SB7 body, which by design carries no CTA. This lane then
+        mutates the caption afterwards, and because only caption/pillar were ever
+        written, the levers stayed frozen at their pre-repair values. Measured on
+        Reverb's live book: ask_type='none' on 93 of 93 rows while 90 of them
+        ended in an ask, and caption_len_band='mid' on 100% of rows. Nothing could
+        correct it either, because jobs/backfill_levers only selects rows WHERE
+        hook_family IS NULL and these were already stamped. That is a lie the
+        learner reads: metrics_sync copies these columns onto post_metrics and
+        monthly_retro compares on them. A caller that changes the caption must
+        pass the re-stamped levers so the label keeps telling the truth.
+        """
         fields = {}
         if caption is not None:
             fields["caption"] = caption
         if pillar is not None:
             fields["pillar"] = pillar
+        for key, value in (levers or {}).items():
+            if key in _LEVER_COLUMNS and value is not None:
+                fields[key] = value
         if not fields:
             return None
         fields["status"] = "pending"
@@ -1528,6 +1915,9 @@ class SupabaseCalendarStore:
             "gym_id": f"eq.{account_key}",
             "status": "eq.pending",
             "post_date": f"gt.{today_iso}",
+            # 0318: a pending CANDIDATE is not the forward book's real post and
+            # must never be denied/mutated as if it were.
+            "variant_status": "eq.active",
             "order": "post_date",
         }
         r = self._client().get(
@@ -1557,6 +1947,10 @@ class SupabaseCalendarStore:
             # never leaks into grading by default.
             "status": "in.(pending,approved,publishing,published,coach_review)",
             "post_date": f"gte.{start_iso}",
+            # 0318: a candidate sitting beside its slot's active row is not a
+            # second post the audience will see -- grading it would inflate
+            # cadence/content-mix and double-count the slot.
+            "variant_status": "eq.active",
             "order": "post_date",
             "limit": "1000",
         }
@@ -1578,6 +1972,10 @@ class SupabaseCalendarStore:
         params = {
             "gym_id": f"eq.{account_key}",
             "event_id": f"eq.{event_id}",
+            # 0318: a candidate variant of an arc row is not itself part of the
+            # live arc until picked -- the cancel/ended sweep and publish gate
+            # must only ever see the arc's active rows.
+            "variant_status": "eq.active",
             "order": "post_date",
             "limit": "1000",
         }
@@ -1605,6 +2003,129 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+
+def _dedupe_slot_key(row):
+    """The identity of a calendar row for duplicate purposes, or None when it cannot be
+    established. A row is a duplicate ONLY of a row in the same slot carrying the same
+    content.
+
+    THIS KEY WAS WRONG TWICE AND BOTH MISTAKES DESTROYED CLIENT CONTENT (2026-09-05).
+
+    First it was (gym, account, post_date), which treats a gym posting 2x a day plus a
+    story as duplication. That would have removed roughly 286 legitimate rows.
+
+    Then it was (account, post_date, time_slot, format), which STILL cannot represent two
+    posts inside one time_slot. ENG runs posts_per_day=2 and both posts can land in the
+    same time_slot bucket, separated only by slot_index. A dedupe on that key deleted 140
+    rows across five gyms, and when the survivors were compared against the deletions,
+    ZERO were actually duplicates: 131 differed by image, 123 by caption, 75 by slot_index.
+    All 140 were restored.
+
+    So the identity now carries slot_index AND the content itself. Two rows are the same
+    row only if they occupy the same slot and say the same thing with the same picture.
+    Anything else is a distinct post that a gym owner is entitled to see. slot_index is
+    null on most rows, and a null slot_index is a real value here (the single post of the
+    day) rather than a missing one, so it participates in the key instead of voiding it."""
+    account = str(row.get("account") or "").strip().lower()
+    date = str(row.get("post_date") or "")[:10]
+    slot = str(row.get("time_slot") or "").strip().lower()
+    fmt = str(row.get("format") or "").strip().lower()
+    if not (account and date and slot and fmt):
+        # RULING (AUD-104): a row missing time_slot or format has no identifiable slot, so
+        # it is never deduped. That under-blocks, and under-blocking is the only safe
+        # direction for a filter that can drop a client's content.
+        return None
+    idx = row.get("slot_index")
+    caption = " ".join(str(row.get("caption") or "").split()).lower()
+    image = str(row.get("image_url") or "").strip()
+    return (account, date, slot, fmt, idx, caption, image)
+
+
+def _dedupe_slots(store, account_key, payload, *, existing=None):
+    """Drop rows whose slot is already taken, in the batch or already live in the DB.
+
+    Two passes, because production showed two distinct duplicate sources (see the caller):
+    an in-batch pass that keeps the FIRST row for a slot, then a live pass that drops any
+    slot this gym already holds in a live status. Never deletes anything and never
+    rewrites a row: a duplicate is simply not inserted.
+
+    Fails OPEN on an unreadable live read (returns the in-batch-deduped payload). A
+    staging lane must not stop because a dedupe lookup failed; the worst case is the
+    behaviour that shipped before this belt existed."""
+    if not payload or not config.slot_dedupe_enabled():
+        return payload
+    seen, deduped, in_batch = set(), [], 0
+    for row in payload:
+        if row.get("event_id"):
+            # DATED EVENT ROWS ARE NEVER DROPPED (AUD-102). plan_horizon exempts event_id
+            # for the same reason: an event arc is a deliberate, dated override of the
+            # evergreen plan, so "keep the first row for this slot" is exactly backwards
+            # for it. This is not hypothetical -- the first version of this belt discarded
+            # The Bolton Club's "Bring A Friend Week is on / Day is here / Last day" rows
+            # in favour of the generic rows that happened to be created a day earlier.
+            #
+            # Exempting them can leave a transient duplicate on a slot that already holds
+            # a generic row. That is the correct trade: a stray extra row is recoverable,
+            # a silently missing event post is not, and resolving generic-versus-event on
+            # one slot belongs to the event lane, not to a staging filter that is only
+            # allowed to drop rows and never to delete them.
+            deduped.append(row)
+            continue
+        k = _dedupe_slot_key(row)
+        if k is None:          # unidentifiable slot: never guess, always stage
+            deduped.append(row)
+            continue
+        if k in seen:
+            in_batch += 1
+            continue
+        seen.add(k)
+        deduped.append(row)
+    dropped_live = 0
+    if existing is None:
+        existing = _live_slots_for(store, account_key, {k[1] for k in seen})
+    if existing:
+        kept = []
+        for row in deduped:
+            if row.get("event_id"):
+                kept.append(row)      # AUD-102: never blocked by an existing generic row
+                continue
+            k = _dedupe_slot_key(row)
+            if k is not None and k in existing:
+                dropped_live += 1
+                continue
+            kept.append(row)
+        deduped = kept
+    if in_batch or dropped_live:
+        print(f"[slot-dedupe] {account_key}: dropped {in_batch} in-batch duplicate(s) "
+              f"and {dropped_live} slot(s) already live; staged {len(deduped)}")
+    return deduped
+
+
+def _live_slots_for(store, account_key, dates):
+    """Slot keys this gym already holds in a LIVE status on those dates, or None when the
+    read fails. 'deleted', 'denied' and 'killed' rows free their slot by design."""
+    if not dates:
+        return set()
+    try:
+        rows = store.rows_in_range(account_key, min(dates), max(dates))
+    except Exception as e:  # noqa: BLE001 - never block staging on a lookup
+        print(f"[slot-dedupe] live slot read failed for {account_key}: "
+              f"{type(e).__name__}: {e}")
+        return None
+    # EXACTLY the statuses rows_in_range can return (its own positive allowlist at the
+    # top of this file). "draft" was dead code here -- that reader never returns it -- and
+    # "coach_review" WAS being returned while missing from this set, so a coach-review slot
+    # read as free and a re-plan stacked on top of it. 105 forward draft rows and every
+    # coach_review row were invisible to this pass.
+    live = {"pending", "approved", "publishing", "published", "coach_review"}
+    out = set()
+    for r in (rows or []):
+        if str(r.get("status") or "").strip().lower() in live:
+            k = _dedupe_slot_key(r)
+            if k is not None:
+                out.add(k)
+    return out
+
 
 def _stage_belts(account_key, payload):
     """Apply the stage-time empty-caption + verbatim-dedup belts to an

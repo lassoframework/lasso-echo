@@ -156,11 +156,27 @@ Account(
 # Stage 2 T2: Autonomous onboard  (run via: python -m agent onboard ...)
 # ---------------------------------------------------------------------------
 
+class OnboardRefused(RuntimeError):
+    """onboard.run refused to stand up a gym that carries no Echo client marker.
+    Raised (not returned) so POST /portal/onboard's generic exception path stops the
+    mint: no token, no gym row, no scaffold. `force=True` (the CLI's --force, a human
+    at the keyboard) bypasses it."""
+
+
 def run(account_key, display_name, db_conn=None, voice_dir=None,
-        brains_dir=None, base_url=None, socialapi_http=None):
+        brains_dir=None, base_url=None, socialapi_http=None, posting_timezone=None,
+        force=False):
     """
     Stand up a new gym end to end. Idempotent: re-running updates display_name
     if different, never re-mints unless rotate was called.
+
+    ECHO CLIENTS ONLY (2026-09-11, round 2 ruling): after the canonical key is derived
+    the gym must carry an Echo client marker (echo_clients.is_echo_client by the portal
+    uuid or by the key) or OnboardRefused is raised before anything is written. The
+    portal's per-gym Echo onboard button upserts echo_gym_settings before it calls
+    POST /portal/onboard (parallel portal PR), so the rule is true by construction for
+    the real door; `force=True` is the operator's by-hand bypass (python -m agent
+    onboard --force).
 
     Returns a result dict with keys:
       account_key, display_name, token_minted, voice_path, brain_path,
@@ -175,13 +191,35 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
       - publish_flag is ALWAYS OFF.
       - No em dashes, en dashes, or hyphens in any gym-facing copy in this result.
       - Fabrication gate: no invented facts, stats, prices, or offers written into files.
+
+    posting_timezone: OPTIONAL onboarding-time hint (an IANA zone name). Applied ONLY
+      when the gym has NO posting_timezone set yet -- never overwrites a value a human
+      set by hand, or one the posting_tz_backfill watchdog already resolved from real
+      evidence (a connected Google Business location or the gym's own brand bible). This
+      is a same-day head start for the common case (a phone area code the portal already
+      had at signup), not a replacement for that watchdog: an unresolved gym still gets
+      picked up and alerted on by AGENT_POSTING_TZ_WATCH the same as any other.
     """
-    # Resolve paths relative to cwd when not supplied, using the same conventions
-    # as the rest of the codebase (brand_voice/ and brains/ at the repo root).
+    # DURABLE ROOTS BY DEFAULT (2026-09-10 storage-risk fix). Every self-serve gym runs
+    # this from /portal/onboard on the echo-intake-web Railway service, whose CWD is the
+    # container image (/app): a bare "brand_voice" / "brains" relative dir there is
+    # EPHEMERAL and is wiped on the service's own next deploy, taking this gym's scaffold
+    # voice/brain files with it. config.client_voice_dir() / config.tenant_brain_dir()
+    # resolve to <AGENT_DATA_DIR or /data>/brand_voice and .../brains -- the SAME durable
+    # roots the `echo` worker already uses for the REAL bible it writes later from intake
+    # answers (social_intake_reader.write_brand_docs), and they fall back to the
+    # repo-relative "." dirs in local dev/tests where no /data volume is mounted, so this
+    # is a no-op change everywhere a volume is absent. NOTE: echo-intake-web and echo are
+    # two separate Railway services with two SEPARATE volumes (Railway does not support
+    # mounting one volume on two services), so this durable write survives THIS service's
+    # own redeploys but does not by itself land on the worker's volume -- that is fine,
+    # because the worker never reads this scaffold: it independently writes the real,
+    # canonical bible to ITS OWN durable volume once social intake completes. This write
+    # only has to survive echo-intake-web's own redeploy, which it now does.
     if voice_dir is None:
-        voice_dir = "brand_voice"
+        voice_dir = config.client_voice_dir()
     if brains_dir is None:
-        brains_dir = "brains"
+        brains_dir = config.tenant_brain_dir()
 
     # CANONICAL KEY AT MINT (topfuel / district_h stranding fix): derive the key EVERY
     # onboarding artifact + the intake link will use from the portal gyms.id UUID +
@@ -193,6 +231,17 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
     # creds) the passed key is kept verbatim; NEVER fabricates a gym_id, NEVER blocks the mint.
     from . import account_key_mint as _akm
     account_key, _mint_info = _akm.derive_mint_key(account_key, display_name)
+
+    # THE GATE. Nothing below this line is written for a gym that is not an Echo client.
+    if not force:
+        from . import echo_clients
+        _uuid = (_mint_info or {}).get("gym_uuid") or ""
+        if not (echo_clients.is_echo_client(_uuid) or echo_clients.is_echo_client(account_key)):
+            raise OnboardRefused(
+                f"{account_key}: not an Echo client (no echo_gym_settings / "
+                "echo_social_intake / social product / echo_standalone marker). Onboard "
+                "it from the portal's Echo button (which writes the marker first), or "
+                "re-run with --force by hand.")
 
     result = {
         "account_key": account_key,
@@ -211,6 +260,15 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
 
     # (a) Upsert gym row --------------------------------------------------
     db.gym_upsert(account_key, display_name=display_name)
+
+    # (a2) Onboarding-time timezone hint -----------------------------------
+    # NEVER CLOBBERS: only written when the row's posting_timezone is still empty, so a
+    # value a human set by hand or the posting_tz_backfill watchdog already resolved is
+    # always left alone, no matter how many times onboard.run is re-called.
+    if posting_timezone:
+        _existing_row = db.gym_get(account_key) or {}
+        if not (_existing_row.get("posting_timezone") or "").strip():
+            db.gym_upsert(account_key, posting_timezone=posting_timezone)
 
     # (b) Token minting ---------------------------------------------------
     if config.onboard_automint_enabled():

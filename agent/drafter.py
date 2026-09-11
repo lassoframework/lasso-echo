@@ -343,12 +343,119 @@ def openings_collide(caption, avoid_openings, prefix=_OPENING_COLLIDE_WORDS):
     return False
 
 
+# ---- opening FORMULA (the repetition openings_collide cannot see) ------------------
+#
+# Tough Temple, measured on production 2026-09-05: fifteen consecutive captions, every
+# single one opening on the second person pronoun.
+#
+#   "You walk in and see the space where your excuses end..."
+#   "You show up consistent. You do the work..."
+#   "You showed up even though the treadmill felt..."
+#   "You've been meaning to get stronger..."
+#   "You're holding the rings, and your shoulders are screaming..."
+#
+# openings_collide() compares the first FOUR words, and most of those diverge at word
+# two: measured against every earlier caption in the run it fires on 2 of the 15. The
+# de-dup let 13 through while the client denied 13 rows across five straight days
+# (2026-09-09 to 2026-09-13, both accounts), every reject_reason NULL. The repetition
+# a reader actually sees is not the shared WORDS, it is the shared FRAME: same pronoun,
+# same tense, same cold declarative open, every day.
+#
+# opening_formula() names that frame so it can be capped. It is deliberately COARSE:
+# second person openings are good direct response copy and must not be banned, only
+# rationed, so the cap is on how many may run CONSECUTIVELY, never on how many exist.
+_FORMULA_SECOND_PERSON = frozenset((
+    "you", "youre", "youve", "youll", "youd", "your", "yours", "yourself",
+))
+_FORMULA_FIRST_PERSON = frozenset((
+    "we", "were", "weve", "well", "wed", "our", "ours", "us", "im", "ive", "i",
+))
+_FORMULA_DEICTIC = frozenset((
+    "this", "that", "these", "those", "there", "here", "it", "its",
+))
+
+
+def opening_formula(caption):
+    """The coarse OPENING FRAME of a caption: the shape a reader recognizes before
+    they read the words. Returns one of:
+
+        'question'       the first real line asks something
+        'number'         it opens on a figure ("3 things", "90 days")
+        'second_person'  "You ...", "You're ...", "Your ..."
+        'first_person'   "We ...", "Our ...", "I ..."
+        'deictic'        "This ...", "That ...", "Here ..."
+        '<token>'        anything else, keyed on its own leading word, so genuinely
+                         different openers never collide with each other
+
+    Returns "" for an empty caption. Pure."""
+    toks = _opening_tokens(caption)
+    if not toks:
+        return ""
+    # A question HOOK is the frame even when the line carries on after it, so the
+    # test is on the first SENTENCE of the first real line, not the whole line.
+    for line in (caption or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        end = min((p for p in (line.find(c) for c in ".?!") if p >= 0),
+                  default=-1)
+        if end >= 0 and line[end] == "?":
+            return "question"
+        break
+    head = toks[0]
+    if head.isdigit():
+        return "number"
+    if head in _FORMULA_SECOND_PERSON:
+        return "second_person"
+    if head in _FORMULA_FIRST_PERSON:
+        return "first_person"
+    if head in _FORMULA_DEICTIC:
+        return "deictic"
+    return head
+
+
+# How many posts in a row may share one opening formula before the next one must
+# vary. Three is deliberate: a run of three second person opens reads as a voice, a
+# run of fifteen reads as a template, and Tough Temple denied twelve of the fifteen.
+FORMULA_MAX_RUN = 3
+
+
+def formula_run_exceeded(caption, recent_formulas, max_run=FORMULA_MAX_RUN):
+    """True when `caption` would extend an unbroken run of `max_run` posts that
+    already share its opening formula.
+
+    `recent_formulas` is the build's accepted formulas oldest to newest. A caption
+    with no readable opening never blocks. max_run <= 0 disables the check.
+
+    This is the check openings_collide cannot make: it fires on the fifteenth "You ..."
+    in a row even though no two of them share four leading words."""
+    if not max_run or max_run <= 0:
+        return False
+    formula = opening_formula(caption)
+    if not formula:
+        return False
+    recent = [f for f in (recent_formulas or ()) if f]
+    if len(recent) < max_run:
+        return False
+    tail = recent[-max_run:]
+    return all(f == formula for f in tail)
+
+
 def _output_claims_cleared(body, voice, client_note):
-    """True when every figure in `body` appears verbatim in an approved input (the
-    client note or the voice doc). No approved figure -> clean. This blocks an LLM
-    from smuggling an invented stat/price/count into a caption; a rephrased but real
-    number (its digits are in the sources) still passes."""
-    sources = f"{client_note}\n{getattr(voice, 'raw', '') or ''}"
+    """True when every figure in `body` appears verbatim in an APPROVED input (the
+    client note or a human-owned voice doc). No approved figure -> clean. This blocks
+    an LLM from smuggling an invented stat/price/count into a caption; a rephrased but
+    real number (its digits are in the sources) still passes.
+
+    An AUTO-DRAFTED bible is NOT an approved input (finding 2026-09-06). A bible a
+    machine wrote off a gym's public website carries voice.auto_drafted=True, and its
+    text is excluded from `sources` here: a scraped figure ("847 members since 2015")
+    that no human ever approved must not be able to clear the very gate that exists to
+    stop unapproved figures. Human-written bibles are unaffected."""
+    voice_raw = getattr(voice, "raw", "") or ""
+    if getattr(voice, "auto_drafted", False):
+        voice_raw = ""  # scraped, unapproved: it clears nothing
+    sources = f"{client_note}\n{voice_raw}"
     for tok in _FIGURE_RE.findall(body or ""):
         norm = tok.strip(".,")
         if norm and norm not in sources:
@@ -403,6 +510,93 @@ def _note_sb7_fallback(account_key, reason):
 _SB7_FALLBACK_ALERT_AT = 8      # fallbacks per gym per day before a human is pinged
 
 
+# ---- named-member preservation (Pete/Zanshin, Dean/Reverb, 2026-09-07) ------------------
+# Client complaint: a caption "repeatedly refers to one of my oldest members primarily by
+# her age instead of her name and her actual story." This is DISTINCT from vision.py's
+# identity firewall (ECHO_VISION_SPEC §2.2/§8), which governs claims INFERRED FROM A PHOTO
+# and deliberately withholds a name/age/body the model only guessed at from pixels. Here
+# the name is not inferred from an image at all: it is sitting verbatim in the APPROVED
+# client note (a testimonial/about source a human at the gym wrote and a human approved —
+# client_sources.py: "testimonial: a member result or quote, permission assumed at
+# intake"). Neither Zanshin nor Reverb has vision on, so vision's firewall never runs for
+# them; this generic-descriptor behavior is the LLM's own caution, unprompted either way by
+# the SB7 _SYSTEM rules below (which say nothing about names at all). The fix is narrow and
+# text-only: when the approved source itself names a real person, tell the model plainly
+# that the name is already the client's own approved words and nudge it back to using the
+# name when a first attempt drops it for a generic age/role stand-in. This never grants
+# permission to name someone the source does NOT name, and it never touches vision.py's
+# photo-derived identity firewall.
+import re as _re_names
+
+_NAME_GYM_VOCAB = {
+    "the", "and", "for", "gym", "fitness", "studio", "club", "box", "team", "crew",
+    "class", "open", "week", "day", "days", "hours", "welcome", "coach", "coaches",
+    "member", "members", "front", "desk", "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday", "january", "february", "march", "april", "may",
+    "june", "july", "august", "september", "october", "november", "december",
+    "instagram", "facebook", "crossfit", "hyrox", "wod", "amrap", "emom",
+}
+_NAME_CUE_RE = _re_names.compile(
+    r"\b(?:coach|member|welcome|congrats|congratulations|meet|shout ?out(?: to)?|"
+    r"thanks?|thank you|proud of|say hi to)\s+([A-Z][a-zA-Z]{1,})",
+    _re_names.IGNORECASE)
+_FULL_NAME_RE = _re_names.compile(r"\b([A-Z][a-z]{2,})\s+[A-Z][a-z]{2,}\b")
+
+# Generic stand-ins the model reaches for INSTEAD of a name that is right there in the
+# source: age descriptors (the exact complaint) plus the bare role words a caption can
+# always fall back to honestly, so we only flag the case the source itself outranks.
+_AGE_STANDIN_RE = _re_names.compile(
+    r"\b(?:young|old|elderly|teenage[dr]?|teens?|seniors?|middle.aged|"
+    r"\d{2,3}[- ]?years?[- ]?old|in (?:her|his|their) \d0s)\b",
+    _re_names.IGNORECASE)
+
+
+def _approved_source_only(client_note):
+    """`client_note` truncated at the first appended scene/grounding hint marker (the same
+    markers _hint_free strips), so name detection ONLY ever reads the human-APPROVED
+    source text — never the picked photo's own sidecar note / humanized filename hint,
+    which _SourceCreative appends below one of _HINT_MARKERS and which is explicitly a
+    scene hint, "NOT a source of facts... or names to state" (client_content.py). A photo
+    filename is not consent to name someone in THIS caption."""
+    note = client_note or ""
+    cut = min((note.find(m) for m in _HINT_MARKERS if m in note), default=-1)
+    return note[:cut] if cut >= 0 else note
+
+
+def _named_member(client_note):
+    """The first real person's name the APPROVED source itself names, or "" when none is
+    detected. Conservative by design (mirrors vision._looks_like_person_name): a name CUE
+    followed by a Titlecase word, or a Firstname Lastname pair, whose tokens are not gym
+    vocabulary. Only ever reads the approved-source portion of client_note — never the
+    appended photo/scene hint, and never a vision analysis."""
+    text = _approved_source_only(client_note)
+    for m in _NAME_CUE_RE.finditer(text):
+        cand = m.group(1)
+        if cand.lower() not in _NAME_GYM_VOCAB:
+            return cand
+    for m in _FULL_NAME_RE.finditer(text):
+        first = m.group(1)
+        if first.lower() not in _NAME_GYM_VOCAB:
+            return first
+    return ""
+
+
+def _dropped_name_for_age(client_note, body):
+    """The name the approved source gives that `body` silently swapped for a generic age
+    descriptor, or "" when there is nothing to fix. Fires ONLY when: (1) the source names
+    someone, (2) that name does not appear (whole word, case-insensitive) anywhere in the
+    generated caption, AND (3) the caption instead leans on an age stand-in. A caption that
+    uses the name, or one with no age stand-in at all, never triggers a retry."""
+    name = _named_member(client_note)
+    if not name:
+        return ""
+    if _re_names.search(r"\b" + _re_names.escape(name) + r"\b", body or "", _re_names.IGNORECASE):
+        return ""       # the name made it into the caption; nothing to fix
+    if not _AGE_STANDIN_RE.search(body or ""):
+        return ""       # no age stand-in either; not the pattern we're guarding against
+    return name
+
+
 class StoryBrandGenerator:
     """
     LLM-powered caption generator using the StoryBrand SB7 framework.
@@ -442,7 +636,12 @@ class StoryBrandGenerator:
         "meta labels such as [why], [reason], [edit], or [note]. The output ends "
         "with the caption's final sentence.\n"
         "- Never mention specific numbers, percentages, or prices unless they appear "
-        "verbatim in the client note."
+        "verbatim in the client note.\n"
+        "- When the client note itself names a real member or coach (the gym's own "
+        "approved words, e.g. a testimonial or spotlight), USE that person's actual name "
+        "and the specific story details given. Do not replace a person the source already "
+        "names with a generic stand-in like their age, 'a member', or a role word; the "
+        "source naming them IS the client's own approved copy, already theirs to publish."
     )
 
     @staticmethod
@@ -510,6 +709,54 @@ class StoryBrandGenerator:
                          + ", ".join(phrases) + ".")
         return "\n".join(block) + "\n\n"
 
+    _HOOK_INSTRUCTIONS = {
+        "second_person_problem":
+            "open by naming the reader's problem directly in the second person",
+        "scene":
+            "open on what is physically happening in the photo or in the gym, "
+            "a moment, not a diagnosis of the reader",
+        "myth_bust":
+            "open by naming a belief the reader holds that is not true, then correct it",
+        "question":
+            "open with ONE real question the reader is actually asking themselves",
+        "outcome_first":
+            "open with where the reader ends up, the result, before any mention "
+            "of the problem",
+        "flat_statement":
+            "open with a short flat declarative sentence. No wind up, no second "
+            "person, no question",
+    }
+
+    @classmethod
+    def _form_block(cls, plan):
+        """A STYLE-only instruction giving THIS post a concrete shape.
+
+        The prompt used to ask for the identical shape every time ("Body max 260
+        characters") plus a soft "vary the entry point", and a soft instruction
+        repeated 31 times produces 31 similar captions. Measured on the live
+        fleet: 90.3% of Reverb's captions opened "You + problem", 100% of rows
+        sat in one length band, sentence count sd was 1.3.
+
+        Carries no fact, no topic and no copy; the approved source still owns
+        every claim and the figure gate still runs. Returns "" when no plan is
+        supplied (flag OFF), so the prompt is byte-for-byte today's.
+        """
+        if not plan:
+            return ""
+        hook = str(plan.get("hook_family") or "")
+        how = cls._HOOK_INSTRUCTIONS.get(hook)
+        lines = ["SHAPE FOR THIS CAPTION (style only, never a new fact and never an "
+                 "override of the approved source above). Other posts in this book "
+                 "get DIFFERENT shapes on purpose, so follow this one exactly:"]
+        if how:
+            lines.append(f"- OPENING: {how}.")
+        smin, smax = plan.get("min_sentences"), plan.get("max_sentences")
+        if smin and smax:
+            lines.append(f"- LENGTH: write {smin} to {smax} sentences, "
+                         f"no more than {plan.get('max_chars')} characters total.")
+        lines.append("- Do not restate the opening move of any recent post listed below.")
+        return "\n".join(lines) + "\n\n"
+
     @staticmethod
     def _brain_guidance(account):
         """Fold THIS gym's learned preferences into the prompt so every edit
@@ -554,9 +801,80 @@ class StoryBrandGenerator:
                 parts.append(f"  AFTER (preferred): {after}")
         return "\n".join(parts) + "\n\n"
 
+    @staticmethod
+    def _cross_gym_form_block(account):
+        """FLEET FORM HINTS from the WEEKLY cross gym brain (Blake, 2026-09-06:
+        "see trends on what is working and use that ... to create the best post").
+
+        This is the read side of agent/jobs/cross_gym_brain.py, which pools every
+        gym's matured post_metrics once a week and asks which FORM choices — hook
+        shape, caption length band, sentence structure band, ask presence and
+        type, pillar, slot, format, media product type, member face — actually
+        correlate with engagement across the fleet, and separately what the top
+        decile of posts share. Only a finding that cleared the sample floor on
+        both sides, drew on at least two DISTINCT gyms on both sides, survived a
+        Benjamini Hochberg FDR correction and cleared the effect floor is here.
+
+        WHY THIS CANNOT LEAK ONE GYM'S CONTENT INTO ANOTHER'S CAPTION, structurally:
+          * NO STRING THAT CAME OUT OF A DATABASE REACHES THIS BLOCK AT ALL. Every
+            line is rendered by cross_gym_guidance.prompt_lines() from that
+            module's OWN fixed phrase table plus two integers: the stored lever
+            and value SELECT a constant phrase and are never themselves printed.
+            So a caption fragment, a stat, an offer, a price, a member name or a
+            handle cannot appear here even if one somehow survived the writer's
+            whitelist and _clean()'s re-validation on the read. There is no
+            branch here that reads post text.
+          * the guidance is IDENTICAL for every gym (fleet statistics), which is
+            the isolation guarantee made structural rather than promised.
+          * it is FORM ONLY. It is placed BELOW the brand voice doc and BELOW the
+            approved source in the prompt, and it is labeled as shape guidance
+            that is never a fact and never an override, exactly like the existing
+            _form_block and _angle_block. The figure gate, the fabrication gate
+            and the human approval gate are all untouched.
+
+        Returns "" when AGENT_BRAIN_FEEDS_CAPTIONS is OFF (the default), when
+        AGENT_CROSS_GYM_BRAIN is OFF, when there is no account, when the newest
+        rollup is stale, or when nothing cleared the significance bar — so with
+        the flag off the prompt is byte-for-byte today's prompt, and with it on
+        but nothing learned yet, still byte-for-byte today's prompt."""
+        if account is None:
+            return ""
+        from . import config as _cfg
+        if not _cfg.brain_feeds_captions_enabled():
+            return ""
+        key = getattr(account, "key", "") or ""
+        if not key:
+            return ""
+        try:
+            from . import cross_gym_guidance
+            lines = cross_gym_guidance.prompt_lines(key)
+        except Exception as exc:  # noqa: BLE001 — never block a caption over a hint
+            print(f"[sb7] cross gym form hints unavailable "
+                  f"({type(exc).__name__}: {exc})")
+            return ""
+        if not lines:
+            return ""
+        parts = ["FLEET FORM SIGNALS (shape guidance ONLY, from statistics across "
+                 "every gym Echo posts for. These carry NO facts, NO offers, NO "
+                 "numbers to state and NO copy from anyone else's posts. They never "
+                 "override the brand voice doc or the approved source above, and "
+                 "you must not treat any of them as something to say):"]
+        for line in lines:
+            parts.append(f"- {line}")
+        return "\n".join(parts) + "\n\n"
+
     def build(self, voice, creative, account=None, avoid_openings=(),
-              angle="", avoid_angles=()):
+              angle="", avoid_angles=(), form_plan=None):
         """Write one SB7 caption.
+
+        form_plan (Dean Holcomb / CrossFit Reverb, 2026-09-05,
+        AGENT_CAPTION_FORM_PLAN): the concrete SHAPE this post should take
+        (opening move, sentence count, character cap) from
+        caption_variety.form_plan, so consecutive posts are told to be different
+        shapes instead of being asked identically to "vary the entry point".
+        STYLE-ONLY: it carries no fact and never overrides the approved source;
+        the figure and fabrication gates are unchanged. None (the default, flag
+        OFF) => the prompt is byte-for-byte today's.
 
         avoid_openings (optional): normalized opening phrases used on RECENT planned
         days (see opening_signature). Folded into the prompt as a HARD "do not open
@@ -573,7 +891,14 @@ class StoryBrandGenerator:
         CAPTION_ANGLES), or the special 'educational' post type; avoid_angles are the
         recent angles to steer away from. Both are STYLE-only: they never carry a fact
         and never override the approved source (the figure/fabrication gate still runs).
-        Empty (the default, flag OFF) => no angle guidance, exactly today's prompt."""
+        Empty (the default, flag OFF) => no angle guidance, exactly today's prompt.
+
+        FLEET FORM HINTS (Blake, 2026-09-06, AGENT_BRAIN_FEEDS_CAPTIONS): the weekly
+        cross gym brain's FORM guidance is appended LAST, below everything else, by
+        _cross_gym_form_block. It is rendered only from whitelisted lever tokens and
+        integers, so it can carry no fact, no offer and no other gym's copy; it is
+        FORM guidance and nothing else. Flag OFF (the default) => "" => the prompt is
+        byte-for-byte today's."""
         client_note = (creative.client_note or "").strip()
         cta = _pick_cta(voice, creative)
         hashtags = _select_hashtags(voice, creative)
@@ -584,6 +909,12 @@ class StoryBrandGenerator:
         guidance = self._brain_guidance(account)
         avoid_block = self._avoid_openings_block(avoid_openings)
         angle_block = self._angle_block(angle, avoid_angles)
+        form_block = self._form_block(form_plan)
+        # THE FLEET half of "use that + the gyms brain". Deliberately assembled
+        # LAST and emitted LAST of the hint blocks, so it sits below the brand
+        # voice doc, below the approved source, and below this gym's OWN learned
+        # preferences. FORM only; see _cross_gym_form_block.
+        cross_gym_block = self._cross_gym_form_block(account)
         avoid_list = [p for p in (avoid_openings or ()) if (p or "").strip()]
 
         def _compose(extra_nudge=""):
@@ -592,10 +923,20 @@ class StoryBrandGenerator:
                 f"CLIENT NOTE ON THIS POST:\n{client_note}\n\n"
                 f"{guidance}"
                 f"{angle_block}"
+                f"{form_block}"
                 f"{avoid_block}"
+                f"{cross_gym_block}"
                 f"{extra_nudge}"
                 "Write a StoryBrand-structured caption body. Problem-first. "
-                "Gym as guide, not hero. Max 260 characters. Caption body only."
+                "Gym as guide, not hero. "
+                # The fixed 260 char cap is what flattened every book into one
+                # length band. With a form plan the SHAPE block above owns the
+                # length, and repeating a contradictory cap here would just
+                # confuse the model.
+                + ("The SHAPE block above sets this caption's length; follow it "
+                   "and ignore any other length limit. "
+                   if form_block else "Max 260 characters. ")
+                + "Caption body only."
             )
             return _strip_llm_scaffold(_call_llm_caption(self._SYSTEM, user) or "")
 
@@ -612,6 +953,19 @@ class StoryBrandGenerator:
                     "IMPORTANT: your opening MUST be clearly different from the recent "
                     "openings listed above. Start from a different angle entirely.\n\n")
                 if retry and not openings_collide(retry, avoid_list):
+                    body = retry
+            # NAMED-MEMBER PRESERVATION: if the approved source names a real person and
+            # this caption silently swapped them for a generic age stand-in, retry ONCE
+            # with an explicit nudge naming them. Never blocks: a caption that still drops
+            # the name after the retry is still valid copy (the figure/fabrication gate
+            # below is the only hard stop), so we only PREFER the name-preserving result.
+            dropped_name = _dropped_name_for_age(client_note, body)
+            if dropped_name:
+                retry = _compose(
+                    f"IMPORTANT: the approved source above names {dropped_name}. Use "
+                    f"{dropped_name}'s actual name when referencing them in this caption, "
+                    "not their age or a generic descriptor.\n\n")
+                if retry and not _dropped_name_for_age(client_note, retry):
                     body = retry
             # OUTPUT FABRICATION GATE (deterministic, never skipped): every figure
             # (stat, price, count) in the generated caption MUST trace to an approved

@@ -184,7 +184,8 @@ def _who(kind, uid="U_CLIENT", account_key="crossfitlocal", gym_id="g-1"):
 
 
 def _deps(bus, *, who=IG.CLIENT, identity="echo", enabled=True, client_armed=False,
-          staff_armed=True, cap=10, answer=None):
+          staff_armed=True, cap=10, answer=None, auto_answer=False, cross_product=False,
+          describe_gym=None, classify_llm=None):
     ident = IDS.get(identity)
     return A.Deps(bus=bus, identity=ident,
                   resolve_identity=lambda uid: _who(who, uid),
@@ -192,7 +193,10 @@ def _deps(bus, *, who=IG.CLIENT, identity="echo", enabled=True, client_armed=Fal
                   client_reply_armed=lambda: client_armed,
                   staff_reply_armed=lambda: staff_armed,
                   daily_cap=lambda: cap, open_window_days=lambda: 7,
-                  answer=answer, classify_llm=None, log=lambda *a, **k: None)
+                  answer=answer, classify_llm=classify_llm, log=lambda *a, **k: None,
+                  describe_gym=describe_gym,
+                  auto_answer_armed=lambda: auto_answer,
+                  cross_product_armed=lambda: cross_product)
 
 
 def _ev(text, *, channel="G0MPIM", ts="1.001", channel_type="mpim", user="U_CLIENT",
@@ -225,6 +229,7 @@ def test_flags_off_touches_nothing():
 
 def test_attach_registers_nothing_when_master_off(monkeypatch):
     from agent.slack_convo import listener_wiring as W
+
     monkeypatch.delenv("SLACK_CONVO_ENABLED", raising=False)
 
     class _App:
@@ -547,11 +552,16 @@ def test_question_answer_sets_verification_and_writes_answer():
 
 
 def test_ticket_resolves_only_when_the_answer_posts(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     ans = lambda t, w, m, q: {"body": "Yes, both connected.", "grounding": {"ig": "connected"}}
-    d = A.handle_event(_ev("are my accounts connected?"), "k", _deps(bus, answer=ans, client_armed=True))
+    d = A.handle_event(_ev("are my accounts connected?"), "k",
+                       _deps(bus, answer=ans, client_armed=True, auto_answer=True))
     assert bus.ticket(d.ticket_id)["status"] == "verification"
     post, calls = _posted()
     s = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
@@ -726,10 +736,15 @@ def _rows(bus, tid, kind):
 
 
 def test_reply_never_posts_without_verification_after(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     bus = FakeBus()
     ans = lambda t, w, m, q: {"body": "answer", "grounding": {"x": 1}}
-    d = A.handle_event(_ev("are my accounts connected?"), "k", _deps(bus, answer=ans, client_armed=True))
+    d = A.handle_event(_ev("are my accounts connected?"), "k",
+                       _deps(bus, answer=ans, client_armed=True, auto_answer=True))
     bus.set_ticket(d.ticket_id, verification_after=None)   # someone cleared it
     post, calls = _posted()
     s = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
@@ -797,6 +812,87 @@ def test_outbox_recheck_holds_a_ready_row_if_flag_flipped_off(monkeypatch):
                    if m["attachments"]["held_message_id"] == ack["id"]]
     assert len(_rows(bus, d.ticket_id, A.KIND_HOLD_NOTICE)) == notices_before + 1
     assert new_notices and "flag off at post time" in new_notices[0]["body"]
+
+
+def test_client_dm_lane_row_is_held_at_dispatch_if_the_lanes_own_arming_lapses(
+        monkeypatch):
+    """GAP 2 (audit of PR #68). A row client_dm_support wrote while its OWN
+    three-flag interlock was live must be held at dispatch time the moment that
+    interlock no longer holds -- independent of SLACK_CONVO_ECHO_CLIENT_REPLY, which
+    stays ON throughout (D51, live in production since 2026-09-05) and is exactly
+    the flag the audit's "one-variable escape" claim was about. If this recheck did
+    not exist, _recipient_armed alone (true the whole time here) would release the
+    row with zero awareness this lane, or its revocation, exists."""
+    from agent.client_dm_support import lane as L
+
+    bus = FakeBus()
+    t, _ = bus.get_or_create_ticket(
+        channel_id="G0MPIM", thread_ts="1.001", product="echo", bot_identity="echo",
+        slack_user_id="U_CLIENT", identity_kind="client", client_id="g-1",
+        reporter="chad@x.com", raw_text="my posts have no photos")
+    bus.record_inbound(ticket_id=t["id"], slack_event_id="e1", slack_ts="1.001",
+                       author_type="client", author_id="U_CLIENT",
+                       body="my posts have no photos")
+    row = bus.record_outbound(
+        ticket_id=t["id"], author_type="echo", body="I ran your photo sync just now.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "surface": "mpim",
+              L.LANE_META: L.LANE_NAME, "condition_id": "drive_library_empty"})
+
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")   # unchanged throughout
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    monkeypatch.setenv("AGENT_OPS_FIX_CHANNEL_ID", "C_OPSFIX")
+    # client_dm_support's OWN arming was never live (AGENT_CLIENT_DM_AUTOFIX unset) --
+    # the "revoked, or never armed in the first place" shape this gate exists for.
+    monkeypatch.delenv("AGENT_CLIENT_DM_AUTOFIX", raising=False)
+    monkeypatch.delenv("AGENT_CLIENT_DM_CLIENT_REPLY", raising=False)
+    monkeypatch.delenv("AGENT_CLIENT_DM_LIVE_ACK", raising=False)
+
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    assert not any(c["channel"] == "G0MPIM" for c in calls), (
+        "the client_dm_support reply reached the client's own channel despite this "
+        "lane's arming never having gone live")
+    notices = [m for m in _rows(bus, t["id"], A.KIND_HOLD_NOTICE)
+              if m["attachments"].get("held_message_id") == row["id"]]
+    assert notices, "a human must still get a card explaining why this row was held"
+    assert "client_dm_support" in notices[0]["body"]
+
+
+def test_client_dm_lane_row_still_posts_when_the_lane_is_genuinely_live(monkeypatch):
+    """The negative case: the SAME row, with client_dm_support's own arming actually
+    satisfied, is not affected by the new dispatch-time recheck."""
+    from agent.client_dm_support import arming as ARM
+    from agent.client_dm_support import lane as L
+
+    bus = FakeBus()
+    t, _ = bus.get_or_create_ticket(
+        channel_id="G0MPIM", thread_ts="1.001", product="echo", bot_identity="echo",
+        slack_user_id="U_CLIENT", identity_kind="client", client_id="g-1",
+        reporter="chad@x.com", raw_text="my posts have no photos")
+    bus.record_inbound(ticket_id=t["id"], slack_event_id="e1", slack_ts="1.001",
+                       author_type="client", author_id="U_CLIENT",
+                       body="my posts have no photos")
+    row = bus.record_outbound(
+        ticket_id=t["id"], author_type="echo", body="I ran your photo sync just now.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "surface": "mpim",
+              L.LANE_META: L.LANE_NAME, "condition_id": "drive_library_empty"})
+
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    monkeypatch.setenv("AGENT_CLIENT_DM_AUTOFIX", "true")
+    monkeypatch.setenv("AGENT_CLIENT_DM_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_CLIENT_DM_LIVE_ACK",
+                       ARM.required_ack("echo", client_reply_armed=True))
+
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert any(c["channel"] == "G0MPIM" for c in calls)
 
 
 def _orphan_ticket(bus):
@@ -1096,7 +1192,8 @@ def test_release_button_on_an_outreach_request_actually_sends_not_a_silent_noop(
     assert w.counts.get("release:noop", 0) == 0
 
 
-def test_resolve_button_on_an_escalation_card_actually_notifies_not_a_silent_dead_button():
+def test_resolve_button_on_an_escalation_card_actually_notifies_not_a_silent_dead_button(
+        monkeypatch):
     """Frame 1 audit MAJOR (closing here): escalation_blocks() (outbox.py, D48/#41) has
     rendered a "Resolved, tell them" button on every escalation card since that commit,
     and its own docstring promises "listener_wiring routes it (operator-gated) to
@@ -1109,6 +1206,14 @@ def test_resolve_button_on_an_escalation_card_actually_notifies_not_a_silent_dea
     isolation -- the bug was entirely in the missing registration) and asserts the
     ticket actually closes and the person actually gets a notice."""
     from agent.slack_convo import listener_wiring as W
+
+    # Audit 4, finding 9: resolve_and_notify now REFUSES when the client notice would be
+    # held by the trust ladder -- claiming a resolution the client will never hear about is
+    # the same lie in a different place. This test is about the button being wired, so it
+    # arms the flag that makes delivery possible.
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
 
     bus = FakeBus()
     d = A.handle_event(_ev("posts broken"), "k", _deps(bus, client_armed=False))
@@ -1141,11 +1246,18 @@ def test_resolve_button_on_an_escalation_card_actually_notifies_not_a_silent_dea
     handler = app._actions[OB.RESOLVE_ACTION_ID]
     handler(ack=lambda: None, body={"user": {"id": "U06EPUUCL13"}}, action={"value": tid})
 
-    assert bus.tickets[tid]["status"] == "resolved", \
-        "the ticket must actually close, not sit open after a tap that appears to work"
     notices = [m for m in bus.messages_for(tid)
               if m["direction"] == "outbound" and m["attachments"]["kind"] == A.KIND_STATUS]
     assert len(notices) == 1, "the person must actually be told, once"
+    # MINOR 5 (audit 7): the ticket closes when the person HAS the notice, not when the tap
+    # is registered -- a post failure must never leave a ticket asserting it was resolved.
+    assert bus.tickets[tid]["status"] != "resolved", "not resolved before it is delivered"
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert any(OB.RESOLVED_NOTICE[:30] in c["text"] for c in calls), \
+        "the notice must actually reach the person"
+    assert bus.tickets[tid]["status"] == "resolved", \
+        "and the ticket closes once it has"
     assert notices[0]["body"] == OB.RESOLVED_NOTICE
     assert w.counts["resolve:ok"] == 1
     assert w.counts.get("resolve:noop", 0) == 0

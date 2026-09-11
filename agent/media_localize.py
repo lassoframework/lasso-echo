@@ -31,7 +31,7 @@ from . import config
 DEFAULT_SUBDIR = "media_src"
 # extensions we are willing to treat as a still image source
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
-_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm")
+from .media_types import VIDEO_EXTS as _VIDEO_EXTS   # ONE definition (audit D1)
 
 
 def cache_dir(subdir: str = DEFAULT_SUBDIR) -> str:
