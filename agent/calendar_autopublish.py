@@ -732,6 +732,34 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         except Exception:  # noqa: BLE001 - a rail that cannot load must not publish
             pass
 
+        # CLIENT-SAFE REVIEW HARD BLOCK (2026-09-11): a row Echo generated
+        # without a client's own real photo/voice behind it must NEVER auto-
+        # publish, on ANY account, regardless of trust level, approved_only,
+        # catch_all, or a status of 'approved' reached by any path (a client
+        # mistap included). Unconditional and explicit — it does not rely on
+        # approved_only/trust already covering this case, even though they
+        # independently do today; a future change to either must not be able
+        # to silently open this lane. Checked BEFORE the approval gate,
+        # exactly like the sample rail above. Covers BOTH fallback lanes:
+        #   - no_media_astra_seed.py: pillar is an EXACT match
+        #     (NEEDS_CLIENT_SAFE_REVIEW_PILLAR, a throwaway label with no
+        #     other meaning).
+        #   - client_infographic_fill.py: pillar is the source's REAL category
+        #     (service/about/offer/...) with a SUFFIX appended
+        #     (_NEEDS_CLIENT_SAFE_REVIEW_SUFFIX), since that category is
+        #     otherwise meaningful and must not be replaced outright — so this
+        #     checks endswith(), not equality.
+        try:
+            pillar = str(row.get("pillar") or "")
+            from . import no_media_astra_seed as _nmas
+            from . import client_infographic_fill as _cif
+            if pillar == _nmas.NEEDS_CLIENT_SAFE_REVIEW_PILLAR or \
+                    pillar.endswith(_cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX):
+                skipped.append(row_id)
+                continue
+        except Exception:  # noqa: BLE001 - a rail that cannot load must not publish
+            pass
+
         # CLIENT approval gate: when approved_only (client gyms), a row that the client
         # has not approved yet is left UNTOUCHED (never claimed, never published). LASSO
         # (approved_only=False) is unchanged: it auto-publishes pending rows at slot time.

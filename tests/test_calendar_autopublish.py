@@ -192,6 +192,53 @@ def test_already_published_row_is_skipped(armed):
     assert [d.draft_id for d, _ in pub.calls] == ["fresh"]
 
 
+def test_needs_client_safe_review_pillar_never_autopublishes(armed):
+    """HARD BLOCK (2026-09-11): a row from the no-media Astra fallback
+    (pillar==no_media_astra_seed.NEEDS_CLIENT_SAFE_REVIEW_PILLAR) must never
+    auto-publish, even when every other gate would otherwise let it through:
+    status already 'approved' and catch_all bypassing the slot gate. Proves
+    the block is unconditional, not merely a side effect of approved_only/
+    trust already covering it (this test runs with approved_only OFF, the
+    LASSO-lane default that would otherwise auto-publish a pending/approved
+    row with no extra gate at all)."""
+    from agent import no_media_astra_seed as nmas
+    row = _row("needs-review", status="approved")
+    row["pillar"] = nmas.NEEDS_CLIENT_SAFE_REVIEW_PILLAR
+    ordinary = _row("ordinary", status="approved")
+    store = _FakeStore([row, ordinary])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True)
+
+    assert "needs-review" not in summary["published"]
+    assert "needs-review" in summary["skipped"]
+    assert "needs-review" not in store.publishing_calls   # never even claimed
+    assert "ordinary" in summary["published"]
+    assert [d.draft_id for d, _ in pub.calls] == ["ordinary"]
+
+
+def test_client_infographic_fill_suffixed_pillar_never_autopublishes(armed):
+    """HARD BLOCK covers client_infographic_fill.py too: its pillar is the
+    source's real category PLUS a suffix (e.g. 'offer::needs_client_safe_
+    review'), not an exact match to no_media_astra_seed's marker -- proves
+    the endswith() check, not just the == check, actually fires."""
+    from agent import client_infographic_fill as cif
+    row = _row("needs-review-2", status="approved")
+    row["pillar"] = "offer" + cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX
+    ordinary = _row("ordinary2", status="approved")
+    store = _FakeStore([row, ordinary])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True)
+
+    assert "needs-review-2" not in summary["published"]
+    assert "needs-review-2" in summary["skipped"]
+    assert "needs-review-2" not in store.publishing_calls
+    assert "ordinary2" in summary["published"]
+
+
 def test_lost_claim_is_not_published(armed):
     # mark_publishing returns False (another worker won the claim) -> SKIP, no publish.
     store = _FakeStore([_row("x"), _row("y")], claim_returns={"x": False, "y": True})

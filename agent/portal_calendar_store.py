@@ -257,6 +257,38 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def list_variant_candidates(self, account_key, month):
+        """The gym's 'candidate' rows (variant_status='candidate') whose
+        post_date falls inside `month` — the complement of list_month's
+        variant_status=active filter. Exists because list_month deliberately
+        NEVER returns a candidate row (see its own comment: a caller treating
+        the month as 'one row per logical post' must not double-count a
+        pending variant), so any caller that needs to know "does this anchor
+        already have a linked candidate" (e.g. lasso_astra_rework's dedup)
+        cannot get that from list_month at all. Real production bug found
+        2026-09-11: a first cut of that dedup silently no-op'd because it
+        tried to find candidate rows inside list_month's own results."""
+        year = int(month[:4])
+        mon = int(month[5:7])
+        last_day = _calendar.monthrange(year, mon)[1]
+        first = f"{month}-01"
+        last = f"{month}-{last_day:02d}"
+        params = {
+            "gym_id": f"eq.{account_key}",
+            "post_date": [f"gte.{first}", f"lte.{last}"],
+            "variant_status": "eq.candidate",
+            "order": "post_date",
+        }
+        r = self._client().get(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
     def has_owner_visible_rows(self, account_key):
         """GATE 2 (coach-screens-first-month): True if the gym has EVER had an owner-visible
         content_calendar row (any status EXCEPT 'coach_review', any account, any date). A

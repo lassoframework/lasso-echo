@@ -28,6 +28,26 @@ from . import config
 
 FILL_DAYS_AHEAD = 7          # look this many days ahead for empty days
 FILL_MAX_PER_RUN = 2         # cards per scan pass (drip, never flood)
+
+# CLIENT-SAFE REVIEW MARK (2026-09-11, same requirement as no_media_astra_seed.py's
+# NEEDS_CLIENT_SAFE_REVIEW_PILLAR): every row here is Echo's own scrape-grounded
+# infographic, not a client-submitted photo -- a reviewer must be able to tell it
+# apart from an ordinary pending draft at a glance. Unlike no_media_astra_seed's
+# pillar (a throwaway label with no other meaning), THIS module's pillar carries
+# real taxonomy (the source's own category: service/about/offer/educational/faq)
+# that a human reviewer benefits from seeing, so the mark is a SUFFIX, not a
+# replacement -- "offer" becomes "offer::needs_client_safe_review", still legible
+# as "offer" at a glance, still a distinct string. Verified before choosing this:
+# content_categories.GYM_PILLARS and day_shape.PROOF_PILLARS/INVITATION_PILLARS
+# are the only fixed pillar lists in the codebase and neither is read by ANY
+# other module (grepped 2026-09-11) -- there is no live rotation/day-shape logic
+# for this suffix to disturb.
+_NEEDS_CLIENT_SAFE_REVIEW_SUFFIX = "::needs_client_safe_review"
+
+
+def _with_review_mark(category):
+    base = (category or "educational").strip() or "educational"
+    return f"{base}{_NEEDS_CLIENT_SAFE_REVIEW_SUFFIX}"
 _ARCHETYPES = ("flow", "split", "hero", "path", "headline")
 
 
@@ -170,7 +190,7 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
                               f"cite:{getattr(source, 'citation', '')}",
                               "infographic_fill"],
             day_key=day,
-            category=getattr(source, "category", "") or "educational",
+            category=_with_review_mark(getattr(source, "category", "")),
         )
         draft.is_story = False
         issues = post_quality.post_issues(draft)
