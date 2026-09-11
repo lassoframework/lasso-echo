@@ -1124,3 +1124,38 @@ def test_apply_shrink_guard_counts_preserved_locked_days(tmp_path):
                      locked_days=locked)
     assert not res.get("noop_shrink"), "post-merge growth must proceed, not no-op"
     assert store.inserted, "the grow build's rows must be written"
+
+
+def test_concurrent_rebuild_for_same_gym_is_refused_not_raced(tmp_path):
+    """Ticket 4941e162 (CrossFit Reverb): a second build_client_month call for the
+    SAME gym while the first is still "in flight" (lock held, never released) must
+    be refused cleanly -- never race a delete+insert against the first call's. This
+    is the regression for the duplicate/near-duplicate pending rows Dean saw."""
+    from agent import build_lock
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+    # Simulate an already in-flight build for this gym (another process/run holds it).
+    assert build_lock.acquire("gritx", holder="other-run") is True
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is False
+    assert out["reason"] == "build_in_progress"
+    assert store.deleted == [] and store.inserted == [], (
+        "a gym already mid-build must never have its month touched by a second call")
+
+
+def test_lock_is_released_after_a_successful_build_so_the_next_call_can_run(tmp_path):
+    """The lock must not be held past the build that acquired it: a legitimate next
+    rebuild (nightly scan the following night, a human-triggered restage) must be
+    able to proceed once the in-flight build actually finishes."""
+    from agent import build_lock
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    assert build_lock.is_locked("gritx") is False
