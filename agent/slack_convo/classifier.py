@@ -63,6 +63,32 @@ _BREAKAGE_RE = re.compile(
     r"won't (?:post|publish|go out|send|load|connect|update)|"
     r"wont (?:post|publish|go out|send|load|connect|update))", re.IGNORECASE)
 
+# WRONG OUTPUT, not a dead machine (John Weeks / Tough Temple, 2026-09-11).
+#
+# Every pattern in _BREAKAGE_RE describes something NOT HAPPENING: not posting, not
+# going out, broken, error, failed. Echo's most common real client complaint is the
+# OPPOSITE shape -- it is running fine and producing the WRONG THING. John's
+# "9/14-9/16 are still repeat images" matched nothing above, so it classified ESCALATE
+# and the fixer lane never saw it. He reported the same defect twice and a human
+# carried the whole ticket both times.
+#
+# Kept as its OWN regex rather than widened into _BREAKAGE_RE for one reason: unlike a
+# dead machine, this family collides with ordinary QUESTIONS ("how often do posts
+# repeat?"), and _BREAKAGE_RE is deliberately checked BEFORE _QUESTION_RE. classify()
+# therefore checks this one AFTER the question rule, so an owner ASKING about repeats
+# still reaches the answer lane. _BREAKAGE_RE's own ordering is untouched.
+#
+# Still gated by _DOMAIN_RE (RT-M2): "same old same old" and "my duplicate gym keys"
+# carry no Echo noun and still escalate.
+_REPEAT_RE = re.compile(
+    r"\b(?:repeat|repeats|repeated|repeating|duplicate|duplicates|duplicated|"
+    r"duplicating|reuse|reuses|reused|reusing|re-used|re-using|recycled|recycling)\b|"
+    r"\b(?:same|identical) (?:photo|photos|image|images|picture|pictures|pic|pics|"
+    r"video|videos|clip|clips|post|posts|shot|shots|footage|thing)\b|"
+    r"\b(?:over and over|again and again|twice in a row|multiple times|"
+    r"more than once|(?:\d+|two|three|four|five|several) (?:days|times|weeks) in a row)"
+    r"\b", re.IGNORECASE)
+
 _QUESTION_RE = re.compile(
     r"(\?\s*$)|^\s*(how|what|when|where|why|who|which|can you|could you|do you|does|is it|"
     r"are you|will|should i|did)\b", re.IGNORECASE)
@@ -106,6 +132,11 @@ _DOMAIN_RE = re.compile(
     r"caption|captions|calendar|schedule|scheduled|instagram|ig|facebook|fb|page|google|"
     r"gbp|business profile|connect|connection|connected|connecting|link|upload|uploads|"
     r"photo|photos|video|videos|media|approve|approval|approvals|portal|login|log in|"
+    # "image / images / picture / pictures / clip / clips / footage / shot": the words a
+    # gym owner actually types for the same things. "photo" and "video" were here;
+    # "image" was not, so "9/14-9/16 are still repeat images" failed the domain check
+    # even once the breakage side matched (John Weeks / Tough Temple, 2026-09-11).
+    r"image|images|picture|pictures|pic|pics|clip|clips|footage|shot|shots|"
     r"sign in|echo|dashboard|reply|replies|comment|comments|drive|folder|"
     # RTF-1: the website product's nouns, which were missing entirely -- every
     # Wrangler-shaped breakage report ("the website is showing the wrong hours") failed
@@ -294,6 +325,12 @@ def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=No
         return CODE_FIX
     if _QUESTION_RE.search(t):
         return QUESTION
+    # WRONG-OUTPUT reports ("still repeat images", "the same photo three days in a
+    # row"). Checked AFTER the question rule on purpose -- see _REPEAT_RE -- so an owner
+    # ASKING about repeats reaches the answer lane, while an owner REPORTING them
+    # reaches the fixer. Same _DOMAIN_RE gate every code_fix carries (RT-M2).
+    if _REPEAT_RE.search(t) and _DOMAIN_RE.search(t):
+        return CODE_FIX
     # CANCEL_POST is gated on cancel_post_enabled even from a brain hint or the LLM
     # fallback: the flag is the ONE switch for this whole capability, so a learned
     # phrase or a model guess can never turn it on when it is off.
