@@ -794,12 +794,15 @@ def sync_unrouted(*, lister=None, reader=None, marker=None, onboard=None,
                     gid = gym_id_resolver(raw_key, base)
                 except Exception:  # noqa: BLE001 - no signal is fine, never blocks registration
                     gid = None
+                # own_submission: `base` was resolved from THIS gym's own
+                # echo_social_intake row (its token row / canonical key), i.e. the
+                # owner's own Echo intake -- itself an Echo client marker (D73).
                 _accounts.register_gym(
                     base,
                     name=_clean(gym.get("name")) or base,
                     ig_handle=_clean(gym.get("ig_handle")),
                     fb_page=_clean(gym.get("fb_page")),
-                    gym_id=gid)
+                    gym_id=gid, own_submission=True, door="social_intake_reader")
                 have_account = _accounts.get_account(account_key) is not None
             except Exception as e:
                 ops_alerts.alert(f"social-intake-sync: auto-provision of '{base}' "

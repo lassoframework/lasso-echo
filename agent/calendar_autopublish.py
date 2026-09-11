@@ -1302,8 +1302,15 @@ def run_slot_ticks(run_date, *, gym_id="lasso", store=None, publisher=None,
 
 def client_gym_bases():
     """Distinct client-gym tenant bases (non-LASSO) from the account registry:
-    eng_ig / eng_fb -> 'eng'. LASSO is excluded (it has its own Meta-direct lane)."""
+    eng_ig / eng_fb -> 'eng'. LASSO is excluded (it has its own Meta-direct lane).
+
+    ECHO CLIENTS ONLY (2026-09-11 incident): a dynamic-registry base is returned only
+    when echo_clients says the gym is an Echo client (an echo_gym_settings row); the
+    registry itself was polluted with ~110 ads-only gyms by autoregister sweeping
+    echo_intake_tokens. Hardcoded ACCOUNTS bases are trusted without a plane read.
+    Fails closed: an unreadable client universe yields the hardcoded bases only."""
     from .accounts import all_accounts
+    from . import echo_clients
     seen, bases = set(), []
     for a in all_accounts():
         k = a.key or ""
@@ -1317,7 +1324,7 @@ def client_gym_bases():
         if base and base not in seen:
             seen.add(base)
             bases.append(base)
-    return bases
+    return echo_clients.only_client_bases(bases)
 
 
 # Stale-'publishing' ALERT sweep (audit MEDIUM): a worker that dies between the

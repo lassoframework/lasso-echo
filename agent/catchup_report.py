@@ -33,6 +33,7 @@ def _recent_gyms_default(now):
     Supabase REST via the calendar store's creds. Raises CatchupReadError on an HTTP
     error so a failed read is NEVER rendered as 'window empty'."""
     from .portal_calendar_store import SupabaseCalendarStore
+    from . import echo_clients
     store = SupabaseCalendarStore()
     cutoff = (now - timedelta(days=CATCHUP_WINDOW_DAYS)).date().isoformat()
     r = store._client().get(
@@ -41,7 +42,7 @@ def _recent_gyms_default(now):
             "created_at": f"gte.{cutoff}",
             "status": "eq.active",
             "is_demo": "eq.false",
-            "select": "slug,name,created_at",
+            "select": "id,slug,name,created_at",
             "order": "created_at",
         },
         headers=store._headers(),
@@ -49,7 +50,13 @@ def _recent_gyms_default(now):
     )
     if r.status_code >= 400:
         raise CatchupReadError(f"gyms read {r.status_code}")
-    return [g for g in (r.json() or []) if g.get("slug")]
+    # ECHO CLIENTS ONLY (2026-09-11). "Gyms signed up in the last 60 days" means gyms
+    # signed up FOR ECHO: the portal gyms table is the whole LASSO ads fleet, and every
+    # ads-only gym in the window used to be reported as "behind" with zero coverage,
+    # forever. The predicate fails closed, so an unreadable client universe reports an
+    # empty window rather than the fleet.
+    return [g for g in (r.json() or [])
+            if g.get("slug") and echo_clients.is_echo_client(g.get("id"))]
 
 
 def _coverage_default(slug, today):

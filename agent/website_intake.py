@@ -518,6 +518,13 @@ def run(bases=None, websites=None, fetch=None, llm=None, alert=None):
     if bases is None:
         from .calendar_autopublish import client_gym_bases
         bases = client_gym_bases()
+    # ECHO CLIENTS ONLY (2026-09-11): this sweep fetched 131 gym websites -- the whole
+    # LASSO ads fleet -- and wrote brand bibles for gyms that never bought Echo, because
+    # the registry it iterated had been auto-filled off echo_intake_tokens. The registry
+    # is gated at its source now; this second gate makes the sweep safe even against a
+    # polluted registry or an explicit `bases` list. Fails closed.
+    from . import echo_clients
+    bases = echo_clients.only_client_bases(bases)
     websites = websites or {}
     intaken, skipped, failed, landed = [], [], [], 0
     for base in bases:

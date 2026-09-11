@@ -616,7 +616,13 @@ def _client_bases(clients=None):
         base = _base_of(key)
         if base and base not in bases:
             bases.append(base)
-    return bases
+    # ECHO CLIENTS ONLY (2026-09-11 incident): the dynamic registry is NOT a list of
+    # Echo clients -- onboarding_watch.autoregister filled it from echo_intake_tokens,
+    # which the portal mints for EVERY gym, so ~110 ads-only gyms landed here and were
+    # scanned, alerted on ("no_account", "no_voice") and website-intaken. A dynamic
+    # base must have an echo_gym_settings row; hardcoded ACCOUNTS are trusted as-is.
+    from . import echo_clients
+    return echo_clients.only_client_bases(bases)
 
 
 def _base_of(key):

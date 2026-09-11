@@ -828,7 +828,8 @@ def _queue_has_name(name):
 
 
 def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days=45,
-                            bg_client=None, force=False, out_dir=None, cache_dir=None):
+                            bg_client=None, force=False, out_dir=None, cache_dir=None,
+                            is_client=None):
     """Scan the PORTAL `gyms` table for recently added clients and enqueue every READY
     welcome the SAME way the Stripe scan does (feed + a genuine 9:16 story, hosted).
     This is the fix for portal-added clients who have no Stripe record and so were
@@ -845,6 +846,10 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
       * only real clients are considered at all: list_recent_portal_gyms excludes
         demo/test/verification rows AND known non-client statuses (onboarding lead
         stubs, inactive, archived), so a person-name lead never enters the queue.
+      * only ECHO clients are welcomed (2026-09-11): the portal gyms table is the
+        whole LASSO ads fleet; a gym is welcomed by Echo only when `is_client`
+        (default echo_clients.is_echo_client: an echo_gym_settings row) says so.
+        Fails closed -- an unreadable client universe welcomes nobody this sweep.
 
     Creds absent (no SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY) -> list is empty and this
     no-ops: the Stripe path is byte-for-byte unchanged. Requires AGENT_HOSTING_ENABLED to
@@ -862,6 +867,13 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
         gyms = portal_gyms.list_recent_portal_gyms(days=window_days, reader=reader)
     except Exception as e:
         return {"scanned": False, "reason": f"portal read failed: {type(e).__name__}: {e}"}
+
+    # ECHO CLIENTS ONLY. See the docstring; the portal roster is not the client list.
+    from . import echo_clients
+    is_client = is_client or echo_clients.is_echo_client
+    portal_seen = len(gyms)
+    gyms = [g for g in gyms if is_client(g.get("gym_id"))]
+    not_echo = portal_seen - len(gyms)
 
     enqueued = needs_logo = already = deduped = 0
     blocked = []
@@ -925,7 +937,8 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
         "scanned": True,
         "source": "portal",
         "enqueued": enqueued,
-        "portal_seen": len(gyms),
+        "portal_seen": portal_seen,
+        "not_echo_client": not_echo,
         "needs_logo": needs_logo,
         "logo_alerted_new": logo_alerted_new,
         "already_welcomed": already,
@@ -976,6 +989,12 @@ def prune_portal_junk(reader=None, dry_run=False):
                 "error": msg, "dry_run": dry_run}
     by_id = {str(p.get("id")): p for p in portal_rows}
 
+    # ECHO CLIENTS ONLY (2026-09-11): a queued welcome for a gym that is not an Echo
+    # client is junk too. Judged ONLY on a good reading of the client universe: an
+    # unreadable universe prunes nothing on this criterion (unsure = keep).
+    from . import echo_clients
+    universe = echo_clients.snapshot()
+
     pruned, kept = [], []
     for r in rows:
         gym_id = r["gym_key"].split(":", 1)[1]
@@ -985,6 +1004,8 @@ def prune_portal_junk(reader=None, dry_run=False):
         elif portal_gyms.is_excluded(prow):
             status = str(prow.get("status") or "").strip().lower()
             reason = f"fails client filter (status={status or 'demo/test flag'!r})"
+        elif universe.ok and not universe.is_client(gym_id):
+            reason = "not an Echo client (no echo_gym_settings row)"
         else:
             kept.append(r["name"])
             continue

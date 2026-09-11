@@ -78,7 +78,10 @@ def run(apply=True, store=None, accounts=None, alert=None):
 
     if accounts is None:
         from .. import accounts as _accounts
-        bases = sorted({_base(a) for a in _accounts.all_accounts()})
+        from .. import echo_clients
+        # ECHO CLIENTS ONLY (2026-09-11): the registry is not the client list.
+        bases = sorted(set(echo_clients.only_client_bases(
+            sorted({_base(a) for a in _accounts.all_accounts()}))))
     else:
         bases = sorted(set(accounts))
 
