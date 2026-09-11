@@ -4380,3 +4380,45 @@ dates appear:
 If they come back "APPROVED duplicate (left)" instead, this fix does not reach them:
 the gym approved those exact cards and the sweep is forbidden to change them by
 design. That case needs a person to deny the days, not a code change.
+
+## Why the FIXER never ran on John's ticket (2026-09-11)
+
+Blake asked the right question: Echo reads these Slack messages and is supposed to hand
+a code_fix to the Claude Code worker. It never did. John reported the SAME defect twice
+and a human carried the whole ticket both times.
+
+One line in `agent/slack_convo/classifier.py`. `code_fix` requires a `_BREAKAGE_RE`
+match, and EVERY pattern in that regex describes something NOT HAPPENING: not posting,
+not going out, broken, error, failed, crash, stuck, 404, nothing published. There was
+no vocabulary at all for the opposite and more common shape -- **the machine is running
+fine and producing the WRONG THING**. Measured on his exact sentence:
+
+    classify("9/14-9/16 are still repeat images") -> None    # ESCALATE, a human looks
+
+Every phrasing of a duplicate-media complaint escalated: "the same photo keeps showing
+up on different days", "my posts are repeating the same picture", "duplicate images on
+my calendar". Two gaps compounded: `_BREAKAGE_RE` had no repeat/duplicate family, and
+`_DOMAIN_RE` (the RT-M2 noun gate) had `photo` and `video` but **not `image`** -- so his
+sentence failed the domain check too, even if the breakage side had matched.
+
+- [~] `_REPEAT_RE`, its own regex, NOT widened into `_BREAKAGE_RE`. Reason: unlike a
+  dead machine, this family collides with ordinary questions ("how often do posts
+  repeat?"), and `_BREAKAGE_RE` is deliberately checked BEFORE `_QUESTION_RE`.
+  `classify()` checks `_REPEAT_RE` AFTER the question rule, so an owner ASKING about
+  repeats still reaches the answer lane while an owner REPORTING them reaches the
+  fixer. `_BREAKAGE_RE`'s own ordering is byte for byte unchanged.
+- [~] `_DOMAIN_RE` gained the words gym owners actually type: image(s), picture(s),
+  pic(s), clip(s), footage, shot(s).
+- [~] RT-M2 still holds: a repeat word with no Echo-domain noun still escalates
+  ("same old same old", "my duplicate set of gym keys", "we run the same workout three
+  days in a row on purpose").
+- [x] No new gate, no flag: this widens an existing deterministic rule exactly as RTF-1
+  did, and a client `code_fix` is STILL held behind Blake's #fixer tap
+  (`adapter.py` KIND_FIXER_REQUEST is HELD unless staff-origin), so a false positive
+  costs one tap, never an auto-applied change. D14's invariant is untouched.
+- [x] `tests/test_slack_convo_repeat_reports.py`: John's exact message, the wrong-output
+  family, and both guards (question-about-repeats, no-domain-noun).
+
+Note the separate lane this was NOT: `agent/echo_ticket_worker.py` is `SOURCE =
+"website_tab"` -- the PORTAL support tab. John wrote in Slack, so that worker was never
+in the path. The Slack path is `slack_convo/` and it stopped at classification.
