@@ -917,6 +917,7 @@ _COMMANDS = {
         ("draft-bible", "draft a brand bible from an intake doc"),
         ("intake-doc", "turn a client PDF into held draft posts"),
         ("intake-web", "the upload web surface (own service)"),
+        ("ops-action", "run one FIXER ops action (D72): <action> --gym K --ticket T [--args JSON]"),
         ("intake-link", "mint a gym's signed intake + upload links (--account <key>)"),
         ("intake-revoke", "kill one gym's signed link via the R2 denylist (--account <key>)"),
         ("intake-unrevoke", "restore one gym's revoked link (--account <key>)"),
@@ -1668,6 +1669,40 @@ def main(argv=None):
         # SEPARATE web process (own Railway service). R2 only, never /data.
         from .intake_web import serve
         serve()
+    elif cmd == "ops-action":
+        # D72: the FIXER's ops-action catalog from a shell on the worker (the host with
+        # the /data volume), e.g. over `railway ssh -s echo`:
+        #   python -m agent ops-action restage_month --gym toughtemple52040e \
+        #       --ticket <support_tickets.id> --args '{"days": 21}'
+        # Same fixer_ops.run_action the HTTP routes call: same validation, same org-floor
+        # refusals, same ticket record and audit line. A background action is waited on.
+        import argparse as _ap
+        import json as _json
+        import time as _time
+        from . import fixer_ops as _fo
+        p = _ap.ArgumentParser(prog="python -m agent ops-action")
+        p.add_argument("action", help=", ".join(sorted(_fo.CATALOG)))
+        p.add_argument("--gym", required=True, help="Echo account key")
+        p.add_argument("--ticket", required=True, help="support_tickets.id to record on")
+        p.add_argument("--args", default="{}", help="JSON object of action args")
+        p.add_argument("--no-wait", action="store_true",
+                       help="return immediately for a background action")
+        ns = p.parse_args(argv[1:])
+        status, body = _fo.run_action(ns.action, ns.gym, ns.ticket, _json.loads(ns.args))
+        print(_json.dumps({"status": status, **body}, indent=1, default=str))
+        job_id = body.get("job_id")
+        if job_id and not ns.no_wait:
+            seen = 0
+            while True:
+                job = _fo.JOBS.get(job_id) or {}
+                for step in (job.get("steps") or [])[seen:]:
+                    print(f"[ops-action] step {_json.dumps(step, default=str)}")
+                seen = len(job.get("steps") or [])
+                if job.get("status") != "running":
+                    print(_json.dumps({"job": job}, indent=1, default=str))
+                    break
+                _time.sleep(5)
+        sys.exit(0 if 200 <= status < 300 else 1)
     elif cmd == "intake-link":
         # Mint a gym's signed intake + upload links from the shared secret (no
         # per-gym env var). Runs where the secret lives (intake-web / listener);

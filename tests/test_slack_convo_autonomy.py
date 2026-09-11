@@ -1207,8 +1207,15 @@ def test_no_client_facing_constant_promises_future_human_action():
     restored in a different constant, and the D52 test only scanned three others."""
     promises = ("follow up", "hear back", "get back to you", "will be in touch",
                 "someone will", "we will reach out", "will look into", "will fix")
+    # D72 (Blake, 2026-09-11): the two HOLD notices DO say a teammate will follow up, and
+    # may -- they are written by hold_answer_for_team only AFTER the ticket is escalated and
+    # the #fixer team card is queued, so the mechanism exists at the moment the sentence is
+    # written. test_no_silent_holds.py asserts that ordering. Every other constant is still
+    # scanned: a promise with no mechanism behind it remains banned.
+    mechanism_backed = {"TEMPLATE_HARD_LINE", "TEMPLATE_HELD_FOR_REVIEW"}
     client_facing = [n for n in dir(A)
-                     if n.startswith(("TEMPLATE_", "ACK_")) and isinstance(getattr(A, n), str)]
+                     if n.startswith(("TEMPLATE_", "ACK_")) and isinstance(getattr(A, n), str)
+                     and n not in mechanism_backed]
     assert len(client_facing) >= 6, "the scan must cover every client-facing constant"
     for name in client_facing:
         body = getattr(A, name).lower()

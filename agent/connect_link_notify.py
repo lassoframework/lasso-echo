@@ -192,7 +192,7 @@ def _default_is_client(gym_id, base_key):
 
 
 def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None,
-                   is_client=None):
+                   is_client=None, force=False):
     """Send a newly-registered gym's owner its connect link, once. Returns True only
     when a message was actually sent this call. OFF unless
     config.auto_connect_link_enabled(). Never raises; every failure path ESCALATES
@@ -202,8 +202,15 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
 
     ECHO CLIENTS ONLY (2026-09-11): a gym `is_client` (default: echo_clients, by
     gym_id or base key) does not vouch for is REFUSED before any lookup, DM or link
-    mint, with ONE alert per gym ever (kv `connect_link_refused_<base>`)."""
-    if not config.auto_connect_link_enabled():
+    mint, with ONE alert per gym ever (kv `connect_link_refused_<base>`).
+
+    `force=True` (D72, the FIXER's `resend_connect_link` ops action): an explicit
+    operator RESEND. It skips the auto-send flag (this is not the automatic first send
+    the flag governs) and the once-ever dedupe stamp -- and NOTHING else: the Echo-client
+    gate above applies to a forced resend exactly as to the automatic send (the live
+    incident that DM'd 36 non-clients came through this function). Callers of the
+    automatic send are byte-for-byte unchanged."""
+    if not force and not config.auto_connect_link_enabled():
         return False
     base_key = str(base_key or "").strip()
     gym_name = str(gym_name or "").strip()
@@ -234,11 +241,12 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
         return False
 
     dedupe_key = f"connect_link_sent_{base_key}"
-    try:
-        if db.kv_get(dedupe_key):
-            return False
-    except Exception:
-        pass  # a dedupe READ failure must not block a first-ever send
+    if not force:
+        try:
+            if db.kv_get(dedupe_key):
+                return False
+        except Exception:
+            pass  # a dedupe READ failure must not block a first-ever send
 
     token = os.environ.get(config.SLACK_BOT_TOKEN_ENV, "")
     if not token:
