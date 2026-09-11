@@ -2822,7 +2822,7 @@ product default, the runner's caller, the outbox dispatch-time recheck, or the
 `ESCALATE_ALWAYS` additions each turns the corresponding test red, including
 `test_client_dm_end_to_end.py`'s full real-adapter path.
 
-## D72 (2026-09-11) -- echo_gym_settings is the Echo client universe; echo_intake_tokens is NOT
+## D73 (2026-09-11) -- echo_gym_settings is the Echo client universe; echo_intake_tokens is NOT
 
 **The incident (12:03-12:06 UTC).** Echo's onboarding lane ran fleet-wide.
 `onboarding_watch.portal_keys()` read every `echo_intake_tokens` row as "the
@@ -2859,6 +2859,38 @@ rows, 115 of them for non-clients, pushed by `gym-store-sync` on 2026-09-10 19:1
 **The rule.**
 
     echo_gym_settings IS the Echo client universe.  echo_intake_tokens IS NOT.
+
+**Round-2 audit ruling: the day-one marker.** `echo_gym_settings` rows are only
+created by the /my cadence + autonomy toggles (portal `echo-cadence.ts:44`,
+`echo-autonomy.ts:45`) and by Echo's `set_gym_zernio_profile_id` at CONNECT time
+(`portal_calendar_store.py` <- `zernio_routes.py`). Under (1) alone a new Echo client
+is not a client until the owner connects, so `connect_link_notify` could never fire for
+the gym it exists for (bootstrap deadlock) and `onboarding_watch` was blind to
+never-connected clients. The predicate is therefore the union of four positive markers,
+each created only by an Echo purchase or an Echo owner action:
+
+  1. `echo_gym_settings` row (live 20)
+  2. `echo_social_intake` row -- the owner's OWN Echo intake, by gym_id / client_key
+     (live 16, all within (1); 0 non-clients)
+  3. `gym_products.product in ('social','echo_social')`, status active (live 0)
+  4. `gyms.plan = 'echo_standalone'` (live 0)
+
+Still NOT markers: `echo_intake_tokens` (a capability token minted for every gym; read
+only for a client's minted key), `gym_billing.tier` (the ads tier), `gyms.plan='full'`
+(every gym). A parallel portal PR upserts `echo_gym_settings` from the per-gym Echo
+onboard button, so (1) becomes true by construction on day one as well.
+
+**Registration doors (round 2).** `accounts.register_gym` -- THE place registry rows
+are created -- is gated on the predicate: no marker, no row, one ops alert per base
+naming the door. The ONE exemption is `own_submission=True`: the registration was
+driven by the gym's own intake submission under its own signed token, so the base is
+the submitting gym's key by construction (`intake_ingest._land_intake_form`,
+`social_intake_reader` over `echo_social_intake` rows). `onboarding_watch.autoregister`
+is a fleet sweep, never a submission, and does not get it. `onboard.run` (behind POST
+/portal/onboard and the CLI) raises `OnboardRefused` before writing anything for a gym
+with no marker; `python -m agent onboard --force` is the by-hand bypass. POST
+/portal/onboard maps the raise to its existing generic 500 today; returning a 403 with
+the reason is a follow-up in `intake_web.py` (another agent's file at the time).
 
 **What shipped (branch `fix/echo-client-universe`).**
 
@@ -2906,10 +2938,9 @@ rows, 115 of them for non-clients, pushed by `gym-store-sync` on 2026-09-10 19:1
   the honest live answer is "not a client", which is not what pre-existing lane tests
   test); the gate's own tests use `real_echo_clients` to switch it off.
 
-**Not done here, for a ruling.** (1) `accounts.register_gym` itself is not gated --
-`onboard.run` (the portal's self-serve POST /portal/onboard, another agent's worktree
-today) may legitimately register a gym before its `echo_gym_settings` row exists;
-gating there needs the onboard order confirmed. (2) `brains/<key>` and
+**Not done here, for a ruling.** (1) POST /portal/onboard still answers a refused
+onboard with its generic 500 (the raise is in `onboard.run`; mapping `OnboardRefused`
+to a 403 lives in `intake_web.py`). (2) `brains/<key>` and
 `deep_brains/<key>` are not swept by the cleanup (not in the incident's write set as
 far as the logs show; add if the box shows otherwise). (3) The 36 owners were DMed; the
 message itself cannot be unsent from here. (4) `AGENT_ONBOARDING_WATCH` can stay armed

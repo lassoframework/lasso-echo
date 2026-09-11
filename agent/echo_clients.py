@@ -18,14 +18,40 @@ THE RULE
 --------
     echo_gym_settings IS the Echo client universe.  echo_intake_tokens IS NOT.
 
-Verified against the live portal DB the same day: echo_gym_settings held exactly the
-20 Echo clients (Chateau, Local, Newtown, Nine 7, Reverb, Sunnyside, Zanshin,
-District H, ENG, GRITX, Hill Country, LASSO, MFLH, Pierce, Swift River, Bolton Club,
-Top Fuel, Tough Temple, Train716, ZZ Test Gym); echo_intake_tokens held 131 gyms;
-gyms.plan was 'full' for all 158 rows, gym_products carried only the 'ads' product,
-and gym_billing.tier is the ADS tier. No other positive Echo marker exists in the
-schema, so a row in echo_gym_settings is the strictest predicate that still includes
-all 20 and excludes every one of the 36.
+THE MARKERS (audit ruling, 2026-09-11 round 2). A gym is an Echo client when its
+gym_id carries ANY of these four positive markers. Each is something only an Echo
+purchase / an Echo owner action creates:
+
+  1. echo_gym_settings row      -- written by the /my cadence + autonomy toggles
+                                   (portal echo-cadence.ts / echo-autonomy.ts) and by
+                                   Echo's set_gym_zernio_profile_id at CONNECT time
+                                   (portal_calendar_store <- zernio_routes), and, once
+                                   the parallel portal PR lands, by the per-gym Echo
+                                   onboard button. Live: 20 gyms.
+  2. echo_social_intake row     -- the owner's OWN Echo (DFY social) intake submission,
+                                   keyed by gym_id / client_key. THE DAY-ONE MARKER:
+                                   without it a new client is not a client until the
+                                   owner connects, connect_link_notify can never fire
+                                   for the gym it exists for (bootstrap deadlock), and
+                                   onboarding_watch is blind to never-connected clients.
+                                   Live: 16 gyms, all of them already in (1); 0
+                                   non-clients.
+  3. gym_products               -- product in ('social', 'echo_social'), status active:
+                                   the standalone Stripe lane's product marker. Live: 0
+                                   rows (today the table carries only 'ads').
+  4. gyms.plan = 'echo_standalone' -- the standalone lane's plan marker. Live: 0 rows
+                                   (every row is 'full').
+
+NOT MARKERS, and why:
+  * echo_intake_tokens         -- the portal mints one for EVERY gym it knows (131 rows
+                                  for 158 gyms). It is a capability token, not a purchase.
+                                  Sweeping it is exactly the incident. It is read here
+                                  ONLY to learn a client's minted key (an alias).
+  * gym_billing.tier           -- LAUNCH / ASCEND / APEX is the ADS tier.
+  * gyms.plan = 'full'         -- every gym has it; it says nothing about Echo.
+
+Verified live: the four markers together yield the same 20 gyms as (1) alone today,
+exclude all 112 non-client token keys, all 36 DMed gyms, and Empire Training Academy.
 
 WHAT THIS MODULE ANSWERS
 ------------------------
@@ -84,6 +110,7 @@ class ClientSet:
     names: dict = field(default_factory=dict)      # gym_id -> portal name
     other_keys: frozenset = frozenset()    # token keys of gyms that are NOT clients
     other_gym_ids: frozenset = frozenset() # portal gym ids that are NOT clients
+    markers: dict = field(default_factory=dict)    # gym_id -> frozenset of marker names
     error: str = ""
     at: float = 0.0
 
@@ -129,21 +156,66 @@ def _portal_key(gym_id, name):
     return s + raw[:_ID_FINGERPRINT_LEN]
 
 
-def build(settings_rows, token_rows, gym_rows, *, now=None):
-    """PURE: assemble a ClientSet from the three table readings. Exposed so a test (or
-    an operator with SQL access and no service key) can evaluate the exact predicate
-    over real rows."""
-    gym_ids = set()
+MARKER_SETTINGS = "echo_gym_settings"
+MARKER_INTAKE = "echo_social_intake"
+MARKER_PRODUCT = "gym_products:social"
+MARKER_PLAN = "gyms.plan=echo_standalone"
+MARKERS = (MARKER_SETTINGS, MARKER_INTAKE, MARKER_PRODUCT, MARKER_PLAN)
+SOCIAL_PRODUCTS = ("social", "echo_social")
+STANDALONE_PLAN = "echo_standalone"
+
+
+def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(),
+          standalone_rows=(), now=None):
+    """PURE: assemble a ClientSet from the table readings. Exposed so a test (or an
+    operator with SQL access and no service key) can evaluate the exact predicate over
+    real rows.
+
+    settings_rows   echo_gym_settings(gym_id)                       -> marker 1
+    intake_rows     echo_social_intake(gym_id, client_key,
+                    echo_account_key)                               -> marker 2
+    product_rows    gym_products(gym_id, product, status)           -> marker 3
+    standalone_rows gyms(id, name, slug) WHERE plan=echo_standalone -> marker 4
+    token_rows      echo_intake_tokens(gym_id, echo_account_key)    -> aliases ONLY
+    gym_rows        gyms(id, name, slug) for the client ids         -> aliases ONLY
+    """
+    gym_ids, markers = set(), {}
+
+    def _mark(gid, marker):
+        gid = normalize_key(gid)
+        if not gid:
+            return
+        gym_ids.add(gid)
+        markers.setdefault(gid, set()).add(marker)
+
     for r in settings_rows or []:
+        _mark(r.get("gym_id"), MARKER_SETTINGS)
+    intake_aliases = {}
+    for r in intake_rows or []:
         gid = normalize_key(r.get("gym_id"))
-        if gid:
-            gym_ids.add(gid)
+        ck = normalize_key(r.get("client_key"))
+        if not gid and _UUID_RE.match(ck or ""):
+            gid = ck                       # older rows carry the UUID as client_key
+        if not gid:
+            continue
+        _mark(gid, MARKER_INTAKE)
+        for alias in (ck, normalize_key(r.get("echo_account_key"))):
+            if alias and not _UUID_RE.match(alias):
+                intake_aliases.setdefault(gid, set()).add(alias)
+    for r in product_rows or []:
+        product = str(r.get("product") or "").strip().lower()
+        status = str(r.get("status") or "").strip().lower()
+        if product in SOCIAL_PRODUCTS and status == "active":
+            _mark(r.get("gym_id"), MARKER_PRODUCT)
+    for r in standalone_rows or []:
+        if str(r.get("plan") or STANDALONE_PLAN).strip().lower() == STANDALONE_PLAN:
+            _mark(r.get("id"), MARKER_PLAN)
     if not gym_ids:
-        return ClientSet(ok=False, error="echo_gym_settings returned zero rows; refusing "
-                         "to believe an empty client universe", at=now or time.time())
+        return ClientSet(ok=False, error="every Echo marker table returned zero rows; "
+                         "refusing to believe an empty client universe", at=now or time.time())
 
     names, slugs, raw_ids = {}, {}, {}
-    for g in gym_rows or []:
+    for g in list(gym_rows or []) + list(standalone_rows or []):
         gid = normalize_key(g.get("id"))
         if gid in gym_ids:
             names[gid] = str(g.get("name") or "").strip()
@@ -151,6 +223,10 @@ def build(settings_rows, token_rows, gym_rows, *, now=None):
             raw_ids[gid] = str(g.get("id") or "").strip()
 
     keys, key_to_gym, other, other_ids = set(), {}, set(), set()
+    for gid, aliases in intake_aliases.items():
+        for a in aliases:
+            keys.add(a)
+            key_to_gym.setdefault(a, gid)
     for t in token_rows or []:
         gid = normalize_key(t.get("gym_id"))
         key = normalize_key(t.get("echo_account_key"))
@@ -183,9 +259,12 @@ def build(settings_rows, token_rows, gym_rows, *, now=None):
                 key_to_gym.setdefault(a, gid)
     # A key both a client and a non-client hold cannot be a non-client marker.
     other -= keys
+    other_ids -= gym_ids
     return ClientSet(ok=True, gym_ids=frozenset(gym_ids), keys=frozenset(keys),
                      key_to_gym=key_to_gym, names=names, other_keys=frozenset(other),
-                     other_gym_ids=frozenset(other_ids), at=now or time.time())
+                     other_gym_ids=frozenset(other_ids),
+                     markers={g: frozenset(m) for g, m in markers.items()},
+                     at=now or time.time())
 
 
 # ---- live reads ------------------------------------------------------------------
@@ -237,24 +316,41 @@ def _load(http=None, now=None):
     if http is None:
         import requests  # lazy, matches the rest of the repo
         http = requests
+    # The four MARKER reads. Any one failing = the universe is unknown = fail closed.
     settings, ok = _read_all(http, url, key, "echo_gym_settings", "gym_id")
     if not ok:
         return ClientSet(ok=False, error="echo_gym_settings unreadable", at=stamp)
+    intake, ok = _read_all(http, url, key, "echo_social_intake",
+                           "gym_id,client_key,echo_account_key")
+    if not ok:
+        return ClientSet(ok=False, error="echo_social_intake unreadable", at=stamp)
+    products, ok = _read_all(http, url, key, "gym_products", "gym_id,product,status",
+                             {"product": f"in.({','.join(SOCIAL_PRODUCTS)})"})
+    if not ok:
+        return ClientSet(ok=False, error="gym_products unreadable", at=stamp)
+    standalone, ok = _read_all(http, url, key, "gyms", "id,name,slug,plan",
+                               {"plan": f"eq.{STANDALONE_PLAN}"})
+    if not ok:
+        return ClientSet(ok=False, error="gyms (plan) unreadable", at=stamp)
+    # ALIAS reads: the token table is NOT a marker (see the module docstring); it is
+    # read only so a client's minted key(s) resolve to the client.
     tokens, ok = _read_all(http, url, key, "echo_intake_tokens", "gym_id,echo_account_key")
     if not ok:
         return ClientSet(ok=False, error="echo_intake_tokens unreadable", at=stamp)
-    ids = sorted({str(r.get("gym_id") or "").strip() for r in settings
-                  if str(r.get("gym_id") or "").strip()})
-    if not ids:
-        return build(settings, tokens, [], now=stamp)   # -> ok=False, empty universe
+    probe = build(settings, tokens, [], intake_rows=intake, product_rows=products,
+                  standalone_rows=standalone, now=stamp)
+    if not probe.ok:
+        return probe                                    # empty universe -> refused
     # Only the CLIENT gyms' rows are needed for aliases; the non-client id set is
     # complete from the token rows (every registry / echo_gyms entry the incident
     # created came off that roster).
+    ids = sorted(probe.gym_ids)
     gyms, ok = _read_all(http, url, key, "gyms", "id,name,slug",
                          {"id": f"in.({','.join(ids)})"})
     if not ok:
         return ClientSet(ok=False, error="gyms unreadable", at=stamp)
-    return build(settings, tokens, gyms, now=stamp)
+    return build(settings, tokens, gyms, intake_rows=intake, product_rows=products,
+                 standalone_rows=standalone, now=stamp)
 
 
 # ---- cache -----------------------------------------------------------------------

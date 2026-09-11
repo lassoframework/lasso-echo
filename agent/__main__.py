@@ -1832,10 +1832,17 @@ def main(argv=None):
             base_url_arg = os.environ.get("AGENT_UPLOAD_BASE_URL") or None
         if not account_key or not display_name:
             print('usage: python -m agent onboard --account <key> --name "<Gym Name>" '
-                  '[--base-url <url>]')
+                  '[--base-url <url>] [--force]')
         else:
-            from .onboard import run as _onboard_run
-            r = _onboard_run(account_key, display_name, base_url=base_url_arg)
+            from .onboard import run as _onboard_run, OnboardRefused as _Refused
+            try:
+                r = _onboard_run(account_key, display_name, base_url=base_url_arg,
+                                 force="--force" in args_rest)
+            except _Refused as exc:
+                # ECHO CLIENTS ONLY (D73): no marker, nothing written. --force is the
+                # by-hand override for a human who knows the gym bought Echo.
+                print(f"onboard REFUSED: {exc}")
+                sys.exit(2)
             print(f"GYM: {r['account_key']} ({r['display_name']})")
             if r["token_minted"] is None:
                 print("Token: PENDING (set AGENT_ONBOARD_AUTOMINT=true by hand)")
@@ -1994,13 +2001,17 @@ def main(argv=None):
             print(f"echo-clients: client universe UNREADABLE ({_snap.error}); every fleet "
                   "lane is failing closed (doing nothing) until this reads.")
             sys.exit(2)
-        print(f"Echo clients: {len(_snap.gym_ids)} gyms (echo_gym_settings rows). "
-              f"echo_intake_tokens is NOT the client list: {len(_snap.other_keys)} "
-              "portal keys there belong to gyms that are not Echo clients.")
+        _per_marker = {m: sum(1 for ms in _snap.markers.values() if m in ms)
+                       for m in _ec.MARKERS}
+        print(f"Echo clients: {len(_snap.gym_ids)} gyms. Markers: "
+              + ", ".join(f"{m} {n}" for m, n in _per_marker.items())
+              + f". echo_intake_tokens is NOT a marker: {len(_snap.other_keys)} portal "
+              "keys there belong to gyms that are not Echo clients.")
         print()
         for _gid in sorted(_snap.gym_ids, key=lambda g: _snap.names.get(g, g)):
             _aliases = sorted(k for k, v in _snap.key_to_gym.items() if v == _gid)
             print(f"  {_snap.names.get(_gid, '?'):<32} {_gid}")
+            print(f"    markers: {', '.join(sorted(_snap.markers.get(_gid, ())))}")
             print(f"    keys: {', '.join(_aliases)}")
     elif cmd == "onboarding-audit":
         # READ ONLY fleet readiness. Sweeps the PORTAL roster of ECHO CLIENTS

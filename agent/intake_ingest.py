@@ -388,11 +388,15 @@ def _land_intake_form(client, payload, r2, key, manifest):
                         gid = _store.resolve_gym_uuid(client)
                 except Exception:  # noqa: BLE001
                     gid = None
+                # own_submission: this form landed under the gym's OWN signed upload
+                # token, so `client` IS the submitting gym's key by construction
+                # (echo_clients / D73 ruling: an owner's own intake may register the
+                # gym before its Echo marker is readable; a fleet sweep may not).
                 registered = bool(_accounts.register_gym(
                     client, name=proposal["gym_name"],
                     ig_handle=proposal.get("ig_handle", ""),
                     fb_page=proposal.get("fb_page", ""),
-                    gym_id=gid))
+                    gym_id=gid, own_submission=True, door="intake_ingest"))
             except Exception as exc:  # noqa: BLE001 - never fail the intake landing
                 ops_alerts.alert(
                     f"{client}: intake landed but auto-register failed "

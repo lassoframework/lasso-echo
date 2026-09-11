@@ -138,8 +138,20 @@ class _Http:
         if flt and flt.startswith("in.("):
             wanted = set(flt[4:-1].split(","))
             rows = [r for r in rows if r.get("id") in wanted]
+        plan = params.get("plan")
+        if plan and plan.startswith("eq."):
+            rows = [r for r in rows if r.get("plan") == plan[3:]]
+        prod = params.get("product")
+        if prod and prod.startswith("in.("):
+            rows = [r for r in rows if r.get("product") in set(prod[4:-1].split(","))]
         off, lim = int(params.get("offset", 0)), int(params.get("limit", 1000))
         return _Resp(self.status, rows[off:off + lim])
+
+
+# One full reading = six REST reads: the four marker tables (settings, intake,
+# products, gyms plan=echo_standalone), the token table (aliases) and the client
+# gyms rows (aliases).
+READS_PER_LOAD = 6
 
 
 @pytest.fixture
@@ -152,15 +164,83 @@ def _tables():
     return {"echo_gym_settings": SETTINGS, "echo_intake_tokens": TOKENS, "gyms": GYMS}
 
 
-def test_live_load_reads_three_tables_and_only_client_gyms(creds, real_echo_clients):
+def test_live_load_reads_the_marker_tables_and_only_client_gyms(creds, real_echo_clients):
     http = _Http(_tables())
     s = ec._load(http=http)
     assert s.ok and s.gym_ids == {TOUGH, LOCAL}
     tables = [t for t, _ in http.calls]
-    assert tables == ["echo_gym_settings", "echo_intake_tokens", "gyms"]
-    # the gyms read is scoped to the client ids; the fleet's 158 rows are never pulled
-    gyms_params = [p for t, p in http.calls if t == "gyms"][0]
-    assert gyms_params["id"].startswith("in.(") and BOOM not in gyms_params["id"]
+    assert tables == ["echo_gym_settings", "echo_social_intake", "gym_products", "gyms",
+                      "echo_intake_tokens", "gyms"]
+    plan_params, alias_params = [p for t, p in http.calls if t == "gyms"]
+    assert plan_params["plan"] == "eq.echo_standalone"
+    # the alias gyms read is scoped to the client ids; the fleet's rows are never pulled
+    assert alias_params["id"].startswith("in.(") and BOOM not in alias_params["id"]
+    assert s.markers[TOUGH] == {ec.MARKER_SETTINGS} and s.markers[LOCAL] == {ec.MARKER_SETTINGS}
+
+
+@pytest.mark.parametrize("broken", ["echo_social_intake", "gym_products"])
+def test_a_marker_table_failing_fails_closed(creds, real_echo_clients, broken):
+    s = ec._load(http=_Http(_tables(), fail={broken}))
+    assert not s.ok and broken in s.error
+
+
+# ---- the four markers (round-2 ruling: the day-one marker) ---------------------------
+
+NEWBIE = "0f0f0f0f-0000-4000-8000-000000000005"    # intake submitted, never connected
+STANDALONE = "0f0f0f0f-0000-4000-8000-000000000006"
+PRODUCT = "0f0f0f0f-0000-4000-8000-000000000007"
+
+
+def test_an_echo_social_intake_row_is_a_client_on_day_one():
+    """THE BOOTSTRAP: echo_gym_settings only appears when the owner connects (or flips a
+    /my toggle), so a settings-only rule made connect_link_notify unable to fire for the
+    gym it exists for. The owner's own Echo intake is the day-one marker."""
+    s = ec.build(SETTINGS, TOKENS + [{"gym_id": NEWBIE, "echo_account_key": "newbox0f0f0f"}],
+                 GYMS + [{"id": NEWBIE, "name": "New Box", "slug": "new-box"}],
+                 intake_rows=[{"gym_id": NEWBIE, "client_key": NEWBIE,
+                               "echo_account_key": "newbox0f0f0f"}])
+    assert s.is_client(NEWBIE) and s.is_client("newbox0f0f0f") and s.is_client("new-box")
+    assert s.markers[NEWBIE] == {ec.MARKER_INTAKE}
+    assert "newbox0f0f0f" not in s.other_keys and NEWBIE not in s.other_gym_ids
+
+
+def test_intake_rows_resolve_by_uuid_client_key_and_carry_their_keys_as_aliases():
+    """Older rows carry the UUID as client_key and no gym_id; the echo_account_key the
+    intake forwarded under (e.g. crossfitreverb6cdf33) is the gym's alias."""
+    s = ec.build([], [], GYMS + [{"id": NEWBIE, "name": "New Box", "slug": "new-box"}],
+                 intake_rows=[{"gym_id": "", "client_key": NEWBIE,
+                               "echo_account_key": "newboxstale6cdf33"},
+                              {"gym_id": TOUGH, "client_key": "toughtemple",
+                               "echo_account_key": "toughtemple086f51"}])
+    assert s.ok and s.gym_ids == {NEWBIE, TOUGH}
+    assert s.is_client("newboxstale6cdf33") and s.key_to_gym["newboxstale6cdf33"] == NEWBIE
+    assert s.is_client("toughtemple086f51") and s.is_client("toughtemple")
+
+
+def test_social_product_and_standalone_plan_are_markers():
+    s = ec.build(SETTINGS, TOKENS, GYMS,
+                 product_rows=[{"gym_id": PRODUCT, "product": "social", "status": "active"},
+                               {"gym_id": BOOM, "product": "ads", "status": "active"},
+                               {"gym_id": LEAD, "product": "echo_social", "status": "cancelled"}],
+                 standalone_rows=[{"id": STANDALONE, "name": "Solo Gym", "slug": "solo-gym",
+                                   "plan": "echo_standalone"}])
+    assert s.is_client(PRODUCT) and s.markers[PRODUCT] == {ec.MARKER_PRODUCT}
+    assert s.is_client(STANDALONE) and s.is_client("solo-gym") and s.is_client("sologym")
+    assert s.markers[STANDALONE] == {ec.MARKER_PLAN}
+    assert not s.is_client(BOOM)      # ads product is NOT a marker
+    assert not s.is_client(LEAD)      # a cancelled social product is NOT a marker
+
+
+def test_a_token_row_is_still_not_a_marker_under_the_union():
+    s = ec.build(SETTINGS, TOKENS, GYMS, intake_rows=[], product_rows=[], standalone_rows=[])
+    assert not s.is_client(BOOM) and not s.is_client("boomfitbcs3b4da7")
+    assert s.markers[TOUGH] == {ec.MARKER_SETTINGS}
+
+
+def test_empty_markers_everywhere_is_refused():
+    s = ec.build([], TOKENS, GYMS, intake_rows=[], product_rows=[
+        {"gym_id": BOOM, "product": "ads", "status": "active"}], standalone_rows=[])
+    assert not s.ok and "zero rows" in s.error
 
 
 def test_no_creds_fails_closed(real_echo_clients, monkeypatch):
@@ -187,7 +267,7 @@ def test_a_truncated_page_fails_closed(creds, real_echo_clients, monkeypatch):
     than the fleet could be, so the reading is INCOMPLETE and not believed."""
     monkeypatch.setattr(ec, "_PAGE", 1)
     monkeypatch.setattr(ec, "_MAX_PAGES", 2)
-    s = ec._load(http=_Http(_tables()))       # 4 token rows > 2 pages of 1
+    s = ec._load(http=_Http(_tables()))       # 2 settings rows fill 2 pages of 1 -> incomplete
     assert not s.ok
 
 
@@ -216,13 +296,13 @@ def test_good_reading_is_cached_five_minutes_and_failure_twenty_seconds(
     http = _Http(_tables())
     ec.snapshot(http=http, now_fn=lambda: clock["t"])
     ec.snapshot(http=http, now_fn=lambda: clock["t"])
-    assert len(http.calls) == 3                       # one read, three tables
+    assert len(http.calls) == READS_PER_LOAD          # one reading
     clock["t"] += 299
     ec.snapshot(http=http, now_fn=lambda: clock["t"])
-    assert len(http.calls) == 3                       # still cached
+    assert len(http.calls) == READS_PER_LOAD          # still cached
     clock["t"] += 2
     ec.snapshot(http=http, now_fn=lambda: clock["t"])
-    assert len(http.calls) == 6                       # re-read after 5 min
+    assert len(http.calls) == 2 * READS_PER_LOAD      # re-read after 5 min
     # a failure is retried after 20s, not 300s
     bad = _Http(_tables(), fail={"echo_gym_settings"})
     ec.reset_cache()
@@ -240,7 +320,7 @@ def test_fresh_forces_a_reread(creds, real_echo_clients):
     http = _Http(_tables())
     ec.snapshot(http=http)
     ec.snapshot(http=http, fresh=True)
-    assert len(http.calls) == 6
+    assert len(http.calls) == 2 * READS_PER_LOAD
 
 
 def test_is_echo_client_never_raises(real_echo_clients, monkeypatch):
