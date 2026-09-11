@@ -55,6 +55,23 @@ SEED_MAX_PER_RUN = 3
 SEED_DAYS_AHEAD = 7
 _SCRAPE_MARK_PREFIX = "deep_brain_scraped_"
 
+# CLIENT-SAFE REVIEW MARK (2026-09-11): every row this module inserts is
+# machine-generated from a scrape, ungrounded in any human-approved brand
+# voice yet -- it must read as MORE cautious than an ordinary pending draft,
+# not identical to one. status is already 'pending' (the same universal
+# approval gate every post clears), but a reviewer scanning the queue has no
+# way to tell "a human wrote/approved this brief" apart from "Echo scraped
+# this and took its best shot" without opening each row. This pillar value is
+# the real, visible distinction: distinct from every taxonomy pillar
+# (content_categories.GYM_PILLARS, day_shape.PROOF_PILLARS/
+# INVITATION_PILLARS all check FIXED, known lists and simply do not match this
+# value -- verified, not assumed), so it changes zero downstream rotation
+# logic, and it is returned to the portal UI as-is (portal_social.py serializes
+# `pillar` verbatim). calendar_autopublish.py additionally hard-blocks
+# autopublish on this exact pillar value below (defense in depth beyond the
+# approved_only client gate that already exists).
+NEEDS_CLIENT_SAFE_REVIEW_PILLAR = "deep_brain_needs_client_safe_review"
+
 
 def enabled() -> bool:
     """AGENT_NO_MEDIA_ASTRA_SEED, default OFF."""
@@ -179,8 +196,8 @@ def seed_gaps(base, account, store, *, log=None, today=None,
             continue
         rows.append({
             "gym_id": base, "account": "instagram", "post_date": day,
-            "format": "feed", "pillar": "deep_brain", "caption": headline,
-            "image_url": url, "status": "pending",
+            "format": "feed", "pillar": NEEDS_CLIENT_SAFE_REVIEW_PILLAR,
+            "caption": headline, "image_url": url, "status": "pending",
         })
 
     if not rows:

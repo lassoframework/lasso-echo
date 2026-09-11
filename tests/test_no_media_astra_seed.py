@@ -113,6 +113,22 @@ def test_generates_grounded_pending_rows(monkeypatch):
         assert row["gym_id"] == "chateau"
         assert row["image_url"].startswith("https://r2/")
         assert row["caption"]
+        # client-safe-review mark: real, visible, distinct from an ordinary
+        # pending draft -- a reviewer scanning the queue can tell this one is
+        # machine-scraped, not human-authored/approved.
+        assert row["pillar"] == nmas.NEEDS_CLIENT_SAFE_REVIEW_PILLAR
+        assert row["pillar"] != "pending"
+
+
+def test_needs_client_safe_review_pillar_is_never_a_known_taxonomy_pillar():
+    """The marker must not collide with any real pillar list content/day-shape
+    logic checks against -- otherwise a scraped fallback card could silently
+    get treated as ordinary proof/invitation content."""
+    from agent import content_categories, day_shape
+    marker = nmas.NEEDS_CLIENT_SAFE_REVIEW_PILLAR
+    assert marker not in content_categories.GYM_PILLARS
+    assert marker not in day_shape.PROOF_PILLARS
+    assert marker not in day_shape.INVITATION_PILLARS
 
 
 def test_existing_active_day_is_skipped(monkeypatch):
