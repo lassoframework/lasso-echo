@@ -103,57 +103,49 @@ def _owner_date(by_date):
 # was written for. _fresh_photo shares this function, so the hole was in the DEFAULT
 # (flag OFF) lane too: the sweep could replace a repeat with a byte-identical copy of
 # itself and report the date fixed.
-# A duplicate's suffix: "IMG (1).jpg", "IMG-copy.jpg", "Copy of IMG.jpg".
-#
-# ONE suffix per match, NO outer "+" (independent audit round 4, CRITICAL). The round-3
-# shape `(?:[\s._-]*ALT)+$` let every separator be assigned two ways, so a stem like
-# "img" + "-copy"*n + "x" backtracked 2^n: 24 repeats took 16.7s and a legal 255-char
-# basename never returned. _cluster_key runs per library file on the DEFAULT path via
-# _fresh_photo, and run()'s per-gym try catches exceptions, not hangs -- one crafted or
-# unlucky filename would wedge the whole nightly draft run. _strip_copy_suffix loops a
-# bounded number of times instead, which is linear and cannot backtrack.
-#
-# A BARE TRAILING NUMBER IS NOT A COPY MARKER (round 4, CRITICAL). Round 3 stripped it,
-# so "gym.jpg" + "gym-1.jpg".."gym-5.jpg" collapsed to one cluster the moment the bare
-# original existed, and _fresh_photo returned None for a gym with five usable stills --
-# on the default path, firing the small-library alert where main swapped the repeat.
-# "IMG_6771_1.jpg" is genuinely indistinguishable from "photo_01.jpg", so it is left
-# uncollapsed: a missed dupe costs one repeat, a starved library costs every day.
-_ONE_COPY_SUFFIX_RE = re.compile(
-    r"[\s._-]*(?:\(\s*\d+\s*\)|(?:copy|copie|duplicate|dup)\s*\d*)$",
-    re.IGNORECASE)
-_COPY_PREFIX_RE = re.compile(r"^(?:copy|duplicate)\s+of\s+", re.IGNORECASE)
-_MAX_COPY_SUFFIXES = 4        # "IMG (1) (1) copy copy" and then some
-# A trimmed stem shared by this many files is a SEQUENCE, not a pile of copies: nobody
-# has eight copies of one photo, but "IMG (1)".."IMG (8)" is a normal bulk download.
-_SEQUENCE_MIN = 3
-_PAREN_N_RE = re.compile(r"\(\s*\d+\s*\)\s*$")
+def _content_print(lib, key):
+    """A library file's CONTENT identity (size + sha256, cached by path/mtime/size via
+    media_guard), or None when it cannot be read.
+
+    THE FILENAME HEURISTIC IS GONE (independent audit rounds 2-5). Three rounds went into
+    spotting a duplicate from its NAME, and every version was wrong in one of two
+    directions: too narrow and "IMG_6771 (1).jpg" slipped through as fresh; too wide and
+    "gym.jpg" + "gym-1.jpg".."gym-5.jpg" collapsed into one cluster, so _fresh_photo
+    returned None for a gym with five usable stills and the sweep declared "small
+    library" -- on the DEFAULT path, where origin/main had swapped the repeat. Round 5
+    found BOTH failure modes still live, either side of a threshold.
+
+    Names cannot answer this question. Bytes can, and _is_real_image already opens every
+    candidate, so the cost is a cached hash. A RE-ENCODED near-dupe still slips through;
+    that is the honest limit of a content check, and it is strictly better than the
+    name-guessing it replaces, which could starve a whole library."""
+    try:
+        path = os.path.join(lib, key)
+        h = media_guard._library_hash(path)
+        return (os.path.getsize(path), h) if h else None
+    except OSError:
+        return None
 
 
-def _strip_copy_suffix(stem):
-    """`stem` with its copy suffixes removed, or `stem` unchanged. Bounded and linear."""
-    out = _COPY_PREFIX_RE.sub("", stem)
-    for _ in range(_MAX_COPY_SUFFIXES):
-        nxt = _ONE_COPY_SUFFIX_RE.sub("", out).strip(" ._-")
-        if nxt == out or not nxt:
-            break
-        out = nxt
-    return out or stem
+def _content_prints(lib, keys, lib_names):
+    """The content identities of `keys` that are real files in this library."""
+    out = set()
+    for k in keys:
+        if k in lib_names:
+            fp = _content_print(lib, k)
+            if fp:
+                out.add(fp)
+    return out
 
 
-def _cluster_key(lib, key, lib_names=None):
+def _cluster_key(lib, key):
     """The near-dupe identity of a library file: dam.rotation_key when the gym is
-    vision-clustered, else the case-folded stem with a copy suffix stripped ONLY WHEN
-    the bare original is really in this library AND the family is small enough to be
-    copies rather than a sequence.
+    vision-clustered, else the case-folded stem (catches IMG_6771.JPG vs IMG_6771.jpg --
+    the same photo uploaded twice).
 
-    Both gates exist because over-collapsing is the worse failure. `_fresh_photo` shares
-    this function on the DEFAULT path, so a stem that swallows its neighbours turns a
-    usable library into "small library" and leaves every repeat standing -- the exact
-    outcome this whole change exists to prevent.
-
-    lib_names: every basename in the library. None = no context, so no collapsing beyond
-    case folding (the safe direction: never starve)."""
+    UNCHANGED FROM origin/main on purpose. Everything this briefly tried to infer from a
+    filename now lives in _content_print, so the flag-OFF path is byte-for-byte what it
+    has always been."""
     try:
         from agent import dam
         rk = dam.rotation_key(os.path.join(lib, key))
@@ -161,37 +153,29 @@ def _cluster_key(lib, key, lib_names=None):
             return rk
     except Exception:  # noqa: BLE001
         pass
-    stem = os.path.splitext(key)[0].lower()
-    trimmed = _strip_copy_suffix(stem)
-    if trimmed == stem or not lib_names:
-        return stem
-    stems = [os.path.splitext(str(n))[0].lower() for n in lib_names]
-    if trimmed not in stems:
-        return stem                      # SIBLING GATE: no bare original, so a sequence
-    # SEQUENCE GATE, counted on the NUMBERED members only. "IMG (1)".."IMG (8)" beside
-    # "IMG" is a bulk download, not eight copies. A word-marked family ("-copy",
-    # "Copy of", a case variant) is never a sequence however many members it has.
-    numbered = {st for st in stems
-                if _PAREN_N_RE.search(st) and _strip_copy_suffix(st) == trimmed}
-    if len(numbered) > _SEQUENCE_MIN:
-        return stem
-    return trimmed
+    return os.path.splitext(key)[0].lower()
 
 
 def _fresh_photo(lib, state, exclude):
-    """A genuinely unused, VALIDATED library image (never on any book/window
-    date, never in exclude, never a NEAR-DUPE of one), deterministic.
+    """A genuinely unused, VALIDATED library image (never on any book/window date, never
+    in exclude, never a NEAR-DUPE of one, never BYTE-IDENTICAL to one), deterministic.
     (None, None) when nothing unused."""
     used = set(state.keys()) | set(exclude)
     lib_names = media_guard.library_keys(lib)
-    used_clusters = {_cluster_key(lib, k, lib_names) for k in used if k in lib_names}
+    used_clusters = {_cluster_key(lib, k) for k in used if k in lib_names}
+    used_prints = _content_prints(lib, used, lib_names)
     for key in sorted(lib_names):
         if key in used:
             continue
         if os.path.splitext(key)[1].lower() not in _IMG_EXTS:
             continue                       # image swaps only; videos need their lanes
-        if _cluster_key(lib, key, lib_names) in used_clusters:
+        if _cluster_key(lib, key) in used_clusters:
             continue                       # a near-dupe of a used photo repeats visually
+        # BYTE-IDENTICAL to a photo already on the book, whatever it is called:
+        # "IMG_6771 (1).jpg" beside "IMG_6771.jpg" is the same picture to a follower,
+        # and no filename rule could tell those apart without starving real sequences.
+        if _content_print(lib, key) in used_prints:
+            continue
         path = os.path.join(lib, key)
         if os.path.isfile(path) and _is_real_image(path):
             return key, path
@@ -263,9 +247,13 @@ def _blocked_book_state(base, state, current_key):
         if not lib_names:
             return blocked
         seeds = (set(state or {}) | {current_key}) & lib_names
-        used_clusters = {_cluster_key(lib, k, lib_names) for k in seeds}
+        used_clusters = {_cluster_key(lib, k) for k in seeds}
+        used_prints = _content_prints(lib, seeds, lib_names)
         for name in lib_names:
-            if name not in blocked and _cluster_key(lib, name, lib_names) in used_clusters:
+            if name in blocked:
+                continue
+            if (_cluster_key(lib, name) in used_clusters
+                    or _content_print(lib, name) in used_prints):
                 blocked.setdefault(name, set()).add(("near-dupe", "x"))
     except Exception as exc:  # noqa: BLE001 - never let this block a swap entirely
         _log(f"{base}: near-dupe widening skipped ({type(exc).__name__})")
@@ -328,7 +316,13 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
     holds: only `fixable` (pending / coach_review) rows are passed, the write is the
     status-guarded store.swap_media, and nothing is fabricated.
 
-    True when at least one row was re-pointed. Never raises."""
+    Returns the pick's SOURCE ("drive" or "local") when at least one row was
+    re-pointed, else "" -- the caller needs the distinction because this function
+    legitimately returns a LOCAL pick (pick_replacement draws from both pools, and a
+    local VIDEO is a fine answer here since _fresh_photo only ever looked at images).
+    Counting those as Drive coverage is what made unfixable_report tell a gym its
+    "connected Drive folder covered 1 day(s)" on a night the Drive lane did nothing
+    (independent audit round 5). Never raises."""
     ordered = _feed_first(fixable)
     row, siblings = ordered[0], ordered[1:]
     try:
@@ -339,11 +333,11 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
             asset_state=asset_state, siblings=siblings)
     except Exception as exc:  # noqa: BLE001 - a picker failure is "no Drive swap"
         _log(f"{base}: Drive replacement failed for {key} {pd} ({type(exc).__name__})")
-        return False
+        return ""
     # A picker that returns a non-dict must not raise out of sweep_gym and skip every
     # remaining gym for the night (run() walks gyms in one unguarded loop).
     if not isinstance(pick, dict) or not pick.get("ok"):
-        return False
+        return ""
     from agent import media_swap
     variants = pick.get("siblings") or {}
     # ALL OR NOTHING, exactly like the portal swap: a sibling the picker could not
@@ -353,7 +347,7 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
     if missing:
         _log(f"{base}: {key} {pd}: Drive swap skipped, a sibling row could not be "
              "shaped from the same clip")
-        return False
+        return ""
 
     # ALL OR NOTHING AT WRITE TIME TOO (independent audit 2026-09-11, MAJOR). The
     # picker's own all-or-nothing only covers SHAPING. Each swap_media below is a
@@ -401,9 +395,9 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
         _log(f"{base}: {key} {pd}: row {failed_row} could not be re-pointed; rolling "
              f"back {len(undo)} sibling row(s) so the post is never half swapped")
         _restore_rows(base, store, undo)
-        return False
+        return ""
     if not swapped:
-        return False
+        return ""
     result["rows_repointed"] += len(swapped)
     result["stories_reburned"] += stories
 
@@ -427,7 +421,7 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
              else "the local library")
     result["detail"].append(
         f"{key} {pd}: -> {new_key} from {where} ({len(swapped)} row(s))")
-    return True
+    return "drive" if pick.get("source") == "drive" else "local"
 
 
 def _gym_name(base):
@@ -786,10 +780,15 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                         # downloads, uncapped, inside the nightly draft run, and
                         # reported budget_capped 0 so nothing said why.
                         drive_fixes_left -= 1
-                        if _swap_from_drive_pool(base, store, fixable, state=state,
-                                                 asset_state=asset_state, rows=rows,
-                                                 result=result, key=key, pd=pd):
-                            drive_fixed += 1
+                        _src = _swap_from_drive_pool(
+                            base, store, fixable, state=state, asset_state=asset_state,
+                            rows=rows, result=result, key=key, pd=pd)
+                        if _src:
+                            # ONLY a real Drive pick counts as Drive coverage: the same
+                            # call can return a LOCAL video, and crediting the gym's
+                            # Drive folder for that is the falsehood round 5 caught.
+                            if _src == "drive":
+                                drive_fixed += 1
                             result["dates_fixed"] += 1
                             continue
                 result["small_library"] = True

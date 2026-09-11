@@ -4613,3 +4613,52 @@ Classifier, measured on round 4's held-out corpus plus every earlier one:
 - [x] Flag OFF proven identical to origin/main across 198 (sentence x identity x
   ticket-state) combinations spanning every rule family: **0 diffs**, pinned by a test
   that loads origin/main's module side by side.
+
+## Audit round 5 (2026-09-11): B, shippable. Then the filename heuristic was deleted.
+
+Round 5 graded **B -- SHIPPABLE as merged** (both capabilities flag-gated OFF, every
+gate proven, suite green) with no criticals, and confirmed the end-to-end again through
+the REAL `media_swap.pick_replacement`: 9/15 -> clip19.mp4, 9/16 -> clip20.mp4, feed +
+FB mirror + story moving together, all distinct media from the Drive pool.
+
+Four majors were still open, and the first two were the same defect wearing a third
+disguise. Rounds 2, 3 and 4 each tried to recognise a duplicate from its FILENAME, and
+round 5 found both failure modes alive on either side of the threshold I had picked:
+
+  * too NARROW: `IMG.jpg` + four byte-identical `IMG (1..4).jpg` -- sha256 all
+    `820528ac` -- and `_fresh_photo` happily returned `IMG (1).jpg` as fresh, hosted it,
+    swapped it in and counted the date fixed. The round-2 CRITICAL, reopened above the
+    gate.
+  * too WIDE: `IMG.jpg` + three genuinely different `IMG (1..3).jpg` collapsed to one
+    cluster, `_fresh_photo` returned None, and the sweep declared "small library" where
+    origin/main had swapped the repeat -- on the DEFAULT path, with no flag.
+
+- [~] **The filename heuristic is deleted.** `_cluster_key` is back to exactly
+  origin/main (dam.rotation_key + case-folded stem), so the flag-OFF path is
+  byte-for-byte what it always was, and the whole `_COPY_SUFFIX_RE` / sibling-gate /
+  sequence-gate apparatus is gone with it -- along with its ReDoS surface. Duplicate
+  detection is now `_content_print`: size + sha256, cached by (path, mtime, size)
+  through `media_guard._library_hash`, which `_is_real_image` already pays for by
+  opening every candidate. Names cannot answer "is this the same picture"; bytes can.
+  A RE-ENCODED near-dupe still slips through -- the honest limit of a content check,
+  and strictly better than a name rule that could starve a whole library.
+- [~] `drive_fixed` counted a LOCAL pick. `_swap_from_drive_pool` legitimately returns
+  one (`pick_replacement` draws from both pools, and a local VIDEO is a fine answer
+  since `_fresh_photo` only ever looked at images), so a night where every Drive attempt
+  failed still told the gym its "connected Drive folder covered 1 day(s) tonight". It
+  now returns the pick's SOURCE and only "drive" counts.
+- [~] Classifier precision: round 5's 15 targeted false positives -> **0**. Two leaks:
+  the clause splitter severed justifications from statements (" so ", ". " turned "the
+  class schedule repeats so the same photo is fine" into a bare "the same photo is
+  fine"), and the veto had no REQUEST family ("we need you to reuse the same photo",
+  "we would like the same picture on both posts", "our marketing guy requested duplicate
+  images"). Split on contrast only; added need/want/would like/asked for/requested/
+  prefer/expect/hoping.
+
+**Final measured position: precision 49/49, recall 19/20.** The single miss is a
+question-shaped complaint ("WHY IS THE SAME PHOTO ON MY CALENDAR THREE TIMES") which
+reaches the ANSWER lane, not silence -- round 2's deliberate ordering, and chasing it
+reintroduces the "how often do posts repeat?" false positive. Flag OFF proven identical
+to origin/main across 180 sentence x identity x ticket-state combinations: 0 diffs.
+Fuzzed 3,000 random strings plus 45 crafted backtracking inputs across every new regex:
+worst single match 6.6ms.

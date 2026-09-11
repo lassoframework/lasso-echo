@@ -289,3 +289,50 @@ def test_a_complaint_after_a_thank_you_still_reports():
     assert c.is_repeat_report(
         "thanks for the quick turnaround, but the repeat images are still there") is True
     assert c.is_repeat_report("thanks for fixing the duplicate images last week") is False
+
+
+# ---- round 5: requests, preferences, and severed justifications ---------------------
+@pytest.mark.parametrize("text", [
+    # a justification must not be severed from its statement by " so " / ". "
+    "The programming repeats every 8 weeks so the same footage works.",
+    "The class schedule repeats so the same photo is fine.",
+    "Great work this month. The same photo on both posts was my call.",
+    "our schedule repeats so the captions repeat too",
+    "the promo repeats. the same image is intentional",
+    # a REQUEST or a PREFERENCE is not a bug report
+    "we need you to reuse the same photo for the promo",
+    "we would like the same picture on both posts",
+    "I want the duplicate pictures kept as is",
+    "our marketing guy requested duplicate images",
+    "we asked for the same image on both platforms",
+    "I'd like you to repeat that photo next week",
+    "we prefer the same picture across both posts",
+    "we expect the same clip on the story and the feed",
+    "hoping you can reuse the duplicate photos",
+    "we need the duplicate images left alone",
+])
+def test_a_request_or_a_justification_is_not_a_bug_report(text):
+    got = _classify(text)
+    assert got != c.CODE_FIX, (
+        f"dispatched a fixer on {text!r} -> {got}. The owner would be told 'I read that "
+        "as something not working on our side' about media they asked for on purpose.")
+
+
+@pytest.mark.parametrize("text", [
+    "WHY IS THE SAME PHOTO ON MY CALENDAR THREE TIMES",
+    "duplicate pics again 😩",
+    "the same photo is on 9/14 and 9/15 and 9/16",
+])
+def test_real_reports_in_awkward_registers_are_not_dropped_silently(text):
+    """CAPS, emoji and bare-date shapes must not ESCAPE the system. A question-shaped
+    complaint is allowed to reach the ANSWER lane (round 2's deliberate ordering), but
+    nothing here may simply vanish."""
+    assert _classify(text) in (c.CODE_FIX, c.QUESTION), f"{text!r} fell through"
+
+
+def test_the_clause_splitter_only_splits_on_contrast():
+    """Splitting on ' so ' and '. ' severed justifications from their statements and
+    manufactured false reports."""
+    assert c.is_repeat_report("the class schedule repeats so the same photo is fine") is False
+    assert c.is_repeat_report(
+        "thanks for the turnaround, but the duplicate images are back") is True

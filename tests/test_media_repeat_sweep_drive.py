@@ -672,95 +672,101 @@ def test_the_picker_is_told_what_is_already_on_the_book(monkeypatch):
 # still open by its own worked example, and four new defects were found.
 # =====================================================================================
 
-# ---- B1 / C2: the copy-suffix family, SIBLING GATED ------------------------------
-_LIB_WITH_ORIGINAL = [REPEATED, "IMG_6771 (1).jpg", "IMG_6771-copy.jpg",
-                      "IMG_6771 copy.jpg", "IMG_6771(2).png", "IMG_6771 - Copy.jpg",
-                      "img_6771.JPG", "Copy of IMG_6771.jpg"]
+# ---- B1 / C2: duplicate detection is by CONTENT, not by filename -------------------
+# Rounds 2-5 each broke this a different way trying to read a duplicate off its NAME:
+# too narrow and "IMG_6771 (1).jpg" slipped through as fresh; too wide and a gym's
+# "gym-1.jpg".."gym-5.jpg" collapsed into one cluster so the sweep reported "small
+# library" for a gym with five usable stills -- on the DEFAULT path. Names cannot answer
+# the question. These pin the content check that replaced them.
+_DUPE_BYTES = b"\xff\xd8\xff" + b"A" * 5000
+_OTHER_BYTES = b"\xff\xd8\xff" + b"B" * 5000
 
 
-@pytest.mark.parametrize("dupe", [n for n in _LIB_WITH_ORIGINAL if n != REPEATED])
-def test_a_copy_collapses_when_the_original_is_in_the_library(dupe):
-    """dam.rotation_key only clusters a MARKED library (mark_near_dupes runs once, at
-    onboarding; nothing re-marks after a portal upload or a Drive sync), so in production
-    _cluster_key falls back to the stem. Case-folding alone missed every one of these --
-    including 'IMG_6771 (1).jpg', the exact example the guard was written for. This is
-    the DEFAULT lane too: _fresh_photo shares _cluster_key."""
-    assert (mrs._cluster_key("/nolib", dupe, _LIB_WITH_ORIGINAL)
-            == mrs._cluster_key("/nolib", REPEATED, _LIB_WITH_ORIGINAL))
+def _write(lib, names, data):
+    for n in names:
+        (lib / n).write_bytes(data)
 
 
-@pytest.mark.parametrize("lib", [
-    [f"IMG ({i}).jpg" for i in range(1, 9)],          # bulk phone / Drive download
-    ["team copy.jpg", "team copy 2.jpg", "team copy 3.jpg"],
-    [f"photo_{i:02d}.jpg" for i in range(1, 6)],
-    ["1.jpg", "2.jpg", "3.jpg"],
+@pytest.mark.parametrize("dupe", [
+    "IMG_6771 (1).jpg", "IMG_6771-copy.jpg", "IMG_6771 copy.jpg", "IMG_6771(2).png",
+    "IMG_6771 - Copy.jpg", "Copy of IMG_6771.jpg", "IMG_6771_1.jpg", "IMG_6771-2.jpg",
+    "totally_unrelated_name.jpg",          # the name is irrelevant; the bytes are not
 ])
-def test_a_numbered_family_with_no_original_stays_distinct(lib):
-    """THE STARVATION CASE (audit round 3, CRITICAL). Round 2 stripped copy markers
-    unconditionally, so a library of 'IMG (1).jpg'..'IMG (8).jpg' -- the standard bulk
-    download naming, which client_media_sync keeps verbatim -- collapsed to ONE cluster.
-    _fresh_photo then returned None for a gym with eight usable stills and the sweep
-    reported 'small library'. Over-collapsing is the worse failure: it causes MORE
-    repeats, and it was live on the default path."""
-    keys = {mrs._cluster_key("/nolib", n, lib) for n in lib}
-    assert len(keys) == len(lib), f"collapsed {lib} into {keys}"
+def test_a_byte_identical_copy_is_never_offered_as_fresh(dupe, tmp_path, monkeypatch):
+    lib = tmp_path / "dupes"
+    lib.mkdir()
+    _write(lib, [REPEATED, dupe], _DUPE_BYTES)
+    monkeypatch.setattr(mrs, "_is_real_image", lambda path: True)
+    got, _ = mrs._fresh_photo(str(lib), {REPEATED: {("2026-09-13", "x")}},
+                              exclude={REPEATED})
+    assert got is None, f"offered {got!r}, a byte-identical copy of the repeat"
 
 
-@pytest.mark.parametrize("name", ["IMG_6771_1.jpg", "IMG_6771-2.jpg"])
-def test_a_bare_trailing_number_is_never_treated_as_a_copy(name):
-    """THE DELIBERATE TRADE (audit round 4, CRITICAL). "IMG_6771_1.jpg" is genuinely
-    indistinguishable from "photo_01.jpg", and round 3 collapsed both: "gym.jpg" plus
-    "gym-1.jpg".."gym-5.jpg" became ONE cluster the moment the bare original existed, so
-    _fresh_photo returned None for a gym with five usable stills and the sweep fired the
-    small-library alert where main had swapped the repeat -- on the DEFAULT path. A
-    missed dupe costs one repeat; a starved library costs every day."""
-    lib = [REPEATED, name]
-    assert (mrs._cluster_key("/nolib", name, lib)
-            != mrs._cluster_key("/nolib", REPEATED, lib))
-
-
-@pytest.mark.parametrize("lib", [
+@pytest.mark.parametrize("lib_names", [
     ["gym.jpg"] + [f"gym-{i}.jpg" for i in range(1, 6)],
     ["photo.jpg"] + [f"photo_{i:02d}.jpg" for i in range(1, 7)],
-    ["tough.jpg"] + [f"tough-{i}.jpg" for i in range(1, 9)],
-    ["IMG.jpg"] + [f"IMG ({i}).jpg" for i in range(1, 9)],     # the SEQUENCE gate
+    ["IMG.jpg"] + [f"IMG ({i}).jpg" for i in range(1, 9)],
+    [f"IMG ({i}).jpg" for i in range(1, 9)],
+    ["a.jpg", "a (1).jpg", "a (2).jpg"],
 ])
-def test_a_sequence_beside_its_bare_original_is_not_starved(lib):
-    """Round 4's CRITICAL: the sibling gate alone still collapsed a plain sequence as
-    soon as the bare stem happened to be present. Measured against origin/main,
-    _fresh_photo went from returning a usable photo to returning None."""
-    keys = {mrs._cluster_key("/nolib", n, lib) for n in lib}
-    assert len(keys) == len(lib), f"starved {lib} into {keys}"
-
-
-@pytest.mark.parametrize("stem_len", [13, 20, 24, 40, 120])
-def test_the_copy_suffix_matcher_cannot_backtrack(stem_len):
-    """Round 4 CRITICAL: `(?:[\\s._-]*ALT)+$` assigned every separator two ways, so
-    "img" + "-copy"*24 took 16.7s and a legal 255-char basename never returned.
-    _cluster_key runs per library file on the default path, and run()'s per-gym try
-    catches exceptions, not hangs."""
-    import time
-    stem = "img" + "-copy" * stem_len + "x"
-    started = time.perf_counter()
-    mrs._cluster_key("/nolib", stem + ".jpg", [stem + ".jpg"])
-    assert time.perf_counter() - started < 0.5, "catastrophic backtracking"
-
-
-def test_no_library_context_never_collapses():
-    """The safe direction: with no library to check a sibling against, do not guess."""
-    assert (mrs._cluster_key("/nolib", "IMG_6771 (1).jpg")
-            != mrs._cluster_key("/nolib", REPEATED))
-
-
-def test_a_numbered_library_with_no_original_is_not_starved(tmp_path):
-    """End to end through _fresh_photo: eight usable stills must stay eight."""
-    lib = tmp_path / "bulk"
+def test_a_visually_distinct_library_is_never_starved(lib_names, tmp_path, monkeypatch):
+    """THE STARVATION CASE, in every naming shape rounds 3-5 got wrong. Different
+    pictures that merely share a stem must stay usable: a starved library reports
+    'small library' and leaves EVERY repeat standing, which is worse than the one dupe
+    the name heuristic was chasing."""
+    lib = tmp_path / "distinct"
     lib.mkdir()
-    for i in range(1, 9):
-        (lib / f"IMG ({i}).jpg").write_bytes(b"\xff\xd8\xff" + b"x" * 4096)
-    state = {"IMG (1).jpg": {("2026-09-13", "x")}}
-    got, _path = mrs._fresh_photo(str(lib), state, exclude={"IMG (1).jpg"})
-    assert got == "IMG (2).jpg", f"library starved: _fresh_photo returned {got!r}"
+    for i, n in enumerate(lib_names):
+        (lib / n).write_bytes(b"\xff\xd8\xff" + bytes([i % 251]) * 5000)
+    monkeypatch.setattr(mrs, "_is_real_image", lambda path: True)
+    used = lib_names[0]
+    got, _ = mrs._fresh_photo(str(lib), {used: {("2026-09-13", "x")}}, exclude={used})
+    assert got is not None, f"starved {lib_names}: no fresh photo offered"
+    assert got != used
+
+
+def test_the_near_dupe_widening_leaves_unrelated_photos_available(tmp_path, monkeypatch):
+    """_blocked_book_state must block the copies of what is on the book, not the
+    library."""
+    lib = tmp_path / "mixed"
+    lib.mkdir()
+    _write(lib, [REPEATED, "IMG_6771 (1).jpg"], _DUPE_BYTES)
+    _write(lib, ["totally_other.jpg"], _OTHER_BYTES)
+    (lib / "another_one.jpg").write_bytes(b"\xff\xd8\xff" + b"C" * 5000)
+    monkeypatch.setattr(mrs, "_lib_dir", lambda base: str(lib))
+    blocked = mrs._blocked_book_state(GYM, {REPEATED: {("2026-09-13", "x")}}, REPEATED)
+    assert "IMG_6771 (1).jpg" in blocked, "the byte-identical copy must be blocked"
+    assert "totally_other.jpg" not in blocked
+    assert "another_one.jpg" not in blocked
+
+
+def test_the_cluster_key_is_unchanged_from_origin_main():
+    """Everything the filename heuristic tried to do now lives in _content_print, so
+    this function -- which runs on the DEFAULT path -- is back to exactly what it was."""
+    assert mrs._cluster_key("/nolib", "IMG_6771 (1).jpg") == "img_6771 (1)"
+    assert mrs._cluster_key("/nolib", "IMG_6771.JPG") == "img_6771"
+    assert mrs._cluster_key("/nolib", "photo_01.jpg") == "photo_01"
+
+
+def test_a_content_print_never_raises_on_a_missing_file():
+    assert mrs._content_print("/nope/not/here", "ghost.jpg") is None
+    assert mrs._content_prints("/nope", {"ghost.jpg"}, {"ghost.jpg"}) == set()
+
+
+def test_fresh_photo_stays_fast_on_a_large_library(tmp_path, monkeypatch):
+    """The content check reads bytes, so guard the cost: media_guard caches by
+    (path, mtime, size), and this must stay well inside a nightly budget."""
+    import time
+    lib = tmp_path / "big"
+    lib.mkdir()
+    for i in range(400):
+        (lib / f"p{i:04d}.jpg").write_bytes(b"\xff\xd8\xff" + bytes([i % 251]) * 3000)
+    monkeypatch.setattr(mrs, "_is_real_image", lambda path: True)
+    state = {f"p{i:04d}.jpg": {("2026-09-13", "x")} for i in range(50)}
+    started = time.perf_counter()
+    got, _ = mrs._fresh_photo(str(lib), state, exclude=set())
+    assert got is not None
+    assert time.perf_counter() - started < 2.0
 
 
 def test_the_default_lane_never_swaps_a_repeat_for_its_own_copy(monkeypatch, tmp_path):
@@ -1042,3 +1048,34 @@ def test_a_dry_run_says_it_never_tested_deliverability(monkeypatch):
     res = _sweep(_Store(_book()), apply=False, picker=None, drive_n=9,
                  monkeypatch=monkeypatch)
     assert any("DELIVERABILITY NOT TESTED" in d for d in res["detail"])
+
+
+# ---- round 5: the Drive lane is credited only for what IT did ----------------------
+def test_a_local_pick_is_not_credited_to_the_drive_folder(monkeypatch):
+    """_swap_from_drive_pool legitimately returns a LOCAL pick (pick_replacement draws
+    from both pools, and a local VIDEO is a fine answer since _fresh_photo only ever
+    looked at images). Counting those as Drive coverage told a gym its "connected Drive
+    folder covered 1 day(s) tonight" on a night the Drive lane did nothing."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+
+    def local_pick(base, row, *, store, siblings=(), **kw):
+        got = {"ok": True, "source": "local", "kind": "video", "key": "reel_02.mp4",
+               "image_url": "https://cdn.tt/reel_02.mp4", "source_media_url": None,
+               "thumbnail_url": "", "source_media_asset_id": "", "path": "/tmp/r.mp4"}
+        got["siblings"] = {str(s.get("id")): dict(got) for s in siblings}
+        return got
+
+    res = _sweep(_Store(_book()), picker=local_pick, drive_n=40, monkeypatch=monkeypatch)
+    assert res["dates_fixed"] == 1
+    assert res["drive_fixed"] == 0, "credited the Drive folder for a local pick"
+    assert any("from the local library" in d for d in res["detail"])
+
+
+def test_a_drive_pick_is_credited_to_the_drive_folder(monkeypatch):
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    res = _sweep(_Store(_book()), picker=_picker(), drive_n=40, monkeypatch=monkeypatch)
+    assert res["dates_fixed"] == 1 and res["drive_fixed"] == 1
+
+
+def test_swap_from_drive_pool_reports_its_source():
+    assert mrs._swap_from_drive_pool.__doc__ and "SOURCE" in mrs._swap_from_drive_pool.__doc__

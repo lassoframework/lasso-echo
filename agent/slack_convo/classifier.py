@@ -126,6 +126,13 @@ _NOT_A_REPEAT_REPORT_RE = re.compile(
     r"don'?t\b|dont\b|never\b|make sure\b|go ahead\b|feel free\b|if\b|"
     r"it'?s fine\b|it is fine\b|honestly\b)|"
     r"\b(?:just |please |feel free to )(?:recycle|reuse|repeat|duplicate)\b|"
+    # a REQUEST or a PREFERENCE, however it is worded: "we need you to reuse the same
+    # photo", "we would like the same picture on both posts", "keep the duplicates".
+    r"\b(?:need|needs|needed|want|wants|wanted|would like|'?d like|asked for|ask for|"
+    r"requested|request|prefer|prefers|expect|expects|hoping|hope) (?:you |us |echo |"
+    r"them )?(?:to )?\w*\s*(?:reuse|repeat|duplicate|recycle|keep|use|leave)?\b"
+    r"(?=.*\b(?:reuse|reused|repeat|repeats|repeated|duplicate|duplicates|duplicated|"
+    r"recycle|recycled|same)\b)|"
     r"\bfine to (?:reuse|repeat|duplicate|recycle|use)\b|"
     r"\bkeep (?:the )?same\b|"
     # gratitude ABOUT a past fix ("thanks for fixing the duplicate images"). Clause
@@ -178,9 +185,13 @@ _POLITE_OPENER_RE = re.compile(
 # A message can be an apology AND a report ("thanks for the quick turnaround, but the
 # repeat images are still there"). Judged clause by clause, so one benign clause cannot
 # bury a real complaint and one repeat word cannot convict a benign sentence.
+# CONTRASTIVE boundaries only (independent audit round 5). Splitting on " so " and
+# ". " severed a justification from its statement -- "The class schedule repeats so the
+# same photo is fine" became a bare "the same photo is fine" -- and manufactured false
+# reports. A contrastive marker is the one place a complaint genuinely hides behind a
+# pleasantry ("thanks ..., but the repeat images are still there").
 _CLAUSE_SPLIT_RE = re.compile(
-    r"\s+(?:but|however|though|although|except)\s+|\s+so\s+|\s+and then\s+|"
-    r"[;\n]+|\.\s+", re.IGNORECASE)
+    r"\s+(?:but|however|though|although|except)\s+|[;\n]+", re.IGNORECASE)
 
 
 def is_repeat_report(text):
