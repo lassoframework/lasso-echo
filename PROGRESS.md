@@ -4422,3 +4422,52 @@ sentence failed the domain check too, even if the breakage side had matched.
 Note the separate lane this was NOT: `agent/echo_ticket_worker.py` is `SOURCE =
 "website_tab"` -- the PORTAL support tab. John wrote in Slack, so that worker was never
 in the path. The Slack path is `slack_convo/` and it stopped at classification.
+
+## Creative variants — Astra v2 side-by-side pick (2026-09-11, migration 0318)
+
+Astra can now regenerate an existing scheduled post's image as an alternate "v2"
+WITHOUT overwriting the live creative. Schema: `content_calendar.variant_of`
+(nullable uuid, the stable group anchor) + `variant_status`
+(`active`/`candidate`/`archived`). A v2 is a NEW linked row, not a JSON array —
+every existing per-row code path (approval, publish, media guards) keeps working
+untouched; only the SELECT filters needed `variant_status=eq.active` added.
+
+- [x] `supabase/migrations/0318_content_calendar_variants.sql` (portal repo): the
+  two columns + a partial UNIQUE index (`content_calendar_one_active_per_group`)
+  that is the actual atomicity guarantee — Postgres itself refuses a second
+  'active' row per group, not application discipline. Plus
+  `content_calendar_swap_variant(gym_id, candidate_id, actor)`, a SECURITY
+  DEFINER RPC that locks the whole group with `FOR UPDATE` before touching
+  anything, refuses on a published row (either side) or a cross-gym id, and is
+  idempotent-safe against a double-click (second call sees `variant_status !=
+  'candidate'` post-commit and no-ops with `not_a_candidate`).
+- [x] `agent/portal_calendar_store.py`: `get_variant_group` / `create_variant_candidate`
+  / `swap_variant` (the last calls the RPC via `rpc/content_calendar_swap_variant` —
+  the atomicity cannot be built from separate PostgREST reads+writes, it has to be
+  one Postgres transaction). Every existing "one row = one post" read
+  (`list_month`, `due_rows`, `has_owner_visible_rows`, `first_calendar_date`,
+  `publishing_rows`, `expired_rows`, `list_pending_future`, `rows_in_range`,
+  `list_event_rows`) now filters `variant_status=eq.active`, so a pending
+  candidate can never be double-counted, published, graded, or deleted.
+  `locked_slots` needed no direct change — it derives from `list_month`.
+- [x] `agent/variant_regen.py`: generates the v2 through `creative_studio.generate`
+  (the SAME Astra-first, house-style-grade pipeline `daily_studio` uses for every
+  normal build — no bespoke image path), facts drawn only from the row's own
+  already-approved caption (no fabrication).
+- [x] `agent/portal_social.py` + `agent/intake_web.py`: `GET
+  /portal/<token>/posts/<id>/variants` (list, ungated), `POST .../regen-variant`
+  (create a candidate, original untouched), `POST .../pick-variant` (the atomic
+  swap). All gated by `ECHO_VARIANT_PAIRING` (default OFF) except the read.
+- [x] `tests/test_variant_pairing.py`: store-level PostgREST call shape, the
+  backward-compat filters, handler flag/ownership/published-row gating, and
+  `variant_regen` fact-extraction + failure reasons. 28 tests, all offline.
+
+### Not yet done
+- [ ] Portal (Next.js) review UI: side-by-side variants + a pick button on the
+  staff/client calendar surface. Backend is usable via curl/Postman today; no
+  human-facing button yet.
+- [ ] Migration 0318 not yet applied to prod (`ooqcvmcjspeltuuhcvlh`) — ships via
+  the portal's normal `deploy-migrate.mjs` ledger, not applied by hand or via
+  Supabase MCP (that would desync the ledger — see the portal migrations README).
+- [ ] `ECHO_VARIANT_PAIRING` stays OFF until the fleet-wide Astra regen sweep
+  (~1,000+ September posts) is ready to use it.

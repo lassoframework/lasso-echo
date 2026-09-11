@@ -238,6 +238,13 @@ class SupabaseCalendarStore:
         params = {
             "gym_id": f"eq.{account_key}",
             "post_date": [f"gte.{first}", f"lte.{last}"],
+            # 0318 (variant rows): a candidate/archived row shares a slot with its
+            # group's active row. Every caller of list_month treats the return as
+            # "one row per logical post" (counts, slot-locking, the client feed) --
+            # without this filter a pending Astra-v2 candidate would double-count
+            # the slot and could even get published by a rebuild that doesn't know
+            # to skip it. See PROGRESS.md / the variant-pairing audit.
+            "variant_status": "eq.active",
             "order": "post_date",
         }
         r = self._client().get(
@@ -256,6 +263,10 @@ class SupabaseCalendarStore:
         gym with none is in its FIRST, not-yet-released month; a gym with any is established
         and grandfathered (never re-withheld on a rebuild)."""
         params = {"gym_id": f"eq.{account_key}", "status": "neq.coach_review",
+                  # 0318: a 'candidate' row (an unchosen Astra v2, never itself
+                  # owner-visible in the review sense this gate cares about)
+                  # must not count as "the gym already has a released month".
+                  "variant_status": "eq.active",
                   "select": "id", "limit": "1"}
         r = self._client().get(self._rest(_TABLE), params=params,
                                headers=self._headers(), timeout=30)
@@ -423,6 +434,107 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    # ---- variant pairing (0318): v2 creative candidates -----------------------
+    # A "logical post" can have MORE THAN ONE content_calendar row once this
+    # ships: exactly one 'active' row (the live/publishing creative) plus zero
+    # or more 'candidate' rows (alternate not-yet-picked creative, e.g. an
+    # Astra v2 regen) and 'archived' rows (superseded actives / rejected
+    # candidates, kept for audit, never deleted). Group membership for row R
+    # is coalesce(R.variant_of, R.id) -- see the migration's header comment.
+
+    def get_variant_group(self, account_key, row_id):
+        """The full variant group (active + candidates, NOT archived) for the
+        logical post `row_id` belongs to, gym-scoped. `row_id` may be the
+        anchor (original) row OR any candidate/active row in the group --
+        the anchor is resolved from whichever row is fetched first. Returns
+        [] when the row does not exist / belongs to another gym. The list is
+        NOT itself the 'one row per post' read path (list_month is); this is
+        the review-surface read that WANTS to see every candidate."""
+        seed = self.get_row(account_key, row_id)
+        if seed is None:
+            return []
+        anchor = seed.get("variant_of") or seed.get("id")
+        r = self._client().get(
+            self._rest(_TABLE),
+            params={
+                "gym_id": f"eq.{account_key}",
+                "or": f"(id.eq.{anchor},variant_of.eq.{anchor})",
+                "variant_status": "in.(active,candidate)",
+                "order": "variant_status.desc,created_at",
+            },
+            headers=self._headers(), timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return [row for row in (r.json() or [])
+                if str(row.get("gym_id")) == str(account_key)]
+
+    def create_variant_candidate(self, account_key, anchor_row, image_url,
+                                 caption=None, thumbnail_url=None,
+                                 source_media_asset_id=None, prompt_used=None):
+        """INSERT a new 'candidate' row linked to `anchor_row` (a dict, the row the
+        candidate is an alternate FOR). Copies the slot identity (post_date,
+        account, format, pillar, gbp_* fields) so the candidate is a genuine
+        alternate for the SAME logical post, never a floating duplicate. status
+        is always 'pending' (a candidate is never pre-approved by existing) --
+        it must clear the same review gate as any post once/if it becomes
+        active. variant_of is the ANCHOR's own id: if `anchor_row` is itself
+        already a candidate/archived member of a group, its OWN variant_of
+        (never re-derived) is used so every candidate in a group points at the
+        same stable anchor. gym_id is always account_key (never trusted from
+        the caller-supplied anchor_row) -- this is the ownership guarantee.
+        Returns the inserted row."""
+        anchor_id = anchor_row.get("variant_of") or anchor_row.get("id")
+        payload = {
+            "gym_id": account_key,
+            "account": anchor_row.get("account"),
+            "post_date": anchor_row.get("post_date"),
+            "format": anchor_row.get("format"),
+            "pillar": anchor_row.get("pillar"),
+            "caption": caption if caption is not None else anchor_row.get("caption"),
+            "image_url": image_url,
+            "status": "pending",
+            "variant_of": anchor_id,
+            "variant_status": "candidate",
+        }
+        if thumbnail_url is not None:
+            payload["thumbnail_url"] = thumbnail_url
+        if source_media_asset_id is not None:
+            payload["source_media_asset_id"] = source_media_asset_id
+        r = self._client().post(
+            self._rest(_TABLE),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=[payload], timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
+
+    def swap_variant(self, account_key, candidate_id, actor=""):
+        """THE atomic pick: promote `candidate_id` to 'active' for its group,
+        archiving the previously-active row and every other candidate in the
+        SAME transaction (content_calendar_swap_variant, migration 0318).
+        Calls the Postgres function via PostgREST rpc/ rather than issuing
+        the reads+writes from here, because the atomicity guarantee (no
+        window where two rows are both active, no window a publisher could
+        observe an inconsistent group) requires ONE transaction with the
+        whole group row-locked -- something a sequence of separate PostgREST
+        calls from Python cannot provide. Returns the function's jsonb result
+        dict: {"ok": true, "active_id": ..., ...} or {"ok": false, "error":
+        one of "not_found"/"not_a_candidate"/"published_final"}."""
+        r = self._client().post(
+            self._rest("rpc/content_calendar_swap_variant"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"p_gym_id": account_key, "p_candidate_id": candidate_id,
+                 "p_actor": (actor or None)},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or {"ok": False, "error": "empty_response"}
+
     def patch_gbp_fields(self, account_key, row_id, fields):
         """G1: persist edited GBP structured columns (already normalized to gbp_* names)
         and revert status to 'pending' — an edit to CTA/event/offer/location resets the
@@ -586,6 +698,10 @@ class SupabaseCalendarStore:
             "published_at": "is.null",
             "image_url": "not.is.null",
             "account": "in.(instagram,facebook)",
+            # 0318: never let a candidate variant (an unchosen Astra v2 sitting
+            # beside its slot's real active row) get claimed and published --
+            # only the active row for a slot is ever eligible.
+            "variant_status": "eq.active",
             "order": "post_date.desc,created_at",
         }
         r = self._client().get(
@@ -1092,6 +1208,9 @@ class SupabaseCalendarStore:
             "select": "post_date",
             "order": "post_date.asc",
             "limit": "1",
+            # 0318: a candidate row must never set the "before Echo" reference
+            # date — it is an unchosen alternate, not a real planned/published post.
+            "variant_status": "eq.active",
         }
         if status:
             params["status"] = f"eq.{status}"
@@ -1341,6 +1460,11 @@ class SupabaseCalendarStore:
         params = {
             "status": "eq.publishing",
             "published_at": "is.null",
+            # 0318: a candidate/archived row can never legitimately be
+            # 'publishing' (only an active row is ever claimed by mark_publishing),
+            # but the filter is added anyway so a future bug elsewhere can never
+            # turn this into a false stale-claim alert on a variant row.
+            "variant_status": "eq.active",
             "select": "id,gym_id,account,post_date",
         }
         r = self._client().get(
@@ -1396,6 +1520,10 @@ class SupabaseCalendarStore:
             # for the same reason, so counting them here would fire false "can never
             # publish" alerts on healthy rows.
             "account": "neq.googlebusiness",
+            # 0318: an unchosen candidate must never fire a false "N approved
+            # posts can never publish" alert — only the group's active row is
+            # actually due to publish.
+            "variant_status": "eq.active",
             "select": "id,gym_id,account,post_date,status",
             "order": "post_date.asc",
         }
@@ -1659,6 +1787,14 @@ class SupabaseCalendarStore:
         params = {
             "gym_id": f"eq.{account_key}",
             "post_date": post_date_filter,
+            # 0318: NEVER delete a candidate (an unchosen alternate awaiting a
+            # human pick) or an archived row (kept for audit, by design, not
+            # deletable). A rebuild must only ever touch the plain active row
+            # a slot already had -- deleting an archived row would silently
+            # break the "kept, not deleted" guarantee the swap feature makes,
+            # and deleting a pending candidate would destroy an in-flight pick
+            # the moment the nightly job ran.
+            "variant_status": "eq.active",
         }
         if preserve_human:
             # delete only the never-touched drafts: status IS NULL OR status IN wipeable.
@@ -1779,6 +1915,9 @@ class SupabaseCalendarStore:
             "gym_id": f"eq.{account_key}",
             "status": "eq.pending",
             "post_date": f"gt.{today_iso}",
+            # 0318: a pending CANDIDATE is not the forward book's real post and
+            # must never be denied/mutated as if it were.
+            "variant_status": "eq.active",
             "order": "post_date",
         }
         r = self._client().get(
@@ -1808,6 +1947,10 @@ class SupabaseCalendarStore:
             # never leaks into grading by default.
             "status": "in.(pending,approved,publishing,published,coach_review)",
             "post_date": f"gte.{start_iso}",
+            # 0318: a candidate sitting beside its slot's active row is not a
+            # second post the audience will see -- grading it would inflate
+            # cadence/content-mix and double-count the slot.
+            "variant_status": "eq.active",
             "order": "post_date",
             "limit": "1000",
         }
@@ -1829,6 +1972,10 @@ class SupabaseCalendarStore:
         params = {
             "gym_id": f"eq.{account_key}",
             "event_id": f"eq.{event_id}",
+            # 0318: a candidate variant of an arc row is not itself part of the
+            # live arc until picked -- the cancel/ended sweep and publish gate
+            # must only ever see the arc's active rows.
+            "variant_status": "eq.active",
             "order": "post_date",
             "limit": "1000",
         }
