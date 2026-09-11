@@ -4481,3 +4481,63 @@ build. Leaving the original lines struck through for history.)
   ready.~~ Armed `true` in prod 2026-09-11. The ~1,000+ September post regen
   sweep itself has NOT been run yet — that is the one real remaining item from
   this list.
+
+## build_lock heartbeat: the static 15-minute timeout was never checked against a real worst case (Blake, 2026-09-11 follow-up)
+
+PR #113/#115 (same day) shipped `agent/build_lock.py`'s per-gym advisory lock
+around `build_client_month` / `backfill_denied_slots` (ticket 4941e162,
+CrossFit Reverb) with a fixed `STALE_SECONDS = 15 * 60`. Blake flagged,
+unresolved, that this number was picked without checking it against the
+actual worst-case LEGITIMATE build runtime. Audited it and the concern was
+real:
+
+- `agent/config.py` `rendition_max_per_build()` defaults to 8;
+  `agent/gym_media_index.py` `RENDITION_TIMEOUT_SEC = 180` per clip -- 8 x 180s
+  = 24 minutes of transcode budget ALONE, already past 15 minutes.
+- On top of that: `agent/drafter.py` calls Claude for each caption
+  (`_call_llm_caption`, no per-call timeout override -> the anthropic SDK's
+  own ~600s default) up to FOUR times per caption (initial compose + up to
+  three conditional retries: opening-collision, dropped-name, figure-gate),
+  for up to 31 days x 2 cadence slots (`agent/plan_horizon.py`,
+  `AGENT_PLAN_HORIZON_DAYS` default 31) = up to 62 captions, i.e. up to ~248
+  LLM calls in one build.
+- The Drive media lane (`agent/gym_media_builder.py`'s "trying the next
+  asset" loop) can also call `agent/vision.py`'s Gemini reader with NO
+  explicit timeout kwarg at all, per candidate photo, for every day the
+  Drive lane fills in.
+
+Conclusion: a precise "worst legitimate runtime" number is not knowable from
+a static code read — two of the slow paths (Claude, Gemini) carry no
+explicit timeout in this codebase at all, only SDK defaults, and the
+multipliers (retries x captions x candidates) stack. Picking a bigger static
+number just moves the goalpost to the next unaudited slow step. Flagging this
+plainly rather than picking an arbitrary "big enough" number and calling it
+settled.
+
+- [x] Replaced the static-timeout design with a heartbeat. `agent/build_lock.py`:
+  `heartbeat(base_key, holder)` re-stamps the lock (fail-open on a kv write
+  hiccup -- never raises, never releases early); `HeartbeatHandle` /
+  `start_heartbeat()` run it on a background thread every
+  `HEARTBEAT_INTERVAL_SECONDS` (45s) for as long as the holder is alive.
+  Staleness is now measured from "time since last heartbeat"
+  (`HEARTBEAT_STALE_SECONDS`, 4 minutes) instead of "time since acquisition",
+  so a live build of ANY length keeps proving it is alive, and a genuinely
+  crashed/silent holder is reclaimed in ~4 minutes instead of 15+.
+  `STALE_SECONDS` kept as a backward-compatible alias.
+- [x] Wired into both call sites in `agent/client_month_run.py`
+  (`build_client_month` and `backfill_denied_slots`): `start_heartbeat()`
+  right after `acquire()` succeeds, `.stop()` in the `finally` block BEFORE
+  `release()`.
+- [x] `tests/test_build_lock.py`: 6 new tests -- a simulated 40-minute build
+  that heartbeats every interval never loses its lock and keeps a second
+  caller refused throughout; a holder that stops heartbeating is reclaimed
+  within the new short window (and asserts that window is shorter than the
+  old 15-minute one); a heartbeat write failure returns False without
+  raising and without releasing/corrupting a still-live lock; a late
+  heartbeat from a holder that was legitimately reclaimed is refused rather
+  than clobbering the new owner; the background thread actually fires
+  renewals on its interval and stops cleanly. All 15 tests in the file pass
+  (9 original + 6 new).
+- [x] Full suite run before merge: confirmed green (see PR for the exact
+  count run same session as origin/main's pre-change baseline of 7177
+  passed / 13 skipped / 0 failed).
