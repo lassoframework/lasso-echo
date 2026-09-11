@@ -59,6 +59,13 @@ _REGISTRY = {
         "domain": "tricorefit.com",               # Phoenix, AZ (TriCore Fitness)
         "instagram": "tricore.fitness",
     },
+    # Looked up + verified 2026-09-11 (no-media Astra seed verification run,
+    # CrossFit Chateau: zero uploaded media, zero approved sources on file).
+    "crossfit chateau": {
+        "domain": "crossfitchateau.com",          # Woodinville, WA, since 2010
+        "instagram": "crossfitchateau",
+        "facebook": "CrossFitChateau",
+    },
     "x4 hoover": {
         "domain": "x4fit.com",                    # Hoover, AL location of the X4 FIT brand
     },
