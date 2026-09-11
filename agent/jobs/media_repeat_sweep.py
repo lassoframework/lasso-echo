@@ -429,6 +429,16 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
         _log(f"{base}: {key} {pd}: row {failed_row} could not be re-pointed; rolling "
              f"back {len(undo)} sibling row(s) so the post is never half swapped")
         stuck = _restore_rows(base, store, undo)
+        if not stuck:
+            # A CLEAN ROLLBACK IS NOT A THIN LIBRARY (independent audit round 11). This
+            # returned "" and sweep_gym then set small_library and fired
+            # media_guard.alert_small_library, whose text is "Add photos (connect the
+            # gym's Drive folder ...)" -- the exact sentence this whole change exists to
+            # stop sending Tough Temple. A replacement WAS found; the write did not land.
+            result["detail"].append(
+                f"{key} {pd}: a replacement was found but the write did not land; "
+                "retried on the next run")
+            return "rolledback"
         if stuck:
             # RESERVE THE ASSET BEFORE RETURNING (independent audit round 10, CRITICAL).
             # The stamping and after_swap lived only on the full-success path below, but
@@ -465,7 +475,10 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
             return "mixed"
         return ""
     if not swapped:
-        return ""
+        result["detail"].append(
+            f"{key} {pd}: a replacement was found but no row could be written; "
+            "retried on the next run")
+        return "rolledback"
     result["rows_repointed"] += len(swapped)
     result["stories_reburned"] += stories
 
@@ -593,7 +606,8 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
               if "APPROVED duplicate" in d or "LIVE row also carries it" in d
               or "no unused photo left" in d or "hosting unavailable" in d
               or "past-dated" in d or "story re-burn failed" in d
-              or "kept the repeat" in d]
+              or "kept the repeat" in d or "write did not land" in d
+              or "no row could be written" in d]
     capped = int((result or {}).get("budget_capped") or 0)
     if not detail and not capped:
         return ""
@@ -636,9 +650,12 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
     _fixed = int((result or {}).get("dates_fixed") or 0)
     _mixed = int((result or {}).get("mixed_posts") or 0)
     if _mixed:
+        # "the rest were left in place on purpose" swallowed the days that WERE fully
+        # changed, because this short-circuited elif _fixed (round 11 MAJOR).
+        _also = f", {_fixed} day(s) were fully changed" if _fixed else ""
         lines = [f"{gym}: {photos} photo(s) repeat across different days of the book. "
-                 f"{_mixed} day(s) were only PARTLY changed and need a person; the rest "
-                 "were left in place on purpose."]
+                 f"{_mixed} day(s) were only PARTLY changed and need a person{_also}; "
+                 "the rest were left in place on purpose."]
     elif _fixed:
         lines = [f"{gym}: {photos} photo(s) repeat across different days of the book. "
                  f"{_fixed} day(s) were changed; the rest were left in place on "
@@ -647,9 +664,10 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
         lines = [f"{gym}: {photos} photo(s) repeat across different days of the book "
                  "and this sweep left them in place ON PURPOSE."]
     if approved:
-        lines.append(f"{approved} of them sit on APPROVED posts. Echo will not change "
-                     "a card the gym already approved, so a person has to decide: "
-                     "approve a swap, or leave the repeat.")
+        _n = ("1 of them sits on an APPROVED post" if approved == 1
+              else f"{approved} of them sit on APPROVED posts")
+        lines.append(f"{_n}. Echo will not change a card the gym already approved, so a "
+                     "person has to decide: approve a swap, or leave the repeat.")
     if small:
         # NEVER tell a gym to connect a folder it already connected (John Weeks /
         # Tough Temple: a full Drive folder and this line still asked for photos).
@@ -659,8 +677,11 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
         # (independent audit round 2): a run that used the last asset left drive_pool
         # at 0 and fell through to "Add photos", the exact sentence this branch exists
         # to stop sending a gym whose folder is full.
-        pool = int((result or {}).get("drive_pool_seen")
-                   or (result or {}).get("drive_pool") or 0)
+        # `or` collapsed a genuine 0 into the fallback and let the -1 sentinel through
+        # from either key (independent audit round 11).
+        _seen = (result or {}).get("drive_pool_seen")
+        pool = int(_seen if _seen is not None
+                   else ((result or {}).get("drive_pool") or 0))
         armed = bool((result or {}).get("drive_armed"))
         if pool < 0:
             # A FAILED READ IS NOT AN EMPTY FOLDER, and must never fall through to the
@@ -678,10 +699,13 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
             fixed = int((result or {}).get("drive_fixed") or 0)
             left = int((result or {}).get("drive_pool") or 0)
             if fixed:
+                # A POST-LOOP read can fail after a good pre-loop one, and -1 was
+                # printed verbatim: "holds -1 unused item(s)" (round 11 MAJOR).
+                tail = (f" and holds {left} unused item(s) for the rest"
+                        if left >= 0 else "")
                 lines.append(f"This gym's uploaded photos are all on the book. Its "
-                             f"connected Drive folder covered {fixed} day(s) tonight "
-                             f"and holds {left} unused item(s) for the rest. Nothing "
-                             "more is needed from the gym.")
+                             f"connected Drive folder covered {fixed} day(s) "
+                             f"tonight{tail}. Nothing more is needed from the gym.")
             else:
                 lines.append(f"This gym's uploaded photos are all on the book. Its "
                              f"connected Drive folder holds {pool} unused item(s) and "
@@ -706,6 +730,10 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
     if any("hosting unavailable" in d for d in detail):
         lines.append("Some of these could not be moved because media hosting was "
                      "unavailable on this run. That is ours to fix, not the gym's.")
+    if any("did not land" in d or "no row could be written" in d for d in detail):
+        lines.append("On at least one day a fresh photo was ready but the write did "
+                     "not land, so the day still shows the repeat. It retries on the "
+                     "next run. That is ours to fix, not the gym's.")
     if any("story re-burn failed" in d or "kept the repeat" in d for d in detail):
         lines.append("On at least one day the post could not be moved as a whole, so "
                      "part of it still carries the old photo. A person needs to look "
@@ -892,9 +920,10 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                         _src = _swap_from_drive_pool(
                             base, store, fixable, state=state, asset_state=asset_state,
                             rows=rows, result=result, key=key, pd=pd)
-                        if _src == "mixed":
-                            continue         # reported as a mixed post, not a fix, and
-                                             # never as an untouched small library
+                        if _src in ("mixed", "rolledback"):
+                            # Neither is a fix, and NEITHER is a small library: a
+                            # replacement was found both times.
+                            continue
                         if _src:
                             # ONLY a real Drive pick counts as Drive coverage: the same
                             # call can return a LOCAL video, and crediting the gym's

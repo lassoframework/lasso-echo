@@ -4450,7 +4450,7 @@ message from that owner classifies FOLLOW_UP until a person closes it, and the A
 sends reads "I read that as something not working on our side."
 
 - [~] `AGENT_SLACK_REPEAT_CODE_FIX`, default OFF, threaded through
-  `adapter.RunDeps.repeat_report_enabled` exactly like `cancel_post_enabled`. OFF is
+  `adapter.Deps.repeat_report_enabled` exactly like `cancel_post_enabled`. OFF is
   byte-for-byte the old behavior. PROGRESS's earlier claim of "no new gate, no flag"
   was wrong and is retracted.
 - [~] `_NOT_A_REPEAT_REPORT_RE`: instruction/request, client-is-the-actor, and
@@ -4878,3 +4878,48 @@ return, and it is the defect this whole job exists to prevent:
   `repeat_report_enabled` at all, which also removes the one unguarded call on that path.
 
 Eight mutation tests, eight caught.
+
+## Audit round 11 (2026-09-11): B-, SHIPPABLE at defaults. Three falsehoods in the copy.
+
+Round 11 found **no critical and no major in the write path**. All six round-10 findings
+are closed and mutation-proven, and the round-10 CRITICAL fix survived a 400-seed fuzz
+(2-5 repeated dates x 1-3 siblings x injected write-failure and rollback-refusal rates,
+both flags): no Drive asset on two dates, no split-media date beyond the run's own
+`mixed_posts`, no emptied row, no fabricated URL, the approved owner row untouched. The
+same fuzz fails 31/400 against the mutated module, so it is not vacuous. The reviewer
+also confirmed `after_swap(swapped_ids=stuck)` is the RIGHT argument: after a refused
+rollback the rows still carrying the OLD asset are exactly everything except `stuck`.
+
+All three remaining majors were in the words we would send John, which on this ticket is
+not a small category:
+
+- [~] **The `-1` sentinel reached client copy verbatim.** A post-loop pool read can fail
+  after a good pre-loop one, and the report printed "holds **-1** unused item(s) for the
+  rest". Also `pool = int(seen or drive_pool or 0)` collapsed a genuine EMPTY pool into
+  the fallback, so an empty folder and a failed read told the gym the same thing.
+- [~] **The mixed opener swallowed the days that WERE fixed.** `if _mixed:` short-
+  circuited `elif _fixed:`, so a run with one mixed and one fixed day said "the rest
+  were left in place on purpose" with the fixed day inside "the rest".
+- [~] **A CLEAN ROLLBACK was reported as a small library.** When the forward write failed
+  and the rollback fully succeeded, `_swap_from_drive_pool` returned "" and `sweep_gym`
+  set `small_library` and fired `media_guard.alert_small_library` -- whose text is "Add
+  photos (connect the gym's Drive folder or upload in the portal)". That is the exact
+  sentence this entire change exists to stop sending Tough Temple, fired on a gym with
+  57 unused clips. It now returns "rolledback": not a fix, not a small library, and the
+  client line says a fresh photo was ready but the write did not land, which is ours.
+
+Five mutation tests, five caught. Suite 7101.
+
+### Where this stands after eleven rounds
+
+Grades: D, D, D, C, B, B, B-, C, C, C+, B-. The write path has been clean of correctness
+defects for two rounds and is fuzz-verified; every remaining finding has been in
+reporting copy. The end-to-end has now passed SIX times through the real
+`media_swap.pick_replacement`: John's three days each get a distinct Drive clip, all
+same-date siblings moving together.
+
+**One unflagged default-path delta still wants Blake's explicit sign-off** (round 11
+raised it again): a row that already carried a stale `source_media_url` is now written
+`""` instead of being left pointing at media it no longer has. It is a data-integrity
+fix with no product trade, guarded so a row without the column is never written to, and
+tested -- but it is not behind a flag, and CLAUDE.md says new capability ships OFF.

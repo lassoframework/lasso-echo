@@ -1445,3 +1445,82 @@ def test_a_failed_drive_pool_read_is_not_reported_as_an_empty_folder(monkeypatch
     text = mrs.unfixable_report(res)
     assert "could not read this gym's connected Drive folder" in text
     assert "Add photos" not in text, "told a connected gym to connect a folder"
+
+
+# ---- round 11: three falsehoods in the copy we would send John ---------------------
+def test_a_failed_second_pool_read_never_prints_minus_one():
+    """Round 11 MAJOR. The -1 sentinel added in round 10 reached client copy verbatim:
+    "holds -1 unused item(s) for the rest"."""
+    res = {"gym": GYM, "photos_repeated": 1, "approved_left": 0, "small_library": True,
+           "dates_fixed": 1, "drive_fixed": 1, "mixed_posts": 0,
+           "drive_pool_seen": 7, "drive_pool": -1, "drive_armed": True,
+           "detail": [f"{REPEATED} 2026-09-16: no unused photo left "
+                      "(small library; left with spacing)"]}
+    text = mrs.unfixable_report(res)
+    assert "-1" not in text, text
+    assert "covered 1 day(s) tonight." in text, "the tail should just be dropped"
+
+
+def test_a_genuinely_empty_pool_is_not_read_as_a_failed_read():
+    """`or` collapsed a real 0 into the fallback, so an empty folder and a failed read
+    told the gym the same thing."""
+    res = {"gym": GYM, "photos_repeated": 1, "approved_left": 0, "small_library": True,
+           "dates_fixed": 0, "drive_fixed": 0, "mixed_posts": 0,
+           "drive_pool_seen": 0, "drive_pool": -1, "drive_armed": True,
+           "detail": [f"{REPEATED} 2026-09-16: no unused photo left "
+                      "(small library; left with spacing)"]}
+    text = mrs.unfixable_report(res)
+    assert "could not read" not in text
+    assert "Add photos" in text, "an empty folder really does need photos"
+
+
+def test_the_mixed_opener_does_not_swallow_the_days_that_were_fixed():
+    """Round 11 MAJOR: `if _mixed:` short-circuited `elif _fixed:`, so a run with one
+    mixed and one fixed day told the gym "the rest were left in place on purpose" --
+    and the fixed day was inside "the rest"."""
+    res = {"gym": GYM, "photos_repeated": 2, "approved_left": 0, "small_library": False,
+           "dates_fixed": 1, "mixed_posts": 1, "drive_pool_seen": 5, "drive_armed": True,
+           "detail": [f"{REPEATED} 2026-09-14: -> v1 (2 row(s) moved, 1 could not be "
+                      "rolled back; the rest kept the repeat)"]}
+    text = mrs.unfixable_report(res)
+    assert "1 day(s) were fully changed" in text, text
+    assert "only PARTLY changed" in text
+
+
+def test_a_clean_rollback_is_never_reported_as_a_small_library(monkeypatch):
+    """Round 11 MAJOR. A replacement WAS found; the write did not land. Returning ""
+    made sweep_gym set small_library and fire media_guard.alert_small_library, whose
+    text is "Add photos (connect the gym's Drive folder ...)" -- the exact sentence this
+    whole change exists to stop sending Tough Temple."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    alerts = []
+    monkeypatch.setattr("agent.media_guard.alert_small_library",
+                        lambda base, day, log=None: alerts.append(base))
+    store = _Store(_book())
+    real = store.swap_media
+    calls = {"n": 0}
+
+    def fail_then_rollback(base, row_id, image_url, source_media_url=None,
+                           extra_fields=None):
+        calls["n"] += 1
+        if str(row_id) == "r14st":
+            raise RuntimeError("supabase 500")      # forward write fails
+        return real(base, row_id, image_url, source_media_url=source_media_url,
+                    extra_fields=extra_fields)      # rollback succeeds
+
+    store.swap_media = fail_then_rollback
+    res = _sweep(store, picker=_picker(), drive_n=57, monkeypatch=monkeypatch)
+    assert res["small_library"] is False, "57 unused clips is not a small library"
+    assert alerts == [], "asked a gym with a full Drive folder to add photos"
+    assert any("write did not land" in d for d in res["detail"])
+    assert "That is ours to fix, not the gym's." in mrs.unfixable_report(res)
+
+
+def test_the_approved_sentence_agrees_in_number():
+    one = {"gym": GYM, "photos_repeated": 1, "approved_left": 1, "small_library": False,
+           "dates_fixed": 0, "mixed_posts": 0,
+           "detail": [f"{REPEATED} 2026-09-14: APPROVED duplicate (left; the gym "
+                      "approved this card)"]}
+    assert "1 of them sits on an APPROVED post" in mrs.unfixable_report(one)
+    assert "2 of them sit on APPROVED posts" in mrs.unfixable_report(
+        dict(one, approved_left=2))
