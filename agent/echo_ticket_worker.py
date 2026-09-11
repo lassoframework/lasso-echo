@@ -372,7 +372,16 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 message_text=answer["body"], mark_message=mark_message,
                 claim_message=claim_message, log=log)
             if getattr(result, "delivered", False):
-                bus.set_ticket(tid, status="resolved")
+                # Round 2 (MAJOR 6): an answer that promised a PERSON will follow up must
+                # not close the ticket -- it goes to the FIXER with the follow-up marker
+                # instead (same disposition the Slack adapter and the outbox use).
+                if _a.promises_human_follow_up(answer["body"]):
+                    _a.route_follow_up_promise(bus, bus.ticket(tid) or {"id": tid},
+                                               ident_name=identity_name, body=answer["body"],
+                                               recipient_kind=who.kind,
+                                               surface="portal_ticket_bridge", log=log)
+                else:
+                    bus.set_ticket(tid, status="resolved")
                 # M1: the one path that sends a model answer with NO tap at all produced no
                 # receipt, so the very thing Blake asked to see was the one thing invisible.
                 try:

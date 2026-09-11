@@ -189,10 +189,34 @@ def _gym_row_for(ctx):
     return gym_id, (name or ctx.gym_key)
 
 
+def _is_echo_client(ctx, gym_id):
+    """Round 2 (MINOR): notify_new_gym(force=True) DM'd 36 non-clients in a live incident, so
+    the resend is gated on the gym actually being an Echo client -- a row in the shared
+    echo_gym_settings plane for this gym_id. FAILS CLOSED: no row, no creds, any error ->
+    not a client, no DM. Injectable as deps['is_echo_client'] -> bool."""
+    pred = ctx.deps.get("is_echo_client")
+    if pred is not None:
+        try:
+            return bool(pred(gym_id))
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        from .slack_convo.bus import Bus
+        rows = Bus()._get("echo_gym_settings", {"gym_id": f"eq.{gym_id}",
+                                                 "select": "gym_id", "limit": "1"})
+        return bool(rows)
+    except Exception:  # noqa: BLE001 - unverifiable means NOT a client
+        return False
+
+
 def _run_resend_connect_link(ctx):
     gym_id, name = _gym_row_for(ctx)
     if not gym_id:
         return 404, {"error": "gym_not_found", "gym_key": ctx.gym_key}
+    if not _is_echo_client(ctx, gym_id):
+        return 403, {"error": "not_echo_client", "gym_key": ctx.gym_key, "gym_id": gym_id,
+                     "summary": ("connect link NOT sent: this gym has no echo_gym_settings "
+                                 "row (not an Echo client, or unverifiable); refused")}
     notify = _dep(ctx, "notify_new_gym", lambda: __import__(
         "agent.connect_link_notify", fromlist=["notify_new_gym"]).notify_new_gym)
     alerts = []
@@ -527,6 +551,12 @@ def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
     action = str(action or "").strip()
     if action in ORG_FLOOR_ACTIONS:
         _audit(action, gym_key, ticket_id, 403, "refused: org floor", log)
+        # Round 2 (R4): a refused attempt leaves a trace ON THE TICKET too, not only in the
+        # process log -- a teammate reading the thread should see the FIXER tried.
+        if _TICKET_ID.match(str(ticket_id or "").strip()):
+            _ticket_note(deps.get("bus"), str(ticket_id).strip(), action,
+                         "REFUSED: org_floor (billing/Stripe, pixel/CAPI, ad budget, "
+                         "targeting, deleting published posts are never automated)", log)
         return 403, {"error": "org_floor", "action": action,
                      "detail": ("billing/Stripe, pixel/CAPI, ad budget, targeting and "
                                 "deleting published posts are never automated; a person "

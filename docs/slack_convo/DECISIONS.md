@@ -2908,3 +2908,36 @@ Both wore the hard-line label because outbox._dispatch_one collapsed every
 Tests: `tests/test_no_silent_holds.py` (the two real held rows as fixtures, eight genuine
 floors, all three paths), `tests/test_fixer_ops.py` (auth, catalog, every action, org floor,
 volume preflight, jobs, the intake_web mount).
+
+### Round 2 (independent audit of PR #107 graded B; every item addressed)
+
+* **MAJOR 6 / R5 -- a promised follow-up now has one disposition on all three paths.**
+  Round 1 wired `promises_human_follow_up` on the Slack adapter only; Dean's and Pete's
+  tickets came through the portal bridge and the outbox, where "I'll flag this for someone
+  on the team" posted and the ticket RESOLVED with nobody flagged. Now
+  `adapter.route_follow_up_promise` (called at draft time by the adapter, at post time by
+  `echo_ticket_worker` and `outbox._after_answer_posted`) posts the answer ONCE, does not
+  resolve, sets hold + escalated + classification NULL and stamps
+  `verification_after.hold = {tier: 'follow_up', reason: 'human_follow_up_promised', ...}`,
+  and cards #fixer. **THE MARKER IS THE CONTRACT WITH THE FIXER:** `adapter.FOLLOW_UP_MARKER
+  == "human_follow_up_promised"`. A ticket carrying it has already been answered; the FIXER
+  follows up on what was promised and must NOT draft a second answer (the two-answers race
+  R5 named). Idempotent (draft-time then post-time = one card, one stamp); never for staff.
+* **MAJOR 7 -- declarative floor statements.** "Your Saturday 9am class is moving to 10",
+  "The gym opens at 5am", "Our hours are 6-9 now" are now the gym-schedule leg; fee / waive /
+  discount / credit / comp / free month / no charge join billing (a FIXER-authored "Sure, we
+  can waive the fee this month" had posted); a first-person "I deleted the published post" /
+  "deleted your post" is a new `delete_published` topic. All apply to Echo AND FIXER rows.
+* **MAJOR 9 -- Echo-product commitments are never a teammate's hold.** `_REAL_WORLD_OBJECT`
+  made "I'll move the member spotlight post to Friday", "I'll queue a post about your 6am
+  class", "I'll swap the photo on that ad" org_floor. `commitment_is_real_world` now checks
+  the commitment's OBJECT first: a post / story / reel / caption / photo / video / calendar /
+  queue / draft is product work -> never the floor (needs_review for Echo, ok for the FIXER);
+  only an org-floor TOPIC in the sentence ("I'll move your Saturday class to 10") still is.
+* **R4** -- a 403 `org_floor` ops call writes the ticket row too ("OPS ACTION <name> by
+  fixer: REFUSED: org_floor ...").
+* **MINOR** -- `resend_connect_link` is gated on the gym having an `echo_gym_settings` row
+  (`fixer_ops._is_echo_client`, fails CLOSED on no row / no creds / any error); this is the
+  function that DM'd 36 non-clients in the live incident. `agent.echo_clients` does not exist
+  on this branch, so the read is direct. The auditor's `runner.py:1027` item does not
+  reproduce: `git diff origin/main...HEAD -- agent/runner.py` is empty on this branch.

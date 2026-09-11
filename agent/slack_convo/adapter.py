@@ -270,9 +270,13 @@ TOPIC_BILLING = "billing"
 TOPIC_INJURY = "injury_liability"
 TOPIC_GYM_SCHEDULE = "gym_schedule"
 TOPIC_ADS = "ad_settings"
+# Round 2 (audit of PR #107, MAJOR 7): fee / waive / discount / credit / comp / free month /
+# no charge were missing, so a FIXER-authored "Sure, we can waive the fee this month" posted.
 _FORBIDDEN_BILLING = _re.compile(
     r"\b(price|prices|pricing|cost|costs|charge|charged|bill|billing|billed|invoice|refund|"
-    r"refunds|subscription|payment|pay|pays|paying|stripe|credit card)\b|"
+    r"refunds|subscription|payment|pay|pays|paying|stripe|credit card|fee|fees|waive|waived|"
+    r"waiving|discount|discounts|discounted|comp|comped|free month|no charge|"
+    r"(?<!photo )(?<!image )(?<!video )credit|credits)\b|"
     r"\bhow much (?:is|does|will|would|do|are)\b|\$\s?\d", _re.IGNORECASE)
 _FORBIDDEN_INJURY = _re.compile(
     r"\b(injur\w*|hurt|pain|sore|surgery|physio|physical therapy|doctor|medical|pregnan\w*|"
@@ -287,7 +291,16 @@ _FORBIDDEN_GYM_SCHEDULE = _re.compile(
     r"(?:hours|schedule|class|classes)\b|"
     r"\breschedule\b|\btimetable\b|\bwhat time do (?:you|we) (?:open|close)\b|"
     r"\bare (?:you|we) open\b|\bwhen do (?:you|we) (?:open|close)\b|"
-    r"\bwhat are (?:your|our) hours\b|\bholiday hours\b", _re.IGNORECASE)
+    r"\bwhat are (?:your|our) hours\b|\bholiday hours\b|"
+    # Round 2 (MAJOR 7): DECLARATIVE statements of the gym's hours or a class change are the
+    # floor too, not only questions and requests -- "The gym opens at 5am", "Your Saturday
+    # 9am class is moving to 10", "our hours are 6-9 now".
+    r"\b(?:opens?|closes?|closing|opening)\s+at\s+\d|"
+    r"\bclass(?:es)?\b[^.?!]{0,40}?\b(?:is|are|was|were|has been|have been|will be|got|"
+    r"being|now)\s+(?:moving|moved|cancell?ed|added|dropped|rescheduled|changing|changed|"
+    r"starting|start)\b|"
+    r"\b(?:our|the|your|gym|new|holiday)\s+hours\s+(?:are|will be|have changed|changed|"
+    r"is|remain)\b", _re.IGNORECASE)
 # The org floor's fourth leg (org instructions: pixel/CAPI, ad budget, targeting are never
 # touched without explicit approval). Echo is a social product; a message about ad settings
 # reaching it is either Ranger's (action_request, routed before this) or a person's to answer.
@@ -295,8 +308,18 @@ _FORBIDDEN_ADS = _re.compile(
     r"\b(pixel|capi|conversions? api|ad budget|ad spend|daily budget|targeting|"
     r"ad set|ad sets|adset|adsets|campaign budget|boost(?:ed|ing)? (?:the |that |this )?post)\b",
     _re.IGNORECASE)
+# Round 2 (MAJOR 7): a first-person STATEMENT that we deleted / took down a published post
+# is the org floor (deleting published posts is never automated). First-person only, so a
+# client's "can you delete the post scheduled for friday" (the cancel lane's job) is not it.
+TOPIC_DELETE_PUBLISHED = "delete_published"
+_FORBIDDEN_DELETE_PUBLISHED = _re.compile(
+    r"\b(?:i|we)\s*(?:'ve|have|'ll|will|just|already)?\s*(?:delet\w*|took down|take down|"
+    r"removed|remove|unpublish\w*)\s+(?:the |your |that |this |those |these )?"
+    r"(?:published |live )?(?:posts?|reels?|stor(?:y|ies))\b|"
+    r"\bdeleted (?:your|the) (?:published |live )?(?:posts?|reels?)\b", _re.IGNORECASE)
 _FORBIDDEN_BY_TOPIC = ((TOPIC_BILLING, _FORBIDDEN_BILLING), (TOPIC_INJURY, _FORBIDDEN_INJURY),
-                       (TOPIC_GYM_SCHEDULE, _FORBIDDEN_GYM_SCHEDULE), (TOPIC_ADS, _FORBIDDEN_ADS))
+                       (TOPIC_GYM_SCHEDULE, _FORBIDDEN_GYM_SCHEDULE), (TOPIC_ADS, _FORBIDDEN_ADS),
+                       (TOPIC_DELETE_PUBLISHED, _FORBIDDEN_DELETE_PUBLISHED))
 AUTO_ANSWER_FORBIDDEN = _re.compile(
     "|".join(f"(?:{rx.pattern})" for _, rx in _FORBIDDEN_BY_TOPIC), _re.IGNORECASE)
 
@@ -460,16 +483,32 @@ _REAL_WORLD_OBJECT = _re.compile(
     r"appointment|coach|trainer|ads?|ad set|campaign|campaigns|budget|"
     r"spend|audience|targeting|pixel|capi)\b", _re.IGNORECASE)
 _SENTENCE_SPLIT = _re.compile(r"(?<=[.!?])\s+")
+# Round 2 (audit of PR #107, MAJOR 9): "I'll move the member spotlight post to Friday",
+# "I'll queue a post about your 6am class", "I'll swap the photo on that ad" all became
+# org_floor holds waiting on a teammate -- the exact human wait the ruling forbids, on
+# Echo's own content work. A commitment whose grammatical OBJECT is a piece of Echo content
+# is product work: never the floor. Only an org-floor TOPIC in the sentence (a class that
+# is moving, a refund, a deleted published post) can still make it one.
+_PRODUCT_OBJECT = _re.compile(
+    r"\b(?:posts?|stor(?:y|ies)|reels?|captions?|photos?|pictures?|images?|videos?|clips?|"
+    r"thumbnails?|calendar|queue|drafts?|carousels?|graphics?|flyers?)\b", _re.IGNORECASE)
 
 
 def commitment_is_real_world(text):
     """True when a first-person commitment in OUR answer sits in a sentence that names a
-    real-world object or an org-floor topic. Sentence-scoped so a descriptive sentence about
-    a class next to a benign commitment about a photo does not trip it."""
+    real-world object or an org-floor topic -- unless the thing being committed to is a
+    piece of Echo content (a post, a photo, the calendar), which is product work and routes
+    to needs_review / the FIXER, never to a teammate's tap. Sentence-scoped so a descriptive
+    sentence about a class next to a benign commitment about a photo does not trip it."""
     for sentence in _SENTENCE_SPLIT.split(text or ""):
-        if not _ANSWER_COMMITS.search(sentence):
+        m = _ANSWER_COMMITS.search(sentence)
+        if not m:
             continue
-        if forbidden_topic(sentence) or _REAL_WORLD_OBJECT.search(sentence):
+        if forbidden_topic(sentence):
+            return True
+        if _PRODUCT_OBJECT.search(sentence[m.end():]):
+            continue  # the object of the commitment is our own content: product work
+        if _REAL_WORLD_OBJECT.search(sentence):
             return True
     return False
 
@@ -654,7 +693,8 @@ def auto_answer_verdict(question, body="", *, grounded_by_fixer=False):
 # written: the ticket is escalated (a teammate/the FIXER sees it) before the row is queued.
 _TOPIC_WORDS = {TOPIC_BILLING: "billing or pricing", TOPIC_INJURY: "injury or liability",
                 TOPIC_GYM_SCHEDULE: "your gym's hours or class schedule",
-                TOPIC_ADS: "ad budget, targeting or tracking"}
+                TOPIC_ADS: "ad budget, targeting or tracking",
+                TOPIC_DELETE_PUBLISHED: "removing an already published post"}
 TEMPLATE_HARD_LINE = (
     "Got it. I can't confirm {topic} details myself, so I have not answered that part; a "
     "LASSO teammate will follow up here today.")
@@ -773,6 +813,72 @@ def _escalate_held_ticket(bus, ticket, *, tier, verdict, fixer_authored, log=pri
         bus.set_ticket(tid, **fields)
     except Exception as e:  # noqa: BLE001 - the card and notice are already written
         log(f"[slack-convo] hold escalation stamp failed ticket={tid}: {type(e).__name__}")
+
+
+# Round 2 (audit of PR #107, MAJOR 6 + R5): an answer that says a PERSON will follow up
+# ("I'll flag this for someone on the team") posts -- it is otherwise fine -- but the ticket
+# must not resolve, and it must reach the FIXER, or the sentence is a lie. One disposition
+# for all three paths (Slack adapter at draft time, portal bridge and outbox at post time):
+# the answer goes out ONCE, the ticket stays open (hold + escalated + classification NULL)
+# carrying this marker, and #fixer gets a card. THE MARKER IS THE CONTRACT WITH THE FIXER:
+# a ticket whose verification_after.hold.reason == FOLLOW_UP_MARKER has already been
+# answered; the FIXER follows up on it (looks into what was promised) and must NOT draft a
+# second answer to the original question.
+FOLLOW_UP_MARKER = "human_follow_up_promised"
+HOLD_TIER_FOLLOW_UP = "follow_up"
+
+
+def follow_up_already_routed(ticket):
+    hold = ((ticket or {}).get("verification_after") or {}).get("hold") \
+        if isinstance((ticket or {}).get("verification_after"), dict) else None
+    return bool(hold) and hold.get("reason") == FOLLOW_UP_MARKER
+
+
+def route_follow_up_promise(bus, ticket, *, ident_name, body, recipient_kind="client",
+                            surface="", person="", log=print):
+    """The answer posted (or is queued to post) and promised a human follow-up: keep the
+    ticket open for the FIXER with the marker, and card the team. Idempotent -- the second
+    caller (draft time, then post time) finds the marker and does nothing. Returns True when
+    this call did the routing."""
+    from datetime import datetime as _dt, timezone as _tz
+    t = ticket if isinstance(ticket, dict) else {"id": ticket}
+    tid = t["id"]
+    if recipient_kind in ("staff", "coach"):
+        return False
+    try:
+        fresh = bus.ticket(tid) or t
+    except Exception:  # noqa: BLE001
+        fresh = t
+    if follow_up_already_routed(fresh):
+        return False
+    prior = fresh.get("verification_after") if isinstance(fresh.get("verification_after"),
+                                                           dict) else {}
+    m = _HUMAN_FOLLOW_UP.search(body or "")
+    hold = {"tier": HOLD_TIER_FOLLOW_UP, "reason": FOLLOW_UP_MARKER,
+            "rule": "promises_human_follow_up", "detail": (m.group(0) if m else ""),
+            "answer_posted": True, "at": _dt.now(_tz.utc).isoformat()}
+    try:
+        bus.set_ticket(tid, status="hold", escalated=True, hold_tier="routine",
+                       classification=None, verification_after={**prior, "hold": hold})
+    except Exception as e:  # noqa: BLE001
+        log(f"[slack-convo/{ident_name}] follow-up routing stamp failed ticket={tid}: "
+            f"{type(e).__name__}")
+        return False
+    who_line = person or f"{recipient_kind} {_slack_escape(str(fresh.get('slack_user_id') or '?'))}"
+    bus.record_outbound(
+        ticket_id=tid, author_type="system",
+        body=(f"FOLLOW-UP PROMISED: needs a teammate or the FIXER\n"
+              f"FROM: {who_line}\nBOT: {ident_name}   TICKET: {tid}\n"
+              f"The answer below posted to the client and says a person will follow up "
+              f"({_slack_escape(hold['detail'])!s}). The ticket is open, escalated and "
+              f"unclassified with marker {FOLLOW_UP_MARKER}: follow up on what was promised; "
+              f"do NOT re-answer the original question.\n\n{_slack_escape(body or '')}"),
+        delivery_status="ready", kind=KIND_ESCALATION,
+        meta={"identity": ident_name, "surface": surface, "recipient_kind": recipient_kind,
+              "follow_up_promised": True})
+    log(f"[slack-convo/{ident_name}] ticket={tid} answer promised human follow-up; handed "
+        f"to the FIXER with marker {FOLLOW_UP_MARKER}")
+    return True
 
 
 # ---- D53: cards a human can actually read ----------------------------------------------
@@ -1177,10 +1283,15 @@ def handle_event(event, event_id, deps):
             if _is_staffish(who) or (verdict.ok and armed and deps.client_reply_armed()):
                 emit(KIND_ANSWER, answer["body"], meta=base_meta)
                 if not _is_staffish(who) and promises_human_follow_up(answer["body"]):
-                    # The answer says a person will follow up: make that true by mechanism.
-                    # hold + escalated + unclassified is what the FIXER's poll picks up.
-                    deps.bus.set_ticket(tid, status="hold", escalated=True,
-                                        hold_tier="routine", classification=None)
+                    # The answer says a person will follow up: make that true by mechanism
+                    # (route_follow_up_promise: ticket open for the FIXER with the marker,
+                    # team card; the outbox's post-time call finds the marker and is a no-op).
+                    route_follow_up_promise(deps.bus, deps.bus.ticket(tid) or {"id": tid},
+                                            ident_name=ident.name, body=answer["body"],
+                                            recipient_kind=who.kind, surface=surface,
+                                            person=describe_person(deps, who, user),
+                                            log=deps.log)
+                    out.append(KIND_ESCALATION)
             elif not deps.client_reply_armed():
                 # Nothing can reach this client at all (CLIENT_REPLY off): the legacy card
                 # is the only honest surface; a client notice would hold the same way.

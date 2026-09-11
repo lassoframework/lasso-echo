@@ -400,3 +400,162 @@ def test_portal_bridge_needs_review_clears_classification_for_the_fixer(monkeypa
     _answering_worker(bus, (seen, open_dm, post), answer_body="Yes, it went out tuesday.")
     t = bus.tickets["t-1"]
     assert t["status"] == "hold" and t["escalated"] is True and t["classification"] is None
+
+
+# =========================================================================================
+# Round 2 (independent audit of PR #107): the auditor's exact probe strings
+# =========================================================================================
+
+# (label, question, answer, fixer-authored, tiers allowed)
+ORG = A.HOLD_TIER_ORG_FLOOR
+REV = A.HOLD_TIER_NEEDS_REVIEW
+PROBES = [
+    # MAJOR 7: declarative floor statements
+    ("declarative class move", "is my instagram connected?",
+     "Your Saturday 9am class is moving to 10.", False, {ORG}),
+    ("declarative class move (fixer)", "is my instagram connected?",
+     "Your Saturday 9am class is moving to 10.", True, {ORG}),
+    ("declarative opens at", "is my instagram connected?", "The gym opens at 5am.", False, {ORG}),
+    ("declarative opens at (fixer)", "is my instagram connected?", "The gym opens at 5am.",
+     True, {ORG}),
+    ("waive the fee (fixer)", "is my instagram connected?",
+     "Sure, we can waive the fee this month.", True, {ORG}),
+    ("waive the fee (echo)", "is my instagram connected?",
+     "Sure, we can waive the fee this month.", False, {ORG}),
+    ("hours are", "is my instagram connected?", "Our hours are 6am to 9pm now.", True, {ORG}),
+    ("deleted the published post", "is my instagram connected?",
+     "I deleted the published post.", True, {ORG}),
+    ("deleted your post", "is my instagram connected?", "Yes, deleted your post.", True, {ORG}),
+    # MAJOR 9: Echo-product commitments are never a teammate's hold
+    ("move the spotlight post", "is my instagram connected?",
+     "I'll move the member spotlight post to Friday.", False, {"", REV}),
+    ("move the spotlight post (fixer)", "is my instagram connected?",
+     "I'll move the member spotlight post to Friday.", True, {""}),
+    ("queue a post about the class", "is my instagram connected?",
+     "I'll queue a post about your 6am class.", False, {"", REV}),
+    ("queue a post about the class (fixer)", "is my instagram connected?",
+     "I'll queue a post about your 6am class.", True, {""}),
+    ("swap the photo on that ad", "is my instagram connected?",
+     "I'll swap the photo on that ad.", False, {"", REV}),
+    ("swap the photo on that ad (fixer)", "is my instagram connected?",
+     "I'll swap the photo on that ad.", True, {""}),
+    # ...but a real-world commitment stays the floor
+    ("move your class", "is my instagram connected?",
+     "I'll move your Saturday class to 10.", False, {ORG}),
+    ("move your class (fixer)", "is my instagram connected?",
+     "I'll move your Saturday class to 10.", True, {ORG}),
+    ("bump the budget on that ad (fixer)", "is my instagram connected?",
+     "I'll bump the budget on that ad.", True, {ORG}),
+    # a client asking to cancel a scheduled post is the cancel lane's, not the floor's
+    ("client asks to delete a pending post", "can you delete the post scheduled for friday",
+     "Done.", True, {"", REV}),
+    # photo credit is not billing
+    ("photo credit", "is my instagram connected?",
+     "Yes, and the photo credit is on the caption.", True, {""}),
+]
+
+
+@pytest.mark.parametrize("label,question,answer,fixer,allowed", PROBES)
+def test_round2_probe_table(label, question, answer, fixer, allowed):
+    v = A.auto_answer_verdict(question, answer, grounded_by_fixer=fixer)
+    assert v.tier in allowed, f"{label}: {v}"
+    if ORG in allowed:
+        assert v.held, f"{label}: must be held: {v}"
+    if allowed == {""}:
+        assert v.ok, f"{label}: must pass: {v}"
+
+
+def test_product_commitments_never_reach_org_floor_via_real_world_objects():
+    for body in ("I'll move the member spotlight post to Friday.",
+                 "I'll queue a post about your 6am class.",
+                 "I'll swap the photo on that ad."):
+        assert not A.commitment_is_real_world(body), body
+    assert A.commitment_is_real_world("I'll move your Saturday class to 10.")
+    assert A.commitment_is_real_world("I'll let your members know the class is cancelled.")
+
+
+# ---- MAJOR 6 / R5: the follow-up promise on all three paths ------------------------------
+
+FOLLOW_UP_A = ("I can confirm your Instagram connection is fine. I'll flag this for someone on "
+               "the team to dig into the posting activity directly.")
+
+
+def _follow_up_hold(t):
+    return (t.get("verification_after") or {}).get("hold") or {}
+
+
+def test_slack_adapter_promise_posts_once_and_hands_the_ticket_to_the_fixer(monkeypatch):
+    _armed(monkeypatch)
+    bus = FakeBus()
+    d = A.handle_event(_ev("is my instagram connected?"), "k", _answering(bus, FOLLOW_UP_A))
+    tid = d.ticket_id
+    answers = _rows(bus, tid, A.KIND_ANSWER)
+    assert len(answers) == 1 and answers[0]["delivery_status"] == "ready"
+    t = bus.tickets[tid]
+    assert t["status"] == "hold" and t["escalated"] is True and t["classification"] is None
+    assert _follow_up_hold(t)["reason"] == A.FOLLOW_UP_MARKER
+    assert _follow_up_hold(t)["answer_posted"] is True
+    cards = [m for m in _rows(bus, tid, A.KIND_ESCALATION)
+             if m["attachments"].get("follow_up_promised")]
+    assert len(cards) == 1 and "do NOT re-answer" in cards[0]["body"]
+    # the outbox then posts the answer, does NOT resolve, and does not card twice
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus.message(answers[0]["id"])["delivery_status"] == "posted"
+    assert bus.tickets[tid]["status"] == "hold", "an answered-but-promised ticket stays open"
+    assert len([m for m in _rows(bus, tid, A.KIND_ESCALATION)
+                if m["attachments"].get("follow_up_promised")]) == 1
+    assert sum(1 for c in calls if c["channel"] == "G0MPIM"
+               and "flag this" in c["text"]) == 1, "the client gets ONE answer"
+
+
+def test_outbox_promise_on_a_fixer_answer_posts_but_does_not_resolve(monkeypatch):
+    _armed(monkeypatch)
+    bus = FakeBus()
+    tid, mid = _fixer_answer_ticket(bus, PETE_Q, PETE_A)
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus.message(mid)["delivery_status"] == "posted"
+    t = bus.tickets[tid]
+    assert t["status"] == "hold" and t["escalated"] is True and t["classification"] is None
+    assert _follow_up_hold(t)["reason"] == A.FOLLOW_UP_MARKER
+    assert [m for m in _rows(bus, tid, A.KIND_ESCALATION)
+            if m["attachments"].get("follow_up_promised")]
+    # Dean's answer promises nobody: it resolves as before
+    bus2 = FakeBus()
+    tid2, mid2 = _fixer_answer_ticket(bus2, DEAN_Q, DEAN_A)
+    OB.run_once(bus2, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus2.tickets[tid2]["status"] == "resolved"
+
+
+def test_portal_bridge_promise_posts_but_does_not_resolve(monkeypatch):
+    from tests.test_portal_escalation_loop import Bus, _ticket, _slack_calls, _answering_worker
+    _armed(monkeypatch)
+    bus = Bus([_ticket(raw_text="is my instagram connected?")])
+    seen, open_dm, post = _slack_calls()
+    _answering_worker(bus, (seen, open_dm, post), answer_body=FOLLOW_UP_A)
+    assert seen["posted"], "the answer itself is delivered"
+    t = bus.tickets["t-1"]
+    assert t["status"] == "hold" and t["escalated"] is True and t["classification"] is None
+    assert _follow_up_hold(t)["reason"] == A.FOLLOW_UP_MARKER
+    assert [m for m in bus.of_kind(A.KIND_ESCALATION)
+            if (m.get("attachments") or {}).get("follow_up_promised")]
+    # and without a promise the bridge still resolves
+    bus2 = Bus([_ticket(raw_text="is my instagram connected?")])
+    seen2, open_dm2, post2 = _slack_calls()
+    _answering_worker(bus2, (seen2, open_dm2, post2), answer_body="Yes, both are connected.")
+    assert bus2.tickets["t-1"]["status"] == "resolved"
+
+
+def test_follow_up_routing_is_idempotent_and_never_for_staff():
+    bus = FakeBus()
+    t, _ = bus.get_or_create_ticket(channel_id="C", thread_ts="1", product="echo",
+                                    bot_identity="echo", slack_user_id="U", identity_kind="client",
+                                    client_id="g", reporter="r", raw_text="q",
+                                    classification="answerable_question", request_type=None)
+    assert A.route_follow_up_promise(bus, t, ident_name="echo", body=FOLLOW_UP_A)
+    assert not A.route_follow_up_promise(bus, bus.ticket(t["id"]), ident_name="echo",
+                                         body=FOLLOW_UP_A)
+    assert len(_rows(bus, t["id"], A.KIND_ESCALATION)) == 1
+    assert not A.route_follow_up_promise(bus, t, ident_name="echo", body=FOLLOW_UP_A,
+                                         recipient_kind="staff")

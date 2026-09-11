@@ -515,7 +515,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
             return
         bus.mark_message(row["id"], "posted", meta_update={"delivered_via": "portal_thread"})
         summary["posted"] += 1
-        _resolve_on_answer(bus, ticket, kind, summary, att)
+        _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log)
         # m4: no Slack call happens on this branch -- "posted" here means migration 0310 now
         # lets the client read it in the thread they wrote from. The receipt says exactly
         # that rather than claiming a message was pushed to them.
@@ -526,7 +526,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
     ts = post(channel, row["body"], thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
-    _resolve_on_answer(bus, ticket, kind, summary, att)
+    _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log)
     _receipt(bus, ticket, row, identity, kind, att, where=f"Slack {channel}", summary=summary)
 
 
@@ -595,6 +595,22 @@ def _receipt(bus, ticket, row, identity, kind, att, *, where, summary):
                   "receipt_kind": kind, "auto_answer": auto, "sent_at": sent_at})
     except Exception:  # noqa: BLE001 - never undo a successful post over a receipt
         pass
+
+
+def _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log=print):
+    """Round 2 (audit of PR #107, MAJOR 6): what happens to the ticket once an answer is
+    with the person. An answer that promised a HUMAN follow-up does not close the ticket --
+    it is routed to the FIXER with adapter.FOLLOW_UP_MARKER (idempotent: the Slack adapter
+    may already have done this at draft time). Every other answer resolves as before."""
+    if kind == _a.KIND_ANSWER and (att or {}).get("recipient_kind") not in ("staff", "coach") \
+            and _a.promises_human_follow_up(row.get("body") or ""):
+        _a.route_follow_up_promise(bus, ticket, ident_name=identity.name,
+                                   body=row.get("body") or "",
+                                   recipient_kind=(att or {}).get("recipient_kind") or "client",
+                                   surface=(att or {}).get("surface") or "",
+                                   person=_person_for_card(bus, ticket, identity), log=log)
+        return
+    _resolve_on_answer(bus, ticket, kind, summary, att)
 
 
 def _resolve_on_answer(bus, ticket, kind, summary, att=None):

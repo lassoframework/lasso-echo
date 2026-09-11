@@ -101,7 +101,8 @@ def test_org_floor_actions_are_403_by_name(armed, name):
     logs = []
     status, body = _post(name, _body(), deps={"bus": bus}, logs=logs)
     assert status == 403 and body["error"] == "org_floor"
-    assert bus.rows == [], "a refused action writes no ticket record"
+    # round 2 (R4): the refusal leaves a trace on the ticket, and nothing else runs
+    assert len(bus.rows) == 1 and "REFUSED: org_floor" in bus.rows[0]["body"]
     assert any("AUDIT" in line and "org floor" in line for line in logs)
 
 
@@ -139,7 +140,7 @@ def test_resend_connect_link_forces_the_send_and_reports_a_decline(armed):
         return True
 
     deps = {"bus": FakeBus(), "gym_lookup": lambda k: ("g-uuid", "CrossFit Reverb"),
-            "notify_new_gym": notify}
+            "notify_new_gym": notify, "is_echo_client": lambda gid: gid == "g-uuid"}
     status, body = _post("resend_connect_link", _body(), deps=deps)
     assert status == 200 and body["result"]["sent"] is True
     assert seen == {"base_key": GYM, "gym_id": "g-uuid", "name": "CrossFit Reverb", "force": True}
@@ -368,3 +369,34 @@ def test_intake_web_bounds_the_body_before_reading_it(armed):
                                    "Content-Length": str(FO.MAX_BODY_BYTES + 1)}, b"x")
     inst.do_POST()
     assert cap["json"][0] == 413
+
+
+# ---- round 2 (audit of PR #107) -----------------------------------------------------------
+
+def test_resend_connect_link_refuses_a_non_echo_client_and_fails_closed(armed):
+    """MINOR: notify_new_gym(force=True) DM'd 36 non-clients live. The resend is gated on an
+    echo_gym_settings row for the gym; no row, or an unverifiable lookup, is a refusal."""
+    sent = []
+    deps = {"bus": FakeBus(), "gym_lookup": lambda k: ("g-uuid", "Not A Client Gym"),
+            "notify_new_gym": lambda *a, **kw: sent.append(a) or True,
+            "is_echo_client": lambda gid: False}
+    status, body = _post("resend_connect_link", _body(), deps=deps)
+    assert status == 403 and body["error"] == "not_echo_client" and sent == []
+
+    def boom(gid):
+        raise RuntimeError("supabase down")
+
+    deps["is_echo_client"] = boom
+    status, body = _post("resend_connect_link", _body(), deps=deps)
+    assert status == 403 and sent == [], "an unverifiable client status never sends"
+
+
+def test_org_floor_refusal_leaves_a_trace_on_the_ticket(armed):
+    """R4: a 403 wrote an audit line but no support_messages row; a teammate reading the
+    thread should see the FIXER tried."""
+    bus = FakeBus()
+    status, body = _post("refund", _body(), deps={"bus": bus})
+    assert status == 403
+    assert len(bus.rows) == 1
+    assert bus.rows[0]["body"].startswith("OPS ACTION refund by fixer: REFUSED: org_floor")
+    assert bus.rows[0]["kind"] == "escalation" and bus.rows[0]["delivery_status"] is None
