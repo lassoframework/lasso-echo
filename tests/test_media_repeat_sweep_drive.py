@@ -936,7 +936,7 @@ def test_budget_exhaustion_is_not_reported_as_a_small_library(monkeypatch):
     assert alerts == [], "fired the small-library alert with a full Drive folder"
     text = mrs.unfixable_report(res)
     assert "could not prepare one" not in text, "it prepared five"
-    assert "queued behind tonight's per-gym limit" in text
+    assert "queued behind tonight's per gym limit" in text
 
 
 def test_a_run_that_drains_the_pool_reports_what_it_first_saw(monkeypatch):
@@ -1122,3 +1122,71 @@ def test_a_hosting_failure_is_never_printed_as_a_fix(monkeypatch, tmp_path):
     assert any("hosting unavailable" in d for d in res["detail"])
     # and it is no longer SILENT to the client
     assert "media hosting was unavailable" in mrs.unfixable_report(res)
+
+
+# ---- round 7: the LOCAL path (the one that runs with every flag off) ---------------
+def _local_lib(tmp_path, monkeypatch, n=3):
+    lib = tmp_path / "local"
+    lib.mkdir()
+    for i in range(n):
+        (lib / f"L{i}.jpg").write_bytes(b"\xff\xd8\xff" + bytes([i + 1]) * 5000)
+    (lib / REPEATED).write_bytes(b"\xff\xd8\xff" + b"Z" * 5000)
+    monkeypatch.setattr(mrs, "_lib_dir", lambda base: str(lib))
+    monkeypatch.setattr(mrs, "_is_real_image", lambda path: True)
+    monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda path, tenant: f"https://cdn.tt/{os.path.basename(path)}")
+    monkeypatch.setattr("agent.media_swap.after_swap", lambda *a, **k: None)
+    return lib
+
+
+def test_a_failed_story_reburn_is_never_counted_as_a_clean_fix(monkeypatch, tmp_path):
+    """Round 7 MAJOR. The local path has no all-or-nothing and no rollback: a failed
+    re-burn left the feed on the new photo and the story on the repeat, printed
+    "2 row(s)", counted the date fixed, and the client report came back EMPTY."""
+    _local_lib(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setattr(mrs, "_reburn_story", lambda *a, **k: None)
+    import datetime
+    store = _Store(_book())
+    res = mrs.sweep_gym(GYM, store, apply=True, today=datetime.date(2026, 9, 11))
+    moved = [d for d in res["detail"] if "-> " in d]
+    assert moved and all("of 3 row(s)" in d and "kept the repeat" in d for d in moved), \
+        f"overstated what landed: {res['detail']}"
+    text = mrs.unfixable_report(res)
+    assert "could not be moved as a whole" in text, \
+        "a half-swapped post was invisible to the client report"
+
+
+def test_the_local_path_clears_a_stale_source_media_url(monkeypatch, tmp_path):
+    """Round 7 MAJOR. media_guard.row_media_key reads source_media_url FIRST, so a
+    stranded one makes the row key as media it no longer carries: invisible to every
+    future guard and sweep, and it blocks that photo from every future pick. Round 3
+    fixed this on the Drive path; the LOCAL path -- the default one -- still had it."""
+    _local_lib(tmp_path, monkeypatch)
+    import datetime
+    store = _Store(_book())
+    for r in store.rows:
+        if r["id"] == "r14ig":
+            r["source_media_url"] = f"https://tt.media/{REPEATED}"
+    mrs.sweep_gym(GYM, store, apply=True, today=datetime.date(2026, 9, 11))
+    row = [r for r in store.rows if r["id"] == "r14ig"][0]
+    assert row["image_url"] != f"https://cdn.tt/{REPEATED}", "the row did not move"
+    assert row["source_media_url"] == "", \
+        f"stranded {row['source_media_url']!r}: the repeat is invisible to Echo"
+    assert not media_guard.row_media_key(row).endswith(REPEATED)
+
+
+def test_a_row_with_no_source_media_url_is_not_given_one(monkeypatch, tmp_path):
+    """Never write the column for a gym whose schema predates it."""
+    _local_lib(tmp_path, monkeypatch)
+    import datetime
+    store = _Store(_book())
+    sent = []
+    real = store.swap_media
+    store.swap_media = lambda b, r, u, source_media_url=None, extra_fields=None: (
+        sent.append(source_media_url)
+        or real(b, r, u, source_media_url=source_media_url, extra_fields=extra_fields))
+    mrs.sweep_gym(GYM, store, apply=True, today=datetime.date(2026, 9, 11))
+    assert sent and all(v is None for v in sent), \
+        f"wrote source_media_url on rows that never had one: {sent}"

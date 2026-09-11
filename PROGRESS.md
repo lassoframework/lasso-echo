@@ -4707,3 +4707,43 @@ fragment with no report signal ("duplicate pics again") escalates. Both are the 
 direction and neither is worse than today, where every one of these escalates. Chasing
 them reintroduces false positives on instructions, which cost a wrong ACK plus a
 swallowed conversation.
+
+## Audit round 7 (2026-09-11): B-. Two of the three majors are DEFAULT-path bugs this work exposed.
+
+Round 7 found no ship blockers, confirmed flag-OFF is byte-for-byte origin/main across
+10 library shapes x dry/apply (0 divergences in every counter and the full write log),
+and passed the end-to-end a fourth time. Three majors:
+
+- [~] **My precision claim was an artifact of my own corpus.** Round 6's shipped
+  imperative set said "Thursday's post", "the story", "both platforms" and never "my
+  calendar" -- so it never exercised the one signal family an INSTRUCTION can carry.
+  On a held-out set targeting that gap, 15 of 18 benign imperatives dispatched a fixer:
+  "Use the same image on my posts for the rest of the month", "Leave the duplicate
+  photos on my calendar". The possessive is now WEAK evidence: necessary, never
+  sufficient. A clause relying on it alone must not also open with a bare imperative.
+  Two subtleties that cost real cases: bare `are`/`is` in the strong family made "where
+  they are" a report signal, and treating every leading `duplicate` as a verb lost
+  John's own phrasing ("duplicate images on my calendar" is a noun phrase; "duplicate
+  the images" is a command). **Measured across all seven rounds' corpora: precision
+  76/76, recall 27/27.**
+- [~] **The LOCAL swap path could ship a MIXED POST and count it fixed.** With
+  `AGENT_STORY_FORMAT` on and a failed `_reburn_story`, the feed moved to the new photo,
+  the story kept the repeat, the detail line said "2 row(s)", `dates_fixed` went up, and
+  `unfixable_report` returned "". The Drive path has all-or-nothing plus `_restore_rows`;
+  the local path has neither. It now counts what LANDED ("2 of 3 row(s); the rest kept
+  the repeat"), logs a MIXED POST line, and the client report says a person needs to
+  look at that day.
+- [~] **The LOCAL path stranded `source_media_url`.** Feed rows passed None, and
+  portal_calendar_store only writes the column when the value is not None, so a row
+  carrying one from a portal edit-image swap kept pointing at the OLD photo.
+  `media_guard.row_media_key` reads source_media_url FIRST, so that row keys as media it
+  no longer carries: invisible to every future guard and sweep, and the old photo stays
+  blocked from every future pick. Round 3 fixed exactly this on the Drive path and the
+  comment even says "the forward path did not" -- the LOCAL path, the one that runs with
+  every flag off, still had it. Now cleared with "", and ONLY on rows that actually have
+  something to clear, so a gym whose schema predates the column is never written to.
+
+Minors closed: dry-run `drive_fixed` parity; `_blocked_book_state` no longer hashes
+booked videos; `media_guard._hash_cache` is bounded (it grew per file rewrite forever,
+and the content dedupe now drives it over whole libraries); a refused rollback reaches
+ops_alerts instead of only stdout; hyphens removed from the client-readable report copy.

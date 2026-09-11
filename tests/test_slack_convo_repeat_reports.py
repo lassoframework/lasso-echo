@@ -361,6 +361,28 @@ def test_the_clause_splitter_only_splits_on_contrast():
     "My coach emailed duplicate clips for the reel.",
     "I scheduled the same picture on two days by mistake.",
     "I dropped duplicate images into the Drive folder last night by mistake.",
+    # round 7: an instruction that names the owner's OWN book. The round-6 corpus said
+    # "Thursday's post" / "the story" / "both platforms" and never "my calendar", so it
+    # never exercised the one signal family an instruction CAN carry. 15 of 18 of these
+    # dispatched a fixer request.
+    "Use the same image on my posts for the rest of the month",
+    "Leave the duplicate photos on my calendar",
+    "Run the same clip on our reels again",
+    "Our photographer sent duplicate images, they are on my calendar now",
+    "Put the same photo on my story and my feed",
+    "Keep the duplicate images on our calendar please",
+    "Just repeat last month's photos on my calendar",
+    "Swap in a duplicate on my posts for Friday",
+    "Load the same footage onto our reels",
+    "Stick with the same picture on my posts",
+    "Send the duplicate images to my calendar",
+    "Add the same clip to our stories",
+    "Post the same photo on my feed again",
+    "Go ahead and reuse those photos on my calendar",
+    "Drop the duplicate pictures onto our posts",
+    "Set the same image on my posts for both days",
+    "Bring back the duplicate photo on our feed",
+    "Schedule the same picture on my posts twice",
 ])
 def test_a_bare_imperative_is_never_a_fixer_request(text):
     got = _classify(text)
@@ -379,6 +401,14 @@ def test_a_bare_imperative_is_never_a_fixer_request(text):
     "thanks for the turnaround, but the duplicate images are back",
     "the same photo is on 9/14 and 9/15 and 9/16",
     "same photo three days in a row",
+    # round 7 recall: the possessive is WEAK evidence, not absent evidence -- a report
+    # that carries only it must still get through when it does not read as a command.
+    "duplicate images on my calendar",
+    "my calendar has the same photo twice",
+    "repeat images on my calendar again",
+    "there's duplicate images",
+    "duplicate pictures went out",
+    "these are duplicate images again",
 ])
 def test_a_report_signal_carries_a_real_complaint_through(text):
     assert _classify(text) == c.CODE_FIX, f"a genuine report escalated: {text!r}"
@@ -390,3 +420,29 @@ def test_a_weekday_alone_is_not_a_report_signal():
     assert not c._REPORT_SIGNAL_RE.search("on Friday")
     assert not c._REPORT_SIGNAL_RE.search("this week")
     assert c._REPORT_SIGNAL_RE.search("on 9/14")
+
+
+def test_the_possessive_alone_is_weak_evidence_not_proof():
+    """Round 7's MAJOR. "my calendar" reads like a report AND an instruction names it
+    just as readily, so it is necessary-but-not-sufficient: only a clause that does NOT
+    open with a bare imperative may rely on it alone."""
+    assert c._reads_as_a_report("duplicate images on my calendar") is True
+    assert c._reads_as_a_report("leave the duplicate photos on my calendar") is False
+    # a STRONG signal is unaffected by the imperative shape
+    assert c._reads_as_a_report("keep showing up on my calendar") is True
+
+
+def test_a_repeat_word_used_as_an_adjective_is_not_an_imperative():
+    """"duplicate images" opens a report; "duplicate the images" opens an instruction.
+    Treating every leading `duplicate` as a verb lost John's own phrasing."""
+    assert not c._LEADING_IMPERATIVE_RE.match("duplicate images on my calendar")
+    assert not c._LEADING_IMPERATIVE_RE.match("repeat photos on my posts")
+    assert c._LEADING_IMPERATIVE_RE.match("just repeat last month's photos")
+    assert c._LEADING_IMPERATIVE_RE.match("duplicate the hero shot")
+
+
+def test_a_polite_opener_is_still_stripped():
+    """Pinned because a mutation that deleted the strip survived the round-6 suite."""
+    assert c._POLITE_OPENER_RE.sub("", "heads up, the duplicate images are back",
+                                   count=1).strip() == "the duplicate images are back"
+    assert c.is_repeat_report("heads up, the duplicate images are back") is True

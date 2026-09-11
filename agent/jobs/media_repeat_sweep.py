@@ -259,7 +259,7 @@ def _blocked_book_state(base, state, current_key):
             return blocked
         seeds = (set(state or {}) | {current_key}) & lib_names
         used_clusters = {_cluster_key(lib, k) for k in seeds}
-        used_prints = (_content_prints(lib, seeds, lib_names)
+        used_prints = (_content_prints(lib, seeds, lib_names, images_only=True)
                        if config.media_dedupe_by_content_enabled() else set())
         for name in lib_names:
             if name in blocked:
@@ -304,9 +304,15 @@ def _restore_rows(base, store, undo):
         if done is None:
             stuck.append(str(rid))
     if stuck:
-        _log(f"{base}: ROLLBACK REFUSED for row(s) {', '.join(stuck)} (approved or live "
-             "since the read). They carry the NEW media while a sibling carries the old "
-             "one: a MIXED POST that needs a person.")
+        msg = (f"{base}: ROLLBACK REFUSED for row(s) {', '.join(stuck)} (approved or "
+               "live since the read). They carry the NEW media while a sibling carries "
+               "the old one: a MIXED POST that needs a person.")
+        _log(msg)
+        try:
+            from agent import ops_alerts
+            ops_alerts.alert(msg)
+        except Exception:  # noqa: BLE001 - alerting never breaks a sweep
+            pass
     return stuck
 
 
@@ -536,7 +542,8 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
     detail = [d for d in (result or {}).get("detail") or []
               if "APPROVED duplicate" in d or "LIVE row also carries it" in d
               or "no unused photo left" in d or "hosting unavailable" in d
-              or "past-dated" in d]
+              or "past-dated" in d or "story re-burn failed" in d
+              or "kept the repeat" in d]
     capped = int((result or {}).get("budget_capped") or 0)
     if not detail and not capped:
         return ""
@@ -578,7 +585,7 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
     if approved:
         lines.append(f"{approved} of them sit on APPROVED posts. Echo will not change "
                      "a card the gym already approved, so a person has to decide: "
-                     "re-approve a swap, or leave the repeat.")
+                     "approve a swap, or leave the repeat.")
     if small:
         # NEVER tell a gym to connect a folder it already connected (John Weeks /
         # Tough Temple: a full Drive folder and this line still asked for photos).
@@ -620,15 +627,19 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
                          "so there is nothing fresh to swap in. Add photos (connect "
                          "the gym's Drive folder or upload in the portal).")
     if capped:
-        lines.append(f"{capped} more day(s) are queued behind tonight's per-gym limit "
+        lines.append(f"{capped} more day(s) are queued behind tonight's per gym limit "
                      f"of {DRIVE_FALLBACK_MAX_PER_GYM} and clear on the next runs. "
                      "Nothing more is needed from the gym.")
     # Named, not silent (independent audit round 6). AGENT_HOSTING_ENABLED defaults
     # FALSE, so on a default-posture box EVERY swap dies at hosting and this report used
     # to come back empty while the repeats stood.
     if any("hosting unavailable" in d for d in detail):
-        lines.append("Some of these could not be re-pointed because media hosting was "
+        lines.append("Some of these could not be moved because media hosting was "
                      "unavailable on this run. That is ours to fix, not the gym's.")
+    if any("story re-burn failed" in d or "kept the repeat" in d for d in detail):
+        lines.append("On at least one day the post could not be moved as a whole, so "
+                     "part of it still carries the old photo. A person needs to look "
+                     "at that day.")
     if any("past-dated" in d for d in detail):
         lines.append("Some sit on dates that have already passed; the expired sweep "
                      "owns those, not this one.")
@@ -785,6 +796,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                         if pool_dry > 0:
                             pool_dry -= 1
                             drive_fixes_left -= 1    # the SAME budget apply spends
+                            drive_fixed += 1         # parity with apply's counter
                             result["dates_fixed"] += 1
                             result["rows_repointed"] += len(fixable)
                             result["detail"].append(
@@ -853,18 +865,30 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                             feed_url = reframed
                 except Exception:  # noqa: BLE001 - keep the raw hosted photo
                     pass
-            fixed_any = False
+            swapped_local, burn_failed = [], False
             for r in fixable:
                 rid = r.get("id")
                 fmt = str(r.get("format") or "").lower()
                 target_url = feed_url
-                src_url = None
+                # "" not None, so a row that already carries a source_media_url (from a
+                # portal edit-image swap, or an earlier armed Drive sweep) does not keep
+                # pointing at media it no longer has. portal_calendar_store only writes
+                # the column when the value is not None, and media_guard.row_media_key
+                # reads source_media_url FIRST -- a stranded one makes the row key as a
+                # photo it does not carry, invisible to every future guard and sweep,
+                # and blocks that photo from every future pick. Round 3 fixed this on
+                # the Drive path; the LOCAL path -- the one that runs with every flag
+                # off -- still had it (independent audit round 7). Only sent when the
+                # row actually has something to clear, so a gym whose schema predates
+                # the column is never written to.
+                src_url = "" if (r.get("source_media_url") or "") else None
                 if fmt == "story":
                     if config.story_format_enabled():
                         burned = _reburn_story(base, r, new_path, lib)
                         if not burned:
                             result["detail"].append(
                                 f"{key} {pd}: story re-burn failed; left")
+                            burn_failed = True
                             continue
                         target_url = burned
                         result["stories_reburned"] += 1
@@ -877,10 +901,19 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                 if store.swap_media(base, rid, target_url,
                                     source_media_url=src_url) is not None:
                     result["rows_repointed"] += 1
-                    fixed_any = True
-            if fixed_any:
-                result["detail"].append(
-                    f"{key} {pd}: -> {new_key} ({len(fixable)} row(s))")
+                    swapped_local.append(str(rid))
+            if swapped_local:
+                # THE COUNT IS WHAT LANDED (independent audit round 7). This printed
+                # len(fixable) unconditionally, so a failed story re-burn reported
+                # "2 row(s)" on a post where the feed moved and the story kept the
+                # repeat -- a MIXED POST, counted as a clean fix.
+                _n = len(swapped_local)
+                _of = (f"{_n} of {len(fixable)} row(s); the rest kept the repeat"
+                       if _n < len(fixable) else f"{_n} row(s)")
+                result["detail"].append(f"{key} {pd}: -> {new_key} ({_of})")
+                if burn_failed or _n < len(fixable):
+                    _log(f"{base}: {key} {pd}: MIXED POST -- {_n} of {len(fixable)} "
+                         "rows moved; a person needs to look at this date")
                 result["dates_fixed"] += 1
                 state.setdefault(new_key, set()).add((pd, "x"))
                 try:

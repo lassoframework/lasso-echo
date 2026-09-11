@@ -74,6 +74,10 @@ def row_media_key(row):
 # size) so a scan does not re-read an unchanged library.
 _REFRAME_SUFFIX = "__feed.jpg"
 _hash_cache = {}
+# Bounded (independent audit round 7): keyed on (path, mtime, size), so a long-lived
+# worker whose Drive sync rewrites files accumulated an entry per rewrite forever. The
+# content dedupe now drives this over whole libraries, not just reframe names.
+_HASH_CACHE_MAX = 4096
 
 
 def _library_hash(path):
@@ -96,6 +100,8 @@ def _library_hash(path):
             h = digest.hexdigest()[:12]
         except OSError:
             return None
+        if len(_hash_cache) >= _HASH_CACHE_MAX:
+            _hash_cache.clear()          # simplest bound; the next scan re-warms it
         _hash_cache[ck] = h
     return h
 

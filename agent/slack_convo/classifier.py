@@ -152,7 +152,8 @@ _NOT_A_REPEAT_REPORT_RE = re.compile(
     r"copied|copy|uploaded|approved|sent|added|dropped|loaded|pasted|emailed|"
     r"scheduled|imported|put)\b|"
     r"\b(?:my|our) (?:front desk|desk|coach|coaches|manager|assistant|staff|team|gm|"
-    r"wife|husband|partner|kid|kids|son|daughter|intern|owner|trainer|trainers)"
+    r"wife|husband|partner|kid|kids|son|daughter|intern|owner|trainer|trainers|"
+    r"photographer|videographer|marketing (?:guy|person|girl|team)|admin|va)"
     r"\s+\w*\s*(?:duplicated|uploaded|reused|recycled|copied|sent|added|keeps)\b|"
     r"\brepeat(?:ing)? (?:myself|ourselves|itself)\b|"
     r"\b(?:accidentally|by accident|by mistake|my bad|oops|sorry about that|"
@@ -210,30 +211,65 @@ _CLAUSE_SPLIT_RE = re.compile(
 # the client's OWN book as the subject (my posts, my calendar), a persistence marker
 # (still, again, keeps, there are, back on, showing up), or a date. Every genuine
 # complaint in five rounds of corpora carries one; an instruction carries none.
+# STRONG signals: an instruction cannot carry one of these.
+#   1. someone OTHER than the client is doing it, including the book itself
+#   3. it is STILL happening / it is THERE
+#   4. a run of days, a spread across posts, a numeric date
 _REPORT_SIGNAL_RE = re.compile(
-    # 1. someone OTHER than the client is doing it -- including the book itself
     r"\b(?:you|you'?re|youre|echo|it'?s|its|it is|they|the system|the calendar|"
     r"the feed|the queue|the book|the images?|the photos?|the pics?|the pictures?|"
     r"the posts?|the reels?|the clips?|the videos?|the footage|the captions?)\s+"
     r"(?:\w+\s+){0,3}?"
     r"(?:repeat|repeats|repeated|repeating|reuse|reused|reusing|duplicate|duplicated|"
     r"duplicating|recycled|recycling|used|using|put|putting|posted|scheduled)\b|"
-    # 2. the client's OWN book is the SUBJECT ("my posts are repeating")
-    r"\b(?:my|our) (?:posts?|reels?|calendar|images?|photos?|pics?|pictures?|videos?|"
-    r"clips?|footage|feed|story|stories|book|queue)\b|"
-    # 3. it is STILL happening / it is THERE -- never how an instruction reads
+    # PAST TENSE about what happened: an instruction never says "went out".
+    r"\b(?:went out|came out|got posted|got published)\b|"
+    # "these are duplicate images again" -- a demonstrative subject is report shaped.
+    r"\b(?:these|those) (?:are|were|keep|look)\b|"
     r"\b(?:still|keeps|kept|back on|(?:are|is|were|was) back|showing up|showed up|"
-    r"shows up|"
-    r"there (?:are|is|were|was)|noticed|why (?:is|are|do|does|did))\b|"
-    # 4. a run of days, and numeric dates. Bare weekday names are deliberately NOT
-    #    here: an instruction schedules with them constantly ("Post the same clip
-    #    again on Friday"), so they carry no report signal at all.
+    r"shows up|there'?s|there (?:are|is|were|was)|noticed|"
+    r"why (?:is|are|do|does|did))\b|"
     r"\b(?:\d+|two|three|four|five|several) (?:days|weeks|times) in a row\b|"
     r"\b(?:is|are|sits?|sitting) on \w+ (?:posts?|days?|dates?)\b|"
     r"\bon (?:\d+|two|three|four|five|several|multiple|different) "
     r"(?:posts?|days?|dates?)\b|"
     r"\b\d{1,2}\s*/\s*\d{1,2}\b"
     , re.IGNORECASE)
+
+# WEAK signal: the client's OWN book named as a possessive. It reads like a report
+# ("my posts are repeating") but an INSTRUCTION names the same thing just as readily
+# ("use the same image on my posts for the rest of the month"), and round 7 measured 15
+# of 18 such imperatives dispatching a fixer request. So this is necessary, never
+# sufficient: a clause whose ONLY evidence is the possessive must not also open with a
+# bare imperative verb.
+_OWN_BOOK_RE = re.compile(
+    r"\b(?:my|our) (?:posts?|reels?|calendar|images?|photos?|pics?|pictures?|videos?|"
+    r"clips?|footage|feed|story|stories|book|queue)\b", re.IGNORECASE)
+
+# A clause that OPENS with a bare verb is an instruction, not a report. Only consulted
+# when the possessive above is the sole evidence, so "Repeat photos again this week on
+# the posts" -- which the round-6 comment rightly flagged as a real complaint -- is
+# unaffected unless it carries nothing else either.
+_LEADING_IMPERATIVE_RE = re.compile(
+    r"^\s*(?:just |please |pls |also |and )?"
+    r"(?:(?:use|put|post|run|swap|stick|keep|leave|load|send|bring|add|drop|set|make|"
+    r"schedule|upload|go|pull|grab|throw|change|move)"
+    # repeat / duplicate / reuse double as ADJECTIVES on the media noun, which is how a
+    # report opens ("duplicate images on my calendar"). Only an object that is NOT a
+    # media noun makes them imperative ("just repeat last month's photos").
+    r"|(?:reuse|repeat|duplicate|recycle)(?!\s+(?:images?|photos?|pics?|pictures?|"
+    r"videos?|clips?|posts?|reels?|footage)\b))\b",
+    re.IGNORECASE)
+
+
+def _reads_as_a_report(clause):
+    """True when this clause reads as a REPORT of duplicate media rather than an
+    instruction to produce some. See _REPORT_SIGNAL_RE / _OWN_BOOK_RE."""
+    if _REPORT_SIGNAL_RE.search(clause):
+        return True
+    if not _OWN_BOOK_RE.search(clause):
+        return False
+    return not _LEADING_IMPERATIVE_RE.match(clause)
 
 
 def is_repeat_report(text):
@@ -252,7 +288,7 @@ def is_repeat_report(text):
             continue
         # A REPORT, not an instruction: something must say who, when, or that it is
         # still happening. See _REPORT_SIGNAL_RE.
-        if not _REPORT_SIGNAL_RE.search(clause):
+        if not _reads_as_a_report(clause):
             continue
         return True
     return False
