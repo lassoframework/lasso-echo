@@ -522,6 +522,48 @@ def register_gym(base, *, name="", ig_handle="", fb_page="", gym_id=None):
     return [f"{base}_ig", f"{base}_fb"]
 
 
+def remove_gyms(bases, *, backup_dir=None):
+    """Remove the given bases from the dynamic registry. LOCKED read-modify-write with the
+    same atomic replace register_gym uses, plus a timestamped .bak copy of the file as it
+    was (in `backup_dir` when given, else beside the registry). Returns the removed rows.
+
+    THE ONLY CALLER is echo_clients_cleanup (2026-09-11), which computes the list from
+    the Echo client universe and never passes a hardcoded ACCOUNTS base or a client.
+    This function does not re-check that: it removes exactly what it is told, so the
+    decision stays in one place and is testable there. A corrupt registry RAISES
+    (RegistryUnreadable) rather than being treated as empty and saved over."""
+    global _dynamic_cache
+    import shutil
+    import time as _time
+    from . import config
+    wanted = {(b or "").strip() for b in (bases or []) if (b or "").strip()}
+    if not wanted:
+        return []
+    path = config.gym_registry_path()
+    with _registry_lock(path):
+        rows = _load_registry_rows(strict=True)
+        removed = [r for r in rows if (r.get("base") or "").strip() in wanted]
+        if not removed:
+            return []
+        keep = [r for r in rows if (r.get("base") or "").strip() not in wanted]
+        stamp = _time.strftime("%Y%m%dT%H%M%S")
+        bak_dir = backup_dir or (os.path.dirname(path) or ".")
+        os.makedirs(bak_dir, exist_ok=True)
+        try:
+            shutil.copy2(path, os.path.join(bak_dir,
+                                            f"{os.path.basename(path)}.bak-{stamp}"))
+        except OSError:
+            pass   # the registry may not exist yet on disk; nothing to back up
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(keep, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    _dynamic_cache = None
+    return removed
+
+
 def active_accounts():
     """The accounts the daily runner drafts for: active only (inactive records skipped)."""
     return [a for a in all_accounts() if a.active]

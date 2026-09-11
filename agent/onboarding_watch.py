@@ -8,9 +8,20 @@ could not see the gym at all. Hill Country's partial connection is the watch's o
 founding story, and Hill Country was absent from the registry for weeks. CrossFit
 Reverb signed up on 2026-08-30 and was invisible the same way within hours.
 
-So this watch reads the AUTHORITATIVE list instead: echo_intake_tokens, the portal's
-own record of every gym it has minted an Echo key for. A gym cannot hide from it by
-being missing from Echo's side, because Echo's side is exactly what it audits.
+So this watch reads the PORTAL's roster instead of Echo's registry, so a gym cannot hide
+from it by being missing from Echo's side, because Echo's side is exactly what it audits.
+
+THE ROSTER IS *NOT* echo_intake_tokens (2026-09-11 incident). This docstring used to
+call echo_intake_tokens "the AUTHORITATIVE list of Echo clients". It is not: the portal
+mints an Echo intake token for EVERY gym it knows (131 rows, one per portal gym), so
+with autoregister + auto connect-link armed this watch registered ~110 LASSO ads-only
+gyms into Echo's registry, DMed 36 of their owners a connect link "from Echo", and
+minted 153 "not set up to post" tickets for gyms that never bought Echo. The client
+universe is `echo_gym_settings` (agent/echo_clients.py, the ONE predicate); the token
+table only supplies each client's minted key. portal_keys() returns token rows for
+Echo clients ONLY, and every action in this module re-checks is_echo_client before it
+alerts, registers or notifies. echo_clients fails closed: an unreadable client universe
+means an empty roster and a silent sweep, never the fleet.
 
 WHAT IT CATCHES (each its own reason code, so an alert names the actual next action):
   not_registered  the portal knows this gym, Echo's registry does not -> it is in
@@ -31,11 +42,12 @@ WHAT IT CATCHES (each its own reason code, so an alert names the actual next act
                   case by design: it only reports PARTIAL connections)
   no_fb_page      Facebook is connected but no page is selected -> every Facebook
                   publish raises "no Facebook page selected" (live on Reverb)
-  no_intake_token the portal's gyms table knows this gym but echo_intake_tokens has
-                  ZERO rows for it, so it never even ENTERS the sweep above (Empire
-                  Training Academy, 2026-09-09). Read straight from `gyms` rather than
-                  through the token-keyed roster, so this is the one check that does
-                  not require a base_key to already exist.
+  no_intake_token an ECHO CLIENT (echo_gym_settings row) the portal's gyms table knows
+                  but echo_intake_tokens has ZERO rows for, so it never even ENTERS
+                  the sweep above (Empire Training Academy, 2026-09-09). Read straight
+                  from `gyms` rather than through the token-keyed roster, so this is
+                  the one check that does not require a base_key to already exist.
+                  Gated on is_echo_client like everything else here.
 
 RAILS: read-only everywhere except its own kv dedup stamps. Never registers, connects,
 approves or publishes anything: a human reads the alert and acts. ONE alert per gym per
@@ -46,6 +58,7 @@ import os
 from datetime import date
 
 from . import config
+from . import echo_clients
 from . import zernio as _z
 
 # Order matters: the FIRST unmet requirement is the one the alert leads with, because
@@ -198,14 +211,20 @@ def is_client_gym(base_key):
     return bool(k) and k not in _NOT_CLIENTS and not k.startswith("lasso")
 
 
-def portal_keys(http=None):
-    """Every (gym_id, echo_account_key) the PORTAL has minted, from echo_intake_tokens.
-    This is the authoritative roster; Echo's own registry is what we audit against it.
-    Returns [] when creds are absent or the read fails (the sweep is then a no-op)."""
+def portal_keys(http=None, is_client=None):
+    """(gym_id, echo_account_key) for every ECHO CLIENT the portal has minted a key
+    for: echo_intake_tokens rows whose gym_id has an echo_gym_settings row.
+
+    NOT the whole token table (2026-09-11): the portal mints a token for every gym it
+    knows, clients or not, so the unfiltered table is the LASSO ads fleet. The client
+    filter is echo_clients.is_echo_client, which fails closed -- an unreadable client
+    universe makes this an empty roster and the sweep a no-op, never the fleet.
+    Returns [] when creds are absent or the read fails."""
     url = config.supabase_url()
     key = config.supabase_service_key()
     if not url or not key:
         return []
+    is_client = is_client or echo_clients.is_echo_client
     if http is None:
         import requests  # lazy
         http = requests
@@ -216,10 +235,11 @@ def portal_keys(http=None):
                      timeout=30)
         if r.status_code >= 400:
             return []
-        return [(str(t.get("gym_id") or ""), str(t.get("echo_account_key") or ""))
+        rows = [(str(t.get("gym_id") or ""), str(t.get("echo_account_key") or ""))
                 for t in (r.json() or []) if (t.get("echo_account_key") or "").strip()]
     except Exception:  # noqa: BLE001 - a roster read failure is a silent no-op
         return []
+    return [(gid, k) for gid, k in rows if is_client(gid)]
 
 
 def intake_keys(http=None):
@@ -246,10 +266,14 @@ def intake_keys(http=None):
         return {}
 
 
-def zero_token_gyms(known_gym_ids, http=None):
-    """Real client gyms in the portal's `gyms` table with ZERO echo_intake_tokens rows:
+def zero_token_gyms(known_gym_ids, http=None, is_client=None):
+    """ECHO CLIENT gyms in the portal's `gyms` table with ZERO echo_intake_tokens rows:
     the blind spot portal_keys() (and therefore every check_gym() sweep) can never see,
     because a gym needs a token row just to enter that roster in the first place.
+
+    Gated on echo_clients.is_echo_client (2026-09-11): the gyms table is the whole
+    LASSO fleet, and "a gym with no Echo token" is the NORMAL state of an ads-only
+    gym, not a fault. Only a gym with an echo_gym_settings row and no token is one.
 
     Reads `gyms` directly (id, name, slug, status, is_demo, load_test, is_verification)
     rather than joining in SQL, so a read failure here fails the SAME way every other
@@ -284,12 +308,15 @@ def zero_token_gyms(known_gym_ids, http=None):
         rows = r.json() or []
     except Exception:  # noqa: BLE001 - a roster read failure is a silent no-op
         return []
+    is_client = is_client or echo_clients.is_echo_client
     known = set(known_gym_ids or ())
     out = []
     for g in rows:
         gid = str(g.get("id") or "")
         if not gid or gid in known:
             continue
+        if not is_client(gid):
+            continue                      # an ads-only gym: no Echo token is correct
         status = str(g.get("status") or "").strip().lower()
         if status in _EXCLUDED_GYM_STATUSES:
             continue
@@ -387,6 +414,14 @@ def autoregister(base_key, gym_id, *, deps=None, alert=None):
     if not is_client_gym(base_key):
         return False
     d = deps or _live_deps()
+    # ECHO CLIENTS ONLY (2026-09-11): this is the exact call that put ~110 ads-only
+    # gyms into gym_accounts.json and, through notify_new_gym below, DMed 36 of their
+    # owners. A gym that is not in echo_gym_settings is never registered, never
+    # notified, and never alerted about. Silent by design: a non-client producing an
+    # alert is the same noise the incident produced.
+    is_client = d.get("is_client") or echo_clients.is_echo_client
+    if not (is_client(gym_id) or is_client(base_key)):
+        return False
     try:
         name = str(d["gym_name"](gym_id) or "").strip()
     except Exception:  # noqa: BLE001
@@ -447,6 +482,10 @@ def run(*, deps=None, alert=None, kv=None, today=None, http=None):
         kv = type("_KV", (), {"get": staticmethod(db.kv_get),
                               "set": staticmethod(db.kv_set)})()
     day = str(today or date.today())
+    # THE GATE (2026-09-11). Both rosters below are re-checked against the Echo client
+    # universe here, in the loop, even though the live readers already filter: a fake
+    # or future reader that forgets to must still be unable to page the fleet.
+    is_client = d.get("is_client") or echo_clients.is_echo_client
     roster = d["roster"](http)
     intake = d["intake"](http)
     try:
@@ -457,6 +496,8 @@ def run(*, deps=None, alert=None, kv=None, today=None, http=None):
     for gym_id, base_key in roster:
         if not is_client_gym(base_key):
             continue
+        if not (is_client(gym_id) or is_client(base_key)):
+            continue                      # not an Echo client: no check, no alert
         try:
             issues = check_gym(base_key, gym_id, intake.get(gym_id, ""),
                                bases=bases, deps=d)
@@ -506,6 +547,8 @@ def run(*, deps=None, alert=None, kv=None, today=None, http=None):
         label = slug or name or gym_id
         if not is_client_gym(label):
             continue
+        if not is_client(gym_id):
+            continue                      # an ads-only gym with no Echo token is normal
         stamp = f"onboarding_watch_notoken_{gym_id}_{day}"
         try:
             if kv.get(stamp, ""):
@@ -523,7 +566,9 @@ def run(*, deps=None, alert=None, kv=None, today=None, http=None):
 
 
 def _live_deps():
-    """The real readers. Split out so run()/check_gym() are fully injectable."""
+    """The real readers. Split out so run()/check_gym() are fully injectable.
+    `is_client` is the Echo client universe predicate (echo_clients.is_echo_client);
+    every roster row and every action goes through it."""
     def _bases():
         from .calendar_autopublish import client_gym_bases
         return client_gym_bases()
@@ -608,4 +653,5 @@ def _live_deps():
     return {"roster": portal_keys, "intake": intake_keys, "bases": _bases,
             "approved_sources": _approved, "voice": _voice, "profile_id": _profile,
             "platforms": _platforms, "fb_page": _fb_page, "gym_name": _gym_name,
-            "zero_token": zero_token_gyms}
+            "zero_token": zero_token_gyms,
+            "is_client": echo_clients.is_echo_client}

@@ -91,6 +91,36 @@ def _isolated_db(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _echo_client_universe_allow_all():
+    """ECHO CLIENT UNIVERSE (2026-09-11 incident): every fleet lane now passes through
+    agent.echo_clients.is_echo_client, which reads echo_gym_settings off the shared
+    plane and FAILS CLOSED (unknown = not a client). The suite runs offline with the
+    creds stripped above, so the honest live answer in a test is always "not a client"
+    and every lane would do nothing -- which is not what the hundreds of lane tests
+    written before the gate existed are testing. Install an allow-all override for the
+    suite; the gate's OWN tests (tests/test_echo_clients*.py, the lane-gate tests) call
+    `echo_clients.set_test_override(None)` or use `real_echo_clients` to test the real
+    predicate with fake readings."""
+    from agent import echo_clients as _ec
+    _ec.set_test_override(lambda ident: True)
+    _ec.reset_cache()
+    yield
+    _ec.set_test_override(None)
+    _ec.reset_cache()
+
+
+@pytest.fixture
+def real_echo_clients():
+    """Opt OUT of the allow-all override: the live predicate, over whatever `_load`
+    (or a monkeypatched `_load`) returns. Cache is cleared on entry and exit."""
+    from agent import echo_clients as _ec
+    _ec.set_test_override(None)
+    _ec.reset_cache()
+    yield _ec
+    _ec.reset_cache()
+
+
+@pytest.fixture(autouse=True)
 def _clear_process_local_caches():
     """Empty every process-local memo cache before AND after each test.
 

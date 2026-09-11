@@ -2821,3 +2821,97 @@ Mutation-checked, `__pycache__` cleared between each: reverting the `run_once()`
 product default, the runner's caller, the outbox dispatch-time recheck, or the
 `ESCALATE_ALWAYS` additions each turns the corresponding test red, including
 `test_client_dm_end_to_end.py`'s full real-adapter path.
+
+## D72 (2026-09-11) -- echo_gym_settings is the Echo client universe; echo_intake_tokens is NOT
+
+**The incident (12:03-12:06 UTC).** Echo's onboarding lane ran fleet-wide.
+`onboarding_watch.portal_keys()` read every `echo_intake_tokens` row as "the
+AUTHORITATIVE list of Echo clients" (its own docstring, lines 8-13 and 201). The portal
+mints an Echo intake token for EVERY gym it knows -- 131 rows that morning, one per
+portal gym -- so with `AGENT_ONBOARDING_AUTOREGISTER` and `AGENT_AUTO_CONNECT_LINK`
+armed the sweep:
+
+* auto-registered ~110 non-clients into `/data/gym_accounts.json` (19 -> 126 entries;
+  `alexanderlkonicke981780`, `deanholcomb9ebee0` ... are people, not gyms);
+* sent `connect_link_notify`'s "Hey <name>, this is Echo ... here is your connect link"
+  Slack group DM to 36 gym owners who are LASSO ads clients (Launch / Ascend / Apex),
+  not Echo clients;
+* ran website-intake against the fleet (`intaken 8, skipped 18, failed 105`) and wrote
+  brand bibles under `brand_voice/` for 8 non-clients;
+* minted 153 "not set up to post (no_sources, no_profile)" / "no single client_owner
+  email" ops alerts as ops tickets.
+
+Flags were turned OFF on Railway (`AGENT_AUTO_CONNECT_LINK`,
+`AGENT_ONBOARDING_AUTOREGISTER`, `AGENT_ONBOARD_AUTOMINT`; `AGENT_ONBOARDING_WATCH`
+left on).
+
+**The wrong predicate, verified against the live portal DB the same day.**
+`echo_gym_settings` held exactly the 20 Echo clients (CrossFit Chateau, CrossFit Local,
+CrossFit Newtown, CrossFit Nine 7, CrossFit Reverb, CrossFit Sunnyside, CrossFit
+Zanshin, District H, ENG, GRITX, Hill Country, LASSO FRAMEWORK LLC, MFLH, Pierce
+Fitness, Swift River CrossFit, The Bolton Club, Top Fuel, Tough Temple, Train716, ZZ
+Test Gym). `echo_intake_tokens` held 131 gyms (19 of them clients; ZZ Test Gym has no
+token). No other positive Echo marker exists: `gyms.plan` is `full` for all 158 rows,
+`gym_products` carries only the `ads` product, `gym_billing.tier` is the ADS tier
+(ASCEND 50 / APEX 13 / LAUNCH 10 / null 40). `echo_gyms` (the shared mirror) held 140
+rows, 115 of them for non-clients, pushed by `gym-store-sync` on 2026-09-10 19:13.
+
+**The rule.**
+
+    echo_gym_settings IS the Echo client universe.  echo_intake_tokens IS NOT.
+
+**What shipped (branch `fix/echo-client-universe`).**
+
+* `agent/echo_clients.py` -- the ONE predicate: `is_echo_client(gym_id | base_key |
+  account_key)`, `echo_client_keys()`, `echo_client_gym_ids()`, `only_clients()`,
+  `only_client_bases()`. Reads `echo_gym_settings` + `echo_intake_tokens` + the 20
+  clients' `gyms` rows; admits a gym by UUID or by ANY key it has legitimately held
+  (both token rows of a split gym, the Echo derivation `slug+sha256(id)[:6]`, the portal
+  derivation `slug+rawUUID[:6]`, `gyms.slug`, the bare name slug), so
+  `toughtemple086f51` AND `toughtemple52040e` both resolve to Tough Temple. Cached 5 min;
+  FAILS CLOSED on any read error, missing creds, truncated page, or an empty
+  `echo_gym_settings` (retried after 20 s). Hardcoded `accounts.ACCOUNTS` bases are
+  trusted without a plane read so LASSO's own run never waits on Supabase. Live counts
+  over the real rows: 20 clients, 79 client keys/aliases, 112 non-client token keys, all
+  36 DMed gyms excluded, zero alias collisions.
+* Every fleet lane goes through it: `onboarding_watch` (`portal_keys`,
+  `zero_token_gyms`, `autoregister`, `run`), `connect_link_notify.notify_new_gym`
+  (refuses + ONE alert per gym), `welcome_queue.scan_portal_and_enqueue` +
+  `prune_portal_junk`, `catchup_report._recent_gyms_default`, `website_intake.run`,
+  `client_media_sync._client_bases`, `calendar_autopublish.client_gym_bases` (which
+  feeds connection_watch, gbp_conn_sync, zernio_profile_link, social_baseline, the
+  client publish tick), `jobs/billing_customer_sync`. Non-clients produce ZERO alerts
+  and ZERO outbound messages. The daily draft cycle and heartbeat iterate
+  `active_accounts()`; registry rows are `active=False` by construction, and a guard
+  test now pins that.
+* `python -m agent echo-clients-cleanup [--apply] [--keep a,b]` -- lists every
+  `gym_accounts.json` row, `brand_voice/<key>`, `content_library/<key>`, `echo_gyms` row
+  and local `gyms` row with a verdict (keep / remove / unknown) and times; `--apply`
+  MOVES directories and archives rows as JSON to `<DATA_DIR>/_trash/<date>/`, copies the
+  registry to a `.bak` first, then rewrites it (locked, atomic). Removes ONLY items
+  whose key or gym_id belongs to a portal gym with no `echo_gym_settings` row; a
+  hardcoded base, a `--keep` base, a client alias, or anything the plane never carried
+  (`content_library/book_campaign`, the legacy `districth`) is never touched. REFUSES
+  (exit 2) when the client universe cannot be read. `python -m agent echo-clients`
+  prints the universe.
+* `tests/test_echo_client_universe_guard.py` -- static: every lane imports and calls
+  the gate; any module whose CODE reads `echo_intake_tokens` or iterates
+  `all_accounts()` must import `echo_clients` or sit on a reviewed allowlist of
+  single-gym key resolvers (`account_key_resolve`, `account_key_reconcile`,
+  `account_key_split_watch`, `gym_identity`, `intake_web`, `social_intake_reader`;
+  `inbox_alerts`, `library`, `social_baseline`), and a stale allowlist entry fails the
+  test. Behavioural: each lane, handed a roster with a non-client, sends nothing and
+  alerts nothing for it.
+* `tests/conftest.py` installs an allow-all override for the suite (offline, no creds,
+  the honest live answer is "not a client", which is not what pre-existing lane tests
+  test); the gate's own tests use `real_echo_clients` to switch it off.
+
+**Not done here, for a ruling.** (1) `accounts.register_gym` itself is not gated --
+`onboard.run` (the portal's self-serve POST /portal/onboard, another agent's worktree
+today) may legitimately register a gym before its `echo_gym_settings` row exists;
+gating there needs the onboard order confirmed. (2) `brains/<key>` and
+`deep_brains/<key>` are not swept by the cleanup (not in the incident's write set as
+far as the logs show; add if the box shows otherwise). (3) The 36 owners were DMed; the
+message itself cannot be unsent from here. (4) `AGENT_ONBOARDING_WATCH` can stay armed
+-- its roster is Echo clients only now -- but re-arming
+`AGENT_ONBOARDING_AUTOREGISTER` / `AGENT_AUTO_CONNECT_LINK` is Blake's call.
