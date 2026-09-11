@@ -4463,11 +4463,21 @@ untouched; only the SELECT filters needed `variant_status=eq.active` added.
   `variant_regen` fact-extraction + failure reasons. 28 tests, all offline.
 
 ### Not yet done
-- [ ] Portal (Next.js) review UI: side-by-side variants + a pick button on the
-  staff/client calendar surface. Backend is usable via curl/Postman today; no
-  human-facing button yet.
-- [ ] Migration 0318 not yet applied to prod (`ooqcvmcjspeltuuhcvlh`) — ships via
-  the portal's normal `deploy-migrate.mjs` ledger, not applied by hand or via
-  Supabase MCP (that would desync the ledger — see the portal migrations README).
-- [ ] `ECHO_VARIANT_PAIRING` stays OFF until the fleet-wide Astra regen sweep
-  (~1,000+ September posts) is ready to use it.
+(Update 2026-09-11: the three items below were marked "not yet done" but portal
+PR #614 already shipped the review UI + applied migration 0318 to prod that
+same morning, and `ECHO_VARIANT_PAIRING` is now `true` on the live `echo`
+Railway service — this section was stale, not current state. Verified live:
+`content_calendar.variant_of`/`variant_status` columns, the
+`content_calendar_swap_variant` RPC, and the `content_calendar_one_active_per_group`
+unique index all exist in prod; `ops.lassoframework.com` is serving the PR #614
+build. Leaving the original lines struck through for history.)
+
+- ~~Portal (Next.js) review UI: side-by-side variants + a pick button on the
+  staff/client calendar surface.~~ Shipped in portal PR #614, live on
+  `ops.lassoframework.com`.
+- ~~Migration 0318 not yet applied to prod.~~ Applied 2026-09-11 12:26:53 UTC,
+  confirmed in `public.schema_migrations`.
+- ~~`ECHO_VARIANT_PAIRING` stays OFF until the fleet-wide Astra regen sweep is
+  ready.~~ Armed `true` in prod 2026-09-11. The ~1,000+ September post regen
+  sweep itself has NOT been run yet — that is the one real remaining item from
+  this list.
