@@ -85,6 +85,14 @@ def test_the_flag_cannot_be_turned_on_by_a_brain_hint_or_the_llm():
     "there are duplicate posts this week",
     "echo reused the same video twice",
     "the same footage showed up several weeks in a row",
+    # round 4: HEDGED and POLITE reports. A polite opener is not a verdict on the
+    # sentence, and a message can be an apology AND a report -- "thanks for the quick
+    # turnaround, but the repeat images are still there" is exactly how John's second
+    # report would read. Vetoing on the first two words lost all of these.
+    "heads up, the same picture is on three posts next week",
+    "fyi the duplicate images are back on the calendar",
+    "thanks for the quick turnaround, but the repeat images are still there",
+    "my manager noticed the duplicate images on the calendar",
 ])
 def test_a_wrong_output_report_reaches_the_fixer(text):
     assert _classify(text) == c.CODE_FIX, f"escalated instead of dispatching: {text!r}"
@@ -128,6 +136,12 @@ def test_a_wrong_output_report_reaches_the_fixer(text):
     "Our schedule repeats weekly for the 5am class, not the posts.",
     "my trainer uploaded duplicate pics again",
     "our program repeats every 8 weeks so the captions can repeat too",
+    # round 4's five held-out false positives
+    "we run the same promo every september so feel free to repeat those captions",
+    "our saturday classes duplicate the thursday programming if that changes the posts",
+    "would it be weird to repeat last month's transformation photo on the anniversary post",
+    "we are going to repeat the 6 week challenge, so keep the same photos for continuity",
+    "the duplicate charge on my card is sorted, unrelated to the calendar",
 ])
 def test_benign_chatter_with_an_echo_noun_is_never_a_fixer_request(text):
     got = _classify(text)
@@ -226,3 +240,52 @@ def test_a_dead_machine_report_is_unchanged():
 def test_is_repeat_report_is_pure_and_handles_empty():
     assert c.is_repeat_report("") is False
     assert c.is_repeat_report(None) is False
+
+
+# ---- round 4: the flag OFF is provably origin/main ----------------------------------
+def test_flag_off_matches_origin_main_across_the_whole_rule_surface():
+    """The round-3 test only exercised repeat-family sentences, which is why eight
+    breakage/question changes on the DEFAULT path went unnoticed. This compares the
+    branch against origin/main's actual module over every rule family, all three
+    identities, and both ticket states."""
+    import itertools
+    import subprocess
+    import types
+    src = subprocess.run(["git", "show", "origin/main:agent/slack_convo/classifier.py"],
+                         capture_output=True, text=True).stdout
+    if not src.strip():
+        pytest.skip("origin/main not available in this checkout")
+    main = types.ModuleType("main_classifier")
+    exec(compile(src, "main_classifier", "exec"), main.__dict__)  # noqa: S102
+    sents = [
+        "the image is broken", "the images are not loading", "the clip is broken",
+        "the footage didn't go out", "is the image broken?", "my pic is broken",
+        "my posts are not going out", "the calendar is broken", "nothing posted today",
+        "9/14-9/16 are still repeat images", "duplicate images on my calendar",
+        "how often do posts repeat?", "thanks that looks great", "hey", "worth a shot",
+        "the website is showing the wrong hours", "pause the ad", "cancel my post today",
+        "can you scale the budget", "my instagram won't connect", "nice shot",
+        "heads up, the same picture is on three posts next week",
+        "the duplicate charge on my card is sorted", "why do my images repeat?",
+    ]
+    diffs = []
+    for text, prod, tick in itertools.product(sents, ("echo", "ranger", "wrangler"),
+                                              (False, True)):
+        a = main.classify(text, has_open_ticket=tick, identity_product=prod)
+        b = c.classify(text, has_open_ticket=tick, identity_product=prod)
+        if a != b:
+            diffs.append((prod, tick, text, a, b))
+    assert not diffs, f"flag OFF diverged from origin/main: {diffs}"
+
+
+def test_a_polite_opener_is_stripped_not_treated_as_a_verdict():
+    assert c.is_repeat_report("heads up, the duplicate images are back") is True
+    assert c.is_repeat_report("fyi the calendar is reusing photos") is True
+
+
+def test_a_complaint_after_a_thank_you_still_reports():
+    """One benign clause must not bury a real complaint -- and this is exactly how a
+    second report from a patient client reads."""
+    assert c.is_repeat_report(
+        "thanks for the quick turnaround, but the repeat images are still there") is True
+    assert c.is_repeat_report("thanks for fixing the duplicate images last week") is False

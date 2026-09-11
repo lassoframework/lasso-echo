@@ -4558,3 +4558,58 @@ A repeat reported AS A QUESTION ("why is the same photo on three different days?
 routes to the answer lane, not the fixer. That is round 2's deliberate ordering --
 questions about repeats must not dispatch a worker -- and chasing it reintroduces the
 "how often do posts repeat?" false positive. The answer lane is a real path, not silence.
+
+## Audit round 4 (2026-09-11): C. Two criticals, both in the near-dupe guard I added
+
+Round 4 graded C (up from three D's) and confirmed, independently, that the armed sweep
+really does fix John's three days -- through the REAL `media_swap.pick_replacement`,
+against a book built by `client_month_run.build_client_month`:
+
+    ARMED apply : dates_fixed 4, rows_repointed 7, drive_pool_seen 39
+                  9/14 -> v019, 9/15 -> v020, 9/16 -> v021  (three distinct clips)
+    FLAG OFF    : dates_fixed 0, small_library True
+
+Both criticals were regressions I introduced while fixing round 3, both on the DEFAULT
+(flag OFF) path, and both in `_cluster_key`:
+
+- [~] **Starvation, narrowed but not closed.** Round 3's sibling gate only asked "is the
+  trimmed stem in the library?", and the suffix list still stripped a bare trailing
+  number. So `gym.jpg` + `gym-1.jpg`..`gym-5.jpg` collapsed to ONE cluster the moment
+  the bare original existed: `_fresh_photo` returned None for a gym with five usable
+  stills, the sweep fired `alert_small_library`, and the repeat stayed -- where
+  origin/main had swapped it. Fixed by dropping the bare-number branch entirely and
+  adding a SEQUENCE GATE (more than three paren-numbered members sharing a stem is a
+  bulk download, not a pile of copies). The deliberate trade: `IMG_6771_1.jpg` is now
+  never collapsed, because it is genuinely indistinguishable from `photo_01.jpg`. A
+  missed dupe costs one repeat; a starved library costs every day.
+- [~] **ReDoS.** `(?:[\s._-]*ALT)+$` let every separator be assigned two ways, so
+  `"img" + "-copy"*24` took **16.7 seconds** and a legal 255-char basename never
+  returned. `_cluster_key` runs per library file on the default path, and `run()`'s
+  per-gym `try` catches exceptions, not hangs -- one unlucky filename would have wedged
+  the entire nightly draft run. Replaced with a bounded loop over a single-suffix match:
+  **16.7s -> 0.017ms**, linear to 600 chars, pinned by test.
+
+Three majors, all in the honesty of what we report:
+- [~] `DRIVE_FALLBACK_MAX_PER_GYM` bounded only SUCCESSFUL swaps, so a gym whose picker
+  kept failing (hosting outage, the 75s deadline) called `pick_replacement` once per
+  repeated date -- uncapped real Drive downloads inside the nightly run -- and reported
+  `budget_capped 0`. Every ATTEMPT spends the budget now.
+- [~] `unfixable_report` credited the Drive lane using `dates_fixed`, which mixes in
+  LOCAL swaps: a run where every Drive attempt failed still told the gym its folder
+  "covered 2 day(s) tonight". Now a separate `drive_fixed`. It also promised assets the
+  run had already consumed (printing the PRE-run count); it prints what is LEFT now.
+- [~] The dry run counts a date fixed on pool depth alone and never asks the picker, so
+  it can call John's three days fixable on a night apply would fix none. It now says so
+  on the line: "DELIVERABILITY NOT TESTED in a dry run".
+
+Classifier, measured on round 4's held-out corpus plus every earlier one:
+- [~] **Precision 34/34, recall 17/17.** Round 4 found 5 false positives in 34 held-out
+  sentences and, worse, recall collapsing to 2/11 on HEDGED reports -- "heads up, ...",
+  "fyi ...", "thanks for the quick turnaround, but the repeat images are still there".
+  That last shape is exactly how John's second report would read, and the rule would
+  have missed it. Fixed by judging CLAUSE BY CLAUSE after stripping a polite opener, so
+  one benign clause cannot bury a complaint and one repeat word cannot convict a benign
+  sentence.
+- [x] Flag OFF proven identical to origin/main across 198 (sentence x identity x
+  ticket-state) combinations spanning every rule family: **0 diffs**, pinned by a test
+  that loads origin/main's module side by side.

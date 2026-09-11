@@ -121,49 +121,84 @@ _REPEAT_RE = re.compile(
 # plus "repeat customers/clients/members", which is a business metric, not media.
 _NOT_A_REPEAT_REPORT_RE = re.compile(
     # 1. an instruction, a request, or a hypothetical
-    r"^\s*(?:please\b|pls\b|can (?:we|you)\b|could (?:we|you)\b|would you\b|"
-    r"let'?s\b|lets\b|do not\b|don'?t\b|dont\b|never\b|make sure\b|"
-    r"go ahead\b|feel free\b|heads up\b|fyi\b|thanks\b|thank you\b|thx\b|"
-    r"if\b|it'?s fine\b|it is fine\b|honestly\b|appreciate\b)|"
-    r"\b(?:just |please )(?:recycle|reuse|repeat|duplicate)\b|"
+    r"^\s*(?:please\b|pls\b|can (?:we|you)\b|could (?:we|you)\b|would (?:you|it)\b|"
+    r"should (?:we|i)\b|is it (?:ok|okay|weird|fine)\b|let'?s\b|lets\b|do not\b|"
+    r"don'?t\b|dont\b|never\b|make sure\b|go ahead\b|feel free\b|if\b|"
+    r"it'?s fine\b|it is fine\b|honestly\b)|"
+    r"\b(?:just |please |feel free to )(?:recycle|reuse|repeat|duplicate)\b|"
     r"\bfine to (?:reuse|repeat|duplicate|recycle|use)\b|"
-    # 2. a PERSON did it, not Echo -- the client, or someone at the gym
+    r"\bkeep (?:the )?same\b|"
+    # gratitude ABOUT a past fix ("thanks for fixing the duplicate images"). Clause
+    # scoped, so "thanks for the turnaround, but the repeats are still there" still
+    # reports: the complaint lives in its own clause.
+    r"\bthank(?:s| you) for\b|"
+    # permission and hypotheticals: "the captions can repeat too", "the same post
+    # twice would be weird", "that would look odd"
+    r"\b(?:can|could|should|may) (?:repeat|reuse|duplicate|recycle)\b|"
+    r"\bwould (?:be|look|seem|feel)\b|"
+    # 2. a PERSON did it, not Echo -- the client, or someone at the gym. A person who
+    #    NOTICED it is reporting, not causing: only causing verbs veto.
     r"\b(?:i|we) (?:just |already |think i |think we |always |usually |keep |kept |"
-    r"accidentally |may have |might have |must have )*"
+    r"accidentally |may have |might have |must have |are going to |am going to |"
+    r"gonna |will |plan to |want to )*"
     r"(?:duplicated|duplicate|reused|reuse|re-used|recycled|recycle|repeated|repeat|"
     r"copied|copy|uploaded|approved|sent|added)\b|"
     r"\b(?:my|our) (?:front desk|desk|coach|coaches|manager|assistant|staff|team|gm|"
-    r"wife|husband|partner|kid|kids|son|daughter|intern|owner|trainer|trainers)\b|"
+    r"wife|husband|partner|kid|kids|son|daughter|intern|owner|trainer|trainers)"
+    r"\s+\w*\s*(?:duplicated|uploaded|reused|recycled|copied|sent|added|keeps)\b|"
     r"\brepeat(?:ing)? (?:myself|ourselves|itself)\b|"
     r"\b(?:accidentally|by accident|my bad|oops|sorry about that|my fault)\b|"
     # 3. thanks, approval, or "already resolved"
-    r"\b(?:thank(?:s| you)|appreciate)\b|"
+    r"\b(?:appreciate)\b|"
     r"\b(?:resolved|all set|all good|no longer an issue|nice work|looks good|"
-    r"looks great|fixed now|sorted out|sorted it)\b|"
+    r"looks great|fixed now|sorted|sorted out|sorted it|unrelated)\b|"
     r"\b(?:did not|didn'?t|does not|doesn'?t) bother\b|"
     r"\b(?:no worries|not a problem|not an issue|totally fine|fine (?:with|by) "
-    r"(?:us|me)|no big deal|hope that'?s ok|on purpose|intentional|deliberate)\b|"
+    r"(?:us|me)|no big deal|hope that'?s ok|on purpose|intentional|deliberate|"
+    r"for continuity)\b|"
     r"\b(?:love|loved|loves|liked|great|perfect|awesome|crushed|working well)\b|"
-    # 4. a SCHEDULE or a business metric that repeats, not media
+    # 4. a SCHEDULE, a CHARGE, or a business metric that repeats -- not media
     r"\brepeat (?:customer|customers|client|clients|member|members|business|rate)\b|"
-    r"\b(?:schedule|class|classes|workout|workouts|programming|program|promo|"
-    r"promotion|event|hours) (?:repeats|repeat)\b|"
+    r"\bduplicate (?:charge|charges|payment|payments|invoice|billing|bill|"
+    r"subscription|membership)\b|"
+    r"\b(?:schedule|class|classes|session|sessions|workout|workouts|programming|"
+    r"program|promo|promotion|event|hours) (?:repeats?|duplicates?)\b|"
     r"\brepeats? (?:weekly|daily|monthly|yearly|annually|every (?:year|week|month|day))"
     r"\b",
     re.IGNORECASE)
+
+# A polite OPENER is not a verdict on the sentence (independent audit round 4, MAJOR).
+# "heads up, the same picture is on three posts next week" and "fyi the duplicate images
+# are back on the calendar" are REPORTS wearing manners, and vetoing the whole message on
+# the first two words lost them. The opener is stripped, then the rest is judged.
+_POLITE_OPENER_RE = re.compile(
+    r"^\s*(?:heads up|fyi|just so you know|quick one|quick question|hey|hi|hello|"
+    r"morning|good morning|ok so|okay so|so)\b[\s,:-]*", re.IGNORECASE)
+
+# A message can be an apology AND a report ("thanks for the quick turnaround, but the
+# repeat images are still there"). Judged clause by clause, so one benign clause cannot
+# bury a real complaint and one repeat word cannot convict a benign sentence.
+_CLAUSE_SPLIT_RE = re.compile(
+    r"\s+(?:but|however|though|although|except)\s+|\s+so\s+|\s+and then\s+|"
+    r"[;\n]+|\.\s+", re.IGNORECASE)
 
 
 def is_repeat_report(text):
     """True when this reads as a CLIENT REPORTING duplicate media, not asking about it,
     instructing us to reuse something, or thanking us. Pure and deterministic."""
-    t = (text or "").strip()
+    t = _POLITE_OPENER_RE.sub("", (text or "").strip(), count=1).strip()
     if not t:
         return False
-    if _NOT_A_REPEAT_REPORT_RE.search(t):
-        return False
-    if not _REPEAT_RE.search(t):
-        return False
-    return bool(_DOMAIN_RE.search(t)) or bool(_MEDIA_NOUN_RE.search(t))
+    for clause in _CLAUSE_SPLIT_RE.split(t):
+        clause = (clause or "").strip(" ,")
+        if not clause or not _REPEAT_RE.search(clause):
+            continue
+        if not (_DOMAIN_RE.search(clause) or _MEDIA_NOUN_RE.search(clause)):
+            continue
+        if _NOT_A_REPEAT_REPORT_RE.search(clause):
+            continue
+        return True
+    return False
 
 _QUESTION_RE = re.compile(
     r"(\?\s*$)|^\s*(how|what|when|where|why|who|which|can you|could you|do you|does|is it|"

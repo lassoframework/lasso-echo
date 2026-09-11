@@ -675,8 +675,7 @@ def test_the_picker_is_told_what_is_already_on_the_book(monkeypatch):
 # ---- B1 / C2: the copy-suffix family, SIBLING GATED ------------------------------
 _LIB_WITH_ORIGINAL = [REPEATED, "IMG_6771 (1).jpg", "IMG_6771-copy.jpg",
                       "IMG_6771 copy.jpg", "IMG_6771(2).png", "IMG_6771 - Copy.jpg",
-                      "img_6771.JPG", "IMG_6771_1.jpg", "IMG_6771-2.jpg",
-                      "Copy of IMG_6771.jpg"]
+                      "img_6771.JPG", "Copy of IMG_6771.jpg"]
 
 
 @pytest.mark.parametrize("dupe", [n for n in _LIB_WITH_ORIGINAL if n != REPEATED])
@@ -705,6 +704,46 @@ def test_a_numbered_family_with_no_original_stays_distinct(lib):
     repeats, and it was live on the default path."""
     keys = {mrs._cluster_key("/nolib", n, lib) for n in lib}
     assert len(keys) == len(lib), f"collapsed {lib} into {keys}"
+
+
+@pytest.mark.parametrize("name", ["IMG_6771_1.jpg", "IMG_6771-2.jpg"])
+def test_a_bare_trailing_number_is_never_treated_as_a_copy(name):
+    """THE DELIBERATE TRADE (audit round 4, CRITICAL). "IMG_6771_1.jpg" is genuinely
+    indistinguishable from "photo_01.jpg", and round 3 collapsed both: "gym.jpg" plus
+    "gym-1.jpg".."gym-5.jpg" became ONE cluster the moment the bare original existed, so
+    _fresh_photo returned None for a gym with five usable stills and the sweep fired the
+    small-library alert where main had swapped the repeat -- on the DEFAULT path. A
+    missed dupe costs one repeat; a starved library costs every day."""
+    lib = [REPEATED, name]
+    assert (mrs._cluster_key("/nolib", name, lib)
+            != mrs._cluster_key("/nolib", REPEATED, lib))
+
+
+@pytest.mark.parametrize("lib", [
+    ["gym.jpg"] + [f"gym-{i}.jpg" for i in range(1, 6)],
+    ["photo.jpg"] + [f"photo_{i:02d}.jpg" for i in range(1, 7)],
+    ["tough.jpg"] + [f"tough-{i}.jpg" for i in range(1, 9)],
+    ["IMG.jpg"] + [f"IMG ({i}).jpg" for i in range(1, 9)],     # the SEQUENCE gate
+])
+def test_a_sequence_beside_its_bare_original_is_not_starved(lib):
+    """Round 4's CRITICAL: the sibling gate alone still collapsed a plain sequence as
+    soon as the bare stem happened to be present. Measured against origin/main,
+    _fresh_photo went from returning a usable photo to returning None."""
+    keys = {mrs._cluster_key("/nolib", n, lib) for n in lib}
+    assert len(keys) == len(lib), f"starved {lib} into {keys}"
+
+
+@pytest.mark.parametrize("stem_len", [13, 20, 24, 40, 120])
+def test_the_copy_suffix_matcher_cannot_backtrack(stem_len):
+    """Round 4 CRITICAL: `(?:[\\s._-]*ALT)+$` assigned every separator two ways, so
+    "img" + "-copy"*24 took 16.7s and a legal 255-char basename never returned.
+    _cluster_key runs per library file on the default path, and run()'s per-gym try
+    catches exceptions, not hangs."""
+    import time
+    stem = "img" + "-copy" * stem_len + "x"
+    started = time.perf_counter()
+    mrs._cluster_key("/nolib", stem + ".jpg", [stem + ".jpg"])
+    assert time.perf_counter() - started < 0.5, "catastrophic backtracking"
 
 
 def test_no_library_context_never_collapses():
@@ -946,3 +985,60 @@ def test_the_forward_swap_clears_a_stale_source_media_url(monkeypatch):
     assert story["source_media_url"] == "", \
         f"stranded {story['source_media_url']!r}: the repeat is now invisible to Echo"
     assert media_guard.row_media_key(story).endswith(".mp4")
+
+
+def test_the_budget_bounds_failed_attempts_too(monkeypatch):
+    """Round 4 MAJOR: drive_fixes_left decremented only on SUCCESS, so a gym whose
+    picker keeps failing (hosting outage, the 75s deadline, no fresh media) called
+    pick_replacement once per repeated date -- uncapped real Drive downloads inside the
+    nightly draft run -- and reported budget_capped 0, so nothing said why."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    rows = _book()
+    for i in range(15, 26):
+        rows.append(_row(f"r{i}", f"2026-09-{i:02d}", "instagram", "feed"))
+    calls = []
+
+    def always_fails(base, row, *, store, siblings=(), **kw):
+        calls.append(row.get("id"))
+        return {"ok": False, "reason": "hosting_unavailable"}
+
+    res = _sweep(_Store(rows), picker=always_fails, drive_n=40, monkeypatch=monkeypatch)
+    assert len(calls) <= mrs.DRIVE_FALLBACK_MAX_PER_GYM, \
+        f"{len(calls)} uncapped picker calls on a gym whose swaps all fail"
+    assert res["budget_capped"] > 0, "the deferral was silent"
+
+
+def test_the_report_credits_the_drive_lane_only_for_what_it_did(monkeypatch):
+    """Round 4 MAJOR: `fixed` read dates_fixed, which mixes in LOCAL swaps, so a run
+    where the Drive lane failed every attempt still told the gym the folder 'covered N
+    day(s) tonight'."""
+    res = {"gym": GYM, "photos_repeated": 3, "approved_left": 0, "small_library": True,
+           "dates_fixed": 2, "drive_fixed": 0, "drive_pool": 12, "drive_pool_seen": 12,
+           "drive_armed": True,
+           "detail": [f"{REPEATED} 2026-09-14: no unused photo left "
+                      "(small library; left with spacing)"]}
+    text = mrs.unfixable_report(res)
+    assert "covered 2 day(s)" not in text, "credited Drive for two local swaps"
+    assert "could not prepare one" in text
+
+
+def test_the_report_prints_what_is_left_not_what_it_started_with():
+    res = {"gym": GYM, "photos_repeated": 3, "approved_left": 0, "small_library": True,
+           "dates_fixed": 2, "drive_fixed": 2, "drive_pool": 0, "drive_pool_seen": 2,
+           "drive_armed": True,
+           "detail": [f"{REPEATED} 2026-09-16: no unused photo left "
+                      "(small library; left with spacing)"]}
+    text = mrs.unfixable_report(res)
+    assert "holds 0 unused item(s) for the rest" in text, \
+        "promised assets the run had already consumed"
+    assert "Add photos" not in text
+
+
+def test_a_dry_run_says_it_never_tested_deliverability(monkeypatch):
+    """Round 4 MAJOR: the dry run counts a date fixed on pool depth alone and never
+    asks the picker, so it can report John's three days fixable on a night apply would
+    fix none. It must not read as a promise."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    res = _sweep(_Store(_book()), apply=False, picker=None, drive_n=9,
+                 monkeypatch=monkeypatch)
+    assert any("DELIVERABILITY NOT TESTED" in d for d in res["detail"])

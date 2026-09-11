@@ -103,36 +103,57 @@ def _owner_date(by_date):
 # was written for. _fresh_photo shares this function, so the hole was in the DEFAULT
 # (flag OFF) lane too: the sweep could replace a repeat with a byte-identical copy of
 # itself and report the date fixed.
-# A duplicate's suffix: "IMG (1).jpg", "IMG-copy.jpg", "IMG_1.jpg", "Copy of IMG.jpg".
-# Matching one is NOT enough to collapse -- see the SIBLING GATE in _cluster_key.
-_COPY_SUFFIX_RE = re.compile(
-    r"(?:[\s._-]*\(\s*\d+\s*\)"
-    r"|[\s._-]*(?:copy|copie|duplicate|dup)[\s._-]*\d*"
-    r"|[\s._-]+\d{1,3})+$", re.IGNORECASE)
+# A duplicate's suffix: "IMG (1).jpg", "IMG-copy.jpg", "Copy of IMG.jpg".
+#
+# ONE suffix per match, NO outer "+" (independent audit round 4, CRITICAL). The round-3
+# shape `(?:[\s._-]*ALT)+$` let every separator be assigned two ways, so a stem like
+# "img" + "-copy"*n + "x" backtracked 2^n: 24 repeats took 16.7s and a legal 255-char
+# basename never returned. _cluster_key runs per library file on the DEFAULT path via
+# _fresh_photo, and run()'s per-gym try catches exceptions, not hangs -- one crafted or
+# unlucky filename would wedge the whole nightly draft run. _strip_copy_suffix loops a
+# bounded number of times instead, which is linear and cannot backtrack.
+#
+# A BARE TRAILING NUMBER IS NOT A COPY MARKER (round 4, CRITICAL). Round 3 stripped it,
+# so "gym.jpg" + "gym-1.jpg".."gym-5.jpg" collapsed to one cluster the moment the bare
+# original existed, and _fresh_photo returned None for a gym with five usable stills --
+# on the default path, firing the small-library alert where main swapped the repeat.
+# "IMG_6771_1.jpg" is genuinely indistinguishable from "photo_01.jpg", so it is left
+# uncollapsed: a missed dupe costs one repeat, a starved library costs every day.
+_ONE_COPY_SUFFIX_RE = re.compile(
+    r"[\s._-]*(?:\(\s*\d+\s*\)|(?:copy|copie|duplicate|dup)\s*\d*)$",
+    re.IGNORECASE)
 _COPY_PREFIX_RE = re.compile(r"^(?:copy|duplicate)\s+of\s+", re.IGNORECASE)
+_MAX_COPY_SUFFIXES = 4        # "IMG (1) (1) copy copy" and then some
+# A trimmed stem shared by this many files is a SEQUENCE, not a pile of copies: nobody
+# has eight copies of one photo, but "IMG (1)".."IMG (8)" is a normal bulk download.
+_SEQUENCE_MIN = 3
+_PAREN_N_RE = re.compile(r"\(\s*\d+\s*\)\s*$")
+
+
+def _strip_copy_suffix(stem):
+    """`stem` with its copy suffixes removed, or `stem` unchanged. Bounded and linear."""
+    out = _COPY_PREFIX_RE.sub("", stem)
+    for _ in range(_MAX_COPY_SUFFIXES):
+        nxt = _ONE_COPY_SUFFIX_RE.sub("", out).strip(" ._-")
+        if nxt == out or not nxt:
+            break
+        out = nxt
+    return out or stem
 
 
 def _cluster_key(lib, key, lib_names=None):
     """The near-dupe identity of a library file: dam.rotation_key when the gym is
     vision-clustered, else the case-folded stem with a copy suffix stripped ONLY WHEN
-    THE ORIGINAL IS ACTUALLY IN THIS LIBRARY.
+    the bare original is really in this library AND the family is small enough to be
+    copies rather than a sequence.
 
-    THE SIBLING GATE (independent audit round 3, 2026-09-11, CRITICAL). Round 2 stripped
-    copy markers unconditionally, which collapsed a whole library of "IMG (1).jpg" ..
-    "IMG (8).jpg" -- the standard bulk phone/Drive/Finder download naming, which
-    client_media_sync keeps verbatim -- into ONE cluster. _fresh_photo then returned
-    None for a gym with eight usable stills, _blocked_book_state blocked all eight, and
-    the sweep reported "small library" and left the repeats. That is worse than the
-    dupe it was catching, and it was live on the DEFAULT path.
+    Both gates exist because over-collapsing is the worse failure. `_fresh_photo` shares
+    this function on the DEFAULT path, so a stem that swallows its neighbours turns a
+    usable library into "small library" and leaves every repeat standing -- the exact
+    outcome this whole change exists to prevent.
 
-    Gating on the sibling gets both directions right: "IMG (1).jpg" collapses onto
-    "IMG.jpg" only when "IMG.jpg" is really there (a copy), and a library of numbered
-    siblings with no bare original stays N distinct photos (a sequence). It also closes
-    round 2's leftover "IMG_6771_1.jpg" case, which a suffix list alone could never
-    reach without eating "photo_01.jpg".
-
-    lib_names: every basename in the library. None = no library context, so no
-    collapsing beyond case folding (the safe direction: never starve)."""
+    lib_names: every basename in the library. None = no context, so no collapsing beyond
+    case folding (the safe direction: never starve)."""
     try:
         from agent import dam
         rk = dam.rotation_key(os.path.join(lib, key))
@@ -141,13 +162,20 @@ def _cluster_key(lib, key, lib_names=None):
     except Exception:  # noqa: BLE001
         pass
     stem = os.path.splitext(key)[0].lower()
-    trimmed = _COPY_SUFFIX_RE.sub("", _COPY_PREFIX_RE.sub("", stem)).strip(" ._-")
-    if not trimmed or trimmed == stem:
+    trimmed = _strip_copy_suffix(stem)
+    if trimmed == stem or not lib_names:
         return stem
-    if not lib_names:
+    stems = [os.path.splitext(str(n))[0].lower() for n in lib_names]
+    if trimmed not in stems:
+        return stem                      # SIBLING GATE: no bare original, so a sequence
+    # SEQUENCE GATE, counted on the NUMBERED members only. "IMG (1)".."IMG (8)" beside
+    # "IMG" is a bulk download, not eight copies. A word-marked family ("-copy",
+    # "Copy of", a case variant) is never a sequence however many members it has.
+    numbered = {st for st in stems
+                if _PAREN_N_RE.search(st) and _strip_copy_suffix(st) == trimmed}
+    if len(numbered) > _SEQUENCE_MIN:
         return stem
-    originals = {os.path.splitext(str(n))[0].lower() for n in lib_names}
-    return trimmed if trimmed in originals else stem
+    return trimmed
 
 
 def _fresh_photo(lib, state, exclude):
@@ -560,11 +588,15 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
             # ARMED and still stuck. Say which of the three it actually was, because
             # round 3 caught this branch claiming "could not prepare one" on a run that
             # had prepared five. Nothing here may be a guess.
-            fixed = int((result or {}).get("dates_fixed") or 0)
+            # drive_fixed, NOT dates_fixed: the latter mixes in LOCAL swaps, so a run
+            # where the Drive lane failed every attempt still credited it (round 4).
+            # And print what is LEFT (drive_pool), not the pre-run count we branch on.
+            fixed = int((result or {}).get("drive_fixed") or 0)
+            left = int((result or {}).get("drive_pool") or 0)
             if fixed:
                 lines.append(f"This gym's uploaded photos are all on the book. Its "
                              f"connected Drive folder covered {fixed} day(s) tonight "
-                             f"and holds {pool} unused item(s) for the rest. Nothing "
+                             f"and holds {left} unused item(s) for the rest. Nothing "
                              "more is needed from the gym.")
             else:
                 lines.append(f"This gym's uploaded photos are all on the book. Its "
@@ -650,7 +682,8 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     result = {"gym": base, "photos_repeated": len(dupes), "dates_fixed": 0,
               "rows_repointed": 0, "stories_reburned": 0, "approved_left": 0,
               "small_library": False, "drive_pool": 0, "drive_pool_seen": 0,
-              "drive_armed": False, "budget_capped": 0, "detail": []}
+              "drive_armed": False, "budget_capped": 0, "drive_fixed": 0,
+              "detail": []}
     if not dupes:
         return result
 
@@ -671,6 +704,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     # are reported and picked up by the next run.
     drive_fixes_left = DRIVE_FALLBACK_MAX_PER_GYM
     budget_capped = 0                # dates the cap deferred to the next run
+    drive_fixed = 0                  # dates the DRIVE lane covered (not local swaps)
     if config.media_repeat_sweep_drive_enabled():
         # BEFORE the loop, so the report can tell a gym with a FULL folder apart from
         # one with an empty folder even after this run drains the pool (independent
@@ -738,15 +772,26 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                             result["dates_fixed"] += 1
                             result["rows_repointed"] += len(fixable)
                             result["detail"].append(
-                                f"{key} {pd}: -> connected Drive pool "
-                                f"({pool_dry} asset(s) left after this) [dry-run]")
+                                f"{key} {pd}: -> connected Drive pool has an asset "
+                                f"({pool_dry} left after this); DELIVERABILITY NOT "
+                                "TESTED in a dry run (no download, probe or host) "
+                                "[dry-run]")
                             continue
-                    elif _swap_from_drive_pool(base, store, fixable, state=state,
-                                               asset_state=asset_state, rows=rows,
-                                               result=result, key=key, pd=pd):
+                    else:
+                        # EVERY ATTEMPT SPENDS IT (independent audit round 4, MAJOR).
+                        # Decrementing only on success meant a gym whose picker keeps
+                        # failing -- a hosting outage, the 75s deadline, no fresh media,
+                        # exactly what the deadline exists for -- called
+                        # pick_replacement once per repeated date with real Drive
+                        # downloads, uncapped, inside the nightly draft run, and
+                        # reported budget_capped 0 so nothing said why.
                         drive_fixes_left -= 1
-                        result["dates_fixed"] += 1
-                        continue
+                        if _swap_from_drive_pool(base, store, fixable, state=state,
+                                                 asset_state=asset_state, rows=rows,
+                                                 result=result, key=key, pd=pd):
+                            drive_fixed += 1
+                            result["dates_fixed"] += 1
+                            continue
                 result["small_library"] = True
                 result["detail"].append(f"{key} {pd}: no unused photo left "
                                         "(small library; left with spacing)")
@@ -818,6 +863,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                 except Exception:  # noqa: BLE001
                     pass
     result["budget_capped"] = budget_capped
+    result["drive_fixed"] = drive_fixed
     if result["small_library"]:
         # MEASURE what the sweep could not reach, so the report tells the truth about
         # WHY (a genuinely thin library, or a full Drive folder behind an unarmed lane)
