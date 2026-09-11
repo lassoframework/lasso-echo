@@ -92,35 +92,29 @@ def base_gym_key(account_key):
     return base
 
 
-def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=()):
-    """The least-used, longest-unused eligible, not-excluded asset for THIS gym, or
-    None.
-
-    Order: used_count ASC, last_used_at ASC NULLS FIRST (id tiebreak for
-    determinism). Skips any asset used inside REUSE_COOLDOWN_DAYS and any asset
-    already used THIS calendar month. `kind_preference` ('photo'|'video') filters
-    to that kind when supplied (the planner's faces/community/results slots prefer
-    photos); with no match of the preferred kind the pool is treated as empty for
-    that slot (the caller falls through). `exclude_ids` skips assets that just
-    failed validation in this same slot.
-
-    Empty pool -> ONE deduped alert naming the gym and None. A cooling-down asset
-    is NEVER reused to fill the gap."""
+def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=()):
+    """Every asset pick_media could hand out RIGHT NOW for this gym, in pick order
+    (used_count ASC, last_used_at ASC NULLS FIRST, id tiebreak). [] when the pool is
+    empty, the store is down, or the read fails. NEVER alerts: this is the read the
+    planner, the Lane-A repeat gate and the portal swap use to ask "could the Drive
+    pool fill this slot?" -- only pick_media (the actual pick) owns the pool-empty
+    alert. Same eligibility + cooldown + this-month rules as pick_media, ONE
+    implementation (pick_media is `pickable(...)[0]`)."""
     base = base_gym_key(gym_id)
     store = store or _idx.default_store()
     if not store.available():
-        print("[gym-media-selector] store unavailable; no asset selected (lane unarmed)")
-        return None
+        return []
     now = _now_utc(now)
     try:
         assets = store.list_assets(base)
     except Exception as e:  # noqa: BLE001 - a read failure is an empty pick, not a crash
         print(f"[gym-media-selector] asset read failed for {base}: "
               f"{type(e).__name__}: {e}")
-        return None
+        return []
 
     cutoff = now - timedelta(days=REUSE_COOLDOWN_DAYS)
     month = now.strftime("%Y-%m")
+    excl = {str(i) for i in (exclude_ids or ()) if i}
 
     candidates = []
     for a in assets:
@@ -132,7 +126,7 @@ def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_id
         # ONE implementation, shared with client_dm_support.probes — see is_usable.
         if not is_usable(a):
             continue
-        if a.get("id") in exclude_ids:
+        if str(a.get("id")) in excl:
             continue
         if kind_preference and a.get("kind") != kind_preference:
             continue
@@ -144,7 +138,51 @@ def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_id
                 continue
         candidates.append(a)
 
+    _floor = datetime.min.replace(tzinfo=timezone.utc)
+    candidates.sort(key=lambda a: (
+        int(a.get("used_count") or 0),
+        _parse_ts(a.get("last_used_at")) or _floor,      # NULLS FIRST
+        str(a.get("id") or "")))
+    return candidates
+
+
+def pool_kinds(gym_id, *, store=None, now=None, exclude_ids=()):
+    """The media kinds ('photo' / 'video') the gym's Drive pool can hand out right
+    now. The media-mix planner reads this to decide whether a video slot is even
+    possible; a photo-only pool never gets a video slot asked of it."""
+    return {str(a.get("kind") or "") for a in
+            pickable(gym_id, store=store, now=now, exclude_ids=exclude_ids)}
+
+
+def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=()):
+    """The least-used, longest-unused eligible, not-excluded asset for THIS gym, or
+    None.
+
+    Order: used_count ASC, last_used_at ASC NULLS FIRST (id tiebreak for
+    determinism). Skips any asset used inside REUSE_COOLDOWN_DAYS and any asset
+    already used THIS calendar month. `kind_preference` ('photo'|'video') filters
+    to that kind when supplied; with no match of the preferred kind the pool is
+    treated as empty for that slot (the caller falls through, or -- the media-mix
+    builder -- retries with the other kind). `exclude_ids` skips assets that just
+    failed validation in this same slot.
+
+    Empty pool -> ONE deduped alert naming the gym and None. A cooling-down asset
+    is NEVER reused to fill the gap."""
+    base = base_gym_key(gym_id)
+    store = store or _idx.default_store()
+    if not store.available():
+        print("[gym-media-selector] store unavailable; no asset selected (lane unarmed)")
+        return None
+    candidates = pickable(base, kind_preference, store=store, now=now,
+                          exclude_ids=exclude_ids)
     if not candidates:
+        # KIND EXHAUSTION IS NOT AN EMPTY POOL (audit D6): the media-mix builder asks
+        # for one kind first and falls back to the other, so "no photo left" while
+        # videos remain must not page staff to "ask for photos". Alert only when the
+        # pool has nothing of ANY kind.
+        if kind_preference and pickable(base, None, store=store, now=now,
+                                        exclude_ids=exclude_ids):
+            return None
         # "Ask for photos" is only actionable for a gym that is actually posting.
         # A gym still onboarding (publish flag OFF, socials not connected yet) has an
         # empty pool BY DEFINITION, and paging staff about it every build is noise
@@ -158,12 +196,6 @@ def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_id
         return None
     # Pool healthy again: reset the empty stamp so a future empty pool alerts once.
     _idx.clear_alert_stamp(_POOL_EMPTY_STAMP.format(base))
-
-    _floor = datetime.min.replace(tzinfo=timezone.utc)
-    candidates.sort(key=lambda a: (
-        int(a.get("used_count") or 0),
-        _parse_ts(a.get("last_used_at")) or _floor,      # NULLS FIRST
-        str(a.get("id") or "")))
     return candidates[0]
 
 
@@ -333,9 +365,23 @@ def _use_records():
     return out
 
 
+# The columns observe_denials filters on. source_media_asset_id is the whole signal:
+# a select that omits it makes the sweep a silent no-op (see _default_fetch_rows).
+_FETCH_SELECT = "id,status,pillar,source_media_asset_id"
+
+
 def _default_fetch_rows(gym_id, post_date, http=None):
-    """content_calendar rows (id, status, pillar, draft_type) for one gym+date, ALL
-    statuses. Offline/creds-absent -> [] (the sweep then does nothing; safe)."""
+    """content_calendar rows (id, status, pillar, source_media_asset_id) for one
+    gym+date, ALL statuses. Offline/creds-absent -> [] (the sweep then does nothing;
+    safe).
+
+    THE SECOND DEAD FILTER (Tough Temple, 2026-09-10): observe_denials was fixed to
+    key on source_media_asset_id, but this select never asked PostgREST for that
+    column, so every live row still read '' and the sweep still rolled back nothing.
+    Portal denies happen out-of-band (no on_draft_denied hook), so this sweep is the
+    ONLY thing that returns a portal-denied Drive asset to the pool: with it dead,
+    every denied photo stayed stamped for its 90-day cooldown and the pool read as
+    empty while 57 eligible videos sat unused. The column is selected explicitly."""
     from . import config
     url = config.supabase_url()
     key = config.supabase_service_key()
@@ -347,7 +393,7 @@ def _default_fetch_rows(gym_id, post_date, http=None):
     r = http.get(
         f"{url.rstrip('/')}/rest/v1/content_calendar",
         params={"gym_id": f"eq.{gym_id}", "post_date": f"eq.{post_date}",
-                "select": "id,status,pillar,draft_type"},
+                "select": _FETCH_SELECT},
         headers={"apikey": key, "Authorization": f"Bearer {key}"},
         timeout=30)
     if r.status_code >= 400:

@@ -31,7 +31,7 @@ CONNECT_PLATFORMS = ("instagram", "facebook", "googlebusiness")
 # the googlebusiness account once linked). Posting still keys off PLATFORMS.
 STATUS_PLATFORMS = ("instagram", "facebook", "googlebusiness")
 
-_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi")
+from .media_types import VIDEO_EXTS as _VIDEO_EXTS   # ONE definition (audit D1)
 
 
 # A canonical account_key is "<name-slug><6 hex chars of sha256(gym_id)>" (account_key.py),

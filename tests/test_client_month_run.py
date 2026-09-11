@@ -397,6 +397,51 @@ def test_stale_reuse_skipped_when_drive_pool_connected(tmp_path, monkeypatch):
     library silently claiming every day forever."""
     monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
     monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    # The pool gate (2026-09-10): the flags alone no longer decide; the gym's Drive
+    # pool must actually hold a pickable asset. Stub the pool read as "one video
+    # ready" so no store is touched.
+    from agent import gym_media_selector as _sel
+    client_content.clear_drive_pool_cache()
+    monkeypatch.setattr(_sel, "pickable",
+                        lambda *a, **k: [{"id": "v1", "kind": "video", "gym_id": "gritx"}])
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=5)
+    served = [{"key": f"photo_{i:02d}.jpg", "date": f"2026-08-{15 + i:02d}",
+               "pillar": "service"} for i in range(5)]
+    monkeypatch.setattr(client_content.rotation, "load_served",
+                        lambda: {"gritx_ig": list(served)})
+    store = _FakeStore()
+    logs = []
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
+        library_path=lib, store=store, banned_words=(), logger=logs.append)
+    assert out["ok"] is True
+    # Every day was DEFERRED to the Drive pool by Lane A (no stale repeat placed in
+    # the main loop)...
+    deferred = [m for m in logs if "leaving the day for the connected Drive pool" in m]
+    assert len(deferred) == 5, deferred
+    # ...but no Drive builder is wired into this fake store, so the Drive lane covered
+    # nothing, and the NO-EMPTY-DAY fallback (audit 2c, 2026-09-10) then placed a
+    # spaced repeat on each day: never 5 empty days.
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(feed_ig) == 5, f"expected 5 fallback repeats, got {len(feed_ig)}"
+    assert len({r["image_url"] for r in feed_ig}) == 5, "repeats spread across photos"
+    assert sum("placed a spaced repeat" in m for m in logs) == 5
+    client_content.clear_drive_pool_cache()
+
+
+def test_stale_reuse_still_placed_when_drive_pool_is_empty(tmp_path, monkeypatch):
+    """Both Drive flags ON (the live posture: GYM_DRIVE_CONNECT=true globally) but
+    this gym's pool has NOTHING pickable (no source, or everything on cooldown). The
+    flags used to be the whole gate, so every such gym's stale repeat became an EMPTY
+    day. A gym with no other source keeps its repeat (John Weeks / Tough Temple fix,
+    2026-09-10)."""
+    monkeypatch.setenv("GYM_DRIVE_CONNECT", "true")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    from agent import gym_media_selector as _sel
+    client_content.clear_drive_pool_cache()
+    monkeypatch.setattr(_sel, "pickable", lambda *a, **k: [])
     _stock_clean("gritx_ig")
     lib = _lib(tmp_path, n=5)
     served = [{"key": f"photo_{i:02d}.jpg", "date": f"2026-08-{15 + i:02d}",
@@ -410,13 +455,10 @@ def test_stale_reuse_skipped_when_drive_pool_connected(tmp_path, monkeypatch):
     assert out["ok"] is True
     feed_ig = [r for r in store.inserted
                if r["format"] == "feed" and r["account"] == "instagram"]
-    # No Drive builder is wired into this fake store, so the Drive lane itself
-    # produces nothing here -- the point is that the STALE repeat was never placed
-    # either, unlike the no-Drive-connection baseline (5/5 placed).
-    assert len(feed_ig) == 0, (
-        f"expected the stale-reuse day to be left for the Drive pool, not filled "
-        f"with a repeat, got {len(feed_ig)} feed day(s)"
-    )
+    assert len(feed_ig) == 5, (
+        f"an empty Drive pool cannot fill anything; the stale repeat must still place, "
+        f"got {len(feed_ig)} feed day(s)")
+    client_content.clear_drive_pool_cache()
 
 
 def test_stale_reuse_still_placed_when_drive_connected_but_not_staged(tmp_path, monkeypatch):

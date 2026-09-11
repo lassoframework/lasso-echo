@@ -65,7 +65,7 @@ from . import config, gbp
 
 # a video creative has no still to hand Google; its POSTER frame is used instead (the
 # same frame the portal already shows for that post), and only when it is local.
-_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm")
+from .media_types import VIDEO_EXTS as _VIDEO_EXTS   # ONE definition (audit D1)
 
 # hashtag-only lines and a trailing inline hashtag run. Used ONLY to sanitize the
 # grounding text handed to the caption generator, never to produce client copy.
@@ -432,9 +432,17 @@ def rows_for(base_key, drafts, *, library_path=None, store=None, ctx=None,
             return []
         from . import gbp_planner
         rows = []
-        skipped_caption = skipped_media = 0
+        skipped_caption = skipped_media = skipped_video = 0
         for draft in candidates:
             day_key = post_date_of(draft)
+            # REMOTE VIDEO (audit D7): a Drive-lane video has no local file, so
+            # there is no poster to crop for Google. Counted and named in the digest
+            # instead of vanishing into the generic "no croppable still" bucket.
+            _cp = (getattr(draft, "creative_path", "") or "").strip()
+            if (_cp.lower().endswith(_VIDEO_EXTS) and not os.path.isfile(_cp)
+                    and image_fn is None):
+                skipped_video += 1
+                continue
             img_url = (image_fn(draft, day_key) if image_fn is not None
                        else cropped_url(draft, ctx, library_path, log))
             if not img_url:
@@ -452,7 +460,8 @@ def rows_for(base_key, drafts, *, library_path=None, store=None, ctx=None,
                 fmt="update", status="pending"))
         log(f"{base_key}: mirrored {len(rows)} feed post(s) to Google Business "
             f"({skipped_caption} skipped on the A+ caption gate, {skipped_media} with no "
-            f"croppable still, of {len(candidates)} feed candidate(s))")
+            f"croppable still, {skipped_video} remote video(s) with no poster to crop, "
+            f"of {len(candidates)} feed candidate(s))")
         return rows
     except Exception as exc:  # noqa: BLE001 - the mirror never sinks the real month
         log(f"{base_key}: Google Business mirror skipped ({type(exc).__name__}: {exc})")

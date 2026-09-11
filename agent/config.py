@@ -785,6 +785,27 @@ def gym_drive_sync_max_depth() -> int:
         return 4
 
 
+def rendition_max_per_build() -> int:
+    """Transcodes (HEVC / odd-container video -> H.264 .mp4) ONE month build may run
+    synchronously (audit R-D1 #3). Env RENDITION_MAX_PER_BUILD, default 8. Once spent
+    the build prefers already-renditioned videos, then photos; the nightly pre-render
+    pass (rendition_max_per_sync) renders the rest."""
+    try:
+        return max(0, int(os.environ.get("RENDITION_MAX_PER_BUILD", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def rendition_max_per_sync() -> int:
+    """Transcodes the nightly Drive sync (sync_gym_media) may run per source per run
+    to pre-render eligible HEVC videos that lack a rendition_url (audit R-D1 #5). Env
+    RENDITION_MAX_PER_SYNC, default 12 (converges across nights)."""
+    try:
+        return max(0, int(os.environ.get("RENDITION_MAX_PER_SYNC", "12")))
+    except (TypeError, ValueError):
+        return 12
+
+
 def gym_drive_probe_max_per_run() -> int:
     """Budget of unprobed videos ffprobed per sync run per source (spec §4).
     Env GYM_DRIVE_PROBE_MAX_PER_RUN, default 20 (converges across nights)."""

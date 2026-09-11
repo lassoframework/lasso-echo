@@ -20,14 +20,16 @@ from dataclasses import dataclass
 
 from . import config
 from .accounts import Platform
+from .media_types import is_video_url          # ONE video definition (audit D1)
 
 
 def _is_video(url):
-    """True if the path/URL ends in a video extension (.mp4/.mov), case-insensitive.
+    """True if the path/URL ends in a recognised video extension (agent/media_types,
+    the ONE definition; audit D1), case-insensitive.
 
     Accepts None/empty and returns False. Used to route a video creative to the
     Reels flow (and to label it in the Slack card)."""
-    return bool(url) and str(url).lower().endswith((".mp4", ".mov"))
+    return bool(url) and is_video_url(url)
 
 
 class PublishError(Exception):
@@ -320,7 +322,7 @@ def _publish_instagram(client, account, draft, caption, token):
             "Host it and set public_url in its sidecar. See AGENT_README.md."
         )
     base = config.GRAPH_API_BASE
-    media_param = "video_url" if draft.platform and draft.creative_public_url.lower().endswith((".mp4", ".mov")) else "image_url"
+    media_param = "video_url" if draft.platform and _is_video(draft.creative_public_url) else "image_url"
     # step 1: create container
     r1 = client.post(
         f"{base}/{ig_id}/media",

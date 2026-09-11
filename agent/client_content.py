@@ -92,6 +92,63 @@ def _image_key(creative):
     return os.path.basename(creative.path)
 
 
+# drive_pool_can_fill's per-gym answer cache: {base: (monotonic_expiry, bool)}. A month
+# build asks once per day-slot; without this a 30-day build is 30 identical Supabase
+# reads of the same pool. Short TTL so a pool that fills mid-run is seen within a run
+# or two; tests clear it via clear_drive_pool_cache().
+_DRIVE_POOL_CACHE = {}
+_DRIVE_POOL_TTL_SEC = 120.0
+
+
+def clear_drive_pool_cache():
+    _DRIVE_POOL_CACHE.clear()
+
+
+def drive_pool_has_video(account_key, *, store=None, now=None):
+    """True when the Drive lane is armed for this gym AND its pool holds at least one
+    pickable VIDEO (audit round 5 MAJOR 1): the month build then hands video-beat days
+    to the Drive lane BEFORE Lane A, so a big fresh local still library can no longer
+    make the video mix inert. Never raises; a read failure answers False."""
+    try:
+        if not drive_pool_can_fill(account_key, store=store, now=now):
+            return False
+        from . import gym_media_selector as _sel
+        return "video" in _sel.pool_kinds(_sel.base_gym_key(account_key), store=store,
+                                          now=now)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def drive_pool_can_fill(account_key, *, store=None, now=None):
+    """True when the connected Drive lane could fill a slot for this gym RIGHT NOW:
+    GYM_DRIVE_STAGE is on, the gym is armed for GYM_DRIVE_CONNECT, AND its Drive pool
+    holds at least one pickable asset (eligible, not hidden, outside the 90-day
+    cooldown; gym_media_selector.pickable, any kind).
+
+    THE ONE GATE for "leave the day to Drive instead of placing a repeat". The month
+    run's 2026-09-07 skip keyed on the two FLAGS alone, and with GYM_DRIVE_CONNECT=true
+    globally (live since 2026-09) every gym answered yes, including gyms with no Drive
+    source at all, whose stale repeat then became an empty day. A gym with no other
+    source keeps its stale repeat; a gym whose pool is exhausted on cooldown also keeps
+    it (an empty pool cannot fill anything). Never raises; a read failure answers False
+    so a flaky store never empties a month."""
+    try:
+        if not (config.gym_drive_stage_enabled()
+                and config.gym_drive_connect_active_for(account_key)):
+            return False
+        from . import gym_media_selector as _sel
+        base = _sel.base_gym_key(account_key)
+        import time as _time
+        hit = _DRIVE_POOL_CACHE.get(base)
+        if hit and hit[0] > _time.monotonic():
+            return hit[1]
+        answer = bool(_sel.pickable(base, store=store, now=now))
+        _DRIVE_POOL_CACHE[base] = (_time.monotonic() + _DRIVE_POOL_TTL_SEC, answer)
+        return answer
+    except Exception:  # noqa: BLE001 - never let the gate itself empty a month
+        return False
+
+
 def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
                allow_reuse=False):
     """A creative from the account's uploaded library.
@@ -184,6 +241,17 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
         return best
 
     fresh = [c for c in imgs if last_served.get(_rkey(c), "") < window_start]
+    if not fresh and not allow_reuse and drive_pool_can_fill(account_key):
+        # NO REPEAT WHEN DRIVE CAN FILL THE DAY (John Weeks / Tough Temple,
+        # 2026-09-10): every local creative is inside the repeat window and the gym
+        # has a connected Drive pool with pickable assets (57 eligible videos in his
+        # case). Returning no pick leaves the day uncovered so the Drive lane
+        # (client_month_run.append_gym_drive_drafts) fills it with something the
+        # follower has not seen, instead of this branch placing "the same nine
+        # stills" for the third week running. allow_reuse=True (the denied-slot
+        # backfill's explicit LAST RESORT, which already tried Drive first) keeps
+        # the stale pick below so a denied slot is never left empty.
+        return None
     pool = fresh if fresh else imgs
     pool.sort(key=lambda c: (last_served.get(_rkey(c), ""), _image_key(c)))
     legacy = pool[0]
@@ -673,6 +741,14 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
             except Exception:
                 pass
         return draft
+
+    # DEFERRED TO THE DRIVE POOL (2026-09-10): pick_image returned no pick because
+    # every local creative is inside its repeat window and the gym's Drive pool can
+    # fill the day. That is not a thin library: no needs-media card, no "add photos"
+    # alert. The day goes back to client_month_run uncovered so the Drive lane (and,
+    # if the pool runs out, the no-empty-day fallback) owns it.
+    if not allow_reuse and drive_pool_can_fill(account.key):
+        return None
 
     # THIN-LIBRARY GRACE: caption is ready, but there is no image.
     caption, hashtags = make_caption(account, source, voice, f"src_{source.id}",
