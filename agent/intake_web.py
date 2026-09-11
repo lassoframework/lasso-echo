@@ -81,7 +81,7 @@ def _rate_per_minute():
 # regen, 2026-09-07) is the missing other half: "the caption is wrong" rewrites ONLY
 # the copy on the SAME photo instead of a full recreate that can swap the photo too.
 PORTAL_POST_ACTIONS = ("approve", "edit", "deny", "kill", "swap-media",
-                       "recreate-caption")
+                       "recreate-caption", "delete")
 
 
 def client_for_token(token):
@@ -2917,6 +2917,8 @@ def build_server(port=None):
                 elif ps_action == "recreate-caption":
                     status, resp = _ps.handle_recreate_caption(account_key, ps_post_id,
                                                                actor_id)
+                elif ps_action == "delete":
+                    status, resp = _ps.handle_delete(account_key, ps_post_id, actor_id)
                 else:  # kill
                     status, resp = _ps.handle_kill(account_key, ps_post_id, actor_id,
                                                    confirm=confirm, store=store)

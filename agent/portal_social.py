@@ -1355,6 +1355,59 @@ def handle_kill(account_key, draft_id, actor_id, confirm=False, store=None, read
 
 
 # ==========================================================================
+# POST /portal/<token>/posts/<id>/delete  (pending only, free, row-scoped)
+#
+# THE MISSING DISMISS (Dean Holcomb, crossfitreverb, 2026-09-11): a gym owner
+# whose approval queue contained past-dated pending posts had no way to clear
+# them without spending a monthly recreate (deny) or permanently banning the
+# concept (kill). Both are the wrong tool: a past post that was never approved
+# simply needs to be removed from the queue. SupabaseCalendarStore.delete_row
+# already existed with gym_id isolation; this exposes it as a portal action.
+#
+# RESTRICTED TO PENDING: an approved row cannot be deleted until denied; a
+# published row is final. A future pending post can also be deleted (the gym
+# owner is entitled to discard content they have not approved). Free: the
+# recreate budget is not charged, because no replacement caption is generated.
+# ==========================================================================
+
+def handle_delete(account_key, draft_id, actor_id, reader=None, sb_store=None):
+    """Delete a pending post from the calendar. Free and row-scoped: removes only
+    this one row, does not ban the concept, does not charge the recreate budget.
+    Only pending rows may be deleted: approved rows must be denied first; published
+    and publishing rows are final. Requires Supabase data plane (503 without it).
+
+    Gated by AGENT_PORTAL_SOCIAL_ENABLED. TOKEN ISOLATION: the row must belong to
+    account_key. A cross-gym id is a 404 that never reveals the row exists."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "delete", "draft_id": draft_id,
+                     "error": "delete requires the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "delete", draft_id)
+        if final is not None:
+            return final
+        status_now = str(row.get("status") or "").lower()
+        if status_now != "pending":
+            return 409, {"ok": False, "action": "delete", "draft_id": draft_id,
+                         "error": (f"only pending posts can be deleted "
+                                   f"(this post is {status_now}); "
+                                   f"use deny to remove an approved post")}
+        deleted = sb_store.delete_row(account_key, draft_id)
+        if deleted == 0:
+            return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+        return 200, {"ok": True, "action": "delete", "draft_id": draft_id}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+
+
+# ==========================================================================
 # POST /portal/<token>/autonomy  -> flip per-account autonomy on/off
 # ==========================================================================
 
