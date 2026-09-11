@@ -4842,3 +4842,39 @@ cache bound is now exercised through the real function (the old test re-implemen
 eviction and never called it, so deleting the production guard left the suite green);
 the forward Drive `_src` rule is pinned; local dry-run `stories_reburned` parity; a dead
 `import re`; grammar in the client-readable copy.
+
+## Audit round 10 (2026-09-11): a CRITICAL inside round 9's own fix
+
+Round 10 graded C+ and NOT SHIPPABLE. The critical was introduced by round 9's `"mixed"`
+return, and it is the defect this whole job exists to prevent:
+
+- [~] **A mixed Drive swap did not reserve the asset it had just placed.** The stamping
+  and `after_swap` lived only on the full-success path, but a REFUSED rollback means
+  those rows KEEP the new media. So the next repeated date in the same run was offered
+  the very clip still sitting on the book, and the sweep put ONE Drive asset on TWO
+  days. `after_swap` was skipped too, so the 90-day cooldown never learned it was used
+  and later nights could re-offer it. Reserved before returning now.
+- [~] `rows_repointed` was inverted on that path: `stuck` are the rows the rollback
+  could NOT undo, i.e. exactly the rows still carrying the new media, and the old
+  arithmetic counted the ones put BACK on the repeat.
+- [~] `unfixable_report` still opened with "this sweep left them in place ON PURPOSE" on
+  a run that had mutated rows, and on a run that left a post HALF swapped, which is the
+  opposite of on purpose. The shipped assertion could not catch it: its right disjunct
+  was always true. The opener now says what actually happened.
+- [~] **The escalation hint had zero behavioural coverage** -- only a source-string
+  grep, and FOUR independent mutations survived the whole suite: deleting the hint from
+  the card, forcing the condition False, dropping the FLAG from the condition (so it
+  fired with the flag OFF, a CLAUDE.md gate violation), and deleting the production
+  wiring so the flag could never be armed at all. Now driven through the real
+  `handle_event`: card text on/off/unwired, no Decision or ticket-state change, a
+  raising flag callable, and the wiring itself.
+- [x] Three operator surfaces still promised a `code_fix` dispatch that round 9 deleted
+  (`docs/ENV.md`, `--status`, the config docstring). Anyone arming the flag from those
+  docs would have got none of the promised behaviour. All three now describe the hint.
+- [~] A FAILED Drive-pool read returned 0 and read as an empty folder, so a gym with a
+  connected Drive got the "connect your Drive folder" line that branch exists to
+  prevent. It returns -1 and the report says we could not read it.
+- [x] The dead flag read on every Slack message is gone: `classify()` no longer takes
+  `repeat_report_enabled` at all, which also removes the one unguarded call on that path.
+
+Eight mutation tests, eight caught.

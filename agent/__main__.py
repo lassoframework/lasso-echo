@@ -231,7 +231,7 @@ def _status():
           f"AGENT_SLACK_CANCEL_POST_ENABLED; a CLIENT's 'cancel my post'/'skip today's "
           f"post' message denies THEIR next eligible content_calendar row through the "
           f"same path as the portal's own Cancel button, no new state machine)")
-    print(f"    repeat_fix  : {config.slack_repeat_code_fix_enabled()}  (env AGENT_SLACK_REPEAT_CODE_FIX; a client duplicate-media report becomes a code_fix instead of an escalation, default OFF)")
+    print(f"    repeat_fix  : {config.slack_repeat_code_fix_enabled()}  (env AGENT_SLACK_REPEAT_CODE_FIX; a client duplicate-media report gets a HINT on its escalation card, never a fixer dispatch, default OFF)")
     print(f"  client_dm      : {config.client_dm_autofix_enabled()}  (env AGENT_CLIENT_DM_AUTOFIX; "
           f"the client-DM support lane: measure one enumerated condition, run at most a "
           f"per-gym Drive media sync, card a human every time. On its own it sends a client "

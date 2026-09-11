@@ -35,7 +35,6 @@ from agent.slack_convo import classifier as c  # noqa: E402
 def _classify(text, **kw):
     kw.setdefault("has_open_ticket", False)
     kw.setdefault("identity_product", "echo")
-    kw.setdefault("repeat_report_enabled", True)
     return c.classify(text, **kw)
 
 
@@ -55,41 +54,28 @@ def test_johns_first_report_shape_is_a_code_fix_too():
 
 
 # ---- the flag is the one switch -----------------------------------------------------
-def test_nothing_ever_dispatches_a_fixer_flag_on_or_off():
+def test_nothing_ever_dispatches_a_fixer_ever():
     """THE INVARIANT five rounds of audit arrived at. Telling an instruction from a
     complaint is an intent judgement and a regex cannot make it: each round the false
     positive FAMILY moved and the RATE did not, and the obvious tightening cost recall
     (0.978 -> 0.844). So the rule annotates an escalation card a human already reads --
-    it never sets a ticket to triage and never auto-replies "something is not working"."""
+    it never sets a ticket to triage and never auto-replies "something is not working".
+    classify() no longer even takes the flag."""
+    import inspect
+    assert "repeat_report_enabled" not in inspect.signature(c.classify).parameters
     for text in ("9/14-9/16 are still repeat images",
                  "there are two posts next week, use the same image on both",
                  "copy the same photo onto my calendar",
                  "the calendar is reusing photos",
                  "plz reuse same photo on my posts nxt week"):
-        for flag in (False, True):
-            assert c.classify(text, has_open_ticket=False, identity_product="echo",
-                              repeat_report_enabled=flag) != c.CODE_FIX, (text, flag)
+        assert _classify(text) != c.CODE_FIX, text
 
 
-def test_the_flag_off_is_the_old_behavior():
-    """OFF must be byte-for-byte what the classifier did before this rule existed."""
-    assert _classify("9/14-9/16 are still repeat images",
-                     repeat_report_enabled=False) is c.ESCALATE
-    assert c.classify("duplicate images on my calendar", has_open_ticket=False,
-                      identity_product="echo") is c.ESCALATE, \
-        "the default must be OFF"
+def test_classify_is_unchanged_from_origin_main_for_this_family():
+    """The rule left classify() entirely: ESCALATE for this family, exactly as before."""
+    assert _classify("9/14-9/16 are still repeat images") is c.ESCALATE
+    assert _classify("duplicate images on my calendar") is c.ESCALATE
 
-
-def test_the_flag_cannot_be_turned_on_by_a_brain_hint_or_the_llm():
-    """CANCEL_POST's own invariant, applied here: the flag is the ONE switch, so a
-    learned phrase or a model guess can never mint this label while it is off."""
-    assert _classify("duplicate images on my calendar", repeat_report_enabled=False,
-                     llm=lambda t: c.CODE_FIX) == c.CODE_FIX, \
-        "the LLM may still return code_fix on its own merits"
-    # ...but the repeat RULE itself did not fire:
-    assert c.is_repeat_report("duplicate images on my calendar") is True
-    assert _classify("duplicate images on my calendar",
-                     repeat_report_enabled=False) is c.ESCALATE
 
 
 # ---- the wrong-output family --------------------------------------------------------
@@ -503,15 +489,90 @@ def test_a_report_carrying_only_a_date_still_gets_through():
 
 
 # ---- round 9: the hint reaches the card, and costs nothing when wrong ---------------
-def test_the_escalation_card_carries_the_duplicate_media_hint():
-    """The whole point of keeping the rule: a human reading the escalation card is told
-    what this might be. A wrong hint is a few words on an internal card; a wrong
-    code_fix triaged the ticket and auto-replied 'something is not working'."""
+# ---- the hint, driven through the real adapter --------------------------------------
+# Round 10 MAJOR: the only coverage here was a source-string grep, and FOUR independent
+# mutations survived the whole suite -- deleting {_hint} from the card, forcing the
+# condition False, dropping the FLAG from the condition (so the hint fired with the flag
+# OFF), and deleting the wiring so the flag could never be armed in production.
+def _escalation_cards(bus):
     from agent.slack_convo import adapter as _a
-    assert hasattr(_a, "_cls") and _a._cls.is_repeat_report is c.is_repeat_report
-    src = __import__("inspect").getsource(_a)
-    assert "DUPLICATE MEDIA report" in src, "the hint is not wired to the card"
-    assert "is_repeat_report" in src
+    return [m["body"] for m in bus.msgs
+            if m["direction"] == "outbound"
+            and (m.get("attachments") or {}).get("kind") == _a.KIND_ESCALATION]
+
+
+def _run(text, *, flag):
+    """One real inbound Slack message through A.handle_event, flag on or off."""
+    import dataclasses
+    import tests.test_slack_convo as H
+    from agent.slack_convo import adapter as _a
+    bus = H.FakeBus()
+    deps = dataclasses.replace(
+        H._deps(bus),
+        repeat_report_enabled=((lambda: flag) if flag is not None else None))
+    decision = _a.handle_event(H._ev(text), "G0MPIM:1.001", deps)
+    return decision, bus
+
+
+_HINT = "DUPLICATE MEDIA report"
+
+
+def test_the_hint_reaches_the_escalation_card_when_armed():
+    _d, bus = _run("9/14-9/16 are still repeat images", flag=True)
+    cards = _escalation_cards(bus)
+    assert cards, "no escalation card was emitted"
+    assert any(_HINT in (t or "") for t in cards), \
+        f"the hint never reached the card: {cards}"
+
+
+@pytest.mark.parametrize("flag", [False, None])
+def test_the_hint_is_absent_when_the_flag_is_off_or_unwired(flag):
+    """CLAUDE.md: a new capability ships behind a flag that defaults OFF. A mutation
+    that dropped the flag from the condition made the hint fire regardless, undetected."""
+    _d, bus = _run("9/14-9/16 are still repeat images", flag=flag)
+    assert not any(_HINT in (t or "") for t in _escalation_cards(bus))
+
+
+def test_a_message_that_is_not_a_repeat_report_gets_no_hint():
+    _d, bus = _run("what time does the gym open on saturday", flag=True)
+    assert not any(_HINT in (t or "") for t in _escalation_cards(bus))
+
+
+def test_the_hint_changes_no_decision_and_no_ticket_state():
+    """The hint must be words on a card and nothing else."""
+    on, bus_on = _run("9/14-9/16 are still repeat images", flag=True)
+    off, bus_off = _run("9/14-9/16 are still repeat images", flag=False)
+    assert (on.action, on.reason, on.classification) == \
+           (off.action, off.reason, off.classification)
+    kinds_on = bus_on.outbound_kinds(on.ticket_id)
+    kinds_off = bus_off.outbound_kinds(off.ticket_id)
+    assert kinds_on == kinds_off, "the hint changed which cards are emitted"
+
+
+def test_a_raising_flag_callable_never_kills_the_turn():
+    _d, bus = _run("9/14-9/16 are still repeat images", flag=True)   # sanity
+    import tests.test_slack_convo as H
+    from agent.slack_convo import adapter as _a
+
+    def boom():
+        raise RuntimeError("flag read blew up")
+
+    import dataclasses
+    bus2 = H.FakeBus()
+    deps = dataclasses.replace(H._deps(bus2), repeat_report_enabled=boom)
+    decision = _a.handle_event(H._ev("9/14-9/16 are still repeat images"),
+                               "G0MPIM:1.001", deps)
+    assert decision.action == "ticketed"
+    assert _escalation_cards(bus2), "the escalation was lost"
+
+
+def test_the_production_wiring_actually_supplies_the_flag():
+    """A mutation deleting this line meant the flag could never be armed in production,
+    and nothing noticed."""
+    import inspect
+    from agent.slack_convo import listener_wiring as _lw
+    src = inspect.getsource(_lw)
+    assert "repeat_report_enabled" in src and "slack_repeat_code_fix_enabled" in src
 
 
 @pytest.mark.parametrize("text", [

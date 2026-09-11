@@ -543,7 +543,7 @@ def default_classify_llm(model=None):
 
 
 def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=None,
-            cancel_post_enabled=False, repeat_report_enabled=False):
+            cancel_post_enabled=False):
     """One label from the fixed set, or None (escalate). Never raises.
 
     cancel_post_enabled (AGENT_SLACK_CANCEL_POST_ENABLED, default False): the ONLY gate
@@ -579,10 +579,10 @@ def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=No
         return CODE_FIX
     if _QUESTION_RE.search(t):
         return QUESTION
-    # NOTE: a duplicate-media report does NOT dispatch a fixer. is_repeat_report is a
-    # HINT for the escalation card a human already reads (adapter.py), not a label.
-    # See that function for why five rounds of audit ended here.
-    del repeat_report_enabled
+    # NOTE: a duplicate-media report does NOT dispatch a fixer, so there is no branch
+    # for it here. is_repeat_report is a HINT for the escalation card a human already
+    # reads (adapter.py), not a label. See that function for why five rounds of audit
+    # ended there.
     # CANCEL_POST is gated on cancel_post_enabled even from a brain hint or the LLM
     # fallback: the flag is the ONE switch for this whole capability, so a learned
     # phrase or a model guess can never turn it on when it is off.

@@ -225,8 +225,11 @@ def _drive_candidate_count(base, asset_state):
         from agent import media_swap
         return len(media_swap.drive_candidates(base, set(asset_state or {})))
     except Exception as exc:  # noqa: BLE001 - a pool read never breaks a sweep
+        # -1, not 0 (independent audit round 10): a FAILED read is not an empty folder,
+        # and reporting it as one sends a gym with a connected Drive the exact
+        # "connect your Drive folder" line this branch exists to prevent.
         _log(f"{base}: Drive pool read failed ({type(exc).__name__})")
-        return 0
+        return -1
 
 
 def _feed_first(fixable):
@@ -427,6 +430,24 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
              f"back {len(undo)} sibling row(s) so the post is never half swapped")
         stuck = _restore_rows(base, store, undo)
         if stuck:
+            # RESERVE THE ASSET BEFORE RETURNING (independent audit round 10, CRITICAL).
+            # The stamping and after_swap lived only on the full-success path below, but
+            # a REFUSED rollback means `stuck` rows KEEP the new media -- so without
+            # this the next repeated date in the same run is offered the very clip we
+            # just placed, and the sweep puts one Drive asset on two days: the exact
+            # defect this job exists to prevent. after_swap also never learned the asset
+            # was on the book, so the 90-day cooldown would re-offer it on later nights.
+            _na = str(pick.get("source_media_asset_id") or "")
+            if _na:
+                asset_state.setdefault(_na, set()).add((pd, "x"))
+            if pick.get("source") == "local" and pick.get("key"):
+                state.setdefault(str(pick["key"]), set()).add((pd, "x"))
+            try:
+                media_swap.after_swap(base, row, pick, book_rows=rows,
+                                      swapped_ids=stuck)
+            except Exception as exc:  # noqa: BLE001
+                _log(f"{base}: ledger not settled after a mixed swap "
+                     f"({type(exc).__name__})")
             # THE ROLLBACK WAS REFUSED, so the post really is mixed (independent audit
             # round 9, MAJOR). Returning "" here sent sweep_gym straight to
             # small_library, and the client line then said the sweep "left them in place
@@ -434,7 +455,10 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
             # day that is half swapped. Round 8 fixed this counting on the LOCAL lane
             # only.
             result["mixed_posts"] = int(result.get("mixed_posts") or 0) + 1
-            result["rows_repointed"] += max(0, len(swapped) - len(stuck))
+            # `stuck` are the rows the rollback could NOT undo, i.e. exactly the rows
+            # still carrying the new media. The old arithmetic counted the ones put
+            # BACK on the repeat (round 10 MAJOR).
+            result["rows_repointed"] += len(stuck)
             result["detail"].append(
                 f"{key} {pd}: -> {pick.get('key')} ({len(swapped)} row(s) moved, "
                 f"{len(stuck)} could not be rolled back; the rest kept the repeat)")
@@ -606,8 +630,22 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
         if best is not None:
             near.append(f"{key} on {best[1]} and {best[2]} ({best[0]} days apart)")
 
-    lines = [f"{gym}: {photos} photo(s) repeat across different days of the book and "
-             f"this sweep left them in place ON PURPOSE."]
+    # OPEN WITH WHAT ACTUALLY HAPPENED (independent audit round 10). This opened with
+    # "left them in place ON PURPOSE" even on a run that mutated rows -- and on a run
+    # that left a post HALF swapped, which is the opposite of on purpose.
+    _fixed = int((result or {}).get("dates_fixed") or 0)
+    _mixed = int((result or {}).get("mixed_posts") or 0)
+    if _mixed:
+        lines = [f"{gym}: {photos} photo(s) repeat across different days of the book. "
+                 f"{_mixed} day(s) were only PARTLY changed and need a person; the rest "
+                 "were left in place on purpose."]
+    elif _fixed:
+        lines = [f"{gym}: {photos} photo(s) repeat across different days of the book. "
+                 f"{_fixed} day(s) were changed; the rest were left in place on "
+                 "purpose."]
+    else:
+        lines = [f"{gym}: {photos} photo(s) repeat across different days of the book "
+                 "and this sweep left them in place ON PURPOSE."]
     if approved:
         lines.append(f"{approved} of them sit on APPROVED posts. Echo will not change "
                      "a card the gym already approved, so a person has to decide: "
@@ -624,7 +662,13 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
         pool = int((result or {}).get("drive_pool_seen")
                    or (result or {}).get("drive_pool") or 0)
         armed = bool((result or {}).get("drive_armed"))
-        if pool and armed:
+        if pool < 0:
+            # A FAILED READ IS NOT AN EMPTY FOLDER, and must never fall through to the
+            # "Add photos, connect your Drive folder" line (round 10 minor).
+            lines.append("We could not read this gym's connected Drive folder on this "
+                         "run, so we do not know what is in it. That is ours to check, "
+                         "not the gym's.")
+        elif pool > 0 and armed:
             # ARMED and still stuck. Say which of the three it actually was, because
             # round 3 caught this branch claiming "could not prepare one" on a run that
             # had prepared five. Nothing here may be a guess.
@@ -643,7 +687,7 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
                              f"connected Drive folder holds {pool} unused item(s) and "
                              "tonight's run could not prepare one; it retries on the "
                              "next run. Nothing more is needed from the gym.")
-        elif pool:
+        elif pool > 0:
             lines.append(f"This gym's uploaded photos are all on the book, but its "
                          f"connected Drive folder holds {pool} unused item(s) the "
                          "nightly sweep cannot reach yet. Nothing more is needed from "
@@ -819,7 +863,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                         # the instrument we verify against a client's gym, so it has to
                         # predict what apply will actually do.
                         if pool_dry is None:
-                            pool_dry = _drive_candidate_count(base, asset_state)
+                            pool_dry = max(0, _drive_candidate_count(base, asset_state))
                         if pool_dry > 0:
                             pool_dry -= 1
                             drive_fixes_left -= 1    # the SAME budget apply spends

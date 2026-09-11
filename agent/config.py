@@ -4226,8 +4226,8 @@ def media_repeat_sweep_enabled() -> bool:
 
 
 def slack_repeat_code_fix_enabled() -> bool:
-    """A client's DUPLICATE-MEDIA report in Slack becomes a code_fix instead of an
-    escalation (AGENT_SLACK_REPEAT_CODE_FIX, default OFF).
+    """A client's DUPLICATE-MEDIA report in Slack gets a HINT on its escalation card
+    (AGENT_SLACK_REPEAT_CODE_FIX, default OFF). It NEVER dispatches a fixer.
 
     John Weeks / Tough Temple, 2026-09-11. He reported "9/14-9/16 are still repeat
     images" twice and the fixer lane never saw it: code_fix requires a _BREAKAGE_RE
@@ -4236,16 +4236,24 @@ def slack_repeat_code_fix_enabled() -> bool:
     common shape -- Echo is running fine and producing the WRONG THING -- so every
     duplicate-media report classified ESCALATE and a human carried the whole ticket.
 
-    OFF is byte identical to before the rule existed. It ships OFF because a FALSE
-    positive here is not free: adapter.py sets the ticket to 'triage', so every later
-    message from that owner classifies FOLLOW_UP until a person closes it, and the ACK
-    Echo sends reads "I read that as something not working on our side" -- which a gym
-    owner should never receive in answer to "thanks for fixing the duplicate images."
-    An independent review measured 14 of 23 realistic benign sentences dispatching a
-    fixer request before classifier._NOT_A_REPEAT_REPORT_RE was added.
+    THE NAME IS HISTORICAL. This flag was built to make such a report classify as a
+    code_fix, and five rounds of independent audit killed that with data: the
+    false-positive family moved every round and the RATE did not (14/23, 11/30, 15/15,
+    16/20, 15/18, 10/72, 7/77), and the obvious tightening cost recall 0.978 -> 0.844.
+    Telling a duplicate-media COMPLAINT from a scheduling INSTRUCTION is an intent
+    judgement and a regex cannot make it. See classifier.is_repeat_report.
 
-    Arm by hand: AGENT_SLACK_REPEAT_CODE_FIX=true. A client code_fix is still HELD
-    behind Blake's #fixer tap either way (adapter.KIND_FIXER_REQUEST)."""
+    So the OUTCOME changed, not the detector. A false code_fix was expensive: adapter.py
+    set the ticket to 'triage', locking every later message from that owner into
+    FOLLOW_UP until a person closed it, and Echo auto-replied "I read that as something
+    not working on our side" -- measured against a thank-you note and a scheduling
+    instruction. What this flag does NOW is append ONE sentence to the escalation card a
+    human is already reading: "This reads like a DUPLICATE MEDIA report ... If it is, it
+    is a code fix, not a question." classify() returns ESCALATE for this family exactly
+    as it did before, on or off; a wrong hint costs a few words on an internal card.
+
+    Automatic dispatch on this class needs the LLM lane classify() already falls through
+    to. Arm by hand: AGENT_SLACK_REPEAT_CODE_FIX=true."""
     return _truthy(os.environ.get("AGENT_SLACK_REPEAT_CODE_FIX", "false"))
 
 

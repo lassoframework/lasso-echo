@@ -1349,3 +1349,99 @@ def test_the_forward_drive_path_never_creates_source_media_url(monkeypatch):
     _sweep(store, picker=no_src, drive_n=40, monkeypatch=monkeypatch)
     assert sent and all(v is None for v in sent), \
         f"created source_media_url on rows that never had one: {sent}"
+
+
+# ---- round 10 ---------------------------------------------------------------------
+def _mixed_store(rows):
+    """A store that refuses the story write AND the rollback -- the likeliest pair,
+    since the rows went live, which is what failed the write."""
+    store = _Store(rows)
+    n = {"i": 0}
+    real = store.swap_media
+
+    def refuse(base, row_id, image_url, source_media_url=None, extra_fields=None):
+        n["i"] += 1
+        if str(row_id).endswith("st"):
+            return None                      # forward write refused
+        if n["i"] > 3:
+            return None                      # rollback refused
+        return real(base, row_id, image_url, source_media_url=source_media_url,
+                    extra_fields=extra_fields)
+
+    store.swap_media = refuse
+    return store
+
+
+def test_a_mixed_swap_reserves_the_asset_it_left_on_the_book(monkeypatch):
+    """Round 10 CRITICAL. Stamping and after_swap lived only on the full-success path,
+    but a REFUSED rollback means those rows KEEP the new media -- so the next repeated
+    date in the same run was offered the very clip just placed, and the sweep put one
+    Drive asset on TWO days: the exact defect this job exists to prevent."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    rows = _book() + [_row("r15ig", "2026-09-15", "instagram", "feed")]
+    store = _mixed_store(rows)
+    seen = []
+    res = _sweep(store, picker=_picker(clips=(1, 2), seen=seen), drive_n=40,
+                 monkeypatch=monkeypatch)
+    assert res["mixed_posts"] == 1
+    assert len(seen) >= 2, "the second date never asked for a replacement"
+    assert "v001" in seen[1], \
+        "the second date was offered the clip the mixed post is still carrying"
+    carried = {r["id"]: r["image_url"] for r in store.rows
+               if r["id"] in ("r14ig", "r15ig")}
+    assert len(set(carried.values())) == 2, f"one clip on two days: {carried}"
+
+
+def test_a_mixed_swap_counts_the_rows_that_kept_the_new_media(monkeypatch):
+    """Round 10 MAJOR: `stuck` are the rows the rollback could NOT undo, i.e. exactly
+    the rows still carrying the new media. The old arithmetic counted the ones put back
+    on the repeat."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    store = _mixed_store(_book())
+    res = _sweep(store, picker=_picker(), drive_n=40, monkeypatch=monkeypatch)
+    moved = [r for r in store.rows
+             if r["id"].startswith("r14") and r["image_url"].endswith(".mp4")]
+    assert res["rows_repointed"] == len(moved) > 0, \
+        f"rows_repointed={res['rows_repointed']} but {len(moved)} rows carry the clip"
+
+
+def test_the_report_does_not_open_with_on_purpose_after_changing_rows():
+    """Round 10 MAJOR. This opened with "left them in place ON PURPOSE" even on a run
+    that mutated rows -- and on a run that left a post HALF swapped, which is the
+    opposite of on purpose. The old assertion could not catch it (its right disjunct was
+    always true)."""
+    mixed = {"gym": GYM, "photos_repeated": 1, "approved_left": 0, "small_library": False,
+             "dates_fixed": 0, "mixed_posts": 1, "drive_pool_seen": 5, "drive_armed": True,
+             "detail": [f"{REPEATED} 2026-09-14: -> v1 (2 row(s) moved, 1 could not be "
+                        "rolled back; the rest kept the repeat)"]}
+    text = mrs.unfixable_report(mixed)
+    assert "ON PURPOSE" not in text, text
+    assert "only PARTLY changed" in text and "need a person" in text
+
+    fixed = dict(mixed, mixed_posts=0, dates_fixed=2,
+                 detail=[f"{REPEATED} 2026-09-14: no unused photo left "
+                         "(small library; left with spacing)"], small_library=True)
+    t2 = mrs.unfixable_report(fixed)
+    assert "ON PURPOSE" not in t2 and "2 day(s) were changed" in t2
+
+    untouched = dict(mixed, mixed_posts=0, dates_fixed=0, small_library=True,
+                     detail=[f"{REPEATED} 2026-09-14: APPROVED duplicate (left; the "
+                             "gym approved this card)"], approved_left=1)
+    assert "ON PURPOSE" in mrs.unfixable_report(untouched)
+
+
+def test_a_failed_drive_pool_read_is_not_reported_as_an_empty_folder(monkeypatch):
+    """Round 10 MINOR: the read swallowed its exception and returned 0, so a gym with a
+    connected folder got the "connect your Drive folder" line this branch exists to
+    prevent."""
+    monkeypatch.setattr("agent.media_swap.drive_candidates",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("supabase")))
+    assert mrs._drive_candidate_count(GYM, {}) == -1
+    res = {"gym": GYM, "photos_repeated": 1, "approved_left": 0, "small_library": True,
+           "dates_fixed": 0, "mixed_posts": 0, "drive_pool_seen": -1, "drive_pool": -1,
+           "drive_armed": True,
+           "detail": [f"{REPEATED} 2026-09-14: no unused photo left "
+                      "(small library; left with spacing)"]}
+    text = mrs.unfixable_report(res)
+    assert "could not read this gym's connected Drive folder" in text
+    assert "Add photos" not in text, "told a connected gym to connect a folder"
