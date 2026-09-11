@@ -125,7 +125,10 @@ def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print
     ("Can we add our group sessions schedule to the website?") was stuck in exactly
     this loop from the moment AGENT_PORTAL_ECHO_TICKETS_ENABLED first armed."""
     tid = ticket.get("id")
-    bus.set_ticket(tid, status="hold", escalated=True)
+    # Round 3 (audit of PR #107): classification is cleared explicitly. The QUESTION branch
+    # stamps answerable_question before an undelivered answer lands here, and the FIXER's
+    # poll (hold + escalated + classification NULL) would skip that ticket forever.
+    bus.set_ticket(tid, status="hold", escalated=True, classification=None)
     bus.record_outbound(
         ticket_id=tid, author_type="system",
         body=f"Portal ticket {tid} ({identity_name}) could not be routed "

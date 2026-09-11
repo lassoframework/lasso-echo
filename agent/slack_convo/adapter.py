@@ -280,7 +280,14 @@ _FORBIDDEN_BILLING = _re.compile(
     r"\bhow much (?:is|does|will|would|do|are)\b|\$\s?\d", _re.IGNORECASE)
 _FORBIDDEN_INJURY = _re.compile(
     r"\b(injur\w*|hurt|pain|sore|surgery|physio|physical therapy|doctor|medical|pregnan\w*|"
-    r"liability|waiver|insurance|lawsuit|legal)\b", _re.IGNORECASE)
+    r"liability|waiver|insurance|lawsuit|legal)\b|"
+    # Round 3 (MINOR 2): injury ADVICE with no injury keyword -- "ice it and rest",
+    # "stretch it out", "push through the pain", "take some ibuprofen".
+    r"\bice (?:it|that|the \w+)\b|\brest (?:it|that|the \w+)\b|\b(?:rest and ice|ice and rest)\b|"
+    r"\bstretch (?:it|that|them) out\b|\bpush through\b|\bfoam roll\b|"
+    r"\b(?:take|pop) (?:some |an? )?(?:ibuprofen|advil|tylenol|aleve|painkillers?)\b|"
+    r"\bsee (?:a|your) (?:doctor|physio|pt|chiro\w*)\b|\bcompression\b|\belevate (?:it|that)\b",
+    _re.IGNORECASE)
 _FORBIDDEN_GYM_SCHEDULE = _re.compile(
     r"\b(?:gym|class|classes|session|sessions|group sessions|studio|business|holiday|"
     r"opening|door|front desk|member)\s+(?:hours|schedule|schedules|times|time)\b|"
@@ -298,16 +305,30 @@ _FORBIDDEN_GYM_SCHEDULE = _re.compile(
     r"\b(?:opens?|closes?|closing|opening)\s+at\s+\d|"
     r"\bclass(?:es)?\b[^.?!]{0,40}?\b(?:is|are|was|were|has been|have been|will be|got|"
     r"being|now)\s+(?:moving|moved|cancell?ed|added|dropped|rescheduled|changing|changed|"
-    r"starting|start)\b|"
+    r"starting|starts?|begins?|runs?|meets?)\b|"
     r"\b(?:our|the|your|gym|new|holiday)\s+hours\s+(?:are|will be|have changed|changed|"
-    r"is|remain)\b", _re.IGNORECASE)
+    r"is|remain|start|begin|kick in)\b|"
+    # Round 3 (MINOR 2): "class now starts at 9", "closed Monday for Labor Day", "we'll be
+    # open 7 to noon Saturday", "new hours start Monday".
+    r"\bclass(?:es)?\s+(?:now\s+)?(?:starts?|begins?|runs?)\s+at\s+\d|"
+    r"\bclosed\s+(?:on\s+|this\s+|next\s+)?(?:(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
+    r"tomorrow|today|(?:for|on) (?:the )?(?:holiday|labor day|memorial day|christmas|"
+    r"thanksgiving|new year|july 4|the 4th))\b|"
+    r"\b(?:be |are |is |we're |were )?open\s+(?:from\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*"
+    r"(?:to|-|until|till|through)\s*(?:\d|noon|midnight)|"
+    r"\b(?:new|summer|winter|fall|spring|holiday|weekend)\s+hours\b", _re.IGNORECASE)
 # The org floor's fourth leg (org instructions: pixel/CAPI, ad budget, targeting are never
 # touched without explicit approval). Echo is a social product; a message about ad settings
 # reaching it is either Ranger's (action_request, routed before this) or a person's to answer.
 _FORBIDDEN_ADS = _re.compile(
     r"\b(pixel|capi|conversions? api|ad budget|ad spend|daily budget|targeting|"
-    r"ad set|ad sets|adset|adsets|campaign budget|boost(?:ed|ing)? (?:the |that |this )?post)\b",
-    _re.IGNORECASE)
+    r"ad set|ad sets|adset|adsets|campaign budget|boost(?:ed|ing)? (?:the |that |this )?post)\b|"
+    # Round 3 (MINOR 2): past-tense / declarative ad changes -- "I paused your campaign",
+    # "we raised the budget", "lowered the ad set", "changed the targeting".
+    r"\b(?:paused|unpaused|resumed|stopped|changed|raised|lowered|increased|decreased|"
+    r"updated|edited|adjusted|turned (?:off|on)|switched (?:off|on)|scaled)\s+"
+    r"(?:your |the |that |this |our )?(?:\w+\s+){0,2}?(?:campaigns?|budgets?|ad sets?|"
+    r"adsets?|targeting|ads)\b", _re.IGNORECASE)
 # Round 2 (MAJOR 7): a first-person STATEMENT that we deleted / took down a published post
 # is the org floor (deleting published posts is never automated). First-person only, so a
 # client's "can you delete the post scheduled for friday" (the cancel lane's job) is not it.
@@ -316,7 +337,13 @@ _FORBIDDEN_DELETE_PUBLISHED = _re.compile(
     r"\b(?:i|we)\s*(?:'ve|have|'ll|will|just|already)?\s*(?:delet\w*|took down|take down|"
     r"removed|remove|unpublish\w*)\s+(?:the |your |that |this |those |these )?"
     r"(?:published |live )?(?:posts?|reels?|stor(?:y|ies))\b|"
-    r"\bdeleted (?:your|the) (?:published |live )?(?:posts?|reels?)\b", _re.IGNORECASE)
+    r"\bdeleted (?:your|the) (?:published |live )?(?:posts?|reels?)\b|"
+    # Round 3 (MINOR 2): split-verb deletions -- "take that post down", "took the reel
+    # down", "pull the post that went live".
+    r"\b(?:take|took|taking|takes|pull|pulled|pulling|pulls)\s+(?:that|the|your|this|it)"
+    r"(?:\s+\w+){0,3}?\s*(?:posts?|reels?|stor(?:y|ies))?\s+(?:down|offline)\b|"
+    r"\bpull(?:ed|ing|s)?\s+(?:the|that|your|this)\s+(?:posts?|reels?|stor(?:y|ies))\b"
+    r"(?=[^.?!]*\b(?:went live|is live|was published|published|live)\b)", _re.IGNORECASE)
 _FORBIDDEN_BY_TOPIC = ((TOPIC_BILLING, _FORBIDDEN_BILLING), (TOPIC_INJURY, _FORBIDDEN_INJURY),
                        (TOPIC_GYM_SCHEDULE, _FORBIDDEN_GYM_SCHEDULE), (TOPIC_ADS, _FORBIDDEN_ADS),
                        (TOPIC_DELETE_PUBLISHED, _FORBIDDEN_DELETE_PUBLISHED))
@@ -522,8 +549,22 @@ _HUMAN_FOLLOW_UP = _re.compile(
     r"someone)|make sure (?:someone|the team|a teammate))\b|"
     r"\b(?:someone|a teammate|the team|a person) (?:on the team )?will (?:follow up|"
     r"look into|dig into|get back|take a look|reach out|be in touch)\b|"
-    r"\bflag(?:ged|ging)? (?:this|that|it) for (?:someone|the team|a teammate)\b",
-    _re.IGNORECASE)
+    r"\bflag(?:ged|ging)? (?:this|that|it) for (?:someone|the team|a teammate)\b|"
+    # Round 3 (MINOR 1): a THIRD-PERSON named human is a follow-up promise too -- "Blake
+    # will take a look", "Dean will get back to you", "someone from the team will reach
+    # out". Any subject word but a pronoun for a thing, then a future marker, then an
+    # attention verb.
+    # The subject is a capitalised NAME (case-sensitive inside the group) or an explicit
+    # person noun -- never "we"/"I" (the first leg's narrower verb list governs those, so
+    # Dean's conditional "let us know ... and we will take a look" is not a promise) and
+    # never a content noun ("Your post will follow up the reel").
+    r"\b(?:(?-i:(?!It\b|That\b|This\b|There\b|Which\b|Your\b|Our\b|The\b|Post\b|Echo\b)"
+    r"[A-Z][a-z]{1,20})|someone|somebody|a teammate|the team|a person|a coach|our coach|"
+    r"one of (?:our|the) team|someone (?:from|on) (?:the|our) team)"
+    r"(?: from the team| on the team| on our team)? (?:will|'ll|is going to|is gonna) "
+    r"(?:take a look|have a look|look into|dig into|get back to (?:you|ya)|follow up|"
+    r"reach out|be in touch|check (?:on |in on )?(?:it|that|this)|review (?:it|that|this)|"
+    r"sort (?:it|that|this) out)\b", _re.IGNORECASE)
 
 
 def promises_human_follow_up(text):
@@ -731,10 +772,19 @@ def hold_card_why(verdict_or_tier, *, unarmed_flag=""):
             f"unclassified). The client has been told.")
 
 
+def _fresh_ticket(bus, tid):
+    """The current ticket row, or a bare {"id"} when the bus cannot re-read it (an older
+    fake without ticket(), or a read fault) -- never a raise on a disposition path."""
+    try:
+        return bus.ticket(tid) or {"id": tid}
+    except Exception:  # noqa: BLE001
+        return {"id": tid}
+
+
 def hold_answer_for_team(bus, *, ticket, ident_name, recipient_kind, user, account_key,
                          surface, body, held_message_id, verdict, person="",
                          write_hold_notice_fn=None, fixer_authored=False, unarmed_flag="",
-                         log=print):
+                         card=True, notice_text=None, log=print):
     """D72: the ONE disposition for a held client answer, shared by the Slack adapter, the
     portal bridge and the outbox's post-time re-check, so no path can hold silently.
 
@@ -749,14 +799,18 @@ def hold_answer_for_team(bus, *, ticket, ident_name, recipient_kind, user, accou
     if write is None:
         def write(**kw):
             return write_hold_notice(bus, **kw)
-    write(ident_name=ident_name, tid=tid, recipient_kind=recipient_kind, user=user or "?",
-          account_key=account_key, kind=KIND_ANSWER, body=body,
-          held_message_id=held_message_id, surface=surface, why=why, person=person)
+    if card:
+        # Round 3: a branch that already emitted its own richer card (question_card) passes
+        # card=False so the team is told once, not twice.
+        write(ident_name=ident_name, tid=tid, recipient_kind=recipient_kind, user=user or "?",
+              account_key=account_key, kind=KIND_ANSWER, body=body,
+              held_message_id=held_message_id, surface=surface, why=why, person=person)
     notified = False
     if recipient_kind not in ("staff", "coach"):
         notified = _client_hold_notice(bus, tid, ident_name=ident_name,
                                        recipient_kind=recipient_kind, surface=surface,
-                                       verdict=verdict, tier=tier, log=log)
+                                       verdict=verdict, tier=tier, notice_text=notice_text,
+                                       log=log)
     _escalate_held_ticket(bus, ticket, tier=tier, verdict=verdict,
                           fixer_authored=fixer_authored, log=log)
     log(f"[slack-convo/{ident_name}] answer HELD ticket={tid} tier={tier} "
@@ -765,7 +819,7 @@ def hold_answer_for_team(bus, *, ticket, ident_name, recipient_kind, user, accou
 
 
 def _client_hold_notice(bus, tid, *, ident_name, recipient_kind, surface, verdict, tier,
-                        log=print):
+                        notice_text=None, log=print):
     """The client's line, once per ticket per tier. Fails CLOSED on a read fault (a second
     notice is noise; a missing one is caught by the card, which says whether it was sent)."""
     try:
@@ -778,13 +832,14 @@ def _client_hold_notice(bus, tid, *, ident_name, recipient_kind, surface, verdic
         att = m.get("attachments") or {}
         if m.get("direction") == "outbound" and att.get("hold_client_notice") == tier:
             return True
-    text = client_hold_notice_text(verdict if getattr(verdict, "tier", "") else tier,
-                                   getattr(verdict, "topic", ""))
+    text = notice_text or client_hold_notice_text(
+        verdict if getattr(verdict, "tier", "") else tier, getattr(verdict, "topic", ""))
     bus.record_outbound(ticket_id=tid, author_type=ident_name, body=text,
                         delivery_status="ready", kind=KIND_TEMPLATE,
                         meta={"identity": ident_name, "recipient_kind": recipient_kind,
                               "surface": surface, "hold_client_notice": tier,
-                              "hold_rule": getattr(verdict, "rule", "")})
+                              "hold_rule": getattr(verdict, "rule", ""),
+                              "no_draft": bool(notice_text == TEMPLATE_NO_ANSWER_YET)})
     return True
 
 
@@ -1286,7 +1341,7 @@ def handle_event(event, event_id, deps):
                     # The answer says a person will follow up: make that true by mechanism
                     # (route_follow_up_promise: ticket open for the FIXER with the marker,
                     # team card; the outbox's post-time call finds the marker and is a no-op).
-                    route_follow_up_promise(deps.bus, deps.bus.ticket(tid) or {"id": tid},
+                    route_follow_up_promise(deps.bus, _fresh_ticket(deps.bus, tid),
                                             ident_name=ident.name, body=answer["body"],
                                             recipient_kind=who.kind, surface=surface,
                                             person=describe_person(deps, who, user),
@@ -1303,7 +1358,7 @@ def handle_event(event, event_id, deps):
                 _, row = emit(KIND_ANSWER, answer["body"],
                               meta={**base_meta, "hold_tier": tier, "hold_rule": verdict.rule},
                               hold_handled=True)
-                fresh = deps.bus.ticket(tid) or {"id": tid}
+                fresh = _fresh_ticket(deps.bus, tid)
                 hold_answer_for_team(
                     deps.bus, ticket=fresh, ident_name=ident.name, recipient_kind=who.kind,
                     user=user, account_key=who.account_key, surface=surface,
@@ -1313,17 +1368,27 @@ def handle_event(event, event_id, deps):
                     unarmed_flag=f"SLACK_CONVO_{ident.name.upper()}_AUTO_ANSWER",
                     log=deps.log)
         else:
-            deps.bus.set_ticket(tid, classification=_cls.QUESTION, status="hold",
-                                escalated=True)
+            # Round 3 (audit of PR #107, MAJOR): this used to park the ticket with
+            # classification=QUESTION, which the FIXER's poll (hold + escalated +
+            # classification NULL) skips -- a non-floor question waited on a person. It is
+            # a needs_review hold now: the same disposition as every other one (client told,
+            # ticket unclassified for the FIXER), with question_card as the team card.
             emit(KIND_ESCALATION,
                  question_card(deps, ident, tid, who, user, text,
                                proposal=("no answer drafted: the answer lane had no grounded "
                                          "facts for this question, so nothing was written "
                                          "for the client to read"),
-                               status="hold, escalated, waiting on a person"),
+                               status="hold, escalated, with the FIXER / team"),
                  author_type="system")
+            hold_answer_for_team(
+                deps.bus, ticket=_fresh_ticket(deps.bus, tid), ident_name=ident.name,
+                recipient_kind=who.kind, user=user, account_key=who.account_key,
+                surface=surface, body="", held_message_id=None,
+                verdict=AnswerVerdict(False, HOLD_TIER_NEEDS_REVIEW, "answer_not_groundable"),
+                person=describe_person(deps, who, user), card=False,
+                notice_text=TEMPLATE_NO_ANSWER_YET, log=deps.log)
             if not _is_staffish(who):
-                emit(KIND_TEMPLATE, TEMPLATE_NO_ANSWER_YET, meta={"no_draft": True})
+                out.append(KIND_TEMPLATE)
         return Decision("ticketed", "question", surface, who.kind, tid, created,
                         _cls.QUESTION, out)
 
@@ -1353,8 +1418,10 @@ def handle_event(event, event_id, deps):
         # be pointed at another gym's calendar. Staff/coach have no account_key of their
         # own to scope a cancel to; that is a portal job, not a Slack one, from here.
         if not who.account_key:
-            deps.bus.set_ticket(tid, classification=_cls.CANCEL_POST, status="hold",
-                                escalated=True)
+            # Round 3: classification is left NULL on a parked cancel so the FIXER's poll
+            # takes it (and 'cancel_post' is not a value support_tickets.classification's
+            # CHECK accepts -- writing it would have raised live).
+            deps.bus.set_ticket(tid, classification=None, status="hold", escalated=True)
             emit(KIND_ESCALATION,
                  f"{who.kind} {user} asked to cancel/skip a scheduled post on "
                  f"{ident.name} but has no single resolved account to scope the write "
@@ -1371,8 +1438,8 @@ def handle_event(event, event_id, deps):
             deps.log(f"[slack-convo] cancel_post lane failed: {type(e).__name__}")
             result = None
         if not result:
-            deps.bus.set_ticket(tid, classification=_cls.CANCEL_POST, status="hold",
-                                escalated=True)
+            # Round 3: same as above -- unclassified so the FIXER picks it up.
+            deps.bus.set_ticket(tid, classification=None, status="hold", escalated=True)
             emit(KIND_ESCALATION,
                  f"Cancel/skip request from {who.kind} {user} on {ident.name} "
                  f"({who.account_key}) failed to process. Ticket {tid}.",
@@ -1391,14 +1458,16 @@ def handle_event(event, event_id, deps):
         return Decision("ticketed", reason, surface, who.kind, tid, created,
                         _cls.CANCEL_POST, out)
 
-    # ESCALATE: nothing decided -> a human looks. No worker, no answer.
-    deps.bus.set_ticket(tid, status="hold", escalated=True)
+    # ESCALATE: nothing decided -> the FIXER looks (hold + escalated + classification NULL is
+    # its poll). Round 3: classification is cleared explicitly, so a reused ticket that still
+    # carries an old label cannot slip past that poll.
+    deps.bus.set_ticket(tid, status="hold", escalated=True, classification=None)
     emit(KIND_ESCALATION,
          question_card(deps, ident, tid, who, user, text,
                        proposal=(f"{NO_DRAFT_LABEL}: the classifier did not decide what this "
                                  f"is, so no answer, no fix request and no ad action was "
                                  f"started. Nothing has been drafted for the client"),
-                       status="hold, escalated, waiting on a person"),
+                       status="hold, escalated, with the FIXER / team"),
          author_type="system")
     if not _is_staffish(who):
         emit(KIND_TEMPLATE, TEMPLATE_NO_ANSWER_YET, meta={"no_draft": True})

@@ -559,3 +559,120 @@ def test_follow_up_routing_is_idempotent_and_never_for_staff():
     assert len(_rows(bus, t["id"], A.KIND_ESCALATION)) == 1
     assert not A.route_follow_up_promise(bus, t, ident_name="echo", body=FOLLOW_UP_A,
                                          recipient_kind="staff")
+
+
+# =========================================================================================
+# Round 3 (re-audit of PR #107)
+# =========================================================================================
+
+ROUND3_PROBES = [
+    # MINOR 2: declarative / past-tense / split-verb / keyword-less floor statements
+    ("class now starts at 9", "Class now starts at 9.", A.TOPIC_GYM_SCHEDULE),
+    ("closed for the holiday", "We are closed Monday for Labor Day.", A.TOPIC_GYM_SCHEDULE),
+    ("open 7 to noon", "We'll be open 7 to noon Saturday.", A.TOPIC_GYM_SCHEDULE),
+    ("new hours start", "New hours start Monday.", A.TOPIC_GYM_SCHEDULE),
+    ("paused your campaign", "I paused your campaign.", A.TOPIC_ADS),
+    ("raised the budget", "We raised the budget on that ad set yesterday.", A.TOPIC_ADS),
+    ("changed the targeting", "I changed the targeting on the campaign.", A.TOPIC_ADS),
+    ("take that post down", "I'll take that post down.", A.TOPIC_DELETE_PUBLISHED),
+    ("pull the post that went live", "Let me pull the post that went live.",
+     A.TOPIC_DELETE_PUBLISHED),
+    ("took the reel down", "Took the reel down for you.", A.TOPIC_DELETE_PUBLISHED),
+    ("ice it and rest", "Ice it and rest for a few days.", A.TOPIC_INJURY),
+    ("stretch it out", "Just stretch it out before class.", A.TOPIC_INJURY),
+    ("push through the pain", "You can push through the pain.", A.TOPIC_INJURY),
+]
+
+
+@pytest.mark.parametrize("label,answer,topic", ROUND3_PROBES)
+def test_round3_probe_table_floors(label, answer, topic):
+    for fixer in (False, True):
+        v = A.auto_answer_verdict("is my instagram connected?", answer, grounded_by_fixer=fixer)
+        assert v.held and v.tier == ORG and v.topic == topic, f"{label} (fixer={fixer}): {v}"
+
+
+@pytest.mark.parametrize("text", [
+    "is the october schedule loaded?", "did my posts go out this week?",
+    "Your post about the new class went out tuesday morning.",
+    "can you pull the post scheduled for friday",           # a pending post: the cancel lane
+    "The october schedule is loaded with twelve posts, and the first goes out monday.",
+])
+def test_round3_legs_do_not_swallow_ordinary_echo_sentences(text):
+    assert not A.forbidden_topic(text), text
+
+
+# ---- MINOR 1: a third-person named human is a follow-up promise -------------------------
+
+@pytest.mark.parametrize("body", [
+    "Blake will take a look.", "Dean will get back to you.",
+    "Someone from the team will reach out.", "A teammate will follow up with you here.",
+])
+def test_third_person_follow_up_is_a_promise(body):
+    assert A.promises_human_follow_up(body), body
+
+
+@pytest.mark.parametrize("body", [
+    "It will get back to normal.", "Your post will follow up the reel.",
+    "let us know which one and we will take a look", DEAN_A,
+])
+def test_things_and_conditionals_are_not_follow_up_promises(body):
+    assert not A.promises_human_follow_up(body), body
+
+
+def test_outbox_third_person_promise_is_routed_never_plainly_resolved(monkeypatch):
+    _armed(monkeypatch)
+    bus = FakeBus()
+    tid, mid = _fixer_answer_ticket(bus, "is my instagram connected?",
+                                    "Yes, it is connected. Blake will take a look at the "
+                                    "duplicate posts.")
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus.message(mid)["delivery_status"] == "posted"
+    t = bus.tickets[tid]
+    assert t["status"] == "hold" and t["classification"] is None
+    assert _follow_up_hold(t)["reason"] == A.FOLLOW_UP_MARKER
+
+
+# ---- MAJOR: an unanswerable question goes to the FIXER, not to a person ------------------
+
+def test_slack_question_with_no_grounded_answer_is_handed_to_the_fixer(monkeypatch):
+    _armed(monkeypatch)
+    bus = FakeBus()
+    d = A.handle_event(_ev("is my instagram connected?"), "k",
+                       _deps(bus, answer=lambda t, w, m, q: None, client_armed=True,
+                             auto_answer=True))
+    tid = d.ticket_id
+    t = bus.tickets[tid]
+    assert t["status"] == "hold" and t["escalated"] is True
+    assert t["classification"] is None, "the FIXER's poll takes hold+escalated+unclassified"
+    assert _follow_up_hold(t)["tier"] == A.HOLD_TIER_NEEDS_REVIEW
+    assert _follow_up_hold(t)["rule"] == "answer_not_groundable"
+    cards = _rows(bus, tid, A.KIND_ESCALATION)
+    assert len(cards) == 1 and "with the FIXER / team" in cards[0]["body"]
+    assert "waiting on a person" not in cards[0]["body"]
+    assert not _rows(bus, tid, A.KIND_HOLD_NOTICE), "question_card is the one team card"
+    notices = _rows(bus, tid, A.KIND_TEMPLATE)
+    assert len(notices) == 1 and notices[0]["body"] == A.TEMPLATE_NO_ANSWER_YET
+    assert notices[0]["delivery_status"] == "ready"
+    assert notices[0]["attachments"]["hold_client_notice"] == A.HOLD_TIER_NEEDS_REVIEW
+
+
+def test_slack_undecided_classification_clears_a_stale_label(monkeypatch):
+    _armed(monkeypatch)
+    bus = FakeBus()
+    d = A.handle_event(_ev("asdkjh qwe zxc"), "k", _deps(bus, client_armed=True))
+    t = bus.tickets[d.ticket_id]
+    assert t["status"] == "hold" and t["escalated"] is True and t["classification"] is None
+    card = _rows(bus, d.ticket_id, A.KIND_ESCALATION)[0]["body"]
+    assert "with the FIXER / team" in card and "waiting on a person" not in card
+
+
+def test_portal_bridge_undelivered_answer_clears_classification_for_the_fixer():
+    from tests.test_portal_escalation_loop import Bus, _ticket
+    import agent.echo_ticket_worker as WW
+    bus = Bus([_ticket()])
+    bus.set_ticket("t-1", classification="answerable_question", status="verification")
+    WW._escalate_unresolved(bus, bus.ticket("t-1"), reason="answer_undelivered_post_failed",
+                            identity_name="echo", log=lambda *a, **k: None)
+    t = bus.tickets["t-1"]
+    assert t["status"] == "hold" and t["escalated"] is True and t["classification"] is None

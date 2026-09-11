@@ -2941,3 +2941,33 @@ volume preflight, jobs, the intake_web mount).
   function that DM'd 36 non-clients in the live incident. `agent.echo_clients` does not exist
   on this branch, so the read is direct. The auditor's `runner.py:1027` item does not
   reproduce: `git diff origin/main...HEAD -- agent/runner.py` is empty on this branch.
+
+### Round 3 (re-audit of PR #107; every item addressed)
+
+* **MAJOR -- an unanswerable question goes to the FIXER, not to a person.** The Slack
+  QUESTION branch with no grounded answer parked the ticket with
+  `classification=answerable_question`, which the FIXER's poll (hold + escalated +
+  classification NULL) skips. It now runs `hold_answer_for_team` with a `needs_review`
+  verdict (`answer_not_groundable`, `card=False` because `question_card` is already the team
+  card, `notice_text=TEMPLATE_NO_ANSWER_YET`): client told, classification NULL, tier in
+  `verification_after.hold`. `echo_ticket_worker._escalate_unresolved` clears
+  `classification` explicitly (the bridge's undelivered-answer path had stamped
+  answerable_question first). The two `cancel_post` parks write `classification=None` --
+  which also removes a latent live fault: `"cancel_post"` is not a value the
+  `support_tickets.classification` CHECK accepts. The ESCALATE branch clears a stale label.
+  Every `status="hold"` write in `agent/slack_convo` + `echo_ticket_worker` and its
+  disposition is tabled in the PR body.
+* **MINOR 1** -- `promises_human_follow_up` treats a third-person named human ("Blake will
+  take a look", "Dean will get back to you", "someone from the team will reach out") as a
+  follow-up promise -> `route_follow_up_promise`, never a plain resolve. The subject must
+  be a capitalised name (case-sensitive `(?-i:...)` group) or a person noun -- "we will
+  take a look" (Dean's conditional) and "your post will follow up the reel" are not.
+* **MINOR 2** -- regex legs: gym_schedule ("class now starts at 9", "closed Monday for
+  Labor Day", "open 7 to noon Saturday", "new hours start Monday"); ad_settings
+  (past-tense paused|changed|raised|lowered|... campaign|budget|ad set|targeting);
+  delete_published split verbs ("take that post down", "pull the post that went live",
+  "took the reel down"), for FIXER rows too; injury advice with no keyword ("ice it and
+  rest", "stretch it out", "push through"). Each string is in the probe-table test, with a
+  negative set proving ordinary Echo sentences ("is the october schedule loaded?", "can you
+  pull the post scheduled for friday") still pass.
+* **MINOR 3** -- `question_card` STATUS reads "hold, escalated, with the FIXER / team".
