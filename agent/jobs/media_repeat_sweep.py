@@ -127,14 +127,20 @@ def _content_print(lib, key):
         return None
 
 
-def _content_prints(lib, keys, lib_names):
-    """The content identities of `keys` that are real files in this library."""
+def _content_prints(lib, keys, lib_names, images_only=False):
+    """The content identities of `keys` that are real files in this library.
+
+    images_only skips keys _fresh_photo could never return anyway (videos, burned
+    cards): hashing a booked 180 MB mp4 to seed an image-only pick is pure cost."""
     out = set()
     for k in keys:
-        if k in lib_names:
-            fp = _content_print(lib, k)
-            if fp:
-                out.add(fp)
+        if k not in lib_names:
+            continue
+        if images_only and os.path.splitext(k)[1].lower() not in _IMG_EXTS:
+            continue
+        fp = _content_print(lib, k)
+        if fp:
+            out.add(fp)
     return out
 
 
@@ -144,8 +150,8 @@ def _cluster_key(lib, key):
     the same photo uploaded twice).
 
     UNCHANGED FROM origin/main on purpose. Everything this briefly tried to infer from a
-    filename now lives in _content_print, so the flag-OFF path is byte-for-byte what it
-    has always been."""
+    filename now lives in _content_print, behind AGENT_MEDIA_DEDUPE_BY_CONTENT, so with
+    both new flags off this module behaves exactly as it always has."""
     try:
         from agent import dam
         rk = dam.rotation_key(os.path.join(lib, key))
@@ -163,7 +169,12 @@ def _fresh_photo(lib, state, exclude):
     used = set(state.keys()) | set(exclude)
     lib_names = media_guard.library_keys(lib)
     used_clusters = {_cluster_key(lib, k) for k in used if k in lib_names}
-    used_prints = _content_prints(lib, used, lib_names)
+    # BEHIND ITS OWN FLAG (independent audit round 6): this changes the DEFAULT path --
+    # where the only spare is a byte-identical copy, OFF swaps it in and calls the date
+    # fixed, ON leaves it and reports a small library. More truthful, but a behavior
+    # change, and CLAUDE.md is explicit that a new capability ships OFF.
+    used_prints = (_content_prints(lib, used, lib_names, images_only=True)
+                   if config.media_dedupe_by_content_enabled() else set())
     for key in sorted(lib_names):
         if key in used:
             continue
@@ -248,7 +259,8 @@ def _blocked_book_state(base, state, current_key):
             return blocked
         seeds = (set(state or {}) | {current_key}) & lib_names
         used_clusters = {_cluster_key(lib, k) for k in seeds}
-        used_prints = _content_prints(lib, seeds, lib_names)
+        used_prints = (_content_prints(lib, seeds, lib_names)
+                       if config.media_dedupe_by_content_enabled() else set())
         for name in lib_names:
             if name in blocked:
                 continue
@@ -523,7 +535,8 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
     follower actually notices -- the same photo twice in a week reads as a bot."""
     detail = [d for d in (result or {}).get("detail") or []
               if "APPROVED duplicate" in d or "LIVE row also carries it" in d
-              or "no unused photo left" in d]
+              or "no unused photo left" in d or "hosting unavailable" in d
+              or "past-dated" in d]
     capped = int((result or {}).get("budget_capped") or 0)
     if not detail and not capped:
         return ""
@@ -610,6 +623,15 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
         lines.append(f"{capped} more day(s) are queued behind tonight's per-gym limit "
                      f"of {DRIVE_FALLBACK_MAX_PER_GYM} and clear on the next runs. "
                      "Nothing more is needed from the gym.")
+    # Named, not silent (independent audit round 6). AGENT_HOSTING_ENABLED defaults
+    # FALSE, so on a default-posture box EVERY swap dies at hosting and this report used
+    # to come back empty while the repeats stood.
+    if any("hosting unavailable" in d for d in detail):
+        lines.append("Some of these could not be re-pointed because media hosting was "
+                     "unavailable on this run. That is ours to fix, not the gym's.")
+    if any("past-dated" in d for d in detail):
+        lines.append("Some sit on dates that have already passed; the expired sweep "
+                     "owns those, not this one.")
     if near:
         lines.append(f"Inside {near_days} days (the ones a follower notices): "
                      + "; ".join(sorted(near)[:4]) + ".")
@@ -795,14 +817,18 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                 result["detail"].append(f"{key} {pd}: no unused photo left "
                                         "(small library; left with spacing)")
                 continue
-            result["detail"].append(
-                f"{key} {pd}: -> {new_key} ({len(fixable)} row(s))"
-                + ("" if apply else " [dry-run]"))
             if not apply:
+                result["detail"].append(
+                    f"{key} {pd}: -> {new_key} ({len(fixable)} row(s)) [dry-run]")
                 result["dates_fixed"] += 1
                 result["rows_repointed"] += len(fixable)
                 state.setdefault(new_key, set()).add((pd, "x"))
                 continue
+            # The "-> new_key" line is appended only once a write has LANDED
+            # (independent audit round 6): announcing it here and then appending
+            # "hosting unavailable; left" below showed the operator a fix that never
+            # happened -- and AGENT_HOSTING_ENABLED defaults FALSE, so on a default
+            # box that is every single swap.
             hosted = ""
             try:
                 from agent import media_host
@@ -853,6 +879,8 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                     result["rows_repointed"] += 1
                     fixed_any = True
             if fixed_any:
+                result["detail"].append(
+                    f"{key} {pd}: -> {new_key} ({len(fixable)} row(s))")
                 result["dates_fixed"] += 1
                 state.setdefault(new_key, set()).add((pd, "x"))
                 try:
@@ -913,7 +941,7 @@ def run(gyms, *, apply=False, horizon=62):
     print(f"\n=== media_repeat_sweep [{mode}] ===")
     print(f"{'gym':<14}{'photos':>7}{'dates_fixed':>12}{'rows':>6}"
           f"{'reburned':>9}{'approved_left':>14}{'small_lib':>10}"
-          f"{'drive_pool':>11}{'capped':>7}")
+          f"{'pool_seen':>11}{'capped':>7}")
     for r in results:
         if r.get("error"):
             print(f"{r['gym']:<14} ERROR {r['error']}")

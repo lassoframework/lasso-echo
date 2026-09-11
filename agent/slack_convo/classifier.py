@@ -149,12 +149,14 @@ _NOT_A_REPEAT_REPORT_RE = re.compile(
     r"accidentally |may have |might have |must have |are going to |am going to |"
     r"gonna |will |plan to |want to )*"
     r"(?:duplicated|duplicate|reused|reuse|re-used|recycled|recycle|repeated|repeat|"
-    r"copied|copy|uploaded|approved|sent|added)\b|"
+    r"copied|copy|uploaded|approved|sent|added|dropped|loaded|pasted|emailed|"
+    r"scheduled|imported|put)\b|"
     r"\b(?:my|our) (?:front desk|desk|coach|coaches|manager|assistant|staff|team|gm|"
     r"wife|husband|partner|kid|kids|son|daughter|intern|owner|trainer|trainers)"
     r"\s+\w*\s*(?:duplicated|uploaded|reused|recycled|copied|sent|added|keeps)\b|"
     r"\brepeat(?:ing)? (?:myself|ourselves|itself)\b|"
-    r"\b(?:accidentally|by accident|my bad|oops|sorry about that|my fault)\b|"
+    r"\b(?:accidentally|by accident|by mistake|my bad|oops|sorry about that|"
+    r"my fault)\b|"
     # 3. thanks, approval, or "already resolved"
     r"\b(?:appreciate)\b|"
     r"\b(?:resolved|all set|all good|no longer an issue|nice work|looks good|"
@@ -164,6 +166,7 @@ _NOT_A_REPEAT_REPORT_RE = re.compile(
     r"(?:us|me)|no big deal|hope that'?s ok|on purpose|intentional|deliberate|"
     r"for continuity)\b|"
     r"\b(?:love|loved|loves|liked|great|perfect|awesome|crushed|working well)\b|"
+    r"\b(?:we|i) (?:like|love|prefer|are fine with|am fine with)\b|"
     # 4. a SCHEDULE, a CHARGE, or a business metric that repeats -- not media
     r"\brepeat (?:customer|customers|client|clients|member|members|business|rate)\b|"
     r"\bduplicate (?:charge|charges|payment|payments|invoice|billing|bill|"
@@ -194,6 +197,45 @@ _CLAUSE_SPLIT_RE = re.compile(
     r"\s+(?:but|however|though|although|except)\s+|[;\n]+", re.IGNORECASE)
 
 
+# A REPORT says who/when/that-it-is-still-happening. An INSTRUCTION does not.
+#
+# Independent audit round 6: the veto list could not keep up with bare imperatives --
+# "Put the duplicate graphic on Thursday's post too", "Stick with the same caption on
+# the story", "Use that same picture again for the Friday reel". 16 of 20 imperatives
+# dispatched a fixer request. Enumerating benign shapes is a losing game: a leading-verb
+# veto also eats "Repeat photos again this week on the posts", which IS a complaint.
+#
+# So this inverts the test. On top of _REPEAT_RE + a domain noun, the clause must carry
+# a POSITIVE report signal: someone other than the client doing it (you / echo / it),
+# the client's OWN book as the subject (my posts, my calendar), a persistence marker
+# (still, again, keeps, there are, back on, showing up), or a date. Every genuine
+# complaint in five rounds of corpora carries one; an instruction carries none.
+_REPORT_SIGNAL_RE = re.compile(
+    # 1. someone OTHER than the client is doing it -- including the book itself
+    r"\b(?:you|you'?re|youre|echo|it'?s|its|it is|they|the system|the calendar|"
+    r"the feed|the queue|the book|the images?|the photos?|the pics?|the pictures?|"
+    r"the posts?|the reels?|the clips?|the videos?|the footage|the captions?)\s+"
+    r"(?:\w+\s+){0,3}?"
+    r"(?:repeat|repeats|repeated|repeating|reuse|reused|reusing|duplicate|duplicated|"
+    r"duplicating|recycled|recycling|used|using|put|putting|posted|scheduled)\b|"
+    # 2. the client's OWN book is the SUBJECT ("my posts are repeating")
+    r"\b(?:my|our) (?:posts?|reels?|calendar|images?|photos?|pics?|pictures?|videos?|"
+    r"clips?|footage|feed|story|stories|book|queue)\b|"
+    # 3. it is STILL happening / it is THERE -- never how an instruction reads
+    r"\b(?:still|keeps|kept|back on|(?:are|is|were|was) back|showing up|showed up|"
+    r"shows up|"
+    r"there (?:are|is|were|was)|noticed|why (?:is|are|do|does|did))\b|"
+    # 4. a run of days, and numeric dates. Bare weekday names are deliberately NOT
+    #    here: an instruction schedules with them constantly ("Post the same clip
+    #    again on Friday"), so they carry no report signal at all.
+    r"\b(?:\d+|two|three|four|five|several) (?:days|weeks|times) in a row\b|"
+    r"\b(?:is|are|sits?|sitting) on \w+ (?:posts?|days?|dates?)\b|"
+    r"\bon (?:\d+|two|three|four|five|several|multiple|different) "
+    r"(?:posts?|days?|dates?)\b|"
+    r"\b\d{1,2}\s*/\s*\d{1,2}\b"
+    , re.IGNORECASE)
+
+
 def is_repeat_report(text):
     """True when this reads as a CLIENT REPORTING duplicate media, not asking about it,
     instructing us to reuse something, or thanking us. Pure and deterministic."""
@@ -207,6 +249,10 @@ def is_repeat_report(text):
         if not (_DOMAIN_RE.search(clause) or _MEDIA_NOUN_RE.search(clause)):
             continue
         if _NOT_A_REPEAT_REPORT_RE.search(clause):
+            continue
+        # A REPORT, not an instruction: something must say who, when, or that it is
+        # still happening. See _REPORT_SIGNAL_RE.
+        if not _REPORT_SIGNAL_RE.search(clause):
             continue
         return True
     return False

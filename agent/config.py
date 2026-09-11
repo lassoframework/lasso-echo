@@ -4249,6 +4249,32 @@ def slack_repeat_code_fix_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_SLACK_REPEAT_CODE_FIX", "false"))
 
 
+def media_dedupe_by_content_enabled() -> bool:
+    """The repeat sweep refuses a replacement that is BYTE-IDENTICAL to a photo already
+    on the book (AGENT_MEDIA_DEDUPE_BY_CONTENT, default OFF).
+
+    A library often holds the same picture twice under two names -- "IMG_6771.jpg" and
+    "IMG_6771 (1).jpg" from a re-upload or a Drive sync. Without this, the sweep can
+    "fix" a repeat by swapping in a byte-identical copy of the very photo it is
+    replacing: the ledger says fixed, the gym still sees the same image. That is John
+    Weeks' complaint with extra steps.
+
+    OFF is the pre-existing behavior EXACTLY (a name-based near-dupe check only). ON
+    adds a size+sha256 comparison, cached by (path, mtime, size).
+
+    THE HONEST TRADE, because this one cuts both ways: when the only spare photo IS a
+    byte-identical copy, OFF swaps it in and reports the date fixed (a false fix), while
+    ON leaves the date alone and reports a small library (true, but the repeat stands
+    and the gym gets an 'add photos' digest that will not help). ON is more truthful;
+    neither is a fix. Three rounds of independent audit were spent trying to infer this
+    from FILENAMES instead, and every version either missed real copies or collapsed
+    distinct photos and starved the library. Content is the only reliable signal, and a
+    re-encoded near-dupe still slips past it.
+
+    Arm by hand: AGENT_MEDIA_DEDUPE_BY_CONTENT=true."""
+    return _truthy(os.environ.get("AGENT_MEDIA_DEDUPE_BY_CONTENT", "false"))
+
+
 def media_repeat_sweep_drive_enabled() -> bool:
     """The nightly repeat sweep may replace a repeat from the gym's CONNECTED DRIVE
     POOL, not only from its local uploads (AGENT_MEDIA_REPEAT_SWEEP_DRIVE, default OFF).

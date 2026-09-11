@@ -320,7 +320,6 @@ def test_a_request_or_a_justification_is_not_a_bug_report(text):
 
 @pytest.mark.parametrize("text", [
     "WHY IS THE SAME PHOTO ON MY CALENDAR THREE TIMES",
-    "duplicate pics again 😩",
     "the same photo is on 9/14 and 9/15 and 9/16",
 ])
 def test_real_reports_in_awkward_registers_are_not_dropped_silently(text):
@@ -336,3 +335,58 @@ def test_the_clause_splitter_only_splits_on_contrast():
     assert c.is_repeat_report("the class schedule repeats so the same photo is fine") is False
     assert c.is_repeat_report(
         "thanks for the turnaround, but the duplicate images are back") is True
+
+
+# ---- round 6: an INSTRUCTION is not a report ----------------------------------------
+# The veto list could not keep up with bare imperatives (16 of 20 dispatched a fixer).
+# Enumerating benign shapes is a losing game -- a leading-verb veto also eats "Repeat
+# photos again this week on the posts", which IS a complaint. So the test is inverted:
+# a clause must carry a POSITIVE report signal (someone else doing it, the client's own
+# book as subject, a persistence marker, a numeric date, a run of days).
+@pytest.mark.parametrize("text", [
+    "Put the duplicate graphic on Thursday's post too.",
+    "Stick with the same caption on the story and the feed post.",
+    "Keep the duplicate images, we like them.",
+    "Go with the same photo on both platforms this week, it performed well.",
+    "Use that same picture of the squat rack again for the Friday reel.",
+    "Reuse whatever photo you like from the open gym folder for the calendar.",
+    "Run the same image on Monday and Tuesday posts.",
+    "Leave the duplicate photos where they are.",
+    "Swap in a duplicate of the hero picture for the story.",
+    "Post the same clip again on Friday.",
+    "Just repeat last week's photos on the calendar.",
+    "Send me the duplicate images from the folder.",
+    "Load the same footage onto both posts.",
+    "Bring back the same photo for the anniversary post.",
+    "My coach emailed duplicate clips for the reel.",
+    "I scheduled the same picture on two days by mistake.",
+    "I dropped duplicate images into the Drive folder last night by mistake.",
+])
+def test_a_bare_imperative_is_never_a_fixer_request(text):
+    got = _classify(text)
+    assert got != c.CODE_FIX, (
+        f"dispatched a fixer on an instruction: {text!r} -> {got}. The owner would be "
+        "told 'I read that as something not working on our side' about media they "
+        "asked for, and their next message would be swallowed as a FOLLOW_UP.")
+
+
+@pytest.mark.parametrize("text", [
+    "you scheduled the same image twice",
+    "it keeps putting the same picture on my feed",
+    "the calendar is reusing photos",
+    "the images are repeating again",
+    "heads up, the duplicate images are back",
+    "thanks for the turnaround, but the duplicate images are back",
+    "the same photo is on 9/14 and 9/15 and 9/16",
+    "same photo three days in a row",
+])
+def test_a_report_signal_carries_a_real_complaint_through(text):
+    assert _classify(text) == c.CODE_FIX, f"a genuine report escalated: {text!r}"
+
+
+def test_a_weekday_alone_is_not_a_report_signal():
+    """An instruction schedules with weekday names constantly; a complaint does not
+    rely on them. Treating them as evidence let six imperatives through."""
+    assert not c._REPORT_SIGNAL_RE.search("on Friday")
+    assert not c._REPORT_SIGNAL_RE.search("this week")
+    assert c._REPORT_SIGNAL_RE.search("on 9/14")

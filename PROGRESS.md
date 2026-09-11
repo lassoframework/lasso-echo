@@ -4662,3 +4662,48 @@ reintroduces the "how often do posts repeat?" false positive. Flag OFF proven id
 to origin/main across 180 sentence x identity x ticket-state combinations: 0 diffs.
 Fuzzed 3,000 random strings plus 45 crafted backtracking inputs across every new regex:
 worst single match 6.6ms.
+
+## Audit round 6 (2026-09-11): B, no criticals. Three majors, one of them the flag rule.
+
+Round 6 confirmed the end-to-end a third time through the REAL picker (9/14 -> v018,
+9/15 -> v019, 9/16 -> v020, all three rows per day moving together) and found no ship
+blockers. Three majors, all closed:
+
+- [~] **The classifier could not tell an instruction from a report.** 16 of 20 bare
+  imperatives dispatched a fixer request: "Put the duplicate graphic on Thursday's post
+  too", "Stick with the same caption on the story", "Keep the duplicate images, we like
+  them". Five rounds of adding vetoes was the wrong shape -- a leading-verb veto also
+  eats "Repeat photos again this week on the posts", which IS a complaint. So the test
+  is INVERTED: `_REPORT_SIGNAL_RE` requires a clause to carry a positive report signal
+  (someone other than the client doing it, the client's own book as the subject, a
+  persistence marker like still/keeps/are back/showing up, a numeric date, or a run of
+  days). Weekday names are deliberately NOT a signal -- an instruction schedules with
+  them constantly, and treating them as evidence let six imperatives through.
+  **Measured: precision 57/57, recall 22/22** across every corpus from all six rounds.
+- [~] **Flag OFF was not byte-for-byte origin/main, and the code claimed it was.** The
+  content dedupe in `_fresh_photo` was unflagged, and it changes the default path: where
+  the only spare is a byte-identical copy, OFF swaps it in and reports the date fixed,
+  ON leaves it and reports a small library. ON is more truthful; neither is a fix. That
+  is Blake's call, not the code's, so it is now `AGENT_MEDIA_DEDUPE_BY_CONTENT`,
+  default OFF, and the docstrings state the delta instead of denying it.
+- [~] **`unfixable_report` returned "" while real repeats stood.** The detail filter
+  admitted three phrases and missed "hosting unavailable; left" and "past-dated" --
+  and `AGENT_HOSTING_ENABLED` defaults FALSE, so on a default-posture box EVERY local
+  swap dies at hosting and the client-readable report came back empty. Both now have
+  their own sentence, and the "-> new photo" line is appended only after a write has
+  LANDED (it used to print before hosting was attempted, showing an operator a fix that
+  never happened).
+
+Minors closed: `media_guard._library_hash` now hashes in 1 MB chunks (it read whole
+files: 314 MB peak on one 300 MB clip, and the sweep drives it per library file inside
+the nightly draft run); `_content_prints` skips keys `_fresh_photo` could never return
+anyway; the ops table header names the column it actually prints.
+
+### Known limitation, accepted and measured
+
+Two report shapes reach a HUMAN rather than the fixer: a complaint phrased as a question
+("WHY IS THE SAME PHOTO ON MY CALENDAR THREE TIMES") goes to the answer lane, and a bare
+fragment with no report signal ("duplicate pics again") escalates. Both are the SAFE
+direction and neither is worse than today, where every one of these escalates. Chasing
+them reintroduces false positives on instructions, which cost a wrong ACK plus a
+swallowed conversation.

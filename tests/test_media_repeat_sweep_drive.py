@@ -37,6 +37,7 @@ REPEATED = "IMG_6771.jpg"
 @pytest.fixture(autouse=True)
 def _env(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", raising=False)
+    monkeypatch.delenv("AGENT_MEDIA_DEDUPE_BY_CONTENT", raising=False)
     monkeypatch.setenv("AGENT_MEDIA_REPEAT_WINDOW_DAYS", "30")
     lib = tmp_path / "lib"
     lib.mkdir()
@@ -693,6 +694,7 @@ def _write(lib, names, data):
     "totally_unrelated_name.jpg",          # the name is irrelevant; the bytes are not
 ])
 def test_a_byte_identical_copy_is_never_offered_as_fresh(dupe, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_MEDIA_DEDUPE_BY_CONTENT", "true")
     lib = tmp_path / "dupes"
     lib.mkdir()
     _write(lib, [REPEATED, dupe], _DUPE_BYTES)
@@ -728,6 +730,7 @@ def test_a_visually_distinct_library_is_never_starved(lib_names, tmp_path, monke
 def test_the_near_dupe_widening_leaves_unrelated_photos_available(tmp_path, monkeypatch):
     """_blocked_book_state must block the copies of what is on the book, not the
     library."""
+    monkeypatch.setenv("AGENT_MEDIA_DEDUPE_BY_CONTENT", "true")
     lib = tmp_path / "mixed"
     lib.mkdir()
     _write(lib, [REPEATED, "IMG_6771 (1).jpg"], _DUPE_BYTES)
@@ -772,6 +775,7 @@ def test_fresh_photo_stays_fast_on_a_large_library(tmp_path, monkeypatch):
 def test_the_default_lane_never_swaps_a_repeat_for_its_own_copy(monkeypatch, tmp_path):
     """Flag OFF, the production default. _fresh_photo must refuse IMG_6771 (1).jpg."""
     monkeypatch.delenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", raising=False)
+    monkeypatch.setenv("AGENT_MEDIA_DEDUPE_BY_CONTENT", "true")
     lib = tmp_path / "copies"
     lib.mkdir()
     for n in (REPEATED, "IMG_6771 (1).jpg"):
@@ -1079,3 +1083,42 @@ def test_a_drive_pick_is_credited_to_the_drive_folder(monkeypatch):
 
 def test_swap_from_drive_pool_reports_its_source():
     assert mrs._swap_from_drive_pool.__doc__ and "SOURCE" in mrs._swap_from_drive_pool.__doc__
+
+
+def test_content_dedupe_is_off_by_default(tmp_path, monkeypatch):
+    """CLAUDE.md: a new capability ships behind a flag that defaults OFF. With it off
+    the sweep behaves exactly as origin/main did -- including, honestly, swapping in a
+    byte-identical copy and calling the date fixed. That is the trade Blake arms or
+    does not arm; the code must not decide it silently."""
+    monkeypatch.delenv("AGENT_MEDIA_DEDUPE_BY_CONTENT", raising=False)
+    lib = tmp_path / "copies"
+    lib.mkdir()
+    for n in (REPEATED, "spare_copy.jpg"):
+        (lib / n).write_bytes(b"\xff\xd8\xff" + b"A" * 5000)
+    monkeypatch.setattr(mrs, "_is_real_image", lambda path: True)
+    got, _ = mrs._fresh_photo(str(lib), {REPEATED: {("2026-09-13", "x")}},
+                              exclude={REPEATED})
+    assert got == "spare_copy.jpg", "flag OFF must be the pre-existing behavior"
+
+
+def test_a_hosting_failure_is_never_printed_as_a_fix(monkeypatch, tmp_path):
+    """The '-> new_key' line used to be appended BEFORE the write, so a hosting failure
+    showed the operator a fix that never happened -- and AGENT_HOSTING_ENABLED defaults
+    FALSE, so on a default box that is every swap."""
+    monkeypatch.delenv("AGENT_HOSTING_ENABLED", raising=False)
+    lib = tmp_path / "lib2"
+    lib.mkdir()
+    for n in (REPEATED, "spare.jpg"):
+        (lib / n).write_bytes(b"\xff\xd8\xff" + bytes([hash(n) % 251]) * 5000)
+    monkeypatch.setattr(mrs, "_lib_dir", lambda base: str(lib))
+    monkeypatch.setattr(mrs, "_is_real_image", lambda path: True)
+    monkeypatch.setattr("agent.media_swap.after_swap", lambda *a, **k: None)
+    import datetime
+    store = _Store(_book())
+    res = mrs.sweep_gym(GYM, store, apply=True, today=datetime.date(2026, 9, 11))
+    assert store.swaps == []
+    assert not any("-> spare.jpg" in d for d in res["detail"]), \
+        f"announced a fix that never landed: {res['detail']}"
+    assert any("hosting unavailable" in d for d in res["detail"])
+    # and it is no longer SILENT to the client
+    assert "media hosting was unavailable" in mrs.unfixable_report(res)

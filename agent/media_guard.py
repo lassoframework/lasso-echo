@@ -86,8 +86,14 @@ def _library_hash(path):
     if h is None:
         import hashlib
         try:
+            # CHUNKED (independent audit round 6): fh.read() pulled a whole file into
+            # memory -- 314 MB peak on one 300 MB clip -- and media_repeat_sweep now
+            # drives this per library file on the nightly path, inside the draft run.
+            digest = hashlib.sha256()
             with open(path, "rb") as fh:
-                h = hashlib.sha256(fh.read()).hexdigest()[:12]
+                for block in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(block)
+            h = digest.hexdigest()[:12]
         except OSError:
             return None
         _hash_cache[ck] = h
