@@ -435,11 +435,42 @@ def all_accounts():
     return list(ACCOUNTS) + _dynamic_accounts()
 
 
-def register_gym(base, *, name="", ig_handle="", fb_page="", gym_id=None):
+def _refuse_non_client(base, gym_id, door):
+    """ONE alert per (base) ever about a refused registration, then silence: the
+    refusal itself is the fix, and the alert only says which door tried."""
+    try:
+        from . import db as _db, ops_alerts
+        stamp = f"register_refused_{base}"
+        if _db.kv_get(stamp, ""):
+            return
+        ops_alerts.alert(
+            f"register_gym REFUSED '{base}' (gym_id {gym_id or '?'}) via {door}: not an "
+            "Echo client (no echo_gym_settings / echo_social_intake / social product / "
+            "echo_standalone plan marker). Nothing was written. If this gym really bought "
+            "Echo, onboard it from the portal's Echo button so the marker exists first.")
+        _db.kv_set(stamp, "1")
+    except Exception:  # noqa: BLE001 - the refusal never fails on its own alert
+        pass
+
+
+def register_gym(base, *, name="", ig_handle="", fb_page="", gym_id=None,
+                 own_submission=False, door="register_gym"):
     """Persist one client gym to the dynamic registry so its Account records resolve
     without hand-editing accounts.py. Idempotent (a re-register updates in place).
     No-op returning [] when AGENT_DYNAMIC_ACCOUNTS is OFF. Returns the account keys
     now resolvable for this gym. Tokens are NEVER written here (env, by hand).
+
+    ECHO CLIENTS ONLY (2026-09-11, round 2 ruling). This is THE place registry rows are
+    created, so it is gated on the Echo client universe (echo_clients.is_echo_client by
+    gym_id or by base): a gym that carries no Echo marker is refused -- [] is returned,
+    one ops alert per base names the door, nothing is written. `own_submission=True` is
+    the ONE exemption: the caller asserts this registration was driven by the GYM'S OWN
+    intake submission, made under the gym's own signed token (intake_ingest's landed
+    form, social_intake_reader's echo_social_intake row), so `base` IS the submitting
+    gym's key by construction. Such a submission is itself an Echo marker (the
+    echo_social_intake row), so the exemption only matters in the window before that
+    row is readable. onboarding_watch.autoregister must NOT pass it: it is a fleet sweep,
+    not a submission, and it is the door the incident came through.
 
     gym_id: optional, the gym's STABLE portal UUID, when the caller has one. THE
     STRUCTURAL GUARD against the Sunnyside/Swift River class (2026-08-31): those two
@@ -467,6 +498,11 @@ def register_gym(base, *, name="", ig_handle="", fb_page="", gym_id=None):
     if not base or not config.dynamic_accounts_enabled():
         return []
     gym_id = (str(gym_id) if gym_id is not None else "").strip()
+    if not own_submission:
+        from . import echo_clients
+        if not (echo_clients.is_echo_client(gym_id) or echo_clients.is_echo_client(base)):
+            _refuse_non_client(base, gym_id, door)
+            return []
     path = config.gym_registry_path()
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -520,6 +556,48 @@ def register_gym(base, *, name="", ig_handle="", fb_page="", gym_id=None):
         os.replace(tmp, path)
     _dynamic_cache = None   # invalidate so the new gym resolves immediately
     return [f"{base}_ig", f"{base}_fb"]
+
+
+def remove_gyms(bases, *, backup_dir=None):
+    """Remove the given bases from the dynamic registry. LOCKED read-modify-write with the
+    same atomic replace register_gym uses, plus a timestamped .bak copy of the file as it
+    was (in `backup_dir` when given, else beside the registry). Returns the removed rows.
+
+    THE ONLY CALLER is echo_clients_cleanup (2026-09-11), which computes the list from
+    the Echo client universe and never passes a hardcoded ACCOUNTS base or a client.
+    This function does not re-check that: it removes exactly what it is told, so the
+    decision stays in one place and is testable there. A corrupt registry RAISES
+    (RegistryUnreadable) rather than being treated as empty and saved over."""
+    global _dynamic_cache
+    import shutil
+    import time as _time
+    from . import config
+    wanted = {(b or "").strip() for b in (bases or []) if (b or "").strip()}
+    if not wanted:
+        return []
+    path = config.gym_registry_path()
+    with _registry_lock(path):
+        rows = _load_registry_rows(strict=True)
+        removed = [r for r in rows if (r.get("base") or "").strip() in wanted]
+        if not removed:
+            return []
+        keep = [r for r in rows if (r.get("base") or "").strip() not in wanted]
+        stamp = _time.strftime("%Y%m%dT%H%M%S")
+        bak_dir = backup_dir or (os.path.dirname(path) or ".")
+        os.makedirs(bak_dir, exist_ok=True)
+        try:
+            shutil.copy2(path, os.path.join(bak_dir,
+                                            f"{os.path.basename(path)}.bak-{stamp}"))
+        except OSError:
+            pass   # the registry may not exist yet on disk; nothing to back up
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(keep, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    _dynamic_cache = None
+    return removed
 
 
 def active_accounts():
