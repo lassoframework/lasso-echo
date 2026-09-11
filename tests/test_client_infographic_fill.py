@@ -114,6 +114,35 @@ def test_fills_empty_days_with_pending_infographic_rows(monkeypatch):
         assert len(r.get("caption") or "") >= 40           # a real caption, not a stub
 
 
+def test_every_inserted_row_carries_the_client_safe_review_mark(monkeypatch):
+    """PRODUCTION INCIDENT (2026-09-11): rows this lane inserted before the mark
+    existed reached crossfitnewtown, district_h, toughtemple52040e and
+    crossfitreverb30b5b2 unmarked -- 3 of them were already status='approved' and
+    would have cleared calendar_autopublish's CLIENT-SAFE REVIEW HARD BLOCK
+    (agent/calendar_autopublish.py) silently, since that block trusts the pillar
+    string alone. Every row fill_gaps() ever inserts MUST carry the mark, no
+    exceptions -- this is the regression test for the fix at
+    agent/client_infographic_fill.py's Draft(... category=_with_review_mark(...)).
+    Fails on revert: swap that call back to the pre-fix
+    `getattr(source, "category", "") or "educational"` and every assertion below
+    fails."""
+    _sources()
+    _stub_pipeline(monkeypatch)
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00")
+    assert out["ok"] is True and out["filled"] > 0
+    assert store.inserted, "the fixture must actually exercise an insert"
+    for r in store.inserted:
+        pillar = r.get("pillar") or r.get("category") or ""
+        assert pillar.endswith(cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX), (
+            f"unmarked row would silently clear the autopublish hard block: {r!r}")
+        # the mark is a SUFFIX, not a replacement: the source's real taxonomy
+        # category must still be legible to a human reviewer at a glance.
+        base = pillar[: -len(cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX)]
+        assert base in ("educational", "service"), base
+
+
 def test_days_with_existing_feeds_are_never_touched(monkeypatch):
     _sources()
     _stub_pipeline(monkeypatch)
