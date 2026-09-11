@@ -260,6 +260,16 @@ Now the FALLBACK engine. Everything below is unchanged.
 Per-account routing is NOT an env var: it is the `publish_route` field on the
 Account record in `agent/accounts.py` ("meta_direct" default, or "socialapi").
 
+## Cross-day media repeats (one photo must not sit on several days)
+
+| Var | Default | Owner | Notes |
+|---|---|---|---|
+| AGENT_MEDIA_CROSS_DAY_GUARD | true | code | STAGE-time guard (`agent/media_guard.py`): a photo already on the gym's forward book is never planned onto another day. OFF restores pre-guard behavior (emergency only). |
+| AGENT_MEDIA_REPEAT_WINDOW_DAYS | 30 | code | Trailing PUBLISHED window the guard also blocks against. Clamped 0..120. |
+| AGENT_MEDIA_REPEAT_SWEEP | true | code | The nightly counterpart (`agent/jobs/media_repeat_sweep.py`) for rows ALREADY on the book. Never touches published/publishing, never swaps an APPROVED row. |
+| AGENT_MEDIA_REPEAT_SWEEP_DRIVE | false | BLAKE | Lets that sweep replace a repeat from the gym's CONNECTED DRIVE POOL, not just its local uploads. Without it a gym whose stills are all on the book is reported "small library" and its repeats are left standing even with hundreds of unused Drive clips (John Weeks / Tough Temple, 2026-09-11). Arm by hand. |
+| AGENT_MEDIA_REPEAT_REPORT | false | BLAKE | Raises ONE client-readable line per gym per month naming the repeats the sweep deliberately did NOT fix. Arm by hand. |
+
 ## Previously read in code but documented nowhere (now closed)
 
 - **META_APP_ID / META_APP_SECRET** — the token watchdog's debug_token app

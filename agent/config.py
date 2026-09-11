@@ -4225,6 +4225,34 @@ def media_repeat_sweep_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_SWEEP", "true"))
 
 
+def media_repeat_sweep_drive_enabled() -> bool:
+    """The nightly repeat sweep may replace a repeat from the gym's CONNECTED DRIVE
+    POOL, not only from its local uploads (AGENT_MEDIA_REPEAT_SWEEP_DRIVE, default OFF).
+
+    John Weeks / Tough Temple, 2026-09-11. PR #98 taught the MONTH BUILD to stage from
+    the Drive pool, so new months stopped repeating. The nightly sweep
+    (agent/jobs/media_repeat_sweep.py) was never taught the same pool: its replacement
+    picker (_fresh_photo) reads the LOCAL library only, images only. A gym whose local
+    stills are all on the book is therefore reported as a SMALL LIBRARY and its repeats
+    are left in place -- while 57 eligible, never-used Drive clips sit unused. That is
+    why rows already on Tough Temple's calendar still repeated after the build fix
+    merged: the build never touches a row it did not just create, and the sweep that
+    exists for exactly those rows could not reach the media.
+
+    ON: when no unused local image is left, the sweep asks the SAME engine the portal's
+    edit-image button uses (media_swap.pick_replacement), which draws from the local
+    library AND the Drive pool with every guard already in place -- eligibility, the
+    90-day cooldown, tenant isolation, nothing already on the book. The sweep's own
+    rails are untouched: published / publishing rows are never touched, an APPROVED
+    row's media is never swapped (the gym approved that exact card), the write is still
+    the status-guarded swap_media, and a gym with neither a local photo nor a Drive
+    asset is still reported as a small library rather than given fabricated media.
+
+    Default OFF because reaching a new media pool is a new capability. Arm by hand:
+    AGENT_MEDIA_REPEAT_SWEEP_DRIVE=true."""
+    return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "false"))
+
+
 def plan_horizon_sweep_enabled() -> bool:
     """The RETIREMENT counterpart of the planning-horizon cap
     (AGENT_PLAN_HORIZON_SWEEP, default ON).

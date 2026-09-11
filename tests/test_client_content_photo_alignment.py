@@ -147,3 +147,83 @@ def test_make_caption_without_creative_has_no_scene_hint(monkeypatch):
     client_content.make_caption(_acct(), _Source("We help members win."),
                                 _voice(), "key1")  # no creative
     assert "scene hint" not in seen["note"].lower()
+
+
+# ---- ISSUE 2 (Dean, CrossFit Reverb, 2026-09-10): captions inventing an enrollment/
+# urgency frame around a completed past program, and personalizing a child onto an
+# ungrounded photo. Real source text pulled from crossfitreverb30b5b2_ig's own
+# approved client_sources rows. ---------------------------------------------------
+
+_REVERB_CHALLENGE_SOURCE = (
+    "Members who completed CrossFit Reverb's 6-week Clean & Lean Nutrition "
+    "Challenge (real whole foods, no restrictive diets) reported more energy, "
+    "better sleep, and steadier moods.")
+_REVERB_SEMINAR_SOURCE = (
+    "CrossFit Reverb's nutrition seminar (June 27, 2026) taught members to eat "
+    "meat and vegetables, nuts and seeds, some fruit, little starch, and no sugar.")
+_REVERB_KIDS_SOURCE = "Kids Classes"
+
+
+def _sb7_returning(monkeypatch, text):
+    class _FakeSB7:
+        def build(self, voice, creative, account=None, avoid_openings=(), angle="",
+                  avoid_angles=(), **kw):
+            return (text, ["#Fit"], [])
+    import agent.drafter as drafter
+    monkeypatch.setattr(drafter, "StoryBrandGenerator", _FakeSB7)
+    monkeypatch.setattr(client_content.config, "sb7_enabled", lambda: True)
+
+
+def test_completed_challenge_never_becomes_join_now(monkeypatch):
+    # the real Dean/Reverb defect: a COMPLETED past challenge rewritten as an open
+    # enrollment CTA that does not exist.
+    _sb7_returning(monkeypatch, "Join our 6-week challenge with 1-on-1 coaching "
+                               "starting Monday!")
+    cap, _tags = client_content.make_caption(
+        _acct(), _Source(_REVERB_CHALLENGE_SOURCE), _voice(), "key1")
+    # fell back to the safe baseline; the invented CTA never shipped
+    assert "join our" not in cap.lower()
+    assert "starting monday" not in cap.lower()
+
+
+def test_seminar_never_becomes_last_week(monkeypatch):
+    # the seminar happened 2026-06-27; "last week" (or "recently") relative to any
+    # later post date is a fabricated timeframe the source never states.
+    _sb7_returning(monkeypatch, "Last week our nutrition seminar showed members "
+                               "the difference between real food and processed junk.")
+    cap, _tags = client_content.make_caption(
+        _acct(), _Source(_REVERB_SEMINAR_SOURCE), _voice(), "key1")
+    assert "last week" not in cap.lower()
+
+
+def test_temporal_phrase_ships_when_the_source_actually_says_it(monkeypatch):
+    # not a blanket ban on the phrase -- only when the SOURCE does not support it.
+    source_text = "Join our free intro this week, no commitment required."
+    _sb7_returning(monkeypatch, "Join our free intro this week, no commitment required.")
+    cap, _tags = client_content.make_caption(
+        _acct(), _Source(source_text), _voice(), "key1")
+    assert "this week" in cap.lower()
+
+
+def test_kids_personalization_blocked_without_photo_grounding(monkeypatch):
+    # the real Dean/Reverb defect: "your kid" copy paired with a photo that has no
+    # note, no filename signal, and no vision confirmation of a child in frame.
+    _sb7_returning(monkeypatch, "Your kid's asking what you do at the gym. Bring "
+                               "them next time.")
+    creative = _Creative("ShotbyBobby-082.jpg")  # no client_note: a raw Drive filename
+    cap, _tags = client_content.make_caption(
+        _acct(), _Source(_REVERB_KIDS_SOURCE), _voice(), "key1", creative=creative)
+    assert "your kid" not in cap.lower()
+    # the baseline still states the real fact (Kids Classes), just never personalized
+    assert "kids classes" in cap.lower()
+
+
+def test_kids_personalization_ships_when_photo_note_confirms_it(monkeypatch):
+    # unchanged from the existing ENG alignment fix: a real client-provided note
+    # naming the subject is legitimate grounding, not fabrication.
+    _sb7_returning(monkeypatch, "Your kid's confidence is built right here.")
+    creative = _Creative("20260810T165039Z_Youth_Wall_Sit_w_smiles.jpg",
+                         client_note="Youth fitness fun with smiles")
+    cap, _tags = client_content.make_caption(
+        _acct(), _Source(_REVERB_KIDS_SOURCE), _voice(), "key1", creative=creative)
+    assert "your kid" in cap.lower()
