@@ -460,7 +460,21 @@ def make_caption(account, source, voice, creative_key, creative=None,
                 **({"form_plan": form_plan} if form_plan else {}))
             cap = (cap or "").strip()
             if cap and cap.lower() != (getattr(source, "text", "") or "").strip().lower():
-                return filter_platform_copy(cap).strip(), tags
+                cleaned = filter_platform_copy(cap).strip()
+                # OUTPUT-SIDE GATE (Dean/Reverb, 2026-09-10): is_gate_clean only ever
+                # checked the SOURCE sentence, which is an approved claim by construction
+                # and so always passed -- the LLM's own caption was never re-checked. A
+                # caption that invents an enrollment/urgency frame not in the source, or
+                # personalizes a child onto an ungrounded photo, is a fabrication and
+                # falls back to compose_caption (the deterministic, source-verbatim,
+                # always-safe baseline) instead of shipping.
+                if rotation.caption_output_gate_clean(
+                        cleaned, getattr(source, "text", ""), verified=verified,
+                        photo_hint=hint):
+                    return cleaned, tags
+                print(f"[client-caption] SB7 output failed the fabrication gate for "
+                      f"{account.key} (invented urgency/enrollment or an ungrounded "
+                      "child claim); using the baseline")
         except Exception as exc:  # noqa: BLE001 - never block on the LLM
             print(f"[client-caption] SB7 failed for {account.key} "
                   f"({type(exc).__name__}); using the baseline")

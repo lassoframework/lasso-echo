@@ -322,6 +322,7 @@ def _status():
     print(f"  cross_gym_brain: {config.cross_gym_brain_enabled()}  (env AGENT_CROSS_GYM_BRAIN; WEEKLY fleet rollup of post_metrics into FORM statistics (Welch t + Benjamini Hochberg, sample floor 6, >= 2 gyms per cell) plus the BEST POST digest (top decile, Fisher exact, or an honest 'not distinguishable'), read only + append only cross_gym_brain row, form only by whitelist, default OFF)")
     print(f"  horizon_sweep  : {config.plan_horizon_sweep_enabled()}  (env AGENT_PLAN_HORIZON_SWEEP; nightly retirement of pending rows already past today+{config.plan_horizon_days()} — the belt's retroactive counterpart, exempt dated lanes kept, default ON)")
     print(f"  media_repeat   : {config.media_repeat_sweep_enabled()}  (env AGENT_MEDIA_REPEAT_SWEEP; nightly cross-day same-photo sweep, published/approved rows never touched, default ON)")
+    print(f"  repeat_drive   : {config.media_repeat_sweep_drive_enabled()}  (env AGENT_MEDIA_REPEAT_SWEEP_DRIVE; that sweep may replace a repeat from the gym's CONNECTED DRIVE POOL, not just local uploads, default OFF)")
     print(f"  media_rpt_left : {config.media_repeat_report_enabled()}  (env AGENT_MEDIA_REPEAT_REPORT; say out loud the cross-day photo repeats the sweep deliberately LEAVES (approved rows, small library) instead of only counting them, default OFF)")
     print(f"  reply_watch    : {config.reply_engine_watch_enabled()}  (env AGENT_REPLY_ENGINE_WATCH; read-only watchdog over echo_reply_accounts / settings / queue vs gym_social_accounts, names unmapped gyms + stalled ingest, writes nothing, default OFF)")
     print(f"  media_swap_free: {config.media_swap_free_enabled()}  (env ECHO_MEDIA_SWAP_FREE; a client photo swap is FREE and unlimited, only a caption recreate costs one of 15, default OFF)")
@@ -897,7 +898,9 @@ _COMMANDS = {
         ("onboard-client / add-client", "scaffold a new client account"),
         ("onboard-verify", "check onboarding completeness for one or all gyms"),
         ("gym-store-sync", "reconcile this service's gyms table with the shared echo_gyms record (--apply)"),
-        ("onboarding-audit", "fleet readiness: every gym the PORTAL knows, and what blocks it posting"),
+        ("onboarding-audit", "fleet readiness: every ECHO CLIENT gym the portal knows, and what blocks it posting"),
+        ("echo-clients", "the Echo client universe (echo_gym_settings): counts + every client key/alias; NOT echo_intake_tokens"),
+        ("echo-clients-cleanup", "list (default) or archive (--apply) registry rows, brand_voice/<key>, content_library/<key>, echo_gyms + local gyms rows that are NOT Echo clients; --keep a,b protects extra bases; refuses when the client universe is unreadable"),
         ("onboard-dryrun", "30-day dryrun: plan + draft, no publish, no live tokens"),
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
@@ -1864,10 +1867,17 @@ def main(argv=None):
             base_url_arg = os.environ.get("AGENT_UPLOAD_BASE_URL") or None
         if not account_key or not display_name:
             print('usage: python -m agent onboard --account <key> --name "<Gym Name>" '
-                  '[--base-url <url>]')
+                  '[--base-url <url>] [--force]')
         else:
-            from .onboard import run as _onboard_run
-            r = _onboard_run(account_key, display_name, base_url=base_url_arg)
+            from .onboard import run as _onboard_run, OnboardRefused as _Refused
+            try:
+                r = _onboard_run(account_key, display_name, base_url=base_url_arg,
+                                 force="--force" in args_rest)
+            except _Refused as exc:
+                # ECHO CLIENTS ONLY (D73): no marker, nothing written. --force is the
+                # by-hand override for a human who knows the gym bought Echo.
+                print(f"onboard REFUSED: {exc}")
+                sys.exit(2)
             print(f"GYM: {r['account_key']} ({r['display_name']})")
             if r["token_minted"] is None:
                 print("Token: PENDING (set AGENT_ONBOARD_AUTOMINT=true by hand)")
@@ -2011,12 +2021,41 @@ def main(argv=None):
             r = verify_gym(acct_key)
             for line in format_result(r):
                 print(line)
+    elif cmd == "echo-clients-cleanup":
+        # The 2026-09-11 incident's registry cleanup. Dry run prints a table; --apply
+        # archives REMOVE rows to <DATA_DIR>/_trash/<date>/ (never deletes a client,
+        # never touches an UNKNOWN row, refuses when the client universe is unreadable).
+        from . import echo_clients_cleanup as _ecc
+        sys.exit(_ecc.main(argv[1:]))
+    elif cmd == "echo-clients":
+        # The ONE predicate, on screen: who Echo's clients are (echo_gym_settings), by
+        # gym and by every key/alias the gate accepts. Read-only.
+        from . import echo_clients as _ec
+        _snap = _ec.snapshot(fresh=True)
+        if not _snap.ok:
+            print(f"echo-clients: client universe UNREADABLE ({_snap.error}); every fleet "
+                  "lane is failing closed (doing nothing) until this reads.")
+            sys.exit(2)
+        _per_marker = {m: sum(1 for ms in _snap.markers.values() if m in ms)
+                       for m in _ec.MARKERS}
+        print(f"Echo clients: {len(_snap.gym_ids)} gyms. Markers: "
+              + ", ".join(f"{m} {n}" for m, n in _per_marker.items())
+              + f". echo_intake_tokens is NOT a marker: {len(_snap.other_keys)} portal "
+              "keys there belong to gyms that are not Echo clients.")
+        print()
+        for _gid in sorted(_snap.gym_ids, key=lambda g: _snap.names.get(g, g)):
+            _aliases = sorted(k for k, v in _snap.key_to_gym.items() if v == _gid)
+            print(f"  {_snap.names.get(_gid, '?'):<32} {_gid}")
+            print(f"    markers: {', '.join(sorted(_snap.markers.get(_gid, ())))}")
+            print(f"    keys: {', '.join(_aliases)}")
     elif cmd == "onboarding-audit":
-        # READ ONLY fleet readiness. Sweeps the PORTAL roster (echo_intake_tokens),
-        # not Echo's registry, because every failure of this class has arrived as a
-        # gym MISSING from the registry. Sends NO alerts and writes NO dedup stamps:
-        # this is the on-demand human view, runner.py owns the alerting pass. At 100
-        # gyms this is the one screen that answers "who cannot post today".
+        # READ ONLY fleet readiness. Sweeps the PORTAL roster of ECHO CLIENTS
+        # (echo_intake_tokens rows for gyms in echo_gym_settings; the token table
+        # alone is the whole LASSO fleet -- the 2026-09-11 incident), not Echo's
+        # registry, because every failure of this class has arrived as a gym MISSING
+        # from the registry. Sends NO alerts and writes NO dedup stamps: this is the
+        # on-demand human view, runner.py owns the alerting pass. At 100 gyms this is
+        # the one screen that answers "who cannot post today".
         from . import onboarding_watch as _ow
         _deps = _ow._live_deps()  # noqa: SLF001
         _roster = _deps["roster"](None)
@@ -2036,8 +2075,8 @@ def main(argv=None):
                                                    bases=_bases, deps=_deps)))
             except Exception as exc:  # noqa: BLE001 - one gym never blocks the sweep
                 _rows.append((_base, [f"check_failed:{type(exc).__name__}"]))
-        print(f"portal roster: {len(_roster)} gyms   client gyms audited: {len(_rows)}"
-              f"   registry bases: {len(_bases)}")
+        print(f"portal roster (Echo clients only): {len(_roster)} gyms   client gyms "
+              f"audited: {len(_rows)}   registry bases: {len(_bases)}")
         print()
         for _base, _issues in _rows:
             print(f"  {_base:28s} {'ready' if not _issues else ', '.join(_issues)}")
@@ -2066,8 +2105,8 @@ def main(argv=None):
         _missing = [(g, n, s) for g, n, s in _missing if _ow.is_client_gym(s or n or g)]
         if _missing:
             print()
-            print(f"NEVER ENTERED THE SWEEP ABOVE (no echo_intake_tokens row at all): "
-                  f"{len(_missing)}")
+            print(f"ECHO CLIENTS THAT NEVER ENTERED THE SWEEP ABOVE (no echo_intake_tokens "
+                  f"row at all): {len(_missing)}")
             for _gid, _name, _slug in _missing:
                 print(f"  {_name or _slug or _gid} ({_gid})")
             print(f"    fix: {_ow._FIX[_ow.REASON_NO_INTAKE_TOKEN]}")  # noqa: SLF001

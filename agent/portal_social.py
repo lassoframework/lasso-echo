@@ -1200,6 +1200,136 @@ def handle_recreate_caption(account_key, draft_id, actor_id, reader=None,
                  "recreate_budget": _budget_state(account_key)}
 
 
+# ==========================================================================
+# Variant pairing (0318): "regenerate this photo" produces a v2 CANDIDATE
+# side by side with the live creative, instead of overwriting it. A human
+# picks between them via pick-variant, which does not touch approval status.
+#
+# GET  /portal/<token>/posts/<id>/variants      -- list the group (active + candidates)
+# POST /portal/<token>/posts/<id>/regen-variant -- generate a new candidate FOR <id>
+# POST /portal/<token>/posts/<id>/pick-variant  -- <id> IS the candidate; promote it
+#
+# Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF).
+# ==========================================================================
+
+def handle_list_variants(account_key, draft_id, actor_id, reader=None, sb_store=None):
+    """The variant group (active + candidates) `draft_id` belongs to. Read-only,
+    so NOT gated behind the ECHO_VARIANT_PAIRING flag -- there is nothing to
+    show if no candidate was ever created (create is gated), and a client
+    reading their own already-scoped calendar is never a new capability."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "variants", "draft_id": draft_id,
+                     "error": "variant listing needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        group = sb_store.get_variant_group(account_key, draft_id)
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    if not group:
+        return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+    return 200, {"ok": True, "action": "variants", "draft_id": draft_id,
+                 "variants": [{
+                     "id": v.get("id"), "variant_status": v.get("variant_status"),
+                     "image_url": v.get("image_url"), "caption": v.get("caption"),
+                     "status": v.get("status"), "thumbnail_url": v.get("thumbnail_url"),
+                 } for v in group]}
+
+
+def handle_regen_variant(account_key, draft_id, actor_id, reader=None, sb_store=None,
+                         regen_fn=None):
+    """Generate a NEW image for the logical post `draft_id` represents and store
+    it as a linked 'candidate' row, WITHOUT touching `draft_id` itself. The
+    live creative stays exactly what it was; the candidate awaits a pick.
+
+    Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF
+    -> 403, no store read, no Astra call)."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import variant_regen as _vr
+    if not _vr.enabled():
+        return 403, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                     "error": "variant regeneration is not enabled for this gym"}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                     "error": "variant regeneration needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "regen-variant", draft_id)
+        if final is not None:
+            return final
+        gen = regen_fn or _vr.generate_variant_image
+        result = gen(row, account_key)
+        if not result.get("ok"):
+            return 409, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                         "error": _vr.client_message(result.get("reason")),
+                         "reason": result.get("reason")}
+        candidate = sb_store.create_variant_candidate(
+            account_key, row, result["image_url"])
+        if candidate is None:
+            return 500, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                         "error": "the new image could not be saved as a candidate"}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    return 200, {"ok": True, "action": "regen-variant", "draft_id": draft_id,
+                 "candidate": {"id": candidate.get("id"),
+                              "image_url": candidate.get("image_url"),
+                              "caption": candidate.get("caption"),
+                              "variant_status": candidate.get("variant_status")}}
+
+
+def handle_pick_variant(account_key, draft_id, actor_id, reader=None, sb_store=None):
+    """Promote the candidate `draft_id` to 'active' for its group. `draft_id`
+    here IS the candidate's own row id (the id the client is looking at in
+    the side-by-side picker) -- ownership is still proven the same way every
+    other action proves it (get_row is gym-scoped), and the actual atomic
+    work happens server-side in content_calendar_swap_variant so this handler
+    never has a read-then-write race window of its own.
+
+    Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF
+    -> 403, no store read)."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import variant_regen as _vr
+    if not _vr.enabled():
+        return 403, {"ok": False, "action": "pick-variant", "draft_id": draft_id,
+                     "error": "variant picking is not enabled for this gym"}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "pick-variant", "draft_id": draft_id,
+                     "error": "variant picking needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        # Ownership check up front, same 404-on-cross-gym contract as every
+        # other action -- the RPC ALSO re-checks gym_id itself (belt and
+        # braces: the RPC is the true authority, this is just consistent UX).
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        result = sb_store.swap_variant(account_key, draft_id, actor=actor_id)
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    if not result.get("ok"):
+        error = result.get("error", "unknown")
+        status = 409
+        if error == "not_found":
+            status = 404
+        return status, {"ok": False, "action": "pick-variant", "draft_id": draft_id,
+                        "error": error}
+    return 200, {"ok": True, "action": "pick-variant", "draft_id": draft_id,
+                 "active_id": result.get("active_id"),
+                 "archived_previous_active": result.get("archived_previous_active")}
+
+
 def _handle_kill_supabase(account_key, draft_id, actor_id, confirm, reader, sb_store):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:
@@ -1341,6 +1471,107 @@ def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=Non
     spend_recreate(account_key)
     result["recreate_budget"] = _budget_state(account_key)
     return 200, result
+
+
+# ==========================================================================
+# POST /portal/<token>/posts/<id>/deny-day  (Dean/Reverb, 2026-09-10)
+#
+# THE COMPLAINT: "one day of posts consists of the same picture + caption across
+# 3-4 formats for post/story/GMB/etc, and I apparently have to click on each format
+# and deny and request a re-work on each one? ... It seems like it will then return
+# different caption+pictures across different formats on the same day." Denying one
+# format at a time regenerated JUST that row, so a day could end up mixing a brand
+# new rework on one format with the ORIGINAL rejected concept still sitting pending
+# on the others. This is a day-wide action: find every same-day row for this gym
+# still in a denyable status (pending/coach_review) -- feed, story, Facebook, AND
+# Google Business, every format Dean named -- and deny them together, so the whole
+# day reworks as ONE consistent concept instead of a patchwork.
+# ==========================================================================
+
+def handle_deny_day(account_key, draft_id, actor_id, note="", store=None, reader=None,
+                    sb_store=None):
+    """Deny every denyable same-day row for this gym together (one action instead of
+    one click per format). Charges the recreate budget EXACTLY ONCE for the whole
+    day, not once per format -- the day is one concept, not N separate recreates.
+
+    DOUBLE-CHARGE GUARD (independent audit, 2026-09-10): a naive check-then-act
+    (read budget, write N rows, spend once) still double-charges if two deny-day
+    calls race on the SAME set of rows (a double-click, a client retry) -- both
+    read the budget before either spends, both successfully re-PATCH the same
+    already-pending rows (idempotent at the DB layer), and both then charge. The
+    charge is deduped on a kv stamp keyed by the EXACT sorted set of target row
+    ids: a genuine repeat call denying the SAME rows shares the key and is
+    skipped; a LATER, legitimate deny-day on that day's NEXT rework (a fresh set
+    of row ids after a rebuild) hashes differently and still charges. This
+    narrows the race to a single local kv read+write (serialized by db.py's own
+    lock within one process) rather than eliminating cross-process races
+    entirely -- the same tolerance level as every other kv-stamped dedup in this
+    codebase, never a distributed lock.
+
+    Supabase-only (the shared content_calendar plane is what carries a day's other
+    formats); 503s on the local-drafts plane, which has no day-spanning book."""
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "deny-day", "draft_id": draft_id,
+                     "error": "deny-day needs the shared calendar plane"}
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "deny-day", draft_id)
+        if final is not None:
+            return final
+        day_key = str(row.get("post_date") or "")[:10]
+        month_rows = _month_rows_for(sb_store, account_key, row) or [row]
+        denyable_statuses = {"pending", "coach_review"}
+        targets = [r for r in month_rows
+                  if str(r.get("post_date") or "")[:10] == day_key
+                  and str(r.get("status") or "").lower() in denyable_statuses]
+        if not targets:
+            # Already denied/approved/published elsewhere: report the clicked row's
+            # own state rather than a 404 -- the day may be clean by now.
+            return 200, {"ok": True, "action": "deny-day", "draft_id": draft_id,
+                         "detail": "Nothing left to deny for this day.",
+                         "idempotent": True, "day_key": day_key,
+                         "recreate_budget": _budget_state(account_key)}
+        if recreate_remaining(account_key) <= 0:
+            return 409, {"ok": False, "action": "deny-day", "draft_id": draft_id,
+                         "error": "recreate budget for this month is used up",
+                         "recreate_budget": _budget_state(account_key)}
+        # Stamp keyed to the EXACT target set, computed BEFORE any write, so the
+        # dedupe check happens as early as possible (narrowest race window).
+        import hashlib
+        target_ids = sorted(str(r.get("id") or "") for r in targets if r.get("id"))
+        charge_key = ("denyday_charged_" + account_key + "_" + day_key + "_"
+                     + hashlib.sha256("|".join(target_ids).encode()).hexdigest()[:16])
+        from . import db as _db
+        already_charged = bool(_db.kv_get(charge_key))
+        if not already_charged:
+            _db.kv_set(charge_key, "1")
+        denied_ids = []
+        for r in targets:
+            rid = str(r.get("id") or "")
+            if not rid:
+                continue
+            updated = sb_store.set_status(account_key, rid, _pcs.action_status("deny"))
+            if updated is not None:
+                denied_ids.append(rid)
+        if not denied_ids:
+            return 404, {"ok": False, "error": "no denyable rows found",
+                         "draft_id": draft_id}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    # ONE unit for the whole day (Dean's actual complaint: N clicks, N charges today) --
+    # skipped when a raced duplicate call already charged for this exact row set.
+    if not already_charged:
+        spend_recreate(account_key)
+    return 200, {"ok": True, "action": "deny-day", "draft_id": draft_id,
+                "day_key": day_key, "denied_ids": denied_ids,
+                "recreate_budget": _budget_state(account_key)}
 
 
 # ==========================================================================

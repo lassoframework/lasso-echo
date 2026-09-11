@@ -191,9 +191,11 @@ def _gym_row_for(ctx):
 
 def _is_echo_client(ctx, gym_id):
     """Round 2 (MINOR): notify_new_gym(force=True) DM'd 36 non-clients in a live incident, so
-    the resend is gated on the gym actually being an Echo client -- a row in the shared
-    echo_gym_settings plane for this gym_id. FAILS CLOSED: no row, no creds, any error ->
-    not a client, no DM. Injectable as deps['is_echo_client'] -> bool."""
+    the resend is gated on the gym actually being an Echo client. The predicate is the ONE
+    Echo-client universe, `echo_clients.is_echo_client` (D73: echo_gym_settings rows, by
+    gym id or base key) -- the same gate notify_new_gym itself applies since PR #108, so a
+    forced resend cannot reach a gym the automatic send would refuse. FAILS CLOSED: unknown,
+    no creds, any error -> not a client, no DM. Injectable as deps['is_echo_client'] -> bool."""
     pred = ctx.deps.get("is_echo_client")
     if pred is not None:
         try:
@@ -201,10 +203,9 @@ def _is_echo_client(ctx, gym_id):
         except Exception:  # noqa: BLE001
             return False
     try:
-        from .slack_convo.bus import Bus
-        rows = Bus()._get("echo_gym_settings", {"gym_id": f"eq.{gym_id}",
-                                                 "select": "gym_id", "limit": "1"})
-        return bool(rows)
+        from . import echo_clients
+        return bool(echo_clients.is_echo_client(gym_id)
+                    or echo_clients.is_echo_client(ctx.gym_key))
     except Exception:  # noqa: BLE001 - unverifiable means NOT a client
         return False
 

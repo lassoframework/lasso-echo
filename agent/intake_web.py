@@ -81,8 +81,18 @@ def _rate_per_minute():
 # change cost one of the gym's 15 monthly recreates. "recreate-caption" (partial-
 # regen, 2026-09-07) is the missing other half: "the caption is wrong" rewrites ONLY
 # the copy on the SAME photo instead of a full recreate that can swap the photo too.
+# "deny-day" (Dean/Reverb, 2026-09-10) is a day-wide rework: one day's feed/story/FB/
+# GBP rows are one concept rendered per format, and denying them one click at a time
+# left a day mixing a freshly-reworked format with stale siblings still carrying the
+# rejected photo+caption. This denies every same-day denyable row together.
 PORTAL_POST_ACTIONS = ("approve", "edit", "deny", "kill", "swap-media",
-                       "recreate-caption")
+                       "recreate-caption", "deny-day",
+                       # 0318 variant pairing (ECHO_VARIANT_PAIRING, default OFF):
+                       # regen-variant generates a v2 candidate FOR <id> without
+                       # touching it; pick-variant promotes <id> (itself the
+                       # candidate) to active. "variants" is a GET, not a POST
+                       # action, and is routed separately below.
+                       "regen-variant", "pick-variant")
 
 
 def client_for_token(token):
@@ -2054,14 +2064,29 @@ def build_server(port=None):
             )
             return m.group(1) if m else None
 
+        def _portal_post_variants_route(self):
+            """GET /portal/<token>/posts/<id>/variants (0318). Returns
+            (token, post_id), else (None, None). A separate route from
+            _portal_post_action_route on purpose: it is a READ (GET), and
+            listing is not itself gated by ECHO_VARIANT_PAIRING (see
+            handle_list_variants's docstring)."""
+            m = re.match(
+                r"^/portal/([A-Za-z0-9_.-]{8,})/posts/([A-Za-z0-9_-]+)/variants$",
+                self.path.split("?")[0],
+            )
+            if m:
+                return m.group(1), m.group(2)
+            return None, None
+
         def _portal_post_action_route(self):
             """Part B token-scoped client-social ACTION routes.
             Returns (token, post_id, action) for
             /portal/<token>/posts/<id>/{approve|edit|deny|kill|swap-media|
-            recreate-caption}, else (None,None,None).
+            recreate-caption|regen-variant|pick-variant}, else (None,None,None).
             Gated by AGENT_PORTAL_SOCIAL_ENABLED at the handler; a disabled route 404s.
-            swap-media (B6) is additionally gated by ECHO_MEDIA_SWAP_FREE, and
-            recreate-caption by ECHO_CAPTION_RECREATE_SCOPED -- both default OFF: the
+            swap-media (B6) is additionally gated by ECHO_MEDIA_SWAP_FREE,
+            recreate-caption by ECHO_CAPTION_RECREATE_SCOPED, and regen-variant /
+            pick-variant (0318) by ECHO_VARIANT_PAIRING -- all default OFF: the
             route exists but the handler 403s until armed."""
             m = re.match(
                 r"^/portal/([A-Za-z0-9_.-]{8,})/posts/([A-Za-z0-9_-]+)/"
@@ -2281,6 +2306,18 @@ def build_server(port=None):
                     status, body = _pr.handle_portal_report(account_key, days)
                 else:
                     status, body = _pr.handle_portal_library(account_key)
+                return self._send_json(body, status)
+
+            # Variant pairing (0318): GET /portal/<token>/posts/<id>/variants.
+            # Token->account_key; revoked = 404. actor_id is not required for a
+            # read (only mutating actions need an attributable actor).
+            vr_token, vr_post_id = self._portal_post_variants_route()
+            if vr_token is not None:
+                account_key = client_for_token(vr_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                status, body = _ps.handle_list_variants(account_key, vr_post_id,
+                                                        "portal-variants-read")
                 return self._send_json(body, status)
 
             # Self-serve Events & Promos LIST: GET /portal/<token>/events.
@@ -2944,6 +2981,15 @@ def build_server(port=None):
                 elif ps_action == "recreate-caption":
                     status, resp = _ps.handle_recreate_caption(account_key, ps_post_id,
                                                                actor_id)
+                elif ps_action == "regen-variant":
+                    status, resp = _ps.handle_regen_variant(account_key, ps_post_id,
+                                                            actor_id)
+                elif ps_action == "pick-variant":
+                    status, resp = _ps.handle_pick_variant(account_key, ps_post_id,
+                                                           actor_id)
+                elif ps_action == "deny-day":
+                    status, resp = _ps.handle_deny_day(account_key, ps_post_id, actor_id,
+                                                       note=note, store=store)
                 else:  # kill
                     status, resp = _ps.handle_kill(account_key, ps_post_id, actor_id,
                                                    confirm=confirm, store=store)

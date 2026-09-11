@@ -12,8 +12,17 @@ Zernio profile and ZERO connection attempts EVER logged in Zernio's 90-day retai
 activity log -- not a broken connect flow (it worked for five OTHER gyms that same
 week), just nothing that ever prompted the owner to click it.
 
+THE 2026-09-11 INCIDENT: this message went to 36 gym owners who are NOT Echo clients
+(LASSO ads clients on Launch / Ascend / Apex), because the caller, onboarding_watch.
+autoregister, swept echo_intake_tokens -- a token the portal mints for EVERY gym --
+as if it were the Echo client list. The caller is gated now, and so is this module:
+notify_new_gym refuses any gym echo_clients.is_echo_client does not vouch for
+(echo_gym_settings row), fires ONE ops alert about the refusal (a caller reaching
+here with a non-client is a bug worth one line), and sends nothing. Fails closed.
+
 Rails:
   - OFF by default (config.auto_connect_link_enabled()).
+  - ECHO CLIENTS ONLY: refused + alerted once for any gym not in echo_gym_settings.
   - Fires ONCE per gym, ever (kv-stamped `connect_link_sent_<base_key>`). A later
     autoregister call for the same gym (idempotent, can run repeatedly) never
     re-sends.
@@ -174,8 +183,16 @@ def _slack_send(channel, text, *, token, http=None):
     return bool(body.get("ok"))
 
 
+def _default_is_client(gym_id, base_key):
+    """The Echo client universe predicate, by portal gym id OR by base key (both are
+    positive markers computed from a client gym's own identity). Fails closed."""
+    from . import echo_clients
+    return bool((gym_id and echo_clients.is_echo_client(gym_id))
+                or echo_clients.is_echo_client(base_key))
+
+
 def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None,
-                   force=False):
+                   is_client=None, force=False):
     """Send a newly-registered gym's owner its connect link, once. Returns True only
     when a message was actually sent this call. OFF unless
     config.auto_connect_link_enabled(). Never raises; every failure path ESCALATES
@@ -183,11 +200,16 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
     nothing silently -- a silent gap here is precisely the bug this module exists to
     close.
 
+    ECHO CLIENTS ONLY (2026-09-11): a gym `is_client` (default: echo_clients, by
+    gym_id or base key) does not vouch for is REFUSED before any lookup, DM or link
+    mint, with ONE alert per gym ever (kv `connect_link_refused_<base>`).
+
     `force=True` (D72, the FIXER's `resend_connect_link` ops action): an explicit
     operator RESEND. It skips the auto-send flag (this is not the automatic first send
-    the flag governs) and the once-ever dedupe stamp; everything else -- owner resolved
-    from the portal's own records, the fixed template, the approver in the DM -- is the
-    same path. Callers of the automatic send are byte-for-byte unchanged."""
+    the flag governs) and the once-ever dedupe stamp -- and NOTHING else: the Echo-client
+    gate above applies to a forced resend exactly as to the automatic send (the live
+    incident that DM'd 36 non-clients came through this function). Callers of the
+    automatic send are byte-for-byte unchanged."""
     if not force and not config.auto_connect_link_enabled():
         return False
     base_key = str(base_key or "").strip()
@@ -198,6 +220,25 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
         from . import db as db
     if alert is None:
         from .ops_alerts import alert as alert
+
+    is_client = is_client or _default_is_client
+    if not is_client(gym_id, base_key):
+        refused_key = f"connect_link_refused_{base_key}"
+        already = False
+        try:
+            already = bool(db.kv_get(refused_key))
+        except Exception:  # noqa: BLE001
+            pass
+        if not already:
+            alert(f"auto connect-link for {base_key} ({gym_name}) REFUSED: not an Echo "
+                  "client (no echo_gym_settings row). Nothing was sent. A caller "
+                  "reached notify_new_gym with a non-client -- find the lane that "
+                  "enumerated it without going through echo_clients.is_echo_client.")
+            try:
+                db.kv_set(refused_key, "1")
+            except Exception:  # noqa: BLE001
+                pass
+        return False
 
     dedupe_key = f"connect_link_sent_{base_key}"
     if not force:

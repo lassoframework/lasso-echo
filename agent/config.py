@@ -403,9 +403,12 @@ def onboarding_watch_enabled() -> bool:
     a different key, no approved sources, no Zernio profile, zero connected platforms,
     or Facebook connected with no page selected.
 
-    It audits against echo_intake_tokens rather than Echo's own registry, because every
+    It audits against the portal's roster rather than Echo's own registry, because every
     failure of this class has arrived as a gym MISSING from that registry — which is
     exactly why connection_watch never saw Hill Country, the gym it was built for.
+    THE ROSTER IS ECHO CLIENTS ONLY (2026-09-11): echo_intake_tokens rows for gyms with
+    an echo_gym_settings row, via agent/echo_clients.py. The token table alone is the
+    whole LASSO ads fleet, and sweeping it DMed 36 non-clients a connect link.
     Read-only apart from its dedup stamps; it never registers, connects or approves
     anything. Arm by hand in Railway env.
     """
@@ -1333,6 +1336,23 @@ def caption_recreate_scoped_enabled() -> bool:
     ECHO_CAPTION_RECREATE_SCOPED=true.
     """
     return _truthy(os.environ.get("ECHO_CAPTION_RECREATE_SCOPED", "false"))
+
+
+def variant_pairing_enabled() -> bool:
+    """ECHO_VARIANT_PAIRING, default OFF. The Astra "v2 creative" pairing feature
+    (migration 0318): regenerate an existing scheduled post's IMAGE as a linked
+    'candidate' content_calendar row (variant_of the original), review it side by
+    side with the live creative, and PICK one atomically via
+    content_calendar_swap_variant. Neither row's approval status is touched by any
+    of this -- a variant becoming active still goes through the exact same
+    publish-approval gate as any normal post.
+
+    This is a prerequisite for a queued fleet-wide regeneration sweep (~1,000+
+    September posts), so it ships gated OFF until verified end-to-end against a
+    real gym, same pattern as ECHO_MEDIA_SWAP_FREE / ECHO_CAPTION_RECREATE_SCOPED.
+    Arm by hand: ECHO_VARIANT_PAIRING=true.
+    """
+    return _truthy(os.environ.get("ECHO_VARIANT_PAIRING", "false"))
 
 
 def portal_show_rejected() -> bool:
@@ -4223,6 +4243,34 @@ def media_repeat_sweep_enabled() -> bool:
     false to stop the nightly run; the CLI (`python -m agent.jobs.media_repeat_sweep`)
     still works by hand."""
     return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_SWEEP", "true"))
+
+
+def media_repeat_sweep_drive_enabled() -> bool:
+    """The nightly repeat sweep may replace a repeat from the gym's CONNECTED DRIVE
+    POOL, not only from its local uploads (AGENT_MEDIA_REPEAT_SWEEP_DRIVE, default OFF).
+
+    John Weeks / Tough Temple, 2026-09-11. PR #98 taught the MONTH BUILD to stage from
+    the Drive pool, so new months stopped repeating. The nightly sweep
+    (agent/jobs/media_repeat_sweep.py) was never taught the same pool: its replacement
+    picker (_fresh_photo) reads the LOCAL library only, images only. A gym whose local
+    stills are all on the book is therefore reported as a SMALL LIBRARY and its repeats
+    are left in place -- while 57 eligible, never-used Drive clips sit unused. That is
+    why rows already on Tough Temple's calendar still repeated after the build fix
+    merged: the build never touches a row it did not just create, and the sweep that
+    exists for exactly those rows could not reach the media.
+
+    ON: when no unused local image is left, the sweep asks the SAME engine the portal's
+    edit-image button uses (media_swap.pick_replacement), which draws from the local
+    library AND the Drive pool with every guard already in place -- eligibility, the
+    90-day cooldown, tenant isolation, nothing already on the book. The sweep's own
+    rails are untouched: published / publishing rows are never touched, an APPROVED
+    row's media is never swapped (the gym approved that exact card), the write is still
+    the status-guarded swap_media, and a gym with neither a local photo nor a Drive
+    asset is still reported as a small library rather than given fabricated media.
+
+    Default OFF because reaching a new media pool is a new capability. Arm by hand:
+    AGENT_MEDIA_REPEAT_SWEEP_DRIVE=true."""
+    return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "false"))
 
 
 def plan_horizon_sweep_enabled() -> bool:

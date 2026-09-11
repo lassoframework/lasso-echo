@@ -391,6 +391,25 @@ def test_resend_connect_link_refuses_a_non_echo_client_and_fails_closed(armed):
     assert status == 403 and sent == [], "an unverifiable client status never sends"
 
 
+def test_resend_connect_link_uses_the_one_echo_client_universe(armed):
+    """After the #108 merge the default predicate IS echo_clients.is_echo_client (D73) --
+    the same gate notify_new_gym applies itself -- driven here through its test override."""
+    from agent import echo_clients
+    sent = []
+    deps = {"bus": FakeBus(), "gym_lookup": lambda k: ("g-uuid", "CrossFit Reverb"),
+            "notify_new_gym": lambda *a, **kw: sent.append(a) or True}
+    prior = echo_clients._override
+    try:
+        echo_clients.set_test_override(lambda ident: ident in ("g-uuid", GYM))
+        assert _post("resend_connect_link", _body(), deps=deps)[0] == 200
+        echo_clients.set_test_override(lambda ident: False)
+        status, body = _post("resend_connect_link", _body(), deps=deps)
+        assert status == 403 and body["error"] == "not_echo_client"
+    finally:
+        echo_clients.set_test_override(prior)
+    assert len(sent) == 1
+
+
 def test_org_floor_refusal_leaves_a_trace_on_the_ticket(armed):
     """R4: a 403 wrote an audit line but no support_messages row; a teammate reading the
     thread should see the FIXER tried."""

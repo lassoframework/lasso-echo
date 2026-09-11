@@ -4319,3 +4319,155 @@ exactly one. Dean's voice-doc CTA section is an unfilled onboarding TODO, and
 his only candidate is the FAQ heading the shape gate correctly rejects. Trimming
 gets him to 35.5% without a pool, but **no ask-rate target can put a real CTA on
 a gym that has not approved one**. That is onboarding content, not code.
+
+## The sweep could not reach the Drive folder John already connected (2026-09-11)
+
+John Weeks (Tough Temple) after the #98 fix shipped and his queue was rebuilt:
+**"9/14-9/16 are still repeat images"**.
+
+The build fix was real and it held. The gap is that a month build only ever governs
+rows it CREATES. Rows already sitting on the book are the nightly sweep's job
+(`agent/jobs/media_repeat_sweep.py`), and that sweep was never taught the pool #98
+added. Its picker, `_fresh_photo`, reads the LOCAL library and filters to `_IMG_EXTS`:
+local images only, never a Drive asset, never a clip. So for a gym whose uploaded
+stills are all on the book, every repeat already on the calendar hit
+
+    result["small_library"] = True   # "no unused photo left"
+
+and was LEFT IN PLACE, while 57 eligible, never-used Drive videos sat unreachable.
+The client-readable report then told him to "connect the gym's Drive folder" -- the
+folder he had already connected, full of the media the sweep could not see.
+
+The same asymmetry, stated plainly: the portal's **edit image** button got the Drive
+pool in #98 (`media_swap.pick_replacement`). The **nightly sweep** did not. A repeat
+was fixable only if a human clicked it.
+
+- [~] `AGENT_MEDIA_REPEAT_SWEEP_DRIVE` (default OFF, arm by hand). When no unused
+  LOCAL image is left, the sweep asks `media_swap.pick_replacement` -- the SAME engine
+  the edit-image button runs -- before declaring a small library. Every Drive guard it
+  already ships with applies: eligibility, the 90-day cooldown, the this-month
+  exclusion, tenant isolation, and nothing already on the book in EITHER id space
+  (photo basenames and Drive asset ids are read separately, `_asset_state`).
+- [~] Every sweep rail is untouched and pinned by test: published / publishing rows
+  are never touched, an APPROVED row's media is never swapped, the write is still the
+  status-guarded `swap_media`, both-pools-empty is still "small library" and never
+  fabricated media, a raising picker degrades to the old behavior, and a DRY RUN stays
+  a dry run (it counts the pool with a pure store read, downloads nothing).
+- [~] One post moves as one post: feed + FB mirror + paired story are re-pointed off a
+  SINGLE materialized clip, all-or-nothing. `after_swap` settles the usage ledgers, so
+  a clip the sweep places cools down and cannot be handed out again tomorrow.
+- [~] One run never gives the same clip to two repeated dates (`asset_state` grows as
+  it places).
+- [~] `unfixable_report` stops asking a connected gym for photos. `sweep_gym` now
+  MEASURES what it could not reach (`drive_pool`) and the report says so: "its
+  connected Drive folder holds 57 unused item(s) the nightly sweep cannot reach yet.
+  Nothing more is needed from the gym." A gym with a genuinely thin library still gets
+  the original ask.
+- [x] `docs/ENV.md` gained a cross-day-media-repeat section; the guard/sweep/report
+  flags were read in code and documented nowhere.
+
+### Not verified against live data
+
+This was diagnosed and fixed from the code and reproduced offline
+(`tests/test_media_repeat_sweep_drive.py`, including an end-to-end pass through the
+real `media_swap.pick_replacement`). This sandbox has no Supabase or Drive
+credentials, so Tough Temple's ACTUAL 09-14..09-16 rows were never read. Before
+telling John it is fixed, run the sweep dry against his gym and confirm those three
+dates appear:
+
+    python -m agent.jobs.media_repeat_sweep toughtemple52040e     # dry run first
+
+If they come back "APPROVED duplicate (left)" instead, this fix does not reach them:
+the gym approved those exact cards and the sweep is forbidden to change them by
+design. That case needs a person to deny the days, not a code change.
+
+## Why the FIXER never ran on John's ticket (2026-09-11)
+
+Blake asked the right question: Echo reads these Slack messages and is supposed to hand
+a code_fix to the Claude Code worker. It never did. John reported the SAME defect twice
+and a human carried the whole ticket both times.
+
+One line in `agent/slack_convo/classifier.py`. `code_fix` requires a `_BREAKAGE_RE`
+match, and EVERY pattern in that regex describes something NOT HAPPENING: not posting,
+not going out, broken, error, failed, crash, stuck, 404, nothing published. There was
+no vocabulary at all for the opposite and more common shape -- **the machine is running
+fine and producing the WRONG THING**. Measured on his exact sentence:
+
+    classify("9/14-9/16 are still repeat images") -> None    # ESCALATE, a human looks
+
+Every phrasing of a duplicate-media complaint escalated: "the same photo keeps showing
+up on different days", "my posts are repeating the same picture", "duplicate images on
+my calendar". Two gaps compounded: `_BREAKAGE_RE` had no repeat/duplicate family, and
+`_DOMAIN_RE` (the RT-M2 noun gate) had `photo` and `video` but **not `image`** -- so his
+sentence failed the domain check too, even if the breakage side had matched.
+
+- [~] `_REPEAT_RE`, its own regex, NOT widened into `_BREAKAGE_RE`. Reason: unlike a
+  dead machine, this family collides with ordinary questions ("how often do posts
+  repeat?"), and `_BREAKAGE_RE` is deliberately checked BEFORE `_QUESTION_RE`.
+  `classify()` checks `_REPEAT_RE` AFTER the question rule, so an owner ASKING about
+  repeats still reaches the answer lane while an owner REPORTING them reaches the
+  fixer. `_BREAKAGE_RE`'s own ordering is byte for byte unchanged.
+- [~] `_DOMAIN_RE` gained the words gym owners actually type: image(s), picture(s),
+  pic(s), clip(s), footage, shot(s).
+- [~] RT-M2 still holds: a repeat word with no Echo-domain noun still escalates
+  ("same old same old", "my duplicate set of gym keys", "we run the same workout three
+  days in a row on purpose").
+- [x] No new gate, no flag: this widens an existing deterministic rule exactly as RTF-1
+  did, and a client `code_fix` is STILL held behind Blake's #fixer tap
+  (`adapter.py` KIND_FIXER_REQUEST is HELD unless staff-origin), so a false positive
+  costs one tap, never an auto-applied change. D14's invariant is untouched.
+- [x] `tests/test_slack_convo_repeat_reports.py`: John's exact message, the wrong-output
+  family, and both guards (question-about-repeats, no-domain-noun).
+
+Note the separate lane this was NOT: `agent/echo_ticket_worker.py` is `SOURCE =
+"website_tab"` -- the PORTAL support tab. John wrote in Slack, so that worker was never
+in the path. The Slack path is `slack_convo/` and it stopped at classification.
+
+## Creative variants — Astra v2 side-by-side pick (2026-09-11, migration 0318)
+
+Astra can now regenerate an existing scheduled post's image as an alternate "v2"
+WITHOUT overwriting the live creative. Schema: `content_calendar.variant_of`
+(nullable uuid, the stable group anchor) + `variant_status`
+(`active`/`candidate`/`archived`). A v2 is a NEW linked row, not a JSON array —
+every existing per-row code path (approval, publish, media guards) keeps working
+untouched; only the SELECT filters needed `variant_status=eq.active` added.
+
+- [x] `supabase/migrations/0318_content_calendar_variants.sql` (portal repo): the
+  two columns + a partial UNIQUE index (`content_calendar_one_active_per_group`)
+  that is the actual atomicity guarantee — Postgres itself refuses a second
+  'active' row per group, not application discipline. Plus
+  `content_calendar_swap_variant(gym_id, candidate_id, actor)`, a SECURITY
+  DEFINER RPC that locks the whole group with `FOR UPDATE` before touching
+  anything, refuses on a published row (either side) or a cross-gym id, and is
+  idempotent-safe against a double-click (second call sees `variant_status !=
+  'candidate'` post-commit and no-ops with `not_a_candidate`).
+- [x] `agent/portal_calendar_store.py`: `get_variant_group` / `create_variant_candidate`
+  / `swap_variant` (the last calls the RPC via `rpc/content_calendar_swap_variant` —
+  the atomicity cannot be built from separate PostgREST reads+writes, it has to be
+  one Postgres transaction). Every existing "one row = one post" read
+  (`list_month`, `due_rows`, `has_owner_visible_rows`, `first_calendar_date`,
+  `publishing_rows`, `expired_rows`, `list_pending_future`, `rows_in_range`,
+  `list_event_rows`) now filters `variant_status=eq.active`, so a pending
+  candidate can never be double-counted, published, graded, or deleted.
+  `locked_slots` needed no direct change — it derives from `list_month`.
+- [x] `agent/variant_regen.py`: generates the v2 through `creative_studio.generate`
+  (the SAME Astra-first, house-style-grade pipeline `daily_studio` uses for every
+  normal build — no bespoke image path), facts drawn only from the row's own
+  already-approved caption (no fabrication).
+- [x] `agent/portal_social.py` + `agent/intake_web.py`: `GET
+  /portal/<token>/posts/<id>/variants` (list, ungated), `POST .../regen-variant`
+  (create a candidate, original untouched), `POST .../pick-variant` (the atomic
+  swap). All gated by `ECHO_VARIANT_PAIRING` (default OFF) except the read.
+- [x] `tests/test_variant_pairing.py`: store-level PostgREST call shape, the
+  backward-compat filters, handler flag/ownership/published-row gating, and
+  `variant_regen` fact-extraction + failure reasons. 28 tests, all offline.
+
+### Not yet done
+- [ ] Portal (Next.js) review UI: side-by-side variants + a pick button on the
+  staff/client calendar surface. Backend is usable via curl/Postman today; no
+  human-facing button yet.
+- [ ] Migration 0318 not yet applied to prod (`ooqcvmcjspeltuuhcvlh`) — ships via
+  the portal's normal `deploy-migrate.mjs` ledger, not applied by hand or via
+  Supabase MCP (that would desync the ledger — see the portal migrations README).
+- [ ] `ECHO_VARIANT_PAIRING` stays OFF until the fleet-wide Astra regen sweep
+  (~1,000+ September posts) is ready to use it.
