@@ -119,17 +119,34 @@ def _fresh_photo(lib, state, exclude):
     return None, None
 
 
-def _asset_state(rows):
-    """{drive_asset_id: {(iso_date, 'x'), ...}} for the rows this sweep read. The Drive
-    pool is keyed by asset id, a different id space from library basenames, so blocking
-    "already on the book" needs its own map (media_guard.row_asset_key). Grows as the
-    sweep places assets, so one run never hands the same clip to two dates."""
+def _asset_state(rows, base=None, store=None):
+    """{drive_asset_id: {(iso_date, 'x'), ...}} for every Drive asset on the gym's book.
+    The Drive pool is keyed by asset id, a different id space from library basenames, so
+    blocking "already on the book" needs its own map (media_guard.row_asset_key). Grows
+    as the sweep places assets, so one run never hands the same clip to two dates.
+
+    `rows` is only the sweep's own window (today-repeat_window .. today+horizon, 62 days
+    by default). A Drive asset staged BEYOND that horizon is invisible to it, so an
+    armed sweep could place it a second time just outside its own read (independent
+    audit 2026-09-11, minor). When base+store are given, media_guard.book_state -- which
+    has no horizon -- is unioned in. Never raises; a read failure keeps the window-only
+    map, which is what this did before."""
     state = {}
     for row in rows or []:
         aid = media_guard.row_asset_key(row)
         pd = str((row or {}).get("post_date") or "")[:10]
         if aid and pd:
             state.setdefault(aid, set()).add((pd, "x"))
+    if base and store is not None:
+        try:
+            from datetime import date as _date
+            wide = media_guard.book_state(base, store, _date.today(), 1, log=_log,
+                                          key_fn=media_guard.row_asset_key)
+            for aid, occ in (wide or {}).items():
+                if aid:
+                    state.setdefault(aid, set()).update(occ)
+        except Exception as exc:  # noqa: BLE001 - the window map is still correct
+            _log(f"{base}: wide asset-book read skipped ({type(exc).__name__})")
     return state
 
 
@@ -152,6 +169,49 @@ def _feed_first(fixable):
                                           str(r.get("id") or "")))
 
 
+def _blocked_book_state(base, state, current_key):
+    """The book state handed to the picker, WIDENED to every library file that is a
+    NEAR DUPE of something already on the book.
+
+    Independent audit 2026-09-11 (CRITICAL). `_fresh_photo` refuses a candidate for two
+    different reasons: nothing unused is left, OR everything unused is a `_cluster_key`
+    near-dupe of a photo already placed. This fallback treats both as "local library
+    exhausted" and hands off to media_swap, whose `local_candidates` blocks only by
+    EXACT BASENAME and by the SERVED ledger -- so a cluster sibling sitting on a PENDING
+    row (on the book, never served) is blocked by neither, and the picker returns the
+    very file `_fresh_photo` just refused. The client complaint is "these look like the
+    same image"; swapping IMG_6771.jpg for IMG_6771 (1).jpg and reporting the date fixed
+    is that complaint, made silent. Never raises; a library read failure returns the
+    state unchanged (the exact-basename block still applies)."""
+    blocked = dict(state or {})
+    try:
+        lib = _lib_dir(base)
+        lib_names = media_guard.library_keys(lib)
+        if not lib_names:
+            return blocked
+        seeds = (set(state or {}) | {current_key}) & lib_names
+        used_clusters = {_cluster_key(lib, k) for k in seeds}
+        for name in lib_names:
+            if name not in blocked and _cluster_key(lib, name) in used_clusters:
+                blocked.setdefault(name, set()).add(("near-dupe", "x"))
+    except Exception as exc:  # noqa: BLE001 - never let this block a swap entirely
+        _log(f"{base}: near-dupe widening skipped ({type(exc).__name__})")
+    return blocked
+
+
+def _restore_rows(base, store, undo):
+    """Put back the rows a partially failed swap already re-pointed, so a post never
+    ships half on the new clip and half on the repeat. Best effort, loud on failure."""
+    for rid, before in undo:
+        try:
+            store.swap_media(base, rid, before["image_url"],
+                             source_media_url=before.get("source_media_url"),
+                             extra_fields=before.get("extra_fields") or {})
+        except Exception as exc:  # noqa: BLE001
+            _log(f"{base}: ROLLBACK FAILED for row {rid} ({type(exc).__name__}); it "
+                 "carries the new media while a sibling still carries the old one")
+
+
 def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, result,
                           key, pd, picker=None):
     """REPLACE A REPEAT FROM THE GYM'S CONNECTED DRIVE POOL when no unused LOCAL image
@@ -171,18 +231,22 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
     status-guarded store.swap_media, and nothing is fabricated.
 
     True when at least one row was re-pointed. Never raises."""
-    from agent import media_swap
     ordered = _feed_first(fixable)
     row, siblings = ordered[0], ordered[1:]
     try:
+        from agent import media_swap
         pick = (picker or media_swap.pick_replacement)(
             base, row, store=store, library_path=_lib_dir(base),
-            book_state=state, asset_state=asset_state, siblings=siblings)
+            book_state=_blocked_book_state(base, state, key),
+            asset_state=asset_state, siblings=siblings)
     except Exception as exc:  # noqa: BLE001 - a picker failure is "no Drive swap"
         _log(f"{base}: Drive replacement failed for {key} {pd} ({type(exc).__name__})")
         return False
-    if not pick.get("ok"):
+    # A picker that returns a non-dict must not raise out of sweep_gym and skip every
+    # remaining gym for the night (run() walks gyms in one unguarded loop).
+    if not isinstance(pick, dict) or not pick.get("ok"):
         return False
+    from agent import media_swap
     variants = pick.get("siblings") or {}
     # ALL OR NOTHING, exactly like the portal swap: a sibling the picker could not
     # shape means this date is left alone rather than half re-pointed.
@@ -193,26 +257,50 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
              "shaped from the same clip")
         return False
 
-    swapped = []
-    for target, var in [(row, pick)] + [(s, variants[str(s.get("id"))]) for s in siblings]:
+    # ALL OR NOTHING AT WRITE TIME TOO (independent audit 2026-09-11, MAJOR). The
+    # picker's own all-or-nothing only covers SHAPING. Each swap_media below is a
+    # separate network write, and a failure on one of them used to leave the rest
+    # re-pointed: the IG feed and FB mirror on the fresh clip, the paired story still
+    # on the repeat with a stale source_media_url -- a mixed post, counted as fixed.
+    # A row that fails now rolls the already-written rows back to exactly what they
+    # carried before, and the date is left for the next run.
+    targets = [(row, pick)] + [(s, variants[str(s.get("id"))]) for s in siblings]
+    swapped, undo, stories = [], [], 0
+    failed_row = None
+    for target, var in targets:
         rid = target.get("id")
+        before = {"image_url": target.get("image_url") or "",
+                  "source_media_url": target.get("source_media_url"),
+                  "extra_fields": {"thumbnail_url": target.get("thumbnail_url") or None,
+                                   "source_media_asset_id":
+                                       target.get("source_media_asset_id") or None}}
         try:
             done = store.swap_media(base, rid, var["image_url"],
                                     source_media_url=var.get("source_media_url"),
                                     extra_fields=media_swap.swap_fields(var))
-        except Exception as exc:  # noqa: BLE001 - one row never undoes the others
+        except Exception as exc:  # noqa: BLE001
             _log(f"{base}: swap_media failed for {rid} ({type(exc).__name__})")
             done = None
-        if done is not None:
-            swapped.append(str(rid))
-            result["rows_repointed"] += 1
-            # Parity with the local path's counter: _finish re-burned the story's
-            # caption onto the new media, so the table must count it.
-            if (str(target.get("format") or "").lower() == "story"
-                    and config.story_format_enabled()):
-                result["stories_reburned"] += 1
+        if done is None:
+            # A row that matched nothing was approved or went live between the read
+            # and the write (swap_media is status-guarded server-side). Either way the
+            # post can no longer move as one post.
+            failed_row = str(rid)
+            break
+        swapped.append(str(rid))
+        undo.append((rid, before))
+        if (str(target.get("format") or "").lower() == "story"
+                and config.story_format_enabled()):
+            stories += 1
+    if failed_row is not None:
+        _log(f"{base}: {key} {pd}: row {failed_row} could not be re-pointed; rolling "
+             f"back {len(undo)} sibling row(s) so the post is never half swapped")
+        _restore_rows(base, store, undo)
+        return False
     if not swapped:
         return False
+    result["rows_repointed"] += len(swapped)
+    result["stories_reburned"] += stories
 
     new_asset = str(pick.get("source_media_asset_id") or "")
     new_key = str(pick.get("key") or new_asset or "drive")
@@ -382,7 +470,17 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
         # drive_pool is what sweep_gym measured, not a guess: assets the sweep could
         # have used but did not reach.
         pool = int((result or {}).get("drive_pool") or 0)
-        if pool:
+        armed = bool((result or {}).get("drive_armed"))
+        if pool and armed:
+            # ARMED and still stuck: the lane reached for the pool tonight and could
+            # not use it (hosting down, a swap that timed out, a row that went live
+            # mid-write). Saying "cannot reach yet" here would be false -- it reached,
+            # and it failed. (Independent audit 2026-09-11.)
+            lines.append(f"This gym's uploaded photos are all on the book. Its "
+                         f"connected Drive folder holds {pool} unused item(s) and "
+                         "tonight's run could not prepare one; it retries on the next "
+                         "run. Nothing more is needed from the gym.")
+        elif pool:
             lines.append(f"This gym's uploaded photos are all on the book, but its "
                          f"connected Drive folder holds {pool} unused item(s) the "
                          "nightly sweep cannot reach yet. Nothing more is needed from "
@@ -456,7 +554,8 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     dupes = cross_day_repeats(rows, lib)
     result = {"gym": base, "photos_repeated": len(dupes), "dates_fixed": 0,
               "rows_repointed": 0, "stories_reburned": 0, "approved_left": 0,
-              "small_library": False, "drive_pool": 0, "detail": []}
+              "small_library": False, "drive_pool": 0, "drive_armed": False,
+              "detail": []}
     if not dupes:
         return result
 
@@ -467,7 +566,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
             state.setdefault(key, set()).add((pd, "x"))
     # The same occupancy in the DRIVE ASSET id space, so a Drive replacement is never
     # an asset already sitting on another day (and never the same clip twice in a run).
-    asset_state = _asset_state(rows)
+    asset_state = _asset_state(rows, base, store)
     pool_dry = None                  # dry-run only: the pool size, read once per gym
 
     today_iso = today.isoformat()
@@ -503,17 +602,22 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                 # library. Flag OFF => the old behavior, byte for byte.
                 if config.media_repeat_sweep_drive_enabled():
                     if not apply:
-                        # A dry run places nothing, so the pool never changes: read it
-                        # ONCE per gym, not once per repeated date.
+                        # A dry run places nothing, so the pool is read ONCE per gym --
+                        # but it must still be SPENT DOWN as it reports (independent
+                        # audit 2026-09-11, CRITICAL). Reusing the same count for every
+                        # repeated date said all three of John's days were fixable from
+                        # a pool holding one asset; apply would fix one. The dry run is
+                        # the instrument we verify against a client's gym, so it has to
+                        # predict what apply will actually do.
                         if pool_dry is None:
                             pool_dry = _drive_candidate_count(base, asset_state)
-                        n = pool_dry
-                        if n:
+                        if pool_dry > 0:
+                            pool_dry -= 1
                             result["dates_fixed"] += 1
                             result["rows_repointed"] += len(fixable)
                             result["detail"].append(
                                 f"{key} {pd}: -> connected Drive pool "
-                                f"({n} asset(s) available) [dry-run]")
+                                f"({pool_dry} asset(s) left after this) [dry-run]")
                             continue
                     elif _swap_from_drive_pool(base, store, fixable, state=state,
                                                asset_state=asset_state, rows=rows,
@@ -594,7 +698,16 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
         # MEASURE what the sweep could not reach, so the report tells the truth about
         # WHY (a genuinely thin library, or a full Drive folder behind an unarmed lane)
         # instead of asking a connected gym for photos it already gave us.
-        result["drive_pool"] = _drive_candidate_count(base, asset_state)
+        #
+        # BEHIND THE FLAG (independent audit 2026-09-11, MAJOR): this used to run on
+        # every small-library gym regardless, which is a new Supabase read per gym per
+        # night and new client-readable copy on the DEFAULT path. Flag OFF must be the
+        # old behavior byte for byte -- CLAUDE.md's rule, and this module's own promise.
+        if config.media_repeat_sweep_drive_enabled():
+            # In a dry run the pool was already counted once; do not pay for it twice.
+            result["drive_pool"] = (pool_dry if pool_dry is not None
+                                    else _drive_candidate_count(base, asset_state))
+            result["drive_armed"] = True
         if apply:
             media_guard.alert_small_library(base, today_iso, _log)
     return result
@@ -608,7 +721,16 @@ def run(gyms, *, apply=False, horizon=62):
     results = []
     today_iso = date.today().isoformat()
     for base in gyms:
-        r = sweep_gym(base, store, apply=apply, horizon=horizon)
+        # ONE GYM NEVER TAKES THE NIGHT (independent audit 2026-09-11). This loop was
+        # unguarded, so anything escaping sweep_gym skipped every gym after it and the
+        # ops alert blamed the whole sweep. A gym that raises is recorded and the rest
+        # still get swept.
+        try:
+            r = sweep_gym(base, store, apply=apply, horizon=horizon)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"{base}: sweep raised ({type(exc).__name__}); other gyms continue")
+            results.append({"gym": base, "error": type(exc).__name__})
+            continue
         # B5: say out loud what this sweep deliberately did NOT fix. Flag-gated
         # (AGENT_MEDIA_REPEAT_REPORT, default OFF) and kv-deduped per gym per month.
         # Only in APPLY mode: a dry run must stay a dry run, including its alerts.

@@ -393,3 +393,275 @@ def test_a_reburned_story_is_counted_like_the_local_path_counts_it(monkeypatch):
     res = _sweep(store, picker=_picker(), drive_n=57, monkeypatch=monkeypatch)
     assert res["rows_repointed"] == 3
     assert res["stories_reburned"] == 1, "the one story row was re-burned"
+
+
+# =====================================================================================
+# INDEPENDENT AUDIT, 2026-09-11. Round 1 of this fix graded D. Every CRITICAL and MAJOR
+# below is pinned here, plus the four claims whose code could be deleted with the whole
+# media suite still green.
+# =====================================================================================
+
+# ---- B1 CRITICAL: never swap a repeat onto its own near duplicate -------------------
+def test_a_near_dupe_of_a_booked_photo_is_never_offered_as_the_replacement(
+        monkeypatch, tmp_path):
+    """_fresh_photo refuses a near-dupe (IMG_6771.JPG next to IMG_6771.jpg -- the same
+    photo uploaded twice, which _cluster_key collapses). The fallback picker blocks only
+    by EXACT basename and the SERVED ledger, so a cluster sibling on a PENDING row was
+    blocked by neither and came straight back. Swapping John's repeat for a visually
+    identical frame and reporting the date fixed IS his complaint, made silent."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    lib = tmp_path / "dupes"
+    lib.mkdir()
+    (lib / REPEATED).write_bytes(b"\xff\xd8\xff" + b"x" * 4096)
+    (lib / "IMG_6771.JPG").write_bytes(b"\xff\xd8\xff" + b"x" * 4096)
+    monkeypatch.setattr(mrs, "_lib_dir", lambda base: str(lib))
+
+    # the local pool really is "exhausted" by _fresh_photo's rules
+    assert mrs._fresh_photo(str(lib), {REPEATED: {("2026-09-13", "x")}},
+                            exclude={REPEATED}) == (None, None)
+
+    seen = []
+
+    def pick(base, row, *, store, book_state=None, siblings=(), **kw):
+        seen.append(set(book_state or {}))
+        return {"ok": False, "reason": "no_fresh_photo"}
+
+    store = _Store(_book())
+    res = _sweep(store, picker=pick, drive_n=0, monkeypatch=monkeypatch)
+    assert seen, "the picker was never consulted"
+    assert "IMG_6771.JPG" in seen[0], \
+        "the near-dupe of the repeated photo must be blocked before the picker sees it"
+    assert REPEATED in seen[0]
+    assert store.swaps == []
+    assert res["small_library"] is True
+
+
+def test_the_near_dupe_widening_leaves_unrelated_photos_available(monkeypatch, tmp_path):
+    """_blocked_book_state must widen to CLUSTER SIBLINGS only, never to the library."""
+    lib = tmp_path / "mixed"
+    lib.mkdir()
+    for name in (REPEATED, "IMG_6771.JPG", "totally_other.jpg", "another_one.jpg"):
+        (lib / name).write_bytes(b"\xff\xd8\xff" + b"z" * 4096)
+    monkeypatch.setattr(mrs, "_lib_dir", lambda base: str(lib))
+    blocked = mrs._blocked_book_state(GYM, {REPEATED: {("2026-09-13", "x")}}, REPEATED)
+    assert "IMG_6771.JPG" in blocked, "the case-variant dupe must be blocked"
+    assert "totally_other.jpg" not in blocked
+    assert "another_one.jpg" not in blocked
+
+
+def test_the_near_dupe_widening_never_raises_on_a_missing_library(monkeypatch):
+    monkeypatch.setattr(mrs, "_lib_dir", lambda base: "/nope/not/here")
+    state = {REPEATED: {("2026-09-13", "x")}}
+    assert mrs._blocked_book_state(GYM, state, REPEATED) == state
+
+
+# ---- B2 CRITICAL: the dry run must predict what apply will really do ----------------
+def test_a_dry_run_spends_the_pool_down_instead_of_promising_it_to_every_date(
+        monkeypatch):
+    """Three repeated dates, ONE asset in the pool. The dry run used to claim all three
+    were fixable; apply fixes one. The dry run is the instrument we verify a client's
+    gym with, so it has to match."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    rows = _book() + [_row("r15", "2026-09-15", "instagram", "feed"),
+                      _row("r16", "2026-09-16", "instagram", "feed")]
+    res = _sweep(_Store(rows), apply=False, picker=None, drive_n=1,
+                 monkeypatch=monkeypatch)
+    assert res["dates_fixed"] == 1, \
+        f"a one-asset pool cannot fix {res['dates_fixed']} dates"
+    assert res["small_library"] is True, "the dates it cannot reach must still report"
+
+
+def test_a_dry_run_with_a_deep_pool_reports_every_date(monkeypatch):
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    rows = _book() + [_row("r15", "2026-09-15", "instagram", "feed"),
+                      _row("r16", "2026-09-16", "instagram", "feed")]
+    res = _sweep(_Store(rows), apply=False, picker=None, drive_n=57,
+                 monkeypatch=monkeypatch)
+    assert res["dates_fixed"] == 3
+    assert res["small_library"] is False
+
+
+# ---- C1 MAJOR: all-or-nothing at WRITE time, not just at pick time ------------------
+def test_a_failed_sibling_write_rolls_the_whole_post_back(monkeypatch):
+    """The picker's all-or-nothing only covers SHAPING. Each swap_media is a separate
+    network write; one failure used to leave the IG feed and FB mirror on the new clip
+    and the paired story still on the repeat -- a mixed post, counted as fixed."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    store = _Store(_book())
+    real_swap = store.swap_media
+
+    def flaky(base, row_id, image_url, source_media_url=None, extra_fields=None):
+        if str(row_id) == "r14st":
+            raise RuntimeError("supabase 500")
+        return real_swap(base, row_id, image_url,
+                         source_media_url=source_media_url, extra_fields=extra_fields)
+
+    store.swap_media = flaky
+    res = _sweep(store, picker=_picker(), drive_n=57, monkeypatch=monkeypatch)
+    carried = {r["id"]: r["image_url"] for r in store.rows if r["id"].startswith("r14")}
+    assert len(set(carried.values())) == 1, f"post shipped mixed media: {carried}"
+    assert all(u.endswith(REPEATED) for u in carried.values()), \
+        "every row must be back on what it carried before"
+    assert res["dates_fixed"] == 0
+    assert res["rows_repointed"] == 0
+
+
+def test_a_row_that_went_live_mid_write_rolls_the_post_back(monkeypatch):
+    """swap_media returning None (status-guarded server-side: the row was approved or
+    published between the read and the write) is the same hazard as a raise."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    store = _Store(_book())
+    real_swap = store.swap_media
+
+    def raced(base, row_id, image_url, source_media_url=None, extra_fields=None):
+        if str(row_id) == "r14fb":
+            return None
+        return real_swap(base, row_id, image_url,
+                         source_media_url=source_media_url, extra_fields=extra_fields)
+
+    store.swap_media = raced
+    res = _sweep(store, picker=_picker(), drive_n=57, monkeypatch=monkeypatch)
+    carried = {r["id"]: r["image_url"] for r in store.rows if r["id"].startswith("r14")}
+    assert all(u.endswith(REPEATED) for u in carried.values()), carried
+    assert res["rows_repointed"] == 0
+
+
+# ---- C2 MAJOR: flag OFF is the old behavior, byte for byte --------------------------
+def test_flag_off_never_reads_the_drive_pool_at_all(monkeypatch):
+    """drive_pool was measured on EVERY small-library gym regardless of the flag: a new
+    Supabase read per gym per night, and new client-readable copy, on the default path.
+    CLAUDE.md: a new capability ships behind a flag that defaults OFF."""
+    monkeypatch.delenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", raising=False)
+    calls = []
+    monkeypatch.setattr("agent.gym_media_selector.pickable",
+                        lambda *a, **k: calls.append(a) or [])
+    monkeypatch.setattr("agent.media_swap.after_swap", lambda *a, **k: None)
+    import datetime
+    res = mrs.sweep_gym(GYM, _Store(_book()), apply=True,
+                        today=datetime.date(2026, 9, 11))
+    assert calls == [], f"the Drive pool was read with the flag off: {calls}"
+    assert res["drive_pool"] == 0
+    assert res["drive_armed"] is False
+    assert res["small_library"] is True
+
+
+# ---- C3 MAJOR: the report must not say "cannot reach" a pool it just reached --------
+def test_report_says_retrying_when_the_lane_is_armed_and_still_failed():
+    res = {"gym": GYM, "photos_repeated": 3, "approved_left": 0, "small_library": True,
+           "drive_pool": 57, "drive_armed": True,
+           "detail": [f"{REPEATED} 2026-09-14: no unused photo left "
+                      "(small library; left with spacing)"]}
+    text = mrs.unfixable_report(res)
+    assert "could not prepare one" in text
+    assert "cannot reach yet" not in text, "it reached the pool; it failed to use it"
+    assert "Nothing more is needed from the gym." in text
+
+
+def test_report_says_cannot_reach_when_the_lane_is_unarmed():
+    res = {"gym": GYM, "photos_repeated": 3, "approved_left": 0, "small_library": True,
+           "drive_pool": 57, "drive_armed": False,
+           "detail": [f"{REPEATED} 2026-09-14: no unused photo left "
+                      "(small library; left with spacing)"]}
+    assert "cannot reach yet" in mrs.unfixable_report(res)
+
+
+# ---- C4 MAJOR: one gym never takes the night ---------------------------------------
+def test_a_picker_returning_a_non_dict_does_not_raise(monkeypatch):
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    store = _Store(_book())
+    res = _sweep(store, picker=lambda *a, **k: None, drive_n=57,
+                 monkeypatch=monkeypatch)
+    assert res["small_library"] is True
+    assert store.swaps == []
+
+
+def test_one_gym_raising_never_skips_the_rest(monkeypatch):
+    seen = []
+
+    def boom(base, store, **kw):
+        seen.append(base)
+        if base == "gymA":
+            raise RuntimeError("read blew up")
+        return {"gym": base, "photos_repeated": 0, "dates_fixed": 0,
+                "rows_repointed": 0, "stories_reburned": 0, "approved_left": 0,
+                "small_library": False, "drive_pool": 0, "detail": []}
+
+    monkeypatch.setattr(mrs, "sweep_gym", boom)
+    monkeypatch.setattr(mrs, "SupabaseCalendarStore", lambda *a, **k: object())
+    out = mrs.run(["gymA", "gymB", "gymC"], apply=False)
+    assert seen == ["gymA", "gymB", "gymC"], "a raising gym stopped the night"
+    assert out[0]["error"] == "RuntimeError"
+    assert [r["gym"] for r in out] == ["gymA", "gymB", "gymC"]
+
+
+# ---- C5 MAJOR: the four claims whose code could be deleted with the suite green -----
+def test_the_report_pool_number_is_actually_measured(monkeypatch):
+    """Mutant: delete result["drive_pool"] = _drive_candidate_count(...). Nothing
+    noticed that the client-readable report stopped knowing the pool size."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    monkeypatch.setattr("agent.media_swap.after_swap", lambda *a, **k: None)
+    monkeypatch.setattr(mrs, "_drive_candidate_count", lambda base, st: 57)
+    import datetime
+    # a picker that never succeeds -> small library, but the pool IS there
+    monkeypatch.setattr("agent.media_swap.pick_replacement",
+                        lambda *a, **k: {"ok": False, "reason": "hosting_unavailable"})
+    res = mrs.sweep_gym(GYM, _Store(_book()), apply=True,
+                        today=datetime.date(2026, 9, 11))
+    assert res["small_library"] is True
+    assert res["drive_pool"] == 57, "the report would have no number to tell the truth with"
+    assert res["drive_armed"] is True
+
+
+def test_a_local_pick_is_recorded_so_one_run_never_places_it_twice(monkeypatch):
+    """Mutant: delete the local-pick state.setdefault(...). Nothing noticed that one run
+    could hand the SAME LOCAL file to two repeated dates (the Drive-asset twin of this
+    was covered; the local one was not)."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    rows = _book() + [_row("r15", "2026-09-15", "instagram", "feed")]
+    seen = []
+
+    def local_pick(base, row, *, store, book_state=None, siblings=(), **kw):
+        seen.append(set(book_state or {}))
+        got = {"ok": True, "source": "local", "kind": "video", "key": "reel_02.mp4",
+               "image_url": "https://cdn.tt/reel_02.mp4", "source_media_url": None,
+               "thumbnail_url": "", "source_media_asset_id": "",
+               "path": "/tmp/reel_02.mp4"}
+        got["siblings"] = {str(s.get("id")): dict(got) for s in siblings}
+        return got
+
+    _sweep(_Store(rows), picker=local_pick, drive_n=0, monkeypatch=monkeypatch)
+    assert len(seen) == 2, "expected a pick for each repeated date"
+    assert "reel_02.mp4" in seen[1], \
+        "the second date must be told the first date already took reel_02.mp4"
+
+
+def test_after_swap_is_told_which_rows_this_swap_repointed(monkeypatch):
+    """Mutant: drop swapped_ids= from after_swap. Nothing noticed. Without it the
+    pre-swap book read still shows the OLD asset on the rows we just moved, so
+    book_carries_asset reports it still carried and the old clip is never released."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    got = {}
+    monkeypatch.setattr("agent.media_swap.after_swap",
+                        lambda base, row, pick, **kw: got.update(kw))
+    monkeypatch.setattr("agent.media_swap.pick_replacement", _picker())
+    monkeypatch.setattr(mrs, "_drive_candidate_count", lambda base, st: 57)
+    import datetime
+    mrs.sweep_gym(GYM, _Store(_book()), apply=True, today=datetime.date(2026, 9, 11))
+    assert set(got.get("swapped_ids") or ()) == {"r14ig", "r14fb", "r14st"}
+    assert got.get("book_rows") is not None, "None means UNKNOWN: never roll back"
+
+
+def test_the_picker_is_told_what_is_already_on_the_book(monkeypatch):
+    """Mutant: pass book_state=None. Nothing noticed. The picker would then re-read a
+    book it does not have and could hand back a photo already sitting on another day --
+    trading one repeat for another."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    seen = []
+
+    def pick(base, row, *, store, book_state=None, siblings=(), **kw):
+        seen.append(book_state)
+        return {"ok": False, "reason": "no_fresh_photo"}
+
+    _sweep(_Store(_book()), picker=pick, drive_n=0, monkeypatch=monkeypatch)
+    assert seen and seen[0] is not None, "the picker was handed no book state"
+    assert REPEATED in seen[0], "the repeated photo must be blocked"
