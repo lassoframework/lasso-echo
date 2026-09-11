@@ -121,7 +121,8 @@ _REPEAT_RE = re.compile(
 # plus "repeat customers/clients/members", which is a business metric, not media.
 _NOT_A_REPEAT_REPORT_RE = re.compile(
     # 1. an instruction, a request, or a hypothetical
-    r"^\s*(?:please\b|pls\b|can (?:we|you)\b|could (?:we|you)\b|would (?:you|it)\b|"
+    r"^\s*(?:please\b|pls\b|can (?:we|you|u)\b|could (?:we|you|u)\b|cud (?:we|u)\b|"
+    r"would (?:you|it)\b|"
     r"should (?:we|i)\b|is it (?:ok|okay|weird|fine)\b|let'?s\b|lets\b|do not\b|"
     r"don'?t\b|dont\b|never\b|make sure\b|go ahead\b|feel free\b|if\b|"
     r"it'?s fine\b|it is fine\b|honestly\b)|"
@@ -133,6 +134,10 @@ _NOT_A_REPEAT_REPORT_RE = re.compile(
     r"them )?(?:to )?\w*\s*(?:reuse|repeat|duplicate|recycle|keep|use|leave)?\b"
     r"(?=.*\b(?:reuse|reused|repeat|repeats|repeated|duplicate|duplicates|duplicated|"
     r"recycle|recycled|same)\b)|"
+    # ...and the same family when the repeat word came FIRST ("I know the same photo is
+    # on two days, we asked for that").
+    r"\b(?:we|i) (?:asked for|requested|wanted|needed|prefer(?:red)?) (?:that|it|this|"
+    r"them)\b|"
     r"\bfine to (?:reuse|repeat|duplicate|recycle|use)\b|"
     r"\bkeep (?:the )?same\b|"
     # gratitude ABOUT a past fix ("thanks for fixing the duplicate images"). Clause
@@ -229,7 +234,7 @@ _REPORT_SIGNAL_RE = re.compile(
     r"\b(?:still|keeps|kept|back on|(?:are|is|were|was) back|showing up|showed up|"
     r"shows up|there'?s|there (?:are|is|were|was)|noticed|"
     r"why (?:is|are|do|does|did))\b|"
-    r"\b(?:\d+|two|three|four|five|several) (?:days|weeks|times) in a row\b|"
+    r"\b(?:twice|\d+|two|three|four|five|several) (?:days|weeks|times)? ?in a row\b|"
     r"\b(?:is|are|sits?|sitting) on \w+ (?:posts?|days?|dates?)\b|"
     r"\bon (?:\d+|two|three|four|five|several|multiple|different) "
     r"(?:posts?|days?|dates?)\b|"
@@ -262,12 +267,31 @@ _LEADING_IMPERATIVE_RE = re.compile(
     re.IGNORECASE)
 
 
+# The ONLY signals an instruction genuinely cannot carry: a statement that it is STILL
+# happening, or that it already went out. Everything else -- a date, "on three posts",
+# even "the posts scheduled ..." -- is exactly what a SCHEDULING INSTRUCTION says
+# (independent audit round 8, CRITICAL). The round-7 code asserted "an instruction
+# cannot carry one of these" about the whole strong family and then short-circuited on
+# it, so _LEADING_IMPERATIVE_RE was unreachable for any clause with a date: "Use the
+# same photo on 9/14 and 9/15, it is the same promo" dispatched a fixer request. 10 of
+# 72 held-out benign sentences, 8 of them that shape.
+_PERSISTENCE_RE = re.compile(
+    r"\b(?:still|keeps|kept|back on|(?:are|is|were|was) back|showing up|showed up|"
+    r"shows up|there'?s|there (?:are|is|were|was)|noticed|went out|came out|"
+    r"got posted|got published|why (?:is|are|do|does|did))\b", re.IGNORECASE)
+
+
 def _reads_as_a_report(clause):
     """True when this clause reads as a REPORT of duplicate media rather than an
-    instruction to produce some. See _REPORT_SIGNAL_RE / _OWN_BOOK_RE."""
-    if _REPORT_SIGNAL_RE.search(clause):
+    instruction to produce some.
+
+    Persistence is proof on its own. Every other signal -- a date, a spread across
+    posts, the client's own book named -- is evidence that an INSTRUCTION can carry just
+    as easily, so it is only believed when the clause does not also open with a bare
+    imperative verb."""
+    if _PERSISTENCE_RE.search(clause):
         return True
-    if not _OWN_BOOK_RE.search(clause):
+    if not (_REPORT_SIGNAL_RE.search(clause) or _OWN_BOOK_RE.search(clause)):
         return False
     return not _LEADING_IMPERATIVE_RE.match(clause)
 

@@ -4747,3 +4747,46 @@ Minors closed: dry-run `drive_fixed` parity; `_blocked_book_state` no longer has
 booked videos; `media_guard._hash_cache` is bounded (it grew per file rewrite forever,
 and the content dedupe now drives it over whole libraries); a refused rollback reaches
 ops_alerts instead of only stdout; hyphens removed from the client-readable report copy.
+
+## Audit round 8 (2026-09-11): a CRITICAL in my own "fix", and the mixed-post counter
+
+Round 8 graded C with a CRITICAL, and it was in the guard round 7 added:
+
+- [~] **`_reads_as_a_report` short-circuited before the imperative veto could run.**
+  Round 7's comment asserted "an instruction cannot carry one of these" about the whole
+  strong signal family, then returned True on it immediately -- so
+  `_LEADING_IMPERATIVE_RE` was UNREACHABLE for any clause carrying a date or an
+  "on N posts" locative, which is exactly what a SCHEDULING INSTRUCTION says. 10 of 72
+  held-out benign sentences dispatched a fixer request, 8 of them that shape:
+  "Use the same photo on 9/14 and 9/15, it is the same promo". Only PERSISTENCE
+  (`_PERSISTENCE_RE`: still / back on / keeps / went out / there are) is genuinely
+  instruction-proof; every other signal is now evidence that the veto still judges.
+  Two smaller holes closed with it: "we asked for that" (the veto's lookahead needed the
+  repeat word AFTER it) and "can u" (the opener list had only "can we|can you").
+  **Measured across all eight rounds' corpora: precision 86/86, recall 28/28.**
+- [~] **A mixed post was still counted as a fixed date.** Round 7 made the DETAIL line
+  honest ("2 of 3 row(s); the rest kept the repeat") and left `dates_fixed` claiming the
+  date anyway, so the operator table disagreed with its own detail. A date now counts as
+  fixed ONLY when the whole post moved; anything else increments `mixed_posts`, which
+  the table prints.
+- [~] `stories_reburned` incremented BEFORE `swap_media`, so a refused write claimed a
+  row that still carries the repeat. Counted after the write lands now.
+- [~] **`_content_print` ran with the content flag OFF.** It was evaluated before the
+  `in used_prints` test, so with `used_prints` empty -- where the hash cannot change the
+  answer -- it still sha256'd every library file including booked video. Measured
+  83.9 MB read for a library of one jpg and two clips, once per repeated date, inside
+  the nightly draft run. Short-circuited.
+- [~] The forward Drive path wrote `source_media_url=""` unconditionally, contradicting
+  the rule this same PR added and tested for the local path ("never create the column on
+  a gym whose schema predates it"). `media_guard._hash_cache` now evicts one entry
+  instead of clearing (a library larger than the bound thrashed every scan, and
+  `reframe_map` is on the default path). Dry run reports `stories_reburned` for parity.
+
+### The one unflagged default-path delta, stated plainly
+
+Round 7's `source_media_url` fix means flags-OFF is NOT byte-for-byte origin/main: 4 of
+96 instrumented scenarios differ, all the same one -- a row that already carries a stale
+`source_media_url` now gets it CLEARED instead of stranded. It is a data-integrity fix
+with no product trade (a stale pointer is never desirable, and it makes the row invisible
+to every future guard), so it ships unflagged, but the module no longer claims
+"byte for byte" where that is untrue.

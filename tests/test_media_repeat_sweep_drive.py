@@ -1190,3 +1190,69 @@ def test_a_row_with_no_source_media_url_is_not_given_one(monkeypatch, tmp_path):
     mrs.sweep_gym(GYM, store, apply=True, today=datetime.date(2026, 9, 11))
     assert sent and all(v is None for v in sent), \
         f"wrote source_media_url on rows that never had one: {sent}"
+
+
+# ---- round 8 --------------------------------------------------------------------
+def test_a_mixed_post_is_not_counted_as_a_fixed_date(monkeypatch, tmp_path):
+    """Round 8 MAJOR. Round 7 made the DETAIL line honest but left dates_fixed claiming
+    a date where the feed moved and the story kept the repeat. The operator table and
+    the detail must agree."""
+    _local_lib(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setattr(mrs, "_reburn_story", lambda *a, **k: None)
+    import datetime
+    res = mrs.sweep_gym(GYM, _Store(_book()), apply=True,
+                        today=datetime.date(2026, 9, 11))
+    assert res["dates_fixed"] == 0, "a half swapped post is not a fixed date"
+    assert res["mixed_posts"] == 1
+    assert res["stories_reburned"] == 0, "no story was actually re-burned"
+
+
+def test_a_refused_write_never_counts_a_story_reburn(monkeypatch, tmp_path):
+    """stories_reburned incremented BEFORE swap_media, so a refused write claimed a row
+    that still carries the repeat."""
+    _local_lib(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setattr(mrs, "_reburn_story",
+                        lambda *a, **k: "https://cdn.tt/burned.jpg")
+    import datetime
+    store = _Store(_book())
+    real = store.swap_media
+    store.swap_media = lambda b, r, u, source_media_url=None, extra_fields=None: (
+        None if str(r) == "r14st"
+        else real(b, r, u, source_media_url=source_media_url,
+                  extra_fields=extra_fields))
+    res = mrs.sweep_gym(GYM, store, apply=True, today=datetime.date(2026, 9, 11))
+    assert res["stories_reburned"] == 0
+    assert res["dates_fixed"] == 0 and res["mixed_posts"] == 1
+
+
+def test_the_content_hash_never_runs_when_the_flag_is_off(monkeypatch, tmp_path):
+    """Round 8 MAJOR: _content_print was evaluated before the `in used_prints` test, so
+    with the flag OFF (used_prints empty, answer unchangeable) it still sha256'd every
+    library file including booked video -- once per repeated date, inside the nightly
+    draft run."""
+    monkeypatch.delenv("AGENT_MEDIA_DEDUPE_BY_CONTENT", raising=False)
+    lib = tmp_path / "big"
+    lib.mkdir()
+    for n in ("P0.jpg", "clipA.mp4", "clipB.mov"):
+        (lib / n).write_bytes(b"\xff\xd8\xff" + b"x" * 9000)
+    monkeypatch.setattr(mrs, "_lib_dir", lambda base: str(lib))
+    hashed = []
+    real = media_guard._library_hash
+    monkeypatch.setattr(media_guard, "_library_hash",
+                        lambda path: hashed.append(os.path.basename(path)) or real(path))
+    mrs._blocked_book_state(GYM, {"P0.jpg": {("2026-09-13", "x")}}, "P0.jpg")
+    assert hashed == [], f"hashed with the flag off: {hashed}"
+
+
+def test_the_hash_cache_evicts_one_entry_not_all(tmp_path):
+    """Clearing made a library larger than the bound thrash on every scan, and
+    reframe_map runs on the default path."""
+    media_guard._hash_cache.clear()
+    for i in range(media_guard._HASH_CACHE_MAX + 5):
+        media_guard._hash_cache[(f"/p{i}", i, i)] = "h"
+        if len(media_guard._hash_cache) >= media_guard._HASH_CACHE_MAX:
+            media_guard._hash_cache.pop(next(iter(media_guard._hash_cache)), None)
+    assert len(media_guard._hash_cache) >= media_guard._HASH_CACHE_MAX - 5
+    media_guard._hash_cache.clear()

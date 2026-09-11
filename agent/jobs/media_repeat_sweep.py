@@ -261,11 +261,18 @@ def _blocked_book_state(base, state, current_key):
         used_clusters = {_cluster_key(lib, k) for k in seeds}
         used_prints = (_content_prints(lib, seeds, lib_names, images_only=True)
                        if config.media_dedupe_by_content_enabled() else set())
+        if not (used_clusters or used_prints):
+            return blocked
         for name in lib_names:
             if name in blocked:
                 continue
+            # `used_prints and ...` SHORT-CIRCUITS (independent audit round 8, MAJOR):
+            # with the content flag OFF used_prints is empty, so the hash could not
+            # change the answer -- but it still ran, sha256ing every library file
+            # including booked video. Measured 83.9 MB read for a library of one jpg and
+            # two clips, once per repeated date, inside the nightly draft run.
             if (_cluster_key(lib, name) in used_clusters
-                    or _content_print(lib, name) in used_prints):
+                    or (used_prints and _content_print(lib, name) in used_prints)):
                 blocked.setdefault(name, set()).add(("near-dupe", "x"))
     except Exception as exc:  # noqa: BLE001 - never let this block a swap entirely
         _log(f"{base}: near-dupe widening skipped ({type(exc).__name__})")
@@ -392,8 +399,13 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
             # source_media_url FIRST, so that row would key as the old photo forever --
             # invisible to the client, and blocking that photo from every future pick.
             # _restore_rows got this fix in round 2; the forward path did not.
+            _src = var.get("source_media_url")
+            if _src is None and not (target.get("source_media_url") or ""):
+                _src = None          # nothing to clear; never create the column
+            else:
+                _src = _src or ""    # clear a stale one rather than strand it
             done = store.swap_media(base, rid, var["image_url"],
-                                    source_media_url=(var.get("source_media_url") or ""),
+                                    source_media_url=_src,
                                     extra_fields=media_swap.swap_fields(var))
         except Exception as exc:  # noqa: BLE001
             _log(f"{base}: swap_media failed for {rid} ({type(exc).__name__})")
@@ -710,7 +722,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
               "rows_repointed": 0, "stories_reburned": 0, "approved_left": 0,
               "small_library": False, "drive_pool": 0, "drive_pool_seen": 0,
               "drive_armed": False, "budget_capped": 0, "drive_fixed": 0,
-              "detail": []}
+              "mixed_posts": 0, "detail": []}
     if not dupes:
         return result
 
@@ -771,7 +783,8 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                 # THE LOCAL LIBRARY IS EXHAUSTED -- but the gym's CONNECTED DRIVE POOL
                 # may not be (Tough Temple: every still on the book, 57 unused clips in
                 # Drive). Ask the portal swap's engine before calling this a small
-                # library. Flag OFF => the old behavior, byte for byte.
+                # library. Flag OFF => the old lane (see AGENT_MEDIA_DEDUPE_BY_CONTENT for the one
+                    # unflagged delta: a stale source_media_url is now cleared).
                 if config.media_repeat_sweep_drive_enabled():
                     if drive_fixes_left <= 0:
                         # BUDGET SPENT is not a small library (independent audit round
@@ -797,6 +810,10 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                             pool_dry -= 1
                             drive_fixes_left -= 1    # the SAME budget apply spends
                             drive_fixed += 1         # parity with apply's counter
+                            result["stories_reburned"] += sum(
+                                1 for r in fixable
+                                if str(r.get("format") or "").lower() == "story"
+                                and config.story_format_enabled())
                             result["dates_fixed"] += 1
                             result["rows_repointed"] += len(fixable)
                             result["detail"].append(
@@ -882,6 +899,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                 # row actually has something to clear, so a gym whose schema predates
                 # the column is never written to.
                 src_url = "" if (r.get("source_media_url") or "") else None
+                reburned = False
                 if fmt == "story":
                     if config.story_format_enabled():
                         burned = _reburn_story(base, r, new_path, lib)
@@ -891,7 +909,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                             burn_failed = True
                             continue
                         target_url = burned
-                        result["stories_reburned"] += 1
+                        reburned = True
                     else:
                         target_url = hosted            # raw photo, never the square
                     if config.story_source_media_enabled():
@@ -902,6 +920,11 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                                     source_media_url=src_url) is not None:
                     result["rows_repointed"] += 1
                     swapped_local.append(str(rid))
+                    # counted only once the WRITE landed (round 8 minor): a refused
+                    # write left stories_reburned claiming a row that still carries
+                    # the repeat.
+                    if reburned:
+                        result["stories_reburned"] += 1
             if swapped_local:
                 # THE COUNT IS WHAT LANDED (independent audit round 7). This printed
                 # len(fixable) unconditionally, so a failed story re-burn reported
@@ -912,9 +935,15 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                        if _n < len(fixable) else f"{_n} row(s)")
                 result["detail"].append(f"{key} {pd}: -> {new_key} ({_of})")
                 if burn_failed or _n < len(fixable):
+                    # NOT a fixed date (independent audit round 8, MAJOR). Round 7 made
+                    # the DETAIL line honest but left the aggregate counter claiming a
+                    # date where the feed moved and the story kept the repeat. The
+                    # operator table and dates_fixed must agree with the detail.
                     _log(f"{base}: {key} {pd}: MIXED POST -- {_n} of {len(fixable)} "
                          "rows moved; a person needs to look at this date")
-                result["dates_fixed"] += 1
+                    result["mixed_posts"] = int(result.get("mixed_posts") or 0) + 1
+                else:
+                    result["dates_fixed"] += 1
                 state.setdefault(new_key, set()).add((pd, "x"))
                 try:
                     from agent import dam, rotation
@@ -974,7 +1003,7 @@ def run(gyms, *, apply=False, horizon=62):
     print(f"\n=== media_repeat_sweep [{mode}] ===")
     print(f"{'gym':<14}{'photos':>7}{'dates_fixed':>12}{'rows':>6}"
           f"{'reburned':>9}{'approved_left':>14}{'small_lib':>10}"
-          f"{'pool_seen':>11}{'capped':>7}")
+          f"{'pool_seen':>11}{'capped':>7}{'mixed':>6}")
     for r in results:
         if r.get("error"):
             print(f"{r['gym']:<14} ERROR {r['error']}")
@@ -984,7 +1013,8 @@ def run(gyms, *, apply=False, horizon=62):
         print(f"{r['gym']:<14}{r['photos_repeated']:>7}{r['dates_fixed']:>12}"
               f"{r['rows_repointed']:>6}{r['stories_reburned']:>9}"
               f"{r['approved_left']:>14}{str(r['small_library']):>10}"
-              f"{r.get('drive_pool_seen', 0):>11}{r.get('budget_capped', 0):>7}")
+              f"{r.get('drive_pool_seen', 0):>11}{r.get('budget_capped', 0):>7}"
+              f"{r.get('mixed_posts', 0):>6}")
     for r in results:
         for line in r.get("detail") or []:
             print(f"  {r['gym']}: {line}")

@@ -101,7 +101,10 @@ def _library_hash(path):
         except OSError:
             return None
         if len(_hash_cache) >= _HASH_CACHE_MAX:
-            _hash_cache.clear()          # simplest bound; the next scan re-warms it
+            # Drop the OLDEST entry, not the whole cache (round 8 minor): clearing made
+            # a library larger than the bound thrash on every scan, and reframe_map runs
+            # on the default path.
+            _hash_cache.pop(next(iter(_hash_cache)), None)
         _hash_cache[ck] = h
     return h
 

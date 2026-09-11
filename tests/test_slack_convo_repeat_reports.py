@@ -446,3 +446,34 @@ def test_a_polite_opener_is_still_stripped():
     assert c._POLITE_OPENER_RE.sub("", "heads up, the duplicate images are back",
                                    count=1).strip() == "the duplicate images are back"
     assert c.is_repeat_report("heads up, the duplicate images are back") is True
+
+
+# ---- round 8: an instruction can carry a DATE ---------------------------------------
+@pytest.mark.parametrize("text", [
+    "Use the same photo on 9/14 and 9/15, it is the same promo",
+    "Put the same picture on 9/20 too",
+    "Stick the same picture on 10/1 and we are good",
+    "Run the duplicate graphic on two posts next week",
+    "Use that same image on three posts for the challenge launch",
+    "Put the duplicate image on multiple days, it is our anniversary week",
+    "Use the same footage on different posts this month",
+    "Leave the duplicate photos on the posts scheduled for Friday",
+    "I know the same photo is on two days, we asked for that",
+    "can u repeat that image on my posts next week",
+])
+def test_a_scheduling_instruction_with_a_date_is_not_a_report(text):
+    """Round 8 CRITICAL. _reads_as_a_report short-circuited on the whole strong family,
+    so _LEADING_IMPERATIVE_RE was unreachable for any clause carrying a date or an
+    "on N posts" locative -- which is exactly what a scheduling instruction says. Only
+    PERSISTENCE ("still", "back on", "went out") is proof on its own."""
+    assert _classify(text) != c.CODE_FIX, f"dispatched a fixer on {text!r}"
+
+
+def test_persistence_is_proof_even_in_an_imperative_shape():
+    assert c._reads_as_a_report("keep showing up on 9/14") is True
+    assert c._reads_as_a_report("use the same photo on 9/14") is False
+
+
+def test_a_report_carrying_only_a_date_still_gets_through():
+    assert _classify("the same photo is on 9/14 and 9/15 and 9/16") == c.CODE_FIX
+    assert _classify("Posted the same image twice in a row again") == c.CODE_FIX
