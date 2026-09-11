@@ -217,6 +217,8 @@ class Deps:
     answer: object = None                  # (ticket, identity, messages, question) -> dict|None
     classify_llm: object = None            # (text) -> label | None
     log: object = print
+    repeat_report_enabled: object = None   # () -> bool; None (or false) means a
+                                           # duplicate-media report still ESCALATES
     cancel_post_enabled: object = None     # () -> bool; None (or false) means today's
                                             # behavior, byte identical: CANCEL_POST is
                                             # never classified, so this whole lane is dark.
@@ -712,10 +714,13 @@ def handle_event(event, event_id, deps):
         except Exception:  # noqa: BLE001 - a brain read failure never blocks classification
             hint = None
         cancel_enabled = bool(deps.cancel_post_enabled()) if deps.cancel_post_enabled else False
+        repeat_enabled = (bool(deps.repeat_report_enabled)
+                          and bool(deps.repeat_report_enabled()))
         classification = _cls.classify(text, has_open_ticket=has_open,
                                        identity_product=ident.product,
                                        llm=deps.classify_llm, brain_hint=hint,
-                                       cancel_post_enabled=cancel_enabled)
+                                       cancel_post_enabled=cancel_enabled,
+                                       repeat_report_enabled=repeat_enabled)
         if classification == _cls.ACTION_REQUEST:
             request_type = _cls.request_type_for(text)
 

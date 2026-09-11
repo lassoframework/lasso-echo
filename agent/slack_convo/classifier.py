@@ -84,10 +84,50 @@ _REPEAT_RE = re.compile(
     r"\b(?:repeat|repeats|repeated|repeating|duplicate|duplicates|duplicated|"
     r"duplicating|reuse|reuses|reused|reusing|re-used|re-using|recycled|recycling)\b|"
     r"\b(?:same|identical) (?:photo|photos|image|images|picture|pictures|pic|pics|"
-    r"video|videos|clip|clips|post|posts|shot|shots|footage|thing)\b|"
+    r"video|videos|clip|clips|post|posts|footage|thing)\b|"
     r"\b(?:over and over|again and again|twice in a row|multiple times|"
     r"more than once|(?:\d+|two|three|four|five|several) (?:days|times|weeks) in a row)"
     r"\b", re.IGNORECASE)
+
+# NOT A BUG REPORT, however many repeat words it contains (independent audit round 2,
+# 2026-09-11: 14 of 23 realistic benign client sentences dispatched a fixer request).
+# A false code_fix is not free -- adapter.py sets the ticket to 'triage', so every later
+# message from that owner classifies FOLLOW_UP until a human closes it, and the ACK Echo
+# sends reads "I read that as something not working on our side". Telling a gym owner
+# their thank-you note is a breakage report is worse than escalating it to a person.
+#
+# Three families, all of which SAY they are not complaints:
+#   1. an instruction or request     -- "please reuse the photo from last Tuesday",
+#                                       "can we repeat that promo?", "do not reuse ..."
+#   2. the CLIENT is the actor       -- "I duplicated the calendar by accident",
+#                                       "I recycled the caption", "we reused the logo"
+#   3. approval or thanks            -- "thanks for fixing the duplicate images",
+#                                       "same image different caption is fine by me"
+# plus "repeat customers/clients/members", which is a business metric, not media.
+_NOT_A_REPEAT_REPORT_RE = re.compile(
+    r"^\s*(?:please\b|pls\b|can (?:we|you)\b|could (?:we|you)\b|would you\b|"
+    r"let'?s\b|lets\b|do not\b|don'?t\b|dont\b|never\b|make sure\b|"
+    r"go ahead\b|feel free\b|heads up\b|fyi\b|thanks\b|thank you\b|thx\b)|"
+    r"\b(?:i|we) (?:just |always |usually |keep |kept )?"
+    r"(?:duplicated|duplicate|reused|reuse|re-used|recycled|recycle|repeated|repeat|"
+    r"copied|copy)\b|"
+    r"\brepeat(?:ing)? (?:myself|ourselves|itself)\b|"
+    r"\bthank(?:s| you)\b|"
+    r"\brepeat (?:customer|customers|client|clients|member|members|business|rate)\b|"
+    r"\b(?:love|loved|loves|like|liked|great|perfect|awesome|crushed|working well|"
+    r"fine by me|no big deal|hope that'?s ok|on purpose|intentional|deliberate)\b",
+    re.IGNORECASE)
+
+
+def is_repeat_report(text):
+    """True when this reads as a CLIENT REPORTING duplicate media, not asking about it,
+    instructing us to reuse something, or thanking us. Pure and deterministic."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _NOT_A_REPEAT_REPORT_RE.search(t):
+        return False
+    return bool(_REPEAT_RE.search(t)) and bool(_DOMAIN_RE.search(t))
 
 _QUESTION_RE = re.compile(
     r"(\?\s*$)|^\s*(how|what|when|where|why|who|which|can you|could you|do you|does|is it|"
@@ -136,7 +176,10 @@ _DOMAIN_RE = re.compile(
     # gym owner actually types for the same things. "photo" and "video" were here;
     # "image" was not, so "9/14-9/16 are still repeat images" failed the domain check
     # even once the breakage side matched (John Weeks / Tough Temple, 2026-09-11).
-    r"image|images|picture|pictures|pic|pics|clip|clips|footage|shot|shots|"
+    # Bare "shot" is deliberately OUT, for the same reason bare "site" is:
+    # "nice shot", "worth a shot", "a shot at the title". Every real report
+    # names the photo, the picture, the clip or the footage.
+    r"image|images|picture|pictures|pic|pics|clip|clips|footage|"
     r"sign in|echo|dashboard|reply|replies|comment|comments|drive|folder|"
     # RTF-1: the website product's nouns, which were missing entirely -- every
     # Wrangler-shaped breakage report ("the website is showing the wrong hours") failed
@@ -289,7 +332,7 @@ def default_classify_llm(model=None):
 
 
 def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=None,
-            cancel_post_enabled=False):
+            cancel_post_enabled=False, repeat_report_enabled=False):
     """One label from the fixed set, or None (escalate). Never raises.
 
     cancel_post_enabled (AGENT_SLACK_CANCEL_POST_ENABLED, default False): the ONLY gate
@@ -328,8 +371,12 @@ def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=No
     # WRONG-OUTPUT reports ("still repeat images", "the same photo three days in a
     # row"). Checked AFTER the question rule on purpose -- see _REPEAT_RE -- so an owner
     # ASKING about repeats reaches the answer lane, while an owner REPORTING them
-    # reaches the fixer. Same _DOMAIN_RE gate every code_fix carries (RT-M2).
-    if _REPEAT_RE.search(t) and _DOMAIN_RE.search(t):
+    # reaches the fixer. Same _DOMAIN_RE gate every code_fix carries (RT-M2), plus
+    # _NOT_A_REPEAT_REPORT_RE for the instruction / client-is-the-actor / thanks
+    # families. Gated exactly like CANCEL_POST: repeat_report_enabled is the ONE switch
+    # (AGENT_SLACK_REPEAT_CODE_FIX, default OFF), so False is byte identical to before
+    # this rule existed.
+    if repeat_report_enabled and is_repeat_report(t):
         return CODE_FIX
     # CANCEL_POST is gated on cancel_post_enabled even from a brain hint or the LLM
     # fallback: the flag is the ONE switch for this whole capability, so a learned

@@ -171,6 +171,7 @@ def live_deps(identity, *, bus=None, log=print):
         cross_product_armed=lambda: config.slack_convo_cross_product_routing_enabled(
             identity.name),
         cancel_post_enabled=lambda: config.slack_cancel_post_enabled(),
+        repeat_report_enabled=lambda: config.slack_repeat_code_fix_enabled(),
         log=log)
 
 

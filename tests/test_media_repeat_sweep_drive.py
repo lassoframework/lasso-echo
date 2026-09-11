@@ -665,3 +665,154 @@ def test_the_picker_is_told_what_is_already_on_the_book(monkeypatch):
     _sweep(_Store(_book()), picker=pick, drive_n=0, monkeypatch=monkeypatch)
     assert seen and seen[0] is not None, "the picker was handed no book state"
     assert REPEATED in seen[0], "the repeated photo must be blocked"
+
+
+# =====================================================================================
+# INDEPENDENT AUDIT ROUND 2 (2026-09-11). Round 2 graded the round-1 fix a D: B1 was
+# still open by its own worked example, and four new defects were found.
+# =====================================================================================
+
+# ---- B1, for real this time: the copy-suffix family -------------------------------
+@pytest.mark.parametrize("dupe", [
+    "IMG_6771 (1).jpg", "IMG_6771-copy.jpg", "IMG_6771 copy.jpg",
+    "IMG_6771(2).png", "IMG_6771 - Copy.jpg", "img_6771.JPG",
+])
+def test_every_copy_suffix_shape_shares_one_cluster(dupe):
+    """dam.rotation_key only clusters a MARKED library (mark_near_dupes runs once, at
+    onboarding, and nothing re-marks after a portal upload or a Drive sync), so in
+    production _cluster_key falls back to the stem. Case-folding alone missed every one
+    of these -- including 'IMG_6771 (1).jpg', the exact example the guard was written
+    for. This is the DEFAULT lane too: _fresh_photo shares _cluster_key."""
+    assert mrs._cluster_key("/nolib", dupe) == mrs._cluster_key("/nolib", REPEATED)
+
+
+@pytest.mark.parametrize("distinct", [
+    "photo_01.jpg", "photo_02.jpg", "squat_rack_3.jpg", "gym_shot_2024.jpg",
+    "1.jpg", "2.jpg", "totally_other.jpg", "IMG_6772.jpg",
+])
+def test_a_numbered_sequence_is_not_a_duplicate(distinct):
+    """Over-collapsing is the worse failure: it starves the library, which produces MORE
+    'small library' and MORE repeats left standing. A bare trailing number is a sequence
+    ('photo_01', 'squat_rack_3'), not a copy marker."""
+    assert mrs._cluster_key("/nolib", distinct) != mrs._cluster_key("/nolib", REPEATED)
+
+
+def test_a_numbered_library_keeps_every_photo_distinct():
+    keys = [f"photo_{i:02d}.jpg" for i in range(10)]
+    assert len({mrs._cluster_key("/nolib", k) for k in keys}) == 10
+
+
+def test_the_default_lane_never_swaps_a_repeat_for_its_own_copy(monkeypatch, tmp_path):
+    """Flag OFF, the production default. _fresh_photo must refuse IMG_6771 (1).jpg."""
+    monkeypatch.delenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", raising=False)
+    lib = tmp_path / "copies"
+    lib.mkdir()
+    for n in (REPEATED, "IMG_6771 (1).jpg"):
+        (lib / n).write_bytes(b"\xff\xd8\xff" + b"x" * 4096)
+    monkeypatch.setattr(mrs, "_lib_dir", lambda base: str(lib))
+    monkeypatch.setattr("agent.media_swap.after_swap", lambda *a, **k: None)
+    import datetime
+    store = _Store(_book())
+    res = mrs.sweep_gym(GYM, store, apply=True, today=datetime.date(2026, 9, 11))
+    assert store.swaps == [], "swapped a repeat for a byte-identical copy of itself"
+    assert res["small_library"] is True
+
+
+# ---- C2 again: the flag-OFF path must not grow a book read -------------------------
+def test_flag_off_makes_no_extra_calendar_read(monkeypatch):
+    """Round 1's _asset_state(rows, base, store) called media_guard.book_state
+    unconditionally -- an extra list_month per gym per night on the DEFAULT path. (And
+    it read backwards from today, so it never did what its docstring claimed.)"""
+    monkeypatch.delenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", raising=False)
+
+    class _Counting(_Store):
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.months = []
+
+        def list_month(self, base, month):
+            self.months.append(month)
+            return [dict(r) for r in self.rows
+                    if str(r.get("post_date", "")).startswith(month)]
+
+    monkeypatch.setattr("agent.media_swap.after_swap", lambda *a, **k: None)
+    import datetime
+    store = _Counting(_book())
+    mrs.sweep_gym(GYM, store, apply=True, today=datetime.date(2026, 9, 11))
+    assert store.months == [], f"flag OFF made extra calendar read(s): {store.months}"
+
+
+# ---- _restore_rows: a refused rollback is never silent ------------------------------
+def test_a_rollback_the_status_guard_refuses_is_reported(monkeypatch, capsys):
+    """swap_media returning None IS the likely case here (the row went live, which is
+    what triggered the rollback). Swallowing it let the caller log 'rolling back N rows
+    so the post is never half swapped' without keeping that promise."""
+    store = _Store(_book())
+    store.swap_media = lambda *a, **k: None
+    stuck = mrs._restore_rows(GYM, store, [("r14ig", {"image_url": "u"})])
+    assert stuck == ["r14ig"]
+    assert "ROLLBACK REFUSED" in capsys.readouterr().out
+
+
+def test_a_rollback_clears_a_source_media_url_the_forward_swap_set(monkeypatch):
+    """source_media_url=None does NOT clear the column (portal_calendar_store only
+    writes it when not None). A row whose original had none kept the NEW clip's
+    source_media_url on top of the OLD image_url -- and media_guard.row_media_key reads
+    source_media_url FIRST, so the repeat would go invisible to every future sweep while
+    the gym still saw it."""
+    store = _Store([_row("r1", "2026-09-14", "instagram", "feed")])
+    store.rows[0]["source_media_url"] = "https://cdn.tt/clip1.mp4"   # set by the swap
+    mrs._restore_rows(GYM, store, [("r1", {"image_url": f"https://cdn.tt/{REPEATED}",
+                                           "source_media_url": None,
+                                           "extra_fields": {}})])
+    row = store.rows[0]
+    assert row["source_media_url"] == "", "the stale source_media_url masks the repeat"
+    assert media_guard.row_media_key(row).endswith(REPEATED)
+
+
+# ---- C3 again: a DRAINED pool must not read as an empty one ------------------------
+def test_a_run_that_drains_the_pool_still_reports_the_folder_as_full():
+    """drive_pool is what is LEFT; a run that used the last asset left it at 0 and fell
+    through to 'Add photos (connect the gym's Drive folder...)' -- the exact sentence
+    this branch exists to stop sending a gym whose folder is full."""
+    res = {"gym": GYM, "photos_repeated": 3, "approved_left": 0, "small_library": True,
+           "drive_pool": 0, "drive_pool_seen": 57, "drive_armed": True,
+           "detail": [f"{REPEATED} 2026-09-14: no unused photo left "
+                      "(small library; left with spacing)"]}
+    text = mrs.unfixable_report(res)
+    assert "57 unused item(s)" in text
+    assert "Add photos" not in text, "told a gym with a full folder to add photos"
+
+
+def test_a_genuinely_empty_pool_still_asks_for_photos():
+    res = {"gym": "somegym", "photos_repeated": 3, "approved_left": 0,
+           "small_library": True, "drive_pool": 0, "drive_pool_seen": 0,
+           "drive_armed": True,
+           "detail": ["a.jpg 2026-09-14: no unused photo left "
+                      "(small library; left with spacing)"]}
+    assert "connect the gym's Drive folder or upload in the portal" in \
+        mrs.unfixable_report(res)
+
+
+# ---- the nightly budget -------------------------------------------------------------
+def test_the_drive_fallback_is_capped_per_gym_per_night(monkeypatch):
+    """pick_replacement is an HTTP-request-sized engine (real downloads, a probe, maybe
+    a transcode, 75s deadline) running inside the nightly draft process. This module's
+    own notes record a gym with 28 repeats; uncapped that is ~35 minutes on one gym."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    rows = _book()
+    for i in range(15, 25):
+        rows.append(_row(f"r{i}", f"2026-09-{i:02d}", "instagram", "feed"))
+    calls = []
+
+    def counting(base, row, *, store, siblings=(), **kw):
+        calls.append(row.get("id"))
+        got = _clip(len(calls))
+        got["siblings"] = {str(s.get("id")): dict(got) for s in siblings}
+        return got
+
+    res = _sweep(_Store(rows), picker=counting, drive_n=99, monkeypatch=monkeypatch)
+    assert len(calls) <= mrs.DRIVE_FALLBACK_MAX_PER_GYM, \
+        f"{len(calls)} Drive materializations in one gym-night"
+    assert res["dates_fixed"] == mrs.DRIVE_FALLBACK_MAX_PER_GYM
+    assert any("budget for tonight is spent" in d for d in res["detail"])

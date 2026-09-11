@@ -4422,3 +4422,79 @@ sentence failed the domain check too, even if the breakage side had matched.
 Note the separate lane this was NOT: `agent/echo_ticket_worker.py` is `SOURCE =
 "website_tab"` -- the PORTAL support tab. John wrote in Slack, so that worker was never
 in the path. The Slack path is `slack_convo/` and it stopped at classification.
+
+## Audit round 2 (2026-09-11): the near-dupe hole was never closed, and the classifier shipped unflagged
+
+Round 2 graded round 1 a D again. It was right on both counts.
+
+**B1 was still open, by its own worked example.** `_cluster_key` only reaches
+`dam.rotation_key`'s dupe_group when the sidecar was MARKED, and `dam.mark_near_dupes`
+runs in exactly ONE place: `intake_onboard.py`, once, at onboarding. Nothing re-marks a
+library after a portal upload or a Drive sync. So in production it degraded to the
+case-folded stem, which catches `IMG_6771.JPG` and misses `IMG_6771 (1).jpg` -- the
+exact filename the guard's own docstring names. And because `_fresh_photo` shares
+`_cluster_key`, the hole was in the DEFAULT (flag OFF) lane too: the sweep could replace
+a repeat with a byte-identical copy of itself and report the date fixed.
+
+- [~] `_COPY_SUFFIX_RE` strips only UNAMBIGUOUS copy markers -- `(1)`, `copy`, `dup`.
+  A bare trailing number is deliberately NOT one: `photo_01.jpg`, `squat_rack_3.jpg`,
+  `gym_shot_2024.jpg` are sequences, and collapsing them would starve the library,
+  producing MORE "small library" and MORE repeats left standing. Both directions
+  are pinned by test.
+
+**Commit 2 shipped a default-ON classifier rule.** Measured by the reviewer: 14 of 23
+realistic BENIGN client sentences dispatched a fixer request, including two explicit
+instructions ("Please reuse the photo from last Tuesday") and a thank-you note. And a
+false code_fix is not free -- `adapter.py` sets the ticket to `triage`, so every later
+message from that owner classifies FOLLOW_UP until a person closes it, and the ACK Echo
+sends reads "I read that as something not working on our side."
+
+- [~] `AGENT_SLACK_REPEAT_CODE_FIX`, default OFF, threaded through
+  `adapter.RunDeps.repeat_report_enabled` exactly like `cancel_post_enabled`. OFF is
+  byte-for-byte the old behavior. PROGRESS's earlier claim of "no new gate, no flag"
+  was wrong and is retracted.
+- [~] `_NOT_A_REPEAT_REPORT_RE`: instruction/request, client-is-the-actor, and
+  thanks/approval families, plus "repeat customers". **14 false positives -> 0, with
+  0 of 12 true positives lost.** The whole benign surface is now tested; before, the
+  only negatives were four deliberately noun-free sentences.
+- [~] Bare `shot`/`shots` dropped from `_DOMAIN_RE` for the same reason bare `site`
+  was excluded: "nice shot", "worth a shot". PROGRESS's claim that no existing
+  classification changed was also wrong -- the `_DOMAIN_RE` widening does flip
+  "my pic is broken" and "the clip won't load" from ESCALATE to code_fix. That is
+  desirable, but it is a change and is now stated.
+
+**Four more, all fixed and pinned:**
+- [~] Flag OFF grew an extra `list_month` per gym per night (round 1's wide asset read),
+  and that read went BACKWARDS from today so it never did what its docstring claimed.
+  Reverted to window-only; the horizon gap it chased is theoretical because
+  `plan_horizon` clamps every build to ~1 month.
+- [~] `_restore_rows` swallowed `swap_media` returning None -- which IS the likely case
+  (the row went live, which is why we are rolling back) -- so the caller logged a
+  promise it had not kept. A refusal is now named loudly as a mixed post needing a
+  person. It also could not CLEAR a `source_media_url` the forward swap had set
+  (portal_calendar_store only writes the column when not None), leaving the OLD
+  image_url under the NEW clip's source url; `media_guard.row_media_key` reads
+  source_media_url FIRST, so the repeat would have gone invisible to Echo while the gym
+  still saw it.
+- [~] `drive_pool` is what is LEFT, so a run that used the last asset reported 0 and
+  fell through to "Add photos (connect the gym's Drive folder)" -- the exact sentence
+  that branch exists to stop sending. `drive_pool_seen` now carries what we first saw.
+- [~] `DRIVE_FALLBACK_MAX_PER_GYM = 5`. `media_swap.pick_replacement` is an
+  HTTP-request-sized engine (real downloads, probe, maybe a transcode, 75s deadline)
+  running inside the nightly draft process, and this module's own notes record a gym
+  with 28 repeats: uncapped that is ~35 minutes on one gym.
+
+### The open risk nobody has measured yet
+
+`gym_media_selector.pickable` excludes any asset used THIS CALENDAR MONTH and anything
+inside the 90-day cooldown. `_fill_uncovered_days` fires precisely when the Drive pool
+was already drained for that month's build. So for 9/14-9/16 -- September dates in a
+September book built after #98 staged Drive video on a 45% mix -- the armed sweep may
+find ZERO pickable assets and re-emit "small library" even though 57 clips sit in the
+folder. The claim "57 unused Drive clips sit unreachable" is UNVERIFIED against the
+cooldown and this-month rules.
+
+This is the most likely way this PR ships and John still sees repeat images. The dry run
+is what settles it, and it must be run against his gym before anyone tells him anything:
+
+    python -m agent.jobs.media_repeat_sweep toughtemple52040e     # dry run, writes nothing

@@ -4225,6 +4225,30 @@ def media_repeat_sweep_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_SWEEP", "true"))
 
 
+def slack_repeat_code_fix_enabled() -> bool:
+    """A client's DUPLICATE-MEDIA report in Slack becomes a code_fix instead of an
+    escalation (AGENT_SLACK_REPEAT_CODE_FIX, default OFF).
+
+    John Weeks / Tough Temple, 2026-09-11. He reported "9/14-9/16 are still repeat
+    images" twice and the fixer lane never saw it: code_fix requires a _BREAKAGE_RE
+    match, and every pattern there describes something NOT HAPPENING (not posting, not
+    going out, broken, error, failed). There was no vocabulary for the opposite and more
+    common shape -- Echo is running fine and producing the WRONG THING -- so every
+    duplicate-media report classified ESCALATE and a human carried the whole ticket.
+
+    OFF is byte identical to before the rule existed. It ships OFF because a FALSE
+    positive here is not free: adapter.py sets the ticket to 'triage', so every later
+    message from that owner classifies FOLLOW_UP until a person closes it, and the ACK
+    Echo sends reads "I read that as something not working on our side" -- which a gym
+    owner should never receive in answer to "thanks for fixing the duplicate images."
+    An independent review measured 14 of 23 realistic benign sentences dispatching a
+    fixer request before classifier._NOT_A_REPEAT_REPORT_RE was added.
+
+    Arm by hand: AGENT_SLACK_REPEAT_CODE_FIX=true. A client code_fix is still HELD
+    behind Blake's #fixer tap either way (adapter.KIND_FIXER_REQUEST)."""
+    return _truthy(os.environ.get("AGENT_SLACK_REPEAT_CODE_FIX", "false"))
+
+
 def media_repeat_sweep_drive_enabled() -> bool:
     """The nightly repeat sweep may replace a repeat from the gym's CONNECTED DRIVE
     POOL, not only from its local uploads (AGENT_MEDIA_REPEAT_SWEEP_DRIVE, default OFF).

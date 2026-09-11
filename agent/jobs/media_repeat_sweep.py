@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from datetime import date, timedelta
 
@@ -47,6 +48,9 @@ from agent.portal_calendar_store import SupabaseCalendarStore
 FIXABLE = ("pending", "coach_review")
 UNTOUCHABLE = ("published", "publishing")
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+# At most this many dates per gym per night may go through the Drive fallback, which
+# downloads and may transcode real media. See sweep_gym's NIGHTLY BUDGET note.
+DRIVE_FALLBACK_MAX_PER_GYM = 5
 
 
 def _log(msg):
@@ -85,10 +89,35 @@ def _owner_date(by_date):
     return sorted(by_date)[0]
 
 
+# The suffixes a duplicate file picks up on its way into a library: "IMG_6771 (1).jpg"
+# from a browser/Finder copy, "IMG_6771-copy.jpg", "IMG_6771_1.jpg" from a re-upload or
+# a Drive sync collision.
+#
+# INDEPENDENT AUDIT ROUND 2 (2026-09-11, CRITICAL). _cluster_key only ever reaches
+# dam.rotation_key's dupe_group when the sidecar was MARKED, and dam.mark_near_dupes is
+# called in exactly one place -- intake_onboard.py, once at onboarding. Nothing re-marks
+# a library after a portal upload or a Drive sync, so for the media that actually causes
+# repeats this degraded to the case-folded stem, which catches only "IMG_6771.JPG" vs
+# "IMG_6771.jpg". Measured: 'IMG_6771 (1).jpg', 'IMG_6771-copy.jpg' and 'IMG_6771_1.jpg'
+# were all NOT blocked -- and "IMG_6771 (1).jpg" is the exact example the near-dupe guard
+# was written for. _fresh_photo shares this function, so the hole was in the DEFAULT
+# (flag OFF) lane too: the sweep could replace a repeat with a byte-identical copy of
+# itself and report the date fixed.
+# ONLY UNAMBIGUOUS COPY MARKERS. A bare trailing number is NOT one: real libraries are
+# full of "photo_01.jpg", "squat_rack_3.jpg", "gym_shot_2024.jpg" -- genuine sequences,
+# not duplicates. Collapsing those would starve the very library this guard protects
+# (fewer usable photos -> more "small library" -> more repeats left standing), which is
+# worse than letting one oddly named dupe through. So: "(1)", "copy", "dup" only.
+_COPY_SUFFIX_RE = re.compile(
+    r"(?:[\s._-]*\(\s*\d+\s*\)"
+    r"|[\s._-]*(?:copy|copie|duplicate|dup)[\s._-]*\d*)+$", re.IGNORECASE)
+
+
 def _cluster_key(lib, key):
     """The near-dupe identity of a library file: dam.rotation_key when the gym
-    is vision-clustered, else the case-folded stem (catches IMG_6771.JPG vs
-    IMG_6771.jpg — the same photo uploaded twice)."""
+    is vision-clustered, else the case-folded stem with any copy suffix stripped, so
+    "IMG_6771.jpg", "IMG_6771 (1).jpg", "IMG_6771-copy.jpg" and "IMG_6771_1.jpg" all
+    collapse to one identity (the same photo, uploaded twice)."""
     try:
         from agent import dam
         rk = dam.rotation_key(os.path.join(lib, key))
@@ -96,7 +125,11 @@ def _cluster_key(lib, key):
             return rk
     except Exception:  # noqa: BLE001
         pass
-    return os.path.splitext(key)[0].lower()
+    stem = os.path.splitext(key)[0].lower()
+    # Never collapse a name that is ONLY a copy suffix, and never return empty: a
+    # library of "1.jpg"/"2.jpg" must stay N distinct photos, not one.
+    trimmed = _COPY_SUFFIX_RE.sub("", stem).strip(" ._-")
+    return trimmed or stem
 
 
 def _fresh_photo(lib, state, exclude):
@@ -119,34 +152,28 @@ def _fresh_photo(lib, state, exclude):
     return None, None
 
 
-def _asset_state(rows, base=None, store=None):
-    """{drive_asset_id: {(iso_date, 'x'), ...}} for every Drive asset on the gym's book.
-    The Drive pool is keyed by asset id, a different id space from library basenames, so
-    blocking "already on the book" needs its own map (media_guard.row_asset_key). Grows
-    as the sweep places assets, so one run never hands the same clip to two dates.
+def _asset_state(rows):
+    """{drive_asset_id: {(iso_date, 'x'), ...}} for the Drive assets on the rows this
+    sweep read. The Drive pool is keyed by asset id, a different id space from library
+    basenames, so blocking "already on the book" needs its own map
+    (media_guard.row_asset_key). Grows as the sweep places assets, so one run never
+    hands the same clip to two dates.
 
-    `rows` is only the sweep's own window (today-repeat_window .. today+horizon, 62 days
-    by default). A Drive asset staged BEYOND that horizon is invisible to it, so an
-    armed sweep could place it a second time just outside its own read (independent
-    audit 2026-09-11, minor). When base+store are given, media_guard.book_state -- which
-    has no horizon -- is unioned in. Never raises; a read failure keeps the window-only
-    map, which is what this did before."""
+    SCOPE, stated honestly (independent audit round 2, 2026-09-11): this is the sweep's
+    own window only -- today-repeat_window .. today+horizon, 62 days by default. Round 1
+    flagged that an asset staged BEYOND that horizon is invisible, and round 2 caught the
+    attempted fix doing nothing: media_guard.book_state(start=today, days=1) reads
+    BACKWARDS from today, so it never saw a forward row either, while costing an extra
+    list_month per gym per night ON THE FLAG-OFF PATH. It is reverted rather than
+    widened, because the gap is theoretical: plan_horizon clamps every build to about one
+    month out, so there are no rows past +62 days to collide with. If that clamp is ever
+    raised, widen this read (with a forward span) and gate it on the flag."""
     state = {}
     for row in rows or []:
         aid = media_guard.row_asset_key(row)
         pd = str((row or {}).get("post_date") or "")[:10]
         if aid and pd:
             state.setdefault(aid, set()).add((pd, "x"))
-    if base and store is not None:
-        try:
-            from datetime import date as _date
-            wide = media_guard.book_state(base, store, _date.today(), 1, log=_log,
-                                          key_fn=media_guard.row_asset_key)
-            for aid, occ in (wide or {}).items():
-                if aid:
-                    state.setdefault(aid, set()).update(occ)
-        except Exception as exc:  # noqa: BLE001 - the window map is still correct
-            _log(f"{base}: wide asset-book read skipped ({type(exc).__name__})")
     return state
 
 
@@ -201,15 +228,40 @@ def _blocked_book_state(base, state, current_key):
 
 def _restore_rows(base, store, undo):
     """Put back the rows a partially failed swap already re-pointed, so a post never
-    ships half on the new clip and half on the repeat. Best effort, loud on failure."""
+    ships half on the new clip and half on the repeat. Returns the row ids it could NOT
+    restore (never raises).
+
+    Two things round 2 of the audit caught here:
+
+    * swap_media returning None is a REFUSAL, not a success -- it is the same
+      status guard ("this row was approved or went live") that caused the rollback in
+      the first place, so it is the likeliest outcome, and swallowing it let the caller
+      log "rolling back N rows so the post is never half swapped" without keeping that
+      promise. A refusal is now named, loudly, as needing a person.
+    * `source_media_url=None` does not CLEAR the column -- portal_calendar_store only
+      writes it when the value is not None. A row whose original had none (older story
+      rows, and any row whose forward variant set one) kept the NEW clip's
+      source_media_url on top of the OLD image_url. media_guard.row_media_key reads
+      source_media_url FIRST, so from then on every guard and every future sweep keys
+      that row by media it does not carry: the repeat goes invisible to Echo while the
+      gym still sees it. An absent original is now written as "" explicitly."""
+    stuck = []
     for rid, before in undo:
         try:
-            store.swap_media(base, rid, before["image_url"],
-                             source_media_url=before.get("source_media_url"),
-                             extra_fields=before.get("extra_fields") or {})
+            done = store.swap_media(
+                base, rid, before["image_url"],
+                source_media_url=(before.get("source_media_url") or ""),
+                extra_fields=before.get("extra_fields") or {})
         except Exception as exc:  # noqa: BLE001
-            _log(f"{base}: ROLLBACK FAILED for row {rid} ({type(exc).__name__}); it "
-                 "carries the new media while a sibling still carries the old one")
+            _log(f"{base}: ROLLBACK FAILED for row {rid} ({type(exc).__name__})")
+            done = None
+        if done is None:
+            stuck.append(str(rid))
+    if stuck:
+        _log(f"{base}: ROLLBACK REFUSED for row(s) {', '.join(stuck)} (approved or live "
+             "since the read). They carry the NEW media while a sibling carries the old "
+             "one: a MIXED POST that needs a person.")
+    return stuck
 
 
 def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, result,
@@ -469,7 +521,12 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
         # Tough Temple: a full Drive folder and this line still asked for photos).
         # drive_pool is what sweep_gym measured, not a guess: assets the sweep could
         # have used but did not reach.
-        pool = int((result or {}).get("drive_pool") or 0)
+        # The pool as first SEEN, not what is left after the run drained it
+        # (independent audit round 2): a run that used the last asset left drive_pool
+        # at 0 and fell through to "Add photos", the exact sentence this branch exists
+        # to stop sending a gym whose folder is full.
+        pool = int((result or {}).get("drive_pool_seen")
+                   or (result or {}).get("drive_pool") or 0)
         armed = bool((result or {}).get("drive_armed"))
         if pool and armed:
             # ARMED and still stuck: the lane reached for the pool tonight and could
@@ -554,8 +611,8 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     dupes = cross_day_repeats(rows, lib)
     result = {"gym": base, "photos_repeated": len(dupes), "dates_fixed": 0,
               "rows_repointed": 0, "stories_reburned": 0, "approved_left": 0,
-              "small_library": False, "drive_pool": 0, "drive_armed": False,
-              "detail": []}
+              "small_library": False, "drive_pool": 0, "drive_pool_seen": 0,
+              "drive_armed": False, "detail": []}
     if not dupes:
         return result
 
@@ -566,8 +623,15 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
             state.setdefault(key, set()).add((pd, "x"))
     # The same occupancy in the DRIVE ASSET id space, so a Drive replacement is never
     # an asset already sitting on another day (and never the same clip twice in a run).
-    asset_state = _asset_state(rows, base, store)
+    asset_state = _asset_state(rows)
     pool_dry = None                  # dry-run only: the pool size, read once per gym
+    # NIGHTLY BUDGET (independent audit round 2). media_swap.pick_replacement is an
+    # HTTP-request-sized engine: real Drive downloads, a probe and possibly a transcode,
+    # with a 75s deadline tuned for one portal click. The sweep runs in the same process
+    # as the draft run and this module's own notes record a gym with 28 repeats, so an
+    # uncapped fallback is ~35 minutes on one gym. Bounded per gym per night; the rest
+    # are reported and picked up by the next run.
+    drive_fixes_left = DRIVE_FALLBACK_MAX_PER_GYM
 
     today_iso = today.isoformat()
     for key, by_date in sorted(dupes.items()):
@@ -619,9 +683,14 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                                 f"{key} {pd}: -> connected Drive pool "
                                 f"({pool_dry} asset(s) left after this) [dry-run]")
                             continue
+                    elif drive_fixes_left <= 0:
+                        result["detail"].append(
+                            f"{key} {pd}: Drive fallback budget for tonight is spent "
+                            f"({DRIVE_FALLBACK_MAX_PER_GYM}/gym); next run picks it up")
                     elif _swap_from_drive_pool(base, store, fixable, state=state,
                                                asset_state=asset_state, rows=rows,
                                                result=result, key=key, pd=pd):
+                        drive_fixes_left -= 1
                         result["dates_fixed"] += 1
                         continue
                 result["small_library"] = True
@@ -708,6 +777,10 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
             result["drive_pool"] = (pool_dry if pool_dry is not None
                                     else _drive_candidate_count(base, asset_state))
             result["drive_armed"] = True
+            # What the pool held when we FIRST looked, so the report can tell a gym with
+            # a full folder apart from one with an empty one even after a run drains it.
+            result["drive_pool_seen"] = max(int(result.get("drive_pool_seen") or 0),
+                                            int(result["drive_pool"]))
         if apply:
             media_guard.alert_small_library(base, today_iso, _log)
     return result

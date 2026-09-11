@@ -268,6 +268,7 @@ Account record in `agent/accounts.py` ("meta_direct" default, or "socialapi").
 | AGENT_MEDIA_REPEAT_WINDOW_DAYS | 30 | code | Trailing PUBLISHED window the guard also blocks against. Clamped 0..120. |
 | AGENT_MEDIA_REPEAT_SWEEP | true | code | The nightly counterpart (`agent/jobs/media_repeat_sweep.py`) for rows ALREADY on the book. Never touches published/publishing, never swaps an APPROVED row. |
 | AGENT_MEDIA_REPEAT_SWEEP_DRIVE | false | BLAKE | Lets that sweep replace a repeat from the gym's CONNECTED DRIVE POOL, not just its local uploads. Without it a gym whose stills are all on the book is reported "small library" and its repeats are left standing even with hundreds of unused Drive clips (John Weeks / Tough Temple, 2026-09-11). Arm by hand. |
+| AGENT_SLACK_REPEAT_CODE_FIX | false | BLAKE | A client's duplicate-media report in Slack becomes a `code_fix` (dispatched to the fixer lane, still HELD behind Blake's #fixer tap) instead of escalating to a human. OFF is byte-for-byte the old behavior. Arm by hand. |
 | AGENT_MEDIA_REPEAT_REPORT | false | BLAKE | Raises ONE client-readable line per gym per month naming the repeats the sweep deliberately did NOT fix. Arm by hand. |
 
 ## Previously read in code but documented nowhere (now closed)
