@@ -1340,6 +1340,37 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
                     "reason": "day shape: same post twice in one day",
                     "day_shape_violations": [v.message() for v in exc.violations],
                     "upserted": 0, "deleted": 0}
+
+        # SLOT CAPACITY (2026-09-11, the 141-group lasso duplicate-active audit):
+        # day_shape only refuses two rows that share a caption or photo. It never
+        # refused two GENUINELY DIFFERENT posts landing in the same
+        # (account, post_date, format) slot -- that is exactly how the
+        # 2026-08-08 seed put 2-4 distinct-content active rows into one slot on
+        # 141-147 lasso days, none of them caught by day_violations() and none of
+        # them a 0318 unique-index violation (each was its own one-row variant
+        # group). This is the second, independent belt: no more rows may land
+        # 'active' in a slot than its cadence allows (1, or 2 once the
+        # proof/invitation pairing is armed), regardless of content.
+        from . import cadence as _cadence
+        _slot_capacity = _cadence.resolve_posts_per_day(account_key, sb_store)
+        try:
+            _day_shape.assert_slot_capacity(
+                rows, enabled=config.day_shape_assert_enabled(),
+                capacity=_slot_capacity)
+        except _day_shape.SlotCapacityViolation as exc:
+            try:
+                from agent import ops_alerts as _oa
+                _oa.alert(f"{account_key}: month plan STOPPED and wrote nothing. "
+                          f"{len(exc.violations)} slot(s) would have held more "
+                          f"posts than the day's cadence allows. "
+                          f"First: {exc.violations[0].message()}")
+            except Exception:  # noqa: BLE001 - the alert never sinks the report
+                pass
+            return {"ok": False,
+                    "reason": "day shape: slot over capacity",
+                    "slot_capacity_violations": [v.message() for v in exc.violations],
+                    "upserted": 0, "deleted": 0}
+
         delete_month = getattr(sb_store, "delete_month", None)
         for month in months:
             if delete_month is not None:

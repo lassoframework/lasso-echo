@@ -133,14 +133,26 @@ def test_needs_client_safe_review_pillar_is_never_a_known_taxonomy_pillar():
 
 def test_existing_active_day_is_skipped(monkeypatch):
     """Gap detection reuses client_infographic_fill's _empty_upcoming_days: a day
-    with an existing active IG feed row is never touched."""
+    with an existing active IG feed row is never touched.
+
+    PINS `today` and derives 'tomorrow' from THAT SAME value, both passed
+    through to seed_gaps -- this used to compute 'tomorrow' from the test
+    process's naive datetime.date.today() (implicitly UTC/system-local) while
+    seed_gaps resolves 'today' through _local_now(tz_name) (the gym's posting
+    timezone). Those two disagree on which calendar date is 'tomorrow'
+    whenever the wall clock sits near a timezone boundary (e.g. late evening
+    UTC is already the next gym-local day), producing a flaky off-by-one that
+    depends on what time of day the test happens to run -- exactly what
+    tripped CI here, unrelated to any change in this PR."""
     _stub_pipeline(monkeypatch)
     _stub_deep_brain(monkeypatch, [_Fact("Real fact about Chateau")])
-    from datetime import date, timedelta
-    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    from datetime import datetime, timedelta, timezone
+    pinned_now = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+    tomorrow = (pinned_now + timedelta(days=1)).date().isoformat()
     store = _Store(rows=[{"post_date": tomorrow, "format": "feed",
                          "account": "instagram", "status": "pending"}])
-    n = nmas.seed_gaps("chateau", _acct(), store, max_rows=1, days_ahead=1)
+    n = nmas.seed_gaps("chateau", _acct(), store, max_rows=1, days_ahead=1,
+                       today=pinned_now)
     assert n == 0
     assert store.inserted == []
 
