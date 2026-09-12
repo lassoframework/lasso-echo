@@ -1999,6 +1999,38 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                     "reason": "day shape: same post twice in one day",
                     "day_shape_violations": [v.message() for v in exc.violations],
                     "upserted": 0, "inserted": 0, "deleted": 0, "months": months}
+
+        # SLOT CAPACITY (2026-09-11, the 141-group lasso duplicate-active audit).
+        # day_shape.assert_day_distinct only refuses two rows sharing a caption or
+        # photo; it does nothing for two rows that are each genuinely distinct
+        # content but still both land 'active' in the same (account, post_date,
+        # format) slot. That is the exact shape of the 2026-08-08 seed defect
+        # (see day_shape.py's SLOT CAPACITY section) -- ported here so every
+        # delete-then-insert rebuild lane carries the same belt, not just
+        # real_month_planner's.
+        from . import cadence as _cadence
+        _slot_capacity = _cadence.resolve_posts_per_day(base_key, store)
+        try:
+            day_shape.assert_slot_capacity(
+                clean_rows, enabled=config.day_shape_assert_enabled(),
+                capacity=_slot_capacity)
+        except day_shape.SlotCapacityViolation as exc:
+            for v in exc.violations:
+                log(f"SLOT CAPACITY FAIL: {v.message()}")
+            try:
+                from . import ops_alerts
+                ops_alerts.alert(
+                    f"{base_key}: month build STOPPED and wrote nothing. "
+                    f"{len(exc.violations)} slot(s) would have held more posts "
+                    f"than the day's cadence allows. "
+                    f"First: {exc.violations[0].message()}")
+            except Exception:  # noqa: BLE001 - the alert never sinks the report
+                pass
+            return {"ok": False,
+                    "reason": "day shape: slot over capacity",
+                    "slot_capacity_violations": [v.message() for v in exc.violations],
+                    "upserted": 0, "inserted": 0, "deleted": 0, "months": months}
+
         # CTA SELF-QUESTION GATE (ECHO_CTA_SELF_QUESTION_GATE, default ON). Same
         # plan-time, same fail-closed shape as the day-shape assertion above:
         # nothing is deleted, nothing is inserted, when any row carries the
