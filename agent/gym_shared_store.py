@@ -119,8 +119,8 @@ class SharedGymStore:
     def _client(self):
         if self._http is not None:
             return self._http
-        import requests
-        return requests
+        import httpx
+        return httpx
 
     def _headers(self, extra=None):
         h = {"apikey": self._key, "Authorization": f"Bearer {self._key}",
