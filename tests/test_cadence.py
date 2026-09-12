@@ -415,7 +415,13 @@ def test_cadence_noop_build_never_stamps_applied(monkeypatch, tmp_path):
 
 def test_apply_allow_reshape_skips_never_shrink_once(tmp_path, monkeypatch):
     """1x->2x mid-band (media between days and 2x days): fewer covered DATES with
-    MORE feeds is a legitimate reshape — _apply must write it when allow_reshape."""
+    MORE feeds is a legitimate reshape — _apply must write it when allow_reshape.
+
+    Two feed slots land in one (account, post_date, format) slot on purpose here,
+    so gritx's cadence must genuinely say 2 (SLOT CAPACITY, 2026-09-11 lasso
+    duplicate-active audit) -- exactly the shared plane read gritx's own real
+    2x/day cadence goes through, `_Existing(ppd=2)` below."""
+    monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
     rows = []
     for d in (1, 2):
         for slot in (0, 1):
@@ -432,12 +438,12 @@ def test_apply_allow_reshape_skips_never_shrink_once(tmp_path, monkeypatch):
                      "caption": "x", "image_url": f"e{d}"} for d in (1, 2, 3)]
 
     from datetime import date
-    store = _Existing()
+    store = _Existing(ppd=2)
     blocked = cmr._apply("gritx", list(rows), date(2026, 10, 1), 30, store,
                          lambda m: None)
     assert blocked.get("noop_shrink") is True and store.inserted == []
 
-    store2 = _Existing()
+    store2 = _Existing(ppd=2)
     applied = cmr._apply("gritx", list(rows), date(2026, 10, 1), 30, store2,
                          lambda m: None, allow_reshape=True)
     assert applied["ok"] and not applied.get("noop_shrink")
