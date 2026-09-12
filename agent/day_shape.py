@@ -254,3 +254,121 @@ def assert_day_distinct(rows, *, enabled=True):
     if found:
         raise DayShapeViolation(found)
     return found
+
+
+# ---------------------------------------------------------------------------
+# SLOT CAPACITY (2026-09-11, the 141-group duplicate-active audit on gym
+# 'lasso'): day_violations() above only catches two rows sharing the exact
+# SAME caption or image on one (gym_id, account, post_date, format) slot. It
+# was never meant to catch — and does not catch — two rows that are each
+# perfectly legitimate CONTENT but still both land 'active' in one slot
+# (different pillar, different caption, different photo). That is exactly
+# how the 2026-08-08 lasso seed produced 141-147 slots each holding 2-4
+# active rows: every row was a genuinely distinct post, so day_violations()
+# saw nothing to flag, and the 0318 unique index did not help either --
+# it protects at most one ACTIVE row per variant GROUP (coalesce(variant_of,
+# id)), and every one of those seed rows was its own one-row group (variant_of
+# IS NULL), so the index was satisfied by each row individually while the
+# SLOT ended up double (or triple) booked. The index was never the wrong
+# guarantee; it was just never the guarantee this bug needed.
+#
+# THE SLOT invariant Echo actually wants: at most ONE row occupies a
+# (gym_id, account, post_date, format) slot as far as a plan-time WRITE is
+# concerned, UNLESS the deliberate 2x/day PROOF+INVITATION pairing
+# (day_shape_roles_enabled(), still OFF everywhere today) is armed, in which
+# case a slot may legitimately hold up to two -- one proof-pillar row and one
+# invitation-pillar row, never two of the same role.
+# ---------------------------------------------------------------------------
+
+class SlotOverflowViolation:
+    """One slot a plan pass tried to write more posts into than its cadence
+    allows: (gym_id, account, post_date, format) holding `count` rows against
+    a `capacity` of 1 (or 2 when the proof/invitation pairing is armed)."""
+
+    __slots__ = ("gym_id", "account", "post_date", "fmt", "count", "capacity", "pillars")
+
+    def __init__(self, gym_id, account, post_date, fmt, count, capacity, pillars):
+        self.gym_id = gym_id
+        self.account = account
+        self.post_date = post_date
+        self.fmt = fmt
+        self.count = count
+        self.capacity = capacity
+        self.pillars = list(pillars)
+
+    def __repr__(self):
+        return (f"SlotOverflowViolation({self.gym_id} {self.account} "
+                f"{self.post_date} {self.fmt}: {self.count} rows, "
+                f"capacity {self.capacity})")
+
+    def message(self):
+        return (f"{self.gym_id} {self.post_date} {self.account} {self.fmt}: "
+                f"{self.count} posts ({', '.join(self.pillars)}) would occupy a "
+                f"slot with room for {self.capacity}. Nothing was written.")
+
+
+class SlotCapacityViolation(Exception):
+    """Raised when a plan pass tried to write more posts into a slot than its
+    cadence allows. Carries `.violations`, a list of SlotOverflowViolation."""
+
+    def __init__(self, violations):
+        self.violations = list(violations or ())
+        super().__init__("; ".join(v.message() for v in self.violations)
+                         or "slot capacity violation")
+
+
+def slot_overflow_violations(rows, *, capacity=1):
+    """Every (gym_id, account, post_date, format) slot a batch of rows would
+    over-fill: more than `capacity` rows landing 'active' in the same slot.
+    Content need not be identical -- unlike day_violations(), this catches
+    distinct-but-excess posts, the class of bug the 2026-08-08 lasso seed
+    produced (2-4 genuinely different posts, one slot).
+
+    `capacity` is the CALLER's job to resolve correctly per gym (see
+    cadence.resolve_posts_per_day) -- a 2x/day gym legitimately runs 2
+    distinct posts through one slot; this function only ever enforces
+    whatever ceiling it is given, never guesses one. Pure."""
+    groups = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status") or "").strip().lower() in _IGNORED_STATUS:
+            continue
+        # A row already headed somewhere other than 'active' (e.g. an explicit
+        # candidate created via variant pairing) never competes for the slot.
+        vstatus = str(row.get("variant_status") or "active").strip().lower()
+        if vstatus != "active":
+            continue
+        post_date = str(row.get("post_date") or "").strip()
+        if not post_date:
+            continue
+        key = (str(row.get("gym_id") or ""), str(row.get("account") or ""),
+               post_date, str(row.get("format") or ""))
+        groups.setdefault(key, []).append(row)
+
+    cap = capacity if isinstance(capacity, int) and capacity >= 1 else 1
+    out = []
+    for key in sorted(groups):
+        gym_id, account, post_date, fmt = key
+        bucket = groups[key]
+        if len(bucket) <= cap:
+            continue
+        out.append(SlotOverflowViolation(
+            gym_id, account, post_date, fmt, len(bucket), cap,
+            [str(r.get("pillar") or "") for r in bucket]))
+    return out
+
+
+def assert_slot_capacity(rows, *, enabled=True, capacity=1):
+    """FAIL the plan pass when it would write more active posts into a slot
+    than `capacity` allows -- see slot_overflow_violations(). Raises
+    SlotCapacityViolation carrying every overfull slot; nothing is written on
+    a violation. Returns the (empty) list on a clean pass.
+
+    `enabled=False` skips the check entirely, restoring pre-guard behavior."""
+    if not enabled:
+        return []
+    found = slot_overflow_violations(rows, capacity=capacity)
+    if found:
+        raise SlotCapacityViolation(found)
+    return found
