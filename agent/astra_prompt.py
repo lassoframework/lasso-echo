@@ -61,6 +61,47 @@ FLAT_EDITORIAL_SPEC = (
     "margins, one depth layer at most, high contrast, and no texture or pattern."
 )
 
+# ---------------------------------------------------------------------------
+# TEXTURE AND DEPTH (Blake, 2026-09-13): "I want it to have the freedom to do
+# this level without rules." The flat-only mandate below (no texture, no
+# gradient, no photo, no illustrated props, one depth layer at most) was
+# ITSELF the sameness problem: every card reads as the identical printed-
+# magazine cutout because "flat vector, nothing else" was the whole visual
+# vocabulary. Film grain, glow, drop shadow, halftone, and real photography
+# are now first class tools, not violations, for any FREED card (LASSO's own
+# or a client gym in scope). This REPLACES creative_studio.STORY_REQUIREMENT
+# for a freed card only; the locked/off path still uses STORY_REQUIREMENT
+# unchanged, so the old flat-only house style is untouched for any account
+# still on the single template.
+# ---------------------------------------------------------------------------
+TEXTURE_AND_DEPTH_LAW = (
+    "Quality standard (every card): this card must look clean, professional, "
+    "and high end, premium B2B agency work, the level of a top tier SaaS or "
+    "lifestyle brand campaign.\n"
+    "TEXTURE AND DEPTH ARE WELCOME, not violations: film grain, a soft "
+    "vignette, a drop shadow, a halo glow behind a shape, light halftone or "
+    "paper texture, and layered depth are all in bounds when they serve a "
+    "premium, tactile look. This is a deliberate departure from a flat only "
+    "rule: depth and texture are first class tools now, not a last resort.\n"
+    "PHOTOGRAPHY is allowed on any card when it serves the concept: a real "
+    "event venue, a real gym space, a real workplace scene. Never a stock "
+    "posed corporate smile, never a composite of unrelated people, and never "
+    "a competitive athlete, a CrossFit or HYROX scene, or a barbell hero shot "
+    "(LASSO markets to gen pop boutique fitness: busy professionals, "
+    "beginners, weight loss, lifestyle fitness, postpartum, 40 plus reclaim, "
+    "never competitive strength athletes).\n"
+    "ILLUSTRATION is allowed when it stays clean and purposeful (a simple "
+    "icon inside a glowing circle, clean line art), never cartoonish, "
+    "juvenile, or a cluttered scene.\n"
+    "STILL BANNED: cluttered collages, watermarks, lorem ipsum, illegible or "
+    "purely decorative type, and generic abstract process labels (STEP 1, "
+    "STEP 2, STEP 3, PLAN, GROW, LEARN, DISCOVER, LAUNCH, START, FINISH). "
+    "Labels use real business language a gym owner recognizes: LEADS, "
+    "BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS, COST PER LEAD.\n"
+    "The two second test still applies: a gym owner scrolling fast must read "
+    "the card's point from the headline and the visual in under two seconds."
+)
+
 # Grade-gate compatible accent law: names the single red element explicitly.
 SINGLE_ACCENT_LAW = (
     "COLOR LAW: red is used exactly one time on the card, and it is the CTA "
@@ -155,21 +196,51 @@ _CANVAS_WEIGHTS = {
 }
 CANVAS_POOL = [c for c in CANVAS_ORDER for _ in range(_CANVAS_WEIGHTS[c])]
 
-# COMPOSITION MODES. The old FLAT_EDITORIAL_SPEC is kept as one of seven, not
-# as the law. Each mode changes the card's STRUCTURE and its furniture.
-# The freedom-mode cut of the Full Gym standard. Identical to FLAT_EDITORIAL_SPEC
-# except block 3 no longer declares the button "the ONE red element": under the
-# freedom system the accent may land elsewhere, and two rules claiming the same
-# accent is how a brief contradicts itself. The locked-mode constant is untouched.
-_FLAT_EDITORIAL_FREE = FLAT_EDITORIAL_SPEC.replace(
-    "styled like a real interface button. This is the ONE red element on the "
-    "card.",
-    "styled like a real interface button. Its color follows the COLOR LAW below, "
-    "which decides where this card's single accent lands.",
+# COMPOSITION MODES. The old FLAT_EDITORIAL_SPEC is kept as one of seven-plus,
+# not as the law. Each mode changes the card's STRUCTURE and its furniture.
+# The freedom-mode cut of the Full Gym standard differs from FLAT_EDITORIAL_SPEC
+# in two ways: block 3 no longer declares the button "the ONE red element" (under
+# the freedom system the accent may land elsewhere, and two rules claiming the
+# same accent is how a brief contradicts itself), and block 2 / the closing line
+# no longer mandate flat-only, texture-free rendering (see TEXTURE_AND_DEPTH_LAW,
+# which replaces the old flat-only ban for any freed card). The locked-mode
+# FLAT_EDITORIAL_SPEC constant above is untouched.
+_FLAT_EDITORIAL_FREE = (
+    "STYLE SPEC, FLAT EDITORIAL INFOGRAPHIC (one of the composition modes, not "
+    "the law):\n"
+    "1. BOLD HEADLINE. One headline, the largest element on the card, left "
+    "aligned in the upper area. It is the visual anchor of the composition. "
+    "Nothing competes with it for scale.\n"
+    "2. THREE ELEMENT VISUAL METAPHOR. Exactly three elements, drawn as clean "
+    "vector shapes, line art, simple icons, or a lightly textured or "
+    "photographic treatment (see TEXTURE AND DEPTH below), that show the idea "
+    "concretely: three labeled nodes, three stacked bars, three stages, three "
+    "icons in a row. Three, not two and not five. Each element carries one "
+    "short UPPERCASE business label.\n"
+    "3. CTA BUTTON BLOCK. One solid rounded rectangle near the lower third "
+    "holding the call to action in short bold type, styled like a real "
+    "interface button. Its color follows the COLOR LAW below, which decides "
+    "where this card's single accent lands.\n"
+    "4. URL FOOTER. The site URL set small, uppercase and letterspaced on the "
+    "bottom margin, quiet and out of the way.\n"
+    "Flat editorial means a premium printed magazine infographic: generous "
+    "margins and high contrast. Texture, grain, and depth are welcome tools "
+    "here, not violations."
 )
 
 COMPOSITION_MODES = {
     "flat_editorial": _FLAT_EDITORIAL_FREE,
+    "icon_list": (
+        "COMPOSITION ICON LIST: three to five numbered rows stacked down the "
+        "frame. Each row pairs a bold number or a simple icon inside a circle "
+        "or bordered shape with one short bold label and one quiet subhead "
+        "line beneath it, separated from the next row by a thin rule. The "
+        "headline sits above the list. Even rhythm, generous row spacing, one "
+        "clear reading order top to bottom. A CTA button block, one solid "
+        "rounded bar near the bottom holding the call to action in short bold "
+        "type, may close the card when a call to action is provided; its "
+        "color follows the COLOR LAW below."
+    ),
     "type_poster": (
         "COMPOSITION TYPE POSTER: type carries the entire card. No diagram, no "
         "icon set, no button. The headline is set enormous, filling most of the "
@@ -213,7 +284,7 @@ COMPOSITION_MODES = {
 }
 
 COMPOSITION_ORDER = [
-    "flat_editorial", "type_poster", "data_story", "diagram",
+    "flat_editorial", "icon_list", "type_poster", "data_story", "diagram",
     "split_screen", "stack", "device",
 ]
 
@@ -452,32 +523,44 @@ LOCKED_BRAND_COLORS = (
     "- Sky Blue #5EB9E6\n"
     "- Red #FF0000\n"
     "- White #FFFFFF\n"
-    "Quality bar on every field: premium B2B agency work, clean and deliberate. "
-    "No gradients, no texture, no pattern fills, no gimmicks."
+    "Quality bar on every field: premium B2B agency work, clean and "
+    "deliberate. Texture, grain, and depth are welcome tools (see TEXTURE "
+    "AND DEPTH below), not gimmicks to avoid."
+)
+
+
+# The freedom-mode BANNED list. Drops the old flat-only bans (texture, photo,
+# 3D, illustrated props) that TEXTURE_AND_DEPTH_LAW now explicitly permits --
+# keeping both would contradict the brief. What survives: genuinely bad
+# outcomes (cartoon/juvenile clip art, corny stock-art metaphors, clutter,
+# watermarks, generic process labels) and the avatar-safety line (never a
+# competitive athlete, CrossFit, or HYROX image -- LASSO's avatar is gen pop
+# boutique fitness). The locked-mode BANNED constant above is untouched and
+# still used verbatim whenever style is off.
+FREE_BANNED = (
+    "BANNED, never render any of these: cartoon or juvenile clip art, "
+    "metaphorical props that read as corny stock art (dripping money, safes, "
+    "broken pipes, locks), cluttered collages, watermarks, lorem ipsum, and "
+    "generic process labels (STEP 1, PLAN, GROW, LEARN, DISCOVER, LAUNCH). "
+    "Labels use real business language a gym owner recognizes: LEADS, "
+    "BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS. LASSO's avatar "
+    "rule holds on every canvas: never a competitive athlete, never CrossFit "
+    "or HYROX imagery, never a barbell hero shot (LASSO markets to gen pop "
+    "boutique fitness, never competitive strength athletes)."
 )
 
 
 def banned_for(canvas: str) -> str:
-    """The BANNED list for one card.
-
-    Identical to BANNED on every canvas but DUOTONE, whose whole premise is a
-    real photograph. There the photography ban is lifted and replaced with a
-    tighter rule, because a blanket "no photography" line would cancel the mode.
-    Everything else stays banned on every card, every mode.
-    """
+    """The freedom-mode BANNED list for one card (see FREE_BANNED). DUOTONE
+    gets one extra, more specific photography line layered on top, because
+    its whole premise is a real photograph and "candid, documentary" is a
+    sharper instruction than the general photography allowance above."""
     if canvas != "duotone":
-        return BANNED
-    return (
-        "BANNED, never render any of these: illustrated scenes, cartoon "
-        "elements, metaphorical props (dripping money, safes, broken pipes, "
-        "locks), 3D effects, cluttered collages, watermarks, lorem ipsum, and "
-        "generic process labels (STEP 1, PLAN, GROW, LEARN, DISCOVER, LAUNCH). "
-        "Labels use real business language a gym owner recognizes: LEADS, "
-        "BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS.\n"
-        "PHOTOGRAPHY on this card: one real, candid, documentary frame, duotoned "
-        "to the brand. Never a stock posed smile, never a composite, never an AI "
-        "looking render, never a competitive athlete or a barbell hero shot. The "
-        "subject is an ordinary gym owner or a real gym space."
+        return FREE_BANNED
+    return FREE_BANNED + "\n" + (
+        "PHOTOGRAPHY on this card specifically: one real, candid, "
+        "documentary frame, duotoned to the brand. Never a stock posed "
+        "smile, never a composite, never an AI looking render."
     )
 
 
@@ -493,6 +576,82 @@ VOICE_EXCERPT_CHARS = 1200
 def url_footer() -> str:
     raw = os.environ.get("AGENT_IMAGE_URL_FOOTER", "")
     return raw.strip() or DEFAULT_URL_FOOTER
+
+
+# ---------------------------------------------------------------------------
+# MASTHEAD (Blake, 2026-09-13): a locked lockup so a run of freed cards still
+# reads as ONE series instead of one-off graphics: the LASSO wordmark, a red
+# dot, a thin rule, and (when the caller names one) a small eyebrow tag naming
+# the card's pillar. LASSO'S OWN account only -- a client gym's freed card is
+# that gym's brand, never LASSO's wordmark (see freed_gym_card below).
+# ---------------------------------------------------------------------------
+
+# Sherman Merricks and Blake Ruff are LASSO's own founders (see section 1 of
+# this doc's own brand voice excerpt) -- stating it on LASSO's own content is
+# attribution, not an invented fact, so it is a constant here rather than
+# caller-supplied copy.
+LASSO_BYLINE = "Sherman Merricks & Blake Ruff"
+
+
+def masthead_block(label=None) -> str:
+    """The masthead lockup for one LASSO-owned freed card. `label` is a caller
+    supplied short pillar tag (never invented here -- NO FABRICATION holds for
+    copy same as everywhere else in this brief); omitted, the masthead renders
+    the wordmark and rule only, no eyebrow line."""
+    eyebrow = ""
+    if str(label or "").strip():
+        eyebrow = (
+            " Beneath the rule, a small letterspaced uppercase eyebrow line "
+            f"reading exactly '{str(label).strip().upper()}' (if it names two "
+            "phrases, join them with a real bullet character, never a dash "
+            "or hyphen)."
+        )
+    return (
+        "MASTHEAD (render at the top of every card in this series): the "
+        "wordmark 'LASSO.' in the headline font, with the period rendered as "
+        f"a solid red dot. Beside or beneath it, a thin horizontal rule.{eyebrow} "
+        "This lockup is what makes a run of these cards read as one series, "
+        "not one-off graphics."
+    )
+
+
+def byline_footer(url: str) -> str:
+    """The two-line footer for a LASSO-owned freed card: the standing byline
+    above the URL, both rendered small and quiet."""
+    return (
+        f"FOOTER (render exactly, as two small quiet lines): '{LASSO_BYLINE}' "
+        f"then '{url}'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# BOOK COVER PRODUCT SHOT (Blake, 2026-09-13, a second reference batch: five
+# more of his own cards, all "book" pillar, all showing a photographic-style
+# render of THE FULL GYM's actual cover with a small gold accolade ribbon).
+# The cover render itself is a real brand asset, not a fact -- showing it
+# invents nothing. The RIBBON TEXT (e.g. "Reached #1 on Amazon in Marketing")
+# is a specific claim, so it is caller-supplied only, same no-fabrication
+# contract as every other approved fact in this brief: never defaulted, never
+# invented here. `kind="book"` opts a card into the cover shot; omitting
+# `book_cover_badge` renders the cover with no ribbon at all.
+# ---------------------------------------------------------------------------
+def book_cover_element(badge=None) -> str:
+    """The book-cover product shot block for a `kind="book"` LASSO card.
+    `badge` is a caller-supplied short accolade line; never invented here."""
+    badge_line = ""
+    if str(badge or "").strip():
+        badge_line = (
+            " A small gold ribbon badge near the cover reads exactly: "
+            f"'{str(badge).strip()}'."
+        )
+    return (
+        "BOOK COVER PRODUCT SHOT: include a photographic-style render of THE "
+        "FULL GYM book cover (black cover, bold red and white 'THE FULL GYM' "
+        "title type, the LASSO mark on the spine) angled slightly with a soft "
+        "drop shadow, as a real product shot, not a flat rectangle." +
+        badge_line + " Never invent a different title, author, or badge text "
+        "than what is given here."
+    )
 
 
 def load_voice_excerpt(path=None, limit=VOICE_EXCERPT_CHARS) -> str:
@@ -516,7 +675,8 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
                             pixels=None, aspect=None, voice_path=None,
                             palette=None, footer=None, kind="infographic",
                             style_key=None, canvas=None, composition=None,
-                            accent=None, freedom=None, account_key=None):
+                            accent=None, freedom=None, account_key=None,
+                            masthead_label=None, book_cover_badge=None):
     """Build the Astra creative brief from APPROVED input ONLY.
 
     `headline` is the one hook rendered on the card. `facts` are the approved
@@ -553,6 +713,24 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
     rather than a LASSO-specific look -- the banned list, the readability bar,
     the no-fabrication line, the no-dash rule, the copy hard-rule checks below
     -- is unchanged for a gym card.
+
+    TEXTURE AND DEPTH (Blake, 2026-09-13: "give it the freedom to do this level
+    without rules"). Any FREED card, LASSO's own or a client gym's, now uses
+    TEXTURE_AND_DEPTH_LAW and the loosened banned_for() list in place of
+    creative_studio.STORY_REQUIREMENT and the old flat-only BANNED constant:
+    film grain, glow, drop shadow, halftone texture, and real photography are
+    permitted tools, not violations, wherever the concept calls for them. The
+    locked/off path is untouched (still STORY_REQUIREMENT and BANNED, byte for
+    byte). LASSO's OWN account additionally gets a required MASTHEAD (the
+    'LASSO.' wordmark plus red dot, a rule, and an optional `masthead_label`
+    eyebrow tag) and a two-line FOOTER carrying the standing LASSO_BYLINE above
+    the URL, so a run of freed cards reads as one series -- a client gym's
+    freed card gets neither (it is that gym's brand, never LASSO's wordmark).
+    `kind="book"` on a LASSO card additionally adds the BOOK COVER PRODUCT
+    SHOT block (see book_cover_element); `book_cover_badge` is an optional
+    caller-supplied accolade line for it (e.g. "Reached #1 on Amazon in
+    Marketing") -- never defaulted or invented, same no-fabrication contract
+    as every approved fact elsewhere in this brief.
 
     Returns the brief string, dash-scrubbed and checked against the same hard
     rules the Gemini prompt is checked against (banned headline words, and, in
@@ -611,6 +789,11 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
         sections.append(gym_brand_latitude(style["canvas"]))
     else:
         sections.append(palette or _cs.BRAND_PALETTE)
+    if style and is_lasso:
+        # The masthead is LASSO's own series lockup, never a client gym's.
+        sections.append(masthead_block(masthead_label))
+        if str(kind or "").strip().lower() == "book":
+            sections.append(book_cover_element(book_cover_badge))
     sections.append(BRAND_TYPE_SYSTEM)
     sections.append(
         "HOOK, the one headline rendered on the card, render it exactly and keep "
@@ -633,13 +816,15 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
         accent_section = accent_law_free(style["accent"])
     else:
         accent_section = SINGLE_ACCENT_LAW
+    footer_section = (byline_footer(footer or url_footer()) if (style and is_lasso)
+                     else f"URL FOOTER TEXT (render exactly): {footer or url_footer()}")
     sections.extend([
         COMPOSITION_MODES[style["composition"]] if style else FLAT_EDITORIAL_SPEC,
-        f"URL FOOTER TEXT (render exactly): {footer or url_footer()}",
+        footer_section,
         accent_section,
         ART_DIRECTION_LATITUDE if style else READABILITY_LAW,
         READABILITY_LAW if style else "",
-        _cs.STORY_REQUIREMENT,
+        TEXTURE_AND_DEPTH_LAW if style else _cs.STORY_REQUIREMENT,
         _cs.CLEAR_HEADLINE_LAW,
         _cs.NO_STAT_SLAB_LAW,
         banned_for(style["canvas"]) if style else BANNED,

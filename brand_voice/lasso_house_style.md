@@ -1,13 +1,24 @@
 # LASSO House Style System
 
 Source of truth for every infographic Echo generates.
-Version: 1.2 (2026-09-13)
+Version: 1.3 (2026-09-13)
 
-**v1.2 changes the default.** Cream is no longer THE canvas, it is one of seven.
+**v1.2 changed the default.** Cream is no longer THE canvas, it is one of seven.
 Astra now draws a canvas, a composition, and an accent placement per card instead
 of rendering one template every time. See Section 12. Everything the brand is
 built on stays locked: the colors, two type families, no dashes, no fabrication,
 the readability bar, and the human approval gate.
+
+**v1.3 lifts the flat-only mandate for any FREED card.** Blake graded 5 real
+Astra renders a C against a reference set of his own and diagnosed why: his
+reference used film grain, glow, drop shadow, real photography, and a
+consistent LASSO masthead, every one of which the old spec banned outright.
+His ruling: "I want it to have the freedom to do this level without rules."
+Texture, depth, and photography are now permitted tools on any freed card; the
+LASSO avatar rule (never a competitive athlete) is the one line from the old
+ban that survives, because it protects who LASSO markets to, not a technique.
+LASSO's own account additionally gets a required masthead + byline lockup so
+a run of cards reads as one series. See Section 12A.
 
 All constants in `agent/creative_studio.py` that begin with `HOUSE_STYLE_`
 or reference this document must match the scaffold in Section 8 exactly.
@@ -434,3 +445,94 @@ is_lasso_account`) when it is in freedom scope:
 LASSO's own account is UNCHANGED by this: it still gets `LOCKED_BRAND_COLORS`
 + its 7-canvas system, because those ARE LASSO's real agency colors, not a
 template imposed on someone else's brand.
+
+## 12A. Texture, Depth, Photography, and the LASSO Masthead (v1.3)
+
+**Why:** Blake graded 5 real Astra renders a C against a reference set of his
+own and diagnosed the gap precisely: his reference used film grain, a glow
+halo, a drop shadow, a real skyline photo, and a clean icon-in-a-circle
+illustration — every one of which the v1.2 spec banned outright
+(`FLAT_EDITORIAL_SPEC` block 2: "no illustrated scenes, no photorealism, no
+3D, no gradients"; its closing line: "one depth layer at most... no texture
+or pattern"; the same bans repeated in `creative_studio.STORY_REQUIREMENT`,
+which every brief carried unconditionally). His reference set also carried a
+consistent masthead — the "LASSO." wordmark with a red-dot period, a rule,
+and a small eyebrow tag — plus a "Sherman Merricks & Blake Ruff" byline, on
+every card. His ruling: **"I want it to have the freedom to do this level
+without rules."**
+
+### What's freed (any card style-freedom frees: LASSO's own or a client gym)
+
+`TEXTURE_AND_DEPTH_LAW` (`agent/astra_prompt.py`) replaces
+`creative_studio.STORY_REQUIREMENT` for a freed card. Permitted now, not
+banned: film grain, a soft vignette, a drop shadow, a halo glow, light
+halftone or paper texture, layered depth, and real photography (a real event
+venue, a real gym space, a real workplace scene). `FREE_BANNED` replaces the
+flat-only `BANNED` constant: drops the texture/photo/3D/illustration bans,
+keeps cartoon/juvenile clip art, corny stock-art metaphors, clutter,
+watermarks, and generic process labels banned.
+
+**The one line that survives from the old ban, on every canvas, freed or
+locked:** the LASSO avatar rule. Never a competitive athlete, never
+CrossFit or HYROX imagery, never a barbell hero shot — LASSO markets to gen
+pop boutique fitness (busy professionals, beginners, weight loss, lifestyle
+fitness, postpartum, 40+ reclaim), never competitive strength athletes. That
+is an audience rule, not a technique rule, so lifting the technique ban never
+touches it.
+
+`_FLAT_EDITORIAL_FREE` (the `flat_editorial` composition text) no longer
+mandates flat-only rendering in its own block 2 or closing line.
+
+### A new composition mode: `icon_list`
+
+An 8th composition mode, matching the most-used layout in Blake's reference
+set: three to five numbered rows, each pairing a bold number or icon with a
+label and a subhead, closed by an optional CTA bar. 336 canvas x composition
+x accent combinations now (was 294), all re-verified against the grade gate.
+
+### The LASSO masthead and byline (LASSO's own account only)
+
+A client gym's freed card is that gym's brand, never LASSO's — so this
+section applies only when `is_lasso_account(account_key)` is true.
+
+- **`masthead_block(label)`** renders the "LASSO." wordmark (period as a
+  solid red dot) plus a thin rule at the top of every card, so a run of freed
+  cards reads as one series instead of one-off graphics. An optional `label`
+  (the new `masthead_label` param on `build_infographic_brief`, or
+  `--masthead-label` on the render-card CLI) adds a small eyebrow line
+  rendered exactly as given — the caller supplies the FULL text (e.g. "THE
+  FULL GYM • SALES" or just "THE FULL GYM"), never a bare topic word that the
+  code prefixes itself: not every LASSO card is a book-pillar card, so
+  hardcoding a "THE FULL GYM" prefix would be wrong (and, caught during
+  testing, duplicated the phrase when a caller passed it as the label). If
+  the label names two phrases it says to join them with a real bullet
+  character, never a dash. `label` is never invented by the brief builder;
+  the same no-fabrication contract as everywhere else in this doc holds.
+- **`byline_footer(url)`** renders the standing byline — "Sherman Merricks &
+  Blake Ruff" — above the URL footer. This is attribution (LASSO's own
+  founders, already named in this doc's Section 1), not an invented fact, so
+  it is a constant (`LASSO_BYLINE`) rather than caller-supplied copy.
+
+### Book cover product shot (`kind="book"`, LASSO's own account only)
+
+Blake sent a second reference batch, five more of his own cards, all "book"
+pillar, all showing a photographic-style render of THE FULL GYM's actual
+cover — angled, drop-shadowed, a real product shot — often with a small gold
+accolade ribbon ("Reached #1 on Amazon in Marketing"). `book_cover_element
+(badge)` adds this block when a LASSO card's `kind="book"`. The cover
+render itself is a real brand asset (showing it invents nothing); the ribbon
+TEXT is a specific claim, so `book_cover_badge` is caller-supplied only —
+never defaulted, never invented. Omitting it renders the cover with no
+ribbon at all, same no-fabrication contract as every other approved fact in
+this brief.
+
+### What did NOT change
+
+The locked/off path (style freedom OFF) still uses `STORY_REQUIREMENT` and
+`BANNED` verbatim, with no masthead — untouched, byte for byte, for any
+account still on the single template. The LASSO V3 color values, two type
+families, the no-dash rule, no fabrication, the readability bar, the
+six-question grade gate, and the human approval gate are all still locked,
+on and off. Blake's reference set included a "$499 GENERAL ADMISSION" price
+that no approved fact set backs — that was deliberately NOT carried over.
+Visual freedom never overrides no-fabrication.

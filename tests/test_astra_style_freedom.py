@@ -148,17 +148,27 @@ def test_red_field_flips_the_accent_to_white_so_the_card_never_fights_itself():
     assert "#FF0000" in normal and "exactly one" in normal.lower()
 
 
-def test_duotone_is_the_only_canvas_that_lifts_the_photography_ban():
+def test_texture_and_photography_are_freed_but_the_avatar_rule_still_holds():
+    """Blake, 2026-09-13: "give it the freedom to do this level without rules."
+    Texture, depth, and photography are no longer banned on any freed canvas
+    (that ban lived in the old flat-only BANNED constant, still used verbatim
+    in locked mode below); the LASSO avatar rule (never a competitive athlete)
+    is the one line that survives on every canvas, freed or locked."""
+    for canvas in astra_prompt.CANVAS_ORDER:
+        banned = astra_prompt.banned_for(canvas)
+        assert banned == astra_prompt.FREE_BANNED or canvas == "duotone"
+        assert "never a competitive athlete" in banned
+        assert "photorealistic photography" not in banned
     duo = astra_prompt.banned_for("duotone")
     assert "PHOTOGRAPHY on this card" in duo
-    assert "never a competitive athlete" in duo       # the LASSO avatar rule holds
-    for canvas in ("cream", "navy", "red", "split", "sky", "ink"):
-        assert astra_prompt.banned_for(canvas) == astra_prompt.BANNED
-        assert "photorealistic photography" in astra_prompt.banned_for(canvas)
+    # Locked mode (style off) is untouched: still the old flat-only BANNED.
+    assert "photorealistic photography" in astra_prompt.BANNED
 
 
 def test_every_combination_passes_the_grade_gate_and_the_copy_rules():
-    """294 combinations. A freed card is graded by the same gate as a locked one."""
+    """336 combinations (7 canvas x 8 composition x 6 accent, since icon_list
+    joined the composition modes). A freed card is graded by the same gate as
+    a locked one."""
     checked = 0
     for canvas in astra_prompt.CANVAS_ORDER:
         for comp in astra_prompt.COMPOSITION_ORDER:
@@ -171,7 +181,7 @@ def test_every_combination_passes_the_grade_gate_and_the_copy_rules():
                 assert "NO FABRICATION" in brief
                 assert "READABILITY" in brief
                 checked += 1
-    assert checked == 294
+    assert checked == 336
 
 
 def test_freedom_keeps_the_locked_colors_and_type_families(monkeypatch):
@@ -390,3 +400,97 @@ def test_voice_path_for_a_gym_reads_its_own_durable_doc(monkeypatch, tmp_path):
     voice_file.write_text("gym voice")
     path = astra_prompt._voice_path_for("somegym_ig")
     assert path == str(voice_file)
+
+
+# ---- texture and depth freedom, masthead, byline (Blake, 2026-09-13: "give it
+# the freedom to do this level without rules") ------------------------------
+
+def test_locked_mode_still_bans_texture_and_photography():
+    """The off/locked path is untouched: still the flat-only house style."""
+    brief = _brief(freedom=False)
+    assert "photorealistic photography" in brief
+    assert "TEXTURE AND DEPTH ARE WELCOME" not in brief
+    assert "MASTHEAD" not in brief
+
+
+def test_freed_lasso_card_permits_texture_and_photography():
+    brief = _brief(freedom=True, canvas="navy", composition="flat_editorial",
+                   accent="one_word")
+    assert "TEXTURE AND DEPTH ARE WELCOME" in brief
+    assert "photorealistic photography" not in brief
+    assert "never a competitive athlete" in brief  # avatar rule still holds
+
+
+def test_freed_lasso_card_carries_the_masthead_and_byline():
+    brief = _brief(freedom=True, canvas="navy", composition="flat_editorial",
+                   accent="one_word", account_key="lasso")
+    assert "MASTHEAD" in brief
+    assert "LASSO." in brief
+    assert "Sherman Merricks & Blake Ruff" in brief
+    assert "FOOTER" in brief
+
+
+def test_masthead_label_renders_the_eyebrow_line_verbatim():
+    """The caller supplies the FULL eyebrow text (not just a topic word) --
+    masthead_block does not hardcode a "THE FULL GYM" prefix, since not every
+    LASSO card is a book-pillar card."""
+    brief = _brief(freedom=True, canvas="navy", composition="flat_editorial",
+                   accent="one_word", account_key="lasso",
+                   masthead_label="THE FULL GYM • THE HALO EFFECT")
+    assert "THE FULL GYM • THE HALO EFFECT" in brief
+
+
+def test_masthead_label_omitted_renders_no_eyebrow_line():
+    brief = _brief(freedom=True, canvas="navy", composition="flat_editorial",
+                   accent="one_word", account_key="lasso")
+    assert "eyebrow line" not in brief
+
+
+def test_client_gym_freed_card_gets_no_lasso_masthead_or_byline():
+    """A client gym's card is that gym's brand, never LASSO's wordmark."""
+    brief = _brief(freedom=True, canvas="navy", composition="flat_editorial",
+                   accent="one_word", account_key="somegym")
+    assert "MASTHEAD" not in brief
+    assert "Sherman Merricks & Blake Ruff" not in brief
+    # It still gets the texture/photography freedom (a genuine technique, not
+    # a LASSO-specific look).
+    assert "TEXTURE AND DEPTH ARE WELCOME" in brief
+
+
+def test_icon_list_is_a_real_composition_mode():
+    assert "icon_list" in astra_prompt.COMPOSITION_ORDER
+    brief = _brief(freedom=True, canvas="cream", composition="icon_list",
+                   accent="one_word")
+    assert "COMPOSITION ICON LIST" in brief
+    assert grade_gate.grade_card(brief, headline=HOOK).passed
+
+
+# ---- book cover product shot (Blake, 2026-09-13: a second reference batch,
+# all "book" pillar, all showing the cover as a product shot with an
+# accolade ribbon) ----------------------------------------------------------
+
+def test_book_kind_adds_the_cover_shot_only_for_a_freed_lasso_card():
+    brief = _brief(freedom=True, canvas="cream", composition="flat_editorial",
+                   accent="one_word", account_key="lasso", kind="book")
+    assert "BOOK COVER PRODUCT SHOT" in brief
+    non_book = _brief(freedom=True, canvas="cream", composition="flat_editorial",
+                      accent="one_word", account_key="lasso", kind="infographic")
+    assert "BOOK COVER PRODUCT SHOT" not in non_book
+
+
+def test_book_cover_badge_is_never_invented_by_default():
+    brief = _brief(freedom=True, canvas="cream", composition="flat_editorial",
+                   accent="one_word", account_key="lasso", kind="book")
+    assert "gold ribbon badge" not in brief
+    with_badge = _brief(freedom=True, canvas="cream", composition="flat_editorial",
+                        accent="one_word", account_key="lasso", kind="book",
+                        book_cover_badge="Reached #1 on Amazon in Marketing")
+    assert "Reached #1 on Amazon in Marketing" in with_badge
+
+
+def test_book_cover_shot_never_appears_for_a_client_gym_or_locked_card():
+    gym = _brief(freedom=True, canvas="cream", composition="flat_editorial",
+                accent="one_word", account_key="somegym", kind="book")
+    assert "BOOK COVER PRODUCT SHOT" not in gym
+    locked = _brief(freedom=False, kind="book")
+    assert "BOOK COVER PRODUCT SHOT" not in locked

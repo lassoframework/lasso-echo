@@ -37,7 +37,8 @@ def _parse(argv):
         "headline": "", "facts": [], "cta": "", "surface": "feed post",
         "canvas": None, "composition": None, "accent": None, "style_key": None,
         "out": "astra_renders", "count": 1, "locked": False, "brief_only": False,
-        "account": None,
+        "account": None, "masthead_label": None, "kind": "infographic",
+        "book_cover_badge": None,
     }
     i = 0
     while i < len(argv):
@@ -72,6 +73,12 @@ def _parse(argv):
             opts["locked"] = True; i += 1; continue
         if a == "--account":
             opts["account"] = nxt(); i += 2; continue
+        if a == "--masthead-label":
+            opts["masthead_label"] = nxt(); i += 2; continue
+        if a == "--kind":
+            opts["kind"] = nxt(); i += 2; continue
+        if a == "--book-cover-badge":
+            opts["book_cover_badge"] = nxt(); i += 2; continue
         if a == "--brief-only":
             opts["brief_only"] = True; i += 1; continue
         raise SystemExit(f"render-card: unknown argument {a!r}. Try --help.")
@@ -105,6 +112,17 @@ options
                         and AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS), instead of the
                         default unscoped preview. Ignored if --locked is set.
   --brief-only         print the brief and exit. Renders nothing, costs nothing.
+  --masthead-label TEXT  the FULL eyebrow line under the LASSO masthead
+                        (LASSO's own account only), e.g. "THE FULL GYM • SALES"
+                        or just "THE FULL GYM". Not prefixed automatically --
+                        not every LASSO card is a book-pillar card. Omit for
+                        wordmark-and-rule only, no eyebrow line.
+  --kind TEXT          default "infographic"; "book" opts a LASSO card into
+                        the book-cover product shot (see --book-cover-badge)
+  --book-cover-badge TEXT  the accolade ribbon on the book cover product shot
+                        (kind=book only, e.g. "Reached #1 on Amazon in
+                        Marketing"). Never invented if omitted -- the cover
+                        renders with no ribbon.
   --out DIR            output directory (default ./astra_renders)
 """
 
@@ -151,7 +169,8 @@ def run(argv):
             surface=opts["surface"], freedom=freedom,
             style_key=opts["style_key"], canvas=opts["canvas"],
             composition=opts["composition"], accent=opts["accent"],
-            account_key=opts["account"])
+            account_key=opts["account"], masthead_label=opts["masthead_label"],
+            kind=opts["kind"], book_cover_badge=opts["book_cover_badge"])
     except ValueError as exc:
         print(f"render-card: BLOCKED by a hard rule: {exc}")
         return 2

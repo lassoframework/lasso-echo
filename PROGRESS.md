@@ -126,6 +126,76 @@ else's brand. See `brand_voice/lasso_house_style.md` section 12 for the full
 writeup, and `tests/test_astra_style_freedom.py` for the new gym-latitude
 tests.
 
+### Texture, depth, photography, and the LASSO masthead (2026-09-13, same day)
+
+Blake reviewed 5 real Astra renders against a reference set he generated
+himself and graded them a C: "why don't they look this level?" Diagnosis: not
+a rendering bug, a rules mismatch. His reference cards used film grain, glow,
+drop shadow, a real skyline photo, and an illustrated icon-in-a-circle — every
+one of which the house style explicitly BANNED (`FLAT_EDITORIAL_SPEC` block 2:
+"no illustrated scenes, no photorealism, no 3D, no gradients"; the closing
+line: "one depth layer at most... no texture or pattern"; the same bans
+repeated in `creative_studio.STORY_REQUIREMENT`, appended to every brief
+unconditionally). His reference cards also carried a consistent masthead
+(the "LASSO." wordmark + red dot + a rule + a small eyebrow tag) and a
+"Sherman Merricks & Blake Ruff" byline on every card — an element the brief
+never rendered at all. His ruling: "I want it to have the freedom to do this
+level without rules."
+
+`agent/astra_prompt.py`:
+
+- **`TEXTURE_AND_DEPTH_LAW`** replaces `creative_studio.STORY_REQUIREMENT` for
+  any FREED card (LASSO's own or a client gym in scope): film grain, glow,
+  drop shadow, halftone texture, and real photography are now permitted
+  tools, not violations. The LASSO avatar rule (never a competitive athlete,
+  never CrossFit/HYROX, never a barbell hero shot) is the one line from the
+  old ban that survives, because that is an audience rule, not a technique
+  rule.
+- **`FREE_BANNED`** replaces the flat-only `BANNED` constant for any freed
+  card: drops the texture/photo/3D/illustration bans, keeps cartoon/juvenile
+  clip art, corny stock-art metaphors, clutter, watermarks, generic process
+  labels, and the avatar rule.
+- **`_FLAT_EDITORIAL_FREE`** (the `flat_editorial` composition text) no longer
+  mandates flat-only rendering in its own block 2 / closing line.
+- **`icon_list`** — an 8th composition mode: three to five numbered rows,
+  each an icon-or-number plus a label and subhead, matching Blake's reference
+  set's most-used layout. 336 canvas x composition x accent combinations now
+  (was 294), all re-verified against the grade gate.
+- **`masthead_block()` / `MASTHEAD`** and **`byline_footer()` / `LASSO_BYLINE`**
+  ("Sherman Merricks & Blake Ruff") — LASSO's own account only, so a run of
+  LASSO's freed cards reads as one series. A client gym's freed card gets
+  neither: it is that gym's brand, never LASSO's wordmark. `masthead_label`
+  (new optional param on `build_infographic_brief`, and `--masthead-label` on
+  the render-card CLI) sets the FULL eyebrow line as given — the code does
+  NOT prefix it with "THE FULL GYM" (caught in testing: doing that duplicated
+  the phrase when a caller passed "THE FULL GYM" as the label itself, and it
+  was wrong in general since not every LASSO card is a book-pillar card);
+  never invented by the brief builder itself, same no-fabrication contract as
+  everywhere else.
+- **`book_cover_element()` / `kind="book"`** — Blake sent a SECOND reference
+  batch, five more of his own cards, all book-pillar, all showing a
+  photographic-style product shot of THE FULL GYM's actual cover (angled,
+  drop-shadowed) with a small gold accolade ribbon ("Reached #1 on Amazon in
+  Marketing"). Adds that cover shot for any LASSO card with `kind="book"`.
+  The cover itself is a real brand asset, not a fact. The ribbon TEXT is a
+  specific claim, so `book_cover_badge` (new param / `--book-cover-badge` on
+  the CLI) is caller-supplied only — never defaulted, never invented; omit it
+  and the cover renders with no ribbon.
+
+**What did NOT change:** the locked/off path (`STORY_REQUIREMENT` and `BANNED`
+verbatim, no masthead) is untouched for any account still on the single
+template — this is additive to freedom mode only. The LASSO V3 color values,
+two type families, no-dash rule, no-fabrication line, readability bar, and the
+human approval gate are all still locked, on and off. The reference set's
+fabricated "$499 GENERAL ADMISSION" price was deliberately NOT carried over —
+no fact set backs it, and no-fabrication holds regardless of visual freedom.
+
+Tests: 7 new in `tests/test_astra_style_freedom.py` (texture/photography
+freed but avatar rule holds, locked mode untouched, masthead + byline present
+only for LASSO, `masthead_label` renders or omits the eyebrow line, a client
+gym gets no LASSO wordmark, `icon_list` is real and passes the gate). Full
+suite run pending in this session; will confirm before merge.
+
 ### Image engine traceability (2026-09-13)
 
 Blake reviewed a real published Astra card and wanted PER-POST proof, not
