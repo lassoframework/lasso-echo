@@ -9,14 +9,16 @@ name: adhoc-render-cards
 # Triggered by push to this branch (workflow_dispatch needs the file to be
 # on the default branch first, which this diagnostic never merges to). The
 # MODE file picks the run: "test" renders ONE card to prove the secret and
-# wiring work; "batch30" renders the 30 LASSO cards (book, lasso, summit,
-# echo, website, nurture) Blake asked to be redone via the real pipeline.
+# wiring work; "batch5" renders 5 cards (one per topic pillar); "batch30"
+# renders the full 30 LASSO cards (book, lasso, summit, echo, website,
+# nurture) Blake asked to be redone via the real pipeline.
 on:
   push:
     branches: ["claude/render-card-workflow"]
     paths:
       - ".github/workflows/adhoc_render_cards.yml"
       - "scripts/adhoc_render_30_cards.sh"
+      - "scripts/adhoc_render_5_cards.sh"
       - ".github/RENDER_MODE"
 
 jobs:
@@ -54,6 +56,14 @@ jobs:
             --cta "Save this for later." \
             --account lasso \
             --out astra_renders/book
+
+      - name: Render (batch5)
+        if: ${{ steps.mode.outputs.value == 'batch5' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AGENT_ASTRA_STYLE_FREEDOM: "true"
+        run: |
+          bash scripts/adhoc_render_5_cards.sh
 
       - name: Render (batch30)
         if: ${{ steps.mode.outputs.value == 'batch30' }}
