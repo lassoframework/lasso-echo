@@ -115,10 +115,10 @@ def _draft_for_idea(index, idea, account, voice, nano_client, s3_client):
     # facts. Reuse creative_studio + media_host exactly as daily_studio does, including
     # the same visible fallback when a flag is off or a step returns nothing.
     headline, facts = lines[0], lines[1:]
-    creative_path, creative_public_url = "", ""
+    creative_path, creative_public_url, route = "", "", ""
     if facts:
         art = creative_studio.generate(headline, facts, client=nano_client,
-                                       account_key=acct_key)
+                                       account_key=acct_key, draft_id=draft_id)
         if not art:
             print(f"[doc intake] {acct_key}: idea {index + 1} image generation produced "
                   "nothing; shipping a text only draft for approval.")
@@ -133,6 +133,7 @@ def _draft_for_idea(index, idea, account, voice, nano_client, s3_client):
                       "shipping a text only draft for approval.")
             else:
                 creative_path, creative_public_url = art["path"], hosted
+                route = art.get("route", "")
 
     return Draft(
         draft_id=draft_id, account_key=acct_key, platform=platform,
@@ -140,4 +141,5 @@ def _draft_for_idea(index, idea, account, voice, nano_client, s3_client):
         creative_path=creative_path, creative_public_url=creative_public_url,
         scheduled_for="", status=DraftStatus.PENDING,
         source_fragments=list(lines),  # audit: every fragment is verbatim client text
+        image_engine=route,
     )

@@ -309,6 +309,7 @@ def build_case_study_draft(account, day_key, nano_client=None, s3_client=None):
 def _finish_draft(account, day_key, headline, caption, hashtags, existing_card,
                   nano_client, s3_client, fragments, card_note=""):
     creative_path = existing_card
+    route = ""
     if creative_path is None:
         art = creative_studio.generate(
             headline, [card_note or "The Full Gym book campaign card."],
@@ -321,6 +322,7 @@ def _finish_draft(account, day_key, headline, caption, hashtags, existing_card,
             )
             return None  # studio unavailable: the normal path takes the day
         creative_path = art["path"]
+        route = art.get("route", "")
     hosted = media_host.host_media(creative_path, account.key, client=s3_client)
     if not hosted:
         return None
@@ -332,4 +334,5 @@ def _finish_draft(account, day_key, headline, caption, hashtags, existing_card,
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=fragments, day_key=day_key, draft_type="book",
         warnings=conflict_warnings(caption),
+        image_engine=route,
     )

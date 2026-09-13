@@ -469,7 +469,8 @@ def _post_and_save(draft, store, poster, idempotent):
             postlog.log_post(account_key=draft.account_key, platform=draft.platform,
                              caption=draft.caption,
                              media_id=getattr(result, "media_id", ""),
-                             mode=result.mode, draft_id=draft.draft_id)
+                             mode=result.mode, draft_id=draft.draft_id,
+                             image_engine=getattr(draft, "image_engine", "") or "")
             if _is_welcome and result.mode == "published":
                 from . import welcome_queue as _wq
                 _wq.record_welcome_published(draft)
@@ -506,7 +507,8 @@ def _post_and_save(draft, store, poster, idempotent):
             postlog.log_post(account_key=draft.account_key, platform=draft.platform,
                              caption=draft.caption,
                              media_id=getattr(result, "media_id", ""),
-                             mode=result.mode, draft_id=draft.draft_id)
+                             mode=result.mode, draft_id=draft.draft_id,
+                             image_engine=getattr(draft, "image_engine", "") or "")
             db.audit("trust_autopublish", draft.draft_id, why, draft.account_key,
                      draft.day_key)
             poster.post_notice(

@@ -146,10 +146,32 @@ def test_a_dead_chain_is_reported_not_swallowed(tmp_path, monkeypatch, capsys):
 # ---- --account (Blake, 2026-09-13: "only for LASSO right now") -----------
 
 def test_account_flag_mirrors_production_scoping(capsys, monkeypatch):
-    """--account lasso is freed, --account eng is locked, when the master flag
-    is ON and the scope is still the LASSO-only default."""
+    """--account lasso and --account eng are BOTH freed when the master flag
+    is ON and the scope is left at its default (every account, Blake's
+    2026-09-13 ruling: "LASSO's own account plus any client gym")."""
     monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
     monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
+
+    render_card.run(["--headline", HEAD, "--fact", FACT, "--account", "lasso",
+                     "--brief-only"])
+    lasso_out = capsys.readouterr().out
+    assert "style      : locked" not in lasso_out
+    assert "freedom    : ON" in lasso_out
+
+    render_card.run(["--headline", HEAD, "--fact", FACT, "--account", "eng",
+                     "--brief-only"])
+    eng_out = capsys.readouterr().out
+    assert "style      : locked" not in eng_out
+    assert "freedom    : ON" in eng_out
+    assert "account    : 'eng'" in eng_out
+
+
+def test_account_flag_narrowed_scope_still_locks_a_client_gym(capsys, monkeypatch):
+    """The 2026-09-12 LASSO-only scope is still available by hand
+    (AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS=lasso) for a rollback without a code
+    change: --account lasso freed, --account eng locked."""
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", "lasso")
 
     render_card.run(["--headline", HEAD, "--fact", FACT, "--account", "lasso",
                      "--brief-only"])

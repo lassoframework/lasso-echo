@@ -984,7 +984,7 @@ def spend_allowed(account_key=None, day=None):
 def generate(headline, facts, client=None, out_path=None,
              aspect=None, pixels=None, surface=None, archetype=None,
              palette=None, canvas=None, layout=None, account_key=None,
-             bypass_cap=False):
+             bypass_cap=False, draft_id=""):
     """
     Generate a LASSO infographic from APPROVED input. Returns {"path", "prompt"} on
     success, or None when it must not run:
@@ -995,6 +995,16 @@ def generate(headline, facts, client=None, out_path=None,
     aspect/pixels/surface/archetype are per-use overrides (see build_prompt): the
     feed keeps its 4:5 default; a Story passes 9:16 for its own call only; the
     archetype varies the composition inside the locked brand (default flow).
+
+    The returned dict's `route` (Blake, 2026-09-13, TRACEABILITY) is
+    "{engine}:{model}" (e.g. "astra:gpt-image-2.5-sunburst"), computed by
+    _route_label below. Thread it onto the resulting Draft as
+    `image_engine=art.get("route", "")` so a SPECIFIC published post can be
+    traced to the engine that made it. `draft_id`, when the caller already
+    knows it (every caller in this repo computes it before or independent of
+    this call), rides through to image_engine.generate_image's logs so a
+    generation attempt is traceable in the logs too, not only after the fact
+    via the DB.
     """
     if not config.creative_studio_enabled():
         return None
@@ -1038,7 +1048,8 @@ def generate(headline, facts, client=None, out_path=None,
         }
         return _image_engine.generate_image(
             p, call_opts, gemini_client=client,
-            account_key=account_key or "", subject=headline or "")
+            account_key=account_key or "", subject=headline or "",
+            draft_id=draft_id or "")
 
     result = _do_generate(prompt)
     if result is None:

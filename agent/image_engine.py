@@ -616,7 +616,7 @@ def _attempts_for(engine):
 
 
 def generate_image(prompt, opts=None, *, gemini_client=None, account_key="",
-                   subject="", sleep=None):
+                   subject="", sleep=None, draft_id=""):
     """Run the fallback chain for ONE image.
 
     Astra -> retry once with backoff -> Gemini -> mark "needs human".
@@ -624,10 +624,22 @@ def generate_image(prompt, opts=None, *, gemini_client=None, account_key="",
     Returns an ImageResult on success. Returns None ONLY after mark_needs_human
     has fired the ops alert and written the audit row, so a calendar slot can
     never fail silently. Never raises into the caller.
+
+    `draft_id` (Blake, 2026-09-13, TRACEABILITY) is the caller's own draft id
+    when it is already known at generation time (every caller in this repo
+    computes its draft_id before or independent of calling generate_image, so
+    this is always available to pass). It rides on every log line below so a
+    SPECIFIC card's generation attempt is traceable in the logs, not just
+    provable in aggregate over a time window. `media_id` is NOT logged here:
+    Meta/the publisher assigns it only after this call returns and the asset
+    is hosted + published, so a caller looking up "which engine made post X"
+    joins on draft_id against the `posts` table (see db.post_engine_for),
+    where media_id and image_engine both live on the same published row.
     """
     opts = dict(opts or {})
     sleep = sleep or time.sleep
     failures = []
+    who = f"draft={draft_id or '(none)'} account={account_key or '(none)'}"
 
     for engine in engine_chain(gemini_client):
         tries = _attempts_for(engine)
@@ -637,20 +649,22 @@ def generate_image(prompt, opts=None, *, gemini_client=None, account_key="",
             except ImageEngineError as exc:
                 detail = exc.detail()
                 failures.append(f"{engine.name} attempt {attempt}/{tries}: {detail}")
-                _log(f"FAILED engine={engine.name} attempt={attempt}/{tries} {detail}")
+                _log(f"FAILED {who} engine={engine.name} attempt={attempt}/{tries} "
+                     f"{detail}")
             except Exception as exc:  # noqa: BLE001 - a provider bug may not kill the run
                 from . import ops_alerts
                 detail = ops_alerts.scrub(f"{type(exc).__name__}: {exc}")
                 failures.append(f"{engine.name} attempt {attempt}/{tries}: {detail}")
-                _log(f"FAILED engine={engine.name} attempt={attempt}/{tries} {detail}")
+                _log(f"FAILED {who} engine={engine.name} attempt={attempt}/{tries} "
+                     f"{detail}")
             else:
                 if not result.ok():
                     failures.append(
                         f"{engine.name} attempt {attempt}/{tries}: empty result")
-                    _log(f"FAILED engine={engine.name} attempt={attempt}/{tries} "
+                    _log(f"FAILED {who} engine={engine.name} attempt={attempt}/{tries} "
                          "empty result")
                 else:
-                    _log(f"ok engine={result.engine} model={result.model!r} "
+                    _log(f"ok {who} engine={result.engine} model={result.model!r} "
                          f"latency_ms={result.latency_ms} "
                          f"cost_est=${result.cost_estimate:.3f}")
                     record_cost(result.cost_estimate, account_key=account_key)
@@ -658,11 +672,12 @@ def generate_image(prompt, opts=None, *, gemini_client=None, account_key="",
             if attempt < tries:
                 sleep(ASTRA_RETRY_BACKOFF_SECS * attempt)
 
-    mark_needs_human(subject=subject, account_key=account_key, failures=failures)
+    mark_needs_human(subject=subject, account_key=account_key, failures=failures,
+                     draft_id=draft_id)
     return None
 
 
-def mark_needs_human(subject="", account_key="", failures=(), day=None):
+def mark_needs_human(subject="", account_key="", failures=(), day=None, draft_id=""):
     """Every engine failed: mark the asset for a HUMAN in the approval queue.
 
     Three surfaces, because a silent miss is the failure mode this repo has been
@@ -679,13 +694,15 @@ def mark_needs_human(subject="", account_key="", failures=(), day=None):
     detail = "; ".join(str(f) for f in failures) or "no engine was available"
     label = str(subject or "").strip() or "(no headline)"
     who = account_key or "the shared pool"
-    line = (f"NEEDS HUMAN: image generation failed on EVERY engine for {who}: "
-            f"{label}. No asset was produced and the slot is NOT filled. "
-            f"Attempts: {detail}")
+    draft_tag = f"draft={draft_id or '(none)'} "
+    line = (f"NEEDS HUMAN: {draft_tag}image generation failed on EVERY engine "
+            f"for {who}: {label}. No asset was produced and the slot is NOT "
+            f"filled. Attempts: {detail}")
     _log(line)
     try:
         from . import db as _db
-        _db.audit("image_needs_human", label, detail, account_key, day)
+        _db.audit("image_needs_human", label,
+                 f"draft_id={draft_id or ''}; {detail}", account_key, day)
     except Exception as exc:  # noqa: BLE001 - marking must never break the run
         _log(f"audit write for needs-human failed: {type(exc).__name__}: {exc}")
     try:
@@ -694,7 +711,7 @@ def mark_needs_human(subject="", account_key="", failures=(), day=None):
     except Exception as exc:  # noqa: BLE001
         _log(f"ops alert for needs-human failed: {type(exc).__name__}: {exc}")
     return {"needs_human": True, "subject": label, "account_key": account_key,
-            "day": day, "detail": detail}
+            "day": day, "detail": detail, "draft_id": draft_id}
 
 
 # ---------------------------------------------------------------------------

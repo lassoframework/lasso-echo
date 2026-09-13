@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS drafts (
 CREATE TABLE IF NOT EXISTS posts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id TEXT, account_key TEXT,
   platform TEXT, caption TEXT, media_id TEXT, permalink TEXT, mode TEXT,
-  creative_key TEXT, archetype TEXT, set_name TEXT, published_at TEXT);
+  creative_key TEXT, archetype TEXT, set_name TEXT, published_at TEXT,
+  image_engine TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS served (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account_key TEXT, key TEXT,
   pillar TEXT, date TEXT, archetype TEXT, set_name TEXT);
@@ -121,6 +122,16 @@ def connect(path=None):
     for col in _POST_METRIC_COLUMNS:
         if col not in have:
             conn.execute(f"ALTER TABLE posts ADD COLUMN {col} INTEGER")
+    # additive posts migration (Blake 2026-09-13): which image engine + model
+    # actually generated this post's creative (e.g. "astra:gpt-image-2.5-
+    # sunburst"), so a SPECIFIC published post can be traced to the engine
+    # that made it, not just proven in aggregate over a time window. Existing
+    # rows stay '' (unknown; predate this column).
+    if "image_engine" not in have:
+        try:
+            conn.execute("ALTER TABLE posts ADD COLUMN image_engine TEXT DEFAULT ''")
+        except Exception:
+            pass
     # additive gyms migration: intake_token_encrypted added for reversible
     # encryption at rest (AGENT_INTAKE_ENC_KEY); existing rows stay as-is.
     gyms_have = {r["name"] for r in conn.execute("PRAGMA table_info(gyms)")}
@@ -960,3 +971,36 @@ def audit_rows(day=None, account_key=None, limit=500):
     params.append(limit)
     with connect() as conn:
         return [dict(r) for r in conn.execute(q, params).fetchall()]
+
+
+def post_engine_for(draft_id=None, media_id=None, limit=20):
+    """TRACEABILITY (Blake, 2026-09-13): which engine generated ONE specific
+    published post, looked up by draft_id or media_id against the `posts`
+    table (the row postlog.log_post writes at publish time, carrying
+    `image_engine` = "{engine}:{model}", e.g. "astra:gpt-image-2.5-sunburst").
+
+    Exactly one of draft_id / media_id must be given (both is an error: a
+    lookup should name ONE post, not intersect two identifiers that might
+    not agree). Returns a list of matching rows (draft_id, account_key,
+    platform, mode, published_at, media_id, permalink, image_engine),
+    newest first — normally one row, but a draft can legitimately log more
+    than once (e.g. a retried publish), so every match is returned rather
+    than silently picking one. Empty list when nothing matches or the DB is
+    unreadable; never raises."""
+    if bool(draft_id) == bool(media_id):
+        raise ValueError("post_engine_for: pass exactly one of draft_id or media_id")
+    q = ("SELECT draft_id, account_key, platform, mode, published_at, media_id, "
+         "permalink, image_engine FROM posts WHERE ")
+    if draft_id:
+        q += "draft_id=?"
+        param = draft_id
+    else:
+        q += "media_id=?"
+        param = media_id
+    q += " ORDER BY id DESC LIMIT ?"
+    try:
+        with connect() as conn:
+            return [dict(r) for r in conn.execute(q, (param, limit)).fetchall()]
+    except Exception as e:  # noqa: BLE001 - a lookup tool never crashes the caller
+        print(f"[db] post_engine_for lookup failed: {type(e).__name__}: {e}")
+        return []
