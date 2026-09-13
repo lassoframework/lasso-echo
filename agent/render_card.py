@@ -37,6 +37,7 @@ def _parse(argv):
         "headline": "", "facts": [], "cta": "", "surface": "feed post",
         "canvas": None, "composition": None, "accent": None, "style_key": None,
         "out": "astra_renders", "count": 1, "locked": False, "brief_only": False,
+        "account": None,
     }
     i = 0
     while i < len(argv):
@@ -69,6 +70,8 @@ def _parse(argv):
             opts["count"] = max(1, int(nxt())); i += 2; continue
         if a == "--locked":
             opts["locked"] = True; i += 1; continue
+        if a == "--account":
+            opts["account"] = nxt(); i += 2; continue
         if a == "--brief-only":
             opts["brief_only"] = True; i += 1; continue
         raise SystemExit(f"render-card: unknown argument {a!r}. Try --help.")
@@ -96,6 +99,11 @@ options
   --style-key TEXT     the key the deterministic picker hashes (default: headline)
   --count N            render N times (same card, to compare Astra's takes)
   --locked             render with style freedom OFF, for an A/B against the old look
+  --account KEY        preview what THIS account actually gets in production:
+                        resolves freedom via the same per-account scope
+                        creative_studio.generate() uses (AGENT_ASTRA_STYLE_FREEDOM
+                        and AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS), instead of the
+                        default unscoped preview. Ignored if --locked is set.
   --brief-only         print the brief and exit. Renders nothing, costs nothing.
   --out DIR            output directory (default ./astra_renders)
 """
@@ -118,7 +126,14 @@ def run(argv):
 
     from . import astra_prompt, grade_gate, image_engine
 
-    freedom = not opts["locked"]
+    if opts["locked"]:
+        freedom = False
+    elif opts["account"] is not None:
+        # Mirror production exactly: the same per-account scope
+        # creative_studio.generate() -> _astra_brief_for() resolves through.
+        freedom = config.astra_style_freedom_enabled_for(opts["account"])
+    else:
+        freedom = True  # unscoped manual preview (unchanged default behavior)
     style = None
     if freedom:
         try:
@@ -135,15 +150,19 @@ def run(argv):
             opts["headline"], opts["facts"], cta=opts["cta"],
             surface=opts["surface"], freedom=freedom,
             style_key=opts["style_key"], canvas=opts["canvas"],
-            composition=opts["composition"], accent=opts["accent"])
+            composition=opts["composition"], accent=opts["accent"],
+            account_key=opts["account"])
     except ValueError as exc:
         print(f"render-card: BLOCKED by a hard rule: {exc}")
         return 2
 
     grade = grade_gate.grade_card(brief, headline=opts["headline"])
-    label = ("locked" if opts["locked"]
-             else f"{style['canvas']}/{style['composition']}/{style['accent']}")
+    label = (f"{style['canvas']}/{style['composition']}/{style['accent']}"
+             if style else "locked")
     print(f"style      : {label}")
+    if opts["account"] is not None and not opts["locked"]:
+        print(f"account    : {opts['account']!r} "
+              f"(scope={sorted(config.astra_style_freedom_accounts())})")
     print(f"freedom    : {'ON' if freedom else 'OFF'} "
           f"(env AGENT_ASTRA_STYLE_FREEDOM={os.environ.get('AGENT_ASTRA_STYLE_FREEDOM', 'unset')})")
     print(f"grade gate : {'PASS' if grade.passed else 'FAIL ' + str(grade.failed_questions)}")

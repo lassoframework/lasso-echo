@@ -397,7 +397,7 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
                             pixels=None, aspect=None, voice_path=None,
                             palette=None, footer=None, kind="infographic",
                             style_key=None, canvas=None, composition=None,
-                            accent=None, freedom=None):
+                            accent=None, freedom=None, account_key=None):
     """Build the Astra creative brief from APPROVED input ONLY.
 
     `headline` is the one hook rendered on the card. `facts` are the approved
@@ -412,6 +412,14 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
     so a re-render of an approved card is stable. `canvas`, `composition` and
     `accent` pin any of the three by hand; `freedom` overrides the flag, which is
     what the tests and a one off render use.
+
+    ACCOUNT SCOPE (Blake, 2026-09-13: "only for LASSO right now until a
+    proven [out]"). When `freedom` is not passed explicitly, the flag is
+    resolved PER ACCOUNT via config.astra_style_freedom_enabled_for(account_key)
+    rather than the bare master switch, so the flag being ON in production
+    does not by itself free every client gym's cards. `account_key` is the
+    same value every caller already threads through creative_studio.generate();
+    a missing one is treated as LASSO (see that function's docstring).
 
     Returns the brief string, dash-scrubbed and checked against the same hard
     rules the Gemini prompt is checked against (banned headline words, and, in
@@ -428,8 +436,8 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
     fact_lines = "\n".join(f"- {_cs._scrub_dashes(f)}"
                            for f in (facts or []) if str(f).strip())
 
-    use_freedom = (config.astra_style_freedom_enabled() if freedom is None
-                   else bool(freedom))
+    use_freedom = (config.astra_style_freedom_enabled_for(account_key)
+                   if freedom is None else bool(freedom))
     style = None
     if use_freedom:
         style = style_for(str(style_key or headline or ""), canvas=canvas,

@@ -141,3 +141,47 @@ def test_a_dead_chain_is_reported_not_swallowed(tmp_path, monkeypatch, capsys):
     assert rc == 1
     assert "needs_human" in capsys.readouterr().out
     assert not list(tmp_path.glob("*.png"))
+
+
+# ---- --account (Blake, 2026-09-13: "only for LASSO right now") -----------
+
+def test_account_flag_mirrors_production_scoping(capsys, monkeypatch):
+    """--account lasso is freed, --account eng is locked, when the master flag
+    is ON and the scope is still the LASSO-only default."""
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
+
+    render_card.run(["--headline", HEAD, "--fact", FACT, "--account", "lasso",
+                     "--brief-only"])
+    lasso_out = capsys.readouterr().out
+    assert "style      : locked" not in lasso_out
+    assert "freedom    : ON" in lasso_out
+
+    render_card.run(["--headline", HEAD, "--fact", FACT, "--account", "eng",
+                     "--brief-only"])
+    eng_out = capsys.readouterr().out
+    assert "style      : locked" in eng_out
+    assert "freedom    : OFF" in eng_out
+    assert "account    : 'eng'" in eng_out
+
+
+def test_locked_flag_wins_over_account(capsys, monkeypatch):
+    """--locked is the hard override; it beats --account even for lasso."""
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    render_card.run(["--headline", HEAD, "--fact", FACT, "--account", "lasso",
+                     "--locked", "--brief-only"])
+    out = capsys.readouterr().out
+    assert "style      : locked" in out
+    assert "freedom    : OFF" in out
+
+
+def test_no_account_flag_is_the_unscoped_manual_preview(capsys, monkeypatch):
+    """Omitting --account keeps the pre-scoping preview behavior: freedom ON
+    whenever the master flag is ON, regardless of any account scope."""
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", "lasso")
+    render_card.run(["--headline", HEAD, "--fact", FACT, "--brief-only"])
+    out = capsys.readouterr().out
+    assert "style      : locked" not in out
+    assert "freedom    : ON" in out
+    assert "account    :" not in out

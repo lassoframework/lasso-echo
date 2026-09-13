@@ -4457,3 +4457,44 @@ def astra_style_freedom_enabled() -> bool:
     the readability bar, and the approval gate.
     """
     return _truthy(os.environ.get("AGENT_ASTRA_STYLE_FREEDOM", "false"))
+
+
+def astra_style_freedom_accounts() -> set:
+    """Account-key bases (before an _ig/_fb suffix) allowed to use the Astra
+    style freedom system while AGENT_ASTRA_STYLE_FREEDOM is ON.
+
+    Blake (2026-09-13): "This should only be for LASSO right now until a
+    proven [out]." Default: "lasso" only. AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS
+    widens the rollout, comma-separated ("lasso,eng,gritx"); "*" opens it to
+    every account (the pre-scope, all-accounts behavior).
+    """
+    raw = os.environ.get("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", "lasso")
+    return {a.strip().lower() for a in raw.split(",") if a.strip()}
+
+
+def astra_style_freedom_enabled_for(account_key=None) -> bool:
+    """The style freedom system for ONE account: the master flag AND the
+    account scope.
+
+    False whenever astra_style_freedom_enabled() is False (the master switch
+    is still the gate; scoping only narrows an ON flag, it never widens an
+    OFF one). When the master flag is ON, the account's base key (an
+    "_ig"/"_fb" suffix stripped, same convention as posting_timezone_for) must
+    be in astra_style_freedom_accounts() — LASSO ONLY by default.
+
+    A missing or blank account_key is treated as "lasso": every unscoped
+    caller in this repo (book_campaign, podcast, summit, stories, the
+    render-card CLI) IS LASSO's own content pipeline, never a client gym —
+    client-gym callers (daily_studio.py) always pass their real account_key.
+    """
+    if not astra_style_freedom_enabled():
+        return False
+    scope = astra_style_freedom_accounts()
+    if "*" in scope:
+        return True
+    base = str(account_key or "lasso").strip().lower()
+    for suf in ("_ig", "_fb"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    return base in scope

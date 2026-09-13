@@ -217,3 +217,85 @@ def test_no_two_rules_claim_the_same_accent():
     brief = _brief(freedom=True, composition="flat_editorial", accent="one_node")
     assert brief.count("ONE red element") == 0
     assert "red #FF0000 is used exactly one time" in brief
+
+
+# ---- account scope (Blake, 2026-09-13: "only for LASSO right now") --------
+
+def test_scope_defaults_to_lasso_only(monkeypatch):
+    monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
+    assert config.astra_style_freedom_accounts() == {"lasso"}
+
+
+def test_master_off_means_off_for_every_account_regardless_of_scope(monkeypatch):
+    monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM", raising=False)
+    assert config.astra_style_freedom_enabled_for("lasso") is False
+    assert config.astra_style_freedom_enabled_for("eng") is False
+    assert config.astra_style_freedom_enabled_for(None) is False
+
+
+def test_master_on_defaults_to_lasso_only(monkeypatch):
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
+    assert config.astra_style_freedom_enabled_for("lasso") is True
+    assert config.astra_style_freedom_enabled_for("eng") is False
+    assert config.astra_style_freedom_enabled_for("gritx") is False
+
+
+def test_a_missing_account_key_is_treated_as_lasso(monkeypatch):
+    """Every unscoped caller in this repo (book_campaign, podcast, summit,
+    stories, render-card with no --account) IS LASSO's own content pipeline."""
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
+    assert config.astra_style_freedom_enabled_for(None) is True
+    assert config.astra_style_freedom_enabled_for("") is True
+
+
+def test_ig_and_fb_suffixes_are_stripped_before_the_scope_check(monkeypatch):
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
+    assert config.astra_style_freedom_enabled_for("lasso_ig") is True
+    assert config.astra_style_freedom_enabled_for("lasso_fb") is True
+    assert config.astra_style_freedom_enabled_for("eng_ig") is False
+
+
+def test_the_scope_env_var_widens_the_rollout(monkeypatch):
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", "lasso,eng,gritx")
+    assert config.astra_style_freedom_enabled_for("eng") is True
+    assert config.astra_style_freedom_enabled_for("gritx_ig") is True
+    assert config.astra_style_freedom_enabled_for("pierce") is False
+
+
+def test_star_opens_the_scope_to_every_account(monkeypatch):
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", "*")
+    assert config.astra_style_freedom_enabled_for("pierce") is True
+    assert config.astra_style_freedom_enabled_for("some_new_client") is True
+
+
+def test_the_brief_resolves_freedom_per_account_when_freedom_is_not_pinned(monkeypatch):
+    """The actual integration point: build_infographic_brief must consult the
+    per-account scope, not the bare master flag, when the caller (creative_studio
+    .generate -> _astra_brief_for) hands it a real account_key."""
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
+
+    lasso_brief = astra_prompt.build_infographic_brief(
+        HOOK, FACTS, cta="Book a call", account_key="lasso")
+    client_brief = astra_prompt.build_infographic_brief(
+        HOOK, FACTS, cta="Book a call", account_key="eng_ig")
+
+    assert "CANVAS MODE" in lasso_brief
+    assert "CANVAS MODE" not in client_brief
+    assert "THE canvas" in client_brief          # the client gets the old, locked brief
+
+
+def test_an_explicit_freedom_argument_still_overrides_the_scope(monkeypatch):
+    """`freedom=` stays the hard override the tests and a one off render use —
+    account scoping only fills the gap when freedom is left unpinned."""
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
+    monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
+    assert "CANVAS MODE" in astra_prompt.build_infographic_brief(
+        HOOK, FACTS, account_key="eng", freedom=True)
+    assert "CANVAS MODE" not in astra_prompt.build_infographic_brief(
+        HOOK, FACTS, account_key="lasso", freedom=False)
