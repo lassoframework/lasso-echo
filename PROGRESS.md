@@ -63,6 +63,34 @@ canvas x composition x accent briefs pass `_check_prompt_hard_rules` as written.
 AGENT_ASTRA_STYLE_FREEDOM=true
 ```
 
+**Armed in production 2026-09-13** on the `echo` service (Railway project
+`lasso-echo`, production env). Redeploy `30cf4bce` SUCCESS at 02:29 UTC.
+
+**It is INERT until this branch merges to main.** That redeploy is running commit
+`411ac2cf`, which is this branch's own parent, and `astra_style_freedom_enabled()`
+does not exist there. The env var is set and waiting; the code that reads it ships
+with this branch. Merge to main, let the service redeploy, and the freedom system
+goes live on the next draw.
+
+### Render one card by hand
+
+`python -m agent render-card` renders a single card through the REAL engine chain
+(gpt-6-astra reads the brief, gpt-image-2.5-sunburst draws it), so a look can be
+checked without waiting for a calendar slot. Publishes nothing, queues nothing,
+and BLOCKS without a headline plus at least one approved fact.
+
+```
+python -m agent render-card \
+  --headline "Paid ads are not magic. They are math." \
+  --fact "The Three Levers of Growth: churn, sales, leads" \
+  --cta "Save this for later." --canvas ink --composition type_poster
+```
+
+`--locked` renders the same card with freedom OFF for an A/B. `--brief-only`
+prints the brief and costs nothing. Each render writes a PNG plus a `.txt`
+sidecar carrying the brief as sent, the style selection, the engine and model
+that served it, and Astra's own revised prompt when the provider returns one.
+
 ### Files
 
 - `agent/astra_prompt.py` — the style system + a style-aware brief

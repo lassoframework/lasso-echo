@@ -989,6 +989,7 @@ _COMMANDS = {
         ("account-key-doctor", "early-warning coverage check: for every social-product gym base, assert it resolves to exactly one live gym (+ Zernio profile); flag UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY stranding risks (read-only; --alert fires throttled ops alerts) [--base <base>]"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
+        ("render-card", "render ONE Astra card on demand through the real engine chain (gpt-6-astra reads the brief, Sunburst draws it). Publishes nothing, queues nothing; BLOCKS without --headline and at least one --fact. [--canvas/--composition/--accent to pin] [--locked for an A/B] [--brief-only to cost nothing]"),
         ("lasso-astra-rework", "regenerate the IMAGE (never the schedule) on LASSO's existing non-video, non-published calendar slots as linked Astra v2 candidates (ECHO_VARIANT_PAIRING); same dates/times/count untouched, nothing publishes; [--months YYYY-MM,...] [--limit N] [--write]"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
         ("ops-triage-classify", "classify one ops-alert line as noise/needs_triage (agent/ops_triage.py); prints exactly that word. Arg or stdin: python -m agent ops-triage-classify \"<alert text>\""),
@@ -3384,6 +3385,14 @@ def main(argv=None):
         # ops-triage relay: python -m agent ops-triage-classify "<alert text>"
         from .ops_triage import main as _ops_triage_main
         sys.exit(_ops_triage_main(argv[1:]))
+    elif cmd == "render-card":
+        # Render ONE Astra card on demand through the REAL engine chain
+        # (gpt-6-astra reads the brief, Sunburst draws it). Publishes nothing,
+        # queues nothing, invents nothing: headline + at least one approved fact
+        # are required or it BLOCKS.
+        #   python -m agent render-card --headline "..." --fact "..." [--canvas navy]
+        from .render_card import run as _render_card_run
+        sys.exit(_render_card_run(argv[1:]))
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:
