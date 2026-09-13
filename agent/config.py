@@ -4463,12 +4463,20 @@ def astra_style_freedom_accounts() -> set:
     """Account-key bases (before an _ig/_fb suffix) allowed to use the Astra
     style freedom system while AGENT_ASTRA_STYLE_FREEDOM is ON.
 
-    Blake (2026-09-13): "This should only be for LASSO right now until a
-    proven [out]." Default: "lasso" only. AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS
-    widens the rollout, comma-separated ("lasso,eng,gritx"); "*" opens it to
-    every account (the pre-scope, all-accounts behavior).
+    Blake (2026-09-12): "This should only be for LASSO right now until a
+    proven [out]." That scope held for one day. Blake's ruling (2026-09-13,
+    same ask restated with the explicit widening): "This applies to the real
+    production system -- LASSO's own account plus any client gym using the
+    auto-infographic path." Default is now "*" (every account); the LASSO-only
+    scope from 2026-09-12 is still available by hand via
+    AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS=lasso for a rollback without touching
+    code. Comma-separated to name specific accounts ("lasso,eng,gritx").
+
+    The master flag (astra_style_freedom_enabled(), AGENT_ASTRA_STYLE_FREEDOM)
+    still defaults OFF and is the real gate: this default only decides what an
+    ARMED flag reaches, never whether it is armed.
     """
-    raw = os.environ.get("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", "lasso")
+    raw = os.environ.get("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", "*")
     return {a.strip().lower() for a in raw.split(",") if a.strip()}
 
 
@@ -4480,7 +4488,9 @@ def astra_style_freedom_enabled_for(account_key=None) -> bool:
     is still the gate; scoping only narrows an ON flag, it never widens an
     OFF one). When the master flag is ON, the account's base key (an
     "_ig"/"_fb" suffix stripped, same convention as posting_timezone_for) must
-    be in astra_style_freedom_accounts() — LASSO ONLY by default.
+    be in astra_style_freedom_accounts() — every account by default (Blake's
+    2026-09-13 ruling); AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS=lasso restores the
+    2026-09-12 LASSO-only scope by hand.
 
     A missing or blank account_key is treated as "lasso": every unscoped
     caller in this repo (book_campaign, podcast, summit, stories, the

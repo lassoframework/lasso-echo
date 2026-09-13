@@ -148,14 +148,30 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         # Astra first, Gemini as the fallback rung. A calendar slot may NEVER
         # fail silently: when every engine fails, image_engine marks the slot
         # NEEDS HUMAN (ops alert + audit row) before this returns None.
+        #
+        # ASTRA GETS ITS OWN BRIEF (Blake, 2026-09-13): before this, `prompt`
+        # (the Gemini-style text above, which literally says "Design a clean,
+        # minimal, premium LASSO-branded infographic") was handed to EVERY
+        # engine, Astra included, because image_engine.prompt_for() falls back
+        # to the shared prompt when opts["engine_prompts"] carries no "astra"
+        # key. A client gym's auto-infographic was therefore branded as LASSO
+        # to the primary engine on every card. Building the real Astra brief
+        # here (same helper creative_studio.generate() uses) gives this gym's
+        # card its OWN voice doc and, in freedom scope, its OWN palette
+        # latitude (astra_prompt.gym_brand_latitude) instead of LASSO's.
+        astra_brief = creative_studio._astra_brief_for(
+            headline, [getattr(source, "text", "") or ""], "feed post",
+            None, account_key=account.key)
+        draft_id = f"igfill_{base}_{day}"
         from . import image_engine as _ie
         _res = _ie.generate_image(
             prompt,
             {"kind": "infographic", "surface": "feed post",
              "has_text_overlay": bool(str(headline or "").strip()),
-             "gemini_model": config.NANO_MODEL},
+             "gemini_model": config.NANO_MODEL,
+             "engine_prompts": {"astra": astra_brief, "gemini": prompt}},
             gemini_client=client, account_key=account.key,
-            subject=f"{day} {headline}"[:120])
+            subject=f"{day} {headline}"[:120], draft_id=draft_id)
         img = _res.image_bytes if _res is not None else None
         if not img:
             log(f"{base} {day}: image render failed on every engine; "
@@ -177,7 +193,7 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         caption, hashtags = client_content.make_caption(
             account, source, voice, f"igfill_{day}")
         draft = Draft(
-            draft_id=f"igfill_{base}_{day}",
+            draft_id=draft_id,
             account_key=account.key,
             platform=account.platform,
             caption=caption,
@@ -191,6 +207,7 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
                               "infographic_fill"],
             day_key=day,
             category=_with_review_mark(getattr(source, "category", "")),
+            image_engine=f"{_res.engine}:{_res.model}" if _res is not None else "",
         )
         draft.is_story = False
         issues = post_quality.post_issues(draft)

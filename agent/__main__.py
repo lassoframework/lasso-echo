@@ -995,6 +995,7 @@ _COMMANDS = {
         ("lasso-astra-rework", "regenerate the IMAGE (never the schedule) on LASSO's existing non-video, non-published calendar slots as linked Astra v2 candidates (ECHO_VARIANT_PAIRING); same dates/times/count untouched, nothing publishes; [--months YYYY-MM,...] [--limit N] [--write]"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
         ("ops-triage-classify", "classify one ops-alert line as noise/needs_triage (agent/ops_triage.py); prints exactly that word. Arg or stdin: python -m agent ops-triage-classify \"<alert text>\""),
+        ("post-engine", "TRACEABILITY: which engine + model generated ONE published post's creative, e.g. 'astra:gpt-image-2.5-sunburst' (db.post_engine_for). --draft-id <id> | --media-id <id>"),
     ],
     "trust & approvals": [
         ("trust", "show trust level for an account (--account <key>)"),
@@ -3387,6 +3388,38 @@ def main(argv=None):
         # ops-triage relay: python -m agent ops-triage-classify "<alert text>"
         from .ops_triage import main as _ops_triage_main
         sys.exit(_ops_triage_main(argv[1:]))
+    elif cmd == "post-engine":
+        # TRACEABILITY (Blake, 2026-09-13): which engine generated ONE
+        # specific published post's creative — read-only, no mutation, no
+        # network call. python -m agent post-engine --draft-id <id>
+        #                python -m agent post-engine --media-id <id>
+        from . import db as _db
+        _draft_id = None
+        _media_id = None
+        rest = argv[1:]
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--draft-id" and i + 1 < len(rest):
+                _draft_id = rest[i + 1]
+                i += 2
+            elif rest[i] == "--media-id" and i + 1 < len(rest):
+                _media_id = rest[i + 1]
+                i += 2
+            else:
+                i += 1
+        if bool(_draft_id) == bool(_media_id):
+            print("usage: python -m agent post-engine (--draft-id <id> | --media-id <id>)")
+            sys.exit(2)
+        rows = _db.post_engine_for(draft_id=_draft_id, media_id=_media_id)
+        if not rows:
+            key = f"draft_id={_draft_id}" if _draft_id else f"media_id={_media_id}"
+            print(f"post-engine: no published post found for {key}")
+            sys.exit(1)
+        for r in rows:
+            print(f"draft_id={r['draft_id']} account={r['account_key']} "
+                  f"platform={r['platform']} mode={r['mode']} "
+                  f"published_at={r['published_at']} media_id={r['media_id']} "
+                  f"image_engine={r['image_engine'] or '(unknown, predates this column)'}")
     elif cmd == "render-card":
         # Render ONE Astra card on demand through the REAL engine chain
         # (gpt-6-astra reads the brief, Sunburst draws it). Publishes nothing,

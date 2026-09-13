@@ -40,6 +40,7 @@ def _to_dict(d: Draft):
         "slack_channel": d.slack_channel,
         "slack_ts": d.slack_ts,
         "needs_media": d.needs_media,
+        "image_engine": d.image_engine,
     }
 
 
@@ -111,6 +112,7 @@ def _from_dict(r):
         slack_channel=r.get("slack_channel", ""),
         slack_ts=r.get("slack_ts", ""),
         needs_media=bool(r.get("needs_media", False)),
+        image_engine=r.get("image_engine", ""),
     )
 
 

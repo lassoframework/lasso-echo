@@ -16,10 +16,15 @@ _FIELDS = ["account_key", "platform", "published_at", "caption",
 
 
 def log_post(account_key, platform, caption, media_id, mode, draft_id,
-             path=None, creative_key="", archetype="", set_name="", permalink=""):
+             path=None, creative_key="", archetype="", set_name="", permalink="",
+             image_engine=""):
     """
     mode is "published" (real Meta write) or "would_publish" (draft-only).
-    Returns the record dict that was written.
+    `image_engine` (Blake, 2026-09-13) is "{engine}:{model}", e.g.
+    "astra:gpt-image-2.5-sunburst" — the SAME string creative_studio.generate()
+    already returns as `route`, threaded through the Draft (draft.image_engine)
+    by the caller. Empty for a draft with no generated image (an uploaded
+    photo, a library creative). Returns the record dict that was written.
     """
     record = {
         "account_key": account_key,
@@ -42,11 +47,11 @@ def log_post(account_key, platform, caption, media_id, mode, draft_id,
             conn.execute(
                 "INSERT INTO posts (draft_id, account_key, platform, caption, "
                 "media_id, mode, published_at, creative_key, archetype, set_name, "
-                "permalink) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "permalink, image_engine) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (record["draft_id"], record["account_key"], record["platform"],
                  record["caption"], record["media_id"], record["mode"],
                  record["published_at"], creative_key, archetype, set_name,
-                 permalink))
+                 permalink, image_engine))
             conn.commit()
     except Exception as e:
         print(f"[postlog] db mirror failed (jsonl still written): "

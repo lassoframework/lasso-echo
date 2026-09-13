@@ -219,11 +219,17 @@ def test_no_two_rules_claim_the_same_accent():
     assert "red #FF0000 is used exactly one time" in brief
 
 
-# ---- account scope (Blake, 2026-09-13: "only for LASSO right now") --------
+# ---- account scope --------------------------------------------------------
+# Blake, 2026-09-12: "only for LASSO right now until a proven [out]." Blake,
+# 2026-09-13 (same day the style system shipped, one day later): "This applies
+# to the real production system -- LASSO's own account plus any client gym
+# using the auto-infographic path." The default widened from {"lasso"} to
+# {"*"}; AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS still narrows it back by hand
+# (e.g. "lasso" restores the 2026-09-12 scope without a code change).
 
-def test_scope_defaults_to_lasso_only(monkeypatch):
+def test_scope_defaults_to_every_account(monkeypatch):
     monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
-    assert config.astra_style_freedom_accounts() == {"lasso"}
+    assert config.astra_style_freedom_accounts() == {"*"}
 
 
 def test_master_off_means_off_for_every_account_regardless_of_scope(monkeypatch):
@@ -233,12 +239,12 @@ def test_master_off_means_off_for_every_account_regardless_of_scope(monkeypatch)
     assert config.astra_style_freedom_enabled_for(None) is False
 
 
-def test_master_on_defaults_to_lasso_only(monkeypatch):
+def test_master_on_defaults_to_every_account(monkeypatch):
     monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
     monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
     assert config.astra_style_freedom_enabled_for("lasso") is True
-    assert config.astra_style_freedom_enabled_for("eng") is False
-    assert config.astra_style_freedom_enabled_for("gritx") is False
+    assert config.astra_style_freedom_enabled_for("eng") is True
+    assert config.astra_style_freedom_enabled_for("gritx") is True
 
 
 def test_a_missing_account_key_is_treated_as_lasso(monkeypatch):
@@ -251,14 +257,16 @@ def test_a_missing_account_key_is_treated_as_lasso(monkeypatch):
 
 
 def test_ig_and_fb_suffixes_are_stripped_before_the_scope_check(monkeypatch):
+    """Suffix stripping still matters once the scope is narrowed by hand back
+    to LASSO-only (the 2026-09-12 rollback path)."""
     monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
-    monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", "lasso")
     assert config.astra_style_freedom_enabled_for("lasso_ig") is True
     assert config.astra_style_freedom_enabled_for("lasso_fb") is True
     assert config.astra_style_freedom_enabled_for("eng_ig") is False
 
 
-def test_the_scope_env_var_widens_the_rollout(monkeypatch):
+def test_the_scope_env_var_narrows_the_rollout_back(monkeypatch):
     monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
     monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", "lasso,eng,gritx")
     assert config.astra_style_freedom_enabled_for("eng") is True
@@ -276,7 +284,10 @@ def test_star_opens_the_scope_to_every_account(monkeypatch):
 def test_the_brief_resolves_freedom_per_account_when_freedom_is_not_pinned(monkeypatch):
     """The actual integration point: build_infographic_brief must consult the
     per-account scope, not the bare master flag, when the caller (creative_studio
-    .generate -> _astra_brief_for) hands it a real account_key."""
+    .generate -> _astra_brief_for) hands it a real account_key. A CLIENT GYM in
+    scope still gets freedom mode (composition/accent variety, ART DIRECTION
+    LATITUDE) but NEVER the LASSO CANVAS MODE / locked hex text -- it gets its
+    own palette latitude section instead (gym_brand_latitude)."""
     monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
     monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
 
@@ -287,15 +298,95 @@ def test_the_brief_resolves_freedom_per_account_when_freedom_is_not_pinned(monke
 
     assert "CANVAS MODE" in lasso_brief
     assert "CANVAS MODE" not in client_brief
-    assert "THE canvas" in client_brief          # the client gets the old, locked brief
+    assert "THE canvas" not in client_brief
+    assert "ART DIRECTION LATITUDE" in client_brief
+    assert "PALETTE, YOUR CALL" in client_brief
+    assert "#FAF6F0" not in client_brief and "#121E3C" not in client_brief
+
+    # narrowing the scope back to LASSO-only restores the pre-2026-09-13 brief
+    # for a client gym, unchanged.
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", "lasso")
+    locked_client_brief = astra_prompt.build_infographic_brief(
+        HOOK, FACTS, cta="Book a call", account_key="eng_ig")
+    assert "CANVAS MODE" not in locked_client_brief
+    assert "THE canvas" in locked_client_brief
 
 
 def test_an_explicit_freedom_argument_still_overrides_the_scope(monkeypatch):
     """`freedom=` stays the hard override the tests and a one off render use —
-    account scoping only fills the gap when freedom is left unpinned."""
+    account scoping only fills the gap when freedom is left unpinned. A client
+    gym forced into freedom mode gets the gym palette, not LASSO's canvas."""
     monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "true")
     monkeypatch.delenv("AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS", raising=False)
-    assert "CANVAS MODE" in astra_prompt.build_infographic_brief(
+    eng_brief = astra_prompt.build_infographic_brief(
         HOOK, FACTS, account_key="eng", freedom=True)
+    assert "CANVAS MODE" not in eng_brief
+    assert "PALETTE, YOUR CALL" in eng_brief
+    assert "ART DIRECTION LATITUDE" in eng_brief
     assert "CANVAS MODE" not in astra_prompt.build_infographic_brief(
         HOOK, FACTS, account_key="lasso", freedom=False)
+
+
+# ---- gym brand latitude (Blake, 2026-09-13: "create whatever it wants with
+# the brain", never LASSO's own hex list, never LASSO's own voice doc) ------
+
+def test_gym_brief_never_carries_a_lasso_hex_value(monkeypatch):
+    for canvas in astra_prompt.CANVAS_ORDER:
+        brief = astra_prompt.build_infographic_brief(
+            HOOK, FACTS, cta="Book a call", account_key="somegym",
+            freedom=True, canvas=canvas)
+        for hexval in ("#FAF6F0", "#121E3C", "#5EB9E6", "#FF0000"):
+            assert hexval not in brief, f"{canvas}: leaked LASSO hex {hexval}"
+        assert "PALETTE, YOUR CALL" in brief
+        assert "no fixed color list applies" in brief.lower()
+
+
+def test_gym_brief_keeps_the_real_guardrails(monkeypatch):
+    """Freedom on color; not on the genuine safety/quality rules."""
+    brief = astra_prompt.build_infographic_brief(
+        HOOK, FACTS, cta="Book a call", account_key="somegym", freedom=True)
+    assert "NO FABRICATION" in brief
+    assert "READABILITY" in brief
+    assert "BANNED" in brief
+    assert "—" not in brief and "–" not in brief
+
+
+def test_gym_brief_says_this_gym_not_lasso(monkeypatch):
+    brief = astra_prompt.build_infographic_brief(
+        HOOK, FACTS, cta="Book a call", account_key="somegym", freedom=True)
+    assert "this gym's own brand, not LASSO's" in brief
+    lasso_brief = astra_prompt.build_infographic_brief(
+        HOOK, FACTS, cta="Book a call", account_key="lasso", freedom=True)
+    assert "for the LASSO brand" in lasso_brief
+
+
+def test_gym_accent_law_names_no_color_but_keeps_the_one_accent_discipline():
+    law = astra_prompt.accent_law_free("one_word")
+    assert "exactly one" in law.lower()
+    assert "#ff0000" not in law.lower()
+    assert " red " not in f" {law.lower()} "
+
+
+def test_is_lasso_account_matches_the_style_freedom_convention():
+    assert astra_prompt.is_lasso_account(None) is True
+    assert astra_prompt.is_lasso_account("") is True
+    assert astra_prompt.is_lasso_account("lasso") is True
+    assert astra_prompt.is_lasso_account("lasso_ig") is True
+    assert astra_prompt.is_lasso_account("eng") is False
+    assert astra_prompt.is_lasso_account("eng_fb") is False
+
+
+def test_voice_path_for_lasso_is_unchanged(monkeypatch):
+    assert astra_prompt._voice_path_for("lasso") == config.VOICE_DOC_PATH
+    assert astra_prompt._voice_path_for(None) == config.VOICE_DOC_PATH
+    assert astra_prompt._voice_path_for("lasso", "explicit.md") == "explicit.md"
+
+
+def test_voice_path_for_a_gym_reads_its_own_durable_doc(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "client_voice_dir", lambda: str(tmp_path))
+    gym_dir = tmp_path / "somegym"
+    gym_dir.mkdir()
+    voice_file = gym_dir / "lasso_voice.md"
+    voice_file.write_text("gym voice")
+    path = astra_prompt._voice_path_for("somegym_ig")
+    assert path == str(voice_file)

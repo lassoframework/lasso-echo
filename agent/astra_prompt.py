@@ -241,6 +241,125 @@ ACCENT_ORDER = ["one_word", "one_node", "rule_line", "arrow_tip",
 _RED_FIELD_CANVASES = {"red"}
 
 
+# ---------------------------------------------------------------------------
+# GYM BRAND LATITUDE — a CLIENT GYM is not LASSO. It never gets LASSO's V3 hex
+# palette (that was never this gym's brand to begin with); it gets real color
+# latitude instead, informed by ITS OWN voice doc + approved facts (already in
+# the brief above this section — see _voice_path_for), not a menu of five
+# locked LASSO colors reshuffled. What still travels from the LASSO canvas
+# system is the STRUCTURE each canvas mode implies (field energy, composition
+# discipline) -- restated here with no hex values, so "give it real freedom"
+# does not become "no guidance at all", which is how a run degenerates into
+# noise instead of a brand. Blake, 2026-09-13: "does not need to follow all
+# the colors of cream background and just needs to create whatever it wants
+# with the brain."
+# ---------------------------------------------------------------------------
+
+_CANVAS_MOODS = {
+    "cream": "a calm, light, premium field with generous margins. Editorial, "
+             "not loud.",
+    "navy": "a deep, moody, cinematic field that fills the frame with a "
+            "confident, grounded energy.",
+    "red": "the highest urgency field in the system. Keep the composition "
+           "simple and the type huge so it reads clean, never busy.",
+    "split": "the frame divides into two zones in strong visual opposition, "
+             "on a vertical, horizontal, or diagonal seam. The seam is a "
+             "designed edge, not an accident.",
+    "sky": "a bright, open, friendly field. Reserve this energy for outcome "
+           "and momentum ideas.",
+    "ink": "a near black, serious, highest contrast field; thin precise line "
+           "work, negative space does the work.",
+    "duotone": "one full bleed real photograph treated as a two tone "
+               "duotone, with type reversed out over it. A real gym or "
+               "workplace scene, high contrast, never a stock smile and "
+               "never an illustrated or AI looking image.",
+}
+
+
+def gym_brand_latitude(canvas: str) -> str:
+    """The palette section for a CLIENT GYM card (freedom mode, non-LASSO
+    account). Replaces LOCKED_BRAND_COLORS + CANVAS_MODES[canvas]: no hex
+    value is named anywhere in it, only the field's ENERGY (still varied by
+    `canvas`, same as the LASSO system, so the deterministic per-card pick
+    keeps doing real work). Astra decides the actual colors, grounded in the
+    brand voice excerpt and approved context that already sit earlier in this
+    brief -- the gym's own brand brain, not LASSO's."""
+    mood = _CANVAS_MOODS.get(canvas, _CANVAS_MOODS["cream"])
+    return (
+        "PALETTE, YOUR CALL: this card is for a CLIENT GYM, not LASSO's own "
+        "account. No fixed color list applies here. Choose the background "
+        "field, the supporting colors, and the accent color that fit THIS "
+        "gym's own identity and this post's hook, grounded in the brand "
+        "voice and approved context above (its energy, its language, the "
+        "kind of gym it is) — never LASSO's own colors, and never a generic "
+        "default you would reach for on any gym's card.\n"
+        f"This card's FIELD ENERGY: {mood}\n"
+        "Two different gyms must never look like reskins of the same card. "
+        "What still holds no matter which colors you choose: real contrast "
+        "between type and field (see READABILITY below), and one deliberate "
+        "accent used exactly once for hierarchy, never scattered and never "
+        "the same color as the field."
+    )
+
+
+def accent_law_free(placement: str) -> str:
+    """The single-accent law for a CLIENT GYM card with a free palette: no
+    red, no LASSO hex is named, but the SAME 'exactly one, never scattered'
+    discipline the house-style grade gate rewards still holds -- it is just
+    no longer pinned to a specific color, because the color itself is now
+    this gym's own call (see gym_brand_latitude)."""
+    where = ACCENT_PLACEMENTS.get(placement, ACCENT_PLACEMENTS["one_word"])
+    return (
+        "COLOR LAW: pick ONE accent color of your own choosing for this "
+        f"card and use it exactly one time, at {where}. Never a second "
+        "accent color, never scattered emphasis, never the same color as "
+        "the field."
+    )
+
+
+def _account_base(account_key) -> str:
+    """Base account key (an '_ig'/'_fb' suffix stripped, lower cased). A
+    missing or blank key is treated as LASSO's own, same convention as
+    config.astra_style_freedom_enabled_for."""
+    base = str(account_key or "lasso").strip().lower()
+    for suf in ("_ig", "_fb"):
+        if base.endswith(suf):
+            return base[: -len(suf)]
+    return base
+
+
+def is_lasso_account(account_key) -> bool:
+    return _account_base(account_key) == "lasso"
+
+
+def _voice_path_for(account_key, explicit_path=None):
+    """Which brand voice doc feeds the BRAND VOICE section of the brief.
+
+    An explicit `voice_path` (a caller/test override) always wins, unchanged.
+    LASSO's own account (or a missing/blank account_key) reads
+    config.VOICE_DOC_PATH, byte for byte as before. A CLIENT GYM instead
+    reads its OWN drafted voice doc, via the exact durable-first resolver
+    client_media_sync already uses for that gym's caption path
+    (_resolve_client_voice_path: <DATA_DIR>/brand_voice/<base>/lasso_voice.md,
+    falling back to the repo path) -- so an Astra brief for a client gym is
+    grounded in THAT gym's brand brain, not LASSO's. Before this, every Astra
+    brief (LASSO's own and every client gym's) read config.VOICE_DOC_PATH
+    unconditionally, so a client gym's card was voiced as LASSO. Any failure
+    to resolve falls back to config.VOICE_DOC_PATH so a brief is never
+    blocked over a missing helper or a first-run gym with no voice doc yet."""
+    if explicit_path:
+        return explicit_path
+    base = _account_base(account_key)
+    if base == "lasso":
+        return config.VOICE_DOC_PATH
+    try:
+        from . import client_media_sync
+        return client_media_sync._resolve_client_voice_path(
+            base, os.path.join("brand_voice", base, "lasso_voice.md"))
+    except Exception:
+        return config.VOICE_DOC_PATH
+
+
 def accent_law(canvas: str, placement: str) -> str:
     """The single accent law for one card, aware of its canvas and placement.
 
@@ -413,13 +532,27 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
     `accent` pin any of the three by hand; `freedom` overrides the flag, which is
     what the tests and a one off render use.
 
-    ACCOUNT SCOPE (Blake, 2026-09-13: "only for LASSO right now until a
-    proven [out]"). When `freedom` is not passed explicitly, the flag is
-    resolved PER ACCOUNT via config.astra_style_freedom_enabled_for(account_key)
-    rather than the bare master switch, so the flag being ON in production
-    does not by itself free every client gym's cards. `account_key` is the
-    same value every caller already threads through creative_studio.generate();
-    a missing one is treated as LASSO (see that function's docstring).
+    ACCOUNT SCOPE (Blake, 2026-09-12: "only for LASSO right now until a
+    proven [out]"; widened 2026-09-13, see config.astra_style_freedom_accounts).
+    When `freedom` is not passed explicitly, the flag is resolved PER ACCOUNT
+    via config.astra_style_freedom_enabled_for(account_key) rather than the
+    bare master switch, so the flag being ON in production does not by itself
+    free every client gym's cards ahead of the scope's own rollout. `account_key`
+    is the same value every caller already threads through
+    creative_studio.generate(); a missing one is treated as LASSO (see that
+    function's docstring).
+
+    A CLIENT GYM (account_key not LASSO's own, see is_lasso_account) that is in
+    scope gets a DIFFERENT freedom brief than LASSO's own account: its BRAND
+    VOICE section reads ITS OWN drafted voice doc (_voice_path_for), never
+    LASSO's, and its palette section is gym_brand_latitude (real color choice,
+    grounded in that voice + the approved context) rather than LOCKED_BRAND_
+    COLORS + a LASSO-hex CANVAS_MODES entry. Blake, 2026-09-13: "does not need
+    to follow all the colors of cream background and just needs to create
+    whatever it wants with the brain." Everything that is a genuine guardrail
+    rather than a LASSO-specific look -- the banned list, the readability bar,
+    the no-fabrication line, the no-dash rule, the copy hard-rule checks below
+    -- is unchanged for a gym card.
 
     Returns the brief string, dash-scrubbed and checked against the same hard
     rules the Gemini prompt is checked against (banned headline words, and, in
@@ -428,6 +561,8 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
     from . import creative_studio as _cs
 
     _cs._check_headline_hard_rules(headline)
+
+    is_lasso = is_lasso_account(account_key)
 
     use_pixels = pixels or (config.STORY_PIXELS if "story" in str(surface).lower()
                             else config.IMAGE_PIXELS)
@@ -443,26 +578,37 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
         style = style_for(str(style_key or headline or ""), canvas=canvas,
                           composition=composition, accent=accent)
 
+    # The brand_line only actually changes for a GYM CARD THAT IS FREED: the
+    # locked/non-freedom path is the pre-existing universal template (LASSO's
+    # cream palette, unconditionally, for every account) and is untouched by
+    # this change -- it would be a self-contradicting brief to tell Astra
+    # "not LASSO's brand" and then still hand it LASSO's locked hex palette.
+    freed_gym_card = bool(style) and not is_lasso
+    brand_line = ("for this gym's own brand, not LASSO's" if freed_gym_card
+                  else "for the LASSO brand")
     sections = [
-        f"You are art directing ONE {kind} for the LASSO brand. Produce a single "
+        f"You are art directing ONE {kind} {brand_line}. Produce a single "
         f"finished image by calling the image generation tool.",
         f"CANVAS: {use_aspect} vertical, {use_pixels}, designed for an Instagram "
         f"and Facebook {surface}. The whole composition fits inside the frame "
         "with generous margins; nothing is cut off at the edges.",
     ]
 
-    voice_excerpt = load_voice_excerpt(voice_path)
+    voice_excerpt = load_voice_excerpt(_voice_path_for(account_key, voice_path))
     if voice_excerpt:
         sections.append(
             "BRAND VOICE (the approved doc, for tone of the rendered words only; "
             "do not copy sentences out of it onto the card):\n" + voice_excerpt)
 
-    if style:
+    if style and is_lasso:
         # The canvas mode IS this card's field instruction, so it replaces the
         # cream-locked BRAND_PALETTE. The color VALUES are unchanged: the LASSO
         # V3 palette still governs, only which color carries the field varies.
         sections.append(LOCKED_BRAND_COLORS)
         sections.append(CANVAS_MODES[style["canvas"]])
+    elif style:
+        # A CLIENT GYM: no LASSO hex, real palette latitude (see docstring).
+        sections.append(gym_brand_latitude(style["canvas"]))
     else:
         sections.append(palette or _cs.BRAND_PALETTE)
     sections.append(BRAND_TYPE_SYSTEM)
@@ -481,10 +627,16 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
             f"APPROVED CONTEXT for {what_shows} (do NOT render these sentences "
             "as body text on the image; they tell you what "
             f"{how_many} should SHOW):\n{fact_lines}")
+    if style and is_lasso:
+        accent_section = accent_law(style["canvas"], style["accent"])
+    elif style:
+        accent_section = accent_law_free(style["accent"])
+    else:
+        accent_section = SINGLE_ACCENT_LAW
     sections.extend([
         COMPOSITION_MODES[style["composition"]] if style else FLAT_EDITORIAL_SPEC,
         f"URL FOOTER TEXT (render exactly): {footer or url_footer()}",
-        accent_law(style["canvas"], style["accent"]) if style else SINGLE_ACCENT_LAW,
+        accent_section,
         ART_DIRECTION_LATITUDE if style else READABILITY_LAW,
         READABILITY_LAW if style else "",
         _cs.STORY_REQUIREMENT,

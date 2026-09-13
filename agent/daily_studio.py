@@ -73,7 +73,8 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
     # generated run varies in composition day to day (the brand never varies).
     art = creative_studio.generate(headline, facts, client=nano_client,
                                    account_key=account.key,
-                                   archetype=creative_studio.archetype_for_day(day_key))
+                                   archetype=creative_studio.archetype_for_day(day_key),
+                                   draft_id=draft_id)
     if not art:
         # Acceptable library fallback for now, but make it VISIBLE: run-daily output
         # always, plus one ops alert when AGENT_OPS_ALERTS_ENABLED is armed.
@@ -119,4 +120,5 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=[headline] + facts,  # no-fabrication audit trail
         warnings=warnings,
+        image_engine=art.get("route", ""),
     )

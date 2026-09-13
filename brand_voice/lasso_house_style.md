@@ -385,24 +385,52 @@ text. No fabrication: a missing note still blocks the draft. The readability bar
 approval gate. All 294 canvas and composition and accent combinations were
 verified against the grade gate and the hard copy rules before this shipped.
 
-### Account scope: LASSO only until proven (2026-09-13)
+### Account scope: every account by default (widened 2026-09-13)
 
-Blake: "This should only be for LASSO right now until a proven [out]." The
-master flag being ON does not by itself free every client gym's cards — it is
-scoped per account.
+Blake, 2026-09-12: "This should only be for LASSO right now until a proven
+[out]." One day later, same ask restated with the explicit widening: "This
+applies to the real production system — LASSO's own account plus any client
+gym using the auto-infographic path." The master flag being ON does not by
+itself free every account's cards — it is still scoped per account — but the
+scope now defaults to everyone.
 
-**`AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS`**, default `lasso`. Comma-separated
-account-key bases (an `_ig`/`_fb` suffix is stripped before the check, so
-`lasso_ig` and `lasso_fb` both mean `lasso`). Widen the rollout by adding more
-keys (`lasso,eng,gritx`), or set it to `*` to open the system to every account
-(the pre-scope, all-accounts behavior).
+**`AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS`**, default `*` (every account).
+Comma-separated account-key bases (an `_ig`/`_fb` suffix is stripped before
+the check, so `lasso_ig` and `lasso_fb` both mean `lasso`) still narrows the
+rollout back by hand — set it to `lasso` to restore the 2026-09-12 LASSO-only
+scope without a code change, or to a specific list (`lasso,eng,gritx`).
 
 A missing account_key (book_campaign, podcast, summit, stories, and the
 render-card CLI with no `--account`) is treated as `lasso`, since every
-unscoped caller in this repo IS LASSO's own content pipeline. Client-gym calls
-(the daily draw, via `daily_studio.py`) always pass a real account_key, so they
-are never silently included.
+unscoped caller in this repo IS LASSO's own content pipeline.
 
 `python -m agent render-card --account eng --brief-only` previews exactly what
 a given account gets in production, without touching Railway or waiting for a
 calendar slot.
+
+### A CLIENT GYM gets a DIFFERENT freed brief than LASSO's own account
+
+Freedom mode is not "LASSO's palette, reshuffled" once it reaches a client
+gym. Two things change for a non-LASSO account_key (`astra_prompt.
+is_lasso_account`) when it is in freedom scope:
+
+- **Its own voice, not LASSO's.** `_voice_path_for` resolves the gym's own
+  durable drafted voice doc (`<DATA_DIR>/brand_voice/<base>/lasso_voice.md`,
+  same resolver `client_media_sync._resolve_client_voice_path` uses for that
+  gym's captions), not `config.VOICE_DOC_PATH` (LASSO's own doc). Before
+  2026-09-13 every Astra brief, client gym included, read LASSO's voice doc
+  unconditionally.
+- **Real palette latitude, not LASSO's locked hex.** `gym_brand_latitude`
+  replaces `LOCKED_BRAND_COLORS` + a `CANVAS_MODES` entry: no LASSO hex value
+  is named anywhere in the brief. Astra chooses the field, supporting colors,
+  and accent color itself, grounded in that gym's own voice + approved
+  context, with only the field's ENERGY (calm/moody/urgent/etc, still varied
+  per card) carried over from the canvas system for structure.
+  `accent_law_free` keeps the "exactly one accent, never scattered"
+  discipline without naming red. Genuine guardrails — the banned list, the
+  readability bar, the no-fabrication line, the no-dash rule, the copy
+  hard-rule checks — are unchanged for a gym card.
+
+LASSO's own account is UNCHANGED by this: it still gets `LOCKED_BRAND_COLORS`
++ its 7-canvas system, because those ARE LASSO's real agency colors, not a
+template imposed on someone else's brand.

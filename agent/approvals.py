@@ -333,6 +333,11 @@ def handle_action(action, draft, actor_slack_id, note="",
                 # SocialAPI returns a permalink on the result; Meta's result has no
                 # such attr, so getattr keeps the Meta path byte-identical ("").
                 permalink=getattr(result, "permalink", "") or "",
+                # TRACEABILITY: which engine generated this draft's creative,
+                # threaded from creative_studio.generate()'s "route" onto the
+                # Draft itself. Empty for a non-generated creative (getattr
+                # keeps every pre-2026-09-13 Draft that lacks the attr safe).
+                image_engine=getattr(draft, "image_engine", "") or "",
             )
         except Exception as exc:  # noqa: BLE001 - never re-raise past a live post
             ops_alerts.alert(

@@ -103,7 +103,8 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                                                client=s3_client)
                 if hosted:
                     return _story_draft(account, day_key, draft_id, feed_draft,
-                                        art["path"], hosted, fragments)
+                                        art["path"], hosted, fragments,
+                                        image_engine=art.get("route", ""))
 
     # No genuine 9:16 asset available: SKIP the Story for the day. Never reuse or
     # crop the day's feed image into a Story frame.
@@ -144,7 +145,7 @@ def _premade_story_variant(feed_draft):
 
 
 def _story_draft(account, day_key, draft_id, feed_draft, creative_path,
-                 creative_public_url, fragments):
+                 creative_public_url, fragments, image_engine=""):
     # Task #28 (§5c): stamp the story's RAW hosted media so content_calendar carries
     # source_media_url and an edited story caption RE-BURNS (portal save + the
     # publish-lane self-heal) instead of shipping the old text. Gated by
@@ -161,4 +162,5 @@ def _story_draft(account, day_key, draft_id, feed_draft, creative_path,
         status=DraftStatus.PENDING,
         source_fragments=fragments,  # the same approved text the feed creative used
         is_story=True,
+        image_engine=image_engine,
     ))

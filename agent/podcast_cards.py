@@ -211,6 +211,7 @@ def build_card_draft(account, day_key, nano_client=None, s3_client=None):
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=[f"cite:{podcast_transcripts.citation_id(n)}", hook, support],
         day_key=day_key, draft_type="podcast",
+        image_engine=art.get("route", ""),
     )
     _mark_carded(item["id"], day_key)
     db.audit("podcast_card", draft.draft_id,
@@ -269,6 +270,7 @@ def build_episode_card(account, episode_n, day_key, nano_client=None, s3_client=
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=[f"cite:{podcast_transcripts.citation_id(n)}", hook, support],
         day_key=day_key, draft_type="podcast",
+        image_engine=art.get("route", ""),
     )
     db.audit("podcast_card", draft.draft_id,
              f"episode {n} infographic (Sunday touch) drafted (held for approval)",

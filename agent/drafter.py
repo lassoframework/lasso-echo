@@ -90,6 +90,17 @@ class Draft:
     # every existing draft behaves exactly as before. This only ever STRENGTHENS
     # the gate (adds a required approval); it never bypasses one.
     force_approval: bool = False
+    # TRACEABILITY (Blake, 2026-09-13): which image engine + model actually
+    # generated this draft's creative, e.g. "astra:gpt-image-2.5-sunburst" or
+    # "gemini:gemini-2.5-flash-image". Empty for a draft with no generated
+    # image (a client-uploaded photo, a library creative, a caption-only
+    # draft). Set from creative_studio.generate()'s "route" field (or built
+    # directly from an image_engine.ImageResult as "{engine}:{model}" by a
+    # caller that talks to image_engine.generate_image itself). Carried
+    # through to the posts table by postlog.log_post at publish time, so a
+    # SPECIFIC published post can be traced back to the engine that made it,
+    # not just "Astra was in use during some window."
+    image_engine: str = ""
 
 
 def _make_id(account_key, creative_path, scheduled_for):

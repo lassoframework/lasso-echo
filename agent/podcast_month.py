@@ -146,4 +146,5 @@ def build_month_podcast_draft(account, day_key, *, nano_client=None, s3_client=N
         creative_path=art["path"], creative_public_url=hosted,
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=fragments, day_key=day_key, draft_type="podcast",
+        image_engine=art.get("route", ""),
     )

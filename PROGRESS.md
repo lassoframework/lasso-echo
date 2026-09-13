@@ -72,13 +72,99 @@ does not exist there. The env var is set and waiting; the code that reads it shi
 with this branch. Merge to main, let the service redeploy, and the freedom system
 goes live on the next draw.
 
-**Scoped to LASSO only (2026-09-13, Blake: "only for LASSO right now until a
-proven [out]").** The master flag alone does not free every client gym's cards
-anymore. `AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS` (default `lasso`) is the account
-allowlist; widen it (`lasso,eng,gritx`) or set it to `*` when LASSO's own run
-proves the system out and Blake is ready to roll it to client gyms. See
-`brand_voice/lasso_house_style.md` section 12 for the full account-scope
-contract, and `agent/config.py:astra_style_freedom_enabled_for()` for the code.
+**Scope widened to every account (2026-09-13, same day, Blake's follow-up
+ruling): "This applies to the real production system — LASSO's own account
+plus any client gym using the auto-infographic path."** The LASSO-only scope
+above held for about a day. `AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS` default is
+now `*` (every account); set it to `lasso` to restore the LASSO-only scope by
+hand without a code change. See `brand_voice/lasso_house_style.md` section 12
+for the full account-scope contract, and
+`agent/config.py:astra_style_freedom_enabled_for()` for the code.
+
+Because the master flag was ALREADY armed in production (see above) waiting
+on this code, widening the default scope takes effect on every client gym's
+freedom-scoped card the moment this merges and the service redeploys — not
+just LASSO's. That is the intended effect of today's ruling, not a side
+effect: see "Gym brand latitude" below for what a client gym's freed card
+actually gets (never LASSO's palette, never LASSO's voice doc).
+
+### Gym brand latitude (2026-09-13, same day)
+
+Blake's fuller ask: "does not need to follow all the colors of cream
+background and just needs to create whatever it wants with the brain." Widening
+the account scope alone was not enough — every canvas mode, LASSO's own
+included, still named LASSO's own locked hex values, so a client gym in
+freedom scope would have been "freed" into LASSO's palette, not its own. Fixed
+in `agent/astra_prompt.py`:
+
+- `gym_brand_latitude(canvas)` replaces `LOCKED_BRAND_COLORS` +
+  `CANVAS_MODES[canvas]` for any non-LASSO account (`is_lasso_account`): no
+  LASSO hex value is named; Astra picks the gym's own palette, grounded in its
+  own voice + approved context, with only the canvas's qualitative FIELD
+  ENERGY carried over for structure/variety.
+- `accent_law_free` keeps the "exactly one accent, never scattered" law
+  without pinning it to red.
+- `_voice_path_for` resolves a client gym's OWN durable voice doc
+  (`client_media_sync._resolve_client_voice_path`) instead of
+  `config.VOICE_DOC_PATH` (LASSO's own doc), which every Astra brief —
+  client gym included — read unconditionally before this.
+- `client_infographic_fill.py` (the client-gym auto-infographic path) now
+  builds the real Astra brief via `creative_studio._astra_brief_for` and
+  passes it as `opts["engine_prompts"]["astra"]`. Before this fix, Astra
+  silently received the Gemini-style prompt instead — which literally says
+  "Design a clean, minimal, premium LASSO-branded infographic" — because
+  `image_engine.prompt_for` falls back to the shared prompt when no
+  `engine_prompts["astra"]` key is set.
+
+Genuine guardrails are untouched for a gym card: the banned list (no
+illustrated scenes/cartoons/stock photorealism outside duotone), the
+readability bar, no fabrication, the no-dash rule, the LASSO avatar-scope
+rules referenced elsewhere in this repo. LASSO's own account is unchanged:
+it still gets the locked LASSO V3 hex palette and its 7-canvas system,
+because those are LASSO's real colors, not a template imposed on someone
+else's brand. See `brand_voice/lasso_house_style.md` section 12 for the full
+writeup, and `tests/test_astra_style_freedom.py` for the new gym-latitude
+tests.
+
+### Image engine traceability (2026-09-13)
+
+Blake reviewed a real published Astra card and wanted PER-POST proof, not
+just aggregate proof that Astra was in use during some window:
+
+- `Draft.image_engine` (new field, `agent/drafter.py`): "{engine}:{model}"
+  (e.g. `astra:gpt-image-2.5-sunburst`), set from `creative_studio.generate()`'s
+  existing `route` field (or built directly from an `image_engine.ImageResult`
+  by a caller, like `client_infographic_fill.py`, that talks to
+  `image_engine.generate_image` itself). Threaded through the main
+  Draft-producing pipelines: `daily_studio`, `client_infographic_fill`,
+  `book_campaign`, `doc_intake`, `podcast_month`/`podcast_cards`/
+  `podcast_release`, `stories`, `summit`.
+- `posts.image_engine` (new column, `agent/db.py`, additive migration):
+  `postlog.log_post` now accepts and persists `image_engine`; both live
+  publish call sites (`approvals.py`, `runner.py`) pass
+  `getattr(draft, "image_engine", "")` through.
+- `[image-engine]` log lines (`agent/image_engine.py`) now carry
+  `draft={id} account={key}` on every attempt (ok, FAILED, and NEEDS HUMAN),
+  not just the engine/model/cost they already carried. `draft_id` is threaded
+  from `creative_studio.generate(..., draft_id=...)` for every caller that
+  computes its draft id early (all of the pipelines listed above except the
+  podcast/book/summit set at the log-line level, which still get the
+  engine/model/cost/account_key on the log line and full image_engine
+  attribution in the DB, just not the draft_id in the log line itself — a
+  disclosed, deliberate scope cut).
+- `python -m agent post-engine --draft-id <id>` / `--media-id <id>` (new CLI,
+  `db.post_engine_for`): looks up which engine + model generated one specific
+  published post from the `posts` table.
+
+**Known, deliberate gaps** (out of scope for this pass, flagged rather than
+silently left): `generate_social_proof` (quote cards) and the two
+`video_editor.py` still-card generators don't thread `image_engine`/`draft_id`
+— they are a different, secondary creative surface, not the primary feed/story
+post path. Once a generated image lands in the reusable creative LIBRARY
+(`regen_library.py`, `variant_regen*.py`) and gets picked by a later caller as
+a plain "library creative," its original engine attribution is not carried
+forward — that would require a library-wide sidecar scheme, a larger change
+left for a follow-up if Blake wants library reuse traced too.
 
 ### Render one card by hand
 
