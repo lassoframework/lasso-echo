@@ -21,6 +21,9 @@ on:
       - "scripts/adhoc_render_5_cards.sh"
       - ".github/RENDER_MODE"
 
+permissions:
+  contents: write
+
 jobs:
   render:
     runs-on: ubuntu-latest
@@ -81,3 +84,26 @@ jobs:
           path: astra_renders/
           retention-days: 7
           if-no-files-found: warn
+
+      # Sandbox egress can reach github.com for git ops but not the Actions
+      # artifact CDN (blob.core.windows.net), so this commits the renders
+      # straight to the branch as the only way to pull the actual bytes back
+      # into the agent's session for delivery. Diagnostic-only branch, never
+      # merges to main.
+      - name: Commit rendered cards to branch
+        if: always()
+        run: |
+          set -e
+          if [ -z "$(find astra_renders -type f 2>/dev/null)" ]; then
+            echo "No rendered files to commit."
+            exit 0
+          fi
+          git config user.name "echo-render-bot"
+          git config user.email "echo-render-bot@users.noreply.github.com"
+          git add -f astra_renders/
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Commit rendered cards from run ${{ github.run_id }} (mode=${{ steps.mode.outputs.value }})"
+          git push origin HEAD:${{ github.ref_name }}
