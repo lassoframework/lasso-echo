@@ -1,0 +1,70 @@
+name: adhoc-render-cards
+
+# One-off diagnostic workflow (not part of Echo's product surface): runs
+# `python -m agent render-card` through the REAL engine chain using the
+# OPENAI_API_KEY secret already set on this repo, so gpt-6-astra actually
+# reads the brief and gpt-image-2.5-sunburst draws it. Publishes nothing,
+# queues nothing, touches no calendar row -- render-card's own guards apply.
+#
+# `mode: test` renders ONE card to prove the secret/wiring works before any
+# larger batch runs. `mode: batch30` renders the 30 LASSO cards (book, lasso,
+# summit, echo, website, nurture) Blake asked to be redone via the real
+# pipeline. Results land in the astra-renders build artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test (one card) or batch30 (all 30)"
+        required: true
+        default: "test"
+        type: choice
+        options: ["test", "batch30"]
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Render (test)
+        if: ${{ inputs.mode == 'test' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AGENT_ASTRA_STYLE_FREEDOM: "true"
+        run: |
+          set -e
+          mkdir -p astra_renders
+          python -m agent render-card \
+            --headline "Paid ads are not magic. They are math." \
+            --fact "Verbatim pull quote from our book The Full Gym" \
+            --fact "The Three Levers of Growth: churn, sales, leads" \
+            --fact "Paid ads are the last lever, not the first" \
+            --cta "Save this for later." \
+            --account lasso \
+            --out astra_renders/book
+
+      - name: Render (batch30)
+        if: ${{ inputs.mode == 'batch30' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AGENT_ASTRA_STYLE_FREEDOM: "true"
+        run: |
+          bash scripts/adhoc_render_30_cards.sh
+
+      - name: Upload rendered cards
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: astra-renders
+          path: astra_renders/
+          retention-days: 7
+          if-no-files-found: warn
