@@ -1,0 +1,98 @@
+style       : navy/device/one_node
+freedom     : ON
+engine      : astra
+model       : gpt-image-2.5-sunburst
+latency_ms  : 54092
+cost_est    : 0.19
+grade       : PASS
+
+--- ASTRA REVISED PROMPT (the brief-reading layer's own art direction) ---
+Create ONE finished premium LASSO infographic, portrait 4:5, 1080 x 1350 pixels, for social media. Exceptionally sharp typography and clean vector-like graphic design. Entire composition inside frame with at least 72 px safe margins, no clipping. Use ONLY this exact palette: navy #121E3C, cream #FAF6F0, sky blue #5EB9E6, white #FFFFFF, and red #FF0000. Solid deep navy background; prioritize exact solid brand colors and NO gradients, textures, patterns, shadows or 3D effects.
+
+DESIGN: Dramatic scale contrast, asymmetrical premium B2B editorial SaaS aesthetic. Very large, left aligned, heavy condensed Anton-style cream headline at upper left, tight leading, with EXACT wording and punctuation: 'I saved you a seat.' Set over two lines 'I saved you' / 'a seat.' It should be immediately readable at phone thumbnail size. Headline spans most of the width, roughly y=95 to y=380. Do not add an eyebrow or logo. Only TWO type families: Anton-style heavy condensed for headline, Montserrat Medium for every other word.
+
+HERO VISUAL: A thin sky blue outlined browser reservation panel, tilted clockwise about 5 degrees, offset toward the right, fully contained inside frame. Approximately x=125 to 955, y=460 to 1050, with generous air around it. It is a flat 2D outline interface, not a photorealistic device. Simple thin browser top bar with three tiny SKY BLUE circles at upper left, a divider beneath, and no other browser chrome or fabricated text. Inside the panel all content is clean, neatly aligned and legible. Header text in cream: 'November 7 and 8'. Beneath in smaller white type: 'Virgin Hotel Nashville'. A quiet sky blue line separates event information from the seat diagram.
+
+Show a simple meaningful seating availability diagram: EXACTLY 100 small rounded-square nodes arranged in a tidy 10 by 10 grid with a slightly wider central aisle between the fifth and sixth columns. These are minimal flat interface nodes, not furniture illustrations. 99 nodes are unfilled navy with thin sky blue outlines. EXACTLY ONE node near the front-right part of the grid is solid red #FF0000, without a red border anywhere else. This is the ONE AND ONLY red usage in the whole image. Do not imply the other seats are sold or add a status legend. The simple grid concretely visualizes the headline's saved seat. Alongside the grid within the panel, create a neatly aligned small typographic metadata column of three lines in cream: '100 seats', '10 leaders', '2 days'. These are modest supporting text, never colossal number callouts. Under that column render the concise supported line in white: 'Leave with a plan'. Below this, separated by ample breathing room, render a quiet two-line label: 'No waitlist' / 'when the room is full'. All panel contents tilt together, like one coherent browser interface. No other text, no invented metrics or claims.
+
+BOTTOM: Outside the tilted panel, an unrotated large cream rectangular CTA button with modest corner radius, aligned left to the headline and spanning almost the whole safe width, approximately x=75 y=1140 width=930 height=92. Navy Montserrat Medium text centered inside, EXACT: 'lassoframework.com/summit'. Button must have exceptionally crisp readable text. Near bottom at y=1280, small quiet letterspaced white Montserrat footer, EXACT: 'LASSOFRAMEWORK.COM'. Maintain safe margin beneath.
+
+Use pristine geometry, refined spacing, extremely confident hierarchy, large negative space, highly legible event metadata. No photos, people, figures, illustration scenes, metaphorical imagery, icons beyond browser dots, decorative ornaments, watermark, fake logo, extra copy, generic business process labels, em dashes, en dashes or hyphens. Exactly one red node, no red type. Deliver the finished infographic only.
+
+--- BRIEF AS SENT ---
+You are art directing ONE infographic for the LASSO brand. Produce a single finished image by calling the image generation tool.
+
+CANVAS: 4:5 vertical, 1080x1350, designed for an Instagram and Facebook feed post. The whole composition fits inside the frame with generous margins; nothing is cut off at the edges.
+
+BRAND VOICE (the approved doc, for tone of the rendered words only; do not copy sentences out of it onto the card):
+# LASSO Brand Bible Echo Social Agent
+
+> Single source of truth for Echo, the LASSO social media agent. Echo drafts ONLY
+> from this doc plus the client-provided note on each creative. It never invents
+> an offer, a price, a stat, or a client name.
+>
+> Synthesized from: LASSO AI Social Media Agent Brand Document v1.0 (June 2026),
+> the V3 Style Guide, the Blake Ruff writing style profile, the blake-brief
+> skill, the Gym Marketing Made Simple knowledge base (125 episodes), and the
+> LASSO Brain (~/LASSO/lasso-brain/, READ-ONLY: Echo compiles from it, never
+> edits it Blake, 2026-08-31).
+>
+> Status: canonical reference. Blake owns changes. Echo does not edit this file.
+
+---
+
+## 1. Who LASSO is
+
+LASSO Framework is a complete gym growth system built for boutique fitness owners.
+Not a traditional agency. Every person on the team is an active gym owner doing
+$50K or more per month in their own facility. LASSO installs paid advertising,
+sales systems, and growth mentorship into boutique gyms, and has helped 1,000+ gym
+owners scale.
+
+Founded by Blake Ruff and Sherman Merricks. Blake is a StoryBrand Certified Guide
+
+LOCKED LASSO V3 COLORS (use these exact values, never substitute or invent a color; the CANVAS MODE below decides which one carries the field):
+- Cream #FAF6F0
+- Navy #121E3C
+- Sky Blue #5EB9E6
+- Red #FF0000
+- White #FFFFFF
+Quality bar on every field: premium B2B agency work, clean and deliberate. No gradients, no texture, no pattern fills, no gimmicks.
+
+CANVAS MODE NAVY: a deep navy #121E3C field filling the frame, with a subtle darker vignette. Cream and white type, sky blue #5EB9E6 line work. Moody, cinematic, confident.
+
+BRAND TYPE SYSTEM (two families, never more):
+- HEADLINE: Anton, or the closest heavy condensed grotesque. Tight leading, sentence case or all caps, left aligned.
+- SUPPORT: Oswald Medium for eyebrows and labels, Montserrat Medium for the deck line and the footer. Small, letterspaced, quiet.
+Never a script face, never a serif display face, never more than two families on one card.
+
+HOOK, the one headline rendered on the card, render it exactly and keep it short: I saved you a seat.
+
+CTA, the exact words inside the button block: lassoframework.com/summit
+
+APPROVED CONTEXT for the visual element (do NOT render these sentences as body text on the image; they tell you what it should SHOW):
+- 100 seats. 10 leaders. 2 days. You leave with a plan
+- November 7 and 8. Virgin Hotel Nashville
+- When the room is full there is no waitlist
+
+COMPOSITION DEVICE: a phone screen, a browser window, or a dashboard panel drawn in thin outline is the hero visual, tilted or cropped by the frame edge rather than sitting flat and centered. Its contents are simple and readable. The headline sits above or beside it.
+
+URL FOOTER TEXT (render exactly): LASSOFRAMEWORK.COM
+
+COLOR LAW: red #FF0000 is used exactly one time on this card, and it is one node, bar, or row in the visual element. Never a red field behind the whole card, never red type scattered through the card, never a second red element.
+
+ART DIRECTION LATITUDE (read this before you compose): you are art directing ONE card in a long running brand campaign, not filling in a template. Within the canvas, composition, and color law above, you decide the crop, the scale relationships, where the visual anchor sits, how much negative space each zone gets, and whether the type sits high, low, or against the edge. Push the scale contrast further than feels safe. Vary the composition from the obvious centered arrangement: anchor to an edge, let one element bleed off the frame, or drop the horizon high or low. Two cards from this brand should be recognizable as siblings, never as the same card with the words swapped.
+
+READABILITY: the headline must be legible at thumbnail size in a phone feed. High contrast between type and field. If the composition would compromise legibility, simplify the composition, never the contrast.
+
+Quality standard (every card, every archetype): this card must look clean, professional, and high-end. The standard is premium B2B agency quality, the level of a top-tier SaaS brand. ALLOWED visual elements: simple flat icons (one or two maximum), structured tables or comparison layouts, minimal flow arrows, data callouts with numbers, before/after columns, clean labeled diagrams with meaningful business words. BANNED, do not generate any of these: illustrated scenes, people or figures in action, cartoon elements, metaphorical imagery (dripping money, safes, broken pipes, locks), photorealistic photography, 3D effects, gimmicky concept art, cluttered collages, generic abstract process labels (STEP 1, STEP 2, STEP 3, PLAN, GROW, LEARN, DISCOVER, LAUNCH, START, FINISH). Labels must use real business language a gym owner recognizes: LEADS, BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS, COST PER LEAD. The two-second test: a gym owner scrolling fast must read the card's point from the headline and the visual in under two seconds. Clean, direct, no decoding.
+
+Headline law, BE CLEAR, NOT CUTE: the headline states plainly what the card is about or what LASSO does. No slogans, no aphorisms, no wordplay, no clever compression. If a stranger must decode it, it fails. The two second test: a gym owner scrolling at speed understands the card's point from the headline plus the image in two seconds. Headline says it plainly, image shows it concretely, labels mean something: all three or the card fails.
+
+No stat slab: NEVER render one colossal number or percentage as the hero element filling the card. That layout is retired. Any figure appears only inside a real data visual (labeled bars or a trend) or within the headline sentence, at readable size, never as an oversized standalone slab.
+
+BANNED, never render any of these: illustrated scenes, people or figures in action, cartoon elements, metaphorical props (dripping money, safes, broken pipes, locks), photorealistic photography, 3D effects, cluttered collages, watermarks, lorem ipsum, and generic process labels (STEP 1, PLAN, GROW, LEARN, DISCOVER, LAUNCH). Labels use real business language a gym owner recognizes: LEADS, BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS.
+
+NO FABRICATION: render only the hook, the CTA, the labels the approved context supports, and the URL footer. Invent no number, price, offer, date, client name, or claim that is not above.
+
+Copy mechanics: no em dashes, no en dashes, avoid hyphens in the rendered text. Use the word 'to' for ranges.

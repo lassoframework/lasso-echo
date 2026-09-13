@@ -1,0 +1,94 @@
+style       : navy/split_screen/rule_line
+freedom     : ON
+engine      : astra
+model       : gpt-image-2.5-sunburst
+latency_ms  : 48329
+cost_est    : 0.19
+grade       : PASS
+
+--- ASTRA REVISED PROMPT (the brief-reading layer's own art direction) ---
+Produce ONE finished premium B2B social media infographic, 1080x1350 portrait 4:5. All elements contained within generous 72px safe margins. Exact flat brand palette only: navy #121E3C canvas, cream #FAF6F0 and white #FFFFFF typography, sky blue #5EB9E6 active elements, red #FF0000 used EXACTLY ONCE as a short thin horizontal rule beneath the eyebrow. No gradients, textures, shadows, patterns, photographs, illustrations, people, 3D, or decorative props. Flat navy field takes precedence over vignette. Crisp editorial typography and deliberate negative space. Use only TWO type families: Anton heavy condensed headline, Montserrat Medium for all other text.
+
+Layout: high-impact left aligned upper headline occupies the upper 42% of the card, then a precise split-screen comparison occupies the middle, then CTA and footer. Eyebrow at x76 y76 reads 'SOCIAL MEDIA' in small white spaced Montserrat. Single red horizontal rule 58px wide immediately below this eyebrow. Headline beneath, very large cream Anton, compact leading, exact wording and punctuation: 'We run your social media for you.' Set as three left-aligned lines 'We run your' / 'social media' / 'for you.' Approximately 112px font, excellent phone thumbnail legibility. No competing headline.
+
+Comparison at x76 y580 to x1004 y1010, hard vertical sky blue divider at x454, asymmetric muted left column 38% and vivid right column 62%. Flat navy background in both columns. One short heading per zone: left 'YOUR TO DO LIST' in small cream letters with quiet restrained contrast through thin weights, right 'LASSO HANDLES IT' in bold sky blue. Four aligned rows, generous spacing, no body paragraphs. Left zone shows four short cream business task labels: 'Monthly content', 'Post drafts', 'Post approval', 'Results tracking'. These look pending, quiet, understated; thin short cream horizontal marks alongside each row, no icons or decoration. Right zone displays four corresponding short labels, larger and brighter: 'Month planned', 'Posts drafted', 'Human approved', 'Results tracked'. Each right-side row has a small sky blue square bullet and crisp white typography, with thin sky blue horizontal separators creating a clean structured operational comparison. The right zone is alive and stronger, the left zone is subdued. No invented numbers, metrics, dates, calendars, graphs, or fabricated dashboard data. The visual immediately communicates a gym owner's social media workload is handled by LASSO including human approval. Do not render explanatory prose.
+
+At x76 y1090, place a clean sky blue rectangular CTA button about 720px wide and 100px high, slightly left weighted, with navy bold Montserrat text exactly 'Take the 2 minute quiz.' No pill shape, no extra icons. At x76 y1240, quiet cream spaced Montserrat footer exactly 'LASSOFRAMEWORK.COM'. All elements comfortably contained. Render only the prescribed headline, eyebrow, comparison labels, CTA and footer. Premium restrained Swiss information design, huge scale contrast, precise alignment, excellent spelling, very sharp vector-like finish. No watermarks. Red exists only in the single eyebrow underline.
+
+--- BRIEF AS SENT ---
+You are art directing ONE infographic for the LASSO brand. Produce a single finished image by calling the image generation tool.
+
+CANVAS: 4:5 vertical, 1080x1350, designed for an Instagram and Facebook feed post. The whole composition fits inside the frame with generous margins; nothing is cut off at the edges.
+
+BRAND VOICE (the approved doc, for tone of the rendered words only; do not copy sentences out of it onto the card):
+# LASSO Brand Bible Echo Social Agent
+
+> Single source of truth for Echo, the LASSO social media agent. Echo drafts ONLY
+> from this doc plus the client-provided note on each creative. It never invents
+> an offer, a price, a stat, or a client name.
+>
+> Synthesized from: LASSO AI Social Media Agent Brand Document v1.0 (June 2026),
+> the V3 Style Guide, the Blake Ruff writing style profile, the blake-brief
+> skill, the Gym Marketing Made Simple knowledge base (125 episodes), and the
+> LASSO Brain (~/LASSO/lasso-brain/, READ-ONLY: Echo compiles from it, never
+> edits it Blake, 2026-08-31).
+>
+> Status: canonical reference. Blake owns changes. Echo does not edit this file.
+
+---
+
+## 1. Who LASSO is
+
+LASSO Framework is a complete gym growth system built for boutique fitness owners.
+Not a traditional agency. Every person on the team is an active gym owner doing
+$50K or more per month in their own facility. LASSO installs paid advertising,
+sales systems, and growth mentorship into boutique gyms, and has helped 1,000+ gym
+owners scale.
+
+Founded by Blake Ruff and Sherman Merricks. Blake is a StoryBrand Certified Guide
+
+LOCKED LASSO V3 COLORS (use these exact values, never substitute or invent a color; the CANVAS MODE below decides which one carries the field):
+- Cream #FAF6F0
+- Navy #121E3C
+- Sky Blue #5EB9E6
+- Red #FF0000
+- White #FFFFFF
+Quality bar on every field: premium B2B agency work, clean and deliberate. No gradients, no texture, no pattern fills, no gimmicks.
+
+CANVAS MODE NAVY: a deep navy #121E3C field filling the frame, with a subtle darker vignette. Cream and white type, sky blue #5EB9E6 line work. Moody, cinematic, confident.
+
+BRAND TYPE SYSTEM (two families, never more):
+- HEADLINE: Anton, or the closest heavy condensed grotesque. Tight leading, sentence case or all caps, left aligned.
+- SUPPORT: Oswald Medium for eyebrows and labels, Montserrat Medium for the deck line and the footer. Small, letterspaced, quiet.
+Never a script face, never a serif display face, never more than two families on one card.
+
+HOOK, the one headline rendered on the card, render it exactly and keep it short: We run your social media for you.
+
+CTA, the exact words inside the button block: Take the 2 minute quiz.
+
+APPROVED CONTEXT for the visual element (do NOT render these sentences as body text on the image; they tell you what it should SHOW):
+- We plan the month, draft every post, and track what is working
+- A human approves every post before it goes live
+- You get the results without doing the work
+
+COMPOSITION SPLIT SCREEN: the frame divides into two zones in strong visual opposition, before against after or broken against fixed. One zone is muted and low contrast, one zone is alive in full brand color. Each zone carries one short label. The divide is hard and deliberate.
+
+URL FOOTER TEXT (render exactly): LASSOFRAMEWORK.COM
+
+COLOR LAW: red #FF0000 is used exactly one time on this card, and it is one short horizontal rule under the eyebrow label. Never a red field behind the whole card, never red type scattered through the card, never a second red element.
+
+ART DIRECTION LATITUDE (read this before you compose): you are art directing ONE card in a long running brand campaign, not filling in a template. Within the canvas, composition, and color law above, you decide the crop, the scale relationships, where the visual anchor sits, how much negative space each zone gets, and whether the type sits high, low, or against the edge. Push the scale contrast further than feels safe. Vary the composition from the obvious centered arrangement: anchor to an edge, let one element bleed off the frame, or drop the horizon high or low. Two cards from this brand should be recognizable as siblings, never as the same card with the words swapped.
+
+READABILITY: the headline must be legible at thumbnail size in a phone feed. High contrast between type and field. If the composition would compromise legibility, simplify the composition, never the contrast.
+
+Quality standard (every card, every archetype): this card must look clean, professional, and high-end. The standard is premium B2B agency quality, the level of a top-tier SaaS brand. ALLOWED visual elements: simple flat icons (one or two maximum), structured tables or comparison layouts, minimal flow arrows, data callouts with numbers, before/after columns, clean labeled diagrams with meaningful business words. BANNED, do not generate any of these: illustrated scenes, people or figures in action, cartoon elements, metaphorical imagery (dripping money, safes, broken pipes, locks), photorealistic photography, 3D effects, gimmicky concept art, cluttered collages, generic abstract process labels (STEP 1, STEP 2, STEP 3, PLAN, GROW, LEARN, DISCOVER, LAUNCH, START, FINISH). Labels must use real business language a gym owner recognizes: LEADS, BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS, COST PER LEAD. The two-second test: a gym owner scrolling fast must read the card's point from the headline and the visual in under two seconds. Clean, direct, no decoding.
+
+Headline law, BE CLEAR, NOT CUTE: the headline states plainly what the card is about or what LASSO does. No slogans, no aphorisms, no wordplay, no clever compression. If a stranger must decode it, it fails. The two second test: a gym owner scrolling at speed understands the card's point from the headline plus the image in two seconds. Headline says it plainly, image shows it concretely, labels mean something: all three or the card fails.
+
+No stat slab: NEVER render one colossal number or percentage as the hero element filling the card. That layout is retired. Any figure appears only inside a real data visual (labeled bars or a trend) or within the headline sentence, at readable size, never as an oversized standalone slab.
+
+BANNED, never render any of these: illustrated scenes, people or figures in action, cartoon elements, metaphorical props (dripping money, safes, broken pipes, locks), photorealistic photography, 3D effects, cluttered collages, watermarks, lorem ipsum, and generic process labels (STEP 1, PLAN, GROW, LEARN, DISCOVER, LAUNCH). Labels use real business language a gym owner recognizes: LEADS, BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS.
+
+NO FABRICATION: render only the hook, the CTA, the labels the approved context supports, and the URL footer. Invent no number, price, offer, date, client name, or claim that is not above.
+
+Copy mechanics: no em dashes, no en dashes, avoid hyphens in the rendered text. Use the word 'to' for ranges.

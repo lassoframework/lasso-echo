@@ -1,0 +1,111 @@
+style       : sky/flat_editorial/one_node
+freedom     : ON
+engine      : astra
+model       : gpt-image-2.5-sunburst
+latency_ms  : 44057
+cost_est    : 0.19
+grade       : PASS
+
+--- ASTRA REVISED PROMPT (the brief-reading layer's own art direction) ---
+Create ONE finished premium LASSO flat editorial infographic, portrait 4:5 1080x1350. All contents fully inside frame with generous 80px margins, no bleed or clipping. Exact solid background sky blue #5EB9E6. Palette ONLY #5EB9E6, navy #121E3C, cream #FAF6F0, red #FF0000, white #FFFFFF. No gradients, textures, patterns, shadows, photography, people, illustrations, decorative props, or 3D. Precision vector-like editorial design with exceptionally crisp text.
+
+Typography: use only TWO font families: Anton heavy condensed for the large headline, Montserrat for all other text (medium labels/footer, bold button). Dominant navy left-aligned headline in upper portion, tightly led, very large, about 104px, use these EXACT words with punctuation and these line breaks:
+We get the leads.
+We nurture them.
+All you do
+is sell.
+The headline is the dominant visual anchor, occupying approximately x80 to1000, y85 to600. Keep comfortable clearances, no competing large text.
+
+Below, make a single clear horizontal three-node business flow at approximately y745 to905: EXACTLY THREE equal-height rounded rectangular flat vector nodes, two cream and final node red. Node 1 labeled LEADS in navy, node 2 labeled FOLLOW UP in navy, node 3 labeled CLOSED in white. Bold clean uppercase labels approximately 25px, centered. Nodes approximately 265px wide, 135px high, separated by small navy right-pointing minimal connector arrows. Align entire diagram to headline left edge. Red #FF0000 appears EXACTLY ONCE: the solid fill of the CLOSED node, nowhere else. No icons, no additional node text, no extra shapes except connector arrows and CTA. These three business nodes demonstrate leads to nurture to closed memberships. Quiet open sky negative space between headline and flow.
+
+One navy #121E3C rounded rectangular real-interface CTA button, x80 y1025 width920 height155, holding exact cream bold Montserrat text, centered and comfortably padded, on two lines:
+Book a free call and we will
+look at your numbers.
+Text approximately 34px. Do NOT change the wording. Button is navy, NEVER red.
+
+Bottom margin small navy uppercase letterspaced Montserrat Medium footer, left aligned at x80 around y1260, exact text: LASSOFRAMEWORK.COM
+
+Render ONLY the exact headline, three labels, CTA, and URL. No brand logo, eyebrow, body text, additional claims, numbers, watermark, or other words. Premium high-end SaaS/B2B agency art direction, dramatic headline-to-label scale contrast, spacious and deliberate, clean readable at phone-feed thumbnail size. Full frame composition.
+
+--- BRIEF AS SENT ---
+You are art directing ONE infographic for the LASSO brand. Produce a single finished image by calling the image generation tool.
+
+CANVAS: 4:5 vertical, 1080x1350, designed for an Instagram and Facebook feed post. The whole composition fits inside the frame with generous margins; nothing is cut off at the edges.
+
+BRAND VOICE (the approved doc, for tone of the rendered words only; do not copy sentences out of it onto the card):
+# LASSO Brand Bible Echo Social Agent
+
+> Single source of truth for Echo, the LASSO social media agent. Echo drafts ONLY
+> from this doc plus the client-provided note on each creative. It never invents
+> an offer, a price, a stat, or a client name.
+>
+> Synthesized from: LASSO AI Social Media Agent Brand Document v1.0 (June 2026),
+> the V3 Style Guide, the Blake Ruff writing style profile, the blake-brief
+> skill, the Gym Marketing Made Simple knowledge base (125 episodes), and the
+> LASSO Brain (~/LASSO/lasso-brain/, READ-ONLY: Echo compiles from it, never
+> edits it Blake, 2026-08-31).
+>
+> Status: canonical reference. Blake owns changes. Echo does not edit this file.
+
+---
+
+## 1. Who LASSO is
+
+LASSO Framework is a complete gym growth system built for boutique fitness owners.
+Not a traditional agency. Every person on the team is an active gym owner doing
+$50K or more per month in their own facility. LASSO installs paid advertising,
+sales systems, and growth mentorship into boutique gyms, and has helped 1,000+ gym
+owners scale.
+
+Founded by Blake Ruff and Sherman Merricks. Blake is a StoryBrand Certified Guide
+
+LOCKED LASSO V3 COLORS (use these exact values, never substitute or invent a color; the CANVAS MODE below decides which one carries the field):
+- Cream #FAF6F0
+- Navy #121E3C
+- Sky Blue #5EB9E6
+- Red #FF0000
+- White #FFFFFF
+Quality bar on every field: premium B2B agency work, clean and deliberate. No gradients, no texture, no pattern fills, no gimmicks.
+
+CANVAS MODE SKY: a sky blue #5EB9E6 field with navy #121E3C type and cream #FAF6F0 supporting shapes. Bright, open, the friendliest field in the system. Reserve it for outcome and momentum ideas.
+
+BRAND TYPE SYSTEM (two families, never more):
+- HEADLINE: Anton, or the closest heavy condensed grotesque. Tight leading, sentence case or all caps, left aligned.
+- SUPPORT: Oswald Medium for eyebrows and labels, Montserrat Medium for the deck line and the footer. Small, letterspaced, quiet.
+Never a script face, never a serif display face, never more than two families on one card.
+
+HOOK, the one headline rendered on the card, render it exactly and keep it short: We get the leads. We nurture them. All you do is sell.
+
+CTA, the exact words inside the button block: Book a free call and we will look at your numbers.
+
+APPROVED CONTEXT for the visual element (do NOT render these sentences as body text on the image; they tell you what it should SHOW):
+- The job is closing members, not building funnels
+- Done for you ads, nurture, website, social and reporting
+- You do the one thing only you can do
+
+STYLE SPEC, FLAT EDITORIAL INFOGRAPHIC (the standard every card is held to):
+1. BOLD HEADLINE. One headline, the largest element on the card, left aligned in the upper area. It is the visual anchor of the composition. Nothing competes with it for scale.
+2. THREE ELEMENT VISUAL METAPHOR. Exactly three flat vector elements, drawn in clean line and solid fill, that show the idea concretely: three labeled nodes, three stacked bars, three stages, three icons in a row. Three, not two and not five. Each element carries one short UPPERCASE business label. No illustrated scenes, no people, no photorealism, no 3D, no gradients.
+3. CTA BUTTON BLOCK. One solid rounded rectangle near the lower third holding the call to action in short bold type, styled like a real interface button. Its color follows the COLOR LAW below, which decides where this card's single accent lands.
+4. URL FOOTER. The site URL set small, uppercase and letterspaced on the bottom margin, quiet and out of the way.
+Flat editorial means printed magazine infographic, not AI art: generous margins, one depth layer at most, high contrast, and no texture or pattern.
+
+URL FOOTER TEXT (render exactly): LASSOFRAMEWORK.COM
+
+COLOR LAW: red #FF0000 is used exactly one time on this card, and it is one node, bar, or row in the visual element. Never a red field behind the whole card, never red type scattered through the card, never a second red element.
+
+ART DIRECTION LATITUDE (read this before you compose): you are art directing ONE card in a long running brand campaign, not filling in a template. Within the canvas, composition, and color law above, you decide the crop, the scale relationships, where the visual anchor sits, how much negative space each zone gets, and whether the type sits high, low, or against the edge. Push the scale contrast further than feels safe. Vary the composition from the obvious centered arrangement: anchor to an edge, let one element bleed off the frame, or drop the horizon high or low. Two cards from this brand should be recognizable as siblings, never as the same card with the words swapped.
+
+READABILITY: the headline must be legible at thumbnail size in a phone feed. High contrast between type and field. If the composition would compromise legibility, simplify the composition, never the contrast.
+
+Quality standard (every card, every archetype): this card must look clean, professional, and high-end. The standard is premium B2B agency quality, the level of a top-tier SaaS brand. ALLOWED visual elements: simple flat icons (one or two maximum), structured tables or comparison layouts, minimal flow arrows, data callouts with numbers, before/after columns, clean labeled diagrams with meaningful business words. BANNED, do not generate any of these: illustrated scenes, people or figures in action, cartoon elements, metaphorical imagery (dripping money, safes, broken pipes, locks), photorealistic photography, 3D effects, gimmicky concept art, cluttered collages, generic abstract process labels (STEP 1, STEP 2, STEP 3, PLAN, GROW, LEARN, DISCOVER, LAUNCH, START, FINISH). Labels must use real business language a gym owner recognizes: LEADS, BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS, COST PER LEAD. The two-second test: a gym owner scrolling fast must read the card's point from the headline and the visual in under two seconds. Clean, direct, no decoding.
+
+Headline law, BE CLEAR, NOT CUTE: the headline states plainly what the card is about or what LASSO does. No slogans, no aphorisms, no wordplay, no clever compression. If a stranger must decode it, it fails. The two second test: a gym owner scrolling at speed understands the card's point from the headline plus the image in two seconds. Headline says it plainly, image shows it concretely, labels mean something: all three or the card fails.
+
+No stat slab: NEVER render one colossal number or percentage as the hero element filling the card. That layout is retired. Any figure appears only inside a real data visual (labeled bars or a trend) or within the headline sentence, at readable size, never as an oversized standalone slab.
+
+BANNED, never render any of these: illustrated scenes, people or figures in action, cartoon elements, metaphorical props (dripping money, safes, broken pipes, locks), photorealistic photography, 3D effects, cluttered collages, watermarks, lorem ipsum, and generic process labels (STEP 1, PLAN, GROW, LEARN, DISCOVER, LAUNCH). Labels use real business language a gym owner recognizes: LEADS, BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS.
+
+NO FABRICATION: render only the hook, the CTA, the labels the approved context supports, and the URL footer. Invent no number, price, offer, date, client name, or claim that is not above.
+
+Copy mechanics: no em dashes, no en dashes, avoid hyphens in the rendered text. Use the word 'to' for ranges.

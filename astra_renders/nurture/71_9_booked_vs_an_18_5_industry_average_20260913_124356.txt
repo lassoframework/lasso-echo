@@ -1,0 +1,104 @@
+style       : ink/data_story/corner_block
+freedom     : ON
+engine      : astra
+model       : gpt-image-2.5-sunburst
+latency_ms  : 47285
+cost_est    : 0.19
+grade       : PASS
+
+--- ASTRA REVISED PROMPT (the brief-reading layer's own art direction) ---
+Create ONE finished premium LASSO brand infographic, a precisely typeset flat graphic design, 1080x1350 pixels, 4:5 vertical. Everything fully inside the frame with generous 76px safe margins. No clipping or bleeding. Background solid ink #0B1020. Main typography cream #FAF6F0. Accent sky blue #5EB9E6. Only other color is exactly ONE small solid red #FF0000 square, 22px, anchored inside the upper right corner margin. No other red. No gradients, shadows, textures, pattern, illustrations, photography, 3D, icons, or decoration.
+
+Use only TWO font families: Anton heavy condensed grotesque for headline, Montserrat Medium for all other text. Exceptionally clean editorial typography and perfectly legible exact words. Left-aligned asymmetric composition, dramatic scale relationships, negative space. Brand agency / top SaaS quality.
+
+TOP: at x76 y88 small quiet letterspaced cream eyebrow: 'LASSO LEAD NURTURE PILOT'. Then at x76 y160 set this exact headline in large cream Anton, tight leading, arranged over three lines:
+'71.9% booked vs'
+'an 18.5%'
+'industry average.'
+It must read exactly '71.9% booked vs an 18.5% industry average.' Do not isolate numbers as colossal stat slabs. Font roughly 86px, fits within 920px width.
+
+HERO DATA VISUAL: large two-row horizontal comparison bar chart occupying the broad middle and lower part of the card, approx x76 to x998 and y580 to y1000. It is the main graphic, not standalone stat text. No legend, grid, axis ticks, or unnecessary frames. At y576 small quiet label 'BOOKED'. First data row at y652: left label 'LASSO PILOT', right aligned readable figure '71.9%' in Montserrat Medium approx 42px; under the row at y714 a solid sky blue bar 910px wide and 100px tall, square corners. Second row at y873: left label 'INDUSTRY AVERAGE', right aligned figure '18.5%' in same font and size; under this row at y935 a cream horizontal bar exactly 234px wide and 100px tall, sharing precisely the first bar's left origin. This accurately shows 18.5 to 71.9 ratio. Labels cream, approximately 24px, letterspaced. The two bars and their labels clearly communicate booking comparison in two seconds. No other statistics or body copy.
+
+CTA at x76 y1110, width 922px height 92px: cream rectangular button block with navy #121E3C text, centered Montserrat Medium approx 22px, exact words on one line: 'Book a free call and we will look at your numbers.' No arrow, no red.
+
+FOOTER x76 y1260 in small spaced cream Montserrat Medium: 'LASSOFRAMEWORK.COM'. Keep generous bottom margin.
+
+Render only the specified eyebrow, headline, comparison chart labels and two percentage figures, CTA and URL. No extra copy or invented claims. No watermarks. Crisp vector-like edges. Maintain ink field and intentional space between headline and chart, truly professional finished feed infographic.
+
+--- BRIEF AS SENT ---
+You are art directing ONE infographic for the LASSO brand. Produce a single finished image by calling the image generation tool.
+
+CANVAS: 4:5 vertical, 1080x1350, designed for an Instagram and Facebook feed post. The whole composition fits inside the frame with generous margins; nothing is cut off at the edges.
+
+BRAND VOICE (the approved doc, for tone of the rendered words only; do not copy sentences out of it onto the card):
+# LASSO Brand Bible Echo Social Agent
+
+> Single source of truth for Echo, the LASSO social media agent. Echo drafts ONLY
+> from this doc plus the client-provided note on each creative. It never invents
+> an offer, a price, a stat, or a client name.
+>
+> Synthesized from: LASSO AI Social Media Agent Brand Document v1.0 (June 2026),
+> the V3 Style Guide, the Blake Ruff writing style profile, the blake-brief
+> skill, the Gym Marketing Made Simple knowledge base (125 episodes), and the
+> LASSO Brain (~/LASSO/lasso-brain/, READ-ONLY: Echo compiles from it, never
+> edits it Blake, 2026-08-31).
+>
+> Status: canonical reference. Blake owns changes. Echo does not edit this file.
+
+---
+
+## 1. Who LASSO is
+
+LASSO Framework is a complete gym growth system built for boutique fitness owners.
+Not a traditional agency. Every person on the team is an active gym owner doing
+$50K or more per month in their own facility. LASSO installs paid advertising,
+sales systems, and growth mentorship into boutique gyms, and has helped 1,000+ gym
+owners scale.
+
+Founded by Blake Ruff and Sherman Merricks. Blake is a StoryBrand Certified Guide
+
+LOCKED LASSO V3 COLORS (use these exact values, never substitute or invent a color; the CANVAS MODE below decides which one carries the field):
+- Cream #FAF6F0
+- Navy #121E3C
+- Sky Blue #5EB9E6
+- Red #FF0000
+- White #FFFFFF
+Quality bar on every field: premium B2B agency work, clean and deliberate. No gradients, no texture, no pattern fills, no gimmicks.
+
+CANVAS MODE INK: a near black #0B1020 field with cream #FAF6F0 type. The most serious, highest contrast field. Line work is thin and precise; negative space does the work.
+
+BRAND TYPE SYSTEM (two families, never more):
+- HEADLINE: Anton, or the closest heavy condensed grotesque. Tight leading, sentence case or all caps, left aligned.
+- SUPPORT: Oswald Medium for eyebrows and labels, Montserrat Medium for the deck line and the footer. Small, letterspaced, quiet.
+Never a script face, never a serif display face, never more than two families on one card.
+
+HOOK, the one headline rendered on the card, render it exactly and keep it short: 71.9% booked vs an 18.5% industry average.
+
+CTA, the exact words inside the button block: Book a free call and we will look at your numbers.
+
+APPROVED CONTEXT for the visual element (do NOT render these sentences as body text on the image; they tell you what it should SHOW):
+- 297 leads nurtured across 4 gyms
+- Same leads. Very different outcomes
+- LASSO lead nurture pilot stats
+
+COMPOSITION DATA STORY: one clean data visual is the hero, sized large in the lower two thirds: labeled comparison bars, a simple trend line, or a two column before and after table. Real business labels and real readable figures, no gridline clutter, no legend. The headline sits above it. The shape of the data is the graphic.
+
+URL FOOTER TEXT (render exactly): LASSOFRAMEWORK.COM
+
+COLOR LAW: red #FF0000 is used exactly one time on this card, and it is one small solid block anchored in one corner of the frame. Never a red field behind the whole card, never red type scattered through the card, never a second red element.
+
+ART DIRECTION LATITUDE (read this before you compose): you are art directing ONE card in a long running brand campaign, not filling in a template. Within the canvas, composition, and color law above, you decide the crop, the scale relationships, where the visual anchor sits, how much negative space each zone gets, and whether the type sits high, low, or against the edge. Push the scale contrast further than feels safe. Vary the composition from the obvious centered arrangement: anchor to an edge, let one element bleed off the frame, or drop the horizon high or low. Two cards from this brand should be recognizable as siblings, never as the same card with the words swapped.
+
+READABILITY: the headline must be legible at thumbnail size in a phone feed. High contrast between type and field. If the composition would compromise legibility, simplify the composition, never the contrast.
+
+Quality standard (every card, every archetype): this card must look clean, professional, and high-end. The standard is premium B2B agency quality, the level of a top-tier SaaS brand. ALLOWED visual elements: simple flat icons (one or two maximum), structured tables or comparison layouts, minimal flow arrows, data callouts with numbers, before/after columns, clean labeled diagrams with meaningful business words. BANNED, do not generate any of these: illustrated scenes, people or figures in action, cartoon elements, metaphorical imagery (dripping money, safes, broken pipes, locks), photorealistic photography, 3D effects, gimmicky concept art, cluttered collages, generic abstract process labels (STEP 1, STEP 2, STEP 3, PLAN, GROW, LEARN, DISCOVER, LAUNCH, START, FINISH). Labels must use real business language a gym owner recognizes: LEADS, BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS, COST PER LEAD. The two-second test: a gym owner scrolling fast must read the card's point from the headline and the visual in under two seconds. Clean, direct, no decoding.
+
+Headline law, BE CLEAR, NOT CUTE: the headline states plainly what the card is about or what LASSO does. No slogans, no aphorisms, no wordplay, no clever compression. If a stranger must decode it, it fails. The two second test: a gym owner scrolling at speed understands the card's point from the headline plus the image in two seconds. Headline says it plainly, image shows it concretely, labels mean something: all three or the card fails.
+
+No stat slab: NEVER render one colossal number or percentage as the hero element filling the card. That layout is retired. Any figure appears only inside a real data visual (labeled bars or a trend) or within the headline sentence, at readable size, never as an oversized standalone slab.
+
+BANNED, never render any of these: illustrated scenes, people or figures in action, cartoon elements, metaphorical props (dripping money, safes, broken pipes, locks), photorealistic photography, 3D effects, cluttered collages, watermarks, lorem ipsum, and generic process labels (STEP 1, PLAN, GROW, LEARN, DISCOVER, LAUNCH). Labels use real business language a gym owner recognizes: LEADS, BOOKED, SHOWED, CLOSED, FOLLOW UP, AD SPEND, SIGNUPS.
+
+NO FABRICATION: render only the hook, the CTA, the labels the approved context supports, and the URL footer. Invent no number, price, offer, date, client name, or claim that is not above.
+
+Copy mechanics: no em dashes, no en dashes, avoid hyphens in the rendered text. Use the word 'to' for ranges.
