@@ -92,6 +92,18 @@ def _status():
           f"via AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS, default lasso only)")
     print(f"  style_gate     : {config.style_gate_enabled()}  (env AGENT_STYLE_GATE_ENABLED)")
     print(f"  image_grade    : {config.image_grade_enabled()}  (env AGENT_IMAGE_GRADE_ENABLED)")
+    print(f"  real_grade_policy: {config.real_grade_policy_enabled()}  "
+          f"(env AGENT_REAL_GRADE_POLICY; single grade_gate.evaluate() policy, "
+          "real image-based Q3/Q6 + hard-block copy check, UNGRADED never a "
+          "silent pass; replaces the legacy prompt-keyword style_gate/image_grade "
+          "pair when armed)")
+    print(f"  astra_reference_images: {config.astra_reference_images_enabled()}  "
+          f"(env AGENT_ASTRA_REFERENCE_IMAGES; attaches approved reference "
+          "images as real input_image items on the Astra request)")
+    print(f"  generation_record: {config.generation_record_enabled()}  "
+          f"(env AGENT_GENERATION_RECORD; persists the full brief, reference "
+          "ids, model + request settings, grade result and attempt count per "
+          "generation, going forward only)")
     print(f"  hosting        : {config.hosting_enabled()}  (env AGENT_HOSTING_ENABLED)")
     print(f"  gbp            : {config.gbp_enabled()}  (env AGENT_GBP_ENABLED)")
     print(f"  gbp_conn_sync  : {config.gbp_conn_sync_enabled()}  (env AGENT_GBP_CONN_SYNC; once per loop, read each client gym's LIVE Google Business connection from Zernio and upsert its gym_gbp_connections row so the publish lane can route; reads Zernio + writes the connection row only, NEVER publishes; an inactive Zernio account flips the row to needs_reconnect)")

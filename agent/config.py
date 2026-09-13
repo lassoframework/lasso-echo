@@ -115,6 +115,74 @@ IMAGE_PIXELS = os.environ.get("AGENT_IMAGE_PIXELS", "1080x1350")
 STORY_ASPECT = os.environ.get("AGENT_STORY_ASPECT", "9:16")
 STORY_PIXELS = os.environ.get("AGENT_STORY_PIXELS", "1080x1920")
 
+# ---- Astra request settings (Blake, 2026-09-13, QUALITY UPGRADE) -------------
+# quality/reasoning_effort/input_fidelity were never explicitly set anywhere in
+# the Astra call before this change (left at provider default). Verified against
+# current OpenAI docs (developers.openai.com/api/docs/guides/tools-image-generation,
+# 2026-09-13): the image_generation tool accepts quality in
+# {low, medium, high, auto, xhigh, max} (xhigh/max are 2.5-model-only tiers);
+# reasoning_effort is a top-level Responses API param for the ORCHESTRATING
+# reasoning model's own turn, not a knob on the image tool itself, so it is set
+# (when configured) on the outer payload, never inside the image_generation tool
+# dict. Defaults below are "" (unset -> the request omits the field, provider
+# default applies) rather than silently maxing every dial to "high"/"max":
+# "does higher quality actually fix design quality" is a testable hypothesis
+# (spec section 7), not an assumption to bake in. Set explicitly in Railway env
+# once the 3 review samples show it helps.
+
+
+def astra_image_quality() -> str:
+    """ASTRA_IMAGE_QUALITY: low/medium/high/auto/xhigh/max, or "" (unset, no
+    quality field sent -> provider default). Invalid values are ignored (logged,
+    field omitted) rather than sent and rejected by the live API."""
+    raw = (os.environ.get("ASTRA_IMAGE_QUALITY") or "").strip().lower()
+    allowed = {"low", "medium", "high", "auto", "xhigh", "max"}
+    return raw if raw in allowed else ""
+
+
+def astra_reasoning_effort() -> str:
+    """ASTRA_REASONING_EFFORT for the brief model's own Responses API turn (the
+    ORCHESTRATING model that reads the brief and decides how to call the image
+    tool), never applied to the image_generation tool itself — the tool has no
+    such parameter (verified against current OpenAI docs). "" (default) omits
+    the field entirely."""
+    return (os.environ.get("ASTRA_REASONING_EFFORT") or "").strip().lower()
+
+
+def astra_input_fidelity() -> str:
+    """ASTRA_INPUT_FIDELITY (e.g. "high") for the image_generation tool when
+    reference images are attached, so faces/logos/fine brand detail in a
+    reference are preserved rather than redrawn from scratch. "" omits the
+    field."""
+    return (os.environ.get("ASTRA_INPUT_FIDELITY") or "").strip().lower()
+
+
+def astra_reference_images_enabled() -> bool:
+    """AGENT_ASTRA_REFERENCE_IMAGES, default OFF. A new capability (real image
+    inputs on the Astra request) ships off by default, same house rule as every
+    other new capability in this file."""
+    return _truthy(os.environ.get("AGENT_ASTRA_REFERENCE_IMAGES", "false"))
+
+
+def astra_reference_max() -> int:
+    """Max reference images attached to one Astra request. Bounded on purpose:
+    each reference image adds real request payload size and real token cost on
+    the brief model's turn."""
+    try:
+        return max(0, int(os.environ.get("AGENT_ASTRA_REFERENCE_MAX", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def generation_record_enabled() -> bool:
+    """AGENT_GENERATION_RECORD, default OFF. Persists the full assembled brief,
+    reference ids, model + request settings, revised_prompt, grade results,
+    corrective feedback and attempt count for every Astra/Gemini generation
+    going forward (never backfilled for past generations). New capability,
+    ships off by default."""
+    return _truthy(os.environ.get("AGENT_GENERATION_RECORD", "false"))
+
+
 # ---- Media hosting (S3-compatible; scale-hardened for 200+ clients) ----------
 # OFF by default. Credentials are read lazily in media_host.py by the env var NAMES
 # below, never stored here and never logged. Only NAMES live here, not values.
@@ -310,6 +378,29 @@ def style_gate_enabled() -> bool:
     to the fabrication gate: both must pass. OFF = generation behavior unchanged.
     """
     return _truthy(os.environ.get("AGENT_STYLE_GATE_ENABLED", "false"))
+
+
+def real_grade_policy_enabled() -> bool:
+    """AGENT_REAL_GRADE_POLICY, default OFF (Blake, 2026-09-13, spec section 5).
+
+    When ON, creative_studio.generate()'s retry loop is decided by ONE function
+    — grade_gate.evaluate() — instead of the legacy grade_card (prompt-text
+    keyword matching for Q3/Q6) + grade_image (image-vision Q1/Q2/Q5) pair.
+    evaluate() checks Q3/Q6 on the ACTUAL RENDERED IMAGE via vision, adds a
+    hard-block critical-copy-accuracy check (Q7), and returns UNGRADED (never a
+    silent pass) when no vision client is available or a check could not be
+    parsed. A failed/ungraded attempt also feeds a SPECIFIC corrective
+    instruction into the next Astra request (grade_gate.corrective_instruction)
+    instead of resending the identical brief.
+
+    OFF (default): AGENT_STYLE_GATE_ENABLED / AGENT_GRADE_ENABLED (image_grade_
+    enabled) behave exactly as they did before this change — no behavior change
+    for any account until this flag is explicitly armed. Requires a vision
+    client (image_grade_enabled's OCR_MODEL key) to ever return PASS; without
+    one every card is UNGRADED and routed to human review, never approved
+    silently.
+    """
+    return _truthy(os.environ.get("AGENT_REAL_GRADE_POLICY", "false"))
 
 
 def hosting_enabled() -> bool:

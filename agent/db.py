@@ -94,6 +94,20 @@ CREATE TABLE IF NOT EXISTS socialapi_claims (
   draft_id TEXT, account_key TEXT, status TEXT DEFAULT 'in_flight',
   post_id TEXT DEFAULT '', claimed_at TEXT DEFAULT (datetime('now')),
   PRIMARY KEY (draft_id, account_key));
+CREATE TABLE IF NOT EXISTS generation_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  draft_id TEXT DEFAULT '', account_key TEXT DEFAULT '', kind TEXT DEFAULT '',
+  headline TEXT DEFAULT '', cta TEXT DEFAULT '', facts_json TEXT DEFAULT '[]',
+  brief TEXT DEFAULT '', reference_ids_json TEXT DEFAULT '[]',
+  engine TEXT DEFAULT '', model TEXT DEFAULT '', route TEXT DEFAULT '',
+  quality_used TEXT DEFAULT '', reasoning_effort_used TEXT DEFAULT '',
+  input_fidelity_used TEXT DEFAULT '', revised_prompt TEXT DEFAULT '',
+  original_sha256 TEXT DEFAULT '', final_path TEXT DEFAULT '',
+  final_sha256 TEXT DEFAULT '',
+  grade_status TEXT DEFAULT '', grade_scores_json TEXT DEFAULT '{}',
+  grade_reason TEXT DEFAULT '', corrective_feedback TEXT DEFAULT '',
+  attempt INTEGER DEFAULT 1, final_status TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now')));
 """
 
 
@@ -459,6 +473,89 @@ def socialapi_claim_release(draft_id, account_key):
             "DELETE FROM socialapi_claims WHERE draft_id=? AND account_key=?",
             (draft_id, account_key))
         conn.commit()
+
+
+def record_generation(**fields):
+    """Persist one Astra/Gemini generation attempt (spec section 7: approved
+    source copy, the full assembled brief, reference ids, model + request
+    settings, revised_prompt, image hashes, grade results + corrective
+    feedback, attempt count, final status). ONLY called going forward from new
+    code (agent/generation_log.py) — no past generation is ever backfilled here.
+    Any secret must already be scrubbed by the caller; this function does not
+    scrub (it is not itself a secret-adjacent surface: briefs/prompts/grades
+    hold no credentials by construction elsewhere in this repo). Never raises:
+    a logging failure must not lose or block a real generation."""
+    import json as _json
+    cols = ("draft_id", "account_key", "kind", "headline", "cta", "facts_json",
+            "brief", "reference_ids_json", "engine", "model", "route",
+            "quality_used", "reasoning_effort_used", "input_fidelity_used",
+            "revised_prompt", "original_sha256", "final_path", "final_sha256",
+            "grade_status", "grade_scores_json", "grade_reason",
+            "corrective_feedback", "attempt", "final_status")
+    row = {c: fields.get(c, "") for c in cols}
+    if "facts" in fields:
+        row["facts_json"] = _json.dumps(fields["facts"] or [])
+    if "reference_ids" in fields:
+        row["reference_ids_json"] = _json.dumps(fields["reference_ids"] or [])
+    if "grade_scores" in fields:
+        row["grade_scores_json"] = _json.dumps(fields["grade_scores"] or {})
+    row["attempt"] = int(fields.get("attempt") or 1)
+    try:
+        with _lock, connect() as conn:
+            placeholders = ", ".join("?" for _ in cols)
+            conn.execute(
+                f"INSERT INTO generation_records ({', '.join(cols)}) "
+                f"VALUES ({placeholders})",
+                tuple(row[c] for c in cols))
+            conn.commit()
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    except Exception as exc:  # noqa: BLE001 - a log write must never lose a card
+        print(f"[db] record_generation failed: {type(exc).__name__}: {exc}")
+        return None
+
+
+def get_generation(record_id, conn=None):
+    """One generation record by id, with the JSON columns decoded, or None."""
+    import json as _json
+    own = conn is None
+    conn = conn or connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM generation_records WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        for jc in ("facts_json", "reference_ids_json", "grade_scores_json"):
+            try:
+                d[jc[:-5]] = _json.loads(d.get(jc) or ("[]" if jc != "grade_scores_json" else "{}"))
+            except Exception:
+                d[jc[:-5]] = [] if jc != "grade_scores_json" else {}
+        return d
+    finally:
+        if own:
+            conn.close()
+
+
+def list_generations(draft_id=None, account_key=None, limit=50, conn=None):
+    """Recent generation records, newest first, optionally filtered."""
+    own = conn is None
+    conn = conn or connect()
+    try:
+        where, params = [], []
+        if draft_id:
+            where.append("draft_id=?")
+            params.append(draft_id)
+        if account_key:
+            where.append("account_key=?")
+            params.append(account_key)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        rows = conn.execute(
+            f"SELECT id FROM generation_records {clause} "
+            f"ORDER BY id DESC LIMIT ?", (*params, int(limit))).fetchall()
+        return [get_generation(r["id"], conn=conn) for r in rows]
+    finally:
+        if own:
+            conn.close()
 
 
 def audit(kind, subject, reason, account_key="", day=""):

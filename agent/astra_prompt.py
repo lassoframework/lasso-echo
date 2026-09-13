@@ -516,7 +516,8 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
                             pixels=None, aspect=None, voice_path=None,
                             palette=None, footer=None, kind="infographic",
                             style_key=None, canvas=None, composition=None,
-                            accent=None, freedom=None, account_key=None):
+                            accent=None, freedom=None, account_key=None,
+                            corrective=None, reference_note=None):
     """Build the Astra creative brief from APPROVED input ONLY.
 
     `headline` is the one hook rendered on the card. `facts` are the approved
@@ -648,6 +649,17 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
         "date, client name, or claim that is not above.",
         _cs.NO_DASH_RULE,
     ])
+    if reference_note and str(reference_note).strip():
+        # Real reference IMAGES ride separately as input_image content items on
+        # the actual API request (see image_engine.AstraImageEngine.generate);
+        # this text note only tells the model HOW to use them, so it never
+        # copies a reference's own unrelated headline/claims onto this new card.
+        sections.append(str(reference_note).strip())
+    if corrective and str(corrective).strip():
+        # A retry after a failed grade (spec section 6): the SPECIFIC visual
+        # failure from the previous attempt, never a resend of the identical
+        # brief. Placed last so it is the most recent instruction the model reads.
+        sections.append(_cs._scrub_dashes(str(corrective).strip()))
 
     brief = _cs._scrub_dashes(
         "\n\n".join(sec for sec in sections if str(sec).strip()))
