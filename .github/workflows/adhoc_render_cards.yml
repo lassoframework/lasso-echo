@@ -6,19 +6,18 @@ name: adhoc-render-cards
 # reads the brief and gpt-image-2.5-sunburst draws it. Publishes nothing,
 # queues nothing, touches no calendar row -- render-card's own guards apply.
 #
-# `mode: test` renders ONE card to prove the secret/wiring works before any
-# larger batch runs. `mode: batch30` renders the 30 LASSO cards (book, lasso,
-# summit, echo, website, nurture) Blake asked to be redone via the real
-# pipeline. Results land in the astra-renders build artifact.
+# Triggered by push to this branch (workflow_dispatch needs the file to be
+# on the default branch first, which this diagnostic never merges to). The
+# MODE file picks the run: "test" renders ONE card to prove the secret and
+# wiring work; "batch30" renders the 30 LASSO cards (book, lasso, summit,
+# echo, website, nurture) Blake asked to be redone via the real pipeline.
 on:
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: "test (one card) or batch30 (all 30)"
-        required: true
-        default: "test"
-        type: choice
-        options: ["test", "batch30"]
+  push:
+    branches: ["claude/render-card-workflow"]
+    paths:
+      - ".github/workflows/adhoc_render_cards.yml"
+      - "scripts/adhoc_render_30_cards.sh"
+      - ".github/RENDER_MODE"
 
 jobs:
   render:
@@ -35,8 +34,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Read mode
+        id: mode
+        run: echo "value=$(cat .github/RENDER_MODE)" >> "$GITHUB_OUTPUT"
+
       - name: Render (test)
-        if: ${{ inputs.mode == 'test' }}
+        if: ${{ steps.mode.outputs.value == 'test' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AGENT_ASTRA_STYLE_FREEDOM: "true"
@@ -53,7 +56,7 @@ jobs:
             --out astra_renders/book
 
       - name: Render (batch30)
-        if: ${{ inputs.mode == 'batch30' }}
+        if: ${{ steps.mode.outputs.value == 'batch30' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AGENT_ASTRA_STYLE_FREEDOM: "true"
