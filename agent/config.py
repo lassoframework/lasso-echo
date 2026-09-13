@@ -4437,3 +4437,23 @@ def brain_feeds_captions_enabled() -> bool:
     nothing on its own without AGENT_CROSS_GYM_BRAIN also armed and the weekly
     rollup's top_posts migration applied."""
     return _truthy(os.environ.get("AGENT_BRAIN_FEEDS_CAPTIONS", "false"))
+
+
+def astra_style_freedom_enabled() -> bool:
+    """AGENT_ASTRA_STYLE_FREEDOM, default OFF (house rule: every new capability
+    ships behind a flag that defaults OFF).
+
+    Blake (2026-09-13): "I want to give Astra more freedom, all the infographics
+    look the same in context, feel and look. Take off canvas has to be cream and
+    let it have more freedom in look and feel."
+
+    OFF: build_infographic_brief returns the current single-template brief byte
+    for byte (cream canvas, the four Full Gym blocks, red always the CTA button).
+
+    ON: each card draws one CANVAS mode, one COMPOSITION mode, and one ACCENT
+    placement from astra_prompt, selected deterministically from the headline so
+    a re-render of the same card is stable. The locked items that do NOT vary:
+    the LASSO V3 palette, two type families, the no-dash rule, no fabrication,
+    the readability bar, and the approval gate.
+    """
+    return _truthy(os.environ.get("AGENT_ASTRA_STYLE_FREEDOM", "false"))

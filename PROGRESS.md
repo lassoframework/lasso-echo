@@ -6,7 +6,76 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-09-03
+Last updated: 2026-09-13
+
+---
+
+## Astra style freedom: cream is no longer THE canvas (2026-09-13, flag OFF)
+
+Blake: "I want to give Astra more freedom, all the infographics look the same in
+context, feel and look. Take off canvas has to be cream and let it have more
+freedom in look and feel."
+
+**Root cause was not the cream rule alone.** The Astra brief
+(`astra_prompt.build_infographic_brief`) never received a canvas, a palette, or a
+variant at all. It always composed from two hardcoded constants:
+
+- `creative_studio.BRAND_PALETTE`, which opens "Cream #FAF6F0: THE canvas ... the
+  card background is always cream ... NEVER a full bleed solid color slab"
+- `FLAT_EDITORIAL_SPEC`, which demanded exactly three vector elements ("Three, not
+  two and not five") plus a CTA button block that was *always* the single red element
+
+Same field, same furniture, same accent, on every card Echo has ever drawn through
+Astra. The four-canvas variant system in `creative_studio` existed but the Astra
+path never called it. Sameness by construction, not model behavior.
+
+### What shipped
+
+`agent/astra_prompt.py` gains a style system, `agent/config.py` the flag:
+
+- **7 canvas modes** — cream, navy, split, sky, ink, red, duotone. Built from the
+  locked LASSO V3 colors only; this widens which color carries the FIELD, it adds
+  no color to the brand.
+- **7 composition modes** — flat_editorial (the former only option), type_poster,
+  data_story, diagram, split_screen, stack, device. The CTA button and the three
+  element metaphor are now features of `flat_editorial` alone; six of seven carry
+  no button.
+- **6 accent placements** — one accent element is still the law, only *where* it
+  lands is free. On the red field the accent flips to white.
+- **`ART_DIRECTION_LATITUDE`** — an explicit clause telling the model it is art
+  directing one card in a campaign, not filling a template.
+- **Weighted selection** — an unweighted pick put the loud RED field on ~27% of a
+  month. Weighted: navy/cream ~20% each, red ~6%. All seven still get used.
+  Deterministic per card key, so a re-render of an approved card is stable.
+
+### Gates and rules: unchanged
+
+Flag OFF (the default) returns the old brief **byte for byte**, verified against
+`git show HEAD` in a throwaway worktree. Still locked ON and OFF: the LASSO V3
+color values, two type families, the no-dash rule, no fabrication, the readability
+bar, the six-question grade gate, and the human approval gate. The prompt-level
+ban on "centered composition" / "symmetric layout" was **not** weakened; all 294
+canvas x composition x accent briefs pass `_check_prompt_hard_rules` as written.
+
+### Arm it
+
+```
+AGENT_ASTRA_STYLE_FREEDOM=true
+```
+
+### Files
+
+- `agent/astra_prompt.py` — the style system + a style-aware brief
+- `agent/config.py` — `astra_style_freedom_enabled()`, default OFF
+- `agent/__main__.py` — the flag on the `status` line
+- `brand_voice/lasso_house_style.md` — v1.2, new Section 12
+- `tests/test_astra_style_freedom.py` — 18 tests, including all 294 combinations
+
+### Open decision NOT resolved here
+
+**Brand palette** stays open. This change moves which locked color carries the
+field; it does not pick new brand colors. If the palette decision lands later, the
+canvas modes are the place it applies. The publish-path decision is untouched.
 
 ---
 

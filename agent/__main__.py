@@ -87,6 +87,7 @@ def _status():
     print(f"  content_brain  : {config.content_brain_enabled()}  (env AGENT_CONTENT_BRAIN_ENABLED)")
     print(f"  creative_studio: {config.creative_studio_enabled()}  (env AGENT_NANO_ENABLED)")
     print(f"  nano_flash     : {config.nano_flash_enabled()}  (env AGENT_NANO_FLASH_ENABLED)")
+    print(f"  astra_style_freedom: {config.astra_style_freedom_enabled()}  (env AGENT_ASTRA_STYLE_FREEDOM)")
     print(f"  style_gate     : {config.style_gate_enabled()}  (env AGENT_STYLE_GATE_ENABLED)")
     print(f"  image_grade    : {config.image_grade_enabled()}  (env AGENT_IMAGE_GRADE_ENABLED)")
     print(f"  hosting        : {config.hosting_enabled()}  (env AGENT_HOSTING_ENABLED)")
