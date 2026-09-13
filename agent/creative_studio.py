@@ -592,13 +592,19 @@ def _engine_opts(headline, surface, pixels, gemini_model):
     }
 
 
-def _astra_brief_for(headline, facts, surface, pixels):
+def _astra_brief_for(headline, facts, surface, pixels, account_key=None):
     """The Astra creative brief for this card, or None to reuse the Gemini prompt
-    if the brief cannot be built. Never raises into the render path."""
+    if the brief cannot be built. Never raises into the render path.
+
+    `account_key` threads through to the style freedom scope (Blake, 2026-09-13:
+    "only for LASSO right now until a proven [out]") — without it every card
+    would resolve the freedom flag as if it were LASSO's own, which is exactly
+    the wrong default for a client-gym call."""
     try:
         from . import astra_prompt
         return astra_prompt.build_infographic_brief(
-            headline, facts, surface=surface or "feed post", pixels=pixels)
+            headline, facts, surface=surface or "feed post", pixels=pixels,
+            account_key=account_key)
     except Exception as exc:  # noqa: BLE001 - a brief failure must not lose the card
         print(f"[creative-studio] astra brief build failed "
               f"({type(exc).__name__}: {exc}); using the shared prompt.")
@@ -1026,7 +1032,8 @@ def generate(headline, facts, client=None, out_path=None,
         # creative brief, Gemini reads the classic single-prompt text.
         call_opts = dict(opts)
         call_opts["engine_prompts"] = {
-            "astra": _astra_brief_for(headline, facts, surface, pixels),
+            "astra": _astra_brief_for(headline, facts, surface, pixels,
+                                      account_key=account_key),
             "gemini": p,
         }
         return _image_engine.generate_image(

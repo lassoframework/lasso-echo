@@ -384,3 +384,25 @@ text. No fabrication: a missing note still blocks the draft. The readability bar
 (thumbnail legible, high contrast). The six-question grade gate. The human
 approval gate. All 294 canvas and composition and accent combinations were
 verified against the grade gate and the hard copy rules before this shipped.
+
+### Account scope: LASSO only until proven (2026-09-13)
+
+Blake: "This should only be for LASSO right now until a proven [out]." The
+master flag being ON does not by itself free every client gym's cards — it is
+scoped per account.
+
+**`AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS`**, default `lasso`. Comma-separated
+account-key bases (an `_ig`/`_fb` suffix is stripped before the check, so
+`lasso_ig` and `lasso_fb` both mean `lasso`). Widen the rollout by adding more
+keys (`lasso,eng,gritx`), or set it to `*` to open the system to every account
+(the pre-scope, all-accounts behavior).
+
+A missing account_key (book_campaign, podcast, summit, stories, and the
+render-card CLI with no `--account`) is treated as `lasso`, since every
+unscoped caller in this repo IS LASSO's own content pipeline. Client-gym calls
+(the daily draw, via `daily_studio.py`) always pass a real account_key, so they
+are never silently included.
+
+`python -m agent render-card --account eng --brief-only` previews exactly what
+a given account gets in production, without touching Railway or waiting for a
+calendar slot.

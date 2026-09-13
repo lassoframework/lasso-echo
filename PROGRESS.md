@@ -72,6 +72,14 @@ does not exist there. The env var is set and waiting; the code that reads it shi
 with this branch. Merge to main, let the service redeploy, and the freedom system
 goes live on the next draw.
 
+**Scoped to LASSO only (2026-09-13, Blake: "only for LASSO right now until a
+proven [out]").** The master flag alone does not free every client gym's cards
+anymore. `AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS` (default `lasso`) is the account
+allowlist; widen it (`lasso,eng,gritx`) or set it to `*` when LASSO's own run
+proves the system out and Blake is ready to roll it to client gyms. See
+`brand_voice/lasso_house_style.md` section 12 for the full account-scope
+contract, and `agent/config.py:astra_style_freedom_enabled_for()` for the code.
+
 ### Render one card by hand
 
 `python -m agent render-card` renders a single card through the REAL engine chain
