@@ -171,6 +171,21 @@ def _locked_calendar_state(base_key, start, days, store, log, library_path=None)
                                            library_path=library_path)
     except Exception as exc:  # noqa: BLE001 - the guard must never sink a build
         log(f"cross-day media guard read skipped ({type(exc).__name__})")
+    # Resolve autofit reframe basenames (sha12__feed.jpg) in `used` back to the
+    # original library file basename that pick_image's os.path.basename() exclusion
+    # checks against. surviving_keys does this via resolve_raw_keys, but if
+    # surviving_keys partially degrades (Supabase blink, store read failure) reframe
+    # names land in `used` without their raw counterparts. pick_image keys by
+    # os.path.basename(creative.path) and never sees __feed.jpg names in the library,
+    # so a reframe in `used` without its raw counterpart silently fails to exclude the
+    # original file, and the planner re-picks a photo already on the gym's book.
+    if library_path:
+        try:
+            from . import media_guard as _mg
+            for raw in _mg.reframe_map(library_path, used).values():
+                used.add(raw)
+        except Exception as exc:  # noqa: BLE001 - resolution is best-effort, never a block
+            log(f"reframe-to-basename resolution skipped ({type(exc).__name__})")
     return locked_days, used
 
 
