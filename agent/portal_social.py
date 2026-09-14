@@ -1700,22 +1700,14 @@ def _pending_ids_for(account_key, store):
 
 
 def handle_autonomy(account_key, autonomous, actor_id=None, store=None, reader=None):
-    """POST /portal/<token>/autonomy  body {"autonomous": true|false}.
+    """Persist automatic/manual handling for this gym's entire pending queue.
 
-    Flips per-account autonomy. On ON: persist the flag, then auto-approve EVERY
-    currently-pending post for THIS account through the SAME gated approve path a
-    manual approve uses (so publishing behaves identically and still obeys
-    AGENT_PUBLISH_ENABLED inside publish()). On OFF: clear the flag and un-approve
-    NOTHING. Returns {ok, autonomous, approved_count}.
-
-    Idempotent + null-safe: flipping ON twice re-persists ON and only approves posts
-    that are STILL pending (already-approved posts are not in the pending sweep, so
-    they never double publish and are not re-counted). A bad/empty account or an
-    approve failure never 500s: it returns a clean body.
-
-    Gates: flag OFF -> disabled (404); missing account -> 400; Stripe social product
-    not ACTIVE -> 402. TOKEN ISOLATION: only this account's pending drafts are ever
-    touched (a draft belonging to another gym is skipped)."""
+    Automatic mode publishes eligible pending posts at their scheduled times
+    without further approval. Saving the mode is not a permanent human approval:
+    it must not bulk-approve or publish the queue inside this request. Returning
+    to manual therefore stops automatic handling of still-pending posts, while
+    explicit approvals and posts already sent remain intact.
+    """
     if not config.portal_social_enabled():
         return _disabled("autonomy")
     if not account_key:
@@ -1773,20 +1765,7 @@ def handle_autonomy(account_key, autonomous, actor_id=None, store=None, reader=N
                      "account_key": account_key,
                      "shared_persisted": shared_persisted}
 
-    # ON: auto-approve every currently-pending post for THIS account via the same
-    # gated approve path a manual approve uses. Never fabricates a publish.
-    actor = actor_id or _autonomy_actor(account_key)
-    approved = 0
-    for draft_id in _pending_ids_for(account_key, store):
-        try:
-            result = _pa.approve(account_key, draft_id, actor, store=store)
-            if result.get("ok"):
-                approved += 1
-        except Exception:
-            # One bad draft never aborts the sweep or 500s the flip; the rest still
-            # auto-approve and the flag stays ON for future posts.
-            continue
-    return 200, {"ok": True, "autonomous": True, "approved_count": approved,
+    return 200, {"ok": True, "autonomous": True, "approved_count": 0,
                  "account_key": account_key, "shared_persisted": shared_persisted}
 
 

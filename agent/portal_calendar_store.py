@@ -1635,6 +1635,39 @@ class SupabaseCalendarStore:
                 pass  # ledger stamp failure is never fatal
         return rows[0]
 
+    def mark_duplicate_content(self, account_key, row_id, reason):
+        """Retire a duplicate rejected BEFORE the publisher's network call.
+
+        Only the publisher-owned claim is eligible. Published rows and any row
+        with a provider id or publication timestamp remain untouched. This is a
+        reversible calendar soft delete, never deletion on a social platform.
+        """
+        return self._transition_unpublished_claim(account_key, row_id, "deleted", reason)
+
+    def release_content_ledger_claim(self, account_key, row_id, previous_status, reason):
+        """A ledger read/write failed before any network call: retry the owned row."""
+        if previous_status not in ("pending", "approved"):
+            return None
+        return self._transition_unpublished_claim(account_key, row_id, previous_status, reason)
+
+    def _transition_unpublished_claim(self, account_key, row_id, status, reason):
+        response = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
+                    "status": "eq.publishing", "published_at": "is.null",
+                    "late_post_id": "is.null"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"status": status, "reject_reason": str(reason)[:500]},
+            timeout=30,
+        )
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, _scrub((response.text or "")[:200]))
+        rows = response.json() or []
+        return next((row for row in rows if str(row.get("id")) == str(row_id)
+                     and str(row.get("gym_id")) == str(account_key)
+                     and row.get("status") == status), None)
+
     def mark_publish_failed(self, row_id, revert_status="pending",
                             reject_reason=None):
         """

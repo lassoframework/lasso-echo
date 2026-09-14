@@ -101,9 +101,11 @@ class _DictStore:
         return draft
 
 
-# ===========================================================================
+# ====================================================================
+
 # 1. FLAG OFF -> every route disabled (404), byte-for-byte current behavior
-# ===========================================================================
+# ====================================================================
+
 
 def test_flag_off_all_routes_disabled(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
@@ -116,9 +118,11 @@ def test_flag_off_all_routes_disabled(monkeypatch, tmp_path):
     assert ps.handle_kill("gymA", "d1", "u1", confirm=True)[0] == 404
 
 
-# ===========================================================================
+# ====================================================================
+
 # 2. STRIPE NOT ACTIVE -> 402 + empty state (never a live calendar)
-# ===========================================================================
+# ====================================================================
+
 
 def test_social_not_active_returns_402_empty(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -182,9 +186,11 @@ def test_action_not_active_returns_402(db_env, monkeypatch):
         assert status == 402
 
 
-# ===========================================================================
+# ====================================================================
+
 # 3. TOKEN ISOLATION on EVERY route
-# ===========================================================================
+# ====================================================================
+
 
 def test_social_isolation_only_own_gym_rows(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"), _account("gymB"))
@@ -248,9 +254,11 @@ def test_deny_budget_is_per_gym(db_env, monkeypatch):
     assert ps.recreate_remaining("gymB") == ps.MONTHLY_RECREATE_BUDGET  # untouched
 
 
-# ===========================================================================
+# ====================================================================
+
 # 4. RECREATE BUDGET — server-enforced 30/month, 409 when exhausted, free kill
-# ===========================================================================
+# ====================================================================
+
 
 def test_deny_decrements_budget_and_409_when_exhausted(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -295,9 +303,11 @@ def test_kill_is_free_never_charges_budget(db_env, monkeypatch):
     assert ps.recreate_spent("gymA") == 0, "kill is free"
 
 
-# ===========================================================================
+# ====================================================================
+
 # 5. KILL requires confirm=true
-# ===========================================================================
+# ====================================================================
+
 
 def test_kill_requires_confirm(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -320,9 +330,11 @@ def test_kill_with_confirm_succeeds(db_env, monkeypatch):
     assert body["ok"] is True
 
 
-# ===========================================================================
+# ====================================================================
+
 # 6. EDIT re-runs the fabrication gate -> 422 on an unsupported claim
-# ===========================================================================
+# ====================================================================
+
 
 def test_edit_unsupported_claim_returns_422(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -351,9 +363,11 @@ def test_edit_clean_note_succeeds(db_env, monkeypatch):
     assert status != 422
 
 
-# ===========================================================================
+# ====================================================================
+
 # 7. APPROVE is idempotent
-# ===========================================================================
+# ====================================================================
+
 
 def test_approve_idempotent_on_already_approved(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -366,9 +380,11 @@ def test_approve_idempotent_on_already_approved(db_env, monkeypatch):
     assert body.get("idempotent") is True
 
 
-# ===========================================================================
+# ====================================================================
+
 # 8. metrics shape (Part D) — null values, gaps not zeros, flags OFF
-# ===========================================================================
+# ====================================================================
+
 
 def test_metrics_shape_is_gaps_not_zeros(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -384,9 +400,11 @@ def test_metrics_shape_is_gaps_not_zeros(db_env, monkeypatch):
     assert body["gaps"], "an explicit gap note must be present when analytics are off"
 
 
-# ===========================================================================
+# ====================================================================
+
 # 9. HARD COPY RULES — no dashes, no "vendor" in any client-facing string
-# ===========================================================================
+# ====================================================================
+
 
 def _message_strings(payload):
     """Every human-readable message string in a payload (error/detail/gaps), NOT the
@@ -465,9 +483,11 @@ def test_source_string_literals_have_no_dashes_or_vendor():
             assert "vendor" not in v.lower(), f"'vendor' in literal: {v!r}"
 
 
-# ===========================================================================
+# ====================================================================
+
 # 10. HTTP LAYER — routing, token->account, flag gate, isolation end to end
-# ===========================================================================
+# ====================================================================
+
 
 def _serve(monkeypatch):
     from agent.intake_web import build_server
@@ -559,9 +579,11 @@ def test_http_kill_confirm_flows_through(db_env, monkeypatch):
         server.shutdown()
 
 
-# ===========================================================================
+# ====================================================================
+
 # 11. PER-ACCOUNT AUTONOMY — POST /portal/<token>/autonomy
-# ===========================================================================
+# ====================================================================
+
 
 class _ListStore(_DictStore):
     """A _DictStore that also exposes list_pending (the autonomy sweep needs it)."""
@@ -590,10 +612,8 @@ def test_autonomy_missing_account_is_400(db_env, monkeypatch):
     assert body["ok"] is False
 
 
-def test_autonomy_on_persists_flag_and_auto_approves_pending(db_env, monkeypatch):
-    """Flipping ON persists the flag AND auto-approves every currently-pending post
-    for the account through the real approve path (would_publish with the publish flag
-    off is a real approval, not a fabricated live)."""
+def test_autonomy_on_persists_flag_without_permanent_queue_approval(db_env, monkeypatch):
+    """Automatic owns the queue at slot time; the toggle cannot grant permanent approvals."""
     monkeypatch.delenv("AGENT_PUBLISH_ENABLED", raising=False)  # would_publish path
     _register(monkeypatch, _account("gymA"))
     _mark_stripe_customer("gymA")
@@ -602,12 +622,12 @@ def test_autonomy_on_persists_flag_and_auto_approves_pending(db_env, monkeypatch
     assert status == 200
     assert body["ok"] is True
     assert body["autonomous"] is True
-    assert body["approved_count"] == 2
+    assert body["approved_count"] == 0
     # flag is durably persisted
     assert _db.is_autonomous("gymA") is True
-    # both drafts are now APPROVED through the real path (no fabricated publish)
-    assert store.get("d1").status == DraftStatus.APPROVED
-    assert store.get("d2").status == DraftStatus.APPROVED
+    # Neither row is permanently approved by a setting change.
+    assert store.get("d1").status == DraftStatus.PENDING
+    assert store.get("d2").status == DraftStatus.PENDING
 
 
 def test_autonomy_off_clears_flag_and_unapproves_nothing(db_env, monkeypatch):
@@ -635,8 +655,8 @@ def test_autonomy_isolation_only_own_pending(db_env, monkeypatch):
     store = _ListStore(_draft("dA", "gymA"), _draft("dB", "gymB"))
     status, body = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())
     assert status == 200
-    assert body["approved_count"] == 1  # only gymA's draft
-    assert store.get("dA").status == DraftStatus.APPROVED
+    assert body["approved_count"] == 0
+    assert store.get("dA").status == DraftStatus.PENDING
     assert store.get("dB").status == DraftStatus.PENDING  # gymB untouched
     assert _db.is_autonomous("gymB") is False  # gymB's flag never set
 
@@ -650,7 +670,7 @@ def test_autonomy_on_is_idempotent(db_env, monkeypatch):
     _mark_stripe_customer("gymA")
     store = _ListStore(_draft("d1", "gymA"))
     first = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())[1]
-    assert first["approved_count"] == 1
+    assert first["approved_count"] == 0
     second = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())[1]
     assert second["approved_count"] == 0  # nothing left pending to approve
     assert _db.is_autonomous("gymA") is True
@@ -793,3 +813,16 @@ def test_http_manual_visual_brief_reaches_handler_with_token_identity(db_env, mo
         assert seen==[("lasso","d1","owner","Use a grounded photo collage")]
     finally:
         server.shutdown()
+
+
+def test_automatic_then_manual_does_not_leave_permanent_approvals(db_env, monkeypatch):
+    _register(monkeypatch, _account("gymA"))
+    _mark_stripe_customer("gymA")
+    store = _ListStore(_draft("pending", "gymA"),
+                       _draft("manual-approval", "gymA", status=DraftStatus.APPROVED))
+    for mode in (True, False):
+        code, body = ps.handle_autonomy("gymA", mode, store=store, reader=_ActiveReader())
+        assert code == 200 and body["autonomous"] is mode
+    assert _db.is_autonomous("gymA") is False
+    assert store.get("pending").status == DraftStatus.PENDING
+    assert store.get("manual-approval").status == DraftStatus.APPROVED
