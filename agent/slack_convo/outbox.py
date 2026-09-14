@@ -582,6 +582,9 @@ def _receipt(bus, ticket, row, identity, kind, att, *, where, summary):
         auto = bool(kind == _a.KIND_ANSWER and not (att or {}).get("released_by"))
         how = ("SENT AUTOMATICALLY (no tap)" if auto else
                ("sent after your tap" if (att or {}).get("released_by") else "sent"))
+        # FIXER provenance can remain after a human tap; only the release actor counts.
+        if (att or {}).get("released_by") == "fixer":
+            how = "sent automatically by FIXER"
         bus.record_outbound(
             ticket_id=ticket["id"], author_type="system",
             body=(f"RECEIPT: the client was told this, {how}.\n"
