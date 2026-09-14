@@ -590,10 +590,8 @@ def test_autonomy_missing_account_is_400(db_env, monkeypatch):
     assert body["ok"] is False
 
 
-def test_autonomy_on_persists_flag_and_auto_approves_pending(db_env, monkeypatch):
-    """Flipping ON persists the flag AND auto-approves every currently-pending post
-    for the account through the real approve path (would_publish with the publish flag
-    off is a real approval, not a fabricated live)."""
+def test_autonomy_on_persists_flag_without_permanent_queue_approval(db_env, monkeypatch):
+    """Automatic owns the queue at slot time; the toggle cannot grant permanent approvals."""
     monkeypatch.delenv("AGENT_PUBLISH_ENABLED", raising=False)  # would_publish path
     _register(monkeypatch, _account("gymA"))
     _mark_stripe_customer("gymA")
@@ -602,12 +600,12 @@ def test_autonomy_on_persists_flag_and_auto_approves_pending(db_env, monkeypatch
     assert status == 200
     assert body["ok"] is True
     assert body["autonomous"] is True
-    assert body["approved_count"] == 2
+    assert body["approved_count"] == 0
     # flag is durably persisted
     assert _db.is_autonomous("gymA") is True
-    # both drafts are now APPROVED through the real path (no fabricated publish)
-    assert store.get("d1").status == DraftStatus.APPROVED
-    assert store.get("d2").status == DraftStatus.APPROVED
+    # Neither row is permanently approved by a setting change.
+    assert store.get("d1").status == DraftStatus.PENDING
+    assert store.get("d2").status == DraftStatus.PENDING
 
 
 def test_autonomy_off_clears_flag_and_unapproves_nothing(db_env, monkeypatch):
@@ -635,8 +633,8 @@ def test_autonomy_isolation_only_own_pending(db_env, monkeypatch):
     store = _ListStore(_draft("dA", "gymA"), _draft("dB", "gymB"))
     status, body = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())
     assert status == 200
-    assert body["approved_count"] == 1  # only gymA's draft
-    assert store.get("dA").status == DraftStatus.APPROVED
+    assert body["approved_count"] == 0
+    assert store.get("dA").status == DraftStatus.PENDING
     assert store.get("dB").status == DraftStatus.PENDING  # gymB untouched
     assert _db.is_autonomous("gymB") is False  # gymB's flag never set
 
@@ -650,7 +648,7 @@ def test_autonomy_on_is_idempotent(db_env, monkeypatch):
     _mark_stripe_customer("gymA")
     store = _ListStore(_draft("d1", "gymA"))
     first = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())[1]
-    assert first["approved_count"] == 1
+    assert first["approved_count"] == 0
     second = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())[1]
     assert second["approved_count"] == 0  # nothing left pending to approve
     assert _db.is_autonomous("gymA") is True
@@ -773,3 +771,16 @@ def test_baseline_never_raises(monkeypatch):
     monkeypatch.setattr(ps._db, "get_baseline_posts_per_week", _local_boom)
     monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda: _Store())
     assert ps._baseline_posts_per_week("eng") == (None, None)
+
+
+def test_automatic_then_manual_does_not_leave_permanent_approvals(db_env, monkeypatch):
+    _register(monkeypatch, _account("gymA"))
+    _mark_stripe_customer("gymA")
+    store = _ListStore(_draft("pending", "gymA"),
+                       _draft("manual-approval", "gymA", status=DraftStatus.APPROVED))
+    for mode in (True, False):
+        code, body = ps.handle_autonomy("gymA", mode, store=store, reader=_ActiveReader())
+        assert code == 200 and body["autonomous"] is mode
+    assert _db.is_autonomous("gymA") is False
+    assert store.get("pending").status == DraftStatus.PENDING
+    assert store.get("manual-approval").status == DraftStatus.APPROVED
