@@ -10,6 +10,20 @@ Last updated: 2026-09-13
 
 ---
 
+## LASSO content-led Astra upgrade (2026-09-14, in progress)
+
+- [~] LASSO-only AGENT_LASSO_INFOGRAPHIC_QUALITY flag (default OFF); content-led brief with creative freedom and required supporting copy/CTA.
+- [~] Strict gpt-6-astra route with no Gemini fallback in this scope.
+- [~] Pixel review rubric rejects omissions, inaccuracies, major issues and scores below 90; malformed reviews are UNGRADED.
+- [~] Attached user reference images packaged for production requests.
+- [~] Portal manual/regenerate requests select copy from compiled Brain with source hash. LASSO calendar fill uses common reviewed generation. Remaining fallback/campaign paths and durable audit records pending.
+- [~] Independent audit found library reuse and durable portal evidence gaps. Library rotation now requires current Astra review evidence bound to exact image bytes and rechecks before drafting. Durable portal evidence remains pending. Full-suite wave 3 passed 7306 tests with 1 skipped before the latest punctuation and reuse changes.
+- [~] Five distinct Brain-sourced feed samples generated using gpt-6-astra + Sunburst; actual corrective retries observed (attempts 1,2,3,1,3). All five independently reviewed at 92–94/100, without blocking visual or copy issues. Story composition now contains the complete panel inside the required safe region; a live pixel review passed at 93/100. Eight additional Brain-sourced feed examples and an editorial replacement are available in the rating gallery. Review issues now require severity; minor polish does not force paid retries when every mandatory gate passes. Fourteen focused quality checks passed; full-suite wave 3 running. Latest full suite: 7302 passed, 1 skipped; 69 subsequent targeted checks passed. Not deployed or scheduled.
+- [~] Shared artifact provenance implemented for variant and display paths. Additive migration infographic_artifacts_20260914 applied to verified portal Supabase project. Live permissions verified service access with no browser-role grants. Thirty-two focused checks passed. Live actual-image persistence passed with fresh-client retrieval and cross-tenant isolation. Shared job-claim migration applied and live transaction assertions verified first claim succeeds, duplicate fails, other tenant independent. Runtime deployment remains pending.
+- [ ] Verify deployment and LASSO scheduling through portal and Zernio.
+
+Baseline at 4843d2f: 7291 passed, 1 skipped. First focused run: 119 passed. These are offline tests, not proof of live generation or deployment.
+
 ## Astra style freedom: cream is no longer THE canvas (2026-09-13, flag OFF)
 
 Blake: "I want to give Astra more freedom, all the infographics look the same in

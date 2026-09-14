@@ -437,6 +437,13 @@ def choose(account_key, day_key, library_path, poster=None):
     from . import dam, db
     for c in list_creatives(library_path):
         base = os.path.basename(c.path)
+        if config.lasso_infographic_quality_enabled(account_key) and c.media_type != "video":
+            from .infographic_evidence import reviewed_asset
+            paths = c.slides if c.media_type == "carousel" else [c.path]
+            if not paths or not all(reviewed_asset(path) for path in paths):
+                db.audit("exclusion", base, "missing current Astra pixel-review evidence",
+                         account_key, day_key)
+                continue
         if base in off_style:
             db.audit("exclusion", base, "off-style (pre house-style card)",
                      account_key, day_key)
@@ -556,7 +563,19 @@ def build_rotated_draft(account, day_key, voice, library_path, poster=None,
         return draft
     if kind == "library":
         from . import schedule
+        if config.lasso_infographic_quality_enabled(account.key) and payload.media_type != "video":
+            from .infographic_evidence import reviewed_asset
+            paths = payload.slides if payload.media_type == "carousel" else [payload.path]
+            evidence = [reviewed_asset(path) for path in paths]
+            if not evidence or not all(evidence):
+                return None  # Recheck after selection in case a file was replaced.
+        else:
+            evidence = []
         draft = draft_post(account, payload, schedule.scheduled_for(day_key), voice=voice)
+        if evidence and payload.media_type == "image":
+            draft.infographic_copy = dict(evidence[0]["infographic_copy"])
+            draft.image_engine = evidence[0].get("route", "")
+
         if draft.status.value != "blocked":
             from . import dam
             record_served(account.key, dam.rotation_key(payload.path),

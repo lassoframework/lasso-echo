@@ -28,10 +28,13 @@ from . import config, creative_studio, media_host, ops_alerts, schedule
 from .drafter import Draft, DraftStatus, _make_id
 
 
-def _story_out_path(headline):
+def _story_out_path(headline, unique=False):
     """A Story-specific output path so the 9:16 render never overwrites the day's
     4:5 feed image (both slug from the same approved headline)."""
     slug = re.sub(r"[^a-z0-9]+", "_", (headline or "story").lower()).strip("_") or "story"
+    if unique:
+        import uuid
+        slug += "_" + uuid.uuid4().hex
     return os.path.join(config.LIBRARY_PATH, f"nano_story_{slug}.png")
 
 
@@ -70,7 +73,7 @@ def build_story_draft(account, day_key, *, feed_draft=None,
     # PREMADE story variant first (AGENT_STORY_PREMADE_ENABLED, OFF): a *_story
     # render next to the day's creative (the regen-library convention) is used
     # as-is, nothing generated. This is a genuine 9:16 asset, not a reused feed card.
-    if config.story_premade_enabled():
+    if config.story_premade_enabled() and not config.lasso_infographic_quality_enabled(account.key):
         premade = _premade_story_variant(feed_draft)
         if premade is not None:
             hosted = media_host.host_media(premade, account.key, client=s3_client)
@@ -88,15 +91,22 @@ def build_story_draft(account, day_key, *, feed_draft=None,
     # Purpose-built 9:16 variant from the SAME approved text. Aspect is passed
     # per-use so the feed's 4:5 target is untouched. Only a daily-studio creative
     # carries the approved headline + facts on source_fragments to re-render safely.
-    if _is_studio_creative(feed_draft):
-        headline, facts = fragments[0], fragments[1:]
+    if (_is_studio_creative(feed_draft) or
+            (config.lasso_infographic_quality_enabled(account.key) and
+             getattr(feed_draft, "infographic_copy", None))):
+        headline, facts = (fragments[0] if fragments else ""), fragments[1:]
+        image_copy = getattr(feed_draft, "infographic_copy", {}) or {}
+        if config.lasso_infographic_quality_enabled(account.key) and image_copy:
+            headline, facts = image_copy["headline"], image_copy["facts"]
+        copy_opts = ({"cta": image_copy.get("cta", ""), "footer": image_copy.get("footer")}
+                     if image_copy else {})
         if facts:
             art = creative_studio.generate(
                 headline, facts, client=nano_client,
                 account_key=account.key,
-                out_path=_story_out_path(headline),
+                out_path=_story_out_path(headline, unique=config.lasso_infographic_quality_enabled(account.key)),
                 aspect=config.STORY_ASPECT, pixels=config.STORY_PIXELS,
-                surface="Story",
+                surface="Story", **copy_opts,
             )
             if art:
                 hosted = media_host.host_media(art["path"], account.key,
@@ -160,6 +170,7 @@ def _story_draft(account, day_key, draft_id, feed_draft, creative_path,
         # post land at different times of the same posting day.
         scheduled_for=schedule.scheduled_for(day_key, slot="morning"),
         status=DraftStatus.PENDING,
+        infographic_copy=dict(getattr(feed_draft, "infographic_copy", {}) or {}),
         source_fragments=fragments,  # the same approved text the feed creative used
         is_story=True,
         image_engine=image_engine,

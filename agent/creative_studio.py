@@ -592,23 +592,75 @@ def _engine_opts(headline, surface, pixels, gemini_model):
     }
 
 
-def _astra_brief_for(headline, facts, surface, pixels, account_key=None):
+def _astra_brief_for(headline, facts, surface, pixels, account_key=None,
+                     corrective=None, reference_note=None, cta="", footer=None, art_direction=""):
     """The Astra creative brief for this card, or None to reuse the Gemini prompt
     if the brief cannot be built. Never raises into the render path.
 
     `account_key` threads through to the style freedom scope (Blake, 2026-09-13:
     "only for LASSO right now until a proven [out]") — without it every card
     would resolve the freedom flag as if it were LASSO's own, which is exactly
-    the wrong default for a client-gym call."""
+    the wrong default for a client-gym call. `corrective` (section 6) and
+    `reference_note` (section 3) are optional per-attempt additions; both are
+    "" on a first attempt with no references."""
     try:
         from . import astra_prompt
         return astra_prompt.build_infographic_brief(
             headline, facts, surface=surface or "feed post", pixels=pixels,
-            account_key=account_key)
-    except Exception as exc:  # noqa: BLE001 - a brief failure must not lose the card
+            account_key=account_key, corrective=corrective,
+            reference_note=reference_note, cta=cta, footer=footer, art_direction=art_direction)
+    except Exception as exc:  # noqa: BLE001 - preserve explicit failure in quality scope
+        if config.lasso_infographic_quality_enabled(account_key):
+            raise ValueError("LASSO approved content brief could not be built") from exc
         print(f"[creative-studio] astra brief build failed "
               f"({type(exc).__name__}: {exc}); using the shared prompt.")
         return None
+
+
+def _reference_images_for(headline, account_key, kind=""):
+    """(reference_kind, [reference dicts]) for this card, or ("", []) when the
+    capability is off (config.astra_reference_images_enabled(), default OFF) or
+    no approved reference set matches. Never raises: a reference is a quality
+    enhancement, never a hard dependency for a card to render."""
+    if config.lasso_infographic_quality_enabled(account_key):
+        from . import creative_references as _refs
+        return "lasso_content", _refs.references_for("lasso_content", limit=2)
+    if not config.astra_reference_images_enabled():
+        return "", []
+    try:
+        from . import creative_references as _refs
+        use_kind = kind or _refs.kind_for(headline, account_key)
+        if not use_kind:
+            return "", []
+        return use_kind, _refs.references_for(use_kind)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[creative-studio] reference image lookup failed "
+              f"({type(exc).__name__}: {exc}); continuing with no references.")
+        return "", []
+
+
+def _astra_url_footer():
+    """The URL footer text actually rendered on every card (spec section 5 fix,
+    2026-09-13 live-sample bug): grade_gate.evaluate()'s critical-copy check
+    needs this in its approved-copy list, or it hard-blocks every card for
+    correctly rendering its own approved footer. Never raises."""
+    try:
+        from . import astra_prompt
+        return astra_prompt.url_footer()
+    except Exception:
+        return ""
+
+
+def _reference_note_for(kind, references):
+    if not references:
+        return None
+    return (
+        f"VISUAL REFERENCE ({len(references)} approved {kind.replace('_', ' ')} "
+        "card(s) attached as image inputs on this request): match their "
+        "typography hierarchy, spacing discipline, diagram clarity, level of "
+        "visual detail, and finish. Do NOT copy their headline, body copy, CTA, "
+        "numbers, or any claim onto this new card — this card renders ONLY the "
+        "hook, CTA, and approved context given above, for a different post.")
 
 
 def _scrub_dashes(text):
@@ -712,7 +764,7 @@ NUMBER_CARD_STYLE = (
 
 
 def build_social_proof_prompt(kind, main_line, support_line="", attribution="",
-                              aspect=None, pixels=None, surface=None):
+                              aspect=None, pixels=None, surface=None, account_key=None):
     """
     Build a social proof card prompt from a VERIFIED, PERMISSIONED entry only (the
     caller enforces permission + verification; nothing here invents text). kind is
@@ -747,7 +799,7 @@ def build_social_proof_prompt(kind, main_line, support_line="", attribution="",
 
 def generate_social_proof(kind, main_line, support_line="", attribution="",
                           client=None, out_path=None,
-                          aspect=None, pixels=None, surface=None):
+                          aspect=None, pixels=None, surface=None, account_key=None):
     """
     Generate a social proof card. Same gates as generate(): flag OFF -> None with no
     API call; an empty main line -> None (nothing to render honestly); no client and
@@ -757,6 +809,12 @@ def generate_social_proof(kind, main_line, support_line="", attribution="",
         return None
     if not str(main_line or "").strip():
         return None
+
+    if config.lasso_infographic_quality_enabled(account_key):
+        return generate(main_line, [line for line in (support_line, attribution) if line]
+                        or [main_line], client=client, out_path=out_path,
+                        aspect=aspect, pixels=pixels, surface=surface,
+                        account_key=account_key)
 
     prompt = build_social_proof_prompt(kind, main_line, support_line, attribution,
                                        aspect=aspect, pixels=pixels, surface=surface)
@@ -984,7 +1042,7 @@ def spend_allowed(account_key=None, day=None):
 def generate(headline, facts, client=None, out_path=None,
              aspect=None, pixels=None, surface=None, archetype=None,
              palette=None, canvas=None, layout=None, account_key=None,
-             bypass_cap=False, draft_id=""):
+             bypass_cap=False, draft_id="", reference_kind=None, cta="", footer=None, art_direction=""):
     """
     Generate a LASSO infographic from APPROVED input. Returns {"path", "prompt"} on
     success, or None when it must not run:
@@ -1020,6 +1078,15 @@ def generate(headline, facts, client=None, out_path=None,
     if not bypass_cap and not spend_allowed(account_key=account_key):
         return None
 
+    if config.lasso_infographic_quality_enabled(account_key):
+        from .infographic_copy_style import display_text
+        from .infographic_evidence import brain_snapshot
+        source_snapshot = brain_snapshot()
+        headline = _scrub_dashes(display_text(headline))
+        facts = [_scrub_dashes(display_text(f)) for f in facts]
+        cta = _scrub_dashes(display_text(cta))
+        footer = display_text(footer if footer is not None else _astra_url_footer())
+
     prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
                           surface=surface, archetype=archetype, palette=palette,
                           canvas=canvas, layout=layout)
@@ -1032,24 +1099,53 @@ def generate(headline, facts, client=None, out_path=None,
         return None
 
     gemini_model, gemini_route = _route_model(headline, facts)
-    print(f"[creative-studio] gemini fallback route: {gemini_route}")
+    if config.lasso_infographic_quality_enabled(account_key):
+        print("[creative-studio] LASSO: Astra generation and mandatory pixel review")
+    else:
+        print(f"[creative-studio] gemini fallback route: {gemini_route}")
 
-    opts = _engine_opts(headline, surface, pixels, gemini_model)
+    story_panel = (config.lasso_infographic_quality_enabled(account_key)
+                   and "story" in str(surface).lower())
+    render_surface = "feed post" if story_panel else surface
+    render_pixels = config.IMAGE_PIXELS if story_panel else pixels
+    opts = _engine_opts(headline, render_surface, render_pixels, gemini_model)
 
-    def _do_generate(p):
+    # Reference images (spec section 3), OFF by default
+    # (config.astra_reference_images_enabled). Looked up once per call: the
+    # reference SET does not change across retries of the same card, only the
+    # corrective note does.
+    ref_kind, references = _reference_images_for(headline, account_key,
+                                                 kind=reference_kind or "")
+    reference_note = _reference_note_for(ref_kind, references)
+    reference_ids = [r.get("id", "") for r in references]
+
+    def _do_generate(p, corrective=None):
         # ASTRA FIRST (retry once with backoff), then the UNCHANGED Gemini path,
         # then "needs human". Each engine gets its own prompt: Astra reads the
         # creative brief, Gemini reads the classic single-prompt text.
         call_opts = dict(opts)
-        call_opts["engine_prompts"] = {
-            "astra": _astra_brief_for(headline, facts, surface, pixels,
-                                      account_key=account_key),
-            "gemini": p,
-        }
-        return _image_engine.generate_image(
+        try:
+            brief = _astra_brief_for(headline, facts, render_surface, render_pixels,
+                                     account_key=account_key, corrective=corrective,
+                                     reference_note=reference_note, cta=cta, footer=footer,
+                                     art_direction=art_direction)
+        except ValueError:
+            _image_engine.mark_needs_human(
+                subject=headline, account_key=account_key or "", draft_id=draft_id,
+                failures=["Approved LASSO content brief is invalid"])
+            return None
+        call_opts["engine_prompts"] = {"astra": brief, "gemini": p}
+        if references:
+            call_opts["reference_images"] = references
+        generated = _image_engine.generate_image(
             p, call_opts, gemini_client=client,
             account_key=account_key or "", subject=headline or "",
             draft_id=draft_id or "")
+        if generated is not None and story_panel:
+            from .infographic_layout import story_frame
+            generated.image_bytes = story_frame(generated.image_bytes,
+                _image_engine.parse_size(pixels or config.STORY_PIXELS))
+        return generated
 
     result = _do_generate(prompt)
     if result is None:
@@ -1057,10 +1153,99 @@ def generate(headline, facts, client=None, out_path=None,
         # alert + audit row). None keeps the caller's existing behavior.
         return None
     image_bytes = result.image_bytes
+    original_bytes = image_bytes
     prompt = result.prompt_used or prompt
     model, route = result.model, _route_label(result, gemini_route)
 
-    if config.style_gate_enabled() or config.image_grade_enabled():
+    content_quality = config.lasso_infographic_quality_enabled(account_key)
+    grade_status, grade_scores, grade_reason, corrective_feedback = "", {}, "", ""
+    attempt_count = 1
+    review_history = []
+
+    if content_quality or config.real_grade_policy_enabled():
+        # THE single authoritative policy (spec section 5): one function's
+        # PASS/FAIL/UNGRADED decides the retry loop, no separate prompt-level
+        # and image-level pass/fail that could drift from each other. UNGRADED
+        # (no vision client, or an unparseable/erroring check) is treated the
+        # same as FAIL for retry/withhold purposes — it is NEVER a silent pass.
+        from . import grade_gate as _gg
+        if content_quality:
+            from .infographic_review import AstraReviewer
+            review_key = os.environ.get("OPENAI_API_KEY", "")
+            _vision = AstraReviewer(review_key, references) if review_key else None
+        else:
+            _vision = _default_vision_client()
+        _MAX_ATTEMPTS = 3
+        _attempt = 1
+        gr = None
+        while True:
+            if content_quality:
+                from . import infographic_review
+                gr = infographic_review.evaluate(
+                    image_bytes, headline=headline or "", facts=facts, cta=cta,
+                    footer=footer if footer is not None else _astra_url_footer(),
+                    surface=surface, vision_client=_vision)
+            else:
+                gr = _gg.evaluate(image_bytes, prompt_text=prompt, headline=headline or "",
+                                  facts=facts, cta=cta,
+                                  footer=footer if footer is not None else _astra_url_footer(),
+                                  vision_client=_vision)
+            if content_quality:
+                import hashlib
+                review_history.append({"attempt": _attempt,
+                    "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
+                    "generation_response_id": getattr(result, "response_id", ""),
+                    "review_response_id": getattr(_vision, "response_id", ""),
+                    "status": gr.status, "scores": gr.scores, "reason": gr.reason})
+            grade_status, grade_scores, grade_reason = gr.status, gr.scores, gr.reason
+            attempt_count = _attempt
+            if gr.passed and gr.status == "PASS":
+                break
+            corrective_feedback = (("CORRECTIVE FEEDBACK: " + gr.reason) if content_quality
+                                   else _gg.corrective_instruction(gr))
+            print(f"[creative-studio] grade {gr.status} (attempt {_attempt}): "
+                  f"{gr.failed_questions} reason={gr.reason!r} — retrying")
+            _generation_log_attempt(
+                draft_id=draft_id, account_key=account_key, headline=headline,
+                facts=facts, cta=cta, prompt=prompt, reference_ids=reference_ids,
+                result=result, route=route, original_bytes=original_bytes,
+                final_bytes=image_bytes, final_path="", grade_status=gr.status,
+                grade_scores=gr.scores, grade_reason=gr.reason,
+                corrective_feedback=corrective_feedback, attempt=_attempt,
+                final_status="retrying")
+            if _attempt >= _MAX_ATTEMPTS:
+                from . import ops_alerts as _ops
+                _ops.alert(
+                    f"house-style fail: {headline or '(no headline)'} failed "
+                    f"the grade gate {_MAX_ATTEMPTS} times (last status="
+                    f"{gr.status}: {gr.reason}). Card withheld, routed to "
+                    "human review."
+                )
+                _generation_log_attempt(
+                    draft_id=draft_id, account_key=account_key, headline=headline,
+                    facts=facts, cta=cta, prompt=prompt, reference_ids=reference_ids,
+                    result=result, route=route, original_bytes=original_bytes,
+                    final_bytes=image_bytes, final_path="", grade_status=gr.status,
+                    grade_scores=gr.scores, grade_reason=gr.reason,
+                    corrective_feedback=corrective_feedback, attempt=_attempt,
+                    final_status="needs_human")
+                return None
+            _attempt += 1
+            prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
+                                  surface=surface, archetype=archetype, palette=palette,
+                                  canvas=canvas, layout=layout)
+            result = _do_generate(prompt, corrective=corrective_feedback)
+            if result is None:
+                return None
+            image_bytes = result.image_bytes
+            prompt = result.prompt_used or prompt
+            model, route = result.model, _route_label(result, gemini_route)
+    elif config.style_gate_enabled() or config.image_grade_enabled():
+        # LEGACY gate (unchanged): kept for callers that have not yet opted
+        # into AGENT_REAL_GRADE_POLICY. grade_card/grade_image's Q3/Q6 read the
+        # PROMPT TEXT, not the rendered pixels — see grade_gate.evaluate's
+        # module comment for why this is being replaced. A missing vision
+        # client still auto-passes Q1/Q2/Q5 on this legacy path.
         from . import grade_gate as _gg
         _vision = _default_vision_client() if config.image_grade_enabled() else None
         _MAX_ATTEMPTS = 3
@@ -1101,8 +1286,66 @@ def generate(headline, facts, client=None, out_path=None,
 
     if out_path is None:
         slug = re.sub(r"[^a-z0-9]+", "_", (headline or "infographic").lower()).strip("_") or "infographic"
+        if content_quality:
+            import uuid
+            slug += "_" + uuid.uuid4().hex
         out_path = os.path.join(config.LIBRARY_PATH, f"nano_{slug}.png")
     with open(out_path, "wb") as fh:
         fh.write(image_bytes)
 
-    return {"path": out_path, "prompt": prompt, "model": model, "route": route}
+    _generation_log_attempt(
+        draft_id=draft_id, account_key=account_key, headline=headline,
+        facts=facts, cta=cta, prompt=prompt, reference_ids=reference_ids, result=result,
+        route=route, original_bytes=original_bytes, final_bytes=image_bytes,
+        final_path=out_path, grade_status=grade_status or "not_graded",
+        grade_scores=grade_scores, grade_reason=grade_reason,
+        corrective_feedback=corrective_feedback, attempt=attempt_count,
+        final_status="approved")
+
+    output = {"path": out_path, "prompt": prompt, "model": model, "route": route,
+            "brief_model": getattr(result, "brief_model", ""),
+            "response_id": getattr(result, "response_id", ""),
+            "grade_status": grade_status or "not_graded", "grade_scores": grade_scores,
+            "reference_ids": reference_ids, "attempts": attempt_count,
+            "review_response_id": getattr(_vision, "response_id", "") if content_quality else ""}
+    if content_quality:
+        import hashlib
+        output["infographic_copy"] = {"headline": headline, "facts": list(facts),
+                                      "cta": cta, "footer": footer if footer is not None else _astra_url_footer()}
+        from .infographic_evidence import POLICY_VERSION
+        output["brain_snapshot"] = source_snapshot
+        output["policy_version"] = POLICY_VERSION
+        output["image_sha256"] = hashlib.sha256(image_bytes).hexdigest()
+        output["reviews"] = review_history
+        from pathlib import Path
+        import json
+        Path(str(out_path) + ".review.json").write_text(json.dumps(output, indent=2))
+    return output
+
+
+def _generation_log_attempt(*, draft_id, account_key, headline, facts, prompt, cta="",
+                            reference_ids, result, route, original_bytes,
+                            final_bytes, final_path, grade_status, grade_scores,
+                            grade_reason, corrective_feedback, attempt,
+                            final_status):
+    """Thin call-site wrapper around generation_log.record (spec section 7).
+    OFF by default (config.generation_record_enabled()); never raises."""
+    try:
+        from . import generation_log as _gl
+        _gl.record(
+            draft_id=draft_id or "", account_key=account_key or "",
+            kind="infographic", headline=headline or "", cta=cta or "", facts=facts or [],
+            brief=prompt or "", reference_ids=reference_ids or [],
+            engine=getattr(result, "engine", ""), model=getattr(result, "model", ""),
+            route=route or "", quality_used=getattr(result, "quality_used", ""),
+            reasoning_effort_used=getattr(result, "reasoning_effort_used", ""),
+            input_fidelity_used=getattr(result, "input_fidelity_used", ""),
+            revised_prompt=getattr(result, "revised_prompt", ""),
+            original_bytes=original_bytes or b"", final_path=final_path or "",
+            final_bytes=final_bytes or b"", grade_status=grade_status or "",
+            grade_scores=grade_scores or {}, grade_reason=grade_reason or "",
+            corrective_feedback=corrective_feedback or "", attempt=attempt or 1,
+            final_status=final_status or "")
+    except Exception as exc:  # noqa: BLE001 - logging must never break generation
+        print(f"[creative-studio] generation_log record failed "
+              f"({type(exc).__name__}: {exc})")
