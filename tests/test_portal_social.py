@@ -773,3 +773,23 @@ def test_baseline_never_raises(monkeypatch):
     monkeypatch.setattr(ps._db, "get_baseline_posts_per_week", _local_boom)
     monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda: _Store())
     assert ps._baseline_posts_per_week("eng") == (None, None)
+
+
+def test_http_manual_visual_brief_reaches_handler_with_token_identity(db_env, monkeypatch):
+    monkeypatch.setattr("agent.intake_web.client_for_token", lambda t: "lasso")
+    monkeypatch.setattr("agent.intake_web.is_revoked", lambda k: False)
+    seen=[]
+    def handle(account_key,draft_id,actor_id,brief):
+        seen.append((account_key,draft_id,actor_id,brief))
+        return 200,{"ok":True}
+    monkeypatch.setattr("agent.intake_web._ps.handle_regen_variant_from_brief",handle)
+    import urllib.request,json
+    server,port=_serve(monkeypatch)
+    try:
+        req=urllib.request.Request(f"http://127.0.0.1:{port}/portal/validtoken123/posts/d1/regen-variant-brief",
+            data=json.dumps({"actor_id":"owner","brief":"Use a grounded photo collage","account_key":"other"}).encode(),
+            headers={"Content-Type":"application/json"},method="POST")
+        assert json.loads(urllib.request.urlopen(req).read())["ok"]
+        assert seen==[("lasso","d1","owner","Use a grounded photo collage")]
+    finally:
+        server.shutdown()

@@ -4593,9 +4593,20 @@ def astra_style_freedom_enabled_for(account_key=None) -> bool:
     scope = astra_style_freedom_accounts()
     if "*" in scope:
         return True
-    base = str(account_key or "lasso").strip().lower()
+    base = str(account_key or "").strip().lower()
     for suf in ("_ig", "_fb"):
         if base.endswith(suf):
             base = base[: -len(suf)]
             break
     return base in scope
+
+
+def lasso_infographic_quality_enabled(account_key=None) -> bool:
+    """Source-grounded Astra pipeline for LASSO, explicitly armed per deployment."""
+    base = str(account_key or "").strip().lower()
+    for suffix in ("_ig", "_fb"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    return base in {"lasso", "lasso-framework-llc"} and _truthy(
+        os.environ.get("AGENT_LASSO_INFOGRAPHIC_QUALITY", "false"))

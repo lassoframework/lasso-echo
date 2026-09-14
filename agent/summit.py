@@ -101,7 +101,8 @@ def build_summit_draft(account, day_key, *, voice=None, voice_path=None,
     fact = facts[week % len(facts)]  # facts rotate on the same clock
 
     art = creative_studio.generate(angle, facts, client=nano_client,
-                                   account_key=account.key)
+                                   account_key=account.key, cta="Claim your seat",
+                                   footer="https://lassoframework.com/summit")
     if not art:
         print(f"[summit] {account.key}: card generation unavailable; "
               "normal draft path takes the day.")
@@ -127,6 +128,8 @@ def build_summit_draft(account, day_key, *, voice=None, voice_path=None,
         creative_path=art["path"], creative_public_url=hosted,
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=[angle, fact, cta_line],  # audit: approved lines only
+        infographic_copy={"headline": angle, "facts": list(facts), "cta": "Claim your seat",
+                          "footer": "https://lassoframework.com/summit"},
         draft_type="summit",
         image_engine=art.get("route", ""),
     )

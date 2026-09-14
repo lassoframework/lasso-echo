@@ -164,21 +164,44 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             None, account_key=account.key)
         draft_id = f"igfill_{base}_{day}"
         from . import image_engine as _ie
-        _res = _ie.generate_image(
-            prompt,
-            {"kind": "infographic", "surface": "feed post",
-             "has_text_overlay": bool(str(headline or "").strip()),
-             "gemini_model": config.NANO_MODEL,
-             "engine_prompts": {"astra": astra_brief, "gemini": prompt}},
-            gemini_client=client, account_key=account.key,
-            subject=f"{day} {headline}"[:120], draft_id=draft_id)
-        img = _res.image_bytes if _res is not None else None
+        compiled = None
+        if config.lasso_infographic_quality_enabled(account.key):
+            from .lasso_infographic_content import select_copy
+            try:
+                compiled = select_copy(headline + " " + str(getattr(source, "text", "")))
+            except ValueError:
+                log(f"{base} {day}: no approved Brain material; skipped")
+                continue
+            out_dir = os.path.join(config.LIBRARY_PATH, base)
+            os.makedirs(out_dir, exist_ok=True)
+            import uuid
+            art = creative_studio.generate(
+                compiled["headline"], compiled["facts"], cta=compiled["cta"],
+                client=client, account_key=account.key, draft_id=draft_id,
+                out_path=os.path.join(out_dir, f"igfill_{day}_{archetype}_{uuid.uuid4().hex}.png"))
+            if not art:
+                continue
+            from pathlib import Path
+            img = Path(art["path"]).read_bytes()
+            _res = _ie.ImageResult(image_bytes=img, model=art.get("model", ""), engine="astra")
+        else:
+            _res = _ie.generate_image(
+                prompt,
+                {"kind": "infographic", "surface": "feed post",
+                 "has_text_overlay": bool(str(headline or "").strip()),
+                 "gemini_model": config.NANO_MODEL,
+                 "engine_prompts": {"astra": astra_brief, "gemini": prompt}},
+                gemini_client=client, account_key=account.key,
+                subject=f"{day} {headline}"[:120], draft_id=draft_id)
+            img = _res.image_bytes if _res is not None else None
         if not img:
             log(f"{base} {day}: image render failed on every engine; "
                 "marked NEEDS HUMAN and skipped")
             continue
         out = os.path.join(config.LIBRARY_PATH, base,
                            f"igfill_{day}_{archetype}.png")
+        if compiled:
+            out = art["path"]
         try:
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "wb") as fh:
@@ -192,6 +215,8 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             continue
         caption, hashtags = client_content.make_caption(
             account, source, voice, f"igfill_{day}")
+        if compiled:
+            caption = "\n\n".join([compiled["headline"], *compiled["facts"], compiled["cta"]])
         draft = Draft(
             draft_id=draft_id,
             account_key=account.key,
@@ -202,9 +227,12 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             creative_public_url=hosted,
             scheduled_for=f"{day}T12:00:00",
             status=DraftStatus.PENDING,
-            source_fragments=[getattr(source, "text", "") or "",
+            infographic_copy=dict(compiled or {}),
+            source_fragments=([compiled["headline"], *compiled["facts"],
+                               "cite:" + compiled["source_id"], "sha256:" + compiled["source_hash"]]
+                              if compiled else [getattr(source, "text", "") or "",
                               f"cite:{getattr(source, 'citation', '')}",
-                              "infographic_fill"],
+                              "infographic_fill"]),
             day_key=day,
             category=_with_review_mark(getattr(source, "category", "")),
             image_engine=f"{_res.engine}:{_res.model}" if _res is not None else "",

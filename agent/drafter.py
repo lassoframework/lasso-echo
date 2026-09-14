@@ -52,6 +52,7 @@ class Draft:
     blocked_reason: str = ""
     # source spans we composed FROM, kept for the no-fabrication test + audit
     source_fragments: list = field(default_factory=list)
+    infographic_copy: dict = field(default_factory=dict)
     # carousel support: local slide paths + their public URLs (empty for singles)
     slides: list = field(default_factory=list)
     slide_urls: list = field(default_factory=list)

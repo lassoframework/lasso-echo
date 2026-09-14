@@ -39,6 +39,7 @@ _ASSET_ROOT = os.path.join(os.path.dirname(__file__), "assets", "reference")
 
 # kind -> ordered list of filenames under _ASSET_ROOT/<kind>/
 REFERENCE_SETS = {
+    "lasso_content": ["growth-levers.png", "lead-followup.png", "halo-effect.png", "growth-playbook.png"],
     "full_gym": ["01-growth-controls.png", "02-client-lens.png"],
     "summit": ["02_deliverable_a_story.png", "04_funnel_a_story.png"],
 }

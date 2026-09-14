@@ -90,6 +90,7 @@ def _status():
     print(f"  astra_style_freedom: {config.astra_style_freedom_enabled()}  "
           f"(env AGENT_ASTRA_STYLE_FREEDOM; scope={sorted(config.astra_style_freedom_accounts())} "
           f"via AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS, default lasso only)")
+    print(f"  lasso_infographic_quality: {config.lasso_infographic_quality_enabled('lasso')}  (env AGENT_LASSO_INFOGRAPHIC_QUALITY)")
     print(f"  style_gate     : {config.style_gate_enabled()}  (env AGENT_STYLE_GATE_ENABLED)")
     print(f"  image_grade    : {config.image_grade_enabled()}  (env AGENT_IMAGE_GRADE_ENABLED)")
     print(f"  real_grade_policy: {config.real_grade_policy_enabled()}  "

@@ -106,6 +106,8 @@ class ImageResult:
     reasoning_effort_used: str = ""
     input_fidelity_used: str = ""
     reference_ids_used: list = field(default_factory=list)
+    brief_model: str = ""
+    response_id: str = ""
 
     def ok(self) -> bool:
         return bool(self.image_bytes) or bool(self.image_url)
@@ -375,7 +377,7 @@ class AstraImageEngine(ImageEngine):
         opts = dict(opts or {})
         brief = self.prompt_for(prompt, opts)
         image_model = select_astra_model(opts)
-        brief_model = astra_brief_model()
+        brief_model = "gpt-6-astra" if opts.get("require_astra") else astra_brief_model()
         target_size = size_for(opts)
         # The tool only accepts dimensions divisible by 16; send the snapped
         # size and scale the result back to the caller's target below.
@@ -485,7 +487,8 @@ class AstraImageEngine(ImageEngine):
             revised_prompt=revised, latency_ms=latency_ms, prompt_used=brief,
             quality_used=quality_used, reasoning_effort_used=reasoning_effort_used,
             input_fidelity_used=input_fidelity_used,
-            reference_ids_used=reference_ids_used)
+            reference_ids_used=reference_ids_used, brief_model=brief_model,
+            response_id=str(data.get("id") or ""))
 
 
 def fetch_image_bytes(url, timeout=60):
@@ -698,7 +701,12 @@ def generate_image(prompt, opts=None, *, gemini_client=None, account_key="",
     failures = []
     who = f"draft={draft_id or '(none)'} account={account_key or '(none)'}"
 
-    for engine in engine_chain(gemini_client):
+    require_astra = config.lasso_infographic_quality_enabled(account_key)
+    if require_astra:
+        opts["require_astra"] = True
+    chain = ([AstraImageEngine(os.environ.get(OPENAI_API_KEY_ENV, ""))]
+             if require_astra else engine_chain(gemini_client))
+    for engine in chain:
         tries = _attempts_for(engine)
         for attempt in range(1, tries + 1):
             try:

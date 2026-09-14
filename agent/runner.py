@@ -985,6 +985,13 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # client/non-LASSO accounts are unaffected (_skip_legacy_lasso_daily False).
             if draft is None and not _skip_legacy_lasso_daily:
                 creative = pick_next(account, acct_lib, used_creatives_for(account.key))
+                if config.lasso_infographic_quality_enabled(account.key) and creative is not None:
+                    from .infographic_evidence import reviewed_asset
+                    if creative.media_type != "video":
+                        paths = creative.slides if creative.media_type == "carousel" else [creative.path]
+                        if not paths or not all(reviewed_asset(path) for path in paths):
+                            creative = None
+
                 # BRAND-INTEGRITY GUARD (any SHARED-PARENT account: LASSO + blake_personal
                 # + any future empty-library_prefix owned account): such an account resolves
                 # acct_lib to the shared content_library/ parent, which holds every client

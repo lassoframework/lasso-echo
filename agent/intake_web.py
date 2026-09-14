@@ -92,7 +92,7 @@ PORTAL_POST_ACTIONS = ("approve", "edit", "deny", "kill", "swap-media",
                        # touching it; pick-variant promotes <id> (itself the
                        # candidate) to active. "variants" is a GET, not a POST
                        # action, and is routed separately below.
-                       "regen-variant", "pick-variant")
+                       "regen-variant", "regen-variant-brief", "pick-variant")
 
 
 def client_for_token(token):
@@ -2984,6 +2984,9 @@ def build_server(port=None):
                 elif ps_action == "regen-variant":
                     status, resp = _ps.handle_regen_variant(account_key, ps_post_id,
                                                             actor_id)
+                elif ps_action == "regen-variant-brief":
+                    status, resp = _ps.handle_regen_variant_from_brief(
+                        account_key, ps_post_id, actor_id, brief=body.get("brief", ""))
                 elif ps_action == "pick-variant":
                     status, resp = _ps.handle_pick_variant(account_key, ps_post_id,
                                                            actor_id)
