@@ -134,6 +134,38 @@ class StripeSocialReader:
                     return True
         return False
 
+    def echo_active(self, customer_id, products, base):
+        """Echo products only; explicitly scoped subscriptions cannot cross gyms."""
+        import stripe
+        from .intake_web import _supabase_token_gym
+        stripe.api_key = self._key
+        subs = stripe.Subscription.list(customer=customer_id, status="all", limit=100,
+                                        expand=["data.items.data.price"])
+        gym = None
+        looked_up = False
+        for sub in subs.auto_paging_iter():
+            if sub.get("status") not in ("active", "trialing", "past_due"):
+                continue
+            matches = False
+            for item in (sub.get("items") or {}).get("data", []):
+                product = (item.get("price") or {}).get("product")
+                product = product.get("id") if isinstance(product, dict) else product
+                matches = matches or product in products
+            if not matches:
+                continue
+            metadata = sub.get("metadata") or {}
+            sub_gym = metadata.get("gym_id") or metadata.get("gymId")
+            if sub_gym:
+                if not looked_up:
+                    gym = _supabase_token_gym(base)
+                    looked_up = True
+                if gym is None:
+                    raise RuntimeError("Echo subscription gym mapping unavailable")
+                if gym.get("echo_account_key") != base or gym.get("gym_id") != sub_gym:
+                    continue
+            return True
+        return False
+
 
 def _stripe_customer_id(account_key):
     """The gym's Stripe customer id from its gyms row, or None. Never provisions."""

@@ -10,6 +10,12 @@ Last updated: 2026-09-13
 
 ---
 
+## Echo cancellation publishing gate (2026-09-14)
+
+- [~] Revocation checked before cached billing and at calendar, Zernio, GBP post/photo send paths. Known revocation survives unavailable or malformed storage.
+- [~] Canonical Echo products replace any-subscription entitlement; explicit subscription gym metadata is scoped, unreadable mapping remains unknown. Old permissive cache is invalidated.
+- [~] Focused regression tests cover mixed subscriptions, cross-gym scope, mapping failure, revocation and direct send holds. Deployment and Dean live verification pending.
+
 ## LASSO content-led Astra upgrade (2026-09-14, in progress)
 
 - [~] LASSO-only AGENT_LASSO_INFOGRAPHIC_QUALITY flag (default OFF); content-led brief with creative freedom and required supporting copy/CTA.

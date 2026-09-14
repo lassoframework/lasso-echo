@@ -12,7 +12,7 @@ of cancellation and stays open on any doubt:
   - no stripe_customer_id on the gym       -> OPEN (unknown, never guessed)
   - Stripe key missing / read error        -> OPEN
   - customer HAS a subscription in (active, trialing, past_due) [for the social
-    product when configured, else any]     -> OPEN
+    Echo product allowlist, gym-scoped]    -> OPEN
   - customer exists and has NO such subscription -> CANCELED (publishing holds)
 
 Results are kv-cached (default 6h) so the ~1-min publish tick never hammers Stripe.
@@ -59,8 +59,8 @@ def _cached_state(base, now=None):
     """(state, fresh): the cached gate state and whether it is inside the TTL."""
     try:
         from . import db
-        state = db.kv_get(f"billgate_{base}") or ""
-        ts = float(db.kv_get(f"billgate_ts_{base}") or 0)
+        state = db.kv_get(f"billgate_v2_{base}") or ""
+        ts = float(db.kv_get(f"billgate_v2_ts_{base}") or 0)
         fresh = state in (_STATE_OK, _STATE_CANCELED) and \
             (_now_epoch(now) - ts) < _CACHE_TTL_SECONDS
         return state, fresh
@@ -71,8 +71,8 @@ def _cached_state(base, now=None):
 def _store_state(base, state, now=None):
     try:
         from . import db
-        db.kv_set(f"billgate_{base}", state)
-        db.kv_set(f"billgate_ts_{base}", str(_now_epoch(now)))
+        db.kv_set(f"billgate_v2_{base}", state)
+        db.kv_set(f"billgate_v2_ts_{base}", str(_now_epoch(now)))
     except Exception:  # noqa: BLE001
         pass
 
@@ -89,26 +89,51 @@ def _live_state(base, reader=None):
         reader = reader or StripeSocialReader()
         if not reader.available():
             return _STATE_OK
-        product_id = social_product_id()
-        if product_id:
-            active = bool(reader.social_active(customer_id, product_id))
+        products = {"prod_V1WmWwfIvFn3Rt", "prod_V91b0T0zLNJza8"}
+        if social_product_id():
+            products.add(social_product_id())
+        if hasattr(reader, "echo_active"):
+            active = reader.echo_active(customer_id, products, base)
         else:
-            active = _any_active_subscription(reader, customer_id)
+            active = any(reader.social_active(customer_id, product) for product in products)
         return _STATE_OK if active else _STATE_CANCELED
     except Exception:  # noqa: BLE001 - a flaky read never blocks a paying gym
         return _STATE_OK
 
 
-def _any_active_subscription(reader, customer_id):
-    """True when the customer has ANY subscription in an active-billing state (used
-    when no social product id is configured). Raises up to the caller's fail-open."""
-    import stripe
-    stripe.api_key = reader._key
-    subs = stripe.Subscription.list(customer=customer_id, status="all", limit=100)
-    for s in subs.auto_paging_iter():
-        if getattr(s, "status", None) in ("active", "trialing", "past_due"):
-            return True
-    return False
+def account_revoked(base):
+    """Fresh operator revocation wins over billing cache, with last-known deny on outage.
+
+    Only a successful fresh denylist read can clear an observed revocation.
+    This applies even when the optional Stripe gate is disabled.
+    """
+    from . import db, intake_web
+    base = str(base or "").strip().lower()
+    if not base:
+        return False
+    cache_key = f"publish_revoked_{base}"
+    try:
+        r2 = intake_web._default_r2()
+        if r2 is None:
+            raise RuntimeError("revocation storage unavailable")
+        import json
+        raw = r2.get_bytes(intake_web._DENYLIST_KEY)
+        data = json.loads(raw) if raw is not None else {"revoked": []}
+        if not isinstance(data, dict) or not isinstance(data.get("revoked"), list):
+            raise ValueError("invalid revocation document")
+        if any(not isinstance(key, str) for key in data["revoked"]):
+            raise ValueError("invalid revocation key")
+        revoked = base in {str(k).strip().lower() for k in data["revoked"]}
+    except Exception:
+        try:
+            return db.kv_get(cache_key) == "1"
+        except Exception:
+            return False
+    try:
+        db.kv_set(cache_key, "1" if revoked else "0")
+    except Exception:
+        pass  # persistence failure cannot override fresh positive revocation
+    return revoked
 
 
 def publishing_blocked(base, reader=None, now=None, alert=None):
@@ -116,9 +141,11 @@ def publishing_blocked(base, reader=None, now=None, alert=None):
 
     kv-cached; fires ONE deduped ops alert when a gym first flips to canceled, and
     clears the dedup when it re-activates so a re-cancellation alerts again."""
+    base = (base or "").strip()
+    if account_revoked(base):
+        return True
     if not gate_enabled():
         return False
-    base = (base or "").strip()
     if not base or base.startswith("lasso"):
         return False
     state, fresh = _cached_state(base, now)

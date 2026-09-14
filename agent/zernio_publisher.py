@@ -103,6 +103,11 @@ def publish(draft, account, client=None, scheduled_for=None,
         return PublishResult(ok=True, mode="would_publish",
                              detail="draft-only (publish or zernio-publish flag OFF)")
 
+    from .publish_billing_gate import publishing_blocked
+    from .portal_social import _base_of_account
+    if publishing_blocked(_base_of_account(account.key)):
+        raise ZernioPublishError("Echo publishing held: account revoked or subscription canceled")
+
     platform = _PLATFORM.get(getattr(account, "platform", ""), "")
     if not platform:
         raise ZernioPublishError(f"unsupported platform for {account.key}")

@@ -647,6 +647,11 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         return {"ok": False, "reason": "publish flag OFF (draft-only)",
                 "date": run_date}
 
+    from .publish_billing_gate import publishing_blocked
+    if publishing_blocked(gym_id):
+        return {"ok": False, "held": True, "billing_held": True, "date": run_date,
+                "reason": "Echo access revoked or subscription canceled", "published": []}
+
     # LASSO-VIA-ZERNIO CUTOVER HOLD (AGENT_LASSO_VIA_ZERNIO): when the flag is
     # armed but the 'lasso' gyms row lacks its Zernio profile id or selected FB
     # page, the WHOLE lasso lane HOLDS here — no row is read, claimed, or

@@ -60,6 +60,11 @@ def publish_gbp_row(row, connection, *, client, draft=True):
 
     draft=True (autonomous build + validation) sends isDraft — Zernio stores it and
     publishes NOTHING. The armed worker passes draft=False, human-tap gated upstream."""
+    from .publish_billing_gate import publishing_blocked
+    if not draft and publishing_blocked(row.get("gym_id")):
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": "Echo access revoked or subscription canceled",
+                "held": "echo_access", "mode": ""}
     caption = row.get("caption") or ""
     # INTERNAL EDIT-RATIONALE FINAL GATE (CrossFit ENG '[why]' leak, 2026-08-23): a
     # bracketed meta block after the real caption is stripped here so GBP can never
@@ -210,6 +215,11 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None):
     error -> failed + reason + alert. No caption gate (a gallery photo has no text). In
     the DRAFT build we do NOT call gmb-media (it would upload live); we simulate a
     published result so the dogfood shows the photo card without touching Google."""
+    from .publish_billing_gate import publishing_blocked
+    if not draft and publishing_blocked(row.get("gym_id")):
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": "Echo access revoked or subscription canceled",
+                "held": "echo_access", "mode": ""}
     if not (row.get("image_url") or "").strip():
         return {"ok": False, "status": "failed", "late_post_id": "",
                 "reject_reason": "photo drop has no image", "mode": ""}
@@ -317,7 +327,7 @@ def publish_one(row, connections, *, client, draft=True, alert=None, now=None):
     res = (publish_photo_drop(row, conn, client=client, draft=draft, alert=alert)
            if is_photo
            else publish_gbp_row(row, conn, client=client, draft=draft))
-    if not res["ok"] and alert and not is_photo:
+    if not res["ok"] and not res.get("held") and alert and not is_photo:
         alert(f"GBP send failed for {row.get('gym_id')} row {row.get('id')}: "
               f"{res['reject_reason']}")
     return {"status": res["status"], "late_post_id": res["late_post_id"],
