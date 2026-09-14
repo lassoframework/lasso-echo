@@ -1142,6 +1142,11 @@ def to_calendar_rows(drafts, account_key):
             fb = dict(row)
             fb["account"] = "facebook"
             rows.append(fb)
+    if account_key == 'lasso' and config.lasso_editorial_calendar_enabled():
+        from .calendar_autopublish import scheduled_iso_for_row
+        for row in rows:
+            row['scheduled_at'] = scheduled_iso_for_row(
+                row, tz_name=config.posting_timezone_for(account_key))
     return rows
 
 

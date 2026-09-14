@@ -168,3 +168,13 @@ def test_all_supplied_campaign_assets_have_dated_original_and_story(monkeypatch)
         assert e['feed_url'].startswith('https://') and e['story_url'].startswith('https://')
         assert e['feed_url']!=e['story_url']
         assert feeds[e['date'],e['slot_index']].category==e['category']
+
+
+def test_lasso_calendar_displays_both_real_publish_times(monkeypatch):
+    monkeypatch.setattr(config,'lasso_editorial_calendar_enabled',lambda:True)
+    monkeypatch.setattr(config,'cadence_2x_enabled',lambda:True)
+    monkeypatch.setattr(config,'posting_timezone_for',lambda _: 'America/New_York')
+    am=draft('book','2026-09-15');am.cadence_slot_index=0
+    pm=draft('echo','2026-09-15');pm.cadence_slot_index=1
+    rows=rmp.to_calendar_rows([am,pm],'lasso')
+    assert [r['scheduled_at'][11:16] for r in rows]==['07:30','07:30','18:30','18:30']
