@@ -1,3 +1,4 @@
+import pytest
 from agent import real_month_planner as rmp, config
 from agent.drafter import Draft, DraftStatus
 from agent.portal_calendar_store import preserve_and_prune
@@ -200,11 +201,12 @@ def test_summit_refresh_uses_four_distinct_approved_topics():
     assert all(topic.startswith('Summit:') for topic in topics)
 
 
-def test_misfiled_podcast_never_uses_another_episodes_notes():
+@pytest.mark.parametrize("title", ["GMMS-141-S4.mp4", "GMMS136-S1.mp4", "GMMS-EP139-S3.mp4"])
+def test_misfiled_podcast_never_uses_another_episodes_notes(title):
     from tests.podcast_fakes import FakeDrive, FakeStore, FakeZernio, make_asset
     from tests.test_pending import ACCT, _probe_ok
     from agent.podcast_library_builder import build_podcast_clip_draft
-    asset=make_asset();asset['title']='GMMS-141-S4.mp4';asset['episode']=92
+    asset=make_asset();asset['title']=title;asset['episode']=92
     result=build_podcast_clip_draft(ACCT,'2026-09-23',store=FakeStore([asset]),
         drive=FakeDrive(),zernio_client=FakeZernio(),probe_fn=_probe_ok,
         feed_map={92:{'title':'Wrong episode','description':'Unrelated notes'}},defer_use=True)

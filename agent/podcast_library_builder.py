@@ -140,7 +140,7 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
         tried.append(asset["id"])
         episode = asset.get("episode")
         # A clip filed under the wrong episode must not inherit unrelated notes.
-        named_episode = re.search(r"\bGMMS[-_ ]+(?:EP[-_ ]*)?(\d+)(?:[-_ .]|$)",
+        named_episode = re.search(r"\bGMMS[-_ ]*(?:EP[-_ ]*)?(\d+)(?:[-_ .]|$)",
                                   str(asset.get("title") or ""), re.I)
         if named_episode and str(int(named_episode.group(1))) != str(episode):
             print("[podcast-builder] clip filename and indexed episode disagree; skipping")
