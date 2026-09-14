@@ -494,3 +494,16 @@ def test_setup_reports_when_facebook_is_not_connected():
     assert out["ok"] is False and out["fb_page"] == "no_facebook"
     # the profile stamp still landed (it is independent of the page pick)
     assert db.gym_get("lasso")["zernio_profile_id"] == PROFILE_ID
+
+
+def test_lasso_explicit_shared_manual_overrides_legacy_local_on(armed, lasso_flag, monkeypatch):
+    _stamp_lasso_setup()
+    store = _FakeStore([_row("pending-manual")])
+    monkeypatch.setattr(store, "gym_autonomy", lambda base: False)
+    sent = []
+    out = cap.publish_client_gyms(RUN_DATE, store=store,
+                                  zernio_publish=_zern_capture(sent), now=LATE_NOW)
+    lasso = [s for s in out if s.get("gym") == "lasso"][0]
+    assert lasso["autonomous"] is False
+    assert sent == []
+    assert store.rows["pending-manual"]["status"] == "pending"

@@ -1774,22 +1774,27 @@ def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
                     continue
             except Exception:  # noqa: BLE001 - the gate itself must never block the lane
                 pass
-            # PER-GYM AUTONOMY (never portfolio-wide): the gym owner's own Autonomous
-            # toggle. TWO sources, either arms it for THIS gym only: the portal's
-            # Supabase echo_gym_settings row (the toggle in the client's calendar UI)
-            # or Echo's own kv flag (POST /portal/<token>/autonomy). Autonomous ON =>
-            # this gym's PENDING rows publish on their own at slot time (approved_only
-            # off); every other gym still requires the client's approval. Any read
-            # error defaults to NOT autonomous — approval required is the safe side.
+            # The shared plane is authoritative when configured. A stale local ON
+            # must never override the owner's newer Manual setting on another host.
             autonomous = False
             try:
-                from . import db as _db
-                autonomous = bool(_db.is_autonomous(base))
-                if not autonomous and store is not None:
-                    autonomous = bool(store.gym_autonomy(base))
-                elif not autonomous and store is None:
-                    from .portal_calendar_store import SupabaseCalendarStore
-                    autonomous = bool(SupabaseCalendarStore().gym_autonomy(base))
+                if config.portal_calendar_supabase_enabled() or store is not None:
+                    if store is None:
+                        from .portal_calendar_store import SupabaseCalendarStore
+                        autonomy_store = SupabaseCalendarStore()
+                    else:
+                        autonomy_store = store
+                    shared_mode = autonomy_store.gym_autonomy(base)
+                    autonomous = shared_mode is True
+                    if base == "lasso" and shared_mode is None:
+                        # The internal LASSO cutover predates shared settings and
+                        # its setup stamps local autonomy. An explicit shared OFF
+                        # still wins; client gyms never use this legacy fallback.
+                        from . import db as _db
+                        autonomous = bool(_db.is_autonomous(base))
+                else:
+                    from . import db as _db
+                    autonomous = bool(_db.is_autonomous(base))
             except Exception:
                 autonomous = False
             # SLOT-GATED (audit 2026-08-25 CRITICAL): catch_all=False — a client row
