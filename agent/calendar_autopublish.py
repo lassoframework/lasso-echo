@@ -908,8 +908,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         if _content_key:
             try:
                 _seen = _kv_default().get(_content_key, "")
-            except Exception:  # noqa: BLE001 - a kv fault must not double post
-                _seen = "unreadable"
+            except Exception as exc:  # an unreadable ledger is not proof of a duplicate
+                skipped.append(row_id)
+                print(f"[calendar-autopublish] content ledger unreadable for {row_id} "
+                      f"({type(exc).__name__}); refusing to publish; duplicate cleanup not attempted")
+                _release_content_ledger_claim(store, gym_id, row, "content_ledger_unreadable")
+                continue
             # Same ROW re-entering this path is the row-claim's business, not a content
             # duplicate: mark_publishing already owns exactly-once for one row. What this
             # guard exists to catch is a DIFFERENT row carrying the same words to the same
@@ -920,12 +924,15 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             if _seen:
                 _seen = str(_seen).split("|", 1)[-1]
                 skipped.append(row_id)
-                _mark_duplicate_content(store, gym_id, row_id, _seen)
+                _duplicate_marked = _mark_duplicate_content(store, gym_id, row_id, _seen)
                 _idx_alert = (
                     f"DUPLICATE CONTENT REFUSED: {gym_id} {account.platform} row "
                     f"{row_id} ({row.get('post_date')}) carries a caption already "
-                    f"published to this account on {_seen}. Not sent. The row is marked "
-                    f"so it cannot be retried. This is the guard added after the "
+                    f"claimed or published to this account on {_seen}. Not sent. "
+                    + ("The duplicate row is soft-deleted so it cannot be retried. "
+                       if _duplicate_marked else
+                       "Cleanup was not confirmed; the row requires reconciliation. ")
+                    + f"This is the guard added after the "
                     f"2026-09-05 Tough Temple double post.")
                 print(f"[calendar-autopublish] {_idx_alert}")
                 try:
@@ -942,6 +949,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 print(f"[calendar-autopublish] content stamp failed for {row_id} "
                       f"({type(e).__name__}); refusing to publish rather than risk a "
                       f"duplicate")
+                _release_content_ledger_claim(store, gym_id, row, "content_stamp_failed")
                 continue
 
         draft = _draft_for(row)
@@ -1235,6 +1243,29 @@ def _published_content_key(account, row):
         return ""
 
 
+def _release_content_ledger_claim(store, gym_id, row, reason):
+    """Retry after a PRE-NETWORK ledger fault without revoking a manual approval."""
+    row_id = row["id"]
+    previous = "approved" if row.get("status") == "approved" else "pending"
+    try:
+        fn = getattr(store, "release_content_ledger_claim", None)
+        updated = fn(gym_id, row_id, previous, reason) if fn else None
+        if (isinstance(updated, dict) and str(updated.get("id")) == str(row_id)
+                and str(updated.get("gym_id")) == str(gym_id)
+                and updated.get("status") == previous):
+            return True
+    except Exception:
+        pass
+    try:
+        from .ops_alerts import alert
+        alert(f"calendar row {row_id} (gym {gym_id}) remains claimed after "
+              f"a PRE-NETWORK ledger fault ({reason}); release was not confirmed. "
+              "No publish was attempted by this invocation. Reconciliation required.")
+    except Exception:
+        pass
+    return False
+
+
 def _mark_duplicate_content(store, gym_id, row_id, seen_at):
     """Take a refused duplicate OUT of the publish lane, reversibly.
 
@@ -1242,26 +1273,27 @@ def _mark_duplicate_content(store, gym_id, row_id, seen_at):
     it exactly like the row this build spent the morning un-sticking. 'deleted' is the
     schema's soft delete, is excluded from LIVE_CALENDAR_STATUSES and from the publisher's
     own approved_only filter, and is reversible with one UPDATE."""
-    reason = (f"duplicate content refused 2026-09-05: this caption was already published "
-              f"to this account on {seen_at}. REVERSIBLE: set status back to approved.")
-    for method, args in (("set_status", (gym_id, row_id, "deleted")),
-                         ("mark_publish_failed", (row_id,))):
-        try:
-            fn = getattr(store, method, None)
-            if fn is None:
-                continue
-            if method == "set_status":
-                fn(*args)
-            else:
-                fn(*args, revert_status="deleted")
-            break
-        except Exception:  # noqa: BLE001 - try the next shape
-            continue
+    # Portal set_status deliberately excludes publishing rows. Its empty result
+    # used to be mistaken for success here; the fallback also clamps deleted to
+    # pending. Neither method expresses this publisher-owned transition.
+    reason = f"duplicate content refused: previous content claim {seen_at}"
+    try:
+        fn = getattr(store, "mark_duplicate_content", None)
+        updated = fn(gym_id, row_id, reason) if fn else None
+        if not (isinstance(updated, dict) and str(updated.get("id")) == str(row_id)
+                and str(updated.get("gym_id")) == str(gym_id)
+                and updated.get("status") == "deleted"):
+            print(f"[calendar-autopublish] duplicate cleanup not confirmed for {row_id}")
+            return False
+    except Exception as exc:  # cleanup failure never falls through to publish
+        print(f"[calendar-autopublish] duplicate cleanup failed for {row_id}: {type(exc).__name__}")
+        return False
     try:
         from . import db as _db
         _db.audit("duplicate_content_refused", gym_id, reason, gym_id)
     except Exception:  # noqa: BLE001
         pass
+    return True
 
 
 def _slot_fire_key(run_date, slot_time):
