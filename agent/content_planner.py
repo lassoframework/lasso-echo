@@ -235,7 +235,7 @@ def pick_cta(doc, seed):
     return pool[int(hashlib.sha1(str(seed).encode()).hexdigest(), 16) % len(pool)]
 
 
-def plan_for(day_key, path=None):
+def plan_for(day_key, path=None, *, pillar=None):
     """
     Plan one day's post from the source doc. Returns
       {pillar, caption, cta, hashtags, fragments}  on success, or
@@ -248,7 +248,8 @@ def plan_for(day_key, path=None):
     if doc is None:
         return {"blocked": True, "reason": "Source doc missing or empty. Not drafting."}
 
-    pillar = pick_pillar(doc, day_key)
+    explicit_pillar = pillar is not None
+    pillar = pillar if explicit_pillar else pick_pillar(doc, day_key)
     if pillar is None:
         return {"blocked": True, "reason": "No pillar has approved copy in the source doc."}
 
@@ -268,7 +269,7 @@ def plan_for(day_key, path=None):
     # doctrine angle that fails citation verification is DROPPED with its
     # reason; the lasso_now hook then ships exactly as before.
     from . import doctrine
-    angle = doctrine.angle_for_pillar(pillar, day_key)
+    angle = None if explicit_pillar else doctrine.angle_for_pillar(pillar, day_key)
     if angle is not None:
         if doctrine.verify_citation(angle["copy"], angle["anchor"]):
             hook_line = angle["copy"]

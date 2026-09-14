@@ -34,6 +34,7 @@ the same flag). Every draft is PENDING, held for the tap.
 """
 
 from . import config, real_month_planner as _rmp
+from datetime import datetime, timezone
 
 
 def real_builders_map(account):
@@ -54,6 +55,8 @@ def real_builders_map(account):
     if isinstance(account, str):
         acct = _accts.get_account(account)
 
+    reserved_podcast_ids = set()
+
     def _podcast(_target, day_key):
         # PODCAST LIBRARY (PODCAST_LIBRARY_STAGE, default OFF): when armed, a
         # podcast slot FIRST tries the real Drive clip lane — pick_clip ->
@@ -65,13 +68,44 @@ def real_builders_map(account):
         if config.podcast_library_stage_enabled():
             try:
                 from . import podcast_library_builder as _plib
-                draft = _plib.build_podcast_clip_draft(acct, day_key)
+                draft = _plib.build_podcast_clip_draft(
+                    acct, day_key, exclude_ids=tuple(reserved_podcast_ids),
+                    defer_use=True,
+                    now=datetime.fromisoformat(day_key).replace(tzinfo=timezone.utc))
                 if draft is not None:
+                    _reserve_podcast(draft)
                     return draft
             except Exception as e:  # noqa: BLE001 - the lane never sinks the slot
                 print(f"[podcast-library] builder failed: {type(e).__name__}: {e}; "
                       "falling through to the existing podcast builder")
         return podcast_month.build_month_podcast_draft(acct, day_key)
+
+    def _reserve_podcast(draft):
+        asset = getattr(draft, "podcast_asset", {})
+        if asset:
+            from .podcast_index import default_store
+            reserved_podcast_ids.update(
+                a["id"] for a in default_store().list_assets()
+                if a.get("episode") == asset.get("episode"))
+
+    _podcast.reserve = _reserve_podcast
+
+    def _editorial(category, day_key):
+        from . import content_planner
+        from .lasso_editorial import source_pillar
+        from pathlib import Path
+        source_path = (Path(__file__).resolve().parent.parent / "brand_voice" / "lasso_editorial.md"
+                       if category in ("echo", "website", "summit") else None)
+        doc = content_planner.load_source_doc(source_path)
+        if doc is None:
+            return None
+        pillar = source_pillar(category, day_key, doc)
+        if not pillar:
+            return None
+        draft = daily_studio.build_daily_infographic_draft(acct, day_key, pillar=pillar, source_path=source_path)
+        if draft is not None:
+            draft.category = category
+        return draft
 
     def _platform(_target, day_key):
         return daily_studio.build_daily_infographic_draft(acct, day_key)
@@ -96,13 +130,22 @@ def real_builders_map(account):
         return rotation.build_rotated_draft(acct, day_key, _voice_for(acct), acct_lib)
 
     def _doctrine(_target, day_key):
+        if config.lasso_editorial_calendar_enabled():
+            return _editorial("doctrine", day_key)
         return daily_studio.build_daily_infographic_draft(acct, day_key)
 
     def _summit(_target, day_key):
+        from .lasso_editorial import refresh_dates
+        if (config.lasso_editorial_calendar_enabled() and acct.key in ('lasso_ig','lasso_fb')
+                and day_key in refresh_dates()):
+            return _editorial('summit',day_key)
         return summit.build_summit_draft(acct, day_key, voice=_voice_for(acct))
 
     def _book(_target, day_key):
-        return book_queue.build_book_queue_draft(acct, day_key)
+        draft = book_queue.build_book_queue_draft(acct, day_key)
+        if draft is None and config.lasso_editorial_calendar_enabled():
+            return _editorial("book", day_key)
+        return draft
 
     def _welcome(_target, day_key):
         return welcome_queue.build_welcome_queue_draft(acct, day_key)
@@ -117,6 +160,8 @@ def real_builders_map(account):
         return testimonial_pillar.build_testimonial_draft(acct, day_key)
 
     return {
+        "echo": lambda target, day: _editorial("echo", day) if config.lasso_editorial_calendar_enabled() else None,
+        "website": lambda target, day: _editorial("website", day) if config.lasso_editorial_calendar_enabled() else None,
         "podcast": _podcast,
         "platform": _platform,
         "b2b": _b2b,
@@ -160,6 +205,25 @@ def _real_story_builder(account):
         acct = _accts.get_account(account)
 
     def _story(_target, day_key, feed_draft):
+        if (config.stories_enabled() and config.lasso_editorial_calendar_enabled() and acct.key in ('lasso_ig','lasso_fb')
+                and getattr(feed_draft,'podcast_asset',None)):
+            asset=feed_draft.podcast_asset
+            width,height=asset.get('width',0),asset.get('height',0)
+            if height and abs(width/height - 9/16)<0.01 and 0<asset.get('duration_sec',0)<=60:
+                # An already vertical short video is itself a genuine Story asset.
+                # No crop, invented overlay, or new source is needed.
+                from copy import deepcopy
+                story=deepcopy(feed_draft)
+                story.draft_id += '_story'
+                story.is_story=True
+                story.draft_type='story'
+                story.caption=''
+                return story
+            claims=[s[6:] for s in feed_draft.source_fragments if s.startswith('claim:')]
+            if claims:
+                feed_draft.infographic_copy={
+                    'headline':'From Gym Marketing Made Simple',
+                    'facts':claims[:3], 'cta':'Listen to Gym Marketing Made Simple'}
         return stories.build_story_draft(acct, day_key, feed_draft=feed_draft)
 
     return _story
@@ -215,6 +279,10 @@ def sprint_builders(account, manifest=None, posts_per_day=None):
     slot_map = _sprint_slot_map(posts_per_day=posts_per_day)
 
     def _feed(_target, day_key, slot_index):
+        from .lasso_editorial import refresh_dates
+        if (config.lasso_editorial_calendar_enabled() and acct.key in ('lasso_ig','lasso_fb')
+                and day_key in refresh_dates()):
+            return real_builders_map(acct)['summit'](_target,day_key)
         info = slot_map.get((day_key, slot_index))
         if not info:
             return None
@@ -231,6 +299,10 @@ def sprint_builders(account, manifest=None, posts_per_day=None):
             slides=[], slide_urls=[])
 
     def _story(_target, day_key, slot_index, feed_draft):
+        from .lasso_editorial import refresh_dates
+        if (config.lasso_editorial_calendar_enabled() and acct.key in ('lasso_ig','lasso_fb')
+                and day_key in refresh_dates()):
+            return _real_story_builder(acct)(_target,day_key,feed_draft)
         info = slot_map.get((day_key, slot_index))
         if not info:
             return None
@@ -305,7 +377,11 @@ def plan_and_build(account_key, start_date, days=30, *, book_dates=None,
     story_builder = _real_story_builder(acct if acct is not None else account_key)
     sprint_feed, sprint_story = sprint_builders(
         acct if acct is not None else account_key, manifest=sprint_manifest)
+    from .lasso_campaign_assets import wrap_builders
+    builders, story_builder, sprint_feed, sprint_story = wrap_builders(
+        acct if acct is not None else account_key, builders, story_builder,
+        sprint_feed, sprint_story)
     return _rmp.build_month_drafts(plan, builders, story_builder=story_builder,
-                                   account=None, logger=logger,
+                                   account=_base, logger=logger,
                                    sprint_builder=sprint_feed,
                                    sprint_story_builder=sprint_story)

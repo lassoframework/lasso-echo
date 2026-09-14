@@ -18,14 +18,14 @@ from .drafter import Draft, DraftStatus, _make_id, variant_hashtags
 
 
 def build_daily_infographic_draft(account, day_key, *, nano_client=None,
-                                  s3_client=None, source_path=None):
+                                  s3_client=None, source_path=None, pillar=None):
     # All three capabilities must be armed; otherwise dormant (caller falls back).
     if not (config.content_brain_enabled()
             and config.creative_studio_enabled()
             and config.hosting_enabled()):
         return None
 
-    draft_id = _make_id(account.key, "daily_infographic", day_key)
+    draft_id = _make_id(account.key, "daily_infographic" + (":" + pillar if pillar else ""), day_key)
 
     def _blocked(reason):
         # A blocked plan surfaces on the Slack card AND (flag ON) as an ops alert.
@@ -42,7 +42,8 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
     if doc is None:
         return _blocked("source doc missing or empty. Not drafting.")
 
-    plan = content_planner.plan_for(day_key, path=source_path)
+    plan = (content_planner.plan_for(day_key, path=source_path, pillar=pillar)
+            if pillar else content_planner.plan_for(day_key, path=source_path))
     if plan.get("blocked"):
         return _blocked(plan["reason"])
 

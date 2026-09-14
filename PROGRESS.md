@@ -1,3 +1,12 @@
+## LASSO calendar podcast and cadence repair (2026-09-14)
+
+- [~] Preserve morning/evening ordinals through fallback; pair each Story with its own feed; reject repeated captions within a day before staging.
+- [~] LASSO editorial calendar behind `AGENT_LASSO_EDITORIAL_CALENDAR` (default OFF): book, Summit, podcast, Echo, websites and teaching. Dated Summit campaigns remain authoritative. Echo/websites copy is compiled from the read only LASSO Brain into `brand_voice/lasso_editorial.md`.
+- [~] LASSO rebuilds preserve approved posts while admitting a distinct free second slot within the saved cadence. Legacy sprint rows receive free ordinals; lowering cadence does not add posts.
+- [~] Podcast month builds reserve clips without consuming usage until calendar insertion succeeds. Selection uses the scheduled day, respects existing cooldowns, and includes real poster frames. Paragraph notes can supply verbatim sentence claims.
+- [ ] Deploy, arm the editorial flag, rebuild the next 30 days, and verify persisted distinct daily feed slots and real video URLs.
+- [ ] Separate conference name/source remains requested; no separate conference dates invented.
+
 ## Slack ticket ownership repair (2026-09-14)
 
 - [~] Existing ticket replies are consumed only by their stamped bot identity, including resolved threads and DM lookup. Concurrent thread creation rechecks the winner before consuming inbound event identity. Legacy missing ownership remains unchanged. Sixteen focused regression checks pass; deployment pending.

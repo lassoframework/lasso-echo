@@ -2494,6 +2494,48 @@ def preserve_and_prune(store, account_key, months, rows):
     Returns (kept_rows, locked_slot_count). Safe when the store lacks locked_slots (a test
     fake): then nothing is locked and every row is kept. Never raises out (a read failure
     falls back to keeping all rows, matching the old behavior)."""
+    if (account_key == "lasso" and config.lasso_editorial_calendar_enabled()
+            and callable(getattr(store, "list_month", None))):
+        from .cadence import resolve_posts_per_day
+        capacity = resolve_posts_per_day(account_key, store)
+        existing = []
+        # A failed preservation read must never risk an approved post.
+        for month in months:
+            existing.extend(store.list_month(account_key, month) or [])
+        from collections import defaultdict
+        occupied = defaultdict(set)
+        active_count = defaultdict(int)
+        prior = defaultdict(list)
+        for row in existing:
+            status = str(row.get("status") or "").lower()
+            if not status or status in _WIPEABLE_STATUSES:
+                continue
+            key = _slot_key(row)
+            prior[key].append(row)
+            if status in ("denied", "killed"):
+                continue
+            active_count[key] += 1
+            ordinal = row.get("slot_index")
+            if ordinal not in (0, 1):
+                ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
+            occupied[key].add(ordinal)
+        kept = []
+        for row in rows or []:
+            key = _slot_key(row)
+            ordinal = row.get("slot_index")
+            if ordinal is None:
+                ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
+                row = dict(row, slot_index=ordinal)
+            if active_count[key] >= capacity or ordinal in occupied[key]:
+                continue
+            if any((row.get("caption") and row.get("caption") == old.get("caption"))
+                   or (row.get("image_url") and row.get("image_url") == old.get("image_url"))
+                   for old in prior[key]):
+                continue
+            kept.append(row)
+            occupied[key].add(ordinal)
+            active_count[key] += 1
+        return kept, len(prior)
     getter = getattr(store, "locked_slots", None)
     if getter is None:
         return list(rows or []), 0
