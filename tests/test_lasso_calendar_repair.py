@@ -130,6 +130,7 @@ def test_editorial_sprint_and_varied_feed_have_distinct_cadence(monkeypatch):
 def test_user_campaign_original_pairs_to_own_story_and_is_lasso_only(monkeypatch):
     from agent.lasso_campaign_assets import wrap_builders
     monkeypatch.setattr(config,'lasso_editorial_calendar_enabled',lambda:True)
+    monkeypatch.setattr(config,'stories_enabled',lambda:True)
     entry=dict(id='01',date='2026-09-15',slot_index=0,category='summit',
                is_sprint=True,caption='Approved summit caption',
                feed_url='https://cdn/original.png',story_url='https://cdn/portrait.png')
@@ -153,3 +154,17 @@ def test_rebuild_requires_post_preservation_coverage():
     with pytest.raises(SystemExit,match='incomplete'):
         require_reconciled_coverage(rows,date(2026,9,15),1)
     require_reconciled_coverage(rows+rows,date(2026,9,15),1)
+
+
+def test_all_supplied_campaign_assets_have_dated_original_and_story(monkeypatch):
+    import json
+    from agent.lasso_campaign_assets import MANIFEST
+    monkeypatch.setattr(config,'lasso_editorial_calendar_enabled',lambda:True)
+    entries=json.loads(MANIFEST.read_text())['assets']
+    assert len(entries)==13 and len({e['source_sha256'] for e in entries})==13
+    plan=rmp.plan_month('lasso_ig','2026-09-15',30,posts_per_day=2)
+    feeds={(s.post_date,s.cadence_slot):s for s in plan if s.fmt=='feed'}
+    for e in entries:
+        assert e['feed_url'].startswith('https://') and e['story_url'].startswith('https://')
+        assert e['feed_url']!=e['story_url']
+        assert feeds[e['date'],e['slot_index']].category==e['category']

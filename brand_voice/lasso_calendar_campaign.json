@@ -1,0 +1,147 @@
+{
+  "assets": [
+    {
+      "id": "01",
+      "date": "2026-09-16",
+      "slot_index": 1,
+      "is_sprint": false,
+      "category": "book",
+      "caption": "Your ads can work beyond the click. Someone may see your ad, then search for your gym, ask a friend or visit your website. Look at direct leads, branded searches, website visits and total signups together. Explore The Full Gym: https://lassoframework.com/fullgym",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/970800ce8be04ed0/01-halo-effect-book.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/280f69a9e1a71ef7/01-halo-effect-book-story-safe.png",
+      "source_sha256": "e418abaa20c36055b924ed9bca961e21c6702eaa697e5957a6de69aec1aff41c"
+    },
+    {
+      "id": "02",
+      "date": "2026-09-19",
+      "slot_index": 0,
+      "is_sprint": false,
+      "category": "book",
+      "caption": "Three levers work together: retention, conversion and lead flow. Keep the members you serve, help interested people become members and bring the right people into your gym. Fix retention and sales before scaling your ads. Explore The Full Gym: https://lassoframework.com/fullgym",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/a7062dd257594999/02-three-levers-book.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/1edc960f5f54069b/02-three-levers-book-story-safe.png",
+      "source_sha256": "13911222f912774baff57a8b8718bb3040de3b93e0f2bba2528417c04843bebe"
+    },
+    {
+      "id": "03",
+      "date": "2026-09-23",
+      "slot_index": 0,
+      "is_sprint": false,
+      "category": "book",
+      "caption": "The ad is only the start. Respond while interest is fresh. Connect the conversation to their goal. Agree on a consultation time, then confirm and keep following up. What happens next gives the lead its value. Explore The Full Gym: https://lassoframework.com/fullgym",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/b486f9411167c6fa/03-lead-followup-book.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/fc2a4320c114225d/03-lead-followup-book-story-safe.png",
+      "source_sha256": "40485af73a90955fb756458fb231b18c18daf47307036015657d01f435b47298"
+    },
+    {
+      "id": "04",
+      "date": "2026-09-26",
+      "slot_index": 1,
+      "is_sprint": false,
+      "category": "book",
+      "caption": "Make your member the hero. Speak to one clear type of member, use their words to describe the problem and show how life can improve. Then make the next step a simple conversation. Explore The Full Gym: https://lassoframework.com/fullgym",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/b9ea04882b0fd500/04-member-hero-book.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/698e390dbe49a49b/04-member-hero-book-story-safe.png",
+      "source_sha256": "f7ab80da6eac8632355ff5799619016333ceb5160bc0ccf9009bb6c7d917e837"
+    },
+    {
+      "id": "05",
+      "date": "2026-09-30",
+      "slot_index": 1,
+      "is_sprint": false,
+      "category": "book",
+      "caption": "Better consultations begin with better questions. What do you want to change? What has held you back? What support do you need? What happens next? Listen first, connect your recommendation to their needs and give them room to decide. Explore The Full Gym: https://lassoframework.com/fullgym",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/b1789ff36b3fe773/05-sales-consultations-book.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/e0a1bc082a5d053d/05-sales-consultations-book-story-safe.png",
+      "source_sha256": "f5b0bdc5023393747dbc7991ba9c749057743b52a3f8e67d6704276015ab64a9"
+    },
+    {
+      "id": "06",
+      "date": "2026-09-15",
+      "slot_index": 0,
+      "is_sprint": true,
+      "category": "summit",
+      "caption": "Build your 2027 plan at the LASSO Growth Summit. Two days, 100 seats and one Growth Playbook. November 7 and 8, 2026, at Virgin Hotels Nashville. Reserve your seat: https://lassoframework.com/summit",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/47dac6a6d2f4c572/06-summit-2027-plan.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/affccfab2cb4b051/06-summit-2027-plan-story-safe.png",
+      "source_sha256": "cf255f887d2021d8750a772ee216415dda83af5a4fd4bbc890c271aabe96c408"
+    },
+    {
+      "id": "07",
+      "date": "2026-09-25",
+      "slot_index": 0,
+      "is_sprint": true,
+      "category": "summit",
+      "caption": "Your seat. Your next chapter. Growth Summit general admission is $499 and includes two full days of sessions and panels, speaker decks and resources, networking and Day 1 happy hour, plus your 2027 Growth Playbook. November 7 and 8, 2026, at Virgin Hotels Nashville. Claim your seat: https://lassoframework.com/summit",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/1bd9c8d62a4deb18/07-summit-admission.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/99c2a22e0d6697e6/07-summit-admission-story-safe.png",
+      "source_sha256": "b6aa05108c9ed6ef6ec1619a1cd5bb1729047b36e092d83bbb74a90192f6c42e"
+    },
+    {
+      "id": "08",
+      "date": "2026-10-03",
+      "slot_index": 0,
+      "is_sprint": true,
+      "category": "summit",
+      "caption": "Two days. A clearer growth plan. Day 1 covers paid advertising, growth math, industry insights and a live funnel review. Day 2 covers leadership, hiring, member value and the future of gym growth. Join the LASSO Growth Summit in Nashville on November 7 and 8, 2026: https://lassoframework.com/summit",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/dec1981e33d12e18/08-summit-agenda.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/48d5add7190bfd84/08-summit-agenda-story-safe.png",
+      "source_sha256": "66abd391f220845a314d4f769733ecc4ece894cffca29ee67600f11318516a91"
+    },
+    {
+      "id": "09",
+      "date": "2026-10-05",
+      "slot_index": 0,
+      "is_sprint": false,
+      "category": "book",
+      "caption": "Can the right member see themselves in your message? Start with who you help. Name the problem in their words. Show the result they want and make it easy to book a conversation. Explore The Full Gym: https://lassoframework.com/book",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/6fbe150e62ebc5da/09-member-hero-navy.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/3a648af1bf20ea2b/09-member-hero-navy-story-safe.png",
+      "source_sha256": "2cccf0ad737ce68ae4c80642805606c20b11872df137a45ac990e15705e62bee"
+    },
+    {
+      "id": "10",
+      "date": "2026-10-07",
+      "slot_index": 0,
+      "is_sprint": false,
+      "category": "book",
+      "caption": "A lead needs a clear next step. Keep the conversation moving, make your response personal and guide them toward a consultation time. Follow through with confirmation, reminders and continued conversation. Explore The Full Gym: https://lassoframework.com/book",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/989c97734c8ed18f/10-lead-followup-navy.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/d24b0a274779195d/10-lead-followup-navy-story-safe.png",
+      "source_sha256": "ce8911b9de5e44fe4a4290eccf4cd93d235ceea907628ec8333850e1bed40496"
+    },
+    {
+      "id": "11",
+      "date": "2026-10-12",
+      "slot_index": 1,
+      "is_sprint": false,
+      "category": "book",
+      "caption": "Before you scale your ads, look at the rest of the system. Retention keeps the members you already serve. Conversion helps interested people commit. Lead flow brings more of the right people in. Explore The Full Gym: https://lassoframework.com/book",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/b09232a61500091a/11-three-levers-navy.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/798638189dee2ba7/11-three-levers-navy-story-safe.png",
+      "source_sha256": "e7c4f89f05dc988a8d252b3e08c4cb010025114a8cea27e27cf1510ac6ece206"
+    },
+    {
+      "id": "12",
+      "date": "2026-10-14",
+      "slot_index": 1,
+      "is_sprint": false,
+      "category": "book",
+      "caption": "Look at the whole picture. A person who sees your ad may later search for your gym, visit your website or ask a friend. Evaluate trends across channels alongside direct leads and total signups. Explore The Full Gym: https://lassoframework.com/book",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/b2cd4fcf62e079ac/12-halo-effect-navy.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/3445b89f10f45bc1/12-halo-effect-navy-story-safe.png",
+      "source_sha256": "16e98c5a5c522315168ddf2a0e28ef517cf8dba3b98c32bea55b3f3b6dd50e39"
+    },
+    {
+      "id": "13",
+      "date": "2026-10-11",
+      "slot_index": 0,
+      "is_sprint": true,
+      "category": "summit",
+      "caption": "Your 2027 Growth Playbook starts with a target. Find what is holding growth back, choose your plays across offers, sales, retention and team, then map the next 90 days. LASSO Growth Summit. November 7 and 8, 2026. Nashville. Build your plan: https://lassoframework.com/summit",
+      "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/5dea1901d2d54e3a/13-summit-playbook.png",
+      "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/8003488b6eaffe44/13-summit-playbook-story-safe.png",
+      "source_sha256": "06f11ba56fe06b2d3cd59d971aa7f1b32447f5e1eeb1f27e7f4b7e6f730160d1"
+    }
+  ]
+}

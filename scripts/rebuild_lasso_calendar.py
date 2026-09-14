@@ -6,6 +6,7 @@ messages. The existing approval and scheduled publisher rules govern saved rows.
 """
 import argparse
 import calendar
+import hashlib
 from collections import Counter
 import dataclasses
 from datetime import date, timedelta
@@ -172,11 +173,28 @@ def main():
                 return result
             out[category]=cached
         return out
+    original_story=real_month_run._real_story_builder
+    def cached_story_factory(account):
+        build=original_story(account)
+        def cached_story(target,day,feed):
+            key=hashlib.sha256((day+feed.creative_public_url+feed.caption).encode()).hexdigest()
+            cache=data.setdefault('story_cache',{})
+            if key in cache:
+                return decode(cache[key])
+            result=build(target,day,feed)
+            if result is not None and result.status==DraftStatus.PENDING:
+                cache[key]=encode(result)
+                save(path,data)
+                print('saved story',day,flush=True)
+            return result
+        return cached_story
+    real_month_run._real_story_builder=cached_story_factory
     real_month_run.real_builders_map=cached_builders
     try:
         drafts=real_month_run.plan_and_build('lasso_ig',args.start,args.days)
     finally:
         real_month_run.real_builders_map=original
+        real_month_run._real_story_builder=original_story
     data['drafts']=[encode(d) for d in drafts]
     save(path,data)
     print('built',len(drafts),'drafts; review checkpoint before --apply',flush=True)

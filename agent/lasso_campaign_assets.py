@@ -52,12 +52,16 @@ def wrap_builders(account, builders, story, sprint_feed, sprint_story, manifest=
             return make(candidates[0],day) if candidates else original(target,day)
         result[category]=feed
     def paired(target, day, draft):
+        if not config.stories_enabled():
+            return None
         entry=by_id.get(getattr(draft,'campaign_asset_id',''))
         return make(entry,day,True) if entry else story(target,day,draft)
     def sprint(target,day,index):
         entry=by_slot.get((day,index))
         return make(entry,day) if entry and entry.get('is_sprint') else sprint_feed(target,day,index)
     def sprint_pair(target,day,index,draft):
+        if not config.stories_enabled():
+            return None
         entry=by_id.get(getattr(draft,'campaign_asset_id',''))
         return make(entry,day,True) if entry else sprint_story(target,day,index,draft)
     return result, paired, sprint, sprint_pair
