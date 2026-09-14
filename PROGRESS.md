@@ -1,3 +1,7 @@
+## Slack ticket ownership repair (2026-09-14)
+
+- [~] Existing ticket replies are consumed only by their stamped bot identity, including resolved threads and DM lookup. Concurrent thread creation rechecks the winner before consuming inbound event identity. Legacy missing ownership remains unchanged. Sixteen focused regression checks pass; deployment pending.
+
 # Echo Build Tracker
 
 Living tracker for the Echo social agent build. This markdown is the source of

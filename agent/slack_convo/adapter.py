@@ -1107,6 +1107,10 @@ def handle_event(event, event_id, deps):
         if existing:
             thread_root = existing["slack_thread_ts"]
     if existing is not None:
+        # Only the owning bot may consume a shared Slack thread event. Missing
+        # legacy ownership keeps its existing behavior; never silently reassign it.
+        if existing.get("bot_identity") and existing["bot_identity"] != ident.name:
+            return _ignore("other_ticket_identity", surface, who.kind)
         # RT-M3: only the ticket's own author or LASSO staff may attach to an existing ticket.
         owner = str(existing.get("slack_user_id") or "")
         if user != owner and not _is_staffish(who):
@@ -1202,6 +1206,9 @@ def handle_event(event, event_id, deps):
             request_type=request_type)
     else:
         ticket, created = existing, False
+    # A concurrent identity may have won the unique thread insert after our lookup.
+    if ticket.get("bot_identity") and ticket["bot_identity"] != ident.name:
+        return _ignore("other_ticket_identity", surface, who.kind)
     tid = ticket["id"]
 
     # 8) THE INBOUND ROW FIRST. Duplicate event id -> we already did all of this; stop.
