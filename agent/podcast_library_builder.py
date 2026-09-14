@@ -24,6 +24,7 @@ NO fabrication: the caption is the notes Doc's own text or the slot dies.
 from __future__ import annotations
 
 import tempfile
+import re
 from pathlib import Path
 
 from . import config, podcast_caption as _cap, podcast_index as _idx
@@ -138,6 +139,12 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
             return None  # pool empty: pick_clip already fired the one deduped alert
         tried.append(asset["id"])
         episode = asset.get("episode")
+        # A clip filed under the wrong episode must not inherit unrelated notes.
+        named_episode = re.search(r"\bGMMS[-_ ]+(?:EP[-_ ]*)?(\d+)(?:[-_ .]|$)",
+                                  str(asset.get("title") or ""), re.I)
+        if named_episode and str(int(named_episode.group(1))) != str(episode):
+            print("[podcast-builder] clip filename and indexed episode disagree; skipping")
+            continue
 
         # Assemble grounding: RSS feed entry (primary) + Drive show-notes Doc
         # (supplement/fallback). Either source alone can ground the caption.
@@ -214,8 +221,13 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
                       f"({reject}); trying the next clip")
                 continue
 
-            public_url = _upload_clip(zernio_client, tmp_path, asset.get("title") or
-                                      f"gmms_{episode}_clip.mp4")
+            if config.lasso_editorial_calendar_enabled() and gym_base == 'lasso':
+                # Calendar videos need the same durable media storage as graphics.
+                from .media_host import host_media
+                public_url = host_media(tmp_path, gym_base)
+            else:
+                public_url = _upload_clip(zernio_client, tmp_path, asset.get("title") or
+                                          f"gmms_{episode}_clip.mp4")
             if not public_url:
                 return None  # vendor-side failure: not a clip problem, stop the slot
             from .gym_media_builder import video_poster_url

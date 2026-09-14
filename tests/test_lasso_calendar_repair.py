@@ -198,3 +198,29 @@ def test_summit_refresh_uses_four_distinct_approved_topics():
     topics=[source_pillar('summit',day,doc) for day in refresh_dates()]
     assert len(topics)==len(set(topics))==4
     assert all(topic.startswith('Summit:') for topic in topics)
+
+
+def test_misfiled_podcast_never_uses_another_episodes_notes():
+    from tests.podcast_fakes import FakeDrive, FakeStore, FakeZernio, make_asset
+    from tests.test_pending import ACCT, _probe_ok
+    from agent.podcast_library_builder import build_podcast_clip_draft
+    asset=make_asset();asset['title']='GMMS-141-S4.mp4';asset['episode']=92
+    result=build_podcast_clip_draft(ACCT,'2026-09-23',store=FakeStore([asset]),
+        drive=FakeDrive(),zernio_client=FakeZernio(),probe_fn=_probe_ok,
+        feed_map={92:{'title':'Wrong episode','description':'Unrelated notes'}},defer_use=True)
+    assert result is None
+
+
+def test_lasso_calendar_podcast_uses_durable_host(monkeypatch):
+    from tests.podcast_fakes import FakeDrive, FakeStore, FakeZernio, NOTES_DOC_TEXT, make_asset
+    from tests.test_pending import ACCT, _probe_ok
+    from agent import media_host,podcast_library_builder as builder
+    monkeypatch.setattr(config,'lasso_editorial_calendar_enabled',lambda:True)
+    calls=[]
+    monkeypatch.setattr(media_host,'host_media',lambda path,gym: calls.append(gym) or 'https://cdn.example/clip.mp4')
+    monkeypatch.setattr(builder,'_upload_clip',lambda *a,**k: (_ for _ in ()).throw(AssertionError('temporary uploader called')))
+    result=builder.build_podcast_clip_draft(ACCT,'2026-09-20',store=FakeStore([make_asset()]),
+        drive=FakeDrive(docs={'doc140':NOTES_DOC_TEXT}),zernio_client=FakeZernio(),
+        probe_fn=_probe_ok,feed_map={},defer_use=True)
+    assert result.creative_public_url=='https://cdn.example/clip.mp4'
+    assert 'lasso' in calls
