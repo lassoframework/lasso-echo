@@ -98,6 +98,16 @@ class ImageResult:
     revised_prompt: str = ""
     latency_ms: int = 0
     prompt_used: str = ""
+    # Resolved request settings actually sent (Blake, 2026-09-13, RECORD KEEPING).
+    # "" / [] means the field was not sent (provider default applied) — these are
+    # what generation_log persists so a past run's real settings are queryable,
+    # never reconstructed after the fact.
+    quality_used: str = ""
+    reasoning_effort_used: str = ""
+    input_fidelity_used: str = ""
+    reference_ids_used: list = field(default_factory=list)
+    brief_model: str = ""
+    response_id: str = ""
 
     def ok(self) -> bool:
         return bool(self.image_bytes) or bool(self.image_url)
@@ -367,14 +377,60 @@ class AstraImageEngine(ImageEngine):
         opts = dict(opts or {})
         brief = self.prompt_for(prompt, opts)
         image_model = select_astra_model(opts)
-        brief_model = astra_brief_model()
+        brief_model = "gpt-6-astra" if opts.get("require_astra") else astra_brief_model()
         target_size = size_for(opts)
         # The tool only accepts dimensions divisible by 16; send the snapped
         # size and scale the result back to the caller's target below.
         size = snap_size(target_size)
 
         tool = {"type": "image_generation", "model": image_model, "size": size}
-        payload = {"model": brief_model, "input": brief, "tools": [tool]}
+        quality_used = config.astra_image_quality()
+        if quality_used:
+            tool["quality"] = quality_used
+
+        references = list(opts.get("reference_images") or [])
+        max_refs = config.astra_reference_max()
+        if references and max_refs:
+            references = references[:max_refs]
+        else:
+            references = []
+        input_fidelity_used = ""
+        if references:
+            input_fidelity_used = config.astra_input_fidelity()
+            if input_fidelity_used:
+                tool["input_fidelity"] = input_fidelity_used
+
+        # `input`: a plain string when there are no references (byte-for-byte the
+        # old shape, so every existing non-reference call is unchanged), or a
+        # content-item array carrying the brief text plus each reference as a
+        # real `input_image` item (per the Responses API multi-image input
+        # shape: {"type": "input_image", "image_url": "data:...;base64,..."}) so
+        # the reference actually reaches the model as image data, not just a
+        # filename mentioned in text.
+        reference_ids_used = []
+        if references:
+            content = [{"type": "input_text", "text": brief}]
+            for ref in references:
+                b64 = ref.get("b64")
+                if not b64 and ref.get("bytes"):
+                    import base64 as _b64
+                    b64 = _b64.b64encode(ref["bytes"]).decode("ascii")
+                if not b64:
+                    continue
+                mime = ref.get("mime") or "image/png"
+                content.append({
+                    "type": "input_image",
+                    "image_url": f"data:{mime};base64,{b64}",
+                })
+                reference_ids_used.append(str(ref.get("id") or ""))
+            input_payload = [{"role": "user", "content": content}]
+        else:
+            input_payload = brief
+
+        payload = {"model": brief_model, "input": input_payload, "tools": [tool]}
+        reasoning_effort_used = config.astra_reasoning_effort()
+        if reasoning_effort_used:
+            payload["reasoning"] = {"effort": reasoning_effort_used}
 
         started = time.monotonic()
         status, body = self._post(payload)
@@ -428,7 +484,11 @@ class AstraImageEngine(ImageEngine):
         return ImageResult(
             image_bytes=image_bytes, image_url=image_url, model=image_model,
             engine=self.name, cost_estimate=cost_estimate(self.name, image_model),
-            revised_prompt=revised, latency_ms=latency_ms, prompt_used=brief)
+            revised_prompt=revised, latency_ms=latency_ms, prompt_used=brief,
+            quality_used=quality_used, reasoning_effort_used=reasoning_effort_used,
+            input_fidelity_used=input_fidelity_used,
+            reference_ids_used=reference_ids_used, brief_model=brief_model,
+            response_id=str(data.get("id") or ""))
 
 
 def fetch_image_bytes(url, timeout=60):
@@ -641,7 +701,12 @@ def generate_image(prompt, opts=None, *, gemini_client=None, account_key="",
     failures = []
     who = f"draft={draft_id or '(none)'} account={account_key or '(none)'}"
 
-    for engine in engine_chain(gemini_client):
+    require_astra = config.lasso_infographic_quality_enabled(account_key)
+    if require_astra:
+        opts["require_astra"] = True
+    chain = ([AstraImageEngine(os.environ.get(OPENAI_API_KEY_ENV, ""))]
+             if require_astra else engine_chain(gemini_client))
+    for engine in chain:
         tries = _attempts_for(engine)
         for attempt in range(1, tries + 1):
             try:

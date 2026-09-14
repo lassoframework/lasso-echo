@@ -308,12 +308,17 @@ def build_case_study_draft(account, day_key, nano_client=None, s3_client=None):
 
 def _finish_draft(account, day_key, headline, caption, hashtags, existing_card,
                   nano_client, s3_client, fragments, card_note=""):
-    creative_path = existing_card
+    quality = config.lasso_infographic_quality_enabled(account.key)
+    image_copy = {"headline": headline, "facts": [caption], "cta": "Save this.",
+                  "footer": "lassoframework.com/full-gym/resources"} if quality else {}
+    creative_path = None if quality else existing_card
     route = ""
     if creative_path is None:
         art = creative_studio.generate(
-            headline, [card_note or "The Full Gym book campaign card."],
+            headline, image_copy["facts"] if quality
+            else [card_note or "The Full Gym book campaign card."],
             client=nano_client, account_key=account.key,
+            **({"cta": image_copy["cta"], "footer": image_copy["footer"]} if quality else {}),
             palette=creative_studio.BOOK_COVER_PALETTE)  # the ONE scoped exception
         if art is None:
             ops_alerts.alert(
@@ -332,7 +337,7 @@ def _finish_draft(account, day_key, headline, caption, hashtags, existing_card,
         caption=caption, hashtags=hashtags[:5],
         creative_path=creative_path, creative_public_url=hosted,
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
-        source_fragments=fragments, day_key=day_key, draft_type="book",
+        source_fragments=fragments, infographic_copy=image_copy, day_key=day_key, draft_type="book",
         warnings=conflict_warnings(caption),
         image_engine=route,
     )

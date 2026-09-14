@@ -73,7 +73,7 @@ def build_testimonial_draft(account, day_key, *, path=None, nano_client=None,
     from . import creative_studio, media_host
     art = creative_studio.generate_social_proof(
         entry.kind, entry.main, entry.support, entry.attribution,
-        client=nano_client)
+        client=nano_client, account_key=getattr(account, "key", account))
     if not art:
         return None
     key = getattr(account, "key", None) or (account if isinstance(account, str) else "")

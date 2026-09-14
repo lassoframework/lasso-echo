@@ -101,9 +101,11 @@ class _DictStore:
         return draft
 
 
-# ===========================================================================
+# ====================================================================
+
 # 1. FLAG OFF -> every route disabled (404), byte-for-byte current behavior
-# ===========================================================================
+# ====================================================================
+
 
 def test_flag_off_all_routes_disabled(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
@@ -116,9 +118,11 @@ def test_flag_off_all_routes_disabled(monkeypatch, tmp_path):
     assert ps.handle_kill("gymA", "d1", "u1", confirm=True)[0] == 404
 
 
-# ===========================================================================
+# ====================================================================
+
 # 2. STRIPE NOT ACTIVE -> 402 + empty state (never a live calendar)
-# ===========================================================================
+# ====================================================================
+
 
 def test_social_not_active_returns_402_empty(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -182,9 +186,11 @@ def test_action_not_active_returns_402(db_env, monkeypatch):
         assert status == 402
 
 
-# ===========================================================================
+# ====================================================================
+
 # 3. TOKEN ISOLATION on EVERY route
-# ===========================================================================
+# ====================================================================
+
 
 def test_social_isolation_only_own_gym_rows(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"), _account("gymB"))
@@ -248,9 +254,11 @@ def test_deny_budget_is_per_gym(db_env, monkeypatch):
     assert ps.recreate_remaining("gymB") == ps.MONTHLY_RECREATE_BUDGET  # untouched
 
 
-# ===========================================================================
+# ====================================================================
+
 # 4. RECREATE BUDGET — server-enforced 30/month, 409 when exhausted, free kill
-# ===========================================================================
+# ====================================================================
+
 
 def test_deny_decrements_budget_and_409_when_exhausted(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -295,9 +303,11 @@ def test_kill_is_free_never_charges_budget(db_env, monkeypatch):
     assert ps.recreate_spent("gymA") == 0, "kill is free"
 
 
-# ===========================================================================
+# ====================================================================
+
 # 5. KILL requires confirm=true
-# ===========================================================================
+# ====================================================================
+
 
 def test_kill_requires_confirm(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -320,9 +330,11 @@ def test_kill_with_confirm_succeeds(db_env, monkeypatch):
     assert body["ok"] is True
 
 
-# ===========================================================================
+# ====================================================================
+
 # 6. EDIT re-runs the fabrication gate -> 422 on an unsupported claim
-# ===========================================================================
+# ====================================================================
+
 
 def test_edit_unsupported_claim_returns_422(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -351,9 +363,11 @@ def test_edit_clean_note_succeeds(db_env, monkeypatch):
     assert status != 422
 
 
-# ===========================================================================
+# ====================================================================
+
 # 7. APPROVE is idempotent
-# ===========================================================================
+# ====================================================================
+
 
 def test_approve_idempotent_on_already_approved(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -366,9 +380,11 @@ def test_approve_idempotent_on_already_approved(db_env, monkeypatch):
     assert body.get("idempotent") is True
 
 
-# ===========================================================================
+# ====================================================================
+
 # 8. metrics shape (Part D) — null values, gaps not zeros, flags OFF
-# ===========================================================================
+# ====================================================================
+
 
 def test_metrics_shape_is_gaps_not_zeros(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
@@ -384,9 +400,11 @@ def test_metrics_shape_is_gaps_not_zeros(db_env, monkeypatch):
     assert body["gaps"], "an explicit gap note must be present when analytics are off"
 
 
-# ===========================================================================
+# ====================================================================
+
 # 9. HARD COPY RULES — no dashes, no "vendor" in any client-facing string
-# ===========================================================================
+# ====================================================================
+
 
 def _message_strings(payload):
     """Every human-readable message string in a payload (error/detail/gaps), NOT the
@@ -465,9 +483,11 @@ def test_source_string_literals_have_no_dashes_or_vendor():
             assert "vendor" not in v.lower(), f"'vendor' in literal: {v!r}"
 
 
-# ===========================================================================
+# ====================================================================
+
 # 10. HTTP LAYER — routing, token->account, flag gate, isolation end to end
-# ===========================================================================
+# ====================================================================
+
 
 def _serve(monkeypatch):
     from agent.intake_web import build_server
@@ -559,9 +579,11 @@ def test_http_kill_confirm_flows_through(db_env, monkeypatch):
         server.shutdown()
 
 
-# ===========================================================================
+# ====================================================================
+
 # 11. PER-ACCOUNT AUTONOMY — POST /portal/<token>/autonomy
-# ===========================================================================
+# ====================================================================
+
 
 class _ListStore(_DictStore):
     """A _DictStore that also exposes list_pending (the autonomy sweep needs it)."""
@@ -771,6 +793,26 @@ def test_baseline_never_raises(monkeypatch):
     monkeypatch.setattr(ps._db, "get_baseline_posts_per_week", _local_boom)
     monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda: _Store())
     assert ps._baseline_posts_per_week("eng") == (None, None)
+
+
+def test_http_manual_visual_brief_reaches_handler_with_token_identity(db_env, monkeypatch):
+    monkeypatch.setattr("agent.intake_web.client_for_token", lambda t: "lasso")
+    monkeypatch.setattr("agent.intake_web.is_revoked", lambda k: False)
+    seen=[]
+    def handle(account_key,draft_id,actor_id,brief):
+        seen.append((account_key,draft_id,actor_id,brief))
+        return 200,{"ok":True}
+    monkeypatch.setattr("agent.intake_web._ps.handle_regen_variant_from_brief",handle)
+    import urllib.request,json
+    server,port=_serve(monkeypatch)
+    try:
+        req=urllib.request.Request(f"http://127.0.0.1:{port}/portal/validtoken123/posts/d1/regen-variant-brief",
+            data=json.dumps({"actor_id":"owner","brief":"Use a grounded photo collage","account_key":"other"}).encode(),
+            headers={"Content-Type":"application/json"},method="POST")
+        assert json.loads(urllib.request.urlopen(req).read())["ok"]
+        assert seen==[("lasso","d1","owner","Use a grounded photo collage")]
+    finally:
+        server.shutdown()
 
 
 def test_automatic_then_manual_does_not_leave_permanent_approvals(db_env, monkeypatch):

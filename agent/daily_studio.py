@@ -74,7 +74,7 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
     art = creative_studio.generate(headline, facts, client=nano_client,
                                    account_key=account.key,
                                    archetype=creative_studio.archetype_for_day(day_key),
-                                   draft_id=draft_id)
+                                   draft_id=draft_id, cta=plan.get("cta", ""))
     if not art:
         # Acceptable library fallback for now, but make it VISIBLE: run-daily output
         # always, plus one ops alert when AGENT_OPS_ALERTS_ENABLED is armed.
@@ -93,14 +93,17 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
         return None
 
     # Record the rendered text (the headline) so every later draw gates for free.
-    pixel_gate.write_rendered_text(art["path"], headline)
+    approved_image_copy = headline
+    if config.lasso_infographic_quality_enabled(account.key):
+        approved_image_copy = "\n".join([headline] + facts + [plan.get("cta", "")])
+    pixel_gate.write_rendered_text(art["path"], approved_image_copy)
 
     # PIXEL FABRICATION BELT (OCR): read the pixels once. A number rendered on the
     # image that the approved headline never asked for (a silent generator drift,
     # the "80% more conversions" slab class) BLOCKS the card, named, not shipped.
     # Inert when the studio reader is unavailable; the recorded-text gate holds.
     from .ocr_check import headline_block, headline_warning
-    block_reason = headline_block(art["path"], headline)
+    block_reason = headline_block(art["path"], approved_image_copy)
     if block_reason:
         return _blocked(block_reason)
 
@@ -118,6 +121,8 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
         hashtags=variant_hashtags(account.platform, plan["hashtags"]),
         creative_path=art["path"], creative_public_url=hosted,
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
+        infographic_copy={"headline": headline, "facts": facts, "cta": plan.get("cta", ""),
+                          "footer": creative_studio._astra_url_footer()},
         source_fragments=[headline] + facts,  # no-fabrication audit trail
         warnings=warnings,
         image_engine=art.get("route", ""),

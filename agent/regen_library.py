@@ -1194,9 +1194,15 @@ def _generate_one(key, variant, nano_client, out_dir):
     if variant == "story":
         aspect, pixels, surface = STORY_ASPECT
         kwargs.update({"aspect": aspect, "pixels": pixels, "surface": surface})
-    return creative_studio.generate(spec["headline"], spec["concept"],
+    headline, facts = spec["headline"], spec["concept"]
+    if config.lasso_infographic_quality_enabled("lasso"):
+        from .lasso_infographic_content import select_copy
+        copy = select_copy(headline)
+        headline, facts = copy["headline"], copy["facts"]
+        kwargs.update({"cta": copy["cta"], "footer": copy.get("footer")})
+    return creative_studio.generate(headline, facts,
                                     client=nano_client, out_path=out_path,
-                                    bypass_cap=True, **kwargs)
+                                    account_key="lasso", bypass_cap=True, **kwargs)
 
 
 def run(only=None, dry_run=False, nano_client=None, s3_client=None, out_dir=None,

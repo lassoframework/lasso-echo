@@ -260,6 +260,11 @@ def display_image_for(post, *, out_dir=None, renderer=None, host=None, tenant=No
     if not config.no_creative_fallback_enabled():
         return None
 
+    resolved_tenant = _tenant_for(post, tenant)
+    if config.lasso_infographic_quality_enabled(resolved_tenant):
+        from . import lasso_display_infographic
+        return lasso_display_infographic.display_image_for(post, resolved_tenant)
+
     eyebrow, headline, deck = _approved_text(post.get("caption"), post.get("pillar"))
     # No approved text -> block, never a blank card and never invented copy.
     if not headline:
