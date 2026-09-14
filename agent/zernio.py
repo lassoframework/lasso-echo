@@ -1250,6 +1250,56 @@ _RETRYABLE_STATUS = (408, 429, 500, 502, 503, 504)
 _RECONNECT_STATUS = (401, 403)
 
 
+def _extract_google_validation_reason(raw_detail):
+    """Extract the specific reason/field from a nested Zernio/Google GMB v4 error body.
+
+    Google wraps validation errors in two layers:
+      outer JSON:  {"error": "Invalid request to Google Business Profile: <google_json>"}
+      inner JSON:  {"error": {"details": [{"@type": "...ValidationError",
+                               "errorDetails": [{"field": "...", "reason": "..."}]}]}}
+
+    The compact form (no @type wrapper) puts reason/field directly in the details entry.
+    Both shapes are handled.
+
+    Returns a short string like "PHOTO_URL_INACCESSIBLE (sourceUrl)" or None on any parse
+    failure (truncated body, non-Google error, unexpected structure). Never raises.
+    """
+    import json as _json
+    try:
+        outer = _json.loads(raw_detail or "")
+        if not isinstance(outer, dict):
+            return None
+        inner_str = outer.get("error") or ""
+        if not isinstance(inner_str, str):
+            return None
+        prefix = "Invalid request to Google Business Profile: "
+        if prefix in inner_str:
+            google_json_str = inner_str[inner_str.index(prefix) + len(prefix):]
+        else:
+            google_json_str = inner_str
+        inner = _json.loads(google_json_str)
+        details = (inner.get("error") or {}).get("details") or []
+        for d in details:
+            if not isinstance(d, dict):
+                continue
+            # v4 verbose: @type + errorDetails nesting
+            for ed in (d.get("errorDetails") or []):
+                if not isinstance(ed, dict):
+                    continue
+                reason = str(ed.get("reason") or "").strip()
+                field = str(ed.get("field") or "").strip()
+                if reason or field:
+                    return f"{reason} ({field})" if (reason and field) else (reason or field)
+            # compact form: reason/field at top level of the details entry
+            reason = str(d.get("reason") or "").strip()
+            field = str(d.get("field") or "").strip()
+            if reason or field:
+                return f"{reason} ({field})" if (reason and field) else (reason or field)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def describe_error(exc, *, endpoint=None, account_id=None):
     """Unwrap an exception raised by a Zernio call into a structured, actionable dict.
 
@@ -1282,6 +1332,18 @@ def describe_error(exc, *, endpoint=None, account_id=None):
         detail = scrub(f"{type(exc).__name__}: {raw_detail}")[:900]
     except Exception:  # noqa: BLE001
         detail = type(exc).__name__
+
+    # Nested Zernio/Google errors bury the specific validation reason (e.g.
+    # PHOTO_URL_INACCESSIBLE) hundreds of chars into the verbose body, past the 400-char
+    # downstream truncation in error_summary. Parse it out and prepend it so the actual
+    # cause is always visible in alerts and in the database reject_reason column.
+    google_reason = _extract_google_validation_reason(raw_detail or "")
+    if google_reason:
+        try:
+            google_reason = scrub(google_reason)
+        except Exception:  # noqa: BLE001
+            pass
+        detail = f"{google_reason} | {detail}"[:900]
 
     if status is None:
         # A transport failure (timeout, DNS, reset) never reached Zernio and is the
