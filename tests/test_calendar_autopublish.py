@@ -121,6 +121,20 @@ class _FakeStore:
             r["status"] = "pending"
         return r
 
+    def _transition_unpublished_claim(self, gym_id, row_id, status, reason):
+        row = self.rows.get(row_id)
+        if (not row or row.get("gym_id") != gym_id or row.get("status") != "publishing"
+                or row.get("published_at") is not None or row.get("late_post_id") is not None):
+            return None
+        row.update(status=status, reject_reason=reason)
+        return dict(row)
+
+    def mark_duplicate_content(self, gym_id, row_id, reason):
+        return self._transition_unpublished_claim(gym_id, row_id, "deleted", reason)
+
+    def release_content_ledger_claim(self, gym_id, row_id, previous, reason):
+        return self._transition_unpublished_claim(gym_id, row_id, previous, reason)
+
 
 class _FakePublisher:
     """Records each publish call and returns a canned PublishResult per account."""
@@ -1546,3 +1560,62 @@ def test_expired_row_with_full_book_is_retired_not_stranded(monkeypatch):
     assert store.redates == []
     assert store.status_sets == [("full1", "killed")]
     assert len(seen) == 1 and "No action needed" in seen[0] and "retired 1" in seen[0]
+
+
+def test_unreadable_content_ledger_neither_publishes_nor_deletes(armed, monkeypatch):
+    class UnreadableLedger:
+        def get(self, key, default=""):
+            raise RuntimeError("ledger unavailable")
+
+    store = _FakeStore([_row("ledger-read-failure")])
+    cleanup_calls = []
+    monkeypatch.setattr(cap, "_kv_default", lambda: UnreadableLedger())
+    monkeypatch.setattr(cap, "_mark_duplicate_content",
+                        lambda *args: cleanup_calls.append(args))
+    publisher = _FakePublisher()
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                              notifier=_FakeNotifier(), now=LATE_NOW)
+    assert summary["published"] == []
+    assert summary["skipped"] == ["ledger-read-failure"]
+    assert publisher.calls == []
+    assert cleanup_calls == []
+    assert store.rows["ledger-read-failure"]["status"] == "pending"
+
+
+@pytest.mark.parametrize("cleanup_ok", [True, False])
+def test_duplicate_refusal_reports_real_cleanup_without_publishing(armed, monkeypatch, cleanup_ok):
+    from agent import ops_alerts
+    class ClaimedLedger:
+        def get(self, key, default=""):
+            return "different-row|2026-09-10T12:00:00Z"
+    store = _FakeStore([_row("duplicate-row")])
+    if not cleanup_ok:
+        monkeypatch.setattr(store, "mark_duplicate_content", lambda *args: None)
+    monkeypatch.setattr(cap, "_kv_default", lambda: ClaimedLedger())
+    alerts = []
+    monkeypatch.setattr(ops_alerts, "alert", alerts.append)
+    publisher = _FakePublisher()
+    result = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                             notifier=_FakeNotifier(), now=LATE_NOW)
+    assert publisher.calls == []
+    assert result["skipped"] == ["duplicate-row"]
+    assert store.rows["duplicate-row"]["status"] == ("deleted" if cleanup_ok else "publishing")
+    assert any(("soft-deleted" if cleanup_ok else "Cleanup was not confirmed") in s for s in alerts)
+
+
+@pytest.mark.parametrize("previous", ["pending", "approved"])
+def test_content_stamp_failure_releases_for_retry_and_preserves_approval(armed, monkeypatch, previous):
+    class FailedStampLedger:
+        def get(self, key, default=""):
+            return ""
+        def set(self, key, value):
+            raise RuntimeError("write unavailable")
+    store = _FakeStore([_row("stamp-failure", status=previous)])
+    monkeypatch.setattr(cap, "_kv_default", lambda: FailedStampLedger())
+    publisher = _FakePublisher()
+    result = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                             notifier=_FakeNotifier(), now=LATE_NOW)
+    assert publisher.calls == []
+    assert result["skipped"] == ["stamp-failure"]
+    assert store.rows["stamp-failure"]["status"] == previous
+    assert store.rows["stamp-failure"]["reject_reason"] == "content_stamp_failed"
