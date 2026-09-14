@@ -95,7 +95,7 @@ def real_builders_map(account):
         from .lasso_editorial import source_pillar
         from pathlib import Path
         source_path = (Path(__file__).resolve().parent.parent / "brand_voice" / "lasso_editorial.md"
-                       if category in ("echo", "website") else None)
+                       if category in ("echo", "website", "summit") else None)
         doc = content_planner.load_source_doc(source_path)
         if doc is None:
             return None
@@ -135,6 +135,10 @@ def real_builders_map(account):
         return daily_studio.build_daily_infographic_draft(acct, day_key)
 
     def _summit(_target, day_key):
+        from .lasso_editorial import refresh_dates
+        if (config.lasso_editorial_calendar_enabled() and acct.key in ('lasso_ig','lasso_fb')
+                and day_key in refresh_dates()):
+            return _editorial('summit',day_key)
         return summit.build_summit_draft(acct, day_key, voice=_voice_for(acct))
 
     def _book(_target, day_key):
@@ -275,6 +279,10 @@ def sprint_builders(account, manifest=None, posts_per_day=None):
     slot_map = _sprint_slot_map(posts_per_day=posts_per_day)
 
     def _feed(_target, day_key, slot_index):
+        from .lasso_editorial import refresh_dates
+        if (config.lasso_editorial_calendar_enabled() and acct.key in ('lasso_ig','lasso_fb')
+                and day_key in refresh_dates()):
+            return real_builders_map(acct)['summit'](_target,day_key)
         info = slot_map.get((day_key, slot_index))
         if not info:
             return None
@@ -291,6 +299,10 @@ def sprint_builders(account, manifest=None, posts_per_day=None):
             slides=[], slide_urls=[])
 
     def _story(_target, day_key, slot_index, feed_draft):
+        from .lasso_editorial import refresh_dates
+        if (config.lasso_editorial_calendar_enabled() and acct.key in ('lasso_ig','lasso_fb')
+                and day_key in refresh_dates()):
+            return _real_story_builder(acct)(_target,day_key,feed_draft)
         info = slot_map.get((day_key, slot_index))
         if not info:
             return None

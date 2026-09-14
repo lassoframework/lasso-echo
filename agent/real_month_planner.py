@@ -1127,6 +1127,9 @@ def to_calendar_rows(drafts, account_key):
     rows = []
     for draft in drafts or []:
         row = _mirror._real_row(account_key, draft)
+        if account_key == 'lasso' and config.lasso_editorial_calendar_enabled() and not draft.is_story:
+            from .lasso_editorial import editorial_caption
+            row['caption'] = editorial_caption(draft)
         if not row["post_date"]:
             continue
         # status is normalized to the portal vocabulary by the mirror; the planner's

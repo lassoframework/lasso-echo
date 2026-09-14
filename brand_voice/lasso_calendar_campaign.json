@@ -143,5 +143,23 @@
       "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso/8003488b6eaffe44/13-summit-playbook-story-safe.png",
       "source_sha256": "06f11ba56fe06b2d3cd59d971aa7f1b32447f5e1eeb1f27e7f4b7e6f730160d1"
     }
-  ]
+  ],
+  "refresh_dates": [
+    "2026-09-28",
+    "2026-10-01",
+    "2026-10-12",
+    "2026-10-13"
+  ],
+  "category_overrides": {
+    "2026-09-21": "doctrine",
+    "2026-09-28": "doctrine",
+    "2026-10-03": "website",
+    "2026-10-10": "website"
+  },
+  "pillar_overrides": {
+    "2026-09-21": "Book: Client Avatars",
+    "2026-09-28": "Book: Copy That Sells",
+    "2026-10-03": "Websites: One next step",
+    "2026-10-10": "Websites: Keep visitors informed"
+  }
 }

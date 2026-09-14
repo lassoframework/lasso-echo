@@ -103,8 +103,8 @@ def test_source_pool_produces_distinct_monthly_echo_and_website_topics(monkeypat
     for category in ('echo','website'):
         names=[source_pillar(category,s.post_date,doc) for s in plan
                if s.fmt=='feed' and s.category==category]
-        assert len(names)==8
-        assert len(set(names))==8
+        assert len(names)>=8
+        assert len(set(names))==len(names)
 
 
 def test_legacy_duplicate_approved_ordinals_use_full_capacity(monkeypatch):
@@ -178,3 +178,23 @@ def test_lasso_calendar_displays_both_real_publish_times(monkeypatch):
     pm=draft('echo','2026-09-15');pm.cadence_slot_index=1
     rows=rmp.to_calendar_rows([am,pm],'lasso')
     assert [r['scheduled_at'][11:16] for r in rows]==['07:30','07:30','18:30','18:30']
+
+
+def test_editorial_caption_uses_sourced_details_and_call_path():
+    from agent.lasso_editorial import editorial_caption
+    d=draft('website','2026-10-03')
+    d.source_fragments=['Make the next step clear.', 'Use one clear way to book a conversation.']
+    text=editorial_caption(d)
+    assert text.startswith('Make the next step clear.\n\nUse one clear way')
+    assert 'https://lassoframework.com/growth-call' in text
+    assert 'Book a call to talk about your gym website' in text
+
+
+def test_summit_refresh_uses_four_distinct_approved_topics():
+    from pathlib import Path
+    from agent.content_planner import load_source_doc
+    from agent.lasso_editorial import refresh_dates,source_pillar
+    doc=load_source_doc(Path(__file__).resolve().parents[1]/'brand_voice/lasso_editorial.md')
+    topics=[source_pillar('summit',day,doc) for day in refresh_dates()]
+    assert len(topics)==len(set(topics))==4
+    assert all(topic.startswith('Summit:') for topic in topics)

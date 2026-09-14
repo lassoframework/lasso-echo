@@ -126,6 +126,43 @@ Hook: Make it clear who your gym is for.
 Body: LASSO builds StoryBrand written sites for gyms.
 Body: The website audit checks whether the first screen identifies a clear audience.
 
+### Pillar: Websites: One next step
+Source: LASSO Brain website-kb.md section 4a, compiled 2026-09-14.
+Hook: Make the next step easy to find.
+Body: Booking is one of the six behaviors LASSO checks in a gym website audit.
+Body: LASSO builds StoryBrand written sites for gyms.
+
+### Pillar: Websites: Keep visitors informed
+Source: LASSO Brain website-kb.md section 4a, compiled 2026-09-14.
+Hook: Your gym changes. Keep your website current.
+Body: Current information is one of the six behaviors LASSO checks.
+Body: LASSO builds fast, local SEO ready sites for gyms.
+
+### Pillar: Summit: Set your target
+Source: User supplied Growth Summit 2027 Playbook graphic, 2026-09-14.
+Hook: Start your 2027 plan with a clear target.
+Body: Set your revenue and member targets at the LASSO Growth Summit.
+Body: November 7 and 8, 2026. Virgin Hotels Nashville.
+
+### Pillar: Summit: Find the bottleneck
+Source: User supplied Growth Summit 2027 Playbook graphic, 2026-09-14.
+Hook: Find what is holding your gym's growth back.
+Body: Identify the bottleneck and choose your plays for offers, sales, retention and team.
+Body: November 7 and 8, 2026 in Nashville.
+
+### Pillar: Summit: Your next 90 days
+Source: User supplied Growth Summit 2027 Playbook graphic, 2026-09-14.
+Hook: Leave with your next 90 days mapped out.
+Body: The LASSO Growth Summit helps you map clear actions to put to work.
+Body: November 7 and 8, 2026. Virgin Hotels Nashville.
+
+### Pillar: Summit: Two days together
+Source: User supplied Growth Summit agenda graphic, 2026-09-14.
+Hook: Create demand. Build to last.
+Body: Day one covers paid advertising, growth math, industry insights and live funnel review.
+Body: Day two covers leadership, hiring, member value and the future of gym growth.
+Body: November 7 and 8, 2026 in Nashville.
+
 ## CTAs
 - Save this post.
 - Send this to a gym owner.

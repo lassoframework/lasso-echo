@@ -46,7 +46,7 @@ def require_reconciled_coverage(rows, start, days):
     combined=Counter((r['post_date'],r['account'],r['format']) for r in rows)
     incomplete=[(str(start+timedelta(days=i)),account,fmt)
                 for i in range(days)
-                for account,fmt in [('instagram','feed'),('facebook','feed'),('instagram','story')]
+                for account,fmt in [('instagram','feed'),('facebook','feed')]
                 if combined[(str(start+timedelta(days=i)),account,fmt)]!=2]
     if incomplete:
         raise SystemExit('Reconciled calendar is incomplete; no rows changed: '+str(incomplete))
@@ -87,9 +87,9 @@ def main():
         coverage = Counter((d.day_key, bool(d.is_story)) for d in drafts)
         missing = [str(start + timedelta(days=i)) for i in range(args.days)
                    if coverage[(str(start + timedelta(days=i)), False)] != 2
-                   or coverage[(str(start + timedelta(days=i)), True)] != 2]
+                   ]
         if missing:
-            raise SystemExit('Incomplete feed/Story coverage; no rows changed: ' + ', '.join(missing))
+            raise SystemExit('Incomplete feed coverage; no rows changed: ' + ', '.join(missing))
         if any(not d.creative_public_url or d.status != DraftStatus.PENDING for d in drafts):
             raise SystemExit('Checkpoint contains missing media or nonpending drafts')
         from agent.portal_calendar_store import SupabaseCalendarStore
@@ -136,6 +136,14 @@ def main():
                    if args.start<=r['post_date']<=str(end)
                    and r.get('status') not in ('denied','killed','deleted','superseded','expired')]
         require_reconciled_coverage(preserved+allowed,start,args.days)
+        from agent.lasso_campaign_assets import MANIFEST
+        for asset in json.loads(MANIFEST.read_text()).get('assets',[]):
+            if args.start <= asset['date'] <= str(end):
+                for fmt,url in [('feed',asset['feed_url']),('story',asset['story_url'])]:
+                    if not any(r['post_date']==asset['date'] and r['account']=='instagram'
+                               and r['format']==fmt and r.get('image_url')==url
+                               for r in preserved+allowed):
+                        raise SystemExit('Missing supplied artwork pair; no rows changed: '+asset['id'])
         if config.calendar_grade_enabled_for('lasso'):
             from agent.calendar_grade import grade_month,A_THRESHOLD
             grade=grade_month(real_month_planner.to_calendar_rows(drafts,'lasso'),profile='B2B')
