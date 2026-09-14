@@ -4610,3 +4610,8 @@ def lasso_infographic_quality_enabled(account_key=None) -> bool:
             break
     return base in {"lasso", "lasso-framework-llc"} and _truthy(
         os.environ.get("AGENT_LASSO_INFOGRAPHIC_QUALITY", "false"))
+
+
+def lasso_editorial_calendar_enabled():
+    """LASSO book, podcast, Summit, Echo and websites calendar. Default OFF."""
+    return _truthy(os.environ.get("AGENT_LASSO_EDITORIAL_CALENDAR", "false"))

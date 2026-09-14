@@ -578,6 +578,9 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
         slots.append(PlanSlot(post_date=d, category=category, fmt=STORY,
                               base_category=base, overridden=overridden,
                               video_preferred=_vp))
+    if config.lasso_editorial_calendar_enabled() and account_key in ("lasso", "lasso_ig", "lasso_fb"):
+        from .lasso_editorial import editorial_slots
+        return editorial_slots(slots)
     slots = _cap_platform(slots, video_mix=mark_video)
     if reels_floor:
         slots = _apply_reels_floor(slots)
@@ -826,7 +829,9 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
             drafts.append(draft)
             continue
         draft, built_cat = _build_feed_with_fallback(
-            slot, builders, target, log)
+            slot, builders, target, log,
+            exclude_captions={_draft_caption(d) for d in drafts
+                              if getattr(d, "day_key", "") == slot.post_date})
         if draft is None:
             log(f"skip {slot.post_date}: no real pillar could build a feed for the "
                 f"day (tried {slot.category} then fallbacks); left empty, not fabricated")
@@ -835,8 +840,8 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
         # and to_calendar_rows show the true pillar (never the empty one).
         eff_slot = slot if built_cat == slot.category else _reslot(slot, built_cat)
         draft = _stamp(draft, eff_slot, FEED)
-        feed_by_date[slot.post_date] = draft
-        built_category[slot.post_date] = built_cat
+        feed_by_date[(slot.post_date, slot.cadence_slot)] = draft
+        built_category[(slot.post_date, slot.cadence_slot)] = built_cat
         drafts.append(draft)
 
     # Second pass: build the paired story for each feed that got built.
@@ -864,7 +869,7 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
             story = _stamp(story, slot, STORY)
             drafts.append(story)
             continue
-        feed_draft = feed_by_date.get(slot.post_date)
+        feed_draft = feed_by_date.get((slot.post_date, slot.cadence_slot))
         if feed_draft is None:
             log(f"skip {slot.post_date} {slot.category} story: no feed draft for "
                 "the day to pair to")
@@ -880,7 +885,7 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
             continue
         # Pair the story to the pillar the FEED actually landed on (a fallback feed's
         # story shows the same real pillar, never the empty rotation slot).
-        built_cat = built_category.get(slot.post_date, slot.category)
+        built_cat = built_category.get((slot.post_date, slot.cadence_slot), slot.category)
         eff_slot = slot if built_cat == slot.category else _reslot(slot, built_cat)
         story = _stamp(story, eff_slot, STORY)
         drafts.append(story)
@@ -914,13 +919,16 @@ def _reslot(slot, category):
     return PlanSlot(post_date=slot.post_date, category=category, fmt=slot.fmt,
                     base_category=slot.base_category or slot.category,
                     overridden=True,
+                    slot_index=slot.slot_index,
+                    is_sprint=slot.is_sprint,
+                    cadence_slot=slot.cadence_slot,
                     # VIDEO MIX: a fallback that lands on podcast carries the video
                     # preference forward (so a podcast day filled via fallback still
                     # prefers a real clip); any other pillar clears it.
                     video_preferred=(slot.video_preferred and category == "podcast"))
 
 
-def _build_feed_with_fallback(slot, builders, target, log):
+def _build_feed_with_fallback(slot, builders, target, log, exclude_captions=()):
     """Build a feed for `slot`: the slot's own category first, then the real fallback
     pillars (_FALLBACK_ORDER) in order, until a builder returns a real draft. Returns
     (draft, built_category) or (None, None) when NO real pillar has content for the day.
@@ -957,6 +965,13 @@ def _build_feed_with_fallback(slot, builders, target, log):
         draft = _safe_call(builder, target, slot.post_date, log,
                            f"{slot.post_date} {cat} feed")
         if draft is None:
+            continue
+        status = getattr(draft, "status", None)
+        if str(getattr(status, "value", status)) == "blocked":
+            log(f"skip {slot.post_date} {cat}: source or creative is blocked")
+            continue
+        if _draft_caption(draft) in exclude_captions:
+            log(f"skip {slot.post_date} {cat}: repeats the other daily post")
             continue
         # Wave 3 (AGENT_CAPTION_COOLDOWN): before accepting this draft, check whether
         # its caption is within the repeat cooldown window. Up to 3 attempts pulling
@@ -1377,7 +1392,20 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
                 deleted += delete_month(account_key, month) or 0
         insert_rows = getattr(sb_store, "insert_rows", None)
         if insert_rows is not None and rows:
-            inserted += len(insert_rows(account_key, rows) or [])
+            saved_rows = insert_rows(account_key, rows) or []
+            inserted += len(saved_rows)
+            # Only accepted calendar rows consume podcast inventory. A failed
+            # grade, dry run, or locked slot must not spend the clip cooldown.
+            saved_assets = {r.get("source_media_asset_id") for r in saved_rows}
+            stamped = set()
+            for draft in real_drafts:
+                asset = getattr(draft, "podcast_asset", None)
+                if asset and asset["id"] in saved_assets and asset["id"] not in stamped:
+                    from .podcast_selector import stamp_use
+                    from datetime import datetime, timezone
+                    stamp_use(asset, account_key, draft.day_key,
+                              now=datetime.fromisoformat(draft.day_key).replace(tzinfo=timezone.utc))
+                    stamped.add(asset["id"])
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
                 "upserted": inserted, "deleted": deleted}

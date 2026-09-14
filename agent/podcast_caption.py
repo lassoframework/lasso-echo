@@ -85,7 +85,10 @@ def parse_notes(text):
     # Concrete claims: substantive body lines. Bullets and plain sentences both
     # qualify; headers ('...:'), timestamps, URLs-only lines, and lines carrying
     # their own ask phrase are dropped (one-ask rule).
-    for ln in lines[1:]:
+    body_lines = []
+    for line in lines[1:]:
+        body_lines.extend(re.split(r"(?<=[.!?])\s+", line) if len(line) > 220 else [line])
+    for ln in body_lines:
         body = _BULLET_RE.sub("", ln).strip()
         body = _TIMESTAMP_RE.sub("", body).strip(" -–—:;,")
         if len(body) < 25 or len(body) > 220:
