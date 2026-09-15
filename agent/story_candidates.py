@@ -76,7 +76,7 @@ def _seg_window(asset):
     return 0.0, round(float(end), 2)
 
 
-def _is_finished_render(asset, *, ledger_lookup=None):
+def _is_finished_render(asset, *, ledger_lookup=None, strict=False):
     """True when this asset's bytes are one of Echo's OWN past renders (the EP124
     re-ingest guard): such an asset is FINISHED and blocked from the story lane so Echo
     can never eat its own output and repost it."""
@@ -86,28 +86,33 @@ def _is_finished_render(asset, *, ledger_lookup=None):
     lookup = ledger_lookup
     if lookup is None:
         from . import story_ledger
-        lookup = story_ledger.is_echo_render
+        lookup = (lambda value: story_ledger.is_echo_render(value, strict=True)) if strict else story_ledger.is_echo_render
     try:
         return bool(lookup(ch))
     except Exception as e:  # noqa: BLE001 - a ledger failure fails OPEN to "not finished"
+        if strict:
+            raise ValueError("Raw footage render ledger is unavailable") from None
         print(f"[story-candidates] ledger lookup failed: {type(e).__name__}: {e}")
         return False
 
 
-def _pending_ambiguous_ids(gym_id):
+def _pending_ambiguous_ids(gym_id, *, strict=False):
     """Asset ids sitting UNRESOLVED in the gym's 'Sort these' ambiguous queue. These
     never auto-enter the story lane (spec §0.3: ambiguous NEVER auto-posts) — a human
     must tap Raw first. Best effort: a queue read failure yields an empty set (fail
     toward NOT blocking a genuinely-raw asset, since eligibility already gates)."""
     try:
         from . import story_sort_queue as _q
-        return {str(it.get("asset_id") or "") for it in _q.pending(gym_id)}
+        rows = _q.pending(gym_id, strict=True) if strict else _q.pending(gym_id)
+        return {str(it.get("asset_id") or "") for it in rows}
     except Exception as e:  # noqa: BLE001
+        if strict:
+            raise ValueError("Raw footage classification queue is unavailable") from None
         print(f"[story-candidates] sort-queue read failed: {type(e).__name__}: {e}")
         return set()
 
 
-def _eligible_raw(asset, gym_id, *, ambiguous_ids, ledger_lookup=None):
+def _eligible_raw(asset, gym_id, *, ambiguous_ids, ledger_lookup=None, strict=False):
     """(ok, reason): is this asset an eligible RAW-lane candidate for THIS gym? Applies
     tenant isolation, the render eligibility gate, the coach hide, the re-ingest guard,
     the ambiguous-unsorted guard, and the input caps — in that order."""
@@ -120,7 +125,7 @@ def _eligible_raw(asset, gym_id, *, ambiguous_ids, ledger_lookup=None):
     if asset.get("excluded_by_coach"):
         return False, "coach-hidden"
     # re-ingest guard: never Echo's own past render.
-    if _is_finished_render(asset, ledger_lookup=ledger_lookup):
+    if _is_finished_render(asset, ledger_lookup=ledger_lookup, strict=strict):
         return False, "content_hash matches an Echo render (finished, re-ingest-blocked)"
     # ambiguous-unsorted never auto-enters the story lane.
     if str(asset.get("id") or "") in ambiguous_ids:
@@ -133,7 +138,7 @@ def _eligible_raw(asset, gym_id, *, ambiguous_ids, ledger_lookup=None):
 
 
 def discover_candidates(gym_id, asset_ids=None, *, store=None, now=None,
-                        ledger_lookup=None):
+                        ledger_lookup=None, strict=False):
     """Discover the gym's eligible RAW candidates and return (candidates, assets_by_id).
 
     candidates: list of scored slice dicts {asset_id, gym_id, start_ts, end_ts, score}
@@ -162,7 +167,7 @@ def discover_candidates(gym_id, asset_ids=None, *, store=None, now=None,
         return [], {}
 
     wanted = {str(a) for a in (asset_ids or [])}
-    ambiguous_ids = _pending_ambiguous_ids(gym_id)
+    ambiguous_ids = _pending_ambiguous_ids(gym_id, strict=True) if strict else _pending_ambiguous_ids(gym_id)
 
     candidates, assets_by_id = [], {}
     for a in assets:
@@ -170,7 +175,7 @@ def discover_candidates(gym_id, asset_ids=None, *, store=None, now=None,
         if wanted and aid not in wanted:
             continue
         ok, _reason = _eligible_raw(a, gym_id, ambiguous_ids=ambiguous_ids,
-                                    ledger_lookup=ledger_lookup)
+                                    ledger_lookup=ledger_lookup, strict=strict)
         if not ok:
             continue
         window = _seg_window(a)

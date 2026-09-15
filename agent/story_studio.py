@@ -72,6 +72,11 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     injectable Drive fetch used to bind each picked segment to a local source file (the
     live default is drive_client.download); only used on the default renderer path.
     """
+    if request.get("auto_reel") and not request.get("_moments_prepared"):
+        from .auto_reel_prepare import create_automatic_reel
+        return create_automatic_reel(request, candidates=candidates, assets_by_id=assets_by_id,
+            analysis=analysis, store=store, music_library=music_library, render_fn=render_fn,
+            output_dir=output_dir, now=now, downloader=downloader, cal_store=cal_store)
     gym_id = _base_gym(request.get("gym_id"))
     if not config.story_studio_render_active_for(gym_id):
         return {"status": "off", "reason": "STORY_STUDIO_RENDER not armed for this gym",
@@ -101,6 +106,10 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     tmpl_name, tmpl_src = story_templates.resolve_template(
         declared_template=request.get("template"), analysis=analysis)
     template = story_templates.get(tmpl_name)
+    if request.get("auto_reel"):
+        from dataclasses import replace
+        template = replace(template, segment_plan=replace(template.segment_plan,
+            total_min_sec=15.0, total_max_sec=30.0, min_segments=3))
 
     # 2. grounding (brief first, else vision; low confidence -> generic-safe + flag).
     grounding = story_grounding.ground_copy(brief=request.get("brief"),
@@ -201,22 +210,22 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     public_url = _host(result.output_path, gym_id)
     day_key = request.get("day_key") or str((now or datetime.now(timezone.utc)).date())
     draft = Draft(
-        draft_id=f"story_{request_id}",
+        draft_id=request_id if request.get("auto_reel") else f"story_{request_id}",
         account_key=request.get("account_key") or gym_id,
         # A rendered Story is an INSTAGRAM story. This used to fall back to gym_id,
         # which lands in content_calendar.account as a gym base key ('pierce') —
         # calendar_autopublish._account_for only accepts 'instagram'/'facebook' and
         # SKIPS anything else, so such a row could never publish.
         platform=request.get("platform") or "instagram",
-        caption="",                          # stories carry no caption body
-        hashtags=[],
+        caption=request.get("_automatic_copy", {}).get("caption", "") if request.get("auto_reel") else "",
+        hashtags=request.get("_automatic_copy", {}).get("hashtags", []) if request.get("auto_reel") else [],
         creative_path=result.output_path,
         creative_public_url=public_url,
         scheduled_for="",
         status=DraftStatus.PENDING,          # EVERY render lands PENDING
-        is_story=True,
+        is_story=not bool(request.get("auto_reel")),
         day_key=day_key,
-        draft_type="story_studio",
+        draft_type="auto_reel" if request.get("auto_reel") else "story_studio",
         category=tmpl_name,
         source_fragments=[f"story_request:{request_id}", f"gym:{gym_id}"]
         + [f"seg:{s.asset_id}" for s in plan.segments],
@@ -232,8 +241,8 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
         "request_id": request_id,
         "gym_id": gym_id,
         "segment_plan": seg_plan,
-        "overlay_text_final": overlay_final,
-        "overlay_flags": overlay.flags,
+        "overlay_text_final": "\n\n".join(request["_automatic_copy"]["overlay_beats"] + [request["_automatic_copy"]["ask"]]) if request.get("auto_reel") and request.get("_automatic_copy", {}).get("overlay_beats") else overlay_final,
+        "overlay_flags": overlay.flags + (["portrait_v1"] if request.get("auto_reel") and config.auto_reels_portrait_active_for(gym_id) else []),
         "grounded_from": overlay.grounded_from,
         "template": tmpl_name,
         "track_id": music_sel.track_id,
@@ -400,7 +409,20 @@ def _stage_calendar_row(gym_id, draft, *, cal_store=None):
                 return None, "the calendar store is not configured"
             from .portal_calendar_store import SupabaseCalendarStore  # noqa: PLC0415
             cal_store = SupabaseCalendarStore()
-        written = cal_store.insert_rows(gym_id, [row]) or []
+        if draft.draft_type == "auto_reel":
+            row["id"] = str(uuid.UUID(draft.draft_id))
+            existing = cal_store.get_row(gym_id, row["id"])
+            if existing:
+                return existing["id"], None
+            try:
+                written = cal_store.insert_rows(gym_id, [row], preserve_ids=True) or []
+            except Exception:
+                existing = cal_store.get_row(gym_id, row["id"])
+                if existing:
+                    return existing["id"], None
+                raise
+        else:
+            written = cal_store.insert_rows(gym_id, [row]) or []
     except Exception as exc:  # noqa: BLE001
         return None, f"calendar insert failed ({type(exc).__name__})"
     if not written:

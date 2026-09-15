@@ -121,7 +121,7 @@ def _sb_pending(gym_id=None, http=None):
     return rows
 
 
-def pending(gym_id=None, *, http=None):
+def pending(gym_id=None, *, http=None, strict=False):
     """Every pending sort-queue row (optionally filtered to one gym), ordered by
     enqueued_at.
 
@@ -132,6 +132,8 @@ def pending(gym_id=None, *, http=None):
     sb = _sb_pending(gym_id, http=http)
     if sb is not None:
         return sb
+    if strict and all(_supabase_conf()):
+        raise ValueError('Shared classification queue is unavailable')
     from . import db
     rows = []
     try:
@@ -140,6 +142,8 @@ def pending(gym_id=None, *, http=None):
                 "SELECT key, value FROM kv WHERE key LIKE ?",
                 (_KV_PREFIX + "%",)).fetchall()
     except Exception:
+        if strict:
+            raise ValueError('Local classification queue is unavailable') from None
         return rows
     for r in cur:
         try:
