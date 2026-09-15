@@ -8,7 +8,8 @@ class Store:
         return [{'gym_id':'a','echo_account_key':'Gym_ig'}, {'gym_id':'b','echo_account_key':'demo'},
                 {'gym_id':'missing','echo_account_key':'other'}, {'gym_id':'a','echo_account_key':'bad/key'}]
 
-def test_fleet_roster_excludes_demo_unmapped_and_bad_keys():
+def test_fleet_roster_excludes_demo_unmapped_and_bad_keys(monkeypatch):
+    monkeypatch.setattr(roster.echo_clients, "snapshot", lambda **kw: roster.echo_clients.ClientSet(ok=True, gym_ids=frozenset({"a", "b"})))
     assert roster.load(store=Store())==['gym']
 
 def test_fleet_requires_explicit_flag_and_preserves_named_scope(monkeypatch):
@@ -32,3 +33,14 @@ def test_hdr_paths_are_explicit_and_end_in_sdr(monkeypatch,modern):
     f=render._color_filter('arib-std-b67','bt2020')
     assert 'tonemap=tonemap=hable' in f and f.endswith('format=yuv420p,')
     assert ('in_transfer=arib-std-b67' if modern else 'color_trc=arib-std-b67') in f
+
+
+def test_fleet_roster_rejects_non_clients(monkeypatch):
+    monkeypatch.setattr(roster.echo_clients, "snapshot", lambda **kw: roster.echo_clients.ClientSet(ok=True))
+    assert roster.load(store=Store()) == []
+
+
+def test_fleet_roster_fails_closed_on_unknown_enrollment(monkeypatch):
+    monkeypatch.setattr(roster.echo_clients, "snapshot", lambda **kw: roster.echo_clients.ClientSet(ok=False))
+    with pytest.raises(ValueError, match="enrollment"):
+        roster.load(store=Store())
