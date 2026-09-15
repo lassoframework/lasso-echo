@@ -452,6 +452,26 @@ def _print_scheduled_lanes():
         print(f"[scheduler] {name}: {state}")
 
 
+def _auto_reels_tick(worker, now):
+    """Render off the scheduler thread so a slow montage never delays publishing ticks."""
+    if not config.auto_reels_enabled() or (worker is not None and worker.is_alive()):
+        return worker
+
+    def run():
+        try:
+            from . import auto_reels
+            for outcome in auto_reels.poll(now=now):
+                # Sanitized transition-deduped status (held/exhausted/staged/pre-claim).
+                # Never Slack/client; never raw exception text or URLs.
+                auto_reels.report_outcome(outcome)
+        except Exception as exc:
+            print(f"[auto-reels] pass failed: {type(exc).__name__}")
+
+    worker = threading.Thread(target=run, name="echo-auto-reels", daemon=True)
+    worker.start()
+    return worker
+
+
 def _daily_scheduler(store):
     """
     Minimal in-process daily trigger. Fires run_daily once per day at the target
@@ -478,6 +498,7 @@ def _daily_scheduler(store):
     last_inbox = 0.0
     last_cms = 0.0
     last_portal_echo = 0.0
+    auto_reels_worker = None
     while True:
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
@@ -710,6 +731,8 @@ def _daily_scheduler(store):
                           + ", ".join(r["base"] for r in mapped))
             except Exception as e:
                 print(f"[intake-sync] pass failed: {type(e).__name__}: {e}")
+        # Claims/debounce are durable; rendering does not block this scheduler.
+        auto_reels_worker = _auto_reels_tick(auto_reels_worker, now)
         # Opus Clip poll: FULLY INERT unless BOTH AGENT_OPUS_ENABLED and
         # AGENT_OPUS_POLL_ENABLED are armed. Errors alert (inside pull), never crash.
         if (config.opus_enabled() and config.opus_poll_enabled()

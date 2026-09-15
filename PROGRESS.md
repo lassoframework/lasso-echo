@@ -1,3 +1,11 @@
+## Automatic portrait reels rollout (2026-09-15)
+
+- [~] Native B treatment, measured portrait framing, approved copy/music and durable worker staging transferred onto current main. Existing approval and publishing settings remain unchanged.
+- [~] Fleet scope behind default OFF `AGENT_AUTO_REELS_ALL_ACCOUNTS`; reads current non-demo mapped accounts, fails closed on unavailable roster. New accounts join after the five minute roster refresh.
+- [~] Portal status projection, long-pass heartbeat and automatic render temp cleanup built. Production FFmpeg 6 HDR compatibility path tested on the running server.
+- [x] Shared `auto_reel_status` migration applied; browser roles have no table privileges.
+- [ ] Merge, deploy both Echo services and portal, arm fleet flags, verify live status and per-account readiness.
+
 ## LASSO calendar podcast and cadence repair (2026-09-14)
 
 - [~] Preserve morning/evening ordinals through fallback; pair each Story with its own feed; reject repeated captions within a day before staging.

@@ -1707,7 +1707,7 @@ class SupabaseCalendarStore:
 
     # ---- mirror writes (real-drafts calendar mirror) ------------------------
     # These write calendar rows only. NOTHING here publishes to any social account.
-    def insert_rows(self, account_key, rows):
+    def insert_rows(self, account_key, rows, *, preserve_ids=False):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -1716,7 +1716,8 @@ class SupabaseCalendarStore:
         and the approve/deny actions key off the DB-returned uuid, not the draft id.
 
         Every row's gym_id is FORCED to account_key (a caller can never write another
-        gym's row through this store) and any stray `id` key is STRIPPED before the POST.
+        gym's row through this store). IDs are stripped by default. The explicit
+        preserve_ids option accepts validated UUIDs for crash-safe automatic jobs.
         No on_conflict/upsert: apply is delete-then-insert, so a plain insert is correct
         and idempotent. Returns the list of inserted row dicts (each with its new uuid).
 
@@ -1729,6 +1730,10 @@ class SupabaseCalendarStore:
         payload = []
         for row in (rows or []):
             clean = {k: v for k, v in dict(row or {}).items() if k != "id"}
+            if preserve_ids:
+                import uuid
+                # Explicit stable UUIDs support crash-safe automatic render retries.
+                clean["id"] = str(uuid.UUID(str((row or {}).get("id") or "")))
             clean["gym_id"] = account_key  # gym scope: never trust a foreign gym_id
             payload.append(clean)
         # STAGE-TIME BELTS (report-card build, 2026-08-28; both flags default OFF,

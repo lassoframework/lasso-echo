@@ -215,6 +215,8 @@ def handle_rebuild_story(account_key, request_id, body, actor_id="", *, store=No
     if not original:
         # gym-scoped read: another gym's request id is absent, never content.
         return 404, {"ok": False, "error": "no such story for this gym"}
+    if original.get('requested_by') == 'echo_auto_reels':
+        return 409, {"ok": False, "error": "Automatic reels retain their approved copy and framing. Review or deny this reel in approvals; the legacy story text editor cannot rebuild it."}
     if str(original.get("status") or "").lower() == "denied":
         return 409, {"ok": False,
                      "error": "that story was already denied; create a new one instead"}
@@ -312,7 +314,7 @@ def _render_row(row, request=None):
     }
 
 
-def handle_list_stories(account_key, *, store=None, status=None):
+def handle_list_stories(account_key, *, store=None, status=None, automatic_only=False):
     """GET /studio/story — this gym's Story Studio history, newest first, plus the
     clip-picker bounds. Response: {ok, stories: [...], clip_bounds: {...}}.
 
@@ -325,12 +327,22 @@ def handle_list_stories(account_key, *, store=None, status=None):
     from . import story_templates as _st
     bounds = _st.selection_bounds()
     gym = _base(account_key)
+    automatic = {"enabled": False}
+    if config.auto_reels_portrait_active_for(gym):
+        from .auto_reel_status import read
+        snapshot = read(gym)
+        automatic = {"enabled": True, "ok": snapshot.get('ok', False),
+                     "reason": snapshot.get('reason', ''),
+                     "jobs": sorted(snapshot.get('jobs', []),
+                                    key=lambda j: j.get('updated_at') or 0, reverse=True)[:20]}
+    if automatic_only:
+        return 200, {"ok": True, "automatic_reels": automatic}
     st = store
     if st is None:
         from . import story_studio_store as _sss
         st = _sss.default_store()
     if not getattr(st, "available", lambda: False)():
-        return 200, {"ok": True, "stories": [], "clip_bounds": bounds,
+        return 200, {"ok": True, "stories": [], "clip_bounds": bounds, "automatic_reels": automatic,
                      "note": "story history is not available in this environment"}
     try:
         renders = st.list_renders(gym, status=status)
@@ -340,7 +352,7 @@ def handle_list_stories(account_key, *, store=None, status=None):
                                            f"({type(e).__name__})",
                      "clip_bounds": bounds}
     return 200, {
-        "ok": True, "clip_bounds": bounds,
+        "ok": True, "clip_bounds": bounds, "automatic_reels": automatic,
         "stories": [_render_row(r, requests.get(str(r.get("request_id"))))
                     for r in (renders or [])],
     }

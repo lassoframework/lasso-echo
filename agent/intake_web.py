@@ -2360,7 +2360,9 @@ def build_server(port=None):
                     status, body = _ss.handle_get_story(account_key, _ss_arg)
                 else:
                     # a GET on /studio/story is the LIST read (create-story is a POST).
-                    status, body = _ss.handle_list_stories(account_key)
+                    from urllib.parse import urlparse, parse_qs
+                    automatic_only = parse_qs(urlparse(self.path).query).get('automatic') == ['1']
+                    status, body = _ss.handle_list_stories(account_key, automatic_only=automatic_only)
                 return self._send_json(body, status)
 
             # Zernio social-connect read routes (Blake ruling 2026-07-29: Zernio is the vendor;

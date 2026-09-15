@@ -4615,3 +4615,28 @@ def lasso_infographic_quality_enabled(account_key=None) -> bool:
 def lasso_editorial_calendar_enabled():
     """LASSO book, podcast, Summit, Echo and websites calendar. Default OFF."""
     return _truthy(os.environ.get("AGENT_LASSO_EDITORIAL_CALENDAR", "false"))
+
+
+def auto_reels_enabled():
+    return _truthy(os.environ.get("AGENT_AUTO_REELS_ENABLED", "false"))
+
+
+def auto_reels_gyms():
+    if _truthy(os.environ.get("AGENT_AUTO_REELS_ALL_ACCOUNTS", "false")):
+        from .auto_reel_roster import gyms
+        return gyms()
+    return [v.strip().lower() for v in os.environ.get("AGENT_AUTO_REELS_GYMS", "").split(",") if v.strip() and v.strip() != "*"]
+
+
+def auto_reels_portrait_active_for(gym):
+    """B visual treatment, only within the existing automatic pilot and render gates."""
+    return (_truthy(os.environ.get("AGENT_AUTO_REELS_PORTRAIT_ENABLED", "false"))
+            and auto_reels_enabled() and gym in auto_reels_gyms()
+            and story_studio_render_active_for(gym))
+
+
+def auto_reels_debounce_seconds():
+    try:
+        return max(60, min(3600, int(os.environ.get("AGENT_AUTO_REELS_DEBOUNCE_SECONDS", "300"))))
+    except ValueError:
+        return 300

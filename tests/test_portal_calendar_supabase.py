@@ -1029,3 +1029,21 @@ def test_media_belt_rides_the_existing_flag_and_costs_nothing_when_off(monkeypat
     assert len(_staged(http_off)) == 2, "flag OFF: the batch passes through untouched"
     assert not [c for c in http_off.calls if c[0] == "get"], \
         "flag OFF must not pay for a single book read"
+
+
+def test_insert_rows_stable_uuid_is_opt_in_and_tenant_scoped():
+    import uuid
+    stable = str(uuid.uuid4())
+    http = _FakeHTTP(post_resp=_Resp(201, [{"id": stable, "gym_id": "lasso"}]))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co", service_key="test", http=http)
+    store.insert_rows("lasso", [{"id": stable, "gym_id": "foreign", "caption": "Training", "format": "feed"}], preserve_ids=True)
+    sent = [c for c in http.calls if c[0] == "post"][0][4][0]
+    assert sent["id"] == stable and sent["gym_id"] == "lasso"
+
+def test_insert_rows_rejects_non_uuid_before_network_when_preserving():
+    import pytest
+    http = _FakeHTTP()
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co", service_key="test", http=http)
+    with pytest.raises(ValueError):
+        store.insert_rows("lasso", [{"id": "not-a-uuid"}], preserve_ids=True)
+    assert not http.calls

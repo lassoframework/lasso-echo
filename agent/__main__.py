@@ -268,6 +268,7 @@ def _status():
     print(f"  token_watchdog : {config.token_watchdog_enabled()}  (env AGENT_TOKEN_WATCHDOG_ENABLED, "
           f"warn at {config.token_warn_days()} days)")
     print(f"  plan_month     : {config.plan_month_enabled()}  (env AGENT_PLAN_MONTH_ENABLED)")
+    print(f"  auto_reels     : {config.auto_reels_enabled()}  (env AGENT_AUTO_REELS_ENABLED; explicit gym pilots only)")
     print(f"  review_cycle   : {config.review_cycle_enabled()}  (env AGENT_REVIEW_CYCLE_ENABLED)")
     print(f"  weekly_report  : {config.weekly_report_enabled()}  (env AGENT_WEEKLY_REPORT_ENABLED)")
     print(f"  episode_inbox  : {config.episode_inbox_enabled()}  (env AGENT_EPISODE_INBOX_ENABLED)")
