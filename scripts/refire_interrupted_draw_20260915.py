@@ -26,6 +26,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from pathlib import Path
+import sys
+
+# Direct script execution sets sys.path[0] to scripts/, not the repository root.
+# Add the root explicitly so the deployed /app/agent package is importable.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 _TARGET_DATE = "2026-09-15"
 _MISSING_GYMS = ("blake_personal", "mflhaa5139")
