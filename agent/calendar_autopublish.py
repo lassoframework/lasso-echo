@@ -1376,6 +1376,7 @@ def client_gym_bases():
     Fails closed: an unreadable client universe yields the hardcoded bases only."""
     from .accounts import all_accounts
     from . import echo_clients
+    from .account_key_doctor import _is_internal_base
     seen, bases = set(), []
     for a in all_accounts():
         k = a.key or ""
@@ -1386,7 +1387,7 @@ def client_gym_bases():
             if base.endswith(suf):
                 base = base[: -len(suf)]
                 break
-        if base and base not in seen:
+        if base and not _is_internal_base(base) and base not in seen:
             seen.add(base)
             bases.append(base)
     return echo_clients.only_client_bases(bases)
