@@ -615,6 +615,19 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         return refused
     deps = dict(deps or {})
     method = (method or "").upper()
+    if path.startswith(ROUTE_PREFIX + "/evidence/"):
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        if not (deps["volume_available"]() if "volume_available" in deps else volume_available()):
+            return 503, {"error": "volume_unavailable"}
+        from .fixer_evidence import gather, EvidenceError
+        try:
+            return 200, gather(path[len(ROUTE_PREFIX + "/evidence/"):],
+                               deps=deps.get("evidence"), now=now)
+        except EvidenceError as exc:
+            return exc.status, {"error": exc.code}
+        except Exception:
+            return 503, {"error": "evidence_unavailable"}
     if method == "GET" and path == ROUTE_PREFIX:
         return 200, catalog_json()
     m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/jobs/([0-9a-f]{{32}})$", path)
