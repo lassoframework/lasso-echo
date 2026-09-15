@@ -28,6 +28,7 @@ def test_full_contract_and_no_secret_fields():
     assert 'xoxb' not in json.dumps(result) and 'https://' not in json.dumps(result)
     assert {t for t,p in calls}=={'support_tickets','content_calendar','gym_social_grades','media_asset'}
     assert calls[1][1]['limit']=='501'
+    assert 'updated_at' not in calls[1][1]['select']
 
 @pytest.mark.parametrize('mutate',[
  lambda ts:ts['support_tickets'][0].update(id='wrong'),
