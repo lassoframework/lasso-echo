@@ -10,7 +10,7 @@ from pathlib import Path
 UUID = re.compile(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\Z")
 KEY = r"([A-Za-z0-9][A-Za-z0-9_-]{2,79})"
 CAL_FIELDS = ('id', 'gym_id', 'post_date', 'time_slot', 'format', 'status', 'pillar',
-              'caption', 'created_at', 'updated_at', 'variant_status')
+              'caption', 'created_at', 'variant_status')
 GEN_FIELDS = ('id', 'draft_id', 'account_key', 'kind', 'headline', 'cta', 'engine',
               'model', 'route', 'grade_status', 'grade_reason', 'attempt', 'final_status', 'created_at')
 MAX_BYTES = 128 * 1024
