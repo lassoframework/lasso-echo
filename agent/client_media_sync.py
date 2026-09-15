@@ -1241,6 +1241,20 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 banned_words=banned, logger=log,
                 allow_reshape=cadence_changed)
             if built.get("ok"):
+                # A guarded no-op is not a generated calendar. Treating noop_empty as
+                # success hid live zero-row gyms behind generated=1 and let recovery
+                # tickets resolve without any calendar evidence. Keep cadence pending
+                # and report the honest not-built result so the missing input remains
+                # visible and retryable.
+                _applied = not (built.get("noop_shrink") or built.get("noop_empty"))
+                if not _applied:
+                    reason = "noop_empty" if built.get("noop_empty") else "noop_shrink"
+                    results.append({"base": base, "status": "not_built",
+                                    "reason": reason,
+                                    "synced": sync.get("synced", 0),
+                                    "upserted": 0})
+                    log(f"{base}: calendar was not generated ({reason}); 0 rows written")
+                    continue
                 generated += 1
                 # Remember the media count this build covered, so the next scan does not
                 # rebuild until NEW media arrives (anti-churn; pairs with never-shrink).
@@ -1249,7 +1263,6 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # noop_shrink/noop_empty build silently dropped the client's toggle
                 # forever — an un-applied cadence must stay pending so the next scan
                 # retries it).
-                _applied = not (built.get("noop_shrink") or built.get("noop_empty"))
                 try:
                     from . import db as _db
                     _db.kv_set(f"built_media_{base}", str(media_count))

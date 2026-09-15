@@ -688,6 +688,20 @@ def test_drive_only_gym_with_stale_sample_rows_still_builds(monkeypatch):
     assert drive_rows, "expected real content_calendar rows built from the Drive pool"
 
 
+def test_drive_only_empty_rebuild_is_not_reported_as_generated(monkeypatch):
+    """A connected but unusable Drive pool writes zero rows and must stay visible."""
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    _arm_drive_pool(monkeypatch, [])
+
+    out = cms.scan_and_generate(clients=["gritx"], store=FakeStore(), r2=FakeR2({}))
+
+    assert out["generated"] == 0
+    assert out["results"] == [{"base": "gritx", "status": "not_built",
+                               "reason": "noop_empty", "synced": 0,
+                               "upserted": 0}]
+
+
 def test_drive_only_gym_without_gym_drive_flags_still_awaits(monkeypatch):
     """REGRESSION GUARD: the fix must be gated behind GYM_DRIVE_STAGE +
     gym_drive_connect_active_for, exactly like the lane already is. A Drive pool
