@@ -26,6 +26,7 @@ heartbeat write failure must never crash the build or release the lock early
 
 import os
 import sys
+import threading
 import time
 
 import pytest
@@ -216,18 +217,22 @@ def test_start_heartbeat_thread_renews_the_lock_while_running(monkeypatch):
     assert build_lock.acquire(gym, holder="run-a") is True
 
     calls = []
+    renewed_twice = threading.Event()
     real_heartbeat = build_lock.heartbeat
 
     def _tracking_heartbeat(base_key, *, holder=""):
         calls.append(1)
+        if len(calls) >= 2:
+            renewed_twice.set()
         return real_heartbeat(base_key, holder=holder)
 
     monkeypatch.setattr(build_lock, "heartbeat", _tracking_heartbeat)
 
     handle = build_lock.start_heartbeat(gym, holder="run-a", interval=0.05)
     try:
-        time.sleep(0.3)
-        assert len(calls) >= 2  # several renewals fired while it ran
+        # Wait for the behavior instead of assuming a loaded Mac will schedule
+        # two background callbacks inside a fixed 300 ms window.
+        assert renewed_twice.wait(timeout=2.0)
     finally:
         handle.stop()
 
