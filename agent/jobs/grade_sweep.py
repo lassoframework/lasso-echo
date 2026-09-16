@@ -227,6 +227,10 @@ def _merge_fix(agg: dict, step: dict) -> dict:
     gap = (step or {}).get("gap_fill")
     if gap and gap != "none" and agg.get("gap_fill") in (None, "none"):
         agg["gap_fill"] = gap
+    for day in (step or {}).get("gap_dates") or []:
+        dates = agg.setdefault("gap_dates", [])
+        if day not in dates:
+            dates.append(day)
     agg["ok"] = bool(agg.get("ok", True)) and bool((step or {}).get("ok", False))
     agg["passes"] = int(agg.get("passes") or 0) + 1
     return agg
@@ -278,6 +282,14 @@ def _held_alert_text(gym_id: str, grade, fix: dict) -> str:
     caption legs, and a score that quietly excluded rows without saying so
     would be exactly the kind of dishonesty this grader is meant to end."""
     fixed_txt = "; ".join((fix or {}).get("actions") or []) or "nothing auto-fixable"
+    if (fix or {}).get("gap_fill") == "no_media":
+        dates = list((fix or {}).get("gap_dates") or [])
+        shown = ", ".join(dates[:10])
+        if len(dates) > 10:
+            shown += f", plus {len(dates) - 10} more"
+        fixed_txt += "; no eligible unused media; retained missing dates for retry"
+        if shown:
+            fixed_txt += f": {shown}"
     remaining = [str(d[2]) for d in (grade.defects or [])[:3]]
     lines = [
         f"calendar grade: {gym_id} forward book held at {grade.total} "
