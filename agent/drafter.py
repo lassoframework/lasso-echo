@@ -241,6 +241,32 @@ def _strip_llm_scaffold(text):
     return out
 
 
+_HOOK_MAX_CHARS = 125
+
+
+def _bound_opening_hook(text, max_chars=_HOOK_MAX_CHARS):
+    """Keep the first real caption line within the grade gate without losing copy.
+
+    The model can ignore a character instruction.  In that case, move the overflow
+    onto the following line at a word boundary.  This preserves every source-grounded
+    word while preventing a future calendar from being born with hook_too_long.
+    """
+    lines = (text or "").splitlines()
+    for index, raw in enumerate(lines):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if len(line) <= max_chars:
+            return text
+        cut = line.rfind(" ", 0, max_chars + 1)
+        if cut <= 0:
+            cut = max_chars
+        head, tail = line[:cut].rstrip(), line[cut:].lstrip()
+        lines[index:index + 1] = [head, tail]
+        return "\n".join(lines).strip()
+    return text
+
+
 def _call_llm_caption(system, user):
     """Call Claude for SB7 caption generation. Raises on missing key or SDK."""
     import os as _os
@@ -642,6 +668,7 @@ class StoryBrandGenerator:
         "member moment from the photo, sometimes a myth to bust. Even with limited "
         "source material, make the OPENING WORDS feel fresh, not a repeat of a stock "
         "hook. Be punchy and direct.\n"
+        "- The first line is the hook and MUST be 125 characters or fewer.\n"
         "- Body max 260 characters (hashtags and CTA appended separately).\n"
         "- Output ONLY the caption body text. No CTA. No hashtags. No quotes.\n"
         "- Never explain your choices. No trailing rationale and no bracketed "
@@ -950,7 +977,8 @@ class StoryBrandGenerator:
                    if form_block else "Max 260 characters. ")
                 + "Caption body only."
             )
-            return _strip_llm_scaffold(_call_llm_caption(self._SYSTEM, user) or "")
+            clean = _strip_llm_scaffold(_call_llm_caption(self._SYSTEM, user) or "")
+            return _bound_opening_hook(clean)
 
         try:
             body = _compose()
