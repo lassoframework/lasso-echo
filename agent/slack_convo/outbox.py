@@ -370,7 +370,9 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
     # ---- conversational kinds: the gates ---------------------------------------------
     # Re-read deployment proof at dispatch time. A queued FIXER acknowledgement,
     # held-answer replacement, or stale notice must never reach a client.
-    if att.get("fixer"):
+    if (att.get("fixer") and
+            (att.get("recipient_kind") or ticket.get("identity_kind") or "client")
+            not in ("staff", "coach")):
         release = ((ticket.get("verification_after") or {}).get("fixer") or {})
         deployment = release.get("deployment_check") or {}
         proven = (kind == _a.KIND_STATUS and att.get("resolve_notice") is True
