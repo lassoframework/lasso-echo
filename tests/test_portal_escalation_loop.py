@@ -305,6 +305,26 @@ def test_released_grounded_answer_cannot_bypass_code_fix_release(monkeypatch):
     assert sent == []
 
 
+def test_escalated_question_hold_overrides_question_exception(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    bus = Bus([_ticket(classification="answerable_question", status="hold",
+                       escalated=True, hold_tier="routine",
+                       raw_text="Can we add our group sessions schedule to the website?",
+                       verification_after={"source": "grounding",
+                                           "hold": {"tier": "org_floor"}})])
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com", body="question", meta={})
+    row = bus.record_outbound(ticket_id="t-1", author_type="echo",
+                              body="Yes, we can add your group sessions schedule.",
+                              delivery_status="ready", kind=A.KIND_ANSWER,
+                              meta={"identity": "echo", "recipient_kind": "client",
+                                    "released_by": "U_BLAKE"})
+    sent, post = _posts()
+    OB.run_once(bus, post, identity=ECHO, log=lambda *a: None)
+    assert bus.message(row["id"])["delivery_status"] == "suppressed"
+    assert sent == []
+
+
 def test_code_fix_resolve_requires_release_and_blake_in_conversation():
     bus = Bus([_ticket(classification="code_fix", status="hold")])
     assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
@@ -411,8 +431,9 @@ def test_no_resolve_button_when_there_is_nowhere_to_send_the_notice():
 
 
 def test_resolve_and_notify_writes_the_person_a_notice_and_closes_the_ticket():
-    bus = Bus([_ticket(status="hold", escalated=True,
-                       classification="answerable_question")])
+    bus = Bus([_ticket(status="verification", escalated=False,
+                       classification="answerable_question",
+                       verification_after={"source": "grounding"})])
     # the human's own message, which every real ticket has and which outbox gate 1 (first
     # contact: the bot never speaks first) requires before anything can post
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,

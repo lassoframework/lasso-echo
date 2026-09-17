@@ -117,7 +117,12 @@ def _customer_fix_reply(ticket, att):
     if recipient in ("staff", "coach"):
         return False
     classification = str(ticket.get("classification") or "").lower()
-    if classification == "answerable_question" and not att.get("fixer"):
+    direct_question = (classification == "answerable_question"
+                       and ticket.get("status") == "verification"
+                       and ticket.get("escalated") is not True
+                       and not ticket.get("hold_tier")
+                       and not (ticket.get("verification_after") or {}).get("hold"))
+    if direct_question and not att.get("fixer"):
         return False
     portal_handoff = (ticket.get("product") == "echo"
                       and portal_deliverable(ticket)
