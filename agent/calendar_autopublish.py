@@ -337,6 +337,25 @@ def _alert_daily_cap_hit(gym_id, run_date):
         pass  # an alert failure must never block the publish lane
 
 
+def _alert_slot_capacity_hit(gym_id, row, count, limit):
+    """Tell ops once per gym/day/platform/format when approved rows exceed cadence."""
+    try:
+        from . import db, ops_alerts
+        day = str(row.get("post_date") or "")[:10]
+        platform = str(row.get("account") or "").lower()
+        fmt = str(row.get("format") or "feed").lower()
+        key = f"slotcap_alerted_{gym_id}_{day}_{platform}_{fmt}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"{gym_id}: approved {platform}/{fmt} calendar rows exceed the "
+            f"{day} cadence ({count}/{limit} already publishing or published). "
+            "Extra rows are held for calendar review, not sent.")
+    except Exception:  # noqa: BLE001 - alerting cannot bypass the hold
+        pass
+
+
 def scheduled_iso_for_row(row, now=None, tz_name=None):
     """The ISO8601 go-live timestamp for a row: its post_date at its OWN stable slot
     time (slot_time_for_row), in the GYM'S posting timezone (tz_name; default the
@@ -870,9 +889,24 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 continue
             row = fixed
 
-        # EXACTLY-ONCE CLAIM: only the winner proceeds to a network call.
+        # ATOMIC DAY CAPACITY + ROW CLAIM. The actual gym-local publish day is
+        # used, so catch-up rows dated on different prior days share today's
+        # capacity. Postgres serializes distinct rows/workers in one transaction.
+        # This applies to both manual approval and autonomous client lanes.
         try:
-            won = store.mark_publishing(row_id)
+            claim_slot = getattr(store, "claim_publish_slot", None)
+            if callable(claim_slot):
+                from .cadence import resolve_posts_per_day
+                # Refresh after preflight: a long render/reframe can cross the
+                # gym's midnight before this atomic reservation.
+                reservation_day = _local_now(now, gym_tz).date().isoformat()
+                won = claim_slot(row_id, gym_id, reservation_day, gym_tz,
+                                 resolve_posts_per_day(gym_id, store), approved_only)
+            else:
+                # Legacy injectable test stores have no RPC. The production
+                # Supabase store always exposes claim_publish_slot and fails
+                # closed if its migration has not been applied.
+                won = store.mark_publishing(row_id)
         except Exception as e:
             failed.append(row_id)
             print(f"[calendar-autopublish] claim failed for row {row_id}: "
@@ -884,8 +918,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             _note_repeat_failure(row_id, gym_id, e)
             continue
         if not won:
-            # Another run/worker owns it (or it was already published). Skip.
-            skipped.append(row_id)
+            # Either this row was claimed elsewhere or the local-day platform
+            # cadence is full. Leave it untouched for calendar review.
+            (waiting if callable(claim_slot) else skipped).append(row_id)
             continue
 
         # CONTENT IDEMPOTENCY, WRITTEN BEFORE THE NETWORK CALL (2026-09-05 incident).

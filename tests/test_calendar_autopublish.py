@@ -21,6 +21,7 @@ Coverage:
 
 import os
 import sys
+import threading
 
 import pytest
 
@@ -134,6 +135,34 @@ class _FakeStore:
 
     def release_content_ledger_claim(self, gym_id, row_id, previous, reason):
         return self._transition_unpublished_claim(gym_id, row_id, previous, reason)
+
+
+class _AtomicSlotStore(_FakeStore):
+    """Offline model of the SQL advisory-lock reservation and row claim."""
+
+    def __init__(self, rows):
+        super().__init__(rows)
+        self._slot_lock = threading.Lock()
+
+    def claim_publish_slot(self, row_id, gym, day, timezone_name, capacity,
+                           approved_only):
+        with self._slot_lock:
+            row = self.rows[row_id]
+            if row.get("status") not in ("pending", "approved"):
+                return False
+            if approved_only and row["status"] != "approved":
+                return False
+            used = sum(r.get("status") in ("publishing", "published")
+                       and r.get("publish_reservation_day") == day
+                       for r in self.rows.values()
+                       if (r.get("gym_id"), r.get("account"), r.get("format")) ==
+                       (gym, row.get("account"), row.get("format")))
+            if used >= capacity:
+                return False
+            if not super().mark_publishing(row_id):
+                return False
+            row["publish_reservation_day"] = day
+            return True
 
 
 class _FakePublisher:
@@ -768,7 +797,7 @@ def test_mark_publish_failed_reverts_to_pending_only():
 
     _, _url, params, _headers, body = http.calls[0]
     assert params["id"] == "eq.a"
-    assert body == {"status": "pending"}                 # nothing else recorded
+    assert body == {"status": "pending", "publish_reservation_day": None}
 
 
 def test_account_for_skips_non_ig_fb_platforms():
@@ -1007,6 +1036,148 @@ def test_client_row_waits_for_its_slot_then_publishes_now(armed, monkeypatch):
     assert s2["published"] == ["cx"]
     assert sent == [(store.rows["cx"].get("draft_id") or sent[0][0], None)] or \
            (len(sent) == 1 and sent[0][1] is None)
+
+
+def test_client_approved_rows_respect_platform_day_capacity(armed, monkeypatch):
+    """Separate approved FB rows cannot all publish on a 1x gym day."""
+    from agent import cadence
+
+    class _Acct:
+        key = "gymx_fb"; platform = "facebook"; display_name = "Gym X"
+
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    rows = [_row(rid, account="facebook", status="approved")
+            for rid in ("fb1", "fb2", "fb3")]
+    for row in rows:
+        row["gym_id"] = "gymx"
+    store = _AtomicSlotStore(rows)
+    sent = []
+    summary = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                              approved_only=True, catch_all=True,
+                              zernio_publish=_zern_capture(sent))
+    assert summary["published"] == ["fb1"]
+    assert set(summary["waiting"]) == {"fb2", "fb3"}
+    assert store.publishing_calls == ["fb1"]
+
+    # A real 2x preference still permits its second distinct feed.
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 2)
+    again = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                            approved_only=True, catch_all=True,
+                            zernio_publish=_zern_capture(sent))
+    assert again["published"] == ["fb2"]
+    assert again["waiting"] == ["fb3"]
+
+
+def test_client_slot_capacity_keeps_cross_platform_pair_and_approval_gate(
+        armed, monkeypatch):
+    from agent import cadence
+
+    class _Acct:
+        def __init__(self, platform):
+            self.key = f"gymx_{'fb' if platform == 'facebook' else 'ig'}"
+            self.platform = platform
+            self.display_name = "Gym X"
+
+    monkeypatch.setattr(cap, "_account_for",
+                        lambda row, gym_id: _Acct(row["account"]))
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    rows = [_row("ig", status="approved"),
+            _row("fb", account="facebook", status="approved"),
+            _row("unapproved", account="facebook", status="pending")]
+    for row in rows:
+        row["gym_id"] = "gymx"
+    store = _AtomicSlotStore(rows)
+    sent = []
+    summary = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                              approved_only=True, catch_all=True,
+                              zernio_publish=_zern_capture(sent))
+    assert set(summary["published"]) == {"ig", "fb"}
+    assert summary["waiting"] == ["unapproved"]
+    assert "unapproved" not in store.publishing_calls
+
+
+def test_autonomous_overlap_and_catchup_share_actual_day_capacity(armed, monkeypatch):
+    """Two workers must not send distinct rows from yesterday and today together."""
+    from agent import cadence
+
+    class _Acct:
+        key = "gymx_fb"; platform = "facebook"; display_name = "Gym X"
+
+    barrier = threading.Barrier(2)
+
+    class _ConcurrentStore(_AtomicSlotStore):
+        def due_rows(self, gym, run_date, catchup_days=0):
+            return [dict(r) for r in self.rows.values()
+                    if r.get("status") == "pending"]
+
+        def claim_publish_slot(self, *args):
+            barrier.wait(timeout=5)  # both workers enter before either can reserve
+            return super().claim_publish_slot(*args)
+
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    rows = [_row("yesterday", account="facebook", status="pending",
+                 post_date="2026-08-09"),
+            _row("today", account="facebook", status="pending")]
+    for row in rows:
+        row["gym_id"] = "gymx"
+    store = _ConcurrentStore(rows)
+    sent = []
+    results = []
+
+    def worker():
+        results.append(cap.publish_due(
+            RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+            approved_only=False, catchup_days=1, catch_all=True,
+            zernio_publish=_zern_capture(sent)))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(sent) == 1
+    assert sum(len(result["published"]) for result in results) == 1
+    assert {r.get("publish_reservation_day") for r in store.rows.values()
+            if r.get("status") == "published"} == {RUN_DATE}
+
+
+def test_slot_reservation_refreshes_local_day_after_preflight(armed, monkeypatch):
+    """A render crossing midnight reserves the day of the network send."""
+    from agent import cadence
+
+    class _Acct:
+        key = "gymx_ig"; platform = "instagram"; display_name = "Gym X"
+
+    class _RecordingStore(_AtomicSlotStore):
+        def claim_publish_slot(self, row_id, gym, day, timezone_name,
+                               capacity, approved_only):
+            self.claim_day = day
+            return super().claim_publish_slot(row_id, gym, day, timezone_name,
+                                              capacity, approved_only)
+
+    original_local_now = cap._local_now
+    calls = 0
+
+    def crossing_midnight(now, timezone_name):
+        nonlocal calls
+        calls += 1
+        instant = "2026-08-10T23:59:00-04:00" if calls == 1 else \
+                  "2026-08-11T00:01:00-04:00"
+        return original_local_now(instant, timezone_name)
+
+    monkeypatch.setattr(cap, "_local_now", crossing_midnight)
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    row = _row("cross-midnight", status="approved")
+    row["gym_id"] = "gymx"
+    store = _RecordingStore([row])
+    cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                    approved_only=True, catch_all=True,
+                    zernio_publish=_zern_capture([]))
+    assert store.claim_day == "2026-08-11"
 
 
 def test_autonomous_client_also_publishes_now_at_slot(armed, monkeypatch):
