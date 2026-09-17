@@ -133,6 +133,48 @@ def test_bind_success_writes_source():
     src = list(store.sources.values())[0]
     assert src["gym_id"] == "pierce" and src["folder_id"] == FID
     assert src["active"] is True
+    assert src["sync_status"] == "queued"
+
+
+def test_bind_queue_failure_is_honest_and_retryable():
+    class OnceFailStore(FakeMediaStore):
+        attempts = 0
+
+        def request_sync(self, source_id, gym_id):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("unavailable")
+            return super().request_sync(source_id, gym_id)
+
+    store = OnceFailStore()
+    drive = FakeDrive(meta={"name": "Team", "owner_email": "o@pierce.com"})
+    status, body = gm.handle_bind_source("pierce", f".../folders/{FID}",
+                                         drive=drive, store=store)
+    assert status == 503 and body["ok"] is False
+    assert len(store.sources) == 1
+    status, body = gm.handle_bind_source("pierce", f".../folders/{FID}",
+                                         drive=drive, store=store)
+    assert status == 200 and body["sync_status"] == "queued"
+    assert len(store.sources) == 1
+
+
+def test_source_status_is_tenant_scoped():
+    store = FakeMediaStore(sources=[make_source("a", gym_id="pierce"),
+                                    make_source("b", gym_id="other")])
+    store.sources["a"]["sync_status"] = "indexing"
+    status, body = gm.handle_list_sources("pierce", store=store)
+    assert status == 200
+    assert [s["id"] for s in body["sources"]] == ["a"]
+    assert body["sources"][0]["sync_status"] == "indexing"
+
+
+def test_retry_request_rejects_other_gym():
+    store = FakeMediaStore(sources=[make_source("a", gym_id="pierce")])
+    status, body = gm.handle_request_source_sync("other", "a", store=store)
+    assert status == 404 and not body["ok"]
+    assert "sync_status" not in store.sources["a"]
+    status, body = gm.handle_request_source_sync("pierce", "a", store=store)
+    assert status == 200 and body["sync_status"] == "queued"
 
 
 # ---- disconnect never deletes ------------------------------------------------

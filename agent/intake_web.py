@@ -2147,6 +2147,9 @@ def build_server(port=None):
             m = re.match(pat + r"sources/([A-Za-z0-9_-]+)/disconnect$", path)
             if m:
                 return m.group(1), "sources-disconnect", m.group(2)
+            m = re.match(pat + r"sources/([A-Za-z0-9_-]+)/sync$", path)
+            if m:
+                return m.group(1), "sources-sync", m.group(2)
             m = re.match(pat + r"assets$", path)
             if m:
                 return m.group(1), "assets", None
@@ -2642,7 +2645,7 @@ def build_server(port=None):
             # per-gym inside gym_media_routes (403 when off for this gym).
             mt_token, mt_kind, mt_arg = self._media_route()
             if mt_token is not None and mt_kind in (
-                    "check-connection", "sources", "sources-disconnect",
+                    "check-connection", "sources", "sources-disconnect", "sources-sync",
                     "asset-hide", "asset-unhide"):
                 # CSRF/Origin rail: mirror every other portal write route. A cross-origin
                 # POST is refused unless it is the allowed portal origin (server-to-server
@@ -2677,6 +2680,8 @@ def build_server(port=None):
                         actor_id=body.get("actor_id", ""))
                 elif mt_kind == "sources-disconnect":
                     status, resp = _gm.handle_disconnect_source(account_key, mt_arg)
+                elif mt_kind == "sources-sync":
+                    status, resp = _gm.handle_request_source_sync(account_key, mt_arg)
                 else:  # asset-hide / asset-unhide
                     status, resp = _gm.handle_hide_asset(
                         account_key, mt_arg, hide=(mt_kind == "asset-hide"))

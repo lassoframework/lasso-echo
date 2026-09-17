@@ -369,7 +369,8 @@ def _prerender_pass(gym_id, drive, store, merged, seen_ids, probe_fn, log, *,
 
 
 def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
-                now_iso=None, probe_budget=None, render_budget=None, host_fn=None):
+                now_iso=None, probe_budget=None, render_budget=None, host_fn=None,
+                sweep_missing=True, emit_digest=True):
     """Sync ONE media_source. Returns a per-source summary dict. Never raises out of
     a normal degrade path; a 403 on the walk marks the source revoked_externally and
     returns a revoked summary."""
@@ -409,7 +410,8 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             msg = (f"Google Drive access for {gym_id} was revoked (the shared "
                    f"folder is no longer shared to Echo). Reconnect it in the "
                    f"portal to resume pulling photos. Nothing was lost.")
-            _post_digest(msg, channel=_client_channel_if_armed(gym_id))
+            if emit_digest:
+                _post_digest(msg, channel=_client_channel_if_armed(gym_id))
             log(f"source {source_id} for {gym_id} revoked_externally (Drive {status})")
             return {"ok": False, "revoked": True, "gym_id": gym_id}
         log(f"walk failed for {gym_id}: {type(e).__name__}: {e}")
@@ -436,11 +438,44 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
     skipped += [(t, "echo_render_reingest_skipped") for t in reingest_skipped]
 
     existing = {a["id"]: a for a in store.list_assets(gym_id, source_id=source_id)}
+    # Drive may expose the same file through two bound folders. The asset PK is
+    # global by Drive ID; the first source owns it. Never reassign it or let the
+    # second source's disappearance sweep change its eligibility. A cross-tenant
+    # collision is an error, not permission to read or mutate that tenant's row.
+    owned_rows = []
+    for row in rows:
+        if row["id"] not in existing:
+            owner = store.get_asset(row["id"])
+            if owner:
+                if owner.get("gym_id") != gym_id:
+                    raise ValueError("Drive file is already indexed for another gym")
+                log(f"shared Drive file {row['id']} already belongs to source "
+                    f"{owner.get('source_id')}; skipping duplicate")
+                continue
+        owned_rows.append(row)
+    rows = owned_rows
     seen_ids = {r["id"] for r in rows}
 
     # 3. insert new / patch changed indexer-owned fields
-    new_rows = [r for r in rows if r["id"] not in existing]
-    inserted = store.insert_assets(new_rows)
+    candidates = [r for r in rows if r["id"] not in existing]
+    inserted_ids = store.insert_assets_ignore_conflicts(candidates)
+    # Another source can win between the ownership precheck and this insert.
+    # Re-read every candidate before any probe/update/classification. Unique
+    # files still insert even when one shared ID loses the race.
+    skipped_ids = set()
+    for row in candidates:
+        owner = store.get_asset(row["id"])
+        if not owner:
+            raise RuntimeError("Drive asset insert could not be verified")
+        if owner.get("gym_id") != gym_id:
+            raise ValueError("Drive file is already indexed for another gym")
+        if owner.get("source_id") != source_id:
+            skipped_ids.add(row["id"])
+    if skipped_ids:
+        rows = [r for r in rows if r["id"] not in skipped_ids]
+        seen_ids.difference_update(skipped_ids)
+    new_rows = [r for r in candidates if r["id"] in inserted_ids]
+    inserted = len(new_rows)
     updated = 0
     for r in rows:
         old = existing.get(r["id"])
@@ -456,20 +491,23 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             store.update_asset(r["id"], changes)
             updated += 1
 
-    # 4. vanished Drive ids -> not eligible, removed_from_drive; flip pending rows
+    # 4. Nightly reconciliation only. The queued post-bind import must never
+    # mutate existing assets or pending calendar rows because a temporarily
+    # incomplete Drive walk could otherwise rewrite a pending post.
     removed = 0
     vanished = []
-    for asset_id, old in existing.items():
-        if asset_id in seen_ids:
-            continue
-        if old.get("reject_reason") == _idx.REJECT_REMOVED:
-            continue  # already marked; idempotent
-        store.update_asset(asset_id, {"eligible": False,
-                                      "reject_reason": _idx.REJECT_REMOVED,
-                                      "indexed_at": now_iso})
-        vanished.append(asset_id)
-        removed += 1
-    _flip_pending_for_missing(gym_id, vanished, log)
+    if sweep_missing:
+        for asset_id, old in existing.items():
+            if asset_id in seen_ids:
+                continue
+            if old.get("reject_reason") == _idx.REJECT_REMOVED:
+                continue  # already marked; idempotent
+            store.update_asset(asset_id, {"eligible": False,
+                                          "reject_reason": _idx.REJECT_REMOVED,
+                                          "indexed_at": now_iso})
+            vanished.append(asset_id)
+            removed += 1
+        _flip_pending_for_missing(gym_id, vanished, log)
 
     # 5. budgeted probe pass over unprobed VIDEO candidates
     probe_fn = probe_fn or _idx.probe_video
@@ -581,7 +619,7 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
         "queued_ambiguous": queued_ambiguous,
         "rendered": rendered, "prehosted": prehosted, "render_skipped": render_skipped}
     # 7. per-gym new-asset digest (only when something new arrived)
-    if inserted:
+    if emit_digest and inserted:
         rejected_txt = ", ".join(f"{k} x{v}" for k, v in sorted(reject_counts.items())) \
             or "none"
         _post_digest(
@@ -593,7 +631,7 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
     # "Sort these" coach digest (spec §0.3): fires ONLY when the queue is non-empty.
     # story_sort_queue.post_digest is a no-op on an empty queue, so this never
     # storms the channel. Best effort: a digest failure never sinks the sync.
-    if config.story_classifier_enabled():
+    if emit_digest and config.story_classifier_enabled():
         try:
             from .. import story_sort_queue as _q
             _q.post_digest(gym_id, channel=_client_channel_if_armed(gym_id))

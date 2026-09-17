@@ -215,9 +215,14 @@ def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
                          "error": "this folder is already connected to another gym"}
         # Same gym re-binding the same folder: idempotent success.
         if existing.get("active"):
+            try:
+                if not store.request_sync(existing["id"], gym):
+                    return 503, {"ok": False, "error": "could not queue media indexing"}
+            except Exception:
+                return 503, {"ok": False, "error": "could not queue media indexing"}
             return 200, {"ok": True, "source_id": existing.get("id"),
                          "folder_name": existing.get("folder_name") or "",
-                         "already": True}
+                         "already": True, "sync_status": "queued"}
 
     # Read meta for name/owner + the ownership-sanity rail.
     try:
@@ -256,8 +261,15 @@ def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
         return 409, {"ok": False, "case": "already_bound",
                      "error": "this folder is already connected",
                      "detail": ops_alerts.scrub(str(e))[:120]}
+    try:
+        if not store.request_sync(source_id, gym):
+            raise RuntimeError("source could not be queued")
+    except Exception:
+        # The source is bound. A repeat bind requests indexing on that same row.
+        return 503, {"ok": False, "source_id": source_id,
+                     "error": "folder connected but media indexing could not be queued; retry connect"}
     return 200, {"ok": True, "source_id": source_id,
-                 "folder_name": meta.get("name") or ""}
+                 "folder_name": meta.get("name") or "", "sync_status": "queued"}
 
 
 def _owner_domain_conflict(store, gym, owner_email):
@@ -288,6 +300,22 @@ _PERSONAL_DOMAINS = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.com",
 
 
 # ---- GET /media/sources?gym --------------------------------------------------
+def handle_request_source_sync(account_key, source_id, *, store=None):
+    """Retry an existing source without binding again or touching calendar rows."""
+    if not _armed(account_key):
+        return 403, {"ok": False, "error": "media connect is not enabled for this gym"}
+    store = store or _store()
+    if not store.available():
+        return 503, {"ok": False, "error": "media store unavailable"}
+    try:
+        queued = store.request_sync(source_id, _base(account_key))
+    except Exception:
+        return 503, {"ok": False, "error": "could not queue media indexing"}
+    if not queued:
+        return 404, {"ok": False, "error": "active source not found"}
+    return 200, {"ok": True, "source_id": source_id, "sync_status": "queued"}
+
+
 def handle_list_sources(account_key, *, store=None):
     """GET /media/sources — this gym's connected sources. Response:
       {sources: [{id, folder_id, folder_name, owner_email, active,
@@ -306,7 +334,11 @@ def handle_list_sources(account_key, *, store=None):
          "folder_name": s.get("folder_name"), "owner_email": s.get("owner_email"),
          "active": bool(s.get("active")),
          "revoked_externally": bool(s.get("revoked_externally")),
-         "sync_mode": s.get("sync_mode"), "connected_at": s.get("connected_at")}
+         "sync_mode": s.get("sync_mode"), "connected_at": s.get("connected_at"),
+         "sync_status": s.get("sync_status") or "idle",
+         "sync_requested_at": s.get("sync_requested_at"),
+         "sync_finished_at": s.get("sync_finished_at"),
+         "sync_error": s.get("sync_error")}
         for s in sources]}
 
 

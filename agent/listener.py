@@ -1095,5 +1095,11 @@ def run_listener():
         threading.Thread(target=_daily_scheduler, args=(store,), daemon=True).start()
         print("Daily scheduler started.")
 
+    if config.gym_drive_connect_enabled() or config.gym_drive_connect_gyms():
+        from .jobs.queued_gym_media import serve as _serve_gym_media_queue
+        threading.Thread(target=_serve_gym_media_queue, name="gym-media-queue",
+                         daemon=True).start()
+        print("Gym media indexing queue started.")
+
     print("Echo listener online (Socket Mode). Draft-only:", not config.publish_enabled())
     SocketModeHandler(app, app_token).start()
