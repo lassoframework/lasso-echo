@@ -1144,6 +1144,42 @@ def test_autonomous_overlap_and_catchup_share_actual_day_capacity(armed, monkeyp
             if r.get("status") == "published"} == {RUN_DATE}
 
 
+def test_slot_reservation_refreshes_local_day_after_preflight(armed, monkeypatch):
+    """A render crossing midnight reserves the day of the network send."""
+    from agent import cadence
+
+    class _Acct:
+        key = "gymx_ig"; platform = "instagram"; display_name = "Gym X"
+
+    class _RecordingStore(_AtomicSlotStore):
+        def claim_publish_slot(self, row_id, gym, day, timezone_name,
+                               capacity, approved_only):
+            self.claim_day = day
+            return super().claim_publish_slot(row_id, gym, day, timezone_name,
+                                              capacity, approved_only)
+
+    original_local_now = cap._local_now
+    calls = 0
+
+    def crossing_midnight(now, timezone_name):
+        nonlocal calls
+        calls += 1
+        instant = "2026-08-10T23:59:00-04:00" if calls == 1 else \
+                  "2026-08-11T00:01:00-04:00"
+        return original_local_now(instant, timezone_name)
+
+    monkeypatch.setattr(cap, "_local_now", crossing_midnight)
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    row = _row("cross-midnight", status="approved")
+    row["gym_id"] = "gymx"
+    store = _RecordingStore([row])
+    cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                    approved_only=True, catch_all=True,
+                    zernio_publish=_zern_capture([]))
+    assert store.claim_day == "2026-08-11"
+
+
 def test_autonomous_client_also_publishes_now_at_slot(armed, monkeypatch):
     """Autonomous gyms no longer hand Zernio a future scheduledFor (which was marked
     published immediately, hours before the post existed). They fire at slot time too."""

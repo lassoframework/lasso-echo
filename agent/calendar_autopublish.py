@@ -897,7 +897,10 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             claim_slot = getattr(store, "claim_publish_slot", None)
             if callable(claim_slot):
                 from .cadence import resolve_posts_per_day
-                won = claim_slot(row_id, gym_id, gym_local_today, gym_tz,
+                # Refresh after preflight: a long render/reframe can cross the
+                # gym's midnight before this atomic reservation.
+                reservation_day = _local_now(now, gym_tz).date().isoformat()
+                won = claim_slot(row_id, gym_id, reservation_day, gym_tz,
                                  resolve_posts_per_day(gym_id, store), approved_only)
             else:
                 # Legacy injectable test stores have no RPC. The production

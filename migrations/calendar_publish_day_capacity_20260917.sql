@@ -17,9 +17,9 @@ begin
   if p_capacity not between 1 and 2 or p_day is null or p_timezone is null then
     return false;
   end if;
-  -- One lock per gym and actual publish day serializes all platform slots on
-  -- that day. The row lock below still provides exactly-once for an individual id.
-  perform pg_advisory_xact_lock(hashtextextended(p_gym_id || '|' || p_day::text, 0));
+  -- Lock across day boundaries too: a previous-day in-flight claim must be
+  -- visible to a worker reserving the next local day at midnight.
+  perform pg_advisory_xact_lock(hashtextextended(p_gym_id, 0));
   select * into v_row from public.content_calendar
     where id = p_row_id and gym_id = p_gym_id
       and status in ('pending', 'approved') and published_at is null

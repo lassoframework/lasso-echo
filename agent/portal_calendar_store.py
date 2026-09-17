@@ -786,7 +786,7 @@ class SupabaseCalendarStore:
         """Atomically reserve today's platform slot and claim this row in Postgres.
 
         No split count/claim fallback: an unavailable RPC holds the post. The SQL
-        function serializes all workers for this gym/day with an advisory lock.
+        function serializes all workers for this gym with an advisory lock.
         """
         r = self._client().post(
             self._rest("rpc/claim_calendar_publish_slot"),
