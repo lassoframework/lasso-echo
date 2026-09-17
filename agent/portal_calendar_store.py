@@ -1728,8 +1728,14 @@ class SupabaseCalendarStore:
         stuck at 1 day). We normalize every row to the UNION of keys across the batch,
         filling missing keys with None, so the batch is always uniform."""
         payload = []
+        from .copy_gate import bound_opening_hook
         for row in (rows or []):
             clean = {k: v for k, v in dict(row or {}).items() if k != "id"}
+            if "caption" in clean and clean["caption"] is not None:
+                # Every calendar-building lane converges here. Prompts and individual
+                # generators can miss the hook limit, so enforce the grader's exact
+                # first-line rule at the persistence boundary without dropping words.
+                clean["caption"] = bound_opening_hook(clean["caption"])
             if preserve_ids:
                 import uuid
                 # Explicit stable UUIDs support crash-safe automatic render retries.
