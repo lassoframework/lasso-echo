@@ -436,6 +436,22 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
     skipped += [(t, "echo_render_reingest_skipped") for t in reingest_skipped]
 
     existing = {a["id"]: a for a in store.list_assets(gym_id, source_id=source_id)}
+    # Drive may expose the same file through two bound folders. The asset PK is
+    # global by Drive ID; the first source owns it. Never reassign it or let the
+    # second source's disappearance sweep change its eligibility. A cross-tenant
+    # collision is an error, not permission to read or mutate that tenant's row.
+    owned_rows = []
+    for row in rows:
+        if row["id"] not in existing:
+            owner = store.get_asset(row["id"])
+            if owner:
+                if owner.get("gym_id") != gym_id:
+                    raise ValueError("Drive file is already indexed for another gym")
+                log(f"shared Drive file {row['id']} already belongs to source "
+                    f"{owner.get('source_id')}; skipping duplicate")
+                continue
+        owned_rows.append(row)
+    rows = owned_rows
     seen_ids = {r["id"] for r in rows}
 
     # 3. insert new / patch changed indexer-owned fields

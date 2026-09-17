@@ -27,6 +27,30 @@ def test_sync_indexes_photos_and_videos(monkeypatch):
     assert store.assets["v1"]["eligible"] is None        # video unprobed
 
 
+def test_shared_drive_file_keeps_first_source_owner(monkeypatch):
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest", lambda *a, **k: None)
+    store = FakeMediaStore(assets=[make_asset("shared", gym_id="pierce",
+                                             source_id="src1")])
+    second = make_source("src2", gym_id="pierce", folder_id="fold2")
+    result = sync.sync_source(second, drive=FakeDrive(files=[photo("shared")]),
+                              store=store)
+    assert result["ok"] and result["inserted"] == 0
+    assert store.assets["shared"]["source_id"] == "src1"
+    assert not store.updates
+
+
+def test_cross_gym_drive_id_collision_fails_before_insert():
+    store = FakeMediaStore(assets=[make_asset("shared", gym_id="other",
+                                             source_id="other-src")])
+    try:
+        sync.sync_source(_src(), drive=FakeDrive(files=[photo("shared")]), store=store)
+    except ValueError as exc:
+        assert "another gym" in str(exc)
+    else:
+        raise AssertionError("cross-gym Drive id collision must fail")
+    assert store.assets["shared"]["gym_id"] == "other"
+
+
 def test_sync_removed_file_flips_pending(monkeypatch):
     monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
                         lambda *a, **k: None)

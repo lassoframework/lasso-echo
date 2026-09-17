@@ -53,6 +53,14 @@ class FakeMediaStore:
         self.source_updates.append((source_id, dict(fields)))
         return True
 
+    def request_sync(self, source_id, gym_id):
+        source = self.sources.get(source_id)
+        if not source or source.get("gym_id") != gym_id or not source.get("active", True):
+            return False
+        source["sync_status"] = "queued"
+        source["sync_requested_at"] = "2026-09-17T00:00:00Z"
+        return True
+
     # assets
     def list_assets(self, gym_id, source_id=None):
         if not gym_id:

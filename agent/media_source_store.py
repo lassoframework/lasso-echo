@@ -118,6 +118,27 @@ class SupabaseMediaStore:
             raise MediaStoreError(r.status_code, self._scrubbed(r))
         return True
 
+    def _rpc(self, name, payload):
+        r = self._client().post(
+            f"{self.url}/rest/v1/rpc/{name}", json=payload,
+            headers=self._headers({"Content-Type": "application/json"}), timeout=30)
+        if r.status_code >= 400:
+            raise MediaStoreError(r.status_code, self._scrubbed(r))
+        return r.json()
+
+    def request_sync(self, source_id, gym_id):
+        return bool(self._rpc("request_gym_media_sync",
+                              {"p_source_id": source_id, "p_gym_id": gym_id}))
+
+    def claim_sync(self):
+        rows = self._rpc("claim_gym_media_sync", {}) or []
+        return rows[0] if rows else None
+
+    def finish_sync(self, source_id, token, ok, error=None):
+        return bool(self._rpc("finish_gym_media_sync", {
+            "p_source_id": source_id, "p_token": token,
+            "p_ok": bool(ok), "p_error": error}))
+
     # ---- media_asset ----------------------------------------------------------
     def list_assets(self, gym_id, source_id=None):
         """Every asset for ONE gym (gym_id is REQUIRED — tenant isolation starts
