@@ -788,6 +788,26 @@ def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
                f"<@{OB.config.APPROVER_SLACK_ID}>" in c["text"] for c in calls)
 
 
+def test_fixer_staff_reply_does_not_require_customer_deployment_proof(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_STAFF_REPLY", "true")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {
+        "id": tid, "status": "verification", "bot_identity": "echo",
+        "identity_kind": "staff", "slack_channel_id": "C_STAFF",
+        "slack_thread_ts": "1.0", "verification_after": {"fixer": {"ok": True}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="staff", body="Please check this")
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="Here is the internal finding.",
+        delivery_status="ready", kind=A.KIND_ANSWER,
+        meta={"identity": "echo", "recipient_kind": "staff", "fixer": True})
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert any(c["channel"] == "C_STAFF" for c in calls)
+
+
 def test_reply_never_posts_without_verification_after(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
