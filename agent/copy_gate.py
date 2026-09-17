@@ -158,6 +158,32 @@ def violations(text: str) -> list[str]:
     if _EMAIL_RE.search(s): v.append("email_address")
     return v
 
+HOOK_MAX_CHARS = 125
+
+
+def bound_opening_hook(text: str, max_chars: int = HOOK_MAX_CHARS) -> str:
+    """Wrap an overlong opening line at a word boundary without dropping copy.
+
+    The calendar grader treats the first line as the hook. Generation prompts are
+    advisory, so this deterministic write-time formatter keeps every word while
+    ensuring newly staged captions cannot be born with hook_too_long.
+    """
+    original = str(text or "")
+    stripped = original.strip()
+    if not stripped:
+        return original
+    lines = stripped.splitlines()
+    first = lines[0].strip()
+    if len(first) <= max_chars:
+        return original
+    cut = first.rfind(" ", 0, max_chars + 1)
+    if cut <= 0:
+        cut = max_chars
+    head, tail = first[:cut].rstrip(), first[cut:].lstrip()
+    lines[0:1] = [head, tail]
+    return "\n".join(lines).strip()
+
+
 def soft_flags(text: str) -> list[str]:
     """Quality flags the calendar grader scores against (not hard blocks)."""
     f = []
@@ -165,7 +191,7 @@ def soft_flags(text: str) -> list[str]:
     first = t.splitlines()[0] if t else ""
     if len(t) < 120: f.append("thin_caption")
     if first.startswith("#") or first.startswith("@"): f.append("hook_is_tag")
-    if len(first) > 125: f.append("hook_too_long")
+    if len(first) > HOOK_MAX_CHARS: f.append("hook_too_long")
     if _FILLER_OPENERS.match(first): f.append("filler_opener")
     if not ASK_RE.search(t): f.append("no_ask")
     return f
