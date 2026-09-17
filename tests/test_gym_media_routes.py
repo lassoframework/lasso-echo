@@ -123,6 +123,41 @@ def test_bind_personal_domain_does_not_conflict():
     assert status == 200 and body["ok"] is True
 
 
+def test_bind_lasso_owned_chateau_folder_does_not_conflict_with_another_client():
+    """Agency-owned folders span clients: ENG's LASSO-owned folder cannot
+    prevent Chateau's separate folder from being connected and queued."""
+    store = FakeMediaStore(sources=[make_source("eng-src", gym_id="eng",
+                                               folder_id="different-folder")])
+    store.sources["eng-src"]["owner_email"] = "coach@lassoframework.com"
+    drive = FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                            "owner_email": "blake@lassoframework.com",
+                            "case": "my_drive"})
+    status, body = gm.handle_bind_source("crossfitchateau813e78", f".../folders/{FID}",
+                                         drive=drive, store=store)
+    assert status == 200 and body["ok"] is True and body["sync_status"] == "queued"
+    source = store.sources[body["source_id"]]
+    assert source["gym_id"] == "crossfitchateau813e78"
+    assert source["folder_id"] == FID
+    assert source["sync_status"] == "queued"
+
+
+def test_bind_lasso_owned_exact_folder_collision_still_refused(monkeypatch):
+    alerts = []
+    monkeypatch.setattr("agent.gym_media_index.dedup_alert",
+                        lambda key, message: alerts.append(key))
+    store = FakeMediaStore(sources=[make_source("eng-src", gym_id="eng",
+                                               folder_id=FID)])
+    store.sources["eng-src"]["owner_email"] = "coach@lassoframework.com"
+    status, body = gm.handle_bind_source(
+        "crossfitchateau813e78", f".../folders/{FID}",
+        drive=FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                              "owner_email": "blake@lassoframework.com",
+                              "case": "my_drive"}), store=store)
+    assert status == 409 and body["case"] == "already_bound"
+    assert list(store.sources) == ["eng-src"]
+    assert alerts == [f"hijack:{FID}"]
+
+
 def test_bind_success_writes_source():
     store = FakeMediaStore()
     drive = FakeDrive(meta={"name": "Team Photos", "owner_email": "o@pierce.com",
@@ -134,6 +169,66 @@ def test_bind_success_writes_source():
     assert src["gym_id"] == "pierce" and src["folder_id"] == FID
     assert src["active"] is True
     assert src["sync_status"] == "queued"
+
+
+def test_bind_insert_failure_without_binding_is_not_already_connected(monkeypatch):
+    """A rejected DB write must not tell a client with an empty library that the
+    folder is connected (the CrossFit Chateau contradiction)."""
+    class RejectingStore(FakeMediaStore):
+        def insert_source(self, row):
+            raise RuntimeError("schema write failed")
+
+    alerts = []
+    monkeypatch.setattr("agent.gym_media_index.dedup_alert",
+                        lambda key, message: alerts.append((key, message)))
+    store = RejectingStore()
+    drive = FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                            "owner_email": "alex@gmail.com", "case": "my_drive"})
+    status, body = gm.handle_bind_source("crossfitchateau813e78", f".../folders/{FID}",
+                                         drive=drive, store=store)
+    assert status == 503 and body["ok"] is False
+    assert body["case"] == "store_unavailable"
+    assert "already" not in body["error"]
+    assert store.list_sources("crossfitchateau813e78") == []
+    assert len(alerts) == 1 and "schema write failed" in alerts[0][1]
+
+
+def test_bind_insert_race_with_other_gym_preserves_global_ownership():
+    class RacingStore(FakeMediaStore):
+        calls = 0
+
+        def find_source_by_folder(self, folder_id):
+            self.calls += 1
+            return None if self.calls == 1 else super().find_source_by_folder(folder_id)
+
+        def insert_source(self, row):
+            self.sources["winner"] = make_source("winner", gym_id="othergym",
+                                                  folder_id=FID)
+            raise RuntimeError("unique constraint")
+
+    store = RacingStore()
+    status, body = gm.handle_bind_source("crossfitchateau813e78", f".../folders/{FID}",
+                                         drive=FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                                                               "owner_email": "alex@gmail.com",
+                                                               "case": "my_drive"}), store=store)
+    assert status == 409 and body["case"] == "already_bound"
+    assert store.sources["winner"]["gym_id"] == "othergym"
+
+
+def test_bind_insert_committed_but_transport_failed_confirms_same_gym_and_syncs():
+    class CommittedStore(FakeMediaStore):
+        def insert_source(self, row):
+            super().insert_source(row)
+            raise TimeoutError("response lost")
+
+    store = CommittedStore()
+    status, body = gm.handle_bind_source("crossfitchateau813e78", f".../folders/{FID}",
+                                         drive=FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                                                               "owner_email": "alex@gmail.com",
+                                                               "case": "my_drive"}), store=store)
+    assert status == 200 and body["ok"] is True and body["already"] is True
+    assert body["sync_status"] == "queued"
+    assert store.sources[body["source_id"]]["sync_status"] == "queued"
 
 
 def test_bind_queue_failure_is_honest_and_retryable():

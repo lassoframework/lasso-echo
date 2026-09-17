@@ -256,11 +256,35 @@ def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
     try:
         store.insert_source(row)
     except Exception as e:  # noqa: BLE001 - a UNIQUE(folder_id) race lands here too
-        # The DB-level global UNIQUE is the last-resort hijack guard: if two binds
-        # race, the loser gets a store error here rather than a duplicate row.
-        return 409, {"ok": False, "case": "already_bound",
-                     "error": "this folder is already connected",
-                     "detail": ops_alerts.scrub(str(e))[:120]}
+        # A failed insert is not evidence of an existing binding. In particular,
+        # a PostgREST outage/schema error used to become a false 409 while the
+        # portal truthfully listed no connected folders. Re-read the GLOBAL
+        # folder binding: this also handles an ambiguous transport failure after
+        # the insert actually committed. Never reveal another gym's identity to
+        # the client or treat an unconfirmed write as success.
+        try:
+            concurrent = store.find_source_by_folder(folder_id)
+        except Exception:  # noqa: BLE001 - cannot prove ownership
+            concurrent = None
+        if concurrent:
+            if str(concurrent.get("gym_id") or "") == gym and concurrent.get("active"):
+                try:
+                    if not store.request_sync(concurrent["id"], gym):
+                        return 503, {"ok": False, "error": "could not queue media indexing"}
+                except Exception:  # noqa: BLE001 - bind is real, but indexing unconfirmed
+                    return 503, {"ok": False, "error": "could not queue media indexing"}
+                return 200, {"ok": True, "source_id": concurrent.get("id"),
+                             "folder_name": concurrent.get("folder_name") or "",
+                             "already": True, "sync_status": "queued"}
+            return 409, {"ok": False, "case": "already_bound",
+                         "error": "this folder is already connected"}
+        _idx.dedup_alert(
+            f"media_bind_failed:{gym}:{folder_id}",
+            f"Connect Google Drive bind failed for gym {gym!r}, folder {folder_id!r}; "
+            f"no folder binding could be confirmed. Store error: "
+            f"{ops_alerts.scrub(str(e))[:200]}")
+        return 503, {"ok": False, "case": "store_unavailable",
+                     "error": "could not save the folder connection; please retry"}
     try:
         if not store.request_sync(source_id, gym):
             raise RuntimeError("source could not be queued")
@@ -279,7 +303,7 @@ def _owner_domain_conflict(store, gym, owner_email):
     if "@" not in (owner_email or ""):
         return None
     domain = owner_email.split("@", 1)[1].strip().lower()
-    if not domain or domain in _PERSONAL_DOMAINS:
+    if not domain or domain in _PERSONAL_DOMAINS or domain in _SHARED_PROVIDER_DOMAINS:
         return None
     try:
         sources = store.list_sources()
@@ -297,6 +321,10 @@ def _owner_domain_conflict(store, gym, owner_email):
 
 _PERSONAL_DOMAINS = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.com",
                      "outlook.com", "icloud.com", "aol.com", "me.com", "proton.me"}
+# LASSO manages Drive folders for multiple client gyms. Its own domain is not
+# evidence of which gym owns a folder; the global folder_id uniqueness check
+# above remains authoritative and still refuses an exact cross-gym collision.
+_SHARED_PROVIDER_DOMAINS = {"lassoframework.com"}
 
 
 # ---- GET /media/sources?gym --------------------------------------------------
