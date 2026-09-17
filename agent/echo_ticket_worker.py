@@ -43,7 +43,6 @@ from .slack_convo import identity_gate as _ig
 from .slack_convo import outbox as _ob
 from .slack_convo import outreach as _out
 
-_EPOCH_ISO = "1970-01-01T00:00:00+00:00"
 
 # D47 (Blake, 2026-09-04): generalized from Echo-only to any (product, identity) pair
 # routed through the identity map -- portal tickets (product='portal', the generic
@@ -136,81 +135,10 @@ def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print
              f"{(ticket.get('raw_text') or '')[:300]}",
         delivery_status="ready", kind=_a.KIND_ESCALATION,
         meta={"identity": identity_name, "surface": "portal_ticket_bridge"})
-    acknowledge_submitter(bus, ticket, identity_name=identity_name, who=who,
-                          outreach=outreach, log=log)
+    # Portal incidents stay internal until the fix is merged, deployed and verified,
+    # and Blake is included in the eventual customer conversation. An ACK here can
+    # immediately open a group DM or queue a portal-thread message.
     log(f"[ticket-worker/{identity_name}] escalated ticket={tid} reason={reason}")
-
-
-def acknowledge_submitter(bus, ticket, *, identity_name="echo", who=None, outreach=None,
-                          log=print):
-    """D48 (Blake, 2026-09-05): an escalation must never be silence for the person who
-    wrote in.
-
-    Found live on three real portal tickets: each one reached #fixer correctly and each one
-    left its submitter with nothing at all -- no "we got it", and no word when it was dealt
-    with. The Slack-initiated path has always sent this acknowledgement (adapter.py emits
-    ACK/TEMPLATE_NO_ANSWER_YET inline); the portal bridge never did, because it escalates and
-    returns before any client-facing row is written.
-
-    Best channel available, in order:
-      1. a Slack group DM (Blake + the client + this bot) when we resolved the person to a
-         real client -- the same outreach.initiate the answered path uses, so the DM thread
-         becomes the ticket thread and everything after this lands there too;
-      2. the portal support thread they submitted from, which outbox.py now delivers to.
-
-    Written exactly once per ticket: an ack already on the row (including the one
-    outreach.initiate writes for itself) means this has been done. Returns True when an
-    acknowledgement exists after this call."""
-    tid = ticket.get("id")
-    if _has_outbound_kind(bus, tid, _a.KIND_ACK, log=log):
-        return True
-    # M1 (audit 2): a group DM to a client is a client-facing send and obeys the same flags
-    # as every other one. With them off this falls through to the portal-thread row below,
-    # which the outbox gates in the usual way -- the client is still acknowledged, through a
-    # surface that respects the trust ladder.
-    dm_allowed = (config.slack_convo_identity_enabled(identity_name)
-                  and config.slack_convo_client_reply_armed(identity_name))
-    if (dm_allowed and outreach and who is not None and who.kind == _ig.CLIENT
-            and who.slack_user_id):
-        result = _out.initiate(
-            _verified_ticket_dict(ticket), who, outreach["ident"],
-            open_group_dm=outreach["open_group_dm"],
-            post_first_message=outreach["post_first_message"],
-            record_outbound=bus.record_outbound, stamp_ticket=outreach.get("stamp_ticket"),
-            message_text=_a.TEMPLATE_NO_ANSWER_YET, mark_message=outreach.get("mark_message"),
-            claim_message=outreach.get("claim_message"), log=log)
-        if getattr(result, "delivered", False):
-            return True
-        # C2 (audit 2): this used to return True on `opened`, which is True even when the
-        # post FAILED -- so the client got nothing AND the portal-thread fallback below was
-        # skipped, on the one path whose entire job is making sure they hear something.
-        log(f"[ticket-worker/{identity_name}] escalation ack not delivered "
-            f"ticket={tid} reason={result.reason}; falling back to the portal thread")
-    bus.record_outbound(
-        ticket_id=tid, author_type=identity_name, body=_a.TEMPLATE_NO_ANSWER_YET,
-        delivery_status="ready", kind=_a.KIND_ACK,
-        meta={"identity": identity_name, "surface": "portal_ticket_bridge",
-              "recipient_kind": "client"})
-    return True
-
-
-def _has_outbound_kind(bus, tid, kind, *, log=print):
-    """Fails CLOSED (True, "already sent") on a bus fault -- the same convention
-    adapter._outbound_kind_ever uses: a read failure must never license a second send."""
-    try:
-        return bus.count_outbound_kind_since(tid, kind, _EPOCH_ISO) > 0
-    except AttributeError:
-        pass
-    except Exception as e:  # noqa: BLE001
-        log(f"[ticket-worker] ack lookup failed ticket={tid}: {type(e).__name__}")
-        return True
-    try:
-        return any(m.get("direction") == "outbound"
-                   and (m.get("attachments") or {}).get("kind") == kind
-                   for m in bus.messages(tid, limit=200))
-    except Exception as e:  # noqa: BLE001
-        log(f"[ticket-worker] ack lookup failed ticket={tid}: {type(e).__name__}")
-        return True
 
 
 def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open_group_dm,
@@ -340,10 +268,10 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
             # with no tap. Both paths now call the SAME shared decision so they cannot drift
             # apart again.
             # D72 (2026-09-11): the verdict carries a tier, and a held answer is never
-            # silent -- hold_answer_for_team writes the team card, tells the client (a
-            # template row the outbox delivers to the portal thread or the group DM), and
+            # silent to the team -- hold_answer_for_team writes the team card and
             # escalates the ticket with the tier visible (needs_review clears the
-            # classification so the FIXER's poll picks it up).
+            # classification so the FIXER's poll picks it up). Portal tickets suppress
+            # its customer template until verification and Blake's handoff.
             verdict = _a.auto_answer_verdict(ticket.get("raw_text") or "", answer["body"])
             armed = (config.slack_convo_auto_answer_armed(identity_name)
                      and config.slack_convo_client_reply_armed(identity_name))
@@ -366,7 +294,8 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                     surface="portal_ticket_bridge", body=answer["body"],
                     held_message_id=(row or {}).get("id"), verdict=held_verdict,
                     write_hold_notice_fn=write_hold_notice or None,
-                    unarmed_flag=f"SLACK_CONVO_{identity_name.upper()}_AUTO_ANSWER", log=log)
+                    unarmed_flag=f"SLACK_CONVO_{identity_name.upper()}_AUTO_ANSWER",
+                    client_notice=False, log=log)
                 return
             result = _out.initiate(
                 _verified_ticket_dict(ticket), who, ident,
@@ -420,11 +349,10 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
         # execute -- the same documented limitation every other non-Echo code_fix
         # path in this system already carries.
         bus.set_ticket(tid, classification=_cls.CODE_FIX, status="fixing")
-        # Finding 10 (audit 3): D48's rule is that an escalation is never silence, and this
-        # is the branch the client waits on longest. The Slack path has always acked a
-        # code_fix inline; this one returned without writing the client anything at all.
-        acknowledge_submitter(bus, ticket, who=who, identity_name=identity_name,
-                              outreach=outreach, log=log)
+        # Customer contact for a code fix waits for merge, verified deployment,
+        # and a conversation that includes Blake. The held internal request is
+        # the durable intake signal; an early acknowledgement would violate that
+        # customer-contact gate before the FIXER has changed anything.
         text = _a.fixer_request_text(ident, tid, ticket.get("raw_text") or "", who,
                                     who.slack_user_id)
         row = bus.record_outbound(ticket_id=tid, author_type="system", body=text,
