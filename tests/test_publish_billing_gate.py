@@ -125,6 +125,14 @@ def test_lasso_is_not_counted_as_a_coverage_gap(monkeypatch):
     assert rep["total"] == 1 and rep["uncovered"] == ["eng"]
 
 
+def test_internal_personal_bases_are_not_billing_gaps_even_when_passed_explicitly(monkeypatch):
+    monkeypatch.setenv("AGENT_PUBLISH_BILLING_GATE", "true")
+    rep = _cov(["blake_personal", "another_personal", "lasso", "eng"])
+    assert rep["total"] == 1
+    assert rep["uncovered"] == ["eng"]
+    assert "blake_personal" not in pbg.inertness_message(rep)
+
+
 def test_an_armed_gate_covering_nothing_says_so(monkeypatch):
     monkeypatch.setenv("AGENT_PUBLISH_BILLING_GATE", "true")
     msg = pbg.inertness_message(_cov(["eng", "gritx"]))

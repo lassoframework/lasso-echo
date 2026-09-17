@@ -198,9 +198,11 @@ def coverage_report(bases=None, gym_reader=None):
             except Exception:  # noqa: BLE001
                 return {}
 
-    # LASSO is excluded from the gate itself (publishing_blocked returns False for any
-    # lasso* base), so counting it as uncovered would overstate the gap every day.
-    checked = [b for b in bases if b and not str(b).startswith("lasso")]
+    # Internal/personal accounts are not paying client gyms. The default source
+    # filters them, but explicit callers must not turn them into false billing gaps.
+    from .account_key_doctor import _is_internal_base
+    checked = [b for b in bases if b and not str(b).startswith("lasso")
+               and not _is_internal_base(b)]
     uncovered = []
     with_customer = 0
     for base in checked:
