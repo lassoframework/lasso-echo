@@ -784,12 +784,12 @@ def _fresh_ticket(bus, tid):
 def hold_answer_for_team(bus, *, ticket, ident_name, recipient_kind, user, account_key,
                          surface, body, held_message_id, verdict, person="",
                          write_hold_notice_fn=None, fixer_authored=False, unarmed_flag="",
-                         card=True, notice_text=None, log=print):
+                         card=True, notice_text=None, client_notice=True, log=print):
     """D72: the ONE disposition for a held client answer, shared by the Slack adapter, the
     portal bridge and the outbox's post-time re-check, so no path can hold silently.
 
     Writes, in this order: (1) the #fixer TEAM card for the held row; (2) the client's
-    honest notice as a template row (once per ticket and tier; posts without a tap);
+    honest notice when client_notice is enabled (once per ticket and tier);
     (3) the ticket: open, escalated, hold_tier visible, and -- for needs_review on an
     Echo-drafted answer -- classification cleared so the FIXER's poll picks it up."""
     tid = ticket["id"] if isinstance(ticket, dict) else ticket
@@ -806,7 +806,7 @@ def hold_answer_for_team(bus, *, ticket, ident_name, recipient_kind, user, accou
               account_key=account_key, kind=KIND_ANSWER, body=body,
               held_message_id=held_message_id, surface=surface, why=why, person=person)
     notified = False
-    if recipient_kind not in ("staff", "coach"):
+    if client_notice and recipient_kind not in ("staff", "coach"):
         notified = _client_hold_notice(bus, tid, ident_name=ident_name,
                                        recipient_kind=recipient_kind, surface=surface,
                                        verdict=verdict, tier=tier, notice_text=notice_text,

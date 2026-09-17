@@ -354,7 +354,7 @@ def test_second_unverified_fixer_answer_also_stays_internal(monkeypatch):
 
 # ---- the portal bridge path (draft time) -------------------------------------------------
 
-def test_portal_bridge_floor_hold_tells_the_client_and_the_team(monkeypatch):
+def test_portal_bridge_floor_hold_tells_the_team_without_customer_notice(monkeypatch):
     from tests.test_portal_escalation_loop import Bus, _ticket, _slack_calls, _answering_worker
     _armed(monkeypatch)
     bus = Bus([_ticket(raw_text="Can we add our group sessions schedule to the website?")])
@@ -369,8 +369,7 @@ def test_portal_bridge_floor_hold_tells_the_client_and_the_team(monkeypatch):
     assert cards and "needs a teammate" in cards[0]["why"] and "hard line" in cards[0]["why"]
     notices = [m for m in bus.of_kind(A.KIND_TEMPLATE)
                if (m.get("attachments") or {}).get("hold_client_notice")]
-    assert len(notices) == 1 and "hours or class schedule" in notices[0]["body"]
-    assert notices[0]["delivery_status"] == "ready"
+    assert notices == []
 
 
 def test_portal_bridge_needs_review_clears_classification_for_the_fixer(monkeypatch):

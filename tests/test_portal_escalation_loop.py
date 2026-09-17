@@ -1,16 +1,16 @@
 """
-tests/test_portal_escalation_loop.py -- D48 (Blake, 2026-09-05): an escalated portal
-ticket must never be a dead end for the person who wrote it.
+tests/test_portal_escalation_loop.py -- portal escalation and delivery contracts.
 
 Found live on three real portal tickets (cb7b385a / 063bc73d / af01f3ea, ZZ Test Gym):
 each one escalated correctly into #fixer, and each one left its submitter with nothing.
-No "we got it" when it escalated, no word when it was dealt with. Two holes, both
-covered here:
+The earlier D48 path tried to solve silence with a pre-verification ACK. The
+current customer-contact rule keeps escalations internal until the fix is merged,
+deployed and verified and Blake is included. Portal-thread delivery is still
+tested here for messages that are authorized later.
 
-  1. the bridge escalated and returned without ever writing a client-facing row;
-  2. even if it had, outbox.py's gate 7 marked every conversational row on a ticket with
-     no slack_channel_id 'failed' -- and a portal ticket has no Slack channel until a
-     group DM is opened, which for an unresolved identity never happens.
+Outbox gate 7 previously marked conversational rows on portal tickets with no
+slack_channel_id as failed; a portal ticket has no Slack channel until a group DM
+is opened.
 """
 from datetime import datetime, timezone
 
@@ -191,46 +191,24 @@ def _run_intake(bus, deps, **over):
     return seen, W.intake_pass(bus, **deps, **kwargs)
 
 
-# ---- hole 1: the submitter now always hears something -------------------------------
+# ---- escalation stays internal before verification ----------------------------------
 
-def test_unresolved_identity_still_gets_an_acknowledgement():
+def test_unresolved_identity_stays_internal_until_verification():
     bus = Bus([_ticket()])
     seen, _ = _run_intake(bus, _stranger_deps())
     kinds = dict(bus.outbound_kinds("t-1"))
     assert A.KIND_ESCALATION in kinds, "the #fixer card must still be written"
-    acks = bus.of_kind(A.KIND_ACK)
-    assert len(acks) == 1
-    assert acks[0]["body"] == A.TEMPLATE_NO_ANSWER_YET
-    assert acks[0]["delivery_status"] == "ready"
+    assert bus.of_kind(A.KIND_ACK) == []
+    assert bus.of_kind(A.KIND_TEMPLATE) == []
     assert seen["opened"] == [], "no Slack DM is possible for an unresolved identity"
 
 
-def test_a_known_client_gets_the_acknowledgement_as_a_group_dm():
+def test_a_known_client_does_not_get_an_escalation_dm():
     bus = Bus([_ticket()])
     seen, _ = _run_intake(bus, _client_deps())
-    assert seen["opened"] == [[W._out.BLAKE_SLACK_USER_ID, "U_CLIENT"]]
-    assert seen["posted"] and A.TEMPLATE_NO_ANSWER_YET in seen["posted"][0][1]
-    assert len(bus.of_kind(A.KIND_ACK)) == 1
-
-
-def test_the_acknowledgement_is_written_exactly_once_per_ticket():
-    bus = Bus([_ticket()])
-    W.acknowledge_submitter(bus, bus.ticket("t-1"), identity_name="echo")
-    W.acknowledge_submitter(bus, bus.ticket("t-1"), identity_name="echo")
-    assert len(bus.of_kind(A.KIND_ACK)) == 1
-
-
-def test_a_bus_read_fault_never_licenses_a_second_acknowledgement():
-    class Faulty(Bus):
-        def count_outbound_kind_since(self, *a, **k):
-            raise RuntimeError("bus down")
-
-        def messages(self, *a, **k):
-            raise RuntimeError("bus down")
-
-    bus = Faulty([_ticket()])
-    assert W.acknowledge_submitter(bus, bus.ticket("t-1"), identity_name="echo",
-                                   log=lambda *a: None) is True
+    assert seen["opened"] == []
+    assert seen["posted"] == []
+    assert bus.of_kind(A.KIND_ESCALATION)
     assert bus.of_kind(A.KIND_ACK) == []
 
 
@@ -272,6 +250,27 @@ def test_a_ticket_with_no_slack_channel_and_no_portal_thread_still_fails():
     sent, post = _posts()
     summary = OB.run_once(bus, post, identity=ECHO, log=lambda *a: None)
     assert summary["failed"] == 1 and summary["posted"] == 0
+
+
+def test_post_time_portal_answer_hold_does_not_queue_customer_template():
+    bus = Bus([_ticket(status="verification", verification_after={"source": "test"},
+                       raw_text="Can we add our group sessions schedule to the website?")])
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com",
+                       body="Can we add our group sessions schedule to the website?", meta={})
+    answer = bus.record_outbound(
+        ticket_id="t-1", author_type="echo",
+        body="Yes, we can add your group sessions schedule.",
+        delivery_status="ready", kind=A.KIND_ANSWER,
+        meta={"identity": "echo", "recipient_kind": "client",
+              "surface": "portal_ticket_bridge"})
+    sent, post = _posts()
+
+    OB.run_once(bus, post, identity=ECHO, log=lambda *a: None)
+
+    assert bus.message(answer["id"])["delivery_status"] == "held"
+    assert bus.of_kind(A.KIND_TEMPLATE) == []
+    assert sent == []
 
 
 def test_portal_deliverable_needs_a_client_id():

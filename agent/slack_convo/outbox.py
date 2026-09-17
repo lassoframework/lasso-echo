@@ -457,7 +457,8 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         # D72 (2026-09-11): the verdict names the rule and carries a TIER. A row the FIXER
         # authored (attachments.fixer) is checked against the org floor only; an Echo
         # draft gets the structural checks too. Either way a hold is never silent:
-        # hold_answer_for_team writes the team card, tells the client, escalates the ticket.
+        # hold_answer_for_team writes the team card and escalates the ticket.
+        # Portal holds wait for verification and Blake's customer handoff.
         fixer_authored = bool(att.get("fixer"))
         verdict = _a.auto_answer_verdict(ticket.get("raw_text") or "", row.get("body"),
                                          grounded_by_fixer=fixer_authored)
@@ -478,7 +479,9 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 surface=att.get("surface") or "", body=row.get("body") or "",
                 held_message_id=row["id"], verdict=verdict,
                 person=_person_for_card(bus, ticket, identity),
-                fixer_authored=fixer_authored, log=log)
+                fixer_authored=fixer_authored,
+                client_notice=(att.get("surface") != "portal_ticket_bridge"
+                               and not portal_deliverable(ticket)), log=log)
             return
         if not config.slack_convo_auto_answer_armed(identity.name):
             flag = f"SLACK_CONVO_{identity.name.upper()}_AUTO_ANSWER"
@@ -493,7 +496,9 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 held_message_id=row["id"],
                 verdict=_a.AnswerVerdict(False, _a.HOLD_TIER_UNARMED, "auto_answer_not_armed"),
                 person=_person_for_card(bus, ticket, identity),
-                fixer_authored=fixer_authored, unarmed_flag=flag, log=log)
+                fixer_authored=fixer_authored, unarmed_flag=flag,
+                client_notice=(att.get("surface") != "portal_ticket_bridge"
+                               and not portal_deliverable(ticket)), log=log)
             return
     # 5b. GAP 2 (audit of PR #68): a row THIS SPECIFIC LANE wrote must re-verify that
     # lane's OWN full three-flag interlock at dispatch time, not only the general
