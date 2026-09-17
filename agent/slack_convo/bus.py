@@ -347,3 +347,9 @@ class Bus:
             att.update(meta_update)
             fields["attachments"] = att
         return self._patch(_MESSAGES, {"id": f"eq.{message_id}"}, fields)
+
+    def set_message_body_if_posting(self, message_id, body):
+        """Store the exact Slack text only while this worker owns the claimed row."""
+        return self._patch(_MESSAGES,
+                           {"id": f"eq.{message_id}", "delivery_status": "eq.posting"},
+                           {"body": body})
