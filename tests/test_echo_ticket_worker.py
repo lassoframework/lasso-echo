@@ -419,6 +419,7 @@ def test_intake_pass_holds_a_code_fix_behind_the_fixer_tap_same_as_any_other():
     assert notices[0]["kind"] == A.KIND_FIXER_REQUEST
     # No autonomous client message for a code_fix -- nothing is verified yet.
     assert log["opened"] == []
+    assert not [o for o in bus.outbound if o["kind"] in (A.KIND_ACK, A.KIND_STATUS, A.KIND_TEMPLATE)]
 
 
 # ---- fixed_pass -------------------------------------------------------------------

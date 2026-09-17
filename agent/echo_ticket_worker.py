@@ -420,11 +420,10 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
         # execute -- the same documented limitation every other non-Echo code_fix
         # path in this system already carries.
         bus.set_ticket(tid, classification=_cls.CODE_FIX, status="fixing")
-        # Finding 10 (audit 3): D48's rule is that an escalation is never silence, and this
-        # is the branch the client waits on longest. The Slack path has always acked a
-        # code_fix inline; this one returned without writing the client anything at all.
-        acknowledge_submitter(bus, ticket, who=who, identity_name=identity_name,
-                              outreach=outreach, log=log)
+        # Customer contact for a code fix waits for merge, verified deployment,
+        # and a conversation that includes Blake. The held internal request is
+        # the durable intake signal; an early acknowledgement would violate that
+        # customer-contact gate before the FIXER has changed anything.
         text = _a.fixer_request_text(ident, tid, ticket.get("raw_text") or "", who,
                                     who.slack_user_id)
         row = bus.record_outbound(ticket_id=tid, author_type="system", body=text,
