@@ -164,6 +164,13 @@ class FakeBus:
                 return dict(m)
         return None
 
+    def set_message_body_if_posting(self, mid, body):
+        for m in self.msgs:
+            if m["id"] == mid and m["delivery_status"] == "posting":
+                m["body"] = body
+                return dict(m)
+        return None
+
     # test helpers
     def outbound_kinds(self, tid):
         return [m["attachments"]["kind"] for m in self.msgs
@@ -776,13 +783,19 @@ def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
     bus.set_ticket(tid, verification_after={"exit_code": 0, "fixer": {"merged_sha": sha,
                     "deployment_check": {"verified": True, "sha": sha}}})
     final = notice()
-    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                member_check=lambda channel, user: channel == "C_CLIENT" and
+                user == OB.config.APPROVER_SLACK_ID)
     assert bus.message(final["id"])["delivery_status"] == "posted"
+    assert bus.message(final["id"])["body"] == (
+        f"<@{OB.config.APPROVER_SLACK_ID}> The fix is live.")
     assert len([c for c in calls if c["channel"] == "C_CLIENT"]) == 1
+    assert calls[-1]["text"] == bus.message(final["id"])["body"]
     receipts = [m for m in bus.messages_for(tid)
                 if (m.get("attachments") or {}).get("receipt_for") == final["id"]]
     assert len(receipts) == 1
     assert f"<@{OB.config.APPROVER_SLACK_ID}>" in receipts[0]["body"]
+    assert bus.message(final["id"])["body"] in receipts[0]["body"]
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
     assert any(c["channel"] == "C_FIXER" and
                f"<@{OB.config.APPROVER_SLACK_ID}>" in c["text"] for c in calls)
@@ -806,6 +819,88 @@ def test_fixer_staff_reply_does_not_require_customer_deployment_proof(monkeypatc
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
     assert bus.message(row["id"])["delivery_status"] == "posted"
     assert any(c["channel"] == "C_STAFF" for c in calls)
+
+
+@pytest.mark.parametrize("channel,check", [
+    ("C_CLIENT", lambda channel, user: False),
+    ("D_CLIENT", lambda channel, user: True),
+])
+def test_fixer_customer_slack_reply_requires_blake_in_destination(
+        monkeypatch, channel, check):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", "merged-sha"
+    bus.tickets[tid] = {
+        "id": tid, "status": "merged", "bot_identity": "echo",
+        "identity_kind": "client", "slack_channel_id": channel,
+        "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
+            "deployment_check": {"verified": True, "sha": sha}}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Please fix this")
+    row = bus.record_outbound(ticket_id=tid, author_type="echo", body="Fixed.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "pr_url": pr, "resolve_notice": True})
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                member_check=check)
+    assert bus.message(row["id"])["delivery_status"] == "suppressed"
+    assert not calls
+    assert any("verified Blake membership" in m["body"] for m in bus.messages_for(tid)
+               if (m.get("attachments") or {}).get("kind") == A.KIND_ESCALATION)
+
+
+def test_slack_membership_read_paginates_and_fails_closed(monkeypatch):
+    import types
+    pages = []
+
+    class Client:
+        def __init__(self, **kw):
+            pass
+
+        def conversations_members(self, **kw):
+            pages.append(kw)
+            if not kw.get("cursor"):
+                return {"ok": True, "members": ["U_OTHER"],
+                        "response_metadata": {"next_cursor": "next"}}
+            return {"ok": True, "members": [OB.config.APPROVER_SLACK_ID],
+                    "response_metadata": {"next_cursor": ""}}
+
+    monkeypatch.setitem(sys.modules, "slack_sdk", types.SimpleNamespace(WebClient=Client))
+    ident = IDS.get("echo")
+    assert OB._blake_is_member(ident, "G_CLIENT", OB.config.APPROVER_SLACK_ID)
+    assert pages[1]["cursor"] == "next"
+    assert not OB._blake_is_member(ident, "D_CLIENT", OB.config.APPROVER_SLACK_ID)
+    assert len(pages) == 2
+
+
+def test_fixer_customer_slack_reply_does_not_send_if_exact_body_cannot_be_saved(
+        monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", "merged-sha"
+    bus.tickets[tid] = {
+        "id": tid, "status": "merged", "bot_identity": "echo",
+        "identity_kind": "client", "slack_channel_id": "C_CLIENT",
+        "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
+            "deployment_check": {"verified": True, "sha": sha}}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Please fix this")
+    row = bus.record_outbound(ticket_id=tid, author_type="echo", body="Fixed.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "pr_url": pr, "resolve_notice": True})
+    monkeypatch.setattr(bus, "set_message_body_if_posting", lambda *args: None)
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                member_check=lambda channel, user: True)
+    assert bus.message(row["id"])["delivery_status"] == "failed"
+    assert not calls
 
 
 def test_reply_never_posts_without_verification_after(monkeypatch):

@@ -268,7 +268,30 @@ def _recover_stale_claims(bus, identity, log, now=None):
     return n
 
 
-def run_once(bus, post, *, identity, log=print, limit=50, now=None):
+def _blake_is_member(identity, channel, user):
+    """Read every Slack membership page; an incomplete or unsupported read is not proof."""
+    if not channel.startswith(("C", "G")) or not user:
+        return False
+    from slack_sdk import WebClient
+    client = WebClient(token=identity.env(identity.bot_token_env), timeout=5)
+    cursor = None
+    for _ in range(100):
+        args = {"channel": channel, "limit": 200}
+        if cursor:
+            args["cursor"] = cursor
+        response = client.conversations_members(**args)
+        if not response.get("ok"):
+            return False
+        if user in (response.get("members") or []):
+            return True
+        cursor = (response.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            return False
+    return False
+
+
+def run_once(bus, post, *, identity, log=print, limit=50, now=None,
+             member_check=None):
     """Process up to `limit` ready rows for THIS identity.
     post(channel, text, thread_ts=None, blocks=None) -> slack ts.
     Returns a summary dict. Never raises out of the loop."""
@@ -284,7 +307,9 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None):
         return summary
     for row in rows:
         try:
-            _dispatch_one(bus, post, row, identity=identity, log=log, summary=summary, now=now)
+            _dispatch_one(bus, post, row, identity=identity, log=log, summary=summary,
+                          now=now, member_check=member_check or
+                          (lambda channel, user: _blake_is_member(identity, channel, user)))
         except Exception as e:  # noqa: BLE001 - one row never stalls the queue
             log(f"[slack-convo/outbox] row {row.get('id')} failed: {type(e).__name__}")
             try:
@@ -310,7 +335,8 @@ def _suppress(bus, row, ticket, identity, why, log, summary, *, escalate=True):
                   "recipient_kind": (row.get("attachments") or {}).get("recipient_kind")})
 
 
-def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
+def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
+                  member_check=None):
     att = row.get("attachments") or {}
     kind = att.get("kind") or ""
     ticket = bus.ticket(row["ticket_id"])
@@ -508,6 +534,25 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
             body=row.get("body") or "", held_message_id=row["id"],
             surface=att.get("surface") or "", why="flag off at post time")
         return
+    # FIXER customer Slack messages include Blake in the actual conversation. A receipt
+    # in #fixer alone is not participation in the client's channel. Read membership at
+    # dispatch; Slack read failures, one-to-one DMs and unsupported channel types hold.
+    channel = ticket.get("slack_channel_id")
+    fixer_customer_slack = bool(att.get("fixer") and recipient_kind not in
+                                ("staff", "coach") and channel)
+    if fixer_customer_slack:
+        try:
+            member = bool(channel.startswith(("C", "G")) and member_check and
+                          member_check(channel, config.APPROVER_SLACK_ID))
+        except Exception as e:  # noqa: BLE001
+            log(f"[slack-convo/outbox] membership read failed for {channel}: "
+                f"{type(e).__name__}")
+            member = False
+        if not member:
+            _suppress(bus, row, ticket, identity,
+                      "FIXER customer Slack reply requires verified Blake membership "
+                      "in destination conversation", log, summary)
+            return
     # 6. claim, immediately before posting
     if not _claim(bus, row, log):
         summary["skipped"] += 1
@@ -544,7 +589,19 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
                  where="released into the portal support thread they wrote from",
                  summary=summary)
         return
-    ts = post(channel, row["body"], thread_ts=thread_ts, blocks=None)
+    sent_body = row["body"]
+    if fixer_customer_slack:
+        mention = f"<@{config.APPROVER_SLACK_ID}>"
+        if mention not in sent_body:
+            sent_body = f"{mention} {sent_body}"
+        # Persist the exact body BEFORE posting, so the portal thread and subsequent
+        # receipt cannot disagree with what Slack actually received.
+        if sent_body != row["body"]:
+            stored = bus.set_message_body_if_posting(row["id"], sent_body)
+            if not stored or stored.get("body") != sent_body:
+                raise RuntimeError("FIXER Slack body update was not confirmed")
+            row = {**row, "body": sent_body}
+    ts = post(channel, sent_body, thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
     _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log)
