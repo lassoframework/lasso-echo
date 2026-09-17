@@ -189,6 +189,49 @@ def _locked_calendar_state(base_key, start, days, store, log, library_path=None)
     return locked_days, used
 
 
+def _surviving_pillar_counts(base_key, start, days, store, log):
+    """Pillar counts for human-owned posts that survive this rebuild.
+
+    Count POSTS in the same units as calendar_grade: same-date IG/FB/story rows with
+    the same caption are one post. Pending/draft/queued rows are excluded because this
+    rebuild replaces them. A read failure returns an empty count; the build-local
+    balancing guard still prevents a new single-pillar batch.
+    """
+    from collections import Counter
+    from datetime import timedelta
+    from .caption_ledger import caption_hash
+    from .portal_calendar_store import _WIPEABLE_STATUSES
+
+    counts = Counter()
+    list_month = getattr(store, "list_month", None)
+    if list_month is None:
+        return counts
+    months = sorted({(start + timedelta(days=i)).isoformat()[:7]
+                     for i in range(max(1, days))})
+    seen = set()
+    for month in months:
+        try:
+            rows = list_month(base_key, month) or []
+        except Exception as exc:  # noqa: BLE001 - balancing degrades to build-local state
+            log(f"pillar-mix read failed for {month}: {type(exc).__name__}")
+            continue
+        for row in rows:
+            status = str((row or {}).get("status") or "").lower()
+            if (not status or status in _WIPEABLE_STATUSES
+                    or status not in ("approved", "publishing", "published", "coach_review")):
+                continue
+            category = str(row.get("pillar") or row.get("category") or "").strip().lower()
+            if not category:
+                continue
+            key = (str(row.get("post_date") or "")[:10],
+                   caption_hash(row.get("caption") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            counts[category] += 1
+    return counts
+
+
 def _edited_story_captions(base_key, start, days, store, log):
     """{post_date -> caption} for STORY rows the client edited in the portal but which
     have NOT been re-rendered yet. Editing a story caption (portal_calendar_store.
@@ -248,7 +291,8 @@ def _has_real_creative(draft):
 def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log,
                          exclude_keys=(), avoid_openings=(), allow_reuse=False,
                          angle="", avoid_angles=(), avoid_captions=(),
-                         recent_formulas=(), require_media=True):
+                         recent_formulas=(), require_media=True,
+                         avoid_categories=()):
     """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
     whose caption carries NO banned word, preferring a different approved source/category
     over dropping the day.
@@ -307,6 +351,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
         return " ".join((text or "").split()).strip().lower()
 
     _avoid = {_norm_caption(c) for c in (avoid_captions or ()) if (c or "").strip()}
+    _avoid_categories = {str(c or "").strip().lower()
+                         for c in (avoid_categories or ()) if str(c or "").strip()}
     _formula_cap = bool(recent_formulas) and config.opening_formula_cap_enabled()
     _formula_max = config.opening_formula_max_run() if _formula_cap else 0
     # The best draft that cleared every HARD gate but repeats the opening frame. It is
@@ -322,6 +368,13 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
 
     def _accept(d):
         if d is None:
+            return False
+        # FORWARD-BOOK MIX: when a pillar is already heavier than another approved
+        # pillar, keep walking the real source rotation instead of adding another post
+        # to the heavy pillar. This is selection only: the accepted pillar still comes
+        # from its own approved source and its label remains truthful.
+        category = str(getattr(d, "category", "") or "").strip().lower()
+        if category and category in _avoid_categories:
             return False
         # 2x uniqueness: never the same concept twice in one day (CADENCE_SPEC D5).
         if _avoid and _norm_caption(getattr(d, "caption", "")) in _avoid:
@@ -1236,6 +1289,15 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     _WIDE_OPENING_WINDOW = 12       # widened opening-avoid window when angle rotation is on
     recent_angles = []              # accepted angles, oldest..newest
     angle_idx = 0                   # advances only on an ACCEPTED feed (dense round-robin)
+    # FORWARD-BOOK PILLAR BALANCE. Seed from approved/published posts that the rebuild
+    # must preserve, then update once per accepted feed. The least-used approved pillar
+    # is always eligible; heavier pillars are passed over while the bounded neighbour
+    # walk asks the existing source builder for a real underweight alternative.
+    pillar_counts = _surviving_pillar_counts(base_key, start, days, store, log)
+    available_pillars = tuple(str(p or "").strip().lower()
+                              for p in client_content._pillars_for(  # noqa: SLF001
+                                  getattr(account, "key", "") or base_key)
+                              if str(p or "").strip())
     built_feeds = 0
     # Days the uploaded-media path placed a feed on. The gym-drive lane (below) fills
     # only the GAPS, so a Drive post never doubles up a day that already has a photo.
@@ -1268,6 +1330,9 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                     if not getattr(d, "is_story", False):
                         pre_captions.setdefault(str(getattr(d, "day_key", ""))[:10], []).append(
                             (getattr(d, "caption", "") or "").strip())
+                        _pre_cat = str(getattr(d, "category", "") or "").strip().lower()
+                        if _pre_cat:
+                            pillar_counts[_pre_cat] += 1
                 # a day whose EVERY slot the pre-pass owns is a covered day
                 for dk in {d for d, _s in covered_slots}:
                     if all((dk, s) in covered_slots for s in range(slots_per_day)):
@@ -1322,13 +1387,21 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 day_avoid_angles = tuple(day_shape.angles_for_role(
                     day_shape.role_for_slot(1 - slot_i)))
                 opening_window = _WIDE_OPENING_WINDOW
+            # Select from an underweight approved pillar before queuing the row. This
+            # keeps 2x builds from choosing one day-level pillar for both slots and
+            # prevents surviving approved rows from being amplified by a rebuild.
+            _mix_floor = (min(pillar_counts.get(p, 0) for p in available_pillars)
+                          if available_pillars else 0)
+            _heavy_pillars = {p for p in available_pillars
+                              if pillar_counts.get(p, 0) > _mix_floor}
             feed, feed_drop = _clean_draft_for_day(
                 account, day_key, voice, library_path, banned_words, log,
                 exclude_keys=used_keys,
                 avoid_openings=recent_openings[-opening_window:],
                 angle=day_angle, avoid_angles=day_avoid_angles,
                 avoid_captions=tuple(day_captions),
-                recent_formulas=tuple(recent_formulas[-_FORMULA_WINDOW:]))
+                recent_formulas=tuple(recent_formulas[-_FORMULA_WINDOW:]),
+                avoid_categories=_heavy_pillars)
             if feed is None:
                 if feed_drop:
                     skipped_banned += 1
@@ -1424,6 +1497,9 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                     except Exception:  # noqa: BLE001 - a frozen draft never blocks
                         pass
             drafts.extend(day_drafts)
+            _accepted_pillar = str(getattr(feed, "category", "") or "").strip().lower()
+            if _accepted_pillar:
+                pillar_counts[_accepted_pillar] += 1
             built_feeds += 1
             day_built += 1
             covered_days.add(day_key)   # the gym-drive lane skips days already filled
