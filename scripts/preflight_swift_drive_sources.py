@@ -22,7 +22,8 @@ def main():
     counts = []
     for source_id in SOURCE_IDS:
         source = sources.get(source_id)
-        if not source or source.get("kind") != "gym_drive":
+        if (not source or source.get("kind") != "gym_drive"
+                or source.get("active") is not True):
             raise SystemExit(f"{source_id}: active gym Drive source missing")
         try:
             files = drive.walk(source["folder_id"], max_depth=gym_drive_sync_max_depth(),

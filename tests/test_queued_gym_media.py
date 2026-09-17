@@ -22,7 +22,14 @@ class Store:
 def test_success_claim_and_completion(monkeypatch):
     monkeypatch.setattr(queue.config, "gym_drive_connect_active_for", lambda _: True)
     store = Store()
-    assert queue.run_one(store=store, sync=lambda source, **kw: {"ok": True})
+    calls = []
+
+    def sync(source, **kw):
+        calls.append(kw)
+        return {"ok": True}
+
+    assert queue.run_one(store=store, sync=sync)
+    assert calls[0]["sweep_missing"] is False
     assert store.finished == [("s1", "claim1", True, None)]
     assert not queue.run_one(store=store)
 
@@ -44,3 +51,11 @@ def test_disabled_gym_does_not_sync(monkeypatch):
     store = Store()
     assert queue.run_one(store=store, sync=lambda *a, **kw: None, log=lambda _: None)
     assert store.finished[0][2] is False
+
+
+def test_migration_never_reclaims_uncertain_running_sync():
+    from pathlib import Path
+    migration = (Path(__file__).resolve().parents[1] / "migrations" /
+                 "media_source_sync_request_20260917.sql").read_text()
+    assert "AND sync_status = 'queued'" in migration
+    assert "sync_started_at <" not in migration

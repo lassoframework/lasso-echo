@@ -19,7 +19,8 @@ def run_one(*, store=None, drive=None, sync=None, log=print):
             raise ValueError("source is no longer active")
         if not config.gym_drive_connect_active_for(source.get("gym_id")):
             raise ValueError("Drive connection is disabled for this gym")
-        result = (sync or sync_source)(source, store=store, drive=drive, log=log)
+        result = (sync or sync_source)(source, store=store, drive=drive, log=log,
+                                       sweep_missing=False)
         if not result.get("ok"):
             error = result.get("error") or ("Drive access revoked" if result.get("revoked")
                                             else "indexing did not complete")

@@ -172,6 +172,24 @@ class SupabaseMediaStore:
             raise MediaStoreError(r.status_code, self._scrubbed(r))
         return len(rows)
 
+    def insert_assets_ignore_conflicts(self, rows):
+        """Insert new Drive IDs without replacing the first source's ownership.
+
+        PostgREST returns only rows actually inserted under ignore-duplicates.
+        The caller re-reads every candidate after this call to handle races.
+        """
+        if not rows:
+            return set()
+        r = self._client().post(
+            self._rest(_ASSET_TABLE), params={"on_conflict": "id"},
+            json=list(rows),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "resolution=ignore-duplicates,return=representation"}),
+            timeout=30)
+        if r.status_code >= 400:
+            raise MediaStoreError(r.status_code, self._scrubbed(r))
+        return {row["id"] for row in (r.json() or [])}
+
     def update_asset(self, asset_id, fields):
         r = self._client().patch(
             self._rest(_ASSET_TABLE), params={"id": f"eq.{asset_id}"},

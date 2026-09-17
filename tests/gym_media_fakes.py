@@ -83,6 +83,14 @@ class FakeMediaStore:
             self.assets[r["id"]] = dict(r)
         return len(rows)
 
+    def insert_assets_ignore_conflicts(self, rows):
+        inserted = set()
+        for row in rows:
+            if row["id"] not in self.assets:
+                self.assets[row["id"]] = dict(row)
+                inserted.add(row["id"])
+        return inserted
+
     def update_asset(self, asset_id, fields):
         self.assets.setdefault(asset_id, {"id": asset_id}).update(fields)
         self.updates.append((asset_id, dict(fields)))

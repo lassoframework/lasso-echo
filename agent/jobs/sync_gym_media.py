@@ -369,7 +369,8 @@ def _prerender_pass(gym_id, drive, store, merged, seen_ids, probe_fn, log, *,
 
 
 def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
-                now_iso=None, probe_budget=None, render_budget=None, host_fn=None):
+                now_iso=None, probe_budget=None, render_budget=None, host_fn=None,
+                sweep_missing=True):
     """Sync ONE media_source. Returns a per-source summary dict. Never raises out of
     a normal degrade path; a 403 on the walk marks the source revoked_externally and
     returns a revoked summary."""
@@ -455,8 +456,25 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
     seen_ids = {r["id"] for r in rows}
 
     # 3. insert new / patch changed indexer-owned fields
-    new_rows = [r for r in rows if r["id"] not in existing]
-    inserted = store.insert_assets(new_rows)
+    candidates = [r for r in rows if r["id"] not in existing]
+    inserted_ids = store.insert_assets_ignore_conflicts(candidates)
+    # Another source can win between the ownership precheck and this insert.
+    # Re-read every candidate before any probe/update/classification. Unique
+    # files still insert even when one shared ID loses the race.
+    skipped_ids = set()
+    for row in candidates:
+        owner = store.get_asset(row["id"])
+        if not owner:
+            raise RuntimeError("Drive asset insert could not be verified")
+        if owner.get("gym_id") != gym_id:
+            raise ValueError("Drive file is already indexed for another gym")
+        if owner.get("source_id") != source_id:
+            skipped_ids.add(row["id"])
+    if skipped_ids:
+        rows = [r for r in rows if r["id"] not in skipped_ids]
+        seen_ids.difference_update(skipped_ids)
+    new_rows = [r for r in candidates if r["id"] in inserted_ids]
+    inserted = len(new_rows)
     updated = 0
     for r in rows:
         old = existing.get(r["id"])
@@ -472,20 +490,23 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             store.update_asset(r["id"], changes)
             updated += 1
 
-    # 4. vanished Drive ids -> not eligible, removed_from_drive; flip pending rows
+    # 4. Nightly reconciliation only. The queued post-bind import must never
+    # mutate existing assets or pending calendar rows because a temporarily
+    # incomplete Drive walk could otherwise rewrite a pending post.
     removed = 0
     vanished = []
-    for asset_id, old in existing.items():
-        if asset_id in seen_ids:
-            continue
-        if old.get("reject_reason") == _idx.REJECT_REMOVED:
-            continue  # already marked; idempotent
-        store.update_asset(asset_id, {"eligible": False,
-                                      "reject_reason": _idx.REJECT_REMOVED,
-                                      "indexed_at": now_iso})
-        vanished.append(asset_id)
-        removed += 1
-    _flip_pending_for_missing(gym_id, vanished, log)
+    if sweep_missing:
+        for asset_id, old in existing.items():
+            if asset_id in seen_ids:
+                continue
+            if old.get("reject_reason") == _idx.REJECT_REMOVED:
+                continue  # already marked; idempotent
+            store.update_asset(asset_id, {"eligible": False,
+                                          "reject_reason": _idx.REJECT_REMOVED,
+                                          "indexed_at": now_iso})
+            vanished.append(asset_id)
+            removed += 1
+        _flip_pending_for_missing(gym_id, vanished, log)
 
     # 5. budgeted probe pass over unprobed VIDEO candidates
     probe_fn = probe_fn or _idx.probe_video

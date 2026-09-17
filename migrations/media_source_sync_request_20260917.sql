@@ -28,11 +28,14 @@ GRANT EXECUTE ON FUNCTION request_gym_media_sync(text, text) TO service_role;
 CREATE OR REPLACE FUNCTION claim_gym_media_sync()
 RETURNS SETOF media_source LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 BEGIN
+  -- Deliberately never steal an indexing claim by age. A long-running worker
+  -- may still be writing assets; reclaiming it would create concurrent writers.
+  -- After a confirmed worker crash, an operator must inspect and requeue that
+  -- specific source (sync_status='queued', sync_claim_token=NULL) manually.
   RETURN QUERY WITH pick AS (
     SELECT id FROM media_source
     WHERE active AND kind = 'gym_drive' AND sync_requested_at IS NOT NULL
-      AND (sync_status = 'queued' OR
-           (sync_status = 'indexing' AND sync_started_at < now() - interval '3 hours'))
+      AND sync_status = 'queued'
     ORDER BY sync_requested_at LIMIT 1 FOR UPDATE SKIP LOCKED
   ) UPDATE media_source s SET sync_status = 'indexing', sync_started_at = clock_timestamp(),
       sync_claim_token = md5(random()::text || clock_timestamp()::text), sync_error = NULL

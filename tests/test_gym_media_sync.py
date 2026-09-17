@@ -51,6 +51,26 @@ def test_cross_gym_drive_id_collision_fails_before_insert():
     assert store.assets["shared"]["gym_id"] == "other"
 
 
+def test_racing_source_keeps_shared_owner_and_indexes_unique_file(monkeypatch):
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest", lambda *a, **k: None)
+
+    class RacingStore(FakeMediaStore):
+        def insert_assets_ignore_conflicts(self, rows):
+            # The competing worker inserts after this worker's precheck.
+            self.assets["shared"] = make_asset("shared", gym_id="pierce",
+                                                source_id="src1")
+            return super().insert_assets_ignore_conflicts(rows)
+
+    store = RacingStore()
+    second = make_source("src2", gym_id="pierce", folder_id="fold2")
+    result = sync.sync_source(second,
+                              drive=FakeDrive(files=[photo("shared"), photo("unique")]),
+                              store=store)
+    assert result["ok"] and result["inserted"] == 1
+    assert store.assets["shared"]["source_id"] == "src1"
+    assert store.assets["unique"]["source_id"] == "src2"
+
+
 def test_sync_removed_file_flips_pending(monkeypatch):
     monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
                         lambda *a, **k: None)
@@ -65,6 +85,25 @@ def test_sync_removed_file_flips_pending(monkeypatch):
     assert store.assets["p_gone"]["eligible"] is False
     assert store.assets["p_gone"]["reject_reason"] == "removed_from_drive"
     assert "p_gone" in flipped
+
+
+def test_queued_import_does_not_change_vanished_asset_or_pending_post(monkeypatch):
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest", lambda *a, **k: None)
+    pending = {"media_asset_id": "p_gone", "status": "pending"}
+
+    def flip(_gym, ids, _log):
+        if ids:
+            pending["status"] = "media_not_ready"
+        return len(ids)
+
+    monkeypatch.setattr("agent.jobs.sync_gym_media._flip_pending_for_missing", flip)
+    original = make_asset("p_gone", gym_id="pierce", source_id="src1")
+    store = FakeMediaStore(assets=[original])
+    result = sync.sync_source(_src(), drive=FakeDrive(files=[]), store=store,
+                              sweep_missing=False)
+    assert result["ok"] is True
+    assert store.assets["p_gone"] == original
+    assert pending == {"media_asset_id": "p_gone", "status": "pending"}
 
 
 def test_unshare_marks_revoked_and_notifies(monkeypatch):
