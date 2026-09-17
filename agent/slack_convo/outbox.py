@@ -368,6 +368,25 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
         return
 
     # ---- conversational kinds: the gates ---------------------------------------------
+    # Re-read deployment proof at dispatch time. A queued FIXER acknowledgement,
+    # held-answer replacement, or stale notice must never reach a client.
+    if att.get("fixer"):
+        release = ((ticket.get("verification_after") or {}).get("fixer") or {})
+        deployment = release.get("deployment_check") or {}
+        proven = (kind == _a.KIND_STATUS and att.get("resolve_notice") is True
+                  and ticket.get("status") == "merged"
+                  and (ticket.get("verification_after") or {}).get("exit_code") == 0
+                  and (ticket.get("verification_after") or {}).get("incomplete") is not True
+                  and bool(ticket.get("fix_pr_url"))
+                  and att.get("pr_url") == ticket.get("fix_pr_url")
+                  and bool(release.get("merged_sha"))
+                  and deployment.get("verified") is True
+                  and deployment.get("sha") == release.get("merged_sha"))
+        if not proven:
+            _suppress(bus, row, ticket, identity,
+                      "FIXER client reply requires current PR merged, deployed and verified",
+                      log, summary)
+            return
     # 1. first contact
     if bus.inbound_count(ticket["id"]) < 1:
         _suppress(bus, row, ticket, identity,
@@ -585,9 +604,10 @@ def _receipt(bus, ticket, row, identity, kind, att, *, where, summary):
         # FIXER provenance can remain after a human tap; only the release actor counts.
         if (att or {}).get("released_by") == "fixer":
             how = "sent automatically by FIXER"
+        owner = f"<@{config.APPROVER_SLACK_ID}> " if (att or {}).get("fixer") else ""
         bus.record_outbound(
             ticket_id=ticket["id"], author_type="system",
-            body=(f"RECEIPT: the client was told this, {how}.\n"
+            body=(f"{owner}RECEIPT: the client was told this, {how}.\n"
                   f"BOT: {identity.name}   TICKET: {ticket['id']}   KIND: {kind}\n"
                   f"WHERE: {where}   WHEN: {sent_at}\n"
                   f"STATUS NOW: {status_now}\n\n{row.get('body') or ''}"),

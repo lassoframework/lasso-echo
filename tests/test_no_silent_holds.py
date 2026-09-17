@@ -287,71 +287,54 @@ def _fixer_answer_ticket(bus, question, answer, *, fixer=True):
     return t["id"], row["id"]
 
 
-def test_outbox_posts_deans_fixer_answer_with_no_tap(monkeypatch):
+def test_outbox_blocks_deans_fixer_answer_without_a_deployed_fix(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
     tid, mid = _fixer_answer_ticket(bus, DEAN_Q, DEAN_A)
     post, calls = _posted()
     s = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus.message(mid)["delivery_status"] == "posted", bus.message(mid)["attachments"]
-    assert s["held"] == 0 and any(c["channel"] == "G0MPIM" and "swap it" in c["text"]
-                                  for c in calls)
-    assert bus.tickets[tid]["status"] == "resolved"
+    assert bus.message(mid)["delivery_status"] == "suppressed"
+    assert s["suppressed"] == 1
+    assert not any(c["channel"] == "G0MPIM" for c in calls)
+    assert bus.tickets[tid]["status"] == "verification"
 
 
-def test_outbox_floor_hold_on_a_fixer_answer_is_never_silent(monkeypatch):
+def test_outbox_floor_answer_stays_internal_until_a_deployed_fix(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
     tid, mid = _fixer_answer_ticket(bus, "is my instagram connected?",
                                     "Yes. We will refund last month's charge too.")
     post, calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    held = bus.message(mid)
-    assert held["delivery_status"] == "held"
-    assert held["attachments"]["held_why"] == "org_floor: forbidden_topic_in_answer"
-    assert not any(c["channel"] == "G0MPIM" for c in calls), "the floor never posts"
-    card = _rows(bus, tid, A.KIND_HOLD_NOTICE)[0]["body"]
-    assert "needs a teammate" in card and "awaiting your tap" not in card
-    notices = [m for m in _rows(bus, tid, A.KIND_TEMPLATE)
-               if m["attachments"].get("hold_client_notice") == A.HOLD_TIER_ORG_FLOOR]
-    assert len(notices) == 1 and notices[0]["delivery_status"] == "ready"
-    t = bus.tickets[tid]
-    assert t["status"] == "hold" and t["escalated"] is True
-    assert t["verification_after"]["hold"]["fixer_authored"] is True
-    assert t["classification"] == "answerable_question", "no FIXER re-poll loop on a floor"
-    # the notice itself goes out on the next tick, with no tap
+    assert bus.message(mid)["delivery_status"] == "suppressed"
+    assert not any(c["channel"] == "G0MPIM" for c in calls)
+    assert _rows(bus, tid, A.KIND_ESCALATION), "a teammate sees the refused reply"
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus.message(notices[0]["id"])["delivery_status"] == "posted"
-    assert any(c["channel"] == "G0MPIM" and "billing or pricing" in c["text"] for c in calls)
+    assert not any(c["channel"] == "G0MPIM" for c in calls)
 
 
-def test_outbox_applies_only_the_floor_to_a_fixer_answer(monkeypatch):
-    """A FIXER answer to a 44-word question with a content promise: needs_review would
-    bounce it back to the FIXER forever; the floor alone applies, and it posts."""
+def test_outbox_blocks_fixer_content_promise_before_deployment(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
     tid, mid = _fixer_answer_ticket(bus, PETE_Q, "I'll queue a replacement for monday.")
     post, calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus.message(mid)["delivery_status"] == "posted"
+    assert bus.message(mid)["delivery_status"] == "suppressed"
+    assert not any(c["channel"] == "G0MPIM" for c in calls)
 
 
-def test_outbox_unarmed_flag_hold_tells_the_client(monkeypatch):
+def test_outbox_unarmed_fixer_answer_does_not_tell_the_client(monkeypatch):
     _armed(monkeypatch)
     monkeypatch.delenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", raising=False)
     bus = FakeBus()
     tid, mid = _fixer_answer_ticket(bus, DEAN_Q, DEAN_A)
     post, calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus.message(mid)["delivery_status"] == "held"
-    assert bus.message(mid)["attachments"]["hold_tier"] == A.HOLD_TIER_UNARMED
-    notices = [m for m in _rows(bus, tid, A.KIND_TEMPLATE)
-               if m["attachments"].get("hold_client_notice") == A.HOLD_TIER_UNARMED]
-    assert len(notices) == 1
-    assert "AUTO_ANSWER is off" in _rows(bus, tid, A.KIND_HOLD_NOTICE)[0]["body"]
+    assert bus.message(mid)["delivery_status"] == "suppressed"
+    assert not any(c["channel"] == "G0MPIM" for c in calls)
 
 
-def test_a_second_hold_on_the_same_ticket_does_not_re_notify_the_client(monkeypatch):
+def test_second_unverified_fixer_answer_also_stays_internal(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
     tid, mid = _fixer_answer_ticket(bus, "is my instagram connected?",
@@ -363,12 +346,10 @@ def test_a_second_hold_on_the_same_ticket_does_not_re_notify_the_client(monkeypa
                                      "surface": "mpim", "fixer": True})
     post, calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus.message(mid)["delivery_status"] == "held"
-    assert bus.message(row2["id"])["delivery_status"] == "held"
-    notices = [m for m in _rows(bus, tid, A.KIND_TEMPLATE)
-               if m["attachments"].get("hold_client_notice") == A.HOLD_TIER_ORG_FLOOR]
-    assert len(notices) == 1, "one honest line per ticket per tier"
-    assert len(_rows(bus, tid, A.KIND_HOLD_NOTICE)) == 2, "but every held row gets its card"
+    assert bus.message(mid)["delivery_status"] == "suppressed"
+    assert bus.message(row2["id"])["delivery_status"] == "suppressed"
+    assert not any(c["channel"] == "G0MPIM" for c in calls)
+    assert len(_rows(bus, tid, A.KIND_ESCALATION)) == 2
 
 
 # ---- the portal bridge path (draft time) -------------------------------------------------
@@ -509,23 +490,22 @@ def test_slack_adapter_promise_posts_once_and_hands_the_ticket_to_the_fixer(monk
                and "flag this" in c["text"]) == 1, "the client gets ONE answer"
 
 
-def test_outbox_promise_on_a_fixer_answer_posts_but_does_not_resolve(monkeypatch):
+def test_outbox_fixer_promise_waits_for_deployed_fix(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
     tid, mid = _fixer_answer_ticket(bus, PETE_Q, PETE_A)
     post, calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus.message(mid)["delivery_status"] == "posted"
+    assert bus.message(mid)["delivery_status"] == "suppressed"
     t = bus.tickets[tid]
-    assert t["status"] == "hold" and t["escalated"] is True and t["classification"] is None
-    assert _follow_up_hold(t)["reason"] == A.FOLLOW_UP_MARKER
-    assert [m for m in _rows(bus, tid, A.KIND_ESCALATION)
-            if m["attachments"].get("follow_up_promised")]
-    # Dean's answer promises nobody: it resolves as before
+    assert t["status"] == "verification"
+    assert not any(c["channel"] == "G0MPIM" for c in calls)
+    # An answer without a follow-up promise is blocked by the same release gate.
     bus2 = FakeBus()
     tid2, mid2 = _fixer_answer_ticket(bus2, DEAN_Q, DEAN_A)
     OB.run_once(bus2, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus2.tickets[tid2]["status"] == "resolved"
+    assert bus2.message(mid2)["delivery_status"] == "suppressed"
+    assert bus2.tickets[tid2]["status"] == "verification"
 
 
 def test_portal_bridge_promise_posts_but_does_not_resolve(monkeypatch):
@@ -619,7 +599,7 @@ def test_things_and_conditionals_are_not_follow_up_promises(body):
     assert not A.promises_human_follow_up(body), body
 
 
-def test_outbox_third_person_promise_is_routed_never_plainly_resolved(monkeypatch):
+def test_outbox_third_person_fixer_promise_is_not_sent_before_deployment(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
     tid, mid = _fixer_answer_ticket(bus, "is my instagram connected?",
@@ -627,10 +607,10 @@ def test_outbox_third_person_promise_is_routed_never_plainly_resolved(monkeypatc
                                     "duplicate posts.")
     post, calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus.message(mid)["delivery_status"] == "posted"
+    assert bus.message(mid)["delivery_status"] == "suppressed"
     t = bus.tickets[tid]
-    assert t["status"] == "hold" and t["classification"] is None
-    assert _follow_up_hold(t)["reason"] == A.FOLLOW_UP_MARKER
+    assert t["status"] == "verification"
+    assert not any(c["channel"] == "G0MPIM" for c in calls)
 
 
 # ---- MAJOR: an unanswerable question goes to the FIXER, not to a person ------------------
