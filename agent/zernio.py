@@ -612,16 +612,17 @@ class ZernioClient:
             page += 1
         return posts
 
-    def analytics(self, profile_id, skip=0, limit=50, source=None):
+    def analytics(self, profile_id, page=1, limit=50, source=None):
         """GET /v1/analytics?profileId=... -> the analytics JSON (read-only add-on).
 
         Shape (probed live): {hasAnalyticsAccess, overview, accounts:[...], posts:[...],
-        pagination}. `posts` is a page of up to `limit` (newest first); pass `skip` to page.
+        pagination}. `posts` is a page of up to `limit` (newest first). The live API
+        ignores `skip`; use its page parameter, as list_posts does.
         `source` (optional, e.g. "all") asks Zernio to include EXTERNAL posts too
         (isExternal: true — posts Echo did not publish). Omitted by default so every
         existing caller's request is byte-identical to before Wave 7.
         """
-        params = {"profileId": profile_id, "skip": int(skip), "limit": int(limit)}
+        params = {"profileId": profile_id, "page": int(page), "limit": int(limit)}
         if source:
             params["source"] = str(source)
         return self._get("/v1/analytics", params)
@@ -642,7 +643,7 @@ class ZernioClient:
         if isinstance(days, (int, float)) and days > 0:
             cutoff = datetime.now(timezone.utc) - timedelta(days=float(days))
 
-        first = self.analytics(profile_id, skip=0, limit=page_limit, source=source) or {}
+        first = self.analytics(profile_id, page=1, limit=page_limit, source=source) or {}
         merged = dict(first)
         posts = list(first.get("posts") or [])
         pagination = first.get("pagination") or {}
@@ -672,7 +673,7 @@ class ZernioClient:
             if page >= max_pages:
                 pages_capped = True
                 break
-            nxt = self.analytics(profile_id, skip=len(posts), limit=page_limit, source=source) or {}
+            nxt = self.analytics(profile_id, page=page + 1, limit=page_limit, source=source) or {}
             more = list(nxt.get("posts") or [])
             if not more:
                 break
