@@ -106,6 +106,25 @@ def test_queued_import_does_not_change_vanished_asset_or_pending_post(monkeypatc
     assert pending == {"media_asset_id": "p_gone", "status": "pending"}
 
 
+def test_queued_import_emits_no_client_digest_on_success_or_revocation(monkeypatch):
+    sent = []
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
+                        lambda *a, **k: sent.append("asset-or-revoked"))
+    monkeypatch.setattr("agent.config.story_classifier_enabled", lambda: True)
+    monkeypatch.setattr("agent.jobs.sync_gym_media._sort_ambiguous",
+                        lambda *a, **k: 0)
+    monkeypatch.setattr("agent.story_sort_queue.post_digest",
+                        lambda *a, **k: sent.append("sort"))
+    store = FakeMediaStore()
+    result = sync.sync_source(_src(), drive=FakeDrive(files=[photo("p1")]),
+                              store=store, sweep_missing=False, emit_digest=False)
+    assert result["ok"] and result["inserted"] == 1
+    revoked = sync.sync_source(_src(), drive=FakeDrive(walk_raises=_Resp(403)),
+                               store=store, sweep_missing=False, emit_digest=False)
+    assert revoked["revoked"] is True
+    assert sent == []
+
+
 def test_unshare_marks_revoked_and_notifies(monkeypatch):
     notes = []
     monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",

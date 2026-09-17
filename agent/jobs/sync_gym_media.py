@@ -370,7 +370,7 @@ def _prerender_pass(gym_id, drive, store, merged, seen_ids, probe_fn, log, *,
 
 def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
                 now_iso=None, probe_budget=None, render_budget=None, host_fn=None,
-                sweep_missing=True):
+                sweep_missing=True, emit_digest=True):
     """Sync ONE media_source. Returns a per-source summary dict. Never raises out of
     a normal degrade path; a 403 on the walk marks the source revoked_externally and
     returns a revoked summary."""
@@ -410,7 +410,8 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             msg = (f"Google Drive access for {gym_id} was revoked (the shared "
                    f"folder is no longer shared to Echo). Reconnect it in the "
                    f"portal to resume pulling photos. Nothing was lost.")
-            _post_digest(msg, channel=_client_channel_if_armed(gym_id))
+            if emit_digest:
+                _post_digest(msg, channel=_client_channel_if_armed(gym_id))
             log(f"source {source_id} for {gym_id} revoked_externally (Drive {status})")
             return {"ok": False, "revoked": True, "gym_id": gym_id}
         log(f"walk failed for {gym_id}: {type(e).__name__}: {e}")
@@ -618,7 +619,7 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
         "queued_ambiguous": queued_ambiguous,
         "rendered": rendered, "prehosted": prehosted, "render_skipped": render_skipped}
     # 7. per-gym new-asset digest (only when something new arrived)
-    if inserted:
+    if emit_digest and inserted:
         rejected_txt = ", ".join(f"{k} x{v}" for k, v in sorted(reject_counts.items())) \
             or "none"
         _post_digest(
@@ -630,7 +631,7 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
     # "Sort these" coach digest (spec §0.3): fires ONLY when the queue is non-empty.
     # story_sort_queue.post_digest is a no-op on an empty queue, so this never
     # storms the channel. Best effort: a digest failure never sinks the sync.
-    if config.story_classifier_enabled():
+    if emit_digest and config.story_classifier_enabled():
         try:
             from .. import story_sort_queue as _q
             _q.post_digest(gym_id, channel=_client_channel_if_armed(gym_id))

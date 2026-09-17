@@ -30,6 +30,7 @@ def test_success_claim_and_completion(monkeypatch):
 
     assert queue.run_one(store=store, sync=sync)
     assert calls[0]["sweep_missing"] is False
+    assert calls[0]["emit_digest"] is False
     assert store.finished == [("s1", "claim1", True, None)]
     assert not queue.run_one(store=store)
 
