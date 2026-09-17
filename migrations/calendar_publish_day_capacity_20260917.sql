@@ -31,11 +31,16 @@ begin
   end if;
 
   select count(*) into v_used from public.content_calendar
-    where gym_id = p_gym_id and account = v_row.account and format = v_row.format
-      and status in ('publishing', 'published')
-      and (publish_reservation_day = p_day
-           or (status = 'published' and published_at is not null
-               and (published_at at time zone p_timezone)::date = p_day));
+    where gym_id = p_gym_id
+      and lower(btrim(coalesce(account, ''))) =
+          lower(btrim(coalesce(v_row.account, '')))
+      and coalesce(nullif(lower(btrim(format)), ''), 'feed') =
+          coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed')
+      and (status = 'publishing' -- legacy and previous-day in-flight claims block
+           or (status = 'published' and
+               (publish_reservation_day = p_day
+                or (published_at is not null and
+                    (published_at at time zone p_timezone)::date = p_day))));
   if v_used >= p_capacity then
     return false;
   end if;
