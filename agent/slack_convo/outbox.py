@@ -106,6 +106,31 @@ def portal_deliverable(ticket):
             and bool(str(t.get("client_id") or "").strip()))
 
 
+def _customer_fix_reply(ticket, att):
+    """Identify fix handoffs from the ticket, even when a legacy row has no fixer tag."""
+    recipient = (att.get("recipient_kind") or ticket.get("identity_kind") or "client")
+    if recipient in ("staff", "coach"):
+        return False
+    return (str(ticket.get("classification") or "").lower() == "code_fix"
+            or bool(att.get("fixer")))
+
+
+def _verified_fix_notice(ticket, att, kind):
+    """Only the current fix's resolve notice may tell a customer it is handled."""
+    verification = ticket.get("verification_after") or {}
+    release = verification.get("fixer") or {}
+    deployment = release.get("deployment_check") or {}
+    return (kind == _a.KIND_STATUS and att.get("resolve_notice") is True
+            and ticket.get("status") == "merged"
+            and verification.get("exit_code") == 0
+            and verification.get("incomplete") is not True
+            and bool(ticket.get("fix_pr_url"))
+            and att.get("pr_url") == ticket.get("fix_pr_url")
+            and bool(release.get("merged_sha"))
+            and deployment.get("verified") is True
+            and deployment.get("sha") == release.get("merged_sha"))
+
+
 def _channel_for(kind, identity):
     if kind == _a.KIND_FIXER_REQUEST:
         return config.ops_fix_channel_id()
@@ -396,23 +421,11 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     # ---- conversational kinds: the gates ---------------------------------------------
     # Re-read deployment proof at dispatch time. A queued FIXER acknowledgement,
     # held-answer replacement, or stale notice must never reach a client.
-    if (att.get("fixer") and
-            (att.get("recipient_kind") or ticket.get("identity_kind") or "client")
-            not in ("staff", "coach")):
-        release = ((ticket.get("verification_after") or {}).get("fixer") or {})
-        deployment = release.get("deployment_check") or {}
-        proven = (kind == _a.KIND_STATUS and att.get("resolve_notice") is True
-                  and ticket.get("status") == "merged"
-                  and (ticket.get("verification_after") or {}).get("exit_code") == 0
-                  and (ticket.get("verification_after") or {}).get("incomplete") is not True
-                  and bool(ticket.get("fix_pr_url"))
-                  and att.get("pr_url") == ticket.get("fix_pr_url")
-                  and bool(release.get("merged_sha"))
-                  and deployment.get("verified") is True
-                  and deployment.get("sha") == release.get("merged_sha"))
-        if not proven:
+    customer_fix = _customer_fix_reply(ticket, att)
+    if customer_fix:
+        if not _verified_fix_notice(ticket, att, kind):
             _suppress(bus, row, ticket, identity,
-                      "FIXER client reply requires current PR merged, deployed and verified",
+                      "customer fix reply requires current PR merged, deployed and verified",
                       log, summary)
             return
     # 1. first contact
@@ -543,11 +556,10 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     # in #fixer alone is not participation in the client's channel. Read membership at
     # dispatch; Slack read failures, one-to-one DMs and unsupported channel types hold.
     channel = ticket.get("slack_channel_id")
-    fixer_customer_slack = bool(att.get("fixer") and recipient_kind not in
-                                ("staff", "coach") and channel)
+    fixer_customer_slack = bool(customer_fix)
     if fixer_customer_slack:
         try:
-            member = bool(channel.startswith(("C", "G")) and member_check and
+            member = bool(channel and channel.startswith(("C", "G")) and member_check and
                           member_check(channel, config.APPROVER_SLACK_ID))
         except Exception as e:  # noqa: BLE001
             log(f"[slack-convo/outbox] membership read failed for {channel}: "
@@ -766,6 +778,22 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         return False
     if ticket.get("status") == "resolved":
         return False
+    customer_fix = _customer_fix_reply(ticket, {})
+    if customer_fix:
+        def refuse_fix(reason):
+            why = f"Resolve tap on ticket {ticket_id} did NOT go through: {reason}. " \
+                  "The ticket is unchanged."
+            log(f"[slack-convo/outbox] {why}")
+            try:
+                bus.record_outbound(
+                    ticket_id=ticket_id, author_type="system", body=why,
+                    delivery_status="ready", kind=_a.KIND_ESCALATION,
+                    meta={"identity": getattr(identity, "name", ""),
+                          "resolve_refused": True})
+            except Exception:  # noqa: BLE001 - refusal still stands
+                pass
+            return False
+
     # MINOR 5's fix moved the resolved stamp to delivery time, which quietly broke what the
     # status check had been doing double duty for: idempotence. A second tap before the
     # notice posts would have written a SECOND notice. The notice row itself is the record of
@@ -801,6 +829,13 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         except Exception:  # noqa: BLE001 - the refusal itself already stands
             pass
         return False
+    if customer_fix:
+        proof_meta = {"resolve_notice": True, "pr_url": ticket.get("fix_pr_url")}
+        if not _verified_fix_notice(ticket, proof_meta, _a.KIND_STATUS):
+            return refuse_fix("customer fix has no current merged, deployed and "
+                              "verified release")
+        if not str(ticket.get("slack_channel_id") or "").startswith(("C", "G")):
+            return refuse_fix("customer fix has no group conversation for Blake to join")
     # MINOR 4 (audit 7): `surface` was the ticket's SOURCE ("website_tab"), which is not one
     # of the surfaces gate 7 knows, so the notice was posted as a THREAD REPLY inside a DM --
     # a place people do not look. The real surface is on the ticket's own inbound rows.
@@ -812,7 +847,8 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         # own identity_kind, so a staff ticket with STAFF_REPLY on and CLIENT_REPLY off
         # passed the gate and then held the row -- the exact lie the gate was added to close.
         meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
-              "surface": surface, "resolved_by": approved_by, "resolve_notice": True})
+              "surface": surface, "resolved_by": approved_by, "resolve_notice": True,
+              **({"pr_url": ticket.get("fix_pr_url")} if customer_fix else {})})
     # MINOR 5 (audit 7): the ticket used to be stamped resolved HERE, before the notice had
     # been delivered -- so a post failure left a ticket permanently asserting it was resolved
     # over a row marked failed. Same rule as an answer (V-M4): the ticket closes when the

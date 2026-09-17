@@ -112,6 +112,13 @@ class Bus:
                 return m
         return None
 
+    def set_message_body_if_posting(self, mid, body):
+        for m in self.msgs:
+            if m["id"] == mid and m.get("delivery_status") == "posting":
+                m["body"] = body
+                return dict(m)
+        return None
+
     # helpers for assertions
     def outbound_kinds(self, tid=None):
         return [(m["attachments"].get("kind"), m["delivery_status"])
@@ -238,6 +245,79 @@ def test_a_conversational_row_on_a_portal_ticket_is_delivered_to_the_portal_thre
     assert row["delivery_status"] == "posted"
     assert row["attachments"]["delivered_via"] == "portal_thread"
     assert sent == [], "nothing is posted to Slack for a portal thread delivery"
+
+
+def _fix_proof():
+    return {"exit_code": 0, "incomplete": False, "fixer": {
+        "merged_sha": "abc123", "deployment_check": {"verified": True, "sha": "abc123"}}}
+
+
+def test_legacy_untagged_code_fix_ack_never_reaches_portal_thread():
+    bus = Bus([_ticket(classification="code_fix", status="hold")])
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    row = bus.record_outbound(ticket_id="t-1", author_type="echo", body=A.ACK_CODE_FIX,
+                              delivery_status="ready", kind=A.KIND_ACK,
+                              meta={"identity": "echo", "recipient_kind": "client"})
+    sent, post = _posts()
+    summary = OB.run_once(bus, post, identity=ECHO, log=lambda *a: None)
+    assert summary["posted"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "suppressed"
+    assert sent == []
+
+
+def test_released_grounded_answer_cannot_bypass_code_fix_release(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    bus = Bus([_ticket(classification="code_fix", status="hold",
+                       verification_after={"source": "grounding"})])
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    row = bus.record_outbound(ticket_id="t-1", author_type="echo", body="It is fixed.",
+                              delivery_status="ready", kind=A.KIND_ANSWER,
+                              meta={"identity": "echo", "recipient_kind": "client",
+                                    "released_by": "U_BLAKE"})
+    sent, post = _posts()
+    OB.run_once(bus, post, identity=ECHO, log=lambda *a: None)
+    assert bus.message(row["id"])["delivery_status"] == "suppressed"
+    assert sent == []
+
+
+def test_code_fix_resolve_requires_release_and_blake_in_conversation():
+    bus = Bus([_ticket(classification="code_fix", status="hold")])
+    assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                     log=lambda *a: None)
+    assert bus.of_kind(A.KIND_STATUS) == []
+    bus.set_ticket("t-1", status="merged", fix_pr_url="https://example.test/pr/1",
+                   verification_after=_fix_proof())
+    assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                     log=lambda *a: None)
+    bus.set_ticket("t-1", slack_channel_id="G_CLIENT")
+    assert OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                 log=lambda *a: None)
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    sent, post = _posts()
+    OB.run_once(bus, post, identity=ECHO, log=lambda *a: None,
+                member_check=lambda channel, user: False)
+    assert bus.of_kind(A.KIND_STATUS)[0]["delivery_status"] == "suppressed"
+    assert bus.ticket("t-1")["status"] == "merged"
+    assert all(item["channel"] == "C_FIXER" for item in sent)
+
+
+def test_verified_fix_notice_names_blake_in_group_dm():
+    bus = Bus([_ticket(classification="code_fix", status="merged",
+                       fix_pr_url="https://example.test/pr/1",
+                       verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    assert OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                 log=lambda *a: None)
+    sent, post = _posts()
+    OB.run_once(bus, post, identity=ECHO, log=lambda *a: None,
+                member_check=lambda channel, user: channel == "G_CLIENT" and bool(user))
+    assert len(sent) == 1, bus.outbound_kinds()
+    assert f"<@{OB.config.APPROVER_SLACK_ID}>" in sent[0]["text"]
+    assert bus.ticket("t-1")["status"] == "resolved"
 
 
 def test_a_ticket_with_no_slack_channel_and_no_portal_thread_still_fails():
