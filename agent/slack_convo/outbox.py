@@ -107,12 +107,24 @@ def portal_deliverable(ticket):
 
 
 def _customer_fix_reply(ticket, att):
-    """Identify fix handoffs from the ticket, even when a legacy row has no fixer tag."""
+    """Identify customer handoffs even after escalation clears classification.
+
+    The FIXER poll requires classification NULL, so classification alone cannot
+    protect held portal incidents. A direct grounded QUESTION keeps its explicit
+    classification and remains eligible for the normal answer gates.
+    """
     recipient = (att.get("recipient_kind") or ticket.get("identity_kind") or "client")
     if recipient in ("staff", "coach"):
         return False
-    return (str(ticket.get("classification") or "").lower() == "code_fix"
-            or bool(att.get("fixer")))
+    classification = str(ticket.get("classification") or "").lower()
+    if classification == "answerable_question" and not att.get("fixer"):
+        return False
+    portal_handoff = (ticket.get("product") == "echo"
+                      and portal_deliverable(ticket)
+                      and (ticket.get("escalated") is True
+                           or bool(ticket.get("hold_tier"))
+                           or bool((ticket.get("verification_after") or {}).get("hold"))))
+    return classification == "code_fix" or bool(att.get("fixer")) or portal_handoff
 
 
 def _verified_fix_notice(ticket, att, kind):

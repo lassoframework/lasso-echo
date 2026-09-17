@@ -266,6 +266,29 @@ def test_legacy_untagged_code_fix_ack_never_reaches_portal_thread():
     assert sent == []
 
 
+def test_escalated_portal_ticket_with_cleared_classification_holds_legacy_rows():
+    bus = Bus([_ticket(classification=None, status="hold", escalated=True,
+                       hold_tier="routine", verification_after={
+                           "source": "grounding", "hold": {"reason": "needs_review"}})])
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    ack = bus.record_outbound(ticket_id="t-1", author_type="echo", body=A.ACK_CODE_FIX,
+                              delivery_status="ready", kind=A.KIND_ACK,
+                              meta={"identity": "echo", "recipient_kind": "client"})
+    answer = bus.record_outbound(ticket_id="t-1", author_type="echo", body="Handled.",
+                                 delivery_status="ready", kind=A.KIND_ANSWER,
+                                 meta={"identity": "echo", "recipient_kind": "client",
+                                       "released_by": "U_BLAKE"})
+    assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                     log=lambda *a: None)
+    sent, post = _posts()
+    OB.run_once(bus, post, identity=ECHO, log=lambda *a: None)
+    assert bus.message(ack["id"])["delivery_status"] == "suppressed"
+    assert bus.message(answer["id"])["delivery_status"] == "suppressed"
+    assert bus.of_kind(A.KIND_STATUS) == []
+    assert all(item["channel"] == "C_FIXER" for item in sent)
+
+
 def test_released_grounded_answer_cannot_bypass_code_fix_release(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
     bus = Bus([_ticket(classification="code_fix", status="hold",
@@ -388,7 +411,8 @@ def test_no_resolve_button_when_there_is_nowhere_to_send_the_notice():
 
 
 def test_resolve_and_notify_writes_the_person_a_notice_and_closes_the_ticket():
-    bus = Bus([_ticket(status="hold", escalated=True)])
+    bus = Bus([_ticket(status="hold", escalated=True,
+                       classification="answerable_question")])
     # the human's own message, which every real ticket has and which outbox gate 1 (first
     # contact: the bot never speaks first) requires before anything can post
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
