@@ -735,6 +735,59 @@ def _rows(bus, tid, kind):
             if m["direction"] == "outbound" and m["attachments"]["kind"] == kind]
 
 
+def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    sha = "merged-sha"
+    pr = "https://github.com/lassoframework/lasso-echo/pull/999"
+    bus.tickets[tid] = {
+        "id": tid, "status": "hold", "bot_identity": "echo", "identity_kind": "client",
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
+                                        "deployment_check": {"verified": True, "sha": sha}}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Please fix this")
+
+    def notice(**overrides):
+        meta = {"identity": "echo", "recipient_kind": "client", "fixer": True,
+                "released_by": "fixer", "pr_url": pr, "resolve_notice": True}
+        meta.update(overrides)
+        return bus.record_outbound(ticket_id=tid, author_type="echo", body="The fix is live.",
+                                   delivery_status="ready", kind=A.KIND_STATUS, meta=meta)
+
+    early = notice()
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus.message(early["id"])["delivery_status"] == "suppressed"
+    assert not any(c["channel"] == "C_CLIENT" for c in calls)
+
+    bus.set_ticket(tid, status="merged")
+    wrong_pr = notice(pr_url="https://github.com/lassoframework/lasso-echo/pull/998")
+    wrong_sha = notice()
+    bus.set_ticket(tid, verification_after={"exit_code": 0, "fixer": {"merged_sha": sha,
+                    "deployment_check": {"verified": True, "sha": "other-sha"}}})
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus.message(wrong_pr["id"])["delivery_status"] == "suppressed"
+    assert bus.message(wrong_sha["id"])["delivery_status"] == "suppressed"
+    assert not any(c["channel"] == "C_CLIENT" for c in calls)
+
+    bus.set_ticket(tid, verification_after={"exit_code": 0, "fixer": {"merged_sha": sha,
+                    "deployment_check": {"verified": True, "sha": sha}}})
+    final = notice()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus.message(final["id"])["delivery_status"] == "posted"
+    assert len([c for c in calls if c["channel"] == "C_CLIENT"]) == 1
+    receipts = [m for m in bus.messages_for(tid)
+                if (m.get("attachments") or {}).get("receipt_for") == final["id"]]
+    assert len(receipts) == 1
+    assert f"<@{OB.config.APPROVER_SLACK_ID}>" in receipts[0]["body"]
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert any(c["channel"] == "C_FIXER" and
+               f"<@{OB.config.APPROVER_SLACK_ID}>" in c["text"] for c in calls)
+
+
 def test_reply_never_posts_without_verification_after(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
