@@ -682,26 +682,6 @@ class SupabaseCalendarStore:
     # These serve the scheduled calendar auto-publisher (calendar_autopublish.py).
     # They never publish; they only read the day's rows and flip status atomically
     # so a row is published EXACTLY ONCE across re-runs / concurrent workers.
-    def publishing_slot_count(self, gym_id, post_date, account, fmt):
-        """Count sent or in-flight rows in one gym/platform/date/format slot.
-
-        The row claim is per id, so distinct approved rows can otherwise all send
-        on a one-post day. Include publishing rows to hold another worker's claim.
-        A failed read raises: the caller must hold, never assume an empty slot.
-        """
-        r = self._client().get(
-            self._rest(_TABLE),
-            params={"select": "id", "gym_id": f"eq.{gym_id}",
-                    "post_date": f"eq.{str(post_date)[:10]}",
-                    "account": f"eq.{account}", "format": f"eq.{fmt}",
-                    "status": "in.(publishing,published)",
-                    "variant_status": "eq.active"},
-            headers=self._headers(), timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        return len(r.json() or [])
-
     def due_rows(self, gym_id, run_date, catchup_days=0):
         """
         content_calendar rows that are DUE to publish on `run_date` for `gym_id`:
@@ -800,6 +780,25 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len(rows) == 1
+
+    def claim_publish_slot(self, row_id, gym_id, local_day, timezone_name,
+                           capacity, approved_only):
+        """Atomically reserve today's platform slot and claim this row in Postgres.
+
+        No split count/claim fallback: an unavailable RPC holds the post. The SQL
+        function serializes all workers for this gym/day with an advisory lock.
+        """
+        r = self._client().post(
+            self._rest("rpc/claim_calendar_publish_slot"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"p_row_id": row_id, "p_gym_id": gym_id,
+                  "p_day": local_day, "p_timezone": timezone_name,
+                  "p_capacity": capacity, "p_approved_only": approved_only},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() is True
 
     def patch_post_date(self, row_id, new_post_date):
         """RE-DATE one waiting row (expired-row self-heal, Blake 2026-08-31: no human
@@ -1678,7 +1677,8 @@ class SupabaseCalendarStore:
                     "late_post_id": "is.null"},
             headers=self._headers({"Content-Type": "application/json",
                                    "Prefer": "return=representation"}),
-            json={"status": status, "reject_reason": str(reason)[:500]},
+            json={"status": status, "reject_reason": str(reason)[:500],
+                  "publish_reservation_day": None},
             timeout=30,
         )
         if response.status_code >= 400:
@@ -1706,7 +1706,7 @@ class SupabaseCalendarStore:
         """
         if revert_status not in ("pending", "approved"):
             revert_status = "pending"
-        body = {"status": revert_status}
+        body = {"status": revert_status, "publish_reservation_day": None}
         if reject_reason is not None:
             body["reject_reason"] = str(reject_reason)[:500]
         params = {"id": f"eq.{row_id}"}

@@ -874,33 +874,6 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             _alert_daily_cap_hit(gym_id, run_date)
             continue
 
-        # A row-level claim cannot stop several *different* approved rows for the
-        # same platform and day. Count already sent and in-flight rows against the
-        # gym's effective cadence before claiming another one. This is deliberately
-        # per platform/format: an IG feed, FB mirror and IG story are one planned
-        # creative, while a configured 2x cadence may send two distinct feeds.
-        if approved_only:
-            slot_counter = getattr(store, "publishing_slot_count", None)
-            if callable(slot_counter):
-                try:
-                    from .cadence import resolve_posts_per_day
-                    slot_limit = resolve_posts_per_day(gym_id, store)
-                    slot_count = slot_counter(
-                        gym_id, row_date, str(row.get("account") or "").lower(),
-                        str(row.get("format") or "feed").lower())
-                except Exception as exc:  # noqa: BLE001 - unknown capacity is unsafe
-                    waiting.append(row_id)
-                    print(f"[calendar-autopublish] slot count unavailable for "
-                          f"{gym_id} {row_date} {row_id}: {type(exc).__name__}; held")
-                    continue
-                if slot_count >= slot_limit:
-                    waiting.append(row_id)
-                    _alert_slot_capacity_hit(gym_id, row, slot_count, slot_limit)
-                    print(f"[calendar-autopublish] slot full for {gym_id} "
-                          f"{row_date} {row.get('account')}/{row.get('format')} "
-                          f"({slot_count}/{slot_limit}); held {row_id}")
-                    continue
-
         # FEED ASPECT PREFLIGHT: a feed photo outside IG/FB's accepted ratio is re-framed
         # to an in-spec 1080x1080 card BEFORE the network call, so Zernio never 400s on
         # aspect ratio (ENG/Dale 2026-08-24). No-op for a story (framed by its burner) and
@@ -916,9 +889,21 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 continue
             row = fixed
 
-        # EXACTLY-ONCE CLAIM: only the winner proceeds to a network call.
+        # ATOMIC DAY CAPACITY + ROW CLAIM. The actual gym-local publish day is
+        # used, so catch-up rows dated on different prior days share today's
+        # capacity. Postgres serializes distinct rows/workers in one transaction.
+        # This applies to both manual approval and autonomous client lanes.
         try:
-            won = store.mark_publishing(row_id)
+            claim_slot = getattr(store, "claim_publish_slot", None)
+            if callable(claim_slot):
+                from .cadence import resolve_posts_per_day
+                won = claim_slot(row_id, gym_id, gym_local_today, gym_tz,
+                                 resolve_posts_per_day(gym_id, store), approved_only)
+            else:
+                # Legacy injectable test stores have no RPC. The production
+                # Supabase store always exposes claim_publish_slot and fails
+                # closed if its migration has not been applied.
+                won = store.mark_publishing(row_id)
         except Exception as e:
             failed.append(row_id)
             print(f"[calendar-autopublish] claim failed for row {row_id}: "
@@ -930,8 +915,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             _note_repeat_failure(row_id, gym_id, e)
             continue
         if not won:
-            # Another run/worker owns it (or it was already published). Skip.
-            skipped.append(row_id)
+            # Either this row was claimed elsewhere or the local-day platform
+            # cadence is full. Leave it untouched for calendar review.
+            (waiting if callable(claim_slot) else skipped).append(row_id)
             continue
 
         # CONTENT IDEMPOTENCY, WRITTEN BEFORE THE NETWORK CALL (2026-09-05 incident).

@@ -21,6 +21,7 @@ Coverage:
 
 import os
 import sys
+import threading
 
 import pytest
 
@@ -134,6 +135,34 @@ class _FakeStore:
 
     def release_content_ledger_claim(self, gym_id, row_id, previous, reason):
         return self._transition_unpublished_claim(gym_id, row_id, previous, reason)
+
+
+class _AtomicSlotStore(_FakeStore):
+    """Offline model of the SQL advisory-lock reservation and row claim."""
+
+    def __init__(self, rows):
+        super().__init__(rows)
+        self._slot_lock = threading.Lock()
+
+    def claim_publish_slot(self, row_id, gym, day, timezone_name, capacity,
+                           approved_only):
+        with self._slot_lock:
+            row = self.rows[row_id]
+            if row.get("status") not in ("pending", "approved"):
+                return False
+            if approved_only and row["status"] != "approved":
+                return False
+            used = sum(r.get("status") in ("publishing", "published")
+                       and r.get("publish_reservation_day") == day
+                       for r in self.rows.values()
+                       if (r.get("gym_id"), r.get("account"), r.get("format")) ==
+                       (gym, row.get("account"), row.get("format")))
+            if used >= capacity:
+                return False
+            if not super().mark_publishing(row_id):
+                return False
+            row["publish_reservation_day"] = day
+            return True
 
 
 class _FakePublisher:
@@ -768,7 +797,7 @@ def test_mark_publish_failed_reverts_to_pending_only():
 
     _, _url, params, _headers, body = http.calls[0]
     assert params["id"] == "eq.a"
-    assert body == {"status": "pending"}                 # nothing else recorded
+    assert body == {"status": "pending", "publish_reservation_day": None}
 
 
 def test_account_for_skips_non_ig_fb_platforms():
@@ -1016,20 +1045,13 @@ def test_client_approved_rows_respect_platform_day_capacity(armed, monkeypatch):
     class _Acct:
         key = "gymx_fb"; platform = "facebook"; display_name = "Gym X"
 
-    class _SlotStore(_FakeStore):
-        def publishing_slot_count(self, gym, day, account, fmt):
-            return sum(r.get("status") in ("publishing", "published")
-                       for r in self.rows.values()
-                       if (r.get("gym_id"), r.get("post_date"), r.get("account"),
-                           r.get("format")) == (gym, day, account, fmt))
-
     monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
     monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
     rows = [_row(rid, account="facebook", status="approved")
             for rid in ("fb1", "fb2", "fb3")]
     for row in rows:
         row["gym_id"] = "gymx"
-    store = _SlotStore(rows)
+    store = _AtomicSlotStore(rows)
     sent = []
     summary = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
                               approved_only=True, catch_all=True,
@@ -1057,13 +1079,6 @@ def test_client_slot_capacity_keeps_cross_platform_pair_and_approval_gate(
             self.platform = platform
             self.display_name = "Gym X"
 
-    class _SlotStore(_FakeStore):
-        def publishing_slot_count(self, gym, day, account, fmt):
-            return sum(r.get("status") in ("publishing", "published")
-                       for r in self.rows.values()
-                       if (r.get("gym_id"), r.get("post_date"), r.get("account"),
-                           r.get("format")) == (gym, day, account, fmt))
-
     monkeypatch.setattr(cap, "_account_for",
                         lambda row, gym_id: _Acct(row["account"]))
     monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
@@ -1072,7 +1087,7 @@ def test_client_slot_capacity_keeps_cross_platform_pair_and_approval_gate(
             _row("unapproved", account="facebook", status="pending")]
     for row in rows:
         row["gym_id"] = "gymx"
-    store = _SlotStore(rows)
+    store = _AtomicSlotStore(rows)
     sent = []
     summary = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
                               approved_only=True, catch_all=True,
@@ -1080,6 +1095,53 @@ def test_client_slot_capacity_keeps_cross_platform_pair_and_approval_gate(
     assert set(summary["published"]) == {"ig", "fb"}
     assert summary["waiting"] == ["unapproved"]
     assert "unapproved" not in store.publishing_calls
+
+
+def test_autonomous_overlap_and_catchup_share_actual_day_capacity(armed, monkeypatch):
+    """Two workers must not send distinct rows from yesterday and today together."""
+    from agent import cadence
+
+    class _Acct:
+        key = "gymx_fb"; platform = "facebook"; display_name = "Gym X"
+
+    barrier = threading.Barrier(2)
+
+    class _ConcurrentStore(_AtomicSlotStore):
+        def due_rows(self, gym, run_date, catchup_days=0):
+            return [dict(r) for r in self.rows.values()
+                    if r.get("status") == "pending"]
+
+        def claim_publish_slot(self, *args):
+            barrier.wait(timeout=5)  # both workers enter before either can reserve
+            return super().claim_publish_slot(*args)
+
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    rows = [_row("yesterday", account="facebook", status="pending",
+                 post_date="2026-08-09"),
+            _row("today", account="facebook", status="pending")]
+    for row in rows:
+        row["gym_id"] = "gymx"
+    store = _ConcurrentStore(rows)
+    sent = []
+    results = []
+
+    def worker():
+        results.append(cap.publish_due(
+            RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+            approved_only=False, catchup_days=1, catch_all=True,
+            zernio_publish=_zern_capture(sent)))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(sent) == 1
+    assert sum(len(result["published"]) for result in results) == 1
+    assert {r.get("publish_reservation_day") for r in store.rows.values()
+            if r.get("status") == "published"} == {RUN_DATE}
 
 
 def test_autonomous_client_also_publishes_now_at_slot(armed, monkeypatch):
