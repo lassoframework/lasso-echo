@@ -337,6 +337,25 @@ def _alert_daily_cap_hit(gym_id, run_date):
         pass  # an alert failure must never block the publish lane
 
 
+def _alert_slot_capacity_hit(gym_id, row, count, limit):
+    """Tell ops once per gym/day/platform/format when approved rows exceed cadence."""
+    try:
+        from . import db, ops_alerts
+        day = str(row.get("post_date") or "")[:10]
+        platform = str(row.get("account") or "").lower()
+        fmt = str(row.get("format") or "feed").lower()
+        key = f"slotcap_alerted_{gym_id}_{day}_{platform}_{fmt}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"{gym_id}: approved {platform}/{fmt} calendar rows exceed the "
+            f"{day} cadence ({count}/{limit} already publishing or published). "
+            "Extra rows are held for calendar review, not sent.")
+    except Exception:  # noqa: BLE001 - alerting cannot bypass the hold
+        pass
+
+
 def scheduled_iso_for_row(row, now=None, tz_name=None):
     """The ISO8601 go-live timestamp for a row: its post_date at its OWN stable slot
     time (slot_time_for_row), in the GYM'S posting timezone (tz_name; default the
@@ -854,6 +873,33 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             waiting.append(row_id)
             _alert_daily_cap_hit(gym_id, run_date)
             continue
+
+        # A row-level claim cannot stop several *different* approved rows for the
+        # same platform and day. Count already sent and in-flight rows against the
+        # gym's effective cadence before claiming another one. This is deliberately
+        # per platform/format: an IG feed, FB mirror and IG story are one planned
+        # creative, while a configured 2x cadence may send two distinct feeds.
+        if approved_only:
+            slot_counter = getattr(store, "publishing_slot_count", None)
+            if callable(slot_counter):
+                try:
+                    from .cadence import resolve_posts_per_day
+                    slot_limit = resolve_posts_per_day(gym_id, store)
+                    slot_count = slot_counter(
+                        gym_id, row_date, str(row.get("account") or "").lower(),
+                        str(row.get("format") or "feed").lower())
+                except Exception as exc:  # noqa: BLE001 - unknown capacity is unsafe
+                    waiting.append(row_id)
+                    print(f"[calendar-autopublish] slot count unavailable for "
+                          f"{gym_id} {row_date} {row_id}: {type(exc).__name__}; held")
+                    continue
+                if slot_count >= slot_limit:
+                    waiting.append(row_id)
+                    _alert_slot_capacity_hit(gym_id, row, slot_count, slot_limit)
+                    print(f"[calendar-autopublish] slot full for {gym_id} "
+                          f"{row_date} {row.get('account')}/{row.get('format')} "
+                          f"({slot_count}/{slot_limit}); held {row_id}")
+                    continue
 
         # FEED ASPECT PREFLIGHT: a feed photo outside IG/FB's accepted ratio is re-framed
         # to an in-spec 1080x1080 card BEFORE the network call, so Zernio never 400s on

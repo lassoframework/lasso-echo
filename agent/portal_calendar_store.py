@@ -682,6 +682,26 @@ class SupabaseCalendarStore:
     # These serve the scheduled calendar auto-publisher (calendar_autopublish.py).
     # They never publish; they only read the day's rows and flip status atomically
     # so a row is published EXACTLY ONCE across re-runs / concurrent workers.
+    def publishing_slot_count(self, gym_id, post_date, account, fmt):
+        """Count sent or in-flight rows in one gym/platform/date/format slot.
+
+        The row claim is per id, so distinct approved rows can otherwise all send
+        on a one-post day. Include publishing rows to hold another worker's claim.
+        A failed read raises: the caller must hold, never assume an empty slot.
+        """
+        r = self._client().get(
+            self._rest(_TABLE),
+            params={"select": "id", "gym_id": f"eq.{gym_id}",
+                    "post_date": f"eq.{str(post_date)[:10]}",
+                    "account": f"eq.{account}", "format": f"eq.{fmt}",
+                    "status": "in.(publishing,published)",
+                    "variant_status": "eq.active"},
+            headers=self._headers(), timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return len(r.json() or [])
+
     def due_rows(self, gym_id, run_date, catchup_days=0):
         """
         content_calendar rows that are DUE to publish on `run_date` for `gym_id`:

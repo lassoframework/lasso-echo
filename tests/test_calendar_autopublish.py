@@ -1009,6 +1009,79 @@ def test_client_row_waits_for_its_slot_then_publishes_now(armed, monkeypatch):
            (len(sent) == 1 and sent[0][1] is None)
 
 
+def test_client_approved_rows_respect_platform_day_capacity(armed, monkeypatch):
+    """Separate approved FB rows cannot all publish on a 1x gym day."""
+    from agent import cadence
+
+    class _Acct:
+        key = "gymx_fb"; platform = "facebook"; display_name = "Gym X"
+
+    class _SlotStore(_FakeStore):
+        def publishing_slot_count(self, gym, day, account, fmt):
+            return sum(r.get("status") in ("publishing", "published")
+                       for r in self.rows.values()
+                       if (r.get("gym_id"), r.get("post_date"), r.get("account"),
+                           r.get("format")) == (gym, day, account, fmt))
+
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    rows = [_row(rid, account="facebook", status="approved")
+            for rid in ("fb1", "fb2", "fb3")]
+    for row in rows:
+        row["gym_id"] = "gymx"
+    store = _SlotStore(rows)
+    sent = []
+    summary = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                              approved_only=True, catch_all=True,
+                              zernio_publish=_zern_capture(sent))
+    assert summary["published"] == ["fb1"]
+    assert set(summary["waiting"]) == {"fb2", "fb3"}
+    assert store.publishing_calls == ["fb1"]
+
+    # A real 2x preference still permits its second distinct feed.
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 2)
+    again = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                            approved_only=True, catch_all=True,
+                            zernio_publish=_zern_capture(sent))
+    assert again["published"] == ["fb2"]
+    assert again["waiting"] == ["fb3"]
+
+
+def test_client_slot_capacity_keeps_cross_platform_pair_and_approval_gate(
+        armed, monkeypatch):
+    from agent import cadence
+
+    class _Acct:
+        def __init__(self, platform):
+            self.key = f"gymx_{'fb' if platform == 'facebook' else 'ig'}"
+            self.platform = platform
+            self.display_name = "Gym X"
+
+    class _SlotStore(_FakeStore):
+        def publishing_slot_count(self, gym, day, account, fmt):
+            return sum(r.get("status") in ("publishing", "published")
+                       for r in self.rows.values()
+                       if (r.get("gym_id"), r.get("post_date"), r.get("account"),
+                           r.get("format")) == (gym, day, account, fmt))
+
+    monkeypatch.setattr(cap, "_account_for",
+                        lambda row, gym_id: _Acct(row["account"]))
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    rows = [_row("ig", status="approved"),
+            _row("fb", account="facebook", status="approved"),
+            _row("unapproved", account="facebook", status="pending")]
+    for row in rows:
+        row["gym_id"] = "gymx"
+    store = _SlotStore(rows)
+    sent = []
+    summary = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                              approved_only=True, catch_all=True,
+                              zernio_publish=_zern_capture(sent))
+    assert set(summary["published"]) == {"ig", "fb"}
+    assert summary["waiting"] == ["unapproved"]
+    assert "unapproved" not in store.publishing_calls
+
+
 def test_autonomous_client_also_publishes_now_at_slot(armed, monkeypatch):
     """Autonomous gyms no longer hand Zernio a future scheduledFor (which was marked
     published immediately, hours before the post existed). They fire at slot time too."""
