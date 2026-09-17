@@ -599,18 +599,19 @@ def test_rhythm_from_real_publishes_not_a_constant():
 # ---------------------------------------------------------------------------
 
 class _PagingHttp:
-    """A fake `requests`-like http returning analytics pages by (skip)."""
+    """A fake `requests`-like http returning analytics pages by page number."""
 
     def __init__(self, pages, total):
         self._pages = pages   # list of post-lists, newest first
         self._total = total
-        self.calls = 0
+        self.calls = []
 
     def get(self, url, params=None, headers=None, timeout=None):
-        self.calls += 1
-        skip = int((params or {}).get("skip", 0))
+        page = int((params or {}).get("page", 1))
+        self.calls.append(page)
         limit = int((params or {}).get("limit", 50))
         flat = [p for page in self._pages for p in page]
+        skip = (page - 1) * limit
         window = flat[skip:skip + limit]
 
         class _R:
@@ -626,7 +627,7 @@ class _PagingHttp:
             "hasAnalyticsAccess": True,
             "accounts": [],
             "posts": window,
-            "pagination": {"total": self._total, "skip": skip, "limit": limit},
+            "pagination": {"total": self._total, "page": page, "limit": limit},
         })
 
 
@@ -639,9 +640,10 @@ def test_analytics_window_pages_and_stops_out_of_window():
     c = z.ZernioClient(api_key="sk", base="https://api.zernio.com", http=http)
     merged = c.analytics_window("pid", days=14, page_limit=2, max_pages=20)
     # it must have paged at least twice to discover the window boundary
-    assert http.calls >= 2
+    assert http.calls == [1, 2]
     assert merged["hasAnalyticsAccess"] is True
     assert merged["_pages_capped"] is False
+    assert len(merged["posts"]) == 3
     # the old post is fetched but the mapper (not the pager) filters it out
     out = za.map_metrics(merged, 14, None, None)
     assert out["totals"]["posts_published"] == 2
