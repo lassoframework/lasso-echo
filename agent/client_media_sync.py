@@ -734,6 +734,12 @@ def _existing_feed_count(store, base_key, start, days):
         for row in rows:
             if not isinstance(row, dict):
                 continue
+            # The standard count intentionally covers whole calendar months.
+            # Pierce's weekly store narrows it to the actual review block so
+            # older published feeds cannot suppress the next week's build.
+            if isinstance(store, _PierceWeekStore) and \
+                    str(row.get("post_date"))[:10] not in store._dates:
+                continue
             status = str(row.get("status", "")).lower()
             # Mirror the build query: denied/killed rows are gone — don't count them
             # as "placed". Without this, a denied post blocks its own replacement
@@ -995,6 +1001,8 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                              in ("1", "true", "yes", "on"))
             plan_start, plan_days = ((start, days) if not weekly_pierce else
                                      pierce_weekly_window(start))
+            plan_store = (_PierceWeekStore(store, plan_start, plan_days)
+                          if weekly_pierce and store is not None else store)
             sync = sync_uploads(base, r2=r2, logger=log)
             synced_total += sync.get("synced", 0)
 
@@ -1131,7 +1139,7 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # build_target (30) -> SKIP, no rebuild. A GENUINE media increase below the
             # cap still grows; a library already at/over the cap never churns again.
             existing_feeds, read_ok = _existing_feed_count(
-                store, base, plan_start, plan_days)
+                plan_store, base, plan_start, plan_days)
             if read_ok:
                 # RE-ARM ON RECOVERY (2026-09-02). calendar_unreadable is the one stall
                 # stage that heals ITSELF: it means a shared dependency (Supabase) was
@@ -1288,8 +1296,7 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             built = build_client_month(
                 account, base, plan_start.isoformat(), plan_days,
                 voice=voice, library_path=lib_dir,
-                store=(_PierceWeekStore(store, plan_start, plan_days)
-                       if weekly_pierce else store),
+                store=plan_store,
                 banned_words=banned, logger=log,
                 allow_reshape=cadence_changed)
             if built.get("ok"):
