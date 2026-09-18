@@ -102,12 +102,21 @@ def test_astra_review_sends_actual_candidate_and_benchmark_pixels():
 def test_story_safe_region_is_required_even_with_perfect_copy_and_score():
     class StoryVision:
         def ask_image(self, image_bytes, question):
-            assert "y=0.17 to 0.80" in question
+            assert "y=0.10 to 0.85" in question
+            assert "y=0.17 to 0.80" not in question
             return review_response(placement_safe=False)
     result = infographic_review.evaluate(b"candidate", headline="Approved", facts=["Fact"],
         surface="story", vision_client=StoryVision())
     assert not result.passed
     assert "safe region" in result.reason
+
+
+def test_story_brief_uses_full_height_safe_region():
+    brief = astra_prompt.build_content_brief('Hook', ['Approved fact'],
+        surface='Story', pixels='1080x1920')
+    assert 'y=10 to 85 percent' in brief
+    assert 'y=17 to 80 percent' not in brief
+    assert 'top and bottom controls' in brief
 
 
 def test_persisted_draft_retains_required_image_copy():

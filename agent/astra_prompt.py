@@ -718,7 +718,7 @@ def build_content_brief(headline, facts, *, cta="", surface="feed post",
         f"{pixels or (config.STORY_PIXELS if story else config.IMAGE_PIXELS)}. "
         "Clear hierarchy, deliberate visual detail, readable supporting copy at "
         "360 pixels wide. Reflow to fit; never clip or shrink required copy away.",
-        "For Stories keep essential copy within x=6 to 94 percent and y=17 to 80 percent."
+        "For Stories keep essential copy within x=6 to 94 percent and y=10 to 85 percent, leaving clearance for Instagram's top and bottom controls."
         if story else "Keep essential text within comfortable feed margins.",
         ("For Stories compose directly on the full 9:16 canvas. Extend the designed "
          "background and visual elements through the frame, while keeping essential "

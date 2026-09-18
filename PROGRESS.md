@@ -1,7 +1,7 @@
 ## LASSO infographic Story canvas repair (2026-09-18)
 
-- [~] LASSO quality Stories now request a native 9:16, 1080x1920 composition from the image engine. The former 4:5 panel inset is removed; feed generation remains 4:5. The Astra brief asks for full-frame Story design with essential copy inside the existing safe region, and pixel review treats broad empty bands around a centered feed card as a major failure.
-- [~] Regression checks cover Story surface, target pixels, reviewed pixels and saved full-frame output. Full suite in the repo virtual environment: 7603 passed, 1 skipped. Live and pending calendar rows still need separate LASSO-only replacement and human approval; this code change does not edit or publish them.
+- [~] LASSO quality Stories now request a native 9:16, 1080x1920 composition from the image engine. The former 4:5 panel inset is removed; feed generation remains 4:5. The Astra brief asks for full-frame Story design with essential copy in x=6–94%, y=10–85%, leaving Instagram UI clearance; pixel review treats broad empty bands around a centered feed card as a major failure.
+- [~] Regression checks cover Story surface, target pixels, reviewed pixels, saved full-frame output, and rejection of the old 17–80% text restriction. Full suite in the repo virtual environment: 7604 passed, 1 skipped. Live and pending calendar rows still need separate LASSO-only replacement and human approval; this code change does not edit or publish them.
 
 ## Automatic portrait reels rollout (2026-09-15)
 
