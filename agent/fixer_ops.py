@@ -282,10 +282,33 @@ def _run_reset_recreate_budget(ctx):
 
 # -- release_denied_assets ---------------------------------------------------------------
 
+def _observe_denials_for_gym(gym_key, observe):
+    """Constrain the global ledger sweep's only path to rollback_use.
+
+    observe_denials has no gym argument. It iterates every tenant's use records,
+    but rolls back only after fetch_rows supplies a denied calendar row. Returning
+    no rows for other gyms prevents a tenant-scoped ops request from mutating them.
+    """
+    from . import gym_media_selector as selector
+    checked = 0
+
+    def fetch_scoped(gym_id, post_date):
+        nonlocal checked
+        if gym_id != gym_key:
+            return []
+        checked += 1
+        return selector._default_fetch_rows(gym_id, post_date)
+
+    out = observe(fetch_rows=fetch_scoped) or {}
+    # observe_denials counts every ledger key it scanned, including other gyms.
+    # Report only the target gym's calendar probes in this tenant-scoped result.
+    return {**out, "checked": checked}
+
+
 def _run_release_denied_assets(ctx):
     observe = _dep(ctx, "observe_denials", lambda: __import__(
         "agent.gym_media_selector", fromlist=["observe_denials"]).observe_denials)
-    out = observe() or {}
+    out = _observe_denials_for_gym(ctx.gym_key, observe)
     return 200, {**out, "postcondition_verified": False,
                  "summary": (f"deny sweep checked {out.get('checked', 0)} date(s), "
                                     f"rolled back {out.get('rolled_back', 0)} asset(s)")}
@@ -436,7 +459,7 @@ def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_
     # 1. release denied assets
     observe = deps.get("observe_denials") or __import__(
         "agent.gym_media_selector", fromlist=["observe_denials"]).observe_denials
-    out["observe_denials"] = observe() or {}
+    out["observe_denials"] = _observe_denials_for_gym(gym_key, observe)
     steps.append({"step": "observe_denials", "at": _now_iso(), **out["observe_denials"]})
 
     # 2. build

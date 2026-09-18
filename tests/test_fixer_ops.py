@@ -290,10 +290,30 @@ def test_resend_readiness_turns_lookup_error_into_portal_unavailable(armed):
 
 def test_release_denied_assets_runs_the_sweep_when_the_volume_is_there(armed):
     deps = {"bus": FakeBus(), "volume_available": lambda: True,
-            "observe_denials": lambda: {"checked": 4, "rolled_back": 2}}
+            "observe_denials": lambda **kw: {"checked": 4, "rolled_back": 2}}
     status, body = _post("release_denied_assets", _body(), deps=deps)
     assert status == 200 and body["result"]["rolled_back"] == 2
     assert body["result"]["postcondition_verified"] is False
+
+
+def test_release_denied_assets_cannot_rollback_another_gym(armed, monkeypatch):
+    from agent import gym_media_selector as selector
+
+    other = "anothergym"
+    records = [
+        (f"gym_media_use:{GYM}:2026-09-12", [{"rolled_back": False}]),
+        (f"gym_media_use:{other}:2026-09-12", [{"rolled_back": False}]),
+    ]
+    rolled = []
+    monkeypatch.setattr(selector, "_use_records", lambda: records)
+    monkeypatch.setattr(selector, "_default_fetch_rows", lambda gym, day: [
+        {"source_media_asset_id": "asset-1", "status": "denied"}])
+    monkeypatch.setattr(selector, "rollback_use", lambda gym, day, **kw: rolled.append(gym) or True)
+    status, body = _post("release_denied_assets", _body(), deps={
+        "bus": FakeBus(), "volume_available": lambda: True})
+    assert status == 200 and body["result"]["rolled_back"] == 1
+    assert body["result"]["checked"] == 1
+    assert rolled == [GYM]
 
 
 def test_volume_bound_actions_refuse_honestly_on_a_host_without_it(armed):
@@ -464,7 +484,7 @@ def _restage_deps(bus, jobs, *, fail=False):
     return calls, {"bus": bus, "jobs": jobs, "volume_available": lambda: True,
                    "thread_runner": lambda fn: fn(),        # synchronous for the test
                    "sync_sources": sync_sources, "build_month": build,
-                   "observe_denials": lambda: {"checked": 1, "rolled_back": 1}}
+                   "observe_denials": lambda **kw: {"checked": 1, "rolled_back": 1}}
 
 
 def test_restage_month_returns_a_job_and_runs_the_recipe_in_order(armed):
@@ -487,6 +507,27 @@ def test_restage_month_returns_a_job_and_runs_the_recipe_in_order(armed):
     assert len(bodies) == 2
     assert any(b.startswith("OPS ACTION restage_month by fixer: 202 ") for b in bodies)
     assert any("done" in b and job_id in b for b in bodies)
+
+
+def test_restage_month_denial_sweep_stays_within_the_requested_gym(monkeypatch):
+    from agent import gym_media_selector as selector
+
+    other = "anothergym"
+    monkeypatch.setattr(selector, "_use_records", lambda: [
+        (f"gym_media_use:{GYM}:2026-09-12", [{"rolled_back": False}]),
+        (f"gym_media_use:{other}:2026-09-12", [{"rolled_back": False}]),
+    ])
+    monkeypatch.setattr(selector, "_default_fetch_rows", lambda gym, day: [
+        {"source_media_asset_id": "asset-1", "status": "denied"}])
+    rolled = []
+    monkeypatch.setattr(selector, "rollback_use", lambda gym, day, **kw: rolled.append(gym) or True)
+    out = FO.run_restage_month(GYM, days=1, deps={
+        "sync_sources": lambda gym, budget: [],
+        "build_month": lambda gym, start, days: {"ok": True, "upserted": 0},
+    }, log=lambda *a: None)
+    assert out["observe_denials"]["rolled_back"] == 1
+    assert out["observe_denials"]["checked"] == 1
+    assert rolled == [GYM]
 
 
 def test_restage_month_job_failure_is_recorded_not_swallowed(armed):
