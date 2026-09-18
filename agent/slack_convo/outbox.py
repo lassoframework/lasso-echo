@@ -169,8 +169,8 @@ def _verified_fix_notice(ticket, att, kind):
                 and result.get("siblings_swapped") == []
                 and result.get("siblings_left") == []
                 and isinstance(media_url, str) and bool(media_url.strip())
-                and media_kind in ("image", "video")
-                and (media_kind != "video" or
+                and (media_kind == "image" and result.get("video_url") is None
+                     or media_kind == "video" and
                      isinstance(result.get("video_url"), str) and
                      bool(result["video_url"].strip())))
     # A healthy deployment proves the code is live, not that this owner's symptom

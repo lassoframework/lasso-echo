@@ -843,7 +843,7 @@ def test_verified_ops_notice_posts_and_resolves_only_for_current_request(monkeyp
 @pytest.mark.parametrize("defect", [
     None, "unverified", "wrong_tenant", "wrong_row", "missing_media",
     "sibling_swapped", "sibling_left", "missing_sibling_readback",
-    "missing_video_url", "stale_request", "not_member",
+    "missing_video_url", "image_with_video_url", "stale_request", "not_member",
 ])
 def test_swap_media_ops_notice_delivery_gate(monkeypatch, defect):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
@@ -888,6 +888,8 @@ def test_swap_media_ops_notice_delivery_gate(monkeypatch, defect):
         del result["siblings_left"]
     elif defect == "missing_video_url":
         result["media_kind"] = "video"
+    elif defect == "image_with_video_url":
+        result["video_url"] = "https://img/old.mp4"
     elif defect == "stale_request":
         bus.record_inbound(ticket_id=tid, author_type="client", body="Wait, use another image")
     post, calls = _posted()
