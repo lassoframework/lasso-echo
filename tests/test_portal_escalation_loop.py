@@ -335,10 +335,19 @@ def test_code_fix_resolve_requires_release_and_blake_in_conversation():
     assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
                                      log=lambda *a: None)
     bus.set_ticket("t-1", slack_channel_id="G_CLIENT")
-    assert OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
-                                 log=lambda *a: None)
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
                        author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    bus.tickets["t-1"]["verification_after"]["fixer"]["request_key"] = (
+        OB._current_fixer_request_key(bus, bus.ticket("t-1")))
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com",
+                       body="Correction before the resolve tap", meta={})
+    assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                     log=lambda *a: None)
+    bus.tickets["t-1"]["verification_after"]["fixer"]["request_key"] = (
+        OB._current_fixer_request_key(bus, bus.ticket("t-1")))
+    assert OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                 log=lambda *a: None)
     sent, post = _posts()
     OB.run_once(bus, post, identity=ECHO, log=lambda *a: None,
                 member_check=lambda channel, user: False)
@@ -353,6 +362,8 @@ def test_verified_fix_notice_names_blake_in_group_dm():
                        verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
                        author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    bus.tickets["t-1"]["verification_after"]["fixer"]["request_key"] = (
+        OB._current_fixer_request_key(bus, bus.ticket("t-1")))
     assert OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
                                  log=lambda *a: None)
     sent, post = _posts()
