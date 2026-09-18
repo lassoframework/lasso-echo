@@ -14,15 +14,32 @@ CONTRACT (the FIXER builder reads this block):
       headers   X-Fixer-Ops-Secret: <env FIXER_OPS_SECRET>   (constant-time compare)
                 Content-Type: application/json
       body      {"gym_key": "<echo account key>", "ticket_id": "<support_tickets.id>",
-                 "args": {...}}                              (args per action, below)
+                 "args": {...},                             (args per action, below)
+                 "reservation_key"?: "<8-128 [A-Za-z0-9_-]>"}
+      reservation_key is OPTIONAL. Absent: behavior is exactly as before. Present: the
+      action runs AT MOST ONCE per key -- a durable receipt (agent/fixer_ops_receipts,
+      sqlite kv on the volume host, prefix ops_receipt_) is reserved BEFORE any side
+      effect, then committed with the result, failed on a refusal, or marked unknown
+      when the outcome cannot be determined. A replay (same key, same payload hash)
+      returns the completed result with "replayed": true and NEVER re-executes;
+      reserved, failed, and unknown receipts refuse replay. A key reused with a
+      different payload is 409 reservation_conflict. Keyed restage_month is refused
+      because its background job registry is not durable. Keyed 2xx bodies carry
+      "receipt": {...}; unkeyed calls retain their existing response shape.
       200 {"ok": true, "action": ..., "gym_key": ..., "ticket_id": ..., "result": {...}}
       202 {"ok": true, "action": "restage_month", "job_id": "...", "status": "running", ...}
       400 {"error": "bad_request", "detail": ...}          malformed body / bad args
       401 {"error": "unauthorized"}                          missing or wrong secret
       403 {"error": "org_floor", ...}                        a refused action (see below)
       404 {"error": "unknown_action" | "gym_not_found" | "row_not_found", ...}
-      409 {"error": ..., ...}                                the wrapped function refused
-      503 {"error": "ops_secret_unset" | "volume_unavailable" | "store_unavailable", ...}
+      409 {"error": ..., ...}                                refusal, in-progress, failed receipt,
+                                                            or unsupported keyed background job
+      503 {"error": "ops_secret_unset" | "volume_unavailable" | "store_unavailable" |
+                    "receipt_store_not_durable", ...}
+  GET  /ops/actions/receipts/<key>?gym_key=<gym>   (same header)
+      200 {"ok": true, "receipt": {...}}   the reservation receipt for <key>.
+      Tenant-bound: a receipt belonging to another gym is 403 receipt_tenant_mismatch;
+      an unknown key is 404 unknown_receipt; a malformed key is 400 bad_reservation_key.
   GET  /ops/actions/jobs/<job_id>          (same header)
       200 {"ok": true, "job": {"id", "action", "gym_key", "ticket_id", "status":
            "running"|"done"|"failed"|"timed_out", "started_at", "finished_at",
@@ -704,7 +721,8 @@ def _ticket_tenant(gym_key, ticket_id, deps):
 # dispatch
 # --------------------------------------------------------------------------------------
 
-def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
+def run_action(action, gym_key, ticket_id, args, *, reservation_key=None, deps=None,
+               log=print):
     """Validate, run, record. Returns (status, body). Auth is the transport's job."""
     deps = dict(deps or {})
     action = str(action or "").strip()
@@ -750,12 +768,67 @@ def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
                                     "host has none. Call the same route on the echo worker "
                                     "(connect_web, AGENT_CONNECT_PORT) or run `python -m "
                                     f"agent ops-action {action} ...` there.")}
+    if reservation_key is not None and spec.background:
+        # The existing job registry is in memory. A 202 launch cannot be a
+        # durable completed receipt, and a restart cannot prove job completion.
+        return 409, {"error": "reservation_background_unsupported", "action": action}
+    # Durable reservation (optional): begin BEFORE any side effect; a replay returns
+    # the stored result without re-executing; an unknown outcome is never retried.
+    receipt = None
+    receipt_store = None
+    if reservation_key is not None:
+        from . import fixer_ops_receipts as receipts
+        reservation_key = str(reservation_key).strip()
+        receipt_store = deps.get("receipt_store")
+        try:
+            if receipt_store is None:
+                receipt_store = receipts.default_store()
+            receipt = receipts.begin(receipt_store, reservation_key, action, gym_key,
+                                     ticket_id, args)
+        except receipts.ReceiptError as e:
+            _audit(action, gym_key, ticket_id, e.status,
+                   f"reservation refused: {e.code}", log)
+            return e.status, {"error": e.code, "reservation_key": reservation_key}
+        if receipt.get("replay"):
+            _audit(action, gym_key, ticket_id, 200,
+                   f"replay of reservation {reservation_key}: no side effects", log)
+            body = {"ok": True, "action": action, "gym_key": gym_key,
+                    "ticket_id": ticket_id, "result": receipt.get("result"),
+                    "receipt": receipt, "replayed": True}
+            return receipt.get("http_status", 200), body
     ctx = Ctx(gym_key=gym_key, ticket_id=ticket_id, args=args, deps=deps, log=log)
     try:
         status, result = spec.run(ctx)
     except Exception as e:  # noqa: BLE001 - a wrapped function's fault is a 500 with a name
+        if receipt is not None:
+            # The side effect may or may not have landed: mark the receipt unknown and
+            # refuse automation from here on -- never silently retry an unknown outcome.
+            detail = f"{type(e).__name__}: {e}"[:500]
+            try:
+                receipt = receipts.mark_unknown(receipt_store, reservation_key, detail)
+            except receipts.ReceiptError:
+                pass
+            _audit(action, gym_key, ticket_id, 503,
+                   f"outcome unknown after reservation {reservation_key}: {detail}", log)
+            return 503, {"error": "reservation_outcome_unknown", "detail": detail,
+                         "reservation_key": reservation_key, "receipt": receipt}
         status, result = 500, {"error": f"{type(e).__name__}", "detail": str(e)[:300]}
     result = dict(result or {})
+    if receipt is not None:
+        try:
+            if 200 <= status < 300:
+                receipt = receipts.commit(receipt_store, reservation_key, result,
+                                          http_status=status)
+            elif status < 500:
+                receipt = receipts.fail(receipt_store, reservation_key,
+                                        str(result.get("error") or status))
+            else:
+                receipt = receipts.mark_unknown(receipt_store, reservation_key,
+                                                str(result.get("error") or status))
+        except receipts.ReceiptError as e:
+            _audit(action, gym_key, ticket_id, e.status,
+                   f"receipt finalize failed: {e.code}", log)
+            return e.status, {"error": e.code, "reservation_key": reservation_key}
     summary = str(result.get("summary") or result.get("error") or status)
     _audit(action, gym_key, ticket_id, status, summary, log)
     if status < 500:
@@ -766,6 +839,8 @@ def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
         body["result"] = result
     else:
         body.update(result)
+    if receipt is not None:
+        body["receipt"] = receipt
     return status, body
 
 
@@ -820,6 +895,22 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         if method != "GET":
             return 405, {"error": "method_not_allowed"}
         return _resend_connect_link_readiness(m.group(1), deps)
+    m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/receipts/([A-Za-z0-9_-]{{1,128}})$", path)
+    if m:
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        from .fixer_ops_receipts import ReceiptError, default_store, get_receipt
+        query = parse_qs(parsed.query)
+        gym_key = (query.get("gym_key") or [""])[0].strip()
+        if not gym_key:
+            return 400, {"error": "bad_request", "detail": "gym_key required"}
+        store = deps.get("receipt_store")
+        try:
+            if store is None:
+                store = default_store()
+            return 200, {"ok": True, "receipt": get_receipt(store, m.group(1), gym_key)}
+        except ReceiptError as exc:
+            return exc.status, {"error": exc.code}
     m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/jobs/([0-9a-f]{{32}})$", path)
     if m:
         if method != "GET":
@@ -843,4 +934,5 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
     if not isinstance(body, dict):
         return 400, {"error": "bad_request", "detail": "body must be an object"}
     return run_action(m.group(1), body.get("gym_key"), body.get("ticket_id"),
-                      body.get("args"), deps=deps, log=log)
+                      body.get("args"), reservation_key=body.get("reservation_key"),
+                      deps=deps, log=log)
