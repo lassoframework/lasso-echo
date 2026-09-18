@@ -1104,10 +1104,12 @@ def generate(headline, facts, client=None, out_path=None,
     else:
         print(f"[creative-studio] gemini fallback route: {gemini_route}")
 
-    story_panel = (config.lasso_infographic_quality_enabled(account_key)
-                   and "story" in str(surface).lower())
-    render_surface = "feed post" if story_panel else surface
-    render_pixels = config.IMAGE_PIXELS if story_panel else pixels
+    # A Story needs its own composition. Generating a 4:5 feed card and insetting
+    # it on a 9:16 canvas produced a small central poster with large empty bands.
+    # The Story brief and image request must both use the Story surface and size;
+    # the pixel reviewer below then checks the finished Story itself.
+    render_surface = surface
+    render_pixels = pixels
     opts = _engine_opts(headline, render_surface, render_pixels, gemini_model)
 
     # Reference images (spec section 3), OFF by default
@@ -1141,10 +1143,6 @@ def generate(headline, facts, client=None, out_path=None,
             p, call_opts, gemini_client=client,
             account_key=account_key or "", subject=headline or "",
             draft_id=draft_id or "")
-        if generated is not None and story_panel:
-            from .infographic_layout import story_frame
-            generated.image_bytes = story_frame(generated.image_bytes,
-                _image_engine.parse_size(pixels or config.STORY_PIXELS))
         return generated
 
     result = _do_generate(prompt)

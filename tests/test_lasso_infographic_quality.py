@@ -119,22 +119,45 @@ def test_persisted_draft_retains_required_image_copy():
     assert store._from_dict(store._to_dict(d)).infographic_copy == d.infographic_copy
 
 
-def test_story_placement_preserves_whole_panel_inside_safe_rectangle():
+def test_lasso_story_generation_uses_native_story_canvas(monkeypatch, tmp_path):
     import io
     from PIL import Image
-    from agent.infographic_layout import story_frame
-    image = Image.new("RGB", (1080,1350), "white")
-    # A border at the extreme edges represents copy placed anywhere in the panel.
-    from PIL import ImageDraw
-    ImageDraw.Draw(image).rectangle((0,0,1079,1349), outline="black", width=20)
-    raw=io.BytesIO();image.save(raw,format="PNG")
-    result=Image.open(io.BytesIO(story_frame(raw.getvalue())))
-    assert result.size==(1080,1920)
-    # Every non-background pixel, including original panel border, is safely inset.
-    bg=Image.new("RGB",result.size,result.getpixel((0,0)))
-    from PIL import ImageChops
-    box=ImageChops.difference(result,bg).getbbox()
-    assert box[0]>=64 and box[1]>=326 and box[2]<=1015 and box[3]<=1536
+    from agent import creative_studio
+    from agent.grade_gate import GradeResult
+
+    monkeypatch.setenv('AGENT_NANO_ENABLED', 'true')
+    monkeypatch.setenv('AGENT_LASSO_INFOGRAPHIC_QUALITY', 'true')
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+    monkeypatch.setattr(creative_studio, '_reference_images_for', lambda *a, **kw: ('', []))
+    monkeypatch.setattr(creative_studio, '_generation_log_attempt', lambda **kw: None)
+    monkeypatch.setattr(infographic_review, 'AstraReviewer', lambda *a, **kw: object())
+    calls = []
+    reviewed = []
+    raw = io.BytesIO()
+    Image.new('RGB', (1080, 1920), 'red').save(raw, format='PNG')
+
+    def generate(prompt, opts, **kwargs):
+        calls.append((prompt, opts))
+        return image_engine.ImageResult(image_bytes=raw.getvalue(), engine='astra',
+                                        model='test-model', prompt_used=prompt)
+
+    def review(image_bytes, **kwargs):
+        reviewed.append((image_bytes, kwargs['surface']))
+        return GradeResult({}, True, [], status='PASS')
+
+    monkeypatch.setattr(image_engine, 'generate_image', generate)
+    monkeypatch.setattr(infographic_review, 'evaluate', review)
+    out = tmp_path / 'story.png'
+    result = creative_studio.generate('Hook', ['Approved fact'], client=object(),
+        account_key='lasso_ig', surface='Story', aspect='9:16', pixels='1080x1920',
+        out_path=str(out))
+
+    assert result is not None
+    assert calls[0][1]['surface'] == 'Story'
+    assert calls[0][1]['pixels'] == '1080x1920'
+    assert '9:16' in calls[0][0] and '1080x1920' in calls[0][0]
+    assert reviewed == [(raw.getvalue(), 'Story')]
+    assert out.read_bytes() == raw.getvalue()
 
 
 def test_minor_polish_does_not_force_another_paid_render():
