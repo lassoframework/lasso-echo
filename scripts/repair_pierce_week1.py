@@ -17,17 +17,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 BASE = "piercefitness"
 BACKUP = Path("/data/pierce_calendar_reset_20260918.json")
 
-# Every concrete fact below is in Pierce's approved client_sources on /data.
+# Service names, adult audience, and consultation steps are in Pierce's approved
+# client_sources on /data. Copy does not imply a person pictured is a member.
 COPY = {
-    ("2026-09-20", 0): ("testimonial", "Violet's goal was about everyday life. After three months at Pierce Fitness, she could walk up the stairs without pain and get down on the floor to play with her grandkids again. Those moments are worth training for."),
-    ("2026-09-21", 0): ("testimonial", "Karen completed her first 5K at 56. Progress can look different for everyone. For Karen, it meant crossing a finish line. What goal would make you proud?"),
-    ("2026-09-21", 1): ("service", "Semi Private Personal Training is one of the ways to train at Pierce Fitness. If you want coaching with a smaller group around you, ask us how this option works and whether it fits your goals."),
-    ("2026-09-23", 0): ("testimonial", "David came in struggling with everyday back pain. Now he is deadlifting more than he thought possible without worrying about his back. His story is a reminder that progress is personal. It starts with where you are."),
-    ("2026-09-23", 1): ("service", "Group Fitness Classes are one of the training options at Pierce Fitness. Some people want to train alongside others. Some prefer a smaller setting. Tell a coach what feels right for you and explore the options together."),
-    ("2026-09-24", 0): ("testimonial", "Michelle lost 18 lbs and says she has more energy now than she did in her 40s. Her progress is hers. What would feeling stronger and more energized let you do in your own life?"),
-    ("2026-09-24", 1): ("testimonial", "Aaron lost 10% body fat in less than six months at Pierce Fitness. That is his result, not a promise for anyone else. If you are ready to work toward your own goal, a coach can help you find a place to begin."),
-    ("2026-09-25", 0): ("service", "Nutrition Coaching is available at Pierce Fitness alongside training. If you have questions about food and your fitness goals, bring them to a coach. You can explore what support fits your situation."),
-    ("2026-09-25", 1): ("testimonial", "Amanda has trained twice a week for almost a year. Her story is about finding a rhythm she could keep. What would a routine that fits your life look like?"),
+    ("2026-09-20", 0): ("service", "What would you like daily movement to feel like six months from now? Personal Training at Pierce Fitness gives you a way to work on your own goals with a coach. Tell us what you want to make easier in everyday life."),
+    ("2026-09-21", 0): ("service", "A first fitness goal does not have to be a number on a scale. It might be completing a walk, lifting with confidence, or keeping a routine. Bring your goal to a free consultation and talk through where to begin."),
+    ("2026-09-21", 1): ("service", "Want coaching with a smaller group around you? Semi Private Personal Training is one of the options at Pierce Fitness. Ask a coach how it works and decide whether it fits the way you like to train."),
+    ("2026-09-22", 1): ("service", "Starting again after a long break can feel like a big step. You can begin by telling a coach what matters to you now. Pierce Fitness offers Personal Training, small group options, and classes, so you can explore a starting point that feels right."),
+    ("2026-09-23", 0): ("service", "Strength has a different purpose for everyone. Maybe yours is carrying groceries more easily or feeling steadier in daily life. Tell a Pierce Fitness coach what you want to work toward and ask which training option fits."),
+    ("2026-09-23", 1): ("service", "Do you enjoy the energy of a room full of people? Group Fitness Classes are an option at Pierce Fitness. If you are deciding between a class and a smaller coaching setting, ask us to walk you through both."),
+    ("2026-09-24", 0): ("service", "Your starting point deserves its own conversation. A free consultation at Pierce Fitness includes time to talk about your goals and a Visbody scan to see your baseline. Come with questions and leave with a clearer next step."),
+    ("2026-09-24", 1): ("service", "Some goals call for one on one attention. Others feel better with a few people beside you. Pierce Fitness offers Personal Training and Semi Private Personal Training. Which setting would help you show up consistently?"),
+    ("2026-09-25", 0): ("service", "Training and food questions often show up together. Nutrition Coaching is available at Pierce Fitness alongside the training options. Bring your questions to a coach and explore what kind of support makes sense for you."),
+    ("2026-09-25", 1): ("service", "A useful routine is one you can keep returning to. If twice a week is realistic for your life, start there and talk with a coach about the training option that fits. What days could you make time for yourself?"),
 }
 MISSING = (("2026-09-20", 0), ("2026-09-21", 1))
 
@@ -40,6 +42,12 @@ def _rows(store):
 def main():
     from agent.portal_calendar_store import SupabaseCalendarStore, _media_stage_belt
     from agent import media_guard
+    from agent.copy_gate import bound_opening_hook, violations
+
+    copy = {key: (pillar, bound_opening_hook(caption))
+            for key, (pillar, caption) in COPY.items()}
+    if any(violations(caption) for _, caption in copy.values()):
+        raise SystemExit("Prepared copy failed Pierce's punctuation gate")
 
     if datetime.now(ZoneInfo("America/Toronto")).date().isoformat() > "2026-09-20":
         raise SystemExit("First week has begun publishing; manual re-audit required")
@@ -80,7 +88,7 @@ def main():
                                      preferred.index(r["id"]) if r.get("id") in preferred else 99))
     used_this_repair = set()
     for day, slot in MISSING:
-        pillar, caption = COPY[(day, slot)]
+        pillar, caption = copy[(day, slot)]
         inserted = None
         for candidate in backup_feeds:
             key = media_guard.row_media_key(candidate)
@@ -106,7 +114,7 @@ def main():
             raise SystemExit(f"No eligible distinct backed-up media for {day} slot{slot}")
 
     rows = _rows(store)
-    for (day, slot), (pillar, caption) in COPY.items():
+    for (day, slot), (pillar, caption) in copy.items():
         for row in rows:
             if (str(row.get("post_date"))[:10], row.get("slot_index")) != (day, slot):
                 continue
@@ -127,6 +135,13 @@ def main():
         raise SystemExit(f"Final feed shape {len(feeds)} IG and {len(mirror)} FB")
     if len({r.get("caption") for r in feeds}) != 14:
         raise SystemExit("Feed captions are not distinct")
+    for (day, slot), (_, caption) in copy.items():
+        matching = [r for r in rows if str(r.get("post_date"))[:10] == day
+                    and r.get("slot_index") == slot
+                    and r.get("account") in ("instagram", "facebook")
+                    and r.get("format") == "feed"]
+        if len(matching) != 2 or any(r.get("caption") != caption for r in matching):
+            raise SystemExit(f"Copy did not persist on both feeds for {day} slot{slot}")
     print("Verified 14 IG and 14 FB pending feeds, 14 distinct IG captions")
 
 
