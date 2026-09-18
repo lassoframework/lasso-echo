@@ -1689,15 +1689,18 @@ class SupabaseCalendarStore:
                      and row.get("status") == status), None)
 
     def mark_publish_failed(self, row_id, revert_status="pending",
-                            reject_reason=None):
+                            reject_reason=None, gym_id=None):
         """
         REVERT a claim after a publish failure (or a would_publish result): status
         back to `revert_status` so the row is retried on the next run. LASSO rows
         revert to 'pending' (the default, unchanged). A CLIENT row that was APPROVED
         before the claim reverts to 'approved' so a transient Zernio failure never
         forces the client to re-approve. Records NOTHING else (no media id, no
-        published_at), so a failed attempt never looks published. Filtered by id
-        only. Returns the updated row or None.
+        published_at), so a failed attempt never looks published. The update
+        only matches an unpublished row still in the publisher's `publishing`
+        claim. Pre-network callers also supply gym_id so a stale or cross-tenant
+        row id cannot overwrite a client's later decision. Returns the updated
+        row or None when the claim no longer matches.
 
         reject_reason (publish_guard wiring, 2026-08-27): when the publish guard
         blocks a row, its violation codes land on the row so the portal/human can
@@ -1709,7 +1712,10 @@ class SupabaseCalendarStore:
         body = {"status": revert_status, "publish_reservation_day": None}
         if reject_reason is not None:
             body["reject_reason"] = str(reject_reason)[:500]
-        params = {"id": f"eq.{row_id}"}
+        params = {"id": f"eq.{row_id}", "status": "eq.publishing",
+                  "published_at": "is.null", "late_post_id": "is.null"}
+        if gym_id is not None:
+            params["gym_id"] = f"eq.{gym_id}"
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -1723,7 +1729,10 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
-        return rows[0] if rows else None
+        return next((row for row in rows if str(row.get("id")) == str(row_id)
+                     and row.get("status") == revert_status
+                     and (gym_id is None or str(row.get("gym_id")) == str(gym_id))),
+                    None)
 
     # ---- mirror writes (real-drafts calendar mirror) ------------------------
     # These write calendar rows only. NOTHING here publishes to any social account.

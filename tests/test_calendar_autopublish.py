@@ -1807,6 +1807,30 @@ def test_unconfirmed_pre_network_rollback_is_held_without_send_or_reclaim(
     assert publisher.calls == []
 
 
+def test_pre_network_rollback_supplies_tenant_and_holds_on_cas_miss(
+        armed, monkeypatch):
+    class ConditionalRollbackStore(_FakeStore):
+        def mark_publish_failed(self, row_id, revert_status="pending",
+                                reject_reason=None, gym_id=None):
+            self.rollback_args = (row_id, revert_status, reject_reason, gym_id)
+            return None  # concurrent status change, zero rows updated
+
+    store = ConditionalRollbackStore([_row("raced")])
+    monkeypatch.setattr(cap, "_drive_asset_usable_at_send", lambda *_: False)
+    monkeypatch.setattr(cap, "_alert_publish_blocked", lambda *a, **kw: None)
+    monkeypatch.setattr(cap, "_published_content_key", lambda *a: "")
+    publisher = _FakePublisher()
+
+    result = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                             now=LATE_NOW, catch_all=True)
+
+    assert store.rollback_args == ("raced", "pending",
+                                   "media_asset_review_required", "lasso")
+    assert result["held"] is True
+    assert result["recovery_required"] == ["raced"]
+    assert publisher.calls == []
+
+
 @pytest.mark.parametrize("previous", ["pending", "approved"])
 def test_content_stamp_failure_releases_for_retry_and_preserves_approval(armed, monkeypatch, previous):
     class FailedStampLedger:

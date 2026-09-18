@@ -62,6 +62,65 @@ class _FakeHTTP:
         return self._delete_resp
 
 
+@pytest.mark.parametrize("row_gym,row_status,published_at,late_post_id", [
+    ("other-gym", "publishing", None, None),
+    ("lasso", "denied", None, None),
+    ("lasso", "published", "2026-08-10T12:00:00Z", "provider-1"),
+    ("lasso", "publishing", None, "provider-1"),
+])
+def test_publish_rollback_cas_refuses_changed_or_cross_tenant_row(
+        monkeypatch, row_gym, row_status, published_at, late_post_id):
+    """A concurrent decision or publication wins over a stale worker rollback."""
+    current = {"id": "row-1", "gym_id": row_gym, "status": row_status,
+               "published_at": published_at, "late_post_id": late_post_id}
+
+    class ConditionalHTTP(_FakeHTTP):
+        def patch(self, url, params=None, headers=None, json=None, timeout=None):
+            self.calls.append(("patch", url, params, headers, json))
+            match = (params["id"] == "eq.row-1"
+                     and params["gym_id"] == f"eq.{current['gym_id']}"
+                     and params["status"] == f"eq.{current['status']}"
+                     and params["published_at"] == "is.null"
+                     and current["published_at"] is None
+                     and params["late_post_id"] == "is.null"
+                     and current["late_post_id"] is None)
+            if match:
+                current.update(json)
+            return _Resp(200, [dict(current)] if match else [])
+
+    http = ConditionalHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    result = pcs.SupabaseCalendarStore().mark_publish_failed(
+        "row-1", gym_id="lasso", reject_reason="publish_guard: media_review")
+
+    assert result is None
+    assert current["gym_id"] == row_gym
+    assert current["status"] == row_status
+    assert current["published_at"] == published_at
+    assert current["late_post_id"] == late_post_id
+    params = http.calls[0][2]
+    assert params == {"id": "eq.row-1", "gym_id": "eq.lasso",
+                      "status": "eq.publishing", "published_at": "is.null",
+                      "late_post_id": "is.null"}
+
+
+def test_publish_rollback_cas_restores_owned_unpublished_claim(monkeypatch):
+    updated = {"id": "row-1", "gym_id": "lasso", "status": "approved"}
+    http = _FakeHTTP(patch_resp=_Resp(200, [updated]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().mark_publish_failed(
+        "row-1", revert_status="approved", gym_id="lasso",
+        reject_reason="media_asset_review_required")
+
+    assert result == updated
+    _, _, params, _, body = http.calls[0]
+    assert params["gym_id"] == "eq.lasso"
+    assert params["status"] == "eq.publishing"
+    assert body == {"status": "approved", "publish_reservation_day": None,
+                    "reject_reason": "media_asset_review_required"}
+
+
 def _row(row_id, gym_id="lasso", post_date="2026-08-06", account="instagram",
          status="pending", caption=None, image_url="https://cdn/x.jpg",
          pillar="education"):

@@ -508,7 +508,8 @@ def _planned_mentions(caption, gym_id, category):
     return handles
 
 
-def _revert_to_pending(store, row_id, reject_reason="", revert_status="pending"):
+def _revert_to_pending(store, row_id, reject_reason="", revert_status="pending",
+                       gym_id=None):
     """Revert a row out of the 'publishing' claim after a PRE-NETWORK block.
 
     Returns True only when the store confirms the pre-network rollback.
@@ -530,14 +531,24 @@ def _revert_to_pending(store, row_id, reject_reason="", revert_status="pending")
     try:
         try:
             reverted = store.mark_publish_failed(row_id, revert_status=revert_status,
-                                                 reject_reason=reject_reason)
+                                                 reject_reason=reject_reason,
+                                                 gym_id=gym_id)
         except TypeError:
-            # older store / test fakes without the reject_reason kwarg
-            reverted = store.mark_publish_failed(row_id, revert_status=revert_status)
+            # Only legacy injectable stores lack the tenant-aware signature.
+            # Never retry a real Supabase store without its tenant filter.
+            from .portal_calendar_store import SupabaseCalendarStore
+            if isinstance(store, SupabaseCalendarStore):
+                raise
+            try:
+                reverted = store.mark_publish_failed(
+                    row_id, revert_status=revert_status,
+                    reject_reason=reject_reason)
+            except TypeError:
+                reverted = store.mark_publish_failed(
+                    row_id, revert_status=revert_status)
         # SupabaseCalendarStore returns None when the conditional update matched no
-        # row.  That is not a successful rollback: the claimed row can still be
-        # publishing, so callers must surface a recovery hold instead of claiming it
-        # was reverted.
+        # row. The row may still be publishing, or its status/tenant/provider fields
+        # may have changed. Neither case confirms a rollback.
         if not reverted:
             raise RuntimeError("publish rollback was not confirmed")
         return True
@@ -545,11 +556,11 @@ def _revert_to_pending(store, row_id, reject_reason="", revert_status="pending")
         try:
             from . import ops_alerts
             ops_alerts.alert(
-                f"calendar row {row_id} is STRANDED in 'publishing': it was blocked "
+                f"calendar row {row_id} has a STRANDED or changed publish claim: it was blocked "
                 f"BEFORE any publish attempt ({reject_reason or 'caption cooldown'}) "
-                f"but the revert to pending failed ({type(e).__name__}). The post did "
-                f"NOT go out, so flipping this row back to {revert_status} is safe and cannot "
-                f"double-post. Until then the row is invisible to the publish lane.")
+                f"but the conditional revert to {revert_status} was unconfirmed "
+                f"({type(e).__name__}). This worker's post did NOT go out. Inspect the "
+                "current tenant, status and provider fields before any manual recovery.")
         except Exception:
             pass
         return False
@@ -611,8 +622,8 @@ def _alert_publish_blocked(gym_id, row_id, code, reverted=True,
             return
         db.kv_set(key, str(row_id or "1"))
         _state = (f"reverted to {revert_status} with reject_reason" if reverted else
-                  "REVERT FAILED -- the row is stranded in 'publishing' and the "
-                  "publish lane can no longer see it")
+                  "REVERT FAILED -- the row may be stranded in 'publishing' or "
+                  "changed; inspect it before retry")
         ops_alerts.alert(
             f"publish guard: row {row_id} (gym {gym_id}) blocked at the publish "
             f"boundary ({code}); {_state}. Further "
@@ -1065,6 +1076,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             if _cl.is_blocked(gym_id, _cap, row.get("post_date", ""),
                               db=None):
                 _reverted = _revert_to_pending(row_id=row_id, store=store,
+                                               gym_id=gym_id,
                                                reject_reason="caption cooldown")
                 if _reverted:
                     _oa.alert(
@@ -1088,6 +1100,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             if _viols:
                 _reason = "publish_guard: " + ", ".join(_viols)
                 _reverted = _revert_to_pending(row_id=row_id, store=store,
+                                               gym_id=gym_id,
                                                reject_reason=_reason)
                 if not _reverted:
                     recovery_required.append(row_id)
@@ -1106,7 +1119,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         if not _drive_asset_usable_at_send(row, gym_id):
             _reason = "media_asset_review_required"
             _reverted = _revert_to_pending(
-                store, row_id, reject_reason=_reason,
+                store, row_id, reject_reason=_reason, gym_id=gym_id,
                 revert_status="approved" if approved_only else "pending")
             if not _reverted:
                 recovery_required.append(row_id)
