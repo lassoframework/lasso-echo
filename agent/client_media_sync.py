@@ -726,6 +726,7 @@ def _existing_feed_count(store, base_key, start, days):
     from .onboarding_demo import is_sample_row
     months = sorted({(start + timedelta(days=i)).isoformat()[:7] for i in range(days)})
     feed_dates = set()
+    weekly_feeds = 0
     for month in months:
         try:
             rows = list_month(base_key, month) or []
@@ -764,8 +765,11 @@ def _existing_feed_count(store, base_key, start, days):
             # count one per feed post_date on instagram (skip the facebook mirror and
             # every story so the count equals photos placed, not total rows).
             if fmt == "feed" and acct in ("instagram", "ig", ""):
+                if isinstance(store, _PierceWeekStore):
+                    weekly_feeds += 1
                 feed_dates.add(row.get("post_date") or row.get("id") or len(feed_dates))
-    return len(feed_dates), True
+    return (weekly_feeds if isinstance(store, _PierceWeekStore)
+            else len(feed_dates)), True
 
 
 def _alert_thin_creative(base_key, media_count, days, log):
