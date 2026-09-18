@@ -472,7 +472,17 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     if row_ident and row_ident != identity.name:
         summary["skipped"] += 1
         return
-    if (ticket.get("bot_identity") or "") != identity.name:
+    # Scout raises this system alert precisely when the portal bridge cannot
+    # establish the ticket's bot identity. Route only the stamped internal
+    # escalation for this product; never grant a conversational row this bypass.
+    portal_provenance_alert = (
+        kind == _a.KIND_ESCALATION
+        and row.get("direction") == "outbound"
+        and row.get("author_type") == "system"
+        and att.get("surface") == "portal_bridge_provenance"
+        and row_ident == identity.name
+        and ticket.get("product") == identity.product)
+    if (ticket.get("bot_identity") or "") != identity.name and not portal_provenance_alert:
         summary["skipped"] += 1
         return
     # 0. fail closed on anything we do not recognise
@@ -498,7 +508,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             return
         if kind == _a.KIND_HOLD_NOTICE:
             blocks = hold_notice_blocks(row)
-        elif kind == _a.KIND_ESCALATION:
+        elif kind == _a.KIND_ESCALATION and not portal_provenance_alert:
             blocks = escalation_blocks(row, ticket)
         else:
             blocks = None

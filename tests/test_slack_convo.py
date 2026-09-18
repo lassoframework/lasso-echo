@@ -742,6 +742,74 @@ def _rows(bus, tid, kind):
             if m["direction"] == "outbound" and m["attachments"]["kind"] == kind]
 
 
+@pytest.mark.parametrize("parent_identity", [None, "ranger"])
+def test_portal_provenance_system_alert_routes_to_fixer_once(monkeypatch, parent_identity):
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {"id": tid, "product": "echo", "status": "hold",
+                        "bot_identity": parent_identity, "slack_channel_id": "C_CLIENT"}
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="system", body="Portal bridge provenance failed",
+        delivery_status="ready", kind=A.KIND_ESCALATION,
+        meta={"identity": "echo", "surface": "portal_bridge_provenance"})
+    post, calls = _posted()
+    first = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    second = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert first["posted"] == 1 and second["posted"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert bus.message(row["id"])["slack_ts"] == "9.999"
+    assert bus.ticket(tid)["bot_identity"] == parent_identity
+    assert bus.ticket(tid)["status"] == "hold"
+    assert len(calls) == 1 and calls[0]["channel"] == "C_FIXER"
+    assert calls[0]["blocks"] is None  # no customer resolve button
+
+
+@pytest.mark.parametrize("defect", ["wrong_surface", "wrong_kind", "wrong_author",
+                                    "wrong_product", "wrong_row_identity"])
+def test_portal_provenance_bypass_requires_exact_internal_shape(monkeypatch, defect):
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {"id": tid, "product": "ranger" if defect == "wrong_product" else "echo",
+                        "status": "hold", "bot_identity": None,
+                        "slack_channel_id": "C_CLIENT"}
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="echo" if defect == "wrong_author" else "system",
+        body="A portal bridge notice", delivery_status="ready",
+        kind=A.KIND_STATUS if defect == "wrong_kind" else A.KIND_ESCALATION,
+        meta={"identity": "ranger" if defect == "wrong_row_identity" else "echo",
+              "surface": "portal_ticket_bridge" if defect == "wrong_surface"
+              else "portal_bridge_provenance"})
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus.message(row["id"])["delivery_status"] == "ready"
+    assert calls == []
+    assert bus.ticket(tid)["bot_identity"] is None
+
+
+def test_portal_provenance_alert_failed_post_can_retry_without_customer_delivery(monkeypatch):
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {"id": tid, "product": "echo", "status": "hold",
+                        "bot_identity": None, "slack_channel_id": "C_CLIENT"}
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="system", body="Portal bridge provenance failed",
+        delivery_status="ready", kind=A.KIND_ESCALATION,
+        meta={"identity": "echo", "surface": "portal_bridge_provenance"})
+    def fail(*args, **kwargs):
+        raise RuntimeError("temporary Slack failure")
+    first = OB.run_once(bus, fail, identity=IDS.get("echo"), log=lambda *a: None)
+    assert first["failed"] == 1 and bus.message(row["id"])["delivery_status"] == "failed"
+    bus.mark_message(row["id"], "ready")
+    post, calls = _posted()
+    second = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert second["posted"] == 1
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert len(calls) == 1 and calls[0]["channel"] == "C_FIXER"
+
+
 def test_fixer_request_key_matches_scout_for_multiple_inbound_rows():
     bus = FakeBus()
     tid = str(uuid.uuid4())
