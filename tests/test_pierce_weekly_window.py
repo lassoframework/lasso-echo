@@ -33,9 +33,11 @@ def test_week_count_excludes_older_published_feeds():
             return [{"post_date": "2026-09-18", "format": "feed",
                      "account": "instagram", "status": "published"},
                     {"post_date": "2026-09-19", "format": "feed",
+                     "account": "instagram", "status": "pending"},
+                    {"post_date": "2026-09-19", "format": "feed",
                      "account": "instagram", "status": "pending"}]
 
     first = date(2026, 9, 19)
     assert _existing_feed_count(Store(), "piercefitness", first, 7) == (2, True)
     assert _existing_feed_count(_PierceWeekStore(Store(), first, 7),
-                                "piercefitness", first, 7) == (1, True)
+                                "piercefitness", first, 7) == (2, True)
