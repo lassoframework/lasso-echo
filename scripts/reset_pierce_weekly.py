@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-time, Pierce-only Sep 19-Oct 17 reset and first weekly stage.
+"""One-time, Pierce-only Sep 19-Oct 18 reset and first weekly stage.
 
 Run on the Echo worker with its /data volume after AGENT_PIERCE_WEEKLY=true is
 deployed. The JSON backup contains the complete rows and is mode 0600.
@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 BASE = "piercefitness"
 FIRST = "2026-09-19"
-LAST = "2026-10-17"
+LAST = "2026-10-18"
 BACKUP = Path("/data/pierce_calendar_reset_20260918.json")
 WIPEABLE = {"approved", "denied", "pending", "draft", "queued"}
 
@@ -42,6 +42,12 @@ def main():
     if os.getenv("AGENT_PIERCE_WEEKLY", "").lower() not in ("1", "true", "yes", "on"):
         raise SystemExit("Weekly Pierce gate is not armed on the worker")
     store = SupabaseCalendarStore()
+    if pierce_today == date(2026, 9, 19):
+        today_rows = [r for r in store.list_month(BASE, "2026-09")
+                      if str(r.get("post_date", ""))[:10] == FIRST]
+        if any(r.get("status") in ("published", "publishing", "failed")
+               for r in today_rows):
+            raise SystemExit("Sep 19 publishing has begun; refusing the timed reset")
     before = target_rows(store)
     print(f"Pierce {FIRST}..{LAST}: {len(before)} removable rows; "
           f"statuses={{{', '.join(sorted(set(str(r.get('status')) for r in before)))}}}")
