@@ -1809,10 +1809,18 @@ def test_unconfirmed_pre_network_rollback_is_held_without_send_or_reclaim(
 
 def test_pre_network_rollback_supplies_tenant_and_holds_on_cas_miss(
         armed, monkeypatch):
+    token = "11111111-1111-4111-8111-111111111111"
+
     class ConditionalRollbackStore(_FakeStore):
+        def claim_publish_slot(self, row_id, gym_id, day, timezone_name,
+                               capacity, approved_only):
+            return token if self.mark_publishing(row_id) else None
+
         def mark_publish_failed(self, row_id, revert_status="pending",
-                                reject_reason=None, gym_id=None):
-            self.rollback_args = (row_id, revert_status, reject_reason, gym_id)
+                                reject_reason=None, gym_id=None,
+                                expected_claim_token=None):
+            self.rollback_args = (row_id, revert_status, reject_reason,
+                                  gym_id, expected_claim_token)
             return None  # concurrent status change, zero rows updated
 
     store = ConditionalRollbackStore([_row("raced")])
@@ -1825,7 +1833,7 @@ def test_pre_network_rollback_supplies_tenant_and_holds_on_cas_miss(
                              now=LATE_NOW, catch_all=True)
 
     assert store.rollback_args == ("raced", "pending",
-                                   "media_asset_review_required", "lasso")
+                                   "media_asset_review_required", "lasso", token)
     assert result["held"] is True
     assert result["recovery_required"] == ["raced"]
     assert publisher.calls == []

@@ -783,13 +783,15 @@ class SupabaseCalendarStore:
 
     def claim_publish_slot(self, row_id, gym_id, local_day, timezone_name,
                            capacity, approved_only):
-        """Atomically reserve today's platform slot and claim this row in Postgres.
+        """Atomically reserve a platform slot and return this claim's UUID token.
 
         No split count/claim fallback: an unavailable RPC holds the post. The SQL
-        function serializes all workers for this gym with an advisory lock.
+        function serializes all workers for this gym with an advisory lock. A
+        distinct token on each successful claim prevents a stale worker from
+        reverting a later worker's claim of the same row.
         """
         r = self._client().post(
-            self._rest("rpc/claim_calendar_publish_slot"),
+            self._rest("rpc/claim_calendar_publish_slot_owned"),
             headers=self._headers({"Content-Type": "application/json"}),
             json={"p_row_id": row_id, "p_gym_id": gym_id,
                   "p_day": local_day, "p_timezone": timezone_name,
@@ -798,7 +800,14 @@ class SupabaseCalendarStore:
         )
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        return r.json() is True
+        token = r.json()
+        if token is None:
+            return None
+        try:
+            from uuid import UUID
+            return str(UUID(str(token)))
+        except (TypeError, ValueError, AttributeError):
+            raise PortalStoreError(502, "calendar claim returned an invalid ownership token")
 
     def patch_post_date(self, row_id, new_post_date):
         """RE-DATE one waiting row (expired-row self-heal, Blake 2026-08-31: no human
@@ -1689,7 +1698,8 @@ class SupabaseCalendarStore:
                      and row.get("status") == status), None)
 
     def mark_publish_failed(self, row_id, revert_status="pending",
-                            reject_reason=None, gym_id=None):
+                            reject_reason=None, gym_id=None,
+                            expected_claim_token=None):
         """
         REVERT a claim after a publish failure (or a would_publish result): status
         back to `revert_status` so the row is retried on the next run. LASSO rows
@@ -1699,8 +1709,10 @@ class SupabaseCalendarStore:
         published_at), so a failed attempt never looks published. The update
         only matches an unpublished row still in the publisher's `publishing`
         claim. Pre-network callers also supply gym_id so a stale or cross-tenant
-        row id cannot overwrite a client's later decision. Returns the updated
-        row or None when the claim no longer matches.
+        row id cannot overwrite a client's later decision. The same caller must
+        supply its claim token, since a later worker can claim this row again
+        after it returns to pending. Returns the updated row or None when the
+        claim no longer matches.
 
         reject_reason (publish_guard wiring, 2026-08-27): when the publish guard
         blocks a row, its violation codes land on the row so the portal/human can
@@ -1709,13 +1721,24 @@ class SupabaseCalendarStore:
         """
         if revert_status not in ("pending", "approved"):
             revert_status = "pending"
+        if gym_id is not None and not expected_claim_token:
+            raise PortalStoreError(422, "tenant-scoped rollback requires a claim token")
+        if expected_claim_token:
+            try:
+                from uuid import UUID
+                expected_claim_token = str(UUID(str(expected_claim_token)))
+            except (TypeError, ValueError, AttributeError):
+                raise PortalStoreError(422, "rollback claim token is invalid")
         body = {"status": revert_status, "publish_reservation_day": None}
+        if expected_claim_token:
+            body["publish_claim_token"] = None
         if reject_reason is not None:
             body["reject_reason"] = str(reject_reason)[:500]
         params = {"id": f"eq.{row_id}", "status": "eq.publishing",
                   "published_at": "is.null", "late_post_id": "is.null"}
         if gym_id is not None:
             params["gym_id"] = f"eq.{gym_id}"
+            params["publish_claim_token"] = f"eq.{expected_claim_token}"
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,

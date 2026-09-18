@@ -509,7 +509,7 @@ def _planned_mentions(caption, gym_id, category):
 
 
 def _revert_to_pending(store, row_id, reject_reason="", revert_status="pending",
-                       gym_id=None):
+                       gym_id=None, expected_claim_token=None):
     """Revert a row out of the 'publishing' claim after a PRE-NETWORK block.
 
     Returns True only when the store confirms the pre-network rollback.
@@ -532,7 +532,8 @@ def _revert_to_pending(store, row_id, reject_reason="", revert_status="pending",
         try:
             reverted = store.mark_publish_failed(row_id, revert_status=revert_status,
                                                  reject_reason=reject_reason,
-                                                 gym_id=gym_id)
+                                                 gym_id=gym_id,
+                                                 expected_claim_token=expected_claim_token)
         except TypeError:
             # Only legacy injectable stores lack the tenant-aware signature.
             # Never retry a real Supabase store without its tenant filter.
@@ -951,6 +952,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # used, so catch-up rows dated on different prior days share today's
         # capacity. Postgres serializes distinct rows/workers in one transaction.
         # This applies to both manual approval and autonomous client lanes.
+        claim_token = None
         try:
             claim_slot = getattr(store, "claim_publish_slot", None)
             if callable(claim_slot):
@@ -980,6 +982,10 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             # cadence is full. Leave it untouched for calendar review.
             (waiting if callable(claim_slot) else skipped).append(row_id)
             continue
+        # The production owned-claim RPC returns a fresh UUID per successful
+        # claim. Legacy injected stores return True and use their own rollback
+        # behavior; Supabase rollback refuses to run without this token.
+        claim_token = won if isinstance(won, str) else None
 
         # CONTENT IDEMPOTENCY, WRITTEN BEFORE THE NETWORK CALL (2026-09-05 incident).
         #
@@ -1077,6 +1083,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                               db=None):
                 _reverted = _revert_to_pending(row_id=row_id, store=store,
                                                gym_id=gym_id,
+                                               expected_claim_token=claim_token,
                                                reject_reason="caption cooldown")
                 if _reverted:
                     _oa.alert(
@@ -1101,6 +1108,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 _reason = "publish_guard: " + ", ".join(_viols)
                 _reverted = _revert_to_pending(row_id=row_id, store=store,
                                                gym_id=gym_id,
+                                               expected_claim_token=claim_token,
                                                reject_reason=_reason)
                 if not _reverted:
                     recovery_required.append(row_id)
@@ -1120,6 +1128,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             _reason = "media_asset_review_required"
             _reverted = _revert_to_pending(
                 store, row_id, reject_reason=_reason, gym_id=gym_id,
+                expected_claim_token=claim_token,
                 revert_status="approved" if approved_only else "pending")
             if not _reverted:
                 recovery_required.append(row_id)
