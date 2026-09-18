@@ -772,7 +772,9 @@ def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
 def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now=None):
     """Transport-agnostic router for the two hosts. Returns (status, body_dict), or None
     when `path` is not one of ours (the caller falls through to its own routes)."""
-    path = (path or "").split("?")[0].rstrip("/") or "/"
+    from urllib.parse import parse_qs, urlsplit
+    parsed = urlsplit(path or '')
+    path = parsed.path.rstrip("/") or "/"
     if path != ROUTE_PREFIX and not path.startswith(ROUTE_PREFIX + "/"):
         return None
     refused = authorize(headers_get)
@@ -780,6 +782,23 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         return refused
     deps = dict(deps or {})
     method = (method or "").upper()
+    if path.startswith(ROUTE_PREFIX + "/evidence/media-source/"):
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        from .fixer_evidence import inspect_media_source, EvidenceError
+        try:
+            query = parse_qs(parsed.query, strict_parsing=True)
+            if set(query) != {'gym_key', 'folder_id'} or any(len(v) != 1 for v in query.values()):
+                return 400, {"error": "bad_media_identifier"}
+            return 200, inspect_media_source(
+                path[len(ROUTE_PREFIX + "/evidence/media-source/"):],
+                query['gym_key'][0], query['folder_id'][0], deps=deps.get('evidence'))
+        except (ValueError, EvidenceError) as exc:
+            if isinstance(exc, EvidenceError):
+                return exc.status, {"error": exc.code}
+            return 400, {"error": "bad_media_identifier"}
+        except Exception:
+            return 503, {"error": "evidence_unavailable"}
     if path.startswith(ROUTE_PREFIX + "/evidence/"):
         if method != "GET":
             return 405, {"error": "method_not_allowed"}

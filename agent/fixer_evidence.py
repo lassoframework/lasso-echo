@@ -14,6 +14,7 @@ CAL_FIELDS = ('id', 'gym_id', 'post_date', 'time_slot', 'format', 'status', 'pil
 GEN_FIELDS = ('id', 'draft_id', 'account_key', 'kind', 'headline', 'cta', 'engine',
               'model', 'route', 'grade_status', 'grade_reason', 'attempt', 'final_status', 'created_at')
 MAX_BYTES = 128 * 1024
+FOLDER_ID = re.compile(r'[A-Za-z0-9_-]{3,200}\Z')
 
 class EvidenceError(Exception):
     def __init__(self, code, status=503):
@@ -120,6 +121,61 @@ def optional(fn, reason):
         return fn()
     except Exception:
         return {'status': 'unavailable', 'reason': reason}
+
+def inspect_media_source(ticket_id, gym_key, folder_id, *, deps=None):
+    """Read one exact Drive binding for one ticket-confirmed Echo tenant.
+
+    The caller supplies identifiers, never a display name. A missing binding is
+    unknown; it does not prove that a folder was never connected.
+    """
+    deps = deps or {}
+    if not UUID.fullmatch(ticket_id):
+        raise EvidenceError('bad_ticket_id', 400)
+    if not re.fullmatch(KEY, gym_key or '') or not FOLDER_ID.fullmatch(folder_id or ''):
+        raise EvidenceError('bad_media_identifier', 400)
+    read = deps.get('read', read_rest)
+    tickets = read('support_tickets', {'id': f'eq.{ticket_id}',
+                    'select': 'id,product,client_id', 'limit': '2'})
+    if len(tickets) != 1 or tickets[0].get('id') != ticket_id:
+        raise EvidenceError('ticket_not_found', 404)
+    ticket = tickets[0]
+    if ticket.get('product') != 'echo' or not ticket.get('client_id'):
+        raise EvidenceError('ticket_tenant_mismatch', 409)
+    gym_id = deps.get('resolve', lambda g: resolve_gym(g, read))(gym_key)
+    if not gym_id or ticket['client_id'] not in (gym_key, gym_id):
+        raise EvidenceError('ticket_tenant_mismatch', 409)
+    sources = read('media_source', {'folder_id': f'eq.{folder_id}',
+        'select': 'id,gym_id,kind,folder_id,active,revoked_externally,sync_status,sync_finished_at,sync_error',
+        'limit': '2'})
+    if len(sources) > 1:
+        raise EvidenceError('media_folder_ambiguous', 409)
+    if not sources:
+        return {'ok': True, 'schema_version': 1, 'ticket_id': ticket_id,
+                'gym_key': gym_key, 'folder_id': folder_id,
+                'source': {'status': 'unknown'},
+                'assets': {'status': 'unknown', 'count': None}}
+    source = sources[0]
+    if (source.get('folder_id') != folder_id or source.get('gym_id') != gym_key
+            or source.get('kind') != 'gym_drive' or not source.get('id')):
+        raise EvidenceError('media_source_tenant_mismatch', 409)
+    assets = read('media_asset', {'gym_id': f'eq.{gym_key}',
+        'source_id': f"eq.{source['id']}", 'select': 'id,gym_id,source_id',
+        'limit': '1001'})
+    if len(assets) > 1000:
+        raise EvidenceError('media_asset_count_unavailable', 503)
+    if any(a.get('gym_id') != gym_key or a.get('source_id') != source['id'] for a in assets):
+        raise EvidenceError('media_asset_scope_mismatch', 409)
+    status = source.get('sync_status')
+    if status not in ('idle', 'queued', 'indexing', 'ready', 'failed'):
+        status = 'unknown'
+    return {'ok': True, 'schema_version': 1, 'ticket_id': ticket_id,
+            'gym_key': gym_key, 'folder_id': folder_id,
+            'source': {'status': 'found', 'active': source.get('active') if isinstance(source.get('active'), bool) else None,
+                       'revoked_externally': source.get('revoked_externally') if isinstance(source.get('revoked_externally'), bool) else None,
+                       'sync_status': status,
+                       'sync_finished_at': scrub(source.get('sync_finished_at')),
+                       'sync_error_present': bool(source.get('sync_error'))},
+            'assets': {'status': 'available', 'count': len(assets)}}
 
 def gather(ticket_id, *, deps=None, now=None):
     deps = deps or {}
