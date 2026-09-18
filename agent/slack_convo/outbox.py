@@ -142,8 +142,8 @@ def _verified_fix_notice(ticket, att, kind):
     if kind != _a.KIND_STATUS or att.get("resolve_notice") is not True:
         return False
     operation = release.get("ops_action") or {}
-    if att.get("ops_action") in {"reset_recreate_budget", "requeue_failed_row"}:
-        return (ticket.get("status") == "verification"
+    if att.get("ops_action") in {"reset_recreate_budget", "requeue_failed_row", "swap_media"}:
+        common = (ticket.get("status") == "verification"
                 and release.get("postcondition_verified") is True
                 and operation.get("identityVerified") is True
                 and operation.get("ok") is True
@@ -152,6 +152,27 @@ def _verified_fix_notice(ticket, att, kind):
                 and bool(ticket.get("client_id"))
                 and operation.get("tenantId") == ticket.get("client_id")
                 and bool(release.get("request_key")))
+        if not common or att.get("ops_action") != "swap_media":
+            return common
+        args = operation.get("args") or {}
+        result = operation.get("result") or {}
+        if not isinstance(args, dict) or not isinstance(result, dict):
+            return False
+        row_id = args.get("row_id")
+        media_url = result.get("image_public_url")
+        media_kind = result.get("media_kind")
+        return (isinstance(row_id, str) and bool(row_id.strip())
+                and result.get("ok") is True
+                and result.get("action") == "swap-media"
+                and result.get("postcondition_verified") is True
+                and result.get("draft_id") == row_id
+                and result.get("siblings_swapped") == []
+                and result.get("siblings_left") == []
+                and isinstance(media_url, str) and bool(media_url.strip())
+                and media_kind in ("image", "video")
+                and (media_kind != "video" or
+                     isinstance(result.get("video_url"), str) and
+                     bool(result["video_url"].strip())))
     # A healthy deployment proves the code is live, not that this owner's symptom
     # is gone. The independent business check must identify its observation and
     # bind it to the exact request and commit being released.

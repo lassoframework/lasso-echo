@@ -840,6 +840,71 @@ def test_verified_ops_notice_posts_and_resolves_only_for_current_request(monkeyp
     assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == prior_posts
 
 
+@pytest.mark.parametrize("defect", [
+    None, "unverified", "wrong_tenant", "wrong_row", "missing_media",
+    "sibling_swapped", "sibling_left", "missing_sibling_readback",
+    "missing_video_url", "stale_request", "not_member",
+])
+def test_swap_media_ops_notice_delivery_gate(monkeypatch, defect):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    result = {"ok": True, "action": "swap-media", "draft_id": "row-abc-123",
+              "postcondition_verified": True, "image_public_url": "https://img/new.jpg",
+              "media_kind": "image", "siblings_swapped": [], "siblings_left": []}
+    operation = {"ok": True, "identityVerified": True, "action": "swap_media",
+                 "args": {"row_id": "row-abc-123"}, "gym_key": "gym-key",
+                 "tenantVerified": True, "tenantId": "gym-one", "result": result}
+    bus.tickets[tid] = {
+        "id": tid, "status": "verification", "client_id": "gym-one",
+        "bot_identity": "echo", "identity_kind": "client",
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        "verification_after": {"fixer": {"ops_action": operation,
+                                         "postcondition_verified": True}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Swap the photo on my post")
+    key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = key
+    notice = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="The photo has been changed.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "resolve_notice": True,
+              "ops_action": "swap_media", "request_key": key})
+    if defect == "unverified":
+        result["postcondition_verified"] = False
+    elif defect == "wrong_tenant":
+        operation["tenantId"] = "gym-two"
+    elif defect == "wrong_row":
+        result["draft_id"] = "row-other"
+    elif defect == "missing_media":
+        result["image_public_url"] = ""
+    elif defect == "sibling_swapped":
+        result["siblings_swapped"] = ["sibling-1"]
+    elif defect == "sibling_left":
+        result["siblings_left"] = ["sibling-1"]
+    elif defect == "missing_sibling_readback":
+        del result["siblings_left"]
+    elif defect == "missing_video_url":
+        result["media_kind"] = "video"
+    elif defect == "stale_request":
+        bus.record_inbound(ticket_id=tid, author_type="client", body="Wait, use another image")
+    post, calls = _posted()
+    summary = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                          member_check=lambda channel, user: defect != "not_member")
+    if defect is None:
+        assert bus.message(notice["id"])["delivery_status"] == "posted"
+        assert bus.ticket(tid)["status"] == "resolved"
+        assert summary["resolved"] == 1
+        assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
+    else:
+        assert bus.message(notice["id"])["delivery_status"] == "suppressed"
+        assert bus.ticket(tid)["status"] == "verification"
+        assert summary["resolved"] == 0
+        assert not any(call["channel"] == "C_CLIENT" for call in calls)
+
+
 def _fixer_business_proof(request_key, merged_sha):
     return {"source": "independent_business_check", "verified": True,
             "symptom_resolved": True, "check_id": "verified-customer-symptom",
