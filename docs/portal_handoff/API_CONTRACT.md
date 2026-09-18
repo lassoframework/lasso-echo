@@ -285,23 +285,28 @@ The response is scoped to the account resolved from the token.
 
 The additive media fields are read-only status signals from the Echo backend:
 
-- `awaiting_media` is `true` only for a non-LASSO client with no visible
-  calendar posts. It is `false` for LASSO, for a gym with posts, and for a
-  calendar that exists but is still held for coach review. It does not publish,
-  create content, or mutate the calendar.
+- `awaiting_media` is `true` only for a non-LASSO client whose backend signal
+  set has no calendar rows. That signal set includes rows that may not render
+  as visible cards, such as denied or removed rows, so a month can have no
+  visible cards and still report `false`. It is also `false` for a calendar
+  held for coach review. It does not publish, create content, or mutate the
+  calendar.
 - `upload_url` is the per-gym tokenized upload link when the media signal is
   active, otherwise an empty string. It is never a public or cross-gym link.
 - `media_review.status` is `awaiting` when the media inventory has pending
   review items, `ready` when it has none, or `unknown` when the inventory cannot
-  be read. `pending_review_count` and `publishable_count` are counts when the
-  inventory is available and `null` when it is not.
+  be read. `ready` only means that no assets are pending review. It does not
+  mean usable media exists; `publishable_count` can still be zero.
+  `pending_review_count` and `publishable_count` are counts when the inventory
+  is available and `null` when it is not.
 - `fallback_episode` describes the current media fallback episode. `active`
-  is true only while the episode's local posting window is current;
-  `depleted_on` is its depletion date; `dates` contains the active episode's
-  start and end dates; and `drafts_need_review` reports whether active fallback
-  drafts need review. When there is no current episode, the inactive response
-  has empty dates and a null depletion date. If the lookup fails, the fields
-  are unknown rather than treated as zero or ready.
+  is true when today's local date is on or before the episode end date; the
+  backend does not apply a separate start-date check. `depleted_on` is its
+  depletion date; `dates` contains the active episode's start and end dates;
+  and `drafts_need_review` reports whether active fallback drafts need review.
+  When there is no current episode, the inactive response has empty dates and a
+  null depletion date. If the lookup fails, the fields are unknown rather than
+  treated as zero or ready.
 - `notice_state.status` is the current notice record status for the active
   episode. Known values are `none`, `unresolved`, `ready`, and `sent`;
   lookup failures return `unknown`. `delivery_confirmed` is true only when the
