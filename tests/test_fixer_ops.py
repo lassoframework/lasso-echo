@@ -317,6 +317,34 @@ def test_restage_month_job_failure_is_recorded_not_swallowed(armed):
     assert any("FAILED" in r["body"] for r in bus.rows)
 
 
+def test_restage_month_rejects_a_build_that_returns_ok_false(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+    _, deps = _restage_deps(bus, jobs)
+    deps["build_month"] = lambda _gym, _start, _days: {
+        "ok": False, "reason": "calendar store write failed", "upserted": 0,
+    }
+    status, body = _post("restage_month", _body(days=7), deps=deps)
+    assert status == 202
+    job = jobs.get(body["job_id"])
+    assert job["status"] == "failed"
+    assert "calendar store write failed" in job["error"]
+    assert job["steps"][-1]["ok"] is False
+    assert any("FAILED" in row["body"] for row in bus.rows)
+
+
+def test_restage_month_accepts_a_successful_noop_build(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+    _, deps = _restage_deps(bus, jobs)
+    deps["build_month"] = lambda _gym, _start, _days: {
+        "ok": True, "upserted": 0, "reason": "no eligible rows to change",
+    }
+    status, body = _post("restage_month", _body(days=7), deps=deps)
+    assert status == 202
+    job = jobs.get(body["job_id"])
+    assert job["status"] == "done"
+    assert job["steps"][-1]["ok"] is True
+
+
 def test_restage_month_bounds_its_inputs(armed):
     deps = {"bus": FakeBus(), "jobs": FO.Jobs(), "volume_available": lambda: True,
             "thread_runner": lambda fn: pytest.fail("must not start")}

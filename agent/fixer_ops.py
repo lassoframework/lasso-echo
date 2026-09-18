@@ -416,8 +416,12 @@ def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_
                                    library_path=cms._library_dir(gym_key), store=store,
                                    banned_words=cms._banned_words_for(gym_key), logger=log)
     out["build"] = built
-    steps.append({"step": "build", "at": _now_iso(), "ok": bool((built or {}).get("ok")),
-                  "upserted": (built or {}).get("upserted")})
+    build_result = built if isinstance(built, dict) else {}
+    steps.append({"step": "build", "at": _now_iso(), "ok": build_result.get("ok") is True,
+                  "upserted": build_result.get("upserted")})
+    if not isinstance(built, dict) or built.get("ok") is not True:
+        reason = build_result.get("reason") or "invalid build result"
+        raise RuntimeError(f"calendar build did not succeed: {reason or 'ok was not true'}")
     out["summary"] = (f"restage {gym_key}: {len(prerender) if isinstance(prerender, list) else '?'}"
                       f" source(s) prerendered, {out['observe_denials'].get('rolled_back', 0)} "
                       f"asset(s) released, build ok={bool((built or {}).get('ok'))} "
