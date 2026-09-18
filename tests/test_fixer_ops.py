@@ -122,6 +122,7 @@ def test_reset_recreate_budget_records_and_audits(armed):
                          deps={"bus": bus, "reset_recreate_budget": reset}, logs=logs)
     assert status == 200 and body["ok"] and calls == [GYM]
     assert body["result"]["after"]["used"] == 0
+    assert body["result"]["postcondition_verified"] is True
     assert len(bus.rows) == 1
     row = bus.rows[0]
     assert row["ticket_id"] == TICKET and row["author_type"] == "system"
@@ -130,6 +131,17 @@ def test_reset_recreate_budget_records_and_audits(armed):
         "client-invisible kind, never posted by an outbox"
     assert row["meta"]["ops_action"] == "reset_recreate_budget"
     assert any(line.startswith("[fixer-ops] AUDIT action=reset_recreate_budget") for line in logs)
+
+
+def test_reset_recreate_budget_refuses_unconfirmed_readback(armed):
+    def reset(_key):
+        return {"before": {"limit": 30, "used": 30, "remaining": 0},
+                "after": {"limit": 30, "used": 1, "remaining": 29}}
+
+    status, body = _post("reset_recreate_budget", _body(),
+                         deps={"bus": FakeBus(), "reset_recreate_budget": reset})
+    assert status == 409 and body["ok"] is False
+    assert body["error"] == "postcondition_unconfirmed"
 
 
 def test_resend_connect_link_forces_the_send_and_reports_a_decline(armed):
@@ -258,12 +270,43 @@ def test_requeue_failed_row_checks_ownership_and_state_first(armed):
     deps = {"bus": FakeBus(), "calendar_store": store}
     status, body = _post("requeue_failed_row", _body(row_id="row-failed-1"), deps=deps)
     assert status == 200 and body["result"]["status"] == "approved"
+    assert body["result"]["postcondition_verified"] is True
     assert store.requeued == ["row-failed-1"]
     status, body = _post("requeue_failed_row", _body(row_id="row-live-22"), deps=deps)
     assert status == 409 and body["error"] == "row_not_failed"
     status, body = _post("requeue_failed_row", _body(row_id="row-other-33"), deps=deps)
     assert status == 404 and body["error"] == "row_not_found", "another gym's row never loads"
     assert store.requeued == ["row-failed-1"], "only the owned, failed row was written"
+
+
+def test_requeue_failed_row_refuses_a_stale_readback(armed):
+    class StaleStore(FakeCalendarStore):
+        def get_row(self, account_key, row_id):
+            row = super().get_row(account_key, row_id)
+            if row and self.requeued:
+                return {**row, "status": "failed"}
+            return row
+
+    store = StaleStore([{"id": "row-failed-1", "gym_id": GYM,
+                         "status": "failed", "post_date": "2026-09-12"}])
+    status, body = _post("requeue_failed_row", _body(row_id="row-failed-1"),
+                         deps={"bus": FakeBus(), "calendar_store": store})
+    assert status == 409 and body["ok"] is False
+    assert body["error"] == "postcondition_unconfirmed"
+
+
+def test_requeue_failed_row_refuses_wrong_tenant_write_response(armed):
+    class WrongTenantStore(FakeCalendarStore):
+        def requeue_failed_row(self, row_id):
+            row = super().requeue_failed_row(row_id)
+            return {**row, "gym_id": "another-gym"}
+
+    store = WrongTenantStore([{"id": "row-failed-1", "gym_id": GYM,
+                               "status": "failed", "post_date": "2026-09-12"}])
+    status, body = _post("requeue_failed_row", _body(row_id="row-failed-1"),
+                         deps={"bus": FakeBus(), "calendar_store": store})
+    assert status == 409 and body["ok"] is False
+    assert body["error"] == "postcondition_unconfirmed"
 
 
 # ---- restage_month: background job + status route ----------------------------------------

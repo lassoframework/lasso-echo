@@ -268,7 +268,11 @@ def _run_reset_recreate_budget(ctx):
     out = reset(ctx.gym_key)
     before = (out or {}).get("before") or {}
     after = (out or {}).get("after") or {}
+    if after.get("used") != 0 or after.get("remaining") != after.get("limit"):
+        return 409, {"error": "postcondition_unconfirmed", "before": before,
+                     "after": after, "summary": "recreate budget reset was not confirmed"}
     return 200, {**(out or {}),
+                 "postcondition_verified": True,
                  "summary": (f"recreate budget {before.get('used', '?')} used -> "
                              f"{after.get('used', '?')} used "
                              f"({after.get('remaining', '?')} of {after.get('limit', '?')} left)")}
@@ -327,9 +331,21 @@ def _run_requeue_failed_row(ctx):
         return 409, {"error": "requeue_matched_nothing", "row_id": rid,
                      "summary": (f"row {rid} did not match failed + googlebusiness + no post "
                                  "id at write time; nothing changed")}
-    return 200, {"row_id": rid, "status": updated.get("status"),
-                 "post_date": updated.get("post_date"),
-                 "summary": f"row {rid} requeued: failed -> {updated.get('status')}"}
+    if (updated.get("id") != rid or updated.get("gym_id") != ctx.gym_key
+            or updated.get("status") != "approved"):
+        return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                     "summary": f"row {rid} requeue response did not match the target gym"}
+    confirmed = store.get_row(ctx.gym_key, rid)
+    if (not confirmed or confirmed.get("id") != rid
+            or confirmed.get("gym_id") != ctx.gym_key
+            or confirmed.get("status") != "approved"
+            or confirmed.get("late_post_id") is not None):
+        return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                     "summary": f"row {rid} requeue was not confirmed by calendar readback"}
+    return 200, {"row_id": rid, "status": confirmed.get("status"),
+                 "post_date": confirmed.get("post_date"),
+                 "postcondition_verified": True,
+                 "summary": f"row {rid} requeued: failed -> {confirmed.get('status')}"}
 
 
 # -- restage_month (background) -----------------------------------------------------------
