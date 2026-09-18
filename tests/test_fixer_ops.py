@@ -353,7 +353,11 @@ def test_swap_media_does_not_claim_success_when_readback_disagrees(armed):
     assert len(calls) == 1
 
 
-def test_swap_media_does_not_verify_unread_sibling_writes(armed):
+@pytest.mark.parametrize("sibling_result", [
+    {"siblings_swapped": ["sibling-1"]},
+    {"siblings_left": ["sibling-1"]},
+])
+def test_swap_media_does_not_verify_unread_sibling_writes(armed, sibling_result):
     class Store:
         def get_row(self, account_key, row_id):
             return {"id": row_id, "gym_id": account_key, "image_url": "https://img/new.jpg"}
@@ -362,7 +366,18 @@ def test_swap_media_does_not_verify_unread_sibling_writes(armed):
         "bus": FakeBus(), "calendar_store": Store(),
         "handle_swap_media": lambda *args: (200, {
             "ok": True, "image_public_url": "https://img/new.jpg",
-            "siblings_swapped": ["sibling-1"]})})
+            **sibling_result})})
+    assert status == 409 and body["error"] == "postcondition_unconfirmed"
+
+
+def test_swap_media_requires_public_media_identity_to_verify(armed):
+    class Store:
+        def get_row(self, account_key, row_id):
+            pytest.fail("missing media identity should not trigger a readback")
+
+    status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
+        "bus": FakeBus(), "calendar_store": Store(),
+        "handle_swap_media": lambda *args: (200, {"ok": True, "video_url": "https://img/new.mp4"})})
     assert status == 409 and body["error"] == "postcondition_unconfirmed"
 
 

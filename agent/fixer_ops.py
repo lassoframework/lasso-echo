@@ -312,7 +312,7 @@ def _run_swap_media(ctx):
         # The handler's returned row is a write response, not an independent proof.
         # A missing or failed readback is ambiguous: the write may already have landed,
         # so report it without invoking the non-idempotent swap a second time.
-        expected = body.get("video_url") or body.get("image_public_url")
+        expected = body.get("image_public_url")
         try:
             store = _dep(ctx, "calendar_store", lambda: __import__(
                 "agent.portal_calendar_store", fromlist=["SupabaseCalendarStore"]
@@ -325,6 +325,7 @@ def _run_swap_media(ctx):
         if (not confirmed or confirmed.get("id") != rid
                 or confirmed.get("gym_id") != ctx.gym_key
                 or body.get("siblings_swapped")
+                or body.get("siblings_left")
                 or (body.get("video_url") and actual != body["video_url"])
                 or (not body.get("video_url") and actual != body.get("image_public_url"))
                 or display != body.get("image_public_url")):
