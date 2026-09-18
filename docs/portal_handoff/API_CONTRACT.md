@@ -231,6 +231,96 @@ Limits:
 
 ---
 
+### GET /portal/<token>/social?month=YYYY-MM
+
+**Purpose:** Returns the token's month calendar for that gym. The route is
+behind `AGENT_PORTAL_SOCIAL_ENABLED` and the active social subscription gate.
+The response is scoped to the account resolved from the token.
+
+**Response 200:**
+```json
+{
+  "account_key": "districth",
+  "month": "2026-09",
+  "active": true,
+  "posts": [
+    {
+      "day_key": "2026-09-18",
+      "status": "pending",
+      "pillar": "community",
+      "format": "infographic",
+      "image_public_url": "https://...",
+      "caption": "..."
+    }
+  ],
+  "recreate_budget": {"limit": 30, "used": 0, "remaining": 30},
+  "low_creative": false,
+  "days_remaining": 12,
+  "awaiting_media": false,
+  "upload_url": "",
+  "media_review": {
+    "status": "ready",
+    "pending_review_count": 0,
+    "publishable_count": 4
+  },
+  "fallback_episode": {
+    "active": false,
+    "depleted_on": null,
+    "dates": [],
+    "drafts_need_review": false
+  },
+  "notice_state": {
+    "status": "none",
+    "episode_id": null,
+    "created_at": null,
+    "delivery_confirmed": false
+  },
+  "upload_action": {
+    "url": "https://.../u/<token>",
+    "label": "Upload media",
+    "received_means_indexed": false
+  }
+}
+```
+
+The additive media fields are read-only status signals from the Echo backend:
+
+- `awaiting_media` is `true` only for a non-LASSO client with no visible
+  calendar posts. It is `false` for LASSO, for a gym with posts, and for a
+  calendar that exists but is still held for coach review. It does not publish,
+  create content, or mutate the calendar.
+- `upload_url` is the per-gym tokenized upload link when the media signal is
+  active, otherwise an empty string. It is never a public or cross-gym link.
+- `media_review.status` is `awaiting` when the media inventory has pending
+  review items, `ready` when it has none, or `unknown` when the inventory cannot
+  be read. `pending_review_count` and `publishable_count` are counts when the
+  inventory is available and `null` when it is not.
+- `fallback_episode` describes the current media fallback episode. `active`
+  is true only while the episode's local posting window is current;
+  `depleted_on` is its depletion date; `dates` contains the active episode's
+  start and end dates; and `drafts_need_review` reports whether active fallback
+  drafts need review. When there is no current episode, the inactive response
+  has empty dates and a null depletion date. If the lookup fails, the fields
+  are unknown rather than treated as zero or ready.
+- `notice_state.status` is the current notice record status for the active
+  episode. Known values are `none`, `unresolved`, `ready`, and `sent`;
+  lookup failures return `unknown`. `delivery_confirmed` is true only when the
+  status is `sent` and a delivery timestamp exists. An `unresolved` status is
+  not evidence that a Slack or client notice was delivered.
+- `upload_action` is the portal action descriptor. Its URL is the per-gym
+  upload link when available, `label` is `Upload media`, and
+  `received_means_indexed` remains false because receipt does not prove that
+  assets have been indexed or approved for selection.
+
+The separate portal frontend has not been verified here to render these
+additive fields. Backend presence alone does not establish a visible banner,
+upload action, media status, fallback status, or client notice in the portal.
+
+**Error responses:**
+- `402` with the empty calendar when the gym's social product is not active.
+- `404` when the feature flag is off or the token is unknown/revoked.
+- `500` when the calendar store cannot be read.
+
 ## PLANNED Endpoints (not yet built)
 
 These endpoints do not exist in Echo today. They are specified here so the portal CC can build stubs and wire them when Echo ships them. Mark all portal UI that depends on these as **PLANNED** until STATUS.md says otherwise.
