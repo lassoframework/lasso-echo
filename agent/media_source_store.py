@@ -201,6 +201,20 @@ class SupabaseMediaStore:
             raise MediaStoreError(r.status_code, self._scrubbed(r))
         return True
 
+    def update_review_asset(self, gym_id, asset_id, fields):
+        """Tenant-scoped review write; never expose through a portal body actor."""
+        r = self._client().patch(
+            self._rest(_ASSET_TABLE),
+            params={"id": f"eq.{asset_id}", "gym_id": f"eq.{gym_id}"},
+            json=dict(fields),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}), timeout=30)
+        if r.status_code >= 400:
+            raise MediaStoreError(r.status_code, self._scrubbed(r))
+        if len(r.json() or []) != 1:
+            raise MediaStoreError(404, "review target disappeared")
+        return True
+
 
 def default_store():
     return SupabaseMediaStore()

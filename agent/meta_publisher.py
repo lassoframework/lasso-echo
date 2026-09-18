@@ -158,6 +158,11 @@ def publish(draft, account, http=None):
         return PublishResult(ok=True, mode="would_publish",
                              detail="stories flag OFF (draft only)")
 
+    from .publish_billing_gate import publishing_blocked
+    from .portal_social import _base_of_account
+    if publishing_blocked(_base_of_account(account.key)):
+        raise PublishError("Echo publishing held: account revoked or subscription canceled")
+
     prior = _recent_duplicate(account.key, draft)
     if prior is not None:
         return PublishResult(

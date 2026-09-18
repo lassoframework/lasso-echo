@@ -1774,6 +1774,39 @@ def test_duplicate_refusal_reports_real_cleanup_without_publishing(armed, monkey
     assert any(("soft-deleted" if cleanup_ok else "Cleanup was not confirmed") in s for s in alerts)
 
 
+@pytest.mark.parametrize("rollback_result", [False, None])
+def test_unconfirmed_pre_network_rollback_is_held_without_send_or_reclaim(
+        armed, monkeypatch, rollback_result):
+    """A zero-row rollback must be visible as recovery work, never a successful revert."""
+    class ZeroRowRollbackStore(_FakeStore):
+        def mark_publish_failed(self, row_id, revert_status="pending", reject_reason=""):
+            self.failed_calls.append(row_id)
+            return rollback_result
+
+    store = ZeroRowRollbackStore([_row("stranded")])
+    alerts = []
+    monkeypatch.setattr(cap, "_drive_asset_usable_at_send", lambda *_: False)
+    monkeypatch.setattr(cap, "_alert_publish_blocked",
+                        lambda *args, **kwargs: alerts.append((args, kwargs)))
+    publisher = _FakePublisher()
+
+    result = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                             now=LATE_NOW, catch_all=True)
+
+    assert result["failed"] == ["stranded"]
+    assert result["held"] is True
+    assert result["recovery_required"] == ["stranded"]
+    assert store.rows["stranded"]["status"] == "publishing"
+    assert publisher.calls == []
+    assert alerts[0][1]["reverted"] is False
+
+    # An unconfirmed rollback leaves its claim in place, so another tick cannot post it.
+    retry = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                            now=LATE_NOW, catch_all=True)
+    assert retry["published"] == []
+    assert publisher.calls == []
+
+
 @pytest.mark.parametrize("previous", ["pending", "approved"])
 def test_content_stamp_failure_releases_for_retry_and_preserves_approval(armed, monkeypatch, previous):
     class FailedStampLedger:

@@ -359,6 +359,7 @@ def test_handle_upload_wraps_storage_write_error():
     assert status == 503 and "storage" in body["error"]
 
 
+@pytest.mark.real_default_r2
 def test_default_r2_none_on_placeholder_env(monkeypatch):
     """The live root cause reproduced: unfilled setup placeholders ('<...>') mean
     _default_r2() returns None (so uploads 503) rather than building a broken client."""

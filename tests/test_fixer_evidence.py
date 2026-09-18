@@ -89,7 +89,9 @@ def test_actual_sqlite_reads_cannot_initialize_or_modify(tmp_path):
 def test_media_inventory_uses_real_eligibility_and_cooldown():
  deps,tables,_=fixture()
  tables['media_asset']=[
-  {'id':'1','gym_id':GYM,'kind':'photo','eligible':True,'excluded_by_coach':False,'last_used_at':None},
+  {'id':'1','gym_id':GYM,'kind':'photo','eligible':True,'excluded_by_coach':False,'last_used_at':None,
+   'review_status':'approved','reviewed_by':'test-reviewer','reviewed_at':'2026-09-01T12:00:00+00:00',
+   'moderation_status':'clean','moderation_json':{'verdict':'clean','provider':'test-review'},'people_detected':False,'consent_status':'not_required'},
   {'id':'2','gym_id':GYM,'kind':'video','eligible':True,'excluded_by_coach':True},
   {'id':'3','gym_id':GYM,'kind':'video','eligible':True,'last_used_at':'2026-09-10T00:00:00Z'},
   {'id':'4','gym_id':GYM,'kind':'photo','eligible':None},

@@ -131,7 +131,12 @@ def test_builder_stamps_asset_id_end_to_end(monkeypatch, tmp_path):
         key = "gritx_ig"
         platform = "instagram"
 
-    store = FakeMediaStore(assets=[make_asset("A1", gym_id="gritx", kind="photo")])
+    reviewed = make_asset("A1", gym_id="gritx", kind="photo")
+    reviewed.update(review_status="approved", reviewed_by="operator",
+                    reviewed_at="2026-08-04T00:00:00Z", moderation_status="clean",
+                    moderation_json={"provider": "test", "verdict": "clean"}, people_detected=False,
+                    consent_status="not_required")
+    store = FakeMediaStore(assets=[reviewed])
     drive = FakeDrive(blobs={"A1": b"jpg"})
     draft = builder.build_gym_media_draft(
         _Acct(), "2026-08-05", "faces", voice=object(), source=object(),

@@ -33,7 +33,16 @@ def src(gym="crossfitlocal", sid="s1", active=True, revoked=False):
 
 def assets(n, gym="crossfitlocal", sid="s1", eligible=True):
     return [{"id": f"{gym}-{i}", "gym_id": gym, "source_id": sid,
-             "eligible": eligible, "excluded_by_coach": False} for i in range(n)]
+             "eligible": eligible, "excluded_by_coach": False,
+             # A library count and a client-facing "can post" claim must use the
+             # same strict selector proof as production. These fixture assets are
+             # explicitly reviewed, cleanly moderated, and confirmed no-people,
+             # so consent is genuinely not required.
+             "review_status": "approved", "reviewed_by": "test-reviewer",
+             "reviewed_at": "2026-09-01T12:00:00+00:00",
+             "moderation_status": "clean", "moderation_json": {"verdict": "clean", "provider": "test-review"},
+             "people_detected": False, "consent_status": "not_required"}
+            for i in range(n)]
 
 
 VOICE_TODO = ("### CTA rotation (cycle in order, one per post)\n"

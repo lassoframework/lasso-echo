@@ -38,6 +38,8 @@ HARD COPY RULES (grep-asserted in tests): no em / en / hyphen dashes and never t
 "vendor" in any on-image text.
 """
 
+import hashlib
+import json
 import os
 import re
 import tempfile
@@ -202,18 +204,43 @@ def _render_infographic(eyebrow, headline, deck, out_path, is_story=False):
 # A short in-process cache so repeated /social page loads do not re-render + re-host the
 # same card. Keyed by the post's IDENTITY (id, caption, pillar, format): a changed
 # caption / pillar renders a fresh card, an unchanged one reuses the last hosted url.
-# Process-local + tiny; it holds only public urls (never secrets) and never persists.
+# Process-local + tiny. Durable kv survives eviction and restart. Both tiers
+# contain hosted public URLs scoped to tenant and content.
 _URL_CACHE = {}
 _URL_CACHE_MAX = 512
 
 
-def _cache_key(post, is_story):
+def _cache_key(post, is_story, tenant):
     return (
+        tenant,
         str(post.get("id") or ""),
         _clean(post.get("caption")),
         _clean(post.get("pillar")),
         "story" if is_story else "feed",
     )
+
+
+def _durable_key(cache_key):
+    # Hash tenant and content identity rather than putting approved copy in keys.
+    digest = hashlib.sha256(json.dumps(cache_key, ensure_ascii=False).encode()).hexdigest()
+    return f"no_creative_display:v1:{digest}"
+
+
+def _saved_url(cache_key):
+    from . import db
+    try:
+        value = db.kv_get(_durable_key(cache_key))
+        return value if _has_usable_image(value) else None
+    except Exception:
+        return None  # storage failures must not break calendar reads
+
+
+def _save_url(cache_key, url):
+    from . import db
+    try:
+        db.kv_set(_durable_key(cache_key), url)
+    except Exception:
+        pass  # keep in-process availability if durable storage is unavailable
 
 
 def _tenant_for(post, tenant):
@@ -274,11 +301,17 @@ def display_image_for(post, *, out_dir=None, renderer=None, host=None, tenant=No
 
     # Repeated page loads of the same unchanged post reuse the last hosted url instead
     # of re-rendering + re-hosting blindly.
-    ck = _cache_key(post, is_story)
-    cached = _URL_CACHE.get(ck)
+    ck = _cache_key(post, is_story, resolved_tenant)
+    cached = _URL_CACHE.get(ck) or _saved_url(ck)
     if cached:
         return cached
 
+    if not resolved_tenant.lower().startswith("lasso"):
+        from .client_infographic_fill import real_media_depleted
+        from .media_bridge import bridge_days
+        if (not real_media_depleted(resolved_tenant)
+                or str(post.get("day_key") or "")[:10] not in bridge_days(resolved_tenant)):
+            return None
     render = renderer or _render_infographic
     host_media = host or _default_host
 
@@ -314,6 +347,7 @@ def display_image_for(post, *, out_dir=None, renderer=None, host=None, tenant=No
 
         if len(_URL_CACHE) >= _URL_CACHE_MAX:
             _URL_CACHE.clear()  # tiny, simple bound: drop the whole cache when full
+        _save_url(ck, hosted)
         _URL_CACHE[ck] = hosted
         return hosted
     finally:

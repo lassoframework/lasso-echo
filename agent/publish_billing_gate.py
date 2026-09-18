@@ -102,10 +102,11 @@ def _live_state(base, reader=None):
 
 
 def account_revoked(base):
-    """Fresh operator revocation wins over billing cache, with last-known deny on outage.
+    """Fresh operator revocation wins over billing cache; client outages hold sends.
 
-    Only a successful fresh denylist read can clear an observed revocation.
-    This applies even when the optional Stripe gate is disabled.
+    Only a successful fresh denylist read can establish that a client is safe
+    to publish. LASSO remains available on a denylist outage. This check applies
+    even when the optional Stripe gate is disabled.
     """
     from . import db, intake_web
     base = str(base or "").strip().lower()
@@ -118,17 +119,24 @@ def account_revoked(base):
             raise RuntimeError("revocation storage unavailable")
         import json
         raw = r2.get_bytes(intake_web._DENYLIST_KEY)
-        data = json.loads(raw) if raw is not None else {"revoked": []}
+        # The R2 adapter returns None for a missing key *and* a missing bucket.
+        # Neither is a confirmed empty denylist.  Only bytes containing a valid
+        # document can establish that a client is safe to publish.
+        if raw is None:
+            raise RuntimeError("revocation denylist object is missing")
+        data = json.loads(raw)
         if not isinstance(data, dict) or not isinstance(data.get("revoked"), list):
             raise ValueError("invalid revocation document")
         if any(not isinstance(key, str) for key in data["revoked"]):
             raise ValueError("invalid revocation key")
         revoked = base in {str(k).strip().lower() for k in data["revoked"]}
     except Exception:
-        try:
-            return db.kv_get(cache_key) == "1"
-        except Exception:
+        # A missing/unreadable denylist cannot establish that a client is safe to
+        # publish. Preserve LASSO's own lane on a storage outage; a fresh explicit
+        # LASSO revocation above still wins.
+        if base == "lasso":
             return False
+        return True
     try:
         db.kv_set(cache_key, "1" if revoked else "0")
     except Exception:
@@ -146,7 +154,7 @@ def publishing_blocked(base, reader=None, now=None, alert=None):
         return True
     if not gate_enabled():
         return False
-    if not base or base.startswith("lasso"):
+    if not base or base.lower() == "lasso":
         return False
     state, fresh = _cached_state(base, now)
     if not fresh:

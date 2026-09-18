@@ -11,6 +11,15 @@ import sys
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def available_revocation_store(monkeypatch):
+    """Billing cases assume a healthy, empty revocation denylist."""
+    from agent import intake_web
+    from types import SimpleNamespace
+    monkeypatch.setattr(intake_web, "_default_r2", lambda: SimpleNamespace(
+        get_bytes=lambda key: b'{"revoked": []}'))
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import publish_billing_gate as pbg  # noqa: E402
@@ -278,6 +287,34 @@ def test_fresh_revocation_survives_cache_write_failure(monkeypatch):
     monkeypatch.setattr(db, 'kv_set', lambda *args: (_ for _ in ()).throw(RuntimeError('db unavailable')))
     monkeypatch.setattr(db, 'kv_get', lambda *args: '0')
     assert pbg.account_revoked('gymx') is True
+
+
+def test_missing_denylist_object_fails_closed_for_client_but_not_exact_lasso(monkeypatch):
+    """R2 None means missing key/bucket, never a confirmed empty denylist."""
+    from agent import intake_web
+    from types import SimpleNamespace
+    storage = SimpleNamespace(get_bytes=lambda key: b'{"revoked":["lasso"]}')
+    monkeypatch.setattr(
+        intake_web, '_default_r2', lambda: storage,
+    )
+    # The exact LASSO policy exempts only an unreadable store; a fresh positive
+    # revocation remains authoritative even for that internal lane.
+    assert pbg.account_revoked('lasso') is True
+    storage.get_bytes = lambda key: None
+    assert pbg.account_revoked('gymx') is True
+    assert pbg.publishing_blocked('gymx') is True
+    assert pbg.account_revoked('lasso') is False
+    assert pbg.account_revoked('lasso-client') is True
+
+
+def test_confirmed_empty_denylist_is_distinct_from_missing_object(monkeypatch):
+    from agent import intake_web
+    from types import SimpleNamespace
+    monkeypatch.setattr(
+        intake_web, '_default_r2',
+        lambda: SimpleNamespace(get_bytes=lambda key: b'{"revoked": []}'),
+    )
+    assert pbg.account_revoked('gymx') is False
 
 
 def test_zernio_wire_revocation_refuses_before_client_access(monkeypatch):

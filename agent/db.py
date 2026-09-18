@@ -26,6 +26,10 @@ import sqlite3
 import threading
 
 _lock = threading.Lock()
+# Schema setup opens a connection and may run additive ALTER TABLE migrations.  It
+# must be separate from _lock: several helpers already hold _lock while calling
+# connect(), so reusing it here would deadlock those callers.
+_schema_lock = threading.Lock()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS drafts (
@@ -126,6 +130,17 @@ _POST_METRIC_COLUMNS = ("likes", "comments", "saves", "shares", "views", "reach"
 
 def connect(path=None):
     """A WAL-mode connection with the schema ensured. Callers close it."""
+    # Two listener threads can first-open the same SQLite file at once.  Without
+    # serialization, each can observe a missing additive column and one loses
+    # with "duplicate column name" (or journal-mode's immediate lock error).
+    # This lock covers setup only; callers receive independent connections for
+    # their normal concurrent work.
+    with _schema_lock:
+        return _connect_initialized(path)
+
+
+def _connect_initialized(path=None):
+    """Open one connection after this process has exclusive schema setup access."""
     conn = sqlite3.connect(path or db_path(), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")

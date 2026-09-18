@@ -14,6 +14,15 @@ import sys
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def available_revocation_store(monkeypatch):
+    """SocialAPI behavior tests run with an explicit healthy denylist read."""
+    from agent import intake_web
+    from types import SimpleNamespace
+    monkeypatch.setattr(intake_web, "_default_r2", lambda: SimpleNamespace(
+        get_bytes=lambda key: b'{"revoked": []}'))
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import (config, accounts, approvals, socialapi_client,

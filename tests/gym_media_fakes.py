@@ -200,6 +200,8 @@ def make_asset(fid="a1", gym_id="pierce", source_id="src1", kind="photo",
                title="team.jpg", size=2_000_000, eligible=True,
                excluded_by_coach=False, used_count=0, last_used_at=None,
                content_hash="h1", reject=None, mime="image/jpeg"):
+    # Historical selector/planner fixtures represent media ready for use. New
+    # quarantine tests explicitly override these fields to pending/unknown.
     return {"id": fid, "source_id": source_id, "gym_id": gym_id, "kind": kind,
             "title": title, "mime_type": mime, "size_bytes": size,
             "content_hash": content_hash, "duration_sec": None, "width": 1080,
@@ -208,7 +210,12 @@ def make_asset(fid="a1", gym_id="pierce", source_id="src1", kind="photo",
             "excluded_by_coach": excluded_by_coach, "reject_reason": reject,
             "used_count": used_count, "last_used_at": last_used_at,
             "drive_modified": "2026-08-01T00:00:00Z",
-            "indexed_at": "2026-08-27T00:00:00+00:00"}
+            "indexed_at": "2026-08-27T00:00:00+00:00",
+            "review_status": "approved", "reviewed_by": "test-operator",
+            "reviewed_at": "2026-08-27T00:00:00Z",
+            "moderation_status": "clean",
+            "moderation_json": {"provider": "test", "verdict": "clean"},
+            "people_detected": False, "consent_status": "not_required"}
 
 
 def make_source(sid="src1", gym_id="pierce", folder_id="fold1", active=True,
