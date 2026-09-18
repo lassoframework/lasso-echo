@@ -882,6 +882,45 @@ def _clear_stall(base_key, stage):
         pass
 
 
+def pierce_weekly_window(today):
+    """The seven-day Pierce review block, Saturday through Friday.
+
+    On Friday, stage the next block so Bryan can review it before posting.
+    On other days, inspect the current block and repair it only if needed.
+    """
+    from datetime import timedelta
+
+    offset = (today.weekday() - 5) % 7
+    first = today - timedelta(days=offset)
+    if today.weekday() == 4:
+        first += timedelta(days=7)
+    return first, 7
+
+
+class _PierceWeekStore:
+    """Keep a monthly builder's delete scoped to the Pierce review week."""
+
+    def __init__(self, store, first, days):
+        from datetime import timedelta
+
+        self._store = store
+        self._dates = {(first + timedelta(days=i)).isoformat()
+                       for i in range(days)}
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def delete_month(self, account_key, month, *, preserve_dates=()):
+        if account_key != "piercefitness":
+            raise ValueError("Pierce weekly store cannot mutate another gym")
+        rows = self._store.list_month(account_key, month)
+        outside = {str(r.get("post_date"))[:10] for r in rows
+                   if str(r.get("post_date"))[:10] not in self._dates}
+        return self._store.delete_month(
+            account_key, month,
+            preserve_dates=tuple(set(preserve_dates) | outside))
+
+
 def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                       logger=None):
     """For each onboarded client gym: sync its uploaded media, then build its DRAFT
@@ -948,6 +987,14 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
 
     for base in bases:
         try:
+            # Pierce reviews one week at a time. Friday stages the coming
+            # Saturday-Friday block; the rest of the week only repairs a
+            # missing block. This is tenant scoped and opt-in for rollout.
+            weekly_pierce = (base == "piercefitness" and
+                             os.getenv("AGENT_PIERCE_WEEKLY", "").lower()
+                             in ("1", "true", "yes", "on"))
+            plan_start, plan_days = ((start, days) if not weekly_pierce else
+                                     pierce_weekly_window(start))
             sync = sync_uploads(base, r2=r2, logger=log)
             synced_total += sync.get("synced", 0)
 
@@ -1045,7 +1092,8 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 awaiting += 1
                 # NO PHOTOS AT ALL: the exact "if they don't upload" case — fill
                 # upcoming days with approved-source infographic cards (self-gated).
-                _maybe_infographic_fill(base, account, store, log)
+                if not weekly_pierce:
+                    _maybe_infographic_fill(base, account, store, log)
                 _maybe_seed_onboarding_demo(base, store, log)
                 results.append({"base": base, "status": "awaiting_media",
                                 "synced": sync.get("synced", 0)})
@@ -1082,7 +1130,8 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # 179-photo gym is built out to its 30-feed cap, existing_feeds (30) >=
             # build_target (30) -> SKIP, no rebuild. A GENUINE media increase below the
             # cap still grows; a library already at/over the cap never churns again.
-            existing_feeds, read_ok = _existing_feed_count(store, base, start, days)
+            existing_feeds, read_ok = _existing_feed_count(
+                store, base, plan_start, plan_days)
             if read_ok:
                 # RE-ARM ON RECOVERY (2026-09-02). calendar_unreadable is the one stall
                 # stage that heals ITSELF: it means a shared dependency (Supabase) was
@@ -1118,7 +1167,7 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             except Exception:  # noqa: BLE001
                 _cadence_applied = "1"
             cadence_changed = str(ppd) != _cadence_applied
-            feed_budget = days * ppd
+            feed_budget = plan_days * ppd
             # A Drive-only gym (media_count == 0, drive_lane_may_cover True — the branch
             # above already returned/continued for every other media_count == 0 case) has
             # no local media to cap the target against; target the full feed budget so
@@ -1192,7 +1241,7 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                         if voice is not None:
                             from .client_month_run import backfill_denied_slots
                             bf = backfill_denied_slots(
-                                account, base, start.isoformat(), days,
+                                account, base, plan_start.isoformat(), plan_days,
                                 voice=voice, library_path=lib_dir, store=store,
                                 banned_words=_banned_words_for(base), logger=log)
                             backfilled = bf.get("backfilled", 0)
@@ -1203,7 +1252,8 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # exhausted / reuse-blocked): fill upcoming EMPTY days with
                 # approved-source infographic cards (self-gated, insert-only — a real
                 # photo day is never touched).
-                _maybe_infographic_fill(base, account, store, log)
+                if not weekly_pierce:
+                    _maybe_infographic_fill(base, account, store, log)
                 results.append({"base": base, "status": "has_calendar",
                                 "synced": sync.get("synced", 0),
                                 "media_count": media_count,
@@ -1236,8 +1286,10 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             banned = _banned_words_for(base)
             from .client_month_run import build_client_month
             built = build_client_month(
-                account, base, start.isoformat(), days,
-                voice=voice, library_path=lib_dir, store=store,
+                account, base, plan_start.isoformat(), plan_days,
+                voice=voice, library_path=lib_dir,
+                store=(_PierceWeekStore(store, plan_start, plan_days)
+                       if weekly_pierce else store),
                 banned_words=banned, logger=log,
                 allow_reshape=cadence_changed)
             if built.get("ok"):
