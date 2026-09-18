@@ -23,8 +23,8 @@ Contract under test (shared, do not rename anything):
 """
 import hashlib
 import json
-import multiprocessing
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -119,16 +119,6 @@ class ExplodingStore:
         raise RuntimeError("kv down")
 
     get = __getitem__ = __setitem__ = __contains__ = setdefault = pop = _boom
-
-
-def _reserve_in_process(gate, results):
-    gate.wait(10)
-    try:
-        FR.begin(FR.KvReceiptStore(), "multiprocess-key-0001", "swap_media",
-                 GYM, TICKET, {"row_id": "r1"})
-        results.put("owner")
-    except FR.ReceiptError as exc:
-        results.put(exc.code)
 
 
 def _hdr(secret=SECRET):
@@ -461,16 +451,45 @@ def test_sqlite_reservation_is_atomic_across_processes(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
     from agent import db
     db.connect().close()  # the real worker initializes its schema before serving
-    ctx = multiprocessing.get_context("fork")
-    gate, results = ctx.Barrier(4), ctx.Queue()
-    procs = [ctx.Process(target=_reserve_in_process, args=(gate, results))
-             for _ in range(4)]
-    for proc in procs:
-        proc.start()
-    for proc in procs:
-        proc.join(15)
-        assert proc.exitcode == 0
-    outcomes = [results.get(timeout=2) for _ in procs]
+    gate = tmp_path / "start"
+    script = """
+import pathlib, sys, time
+from agent import fixer_ops_receipts as receipts
+ready, gate = map(pathlib.Path, sys.argv[1:3])
+gym, ticket = sys.argv[3:5]
+ready.touch()
+deadline = time.monotonic() + 15
+while not gate.exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError('reservation start gate never opened')
+    time.sleep(.01)
+try:
+    receipts.begin(receipts.KvReceiptStore(), 'multiprocess-key-0001',
+                   'swap_media', gym, ticket, {'row_id': 'r1'})
+    print('owner')
+except receipts.ReceiptError as exc:
+    print(exc.code)
+"""
+    procs = [subprocess.Popen([sys.executable, "-c", script,
+                               str(tmp_path / f"ready-{i}"), str(gate), GYM, TICKET],
+                              cwd=os.path.dirname(os.path.dirname(__file__)),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True) for i in range(4)]
+    try:
+        deadline = time.monotonic() + 15
+        while not all((tmp_path / f"ready-{i}").exists() for i in range(4)):
+            assert time.monotonic() < deadline, "all subprocesses must reach the start gate"
+            time.sleep(.01)
+        gate.touch()
+        outputs = [proc.communicate(timeout=15) for proc in procs]
+        for proc, (_, stderr) in zip(procs, outputs):
+            assert proc.returncode == 0, stderr
+        outcomes = [stdout.strip() for stdout, _ in outputs]
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
     assert outcomes.count("owner") == 1
     assert outcomes.count("reservation_in_progress") == 3
 
