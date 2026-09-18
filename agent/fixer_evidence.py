@@ -15,6 +15,9 @@ GEN_FIELDS = ('id', 'draft_id', 'account_key', 'kind', 'headline', 'cta', 'engin
               'model', 'route', 'grade_status', 'grade_reason', 'attempt', 'final_status', 'created_at')
 MAX_BYTES = 128 * 1024
 FOLDER_ID = re.compile(r'[A-Za-z0-9_-]{3,200}\Z')
+MEDIA_PAGE_SIZE = 500
+MEDIA_MAX_ASSETS = 10000
+MEDIA_MAX_SECONDS = 30
 
 class EvidenceError(Exception):
     def __init__(self, code, status=503):
@@ -122,6 +125,34 @@ def optional(fn, reason):
     except Exception:
         return {'status': 'unavailable', 'reason': reason}
 
+def count_source_assets(gym_key, source_id, read):
+    """Count only a complete, ordered source scan; server row caps cannot hide a tail."""
+    count, last_id = 0, None
+    deadline = time.monotonic() + MEDIA_MAX_SECONDS
+    while True:
+        if time.monotonic() > deadline:
+            raise EvidenceError('media_asset_count_unavailable', 503)
+        params = {'gym_id': f'eq.{gym_key}', 'source_id': f'eq.{source_id}',
+                  'select': 'id,gym_id,source_id', 'order': 'id.asc',
+                  'limit': str(MEDIA_PAGE_SIZE)}
+        if last_id is not None:
+            params['id'] = f'gt.{last_id}'
+        rows = read('media_asset', params)
+        if not isinstance(rows, list) or len(rows) > MEDIA_PAGE_SIZE:
+            raise EvidenceError('media_asset_count_unavailable', 503)
+        if not rows:
+            return count
+        for asset in rows:
+            if not isinstance(asset, dict) or asset.get('gym_id') != gym_key or asset.get('source_id') != source_id:
+                raise EvidenceError('media_asset_scope_mismatch', 409)
+            asset_id = asset.get('id')
+            if not isinstance(asset_id, str) or not asset_id or (last_id is not None and asset_id <= last_id):
+                raise EvidenceError('media_asset_count_unavailable', 503)
+            last_id = asset_id
+        count += len(rows)
+        if count > MEDIA_MAX_ASSETS:
+            raise EvidenceError('media_asset_count_unavailable', 503)
+
 def inspect_media_source(ticket_id, gym_key, folder_id, *, deps=None):
     """Read one exact Drive binding for one ticket-confirmed Echo tenant.
 
@@ -158,13 +189,7 @@ def inspect_media_source(ticket_id, gym_key, folder_id, *, deps=None):
     if (source.get('folder_id') != folder_id or source.get('gym_id') != gym_key
             or source.get('kind') != 'gym_drive' or not source.get('id')):
         raise EvidenceError('media_source_tenant_mismatch', 409)
-    assets = read('media_asset', {'gym_id': f'eq.{gym_key}',
-        'source_id': f"eq.{source['id']}", 'select': 'id,gym_id,source_id',
-        'limit': '1001'})
-    if len(assets) > 1000:
-        raise EvidenceError('media_asset_count_unavailable', 503)
-    if any(a.get('gym_id') != gym_key or a.get('source_id') != source['id'] for a in assets):
-        raise EvidenceError('media_asset_scope_mismatch', 409)
+    asset_count = count_source_assets(gym_key, source['id'], read)
     status = source.get('sync_status')
     if status not in ('idle', 'queued', 'indexing', 'ready', 'failed'):
         status = 'unknown'
@@ -175,7 +200,7 @@ def inspect_media_source(ticket_id, gym_key, folder_id, *, deps=None):
                        'sync_status': status,
                        'sync_finished_at': scrub(source.get('sync_finished_at')),
                        'sync_error_present': bool(source.get('sync_error'))},
-            'assets': {'status': 'available', 'count': len(assets)}}
+            'assets': {'status': 'available', 'count': asset_count}}
 
 def gather(ticket_id, *, deps=None, now=None):
     deps = deps or {}

@@ -24,6 +24,11 @@ def fixture():
     calls = []
     def read(table, params):
         calls.append((table, params))
+        if table == 'media_asset':
+            rows = sorted(tables[table], key=lambda row: row['id'])
+            if 'id' in params:
+                rows = [row for row in rows if row['id'] > params['id'][3:]]
+            return rows[:int(params['limit'])]
         return tables[table]
     return {'read': read, 'resolve': lambda _: 'portal-uuid'}, tables, calls
 
@@ -39,9 +44,10 @@ def test_valid_readback_is_bounded_and_read_only(monkeypatch):
                               'sync_status': 'ready', 'sync_finished_at': '2026-09-18T10:00:00Z',
                               'sync_error_present': False}
     assert body['assets'] == {'status': 'available', 'count': 1}
-    assert [t for t, _ in calls] == ['support_tickets', 'media_source', 'media_asset']
+    assert [t for t, _ in calls] == ['support_tickets', 'media_source', 'media_asset', 'media_asset']
     assert calls[1][1]['folder_id'] == 'eq.' + FOLDER
     assert calls[2][1]['source_id'] == 'eq.source-1'
+    assert calls[3][1]['id'] == 'gt.asset-1'
 
 
 def test_wrong_tenant_and_ambiguous_folder_fail_closed():
@@ -84,3 +90,70 @@ def test_missing_source_is_unknown_and_error_text_is_withheld():
     result = evidence.inspect_media_source(TICKET, GYM, FOLDER, deps=deps)
     assert result['source']['sync_error_present'] is True
     assert 'credential secret' not in str(result)
+
+
+def test_server_row_cap_never_masquerades_as_exact_asset_count():
+    deps, tables, calls = fixture()
+    tables['media_asset'] = [dict(tables['media_asset'][0], id=f'asset-{n:04d}')
+                             for n in range(1201)]
+    original = deps['read']
+    def capped(table, params):
+        rows = original(table, params)
+        return rows[:400] if table == 'media_asset' else rows
+    deps['read'] = capped
+    result = evidence.inspect_media_source(TICKET, GYM, FOLDER, deps=deps)
+    assert result['assets'] == {'status': 'available', 'count': 1201}
+    assert [params.get('id') for table, params in calls if table == 'media_asset'] == [
+        None, 'gt.asset-0399', 'gt.asset-0799', 'gt.asset-1199', 'gt.asset-1200']
+
+
+@pytest.mark.parametrize('bad_row', [
+    {'id': 'asset-2', 'gym_id': 'foreign', 'source_id': 'source-1'},
+    {'id': 'asset-2', 'gym_id': GYM, 'source_id': 'foreign'},
+])
+def test_later_page_scope_mismatch_fails_closed(bad_row):
+    deps, tables, _ = fixture()
+    tables['media_asset'] = [dict(tables['media_asset'][0], id=f'asset-{n:04d}')
+                             for n in range(evidence.MEDIA_PAGE_SIZE)]
+    bad_row['id'] = 'asset-0500'
+    tables['media_asset'].append(bad_row)
+    with pytest.raises(evidence.EvidenceError, match='media_asset_scope_mismatch'):
+        evidence.inspect_media_source(TICKET, GYM, FOLDER, deps=deps)
+
+
+def test_nonadvancing_or_unbounded_pages_fail_closed():
+    deps, tables, _ = fixture()
+    original = deps['read']
+    def stale(table, params):
+        if table == 'media_asset':
+            return tables['media_asset']
+        return original(table, params)
+    deps['read'] = stale
+    with pytest.raises(evidence.EvidenceError, match='media_asset_count_unavailable'):
+        evidence.inspect_media_source(TICKET, GYM, FOLDER, deps=deps)
+
+    deps, tables, _ = fixture()
+    tables['media_asset'] = [dict(tables['media_asset'][0], id=f'asset-{n:05d}')
+                             for n in range(evidence.MEDIA_MAX_ASSETS + 1)]
+    with pytest.raises(evidence.EvidenceError, match='media_asset_count_unavailable'):
+        evidence.inspect_media_source(TICKET, GYM, FOLDER, deps=deps)
+
+
+def test_count_timeout_and_later_read_error_never_return_partial_count(monkeypatch):
+    deps, tables, _ = fixture()
+    tables['media_asset'] = [dict(tables['media_asset'][0], id=f'asset-{n:04d}')
+                             for n in range(evidence.MEDIA_PAGE_SIZE + 1)]
+    original = deps['read']
+    def later_error(table, params):
+        if table == 'media_asset' and 'id' in params:
+            raise evidence.EvidenceError('store_unavailable')
+        return original(table, params)
+    deps['read'] = later_error
+    with pytest.raises(evidence.EvidenceError, match='store_unavailable'):
+        evidence.inspect_media_source(TICKET, GYM, FOLDER, deps=deps)
+
+    clock = iter([0, 0, evidence.MEDIA_MAX_SECONDS + 1])
+    monkeypatch.setattr(evidence.time, 'monotonic', lambda: next(clock))
+    deps, tables, _ = fixture()
+    with pytest.raises(evidence.EvidenceError, match='media_asset_count_unavailable'):
+        evidence.inspect_media_source(TICKET, GYM, FOLDER, deps=deps)
