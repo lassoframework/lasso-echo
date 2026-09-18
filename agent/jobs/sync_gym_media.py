@@ -488,7 +488,28 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             changes["reject_reason"] = r.get("reject_reason")
         if changes:
             changes["indexed_at"] = now_iso
-            store.update_asset(r["id"], changes)
+            if old.get("content_hash") != r.get("content_hash"):
+                # Drive IDs survive byte replacement. All inspection and
+                # consent decisions for the old bytes must be invalidated in
+                # the same conditional write as the new hash. A concurrent
+                # operator review locks/checks the old hash and cannot revive
+                # this asset after this patch.
+                changes.update(
+                    review_status="pending_review", reviewed_by=None,
+                    reviewed_at=None, review_note=None,
+                    review_content_hash=None,
+                    moderation_status="pending", moderation_json=None,
+                    people_detected=None, consent_status="pending",
+                    consent_member_ref=None, release_ref=None,
+                    consent_expires_at=None,
+                    eligible=r.get("eligible"),
+                    duration_sec=None, width=r.get("width"),
+                    height=r.get("height"), aspect=r.get("aspect"),
+                    vision_json=None, rendition_key=None, rendition_url=None)
+                store.update_indexed_asset_if_hash(
+                    gym_id, r["id"], old.get("content_hash"), changes)
+            else:
+                store.update_asset(r["id"], changes)
             updated += 1
 
     # 4. Nightly reconciliation only. The queued post-bind import must never

@@ -22,9 +22,13 @@ class ReviewCalendarStore(_FakeStore):
 
 def asset(gym_id="lasso", **overrides):
     data = dict(id="asset-1", gym_id=gym_id, eligible=True,
+                content_hash="hash-asset-1", review_content_hash="hash-asset-1",
                 review_status="approved", reviewed_by="operator",
                 reviewed_at="2026-08-26T00:00:00Z",
-                moderation_status="clean", moderation_json={"provider": "test", "verdict": "clean"},
+                moderation_status="clean", moderation_json={
+                    "provider": "test", "verdict": "clean", "content_hash": "hash-asset-1",
+                    "asset_id": "asset-1", "gym_id": gym_id, "people_detected": False,
+                    "observed_at": "2026-08-26T00:00:00Z"},
                 people_detected=False, consent_status="not_required")
     data.update(overrides)
     return data

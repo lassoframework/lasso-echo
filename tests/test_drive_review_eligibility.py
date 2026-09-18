@@ -19,8 +19,13 @@ def asset(**fields):
 def approved(**fields):
     row = asset(review_status="approved", reviewed_by="operator",
                 reviewed_at="2026-09-18T00:00:00Z", moderation_status="clean",
-                moderation_json={"provider": "test", "verdict": "clean"},
                 people_detected=False, consent_status="not_required")
+    row["review_content_hash"] = row["content_hash"]
+    row["moderation_json"] = {"provider": "test", "verdict": "clean",
+                              "content_hash": row["content_hash"],
+                              "asset_id": row["id"], "gym_id": row["gym_id"],
+                              "people_detected": False,
+                              "observed_at": "2026-09-18T00:00:00Z"}
     row.update(fields)
     return row
 
@@ -51,6 +56,7 @@ def test_people_asset_requires_live_release(change):
     row.update(people_detected=True, consent_status="granted",
                consent_member_ref="member-1", release_ref="release-1",
                consent_expires_at=(datetime.now(timezone.utc) + timedelta(days=2)).isoformat())
+    row["moderation_json"]["people_detected"] = True
     assert gym_media_selector.is_usable(row)
     row.update(change)
     assert not gym_media_selector.is_usable(row)
@@ -62,11 +68,10 @@ def test_moderation_must_be_clean(status):
 
 
 def test_operator_approval_requires_evidence_and_records_actor():
-    store = FakeMediaStore(assets=[asset(moderation_status="clean",
-                                        moderation_json={"provider": "test", "verdict": "clean"},
-                                        people_detected=False,
-                                        consent_status="not_required")])
-    store.update_review_asset = lambda gym, aid, fields: store.update_asset(aid, fields)
+    row = approved()
+    row.update(review_status="pending_review", reviewed_by=None, reviewed_at=None,
+               review_content_hash=None)
+    store = FakeMediaStore(assets=[row])
     result = gym_media_review.review_asset("gym1", "drive1", "approve",
                                           store=store, operator="local-user")
     assert result["review_status"] == "approved"

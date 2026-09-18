@@ -62,13 +62,25 @@ def _parse_ts(s):
 
 
 def _clean_moderation_evidence(asset):
-    """Require a typed, attributable clean verdict, not a truthy JSON value."""
+    """Only evidence for this exact Drive file and byte version can clear it.
+
+    This validates binding, not the identity of a scan provider. A trusted scan
+    producer is still required before operators can safely populate evidence.
+    """
     evidence = asset.get("moderation_json")
     if asset.get("moderation_status") != "clean" or not isinstance(evidence, dict):
         return False
+    content_hash = str(asset.get("content_hash") or "").strip()
+    if not content_hash or not asset.get("id") or not asset.get("gym_id"):
+        return False
     return (evidence.get("verdict") == "clean"
             and isinstance(evidence.get("provider"), str)
-            and bool(evidence["provider"].strip()))
+            and bool(evidence["provider"].strip())
+            and evidence.get("content_hash") == content_hash
+            and evidence.get("asset_id") == asset["id"]
+            and evidence.get("gym_id") == asset["gym_id"]
+            and evidence.get("people_detected") is asset.get("people_detected")
+            and _parse_ts(evidence.get("observed_at")) is not None)
 
 
 def is_usable(asset):
@@ -92,6 +104,10 @@ def is_usable(asset):
     if a.get("review_status") != "approved":
         return False
     if not a.get("reviewed_by") or not _parse_ts(a.get("reviewed_at")):
+        return False
+    if not str(a.get("content_hash") or "").strip():
+        return False
+    if a.get("review_content_hash") != a.get("content_hash"):
         return False
     if not _clean_moderation_evidence(a):
         return False

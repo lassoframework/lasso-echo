@@ -7,6 +7,7 @@ import pytest
 from PIL import Image
 from agent import media_bridge as mb, config, db
 from agent.media_bridge_route import Route
+from tests.gym_media_fakes import bound_review_fields
 
 
 def _valid_jpeg():
@@ -171,12 +172,7 @@ def test_active_drive_inventory_suppresses_depletion_alert(monkeypatch):
                 return [{'id': 'a1', 'gym_id': gym, 'eligible': True,
                          'excluded_by_coach': False, 'used_count': 0,
                          'last_used_at': None, 'kind': 'photo',
-                         'review_status': 'approved', 'reviewed_by': 'operator',
-                         'reviewed_at': '2026-09-18T00:00:00Z',
-                         'moderation_status': 'clean',
-                         'moderation_json': {'verdict': 'clean', 'provider': 'test-review'},
-                         'people_detected': False,
-                         'consent_status': 'not_required'}]
+                         **bound_review_fields('a1', gym)}]
     from agent import gym_media_index
     monkeypatch.setattr(gym_media_index, 'default_store', lambda: MediaStore())
     assert cif.real_media_depleted('gymx') is False

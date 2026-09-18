@@ -16,7 +16,6 @@ def reviewed_asset(*args, **kwargs):
     row = make_asset(*args, **kwargs)
     row.update(review_status="approved", reviewed_by="operator",
                reviewed_at="2026-08-26T00:00:00Z", moderation_status="clean",
-               moderation_json={"provider": "test", "verdict": "clean"}, people_detected=False,
                consent_status="not_required")
     return row
 

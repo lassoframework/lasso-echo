@@ -25,6 +25,7 @@ So this file does three things no fixture-driven test can do:
      wrong for a SELECTOR, which decides which rows come in.)
 """
 import inspect
+from tests.gym_media_fakes import bound_review_fields
 
 import pytest
 
@@ -128,10 +129,7 @@ def test_probe_drive_with_no_deps_uses_the_selectors_own_predicate(monkeypatch):
         sources=[{"id": "s1", "gym_id": "g", "kind": "gym_drive", "active": True,
                   "revoked_externally": False}],
         assets=[{"id": "a1", "gym_id": "g", "source_id": "s1", "eligible": True,
-                 "excluded_by_coach": False, "review_status": "approved",
-                 "reviewed_by": "test-reviewer", "reviewed_at": "2026-09-01T12:00:00+00:00",
-                 "moderation_status": "clean", "moderation_json": {"verdict": "clean", "provider": "test-review"},
-                 "people_detected": False, "consent_status": "not_required"},
+                 "excluded_by_coach": False, **bound_review_fields("a1", "g")},
                 {"id": "a2", "gym_id": "g", "source_id": "s1", "eligible": None}])
     monkeypatch.setattr(_idx, "default_store", lambda: store)
     monkeypatch.setattr(_sel, "is_usable", spy)
@@ -204,11 +202,8 @@ def test_the_whole_decision_runs_with_no_deps_at_all(monkeypatch):
     def spy(source, **kw):
         store.assets.extend([{"id": f"a{i}", "gym_id": "crossfitlocal",
                               "source_id": "s1", "eligible": True,
-                              "excluded_by_coach": False, "review_status": "approved",
-                              "reviewed_by": "test-reviewer",
-                              "reviewed_at": "2026-09-01T12:00:00+00:00",
-                              "moderation_status": "clean", "moderation_json": {"verdict": "clean", "provider": "test-review"},
-                              "people_detected": False, "consent_status": "not_required"}
+                              "excluded_by_coach": False,
+                              **bound_review_fields(f"a{i}", "crossfitlocal")}
                              for i in range(6)])
         return {"ok": True, "inserted": 6}
 
