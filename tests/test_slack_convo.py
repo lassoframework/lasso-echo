@@ -840,6 +840,13 @@ def test_verified_ops_notice_posts_and_resolves_only_for_current_request(monkeyp
     assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == prior_posts
 
 
+def _fixer_business_proof(request_key, merged_sha):
+    return {"source": "independent_business_check", "verified": True,
+            "symptom_resolved": True, "check_id": "verified-customer-symptom",
+            "evidence": "Observed the customer symptom resolved",
+            "request_key": request_key, "merged_sha": merged_sha}
+
+
 def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
@@ -884,7 +891,8 @@ def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
 
     bus.set_ticket(tid, verification_after={"exit_code": 0, "fixer": {"merged_sha": sha,
                     "deployment_check": {"verified": True, "sha": sha},
-                    "request_key": request_key}})
+                    "request_key": request_key,
+                    "business_postcondition": _fixer_business_proof(request_key, sha)}})
     final = notice()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
                 member_check=lambda channel, user: channel == "C_CLIENT" and
@@ -951,6 +959,7 @@ def test_fixer_correction_during_slack_post_keeps_ticket_open(monkeypatch):
     bus.record_inbound(ticket_id=tid, author_type="client", body="Original request")
     key = OB._current_fixer_request_key(bus, bus.ticket(tid))
     bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = key
+    bus.tickets[tid]["verification_after"]["fixer"]["business_postcondition"] = _fixer_business_proof(key, sha)
     notice = bus.record_outbound(
         ticket_id=tid, author_type="echo", body="The fix is live.",
         delivery_status="ready", kind=A.KIND_STATUS,
@@ -1041,6 +1050,7 @@ def test_fixer_customer_slack_reply_requires_blake_in_destination(
     bus.record_inbound(ticket_id=tid, author_type="client", body="Please fix this")
     request_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
     bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = request_key
+    bus.tickets[tid]["verification_after"]["fixer"]["business_postcondition"] = _fixer_business_proof(request_key, sha)
     row = bus.record_outbound(ticket_id=tid, author_type="echo", body="Fixed.",
         delivery_status="ready", kind=A.KIND_STATUS,
         meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
@@ -1094,6 +1104,7 @@ def test_fixer_customer_slack_reply_does_not_send_if_exact_body_cannot_be_saved(
     bus.record_inbound(ticket_id=tid, author_type="client", body="Please fix this")
     request_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
     bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = request_key
+    bus.tickets[tid]["verification_after"]["fixer"]["business_postcondition"] = _fixer_business_proof(request_key, sha)
     row = bus.record_outbound(ticket_id=tid, author_type="echo", body="Fixed.",
         delivery_status="ready", kind=A.KIND_STATUS,
         meta={"identity": "echo", "recipient_kind": "client", "fixer": True,

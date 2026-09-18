@@ -152,6 +152,12 @@ def _verified_fix_notice(ticket, att, kind):
                 and bool(ticket.get("client_id"))
                 and operation.get("tenantId") == ticket.get("client_id")
                 and bool(release.get("request_key")))
+    # A healthy deployment proves the code is live, not that this owner's symptom
+    # is gone. The independent business check must identify its observation and
+    # bind it to the exact request and commit being released.
+    business = release.get("business_postcondition") or {}
+    if not isinstance(business, dict):
+        return False
     return (kind == _a.KIND_STATUS and att.get("resolve_notice") is True
             and ticket.get("status") == "merged"
             and verification.get("exit_code") == 0
@@ -160,7 +166,15 @@ def _verified_fix_notice(ticket, att, kind):
             and att.get("pr_url") == ticket.get("fix_pr_url")
             and bool(release.get("merged_sha"))
             and deployment.get("verified") is True
-            and deployment.get("sha") == release.get("merged_sha"))
+            and deployment.get("sha") == release.get("merged_sha")
+            and bool(release.get("request_key"))
+            and business.get("source") == "independent_business_check"
+            and business.get("verified") is True
+            and business.get("symptom_resolved") is True
+            and bool(str(business.get("check_id") or "").strip())
+            and bool(str(business.get("evidence") or "").strip())
+            and business.get("request_key") == release.get("request_key")
+            and business.get("merged_sha") == release.get("merged_sha"))
 
 
 def _current_fixer_request_key(bus, ticket):
@@ -915,7 +929,7 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         proof_meta = {"resolve_notice": True, "pr_url": ticket.get("fix_pr_url")}
         if not _verified_fix_notice(ticket, proof_meta, _a.KIND_STATUS):
             return refuse_fix("customer fix has no current merged, deployed and "
-                              "verified release")
+                              "independently verified business postcondition")
         try:
             current_key = _current_fixer_request_key(bus, ticket)
         except Exception:  # noqa: BLE001 - a human tap cannot waive unreadable context

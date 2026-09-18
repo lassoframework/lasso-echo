@@ -252,6 +252,63 @@ def _fix_proof():
         "merged_sha": "abc123", "deployment_check": {"verified": True, "sha": "abc123"}}}
 
 
+def _verify_business(bus):
+    release = bus.tickets["t-1"]["verification_after"]["fixer"]
+    request_key = OB._current_fixer_request_key(bus, bus.ticket("t-1"))
+    release["request_key"] = request_key
+    release["business_postcondition"] = {
+        "source": "independent_business_check", "verified": True,
+        "symptom_resolved": True, "check_id": "business-check-1",
+        "evidence": "Observed the reported symptom resolved for this request",
+        "request_key": request_key, "merged_sha": release["merged_sha"]}
+
+
+def test_healthy_deployment_with_unresolved_business_symptom_cannot_notify():
+    bus = Bus([_ticket(classification="code_fix", status="merged",
+                       fix_pr_url="https://example.test/pr/1",
+                       verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    _verify_business(bus)
+    release = bus.tickets["t-1"]["verification_after"]["fixer"]
+    release["business_postcondition"]["symptom_resolved"] = False
+    assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                     log=lambda *a: None)
+    assert [m for m in bus.of_kind(A.KIND_STATUS)
+            if (m.get("attachments") or {}).get("recipient_kind") == "client"] == []
+
+    # A stale queued notice must also be suppressed by the dispatch-time read.
+    row = bus.record_outbound(
+        ticket_id="t-1", author_type="echo", body=OB.RESOLVED_NOTICE,
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "resolve_notice": True, "request_key": release["request_key"],
+              "pr_url": bus.ticket("t-1")["fix_pr_url"]})
+    sent, post = _posts()
+    OB.run_once(bus, post, identity=ECHO, log=lambda *a: None)
+    assert bus.message(row["id"])["delivery_status"] == "suppressed"
+    assert not any(item["channel"] == "G_CLIENT" for item in sent)
+
+
+def test_business_evidence_must_match_request_and_merged_sha():
+    bus = Bus([_ticket(classification="code_fix", status="merged",
+                       fix_pr_url="https://example.test/pr/1",
+                       verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    _verify_business(bus)
+    business = bus.tickets["t-1"]["verification_after"]["fixer"]["business_postcondition"]
+    for field, stale in (("request_key", "old-request"), ("merged_sha", "old-sha"),
+                         ("evidence", ""), ("check_id", ""),
+                         ("source", "deployment_check")):
+        original = business[field]
+        business[field] = stale
+        assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                         log=lambda *a: None), field
+        business[field] = original
+    assert bus.of_kind(A.KIND_STATUS) == []
+
+
 def test_legacy_untagged_code_fix_ack_never_reaches_portal_thread():
     bus = Bus([_ticket(classification="code_fix", status="hold")])
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
@@ -337,15 +394,13 @@ def test_code_fix_resolve_requires_release_and_blake_in_conversation():
     bus.set_ticket("t-1", slack_channel_id="G_CLIENT")
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
                        author_type="client", author_id="owner@gym.com", body="broken", meta={})
-    bus.tickets["t-1"]["verification_after"]["fixer"]["request_key"] = (
-        OB._current_fixer_request_key(bus, bus.ticket("t-1")))
+    _verify_business(bus)
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
                        author_type="client", author_id="owner@gym.com",
                        body="Correction before the resolve tap", meta={})
     assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
                                      log=lambda *a: None)
-    bus.tickets["t-1"]["verification_after"]["fixer"]["request_key"] = (
-        OB._current_fixer_request_key(bus, bus.ticket("t-1")))
+    _verify_business(bus)
     assert OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
                                  log=lambda *a: None)
     sent, post = _posts()
@@ -362,8 +417,7 @@ def test_verified_fix_notice_names_blake_in_group_dm():
                        verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
                        author_type="client", author_id="owner@gym.com", body="broken", meta={})
-    bus.tickets["t-1"]["verification_after"]["fixer"]["request_key"] = (
-        OB._current_fixer_request_key(bus, bus.ticket("t-1")))
+    _verify_business(bus)
     assert OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
                                  log=lambda *a: None)
     sent, post = _posts()
