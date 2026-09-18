@@ -20,8 +20,21 @@ TICKET = "27728832-ae54-428c-af8b-0cb5c8ca1666"
 
 
 class FakeBus:
-    def __init__(self):
+    def __init__(self, ticket=None, tokens=None, error=None):
         self.rows = []
+        self.ticket_row = ticket if ticket is not None else {
+            "id": TICKET, "product": "echo", "source": "ops_fix", "client_id": None}
+        self.token_rows = tokens if tokens is not None else []
+        self.error = error
+
+    def _get(self, table, params):
+        if self.error:
+            raise self.error
+        if table == "support_tickets":
+            return [self.ticket_row] if self.ticket_row and params["id"] == f"eq.{TICKET}" else []
+        if table == "echo_intake_tokens":
+            return self.token_rows
+        raise AssertionError(f"unexpected table: {table}")
 
     def record_outbound(self, **kw):
         self.rows.append(kw)
@@ -93,6 +106,55 @@ def test_bad_json_and_missing_fields_are_400(armed):
 def test_unknown_action_is_404_and_never_runs(armed):
     status, body = _post("nuke_everything", _body())
     assert status == 404 and body["error"] == "unknown_action"
+
+
+def test_client_ticket_gym_mapping_is_checked_before_ops_side_effect(armed):
+    client_id = "a0fcb10f-73dc-4e56-b6ca-61ac9bc9470f"
+    ticket = {"id": TICKET, "product": "echo", "source": "slack_conversation",
+              "client_id": client_id}
+    calls = []
+    def reset(key):
+        calls.append(key)
+        return {"before": {"limit": 1, "used": 1, "remaining": 0},
+                "after": {"limit": 1, "used": 0, "remaining": 1}}
+    deps = {"reset_recreate_budget": reset}
+    for tokens, expected in [
+        ([{"gym_id": client_id, "echo_account_key": "differentgym123"}], "ticket_tenant_mismatch"),
+        ([], "ticket_tenant_unconfirmed"),
+        ([{"gym_id": client_id, "echo_account_key": GYM}] * 2, "ticket_tenant_unconfirmed"),
+        ([{"gym_id": "other-uuid", "echo_account_key": GYM}], "ticket_tenant_unconfirmed"),
+        ([{"gym_id": client_id, "echo_account_key": None}], "ticket_tenant_unconfirmed"),
+    ]:
+        status, body = _post("reset_recreate_budget", _body(),
+                             deps={**deps, "bus": FakeBus(ticket, tokens)})
+        assert status == 409 and body["error"] == expected
+    status, body = _post("reset_recreate_budget", _body(),
+                         deps={**deps, "bus": FakeBus(ticket, [{"gym_id": client_id,
+                                                               "echo_account_key": GYM}])})
+    assert status == 200 and body["ok"] is True and calls == [GYM]
+
+
+def test_tenant_store_failure_or_missing_client_does_not_run_action(armed):
+    calls = []
+    action = lambda key: calls.append(key)
+    for bus, status in [
+        (FakeBus(ticket={"id": TICKET, "product": "echo", "source": "slack_conversation",
+                         "client_id": None}), 409),
+        (FakeBus(ticket={"id": "other", "product": "echo", "source": "ops_fix",
+                         "client_id": None}), 409),
+        (FakeBus(error=RuntimeError("store unavailable")), 503),
+    ]:
+        result, _body_out = _post("reset_recreate_budget", _body(),
+                                  deps={"bus": bus, "reset_recreate_budget": action})
+        assert result == status
+    assert calls == []
+
+
+def test_account_key_ticket_must_match_exactly(armed):
+    ticket = {"id": TICKET, "product": "echo", "source": "slack_conversation",
+              "client_id": "othergym123"}
+    status, body = _post("reset_recreate_budget", _body(), deps={"bus": FakeBus(ticket)})
+    assert status == 409 and body["error"] == "ticket_tenant_mismatch"
 
 
 @pytest.mark.parametrize("name", sorted(FO.ORG_FLOOR_ACTIONS))

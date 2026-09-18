@@ -86,6 +86,7 @@ _GYM_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,79}$")
 _ROW_ID = re.compile(r"^[A-Za-z0-9_-]{6,80}$")
 _TICKET_ID = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_UUID = re.compile(r"^[a-fA-F0-9]{8}-(?:[a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}$")
 
 # Named so a FIXER that asks for one of these gets a 403 that says WHY, not a 404 that
 # reads like a typo. Nothing here has an implementation and nothing here may get one
@@ -592,6 +593,51 @@ def _audit(action, gym_key, ticket_id, status, summary, log=print):
         f"status={status} at={_now_iso()} summary={summary!r}")
 
 
+def _ticket_tenant(gym_key, ticket_id, deps):
+    """Bind an ops request to the persisted ticket before any side effect.
+
+    A portal ticket's client_id is a gym UUID; the portal's exact token mapping
+    supplies its Echo account key. Older Echo tickets can carry the account key
+    directly. Internal ops_fix alerts have no client_id and remain a separate,
+    explicitly identified automation lane. A missing or ambiguous mapping never
+    authorizes a write. Only the two identity columns are read from tokens.
+    """
+    bus = deps.get("bus")
+    if bus is None:
+        from .slack_convo.bus import Bus
+        bus = Bus()
+    try:
+        tickets = bus._get("support_tickets", {
+            "id": f"eq.{ticket_id}", "select": "id,product,source,client_id", "limit": "2"})
+        if (not isinstance(tickets, list) or len(tickets) != 1
+                or not isinstance(tickets[0], dict)
+                or tickets[0].get("id") != ticket_id):
+            return 409, {"error": "ticket_tenant_unconfirmed"}
+        ticket = tickets[0]
+        client_id = ticket.get("client_id")
+        if client_id is None:
+            if ticket.get("product") == "echo" and ticket.get("source") == "ops_fix":
+                return None
+            return 409, {"error": "ticket_tenant_unconfirmed"}
+        if not isinstance(client_id, str) or not client_id.strip():
+            return 409, {"error": "ticket_tenant_unconfirmed"}
+        if not _UUID.fullmatch(client_id):
+            return None if client_id == gym_key else (409, {"error": "ticket_tenant_mismatch"})
+        tokens = bus._get("echo_intake_tokens", {
+            "gym_id": f"eq.{client_id}", "select": "gym_id,echo_account_key", "limit": "2"})
+        if (not isinstance(tokens, list) or len(tokens) != 1
+                or not isinstance(tokens[0], dict)
+                or tokens[0].get("gym_id") != client_id
+                or not isinstance(tokens[0].get("echo_account_key"), str)
+                or not _GYM_KEY.fullmatch(tokens[0]["echo_account_key"])):
+            return 409, {"error": "ticket_tenant_unconfirmed"}
+        if tokens[0]["echo_account_key"] != gym_key:
+            return 409, {"error": "ticket_tenant_mismatch"}
+        return None
+    except Exception:  # noqa: BLE001 - unreadable identity plane cannot authorize a write
+        return 503, {"error": "ticket_tenant_unavailable"}
+
+
 # --------------------------------------------------------------------------------------
 # dispatch
 # --------------------------------------------------------------------------------------
@@ -626,6 +672,11 @@ def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
         args = {}
     if not isinstance(args, dict):
         return 400, {"error": "bad_request", "detail": "args must be an object"}
+    tenant_refusal = _ticket_tenant(gym_key, ticket_id, deps)
+    if tenant_refusal:
+        _audit(action, gym_key, ticket_id, tenant_refusal[0],
+               tenant_refusal[1]["error"], log)
+        return tenant_refusal
     if spec.needs_volume:
         has_volume = deps["volume_available"]() if "volume_available" in deps \
             else volume_available()
