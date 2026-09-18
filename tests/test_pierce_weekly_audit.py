@@ -187,6 +187,19 @@ def test_sample_rows_do_not_satisfy_slots():
     assert report["counts"]["sample_rows_excluded"] == 14
 
 
+def test_unexpected_feed_slots_are_reported_for_both_platforms():
+    start = date(2026, 9, 19)
+    rows = complete_week_rows(start)
+    for account in ("instagram", "facebook"):
+        extra = feed_pair("2026-09-19", "other", "Another post", "extra.jpg")
+        rows.extend(r for r in extra if r["account"] == account)
+    report = audit.audit_week(FakeStore(rows), start)
+    codes = {f["code"] for f in report["findings"]}
+    assert "unexpected_ig_feed_slots" in codes
+    assert "unexpected_fb_feed_slots" in codes
+    assert report["ok"] is False
+
+
 @pytest.mark.parametrize("bad_status",
                          ["denied", "killed", "deleted", "failed", "candidate"])
 def test_non_ready_feed_rows_do_not_satisfy_slots(bad_status):

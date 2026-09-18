@@ -199,9 +199,12 @@ def audit_week(store, start, *, base=BASE, days=DAYS):
                     finding("blank_ig_media", day, slot=slot)
                 captions.setdefault(cap, []).append((day, slot))
                 media_keys.setdefault(key, []).append((day, slot))
-        extra_slots = sorted(set(day_ig) - set(EXPECTED_SLOTS))
-        if extra_slots:
-            finding("unexpected_ig_feed_slots", day, slots=extra_slots)
+        for label, day_slots in (("ig", day_ig), ("fb", day_fb)):
+            extra_slots = sorted(
+                (s for s in day_slots if s not in EXPECTED_SLOTS), key=str)
+            if extra_slots:
+                finding(f"unexpected_{label}_feed_slots", day,
+                        slots=extra_slots)
         day_stories = stories.get(day, {})
         for slot in EXPECTED_SLOTS:
             st_slot = day_stories.get(slot, [])
