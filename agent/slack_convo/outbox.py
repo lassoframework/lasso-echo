@@ -473,15 +473,17 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         summary["skipped"] += 1
         return
     # Scout raises this system alert precisely when the portal bridge cannot
-    # establish the ticket's bot identity. Route only the stamped internal
-    # escalation for this product; never grant a conversational row this bypass.
+    # establish the ticket's bot identity. Portal tickets belong to Scout's
+    # outbox, while Echo tickets belong to Echo's. Route only this stamped
+    # internal escalation; never grant a conversational row this bypass.
     portal_provenance_alert = (
         kind == _a.KIND_ESCALATION
         and row.get("direction") == "outbound"
         and row.get("author_type") == "system"
         and att.get("surface") == "portal_bridge_provenance"
         and row_ident == identity.name
-        and ticket.get("product") == identity.product)
+        and (ticket.get("product"), identity.name) in {
+            ("echo", "echo"), ("portal", "scout")})
     if (ticket.get("bot_identity") or "") != identity.name and not portal_provenance_alert:
         summary["skipped"] += 1
         return

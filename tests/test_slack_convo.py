@@ -743,19 +743,22 @@ def _rows(bus, tid, kind):
 
 
 @pytest.mark.parametrize("parent_identity", [None, "ranger"])
-def test_portal_provenance_system_alert_routes_to_fixer_once(monkeypatch, parent_identity):
+@pytest.mark.parametrize("product,row_identity", [("echo", "echo"), ("portal", "scout")])
+def test_portal_provenance_system_alert_routes_to_fixer_once(
+        monkeypatch, parent_identity, product, row_identity):
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    monkeypatch.setenv("SCOUT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     tid = str(uuid.uuid4())
-    bus.tickets[tid] = {"id": tid, "product": "echo", "status": "hold",
+    bus.tickets[tid] = {"id": tid, "product": product, "status": "hold",
                         "bot_identity": parent_identity, "slack_channel_id": "C_CLIENT"}
     row = bus.record_outbound(
         ticket_id=tid, author_type="system", body="Portal bridge provenance failed",
         delivery_status="ready", kind=A.KIND_ESCALATION,
-        meta={"identity": "echo", "surface": "portal_bridge_provenance"})
+        meta={"identity": row_identity, "surface": "portal_bridge_provenance"})
     post, calls = _posted()
-    first = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    second = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    first = OB.run_once(bus, post, identity=IDS.get(row_identity), log=lambda *a: None)
+    second = OB.run_once(bus, post, identity=IDS.get(row_identity), log=lambda *a: None)
     assert first["posted"] == 1 and second["posted"] == 0
     assert bus.message(row["id"])["delivery_status"] == "posted"
     assert bus.message(row["id"])["slack_ts"] == "9.999"
@@ -766,23 +769,28 @@ def test_portal_provenance_system_alert_routes_to_fixer_once(monkeypatch, parent
 
 
 @pytest.mark.parametrize("defect", ["wrong_surface", "wrong_kind", "wrong_author",
-                                    "wrong_product", "wrong_row_identity"])
+                                    "wrong_product", "wrong_row_identity",
+                                    "portal_to_echo", "echo_to_scout"])
 def test_portal_provenance_bypass_requires_exact_internal_shape(monkeypatch, defect):
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    monkeypatch.setenv("SCOUT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     tid = str(uuid.uuid4())
-    bus.tickets[tid] = {"id": tid, "product": "ranger" if defect == "wrong_product" else "echo",
+    product = ("ranger" if defect == "wrong_product" else
+               "portal" if defect == "portal_to_echo" else "echo")
+    row_identity = "scout" if defect == "echo_to_scout" else "echo"
+    bus.tickets[tid] = {"id": tid, "product": product,
                         "status": "hold", "bot_identity": None,
                         "slack_channel_id": "C_CLIENT"}
     row = bus.record_outbound(
         ticket_id=tid, author_type="echo" if defect == "wrong_author" else "system",
         body="A portal bridge notice", delivery_status="ready",
         kind=A.KIND_STATUS if defect == "wrong_kind" else A.KIND_ESCALATION,
-        meta={"identity": "ranger" if defect == "wrong_row_identity" else "echo",
+        meta={"identity": "ranger" if defect == "wrong_row_identity" else row_identity,
               "surface": "portal_ticket_bridge" if defect == "wrong_surface"
               else "portal_bridge_provenance"})
     post, calls = _posted()
-    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    OB.run_once(bus, post, identity=IDS.get(row_identity), log=lambda *a: None)
     assert bus.message(row["id"])["delivery_status"] == "ready"
     assert calls == []
     assert bus.ticket(tid)["bot_identity"] is None
