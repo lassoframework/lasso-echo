@@ -229,6 +229,7 @@ def _run_resend_connect_link(ctx):
     sent = bool(notify(ctx.gym_key, gym_id, name, force=True, alert=alerts.append))
     if sent:
         return 200, {"sent": True, "gym_id": gym_id, "gym_name": name,
+                     "postcondition_verified": False,
                      "summary": f"connect link re-sent to the owner of {name}"}
     return 409, {"error": "not_sent", "sent": False, "gym_id": gym_id, "gym_name": name,
                  "detail": (alerts[-1] if alerts else "notify_new_gym declined to send"),
@@ -285,7 +286,8 @@ def _run_release_denied_assets(ctx):
     observe = _dep(ctx, "observe_denials", lambda: __import__(
         "agent.gym_media_selector", fromlist=["observe_denials"]).observe_denials)
     out = observe() or {}
-    return 200, {**out, "summary": (f"deny sweep checked {out.get('checked', 0)} date(s), "
+    return 200, {**out, "postcondition_verified": False,
+                 "summary": (f"deny sweep checked {out.get('checked', 0)} date(s), "
                                     f"rolled back {out.get('rolled_back', 0)} asset(s)")}
 
 
@@ -306,6 +308,30 @@ def _run_swap_media(ctx):
         "agent.portal_social", fromlist=["handle_swap_media"]).handle_swap_media)
     status, body = handler(ctx.gym_key, rid, f"{ACTOR}:{ctx.ticket_id}")
     body = dict(body or {})
+    if int(status) == 200 and body.get("ok") is True:
+        # The handler's returned row is a write response, not an independent proof.
+        # A missing or failed readback is ambiguous: the write may already have landed,
+        # so report it without invoking the non-idempotent swap a second time.
+        expected = body.get("video_url") or body.get("image_public_url")
+        try:
+            store = _dep(ctx, "calendar_store", lambda: __import__(
+                "agent.portal_calendar_store", fromlist=["SupabaseCalendarStore"]
+            ).SupabaseCalendarStore())
+            confirmed = store.get_row(ctx.gym_key, rid) if expected else None
+        except Exception:  # noqa: BLE001 - readback failure is not proof of rollback
+            confirmed = None
+        actual = (confirmed or {}).get("image_url")
+        display = (confirmed or {}).get("thumbnail_url") or actual
+        if (not confirmed or confirmed.get("id") != rid
+                or confirmed.get("gym_id") != ctx.gym_key
+                or body.get("siblings_swapped")
+                or (body.get("video_url") and actual != body["video_url"])
+                or (not body.get("video_url") and actual != body.get("image_public_url"))
+                or display != body.get("image_public_url")):
+            return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                         "postcondition_verified": False,
+                         "summary": f"swap-media on row {rid}: calendar readback unconfirmed"}
+        body["postcondition_verified"] = True
     body["summary"] = (f"swap-media on row {rid}: "
                        + ("ok" if body.get("ok") else f"refused ({body.get('error', status)})"))
     return int(status), body
@@ -433,6 +459,10 @@ def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_
                                    library_path=cms._library_dir(gym_key), store=store,
                                    banned_words=cms._banned_words_for(gym_key), logger=log)
     out["build"] = built
+    # A successful builder response does not identify which rows survived the
+    # calendar write or human edits. Keep the completed job truthful until a
+    # scoped, independent calendar comparison is available.
+    out["postcondition_verified"] = False
     build_result = built if isinstance(built, dict) else {}
     steps.append({"step": "build", "at": _now_iso(), "ok": build_result.get("ok") is True,
                   "upserted": build_result.get("upserted")})

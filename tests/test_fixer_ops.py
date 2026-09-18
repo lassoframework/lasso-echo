@@ -236,6 +236,7 @@ def test_resend_connect_link_forces_the_send_and_reports_a_decline(armed):
             "notify_new_gym": notify, "is_echo_client": lambda gid: gid == "g-uuid"}
     status, body = _post("resend_connect_link", _body(), deps=deps)
     assert status == 200 and body["result"]["sent"] is True
+    assert body["result"]["postcondition_verified"] is False
     assert seen == {"base_key": GYM, "gym_id": "g-uuid", "name": "CrossFit Reverb", "force": True}
 
     def declines(base_key, gym_id, name, *, force=False, alert=None, **kw):
@@ -292,6 +293,7 @@ def test_release_denied_assets_runs_the_sweep_when_the_volume_is_there(armed):
             "observe_denials": lambda: {"checked": 4, "rolled_back": 2}}
     status, body = _post("release_denied_assets", _body(), deps=deps)
     assert status == 200 and body["result"]["rolled_back"] == 2
+    assert body["result"]["postcondition_verified"] is False
 
 
 def test_volume_bound_actions_refuse_honestly_on_a_host_without_it(armed):
@@ -307,14 +309,23 @@ def test_volume_bound_actions_refuse_honestly_on_a_host_without_it(armed):
 
 def test_swap_media_passes_the_row_and_a_fixer_actor(armed):
     seen = {}
+    row = {"id": "row-abc-123", "gym_id": GYM, "image_url": "https://img/new.jpg"}
+
+    class Store:
+        def get_row(self, account_key, row_id):
+            assert (account_key, row_id) == (GYM, "row-abc-123")
+            return row
 
     def handler(account_key, draft_id, actor_id, **kw):
         seen.update(account_key=account_key, draft_id=draft_id, actor_id=actor_id)
-        return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id, "free": True}
+        return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,
+                     "free": True, "image_public_url": "https://img/new.jpg"}
 
     status, body = _post("swap_media", _body(row_id="row-abc-123"),
-                         deps={"bus": FakeBus(), "handle_swap_media": handler})
+                         deps={"bus": FakeBus(), "handle_swap_media": handler,
+                               "calendar_store": Store()})
     assert status == 200 and body["result"]["free"] is True
+    assert body["result"]["postcondition_verified"] is True
     assert seen == {"account_key": GYM, "draft_id": "row-abc-123",
                     "actor_id": f"fixer:{TICKET}"}
     # the wrapped function's refusal is passed through, not masked as success
@@ -323,6 +334,36 @@ def test_swap_media_passes_the_row_and_a_fixer_actor(armed):
                          deps={"bus": FakeBus(), "handle_swap_media": refuse})
     assert status == 409 and body["ok"] is False and body["error"] == "photo is locked"
     assert _post("swap_media", _body(), deps={"bus": FakeBus()})[0] == 400, "row_id required"
+
+
+def test_swap_media_does_not_claim_success_when_readback_disagrees(armed):
+    calls = []
+
+    class Store:
+        def get_row(self, account_key, row_id):
+            return {"id": row_id, "gym_id": account_key, "image_url": "https://img/old.jpg"}
+
+    def handler(*args):
+        calls.append(args)
+        return 200, {"ok": True, "image_public_url": "https://img/new.jpg"}
+
+    status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
+        "bus": FakeBus(), "handle_swap_media": handler, "calendar_store": Store()})
+    assert status == 409 and body["error"] == "postcondition_unconfirmed"
+    assert len(calls) == 1
+
+
+def test_swap_media_does_not_verify_unread_sibling_writes(armed):
+    class Store:
+        def get_row(self, account_key, row_id):
+            return {"id": row_id, "gym_id": account_key, "image_url": "https://img/new.jpg"}
+
+    status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
+        "bus": FakeBus(), "calendar_store": Store(),
+        "handle_swap_media": lambda *args: (200, {
+            "ok": True, "image_public_url": "https://img/new.jpg",
+            "siblings_swapped": ["sibling-1"]})})
+    assert status == 409 and body["error"] == "postcondition_unconfirmed"
 
 
 class FakeCalendarStore:
@@ -424,6 +465,7 @@ def test_restage_month_returns_a_job_and_runs_the_recipe_in_order(armed):
     assert status == 200 and out["job"]["status"] == "done"
     assert [s["step"] for s in out["job"]["steps"]] == ["prerender", "observe_denials", "build"]
     assert out["job"]["result"]["build"]["upserted"] == 42
+    assert out["job"]["result"]["postcondition_verified"] is False
     # two ticket records: the accepted call and the job's completion (order depends on the
     # runner; the synchronous test runner finishes the job before run_action records 202)
     bodies = [r["body"] for r in bus.rows]
