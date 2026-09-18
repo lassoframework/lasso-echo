@@ -979,6 +979,59 @@ def test_fixer_correction_during_slack_post_keeps_ticket_open(monkeypatch):
     assert bus.ticket(tid)["status"] == "merged"
 
 
+@pytest.mark.parametrize("window", ["membership", "claim", "body", "proof"])
+def test_fixer_correction_before_slack_post_suppresses_old_notice(monkeypatch, window):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", "merged-sha"
+    bus.tickets[tid] = {
+        "id": tid, "status": "merged", "bot_identity": "echo",
+        "identity_kind": "client", "slack_channel_id": "C_CLIENT",
+        "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
+            "deployment_check": {"verified": True, "sha": sha}}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Original request")
+    key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    release = bus.tickets[tid]["verification_after"]["fixer"]
+    release["request_key"] = key
+    release["business_postcondition"] = _fixer_business_proof(key, sha)
+    notice = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="The fix is live.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "pr_url": pr, "resolve_notice": True,
+              "request_key": key})
+    def correction():
+        bus.record_inbound(ticket_id=tid, author_type="client",
+                           body="Correction: the original issue is still broken")
+
+    if window in {"membership", "proof"}:
+        def member_check(channel, user):
+            if window == "proof":
+                release["business_postcondition"]["symptom_resolved"] = False
+            else:
+                correction()
+            return True
+    else:
+        member_check = lambda channel, user: True
+        method = "claim_message" if window == "claim" else "set_message_body_if_posting"
+        original = getattr(bus, method)
+        def mutate(*args):
+            result = original(*args)
+            correction()
+            return result
+        monkeypatch.setattr(bus, method, mutate)
+    post, calls = _posted()
+    result = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                         member_check=member_check)
+    assert bus.message(notice["id"])["delivery_status"] == "suppressed"
+    assert result["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "merged"
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
+
+
 def test_fixer_unreadable_request_thread_suppresses_notice(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     bus = FakeBus()

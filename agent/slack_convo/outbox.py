@@ -171,8 +171,10 @@ def _verified_fix_notice(ticket, att, kind):
             and business.get("source") == "independent_business_check"
             and business.get("verified") is True
             and business.get("symptom_resolved") is True
-            and bool(str(business.get("check_id") or "").strip())
-            and bool(str(business.get("evidence") or "").strip())
+            and isinstance(business.get("check_id"), str)
+            and bool(business["check_id"].strip())
+            and isinstance(business.get("evidence"), str)
+            and bool(business["evidence"].strip())
             and business.get("request_key") == release.get("request_key")
             and business.get("merged_sha") == release.get("merged_sha"))
 
@@ -705,6 +707,25 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             if not stored or stored.get("body") != sent_body:
                 raise RuntimeError("FIXER Slack body update was not confirmed")
             row = {**row, "body": sent_body}
+        # Membership, claiming, and body persistence can each take long enough for
+        # another customer message or a changed verification record to arrive.
+        # Re-read both immediately before the irreversible Slack call.
+        fresh = bus.ticket(ticket["id"])
+        try:
+            current_key = _current_fixer_request_key(bus, fresh) if fresh else None
+        except Exception as e:  # noqa: BLE001 - an unreadable request must hold
+            log(f"[slack-convo/outbox] final request read failed for {ticket['id']}: "
+                f"{type(e).__name__}")
+            current_key = None
+        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get("request_key")
+        if (not fresh or not _verified_fix_notice(fresh, att, kind)
+                or not current_key or release_key != current_key
+                or att.get("request_key") != current_key
+                or fresh.get("slack_channel_id") != channel
+                or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")):
+            _suppress(bus, row, fresh or ticket, identity,
+                      "FIXER notice changed before Slack delivery", log, summary)
+            return
     ts = post(channel, sent_body, thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1

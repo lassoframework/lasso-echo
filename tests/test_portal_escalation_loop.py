@@ -309,6 +309,31 @@ def test_business_evidence_must_match_request_and_merged_sha():
     assert bus.of_kind(A.KIND_STATUS) == []
 
 
+@pytest.mark.parametrize("bad", [True, 42, ["observed"], {"proof": "yes"}, "  "])
+@pytest.mark.parametrize("field", ["check_id", "evidence"])
+def test_business_evidence_requires_text_at_manual_and_dispatch(field, bad):
+    bus = Bus([_ticket(classification="code_fix", status="merged",
+                       fix_pr_url="https://example.test/pr/1",
+                       verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    _verify_business(bus)
+    release = bus.tickets["t-1"]["verification_after"]["fixer"]
+    release["business_postcondition"][field] = bad
+    assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                     log=lambda *a: None)
+    row = bus.record_outbound(
+        ticket_id="t-1", author_type="echo", body=OB.RESOLVED_NOTICE,
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "resolve_notice": True, "request_key": release["request_key"],
+              "pr_url": bus.ticket("t-1")["fix_pr_url"]})
+    sent, post = _posts()
+    OB.run_once(bus, post, identity=ECHO, log=lambda *a: None)
+    assert bus.message(row["id"])["delivery_status"] == "suppressed"
+    assert not any(item["channel"] == "G_CLIENT" for item in sent)
+
+
 def test_legacy_untagged_code_fix_ack_never_reaches_portal_thread():
     bus = Bus([_ticket(classification="code_fix", status="hold")])
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
