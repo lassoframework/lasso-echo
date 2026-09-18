@@ -742,6 +742,254 @@ def _rows(bus, tid, kind):
             if m["direction"] == "outbound" and m["attachments"]["kind"] == kind]
 
 
+@pytest.mark.parametrize("parent_identity", [None, "ranger"])
+@pytest.mark.parametrize("product,row_identity", [("echo", "echo"), ("portal", "scout")])
+def test_portal_provenance_system_alert_routes_to_fixer_once(
+        monkeypatch, parent_identity, product, row_identity):
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    monkeypatch.setenv("SCOUT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {"id": tid, "product": product, "status": "hold",
+                        "bot_identity": parent_identity, "slack_channel_id": "C_CLIENT"}
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="system", body="Portal bridge provenance failed",
+        delivery_status="ready", kind=A.KIND_ESCALATION,
+        meta={"identity": row_identity, "surface": "portal_bridge_provenance"})
+    post, calls = _posted()
+    first = OB.run_once(bus, post, identity=IDS.get(row_identity), log=lambda *a: None)
+    second = OB.run_once(bus, post, identity=IDS.get(row_identity), log=lambda *a: None)
+    assert first["posted"] == 1 and second["posted"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert bus.message(row["id"])["slack_ts"] == "9.999"
+    assert bus.ticket(tid)["bot_identity"] == parent_identity
+    assert bus.ticket(tid)["status"] == "hold"
+    assert len(calls) == 1 and calls[0]["channel"] == "C_FIXER"
+    assert calls[0]["blocks"] is None  # no customer resolve button
+
+
+@pytest.mark.parametrize("defect", ["wrong_surface", "wrong_kind", "wrong_author",
+                                    "wrong_product", "wrong_row_identity",
+                                    "portal_to_echo", "echo_to_scout"])
+def test_portal_provenance_bypass_requires_exact_internal_shape(monkeypatch, defect):
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    monkeypatch.setenv("SCOUT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    product = ("ranger" if defect == "wrong_product" else
+               "portal" if defect == "portal_to_echo" else "echo")
+    row_identity = "scout" if defect == "echo_to_scout" else "echo"
+    bus.tickets[tid] = {"id": tid, "product": product,
+                        "status": "hold", "bot_identity": None,
+                        "slack_channel_id": "C_CLIENT"}
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="echo" if defect == "wrong_author" else "system",
+        body="A portal bridge notice", delivery_status="ready",
+        kind=A.KIND_STATUS if defect == "wrong_kind" else A.KIND_ESCALATION,
+        meta={"identity": "ranger" if defect == "wrong_row_identity" else row_identity,
+              "surface": "portal_ticket_bridge" if defect == "wrong_surface"
+              else "portal_bridge_provenance"})
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get(row_identity), log=lambda *a: None)
+    assert bus.message(row["id"])["delivery_status"] == "ready"
+    assert calls == []
+    assert bus.ticket(tid)["bot_identity"] is None
+
+
+def test_portal_provenance_alert_failed_post_can_retry_without_customer_delivery(monkeypatch):
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {"id": tid, "product": "echo", "status": "hold",
+                        "bot_identity": None, "slack_channel_id": "C_CLIENT"}
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="system", body="Portal bridge provenance failed",
+        delivery_status="ready", kind=A.KIND_ESCALATION,
+        meta={"identity": "echo", "surface": "portal_bridge_provenance"})
+    def fail(*args, **kwargs):
+        raise RuntimeError("temporary Slack failure")
+    first = OB.run_once(bus, fail, identity=IDS.get("echo"), log=lambda *a: None)
+    assert first["failed"] == 1 and bus.message(row["id"])["delivery_status"] == "failed"
+    bus.mark_message(row["id"], "ready")
+    post, calls = _posted()
+    second = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert second["posted"] == 1
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert len(calls) == 1 and calls[0]["channel"] == "C_FIXER"
+
+
+def test_fixer_request_key_matches_scout_for_multiple_inbound_rows():
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    ticket = {"id": tid, "created_at": "2026-09-18T10:00:00Z", "raw_text": "original"}
+    bus.msgs.extend([
+        {"id": "00000000-0000-0000-0000-000000000002", "ticket_id": tid,
+         "direction": "inbound", "author_type": "client",
+         "created_at": "2026-09-18T12:00:00Z", "body": "Please fix this"},
+        {"id": "00000000-0000-0000-0000-000000000001", "ticket_id": tid,
+         "direction": "inbound", "author_type": "client",
+         "created_at": "2026-09-18T11:00:00Z", "body": "Then I corrected it"},
+    ])
+    # Generated with Scout's requestKey in src/fixer/sources.js, not this helper.
+    assert OB._current_fixer_request_key(bus, ticket) == (
+        "6e36339f4853db224780cb74c9c5a5dfaee60bad28737ed4875b5f30da3a232f")
+
+
+def test_fixer_request_key_matches_scout_fallback_without_requester_inbound():
+    bus = FakeBus()
+    tid = "00000000-0000-0000-0000-000000000001"
+    ticket = {"id": tid, "created_at": "2026-09-18T10:00:00Z",
+              "raw_text": "Original text"}
+    assert OB._current_fixer_request_key(bus, ticket) == (
+        "d45972eada0fd20888b7d5f6da3c77745d7a739719768c1a464bf6e24fe9303a")
+
+
+def test_fixer_ops_notice_requires_verified_same_gym_action_and_current_request():
+    from agent.slack_convo import adapter as _a
+
+    operation = {"ok": True, "identityVerified": True,
+                 "action": "reset_recreate_budget", "gym_key": "gym-one",
+                 "tenantVerified": True, "tenantId": "gym-one"}
+    ticket = {"status": "verification", "client_id": "gym-one",
+              "verification_after": {"fixer": {"ops_action": operation,
+                                               "postcondition_verified": True,
+                                               "request_key": "request-one"}}}
+    att = {"resolve_notice": True, "ops_action": "reset_recreate_budget",
+           "request_key": "request-one"}
+    assert OB._verified_fix_notice(ticket, att, _a.KIND_STATUS)
+    for change in (
+        {"status": "fixing"}, {"client_id": "gym-two"},
+        {"verification_after": {"fixer": {**ticket["verification_after"]["fixer"],
+                                          "postcondition_verified": False}}},
+        {"verification_after": {"fixer": {**ticket["verification_after"]["fixer"],
+                                          "ops_action": {**operation, "identityVerified": False}}}},
+    ):
+        assert not OB._verified_fix_notice({**ticket, **change}, att, _a.KIND_STATUS)
+    assert not OB._verified_fix_notice(ticket, {**att, "ops_action": "requeue_failed_row"}, _a.KIND_STATUS)
+    assert not OB._verified_fix_notice(ticket, {**att, "resolve_notice": False}, _a.KIND_STATUS)
+
+
+def test_verified_ops_notice_posts_and_resolves_only_for_current_request(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {
+        "id": tid, "status": "verification", "client_id": "gym-one",
+        "bot_identity": "echo", "identity_kind": "client",
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        "verification_after": {"fixer": {
+                "ops_action": {"ok": True, "identityVerified": True,
+                               "action": "reset_recreate_budget", "gym_key": "gym-one",
+                               "tenantVerified": True, "tenantId": "gym-one"},
+            "postcondition_verified": True}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Reset my recreate budget")
+    key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = key
+    notice = bus.record_outbound(ticket_id=tid, author_type="echo", body="Your recreate budget is reset.",
+                                 delivery_status="ready", kind=A.KIND_STATUS,
+                                 meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+                                       "released_by": "fixer", "resolve_notice": True,
+                                       "ops_action": "reset_recreate_budget", "request_key": key})
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                member_check=lambda channel, user: channel == "C_CLIENT" and
+                user == OB.config.APPROVER_SLACK_ID)
+    assert bus.message(notice["id"])["delivery_status"] == "posted"
+    assert bus.ticket(tid)["status"] == "resolved"
+    assert any(call["channel"] == "C_CLIENT" for call in calls)
+
+    bus.set_ticket(tid, status="verification")
+    stale = bus.record_outbound(ticket_id=tid, author_type="echo", body="Old result is done.",
+                                delivery_status="ready", kind=A.KIND_STATUS,
+                                meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+                                      "released_by": "fixer", "resolve_notice": True,
+                                      "ops_action": "reset_recreate_budget", "request_key": key})
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Wait, I changed my request")
+    prior_posts = len([call for call in calls if call["channel"] == "C_CLIENT"])
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                member_check=lambda channel, user: channel == "C_CLIENT" and
+                user == OB.config.APPROVER_SLACK_ID)
+    assert bus.message(stale["id"])["delivery_status"] == "suppressed"
+    assert bus.ticket(tid)["status"] == "verification"
+    assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == prior_posts
+
+
+@pytest.mark.parametrize("defect", [
+    None, "unverified", "wrong_tenant", "wrong_row", "missing_media",
+    "sibling_swapped", "sibling_left", "missing_sibling_readback",
+    "missing_video_url", "image_with_video_url", "stale_request", "not_member",
+])
+def test_swap_media_ops_notice_delivery_gate(monkeypatch, defect):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    result = {"ok": True, "action": "swap-media", "draft_id": "row-abc-123",
+              "postcondition_verified": True, "image_public_url": "https://img/new.jpg",
+              "media_kind": "image", "siblings_swapped": [], "siblings_left": []}
+    operation = {"ok": True, "identityVerified": True, "action": "swap_media",
+                 "args": {"row_id": "row-abc-123"}, "gym_key": "gym-key",
+                 "tenantVerified": True, "tenantId": "gym-one", "result": result}
+    bus.tickets[tid] = {
+        "id": tid, "status": "verification", "client_id": "gym-one",
+        "bot_identity": "echo", "identity_kind": "client",
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        "verification_after": {"fixer": {"ops_action": operation,
+                                         "postcondition_verified": True}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Swap the photo on my post")
+    key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = key
+    notice = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="The photo has been changed.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "resolve_notice": True,
+              "ops_action": "swap_media", "request_key": key})
+    if defect == "unverified":
+        result["postcondition_verified"] = False
+    elif defect == "wrong_tenant":
+        operation["tenantId"] = "gym-two"
+    elif defect == "wrong_row":
+        result["draft_id"] = "row-other"
+    elif defect == "missing_media":
+        result["image_public_url"] = ""
+    elif defect == "sibling_swapped":
+        result["siblings_swapped"] = ["sibling-1"]
+    elif defect == "sibling_left":
+        result["siblings_left"] = ["sibling-1"]
+    elif defect == "missing_sibling_readback":
+        del result["siblings_left"]
+    elif defect == "missing_video_url":
+        result["media_kind"] = "video"
+    elif defect == "image_with_video_url":
+        result["video_url"] = "https://img/old.mp4"
+    elif defect == "stale_request":
+        bus.record_inbound(ticket_id=tid, author_type="client", body="Wait, use another image")
+    post, calls = _posted()
+    summary = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                          member_check=lambda channel, user: defect != "not_member")
+    if defect is None:
+        assert bus.message(notice["id"])["delivery_status"] == "posted"
+        assert bus.ticket(tid)["status"] == "resolved"
+        assert summary["resolved"] == 1
+        assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
+    else:
+        assert bus.message(notice["id"])["delivery_status"] == "suppressed"
+        assert bus.ticket(tid)["status"] == "verification"
+        assert summary["resolved"] == 0
+        assert not any(call["channel"] == "C_CLIENT" for call in calls)
+
+
+def _fixer_business_proof(request_key, merged_sha):
+    return {"source": "independent_business_check", "verified": True,
+            "symptom_resolved": True, "check_id": "verified-customer-symptom",
+            "evidence": "Observed the customer symptom resolved",
+            "request_key": request_key, "merged_sha": merged_sha}
+
+
 def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
@@ -756,10 +1004,13 @@ def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
                                         "deployment_check": {"verified": True, "sha": sha}}},
     }
     bus.record_inbound(ticket_id=tid, author_type="client", body="Please fix this")
+    request_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = request_key
 
     def notice(**overrides):
         meta = {"identity": "echo", "recipient_kind": "client", "fixer": True,
-                "released_by": "fixer", "pr_url": pr, "resolve_notice": True}
+                "released_by": "fixer", "pr_url": pr, "resolve_notice": True,
+                "request_key": request_key}
         meta.update(overrides)
         return bus.record_outbound(ticket_id=tid, author_type="echo", body="The fix is live.",
                                    delivery_status="ready", kind=A.KIND_STATUS, meta=meta)
@@ -774,14 +1025,17 @@ def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
     wrong_pr = notice(pr_url="https://github.com/lassoframework/lasso-echo/pull/998")
     wrong_sha = notice()
     bus.set_ticket(tid, verification_after={"exit_code": 0, "fixer": {"merged_sha": sha,
-                    "deployment_check": {"verified": True, "sha": "other-sha"}}})
+                    "deployment_check": {"verified": True, "sha": "other-sha"},
+                    "request_key": request_key}})
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
     assert bus.message(wrong_pr["id"])["delivery_status"] == "suppressed"
     assert bus.message(wrong_sha["id"])["delivery_status"] == "suppressed"
     assert not any(c["channel"] == "C_CLIENT" for c in calls)
 
     bus.set_ticket(tid, verification_after={"exit_code": 0, "fixer": {"merged_sha": sha,
-                    "deployment_check": {"verified": True, "sha": sha}}})
+                    "deployment_check": {"verified": True, "sha": sha},
+                    "request_key": request_key,
+                    "business_postcondition": _fixer_business_proof(request_key, sha)}})
     final = notice()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
                 member_check=lambda channel, user: channel == "C_CLIENT" and
@@ -799,6 +1053,156 @@ def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
     assert any(c["channel"] == "C_FIXER" and
                f"<@{OB.config.APPROVER_SLACK_ID}>" in c["text"] for c in calls)
+
+
+def test_fixer_old_request_notice_cannot_post_or_resolve_after_correction(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", "merged-sha"
+    bus.tickets[tid] = {
+        "id": tid, "status": "merged", "bot_identity": "echo",
+        "identity_kind": "client", "slack_channel_id": "C_CLIENT",
+        "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
+            "deployment_check": {"verified": True, "sha": sha}}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Original request")
+    old_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = old_key
+    old_notice = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="The original fix is live.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "pr_url": pr, "resolve_notice": True,
+              "request_key": old_key})
+    bus.record_inbound(ticket_id=tid, author_type="client",
+                       body="Correction: that is not the problem now")
+    post, calls = _posted()
+    result = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                         member_check=lambda channel, user: True)
+    assert bus.message(old_notice["id"])["delivery_status"] == "suppressed"
+    assert result["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "merged"
+    assert not calls
+
+
+def test_fixer_correction_during_slack_post_keeps_ticket_open(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", "merged-sha"
+    bus.tickets[tid] = {
+        "id": tid, "status": "merged", "bot_identity": "echo",
+        "identity_kind": "client", "slack_channel_id": "C_CLIENT",
+        "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
+            "deployment_check": {"verified": True, "sha": sha}}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Original request")
+    key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = key
+    bus.tickets[tid]["verification_after"]["fixer"]["business_postcondition"] = _fixer_business_proof(key, sha)
+    notice = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="The fix is live.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "pr_url": pr, "resolve_notice": True,
+              "request_key": key})
+
+    def post(_channel, _body, thread_ts=None, blocks=None):
+        bus.record_inbound(ticket_id=tid, author_type="client",
+                           body="Correction while Slack delivered the notice")
+        return "9.999"
+
+    result = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                         member_check=lambda channel, user: True)
+    assert bus.message(notice["id"])["delivery_status"] == "posted"
+    assert result["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "merged"
+
+
+@pytest.mark.parametrize("window", ["membership", "claim", "body", "proof"])
+def test_fixer_correction_before_slack_post_suppresses_old_notice(monkeypatch, window):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", "merged-sha"
+    bus.tickets[tid] = {
+        "id": tid, "status": "merged", "bot_identity": "echo",
+        "identity_kind": "client", "slack_channel_id": "C_CLIENT",
+        "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
+            "deployment_check": {"verified": True, "sha": sha}}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Original request")
+    key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    release = bus.tickets[tid]["verification_after"]["fixer"]
+    release["request_key"] = key
+    release["business_postcondition"] = _fixer_business_proof(key, sha)
+    notice = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="The fix is live.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "pr_url": pr, "resolve_notice": True,
+              "request_key": key})
+    def correction():
+        bus.record_inbound(ticket_id=tid, author_type="client",
+                           body="Correction: the original issue is still broken")
+
+    if window in {"membership", "proof"}:
+        def member_check(channel, user):
+            if window == "proof":
+                release["business_postcondition"]["symptom_resolved"] = False
+            else:
+                correction()
+            return True
+    else:
+        member_check = lambda channel, user: True
+        method = "claim_message" if window == "claim" else "set_message_body_if_posting"
+        original = getattr(bus, method)
+        def mutate(*args):
+            result = original(*args)
+            correction()
+            return result
+        monkeypatch.setattr(bus, method, mutate)
+    post, calls = _posted()
+    result = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                         member_check=member_check)
+    assert bus.message(notice["id"])["delivery_status"] == "suppressed"
+    assert result["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "merged"
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
+
+
+def test_fixer_unreadable_request_thread_suppresses_notice(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", "merged-sha"
+    bus.tickets[tid] = {
+        "id": tid, "status": "merged", "bot_identity": "echo",
+        "identity_kind": "client", "slack_channel_id": "C_CLIENT",
+        "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
+            "deployment_check": {"verified": True, "sha": sha}}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Original request")
+    key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = key
+    notice = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="The fix is live.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "pr_url": pr, "resolve_notice": True,
+              "request_key": key})
+    monkeypatch.setattr(bus, "messages", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("read failed")))
+    post, calls = _posted()
+    result = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                         member_check=lambda channel, user: True)
+    assert bus.message(notice["id"])["delivery_status"] == "suppressed"
+    assert result["resolved"] == 0
+    assert not calls
 
 
 def test_fixer_staff_reply_does_not_require_customer_deployment_proof(monkeypatch):
@@ -840,10 +1244,13 @@ def test_fixer_customer_slack_reply_requires_blake_in_destination(
             "deployment_check": {"verified": True, "sha": sha}}},
     }
     bus.record_inbound(ticket_id=tid, author_type="client", body="Please fix this")
+    request_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = request_key
+    bus.tickets[tid]["verification_after"]["fixer"]["business_postcondition"] = _fixer_business_proof(request_key, sha)
     row = bus.record_outbound(ticket_id=tid, author_type="echo", body="Fixed.",
         delivery_status="ready", kind=A.KIND_STATUS,
         meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
-              "pr_url": pr, "resolve_notice": True})
+              "pr_url": pr, "resolve_notice": True, "request_key": request_key})
     post, calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
                 member_check=check)
@@ -891,10 +1298,13 @@ def test_fixer_customer_slack_reply_does_not_send_if_exact_body_cannot_be_saved(
             "deployment_check": {"verified": True, "sha": sha}}},
     }
     bus.record_inbound(ticket_id=tid, author_type="client", body="Please fix this")
+    request_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = request_key
+    bus.tickets[tid]["verification_after"]["fixer"]["business_postcondition"] = _fixer_business_proof(request_key, sha)
     row = bus.record_outbound(ticket_id=tid, author_type="echo", body="Fixed.",
         delivery_status="ready", kind=A.KIND_STATUS,
         meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
-              "pr_url": pr, "resolve_notice": True})
+              "pr_url": pr, "resolve_notice": True, "request_key": request_key})
     monkeypatch.setattr(bus, "set_message_body_if_posting", lambda *args: None)
     post, calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,

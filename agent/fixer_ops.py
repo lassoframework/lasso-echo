@@ -14,21 +14,42 @@ CONTRACT (the FIXER builder reads this block):
       headers   X-Fixer-Ops-Secret: <env FIXER_OPS_SECRET>   (constant-time compare)
                 Content-Type: application/json
       body      {"gym_key": "<echo account key>", "ticket_id": "<support_tickets.id>",
-                 "args": {...}}                              (args per action, below)
+                 "args": {...},                             (args per action, below)
+                 "reservation_key"?: "<8-128 [A-Za-z0-9_-]>"}
+      reservation_key is OPTIONAL. Absent: behavior is exactly as before. Present: the
+      action runs AT MOST ONCE per key -- a durable receipt (agent/fixer_ops_receipts,
+      sqlite kv on the volume host, prefix ops_receipt_) is reserved BEFORE any side
+      effect, then committed with the result, failed on a refusal, or marked unknown
+      when the outcome cannot be determined. A replay (same key, same payload hash)
+      returns the completed result with "replayed": true and NEVER re-executes;
+      reserved, failed, and unknown receipts refuse replay. A key reused with a
+      different payload is 409 reservation_conflict. Keyed restage_month is refused
+      because its background job registry is not durable. Keyed 2xx bodies carry
+      "receipt": {...}; unkeyed calls retain their existing response shape.
       200 {"ok": true, "action": ..., "gym_key": ..., "ticket_id": ..., "result": {...}}
       202 {"ok": true, "action": "restage_month", "job_id": "...", "status": "running", ...}
       400 {"error": "bad_request", "detail": ...}          malformed body / bad args
       401 {"error": "unauthorized"}                          missing or wrong secret
       403 {"error": "org_floor", ...}                        a refused action (see below)
       404 {"error": "unknown_action" | "gym_not_found" | "row_not_found", ...}
-      409 {"error": ..., ...}                                the wrapped function refused
-      503 {"error": "ops_secret_unset" | "volume_unavailable" | "store_unavailable", ...}
+      409 {"error": ..., ...}                                refusal, in-progress, failed receipt,
+                                                            or unsupported keyed background job
+      503 {"error": "ops_secret_unset" | "volume_unavailable" | "store_unavailable" |
+                    "receipt_store_not_durable", ...}
+  GET  /ops/actions/receipts/<key>?gym_key=<gym>   (same header)
+      200 {"ok": true, "receipt": {...}}   the reservation receipt for <key>.
+      Tenant-bound: a receipt belonging to another gym is 403 receipt_tenant_mismatch;
+      an unknown key is 404 unknown_receipt; a malformed key is 400 bad_reservation_key.
   GET  /ops/actions/jobs/<job_id>          (same header)
       200 {"ok": true, "job": {"id", "action", "gym_key", "ticket_id", "status":
            "running"|"done"|"failed"|"timed_out", "started_at", "finished_at",
            "result"|"error", "steps": [...]}}
       404 {"error": "unknown_job"}
   GET  /ops/actions                        (same header)  -> the catalog, as JSON
+  GET  /ops/actions/resend_connect_link/readiness/<gym_key>  (same header)
+      200 {"category": "ready"|"missing"|"ambiguous"|"user-email-missing"|
+           "portal-unavailable"}
+      This is portal-read-only: no Slack lookup, link mint, ticket record, or DM.
 
   Catalog (`args` keys):
     resend_connect_link     {}                 owner DM with a fresh connect link (forced)
@@ -82,6 +103,7 @@ _GYM_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,79}$")
 _ROW_ID = re.compile(r"^[A-Za-z0-9_-]{6,80}$")
 _TICKET_ID = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_UUID = re.compile(r"^[a-fA-F0-9]{8}-(?:[a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}$")
 
 # Named so a FIXER that asks for one of these gets a 403 that says WHY, not a 404 that
 # reads like a typo. Nothing here has an implementation and nothing here may get one
@@ -224,10 +246,37 @@ def _run_resend_connect_link(ctx):
     sent = bool(notify(ctx.gym_key, gym_id, name, force=True, alert=alerts.append))
     if sent:
         return 200, {"sent": True, "gym_id": gym_id, "gym_name": name,
+                     "postcondition_verified": False,
                      "summary": f"connect link re-sent to the owner of {name}"}
     return 409, {"error": "not_sent", "sent": False, "gym_id": gym_id, "gym_name": name,
                  "detail": (alerts[-1] if alerts else "notify_new_gym declined to send"),
                  "summary": "connect link NOT sent: " + (alerts[-1] if alerts else "declined")}
+
+
+def _resend_connect_link_readiness(gym_key, deps):
+    """Read only whether the portal owner prerequisite is currently satisfied.
+
+    This intentionally does not call notify_new_gym: its force mode is an operator
+    resend and must never be used to poll for a portal-data repair.
+    """
+    if not _GYM_KEY.match(gym_key):
+        return 400, {"error": "bad_request", "detail": "gym_key required (account key)"}
+    ctx = Ctx(gym_key=gym_key, ticket_id="", args={}, deps=deps)
+    gym_id, _name = _gym_row_for(ctx)
+    if not gym_id:
+        return 404, {"error": "gym_not_found", "gym_key": gym_key}
+    if not _is_echo_client(ctx, gym_id):
+        return 403, {"error": "not_echo_client", "gym_key": gym_key, "gym_id": gym_id}
+    readiness = _dep(ctx, "owner_readiness", lambda: __import__(
+        "agent.connect_link_notify", fromlist=["owner_readiness"]).owner_readiness)
+    try:
+        category = readiness(gym_id)
+    except Exception:  # noqa: BLE001 - never mislabel an outage as missing
+        category = "portal-unavailable"
+    if category not in {"ready", "missing", "ambiguous", "user-email-missing",
+                        "portal-unavailable"}:
+        category = "portal-unavailable"
+    return 200, {"category": category}
 
 
 # -- reset_recreate_budget ---------------------------------------------------------------
@@ -238,7 +287,11 @@ def _run_reset_recreate_budget(ctx):
     out = reset(ctx.gym_key)
     before = (out or {}).get("before") or {}
     after = (out or {}).get("after") or {}
+    if after.get("used") != 0 or after.get("remaining") != after.get("limit"):
+        return 409, {"error": "postcondition_unconfirmed", "before": before,
+                     "after": after, "summary": "recreate budget reset was not confirmed"}
     return 200, {**(out or {}),
+                 "postcondition_verified": True,
                  "summary": (f"recreate budget {before.get('used', '?')} used -> "
                              f"{after.get('used', '?')} used "
                              f"({after.get('remaining', '?')} of {after.get('limit', '?')} left)")}
@@ -246,11 +299,35 @@ def _run_reset_recreate_budget(ctx):
 
 # -- release_denied_assets ---------------------------------------------------------------
 
+def _observe_denials_for_gym(gym_key, observe):
+    """Constrain the global ledger sweep's only path to rollback_use.
+
+    observe_denials has no gym argument. It iterates every tenant's use records,
+    but rolls back only after fetch_rows supplies a denied calendar row. Returning
+    no rows for other gyms prevents a tenant-scoped ops request from mutating them.
+    """
+    from . import gym_media_selector as selector
+    checked = 0
+
+    def fetch_scoped(gym_id, post_date):
+        nonlocal checked
+        if gym_id != gym_key:
+            return []
+        checked += 1
+        return selector._default_fetch_rows(gym_id, post_date)
+
+    out = observe(fetch_rows=fetch_scoped) or {}
+    # observe_denials counts every ledger key it scanned, including other gyms.
+    # Report only the target gym's calendar probes in this tenant-scoped result.
+    return {**out, "checked": checked}
+
+
 def _run_release_denied_assets(ctx):
     observe = _dep(ctx, "observe_denials", lambda: __import__(
         "agent.gym_media_selector", fromlist=["observe_denials"]).observe_denials)
-    out = observe() or {}
-    return 200, {**out, "summary": (f"deny sweep checked {out.get('checked', 0)} date(s), "
+    out = _observe_denials_for_gym(ctx.gym_key, observe)
+    return 200, {**out, "postcondition_verified": False,
+                 "summary": (f"deny sweep checked {out.get('checked', 0)} date(s), "
                                     f"rolled back {out.get('rolled_back', 0)} asset(s)")}
 
 
@@ -271,6 +348,31 @@ def _run_swap_media(ctx):
         "agent.portal_social", fromlist=["handle_swap_media"]).handle_swap_media)
     status, body = handler(ctx.gym_key, rid, f"{ACTOR}:{ctx.ticket_id}")
     body = dict(body or {})
+    if int(status) == 200 and body.get("ok") is True:
+        # The handler's returned row is a write response, not an independent proof.
+        # A missing or failed readback is ambiguous: the write may already have landed,
+        # so report it without invoking the non-idempotent swap a second time.
+        expected = body.get("image_public_url")
+        try:
+            store = _dep(ctx, "calendar_store", lambda: __import__(
+                "agent.portal_calendar_store", fromlist=["SupabaseCalendarStore"]
+            ).SupabaseCalendarStore())
+            confirmed = store.get_row(ctx.gym_key, rid) if expected else None
+        except Exception:  # noqa: BLE001 - readback failure is not proof of rollback
+            confirmed = None
+        actual = (confirmed or {}).get("image_url")
+        display = (confirmed or {}).get("thumbnail_url") or actual
+        if (not confirmed or confirmed.get("id") != rid
+                or confirmed.get("gym_id") != ctx.gym_key
+                or body.get("siblings_swapped")
+                or body.get("siblings_left")
+                or (body.get("video_url") and actual != body["video_url"])
+                or (not body.get("video_url") and actual != body.get("image_public_url"))
+                or display != body.get("image_public_url")):
+            return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                         "postcondition_verified": False,
+                         "summary": f"swap-media on row {rid}: calendar readback unconfirmed"}
+        body["postcondition_verified"] = True
     body["summary"] = (f"swap-media on row {rid}: "
                        + ("ok" if body.get("ok") else f"refused ({body.get('error', status)})"))
     return int(status), body
@@ -297,9 +399,21 @@ def _run_requeue_failed_row(ctx):
         return 409, {"error": "requeue_matched_nothing", "row_id": rid,
                      "summary": (f"row {rid} did not match failed + googlebusiness + no post "
                                  "id at write time; nothing changed")}
-    return 200, {"row_id": rid, "status": updated.get("status"),
-                 "post_date": updated.get("post_date"),
-                 "summary": f"row {rid} requeued: failed -> {updated.get('status')}"}
+    if (updated.get("id") != rid or updated.get("gym_id") != ctx.gym_key
+            or updated.get("status") != "approved"):
+        return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                     "summary": f"row {rid} requeue response did not match the target gym"}
+    confirmed = store.get_row(ctx.gym_key, rid)
+    if (not confirmed or confirmed.get("id") != rid
+            or confirmed.get("gym_id") != ctx.gym_key
+            or confirmed.get("status") != "approved"
+            or confirmed.get("late_post_id") is not None):
+        return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                     "summary": f"row {rid} requeue was not confirmed by calendar readback"}
+    return 200, {"row_id": rid, "status": confirmed.get("status"),
+                 "post_date": confirmed.get("post_date"),
+                 "postcondition_verified": True,
+                 "summary": f"row {rid} requeued: failed -> {confirmed.get('status')}"}
 
 
 # -- restage_month (background) -----------------------------------------------------------
@@ -362,7 +476,7 @@ def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_
     # 1. release denied assets
     observe = deps.get("observe_denials") or __import__(
         "agent.gym_media_selector", fromlist=["observe_denials"]).observe_denials
-    out["observe_denials"] = observe() or {}
+    out["observe_denials"] = _observe_denials_for_gym(gym_key, observe)
     steps.append({"step": "observe_denials", "at": _now_iso(), **out["observe_denials"]})
 
     # 2. build
@@ -386,8 +500,16 @@ def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_
                                    library_path=cms._library_dir(gym_key), store=store,
                                    banned_words=cms._banned_words_for(gym_key), logger=log)
     out["build"] = built
-    steps.append({"step": "build", "at": _now_iso(), "ok": bool((built or {}).get("ok")),
-                  "upserted": (built or {}).get("upserted")})
+    # A successful builder response does not identify which rows survived the
+    # calendar write or human edits. Keep the completed job truthful until a
+    # scoped, independent calendar comparison is available.
+    out["postcondition_verified"] = False
+    build_result = built if isinstance(built, dict) else {}
+    steps.append({"step": "build", "at": _now_iso(), "ok": build_result.get("ok") is True,
+                  "upserted": build_result.get("upserted")})
+    if not isinstance(built, dict) or built.get("ok") is not True:
+        reason = build_result.get("reason") or "invalid build result"
+        raise RuntimeError(f"calendar build did not succeed: {reason or 'ok was not true'}")
     out["summary"] = (f"restage {gym_key}: {len(prerender) if isinstance(prerender, list) else '?'}"
                       f" source(s) prerendered, {out['observe_denials'].get('rolled_back', 0)} "
                       f"asset(s) released, build ok={bool((built or {}).get('ok'))} "
@@ -542,11 +664,65 @@ def _audit(action, gym_key, ticket_id, status, summary, log=print):
         f"status={status} at={_now_iso()} summary={summary!r}")
 
 
+def _ticket_tenant(gym_key, ticket_id, deps):
+    """Bind an ops request to the persisted ticket before any side effect.
+
+    A portal ticket's client_id is a gym UUID; the portal's exact token mapping
+    supplies its Echo account key. Older Echo tickets can carry the account key
+    directly. Internal ops_fix alerts have no client_id and remain a separate,
+    explicitly identified automation lane. A missing or ambiguous mapping never
+    authorizes a write. Only the two identity columns are read from tokens.
+    """
+    bus = deps.get("bus")
+    if bus is None:
+        from .slack_convo.bus import Bus
+        bus = Bus()
+    try:
+        tickets = bus._get("support_tickets", {
+            "id": f"eq.{ticket_id}", "select": "id,product,source,client_id", "limit": "2"})
+        if (not isinstance(tickets, list) or len(tickets) != 1
+                or not isinstance(tickets[0], dict)
+                or tickets[0].get("id") != ticket_id):
+            return 409, {"error": "ticket_tenant_unconfirmed"}
+        ticket = tickets[0]
+        client_id = ticket.get("client_id")
+        if client_id is None:
+            if ticket.get("product") == "echo" and ticket.get("source") == "ops_fix":
+                return None
+            return 409, {"error": "ticket_tenant_unconfirmed"}
+        if not isinstance(client_id, str) or not client_id.strip():
+            return 409, {"error": "ticket_tenant_unconfirmed"}
+        if not _UUID.fullmatch(client_id):
+            return None if client_id == gym_key else (409, {"error": "ticket_tenant_mismatch"})
+        tokens = bus._get("echo_intake_tokens", {
+            "gym_id": f"eq.{client_id}", "select": "gym_id,echo_account_key", "limit": "2"})
+        if (not isinstance(tokens, list) or len(tokens) != 1
+                or not isinstance(tokens[0], dict)
+                or tokens[0].get("gym_id") != client_id
+                or not isinstance(tokens[0].get("echo_account_key"), str)
+                or not _GYM_KEY.fullmatch(tokens[0]["echo_account_key"])):
+            return 409, {"error": "ticket_tenant_unconfirmed"}
+        if tokens[0]["echo_account_key"] != gym_key:
+            return 409, {"error": "ticket_tenant_mismatch"}
+        aliases = bus._get("echo_intake_tokens", {
+            "echo_account_key": f"eq.{gym_key}",
+            "select": "gym_id,echo_account_key", "limit": "2"})
+        if (not isinstance(aliases, list) or len(aliases) != 1
+                or not isinstance(aliases[0], dict)
+                or aliases[0].get("gym_id") != client_id
+                or aliases[0].get("echo_account_key") != gym_key):
+            return 409, {"error": "ticket_tenant_unconfirmed"}
+        return None
+    except Exception:  # noqa: BLE001 - unreadable identity plane cannot authorize a write
+        return 503, {"error": "ticket_tenant_unavailable"}
+
+
 # --------------------------------------------------------------------------------------
 # dispatch
 # --------------------------------------------------------------------------------------
 
-def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
+def run_action(action, gym_key, ticket_id, args, *, reservation_key=None, deps=None,
+               log=print):
     """Validate, run, record. Returns (status, body). Auth is the transport's job."""
     deps = dict(deps or {})
     action = str(action or "").strip()
@@ -554,7 +730,9 @@ def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
         _audit(action, gym_key, ticket_id, 403, "refused: org floor", log)
         # Round 2 (R4): a refused attempt leaves a trace ON THE TICKET too, not only in the
         # process log -- a teammate reading the thread should see the FIXER tried.
-        if _TICKET_ID.match(str(ticket_id or "").strip()):
+        if (_TICKET_ID.fullmatch(str(ticket_id or "").strip())
+                and _GYM_KEY.fullmatch(str(gym_key or "").strip())
+                and _ticket_tenant(str(gym_key).strip(), str(ticket_id).strip(), deps) is None):
             _ticket_note(deps.get("bus"), str(ticket_id).strip(), action,
                          "REFUSED: org_floor (billing/Stripe, pixel/CAPI, ad budget, "
                          "targeting, deleting published posts are never automated)", log)
@@ -576,6 +754,11 @@ def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
         args = {}
     if not isinstance(args, dict):
         return 400, {"error": "bad_request", "detail": "args must be an object"}
+    tenant_refusal = _ticket_tenant(gym_key, ticket_id, deps)
+    if tenant_refusal:
+        _audit(action, gym_key, ticket_id, tenant_refusal[0],
+               tenant_refusal[1]["error"], log)
+        return tenant_refusal
     if spec.needs_volume:
         has_volume = deps["volume_available"]() if "volume_available" in deps \
             else volume_available()
@@ -585,12 +768,67 @@ def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
                                     "host has none. Call the same route on the echo worker "
                                     "(connect_web, AGENT_CONNECT_PORT) or run `python -m "
                                     f"agent ops-action {action} ...` there.")}
+    if reservation_key is not None and spec.background:
+        # The existing job registry is in memory. A 202 launch cannot be a
+        # durable completed receipt, and a restart cannot prove job completion.
+        return 409, {"error": "reservation_background_unsupported", "action": action}
+    # Durable reservation (optional): begin BEFORE any side effect; a replay returns
+    # the stored result without re-executing; an unknown outcome is never retried.
+    receipt = None
+    receipt_store = None
+    if reservation_key is not None:
+        from . import fixer_ops_receipts as receipts
+        reservation_key = str(reservation_key).strip()
+        receipt_store = deps.get("receipt_store")
+        try:
+            if receipt_store is None:
+                receipt_store = receipts.default_store()
+            receipt = receipts.begin(receipt_store, reservation_key, action, gym_key,
+                                     ticket_id, args)
+        except receipts.ReceiptError as e:
+            _audit(action, gym_key, ticket_id, e.status,
+                   f"reservation refused: {e.code}", log)
+            return e.status, {"error": e.code, "reservation_key": reservation_key}
+        if receipt.get("replay"):
+            _audit(action, gym_key, ticket_id, 200,
+                   f"replay of reservation {reservation_key}: no side effects", log)
+            body = {"ok": True, "action": action, "gym_key": gym_key,
+                    "ticket_id": ticket_id, "result": receipt.get("result"),
+                    "receipt": receipt, "replayed": True}
+            return receipt.get("http_status", 200), body
     ctx = Ctx(gym_key=gym_key, ticket_id=ticket_id, args=args, deps=deps, log=log)
     try:
         status, result = spec.run(ctx)
     except Exception as e:  # noqa: BLE001 - a wrapped function's fault is a 500 with a name
+        if receipt is not None:
+            # The side effect may or may not have landed: mark the receipt unknown and
+            # refuse automation from here on -- never silently retry an unknown outcome.
+            detail = f"{type(e).__name__}: {e}"[:500]
+            try:
+                receipt = receipts.mark_unknown(receipt_store, reservation_key, detail)
+            except receipts.ReceiptError:
+                pass
+            _audit(action, gym_key, ticket_id, 503,
+                   f"outcome unknown after reservation {reservation_key}: {detail}", log)
+            return 503, {"error": "reservation_outcome_unknown", "detail": detail,
+                         "reservation_key": reservation_key, "receipt": receipt}
         status, result = 500, {"error": f"{type(e).__name__}", "detail": str(e)[:300]}
     result = dict(result or {})
+    if receipt is not None:
+        try:
+            if 200 <= status < 300:
+                receipt = receipts.commit(receipt_store, reservation_key, result,
+                                          http_status=status)
+            elif status < 500:
+                receipt = receipts.fail(receipt_store, reservation_key,
+                                        str(result.get("error") or status))
+            else:
+                receipt = receipts.mark_unknown(receipt_store, reservation_key,
+                                                str(result.get("error") or status))
+        except receipts.ReceiptError as e:
+            _audit(action, gym_key, ticket_id, e.status,
+                   f"receipt finalize failed: {e.code}", log)
+            return e.status, {"error": e.code, "reservation_key": reservation_key}
     summary = str(result.get("summary") or result.get("error") or status)
     _audit(action, gym_key, ticket_id, status, summary, log)
     if status < 500:
@@ -601,13 +839,17 @@ def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
         body["result"] = result
     else:
         body.update(result)
+    if receipt is not None:
+        body["receipt"] = receipt
     return status, body
 
 
 def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now=None):
     """Transport-agnostic router for the two hosts. Returns (status, body_dict), or None
     when `path` is not one of ours (the caller falls through to its own routes)."""
-    path = (path or "").split("?")[0].rstrip("/") or "/"
+    from urllib.parse import parse_qs, urlsplit
+    parsed = urlsplit(path or '')
+    path = parsed.path.rstrip("/") or "/"
     if path != ROUTE_PREFIX and not path.startswith(ROUTE_PREFIX + "/"):
         return None
     refused = authorize(headers_get)
@@ -615,6 +857,23 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         return refused
     deps = dict(deps or {})
     method = (method or "").upper()
+    if path.startswith(ROUTE_PREFIX + "/evidence/media-source/"):
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        from .fixer_evidence import inspect_media_source, EvidenceError
+        try:
+            query = parse_qs(parsed.query, strict_parsing=True)
+            if set(query) != {'gym_key', 'folder_id'} or any(len(v) != 1 for v in query.values()):
+                return 400, {"error": "bad_media_identifier"}
+            return 200, inspect_media_source(
+                path[len(ROUTE_PREFIX + "/evidence/media-source/"):],
+                query['gym_key'][0], query['folder_id'][0], deps=deps.get('evidence'))
+        except (ValueError, EvidenceError) as exc:
+            if isinstance(exc, EvidenceError):
+                return exc.status, {"error": exc.code}
+            return 400, {"error": "bad_media_identifier"}
+        except Exception:
+            return 503, {"error": "evidence_unavailable"}
     if path.startswith(ROUTE_PREFIX + "/evidence/"):
         if method != "GET":
             return 405, {"error": "method_not_allowed"}
@@ -630,6 +889,28 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
             return 503, {"error": "evidence_unavailable"}
     if method == "GET" and path == ROUTE_PREFIX:
         return 200, catalog_json()
+    m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/resend_connect_link/readiness/"
+                 r"([A-Za-z0-9_-]{1,80})$", path)
+    if m:
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        return _resend_connect_link_readiness(m.group(1), deps)
+    m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/receipts/([A-Za-z0-9_-]{{1,128}})$", path)
+    if m:
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        from .fixer_ops_receipts import ReceiptError, default_store, get_receipt
+        query = parse_qs(parsed.query)
+        gym_key = (query.get("gym_key") or [""])[0].strip()
+        if not gym_key:
+            return 400, {"error": "bad_request", "detail": "gym_key required"}
+        store = deps.get("receipt_store")
+        try:
+            if store is None:
+                store = default_store()
+            return 200, {"ok": True, "receipt": get_receipt(store, m.group(1), gym_key)}
+        except ReceiptError as exc:
+            return exc.status, {"error": exc.code}
     m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/jobs/([0-9a-f]{{32}})$", path)
     if m:
         if method != "GET":
@@ -653,4 +934,5 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
     if not isinstance(body, dict):
         return 400, {"error": "bad_request", "detail": "body must be an object"}
     return run_action(m.group(1), body.get("gym_key"), body.get("ticket_id"),
-                      body.get("args"), deps=deps, log=log)
+                      body.get("args"), reservation_key=body.get("reservation_key"),
+                      deps=deps, log=log)

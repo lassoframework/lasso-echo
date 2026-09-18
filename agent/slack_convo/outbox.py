@@ -68,6 +68,8 @@ HARDENING (2026-09-03 re-audit wave 2):
       in Echo's channel.
 """
 from datetime import datetime, timezone
+import hashlib
+import json
 
 from . import adapter as _a
 from .. import config
@@ -137,6 +139,46 @@ def _verified_fix_notice(ticket, att, kind):
     verification = ticket.get("verification_after") or {}
     release = verification.get("fixer") or {}
     deployment = release.get("deployment_check") or {}
+    if kind != _a.KIND_STATUS or att.get("resolve_notice") is not True:
+        return False
+    operation = release.get("ops_action") or {}
+    if att.get("ops_action") in {"reset_recreate_budget", "requeue_failed_row", "swap_media"}:
+        common = (ticket.get("status") == "verification"
+                and release.get("postcondition_verified") is True
+                and operation.get("identityVerified") is True
+                and operation.get("ok") is True
+                and operation.get("action") == att.get("ops_action")
+                and operation.get("tenantVerified") is True
+                and bool(ticket.get("client_id"))
+                and operation.get("tenantId") == ticket.get("client_id")
+                and bool(release.get("request_key")))
+        if not common or att.get("ops_action") != "swap_media":
+            return common
+        args = operation.get("args") or {}
+        result = operation.get("result") or {}
+        if not isinstance(args, dict) or not isinstance(result, dict):
+            return False
+        row_id = args.get("row_id")
+        media_url = result.get("image_public_url")
+        media_kind = result.get("media_kind")
+        return (isinstance(row_id, str) and bool(row_id.strip())
+                and result.get("ok") is True
+                and result.get("action") == "swap-media"
+                and result.get("postcondition_verified") is True
+                and result.get("draft_id") == row_id
+                and result.get("siblings_swapped") == []
+                and result.get("siblings_left") == []
+                and isinstance(media_url, str) and bool(media_url.strip())
+                and (media_kind == "image" and result.get("video_url") is None
+                     or media_kind == "video" and
+                     isinstance(result.get("video_url"), str) and
+                     bool(result["video_url"].strip())))
+    # A healthy deployment proves the code is live, not that this owner's symptom
+    # is gone. The independent business check must identify its observation and
+    # bind it to the exact request and commit being released.
+    business = release.get("business_postcondition") or {}
+    if not isinstance(business, dict):
+        return False
     return (kind == _a.KIND_STATUS and att.get("resolve_notice") is True
             and ticket.get("status") == "merged"
             and verification.get("exit_code") == 0
@@ -145,7 +187,46 @@ def _verified_fix_notice(ticket, att, kind):
             and att.get("pr_url") == ticket.get("fix_pr_url")
             and bool(release.get("merged_sha"))
             and deployment.get("verified") is True
-            and deployment.get("sha") == release.get("merged_sha"))
+            and deployment.get("sha") == release.get("merged_sha")
+            and bool(release.get("request_key"))
+            and business.get("source") == "independent_business_check"
+            and business.get("verified") is True
+            and business.get("symptom_resolved") is True
+            and isinstance(business.get("check_id"), str)
+            and bool(business["check_id"].strip())
+            and isinstance(business.get("evidence"), str)
+            and bool(business["evidence"].strip())
+            and business.get("request_key") == release.get("request_key")
+            and business.get("merged_sha") == release.get("merged_sha"))
+
+
+def _current_fixer_request_key(bus, ticket):
+    """Recompute Scout's requestKey from all requester inbound rows, failing closed.
+
+    A truncated message read cannot prove the current request. Require fewer
+    than the normal PostgREST response cap and compare a separate inbound read.
+    """
+    rows = bus.messages(ticket["id"], limit=1000)
+    if not isinstance(rows, list) or len(rows) >= 1000:
+        return None
+    inbound = [m for m in rows if m.get("direction") == "inbound"]
+    if len(inbound) != bus.inbound_count(ticket["id"]):
+        return None
+    requester = []
+    for m in inbound:
+        att = m.get("attachments") or {}
+        author = m.get("author_type")
+        client = author == "client" or not author
+        operator_mention = (author in ("staff", "blake")
+                            and att.get("surface") == "mention"
+                            and att.get("identity_reason") == "operator list")
+        if client or operator_mention:
+            requester.append([m.get("id"), m.get("created_at"), m.get("body")])
+    encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    requester.sort(key=encode)
+    payload = requester or [ticket.get("id"), ticket.get("created_at"),
+                            ticket.get("raw_text")]
+    return hashlib.sha256(encode(payload).encode("utf-8")).hexdigest()
 
 
 def _channel_for(kind, identity):
@@ -391,7 +472,19 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     if row_ident and row_ident != identity.name:
         summary["skipped"] += 1
         return
-    if (ticket.get("bot_identity") or "") != identity.name:
+    # Scout raises this system alert precisely when the portal bridge cannot
+    # establish the ticket's bot identity. Portal tickets belong to Scout's
+    # outbox, while Echo tickets belong to Echo's. Route only this stamped
+    # internal escalation; never grant a conversational row this bypass.
+    portal_provenance_alert = (
+        kind == _a.KIND_ESCALATION
+        and row.get("direction") == "outbound"
+        and row.get("author_type") == "system"
+        and att.get("surface") == "portal_bridge_provenance"
+        and row_ident == identity.name
+        and (ticket.get("product"), identity.name) in {
+            ("echo", "echo"), ("portal", "scout")})
+    if (ticket.get("bot_identity") or "") != identity.name and not portal_provenance_alert:
         summary["skipped"] += 1
         return
     # 0. fail closed on anything we do not recognise
@@ -417,7 +510,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             return
         if kind == _a.KIND_HOLD_NOTICE:
             blocks = hold_notice_blocks(row)
-        elif kind == _a.KIND_ESCALATION:
+        elif kind == _a.KIND_ESCALATION and not portal_provenance_alert:
             blocks = escalation_blocks(row, ticket)
         else:
             blocks = None
@@ -443,6 +536,18 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         if not _verified_fix_notice(ticket, att, kind):
             _suppress(bus, row, ticket, identity,
                       "customer fix reply requires current PR merged, deployed and verified",
+                      log, summary)
+            return
+        release_key = ((ticket.get("verification_after") or {}).get("fixer") or {}).get("request_key")
+        try:
+            current_key = _current_fixer_request_key(bus, ticket)
+        except Exception as e:  # noqa: BLE001 - unreadable thread must not close a ticket
+            log(f"[slack-convo/outbox] request read failed for {ticket['id']}: "
+                f"{type(e).__name__}")
+            current_key = None
+        if not current_key or release_key != current_key or att.get("request_key") != current_key:
+            _suppress(bus, row, ticket, identity,
+                      "customer fix reply does not match the current requester messages",
                       log, summary)
             return
     # 1. first contact
@@ -635,6 +740,25 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             if not stored or stored.get("body") != sent_body:
                 raise RuntimeError("FIXER Slack body update was not confirmed")
             row = {**row, "body": sent_body}
+        # Membership, claiming, and body persistence can each take long enough for
+        # another customer message or a changed verification record to arrive.
+        # Re-read both immediately before the irreversible Slack call.
+        fresh = bus.ticket(ticket["id"])
+        try:
+            current_key = _current_fixer_request_key(bus, fresh) if fresh else None
+        except Exception as e:  # noqa: BLE001 - an unreadable request must hold
+            log(f"[slack-convo/outbox] final request read failed for {ticket['id']}: "
+                f"{type(e).__name__}")
+            current_key = None
+        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get("request_key")
+        if (not fresh or not _verified_fix_notice(fresh, att, kind)
+                or not current_key or release_key != current_key
+                or att.get("request_key") != current_key
+                or fresh.get("slack_channel_id") != channel
+                or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")):
+            _suppress(bus, row, fresh or ticket, identity,
+                      "FIXER notice changed before Slack delivery", log, summary)
+            return
     ts = post(channel, sent_body, thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
@@ -735,6 +859,15 @@ def _resolve_on_answer(bus, ticket, kind, summary, att=None):
     Two rows close a ticket: the ANSWER that answered it, and the resolve NOTICE a human
     tapped (MINOR 5, audit 7 -- resolve_and_notify used to stamp the ticket itself, before
     delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
+    if (att or {}).get("fixer") and (att or {}).get("resolve_notice"):
+        try:
+            fresh = bus.ticket(ticket["id"])
+            release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get("request_key")
+            current_key = _current_fixer_request_key(bus, fresh or ticket)
+        except Exception:  # noqa: BLE001 - posting never proves a changed request is fixed
+            return
+        if not current_key or release_key != current_key or (att or {}).get("request_key") != current_key:
+            return
     if kind == _a.KIND_ANSWER and ticket.get("status") == "verification":
         bus.set_ticket(ticket["id"], status="resolved")
         summary["resolved"] += 1
@@ -850,7 +983,14 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         proof_meta = {"resolve_notice": True, "pr_url": ticket.get("fix_pr_url")}
         if not _verified_fix_notice(ticket, proof_meta, _a.KIND_STATUS):
             return refuse_fix("customer fix has no current merged, deployed and "
-                              "verified release")
+                              "independently verified business postcondition")
+        try:
+            current_key = _current_fixer_request_key(bus, ticket)
+        except Exception:  # noqa: BLE001 - a human tap cannot waive unreadable context
+            current_key = None
+        release_key = ((ticket.get("verification_after") or {}).get("fixer") or {}).get("request_key")
+        if not current_key or release_key != current_key:
+            return refuse_fix("customer request changed or could not be verified")
         if not str(ticket.get("slack_channel_id") or "").startswith(("C", "G")):
             return refuse_fix("customer fix has no group conversation for Blake to join")
     # MINOR 4 (audit 7): `surface` was the ticket's SOURCE ("website_tab"), which is not one
@@ -865,7 +1005,8 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         # passed the gate and then held the row -- the exact lie the gate was added to close.
         meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
               "surface": surface, "resolved_by": approved_by, "resolve_notice": True,
-              **({"pr_url": ticket.get("fix_pr_url")} if customer_fix else {})})
+              **({"fixer": True, "request_key": current_key,
+                  "pr_url": ticket.get("fix_pr_url")} if customer_fix else {})})
     # MINOR 5 (audit 7): the ticket used to be stamped resolved HERE, before the notice had
     # been delivered -- so a post failure left a ticket permanently asserting it was resolved
     # over a row marked failed. Same rule as an answer (V-M4): the ticket closes when the

@@ -20,8 +20,24 @@ TICKET = "27728832-ae54-428c-af8b-0cb5c8ca1666"
 
 
 class FakeBus:
-    def __init__(self):
+    def __init__(self, ticket=None, tokens=None, error=None, reverse_tokens=None):
         self.rows = []
+        self.ticket_row = ticket if ticket is not None else {
+            "id": TICKET, "product": "echo", "source": "ops_fix", "client_id": None}
+        self.token_rows = tokens if tokens is not None else []
+        self.reverse_token_rows = reverse_tokens
+        self.error = error
+
+    def _get(self, table, params):
+        if self.error:
+            raise self.error
+        if table == "support_tickets":
+            return [self.ticket_row] if self.ticket_row and params["id"] == f"eq.{TICKET}" else []
+        if table == "echo_intake_tokens":
+            if "echo_account_key" in params and self.reverse_token_rows is not None:
+                return self.reverse_token_rows
+            return self.token_rows
+        raise AssertionError(f"unexpected table: {table}")
 
     def record_outbound(self, **kw):
         self.rows.append(kw)
@@ -95,6 +111,71 @@ def test_unknown_action_is_404_and_never_runs(armed):
     assert status == 404 and body["error"] == "unknown_action"
 
 
+def test_client_ticket_gym_mapping_is_checked_before_ops_side_effect(armed):
+    client_id = "a0fcb10f-73dc-4e56-b6ca-61ac9bc9470f"
+    ticket = {"id": TICKET, "product": "echo", "source": "slack_conversation",
+              "client_id": client_id}
+    calls = []
+    def reset(key):
+        calls.append(key)
+        return {"before": {"limit": 1, "used": 1, "remaining": 0},
+                "after": {"limit": 1, "used": 0, "remaining": 1}}
+    deps = {"reset_recreate_budget": reset}
+    for tokens, expected in [
+        ([{"gym_id": client_id, "echo_account_key": "differentgym123"}], "ticket_tenant_mismatch"),
+        ([], "ticket_tenant_unconfirmed"),
+        ([{"gym_id": client_id, "echo_account_key": GYM}] * 2, "ticket_tenant_unconfirmed"),
+        ([{"gym_id": "other-uuid", "echo_account_key": GYM}], "ticket_tenant_unconfirmed"),
+        ([{"gym_id": client_id, "echo_account_key": None}], "ticket_tenant_unconfirmed"),
+    ]:
+        status, body = _post("reset_recreate_budget", _body(),
+                             deps={**deps, "bus": FakeBus(ticket, tokens)})
+        assert status == 409 and body["error"] == expected
+    status, body = _post("reset_recreate_budget", _body(),
+                         deps={**deps, "bus": FakeBus(ticket, [{"gym_id": client_id,
+                                                               "echo_account_key": GYM}])})
+    assert status == 200 and body["ok"] is True and calls == [GYM]
+
+    status, body = _post("reset_recreate_budget", _body(),
+                         deps={**deps, "bus": FakeBus(
+                             ticket, [{"gym_id": client_id, "echo_account_key": GYM}],
+                             reverse_tokens=[{"gym_id": client_id, "echo_account_key": GYM},
+                                             {"gym_id": "other-gym-uuid", "echo_account_key": GYM}])})
+    assert status == 409 and body["error"] == "ticket_tenant_unconfirmed"
+    assert calls == [GYM]
+
+
+def test_tenant_store_failure_or_missing_client_does_not_run_action(armed):
+    calls = []
+    action = lambda key: calls.append(key)
+    for bus, status in [
+        (FakeBus(ticket={"id": TICKET, "product": "echo", "source": "slack_conversation",
+                         "client_id": None}), 409),
+        (FakeBus(ticket={"id": "other", "product": "echo", "source": "ops_fix",
+                         "client_id": None}), 409),
+        (FakeBus(error=RuntimeError("store unavailable")), 503),
+    ]:
+        result, _body_out = _post("reset_recreate_budget", _body(),
+                                  deps={"bus": bus, "reset_recreate_budget": action})
+        assert result == status
+    assert calls == []
+
+
+def test_account_key_ticket_must_match_exactly(armed):
+    ticket = {"id": TICKET, "product": "echo", "source": "slack_conversation",
+              "client_id": "othergym123"}
+    status, body = _post("reset_recreate_budget", _body(), deps={"bus": FakeBus(ticket)})
+    assert status == 409 and body["error"] == "ticket_tenant_mismatch"
+
+
+def test_org_floor_refusal_does_not_write_to_another_tenants_ticket(armed):
+    bus = FakeBus(ticket={"id": TICKET, "product": "echo", "source": "slack_conversation",
+                          "client_id": "othergym123"})
+    status, body = _post("refund", _body(), deps={"bus": bus})
+    assert status == 403 and body["error"] == "org_floor"
+    assert bus.rows == []
+
+
 @pytest.mark.parametrize("name", sorted(FO.ORG_FLOOR_ACTIONS))
 def test_org_floor_actions_are_403_by_name(armed, name):
     bus = FakeBus()
@@ -122,6 +203,7 @@ def test_reset_recreate_budget_records_and_audits(armed):
                          deps={"bus": bus, "reset_recreate_budget": reset}, logs=logs)
     assert status == 200 and body["ok"] and calls == [GYM]
     assert body["result"]["after"]["used"] == 0
+    assert body["result"]["postcondition_verified"] is True
     assert len(bus.rows) == 1
     row = bus.rows[0]
     assert row["ticket_id"] == TICKET and row["author_type"] == "system"
@@ -130,6 +212,17 @@ def test_reset_recreate_budget_records_and_audits(armed):
         "client-invisible kind, never posted by an outbox"
     assert row["meta"]["ops_action"] == "reset_recreate_budget"
     assert any(line.startswith("[fixer-ops] AUDIT action=reset_recreate_budget") for line in logs)
+
+
+def test_reset_recreate_budget_refuses_unconfirmed_readback(armed):
+    def reset(_key):
+        return {"before": {"limit": 30, "used": 30, "remaining": 0},
+                "after": {"limit": 30, "used": 1, "remaining": 29}}
+
+    status, body = _post("reset_recreate_budget", _body(),
+                         deps={"bus": FakeBus(), "reset_recreate_budget": reset})
+    assert status == 409 and body["ok"] is False
+    assert body["error"] == "postcondition_unconfirmed"
 
 
 def test_resend_connect_link_forces_the_send_and_reports_a_decline(armed):
@@ -143,6 +236,7 @@ def test_resend_connect_link_forces_the_send_and_reports_a_decline(armed):
             "notify_new_gym": notify, "is_echo_client": lambda gid: gid == "g-uuid"}
     status, body = _post("resend_connect_link", _body(), deps=deps)
     assert status == 200 and body["result"]["sent"] is True
+    assert body["result"]["postcondition_verified"] is False
     assert seen == {"base_key": GYM, "gym_id": "g-uuid", "name": "CrossFit Reverb", "force": True}
 
     def declines(base_key, gym_id, name, *, force=False, alert=None, **kw):
@@ -157,11 +251,69 @@ def test_resend_connect_link_forces_the_send_and_reports_a_decline(armed):
     assert _post("resend_connect_link", _body(), deps=deps)[0] == 404
 
 
+@pytest.mark.parametrize("category", ["ready", "missing", "ambiguous", "user-email-missing",
+                                      "portal-unavailable"])
+def test_resend_readiness_is_read_only_and_reports_only_category(armed, category):
+    sent = []
+    bus = FakeBus()
+    deps = {
+        "bus": bus,
+        "gym_lookup": lambda k: ("g-uuid", "Gym Name"),
+        "is_echo_client": lambda gid: gid == "g-uuid",
+        "owner_readiness": lambda gid: category,
+        "notify_new_gym": lambda *a, **kw: sent.append((a, kw)),
+    }
+    status, body = FO.handle(
+        "GET", f"{FO.ROUTE_PREFIX}/resend_connect_link/readiness/{GYM}", _hdr(), b"",
+        deps=deps)
+    assert status == 200 and body == {"category": category}
+    assert sent == [] and bus.rows == []
+
+
+def test_resend_readiness_preserves_auth_and_client_gates(armed):
+    path = f"{FO.ROUTE_PREFIX}/resend_connect_link/readiness/{GYM}"
+    assert FO.handle("GET", path, _hdr(None), b"")[0] == 401
+    deps = {"gym_lookup": lambda k: ("g-uuid", "Gym Name"),
+            "is_echo_client": lambda gid: False}
+    status, body = FO.handle("GET", path, _hdr(), b"", deps=deps)
+    assert status == 403 and body["error"] == "not_echo_client"
+
+
+def test_resend_readiness_turns_lookup_error_into_portal_unavailable(armed):
+    path = f"{FO.ROUTE_PREFIX}/resend_connect_link/readiness/{GYM}"
+    deps = {"gym_lookup": lambda k: ("g-uuid", "Gym Name"),
+            "is_echo_client": lambda gid: True,
+            "owner_readiness": lambda gid: (_ for _ in ()).throw(RuntimeError("down"))}
+    status, body = FO.handle("GET", path, _hdr(), b"", deps=deps)
+    assert status == 200 and body == {"category": "portal-unavailable"}
+
+
 def test_release_denied_assets_runs_the_sweep_when_the_volume_is_there(armed):
     deps = {"bus": FakeBus(), "volume_available": lambda: True,
-            "observe_denials": lambda: {"checked": 4, "rolled_back": 2}}
+            "observe_denials": lambda **kw: {"checked": 4, "rolled_back": 2}}
     status, body = _post("release_denied_assets", _body(), deps=deps)
     assert status == 200 and body["result"]["rolled_back"] == 2
+    assert body["result"]["postcondition_verified"] is False
+
+
+def test_release_denied_assets_cannot_rollback_another_gym(armed, monkeypatch):
+    from agent import gym_media_selector as selector
+
+    other = "anothergym"
+    records = [
+        (f"gym_media_use:{GYM}:2026-09-12", [{"rolled_back": False}]),
+        (f"gym_media_use:{other}:2026-09-12", [{"rolled_back": False}]),
+    ]
+    rolled = []
+    monkeypatch.setattr(selector, "_use_records", lambda: records)
+    monkeypatch.setattr(selector, "_default_fetch_rows", lambda gym, day: [
+        {"source_media_asset_id": "asset-1", "status": "denied"}])
+    monkeypatch.setattr(selector, "rollback_use", lambda gym, day, **kw: rolled.append(gym) or True)
+    status, body = _post("release_denied_assets", _body(), deps={
+        "bus": FakeBus(), "volume_available": lambda: True})
+    assert status == 200 and body["result"]["rolled_back"] == 1
+    assert body["result"]["checked"] == 1
+    assert rolled == [GYM]
 
 
 def test_volume_bound_actions_refuse_honestly_on_a_host_without_it(armed):
@@ -177,14 +329,23 @@ def test_volume_bound_actions_refuse_honestly_on_a_host_without_it(armed):
 
 def test_swap_media_passes_the_row_and_a_fixer_actor(armed):
     seen = {}
+    row = {"id": "row-abc-123", "gym_id": GYM, "image_url": "https://img/new.jpg"}
+
+    class Store:
+        def get_row(self, account_key, row_id):
+            assert (account_key, row_id) == (GYM, "row-abc-123")
+            return row
 
     def handler(account_key, draft_id, actor_id, **kw):
         seen.update(account_key=account_key, draft_id=draft_id, actor_id=actor_id)
-        return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id, "free": True}
+        return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,
+                     "free": True, "image_public_url": "https://img/new.jpg"}
 
     status, body = _post("swap_media", _body(row_id="row-abc-123"),
-                         deps={"bus": FakeBus(), "handle_swap_media": handler})
+                         deps={"bus": FakeBus(), "handle_swap_media": handler,
+                               "calendar_store": Store()})
     assert status == 200 and body["result"]["free"] is True
+    assert body["result"]["postcondition_verified"] is True
     assert seen == {"account_key": GYM, "draft_id": "row-abc-123",
                     "actor_id": f"fixer:{TICKET}"}
     # the wrapped function's refusal is passed through, not masked as success
@@ -193,6 +354,51 @@ def test_swap_media_passes_the_row_and_a_fixer_actor(armed):
                          deps={"bus": FakeBus(), "handle_swap_media": refuse})
     assert status == 409 and body["ok"] is False and body["error"] == "photo is locked"
     assert _post("swap_media", _body(), deps={"bus": FakeBus()})[0] == 400, "row_id required"
+
+
+def test_swap_media_does_not_claim_success_when_readback_disagrees(armed):
+    calls = []
+
+    class Store:
+        def get_row(self, account_key, row_id):
+            return {"id": row_id, "gym_id": account_key, "image_url": "https://img/old.jpg"}
+
+    def handler(*args):
+        calls.append(args)
+        return 200, {"ok": True, "image_public_url": "https://img/new.jpg"}
+
+    status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
+        "bus": FakeBus(), "handle_swap_media": handler, "calendar_store": Store()})
+    assert status == 409 and body["error"] == "postcondition_unconfirmed"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("sibling_result", [
+    {"siblings_swapped": ["sibling-1"]},
+    {"siblings_left": ["sibling-1"]},
+])
+def test_swap_media_does_not_verify_unread_sibling_writes(armed, sibling_result):
+    class Store:
+        def get_row(self, account_key, row_id):
+            return {"id": row_id, "gym_id": account_key, "image_url": "https://img/new.jpg"}
+
+    status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
+        "bus": FakeBus(), "calendar_store": Store(),
+        "handle_swap_media": lambda *args: (200, {
+            "ok": True, "image_public_url": "https://img/new.jpg",
+            **sibling_result})})
+    assert status == 409 and body["error"] == "postcondition_unconfirmed"
+
+
+def test_swap_media_requires_public_media_identity_to_verify(armed):
+    class Store:
+        def get_row(self, account_key, row_id):
+            pytest.fail("missing media identity should not trigger a readback")
+
+    status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
+        "bus": FakeBus(), "calendar_store": Store(),
+        "handle_swap_media": lambda *args: (200, {"ok": True, "video_url": "https://img/new.mp4"})})
+    assert status == 409 and body["error"] == "postcondition_unconfirmed"
 
 
 class FakeCalendarStore:
@@ -221,12 +427,43 @@ def test_requeue_failed_row_checks_ownership_and_state_first(armed):
     deps = {"bus": FakeBus(), "calendar_store": store}
     status, body = _post("requeue_failed_row", _body(row_id="row-failed-1"), deps=deps)
     assert status == 200 and body["result"]["status"] == "approved"
+    assert body["result"]["postcondition_verified"] is True
     assert store.requeued == ["row-failed-1"]
     status, body = _post("requeue_failed_row", _body(row_id="row-live-22"), deps=deps)
     assert status == 409 and body["error"] == "row_not_failed"
     status, body = _post("requeue_failed_row", _body(row_id="row-other-33"), deps=deps)
     assert status == 404 and body["error"] == "row_not_found", "another gym's row never loads"
     assert store.requeued == ["row-failed-1"], "only the owned, failed row was written"
+
+
+def test_requeue_failed_row_refuses_a_stale_readback(armed):
+    class StaleStore(FakeCalendarStore):
+        def get_row(self, account_key, row_id):
+            row = super().get_row(account_key, row_id)
+            if row and self.requeued:
+                return {**row, "status": "failed"}
+            return row
+
+    store = StaleStore([{"id": "row-failed-1", "gym_id": GYM,
+                         "status": "failed", "post_date": "2026-09-12"}])
+    status, body = _post("requeue_failed_row", _body(row_id="row-failed-1"),
+                         deps={"bus": FakeBus(), "calendar_store": store})
+    assert status == 409 and body["ok"] is False
+    assert body["error"] == "postcondition_unconfirmed"
+
+
+def test_requeue_failed_row_refuses_wrong_tenant_write_response(armed):
+    class WrongTenantStore(FakeCalendarStore):
+        def requeue_failed_row(self, row_id):
+            row = super().requeue_failed_row(row_id)
+            return {**row, "gym_id": "another-gym"}
+
+    store = WrongTenantStore([{"id": "row-failed-1", "gym_id": GYM,
+                               "status": "failed", "post_date": "2026-09-12"}])
+    status, body = _post("requeue_failed_row", _body(row_id="row-failed-1"),
+                         deps={"bus": FakeBus(), "calendar_store": store})
+    assert status == 409 and body["ok"] is False
+    assert body["error"] == "postcondition_unconfirmed"
 
 
 # ---- restage_month: background job + status route ----------------------------------------
@@ -247,7 +484,7 @@ def _restage_deps(bus, jobs, *, fail=False):
     return calls, {"bus": bus, "jobs": jobs, "volume_available": lambda: True,
                    "thread_runner": lambda fn: fn(),        # synchronous for the test
                    "sync_sources": sync_sources, "build_month": build,
-                   "observe_denials": lambda: {"checked": 1, "rolled_back": 1}}
+                   "observe_denials": lambda **kw: {"checked": 1, "rolled_back": 1}}
 
 
 def test_restage_month_returns_a_job_and_runs_the_recipe_in_order(armed):
@@ -263,12 +500,34 @@ def test_restage_month_returns_a_job_and_runs_the_recipe_in_order(armed):
     assert status == 200 and out["job"]["status"] == "done"
     assert [s["step"] for s in out["job"]["steps"]] == ["prerender", "observe_denials", "build"]
     assert out["job"]["result"]["build"]["upserted"] == 42
+    assert out["job"]["result"]["postcondition_verified"] is False
     # two ticket records: the accepted call and the job's completion (order depends on the
     # runner; the synchronous test runner finishes the job before run_action records 202)
     bodies = [r["body"] for r in bus.rows]
     assert len(bodies) == 2
     assert any(b.startswith("OPS ACTION restage_month by fixer: 202 ") for b in bodies)
     assert any("done" in b and job_id in b for b in bodies)
+
+
+def test_restage_month_denial_sweep_stays_within_the_requested_gym(monkeypatch):
+    from agent import gym_media_selector as selector
+
+    other = "anothergym"
+    monkeypatch.setattr(selector, "_use_records", lambda: [
+        (f"gym_media_use:{GYM}:2026-09-12", [{"rolled_back": False}]),
+        (f"gym_media_use:{other}:2026-09-12", [{"rolled_back": False}]),
+    ])
+    monkeypatch.setattr(selector, "_default_fetch_rows", lambda gym, day: [
+        {"source_media_asset_id": "asset-1", "status": "denied"}])
+    rolled = []
+    monkeypatch.setattr(selector, "rollback_use", lambda gym, day, **kw: rolled.append(gym) or True)
+    out = FO.run_restage_month(GYM, days=1, deps={
+        "sync_sources": lambda gym, budget: [],
+        "build_month": lambda gym, start, days: {"ok": True, "upserted": 0},
+    }, log=lambda *a: None)
+    assert out["observe_denials"]["rolled_back"] == 1
+    assert out["observe_denials"]["checked"] == 1
+    assert rolled == [GYM]
 
 
 def test_restage_month_job_failure_is_recorded_not_swallowed(armed):
@@ -278,6 +537,34 @@ def test_restage_month_job_failure_is_recorded_not_swallowed(armed):
     job = jobs.get(body["job_id"])
     assert job["status"] == "failed" and "voice doc missing" in job["error"]
     assert any("FAILED" in r["body"] for r in bus.rows)
+
+
+def test_restage_month_rejects_a_build_that_returns_ok_false(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+    _, deps = _restage_deps(bus, jobs)
+    deps["build_month"] = lambda _gym, _start, _days: {
+        "ok": False, "reason": "calendar store write failed", "upserted": 0,
+    }
+    status, body = _post("restage_month", _body(days=7), deps=deps)
+    assert status == 202
+    job = jobs.get(body["job_id"])
+    assert job["status"] == "failed"
+    assert "calendar store write failed" in job["error"]
+    assert job["steps"][-1]["ok"] is False
+    assert any("FAILED" in row["body"] for row in bus.rows)
+
+
+def test_restage_month_accepts_a_successful_noop_build(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+    _, deps = _restage_deps(bus, jobs)
+    deps["build_month"] = lambda _gym, _start, _days: {
+        "ok": True, "upserted": 0, "reason": "no eligible rows to change",
+    }
+    status, body = _post("restage_month", _body(days=7), deps=deps)
+    assert status == 202
+    job = jobs.get(body["job_id"])
+    assert job["status"] == "done"
+    assert job["steps"][-1]["ok"] is True
 
 
 def test_restage_month_bounds_its_inputs(armed):

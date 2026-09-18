@@ -656,10 +656,13 @@ def _daily_scheduler(store):
             except Exception as e:
                 print(f"[intake] ingest pass failed: {type(e).__name__}: {e}")
         # Portal Echo ticket bridge (D46): dormant unless
-        # AGENT_PORTAL_ECHO_TICKETS_ENABLED. Picks up a portal-submitted Echo support
-        # ticket, classifies it, dispatches it (grounded answer + outreach, or a HELD
-        # fixer_request behind Blake's tap same as any other code_fix), then a second
-        # pass notifies once a dispatched fix is verified. An error never kills the
+        # AGENT_PORTAL_ECHO_TICKETS_ENABLED. Picks up portal-submitted Echo and
+        # Portal support tickets, classifies them, and dispatches a grounded
+        # answer or a HELD fixer_request as a durable internal record. The
+        # legacy fixed_pass refuses notification without a verdict producer.
+        # Scout may queue an authenticated portal code_fix from that record
+        # under Blake's later
+        # 2026-09-18 ruling. An error never kills the
         # loop; a wired-real Slack client/bus is built lazily inside so an unarmed
         # deploy never even imports the Slack SDK for this lane.
         if (config.portal_echo_tickets_enabled()

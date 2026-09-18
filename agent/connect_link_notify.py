@@ -113,6 +113,62 @@ def _rest_get(path, params, *, url, key, http=None):
         return None
 
 
+def _rest_read(path, params, *, url, key, http=None):
+    """Like _rest_get, but retain whether a failed result was unavailable.
+
+    The resend path intentionally collapses every failure to ``None`` so it can
+    escalate safely. The read-only readiness endpoint must distinguish a portal
+    outage from owner data that needs to be fixed, without returning that data.
+    """
+    q = _up.urlencode(params)
+    try:
+        resp = _http(http).get(
+            f"{url}/rest/v1/{path}?{q}",
+            headers={"apikey": key, "Authorization": f"Bearer {key}",
+                     "Accept": "application/json"})
+    except Exception:
+        return False, None
+    if getattr(resp, "status_code", 599) >= 400:
+        return False, None
+    try:
+        return True, resp.json()
+    except Exception:
+        return False, None
+
+
+def owner_readiness(gym_id, *, http=None):
+    """Return a non-sensitive owner prerequisite category for a connect-link resend.
+
+    This is deliberately a portal read only. It makes no Slack request, link mint,
+    write, or notification. Keep its lookup shape aligned with resolve_owner_email:
+    one distinct client_owner assignment with one nonblank app-user email is ready.
+    """
+    url = config.supabase_url()
+    key = config.supabase_service_key()
+    if not url or not key or not gym_id:
+        return "portal-unavailable"
+    ok, assignments = _rest_read(
+        "gym_assignments",
+        {"gym_id": f"eq.{gym_id}", "relationship": "eq.client_owner",
+         "select": "app_user_id"},
+        url=url, key=key, http=http)
+    if not ok:
+        return "portal-unavailable"
+    user_ids = sorted({a.get("app_user_id") for a in assignments or []
+                       if a.get("app_user_id")})
+    if not user_ids:
+        return "missing"
+    if len(user_ids) > 1:
+        return "ambiguous"
+    ok, users = _rest_read("app_users", {"id": f"eq.{user_ids[0]}", "select": "email"},
+                          url=url, key=key, http=http)
+    if not ok:
+        return "portal-unavailable"
+    if not users or not str((users[0] or {}).get("email") or "").strip():
+        return "user-email-missing"
+    return "ready"
+
+
 def resolve_owner_email(gym_id, *, http=None):
     """The gym's client_owner email, resolved from the portal's OWN records
     (gym_assignments joined to app_users) -- never a guess. Returns None when the

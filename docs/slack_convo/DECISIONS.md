@@ -3097,3 +3097,18 @@ far as the logs show; add if the box shows otherwise). (3) The 36 owners were DM
 message itself cannot be unsent from here. (4) `AGENT_ONBOARDING_WATCH` can stay armed
 -- its roster is Echo clients only now -- but re-arming
 `AGENT_ONBOARDING_AUTOREGISTER` / `AGENT_AUTO_CONNECT_LINK` is Blake's call.
+
+## 2026-09-18 portal code-fix intake ruling (supersedes D14/D46 for this source only)
+
+Blake directed FIXER to take authenticated portal tickets autonomously. For a
+`product=echo` or `product=portal`, `source=website_tab` code-fix ticket, Echo
+continues to classify and persist the held internal `fixer_request`; Scout may
+verify the original portal inbound, reporter, client account, Slack identity,
+bot identity, and held request, then atomically queue the original ticket for
+triage. This does not release the held message to a client and does not change
+the human approval rules for other sources. A customer message about a code fix
+waits for the fix to be merged, deployed, and independently business-verified,
+and Blake must be in that conversation. Echo's `fixed_pass` still refuses its
+legacy notification lane because it has no registered verdict producer; Scout
+owns the new handoff. The Scout implementation and deployment are separate
+release gates; this dated ruling does not assert that the behavior is live.

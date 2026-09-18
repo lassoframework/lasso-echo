@@ -4,13 +4,14 @@ Echo support ticket to the real pipeline.
 
 Ground truth (Blake's own words): "with echo if someone submits a support echo should
 receive that then echo should fix it verify the fix and then send slack message with
-them and me in the message." This module is the "receive" + "dispatch" + "notify once
-verified" half; the actual fix + verify for a code_fix is the SAME ops-fix-triage.js
-worker every Slack-sourced code_fix already uses (D3/D14) -- this does not bypass that,
-or its hold gate. A code_fix from a client is ALWAYS held behind Blake's #fixer tap,
-exactly like every other code_fix in this system; D14's invariant is untouched. What
-changes is that once that worker has verified a real fix, THIS module is what notices
-and sends the client (and Blake) the verified result, automatically.
+them and me in the message." This module receives and classifies the portal
+ticket; the actual code fix is owned by Scout's FIXER worker. The original
+fixer_request remains held for an internal audit trail. Blake's later
+2026-09-18 portal-intake direction permits Scout to verify that authenticated
+bridge record and queue this narrow code-fix source autonomously. Scout owns
+that fix and customer handoff; this module's legacy fixed_pass currently
+refuses code-fix notification because it has no registered fix-verdict writer.
+Customer contact still waits for a verified live fix with Blake present.
 
 PROVENANCE (D42/D45): a ticket from source='website_tab' is trustworthy because
 lasso-ops-portal's /api/gyms/[gymId]/support route stamps `reporter` from the
@@ -28,9 +29,9 @@ no-ops while config.portal_echo_tickets_enabled() is off:
   1. intake_pass(): NEW, unclassified website_tab/echo tickets -> resolve identity,
      classify, dispatch (a grounded question gets an immediate answer + outreach; a
      code_fix gets a HELD fixer_request card, same as any other code_fix).
-  2. fixed_pass(): tickets already dispatched to the fixer worker (status='fixing')
-     whose verification has since landed -> outreach with the VERIFIED result as the
-     first message. A not-yet-verified ticket is left exactly as-is for next cycle.
+  2. fixed_pass(): legacy verification consumer; currently refuses code-fix
+     notification because FIX_VERIFICATION_PRODUCERS is empty. Scout's newer
+     portal handoff owns its post-deploy customer notice.
 
 Both passes are pure given their injected dependencies -- no import of a live Slack
 client or the live bus at module scope, so they are fully unit-testable offline.
@@ -340,14 +341,9 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
         return
 
     if classification == _cls.CODE_FIX:
-        # Same HELD fixer_request path every Slack-sourced code_fix uses (D14) --
-        # a client's code_fix is ALWAYS held behind Blake's #fixer tap, no exception
-        # for this source. This worker only automates the NOTIFY step once the
-        # existing worker (ops-fix-triage.js) has actually verified a fix. NOTE
-        # (D10, unchanged): that desktop worker trusts only Echo's bot_id today, so
-        # a non-Echo identity's fixer_request will queue correctly here but not yet
-        # execute -- the same documented limitation every other non-Echo code_fix
-        # path in this system already carries.
+        # Preserve the HELD fixer_request as durable internal evidence. Scout's
+        # narrow authenticated portal bridge may independently verify it and
+        # queue the original ticket without releasing this internal row.
         bus.set_ticket(tid, classification=_cls.CODE_FIX, status="fixing")
         # Customer contact for a code fix waits for merge, verified deployment,
         # and a conversation that includes Blake. The held internal request is
