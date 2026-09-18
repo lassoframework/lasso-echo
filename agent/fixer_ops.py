@@ -633,6 +633,14 @@ def _ticket_tenant(gym_key, ticket_id, deps):
             return 409, {"error": "ticket_tenant_unconfirmed"}
         if tokens[0]["echo_account_key"] != gym_key:
             return 409, {"error": "ticket_tenant_mismatch"}
+        aliases = bus._get("echo_intake_tokens", {
+            "echo_account_key": f"eq.{gym_key}",
+            "select": "gym_id,echo_account_key", "limit": "2"})
+        if (not isinstance(aliases, list) or len(aliases) != 1
+                or not isinstance(aliases[0], dict)
+                or aliases[0].get("gym_id") != client_id
+                or aliases[0].get("echo_account_key") != gym_key):
+            return 409, {"error": "ticket_tenant_unconfirmed"}
         return None
     except Exception:  # noqa: BLE001 - unreadable identity plane cannot authorize a write
         return 503, {"error": "ticket_tenant_unavailable"}
@@ -650,7 +658,9 @@ def run_action(action, gym_key, ticket_id, args, *, deps=None, log=print):
         _audit(action, gym_key, ticket_id, 403, "refused: org floor", log)
         # Round 2 (R4): a refused attempt leaves a trace ON THE TICKET too, not only in the
         # process log -- a teammate reading the thread should see the FIXER tried.
-        if _TICKET_ID.match(str(ticket_id or "").strip()):
+        if (_TICKET_ID.fullmatch(str(ticket_id or "").strip())
+                and _GYM_KEY.fullmatch(str(gym_key or "").strip())
+                and _ticket_tenant(str(gym_key).strip(), str(ticket_id).strip(), deps) is None):
             _ticket_note(deps.get("bus"), str(ticket_id).strip(), action,
                          "REFUSED: org_floor (billing/Stripe, pixel/CAPI, ad budget, "
                          "targeting, deleting published posts are never automated)", log)

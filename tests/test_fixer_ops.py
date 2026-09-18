@@ -20,11 +20,12 @@ TICKET = "27728832-ae54-428c-af8b-0cb5c8ca1666"
 
 
 class FakeBus:
-    def __init__(self, ticket=None, tokens=None, error=None):
+    def __init__(self, ticket=None, tokens=None, error=None, reverse_tokens=None):
         self.rows = []
         self.ticket_row = ticket if ticket is not None else {
             "id": TICKET, "product": "echo", "source": "ops_fix", "client_id": None}
         self.token_rows = tokens if tokens is not None else []
+        self.reverse_token_rows = reverse_tokens
         self.error = error
 
     def _get(self, table, params):
@@ -33,6 +34,8 @@ class FakeBus:
         if table == "support_tickets":
             return [self.ticket_row] if self.ticket_row and params["id"] == f"eq.{TICKET}" else []
         if table == "echo_intake_tokens":
+            if "echo_account_key" in params and self.reverse_token_rows is not None:
+                return self.reverse_token_rows
             return self.token_rows
         raise AssertionError(f"unexpected table: {table}")
 
@@ -133,6 +136,14 @@ def test_client_ticket_gym_mapping_is_checked_before_ops_side_effect(armed):
                                                                "echo_account_key": GYM}])})
     assert status == 200 and body["ok"] is True and calls == [GYM]
 
+    status, body = _post("reset_recreate_budget", _body(),
+                         deps={**deps, "bus": FakeBus(
+                             ticket, [{"gym_id": client_id, "echo_account_key": GYM}],
+                             reverse_tokens=[{"gym_id": client_id, "echo_account_key": GYM},
+                                             {"gym_id": "other-gym-uuid", "echo_account_key": GYM}])})
+    assert status == 409 and body["error"] == "ticket_tenant_unconfirmed"
+    assert calls == [GYM]
+
 
 def test_tenant_store_failure_or_missing_client_does_not_run_action(armed):
     calls = []
@@ -155,6 +166,14 @@ def test_account_key_ticket_must_match_exactly(armed):
               "client_id": "othergym123"}
     status, body = _post("reset_recreate_budget", _body(), deps={"bus": FakeBus(ticket)})
     assert status == 409 and body["error"] == "ticket_tenant_mismatch"
+
+
+def test_org_floor_refusal_does_not_write_to_another_tenants_ticket(armed):
+    bus = FakeBus(ticket={"id": TICKET, "product": "echo", "source": "slack_conversation",
+                          "client_id": "othergym123"})
+    status, body = _post("refund", _body(), deps={"bus": bus})
+    assert status == 403 and body["error"] == "org_floor"
+    assert bus.rows == []
 
 
 @pytest.mark.parametrize("name", sorted(FO.ORG_FLOOR_ACTIONS))
