@@ -157,6 +157,43 @@ def test_resend_connect_link_forces_the_send_and_reports_a_decline(armed):
     assert _post("resend_connect_link", _body(), deps=deps)[0] == 404
 
 
+@pytest.mark.parametrize("category", ["ready", "missing", "ambiguous", "user-email-missing",
+                                      "portal-unavailable"])
+def test_resend_readiness_is_read_only_and_reports_only_category(armed, category):
+    sent = []
+    bus = FakeBus()
+    deps = {
+        "bus": bus,
+        "gym_lookup": lambda k: ("g-uuid", "Gym Name"),
+        "is_echo_client": lambda gid: gid == "g-uuid",
+        "owner_readiness": lambda gid: category,
+        "notify_new_gym": lambda *a, **kw: sent.append((a, kw)),
+    }
+    status, body = FO.handle(
+        "GET", f"{FO.ROUTE_PREFIX}/resend_connect_link/readiness/{GYM}", _hdr(), b"",
+        deps=deps)
+    assert status == 200 and body == {"category": category}
+    assert sent == [] and bus.rows == []
+
+
+def test_resend_readiness_preserves_auth_and_client_gates(armed):
+    path = f"{FO.ROUTE_PREFIX}/resend_connect_link/readiness/{GYM}"
+    assert FO.handle("GET", path, _hdr(None), b"")[0] == 401
+    deps = {"gym_lookup": lambda k: ("g-uuid", "Gym Name"),
+            "is_echo_client": lambda gid: False}
+    status, body = FO.handle("GET", path, _hdr(), b"", deps=deps)
+    assert status == 403 and body["error"] == "not_echo_client"
+
+
+def test_resend_readiness_turns_lookup_error_into_portal_unavailable(armed):
+    path = f"{FO.ROUTE_PREFIX}/resend_connect_link/readiness/{GYM}"
+    deps = {"gym_lookup": lambda k: ("g-uuid", "Gym Name"),
+            "is_echo_client": lambda gid: True,
+            "owner_readiness": lambda gid: (_ for _ in ()).throw(RuntimeError("down"))}
+    status, body = FO.handle("GET", path, _hdr(), b"", deps=deps)
+    assert status == 200 and body == {"category": "portal-unavailable"}
+
+
 def test_release_denied_assets_runs_the_sweep_when_the_volume_is_there(armed):
     deps = {"bus": FakeBus(), "volume_available": lambda: True,
             "observe_denials": lambda: {"checked": 4, "rolled_back": 2}}

@@ -29,6 +29,10 @@ CONTRACT (the FIXER builder reads this block):
            "result"|"error", "steps": [...]}}
       404 {"error": "unknown_job"}
   GET  /ops/actions                        (same header)  -> the catalog, as JSON
+  GET  /ops/actions/resend_connect_link/readiness/<gym_key>  (same header)
+      200 {"category": "ready"|"missing"|"ambiguous"|"user-email-missing"|
+           "portal-unavailable"}
+      This is portal-read-only: no Slack lookup, link mint, ticket record, or DM.
 
   Catalog (`args` keys):
     resend_connect_link     {}                 owner DM with a fresh connect link (forced)
@@ -228,6 +232,32 @@ def _run_resend_connect_link(ctx):
     return 409, {"error": "not_sent", "sent": False, "gym_id": gym_id, "gym_name": name,
                  "detail": (alerts[-1] if alerts else "notify_new_gym declined to send"),
                  "summary": "connect link NOT sent: " + (alerts[-1] if alerts else "declined")}
+
+
+def _resend_connect_link_readiness(gym_key, deps):
+    """Read only whether the portal owner prerequisite is currently satisfied.
+
+    This intentionally does not call notify_new_gym: its force mode is an operator
+    resend and must never be used to poll for a portal-data repair.
+    """
+    if not _GYM_KEY.match(gym_key):
+        return 400, {"error": "bad_request", "detail": "gym_key required (account key)"}
+    ctx = Ctx(gym_key=gym_key, ticket_id="", args={}, deps=deps)
+    gym_id, _name = _gym_row_for(ctx)
+    if not gym_id:
+        return 404, {"error": "gym_not_found", "gym_key": gym_key}
+    if not _is_echo_client(ctx, gym_id):
+        return 403, {"error": "not_echo_client", "gym_key": gym_key, "gym_id": gym_id}
+    readiness = _dep(ctx, "owner_readiness", lambda: __import__(
+        "agent.connect_link_notify", fromlist=["owner_readiness"]).owner_readiness)
+    try:
+        category = readiness(gym_id)
+    except Exception:  # noqa: BLE001 - never mislabel an outage as missing
+        category = "portal-unavailable"
+    if category not in {"ready", "missing", "ambiguous", "user-email-missing",
+                        "portal-unavailable"}:
+        category = "portal-unavailable"
+    return 200, {"category": category}
 
 
 # -- reset_recreate_budget ---------------------------------------------------------------
@@ -630,6 +660,12 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
             return 503, {"error": "evidence_unavailable"}
     if method == "GET" and path == ROUTE_PREFIX:
         return 200, catalog_json()
+    m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/resend_connect_link/readiness/"
+                 r"([A-Za-z0-9_-]{1,80})$", path)
+    if m:
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        return _resend_connect_link_readiness(m.group(1), deps)
     m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/jobs/([0-9a-f]{{32}})$", path)
     if m:
         if method != "GET":
