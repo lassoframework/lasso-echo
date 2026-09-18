@@ -768,6 +768,78 @@ def test_fixer_request_key_matches_scout_fallback_without_requester_inbound():
         "d45972eada0fd20888b7d5f6da3c77745d7a739719768c1a464bf6e24fe9303a")
 
 
+def test_fixer_ops_notice_requires_verified_same_gym_action_and_current_request():
+    from agent.slack_convo import adapter as _a
+
+    operation = {"ok": True, "identityVerified": True,
+                 "action": "reset_recreate_budget", "gym_key": "gym-one",
+                 "tenantVerified": True, "tenantId": "gym-one"}
+    ticket = {"status": "verification", "client_id": "gym-one",
+              "verification_after": {"fixer": {"ops_action": operation,
+                                               "postcondition_verified": True,
+                                               "request_key": "request-one"}}}
+    att = {"resolve_notice": True, "ops_action": "reset_recreate_budget",
+           "request_key": "request-one"}
+    assert OB._verified_fix_notice(ticket, att, _a.KIND_STATUS)
+    for change in (
+        {"status": "fixing"}, {"client_id": "gym-two"},
+        {"verification_after": {"fixer": {**ticket["verification_after"]["fixer"],
+                                          "postcondition_verified": False}}},
+        {"verification_after": {"fixer": {**ticket["verification_after"]["fixer"],
+                                          "ops_action": {**operation, "identityVerified": False}}}},
+    ):
+        assert not OB._verified_fix_notice({**ticket, **change}, att, _a.KIND_STATUS)
+    assert not OB._verified_fix_notice(ticket, {**att, "ops_action": "requeue_failed_row"}, _a.KIND_STATUS)
+    assert not OB._verified_fix_notice(ticket, {**att, "resolve_notice": False}, _a.KIND_STATUS)
+
+
+def test_verified_ops_notice_posts_and_resolves_only_for_current_request(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {
+        "id": tid, "status": "verification", "client_id": "gym-one",
+        "bot_identity": "echo", "identity_kind": "client",
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        "verification_after": {"fixer": {
+                "ops_action": {"ok": True, "identityVerified": True,
+                               "action": "reset_recreate_budget", "gym_key": "gym-one",
+                               "tenantVerified": True, "tenantId": "gym-one"},
+            "postcondition_verified": True}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Reset my recreate budget")
+    key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = key
+    notice = bus.record_outbound(ticket_id=tid, author_type="echo", body="Your recreate budget is reset.",
+                                 delivery_status="ready", kind=A.KIND_STATUS,
+                                 meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+                                       "released_by": "fixer", "resolve_notice": True,
+                                       "ops_action": "reset_recreate_budget", "request_key": key})
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                member_check=lambda channel, user: channel == "C_CLIENT" and
+                user == OB.config.APPROVER_SLACK_ID)
+    assert bus.message(notice["id"])["delivery_status"] == "posted"
+    assert bus.ticket(tid)["status"] == "resolved"
+    assert any(call["channel"] == "C_CLIENT" for call in calls)
+
+    bus.set_ticket(tid, status="verification")
+    stale = bus.record_outbound(ticket_id=tid, author_type="echo", body="Old result is done.",
+                                delivery_status="ready", kind=A.KIND_STATUS,
+                                meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+                                      "released_by": "fixer", "resolve_notice": True,
+                                      "ops_action": "reset_recreate_budget", "request_key": key})
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Wait, I changed my request")
+    prior_posts = len([call for call in calls if call["channel"] == "C_CLIENT"])
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                member_check=lambda channel, user: channel == "C_CLIENT" and
+                user == OB.config.APPROVER_SLACK_ID)
+    assert bus.message(stale["id"])["delivery_status"] == "suppressed"
+    assert bus.ticket(tid)["status"] == "verification"
+    assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == prior_posts
+
+
 def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")

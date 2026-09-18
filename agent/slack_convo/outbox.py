@@ -139,6 +139,19 @@ def _verified_fix_notice(ticket, att, kind):
     verification = ticket.get("verification_after") or {}
     release = verification.get("fixer") or {}
     deployment = release.get("deployment_check") or {}
+    if kind != _a.KIND_STATUS or att.get("resolve_notice") is not True:
+        return False
+    operation = release.get("ops_action") or {}
+    if att.get("ops_action") in {"reset_recreate_budget", "requeue_failed_row"}:
+        return (ticket.get("status") == "verification"
+                and release.get("postcondition_verified") is True
+                and operation.get("identityVerified") is True
+                and operation.get("ok") is True
+                and operation.get("action") == att.get("ops_action")
+                and operation.get("tenantVerified") is True
+                and bool(ticket.get("client_id"))
+                and operation.get("tenantId") == ticket.get("client_id")
+                and bool(release.get("request_key")))
     return (kind == _a.KIND_STATUS and att.get("resolve_notice") is True
             and ticket.get("status") == "merged"
             and verification.get("exit_code") == 0
