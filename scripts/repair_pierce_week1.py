@@ -43,6 +43,7 @@ def main():
     from agent.portal_calendar_store import SupabaseCalendarStore, _media_stage_belt
     from agent import media_guard
     from agent.copy_gate import bound_opening_hook, violations
+    from agent import lever_stamp
 
     copy = {key: (pillar, bound_opening_hook(caption))
             for key, (pillar, caption) in COPY.items()}
@@ -89,6 +90,10 @@ def main():
     used_this_repair = set()
     for day, slot in MISSING:
         pillar, caption = copy[(day, slot)]
+        same_day_feeds = [r for r in feeds if str(r.get("post_date"))[:10] == day]
+        if len(same_day_feeds) != 1 or not same_day_feeds[0].get("time_slot"):
+            raise SystemExit(f"Cannot derive feed time slot for {day}")
+        time_slot = same_day_feeds[0]["time_slot"]
         inserted = None
         for candidate in backup_feeds:
             key = media_guard.row_media_key(candidate)
@@ -96,7 +101,10 @@ def main():
                 continue
             pair = [{"gym_id": BASE, "account": account, "format": "feed",
                      "post_date": day, "slot_index": slot, "pillar": pillar,
-                     "time_slot": "evening",
+                     "time_slot": time_slot,
+                     "hook_family": lever_stamp.hook_family(caption),
+                     "ask_type": lever_stamp.ask_type(caption),
+                     "caption_len_band": lever_stamp.caption_len_band(caption),
                      "caption": caption, "image_url": candidate["image_url"],
                      "source_media_url": candidate.get("source_media_url"),
                      "status": "pending"}
@@ -122,8 +130,11 @@ def main():
                 continue
             if row.get("caption") == caption and row.get("pillar") == pillar:
                 continue
+            levers = {"hook_family": lever_stamp.hook_family(caption),
+                      "ask_type": lever_stamp.ask_type(caption),
+                      "caption_len_band": lever_stamp.caption_len_band(caption)}
             result = store.patch_pending_plan(BASE, row["id"], caption=caption,
-                                              pillar=pillar)
+                                              pillar=pillar, levers=levers)
             if result is None:
                 raise SystemExit(f"Pending edit failed for {day} slot{slot}")
     rows = _rows(store)
@@ -133,6 +144,13 @@ def main():
               and r.get("format") == "feed"]
     if len(feeds) != 14 or len(mirror) != 14:
         raise SystemExit(f"Final feed shape {len(feeds)} IG and {len(mirror)} FB")
+    expected_slots = {(f"2026-09-{d:02d}", slot) for d in range(19, 26)
+                      for slot in (0, 1)}
+    for account_rows in (feeds, mirror):
+        actual = {(str(r.get("post_date"))[:10], r.get("slot_index"))
+                  for r in account_rows}
+        if actual != expected_slots:
+            raise SystemExit("Final two slot daily feed shape is incomplete")
     if len({r.get("caption") for r in feeds}) != 14:
         raise SystemExit("Feed captions are not distinct")
     for (day, slot), (_, caption) in copy.items():
@@ -140,7 +158,11 @@ def main():
                     and r.get("slot_index") == slot
                     and r.get("account") in ("instagram", "facebook")
                     and r.get("format") == "feed"]
-        if len(matching) != 2 or any(r.get("caption") != caption for r in matching):
+        if len(matching) != 2 or any(r.get("caption") != caption or
+                                     r.get("hook_family") != lever_stamp.hook_family(caption) or
+                                     r.get("ask_type") != lever_stamp.ask_type(caption) or
+                                     r.get("caption_len_band") != lever_stamp.caption_len_band(caption)
+                                     for r in matching):
             raise SystemExit(f"Copy did not persist on both feeds for {day} slot{slot}")
     print("Verified 14 IG and 14 FB pending feeds, 14 distinct IG captions")
 
