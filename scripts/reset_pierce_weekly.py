@@ -48,11 +48,38 @@ def main():
         if any(r.get("status") in ("published", "publishing", "failed")
                for r in today_rows):
             raise SystemExit("Sep 19 publishing has begun; refusing the timed reset")
-    before = target_rows(store)
+    stage_only = "--stage-only" in sys.argv
+    if stage_only:
+        if not BACKUP.exists():
+            raise SystemExit("No prior backup for stage-only recovery")
+        saved = json.loads(BACKUP.read_text())
+        if saved.get("gym_id") != BASE or saved.get("first") != FIRST or saved.get("last") != LAST:
+            raise SystemExit("Backup scope mismatch")
+        before = saved["rows"]
+        if target_rows(store):
+            raise SystemExit("Future rows already exist; refusing stage-only recovery")
+        print(f"Recovery from {BACKUP}, {len(before)} original rows")
+    else:
+        before = target_rows(store)
     print(f"Pierce {FIRST}..{LAST}: {len(before)} removable rows; "
           f"statuses={{{', '.join(sorted(set(str(r.get('status')) for r in before)))}}}")
     if "--dry-run" in sys.argv:
         return
+    if stage_only:
+        print("Existing backup retained; staging the first week")
+    else:
+        _clear_future(store, before)
+
+    from agent.client_media_sync import scan_and_generate
+    result = scan_and_generate(clients=[BASE], store=store, now=date(2026, 9, 18),
+                               days=7, logger=lambda m: print(m))
+    print(f"Weekly scan: {result}")
+    if not result.get("ok") or not result.get("generated"):
+        raise SystemExit("First weekly build did not stage; backup retained for recovery")
+    audit_first_week(store, before)
+
+
+def _clear_future(store, before):
     if not before:
         raise SystemExit("No rows matched; refusing an ambiguous reset")
     if BACKUP.exists():
@@ -89,12 +116,7 @@ def main():
         raise SystemExit("Future rows remain after delete; backup retained")
     print(f"Deleted {len(deleted)} backed-up Pierce rows")
 
-    from agent.client_media_sync import scan_and_generate
-    result = scan_and_generate(clients=[BASE], store=store, now=date(2026, 9, 18),
-                               days=7, logger=lambda m: print(m))
-    print(f"Weekly scan: {result}")
-    if not result.get("ok") or not result.get("generated"):
-        raise SystemExit("First weekly build did not stage; backup retained for recovery")
+def audit_first_week(store, before):
     rows = target_rows(store)
     feeds = [r for r in rows if r.get("format") in ("feed", "reel")
              and r.get("account") == "instagram"
