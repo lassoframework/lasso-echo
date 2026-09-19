@@ -1,3 +1,5 @@
+-- Apply after media_asset_review_20260918.sql. This migration depends on the
+-- review, moderation, people, and consent columns created there.
 -- Additive, intentionally fail-closed until applied by the database operator.
 -- Existing approvals have no reviewed byte version and cannot be selected.
 ALTER TABLE public.media_asset

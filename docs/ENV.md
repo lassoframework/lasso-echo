@@ -190,6 +190,8 @@ Now the FALLBACK engine. Everything below is unchanged.
 | PORT | 8080 | code | Railway sets it on the web service. |
 | AGENT_INTAKE_MAX_FILE_MB / AGENT_INTAKE_MAX_REQUEST_MB | code defaults | code | |
 | AGENT_INTAKE_RATE_PER_MINUTE | code default | code | Per-IP rate limit. |
+| AGENT_MEDIA_BRIDGE_ALERTS | false | BLAKE | Arms one durable client Slack notice per media-depletion episode and a maximum two-day review-held infographic fallback. Keep off until every intended gym has a verified route. |
+| AGENT_MEDIA_BRIDGE_CHANNELS | `{}` | BLAKE | JSON object mapping an exact gym key to its client Slack channel id. A missing or invalid route fails closed and sends nothing. |
 | AGENT_INTAKE_POLL_MINUTES | 5 | code | Worker pass interval. |
 | AGENT_DOC_INTAKE_ENABLED | false | BLAKE | PDF -> held draft posts. |
 | AGENT_MEDIA_INBOX_ENABLED / AGENT_MEDIA_INBOX_DIR | false / code | BLAKE | Provider-agnostic texted-media queue. |
