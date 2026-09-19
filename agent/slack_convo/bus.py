@@ -160,6 +160,44 @@ class Bus:
     def set_ticket(self, ticket_id, **fields):
         return self._patch(_TICKETS, {"id": f"eq.{ticket_id}"}, fields)
 
+    def resolve_current_delivery(self, ticket_id, expected_request_version,
+                                 expected_status, expected_classification,
+                                 expected_product, expected_client_id,
+                                 expected_bot_identity, expected_slack_user_id,
+                                 expected_slack_channel_id, expected_slack_thread_ts):
+        """Atomically resolve one exact, still-current FIXER client delivery.
+
+        Migration 0364 owns the authoritative eligibility envelope. Every mutable
+        tenant, requester and destination field that was validated before delivery
+        is repeated here; an empty representation is a lost CAS, never success.
+        """
+        if (not _UUID.fullmatch(str(ticket_id or ""))
+                or not isinstance(expected_request_version, int)
+                or isinstance(expected_request_version, bool)
+                or expected_request_version < 0):
+            raise BusError(400, "invalid current-delivery identity")
+        body = {
+            "p_ticket_id": ticket_id,
+            "p_expected_request_version": expected_request_version,
+            "p_expected_status": expected_status,
+            "p_expected_classification": expected_classification,
+            "p_expected_product": expected_product,
+            "p_expected_client_id": expected_client_id,
+            "p_expected_bot_identity": expected_bot_identity,
+            "p_expected_slack_user_id": expected_slack_user_id,
+            "p_expected_slack_channel_id": expected_slack_channel_id,
+            "p_expected_slack_thread_ts": expected_slack_thread_ts,
+        }
+        r = self._client().post(
+            f"{self._url}/rest/v1/rpc/fixer_resolve_current_delivery",
+            data=json.dumps(body), headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, (r.text or "")[:200])
+        data = r.json() or []
+        if isinstance(data, dict):
+            return data
+        return data[0] if isinstance(data, list) and len(data) == 1 else None
+
     def portal_client_id(self, gym_key):
         """The one portal UUID mapped to an exact Echo account key, or None.
 

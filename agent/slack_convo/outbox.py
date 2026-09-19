@@ -473,23 +473,42 @@ def _current_fixer_request_key(bus, ticket):
     return hashlib.sha256(encode(payload).encode("utf-8")).hexdigest()
 
 
-def _fresh_fixer_request(bus, ticket, att):
-    """Return the fresh ticket only when its requester hash matches the row.
+_FIXER_REQUEST_IDENTITY_FIELDS = (
+    "product", "client_id", "bot_identity", "slack_user_id",
+    "slack_channel_id", "slack_thread_ts",
+)
+
+
+def _fresh_fixer_request(bus, ticket, att, *, body="", require_direct_answer=False):
+    """Return the fresh ticket only when its requester identity matches the row.
 
     This is intentionally independent of deployment evidence. Grounded FIXER
     answers have no PR to prove, but they still must answer the request that is
-    current at the moment of delivery and resolution. Missing or unreadable
-    durable identity fails closed.
+    current at the moment of delivery and resolution. The monotonic database
+    version closes the hash/read-to-resolve race; the hash still binds the exact
+    requester transcript. Tenant, bot, user and destination may not drift between
+    any two fresh reads. Missing or unreadable durable identity fails closed.
     """
     stamped = (att or {}).get("request_key")
-    if not isinstance(stamped, str) or not stamped:
+    version = (att or {}).get("request_version")
+    if (not isinstance(stamped, str) or not stamped
+            or not isinstance(version, int) or isinstance(version, bool)
+            or version < 0 or not isinstance(ticket, dict)):
         return None
     try:
         fresh = bus.ticket(ticket["id"])
         current = _current_fixer_request_key(bus, fresh) if fresh else None
     except Exception:  # noqa: BLE001 - unreadable identity is never current proof
         return None
-    return fresh if current and stamped == current else None
+    if (not isinstance(fresh, dict)
+            or fresh.get("request_version") != version
+            or any(fresh.get(field) != ticket.get(field)
+                   for field in _FIXER_REQUEST_IDENTITY_FIELDS)
+            or not current or stamped != current):
+        return None
+    if require_direct_answer and not _direct_answerable_question(fresh, body):
+        return None
+    return fresh
 
 
 def _channel_for(kind, identity):
@@ -810,12 +829,16 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             log(f"[slack-convo/outbox] request read failed for {ticket['id']}: "
                 f"{type(e).__name__}")
             current_key = None
-        if not current_key or release_key != current_key or att.get("request_key") != current_key:
+        fresh_request = _fresh_fixer_request(bus, ticket, att)
+        if (not fresh_request or not current_key or release_key != current_key
+                or att.get("request_key") != current_key):
             _suppress(bus, row, ticket, identity,
                       "customer fix reply does not match the current requester messages",
                       log, summary)
             return
-    elif fixer_grounded_answer and not _fresh_fixer_request(bus, ticket, att):
+        ticket = fresh_request
+    elif fixer_grounded_answer and not _fresh_fixer_request(
+            bus, ticket, att, body=row.get("body") or "", require_direct_answer=True):
         _suppress(bus, row, ticket, identity,
                   "grounded FIXER answer does not match the current requester messages",
                   log, summary)
@@ -977,11 +1000,18 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     # Membership reads and the claim itself are externally visible boundaries. A
     # correction arriving during either one invalidates a grounded FIXER answer
     # even though that answer legitimately has no deployment record.
-    if fixer_grounded_answer:
-        fresh = _fresh_fixer_request(bus, ticket, att)
-        if not fresh:
+    if fixer_grounded_answer or customer_fix:
+        fresh = _fresh_fixer_request(
+            bus, ticket, att, body=row.get("body") or "",
+            require_direct_answer=fixer_grounded_answer)
+        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get(
+            "request_key")
+        if (not fresh
+                or (customer_fix and (not _verified_fix_notice(
+                    fresh, att, kind, bus=bus, now=now)
+                    or release_key != att.get("request_key")))):
             _suppress(bus, row, ticket, identity,
-                      "grounded FIXER answer changed before delivery", log, summary)
+                      "FIXER requester identity changed before delivery", log, summary)
             return
         ticket = fresh
     # 7. destination
@@ -1030,36 +1060,22 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             row = {**row, "body": sent_body}
     # Persisting Blake's exact mention/body is another mutation window. Re-read
     # the durable requester identity at the last possible point before Slack.
-    if fixer_grounded_answer:
-        fresh = _fresh_fixer_request(bus, ticket, att)
+    if fixer_grounded_answer or customer_fix:
+        fresh = _fresh_fixer_request(
+            bus, ticket, att, body=row.get("body") or "",
+            require_direct_answer=fixer_grounded_answer)
+        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get(
+            "request_key")
         if (not fresh
                 or fresh.get("slack_channel_id") != channel
-                or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")):
+                or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")
+                or (customer_fix and (not _verified_fix_notice(
+                    fresh, att, kind, bus=bus, now=now)
+                    or release_key != att.get("request_key")))):
             _suppress(bus, row, fresh or ticket, identity,
-                      "grounded FIXER answer changed before Slack delivery", log, summary)
+                      "FIXER requester identity changed before Slack delivery", log, summary)
             return
         ticket = fresh
-    if customer_fix:
-        # Claiming and body persistence can each take long enough for another
-        # customer message or a changed verification record to arrive. Re-read
-        # deployment and request identity immediately before a code-fix notice.
-        # Grounded answer-only rows bypass only this deployment-proof branch.
-        fresh = bus.ticket(ticket["id"])
-        try:
-            current_key = _current_fixer_request_key(bus, fresh) if fresh else None
-        except Exception as e:  # noqa: BLE001 - an unreadable request must hold
-            log(f"[slack-convo/outbox] final request read failed for {ticket['id']}: "
-                f"{type(e).__name__}")
-            current_key = None
-        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get("request_key")
-        if (not fresh or not _verified_fix_notice(fresh, att, kind, bus=bus, now=now)
-                or not current_key or release_key != current_key
-                or att.get("request_key") != current_key
-                or fresh.get("slack_channel_id") != channel
-                or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")):
-            _suppress(bus, row, fresh or ticket, identity,
-                      "FIXER notice changed before Slack delivery", log, summary)
-            return
     ts = post(channel, sent_body, thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
@@ -1151,30 +1167,67 @@ def _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log=pri
                                    surface=(att or {}).get("surface") or "",
                                    person=_person_for_card(bus, ticket, identity), log=log)
         return
-    _resolve_on_answer(bus, ticket, kind, summary, att)
+    _resolve_on_answer(bus, ticket, kind, summary, att, row.get("body") or "")
 
 
-def _resolve_on_answer(bus, ticket, kind, summary, att=None):
+def _resolve_on_answer(bus, ticket, kind, summary, att=None, body=""):
     """V-M4: the ticket closes when the person HAS the message, not when we drafted it.
 
     Two rows close a ticket: the ANSWER that answered it, and the resolve NOTICE a human
     tapped (MINOR 5, audit 7 -- resolve_and_notify used to stamp the ticket itself, before
     delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
-    if _fixer_grounded_question_answer(ticket, att or {}, kind):
-        # Slack may have accepted the old answer while a correction arrived. Keep
-        # the delivery receipt for exactly what was sent, but never let that old
-        # answer close the now-newer request.
-        if not _fresh_fixer_request(bus, ticket, att or {}):
+    meta = att or {}
+    fixer = bool(meta.get("fixer"))
+    should_resolve = (
+        kind == _a.KIND_ANSWER and ticket.get("status") == "verification"
+        or kind == _a.KIND_STATUS and meta.get("resolve_notice") is True
+        and ticket.get("status") != "resolved")
+    if fixer and should_resolve:
+        # Slack (or the portal thread) may accept a delivery while the requester
+        # corrects it or an operator changes its eligibility. Keep the receipt for
+        # exactly what was delivered, but resolve only through the database CAS
+        # over the complete ticket identity that was freshly validated here.
+        grounded = _fixer_grounded_question_answer(ticket, meta, kind, body)
+        fresh = _fresh_fixer_request(
+            bus, ticket, meta, body=body, require_direct_answer=grounded)
+        resolver = getattr(bus, "resolve_current_delivery", None)
+        if not fresh or not callable(resolver):
             return
-    if (att or {}).get("fixer") and (att or {}).get("resolve_notice"):
+        if meta.get("resolve_notice"):
+            release_key = ((fresh.get("verification_after") or {}).get("fixer") or {}).get(
+                "request_key")
+            if release_key != meta.get("request_key"):
+                return
+        expected = {
+            "status": fresh.get("status"),
+            "classification": fresh.get("classification"),
+            **{field: fresh.get(field) for field in _FIXER_REQUEST_IDENTITY_FIELDS},
+        }
         try:
-            fresh = bus.ticket(ticket["id"])
-            release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get("request_key")
-            current_key = _current_fixer_request_key(bus, fresh or ticket)
-        except Exception:  # noqa: BLE001 - posting never proves a changed request is fixed
+            resolved = resolver(
+                ticket["id"], meta.get("request_version"),
+                expected["status"], expected["classification"],
+                expected["product"], expected["client_id"],
+                expected["bot_identity"], expected["slack_user_id"],
+                expected["slack_channel_id"], expected["slack_thread_ts"])
+        except Exception:  # noqa: BLE001 - a failed atomic close leaves it open
             return
-        if not current_key or release_key != current_key or (att or {}).get("request_key") != current_key:
+        if (not isinstance(resolved, dict)
+                or resolved.get("id") != ticket.get("id")
+                or resolved.get("status") != "resolved"
+                or resolved.get("request_version") != meta.get("request_version")
+                or resolved.get("classification") != expected["classification"]
+                or resolved.get("escalated") is not False
+                or resolved.get("hold_tier") is not None
+                or any(resolved.get(field) != expected[field]
+                       for field in _FIXER_REQUEST_IDENTITY_FIELDS)):
             return
+        summary["resolved"] += 1
+        return
+    if fixer:
+        # A FIXER row that is not presently eligible to resolve must never fall
+        # through to the legacy unconditional ticket PATCH below.
+        return
     if kind == _a.KIND_ANSWER and ticket.get("status") == "verification":
         bus.set_ticket(ticket["id"], status="resolved")
         summary["resolved"] += 1
