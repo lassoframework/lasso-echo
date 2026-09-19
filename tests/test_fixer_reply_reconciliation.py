@@ -236,18 +236,18 @@ def test_complete_comment_reader_proves_a_single_captured_provider_page():
                       {"accountId": "account-1", "page": 1, "limit": 2})]
 
 
-def test_complete_review_reader_reads_multiple_pages_and_deduplicates_identity():
+def test_complete_review_reader_rejects_duplicate_identity_below_provider_total():
     first = _review(item_id="review-1")
     second = _review(item_id="review-2")
-    # The provider repeated review-1 on the final page.  Its full identity and
-    # content are identical, so reconciliation receives each provider identity once.
+    # The provider repeated review-1 on the final page. Even though its full
+    # content is identical, two unique identities cannot satisfy total=3.
     client, calls = _complete_zernio({
         1: _review_page(1, 2, 3, 2, [first, second]),
         2: _review_page(2, 2, 3, 2, [first]),
     })
-    result = client.list_inbox_reviews_complete(PROFILE, limit=2)
-    assert result["data"] == [first, second]
-    assert result["pagination"]["complete"] is True
+    with pytest.raises(Z.ZernioPaginationError,
+                       match="duplicate_or_missing_provider_identity"):
+        client.list_inbox_reviews_complete(PROFILE, limit=2)
     assert [params["page"] for _path, params in calls] == [1, 2]
 
 

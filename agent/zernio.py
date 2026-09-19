@@ -448,6 +448,9 @@ class ZernioClient:
             # for an empty result.  This is the only place this helper returns
             # ``complete: true``.
             if wanted_page == max(pages, 1):
+                if len(output) != expected_total:
+                    raise ZernioPaginationError(
+                        "duplicate_or_missing_provider_identity")
                 out = dict(first)
                 out[rows_key] = output
                 out["pagination"] = dict(pagination, complete=True,
