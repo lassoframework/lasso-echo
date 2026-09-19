@@ -283,6 +283,8 @@ def _fixer_answer_ticket(bus, question, answer, *, fixer=True):
     meta = {"identity": "echo", "recipient_kind": "client", "surface": "mpim"}
     if fixer:
         meta["fixer"] = True
+        meta["request_key"] = OB._current_fixer_request_key(
+            bus, bus.ticket(t["id"]))
     row = bus.record_outbound(ticket_id=t["id"], author_type="echo", body=answer,
                               delivery_status="ready", kind=A.KIND_ANSWER, meta=meta)
     return t["id"], row["id"]
