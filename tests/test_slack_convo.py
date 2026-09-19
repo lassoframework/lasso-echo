@@ -1710,10 +1710,12 @@ def test_grounded_fixer_answer_requires_blake_in_destination_without_deploy_proo
     }
     bus.record_inbound(ticket_id=tid, author_type="client",
                        body="Is Instagram connected?")
+    request_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
     row = bus.record_outbound(
         ticket_id=tid, author_type="echo", body="Instagram is connected.",
         delivery_status="ready", kind=A.KIND_ANSWER,
-        meta={"identity": "echo", "recipient_kind": "client", "fixer": True})
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "request_key": request_key})
     post, calls = _posted()
 
     summary = OB.run_once(
@@ -1747,10 +1749,12 @@ def test_grounded_fixer_answer_includes_blake_without_requiring_deploy_proof(
     }
     bus.record_inbound(ticket_id=tid, author_type="client",
                        body="Is Instagram connected?")
+    request_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
     row = bus.record_outbound(
         ticket_id=tid, author_type="echo", body="Instagram is connected.",
         delivery_status="ready", kind=A.KIND_ANSWER,
-        meta={"identity": "echo", "recipient_kind": "client", "fixer": True})
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "request_key": request_key})
     post, calls = _posted()
 
     summary = OB.run_once(
@@ -1763,6 +1767,138 @@ def test_grounded_fixer_answer_includes_blake_without_requiring_deploy_proof(
     assert bus.message(row["id"])["body"] == expected
     assert summary["resolved"] == 1
     assert [call["text"] for call in calls if call["channel"] == "C_CLIENT"] == [expected]
+
+
+def _grounded_fixer_answer_case():
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {
+        "id": tid, "status": "verification", "product": "echo",
+        "classification": "answerable_question", "escalated": False,
+        "bot_identity": "echo", "identity_kind": "client",
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        "verification_after": {"facts": {"instagram": "connected"}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client",
+                       body="Is Instagram connected?")
+    request_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="Instagram is connected.",
+        delivery_status="ready", kind=A.KIND_ANSWER,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "request_key": request_key})
+    return bus, tid, row, request_key
+
+
+@pytest.mark.parametrize("defect", ["missing", "stale", "unreadable"])
+def test_grounded_fixer_answer_requires_readable_current_request_identity(
+        monkeypatch, defect):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    if defect == "missing":
+        next(m for m in bus.msgs if m["id"] == row["id"])["attachments"].pop(
+            "request_key")
+    elif defect == "stale":
+        next(m for m in bus.msgs if m["id"] == row["id"])["attachments"][
+            "request_key"] = "stale"
+    else:
+        monkeypatch.setattr(
+            bus, "messages",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("read failed")))
+    post, calls = _posted()
+
+    summary = OB.run_once(
+        bus, post, identity=IDS.get("echo"), log=lambda *_: None,
+        member_check=lambda _channel, _user: True)
+
+    assert bus.message(row["id"])["delivery_status"] == "suppressed"
+    assert summary["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "verification"
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
+
+
+@pytest.mark.parametrize("window", ["before", "membership", "body"])
+def test_grounded_fixer_correction_before_delivery_suppresses_old_answer(
+        monkeypatch, window):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+
+    def correction():
+        bus.record_inbound(ticket_id=tid, author_type="client",
+                           body="Correction: Facebook is the account I meant")
+
+    if window == "before":
+        correction()
+        member_check = lambda _channel, _user: True
+    elif window == "membership":
+        def member_check(_channel, _user):
+            correction()
+            return True
+    else:
+        member_check = lambda _channel, _user: True
+        original = bus.set_message_body_if_posting
+
+        def mutate(*args):
+            result = original(*args)
+            correction()
+            return result
+
+        monkeypatch.setattr(bus, "set_message_body_if_posting", mutate)
+    post, calls = _posted()
+
+    summary = OB.run_once(
+        bus, post, identity=IDS.get("echo"), log=lambda *_: None,
+        member_check=member_check)
+
+    assert bus.message(row["id"])["delivery_status"] == "suppressed"
+    assert summary["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "verification"
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
+
+
+@pytest.mark.parametrize("during_post", ["correction", "unreadable"])
+def test_grounded_fixer_correction_during_post_keeps_newer_request_open(
+        monkeypatch, during_post):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+
+    def post(_channel, _text, thread_ts=None, blocks=None):
+        if during_post == "correction":
+            bus.record_inbound(ticket_id=tid, author_type="client",
+                               body="Correction while Slack delivered the answer")
+        else:
+            monkeypatch.setattr(
+                bus, "messages",
+                lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("read failed")))
+        return "9.999"
+
+    summary = OB.run_once(
+        bus, post, identity=IDS.get("echo"), log=lambda *_: None,
+        member_check=lambda _channel, _user: True)
+
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert bus.message(row["id"])["slack_ts"] == "9.999"
+    assert summary["posted"] == 1
+    assert summary["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "verification"
+    receipts = [m for m in bus.messages_for(tid)
+                if (m.get("attachments") or {}).get("receipt_for") == row["id"]]
+    assert len(receipts) == 1
 
 
 def test_slack_membership_read_paginates_and_fails_closed(monkeypatch):

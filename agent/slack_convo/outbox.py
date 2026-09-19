@@ -109,6 +109,32 @@ def portal_deliverable(ticket):
             and bool(str(t.get("client_id") or "").strip()))
 
 
+def _direct_answerable_question(ticket, body=""):
+    """A grounded question answer is not a code-fix completion.
+
+    It may skip deployment proof, but FIXER-authored rows are separately bound to
+    the current durable requester hash below. Keep this predicate independent of
+    authorship so ordinary Echo answers retain their existing behavior.
+    """
+    t = ticket or {}
+    classification = str(t.get("classification") or "").lower()
+    direct_question = (classification == "answerable_question"
+                       and t.get("status") == "verification"
+                       and t.get("escalated") is not True
+                       and not t.get("hold_tier")
+                       and not (t.get("verification_after") or {}).get("hold"))
+    promised_work = (_a.answer_commits_to_action(str(body or ""))
+                     or _a.promises_human_follow_up(str(body or "")))
+    return direct_question and not promised_work
+
+
+def _fixer_grounded_question_answer(ticket, att, kind, body=""):
+    """True only for the narrow FIXER question-answer deployment exemption."""
+    return (kind == _a.KIND_ANSWER
+            and bool((att or {}).get("fixer"))
+            and _direct_answerable_question(ticket, body))
+
+
 def _customer_fix_reply(ticket, att, body=""):
     """Identify customer handoffs even after escalation clears classification.
 
@@ -119,21 +145,14 @@ def _customer_fix_reply(ticket, att, body=""):
     recipient = (att.get("recipient_kind") or ticket.get("identity_kind") or "client")
     if recipient in ("staff", "coach"):
         return False
-    classification = str(ticket.get("classification") or "").lower()
-    direct_question = (classification == "answerable_question"
-                       and ticket.get("status") == "verification"
-                       and ticket.get("escalated") is not True
-                       and not ticket.get("hold_tier")
-                       and not (ticket.get("verification_after") or {}).get("hold"))
     # A grounded answer remains an answer when Scout/FIXER authored it.  The
     # normal answer gates below still re-run the hard-line verdict, arming, and
     # conversation checks. Treating every `fixer: true` row as a code-fix
     # completion sent it into the deployment gate, where it could never pass
     # because an answer has no PR or release evidence.
-    promised_work = (_a.answer_commits_to_action(str(body or ""))
-                     or _a.promises_human_follow_up(str(body or "")))
-    if direct_question and not promised_work:
+    if _direct_answerable_question(ticket, body):
         return False
+    classification = str(ticket.get("classification") or "").lower()
     portal_handoff = (ticket.get("product") == "echo"
                       and portal_deliverable(ticket)
                       and (ticket.get("escalated") is True
@@ -454,6 +473,25 @@ def _current_fixer_request_key(bus, ticket):
     return hashlib.sha256(encode(payload).encode("utf-8")).hexdigest()
 
 
+def _fresh_fixer_request(bus, ticket, att):
+    """Return the fresh ticket only when its requester hash matches the row.
+
+    This is intentionally independent of deployment evidence. Grounded FIXER
+    answers have no PR to prove, but they still must answer the request that is
+    current at the moment of delivery and resolution. Missing or unreadable
+    durable identity fails closed.
+    """
+    stamped = (att or {}).get("request_key")
+    if not isinstance(stamped, str) or not stamped:
+        return None
+    try:
+        fresh = bus.ticket(ticket["id"])
+        current = _current_fixer_request_key(bus, fresh) if fresh else None
+    except Exception:  # noqa: BLE001 - unreadable identity is never current proof
+        return None
+    return fresh if current and stamped == current else None
+
+
 def _channel_for(kind, identity):
     if kind == _a.KIND_FIXER_REQUEST:
         return config.ops_fix_channel_id()
@@ -757,6 +795,8 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     # Re-read deployment proof at dispatch time. A queued FIXER acknowledgement,
     # held-answer replacement, or stale notice must never reach a client.
     customer_fix = _customer_fix_reply(ticket, att, row.get("body") or "")
+    fixer_grounded_answer = _fixer_grounded_question_answer(
+        ticket, att, kind, row.get("body") or "")
     if customer_fix:
         if not _verified_fix_notice(ticket, att, kind, bus=bus, now=now):
             _suppress(bus, row, ticket, identity,
@@ -775,6 +815,11 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                       "customer fix reply does not match the current requester messages",
                       log, summary)
             return
+    elif fixer_grounded_answer and not _fresh_fixer_request(bus, ticket, att):
+        _suppress(bus, row, ticket, identity,
+                  "grounded FIXER answer does not match the current requester messages",
+                  log, summary)
+        return
     # 1. first contact
     if bus.inbound_count(ticket["id"]) < 1:
         _suppress(bus, row, ticket, identity,
@@ -929,6 +974,16 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     if not _claim(bus, row, log):
         summary["skipped"] += 1
         return
+    # Membership reads and the claim itself are externally visible boundaries. A
+    # correction arriving during either one invalidates a grounded FIXER answer
+    # even though that answer legitimately has no deployment record.
+    if fixer_grounded_answer:
+        fresh = _fresh_fixer_request(bus, ticket, att)
+        if not fresh:
+            _suppress(bus, row, ticket, identity,
+                      "grounded FIXER answer changed before delivery", log, summary)
+            return
+        ticket = fresh
     # 7. destination
     channel = ticket.get("slack_channel_id")
     surface = att.get("surface") or ""
@@ -973,6 +1028,17 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             if not stored or stored.get("body") != sent_body:
                 raise RuntimeError("FIXER Slack body update was not confirmed")
             row = {**row, "body": sent_body}
+    # Persisting Blake's exact mention/body is another mutation window. Re-read
+    # the durable requester identity at the last possible point before Slack.
+    if fixer_grounded_answer:
+        fresh = _fresh_fixer_request(bus, ticket, att)
+        if (not fresh
+                or fresh.get("slack_channel_id") != channel
+                or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")):
+            _suppress(bus, row, fresh or ticket, identity,
+                      "grounded FIXER answer changed before Slack delivery", log, summary)
+            return
+        ticket = fresh
     if customer_fix:
         # Claiming and body persistence can each take long enough for another
         # customer message or a changed verification record to arrive. Re-read
@@ -1094,6 +1160,12 @@ def _resolve_on_answer(bus, ticket, kind, summary, att=None):
     Two rows close a ticket: the ANSWER that answered it, and the resolve NOTICE a human
     tapped (MINOR 5, audit 7 -- resolve_and_notify used to stamp the ticket itself, before
     delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
+    if _fixer_grounded_question_answer(ticket, att or {}, kind):
+        # Slack may have accepted the old answer while a correction arrived. Keep
+        # the delivery receipt for exactly what was sent, but never let that old
+        # answer close the now-newer request.
+        if not _fresh_fixer_request(bus, ticket, att or {}):
+            return
     if (att or {}).get("fixer") and (att or {}).get("resolve_notice"):
         try:
             fresh = bus.ticket(ticket["id"])
