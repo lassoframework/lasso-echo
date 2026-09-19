@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS public.media_asset_review_event (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE public.media_asset_review_event ENABLE ROW LEVEL SECURITY;
+
 CREATE INDEX IF NOT EXISTS media_asset_review_event_gym_asset_idx
   ON public.media_asset_review_event (gym_id, asset_id, id DESC);
 
