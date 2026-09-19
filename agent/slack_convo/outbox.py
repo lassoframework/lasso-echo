@@ -70,6 +70,7 @@ HARDENING (2026-09-03 re-audit wave 2):
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 
 from . import adapter as _a
 from .. import config
@@ -108,7 +109,33 @@ def portal_deliverable(ticket):
             and bool(str(t.get("client_id") or "").strip()))
 
 
-def _customer_fix_reply(ticket, att):
+def _direct_answerable_question(ticket, body=""):
+    """A grounded question answer is not a code-fix completion.
+
+    It may skip deployment proof, but FIXER-authored rows are separately bound to
+    the current durable requester hash below. Keep this predicate independent of
+    authorship so ordinary Echo answers retain their existing behavior.
+    """
+    t = ticket or {}
+    classification = str(t.get("classification") or "").lower()
+    direct_question = (classification == "answerable_question"
+                       and t.get("status") == "verification"
+                       and t.get("escalated") is not True
+                       and not t.get("hold_tier")
+                       and not (t.get("verification_after") or {}).get("hold"))
+    promised_work = (_a.answer_commits_to_action(str(body or ""))
+                     or _a.promises_human_follow_up(str(body or "")))
+    return direct_question and not promised_work
+
+
+def _fixer_grounded_question_answer(ticket, att, kind, body=""):
+    """True only for the narrow FIXER question-answer deployment exemption."""
+    return (kind == _a.KIND_ANSWER
+            and bool((att or {}).get("fixer"))
+            and _direct_answerable_question(ticket, body))
+
+
+def _customer_fix_reply(ticket, att, body=""):
     """Identify customer handoffs even after escalation clears classification.
 
     The FIXER poll requires classification NULL, so classification alone cannot
@@ -118,14 +145,14 @@ def _customer_fix_reply(ticket, att):
     recipient = (att.get("recipient_kind") or ticket.get("identity_kind") or "client")
     if recipient in ("staff", "coach"):
         return False
-    classification = str(ticket.get("classification") or "").lower()
-    direct_question = (classification == "answerable_question"
-                       and ticket.get("status") == "verification"
-                       and ticket.get("escalated") is not True
-                       and not ticket.get("hold_tier")
-                       and not (ticket.get("verification_after") or {}).get("hold"))
-    if direct_question and not att.get("fixer"):
+    # A grounded answer remains an answer when Scout/FIXER authored it.  The
+    # normal answer gates below still re-run the hard-line verdict, arming, and
+    # conversation checks. Treating every `fixer: true` row as a code-fix
+    # completion sent it into the deployment gate, where it could never pass
+    # because an answer has no PR or release evidence.
+    if _direct_answerable_question(ticket, body):
         return False
+    classification = str(ticket.get("classification") or "").lower()
     portal_handoff = (ticket.get("product") == "echo"
                       and portal_deliverable(ticket)
                       and (ticket.get("escalated") is True
@@ -134,15 +161,232 @@ def _customer_fix_reply(ticket, att):
     return classification == "code_fix" or bool(att.get("fixer")) or portal_handoff
 
 
-def _verified_fix_notice(ticket, att, kind):
-    """Only the current fix's resolve notice may tell a customer it is handled."""
+def _swap_siblings_verified(result, row_id):
+    """Sibling evidence parity for a swap that legitimately moved sibling rows.
+
+    fixer_ops._run_swap_media proves the postcondition by reading back the target row
+    AND every sibling from the calendar store before it stamps postcondition_verified,
+    so a nonempty siblings_swapped list is a legitimate, verified outcome -- requiring
+    it to be empty made such a swap unclosable. Accept it only with the same evidence
+    the producer's readback verified: exact unique nonempty ids, sibling_results whose
+    entry ids match siblings_swapped one for one (no missing, no extra), each entry
+    carrying the readback fields (display url, media kind, and the video pairing rule
+    the target row itself is held to), and nothing left behind. The target row's own
+    id is never a sibling -- its appearance in either list is a malformed or
+    adversarial payload. Any deviation fails closed exactly like an empty-swap record
+    that lost its readback."""
+    swapped = result.get("siblings_swapped")
+    if not isinstance(swapped, list) or result.get("siblings_left") != []:
+        return False
+    ids = []
+    for sid in swapped:
+        if not isinstance(sid, str) or not sid.strip() or sid == row_id:
+            return False
+        ids.append(sid)
+    if len(set(ids)) != len(ids):
+        return False  # duplicate sibling ids are never verified evidence
+    evidence = result.get("sibling_results")
+    if evidence is None:
+        evidence = []  # legacy empty-swap records predate the key; [] must still pass
+    if not isinstance(evidence, list):
+        return False
+    entries = []
+    for entry in evidence:
+        if not isinstance(entry, dict):
+            return False
+        sid = entry.get("id")
+        if not isinstance(sid, str) or not sid.strip() or sid == row_id:
+            return False
+        entries.append(entry)
+    if sorted(entry["id"] for entry in entries) != sorted(ids):
+        return False
+    for entry in entries:
+        url = entry.get("image_public_url")
+        kind = entry.get("media_kind")
+        if not (isinstance(url, str) and url.strip()):
+            return False
+        if kind == "image":
+            if entry.get("video_url") is not None:
+                return False
+        elif kind == "video":
+            video = entry.get("video_url")
+            if not (isinstance(video, str) and video.strip()):
+                return False
+        else:
+            return False
+    return True
+
+
+def _count_field(value):
+    """An integer count field; a bool is never a count."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _release_denied_assets_verified(operation):
+    """release_denied_assets closes a customer ticket only on the sweep's
+    independently re-proven outcome.
+
+    fixer_ops._run_release_denied_assets stamps postcondition_verified True ONLY
+    when its pre-sweep derivation, the sweep's own claim, a post-sweep ledger
+    re-read and per-asset counter re-reads all agree -- and a zero-rollback sweep
+    verifies nothing by construction, so a genuine verified outcome always carries
+    a nonzero rolled_back and at least one probed date. evidence_note exists ONLY
+    on an unverified outcome: its presence, a bare verified flag without the
+    measured counts, or prose offered as proof all fail closed."""
+    result = operation.get("result")
+    if not isinstance(result, dict):
+        return False
+    if result.get("postcondition_verified") is not True or "evidence_note" in result:
+        return False
+    rolled = result.get("rolled_back")
+    checked = result.get("checked")
+    captured = result.get("captured_at")
+    return (_count_field(rolled) and rolled >= 1
+            and _count_field(checked) and checked >= 1
+            and isinstance(captured, str) and bool(captured.strip()))
+
+
+def _restage_month_verified(operation, ticket):
+    """restage_month closes a customer ticket only on the background job's
+    TERMINAL record, bound to this ticket.
+
+    The 202 job-start payload proves nothing, and a running, timed_out or failed
+    job never verifies. fixer_ops.run_restage_month stamps the terminal job
+    result's postcondition_verified True ONLY when an independent before/after
+    calendar snapshot comparison confirms the build's claimed row writes; the
+    builder's own postcondition_verified is stripped on that path, so its
+    presence here means the payload did not come from the truthful producer. A
+    no-op build verifies nothing, so verified implies upserted >= 1. The job
+    record must name this ticket and one gym, its inner result the same gym, and
+    both must match the operation's recorded gym_key when one was stamped."""
+    job = operation.get("result")
+    if not isinstance(job, dict):
+        return False
+    if (job.get("action") != "restage_month" or job.get("status") != "done"
+            or job.get("error") is not None):
+        return False
+    job_id = job.get("id")
+    finished = job.get("finished_at")
+    gym = job.get("gym_key")
+    if not (isinstance(job_id, str) and job_id.strip()
+            and isinstance(finished, str) and finished.strip()
+            and isinstance(gym, str) and gym.strip()):
+        return False
+    if job.get("ticket_id") != (ticket or {}).get("id"):
+        return False
+    op_gym = operation.get("gym_key")
+    if isinstance(op_gym, str) and op_gym.strip() and op_gym != gym:
+        return False
+    result = job.get("result")
+    if not isinstance(result, dict):
+        return False
+    if (result.get("postcondition_verified") is not True
+            or "evidence_note" in result
+            or result.get("gym_key") != gym):
+        return False
+    captured = result.get("captured_at")
+    build = result.get("build")
+    if not isinstance(build, dict) or build.get("ok") is not True:
+        return False
+    if "postcondition_verified" in build:
+        return False  # the truthful path strips the builder's self-certification
+    upserted = build.get("upserted")
+    return (_count_field(upserted) and upserted >= 1
+            and isinstance(captured, str) and bool(captured.strip()))
+
+
+# The stamped business_postcondition is a POINTER, never the proof: only its check_id
+# and params are used, to re-run the independent observation at dispatch time through
+# fixer_business_evidence. Any stamped verified / symptom_resolved / evidence prose is
+# untrusted and ignored for the decision.
+BUSINESS_EVIDENCE_MAX_AGE_SECONDS = STALE_AFTER_SECONDS
+_BUSINESS_EVIDENCE_FUTURE_SKEW_SECONDS = 300
+_RELEASE_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _business_evidence_deps(bus):
+    """The bounded, read-only reader fixer_business_evidence.observe() requires,
+    adapted from the support bus's own bounded PostgREST-style read (the same one
+    _person_for_card uses). The registered checks pass their own explicit limit in
+    the params and the evidence module rejects over-limit or partial payloads, so
+    the adapter stays thin; a bus without that read yields no reader, and no reader
+    fails closed at the caller."""
+    get = getattr(bus, "_get", None)
+    if not callable(get):
+        return None
+
+    def read(table, params):
+        return get(table, params)
+
+    return {"read": read}
+
+
+def _business_postcondition_observed(bus, ticket, business, merged_sha, now=None):
+    """The dispatch-time authoritative read behind the business_postcondition branch.
+
+    The stamped record supplies ONLY the check_id and params to re-run; the verdict
+    comes from a fresh fixer_business_evidence.observe() through a bounded read-only
+    reader, bound to this ticket's tenant, the CURRENT recomputed request key, and
+    the exact release SHA. Any missing pointer field, unavailable reader, stale or
+    future observation, non-VERIFIED outcome, or binding mismatch fails closed --
+    an inline stamped dict can never close the ticket by itself."""
+    check_id = business.get("check_id")
+    params = business.get("params")
+    if not (isinstance(check_id, str) and check_id.strip()
+            and isinstance(params, dict)):
+        return False  # a pointer without a check id and params points at nothing
+    gym_key = (ticket or {}).get("client_id")
+    if not (isinstance(gym_key, str) and gym_key.strip()):
+        return False
+    if bus is None:
+        return False  # no reader can be constructed: fail closed, never skip
+    try:
+        current_key = _current_fixer_request_key(bus, ticket)
+    except Exception:  # noqa: BLE001 - an unreadable thread cannot prove the request
+        return False
+    if not current_key:
+        return False
+    deps = _business_evidence_deps(bus)
+    if deps is None:
+        return False
+    try:
+        from .. import fixer_business_evidence as _fbe
+        observed = _fbe.observe(check_id, gym_key=gym_key, request_key=current_key,
+                                merged_sha=merged_sha, params=params, deps=deps, now=now)
+    except Exception:  # noqa: BLE001 - an observer fault is not evidence
+        return False
+    if not isinstance(observed, dict):
+        return False
+    captured = _parse_ts(observed.get("captured_at"))
+    ref = now or datetime.now(timezone.utc)
+    age = (ref - captured).total_seconds() if captured is not None else None
+    return (observed.get("schema_version") == 1
+            and observed.get("outcome") == _fbe.VERIFIED
+            and observed.get("verified") is True
+            and observed.get("symptom_resolved") is True
+            and age is not None
+            and -_BUSINESS_EVIDENCE_FUTURE_SKEW_SECONDS <= age
+            <= BUSINESS_EVIDENCE_MAX_AGE_SECONDS
+            and _fbe.binding_matches(observed, gym_key=gym_key,
+                                     request_key=current_key, merged_sha=merged_sha))
+
+
+def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
+    """Only the current fix's resolve notice may tell a customer it is handled.
+
+    The ops_action branches are pure payload validation and need no reader. The
+    business_postcondition branch additionally re-runs the independent observation
+    at dispatch time; a caller that cannot supply the bus fails CLOSED there, never
+    skips the check."""
     verification = ticket.get("verification_after") or {}
     release = verification.get("fixer") or {}
     deployment = release.get("deployment_check") or {}
     if kind != _a.KIND_STATUS or att.get("resolve_notice") is not True:
         return False
     operation = release.get("ops_action") or {}
-    if att.get("ops_action") in {"reset_recreate_budget", "requeue_failed_row", "swap_media"}:
+    if att.get("ops_action") in {"resend_connect_link", "reset_recreate_budget",
+                                 "requeue_failed_row", "swap_media",
+                                 "release_denied_assets", "restage_month"}:
         common = (ticket.get("status") == "verification"
                 and release.get("postcondition_verified") is True
                 and operation.get("identityVerified") is True
@@ -152,8 +396,15 @@ def _verified_fix_notice(ticket, att, kind):
                 and bool(ticket.get("client_id"))
                 and operation.get("tenantId") == ticket.get("client_id")
                 and bool(release.get("request_key")))
-        if not common or att.get("ops_action") != "swap_media":
-            return common
+        if not common:
+            return False
+        action = att.get("ops_action")
+        if action == "release_denied_assets":
+            return _release_denied_assets_verified(operation)
+        if action == "restage_month":
+            return _restage_month_verified(operation, ticket)
+        if action != "swap_media":
+            return True
         args = operation.get("args") or {}
         result = operation.get("result") or {}
         if not isinstance(args, dict) or not isinstance(result, dict):
@@ -166,38 +417,31 @@ def _verified_fix_notice(ticket, att, kind):
                 and result.get("action") == "swap-media"
                 and result.get("postcondition_verified") is True
                 and result.get("draft_id") == row_id
-                and result.get("siblings_swapped") == []
-                and result.get("siblings_left") == []
+                and _swap_siblings_verified(result, row_id)
                 and isinstance(media_url, str) and bool(media_url.strip())
                 and (media_kind == "image" and result.get("video_url") is None
                      or media_kind == "video" and
                      isinstance(result.get("video_url"), str) and
                      bool(result["video_url"].strip())))
     # A healthy deployment proves the code is live, not that this owner's symptom
-    # is gone. The independent business check must identify its observation and
-    # bind it to the exact request and commit being released.
+    # is gone. The stamped business_postcondition is only a pointer to the check that
+    # must be re-run at dispatch time; its stamped verdict and prose are untrusted.
     business = release.get("business_postcondition") or {}
     if not isinstance(business, dict):
         return False
-    return (kind == _a.KIND_STATUS and att.get("resolve_notice") is True
+    merged_sha = release.get("merged_sha")
+    if not (kind == _a.KIND_STATUS and att.get("resolve_notice") is True
             and ticket.get("status") == "merged"
             and verification.get("exit_code") == 0
             and verification.get("incomplete") is not True
             and bool(ticket.get("fix_pr_url"))
             and att.get("pr_url") == ticket.get("fix_pr_url")
-            and bool(release.get("merged_sha"))
+            and isinstance(merged_sha, str) and _RELEASE_SHA.fullmatch(merged_sha)
             and deployment.get("verified") is True
-            and deployment.get("sha") == release.get("merged_sha")
-            and bool(release.get("request_key"))
-            and business.get("source") == "independent_business_check"
-            and business.get("verified") is True
-            and business.get("symptom_resolved") is True
-            and isinstance(business.get("check_id"), str)
-            and bool(business["check_id"].strip())
-            and isinstance(business.get("evidence"), str)
-            and bool(business["evidence"].strip())
-            and business.get("request_key") == release.get("request_key")
-            and business.get("merged_sha") == release.get("merged_sha"))
+            and deployment.get("sha") == merged_sha
+            and bool(release.get("request_key"))):
+        return False
+    return _business_postcondition_observed(bus, ticket, business, merged_sha, now=now)
 
 
 def _current_fixer_request_key(bus, ticket):
@@ -227,6 +471,44 @@ def _current_fixer_request_key(bus, ticket):
     payload = requester or [ticket.get("id"), ticket.get("created_at"),
                             ticket.get("raw_text")]
     return hashlib.sha256(encode(payload).encode("utf-8")).hexdigest()
+
+
+_FIXER_REQUEST_IDENTITY_FIELDS = (
+    "product", "client_id", "bot_identity", "slack_user_id",
+    "slack_channel_id", "slack_thread_ts",
+)
+
+
+def _fresh_fixer_request(bus, ticket, att, *, body="", require_direct_answer=False):
+    """Return the fresh ticket only when its requester identity matches the row.
+
+    This is intentionally independent of deployment evidence. Grounded FIXER
+    answers have no PR to prove, but they still must answer the request that is
+    current at the moment of delivery and resolution. The monotonic database
+    version closes the hash/read-to-resolve race; the hash still binds the exact
+    requester transcript. Tenant, bot, user and destination may not drift between
+    any two fresh reads. Missing or unreadable durable identity fails closed.
+    """
+    stamped = (att or {}).get("request_key")
+    version = (att or {}).get("request_version")
+    if (not isinstance(stamped, str) or not stamped
+            or not isinstance(version, int) or isinstance(version, bool)
+            or version < 0 or not isinstance(ticket, dict)):
+        return None
+    try:
+        fresh = bus.ticket(ticket["id"])
+        current = _current_fixer_request_key(bus, fresh) if fresh else None
+    except Exception:  # noqa: BLE001 - unreadable identity is never current proof
+        return None
+    if (not isinstance(fresh, dict)
+            or fresh.get("request_version") != version
+            or any(fresh.get(field) != ticket.get(field)
+                   for field in _FIXER_REQUEST_IDENTITY_FIELDS)
+            or not current or stamped != current):
+        return None
+    if require_direct_answer and not _direct_answerable_question(fresh, body):
+        return None
+    return fresh
 
 
 def _channel_for(kind, identity):
@@ -531,9 +813,11 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     # ---- conversational kinds: the gates ---------------------------------------------
     # Re-read deployment proof at dispatch time. A queued FIXER acknowledgement,
     # held-answer replacement, or stale notice must never reach a client.
-    customer_fix = _customer_fix_reply(ticket, att)
+    customer_fix = _customer_fix_reply(ticket, att, row.get("body") or "")
+    fixer_grounded_answer = _fixer_grounded_question_answer(
+        ticket, att, kind, row.get("body") or "")
     if customer_fix:
-        if not _verified_fix_notice(ticket, att, kind):
+        if not _verified_fix_notice(ticket, att, kind, bus=bus, now=now):
             _suppress(bus, row, ticket, identity,
                       "customer fix reply requires current PR merged, deployed and verified",
                       log, summary)
@@ -545,11 +829,20 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             log(f"[slack-convo/outbox] request read failed for {ticket['id']}: "
                 f"{type(e).__name__}")
             current_key = None
-        if not current_key or release_key != current_key or att.get("request_key") != current_key:
+        fresh_request = _fresh_fixer_request(bus, ticket, att)
+        if (not fresh_request or not current_key or release_key != current_key
+                or att.get("request_key") != current_key):
             _suppress(bus, row, ticket, identity,
                       "customer fix reply does not match the current requester messages",
                       log, summary)
             return
+        ticket = fresh_request
+    elif fixer_grounded_answer and not _fresh_fixer_request(
+            bus, ticket, att, body=row.get("body") or "", require_direct_answer=True):
+        _suppress(bus, row, ticket, identity,
+                  "grounded FIXER answer does not match the current requester messages",
+                  log, summary)
+        return
     # 1. first contact
     if bus.inbound_count(ticket["id"]) < 1:
         _suppress(bus, row, ticket, identity,
@@ -678,7 +971,15 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     # in #fixer alone is not participation in the client's channel. Read membership at
     # dispatch; Slack read failures, one-to-one DMs and unsupported channel types hold.
     channel = ticket.get("slack_channel_id")
-    fixer_customer_slack = bool(customer_fix)
+    # A grounded answer authored by FIXER is intentionally exempt from the
+    # code-fix deployment proof above, but it is still a FIXER customer
+    # outbound.  Blake's membership and visible inclusion apply to every such
+    # Slack message, not only to code-fix completion notices.
+    fixer_customer_slack = bool(
+        channel
+        and recipient_kind not in ("staff", "coach")
+        and (customer_fix or att.get("fixer"))
+    )
     if fixer_customer_slack:
         try:
             member = bool(channel and channel.startswith(("C", "G")) and member_check and
@@ -696,6 +997,23 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     if not _claim(bus, row, log):
         summary["skipped"] += 1
         return
+    # Membership reads and the claim itself are externally visible boundaries. A
+    # correction arriving during either one invalidates a grounded FIXER answer
+    # even though that answer legitimately has no deployment record.
+    if fixer_grounded_answer or customer_fix:
+        fresh = _fresh_fixer_request(
+            bus, ticket, att, body=row.get("body") or "",
+            require_direct_answer=fixer_grounded_answer)
+        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get(
+            "request_key")
+        if (not fresh
+                or (customer_fix and (not _verified_fix_notice(
+                    fresh, att, kind, bus=bus, now=now)
+                    or release_key != att.get("request_key")))):
+            _suppress(bus, row, ticket, identity,
+                      "FIXER requester identity changed before delivery", log, summary)
+            return
+        ticket = fresh
     # 7. destination
     channel = ticket.get("slack_channel_id")
     surface = att.get("surface") or ""
@@ -740,25 +1058,24 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             if not stored or stored.get("body") != sent_body:
                 raise RuntimeError("FIXER Slack body update was not confirmed")
             row = {**row, "body": sent_body}
-        # Membership, claiming, and body persistence can each take long enough for
-        # another customer message or a changed verification record to arrive.
-        # Re-read both immediately before the irreversible Slack call.
-        fresh = bus.ticket(ticket["id"])
-        try:
-            current_key = _current_fixer_request_key(bus, fresh) if fresh else None
-        except Exception as e:  # noqa: BLE001 - an unreadable request must hold
-            log(f"[slack-convo/outbox] final request read failed for {ticket['id']}: "
-                f"{type(e).__name__}")
-            current_key = None
-        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get("request_key")
-        if (not fresh or not _verified_fix_notice(fresh, att, kind)
-                or not current_key or release_key != current_key
-                or att.get("request_key") != current_key
+    # Persisting Blake's exact mention/body is another mutation window. Re-read
+    # the durable requester identity at the last possible point before Slack.
+    if fixer_grounded_answer or customer_fix:
+        fresh = _fresh_fixer_request(
+            bus, ticket, att, body=row.get("body") or "",
+            require_direct_answer=fixer_grounded_answer)
+        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get(
+            "request_key")
+        if (not fresh
                 or fresh.get("slack_channel_id") != channel
-                or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")):
+                or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")
+                or (customer_fix and (not _verified_fix_notice(
+                    fresh, att, kind, bus=bus, now=now)
+                    or release_key != att.get("request_key")))):
             _suppress(bus, row, fresh or ticket, identity,
-                      "FIXER notice changed before Slack delivery", log, summary)
+                      "FIXER requester identity changed before Slack delivery", log, summary)
             return
+        ticket = fresh
     ts = post(channel, sent_body, thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
@@ -850,24 +1167,67 @@ def _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log=pri
                                    surface=(att or {}).get("surface") or "",
                                    person=_person_for_card(bus, ticket, identity), log=log)
         return
-    _resolve_on_answer(bus, ticket, kind, summary, att)
+    _resolve_on_answer(bus, ticket, kind, summary, att, row.get("body") or "")
 
 
-def _resolve_on_answer(bus, ticket, kind, summary, att=None):
+def _resolve_on_answer(bus, ticket, kind, summary, att=None, body=""):
     """V-M4: the ticket closes when the person HAS the message, not when we drafted it.
 
     Two rows close a ticket: the ANSWER that answered it, and the resolve NOTICE a human
     tapped (MINOR 5, audit 7 -- resolve_and_notify used to stamp the ticket itself, before
     delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
-    if (att or {}).get("fixer") and (att or {}).get("resolve_notice"):
+    meta = att or {}
+    fixer = bool(meta.get("fixer"))
+    should_resolve = (
+        kind == _a.KIND_ANSWER and ticket.get("status") == "verification"
+        or kind == _a.KIND_STATUS and meta.get("resolve_notice") is True
+        and ticket.get("status") != "resolved")
+    if fixer and should_resolve:
+        # Slack (or the portal thread) may accept a delivery while the requester
+        # corrects it or an operator changes its eligibility. Keep the receipt for
+        # exactly what was delivered, but resolve only through the database CAS
+        # over the complete ticket identity that was freshly validated here.
+        grounded = _fixer_grounded_question_answer(ticket, meta, kind, body)
+        fresh = _fresh_fixer_request(
+            bus, ticket, meta, body=body, require_direct_answer=grounded)
+        resolver = getattr(bus, "resolve_current_delivery", None)
+        if not fresh or not callable(resolver):
+            return
+        if meta.get("resolve_notice"):
+            release_key = ((fresh.get("verification_after") or {}).get("fixer") or {}).get(
+                "request_key")
+            if release_key != meta.get("request_key"):
+                return
+        expected = {
+            "status": fresh.get("status"),
+            "classification": fresh.get("classification"),
+            **{field: fresh.get(field) for field in _FIXER_REQUEST_IDENTITY_FIELDS},
+        }
         try:
-            fresh = bus.ticket(ticket["id"])
-            release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get("request_key")
-            current_key = _current_fixer_request_key(bus, fresh or ticket)
-        except Exception:  # noqa: BLE001 - posting never proves a changed request is fixed
+            resolved = resolver(
+                ticket["id"], meta.get("request_version"),
+                expected["status"], expected["classification"],
+                expected["product"], expected["client_id"],
+                expected["bot_identity"], expected["slack_user_id"],
+                expected["slack_channel_id"], expected["slack_thread_ts"])
+        except Exception:  # noqa: BLE001 - a failed atomic close leaves it open
             return
-        if not current_key or release_key != current_key or (att or {}).get("request_key") != current_key:
+        if (not isinstance(resolved, dict)
+                or resolved.get("id") != ticket.get("id")
+                or resolved.get("status") != "resolved"
+                or resolved.get("request_version") != meta.get("request_version")
+                or resolved.get("classification") != expected["classification"]
+                or resolved.get("escalated") is not False
+                or resolved.get("hold_tier") is not None
+                or any(resolved.get(field) != expected[field]
+                       for field in _FIXER_REQUEST_IDENTITY_FIELDS)):
             return
+        summary["resolved"] += 1
+        return
+    if fixer:
+        # A FIXER row that is not presently eligible to resolve must never fall
+        # through to the legacy unconditional ticket PATCH below.
+        return
     if kind == _a.KIND_ANSWER and ticket.get("status") == "verification":
         bus.set_ticket(ticket["id"], status="resolved")
         summary["resolved"] += 1
@@ -981,7 +1341,7 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         return False
     if customer_fix:
         proof_meta = {"resolve_notice": True, "pr_url": ticket.get("fix_pr_url")}
-        if not _verified_fix_notice(ticket, proof_meta, _a.KIND_STATUS):
+        if not _verified_fix_notice(ticket, proof_meta, _a.KIND_STATUS, bus=bus):
             return refuse_fix("customer fix has no current merged, deployed and "
                               "independently verified business postcondition")
         try:
@@ -991,6 +1351,10 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         release_key = ((ticket.get("verification_after") or {}).get("fixer") or {}).get("request_key")
         if not current_key or release_key != current_key:
             return refuse_fix("customer request changed or could not be verified")
+        request_version = ticket.get("request_version")
+        if (not isinstance(request_version, int) or isinstance(request_version, bool)
+                or request_version < 0):
+            return refuse_fix("customer request version is unavailable")
         if not str(ticket.get("slack_channel_id") or "").startswith(("C", "G")):
             return refuse_fix("customer fix has no group conversation for Blake to join")
     # MINOR 4 (audit 7): `surface` was the ticket's SOURCE ("website_tab"), which is not one
@@ -1006,6 +1370,7 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
               "surface": surface, "resolved_by": approved_by, "resolve_notice": True,
               **({"fixer": True, "request_key": current_key,
+                  "request_version": request_version,
                   "pr_url": ticket.get("fix_pr_url")} if customer_fix else {})})
     # MINOR 5 (audit 7): the ticket used to be stamped resolved HERE, before the notice had
     # been delivered -- so a post failure left a ticket permanently asserting it was resolved

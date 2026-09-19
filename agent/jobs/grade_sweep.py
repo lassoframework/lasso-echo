@@ -38,6 +38,7 @@ deduped to once per gym per day.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from datetime import date, timedelta, timezone, datetime
 
@@ -182,6 +183,25 @@ def _drop_alert_text(gym_id: str, prev_total: int, grade) -> str:
         f"the nightly repair clears them.\n"
         f"Top defects now: {top}"
     )
+
+
+def _alert_with_business_seed(alert_fn, message: str, seed: dict | None):
+    """Pass structured evidence only to alert functions that declare support.
+
+    Existing tests and operator integrations commonly inject ``list.append`` or
+    another one-argument callable.  They keep receiving the exact alert text;
+    production ``ops_alerts.alert`` additionally receives the trusted seed.
+    """
+    if seed is not None:
+        try:
+            params = inspect.signature(alert_fn).parameters.values()
+            supports = any(p.name == "business_seed"
+                           or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        except (TypeError, ValueError):
+            supports = False
+        if supports:
+            return alert_fn(message, business_seed=seed)
+    return alert_fn(message)
 
 
 def _alert_low_grade(gym_id: str, window: str, grade, alert_fn) -> None:
@@ -425,7 +445,7 @@ def _stuck_alert_text(gym_id, grade, fix, streak, approver_id=""):
     )
 
 
-def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
+def run(gyms=None, store=None, now=None, alert_fn=None, business_seed_fn=None) -> dict:
     """
     Main entry point: grade each gym's trailing 30 days and forward book.
 
@@ -434,6 +454,7 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
         store:     injectable calendar store (must implement rows_in_range)
         now:       injectable today date (YYYY-MM-DD string or date object)
         alert_fn:  injectable alert function (defaults to ops_alerts.alert)
+        business_seed_fn: injectable trusted grade-drop seed producer
 
     Returns:
         dict with per-gym results
@@ -446,6 +467,9 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
     if alert_fn is None:
         from agent import ops_alerts
         alert_fn = ops_alerts.alert
+    if business_seed_fn is None:
+        from agent.fixer_business_seed import prepare_grade_drop_seed
+        business_seed_fn = prepare_grade_drop_seed
 
     if store is None:
         try:
@@ -619,7 +643,16 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                 dropped_gyms.append((gym_id, prev_total, f_grade.total))
                 if _should_alert_drop(gym_id, prev_total, f_grade.total,
                                       today_str):
-                    alert_fn(_drop_alert_text(gym_id, prev_total, f_grade))
+                    message = _drop_alert_text(gym_id, prev_total, f_grade)
+                    seed = None
+                    try:
+                        seed = business_seed_fn(
+                            gym_key=gym_id, min_total=prev_total,
+                            observed_total=f_grade.total, source_day=today_str)
+                    except Exception as exc:  # noqa: BLE001 - human alert still fires
+                        print(f"[grade-sweep] {gym_id}: trusted FIXER seed unavailable: "
+                              f"{type(exc).__name__}: {exc}")
+                    _alert_with_business_seed(alert_fn, message, seed)
                     alerted_gyms.append(gym_id)
 
             gym_result["forward_book"] = {

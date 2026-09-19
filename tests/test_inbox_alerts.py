@@ -189,6 +189,40 @@ def test_sweep_and_card_content(monkeypatch):
         assert end - start - 1 <= 100
 
 
+def test_legacy_one_page_provider_can_alert_but_never_creates_complete_evidence(monkeypatch):
+    """A snapshot may be retained for audit, but only a bounded reader can bless it."""
+    _armed(monkeypatch)
+    z = FakeZernio(
+        profiles={"topfuel": "prof_tf"}, posts={"prof_tf": [_post("p1")]},
+        threads={"p1": [dict(_comment("When is the next class?"),
+                             platform="instagram")]})
+    kv, snapshots = FakeKv(), {}
+    out = run(gyms=["topfuel"], zernio=z, now=NOW, notifier=lambda *_: True,
+              kv_get=kv.get, kv_set=kv.set, snapshot_store=snapshots)
+    summary = out["gyms"][0]
+    assert summary["complete"] is False
+    assert summary["reply_snapshot_complete"] is False
+    snapshot = snapshots[summary["reply_snapshot_id"]]
+    assert snapshot["complete"] is False
+
+
+def test_failed_complete_reader_never_falls_back_to_a_one_page_snapshot(monkeypatch):
+    _armed(monkeypatch)
+
+    class ProofReadFailure(FakeZernio):
+        def list_inbox_comments_complete(self, profile_id, **kwargs):
+            raise RuntimeError("provider proof read failed")
+
+        def list_inbox_comments(self, profile_id, **kwargs):
+            raise AssertionError("ordinary listing must not mask complete-reader failure")
+
+    summary = sweep_gym("topfuel", ProofReadFailure(
+        profiles={"topfuel": "prof_tf"}), NOW)
+    assert summary["source_status"]["comment"] == {
+        "ok": False, "complete": False, "error": "RuntimeError"}
+    assert summary["complete"] is False
+
+
 def test_card_caps_at_five_items(monkeypatch):
     items = [{"kind": "member_comment", "source": "comment",
               "text": f"comment {i}", "url": f"https://x/{i}", "age_days": i}

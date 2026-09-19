@@ -29,6 +29,7 @@ Nothing here logs a token or secret. The manual approval path is untouched.
 
 import os
 from datetime import datetime, time, timedelta, timezone
+from uuid import NAMESPACE_URL, uuid5
 
 from . import config
 from . import meta_publisher
@@ -42,6 +43,63 @@ def _now_iso(now=None):
     if now is not None:
         return now
     return datetime.now(timezone.utc).isoformat()
+
+
+def _calendar_state_conflict_submission_key(gym_id, row_id):
+    """One deterministic FIXER submission identity for one calendar state conflict.
+
+    The key describes the durable domain event, not a transient exception string.
+    Retrying the same provider-confirmed post therefore reaches the same FIXER ticket
+    rather than opening another autonomous repair.
+    """
+    return str(uuid5(
+        NAMESPACE_URL,
+        f"lasso:fixer:calendar-published-state-conflict:v1:{gym_id}:{row_id}",
+    ))
+
+
+def _submit_published_state_conflict(*, gym_id, row, error,
+                                     resolve_client_id=None, event_builder=None,
+                                     sender=None):
+    """Create a row-first FIXER ticket for a proven calendar state conflict.
+
+    This is intentionally narrower than a publish failure.  It runs only after the
+    provider returned ``published`` and the calendar store rejected its guarded
+    ``publishing -> published`` transition with the store's explicit 409 conflict.
+    Network, ledger, and provider uncertainty have no ticket path here.  The ticket
+    transport is best effort and cannot alter the claimed calendar row.
+    """
+    try:
+        from .portal_calendar_store import PortalStoreError
+        if not isinstance(error, PortalStoreError) or error.status != 409:
+            return False
+        row_id = str((row or {}).get("id") or "")
+        row_gym_id = str((row or {}).get("gym_id") or "")
+        gym_id = str(gym_id or "")
+        # ``due_rows`` is tenant-filtered in production.  Keep the assertion here so
+        # an injected or future caller cannot bind a row from another tenant.
+        if not row_id or not gym_id or row_gym_id != gym_id:
+            return False
+        if resolve_client_id is None:
+            from .fixer_business_seed import resolve_portal_client_id
+            resolve_client_id = resolve_portal_client_id
+        if event_builder is None:
+            from .fixer_business_seed_client import calendar_row_event, send
+            event_builder = calendar_row_event
+            if sender is None:
+                sender = send
+        if sender is None:
+            return False
+        client_id = resolve_client_id(gym_id)
+        event = event_builder(
+            submission_key=_calendar_state_conflict_submission_key(gym_id, row_id),
+            client_id=client_id,
+            row_id=row_id,
+            expected_status="published",
+        )
+        return bool(getattr(sender(event), "ok", False))
+    except Exception:  # noqa: BLE001 - intake failure must never corrupt calendar state
+        return False
 
 
 def _stable_hash(s):
@@ -1261,6 +1319,13 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                         "is NOT reverted (that would republish a post already live).")
                 except Exception:
                     pass
+                # A generic write outage is operational noise, not a safe autonomous
+                # code-fix request.  The store's 409 is different: it proves the live
+                # provider result and the calendar's guarded terminal transition are
+                # inconsistent.  Seed that exact row for FIXER without changing the
+                # retained claim when intake is unavailable.
+                _submit_published_state_conflict(
+                    gym_id=gym_id, row=row, error=e)
                 continue
             published.append(row_id)
             published_accounts.add(account.key)

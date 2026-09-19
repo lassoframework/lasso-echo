@@ -26,6 +26,7 @@ from agent.slack_convo import identities as IDS  # noqa: E402
 from agent.slack_convo import identity_gate as IG  # noqa: E402
 from agent.slack_convo import outbox as OB  # noqa: E402
 from tests.test_slack_convo import FakeBus, _deps, _ev, _posted  # noqa: E402
+from agent import config  # noqa: E402
 
 DEAN_Q = ("When reviewing the posts, is there a way to keep the caption but switch out the "
           "picture to a different one?  There are posts where the caption is fine but it "
@@ -282,21 +283,27 @@ def _fixer_answer_ticket(bus, question, answer, *, fixer=True):
     meta = {"identity": "echo", "recipient_kind": "client", "surface": "mpim"}
     if fixer:
         meta["fixer"] = True
+        meta["request_key"] = OB._current_fixer_request_key(
+            bus, bus.ticket(t["id"]))
+        meta["request_version"] = bus.ticket(t["id"])["request_version"]
     row = bus.record_outbound(ticket_id=t["id"], author_type="echo", body=answer,
                               delivery_status="ready", kind=A.KIND_ANSWER, meta=meta)
     return t["id"], row["id"]
 
 
-def test_outbox_blocks_deans_fixer_answer_without_a_deployed_fix(monkeypatch):
+def test_outbox_delivers_grounded_fixer_answer_without_inventing_a_code_release(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
     tid, mid = _fixer_answer_ticket(bus, DEAN_Q, DEAN_A)
     post, calls = _posted()
-    s = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus.message(mid)["delivery_status"] == "suppressed"
-    assert s["suppressed"] == 1
-    assert not any(c["channel"] == "G0MPIM" for c in calls)
-    assert bus.tickets[tid]["status"] == "verification"
+    s = OB.run_once(bus, post, identity=IDS.get("echo"),
+                    member_check=lambda channel, user: True,
+                    log=lambda *a: None)
+    assert bus.message(mid)["delivery_status"] == "posted"
+    assert s["posted"] == 1 and s["suppressed"] == 0
+    assert any(c["channel"] == "G0MPIM" for c in calls)
+    assert any(f"<@{config.APPROVER_SLACK_ID}>" in c["text"] for c in calls)
+    assert bus.tickets[tid]["status"] == "resolved"
 
 
 def test_outbox_floor_answer_stays_internal_until_a_deployed_fix(monkeypatch):
@@ -330,7 +337,7 @@ def test_outbox_unarmed_fixer_answer_does_not_tell_the_client(monkeypatch):
     tid, mid = _fixer_answer_ticket(bus, DEAN_Q, DEAN_A)
     post, calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus.message(mid)["delivery_status"] == "suppressed"
+    assert bus.message(mid)["delivery_status"] == "held"
     assert not any(c["channel"] == "G0MPIM" for c in calls)
 
 
@@ -499,12 +506,16 @@ def test_outbox_fixer_promise_waits_for_deployed_fix(monkeypatch):
     t = bus.tickets[tid]
     assert t["status"] == "verification"
     assert not any(c["channel"] == "G0MPIM" for c in calls)
-    # An answer without a follow-up promise is blocked by the same release gate.
+    # A grounded answer without promised work uses the normal answer gates and
+    # does not invent code-release evidence.
     bus2 = FakeBus()
     tid2, mid2 = _fixer_answer_ticket(bus2, DEAN_Q, DEAN_A)
-    OB.run_once(bus2, post, identity=IDS.get("echo"), log=lambda *a: None)
-    assert bus2.message(mid2)["delivery_status"] == "suppressed"
-    assert bus2.tickets[tid2]["status"] == "verification"
+    OB.run_once(bus2, post, identity=IDS.get("echo"),
+                member_check=lambda channel, user: True,
+                log=lambda *a: None)
+    assert bus2.message(mid2)["delivery_status"] == "posted"
+    assert any(f"<@{config.APPROVER_SLACK_ID}>" in c["text"] for c in calls)
+    assert bus2.tickets[tid2]["status"] == "resolved"
 
 
 def test_portal_bridge_promise_posts_but_does_not_resolve(monkeypatch):

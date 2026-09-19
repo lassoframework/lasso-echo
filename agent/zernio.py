@@ -237,6 +237,16 @@ class ZernioError(Exception):
         super().__init__(f"zernio {status}: {detail}")
 
 
+class ZernioPaginationError(ValueError):
+    """A paged provider read that cannot safely establish a complete result.
+
+    The FIXER reconciliation lane may only clear an alert when it has read the
+    whole relevant provider collection.  This is deliberately distinct from an
+    HTTP failure: a 200 response with an incoherent page contract is still not
+    evidence that a row was absent.
+    """
+
+
 class ZernioClient:
     """Thin Zernio v1 client. `http` is injectable for tests (defaults to lazy `requests`)."""
 
@@ -327,6 +337,126 @@ class ZernioClient:
     #: condition must never depend on a field the API may not send. 50 pages = 5000
     #: profiles, far past any real LASSO org, and at worst 50 x 30s rather than a hang.
     _PROFILE_MAX_PAGES = 50
+
+    # Inbox reads are synchronous and only used to prove a specific alert state.
+    # Keep their worst case bounded even if Zernio returns a nonsensical total.
+    _INBOX_COMPLETE_MAX_PAGES = 20
+    _INBOX_COMPLETE_MAX_ITEMS = 500
+
+    @staticmethod
+    def _strict_pagination_int(value, field):
+        """Return a provider pagination integer or reject an ambiguous shape."""
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ZernioPaginationError(f"invalid_pagination_{field}")
+        return value
+
+    @staticmethod
+    def _stable_provider_row(row):
+        """A deterministic comparison used only to validate duplicate identities."""
+        import json
+        try:
+            return json.dumps(row, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ZernioPaginationError("unserializable_provider_row") from exc
+
+    def _complete_inbox_pages(self, path, params, rows_key, identity_for_row, *,
+                              limit, max_pages=None, max_items=None):
+        """Read a Zernio inbox collection only when page metadata proves exhaustion.
+
+        This helper intentionally accepts no short-page or omitted-field shortcut.
+        The provider must return coherent ``page``, ``limit``, ``total``, and
+        ``pages`` fields for every requested page.  We request each page in order,
+        cap both requests and advertised rows, and return ``complete: true`` only
+        after every row implied by that contract was received.  A repeated full
+        provider identity is de-duplicated only when its full row is byte-for-byte
+        equivalent; conflicting duplicates are ambiguous and fail closed.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        max_pages = (self._INBOX_COMPLETE_MAX_PAGES if max_pages is None
+                     else max_pages)
+        max_items = (self._INBOX_COMPLETE_MAX_ITEMS if max_items is None
+                     else max_items)
+        if (isinstance(max_pages, bool) or not isinstance(max_pages, int)
+                or max_pages <= 0):
+            raise ValueError("max_pages must be a positive integer")
+        if (isinstance(max_items, bool) or not isinstance(max_items, int)
+                or max_items <= 0):
+            raise ValueError("max_items must be a positive integer")
+
+        first = None
+        expected_total = expected_pages = None
+        output = []
+        seen = {}
+        for wanted_page in range(1, max_pages + 1):
+            request_params = dict(params)
+            request_params.update({"page": wanted_page, "limit": limit})
+            payload = self._get(path, request_params)
+            if not isinstance(payload, dict):
+                raise ZernioPaginationError("invalid_pagination_payload")
+            rows = payload.get(rows_key)
+            pagination = payload.get("pagination")
+            if not isinstance(rows, list) or not isinstance(pagination, dict):
+                raise ZernioPaginationError("invalid_pagination_shape")
+            page = self._strict_pagination_int(pagination.get("page"), "page")
+            response_limit = self._strict_pagination_int(
+                pagination.get("limit"), "limit")
+            total = self._strict_pagination_int(pagination.get("total"), "total")
+            pages = self._strict_pagination_int(pagination.get("pages"), "pages")
+            if page != wanted_page or response_limit != limit:
+                raise ZernioPaginationError("non_advancing_or_mismatched_page")
+            if total > max_items or pages > max_pages:
+                raise ZernioPaginationError("pagination_cap_exceeded")
+
+            # A non-empty collection has exactly ceil(total / limit) pages.  For
+            # an empty collection, providers commonly use either 0 or 1 pages;
+            # both are exhaustive when page one is empty.
+            expected_page_count = ((total + limit - 1) // limit) if total else 0
+            if total:
+                if pages != expected_page_count:
+                    raise ZernioPaginationError("inconsistent_pagination_totals")
+            elif pages not in (0, 1):
+                raise ZernioPaginationError("inconsistent_pagination_totals")
+            if first is None:
+                first = payload
+                expected_total, expected_pages = total, pages
+            elif (total, pages) != (expected_total, expected_pages):
+                raise ZernioPaginationError("inconsistent_pagination_totals")
+
+            raw_expected = 0 if total == 0 else min(
+                limit, total - ((wanted_page - 1) * limit))
+            if wanted_page > max(pages, 1) or len(rows) != raw_expected:
+                raise ZernioPaginationError("incomplete_or_ambiguous_page")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ZernioPaginationError("invalid_provider_row")
+                identity = identity_for_row(row)
+                if (not isinstance(identity, tuple) or not identity
+                        or any(not isinstance(value, str) or not value
+                               for value in identity)):
+                    raise ZernioPaginationError("invalid_provider_identity")
+                stable = self._stable_provider_row(row)
+                previous = seen.get(identity)
+                if previous is None:
+                    seen[identity] = stable
+                    output.append(row)
+                elif previous != stable:
+                    raise ZernioPaginationError("ambiguous_duplicate_provider_identity")
+
+            # We have read every page asserted by the provider, including page one
+            # for an empty result.  This is the only place this helper returns
+            # ``complete: true``.
+            if wanted_page == max(pages, 1):
+                if len(output) != expected_total:
+                    raise ZernioPaginationError(
+                        "duplicate_or_missing_provider_identity")
+                out = dict(first)
+                out[rows_key] = output
+                out["pagination"] = dict(pagination, complete=True,
+                                         pages_read=wanted_page)
+                return out
+        raise ZernioPaginationError("pagination_cap_exceeded")
 
     def list_profiles(self):
         """GET /v1/profiles -> {profiles:[{_id,name,...}], total, skip, limit}, ALL pages.
@@ -734,6 +864,25 @@ class ZernioClient:
             params["platform"] = str(platform)
         return self._get("/v1/inbox/comments", params)
 
+    def list_inbox_comments_complete(self, profile_id, limit=50, platform=None,
+                                     max_pages=None, max_items=None):
+        """Return every inbox post for a profile, or raise without completeness proof.
+
+        The comment alert snapshot must establish that its post listing was
+        exhaustive before it can claim the resulting per-post thread reads are
+        complete.  Keep the ordinary one-page method above for callers that do
+        not need that proof.
+        """
+        params = {"profileId": str(profile_id)}
+        if platform:
+            params["platform"] = str(platform)
+        return self._complete_inbox_pages(
+            "/v1/inbox/comments", params, "data",
+            lambda row: ("comment_listing", str(row.get("platform") or ""),
+                         str(row.get("accountId") or ""),
+                         str(row.get("id") or "")),
+            limit=limit, max_pages=max_pages, max_items=max_items)
+
     def inbox_post_comments(self, post_id, account_id, limit=25):
         """GET /v1/inbox/comments/{postId}?accountId=... -> {comments:[{id,
         message, createdTime, from:{name, username, isOwner}, replyCount,
@@ -742,11 +891,47 @@ class ZernioClient:
         return self._get(f"/v1/inbox/comments/{post_id}",
                          {"accountId": account_id, "limit": int(limit)})
 
+    def inbox_post_comments_complete(self, post_id, account_id, limit=25,
+                                     max_pages=None, max_items=None):
+        """Return every comment for one post, or raise without claiming completeness.
+
+        This is the FIXER-specific proof read.  It is deliberately separate from
+        :meth:`inbox_post_comments`, whose existing callers may only need one
+        ordinary page.  The full identity includes the fixed post and account as
+        well as Zernio's platform and comment id, so duplicate rows from adjacent
+        pages cannot make an alert appear resolved twice.
+        """
+        post_id, account_id = str(post_id), str(account_id)
+        return self._complete_inbox_pages(
+            f"/v1/inbox/comments/{post_id}", {"accountId": account_id},
+            "comments",
+            lambda row: ("comment", str(row.get("platform") or ""),
+                         account_id, post_id, str(row.get("id") or "")),
+            limit=limit, max_pages=max_pages, max_items=max_items)
+
     def list_inbox_mentions(self, profile_id, limit=25):
         """GET /v1/inbox/mentions?profileId=... -> {data:[...], pagination,
         meta}. READ ONLY."""
         return self._get("/v1/inbox/mentions",
                          {"profileId": profile_id, "limit": int(limit)})
+
+    def list_inbox_mentions_complete(self, profile_id, limit=25,
+                                     max_pages=None, max_items=None):
+        """Return every inbox mention, or raise without completeness proof.
+
+        Mentions are never auto-resolved, but an immutable snapshot still needs
+        a complete source read so a later reconciliation cannot mistake a
+        partial capture for a coherent inbox state.
+        """
+        profile_id = str(profile_id)
+        return self._complete_inbox_pages(
+            "/v1/inbox/mentions", {"profileId": profile_id}, "data",
+            lambda row: ("mention_listing", str(row.get("platform") or ""),
+                         str(row.get("accountId") or ""),
+                         str(row.get("postId") or row.get("mediaId")
+                             or row.get("id") or ""),
+                         str(row.get("id") or "")),
+            limit=limit, max_pages=max_pages, max_items=max_items)
 
     def list_inbox_reviews(self, profile_id, limit=25):
         """GET /v1/inbox/reviews?profileId=... -> {data:[{id, platform,
@@ -755,6 +940,22 @@ class ZernioClient:
         aggregated. Verified live 2026-08-26. READ ONLY."""
         return self._get("/v1/inbox/reviews",
                          {"profileId": profile_id, "limit": int(limit)})
+
+    def list_inbox_reviews_complete(self, profile_id, limit=25,
+                                    max_pages=None, max_items=None):
+        """Return every review for a profile, or raise without completeness proof.
+
+        The normal review listing remains a one-page primitive for existing inbox
+        work.  Reply reconciliation uses this bounded reader so an item absent
+        from page one can never be mistaken for a missing or unresolved review.
+        """
+        profile_id = str(profile_id)
+        return self._complete_inbox_pages(
+            "/v1/inbox/reviews", {"profileId": profile_id}, "data",
+            lambda row: ("review", str(row.get("platform") or ""),
+                         str(row.get("accountId") or ""),
+                         str(row.get("id") or ""), str(row.get("id") or "")),
+            limit=limit, max_pages=max_pages, max_items=max_items)
 
     def instagram_demographics(self, account_id, metric="follower_demographics",
                                timeframe="this_month", breakdown=None):

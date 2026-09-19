@@ -56,6 +56,18 @@ CONTRACT (the FIXER builder reads this block):
       Bounded read-only diagnostics (agent/fixer_evidence.py). Never runs an action;
       503 volume_unavailable on a host without the worker volume, 503
       evidence_unavailable on a source fault.
+  POST /ops/actions/business-evidence/observe  (same header)
+      Bounded read-only business postcondition observation. The body is the exact
+      versioned Scout contract: schema/contract version, support ticket UUID,
+      portal client UUID, current request SHA, merged Git SHA, registered check id,
+      and that check's strict params. Echo first re-reads the ticket/client binding,
+      then runs fixer_business_evidence.observe. No action, ticket note, or other
+      mutation occurs. The response is the canonical evidence record plus params.
+  GET  /ops/actions/reply-reconciliation/<snapshot_id>?gym_key=<gym>
+      Read-only comparison of a new immutable inbox-alert snapshot with current
+      provider evidence. Tenant bound. Missing, incomplete, ambiguous, or older
+      than 48 hours is refused. Mentions always remain needs_human. This endpoint
+      never replies, hides, deletes, likes, or sends a message.
 
   RESULT EVIDENCE (canonical, consumed by Scout): every synchronous 2xx result
   carries "captured_at" (ISO utc) marking when its evidence was read, and a
@@ -70,18 +82,36 @@ CONTRACT (the FIXER builder reads this block):
                           around the write; 409 postcondition_unconfirmed unless the
                           after-read shows used=0 and remaining=limit.
     release_denied_assets reports the scoped sweep's checked/rolled_back counts
-                          exactly as measured; there is no success flag that could
-                          present a 0-rollback sweep as a release.
+                          exactly as measured, then independently re-proves the
+                          rollback: a bounded readback scoped to this gym (the
+                          gym_media_use ledger, a strict denied-row calendar
+                          re-read, and a per-asset usage-counter re-read) must
+                          confirm every rollback the sweep claimed, or
+                          postcondition_verified stays false with an evidence_note.
+                          A 0-rollback sweep is not a release and never verifies.
     swap_media            exposes the row identity and verifies the handler's write
                           against an independent calendar get_row readback
-                          (409 postcondition_unconfirmed on any disagreement;
-                          sibling writes it did not read are never verified).
+                          (409 postcondition_unconfirmed on any disagreement).
+                          The sibling set is derived INDEPENDENTLY before the swap
+                          (bounded gym-scoped month read + the same
+                          media_swap.sibling_rows grouping rule the handler uses);
+                          the handler's siblings_swapped list must match that
+                          derived set exactly -- an extra, omitted, duplicated, or
+                          target-row sibling is 409 postcondition_unconfirmed, and
+                          a store that cannot support the derivation fails closed.
     requeue_failed_row    succeeds only when an independent get_row readback shows
                           the row at status approved with no post id.
     restage_month         a background job: GET the job for its terminal status and
                           real per-step counts; its result carries captured_at and
-                          postcondition_verified false (no scoped calendar
-                          comparison exists yet).
+                          a postcondition_verified that is true ONLY when an
+                          independent before/after comparison of the gym-scoped
+                          calendar rows across the requested span (a bounded
+                          list_month readback) confirms the build's claimed
+                          upserted/deleted counts exactly, at least one row was
+                          actually written, and no pre-existing row changed. The
+                          builder's own ok/upserted claims are never the proof;
+                          unavailable or disagreeing evidence leaves the terminal
+                          job unverified with an evidence_note.
   Evidence that is unavailable is said so in the result; success fields are never
   invented.
 
@@ -114,6 +144,7 @@ catalog from a shell on the worker.
 from __future__ import annotations
 
 import hmac
+import hashlib
 import json
 import os
 import re
@@ -138,6 +169,18 @@ _ROW_ID = re.compile(r"^[A-Za-z0-9_-]{6,80}$")
 _TICKET_ID = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _UUID = re.compile(r"^[a-fA-F0-9]{8}-(?:[a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}$")
+_BUSINESS_UUID = re.compile(r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$")
+_BUSINESS_REQUEST_KEY = re.compile(r"^[0-9a-f]{64}$")
+_BUSINESS_RELEASE_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_BUSINESS_ROW_ID = re.compile(r"^[A-Za-z0-9_-]{6,80}$")
+_BUSINESS_STATUS = re.compile(r"^[a-z_]{2,32}$")
+_BUSINESS_FOLDER_ID = re.compile(r"^[A-Za-z0-9_-]{3,200}$")
+BUSINESS_EVIDENCE_PATH = ROUTE_PREFIX + "/business-evidence/observe"
+BUSINESS_EVIDENCE_CONTRACT = "echo-business-evidence-v1"
+_BUSINESS_FIELDS = frozenset({
+    "schema_version", "contract_version", "ticket_id", "client_id",
+    "request_key", "merged_sha", "check_id", "params",
+})
 
 # Named so a FIXER that asks for one of these gets a 403 that says WHY, not a 404 that
 # reads like a typo. Nothing here has an implementation and nothing here may get one
@@ -155,6 +198,137 @@ ORG_FLOOR_ACTIONS = frozenset({
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _business_params_valid(check_id, params):
+    if not isinstance(params, dict):
+        return False
+    if check_id == "calendar_row_status":
+        return (set(params) == {"row_id", "expected_status"}
+                and isinstance(params.get("row_id"), str)
+                and _BUSINESS_ROW_ID.fullmatch(params["row_id"]) is not None
+                and isinstance(params.get("expected_status"), str)
+                and _BUSINESS_STATUS.fullmatch(params["expected_status"]) is not None)
+    if check_id == "forward_book_grade_at_least":
+        value = params.get("min_total")
+        return (set(params) == {"min_total"} and isinstance(value, int)
+                and not isinstance(value, bool) and 0 <= value <= 100)
+    if check_id == "media_source_active":
+        return (set(params) == {"folder_id"}
+                and isinstance(params.get("folder_id"), str)
+                and _BUSINESS_FOLDER_ID.fullmatch(params["folder_id"]) is not None)
+    return False
+
+
+def _business_reader(deps):
+    configured = deps.get("business_evidence")
+    if isinstance(configured, dict) and callable(configured.get("read")):
+        return configured["read"]
+    bus = deps.get("bus")
+    if callable(getattr(bus, "_get", None)):
+        return bus._get
+    # The production PostgREST reader lives with the other bounded, read-only
+    # FIXER evidence adapters.  fixer_business_evidence deliberately owns no
+    # transport or environment access of its own.
+    from .fixer_evidence import read_rest
+    return read_rest
+
+
+def _business_request_key(read, ticket):
+    """Recompute Scout's requester-message SHA from a complete bounded read."""
+    try:
+        rows = read("support_messages", {
+            "ticket_id": f"eq.{ticket['id']}", "direction": "eq.inbound",
+            "select": "id,ticket_id,created_at,body,author_type,direction,attachments",
+            "order": "created_at.asc,id.asc", "limit": "1000"})
+    except Exception:  # noqa: BLE001
+        return None
+    if (not isinstance(rows, list) or len(rows) >= 1000
+            or any(not isinstance(row, dict) for row in rows)):
+        return None
+    requester = []
+    for message in rows:
+        if message.get("ticket_id") != ticket["id"] or message.get("direction") != "inbound":
+            return None
+        attachments = message.get("attachments") or {}
+        if not isinstance(attachments, dict):
+            return None
+        author = message.get("author_type")
+        client = author == "client" or not author
+        operator_mention = (author in ("staff", "blake")
+                            and attachments.get("surface") == "mention"
+                            and attachments.get("identity_reason") == "operator list")
+        if client or operator_mention:
+            requester.append([message.get("id"), message.get("created_at"),
+                              message.get("body")])
+    encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    requester.sort(key=encode)
+    identity = requester or [ticket.get("id"), ticket.get("created_at"),
+                             ticket.get("raw_text")]
+    return hashlib.sha256(encode(identity).encode("utf-8")).hexdigest()
+
+
+def _run_business_evidence(raw_body, deps, now=None):
+    """Validate Scout's exact pointer contract and run one read-only Echo check."""
+    if raw_body and len(raw_body) > MAX_BODY_BYTES:
+        return 413, {"error": "too_large"}
+    try:
+        body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+    except Exception:  # noqa: BLE001 - malformed transport input
+        return 400, {"error": "bad_request", "detail": "invalid JSON"}
+    if not isinstance(body, dict) or set(body) != _BUSINESS_FIELDS:
+        return 400, {"error": "bad_request", "detail": "invalid business evidence schema"}
+    if body.get("schema_version") != 1 or body.get("contract_version") != BUSINESS_EVIDENCE_CONTRACT:
+        return 400, {"error": "bad_request", "detail": "unsupported business evidence contract"}
+    ticket_id = body.get("ticket_id")
+    client_id = body.get("client_id")
+    request_key = body.get("request_key")
+    merged_sha = body.get("merged_sha")
+    check_id = body.get("check_id")
+    params = body.get("params")
+    if (not isinstance(ticket_id, str) or not _BUSINESS_UUID.fullmatch(ticket_id)
+            or not isinstance(client_id, str) or not _BUSINESS_UUID.fullmatch(client_id)
+            or not isinstance(request_key, str) or not _BUSINESS_REQUEST_KEY.fullmatch(request_key)
+            or not isinstance(merged_sha, str) or not _BUSINESS_RELEASE_SHA.fullmatch(merged_sha)
+            or not isinstance(check_id, str) or not _business_params_valid(check_id, params)):
+        return 400, {"error": "bad_request", "detail": "invalid business evidence identity or check"}
+
+    read = _business_reader(deps)
+    try:
+        rows = read("support_tickets", {
+            "id": f"eq.{ticket_id}",
+            "select": "id,product,client_id,created_at,raw_text", "limit": "2"})
+    except Exception:  # noqa: BLE001 - source errors never become evidence
+        return 503, {"error": "evidence_unavailable"}
+    if not isinstance(rows, list) or len(rows) > 2 or any(not isinstance(row, dict) for row in rows):
+        return 503, {"error": "evidence_unavailable"}
+    if not rows:
+        return 404, {"error": "ticket_not_found"}
+    if len(rows) != 1 or rows[0].get("id") != ticket_id:
+        return 409, {"error": "ticket_identity_unconfirmed"}
+    ticket = rows[0]
+    if ticket.get("product") != "echo" or ticket.get("client_id") != client_id:
+        return 409, {"error": "ticket_tenant_mismatch"}
+    current_request_key = _business_request_key(read, ticket)
+    if current_request_key is None:
+        return 503, {"error": "evidence_unavailable"}
+    if current_request_key != request_key:
+        return 409, {"error": "request_identity_mismatch"}
+
+    from . import fixer_business_evidence as evidence
+    record = evidence.observe(
+        check_id, gym_key=client_id, request_key=request_key,
+        merged_sha=merged_sha, params=params, deps={"read": read}, now=now)
+    if not isinstance(record, dict):
+        return 503, {"error": "evidence_unavailable"}
+    # Explicit response allowlist. Params are expectations, not proof; returning
+    # the exact validated values lets Scout bind the observation to its pointer.
+    keys = ("schema_version", "source", "check_id", "gym_key", "request_key",
+            "merged_sha", "captured_at", "outcome", "verified",
+            "symptom_resolved", "evidence", "reason")
+    if any(key not in record for key in keys):
+        return 503, {"error": "evidence_unavailable"}
+    return 200, {**{key: record[key] for key in keys}, "params": dict(params)}
 
 
 # --------------------------------------------------------------------------------------
@@ -390,6 +564,311 @@ def _run_reset_recreate_budget(ctx):
 
 # -- release_denied_assets ---------------------------------------------------------------
 
+class _ReadbackUnavailable(Exception):
+    """A verification read failed, or returned a partial or foreign payload. The
+    callers catch broadly: evidence gathering never endangers the action itself,
+    it only withholds postcondition_verified."""
+
+
+# Well-formed identity charset for ledger/asset/calendar ids (uuids, base keys,
+# asset ids all fit). Anything outside it is not an id Echo wrote.
+_LEDGER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_DATE_STRICT = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _strict_date(value):
+    """A date for a strict YYYY-MM-DD REAL calendar date, else None. Never raises."""
+    from datetime import date as _date
+    s = value if isinstance(value, str) else ""
+    if not _DATE_STRICT.match(s):
+        return None
+    try:
+        return _date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _strict_count(value):
+    """A counter as a non-bool int in range, else None. No coercion: a bool, a
+    string, a float, None, or an out-of-range value is a coercion fault, and a
+    fault is evidence-unavailable -- never a coerced guess."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if not 0 <= value < 10 ** 9:
+        return None
+    return value
+
+
+def _strict_iso_or_none(value):
+    """(value, ok): ok when value is None or an ISO-8601 parseable timestamp
+    string; anything else is a coercion fault."""
+    if value is None:
+        return None, True
+    if not isinstance(value, str) or not value.strip():
+        return None, False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return None, False
+    return value, True
+
+
+def _strict_use_record(rec, base):
+    """One gym_media_use record, strictly parsed, or None when malformed. Every
+    field the verification relies on is validated: gym id (exact expected tenant,
+    well-formed), asset id (well-formed, nonempty), rolled_back (a real bool),
+    prev_used_count (a real in-range int), prev_last_used_at (None or ISO). A
+    malformed record is evidence-unavailable -- skipping it could hide a missed
+    rollback."""
+    if not isinstance(rec, dict):
+        return None
+    gym = rec.get("gym_id")
+    if not isinstance(gym, str) or gym != base or not _LEDGER_ID.match(gym):
+        return None
+    asset_id = rec.get("asset_id")
+    if not isinstance(asset_id, str) or not _LEDGER_ID.match(asset_id):
+        return None
+    rolled_back = rec.get("rolled_back")
+    if not isinstance(rolled_back, bool):
+        return None
+    prev_count = _strict_count(rec.get("prev_used_count"))
+    if prev_count is None:
+        return None
+    prev_last, ok = _strict_iso_or_none(rec.get("prev_last_used_at"))
+    if not ok:
+        return None
+    return {"asset_id": asset_id, "rolled_back": rolled_back,
+            "prev_used_count": prev_count, "prev_last_used_at": prev_last}
+
+
+def _strict_denial_row(row, base, post_date):
+    """(status_lower, asset_id_or_empty) for one content_calendar denial-signal
+    row, strictly parsed, or None when the row is malformed."""
+    if not isinstance(row, dict):
+        return None
+    rid = row.get("id")
+    if not isinstance(rid, str) or not _LEDGER_ID.match(rid):
+        return None
+    # The query shape is tenant and date scoped, but a response is evidence only
+    # if it also carries those fields and they agree.  A proxy/cache that leaked
+    # a neighbouring row must never make this tenant's rollback look complete.
+    if row.get("gym_id") != base or row.get("post_date") != post_date:
+        return None
+    status = row.get("status")
+    if not isinstance(status, str) or not status.strip():
+        return None
+    asset = row.get("source_media_asset_id")
+    if asset is None:
+        asset = ""
+    elif isinstance(asset, str):
+        asset = asset.strip()
+        if asset and not _LEDGER_ID.match(asset):
+            return None
+    else:
+        return None
+    return status.strip().lower(), asset
+
+
+def _default_denial_ledger_read(gym_key):
+    """This gym's gym_media_use kv records as (post_date, [record, ...]) pairs, or
+    None on any read failure OR any malformed entry (unparseable JSON, a
+    non-dict record, a key whose date is not a strict real calendar date). The
+    selector's own lenient parse silently skips unreadable values -- right for a
+    sweep that does no harm by standing down, wrong for a verification, where a
+    skipped value could hide a missed rollback. Bounded: one range scan over the
+    exact key prefix plus an exact startswith guard, so no other tenant's ledger
+    rows are ever loaded into a tenant-scoped verification."""
+    from . import db
+    from . import gym_media_selector as selector
+    prefix = f"gym_media_use:{selector.base_gym_key(gym_key)}:"
+    try:
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM kv WHERE key >= ? AND key < ?",
+                (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1))).fetchall()
+    except Exception:  # noqa: BLE001 - an unreadable ledger is unavailable evidence
+        return None
+    out = []
+    for r in rows:
+        key, value = r["key"], r["value"]
+        if not key.startswith(prefix):
+            continue
+        post_date = key.split(":", 2)[2]
+        if _strict_date(post_date) is None:
+            return None
+        try:
+            parsed = json.loads(value or "[]")
+        except Exception:  # noqa: BLE001 - unreadable JSON is unavailable evidence
+            return None
+        if isinstance(parsed, dict):
+            parsed = [parsed] if parsed else []
+        if not isinstance(parsed, list) or any(not isinstance(rec, dict) for rec in parsed):
+            return None
+        if parsed:
+            out.append((post_date, parsed))
+    return out
+
+
+def _default_denial_rows_read(gym_key, post_date):
+    """Strict twin of gym_media_selector._default_fetch_rows: the same bounded
+    gym+date content_calendar read, but a fetch failure RAISES instead of
+    returning [], and every row is strictly parsed (a malformed row raises too).
+    The sweep may fail silent (safe: it then does nothing); a verification that
+    cannot tell 'no rows' from 'store down' or from 'unreadable row' would be
+    certifying on silence."""
+    from . import config
+    from . import gym_media_selector as selector
+    url = config.supabase_url()
+    key = config.supabase_service_key()
+    if not url or not key:
+        raise _ReadbackUnavailable("calendar readback plane is not configured")
+    import requests  # lazy, repo pattern
+    r = requests.get(
+        f"{url}/rest/v1/content_calendar",
+        params={"gym_id": f"eq.{gym_key}", "post_date": f"eq.{post_date}",
+                "select": "id,gym_id,post_date,status,pillar,source_media_asset_id"},
+        headers={"apikey": key, "Authorization": f"Bearer {key}"},
+        timeout=30)
+    if r.status_code >= 400:
+        raise _ReadbackUnavailable(f"calendar readback failed: {r.status_code}")
+    rows = r.json()
+    if not isinstance(rows, list):
+        raise _ReadbackUnavailable("calendar readback returned a non-list payload")
+    if any(_strict_denial_row(row, gym_key, post_date) is None for row in rows):
+        raise _ReadbackUnavailable("calendar readback returned a malformed row")
+    return rows
+
+
+def _default_asset_read(asset_id):
+    """One media_asset row for the rollback counter readback; raises when the
+    store is not there to answer."""
+    from . import gym_media_index as _idx
+    store = _idx.default_store()
+    if not store.available():
+        raise _ReadbackUnavailable("media asset store is unavailable")
+    return store.get_asset(asset_id)
+
+
+def _denial_rollback_worklist(gym_key, *, ledger_read, rows_read):
+    """{post_date: [strictly-parsed un-rolled use-records]} the calendar currently
+    demands rolled back for ONE gym, derived from independent bounded reads taken
+    BEFORE the sweep so the answer cannot be shaped by the sweep's own claims.
+    Re-implements observe_denials' decision rule read-only (denied gym-media row,
+    no live gym-media row on the date). EVERY record relied on is strictly parsed;
+    any read failure or malformed record raises: fail closed."""
+    from . import gym_media_selector as selector
+    ledger = ledger_read(gym_key)
+    if ledger is None:
+        raise _ReadbackUnavailable("use-ledger readback failed")
+    work = {}
+    for post_date, records in ledger:
+        if not isinstance(post_date, str) or _strict_date(post_date) is None:
+            raise _ReadbackUnavailable("use-ledger readback returned a malformed date")
+        if not isinstance(records, list):
+            raise _ReadbackUnavailable("use-ledger readback returned a malformed record list")
+        parsed = []
+        for rec in records:
+            clean = _strict_use_record(rec, gym_key)
+            if clean is None:
+                raise _ReadbackUnavailable("use-ledger readback returned a malformed record")
+            parsed.append(clean)
+        unrolled = [r for r in parsed if not r["rolled_back"]]
+        if not unrolled:
+            continue
+        rows = rows_read(gym_key, post_date) or []
+        if not isinstance(rows, list):
+            raise _ReadbackUnavailable("calendar readback returned a non-list payload")
+        mine = []
+        for row in rows:
+            clean_row = _strict_denial_row(row, gym_key, post_date)
+            if clean_row is None:
+                raise _ReadbackUnavailable("calendar readback returned a malformed row")
+            if clean_row[1]:
+                mine.append(clean_row)
+        if not mine:
+            continue
+        denied_assets = {asset for status, asset in mine if status == "denied"}
+        live_assets = {asset for status, asset in mine
+                       if status in selector._LIVE_STATUSES}
+        staged_assets = {r["asset_id"] for r in unrolled}
+        if denied_assets and not live_assets:
+            # The legacy sweep is date-scoped, but a verified operator result
+            # needs a one-for-one relationship between the denied calendar rows
+            # and the use records it will restore.  Without this, denial of A
+            # could roll back B merely because both were staged on the same date.
+            if staged_assets != denied_assets:
+                raise _ReadbackUnavailable(
+                    "denial ledger assets do not exactly match denied calendar assets")
+            work[post_date] = unrolled
+    return work
+
+
+def _confirm_denial_rollbacks(base, expected, sweep_out, *, ledger_read, asset_read):
+    """(verified, evidence_note) -- the independent POST-sweep readback.
+
+    verified is True ONLY when the sweep claimed exactly the rollback dates the
+    pre-sweep derivation found, a fresh ledger re-read shows every one of those
+    records rolled_back, AND a fresh per-asset re-read shows the EXACT requested
+    asset (id equality -- a different or neighbouring asset is not evidence), this
+    gym's own, with usage counters back at the values the ledger recorded before
+    staging. Any read failure, malformed record, coercion fault, or disagreement
+    is (False, note): the sweep's own counts never certify themselves. A
+    no-rollback sweep verifies nothing -- a release that released nothing is not
+    a release."""
+    claimed = sweep_out.get("rolled_back")
+    if _strict_count(claimed) is None:
+        return False, "the sweep reported no integer rolled_back count to compare"
+    if claimed != len(expected):
+        return False, (f"the sweep claims {claimed} rollback date(s) but the "
+                       f"independent pre-sweep read found {len(expected)}; the state "
+                       "moved mid-flight or the claim is wrong")
+    if not expected:
+        return False, ("no denied asset awaited rollback and the sweep rolled none "
+                       "back; a zero-rollback sweep is not a release and verifies "
+                       "nothing")
+    after = ledger_read(base)
+    if after is None:
+        return False, "post-sweep use-ledger readback failed"
+    after_by_date = {}
+    for post_date, records in after:
+        if not isinstance(post_date, str) or _strict_date(post_date) is None \
+                or not isinstance(records, list):
+            return False, "post-sweep use-ledger readback returned a malformed entry"
+        for rec in records:
+            clean = _strict_use_record(rec, base)
+            if clean is None:
+                return False, "post-sweep use-ledger readback returned a malformed record"
+            after_by_date.setdefault(post_date, {})[clean["asset_id"]] = clean
+    for post_date, records in expected.items():
+        current = after_by_date.get(post_date, {})
+        for rec in records:
+            asset_id = rec["asset_id"]
+            now = current.get(asset_id)
+            if now is None or now["rolled_back"] is not True:
+                return False, (f"asset {asset_id} on {post_date} is not rolled back "
+                               "in the post-sweep ledger read")
+            try:
+                asset = asset_read(asset_id)
+            except Exception:  # noqa: BLE001 - an unreadable asset is partial evidence
+                return False, f"asset {asset_id} counter readback failed"
+            if not isinstance(asset, dict) or str(asset.get("id") or "") != asset_id:
+                return False, (f"asset readback for {asset_id} returned a different "
+                               "or missing asset")
+            if str(asset.get("gym_id") or "") != base:
+                return False, (f"asset {asset_id} is missing from the readback or is "
+                               "not this gym's")
+            used = _strict_count(asset.get("used_count"))
+            last, ok = _strict_iso_or_none(asset.get("last_used_at"))
+            if used is None or not ok:
+                return False, (f"asset {asset_id} counters could not be strictly "
+                               "parsed")
+            if (used != rec["prev_used_count"]
+                    or last != rec["prev_last_used_at"]):
+                return False, (f"asset {asset_id} usage counters do not match the "
+                               "rolled-back state the ledger recorded")
+    return True, None
+
+
 def _observe_denials_for_gym(gym_key, observe):
     """Constrain the global ledger sweep's only path to rollback_use.
 
@@ -416,13 +895,36 @@ def _observe_denials_for_gym(gym_key, observe):
 def _run_release_denied_assets(ctx):
     observe = _dep(ctx, "observe_denials", lambda: __import__(
         "agent.gym_media_selector", fromlist=["observe_denials"]).observe_denials)
+    from . import gym_media_selector as selector
+    base = selector.base_gym_key(ctx.gym_key)
+    ledger_read = _dep(ctx, "denial_ledger_read", lambda: _default_denial_ledger_read)
+    rows_read = _dep(ctx, "denial_rows_read", lambda: _default_denial_rows_read)
+    asset_read = _dep(ctx, "asset_read", lambda: _default_asset_read)
+    # Independent pre-sweep derivation, bounded to this gym. An evidence fault
+    # never blocks the sweep; it only withholds verification.
+    try:
+        expected = _denial_rollback_worklist(base, ledger_read=ledger_read,
+                                             rows_read=rows_read)
+        derivation_note = ""
+    except Exception as e:  # noqa: BLE001
+        expected = None
+        derivation_note = (f"independent pre-sweep readback unavailable: "
+                           f"{type(e).__name__}: {str(e)[:160]}")
     out = _observe_denials_for_gym(ctx.gym_key, observe)
     # Echo the sweep's measured counts and nothing else: an upstream success flag is
     # stripped, never amplified -- a sweep that rolled nothing back is not a release,
-    # whatever the wrapped function claims about itself.
+    # whatever the wrapped function claims about itself. Verification comes only
+    # from the independent ledger/calendar/asset re-probe, never from `out`.
     result = {k: v for k, v in out.items()
               if k not in ("released", "postcondition_verified", "captured_at")}
-    result["postcondition_verified"] = False
+    if expected is None:
+        verified, note = False, derivation_note
+    else:
+        verified, note = _confirm_denial_rollbacks(
+            base, expected, out, ledger_read=ledger_read, asset_read=asset_read)
+    result["postcondition_verified"] = verified
+    if not verified:
+        result["evidence_note"] = note
     result["captured_at"] = _now_iso()
     result["summary"] = (f"deny sweep checked {out.get('checked', 0)} date(s), "
                          f"rolled back {out.get('rolled_back', 0)} asset(s)")
@@ -438,24 +940,92 @@ def _row_id(ctx):
     return rid
 
 
+def _derive_swap_sibling_ids(store, gym_key, rid):
+    """The set of sibling row ids the swap SHOULD move, derived BEFORE the swap
+    from independent bounded gym-scoped reads, using the SAME grouping rule
+    handle_swap_media itself applies (media_swap.sibling_rows over the clicked
+    row's own month: same gym + same post_date + an IG/FB feed/story row + the
+    same Drive asset id or raw media key). The handler's own siblings_swapped
+    list is a self-report and is never the source of truth. Raises
+    _ReadbackUnavailable on any read failure or a partial, malformed, or
+    cross-tenant payload."""
+    row = store.get_row(gym_key, rid)
+    if not isinstance(row, dict) or str(row.get("id") or "") != rid:
+        raise _ReadbackUnavailable("target row unreadable for sibling derivation")
+    if str(row.get("gym_id") or "") != gym_key:
+        raise _ReadbackUnavailable("target row crossed the tenant scope")
+    pd = _strict_date(row.get("post_date"))
+    if pd is None:
+        raise _ReadbackUnavailable("target row carries no strict post_date")
+    rows = _read_month_rows(store, gym_key, pd.isoformat()[:7])
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("id"):
+            raise _ReadbackUnavailable("sibling derivation read returned a partial row")
+        if str(r.get("gym_id") or "") != gym_key:
+            raise _ReadbackUnavailable("sibling derivation read crossed the tenant scope")
+    from . import media_swap as _ms
+    # portal_social moves only pending / coach_review siblings.  Approved and
+    # live siblings are intentionally left in place, so including them in the
+    # expected set would turn a correct, protected swap into a false failure.
+    siblings = [s for s in _ms.sibling_rows(
+        row, rows, lib=_ms.library_path_for(gym_key))
+        if str(s.get("status") or "").lower() in ("pending", "coach_review")]
+    out = set()
+    for s in siblings:
+        sid = str(s.get("id") or "")
+        if not _ROW_ID.match(sid) or sid == rid or sid in out:
+            raise _ReadbackUnavailable("grouping rule returned a malformed sibling set")
+        out.add(sid)
+    return out
+
+
 def _run_swap_media(ctx):
     rid = _row_id(ctx)
     if not rid:
         return 400, {"error": "bad_request", "detail": "args.row_id required"}
     handler = _dep(ctx, "handle_swap_media", lambda: __import__(
         "agent.portal_social", fromlist=["handle_swap_media"]).handle_swap_media)
+    # Derive the expected sibling set INDEPENDENTLY, before the swap: the
+    # handler's siblings_swapped list is a self-report and is never the source of
+    # truth. A store that cannot support the derivation fails closed below.
+    store = None
+    expected_siblings = None
+    sibling_note = "independent sibling derivation unavailable"
+    try:
+        store = _dep(ctx, "calendar_store", lambda: __import__(
+            "agent.portal_calendar_store", fromlist=["SupabaseCalendarStore"]
+        ).SupabaseCalendarStore())
+        expected_siblings = _derive_swap_sibling_ids(store, ctx.gym_key, rid)
+    except Exception as e:  # noqa: BLE001 - evidence fault, never a swap blocker
+        sibling_note = (f"independent sibling derivation unavailable: "
+                        f"{type(e).__name__}: {str(e)[:160]}")
     status, body = handler(ctx.gym_key, rid, f"{ACTOR}:{ctx.ticket_id}")
     body = dict(body or {})
     body.setdefault("row_id", rid)
     if int(status) == 200 and body.get("ok") is True:
+        if expected_siblings is None:
+            return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                         "_outcome_unknown": True,
+                         "postcondition_verified": False,
+                         "captured_at": _now_iso(),
+                         "summary": f"swap-media on row {rid}: {sibling_note}"}
+        swapped_ids = body.get("siblings_swapped")
+        if (not isinstance(swapped_ids, list)
+                or any(not isinstance(v, str) or not _ROW_ID.match(v)
+                       for v in swapped_ids)
+                or len(set(swapped_ids)) != len(swapped_ids)
+                or rid in swapped_ids):
+            return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                         "_outcome_unknown": True,
+                         "postcondition_verified": False,
+                         "captured_at": _now_iso(),
+                         "summary": (f"swap-media on row {rid}: handler-reported "
+                                     "sibling list is malformed")}
         # The handler's returned row is a write response, not an independent proof.
         # A missing or failed readback is ambiguous: the write may already have landed,
         # so report it without invoking the non-idempotent swap a second time.
         expected = body.get("image_public_url")
         try:
-            store = _dep(ctx, "calendar_store", lambda: __import__(
-                "agent.portal_calendar_store", fromlist=["SupabaseCalendarStore"]
-            ).SupabaseCalendarStore())
             confirmed = store.get_row(ctx.gym_key, rid) if expected else None
         except Exception:  # noqa: BLE001 - readback failure is not proof of rollback
             confirmed = None
@@ -471,10 +1041,9 @@ def _run_swap_media(ctx):
                          "postcondition_verified": False,
                          "captured_at": _now_iso(),
                          "summary": f"swap-media on row {rid}: calendar readback unconfirmed"}
-        sibling_ids = body.get("siblings_swapped") or []
         sibling_results = body.get("sibling_results") or []
-        if (not isinstance(sibling_ids, list) or not isinstance(sibling_results, list)
-                or sorted(str(v) for v in sibling_ids)
+        if (not isinstance(sibling_results, list)
+                or sorted(swapped_ids)
                 != sorted(str(v.get("id")) for v in sibling_results
                           if isinstance(v, dict))):
             return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
@@ -501,6 +1070,14 @@ def _run_swap_media(ctx):
                              "captured_at": _now_iso(),
                              "summary": (f"swap-media on row {rid}: sibling {sid} "
                                          "readback unconfirmed")}
+        if set(swapped_ids) != expected_siblings:
+            return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                         "_outcome_unknown": True,
+                         "postcondition_verified": False,
+                         "captured_at": _now_iso(),
+                         "summary": (f"swap-media on row {rid}: handler-reported "
+                                     "siblings do not match the independently "
+                                     "derived set")}
         body["postcondition_verified"] = True
         body["captured_at"] = _now_iso()
     body["summary"] = (f"swap-media on row {rid}: "
@@ -551,6 +1128,156 @@ def _run_requeue_failed_row(ctx):
 
 
 # -- restage_month (background) -----------------------------------------------------------
+
+# The calendar fields the terminal readback fingerprints. Identity, placement, copy,
+# media and status: exactly what a rebuild is allowed to write, so a genuine rebuild
+# never trips the "pre-existing row changed" check and any outside edit does.
+_ROW_FINGERPRINT_FIELDS = ("post_date", "account", "format", "status", "caption",
+                           "image_url", "video_url", "slot_index",
+                           "source_media_asset_id")
+
+# Every field a row MUST carry before it can be fingerprinted: the mutable fields
+# above plus its identity and tenant. A missing KEY means the store selected a
+# partial column set and the comparison would run blind on those fields -- that
+# rejects the whole readback. A present key with a None value (a story's null
+# video_url, a null caption) is a complete row and fingerprints deterministically.
+_ROW_REQUIRED_FIELDS = ("id", "gym_id") + _ROW_FINGERPRINT_FIELDS
+
+# Hard bound on followed pages, so a store that hands out cursors forever is
+# evidence-unavailable rather than an endless read.
+_MAX_MONTH_PAGES = 64
+# Supabase/PostgREST's common default response ceiling.  A legacy bare-list
+# store gives us no continuation token, so a full-sized page is indistinguishable
+# from a truncated response and cannot certify a restage.
+_MAX_UNPAGED_MONTH_ROWS = 1000
+
+
+def _span_months(start, days):
+    """Every 'YYYY-MM' the requested [start, start+days) window touches, computed
+    from the REQUEST, never from the builder's own report."""
+    from datetime import date as _date, timedelta
+    first = _date.fromisoformat(str(start)[:10])
+    return sorted({(first + timedelta(days=i)).isoformat()[:7]
+                   for i in range(max(int(days), 1))})
+
+
+def _default_calendar_readback_store():
+    from . import config
+    if not (config.supabase_url() and config.supabase_service_key()):
+        raise _ReadbackUnavailable("calendar readback plane is not configured")
+    from .portal_calendar_store import SupabaseCalendarStore
+    return SupabaseCalendarStore()
+
+
+def _read_month_rows(store, gym_key, month):
+    """Every row the store holds for one gym-month, with pagination followed to
+    EXHAUSTION. Two store shapes are honoured: a bare list (a non-paginating
+    store, the whole month in one answer) and a page dict {"rows": [...],
+    "next": <cursor>} fetched with list_month(gym, month, cursor) until no
+    cursor remains. A page that announces truncation, a malformed page or
+    cursor, or a page sequence that never terminates is _ReadbackUnavailable --
+    a truncated page set is unavailable evidence, never a partial comparison."""
+    list_month = getattr(store, "list_month", None)
+    if list_month is None:
+        raise _ReadbackUnavailable("calendar store exposes no bounded month read")
+    cursor = None
+    rows = []
+    for _ in range(_MAX_MONTH_PAGES):
+        page = list_month(gym_key, month) if cursor is None \
+            else list_month(gym_key, month, cursor)
+        if isinstance(page, list):
+            if len(page) >= _MAX_UNPAGED_MONTH_ROWS:
+                raise _ReadbackUnavailable(
+                    "unpaged calendar readback may be truncated at the response limit")
+            rows.extend(page)
+            return rows
+        if not isinstance(page, dict):
+            raise _ReadbackUnavailable("calendar readback returned a non-list payload")
+        if page.get("truncated"):
+            raise _ReadbackUnavailable("calendar readback reported a truncated page set")
+        chunk = page.get("rows")
+        if not isinstance(chunk, list):
+            raise _ReadbackUnavailable("paginated calendar readback returned a malformed page")
+        rows.extend(chunk)
+        cursor = page.get("next") or page.get("next_cursor") or page.get("next_page")
+        if not cursor:
+            return rows
+        if not isinstance(cursor, str):
+            raise _ReadbackUnavailable("paginated calendar readback returned a malformed cursor")
+    raise _ReadbackUnavailable("paginated calendar readback did not terminate")
+
+
+def _calendar_snapshot(store, gym_key, months, *, first=None, last=None):
+    """{row_id: fingerprint} for ONE gym's in-span calendar rows across `months`,
+    via pagination-complete bounded month reads. Every returned row is strictly
+    validated: all required fields present, well-formed id, exact tenant, and a
+    strict real post_date inside one of the REQUESTED months (a row from any
+    other month means the read was not actually scoped and rejects the whole
+    readback). Rows inside a requested month but outside the [first, last] day
+    span are legitimately returned by a month-grained store and are excluded
+    from the comparison set -- they are not the build's claimed rows. A partial
+    row, a duplicate id, or any read failure raises _ReadbackUnavailable:
+    untrustworthy evidence, never a pass."""
+    snapshot = {}
+    seen_ids = set()
+    month_set = set(months)
+    for month in months:
+        for row in _read_month_rows(store, gym_key, month):
+            if not isinstance(row, dict):
+                raise _ReadbackUnavailable("calendar readback returned a partial row")
+            missing = [k for k in _ROW_REQUIRED_FIELDS if k not in row]
+            if missing:
+                raise _ReadbackUnavailable(
+                    f"calendar readback returned a partial row (missing {missing[0]})")
+            rid = row["id"]
+            if not isinstance(rid, str) or not _ROW_ID.match(rid):
+                raise _ReadbackUnavailable("calendar readback returned a malformed row id")
+            if not isinstance(row["gym_id"], str) or row["gym_id"] != gym_key:
+                raise _ReadbackUnavailable("calendar readback crossed the tenant scope")
+            pd = _strict_date(row["post_date"])
+            if pd is None:
+                raise _ReadbackUnavailable("calendar readback returned a malformed post_date")
+            if pd.isoformat()[:7] not in month_set:
+                raise _ReadbackUnavailable("calendar readback escaped the requested span")
+            if rid in seen_ids:
+                raise _ReadbackUnavailable("calendar readback returned a duplicate row id")
+            seen_ids.add(rid)
+            if first is not None and last is not None and not (first <= pd <= last):
+                continue
+            snapshot[rid] = json.dumps(
+                {k: row.get(k) for k in _ROW_FINGERPRINT_FIELDS},
+                sort_keys=True, default=str)
+    return snapshot
+
+
+def _compare_calendar_snapshots(before, after, build_result):
+    """(verified, evidence_note). verified is True ONLY when the independent
+    before/after comparison fully confirms the build's claims: exactly `upserted`
+    new row ids, exactly `deleted` removed row ids, NOT ONE pre-existing row
+    changed -- and the build actually wrote something (a no-op build restaged
+    nothing, so there is nothing to verify)."""
+    upserted = build_result.get("upserted")
+    deleted = build_result.get("deleted", 0)
+    for label, value in (("upserted", upserted), ("deleted", deleted)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return False, f"the build reported no integer {label} count to compare"
+    new_ids = set(after) - set(before)
+    gone_ids = set(before) - set(after)
+    changed = [rid for rid in set(before) & set(after) if before[rid] != after[rid]]
+    if changed:
+        return False, (f"{len(changed)} pre-existing row(s) changed while the build "
+                       "ran; the calendar moved under the comparison")
+    if len(new_ids) != upserted:
+        return False, (f"the build claims {upserted} upserted row(s); the independent "
+                       f"readback sees {len(new_ids)} new row(s)")
+    if len(gone_ids) != deleted:
+        return False, (f"the build claims {deleted} deleted row(s); the independent "
+                       f"readback sees {len(gone_ids)} removed row(s)")
+    if upserted == 0:
+        return False, ("the build reported a no-op (0 upserted rows); nothing was "
+                       "restaged, so there is no postcondition to verify")
+    return True, None
+
 
 def _restage_args(ctx):
     a = ctx.args or {}
@@ -614,6 +1341,25 @@ def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_
     steps.append({"step": "observe_denials", "at": _now_iso(), **out["observe_denials"]})
 
     # 2. build
+    # Independent calendar readback, bounded to this gym and the REQUESTED span:
+    # snapshot the span's rows BEFORE the builder runs so the terminal result can
+    # compare what the build claims it wrote against what an independent re-read
+    # sees. An evidence fault never blocks the build; it only withholds
+    # verification from the terminal job result.
+    readback_store = None
+    before_rows = None
+    evidence_note = "independent calendar readback unavailable"
+    try:
+        from datetime import date as _date, timedelta as _td
+        span_first = _date.fromisoformat(str(start)[:10])
+        span_last = span_first + _td(days=max(int(days), 1) - 1)
+        readback_store = deps.get("calendar_store") or _default_calendar_readback_store()
+        before_rows = _calendar_snapshot(readback_store, gym_key,
+                                         _span_months(start, days),
+                                         first=span_first, last=span_last)
+    except Exception as e:  # noqa: BLE001
+        evidence_note = (f"pre-build calendar readback unavailable: "
+                         f"{type(e).__name__}: {str(e)[:160]}")
     if "build_month" in deps:
         built = deps["build_month"](gym_key, start, days)
     else:
@@ -634,14 +1380,28 @@ def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_
                                    library_path=cms._library_dir(gym_key), store=store,
                                    banned_words=cms._banned_words_for(gym_key), logger=log)
     out["build"] = built
-    # A successful builder response does not identify which rows survived the
-    # calendar write or human edits. Keep the completed job truthful until a
-    # scoped, independent calendar comparison is available: the job never verifies
-    # itself, and the builder's own self-certification is stripped, not echoed.
+    # The builder's response does not identify which rows survived the calendar
+    # write or human edits, and its own ok/upserted claims are never the proof:
+    # any postcondition_verified it returns is stripped, and the terminal job
+    # verifies ONLY through the independent before/after comparison.
     if isinstance(out["build"], dict):
         out["build"] = {k: v for k, v in out["build"].items()
                         if k != "postcondition_verified"}
-    out["postcondition_verified"] = False
+    verified = False
+    if before_rows is not None and isinstance(built, dict) and built.get("ok") is True:
+        try:
+            after_rows = _calendar_snapshot(readback_store, gym_key,
+                                            _span_months(start, days),
+                                            first=span_first, last=span_last)
+            verified, evidence_note = _compare_calendar_snapshots(
+                before_rows, after_rows, built)
+        except Exception as e:  # noqa: BLE001
+            verified = False
+            evidence_note = (f"post-build calendar readback failed: "
+                             f"{type(e).__name__}: {str(e)[:160]}")
+    out["postcondition_verified"] = verified
+    if not verified:
+        out["evidence_note"] = evidence_note
     build_result = built if isinstance(built, dict) else {}
     steps.append({"step": "build", "at": _now_iso(), "ok": build_result.get("ok") is True,
                   "upserted": build_result.get("upserted")})
@@ -1018,6 +1778,40 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         return refused
     deps = dict(deps or {})
     method = (method or "").upper()
+    m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/reply-reconciliation/"
+                 r"([0-9a-f]{32})$", path)
+    if m:
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        query = parse_qs(parsed.query)
+        if set(query) != {"gym_key"} or len(query.get("gym_key") or []) != 1:
+            return 400, {"error": "bad_request", "detail": "gym_key required"}
+        gym_key = query["gym_key"][0]
+        from .fixer_reply_reconciliation import (
+            ReconciliationError, default_store, reconcile_snapshot,
+        )
+        store = deps.get("reply_snapshot_store")
+        if store is None:
+            try:
+                store = default_store()
+            except ReconciliationError as exc:
+                return exc.status, {"error": exc.code}
+        zernio = deps.get("reply_reconciliation_zernio")
+        if zernio is None:
+            from .zernio import ZernioClient
+            zernio = ZernioClient()
+        try:
+            result = reconcile_snapshot(m.group(1), gym_key, zernio=zernio,
+                                        store=store, now=now)
+            return 200, result
+        except ReconciliationError as exc:
+            return exc.status, {"error": exc.code}
+        except Exception:  # noqa: BLE001 - provider/store faults fail closed
+            return 503, {"error": "reply_reconciliation_unavailable"}
+    if path == BUSINESS_EVIDENCE_PATH:
+        if method != "POST":
+            return 405, {"error": "method_not_allowed"}
+        return _run_business_evidence(raw_body, deps, now=now)
     if path.startswith(ROUTE_PREFIX + "/evidence/media-source/"):
         if method != "GET":
             return 405, {"error": "method_not_allowed"}
