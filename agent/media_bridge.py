@@ -31,11 +31,100 @@ def _put(conn, key, value):
                  (key, json.dumps(value, sort_keys=True)))
 
 
+_SHARED_RUNWAY_UNAVAILABLE = object()
+
+
+def _shared_store():
+    """The optional cross-service runway store, or None when it is unavailable.
+
+    The worker's SQLite state remains durable on its own.  This adapter deliberately
+    imports lazily so a local-only installation keeps the historical behavior while
+    the shared table is not configured.
+    """
+    try:
+        from .shared_media_runway_store import SharedMediaRunwayStore
+    except ImportError:
+        return None
+    store = SharedMediaRunwayStore()
+    return store if store.available() else None
+
+
+def shared_snapshot(base):
+    """Read the shared worker snapshot.
+
+    `_SHARED_RUNWAY_UNAVAILABLE` is distinct from an available store that has no
+    row: the portal may use its local SQLite fallback only in the former case.
+    A reachable store returns its projection or None.  The portal treats that None
+    as neutral unknown because the read model deliberately does not distinguish a
+    missing row from an unavailable transport.
+    """
+    store = _shared_store()
+    if store is None:
+        return _SHARED_RUNWAY_UNAVAILABLE
+    return store.read(base)
+
+
+def _notice_snapshot(base, state):
+    """The current episode's transport state, without channel or notice text."""
+    episode_id = (state or {}).get("id")
+    notice = next((row for row in notice_status(base)
+                   if row.get("episode_id") == episode_id), None) if episode_id else None
+    status = notice.get("status") if notice else "none"
+    if status not in {"none", "unresolved", "ready", "sent"}:
+        status = "unresolved"
+    return {
+        "status": status,
+        "episode_id": episode_id,
+        "created_at": notice.get("created_at") if notice else None,
+        "delivery_confirmed": bool(status == "sent" and notice.get("ts")),
+    }
+
+
+def _fallback_projection(base, state, *, now=None):
+    """Project private local dates into the portal-safe shared runway contract."""
+    if not state:
+        return None
+    from .calendar_autopublish import _local_now
+    today = _local_now(now, config.posting_timezone_for(base)).date()
+    active = today.isoformat() <= state["end"]
+    return {
+        "active": active,
+        "episode_id": state["id"],
+        "depleted_on": state["depleted_on"],
+        "dates": [state["start"], state["end"]] if active else [],
+        "drafts_need_review": active,
+        "status": None,
+    }
+
+
+def _mirror_shared_snapshot(base, state, *, now=None):
+    """Best-effort mirror after a committed local transition.
+
+    A shared write must never undo or fail the worker's local SQLite transition.
+    The compact payload gives the portal the exact state it needs while excluding
+    Slack channel ids and client-facing notice text.
+    """
+    try:
+        store = _shared_store()
+        if store is None:
+            return False
+        return bool(store.upsert(
+            base,
+            fallback_episode=_fallback_projection(base, state, now=now),
+            notice_state=_notice_snapshot(base, state),
+        ))
+    except Exception as exc:  # local SQLite is the fallback when the shared plane fails
+        print(f"[media-bridge] shared runway mirror failed for {base}: "
+              f"{type(exc).__name__}")
+        return False
+
+
 def episode(base, *, now=None, create=True):
     """Persist two fixed gym-local dates, once for each depletion episode."""
     from .calendar_autopublish import _local_now
     today = _local_now(now, config.posting_timezone_for(base)).date()
     conn = db.connect()
+    changed = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         state = _get(conn, "media_bridge_episode_" + base)
@@ -44,10 +133,13 @@ def episode(base, *, now=None, create=True):
             state = {"id": uuid.uuid4().hex, "depleted_on": today.isoformat(), "start": start.isoformat(),
                      "end": (start + timedelta(days=1)).isoformat()}
             _put(conn, "media_bridge_episode_" + base, state)
+            changed = True
         conn.commit()
-        return state
     finally:
         conn.close()
+    if changed:
+        _mirror_shared_snapshot(base, state, now=now)
+    return state
 
 
 def bridge_days(base, *, now=None, days_ahead=2):
@@ -69,6 +161,7 @@ def reset_notice(base):
         conn.commit()
     finally:
         conn.close()
+    _mirror_shared_snapshot(base, None)
 
 
 def rearm_for_new_upload(base, asset_identity, *, usable):
@@ -83,6 +176,7 @@ def rearm_for_new_upload(base, asset_identity, *, usable):
     if not usable or not identity:
         return False
     conn = db.connect()
+    rearmed = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         seen, _ = _local_inventory_history(conn, base)
@@ -93,12 +187,15 @@ def rearm_for_new_upload(base, asset_identity, *, usable):
         _put(conn, _local_inventory_key(base), sorted(seen))
         conn.execute("DELETE FROM kv WHERE key=?", ("media_bridge_episode_" + base,))
         conn.commit()
-        return True
+        rearmed = True
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+    if rearmed:
+        _mirror_shared_snapshot(base, None)
+    return rearmed
 
 
 def _observe_inventory(base, lane, asset_ids):
@@ -106,12 +203,14 @@ def _observe_inventory(base, lane, asset_ids):
     names = sorted({str(value) for value in asset_ids if value})
     key = "media_bridge_" + lane + "_inventory_" + base
     conn = db.connect()
+    rearmed = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         previous = _get(conn, key)
         seen = set(previous or [])
         if previous is not None and any(name not in seen for name in names):
             conn.execute("DELETE FROM kv WHERE key=?", ("media_bridge_episode_" + base,))
+            rearmed = True
         _put(conn, key, sorted(seen.union(names)))
         conn.commit()
     except Exception:
@@ -119,6 +218,8 @@ def _observe_inventory(base, lane, asset_ids):
         raise
     finally:
         conn.close()
+    if rearmed:
+        _mirror_shared_snapshot(base, None)
 
 
 def _local_inventory_key(base):
@@ -161,12 +262,14 @@ def observe_local_inventory(base, asset_paths):
     names = sorted({identity for path in asset_paths
                     if (identity := _local_asset_identity(path))})
     conn = db.connect()
+    rearmed = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         seen, established = _local_inventory_history(conn, base)
         fresh = set(names).difference(seen)
         if established and fresh:
             conn.execute("DELETE FROM kv WHERE key=?", ("media_bridge_episode_" + base,))
+            rearmed = True
         _put(conn, _local_inventory_key(base), sorted(seen.union(names)))
         conn.commit()
     except Exception:
@@ -174,6 +277,8 @@ def observe_local_inventory(base, asset_paths):
         raise
     finally:
         conn.close()
+    if rearmed:
+        _mirror_shared_snapshot(base, None)
 
 
 def notice_text():
@@ -233,9 +338,10 @@ def reconcile_notice(base, *, delivered=False, channel="", ts="", episode_id="")
             row["ts"] = str(ts)
         _put(conn, key, row)
         conn.commit()
-        return {"ok": True, "status": row["status"]}
     finally:
         conn.close()
+    _mirror_shared_snapshot(base, state)
+    return {"ok": True, "status": row["status"]}
 
 
 def notify_bridge(base, account, *, logger=None, now=None, poster=None):
@@ -284,6 +390,7 @@ def notify_bridge(base, account, *, logger=None, now=None, poster=None):
             conn.commit()
         finally:
             conn.close()
+        _mirror_shared_snapshot(base, state, now=now)
         result = poster._chat_post(text=row["text"], blocks=None, channel=route.channel)
         if not result or not result.get("ok") or not result.get("ts"):
             return {"ok": False, "reason": "unresolved send", "reconcile": True}
@@ -295,6 +402,7 @@ def notify_bridge(base, account, *, logger=None, now=None, poster=None):
             conn.commit()
         finally:
             conn.close()
+        _mirror_shared_snapshot(base, state, now=now)
         return {"ok": True, "sent": True}
     except Exception as exc:
         log(f"{base} media bridge notice failed {type(exc).__name__}")

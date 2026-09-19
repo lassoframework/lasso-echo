@@ -450,6 +450,97 @@ def _base_of_account(account_key):
     return key
 
 
+def _neutral_media_bridge_state():
+    """A shared-state read failed, so never claim an inactive runway."""
+    return (
+        {"active": None, "depleted_on": None, "dates": [],
+         "drafts_need_review": None, "status": "unknown"},
+        {"status": "unknown", "delivery_confirmed": False},
+    )
+
+
+def _media_bridge_payload(state, notice, base, *, now=None):
+    """Normalize worker-local or shared snapshots to the stable portal contract."""
+    if state:
+        from .calendar_autopublish import _local_now
+        today = _local_now(now, config.posting_timezone_for(base)).date()
+        active = today.isoformat() <= state["end"]
+        fallback = {"active": active, "episode_id": state["id"],
+                    "depleted_on": state["depleted_on"],
+                    "dates": [state["start"], state["end"]] if active else [],
+                    "drafts_need_review": active}
+    else:
+        active = False
+        fallback = {"active": False, "depleted_on": None, "dates": [],
+                    "drafts_need_review": False}
+
+    # An expired episode is historical, not proof of a current client notice.
+    current = state if state and active else None
+    if not current or (notice or {}).get("episode_id") != current["id"]:
+        notice = None
+    status = notice.get("status") if notice else "none"
+    if status not in {"none", "unresolved", "ready", "sent"}:
+        status = "unresolved"
+    return fallback, {
+        "status": status,
+        "episode_id": current["id"] if current else None,
+        "created_at": notice.get("created_at") if notice else None,
+        "delivery_confirmed": bool(status == "sent" and notice.get("ts")),
+    }
+
+
+def _shared_media_bridge_payload(fallback, notice, base, *, now=None):
+    """Use the store's already-validated portal projection without local dates."""
+    if fallback is None:
+        rendered = {"active": False, "depleted_on": None, "dates": [],
+                    "drafts_need_review": False}
+        current_id = None
+    elif not isinstance(fallback, dict):
+        raise ValueError("invalid shared fallback episode")
+    else:
+        from .calendar_autopublish import _local_now
+        dates = fallback.get("dates") or []
+        today = _local_now(now, config.posting_timezone_for(base)).date().isoformat()
+        active = bool(fallback.get("active") and dates and today <= dates[-1])
+        rendered = {
+            "active": active,
+            "episode_id": fallback.get("episode_id"),
+            "depleted_on": fallback.get("depleted_on"),
+            "dates": dates if active else [],
+            "drafts_need_review": bool(fallback.get("drafts_need_review") and active),
+        }
+        if fallback.get("status") == "unknown":
+            rendered["status"] = "unknown"
+        current_id = rendered["episode_id"] if rendered["active"] else None
+
+    if not isinstance(notice, dict):
+        raise ValueError("invalid shared notice state")
+    if rendered.get("status") == "unknown":
+        return rendered, {"status": "unknown", "delivery_confirmed": False}
+    if current_id is None or notice.get("episode_id") != current_id:
+        return rendered, {"status": "none", "episode_id": None,
+                          "created_at": None, "delivery_confirmed": False}
+    status = notice.get("status")
+    if status not in {"none", "unresolved", "ready", "sent", "unknown"}:
+        status = "unresolved"
+    return rendered, {
+        "status": status,
+        "episode_id": current_id,
+        "created_at": notice.get("created_at"),
+        "delivery_confirmed": bool(notice.get("delivery_confirmed")),
+    }
+
+
+def _local_media_bridge_payload(base, *, now=None):
+    """The historical single-service SQLite read, retained for local deployments."""
+    from . import media_bridge
+    state = media_bridge.episode(base, now=now, create=False)
+    notices = media_bridge.notice_status(base) if state else []
+    notice = next((row for row in notices if row.get("episode_id") == state["id"]), None) \
+        if state else None
+    return _media_bridge_payload(state, notice, base, now=now)
+
+
 def _media_bridge_status(account_key, *, now=None):
     """Read-only tenant media status for the portal. Unknown is never zero."""
     base = _base_of_account(account_key)
@@ -472,33 +563,22 @@ def _media_bridge_status(account_key, *, now=None):
                   "publishable_count": None, "reason": "media inventory unavailable"}
 
     try:
-        state = media_bridge.episode(base, now=now, create=False)
-        if state:
-            from .calendar_autopublish import _local_now
-            today = _local_now(now, config.posting_timezone_for(base)).date()
-            active = today.isoformat() <= state["end"]
-            fallback = {"active": active, "episode_id": state["id"],
-                        "depleted_on": state["depleted_on"],
-                        "dates": [state["start"], state["end"]] if active else [],
-                        "drafts_need_review": active}
+        snapshot = media_bridge.shared_snapshot(base)
+        if snapshot is media_bridge._SHARED_RUNWAY_UNAVAILABLE:
+            fallback, notice_state = _local_media_bridge_payload(base, now=now)
+        elif snapshot is None:
+            # A shared read cannot distinguish a missing row from an outage or a
+            # not-yet-projected worker transition.  Never call that runway clear.
+            fallback, notice_state = _neutral_media_bridge_state()
+        elif not isinstance(snapshot, dict):
+            raise ValueError("invalid shared runway snapshot")
         else:
-            fallback = {"active": False, "depleted_on": None, "dates": [],
-                        "drafts_need_review": False}
-        # An expired episode is historical, not proof of a current client notice.
-        current = state if state and fallback["active"] else None
-        notices = media_bridge.notice_status(base) if current else []
-        notice = next((n for n in notices if n.get("episode_id") == current["id"]), None) if current else None
-        status = notice.get("status") if notice else "none"
-        if status not in {"none", "unresolved", "ready", "sent"}:
-            status = "unresolved"
-        notice_state = {"status": status,
-                        "episode_id": current["id"] if current else None,
-                        "created_at": notice.get("created_at") if notice else None,
-                        "delivery_confirmed": bool(status == "sent" and notice.get("ts"))}
+            fallback, notice_state = _shared_media_bridge_payload(
+                snapshot.get("fallback_episode"), snapshot.get("notice_state"),
+                base, now=now,
+            )
     except Exception:
-        fallback = {"active": None, "depleted_on": None, "dates": [],
-                    "drafts_need_review": None, "status": "unknown"}
-        notice_state = {"status": "unknown", "delivery_confirmed": False}
+        fallback, notice_state = _neutral_media_bridge_state()
 
     try:
         from . import ghl_intake
