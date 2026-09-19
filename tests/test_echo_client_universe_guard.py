@@ -61,10 +61,12 @@ TOKEN_READ_ALLOWLIST = {
     "account_key_split_watch.py",   # detects a gym whose two keys disagree
     "gym_identity.py",              # name/market tokens for ONE base's grounding
     "fixer_evidence.py",            # exact ticket -> ONE gym alias; never enumerates clients
+    "fixer_business_evidence.py",   # exact authenticated business check -> ONE gym mapping
     "fixer_ops.py",                 # exact ticket gym_id -> ONE account key before ops action
     "intake_web.py",                # the row for ONE signed link's key
     "social_intake_reader.py",      # resolve ONE intake's raw key to its token key
     os.path.join("slack_convo", "listener_wiring.py"),   # ONE Slack user's gym -> its key
+    os.path.join("slack_convo", "bus.py"),               # exact Echo key -> ONE portal UUID
     "__main__.py",                  # onboarding-audit PRINTS the table name; its roster is
                                     # onboarding_watch.portal_keys, which is gated
 }

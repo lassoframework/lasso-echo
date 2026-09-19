@@ -21,6 +21,7 @@ parameter does not emit -- so ON CONFLICT would fail with "no unique or exclusio
 matching" at runtime. Catching the violation is the reliable form.
 """
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 from . import testdata as _td
@@ -30,6 +31,9 @@ _TICKETS = "support_tickets"
 _MESSAGES = "support_messages"
 
 OPEN_STATUSES = ("new", "triage", "fixing", "verification", "hold", "approved")
+_UUID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+_HASH = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _a_kind_escalation():
@@ -155,6 +159,87 @@ class Bus:
 
     def set_ticket(self, ticket_id, **fields):
         return self._patch(_TICKETS, {"id": f"eq.{ticket_id}"}, fields)
+
+    def portal_client_id(self, gym_key):
+        """The one portal UUID mapped to an exact Echo account key, or None.
+
+        This is the tenant-binding lookup used by structured automation tickets.
+        It deliberately refuses display-name and registry fallbacks: a buildable
+        FIXER row may only carry the portal's own client identity.
+        """
+        rows = self._get("echo_intake_tokens", {
+            "echo_account_key": f"eq.{gym_key}",
+            "select": "gym_id,echo_account_key", "limit": "2"})
+        ids = {str(row.get("gym_id") or "") for row in rows
+               if isinstance(row, dict) and row.get("echo_account_key") == gym_key}
+        if len(ids) != 1:
+            return None
+        client_id = next(iter(ids))
+        return client_id if _UUID.fullmatch(client_id) else None
+
+    def record_seeded_ops_fix(self, row):
+        """Insert one deterministic structured ops-fix ticket.
+
+        The caller supplies the fully materialized ticket.  This boundary checks
+        the fields that make it autonomous and tenant-safe, then confirms the
+        returned representation.  A retry may hit the deterministic primary key;
+        it succeeds only when the existing row carries the same immutable source
+        event and business-check pointer.
+        """
+        if not isinstance(row, dict):
+            raise BusError(400, "seeded ops-fix row must be an object")
+        before = row.get("verification_before")
+        fixer = before.get("fixer") if isinstance(before, dict) else None
+        check = fixer.get("business_check") if isinstance(fixer, dict) else None
+        event = fixer.get("source_event") if isinstance(fixer, dict) else None
+        valid = (
+            row.get("product") == "echo" and row.get("source") == "ops_fix"
+            and row.get("status") == "new" and row.get("classification") == "code_fix"
+            and _UUID.fullmatch(str(row.get("id") or ""))
+            and _UUID.fullmatch(str(row.get("client_id") or ""))
+            and isinstance(check, dict) and check.get("ticket_id") == row.get("id")
+            and check.get("client_id") == row.get("client_id")
+            and check.get("schema_version") == 1
+            and check.get("contract_version") == "echo-business-evidence-v1"
+            and check.get("check_id") == "forward_book_grade_at_least"
+            and isinstance(check.get("params"), dict)
+            and set(check["params"]) == {"min_total"}
+            and isinstance(check["params"]["min_total"], int)
+            and not isinstance(check["params"]["min_total"], bool)
+            and 0 <= check["params"]["min_total"] <= 100
+            and _HASH.fullmatch(str(check.get("request_key") or ""))
+            and isinstance(event, dict)
+            and event.get("schema_version") == 1
+            and event.get("source") == "echo.grade_sweep.forward_book_drop"
+            and _HASH.fullmatch(str(event.get("source_event_id") or ""))
+            and isinstance(event.get("gym_key"), str)
+            and isinstance(event.get("previous_total"), int)
+            and not isinstance(event.get("previous_total"), bool)
+            and 0 <= event["previous_total"] <= 100
+            and check["params"]["min_total"] == event.get("previous_total")
+            and isinstance(event.get("observed_total"), int)
+            and not isinstance(event.get("observed_total"), bool)
+            and 0 <= event["observed_total"] <= 100
+            and event["observed_total"] < event.get("previous_total"))
+        if not valid:
+            raise BusError(400, "invalid seeded ops-fix identity or contract")
+        if self.portal_client_id(event["gym_key"]) != row["client_id"]:
+            raise BusError(409, "seeded ops-fix tenant mapping changed")
+
+        created, duplicate = self._insert(_TICKETS, row)
+        stored = self.ticket(row["id"]) if duplicate else created
+        if not isinstance(stored, dict):
+            raise BusError(503, "seeded ops-fix write was not confirmed")
+        stored_before = stored.get("verification_before")
+        stored_fixer = stored_before.get("fixer") if isinstance(stored_before, dict) else None
+        stored_check = stored_fixer.get("business_check") if isinstance(stored_fixer, dict) else None
+        stored_event = stored_fixer.get("source_event") if isinstance(stored_fixer, dict) else None
+        if (stored.get("id") != row["id"] or stored.get("product") != "echo"
+                or stored.get("source") != "ops_fix"
+                or stored.get("client_id") != row["client_id"]
+                or stored_check != check or stored_event != event):
+            raise BusError(409, "seeded ops-fix readback identity mismatch")
+        return stored, duplicate
 
     def find_new_tickets(self, *, product, source, limit=20):
         """D46: the portal-ticket worker's poll query. A non-Slack-sourced ticket

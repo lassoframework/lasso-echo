@@ -1221,10 +1221,12 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             # Nothing landed (a no-op, a gate refusal, a raise, or a delete whose
             # insert then failed): this build's own Drive picks never became rows.
             _rollback_new_drive_drafts(drafts, log)
-            if not _res.get("deleted"):
+            if not _res.get("deleted_total", _res.get("deleted")):
                 # ...and the OLD rows survive, so their released assets are stamped
-                # again. (deleted>0 with no insert: the old rows are gone, so their
-                # assets stay free, which is correct.)
+                # again. (deleted_total>0 with no insert: the old rows are gone, so
+                # their assets stay free, which is correct. The raw month-grained
+                # count is used here, not the span-scoped verifier claim: a delete
+                # that wiped only out-of-span rows still destroyed those rows.)
                 _restore_released_drive_assets(base_key, released_drive, log)
         client_content.clear_drive_pool_cache()
         _heartbeat.stop()
@@ -2003,11 +2005,109 @@ def _to_rows(base_key, drafts):
     return rows
 
 
+def _span_scoped_delete_claim(store, base_key, months, span_first, span_last,
+                              preserve_dates=(), log=None):
+    """How many of THIS gym's rows the month-grained delete in _apply will remove
+    INSIDE the planned day-span [span_first, span_last] — the exact unit the
+    independent restage verification measures with its own before/after
+    readback (agent/fixer_ops.run_restage_month's terminal job).
+
+    portal_calendar_store.delete_month wipes the WHOLE calendar month, so its
+    raw return count also covers wipeable rows on days outside the requested
+    span (2026-09-01..09-18 when restaging 21 days from 2026-09-19). Reporting
+    that month-scoped number as the build's deleted claim made span-scoped
+    evidence impossible: the verifier's snapshots only ever contain in-span
+    rows, so the claimed and independently measured deleted counts could never
+    agree and a genuine whole-month restage could never verify.
+
+    The count mirrors delete_month's filter exactly (wipeable or NULL status,
+    active variant, post_date not preserved), restricted to the planned span
+    and to rows belonging to base_key (tenant binding: a foreign row is never
+    this build's deletion). It is a CLAIM, never self-certification: the
+    verifier recounts independently, so any divergence from what the delete
+    actually removed in-span verifies False (fail closed).
+
+    Returns None when the store cannot support a bounded read (no list_month,
+    a read failure, or a partial row); the caller then reports the store's own
+    count, exactly as before, and the verifier's comparison still decides."""
+    from .portal_calendar_store import _WIPEABLE_STATUSES
+    list_month = getattr(store, "list_month", None)
+    if list_month is None:
+        return None
+    keep = {str(d)[:10] for d in (preserve_dates or ()) if str(d or "")[:10]}
+    total = 0
+    for month in months:
+        try:
+            rows = list_month(base_key, month) or []
+        except Exception as exc:  # noqa: BLE001 - an unreadable store claims nothing new
+            if log:
+                log(f"{base_key}: span-scoped delete evidence read failed for "
+                    f"{month} ({type(exc).__name__}); reporting the store's own count")
+            return None
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            if str(row.get("gym_id")) != str(base_key):
+                continue                    # tenant binding: never another gym's row
+            pd = str(row.get("post_date") or "")[:10]
+            if not pd or pd < span_first or pd > span_last or pd in keep:
+                continue
+            status = str(row.get("status") or "").lower()
+            if status and status not in _WIPEABLE_STATUSES:
+                continue                    # human-owned rows survive (preserve_human)
+            variant = str(row.get("variant_status") or "active").lower()
+            if variant != "active":
+                continue                    # candidates/archived rows are never deleted
+            total += 1
+    return total
+
+
+def _out_of_span_preserve_dates(store, base_key, months, span_first, span_last,
+                                preserve_dates=(), log=None):
+    """Return this gym's dates outside the requested replacement span.
+
+    ``delete_month`` is month-grained.  A mid-month rebuild must therefore add
+    every existing out-of-span date to ``preserve_dates`` before deleting, or
+    it would silently erase unrelated calendar rows.  If the bounded read is
+    unavailable, return ``None`` so the caller can fail closed rather than do a
+    destructive partial-month write.
+    """
+    list_month = getattr(store, "list_month", None)
+    if list_month is None:
+        return None
+    keep = {str(d)[:10] for d in (preserve_dates or ()) if str(d or "")[:10]}
+    for month in months:
+        try:
+            rows = list_month(base_key, month) or []
+        except Exception as exc:  # noqa: BLE001
+            if log:
+                log(f"{base_key}: out-of-span preservation read failed for "
+                    f"{month} ({type(exc).__name__}); refusing the rebuild")
+            return None
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            if str(row.get("gym_id")) != str(base_key):
+                continue
+            pd = str(row.get("post_date") or "")[:10]
+            if pd and (pd < span_first or pd > span_last):
+                keep.add(pd)
+    return keep
+
+
 def _apply(base_key, rows, start, days, store, log, locked_days=(),
            allow_reshape=False):
     """Delete-then-insert, gym-scoped, across every month the rows land in PLUS the full
     planned span. Rows are inserted WITHOUT an id (DB mints the uuid). Mirrors
     apply_month_plan. Refuses the demo gym id. Never raises out.
+
+    Result counts: "deleted" is the SPAN-SCOPED claim (rows the delete removed
+    inside the planned day-span, see _span_scoped_delete_claim) so the
+    independent restage verification can confirm it against its own span-scoped
+    readback; "deleted_total" is the store's raw month-grained count (the full
+    truth of what was wiped, kept for the build's own release/restore
+    bookkeeping). Stores that cannot support a bounded read report the raw
+    count in both, exactly as before.
 
     locked_days: post_dates the builder SKIPPED because a human owns their feed. Those
     days' still-pending sibling rows (FB mirror + story on the approved feed's photo)
@@ -2206,12 +2306,29 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             return {"ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
                     "months": months, "noop_shrink": True,
                     "existing_feeds": existing_feeds, "new_feeds": new_feeds}
+        # SPAN-SCOPED DELETED CLAIM (restage postcondition): computed from a
+        # bounded read BEFORE the delete, in the same unit the independent
+        # verifier measures. None when the store cannot support the read --
+        # the raw count is then reported, and the verifier still decides.
+        span_first = start.isoformat()
+        span_last = (start + timedelta(days=max(1, int(days)) - 1)).isoformat()
+        span_claim = _span_scoped_delete_claim(store, base_key, months,
+                                               span_first, span_last,
+                                               preserve_dates=locked_days, log=log)
+        delete_preserve = _out_of_span_preserve_dates(
+            store, base_key, months, span_first, span_last,
+            preserve_dates=locked_days, log=log)
+        # Legacy stores/test doubles may not expose a bounded read. Preserve
+        # their historical behavior; the production Portal store does expose
+        # list_month and therefore always takes the safe bounded path above.
+        if delete_preserve is None:
+            delete_preserve = {str(d)[:10] for d in (locked_days or ()) if d}
         delete_month = getattr(store, "delete_month", None)
         for month in months:
             if delete_month is not None:
                 try:
                     deleted += delete_month(base_key, month,
-                                            preserve_dates=locked_days) or 0
+                                            preserve_dates=delete_preserve) or 0
                 except TypeError:      # older store/test fakes without the kwarg
                     deleted += delete_month(base_key, month) or 0
         insert_rows = getattr(store, "insert_rows", None)
@@ -2222,7 +2339,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
                 "upserted": inserted, "deleted": deleted, "months": months}
     return {"ok": True, "upserted": inserted, "inserted": inserted,
-            "deleted": deleted, "months": months}
+            "deleted": deleted if span_claim is None else span_claim,
+            "deleted_total": deleted, "months": months}
 
 
 def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,

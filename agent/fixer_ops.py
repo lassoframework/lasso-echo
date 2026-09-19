@@ -56,6 +56,18 @@ CONTRACT (the FIXER builder reads this block):
       Bounded read-only diagnostics (agent/fixer_evidence.py). Never runs an action;
       503 volume_unavailable on a host without the worker volume, 503
       evidence_unavailable on a source fault.
+  POST /ops/actions/business-evidence/observe  (same header)
+      Bounded read-only business postcondition observation. The body is the exact
+      versioned Scout contract: schema/contract version, support ticket UUID,
+      portal client UUID, current request SHA, merged Git SHA, registered check id,
+      and that check's strict params. Echo first re-reads the ticket/client binding,
+      then runs fixer_business_evidence.observe. No action, ticket note, or other
+      mutation occurs. The response is the canonical evidence record plus params.
+  GET  /ops/actions/reply-reconciliation/<snapshot_id>?gym_key=<gym>
+      Read-only comparison of a new immutable inbox-alert snapshot with current
+      provider evidence. Tenant bound. Missing, incomplete, ambiguous, or older
+      than 48 hours is refused. Mentions always remain needs_human. This endpoint
+      never replies, hides, deletes, likes, or sends a message.
 
   RESULT EVIDENCE (canonical, consumed by Scout): every synchronous 2xx result
   carries "captured_at" (ISO utc) marking when its evidence was read, and a
@@ -132,6 +144,7 @@ catalog from a shell on the worker.
 from __future__ import annotations
 
 import hmac
+import hashlib
 import json
 import os
 import re
@@ -156,6 +169,18 @@ _ROW_ID = re.compile(r"^[A-Za-z0-9_-]{6,80}$")
 _TICKET_ID = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _UUID = re.compile(r"^[a-fA-F0-9]{8}-(?:[a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}$")
+_BUSINESS_UUID = re.compile(r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$")
+_BUSINESS_REQUEST_KEY = re.compile(r"^[0-9a-f]{64}$")
+_BUSINESS_RELEASE_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_BUSINESS_ROW_ID = re.compile(r"^[A-Za-z0-9_-]{6,80}$")
+_BUSINESS_STATUS = re.compile(r"^[a-z_]{2,32}$")
+_BUSINESS_FOLDER_ID = re.compile(r"^[A-Za-z0-9_-]{3,200}$")
+BUSINESS_EVIDENCE_PATH = ROUTE_PREFIX + "/business-evidence/observe"
+BUSINESS_EVIDENCE_CONTRACT = "echo-business-evidence-v1"
+_BUSINESS_FIELDS = frozenset({
+    "schema_version", "contract_version", "ticket_id", "client_id",
+    "request_key", "merged_sha", "check_id", "params",
+})
 
 # Named so a FIXER that asks for one of these gets a 403 that says WHY, not a 404 that
 # reads like a typo. Nothing here has an implementation and nothing here may get one
@@ -173,6 +198,134 @@ ORG_FLOOR_ACTIONS = frozenset({
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _business_params_valid(check_id, params):
+    if not isinstance(params, dict):
+        return False
+    if check_id == "calendar_row_status":
+        return (set(params) == {"row_id", "expected_status"}
+                and isinstance(params.get("row_id"), str)
+                and _BUSINESS_ROW_ID.fullmatch(params["row_id"]) is not None
+                and isinstance(params.get("expected_status"), str)
+                and _BUSINESS_STATUS.fullmatch(params["expected_status"]) is not None)
+    if check_id == "forward_book_grade_at_least":
+        value = params.get("min_total")
+        return (set(params) == {"min_total"} and isinstance(value, int)
+                and not isinstance(value, bool) and 0 <= value <= 100)
+    if check_id == "media_source_active":
+        return (set(params) == {"folder_id"}
+                and isinstance(params.get("folder_id"), str)
+                and _BUSINESS_FOLDER_ID.fullmatch(params["folder_id"]) is not None)
+    return False
+
+
+def _business_reader(deps):
+    configured = deps.get("business_evidence")
+    if isinstance(configured, dict) and callable(configured.get("read")):
+        return configured["read"]
+    bus = deps.get("bus")
+    if callable(getattr(bus, "_get", None)):
+        return bus._get
+    from .fixer_business_evidence import read_rest
+    return read_rest
+
+
+def _business_request_key(read, ticket):
+    """Recompute Scout's requester-message SHA from a complete bounded read."""
+    try:
+        rows = read("support_messages", {
+            "ticket_id": f"eq.{ticket['id']}", "direction": "eq.inbound",
+            "select": "id,ticket_id,created_at,body,author_type,direction,attachments",
+            "order": "created_at.asc,id.asc", "limit": "1000"})
+    except Exception:  # noqa: BLE001
+        return None
+    if (not isinstance(rows, list) or len(rows) >= 1000
+            or any(not isinstance(row, dict) for row in rows)):
+        return None
+    requester = []
+    for message in rows:
+        if message.get("ticket_id") != ticket["id"] or message.get("direction") != "inbound":
+            return None
+        attachments = message.get("attachments") or {}
+        if not isinstance(attachments, dict):
+            return None
+        author = message.get("author_type")
+        client = author == "client" or not author
+        operator_mention = (author in ("staff", "blake")
+                            and attachments.get("surface") == "mention"
+                            and attachments.get("identity_reason") == "operator list")
+        if client or operator_mention:
+            requester.append([message.get("id"), message.get("created_at"),
+                              message.get("body")])
+    encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    requester.sort(key=encode)
+    identity = requester or [ticket.get("id"), ticket.get("created_at"),
+                             ticket.get("raw_text")]
+    return hashlib.sha256(encode(identity).encode("utf-8")).hexdigest()
+
+
+def _run_business_evidence(raw_body, deps, now=None):
+    """Validate Scout's exact pointer contract and run one read-only Echo check."""
+    if raw_body and len(raw_body) > MAX_BODY_BYTES:
+        return 413, {"error": "too_large"}
+    try:
+        body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+    except Exception:  # noqa: BLE001 - malformed transport input
+        return 400, {"error": "bad_request", "detail": "invalid JSON"}
+    if not isinstance(body, dict) or set(body) != _BUSINESS_FIELDS:
+        return 400, {"error": "bad_request", "detail": "invalid business evidence schema"}
+    if body.get("schema_version") != 1 or body.get("contract_version") != BUSINESS_EVIDENCE_CONTRACT:
+        return 400, {"error": "bad_request", "detail": "unsupported business evidence contract"}
+    ticket_id = body.get("ticket_id")
+    client_id = body.get("client_id")
+    request_key = body.get("request_key")
+    merged_sha = body.get("merged_sha")
+    check_id = body.get("check_id")
+    params = body.get("params")
+    if (not isinstance(ticket_id, str) or not _BUSINESS_UUID.fullmatch(ticket_id)
+            or not isinstance(client_id, str) or not _BUSINESS_UUID.fullmatch(client_id)
+            or not isinstance(request_key, str) or not _BUSINESS_REQUEST_KEY.fullmatch(request_key)
+            or not isinstance(merged_sha, str) or not _BUSINESS_RELEASE_SHA.fullmatch(merged_sha)
+            or not isinstance(check_id, str) or not _business_params_valid(check_id, params)):
+        return 400, {"error": "bad_request", "detail": "invalid business evidence identity or check"}
+
+    read = _business_reader(deps)
+    try:
+        rows = read("support_tickets", {
+            "id": f"eq.{ticket_id}",
+            "select": "id,product,client_id,created_at,raw_text", "limit": "2"})
+    except Exception:  # noqa: BLE001 - source errors never become evidence
+        return 503, {"error": "evidence_unavailable"}
+    if not isinstance(rows, list) or len(rows) > 2 or any(not isinstance(row, dict) for row in rows):
+        return 503, {"error": "evidence_unavailable"}
+    if not rows:
+        return 404, {"error": "ticket_not_found"}
+    if len(rows) != 1 or rows[0].get("id") != ticket_id:
+        return 409, {"error": "ticket_identity_unconfirmed"}
+    ticket = rows[0]
+    if ticket.get("product") != "echo" or ticket.get("client_id") != client_id:
+        return 409, {"error": "ticket_tenant_mismatch"}
+    current_request_key = _business_request_key(read, ticket)
+    if current_request_key is None:
+        return 503, {"error": "evidence_unavailable"}
+    if current_request_key != request_key:
+        return 409, {"error": "request_identity_mismatch"}
+
+    from . import fixer_business_evidence as evidence
+    record = evidence.observe(
+        check_id, gym_key=client_id, request_key=request_key,
+        merged_sha=merged_sha, params=params, deps={"read": read}, now=now)
+    if not isinstance(record, dict):
+        return 503, {"error": "evidence_unavailable"}
+    # Explicit response allowlist. Params are expectations, not proof; returning
+    # the exact validated values lets Scout bind the observation to its pointer.
+    keys = ("schema_version", "source", "check_id", "gym_key", "request_key",
+            "merged_sha", "captured_at", "outcome", "verified",
+            "symptom_resolved", "evidence", "reason")
+    if any(key not in record for key in keys):
+        return 503, {"error": "evidence_unavailable"}
+    return 200, {**{key: record[key] for key in keys}, "params": dict(params)}
 
 
 # --------------------------------------------------------------------------------------
@@ -1622,6 +1775,40 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         return refused
     deps = dict(deps or {})
     method = (method or "").upper()
+    m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/reply-reconciliation/"
+                 r"([0-9a-f]{32})$", path)
+    if m:
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        query = parse_qs(parsed.query)
+        if set(query) != {"gym_key"} or len(query.get("gym_key") or []) != 1:
+            return 400, {"error": "bad_request", "detail": "gym_key required"}
+        gym_key = query["gym_key"][0]
+        from .fixer_reply_reconciliation import (
+            ReconciliationError, default_store, reconcile_snapshot,
+        )
+        store = deps.get("reply_snapshot_store")
+        if store is None:
+            try:
+                store = default_store()
+            except ReconciliationError as exc:
+                return exc.status, {"error": exc.code}
+        zernio = deps.get("reply_reconciliation_zernio")
+        if zernio is None:
+            from .zernio import ZernioClient
+            zernio = ZernioClient()
+        try:
+            result = reconcile_snapshot(m.group(1), gym_key, zernio=zernio,
+                                        store=store, now=now)
+            return 200, result
+        except ReconciliationError as exc:
+            return exc.status, {"error": exc.code}
+        except Exception:  # noqa: BLE001 - provider/store faults fail closed
+            return 503, {"error": "reply_reconciliation_unavailable"}
+    if path == BUSINESS_EVIDENCE_PATH:
+        if method != "POST":
+            return 405, {"error": "method_not_allowed"}
+        return _run_business_evidence(raw_body, deps, now=now)
     if path.startswith(ROUTE_PREFIX + "/evidence/media-source/"):
         if method != "GET":
             return 405, {"error": "method_not_allowed"}

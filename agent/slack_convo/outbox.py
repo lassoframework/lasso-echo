@@ -109,7 +109,7 @@ def portal_deliverable(ticket):
             and bool(str(t.get("client_id") or "").strip()))
 
 
-def _customer_fix_reply(ticket, att):
+def _customer_fix_reply(ticket, att, body=""):
     """Identify customer handoffs even after escalation clears classification.
 
     The FIXER poll requires classification NULL, so classification alone cannot
@@ -125,7 +125,14 @@ def _customer_fix_reply(ticket, att):
                        and ticket.get("escalated") is not True
                        and not ticket.get("hold_tier")
                        and not (ticket.get("verification_after") or {}).get("hold"))
-    if direct_question and not att.get("fixer"):
+    # A grounded answer remains an answer when Scout/FIXER authored it.  The
+    # normal answer gates below still re-run the hard-line verdict, arming, and
+    # conversation checks. Treating every `fixer: true` row as a code-fix
+    # completion sent it into the deployment gate, where it could never pass
+    # because an answer has no PR or release evidence.
+    promised_work = (_a.answer_commits_to_action(str(body or ""))
+                     or _a.promises_human_follow_up(str(body or "")))
+    if direct_question and not promised_work:
         return False
     portal_handoff = (ticket.get("product") == "echo"
                       and portal_deliverable(ticket)
@@ -358,7 +365,8 @@ def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
     if kind != _a.KIND_STATUS or att.get("resolve_notice") is not True:
         return False
     operation = release.get("ops_action") or {}
-    if att.get("ops_action") in {"reset_recreate_budget", "requeue_failed_row", "swap_media",
+    if att.get("ops_action") in {"resend_connect_link", "reset_recreate_budget",
+                                 "requeue_failed_row", "swap_media",
                                  "release_denied_assets", "restage_month"}:
         common = (ticket.get("status") == "verification"
                 and release.get("postcondition_verified") is True
@@ -748,7 +756,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     # ---- conversational kinds: the gates ---------------------------------------------
     # Re-read deployment proof at dispatch time. A queued FIXER acknowledgement,
     # held-answer replacement, or stale notice must never reach a client.
-    customer_fix = _customer_fix_reply(ticket, att)
+    customer_fix = _customer_fix_reply(ticket, att, row.get("body") or "")
     if customer_fix:
         if not _verified_fix_notice(ticket, att, kind, bus=bus, now=now):
             _suppress(bus, row, ticket, identity,

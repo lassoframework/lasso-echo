@@ -1,0 +1,241 @@
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from agent import fixer_ops
+from agent import fixer_reply_reconciliation as R
+from agent import inbox_alerts
+
+
+NOW = datetime(2026, 9, 19, 5, 0, tzinfo=timezone.utc)
+GYM = "topfuel"
+PROFILE = "profile-topfuel"
+
+
+def _status(complete=True):
+    return {name: {"ok": True, "complete": complete}
+            for name in ("comment", "mention", "review")}
+
+
+def _identity(source="comment", item_id="comment-1"):
+    return {"source": source, "provider": "instagram",
+            "account_id": "account-1",
+            "container_id": "post-1" if source != "review" else item_id,
+            "item_id": item_id}
+
+
+def _item(source="comment", item_id="comment-1", kind="member_comment"):
+    return {"kind": kind, "source": source, "text": "Can I try a class?",
+            "created_at": NOW.isoformat(),
+            "provider_identity": _identity(source, item_id),
+            "provider_evidence": {}}
+
+
+def _snapshot(items=None, complete=True, captured_at=NOW):
+    return R.build_snapshot(GYM, PROFILE, items or [_item()], _status(complete),
+                            now=captured_at, snapshot_id="a" * 32)
+
+
+class ReadOnlyProvider:
+    def __init__(self, *, comments=None, reviews=None, profile=PROFILE,
+                 comment_complete=True, review_complete=True):
+        self.profile = profile
+        self.comments = comments if comments is not None else []
+        self.reviews = reviews if reviews is not None else []
+        self.comment_complete = comment_complete
+        self.review_complete = review_complete
+
+    def find_profile_id(self, gym_key):
+        assert gym_key == GYM
+        return self.profile
+
+    def inbox_post_comments(self, post_id, account_id):
+        assert (post_id, account_id) == ("post-1", "account-1")
+        return {"comments": self.comments,
+                "pagination": {"complete": self.comment_complete}}
+
+    def list_inbox_reviews(self, profile_id):
+        assert profile_id == PROFILE
+        return {"data": self.reviews,
+                "pagination": {"complete": self.review_complete}}
+
+    def __getattr__(self, name):
+        if any(word in name for word in ("reply", "hide", "delete", "send", "post")):
+            raise AssertionError(f"outbound provider method touched: {name}")
+        raise AttributeError(name)
+
+
+def _comment(*, replies=None, hidden=False, item_id="comment-1"):
+    return {"id": item_id, "platform": "instagram", "isHidden": hidden,
+            "replies": replies or []}
+
+
+def _review(*, has_reply=False, item_id="review-1"):
+    return {"id": item_id, "platform": "instagram", "accountId": "account-1",
+            "hasReply": has_reply}
+
+
+def test_snapshot_requires_unique_composite_provider_identity():
+    with pytest.raises(R.ReconciliationError) as exc:
+        R.build_snapshot(GYM, PROFILE, [_item(), _item()], _status(), now=NOW)
+    assert (exc.value.code, exc.value.status) == ("duplicate_provider_identity", 409)
+
+
+def test_partial_page_and_missing_identity_are_persisted_but_never_reconcilable():
+    partial = _snapshot(complete=False)
+    assert partial["complete"] is False
+    store = {partial["snapshot_id"]: partial}
+    with pytest.raises(R.ReconciliationError) as exc:
+        R.reconcile_snapshot(partial["snapshot_id"], GYM,
+                             zernio=ReadOnlyProvider(), store=store, now=NOW)
+    assert exc.value.code == "snapshot_incomplete"
+
+    missing = _item()
+    missing["provider_identity"]["account_id"] = None
+    assert R.build_snapshot(GYM, PROFILE, [missing], _status(), now=NOW)["complete"] is False
+
+
+def test_missing_old_and_cross_tenant_snapshots_are_refused():
+    with pytest.raises(R.ReconciliationError) as exc:
+        R.load_snapshot("b" * 32, GYM, store={}, now=NOW)
+    assert exc.value.code == "snapshot_not_found"
+
+    old = _snapshot(captured_at=NOW - timedelta(hours=49))
+    store = {old["snapshot_id"]: old}
+    with pytest.raises(R.ReconciliationError) as exc:
+        R.load_snapshot(old["snapshot_id"], GYM, store=store, now=NOW)
+    assert exc.value.code == "snapshot_expired"
+    with pytest.raises(R.ReconciliationError) as exc:
+        R.load_snapshot(old["snapshot_id"], "another-gym", store=store,
+                        now=NOW - timedelta(hours=48))
+    assert exc.value.code == "snapshot_tenant_mismatch"
+
+
+def test_comment_requires_exact_identity_and_explicit_owner_reply():
+    snap = _snapshot()
+    store = {snap["snapshot_id"]: snap}
+    owner_reply = {"id": "reply-1", "from": {"isOwner": True}}
+    result = R.reconcile_snapshot(
+        snap["snapshot_id"], GYM,
+        zernio=ReadOnlyProvider(comments=[_comment(replies=[owner_reply])]),
+        store=store, now=NOW)
+    assert result["complete"] is True and result["resolved"] is True
+    assert result["items"][0]["provider_evidence"] == {"owner_reply_ids": ["reply-1"]}
+
+    wrong = ReadOnlyProvider(comments=[_comment(item_id="another-comment")])
+    result = R.reconcile_snapshot(snap["snapshot_id"], GYM, zernio=wrong,
+                                  store=store, now=NOW)
+    assert result["complete"] is False and result["resolved"] is False
+    assert result["items"][0]["status"] == "needs_human"
+
+
+def test_spam_hide_and_review_reply_use_explicit_provider_flags_only():
+    spam_snap = _snapshot(items=[_item(kind="spam")])
+    spam = R.reconcile_snapshot(
+        spam_snap["snapshot_id"], GYM,
+        zernio=ReadOnlyProvider(comments=[_comment(hidden=True)]),
+        store={spam_snap["snapshot_id"]: spam_snap}, now=NOW)
+    assert spam["resolved"] is True
+    assert spam["items"][0]["provider_evidence"] == {"is_hidden": True}
+
+    review_item = _item(source="review", item_id="review-1")
+    review_snap = _snapshot(items=[review_item])
+    reviews = R.reconcile_snapshot(
+        review_snap["snapshot_id"], GYM,
+        zernio=ReadOnlyProvider(reviews=[_review(has_reply=True)]),
+        store={review_snap["snapshot_id"]: review_snap}, now=NOW)
+    assert reviews["complete"] is True and reviews["resolved"] is True
+    assert reviews["items"][0]["provider_evidence"] == {"has_reply": True}
+
+
+def test_mentions_always_need_human_even_with_a_complete_snapshot():
+    mention = _item(source="mention", item_id="mention-1")
+    mention["provider_identity"]["container_id"] = "mention-1"
+    snap = _snapshot(items=[mention])
+    result = R.reconcile_snapshot(snap["snapshot_id"], GYM,
+                                  zernio=ReadOnlyProvider(),
+                                  store={snap["snapshot_id"]: snap}, now=NOW)
+    assert result["complete"] is True and result["resolved"] is False
+    assert result["items"][0] == {
+        "identity": R.provider_identity(mention), "source": "mention",
+        "status": "needs_human", "provider_evidence": None,
+        "reason": "mention_reply_state_not_supported"}
+
+
+def test_current_partial_page_never_proves_resolution():
+    snap = _snapshot()
+    result = R.reconcile_snapshot(
+        snap["snapshot_id"], GYM,
+        zernio=ReadOnlyProvider(
+            comments=[_comment(replies=[{"id": "r", "from": {"isOwner": True}}])],
+            comment_complete=False),
+        store={snap["snapshot_id"]: snap}, now=NOW)
+    assert result["complete"] is False and result["resolved"] is False
+
+
+def test_authenticated_route_is_tenant_bound_read_only(monkeypatch):
+    monkeypatch.setenv(fixer_ops.SECRET_ENV, "secret")
+    snap = _snapshot()
+    store = {snap["snapshot_id"]: snap}
+    provider = ReadOnlyProvider(comments=[_comment(
+        replies=[{"id": "reply-1", "from": {"isOwner": True}}])])
+    path = (f"{fixer_ops.ROUTE_PREFIX}/reply-reconciliation/{snap['snapshot_id']}"
+            f"?gym_key={GYM}")
+
+    assert fixer_ops.handle("GET", path, lambda *_: "", deps={})[0] == 401
+    status, body = fixer_ops.handle(
+        "GET", path, lambda key, default="": "secret" if key == fixer_ops.HEADER else default,
+        deps={"reply_snapshot_store": store,
+              "reply_reconciliation_zernio": provider}, now=NOW)
+    assert status == 200 and body["resolved"] is True
+
+    wrong_path = path.replace(f"gym_key={GYM}", "gym_key=other-gym")
+    status, body = fixer_ops.handle(
+        "GET", wrong_path,
+        lambda key, default="": "secret" if key == fixer_ops.HEADER else default,
+        deps={"reply_snapshot_store": store,
+              "reply_reconciliation_zernio": provider}, now=NOW)
+    assert (status, body["error"]) == (403, "snapshot_tenant_mismatch")
+
+
+class CompleteInboxProvider:
+    def find_profile_id(self, gym):
+        return PROFILE
+
+    def list_inbox_comments(self, profile_id, **kwargs):
+        return {"data": [{"id": "post-1", "accountId": "account-1",
+                          "platform": "instagram", "commentCount": 1,
+                          "createdTime": NOW.isoformat(), "permalink": "https://example/post"}],
+                "pagination": {"complete": True}}
+
+    def inbox_post_comments(self, post_id, account_id, **kwargs):
+        return {"comments": [{"id": "comment-1", "platform": "instagram",
+                              "message": "Can I try a class?", "createdTime": NOW.isoformat(),
+                              "from": {"isOwner": False}, "replies": [],
+                              "isHidden": False}],
+                "pagination": {"complete": True}}
+
+    def list_inbox_mentions(self, profile_id, **kwargs):
+        return {"data": [], "pagination": {"complete": True}}
+
+    def list_inbox_reviews(self, profile_id, **kwargs):
+        return {"data": [], "pagination": {"complete": True}}
+
+
+def test_new_delivered_alert_carries_a_durable_snapshot_id(monkeypatch):
+    monkeypatch.setenv("AGENT_INBOX_ALERTS", "true")
+    kv = {}
+    snapshots = {}
+    sent = []
+    result = inbox_alerts.run(
+        gyms=[GYM], zernio=CompleteInboxProvider(), now=NOW,
+        notifier=lambda gym, card: sent.append(card) or True,
+        kv_get=lambda key, default="": kv.get(key, default),
+        kv_set=lambda key, value: kv.__setitem__(key, value),
+        snapshot_store=snapshots)
+    summary = result["gyms"][0]
+    snapshot_id = summary["reply_snapshot_id"]
+    assert summary["reply_snapshot_complete"] is True
+    assert snapshots[snapshot_id]["complete"] is True
+    assert f"Evidence snapshot: {snapshot_id}" in sent[0]
+    assert snapshots[snapshot_id]["items"][0]["identity"] == _identity()

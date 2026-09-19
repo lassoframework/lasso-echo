@@ -872,6 +872,11 @@ def test_fixer_ops_notice_requires_verified_same_gym_action_and_current_request(
     att = {"resolve_notice": True, "ops_action": "reset_recreate_budget",
            "request_key": "request-one"}
     assert OB._verified_fix_notice(ticket, att, _a.KIND_STATUS)
+    resend = {**operation, "action": "resend_connect_link"}
+    resend_ticket = {**ticket, "verification_after": {"fixer": {
+        **ticket["verification_after"]["fixer"], "ops_action": resend}}}
+    assert OB._verified_fix_notice(
+        resend_ticket, {**att, "ops_action": "resend_connect_link"}, _a.KIND_STATUS)
     for change in (
         {"status": "fixing"}, {"client_id": "gym-two"},
         {"verification_after": {"fixer": {**ticket["verification_after"]["fixer"],
