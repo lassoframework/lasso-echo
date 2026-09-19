@@ -26,6 +26,7 @@ from agent.slack_convo import identities as IDS  # noqa: E402
 from agent.slack_convo import identity_gate as IG  # noqa: E402
 from agent.slack_convo import outbox as OB  # noqa: E402
 from tests.test_slack_convo import FakeBus, _deps, _ev, _posted  # noqa: E402
+from agent import config  # noqa: E402
 
 DEAN_Q = ("When reviewing the posts, is there a way to keep the caption but switch out the "
           "picture to a different one?  There are posts where the caption is fine but it "
@@ -292,10 +293,13 @@ def test_outbox_delivers_grounded_fixer_answer_without_inventing_a_code_release(
     bus = FakeBus()
     tid, mid = _fixer_answer_ticket(bus, DEAN_Q, DEAN_A)
     post, calls = _posted()
-    s = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    s = OB.run_once(bus, post, identity=IDS.get("echo"),
+                    member_check=lambda channel, user: True,
+                    log=lambda *a: None)
     assert bus.message(mid)["delivery_status"] == "posted"
     assert s["posted"] == 1 and s["suppressed"] == 0
     assert any(c["channel"] == "G0MPIM" for c in calls)
+    assert any(f"<@{config.APPROVER_SLACK_ID}>" in c["text"] for c in calls)
     assert bus.tickets[tid]["status"] == "resolved"
 
 
@@ -503,8 +507,11 @@ def test_outbox_fixer_promise_waits_for_deployed_fix(monkeypatch):
     # does not invent code-release evidence.
     bus2 = FakeBus()
     tid2, mid2 = _fixer_answer_ticket(bus2, DEAN_Q, DEAN_A)
-    OB.run_once(bus2, post, identity=IDS.get("echo"), log=lambda *a: None)
+    OB.run_once(bus2, post, identity=IDS.get("echo"),
+                member_check=lambda channel, user: True,
+                log=lambda *a: None)
     assert bus2.message(mid2)["delivery_status"] == "posted"
+    assert any(f"<@{config.APPROVER_SLACK_ID}>" in c["text"] for c in calls)
     assert bus2.tickets[tid2]["status"] == "resolved"
 
 

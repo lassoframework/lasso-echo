@@ -68,7 +68,16 @@ class FakeStore:
     def list_month(self, base_key, month):
         return self.existing.get((base_key, month), [])
 
-    def delete_month(self, base_key, month):
+    def delete_month(self, base_key, month, *, preserve_human=True,
+                     preserve_dates=()):
+        keep = set(preserve_dates)
+        rows = self.existing.get((base_key, month), [])
+        if keep:
+            self.existing[(base_key, month)] = [
+                row for row in rows if row.get("post_date") in keep
+            ]
+        else:
+            self.existing.pop((base_key, month), None)
         self.deleted.append((base_key, month))
         return 0
 
