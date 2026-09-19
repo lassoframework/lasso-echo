@@ -22,7 +22,7 @@ CREATE INDEX IF NOT EXISTS media_asset_review_event_gym_asset_idx
   ON public.media_asset_review_event (gym_id, asset_id, id DESC);
 
 CREATE OR REPLACE FUNCTION public.reject_media_review_event_mutation()
-RETURNS trigger LANGUAGE plpgsql AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path = public AS $$
 BEGIN
   RAISE EXCEPTION 'media review history is append only';
 END;
