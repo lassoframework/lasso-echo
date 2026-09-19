@@ -136,6 +136,13 @@ def mark_near_dupes(library_path, phash=None):
     phash = phash or _phash_default
     by_hash = {}
     for name in sorted(os.listdir(library_path) if os.path.isdir(library_path) else []):
+        # macOS writes AppleDouble metadata beside files on some volumes.  The
+        # metadata filename keeps the asset extension (for example,
+        # ``._member.jpg``), so extension filtering alone would treat it as an
+        # image and could make it the near-dupe group leader.  Skip this exact
+        # AppleDouble prefix while retaining ordinary hidden dotfiles.
+        if name.startswith("._"):
+            continue
         if os.path.splitext(name)[1].lower() not in (".jpg", ".jpeg", ".png", ".webp"):
             continue
         path = os.path.join(library_path, name)

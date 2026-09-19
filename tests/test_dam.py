@@ -96,6 +96,10 @@ def test_near_dupes_collapse_rotation_keys(monkeypatch, tmp_path):
         ("lasso_p1_shot_b.jpg", "clean", None),   # near-identical to shot_a
         ("lasso_p2_other.jpg", "clean", None),
     ])
+    # AppleDouble metadata can appear on macOS-mounted temporary volumes.  It
+    # keeps an image extension and must not enter the image scan or group.
+    (tmp_path / "library" / "._lasso_p1_shot_a.jpg").write_bytes(b"img-shot metadata")
+    (tmp_path / "library" / "._lasso_p1_shot_b.jpg").write_bytes(b"img-shot metadata")
     fake_phash = lambda data: ("SAME" if b"shot" in data else "OTHER")
     groups = dam.mark_near_dupes(lib, phash=fake_phash)
     assert list(groups.values()) == [["lasso_p1_shot_a.jpg", "lasso_p1_shot_b.jpg"]]
