@@ -796,13 +796,20 @@ def test_mark_published_writes_status_time_and_media():
 
 
 def test_mark_publish_failed_reverts_to_pending_only():
-    http = _RecordingHTTP(patch_resp=_Resp(200, [{"id": "a"}]))
+    token = "11111111-1111-4111-8111-111111111111"
+    http = _RecordingHTTP(patch_resp=_Resp(
+        200, [{"id": "a", "gym_id": "lasso", "status": "pending"}]))
     store = _store(http)
-    store.mark_publish_failed("a")
+    store.mark_publish_failed(
+        "a", gym_id="lasso", expected_claim_token=token)
 
     _, _url, params, _headers, body = http.calls[0]
     assert params["id"] == "eq.a"
-    assert body == {"status": "pending", "publish_reservation_day": None}
+    assert params["gym_id"] == "eq.lasso"
+    assert params["status"] == "eq.publishing"
+    assert params["publish_claim_token"] == f"eq.{token}"
+    assert body == {"status": "pending", "publish_reservation_day": None,
+                    "publish_claim_token": None}
 
 
 def test_account_for_skips_non_ig_fb_platforms():
@@ -1887,3 +1894,66 @@ def test_content_stamp_failure_releases_for_retry_and_preserves_approval(armed, 
     assert result["skipped"] == ["stamp-failure"]
     assert store.rows["stamp-failure"]["status"] == previous
     assert store.rows["stamp-failure"]["reject_reason"] == "content_stamp_failed"
+
+
+@pytest.mark.parametrize("ledger_mode", ["read", "write", "duplicate"])
+def test_owned_claim_token_reaches_each_pre_network_ledger_transition(
+        armed, monkeypatch, ledger_mode):
+    """End-to-end publisher wiring must carry the exact claim UUID to cleanup."""
+    token = "33333333-3333-4333-8333-333333333333"
+
+    class OwnedTransitionStore(_FakeStore):
+        def claim_publish_slot(self, row_id, gym_id, day, timezone_name,
+                               capacity, approved_only):
+            row = self.rows[row_id]
+            row.update(status="publishing", publish_claim_token=token)
+            return token
+
+        def release_content_ledger_claim(self, gym_id, row_id, previous, reason,
+                                         expected_claim_token=None):
+            self.transition = ("release", gym_id, row_id, previous, reason,
+                               expected_claim_token)
+            if expected_claim_token != self.rows[row_id].get("publish_claim_token"):
+                return None
+            row = self.rows[row_id]
+            row.update(status=previous, publish_claim_token=None,
+                       reject_reason=reason)
+            return dict(row)
+
+        def mark_duplicate_content(self, gym_id, row_id, reason,
+                                   expected_claim_token=None):
+            self.transition = ("duplicate", gym_id, row_id, reason,
+                               expected_claim_token)
+            if expected_claim_token != self.rows[row_id].get("publish_claim_token"):
+                return None
+            row = self.rows[row_id]
+            row.update(status="deleted", publish_claim_token=None,
+                       reject_reason=reason)
+            return dict(row)
+
+    class Ledger:
+        def get(self, key, default=""):
+            if ledger_mode == "read":
+                raise RuntimeError("read unavailable")
+            if ledger_mode == "duplicate":
+                return "another-row|2026-09-18T12:00:00Z"
+            return ""
+
+        def set(self, key, value):
+            if ledger_mode == "write":
+                raise RuntimeError("write unavailable")
+
+    store = OwnedTransitionStore([_row(f"owned-{ledger_mode}")])
+    monkeypatch.setattr(cap, "_kv_default", lambda: Ledger())
+    publisher = _FakePublisher()
+
+    result = cap.publish_due(
+        RUN_DATE, store=store, publisher=publisher,
+        notifier=_FakeNotifier(), now=LATE_NOW)
+
+    assert publisher.calls == []
+    assert result["skipped"] == [f"owned-{ledger_mode}"]
+    assert store.transition[-1] == token
+    assert store.rows[f"owned-{ledger_mode}"]["publish_claim_token"] is None
+    expected_status = "deleted" if ledger_mode == "duplicate" else "pending"
+    assert store.rows[f"owned-{ledger_mode}"]["status"] == expected_status

@@ -134,4 +134,12 @@ def test_notice_delivery_is_atomic_per_gym(monkeypatch, tmp_path):
 
     assert len(poster.calls) == 1
     assert sorted(result.get("sent", False) for result in results) == [False, True]
-    assert any(result.get("reason") == "unresolved send" for result in results)
+    # The loser either sees the durable unresolved intent before transport, or
+    # acquires the lock after the winner records sent and is safely deduped.
+    losers = [result for result in results if not result.get("sent", False)]
+    assert len(losers) == 1
+    loser = losers[0]
+    assert loser.get("deduped") is True or (
+        loser.get("reason") == "unresolved send"
+        and loser.get("reconcile") is True
+    )

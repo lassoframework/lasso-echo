@@ -18,9 +18,11 @@ Exactly-once design (the claim):
     'pending' -> 'publishing' and returns True only if THIS call won the claim.
     A False means another run/worker already has it, so we SKIP.
   - On a real 'published' result, mark_published(id, media_id, now) records it.
-  - On failure OR a 'would_publish' result (a gate was off inside publish),
-    mark_publish_failed(id) reverts the claim to 'pending' so it retries next run
-    and records nothing. A row that already has published_at is NEVER re-published.
+  - A publisher exception or ordinary non-published result is ambiguous after the
+    network boundary, so the owned claim stays 'publishing' for reconciliation.
+    Only a pre-network 'would_publish' result (or an explicitly proven no-post
+    rejection) reverts the claim for a safe retry. A row that already has
+    published_at is NEVER re-published.
 
 Nothing here logs a token or secret. The manual approval path is untouched.
 """
@@ -1038,7 +1040,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 skipped.append(row_id)
                 print(f"[calendar-autopublish] content ledger unreadable for {row_id} "
                       f"({type(exc).__name__}); refusing to publish; duplicate cleanup not attempted")
-                _release_content_ledger_claim(store, gym_id, row, "content_ledger_unreadable")
+                _release_content_ledger_claim(
+                    store, gym_id, row, "content_ledger_unreadable", claim_token)
                 continue
             # Same ROW re-entering this path is the row-claim's business, not a content
             # duplicate: mark_publishing already owns exactly-once for one row. What this
@@ -1050,7 +1053,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             if _seen:
                 _seen = str(_seen).split("|", 1)[-1]
                 skipped.append(row_id)
-                _duplicate_marked = _mark_duplicate_content(store, gym_id, row_id, _seen)
+                _duplicate_marked = _mark_duplicate_content(
+                    store, gym_id, row_id, _seen, claim_token)
                 _idx_alert = (
                     f"DUPLICATE CONTENT REFUSED: {gym_id} {account.platform} row "
                     f"{row_id} ({row.get('post_date')}) carries a caption already "
@@ -1075,7 +1079,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 print(f"[calendar-autopublish] content stamp failed for {row_id} "
                       f"({type(e).__name__}); refusing to publish rather than risk a "
                       f"duplicate")
-                _release_content_ledger_claim(store, gym_id, row, "content_stamp_failed")
+                _release_content_ledger_claim(
+                    store, gym_id, row, "content_stamp_failed", claim_token)
                 continue
 
         draft = _draft_for(row)
@@ -1218,7 +1223,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         ok = getattr(result, "ok", False)
         mode = getattr(result, "mode", "")
         # ONLY a real 'published' counts. 'would_publish' means a gate was off inside
-        # publish() -> treat as NOT published and revert the claim (retryable).
+        # publish() before the network call, so it can safely revert the claim.
         if ok and mode == "published":
             try:
                 # Only a Zernio 409 content-hash dedup may be stamped published with no
@@ -1401,13 +1406,27 @@ def _published_content_key(account, row):
         return ""
 
 
-def _release_content_ledger_claim(store, gym_id, row, reason):
+def _release_content_ledger_claim(store, gym_id, row, reason,
+                                  expected_claim_token=None):
     """Retry after a PRE-NETWORK ledger fault without revoking a manual approval."""
     row_id = row["id"]
     previous = "approved" if row.get("status") == "approved" else "pending"
     try:
         fn = getattr(store, "release_content_ledger_claim", None)
-        updated = fn(gym_id, row_id, previous, reason) if fn else None
+        if not fn:
+            updated = None
+        else:
+            try:
+                updated = fn(
+                    gym_id, row_id, previous, reason,
+                    expected_claim_token=expected_claim_token)
+            except TypeError:
+                # Legacy injected test stores predate owned claim UUIDs. Production
+                # Supabase transitions must never fall back to a tokenless write.
+                from .portal_calendar_store import SupabaseCalendarStore
+                if isinstance(store, SupabaseCalendarStore):
+                    raise
+                updated = fn(gym_id, row_id, previous, reason)
         if (isinstance(updated, dict) and str(updated.get("id")) == str(row_id)
                 and str(updated.get("gym_id")) == str(gym_id)
                 and updated.get("status") == previous):
@@ -1424,7 +1443,8 @@ def _release_content_ledger_claim(store, gym_id, row, reason):
     return False
 
 
-def _mark_duplicate_content(store, gym_id, row_id, seen_at):
+def _mark_duplicate_content(store, gym_id, row_id, seen_at,
+                            expected_claim_token=None):
     """Take a refused duplicate OUT of the publish lane, reversibly.
 
     mark_publishing already flipped the row to 'publishing'; leaving it there would strand
@@ -1437,7 +1457,19 @@ def _mark_duplicate_content(store, gym_id, row_id, seen_at):
     reason = f"duplicate content refused: previous content claim {seen_at}"
     try:
         fn = getattr(store, "mark_duplicate_content", None)
-        updated = fn(gym_id, row_id, reason) if fn else None
+        if not fn:
+            updated = None
+        else:
+            try:
+                updated = fn(
+                    gym_id, row_id, reason,
+                    expected_claim_token=expected_claim_token)
+            except TypeError:
+                # Keep bounded fake adapters usable without weakening the real store.
+                from .portal_calendar_store import SupabaseCalendarStore
+                if isinstance(store, SupabaseCalendarStore):
+                    raise
+                updated = fn(gym_id, row_id, reason)
         if not (isinstance(updated, dict) and str(updated.get("id")) == str(row_id)
                 and str(updated.get("gym_id")) == str(gym_id)
                 and updated.get("status") == "deleted"):

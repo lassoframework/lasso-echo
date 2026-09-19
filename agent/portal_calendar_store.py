@@ -1671,31 +1671,52 @@ class SupabaseCalendarStore:
                 pass  # ledger stamp failure is never fatal
         return rows[0]
 
-    def mark_duplicate_content(self, account_key, row_id, reason):
+    def mark_duplicate_content(self, account_key, row_id, reason,
+                               expected_claim_token=None):
         """Retire a duplicate rejected BEFORE the publisher's network call.
 
         Only the publisher-owned claim is eligible. Published rows and any row
         with a provider id or publication timestamp remain untouched. This is a
         reversible calendar soft delete, never deletion on a social platform.
         """
-        return self._transition_unpublished_claim(account_key, row_id, "deleted", reason)
+        return self._transition_unpublished_claim(
+            account_key, row_id, "deleted", reason, expected_claim_token)
 
-    def release_content_ledger_claim(self, account_key, row_id, previous_status, reason):
+    def release_content_ledger_claim(self, account_key, row_id, previous_status, reason,
+                                     expected_claim_token=None):
         """A ledger read/write failed before any network call: retry the owned row."""
         if previous_status not in ("pending", "approved"):
             return None
-        return self._transition_unpublished_claim(account_key, row_id, previous_status, reason)
+        return self._transition_unpublished_claim(
+            account_key, row_id, previous_status, reason, expected_claim_token)
 
-    def _transition_unpublished_claim(self, account_key, row_id, status, reason):
+    def _transition_unpublished_claim(self, account_key, row_id, status, reason,
+                                      expected_claim_token):
+        """Change only the exact unpublished claim owned by this worker.
+
+        A row can be released and reclaimed while an older worker is still running.
+        The claim UUID is therefore part of the compare-and-swap identity; row id,
+        tenant and ``publishing`` status alone do not prevent an ABA overwrite.
+        """
+        if not str(account_key or "").strip():
+            raise PortalStoreError(422, "claim transition requires a gym id")
+        if not expected_claim_token:
+            raise PortalStoreError(422, "claim transition requires a claim token")
+        try:
+            from uuid import UUID
+            expected_claim_token = str(UUID(str(expected_claim_token)))
+        except (TypeError, ValueError, AttributeError):
+            raise PortalStoreError(422, "claim transition token is invalid")
         response = self._client().patch(
             self._rest(_TABLE),
             params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
                     "status": "eq.publishing", "published_at": "is.null",
-                    "late_post_id": "is.null"},
+                    "late_post_id": "is.null",
+                    "publish_claim_token": f"eq.{expected_claim_token}"},
             headers=self._headers({"Content-Type": "application/json",
                                    "Prefer": "return=representation"}),
             json={"status": status, "reject_reason": str(reason)[:500],
-                  "publish_reservation_day": None},
+                  "publish_reservation_day": None, "publish_claim_token": None},
             timeout=30,
         )
         if response.status_code >= 400:
@@ -1709,18 +1730,16 @@ class SupabaseCalendarStore:
                             reject_reason=None, gym_id=None,
                             expected_claim_token=None):
         """
-        REVERT a claim after a publish failure (or a would_publish result): status
-        back to `revert_status` so the row is retried on the next run. LASSO rows
-        revert to 'pending' (the default, unchanged). A CLIENT row that was APPROVED
-        before the claim reverts to 'approved' so a transient Zernio failure never
-        forces the client to re-approve. Records NOTHING else (no media id, no
-        published_at), so a failed attempt never looks published. The update
-        only matches an unpublished row still in the publisher's `publishing`
-        claim. Pre-network callers also supply gym_id so a stale or cross-tenant
-        row id cannot overwrite a client's later decision. The same caller must
-        supply its claim token, since a later worker can claim this row again
-        after it returns to pending. Returns the updated row or None when the
-        claim no longer matches.
+        REVERT a claim after a PRE-NETWORK block (including a would_publish result)
+        or a provider result that explicitly proves no post exists. LASSO rows
+        revert to 'pending'. A CLIENT row that was APPROVED before the claim reverts
+        to 'approved', so a safe retry never forces the client to re-approve.
+        Ambiguous outcomes after a network call must not use this method because an
+        automatic retry could duplicate a live post. The update records no media id
+        or publication timestamp and matches only the exact tenant, row, publishing
+        status, and owned claim UUID. The UUID prevents a stale worker from changing
+        the row after it was released and claimed again. Returns the updated row or
+        None when the claim no longer matches.
 
         reject_reason (publish_guard wiring, 2026-08-27): when the publish guard
         blocks a row, its violation codes land on the row so the portal/human can
@@ -1729,24 +1748,23 @@ class SupabaseCalendarStore:
         """
         if revert_status not in ("pending", "approved"):
             revert_status = "pending"
-        if gym_id is not None and not expected_claim_token:
-            raise PortalStoreError(422, "tenant-scoped rollback requires a claim token")
-        if expected_claim_token:
-            try:
-                from uuid import UUID
-                expected_claim_token = str(UUID(str(expected_claim_token)))
-            except (TypeError, ValueError, AttributeError):
-                raise PortalStoreError(422, "rollback claim token is invalid")
-        body = {"status": revert_status, "publish_reservation_day": None}
-        if expected_claim_token:
-            body["publish_claim_token"] = None
+        if gym_id is None:
+            raise PortalStoreError(422, "publish rollback requires a gym id")
+        if not expected_claim_token:
+            raise PortalStoreError(422, "publish rollback requires a claim token")
+        try:
+            from uuid import UUID
+            expected_claim_token = str(UUID(str(expected_claim_token)))
+        except (TypeError, ValueError, AttributeError):
+            raise PortalStoreError(422, "rollback claim token is invalid")
+        body = {"status": revert_status, "publish_reservation_day": None,
+                "publish_claim_token": None}
         if reject_reason is not None:
             body["reject_reason"] = str(reject_reason)[:500]
         params = {"id": f"eq.{row_id}", "status": "eq.publishing",
                   "published_at": "is.null", "late_post_id": "is.null"}
-        if gym_id is not None:
-            params["gym_id"] = f"eq.{gym_id}"
-            params["publish_claim_token"] = f"eq.{expected_claim_token}"
+        params["gym_id"] = f"eq.{gym_id}"
+        params["publish_claim_token"] = f"eq.{expected_claim_token}"
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -1762,7 +1780,7 @@ class SupabaseCalendarStore:
         rows = r.json() or []
         return next((row for row in rows if str(row.get("id")) == str(row_id)
                      and row.get("status") == revert_status
-                     and (gym_id is None or str(row.get("gym_id")) == str(gym_id))),
+                     and str(row.get("gym_id")) == str(gym_id)),
                     None)
 
     # ---- mirror writes (real-drafts calendar mirror) ------------------------

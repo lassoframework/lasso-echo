@@ -37,8 +37,10 @@ class CalendarHTTP:
 
 
 def store_for(**overrides):
+    token = "11111111-1111-4111-8111-111111111111"
     row = {"id": "dbe5fdea-61f3-46f8-a62b-643d639804ab", "gym_id": "lasso",
            "status": "publishing", "published_at": None, "late_post_id": None,
+           "publish_claim_token": token,
            **overrides}
     http = CalendarHTTP(row)
     store = SupabaseCalendarStore(url="https://example.invalid", service_key="fixture", http=http)
@@ -55,7 +57,9 @@ def test_duplicate_claim_is_retired_even_though_portal_status_edits_refuse_it():
     rid = http.row["id"]
     assert store.set_status("lasso", rid, "deleted") is None
     assert http.row["status"] == "publishing"
-    assert cap._mark_duplicate_content(store, "lasso", rid, "2026-09-11T23:10:40Z") is True
+    assert cap._mark_duplicate_content(
+        store, "lasso", rid, "2026-09-11T23:10:40Z",
+        http.row["publish_claim_token"]) is True
     assert http.row["status"] == "deleted"
     assert "duplicate content refused" in http.row["reject_reason"]
     assert http.row["published_at"] is None
@@ -69,7 +73,9 @@ def test_duplicate_claim_is_retired_even_though_portal_status_edits_refuse_it():
 def test_cleanup_never_changes_other_tenants_or_rows_with_publish_evidence(changes):
     store, http = store_for(**changes)
     before = dict(http.row)
-    assert cap._mark_duplicate_content(store, "lasso", http.row["id"], "earlier") is False
+    assert cap._mark_duplicate_content(
+        store, "lasso", http.row["id"], "earlier",
+        before["publish_claim_token"]) is False
     assert http.row == before
 
 
@@ -86,8 +92,9 @@ def test_missing_adapter_and_failed_write_are_not_reported_as_success():
 def test_idempotent_repeat_does_not_reactivate_the_retired_row():
     store, http = store_for()
     rid = http.row["id"]
-    assert cap._mark_duplicate_content(store, "lasso", rid, "earlier") is True
-    assert cap._mark_duplicate_content(store, "lasso", rid, "earlier") is False
+    token = http.row["publish_claim_token"]
+    assert cap._mark_duplicate_content(store, "lasso", rid, "earlier", token) is True
+    assert cap._mark_duplicate_content(store, "lasso", rid, "earlier", token) is False
     assert http.row["status"] == "deleted"
 
 
@@ -95,7 +102,9 @@ def test_idempotent_repeat_does_not_reactivate_the_retired_row():
 def test_pre_network_ledger_fault_releases_real_store_claim(previous):
     store, http = store_for()
     row = {**http.row, "status": previous}
-    assert cap._release_content_ledger_claim(store, "lasso", row, "content_stamp_failed") is True
+    assert cap._release_content_ledger_claim(
+        store, "lasso", row, "content_stamp_failed",
+        http.row["publish_claim_token"]) is True
     assert http.row["status"] == previous
 
 
@@ -109,6 +118,8 @@ def test_ledger_release_cannot_overwrite_publication_or_another_tenant(changes, 
     monkeypatch.setattr(ops_alerts, "alert", alerts.append)
     store, http = store_for(**changes)
     before = dict(http.row)
-    assert cap._release_content_ledger_claim(store, "lasso", http.row, "read_failed") is False
+    assert cap._release_content_ledger_claim(
+        store, "lasso", http.row, "read_failed",
+        before["publish_claim_token"]) is False
     assert http.row == before
     assert alerts and "release was not confirmed" in alerts[0]

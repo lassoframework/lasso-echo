@@ -138,6 +138,21 @@ def test_tenant_rollback_without_owner_token_refuses_write(monkeypatch):
     assert http.calls == []
 
 
+@pytest.mark.parametrize("method,args", [
+    ("mark_duplicate_content", ("lasso", "row-1", "duplicate")),
+    ("release_content_ledger_claim", ("lasso", "row-1", "pending", "fault")),
+])
+@pytest.mark.parametrize("token", [None, "not-a-uuid"])
+def test_pre_network_claim_transitions_require_valid_owner_token(
+        monkeypatch, method, args, token):
+    http = _FakeHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    with pytest.raises(pcs.PortalStoreError):
+        getattr(pcs.SupabaseCalendarStore(), method)(
+            *args, expected_claim_token=token)
+    assert http.calls == []
+
+
 def test_tenant_rollback_rejects_invalid_owner_token(monkeypatch):
     http = _FakeHTTP()
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
@@ -211,6 +226,56 @@ def test_old_claim_cannot_rollback_same_row_after_second_worker_reclaims(
                                       expected_claim_token=claim2)
     assert owned["status"] == "pending"
     assert row["publish_claim_token"] is None
+
+
+@pytest.mark.parametrize("transition,target_status,args", [
+    ("mark_duplicate_content", "deleted", ("duplicate",)),
+    ("release_content_ledger_claim", "pending", ("pending", "ledger fault")),
+])
+def test_old_claim_cannot_run_pre_network_transition_after_aba_reclaim(
+        monkeypatch, transition, target_status, args):
+    first = "11111111-1111-4111-8111-111111111111"
+    second = "22222222-2222-4222-8222-222222222222"
+    row = {"id": "row-1", "gym_id": "lasso", "status": "publishing",
+           "published_at": None, "late_post_id": None,
+           "publish_claim_token": second}
+
+    class ClaimCASHTTP(_FakeHTTP):
+        def patch(self, url, params=None, headers=None, json=None, timeout=None):
+            self.calls.append(("patch", url, params, headers, json))
+            matches = (
+                params == {"id": "eq.row-1", "gym_id": "eq.lasso",
+                           "status": "eq.publishing", "published_at": "is.null",
+                           "late_post_id": "is.null",
+                           "publish_claim_token": f"eq.{row['publish_claim_token']}"}
+                and row["status"] == "publishing"
+                and row["published_at"] is None
+                and row["late_post_id"] is None
+            )
+            if matches:
+                row.update(json)
+            return _Resp(200, [dict(row)] if matches else [])
+
+    http = ClaimCASHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    store = pcs.SupabaseCalendarStore()
+
+    stale = getattr(store, transition)(
+        "lasso", "row-1", *args, expected_claim_token=first)
+    assert stale is None
+    assert row["status"] == "publishing"
+    assert row["publish_claim_token"] == second
+
+    owned = getattr(store, transition)(
+        "lasso", "row-1", *args, expected_claim_token=second)
+    assert owned["status"] == target_status
+    assert row["status"] == target_status
+    assert row["publish_claim_token"] is None
+    _, _, params, _, body = http.calls[-1]
+    assert params["gym_id"] == "eq.lasso"
+    assert params["status"] == "eq.publishing"
+    assert params["publish_claim_token"] == f"eq.{second}"
+    assert body["publish_claim_token"] is None
 
 
 def test_mark_published_filters_by_owned_claim_token(monkeypatch):
