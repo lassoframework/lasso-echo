@@ -45,11 +45,22 @@ TICKET_B = "ticket-b-9999"
 KEY = "rsv-test-0001"
 
 
+def _ops_ticket(ticket_id=TICKET, gym_key=GYM):
+    """Clientless ops ticket carrying both persisted and raw tenant evidence."""
+    return {
+        "id": ticket_id,
+        "product": "echo",
+        "source": "ops_fix",
+        "client_id": None,
+        "raw_text": f"OPS-FIX REQUEST: ECHO ALERT for {gym_key}",
+        "verification_before": {"fixer": {"triage": {"gym_key": gym_key}}},
+    }
+
+
 class FakeBus:
     def __init__(self, ticket=None, tokens=None):
         self.rows = []
-        self.ticket_row = ticket if ticket is not None else {
-            "id": TICKET, "product": "echo", "source": "ops_fix", "client_id": None}
+        self.ticket_row = ticket if ticket is not None else _ops_ticket()
         self.token_rows = tokens if tokens is not None else []
 
     def _get(self, table, params):
@@ -70,8 +81,7 @@ class AnyTicketBus(FakeBus):
 
     def _get(self, table, params):
         if table == "support_tickets":
-            return [{"id": params["id"][len("eq."):], "product": "echo",
-                     "source": "ops_fix", "client_id": None}]
+            return [_ops_ticket(params["id"][len("eq."):])]
         return super()._get(table, params)
 
 
@@ -350,7 +360,7 @@ def test_duplicate_key_with_different_payload_conflicts_and_executes_once(armed)
     # same key, different gym -> refused, no second execution
     status, body = _post("reset_recreate_budget",
                          _body(reservation_key=KEY, gym=OTHER_GYM), deps=deps)
-    assert status == 409 and body["error"] == "reservation_conflict"
+    assert status == 409 and body["error"] == "ticket_tenant_unconfirmed"
     # same key, different ticket -> refused, no second execution
     status, body = _post("reset_recreate_budget",
                          _body(reservation_key=KEY, ticket=TICKET_B), deps=deps)
@@ -403,7 +413,7 @@ def test_receipts_are_tenant_bound_and_never_leak(armed):
     # replay of the same key under a different gym_key is refused, not executed
     status, body = _post("reset_recreate_budget",
                          _body(reservation_key=KEY, gym=OTHER_GYM), deps=deps)
-    assert status == 409 and body["error"] == "reservation_conflict"
+    assert status == 409 and body["error"] == "ticket_tenant_unconfirmed"
     assert calls == [GYM]
 
 
@@ -621,3 +631,48 @@ def test_a_wrapped_refusal_marks_the_receipt_failed(armed):
     receipt = FR.get_receipt(store, KEY, GYM)
     assert receipt["status"] == "failed" and receipt["error"]
     assert receipt["finished_at"] is not None
+
+
+@pytest.mark.parametrize("action,args,deps_factory", [
+    ("swap_media", {"row_id": "row-ambiguous-1"}, lambda store: {
+        "handle_swap_media": lambda *a, **kw: (
+            200, {"ok": True, "image_public_url": "https://img/new.jpg",
+                  "siblings_swapped": [], "sibling_results": []}),
+        "calendar_store": type("MissingSwapReadback", (), {
+            "get_row": lambda self, gym_key, row_id: None,
+        })(),
+    }),
+    ("requeue_failed_row", {"row_id": "row-ambiguous-2"}, lambda store: type(
+        "RequeueDeps", (), {})()),
+])
+def test_post_write_ambiguous_readback_marks_receipt_unknown_and_blocks_retry(
+        armed, action, args, deps_factory):
+    receipt_store = ReceiptStore()
+    if action == "requeue_failed_row":
+        class AmbiguousRequeueStore:
+            def __init__(self):
+                self.reads = 0
+
+            def get_row(self, gym_key, row_id):
+                self.reads += 1
+                if self.reads == 1:
+                    return {"id": row_id, "gym_id": gym_key, "status": "failed",
+                            "late_post_id": None}
+                return None
+
+            def requeue_failed_row(self, row_id):
+                return {"id": row_id, "gym_id": GYM, "status": "approved"}
+
+        action_deps = {"calendar_store": AmbiguousRequeueStore()}
+    else:
+        action_deps = deps_factory(receipt_store)
+    deps = {"bus": FakeBus(), "receipt_store": receipt_store, **action_deps}
+    body = _body(reservation_key=KEY, **args)
+
+    status, result = _post(action, body, deps=deps)
+    assert status == 503 and result["error"] == "reservation_outcome_unknown"
+    receipt = FR.get_receipt(receipt_store, KEY, GYM)
+    assert receipt["status"] == "unknown"
+
+    status, result = _post(action, body, deps=deps)
+    assert status == 409 and result["error"] == "reservation_outcome_unknown"

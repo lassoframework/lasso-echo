@@ -1121,6 +1121,7 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
         # (a sibling approved between the read and this write matches nothing and is
         # reported as left).
         swapped, left = [draft_id], list(locked_siblings)
+        sibling_results = []
         for sib in siblings:
             sid = str(sib.get("id") or "")
             var = variants[sid]
@@ -1131,7 +1132,19 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
             except Exception as exc:  # noqa: BLE001 - one sibling never undoes the swap
                 print(f"[portal-social] sibling swap failed for {sid}: {type(exc).__name__}")
                 done = None
-            (swapped if done is not None else left).append(sid)
+            if done is not None:
+                swapped.append(sid)
+                sibling_kind = _media_kind(done.get("image_url", ""))
+                sibling_results.append({
+                    "id": sid,
+                    "image_public_url": (done.get("thumbnail_url")
+                                         or done.get("image_url", "")),
+                    "media_kind": sibling_kind,
+                    "video_url": (done.get("image_url", "")
+                                  if sibling_kind == "video" else None),
+                })
+            else:
+                left.append(sid)
         # The write landed: settle the Drive usage ledger + the served ledger so the
         # asset now on the row cools down, and the one it replaced returns to the pool
         # ONLY when no remaining row on the book still carries it. A failed re-read
@@ -1145,6 +1158,7 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
     return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,
                  "siblings_swapped": [s for s in swapped if s != draft_id],
                  "siblings_left": left,
+                 "sibling_results": sibling_results,
                  # Display url: a video row's poster frame, else the media itself (the
                  # same rule _post_from_row applies for the calendar card).
                  "image_public_url": (updated.get("thumbnail_url")
