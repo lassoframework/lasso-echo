@@ -472,6 +472,48 @@ def _auto_reels_tick(worker, now):
     return worker
 
 
+def _refresh_shared_media_runway():
+    """Project current client runway state in the isolated startup worker."""
+    try:
+        from .media_bridge import refresh_all_shared_status
+        summary = refresh_all_shared_status()
+        print("[media-bridge] startup shared runway refresh "
+              f"checked={summary['checked']} materialized={summary['materialized']} "
+              f"mirrored={summary['mirrored']} failed={summary['failed']}")
+        return summary
+    except Exception as exc:
+        # This read-model refresh is best effort.  The daily scheduler must still
+        # start so the durable worker state and all unrelated lanes keep running.
+        print(f"[media-bridge] startup shared runway refresh failed: "
+              f"{type(exc).__name__}")
+        return None
+
+
+_SHARED_MEDIA_REFRESH_LOCK = threading.Lock()
+_shared_media_refresh_started = False
+
+
+def _start_shared_media_runway_refresh():
+    """Start the best-effort reconciliation once without delaying listener boot."""
+    global _shared_media_refresh_started
+    with _SHARED_MEDIA_REFRESH_LOCK:
+        if _shared_media_refresh_started:
+            return False
+        _shared_media_refresh_started = True
+        worker = threading.Thread(
+            target=_refresh_shared_media_runway,
+            name="shared-media-runway-refresh", daemon=True)
+        try:
+            worker.start()
+        except Exception as exc:
+            # Thread startup itself is also failure-isolated.  Keep the once flag
+            # set: startup should not spin or repeatedly retry a broken runtime.
+            print(f"[media-bridge] startup refresh worker failed: "
+                  f"{type(exc).__name__}")
+            return False
+    return True
+
+
 def _daily_scheduler(store):
     """
     Minimal in-process daily trigger. Fires run_daily once per day at the target
@@ -1093,6 +1135,12 @@ def run_listener():
             print(f"[slack-convo] REFUSING TO START: {_ce}")
             raise
         print(f"[slack-convo] attach failed: {type(_ce).__name__}: {_ce}")
+
+    # Cross-service runway reconciliation belongs to listener startup, independent
+    # of whether this process owns scheduled jobs.  Its daemon may spend the HTTP
+    # timeout budget without delaying Socket Mode, interrupted-draw recovery, or
+    # scheduler heartbeats.
+    _start_shared_media_runway_refresh()
 
     if str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}:
         threading.Thread(target=_daily_scheduler, args=(store,), daemon=True).start()
