@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent import fixer_ops
+from agent import fixer_ops, zernio as Z
 from agent import fixer_reply_reconciliation as R
 from agent import inbox_alerts
 
@@ -49,12 +49,12 @@ class ReadOnlyProvider:
         assert gym_key == GYM
         return self.profile
 
-    def inbox_post_comments(self, post_id, account_id):
+    def inbox_post_comments_complete(self, post_id, account_id):
         assert (post_id, account_id) == ("post-1", "account-1")
         return {"comments": self.comments,
                 "pagination": {"complete": self.comment_complete}}
 
-    def list_inbox_reviews(self, profile_id):
+    def list_inbox_reviews_complete(self, profile_id):
         assert profile_id == PROFILE
         return {"data": self.reviews,
                 "pagination": {"complete": self.review_complete}}
@@ -171,6 +171,119 @@ def test_current_partial_page_never_proves_resolution():
             comment_complete=False),
         store={snap["snapshot_id"]: snap}, now=NOW)
     assert result["complete"] is False and result["resolved"] is False
+
+
+def test_transport_failure_in_complete_reader_never_proves_resolution():
+    class BrokenCompleteReader(ReadOnlyProvider):
+        def inbox_post_comments_complete(self, post_id, account_id):
+            raise RuntimeError("captured provider transport failure")
+
+    snap = _snapshot()
+    result = R.reconcile_snapshot(snap["snapshot_id"], GYM,
+                                  zernio=BrokenCompleteReader(),
+                                  store={snap["snapshot_id"]: snap}, now=NOW)
+    assert result["complete"] is False and result["resolved"] is False
+    assert result["items"][0]["reason"] == "comment_read_failed"
+
+
+def _complete_zernio(pages):
+    """Captured-provider-shaped pages keyed by the page query Zernio receives."""
+    calls = []
+    client = Z.ZernioClient.__new__(Z.ZernioClient)
+
+    def read(path, params=None):
+        calls.append((path, dict(params or {})))
+        page = int((params or {}).get("page", 0))
+        value = pages[page]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    client._get = read
+    return client, calls
+
+
+def _comment_page(page, limit, total, pages, rows):
+    return {"comments": rows,
+            "pagination": {"page": page, "limit": limit,
+                           "total": total, "pages": pages},
+            "meta": {"captured_provider_shape": True}}
+
+
+def _review_page(page, limit, total, pages, rows):
+    return {"data": rows,
+            "pagination": {"page": page, "limit": limit,
+                           "total": total, "pages": pages},
+            "summary": {"captured_provider_shape": True}}
+
+
+def test_complete_comment_reader_proves_a_single_captured_provider_page():
+    row = _comment(item_id="comment-1")
+    client, calls = _complete_zernio({1: _comment_page(1, 2, 1, 1, [row])})
+    result = client.inbox_post_comments_complete("post-1", "account-1", limit=2)
+    assert result["comments"] == [row]
+    assert result["pagination"]["complete"] is True
+    assert result["pagination"]["pages_read"] == 1
+    assert calls == [("/v1/inbox/comments/post-1",
+                      {"accountId": "account-1", "page": 1, "limit": 2})]
+
+
+def test_complete_review_reader_reads_multiple_pages_and_deduplicates_identity():
+    first = _review(item_id="review-1")
+    second = _review(item_id="review-2")
+    # The provider repeated review-1 on the final page.  Its full identity and
+    # content are identical, so reconciliation receives each provider identity once.
+    client, calls = _complete_zernio({
+        1: _review_page(1, 2, 3, 2, [first, second]),
+        2: _review_page(2, 2, 3, 2, [first]),
+    })
+    result = client.list_inbox_reviews_complete(PROFILE, limit=2)
+    assert result["data"] == [first, second]
+    assert result["pagination"]["complete"] is True
+    assert [params["page"] for _path, params in calls] == [1, 2]
+
+
+@pytest.mark.parametrize("payload", [
+    _comment_page(1, 2, 3, 1, [_comment(), _comment(item_id="comment-2")]),
+    _comment_page(1, 2, 2, 1, [_comment()]),
+])
+def test_complete_reader_rejects_inconsistent_totals_and_page_shapes(payload):
+    client, _calls = _complete_zernio({1: payload})
+    with pytest.raises(Z.ZernioPaginationError):
+        client.inbox_post_comments_complete("post-1", "account-1", limit=2)
+
+
+def test_complete_reader_rejects_transport_failure_and_page_cap():
+    transport, _calls = _complete_zernio({1: RuntimeError("provider unavailable")})
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        transport.inbox_post_comments_complete("post-1", "account-1", limit=2)
+
+    capped, _calls = _complete_zernio({
+        1: _comment_page(1, 2, 4, 2, [_comment(), _comment(item_id="comment-2")]),
+    })
+    with pytest.raises(Z.ZernioPaginationError, match="pagination_cap_exceeded"):
+        capped.inbox_post_comments_complete("post-1", "account-1", limit=2,
+                                            max_pages=1)
+
+
+def test_complete_reader_rejects_nonadvancing_pages_and_conflicting_duplicates():
+    first = _comment()
+    second = _comment(item_id="comment-2")
+    nonadvancing, _calls = _complete_zernio({
+        1: _comment_page(1, 2, 3, 2, [first, second]),
+        2: _comment_page(1, 2, 3, 2, [first]),
+    })
+    with pytest.raises(Z.ZernioPaginationError, match="non_advancing"):
+        nonadvancing.inbox_post_comments_complete("post-1", "account-1", limit=2)
+
+    conflicting = dict(first, isHidden=True)
+    ambiguous, _calls = _complete_zernio({
+        1: _comment_page(1, 2, 3, 2, [first, second]),
+        2: _comment_page(2, 2, 3, 2, [conflicting]),
+    })
+    with pytest.raises(Z.ZernioPaginationError,
+                       match="ambiguous_duplicate_provider_identity"):
+        ambiguous.inbox_post_comments_complete("post-1", "account-1", limit=2)
 
 
 def test_authenticated_route_is_tenant_bound_read_only(monkeypatch):

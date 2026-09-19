@@ -277,7 +277,11 @@ def load_snapshot(snapshot_id, gym_key, *, store=None, now=None,
 
 def _current_comment(item, zernio):
     ident = item["identity"]
-    payload = zernio.inbox_post_comments(ident["container_id"], ident["account_id"])
+    # A one-page inbox read cannot prove a comment disappeared or was answered.
+    # Production uses ZernioClient's bounded complete reader, which returns
+    # ``pagination.complete`` only after it has traversed coherent page metadata.
+    payload = zernio.inbox_post_comments_complete(
+        ident["container_id"], ident["account_id"])
     if not pagination_complete(payload):
         return None, "comment_page_incomplete"
     matches = []
@@ -297,7 +301,7 @@ def _current_comment(item, zernio):
 
 
 def _current_reviews(snapshot, zernio):
-    payload = zernio.list_inbox_reviews(snapshot["profile_id"])
+    payload = zernio.list_inbox_reviews_complete(snapshot["profile_id"])
     if not pagination_complete(payload):
         return None, "review_page_incomplete"
     by_identity = {}
