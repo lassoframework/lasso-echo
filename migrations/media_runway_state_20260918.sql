@@ -83,7 +83,10 @@ begin
     ) values (
       p_gym_id, p_revision, p_fallback_episode, p_notice_state, now()
     )
-    on conflict (gym_id) do nothing;
+    -- The RETURNS TABLE output variable is also named gym_id.  Target the
+    -- primary-key constraint explicitly so PL/pgSQL never treats gym_id as an
+    -- ambiguous output variable during the insert path.
+    on conflict on constraint media_runway_state_pkey do nothing;
   else
     update public.media_runway_state as current_state
        set revision = p_revision,
