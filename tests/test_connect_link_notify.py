@@ -227,6 +227,21 @@ def test_happy_path_sends_and_dedupes():
     assert "/portal/" in payload["text"] and "/connect" in payload["text"]
 
 
+def test_happy_path_can_return_provider_receipt_for_verified_ops():
+    http = _FakeHttp(_full_routes(email="chad@crossfitlocal.com", owner_id="U06LXAZHVBM"))
+    out = cln.notify_new_gym(
+        "crossfitlocal", "g1", "CrossFit Local",
+        http=http, db=_KV(), alert=lambda m: None, return_receipt=True,
+    )
+    assert out == {
+        "sent": True,
+        "provider": "slack",
+        "channel": "C0NEWDM",
+        "ts": "1.0",
+        "message_id": None,
+    }
+
+
 def test_happy_path_opens_dm_with_approver_and_owner():
     http = _FakeHttp(_full_routes(owner_id="U06LXAZHVBM"))
     cln.notify_new_gym("crossfitlocal", "g1", "CrossFit Local",

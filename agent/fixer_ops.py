@@ -20,7 +20,9 @@ CONTRACT (the FIXER builder reads this block):
       action runs AT MOST ONCE per key -- a durable receipt (agent/fixer_ops_receipts,
       sqlite kv on the volume host, prefix ops_receipt_) is reserved BEFORE any side
       effect, then committed with the result, failed on a refusal, or marked unknown
-      when the outcome cannot be determined. A replay (same key, same payload hash)
+      when the outcome cannot be determined. The key is validated EXACTLY as supplied
+      (no trimming, no coercion): anything outside 8-128 [A-Za-z0-9_-] is 400
+      bad_reservation_key. A replay (same key, same payload hash)
       returns the completed result with "replayed": true and NEVER re-executes;
       reserved, failed, and unknown receipts refuse replay. A key reused with a
       different payload is 409 reservation_conflict. Keyed restage_month is refused
@@ -50,6 +52,38 @@ CONTRACT (the FIXER builder reads this block):
       200 {"category": "ready"|"missing"|"ambiguous"|"user-email-missing"|
            "portal-unavailable"}
       This is portal-read-only: no Slack lookup, link mint, ticket record, or DM.
+  GET  /ops/actions/evidence/...           (same header)
+      Bounded read-only diagnostics (agent/fixer_evidence.py). Never runs an action;
+      503 volume_unavailable on a host without the worker volume, 503
+      evidence_unavailable on a source fault.
+
+  RESULT EVIDENCE (canonical, consumed by Scout): every synchronous 2xx result
+  carries "captured_at" (ISO utc) marking when its evidence was read, and a
+  "postcondition_verified" flag that is true ONLY on a real independent readback:
+    resend_connect_link   proves actual sent state with the provider's message
+                          identity from the send call ("sent_message_identity"):
+                          sent true and postcondition_verified true ONLY with that
+                          identity. A bare no-exception return nulls "sent", keeps
+                          postcondition_verified false, and adds an "evidence_note"
+                          saying the sent state is unproven -- never claimed.
+    reset_recreate_budget compares before/after budget values re-read from the kv
+                          around the write; 409 postcondition_unconfirmed unless the
+                          after-read shows used=0 and remaining=limit.
+    release_denied_assets reports the scoped sweep's checked/rolled_back counts
+                          exactly as measured; there is no success flag that could
+                          present a 0-rollback sweep as a release.
+    swap_media            exposes the row identity and verifies the handler's write
+                          against an independent calendar get_row readback
+                          (409 postcondition_unconfirmed on any disagreement;
+                          sibling writes it did not read are never verified).
+    requeue_failed_row    succeeds only when an independent get_row readback shows
+                          the row at status approved with no post id.
+    restage_month         a background job: GET the job for its terminal status and
+                          real per-step counts; its result carries captured_at and
+                          postcondition_verified false (no scoped calendar
+                          comparison exists yet).
+  Evidence that is unavailable is said so in the result; success fields are never
+  invented.
 
   Catalog (`args` keys):
     resend_connect_link     {}                 owner DM with a fresh connect link (forced)
@@ -243,14 +277,66 @@ def _run_resend_connect_link(ctx):
     notify = _dep(ctx, "notify_new_gym", lambda: __import__(
         "agent.connect_link_notify", fromlist=["notify_new_gym"]).notify_new_gym)
     alerts = []
-    sent = bool(notify(ctx.gym_key, gym_id, name, force=True, alert=alerts.append))
-    if sent:
+    raw = notify(ctx.gym_key, gym_id, name, force=True, alert=alerts.append,
+                 return_receipt=True)
+    sent, identity = _send_evidence(raw)
+    captured = _now_iso()
+    if sent and identity is not None:
         return 200, {"sent": True, "gym_id": gym_id, "gym_name": name,
-                     "postcondition_verified": False,
+                     "sent_message_identity": identity,
+                     "postcondition_verified": True,
+                     "captured_at": captured,
                      "summary": f"connect link re-sent to the owner of {name}"}
+    if sent:
+        # A bare no-exception return is not delivery proof (the contract: actual sent
+        # state is proven by provider/message identity from the send call, nothing
+        # less). Null the sent claim rather than assert an unproven success.
+        return 200, {"sent": None, "gym_id": gym_id, "gym_name": name,
+                     "sent_message_identity": None,
+                     "postcondition_verified": False,
+                     "captured_at": captured,
+                     "evidence_note": ("the send call reported no failure but returned "
+                                       "no provider message identity; actual sent "
+                                       "state is unproven"),
+                     "summary": (f"connect link resend for {name}: the send call did "
+                                 "not fail, but it returned no provider message "
+                                 "identity; sent state unproven")}
     return 409, {"error": "not_sent", "sent": False, "gym_id": gym_id, "gym_name": name,
+                 "captured_at": captured,
                  "detail": (alerts[-1] if alerts else "notify_new_gym declined to send"),
                  "summary": "connect link NOT sent: " + (alerts[-1] if alerts else "declined")}
+
+
+def _send_evidence(raw):
+    """(sent, message_identity) from a send call's return.
+
+    A send that can prove itself returns a mapping carrying the provider's own
+    message identity ("message_identity", or provider/channel/ts/message_id fields);
+    that identity is the readback-grade evidence. A bare truthy/falsy return proves
+    nothing beyond no-exception: sent is believed but identity stays None and the
+    caller must not claim verification.
+    """
+    if isinstance(raw, dict):
+        sent = bool(raw.get("sent"))
+        identity = raw.get("message_identity")
+        if not isinstance(identity, dict):
+            identity = {"provider": raw.get("provider") or "slack",
+                        "channel": raw.get("channel"),
+                        "ts": raw.get("ts"),
+                        "message_id": raw.get("message_id")}
+        provider = identity.get("provider")
+        channel = identity.get("channel")
+        ts = identity.get("ts")
+        message_id = identity.get("message_id")
+        if (provider != "slack" or not isinstance(channel, str) or not channel
+                or not ((isinstance(ts, str) and ts)
+                        or (isinstance(message_id, str) and message_id))):
+            identity = None
+        else:
+            identity = {"provider": provider, "channel": channel,
+                        "ts": ts, "message_id": message_id}
+        return sent, identity
+    return bool(raw), None
 
 
 def _resend_connect_link_readiness(gym_key, deps):
@@ -287,11 +373,16 @@ def _run_reset_recreate_budget(ctx):
     out = reset(ctx.gym_key)
     before = (out or {}).get("before") or {}
     after = (out or {}).get("after") or {}
+    # before/after are the wrapped function's own kv re-reads around its write, not
+    # the write's return value; the comparison below is the postcondition readback.
+    captured = _now_iso()
     if after.get("used") != 0 or after.get("remaining") != after.get("limit"):
         return 409, {"error": "postcondition_unconfirmed", "before": before,
-                     "after": after, "summary": "recreate budget reset was not confirmed"}
+                     "after": after, "captured_at": captured,
+                     "summary": "recreate budget reset was not confirmed"}
     return 200, {**(out or {}),
                  "postcondition_verified": True,
+                 "captured_at": captured,
                  "summary": (f"recreate budget {before.get('used', '?')} used -> "
                              f"{after.get('used', '?')} used "
                              f"({after.get('remaining', '?')} of {after.get('limit', '?')} left)")}
@@ -326,9 +417,16 @@ def _run_release_denied_assets(ctx):
     observe = _dep(ctx, "observe_denials", lambda: __import__(
         "agent.gym_media_selector", fromlist=["observe_denials"]).observe_denials)
     out = _observe_denials_for_gym(ctx.gym_key, observe)
-    return 200, {**out, "postcondition_verified": False,
-                 "summary": (f"deny sweep checked {out.get('checked', 0)} date(s), "
-                                    f"rolled back {out.get('rolled_back', 0)} asset(s)")}
+    # Echo the sweep's measured counts and nothing else: an upstream success flag is
+    # stripped, never amplified -- a sweep that rolled nothing back is not a release,
+    # whatever the wrapped function claims about itself.
+    result = {k: v for k, v in out.items()
+              if k not in ("released", "postcondition_verified", "captured_at")}
+    result["postcondition_verified"] = False
+    result["captured_at"] = _now_iso()
+    result["summary"] = (f"deny sweep checked {out.get('checked', 0)} date(s), "
+                         f"rolled back {out.get('rolled_back', 0)} asset(s)")
+    return 200, result
 
 
 # -- swap_media --------------------------------------------------------------------------
@@ -348,6 +446,7 @@ def _run_swap_media(ctx):
         "agent.portal_social", fromlist=["handle_swap_media"]).handle_swap_media)
     status, body = handler(ctx.gym_key, rid, f"{ACTOR}:{ctx.ticket_id}")
     body = dict(body or {})
+    body.setdefault("row_id", rid)
     if int(status) == 200 and body.get("ok") is True:
         # The handler's returned row is a write response, not an independent proof.
         # A missing or failed readback is ambiguous: the write may already have landed,
@@ -364,15 +463,46 @@ def _run_swap_media(ctx):
         display = (confirmed or {}).get("thumbnail_url") or actual
         if (not confirmed or confirmed.get("id") != rid
                 or confirmed.get("gym_id") != ctx.gym_key
-                or body.get("siblings_swapped")
                 or body.get("siblings_left")
                 or (body.get("video_url") and actual != body["video_url"])
-                or (not body.get("video_url") and actual != body.get("image_public_url"))
                 or display != body.get("image_public_url")):
             return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                         "_outcome_unknown": True,
                          "postcondition_verified": False,
+                         "captured_at": _now_iso(),
                          "summary": f"swap-media on row {rid}: calendar readback unconfirmed"}
+        sibling_ids = body.get("siblings_swapped") or []
+        sibling_results = body.get("sibling_results") or []
+        if (not isinstance(sibling_ids, list) or not isinstance(sibling_results, list)
+                or sorted(str(v) for v in sibling_ids)
+                != sorted(str(v.get("id")) for v in sibling_results
+                          if isinstance(v, dict))):
+            return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                         "_outcome_unknown": True,
+                         "postcondition_verified": False,
+                         "captured_at": _now_iso(),
+                         "summary": f"swap-media on row {rid}: sibling evidence unconfirmed"}
+        for expected_sibling in sibling_results:
+            sid = str(expected_sibling.get("id") or "")
+            try:
+                sibling = store.get_row(ctx.gym_key, sid)
+            except Exception:  # noqa: BLE001
+                sibling = None
+            sibling_actual = (sibling or {}).get("image_url")
+            sibling_display = (sibling or {}).get("thumbnail_url") or sibling_actual
+            if (not sibling or sibling.get("id") != sid
+                    or sibling.get("gym_id") != ctx.gym_key
+                    or (expected_sibling.get("video_url")
+                        and sibling_actual != expected_sibling.get("video_url"))
+                    or sibling_display != expected_sibling.get("image_public_url")):
+                return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                             "_outcome_unknown": True,
+                             "postcondition_verified": False,
+                             "captured_at": _now_iso(),
+                             "summary": (f"swap-media on row {rid}: sibling {sid} "
+                                         "readback unconfirmed")}
         body["postcondition_verified"] = True
+        body["captured_at"] = _now_iso()
     body["summary"] = (f"swap-media on row {rid}: "
                        + ("ok" if body.get("ok") else f"refused ({body.get('error', status)})"))
     return int(status), body
@@ -402,6 +532,7 @@ def _run_requeue_failed_row(ctx):
     if (updated.get("id") != rid or updated.get("gym_id") != ctx.gym_key
             or updated.get("status") != "approved"):
         return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                     "_outcome_unknown": True,
                      "summary": f"row {rid} requeue response did not match the target gym"}
     confirmed = store.get_row(ctx.gym_key, rid)
     if (not confirmed or confirmed.get("id") != rid
@@ -409,10 +540,13 @@ def _run_requeue_failed_row(ctx):
             or confirmed.get("status") != "approved"
             or confirmed.get("late_post_id") is not None):
         return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
+                     "_outcome_unknown": True,
+                     "captured_at": _now_iso(),
                      "summary": f"row {rid} requeue was not confirmed by calendar readback"}
     return 200, {"row_id": rid, "status": confirmed.get("status"),
                  "post_date": confirmed.get("post_date"),
                  "postcondition_verified": True,
+                 "captured_at": _now_iso(),
                  "summary": f"row {rid} requeued: failed -> {confirmed.get('status')}"}
 
 
@@ -502,7 +636,11 @@ def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_
     out["build"] = built
     # A successful builder response does not identify which rows survived the
     # calendar write or human edits. Keep the completed job truthful until a
-    # scoped, independent calendar comparison is available.
+    # scoped, independent calendar comparison is available: the job never verifies
+    # itself, and the builder's own self-certification is stripped, not echoed.
+    if isinstance(out["build"], dict):
+        out["build"] = {k: v for k, v in out["build"].items()
+                        if k != "postcondition_verified"}
     out["postcondition_verified"] = False
     build_result = built if isinstance(built, dict) else {}
     steps.append({"step": "build", "at": _now_iso(), "ok": build_result.get("ok") is True,
@@ -514,6 +652,7 @@ def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_
                       f" source(s) prerendered, {out['observe_denials'].get('rolled_back', 0)} "
                       f"asset(s) released, build ok={bool((built or {}).get('ok'))} "
                       f"upserted={(built or {}).get('upserted', '?')} days={days}")
+    out["captured_at"] = _now_iso()
     return out
 
 
@@ -679,7 +818,9 @@ def _ticket_tenant(gym_key, ticket_id, deps):
         bus = Bus()
     try:
         tickets = bus._get("support_tickets", {
-            "id": f"eq.{ticket_id}", "select": "id,product,source,client_id", "limit": "2"})
+            "id": f"eq.{ticket_id}",
+            "select": "id,product,source,client_id,raw_text,verification_before",
+            "limit": "2"})
         if (not isinstance(tickets, list) or len(tickets) != 1
                 or not isinstance(tickets[0], dict)
                 or tickets[0].get("id") != ticket_id):
@@ -687,7 +828,17 @@ def _ticket_tenant(gym_key, ticket_id, deps):
         ticket = tickets[0]
         client_id = ticket.get("client_id")
         if client_id is None:
-            if ticket.get("product") == "echo" and ticket.get("source") == "ops_fix":
+            before = ticket.get("verification_before") or {}
+            fixer = before.get("fixer") if isinstance(before, dict) else {}
+            triage = fixer.get("triage") if isinstance(fixer, dict) else {}
+            bound_key = triage.get("gym_key") if isinstance(triage, dict) else None
+            raw_text = str(ticket.get("raw_text") or "")
+            raw_has_key = bool(re.search(
+                rf"(?<![A-Za-z0-9_-]){re.escape(gym_key)}(?![A-Za-z0-9_-])",
+                raw_text,
+            ))
+            if (ticket.get("product") == "echo" and ticket.get("source") == "ops_fix"
+                    and bound_key == gym_key and raw_has_key):
                 return None
             return 409, {"error": "ticket_tenant_unconfirmed"}
         if not isinstance(client_id, str) or not client_id.strip():
@@ -774,11 +925,13 @@ def run_action(action, gym_key, ticket_id, args, *, reservation_key=None, deps=N
         return 409, {"error": "reservation_background_unsupported", "action": action}
     # Durable reservation (optional): begin BEFORE any side effect; a replay returns
     # the stored result without re-executing; an unknown outcome is never retried.
+    # The key is validated by the receipt store EXACTLY as supplied -- no coercion,
+    # no trimming: a padded or non-string key is 400 bad_reservation_key, and the
+    # stored identity is byte-for-byte the caller's.
     receipt = None
     receipt_store = None
     if reservation_key is not None:
         from . import fixer_ops_receipts as receipts
-        reservation_key = str(reservation_key).strip()
         receipt_store = deps.get("receipt_store")
         try:
             if receipt_store is None:
@@ -814,9 +967,17 @@ def run_action(action, gym_key, ticket_id, args, *, reservation_key=None, deps=N
                          "reservation_key": reservation_key, "receipt": receipt}
         status, result = 500, {"error": f"{type(e).__name__}", "detail": str(e)[:300]}
     result = dict(result or {})
+    outcome_unknown = result.pop("_outcome_unknown", False) is True
     if receipt is not None:
         try:
-            if 200 <= status < 300:
+            if outcome_unknown:
+                original_error = str(result.get("error") or status)
+                receipt = receipts.mark_unknown(receipt_store, reservation_key,
+                                                original_error)
+                status = 503
+                result["error"] = "reservation_outcome_unknown"
+                result["detail"] = original_error
+            elif 200 <= status < 300:
                 receipt = receipts.commit(receipt_store, reservation_key, result,
                                           http_status=status)
             elif status < 500:
@@ -895,7 +1056,11 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         if method != "GET":
             return 405, {"error": "method_not_allowed"}
         return _resend_connect_link_readiness(m.group(1), deps)
-    m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/receipts/([A-Za-z0-9_-]{{1,128}})$", path)
+    # The key segment is captured loosely on purpose: the contract is that a MALFORMED
+    # key (wrong charset, wrong length) is 400 bad_reservation_key, decided by the
+    # receipt store's validator -- a route that pre-filters to well-formed keys would
+    # silently turn those into a wrong, less truthful 404.
+    m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/receipts/([^/]{{1,256}})$", path)
     if m:
         if method != "GET":
             return 405, {"error": "method_not_allowed"}

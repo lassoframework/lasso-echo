@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import fixer_ops as FO  # noqa: E402
+from agent import fixer_ops_receipts as FR  # noqa: E402
 
 SECRET = "s3cr3t-" * 4
 GYM = "crossfitreverb30b5b2"
@@ -23,7 +24,9 @@ class FakeBus:
     def __init__(self, ticket=None, tokens=None, error=None, reverse_tokens=None):
         self.rows = []
         self.ticket_row = ticket if ticket is not None else {
-            "id": TICKET, "product": "echo", "source": "ops_fix", "client_id": None}
+            "id": TICKET, "product": "echo", "source": "ops_fix", "client_id": None,
+            "raw_text": f"OPS-FIX REQUEST: ECHO ALERT: repair {GYM}",
+            "verification_before": {"fixer": {"triage": {"gym_key": GYM}}}}
         self.token_rows = tokens if tokens is not None else []
         self.reverse_token_rows = reverse_tokens
         self.error = error
@@ -161,6 +164,28 @@ def test_tenant_store_failure_or_missing_client_does_not_run_action(armed):
     assert calls == []
 
 
+def test_internal_ops_ticket_requires_persisted_and_raw_tenant_binding(armed):
+    calls = []
+    action = lambda key: calls.append(key) or {
+        "before": {"limit": 1, "used": 1, "remaining": 0},
+        "after": {"limit": 1, "used": 0, "remaining": 1},
+    }
+    base = {"id": TICKET, "product": "echo", "source": "ops_fix", "client_id": None}
+    hostile = [
+        {**base, "raw_text": f"repair {GYM}",
+         "verification_before": {"fixer": {"triage": {"gym_key": OTHER_GYM}}}},
+        {**base, "raw_text": "repair some other gym",
+         "verification_before": {"fixer": {"triage": {"gym_key": GYM}}}},
+        {**base, "raw_text": f"repair prefix{GYM}suffix",
+         "verification_before": {"fixer": {"triage": {"gym_key": GYM}}}},
+    ]
+    for ticket in hostile:
+        status, body = _post("reset_recreate_budget", _body(), deps={
+            "bus": FakeBus(ticket=ticket), "reset_recreate_budget": action})
+        assert status == 409 and body["error"] == "ticket_tenant_unconfirmed"
+    assert calls == []
+
+
 def test_account_key_ticket_must_match_exactly(armed):
     ticket = {"id": TICKET, "product": "echo", "source": "slack_conversation",
               "client_id": "othergym123"}
@@ -235,8 +260,10 @@ def test_resend_connect_link_forces_the_send_and_reports_a_decline(armed):
     deps = {"bus": FakeBus(), "gym_lookup": lambda k: ("g-uuid", "CrossFit Reverb"),
             "notify_new_gym": notify, "is_echo_client": lambda gid: gid == "g-uuid"}
     status, body = _post("resend_connect_link", _body(), deps=deps)
-    assert status == 200 and body["result"]["sent"] is True
+    assert status == 200
+    assert body["result"]["sent"] is None
     assert body["result"]["postcondition_verified"] is False
+    assert body["result"]["sent_message_identity"] is None
     assert seen == {"base_key": GYM, "gym_id": "g-uuid", "name": "CrossFit Reverb", "force": True}
 
     def declines(base_key, gym_id, name, *, force=False, alert=None, **kw):
@@ -249,6 +276,51 @@ def test_resend_connect_link_forces_the_send_and_reports_a_decline(armed):
 
     deps["gym_lookup"] = lambda k: (None, None)
     assert _post("resend_connect_link", _body(), deps=deps)[0] == 404
+
+
+def test_resend_connect_link_verifies_only_with_provider_message_identity(armed):
+    deps = {
+        "bus": FakeBus(),
+        "gym_lookup": lambda k: ("g-uuid", "CrossFit Reverb"),
+        "notify_new_gym": lambda *a, **kw: {
+            "sent": True,
+            "provider": "slack",
+            "channel": "D123",
+            "ts": "1726682400.000100",
+        },
+        "is_echo_client": lambda gid: gid == "g-uuid",
+    }
+    status, body = _post("resend_connect_link", _body(), deps=deps)
+    assert status == 200
+    assert body["result"]["sent"] is True
+    assert body["result"]["postcondition_verified"] is True
+    assert body["result"]["sent_message_identity"] == {
+        "provider": "slack",
+        "channel": "D123",
+        "ts": "1726682400.000100",
+        "message_id": None,
+    }
+
+
+@pytest.mark.parametrize("fake_identity", [
+    {"sent": True, "provider": "slack", "channel": "D123"},
+    {"sent": True, "message": "looks-like-proof"},
+    {"sent": True, "message_identity": "not-an-object"},
+    {"sent": True, "message_identity": {
+        "provider": "email", "channel": "D123", "message_id": "m1"}},
+])
+def test_resend_connect_link_rejects_fabricated_message_identity(armed, fake_identity):
+    deps = {
+        "bus": FakeBus(),
+        "gym_lookup": lambda k: ("g-uuid", "CrossFit Reverb"),
+        "notify_new_gym": lambda *a, **kw: fake_identity,
+        "is_echo_client": lambda gid: gid == "g-uuid",
+    }
+    status, body = _post("resend_connect_link", _body(), deps=deps)
+    assert status == 200
+    assert body["result"]["sent"] is None
+    assert body["result"]["postcondition_verified"] is False
+    assert body["result"]["sent_message_identity"] is None
 
 
 @pytest.mark.parametrize("category", ["ready", "missing", "ambiguous", "user-email-missing",
@@ -377,7 +449,7 @@ def test_swap_media_does_not_claim_success_when_readback_disagrees(armed):
     {"siblings_swapped": ["sibling-1"]},
     {"siblings_left": ["sibling-1"]},
 ])
-def test_swap_media_does_not_verify_unread_sibling_writes(armed, sibling_result):
+def test_swap_media_does_not_verify_unread_or_failed_sibling_writes(armed, sibling_result):
     class Store:
         def get_row(self, account_key, row_id):
             return {"id": row_id, "gym_id": account_key, "image_url": "https://img/new.jpg"}
@@ -388,6 +460,40 @@ def test_swap_media_does_not_verify_unread_sibling_writes(armed, sibling_result)
             "ok": True, "image_public_url": "https://img/new.jpg",
             **sibling_result})})
     assert status == 409 and body["error"] == "postcondition_unconfirmed"
+
+
+def test_swap_media_verifies_thumbnail_and_each_successful_sibling(armed):
+    rows = {
+        "row-abc-123": {"id": "row-abc-123", "gym_id": GYM,
+                        "image_url": "https://img/full.jpg",
+                        "thumbnail_url": "https://img/thumb.jpg"},
+        "sibling-1": {"id": "sibling-1", "gym_id": GYM,
+                      "image_url": "https://img/sibling-full.jpg",
+                      "thumbnail_url": "https://img/sibling-thumb.jpg"},
+    }
+
+    class Store:
+        def get_row(self, account_key, row_id):
+            row = rows.get(row_id)
+            return dict(row) if row and row["gym_id"] == account_key else None
+
+    status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
+        "bus": FakeBus(), "calendar_store": Store(),
+        "handle_swap_media": lambda *args: (200, {
+            "ok": True,
+            "image_public_url": "https://img/thumb.jpg",
+            "siblings_swapped": ["sibling-1"],
+            "siblings_left": [],
+            "sibling_results": [{
+                "id": "sibling-1",
+                "image_public_url": "https://img/sibling-thumb.jpg",
+                "media_kind": "image",
+                "video_url": None,
+            }],
+        }),
+    })
+    assert status == 200
+    assert body["result"]["postcondition_verified"] is True
 
 
 def test_swap_media_requires_public_media_identity_to_verify(armed):
@@ -706,3 +812,434 @@ def test_org_floor_refusal_leaves_a_trace_on_the_ticket(armed):
     assert len(bus.rows) == 1
     assert bus.rows[0]["body"].startswith("OPS ACTION refund by fixer: REFUSED: org_floor")
     assert bus.rows[0]["kind"] == "escalation" and bus.rows[0]["delivery_status"] is None
+
+
+# ---- round 3 (K3): hostile reservation lifecycle, durable readback, truthful fields --------
+# Store-level reservation semantics live in tests/test_fixer_ops_receipts.py; this section
+# pins the ACTION-layer contract: side-effect ordering, replay call counts, per-action
+# readback truthfulness, and the receipts/readiness HTTP routes.
+
+OTHER_GYM = "anothergym999"
+KEY = "rsv-k3-000001"
+
+
+def _keyed_body(key=KEY, gym=GYM, ticket=TICKET, **args):
+    return {"gym_key": gym, "ticket_id": ticket, "args": args, "reservation_key": key}
+
+
+def _ok_reset(calls):
+    def reset(key):
+        calls.append(key)
+        return {"before": {"limit": 30, "used": 30, "remaining": 0},
+                "after": {"limit": 30, "used": 0, "remaining": 30}}
+    return reset
+
+
+# -- 1. reservation lifecycle ---------------------------------------------------------------
+
+def test_keyed_call_reserves_before_the_side_effect_and_commits_done(armed):
+    store = {}
+    seen_status = []
+    calls = []
+
+    def reset(key):
+        calls.append(key)
+        seen_status.append(store.get(KEY, {}).get("status"))
+        return {"before": {"limit": 30, "used": 30, "remaining": 0},
+                "after": {"limit": 30, "used": 0, "remaining": 30}}
+
+    deps = {"bus": FakeBus(), "reset_recreate_budget": reset, "receipt_store": store}
+    status, body = _post("reset_recreate_budget", _keyed_body(), deps=deps)
+    assert status == 200 and body["ok"] is True
+    assert seen_status == ["reserved"], "the durable reservation exists BEFORE any side effect"
+    assert store[KEY]["status"] == "done", "a 2xx commits the receipt"
+    receipt = body["receipt"]
+    assert receipt["key"] == KEY and receipt["status"] == "done"
+    assert receipt["action"] == "reset_recreate_budget"
+    assert receipt["gym_key"] == GYM and receipt["ticket_id"] == TICKET
+    assert receipt["result"]["after"]["used"] == 0
+    assert receipt["finished_at"] is not None
+
+
+def test_a_reserved_receipt_replay_is_an_explicit_409_and_runs_nothing(armed):
+    store = {}
+    FR.begin(store, KEY, "reset_recreate_budget", GYM, TICKET, {})  # left "reserved"
+    calls = []
+    deps = {"bus": FakeBus(), "reset_recreate_budget": _ok_reset(calls),
+            "receipt_store": store}
+    status, body = _post("reset_recreate_budget", _keyed_body(), deps=deps)
+    assert status == 409 and body["error"] == "reservation_in_progress"
+    assert calls == [], "an in-progress reservation never re-executes"
+
+
+def test_a_failed_receipt_replay_is_an_explicit_409_and_runs_nothing(armed):
+    store = {}
+    FR.begin(store, KEY, "reset_recreate_budget", GYM, TICKET, {})
+    FR.fail(store, KEY, "postcondition_unconfirmed")
+    calls = []
+    deps = {"bus": FakeBus(), "reset_recreate_budget": _ok_reset(calls),
+            "receipt_store": store}
+    status, body = _post("reset_recreate_budget", _keyed_body(), deps=deps)
+    assert status == 409 and body["error"] == "reservation_previously_failed"
+    assert calls == [], "a failed receipt never re-executes"
+
+
+def test_an_unknown_receipt_refuses_replay_and_runs_nothing(armed):
+    store = {}
+    FR.begin(store, KEY, "swap_media", GYM, TICKET, {"row_id": "row-abc-123"})
+    FR.mark_unknown(store, KEY, "response lost after the write; outcome undetermined")
+    calls = []
+    deps = {"bus": FakeBus(), "receipt_store": store,
+            "handle_swap_media": lambda *a, **kw: calls.append(a) or (200, {"ok": True})}
+    status, body = _post("swap_media", _keyed_body(row_id="row-abc-123"), deps=deps)
+    assert status == 409 and body["error"] == "reservation_outcome_unknown"
+    assert calls == [], "an unknown outcome is NEVER automatically retried"
+
+
+# -- 2 + 3. durable readback + duplicate no-rerun --------------------------------------------
+
+def test_receipt_readback_comes_from_the_store_with_exact_identity(armed):
+    backing = {}
+    deps = {"bus": FakeBus(), "reset_recreate_budget": _ok_reset([]),
+            "receipt_store": backing}
+    status, body = _post("reset_recreate_budget", _keyed_body(), deps=deps)
+    assert status == 200
+
+    # before anything exists for a key the read route 404s
+    status, body = FO.handle("GET", f"{FO.ROUTE_PREFIX}/receipts/rsv-k3-absent01"
+                             f"?gym_key={GYM}", _hdr(), b"",
+                             deps={"receipt_store": backing}, log=lambda *a: None)
+    assert status == 404 and body["error"] == "unknown_receipt"
+
+    # a "restarted" reader: a brand-new mapping reloaded from the durable bytes,
+    # so the answer cannot come from request memory
+    reloaded = json.loads(json.dumps(backing))
+    status, body = FO.handle("GET", f"{FO.ROUTE_PREFIX}/receipts/{KEY}?gym_key={GYM}",
+                             _hdr(), b"", deps={"receipt_store": reloaded},
+                             log=lambda *a: None)
+    assert status == 200 and body["ok"] is True
+    r = body["receipt"]
+    assert r["key"] == KEY
+    assert r["action"] == "reset_recreate_budget"
+    assert r["gym_key"] == GYM and r["ticket_id"] == TICKET
+    assert r["status"] == "done"
+    assert r["payload_hash"] == FR.payload_hash("reset_recreate_budget", GYM, TICKET, {})
+
+    # the same fresh store refuses another tenant
+    status, body = FO.handle("GET", f"{FO.ROUTE_PREFIX}/receipts/{KEY}?gym_key={OTHER_GYM}",
+                             _hdr(), b"", deps={"receipt_store": reloaded},
+                             log=lambda *a: None)
+    assert status == 403 and body["error"] == "receipt_tenant_mismatch"
+    assert "receipt" not in body
+
+
+def test_keyed_replay_returns_the_durable_receipt_and_never_reruns_swap(armed):
+    store = {}
+    calls = []
+
+    class Store:
+        def get_row(self, account_key, row_id):
+            return {"id": row_id, "gym_id": account_key,
+                    "image_url": "https://img/new.jpg"}
+
+    def handler(account_key, draft_id, actor_id, **kw):
+        calls.append(draft_id)
+        return 200, {"ok": True, "image_public_url": "https://img/new.jpg"}
+
+    deps = {"bus": FakeBus(), "receipt_store": store, "calendar_store": Store(),
+            "handle_swap_media": handler}
+    status, first = _post("swap_media", _keyed_body(row_id="row-abc-123"), deps=deps)
+    assert status == 200 and first["receipt"]["status"] == "done"
+    assert not first.get("replayed")
+
+    status, replay = _post("swap_media", _keyed_body(row_id="row-abc-123"), deps=deps)
+    assert status == 200 and replay["ok"] is True
+    assert replay["replayed"] is True
+    assert replay["receipt"]["key"] == KEY and replay["receipt"]["status"] == "done"
+    assert replay["receipt"]["payload_hash"] == first["receipt"]["payload_hash"]
+    assert replay["result"] == first["result"]
+    assert calls == ["row-abc-123"], "the wrapped action ran exactly once across the replay"
+    assert "replay" not in store[KEY], "the replay marker is response-only, never persisted"
+
+
+# -- 4. wrong tenant / key / ticket -----------------------------------------------------------
+
+def test_a_malformed_key_on_the_receipt_read_route_is_400(armed):
+    deps = {"receipt_store": {}}
+    for bad in ["ab",                    # valid charset, too short
+                "x" * 129,               # over-length
+                "has space!!",           # bad chars
+                "dots.arent.ok"]:        # bad chars
+        status, body = FO.handle("GET", f"{FO.ROUTE_PREFIX}/receipts/{bad}?gym_key={GYM}",
+                                 _hdr(), b"", deps=deps, log=lambda *a: None)
+        assert status == 400 and body["error"] == "bad_reservation_key", \
+            f"malformed key {bad!r} must be 400 bad_reservation_key, got {status} {body}"
+
+
+def test_a_key_reused_with_a_different_payload_conflicts_and_never_reruns(armed):
+    cal = FakeCalendarStore([
+        {"id": "row-failed-1", "gym_id": GYM, "status": "failed", "post_date": "2026-09-12"},
+        {"id": "row-failed-2", "gym_id": GYM, "status": "failed", "post_date": "2026-09-13"}])
+    deps = {"bus": FakeBus(), "calendar_store": cal, "receipt_store": {}}
+    status, body = _post("requeue_failed_row", _keyed_body(row_id="row-failed-1"), deps=deps)
+    assert status == 200 and cal.requeued == ["row-failed-1"]
+
+    # same key, different args -> conflict, not execution
+    status, body = _post("requeue_failed_row", _keyed_body(row_id="row-failed-2"), deps=deps)
+    assert status == 409 and body["error"] == "reservation_conflict"
+    # same key, different gym -> conflict, not execution
+    status, body = _post("requeue_failed_row",
+                         _keyed_body(gym=OTHER_GYM, row_id="row-failed-1"),
+                         deps={**deps, "bus": FakeBus(
+                             ticket={"id": TICKET, "product": "echo", "source": "ops_fix",
+                                     "client_id": None})})
+    assert status == 409 and body["error"] == "ticket_tenant_unconfirmed"
+    assert cal.requeued == ["row-failed-1"], "a conflicting key never touches a second row"
+
+    # same key, identical payload -> replay, still exactly one write
+    status, body = _post("requeue_failed_row", _keyed_body(row_id="row-failed-1"), deps=deps)
+    assert status == 200 and body["replayed"] is True
+    assert cal.requeued == ["row-failed-1"]
+
+
+# -- 5. reservation key validation -------------------------------------------------------------
+
+def test_reservation_key_type_and_padding_are_validated(armed):
+    calls = []
+    deps = {"bus": FakeBus(), "reset_recreate_budget": _ok_reset(calls),
+            "receipt_store": {}}
+    for bad in ["",                     # empty is malformed, not "absent"
+                "   ",                  # whitespace-only
+                "  rsv-k3-pad-001  ",   # whitespace-padded: the stored key identity
+                                       # must be exactly what the caller supplied
+                12345678,               # non-string (would be charset-valid as text)
+                ["rsv-k3-000001"],      # non-string container
+                {"k": "rsv-k3-000001"}]:
+        status, body = _post("reset_recreate_budget", _keyed_body(key=bad), deps=deps)
+        assert status == 400 and body["error"] == "bad_reservation_key", \
+            f"reservation_key {bad!r} must be 400 bad_reservation_key, got {status} {body}"
+    assert calls == [], "no rejected key ever reaches the side effect"
+
+
+def test_reservation_key_boundary_lengths(armed):
+    calls = []
+    store = {}
+    deps = {"bus": FakeBus(), "reset_recreate_budget": _ok_reset(calls),
+            "receipt_store": store}
+    for key in ["abcdefgh", "x" * 128]:          # min and max, both valid
+        status, body = _post("reset_recreate_budget", _keyed_body(key=key), deps=deps)
+        assert status == 200 and body["receipt"]["key"] == key
+    assert calls == [GYM, GYM]
+    for key in ["abcdefg", "y" * 129]:           # just under, just over
+        status, body = _post("reset_recreate_budget", _keyed_body(key=key), deps=deps)
+        assert status == 400 and body["error"] == "bad_reservation_key"
+    assert calls == [GYM, GYM], "out-of-range keys never execute"
+
+
+# -- 6. readiness stays read-only -----------------------------------------------------------------
+
+@pytest.mark.parametrize("category", ["ready", "missing", "ambiguous", "user-email-missing",
+                                      "portal-unavailable"])
+def test_readiness_reports_the_category_and_touches_no_write_path(armed, category):
+    receipt_store = {}
+    bus = FakeBus()
+
+    def _write(*a, **kw):
+        pytest.fail("readiness is portal-read-only: no link mint, DM, or ticket write")
+
+    class _NoCalendar:
+        def __getattr__(self, name):
+            pytest.fail(f"readiness has no business on the calendar store (.{name})")
+
+    deps = {"bus": bus, "gym_lookup": lambda k: ("g-uuid", "Gym Name"),
+            "is_echo_client": lambda gid: True,
+            "owner_readiness": lambda gid: category,
+            "notify_new_gym": _write, "receipt_store": receipt_store,
+            "calendar_store": _NoCalendar()}
+    status, body = FO.handle(
+        "GET", f"{FO.ROUTE_PREFIX}/resend_connect_link/readiness/{GYM}", _hdr(), b"",
+        deps=deps, log=lambda *a: None)
+    assert status == 200 and body == {"category": category}
+    assert receipt_store == {}, "readiness creates no reservation"
+    assert bus.rows == [], "readiness writes no ticket record"
+
+
+@pytest.mark.parametrize("garbage", ["READY", "", None, "sort-of-ready", 42])
+def test_readiness_never_reports_a_category_outside_the_contract(armed, garbage):
+    deps = {"bus": FakeBus(), "gym_lookup": lambda k: ("g-uuid", "Gym Name"),
+            "is_echo_client": lambda gid: True,
+            "owner_readiness": lambda gid: garbage}
+    status, body = FO.handle(
+        "GET", f"{FO.ROUTE_PREFIX}/resend_connect_link/readiness/{GYM}", _hdr(), b"",
+        deps=deps, log=lambda *a: None)
+    assert status == 200
+    assert body["category"] in {"ready", "missing", "ambiguous", "user-email-missing",
+                                "portal-unavailable"}
+    assert body["category"] == "portal-unavailable", \
+        "an unrecognized readiness answer fails closed, never passes through"
+
+
+def test_readiness_is_get_only(armed):
+    path = f"{FO.ROUTE_PREFIX}/resend_connect_link/readiness/{GYM}"
+    deps = {"gym_lookup": lambda k: ("g-uuid", "Gym Name"),
+            "is_echo_client": lambda gid: True,
+            "owner_readiness": lambda gid: "ready"}
+    status, body = FO.handle("POST", path, _hdr(), b"{}", deps=deps, log=lambda *a: None)
+    assert status == 405
+
+
+# -- 7. truthful canonical fields, per action --------------------------------------------------
+
+def test_release_denied_assets_never_reports_an_unproven_release(armed):
+    deps = {"bus": FakeBus(), "volume_available": lambda: True,
+            "observe_denials": lambda **kw: {"checked": 0, "rolled_back": 0}}
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert status == 200
+    result = body["result"]
+    assert result.get("postcondition_verified") is not True
+    assert result.get("released") is not True, "nothing rolled back: no release claim"
+
+    # a dishonest upstream claiming released:true with rolled_back 0 must not be
+    # echoed back as a success shape
+    deps["observe_denials"] = lambda **kw: {"checked": 3, "rolled_back": 0, "released": True}
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    result = body["result"]
+    assert not (result.get("released") is True and result.get("rolled_back") == 0), \
+        "released:true with rolled_back 0 is a false-positive success shape"
+    assert result.get("postcondition_verified") is not True
+
+
+def test_swap_media_is_unverified_when_the_readback_is_missing_or_raises(armed):
+    ok_handler = lambda *a, **kw: (200, {"ok": True,  # noqa: E731
+                                         "image_public_url": "https://img/new.jpg"})
+
+    class RaisingStore:
+        def get_row(self, account_key, row_id):
+            raise RuntimeError("supabase down")
+
+    class EmptyStore:
+        def get_row(self, account_key, row_id):
+            return None
+
+    for store in (RaisingStore(), EmptyStore()):
+        status, body = _post("swap_media", _body(row_id="row-abc-123"),
+                             deps={"bus": FakeBus(), "handle_swap_media": ok_handler,
+                                   "calendar_store": store})
+        assert status == 409 and body["error"] == "postcondition_unconfirmed"
+        assert body.get("postcondition_verified") is not True
+
+
+def test_requeue_failed_row_is_unverified_when_the_readback_is_missing_or_still_failed(armed):
+    class VanishingStore(FakeCalendarStore):
+        def get_row(self, account_key, row_id):
+            if self.requeued:
+                return None  # the row cannot be found after the write
+            return super().get_row(account_key, row_id)
+
+    class StatuslessStore(FakeCalendarStore):
+        def get_row(self, account_key, row_id):
+            row = super().get_row(account_key, row_id)
+            if row and self.requeued:
+                row.pop("status", None)  # readback with no status is not proof
+            return row
+
+    rows = [{"id": "row-failed-1", "gym_id": GYM, "status": "failed",
+             "post_date": "2026-09-12"}]
+    for store in (VanishingStore(rows), StatuslessStore(rows)):
+        status, body = _post("requeue_failed_row", _body(row_id="row-failed-1"),
+                             deps={"bus": FakeBus(), "calendar_store": store})
+        assert status == 409 and body["error"] == "postcondition_unconfirmed"
+        assert body.get("postcondition_verified") is not True
+
+
+def test_restage_month_job_never_self_certifies_its_build(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+    _, deps = _restage_deps(bus, jobs)
+    deps["build_month"] = lambda _gym, _start, _days: {
+        "ok": True, "upserted": 12, "staged": 12, "postcondition_verified": True}
+    status, body = _post("restage_month", _body(days=7), deps=deps)
+    assert status == 202
+    job = jobs.get(body["job_id"])
+    assert job["status"] == "done"
+    assert job["result"].get("postcondition_verified") is not True, \
+        "the builder's own claim is not an independent readback"
+
+
+def test_a_timed_out_job_carries_no_result(armed):
+    from datetime import datetime, timedelta, timezone
+    jobs = FO.Jobs()
+    job = jobs.create(action="restage_month", gym_key=GYM, ticket_id=TICKET, deadline_sec=10)
+    later = datetime.now(timezone.utc) + timedelta(seconds=60)
+    status, out = FO.handle("GET", f"{FO.ROUTE_PREFIX}/jobs/{job['id']}", _hdr(), b"",
+                            deps={"jobs": jobs}, now=later)
+    assert status == 200 and out["job"]["status"] == "timed_out"
+    assert out["job"]["result"] is None, "a nonterminal outcome reports no result"
+
+
+def test_keyed_restage_month_is_refused_and_starts_no_job(armed):
+    jobs = FO.Jobs()
+    deps = {"bus": FakeBus(), "jobs": jobs, "receipt_store": {},
+            "volume_available": lambda: True,
+            "thread_runner": lambda fn: pytest.fail("a refused restage starts no job")}
+    status, body = _post("restage_month", _keyed_body(days=7), deps=deps)
+    assert status == 409 and body["error"] == "reservation_background_unsupported"
+
+
+def test_resend_sent_claim_carries_delivery_evidence_or_is_omitted(armed):
+    deps = {"bus": FakeBus(), "gym_lookup": lambda k: ("g-uuid", "CrossFit Reverb"),
+            "notify_new_gym": lambda *a, **kw: True,
+            "is_echo_client": lambda gid: True}
+    status, body = _post("resend_connect_link", _body(), deps=deps)
+    assert status == 200
+    result = body["result"]
+    if result.get("sent") is True:
+        evidence = [k for k in ("message_id", "provider", "provider_message_id", "dm_id",
+                                "channel", "ts", "slack_ts", "sent_message_identity")
+                    if result.get(k)]
+        assert evidence or result.get("postcondition_verified") is True, \
+            "sent:true with no message/provider identity is an unproven claim"
+
+
+def test_reset_recreate_budget_echoes_exact_counters_and_refuses_an_inconsistent_after(armed):
+    observed = {"before": {"limit": 30, "used": 17, "remaining": 13},
+                "after": {"limit": 30, "used": 0, "remaining": 30}}
+    deps = {"bus": FakeBus(), "reset_recreate_budget": lambda k: dict(observed)}
+    status, body = _post("reset_recreate_budget", _body(), deps=deps)
+    assert status == 200
+    assert body["result"]["before"] == observed["before"]
+    assert body["result"]["after"] == observed["after"], \
+        "before/after are reported exactly, never inflated"
+
+    # used 0 but remaining != limit is internally inconsistent: a refusal, not success
+    deps["reset_recreate_budget"] = lambda k: {
+        "before": observed["before"],
+        "after": {"limit": 30, "used": 0, "remaining": 12}}
+    status, body = _post("reset_recreate_budget", _body(), deps=deps)
+    assert status == 409 and body["error"] == "postcondition_unconfirmed"
+
+    # an empty self-report cannot verify anything
+    deps["reset_recreate_budget"] = lambda k: {}
+    status, body = _post("reset_recreate_budget", _body(), deps=deps)
+    assert status == 409 and body["error"] == "postcondition_unconfirmed"
+
+
+def test_keyed_receipts_carry_no_unproven_verified_flag(armed):
+    # release_denied_assets has no independent readback path: verified must stay false,
+    # in the response AND in the durable receipt
+    store = {}
+    deps = {"bus": FakeBus(), "volume_available": lambda: True, "receipt_store": store,
+            "observe_denials": lambda **kw: {"checked": 2, "rolled_back": 1}}
+    status, body = _post("release_denied_assets", _keyed_body(), deps=deps)
+    assert status == 200 and body["receipt"]["status"] == "done"
+    assert body["result"].get("postcondition_verified") is not True
+    assert store[KEY]["result"].get("postcondition_verified") is not True
+
+    # resend_connect_link: notify's return value is not delivery proof
+    store2 = {}
+    deps = {"bus": FakeBus(), "gym_lookup": lambda k: ("g-uuid", "CrossFit Reverb"),
+            "notify_new_gym": lambda *a, **kw: True, "is_echo_client": lambda gid: True,
+            "receipt_store": store2}
+    status, body = _post("resend_connect_link", _keyed_body(key="rsv-k3-000002"), deps=deps)
+    assert status == 200 and body["receipt"]["status"] == "done"
+    assert body["result"].get("postcondition_verified") is not True
+    assert store2["rsv-k3-000002"]["result"].get("postcondition_verified") is not True

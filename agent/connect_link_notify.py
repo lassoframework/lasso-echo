@@ -235,8 +235,16 @@ def _slack_send(channel, text, *, token, http=None):
             data=json.dumps({"channel": channel, "text": text}))
         body = resp.json()
     except Exception:
-        return False
-    return bool(body.get("ok"))
+        return None
+    if not body.get("ok"):
+        return None
+    return {
+        "sent": True,
+        "provider": "slack",
+        "channel": channel,
+        "ts": body.get("ts"),
+        "message_id": body.get("message_id"),
+    }
 
 
 def _default_is_client(gym_id, base_key):
@@ -248,7 +256,7 @@ def _default_is_client(gym_id, base_key):
 
 
 def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None,
-                   is_client=None, force=False):
+                   is_client=None, force=False, return_receipt=False):
     """Send a newly-registered gym's owner its connect link, once. Returns True only
     when a message was actually sent this call. OFF unless
     config.auto_connect_link_enabled(). Never raises; every failure path ESCALATES
@@ -352,7 +360,8 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
         return False
 
     text = _CONNECT_MESSAGE.format(name=email.split("@")[0], gym=gym_name, link=link)
-    if not _slack_send(channel, text, token=token, http=http):
+    send_receipt = _slack_send(channel, text, token=token, http=http)
+    if not send_receipt:
         alert(f"auto connect-link for {base_key}: Slack DM to {email} failed to "
               f"send. Send the connect link by hand: {link}")
         return False
@@ -361,4 +370,7 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
         db.kv_set(dedupe_key, "1")
     except Exception:
         pass  # the message is already sent; a stamp failure risks one resend, not silence
-    return True
+    # Preserve the long-standing boolean return for existing callers. The FIXER
+    # ops lane explicitly asks for the provider receipt so it can verify delivery
+    # without treating a no-exception return as proof.
+    return send_receipt if return_receipt else True
