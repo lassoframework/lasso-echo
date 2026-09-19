@@ -43,7 +43,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 
 VERIFIED = 'verified'
@@ -54,6 +54,8 @@ SOURCE = 'independent_business_check'
 SCHEMA_VERSION = 1
 
 _GYM_KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{2,79}\Z')
+_PORTAL_GYM_ID = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z')
 _REQUEST_KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}\Z')
 # A business observation is only usable to close a deployed code fix.  Keep the
 # deployment binding as a real Git object id, not a generic release label: a
@@ -65,6 +67,12 @@ _STATUS = re.compile(r'[a-z_]{2,32}\Z')
 _FOLDER_ID = re.compile(r'[A-Za-z0-9_-]{3,200}\Z')
 _MAX_EVIDENCE = 160
 _MAX_REASON = 80
+_FORWARD_BOOK_MAX_AGE = timedelta(hours=24)
+# media_source_sync_request_20260917.sql defines the source lifecycle as
+# idle -> queued -> indexing -> ready (or failed).  Only the terminal success
+# state is business proof that the source is usable; every other value is
+# incomplete, failed, missing, or outside the known schema.
+_HEALTHY_MEDIA_SYNC_STATUSES = frozenset({'ready'})
 
 
 class CheckRefused(Exception):
@@ -101,6 +109,28 @@ class CheckCtx:
     merged_sha: str
     params: dict
     read: object                 # injected reader: (table, params) -> list[dict]
+    observed_at: datetime        # timezone-aware clock owned by the observer
+
+
+def _parse_utc_timestamp(value):
+    """Parse an ISO timestamp without guessing a timezone.
+
+    Stored grades are trusted only when they carry an explicit offset.  Accept
+    the Postgres-style trailing Z but reject naive timestamps: interpreting a
+    server-local value as UTC could turn stale or future evidence into proof.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise CheckUnavailable('grade_timestamp_unreadable')
+    raw = value.strip()
+    if raw.endswith(('Z', 'z')):
+        raw = raw[:-1] + '+00:00'
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        raise CheckUnavailable('grade_timestamp_unreadable')
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise CheckUnavailable('grade_timestamp_unreadable')
+    return parsed.astimezone(timezone.utc)
 
 
 def _code(exc):
@@ -110,12 +140,12 @@ def _code(exc):
     return code or 'refused'
 
 
-def _read_rows(ctx, table, params, limit):
+def _bounded_read(read, table, params, limit):
     """One bounded read through the injected reader. Any reader fault, shape
     violation, or limit breach is UNAVAILABLE: partial evidence is not evidence.
     The exception text is deliberately not carried into the record."""
     try:
-        rows = ctx.read(table, params)
+        rows = read(table, params)
     except (CheckRefused, CheckUnavailable):
         raise
     except Exception:
@@ -126,6 +156,41 @@ def _read_rows(ctx, table, params, limit):
     return rows
 
 
+def _read_rows(ctx, table, params, limit):
+    return _bounded_read(ctx.read, table, params, limit)
+
+
+def _resolve_echo_gym_key(read, portal_gym_id):
+    """Resolve the caller's portal UUID through the authoritative alias plane.
+
+    Both directions must be unique and agree.  The second read prevents a
+    duplicated/collided Echo key from being used as proof for either tenant.
+    The caller never supplies the evidence-table key directly.
+    """
+    rows = _bounded_read(read, 'echo_intake_tokens', {
+        'gym_id': f'eq.{portal_gym_id}',
+        'select': 'gym_id,echo_account_key', 'limit': '2'}, 2)
+    if not rows:
+        raise CheckUnavailable('tenant_binding_missing')
+    if len(rows) != 1:
+        raise CheckUnavailable('tenant_binding_ambiguous')
+    row = rows[0]
+    echo_key = row.get('echo_account_key')
+    if (row.get('gym_id') != portal_gym_id or not isinstance(echo_key, str)
+            or not _GYM_KEY.fullmatch(echo_key)):
+        raise CheckUnavailable('tenant_binding_invalid')
+    reverse = _bounded_read(read, 'echo_intake_tokens', {
+        'echo_account_key': f'eq.{echo_key}',
+        'select': 'gym_id,echo_account_key', 'limit': '2'}, 2)
+    if len(reverse) != 1:
+        raise CheckUnavailable(
+            'tenant_binding_missing' if not reverse else 'tenant_binding_ambiguous')
+    if (reverse[0].get('gym_id') != portal_gym_id
+            or reverse[0].get('echo_account_key') != echo_key):
+        raise CheckUnavailable('tenant_binding_mismatch')
+    return echo_key
+
+
 def _check_calendar_row_status(ctx):
     """One content_calendar row for this tenant reads back at the expected status."""
     row_id = ctx.params.get('row_id')
@@ -134,15 +199,16 @@ def _check_calendar_row_status(ctx):
         raise CheckRefused('bad_params')
     if not isinstance(expected, str) or not _STATUS.fullmatch(expected):
         raise CheckRefused('bad_params')
+    echo_gym_key = _resolve_echo_gym_key(ctx.read, ctx.gym_key)
     rows = _read_rows(ctx, 'content_calendar',
-                      {'id': f'eq.{row_id}', 'gym_id': f'eq.{ctx.gym_key}',
+                      {'id': f'eq.{row_id}', 'gym_id': f'eq.{echo_gym_key}',
                        'select': 'id,gym_id,status', 'limit': '2'}, 2)
     if not rows:
         return Observation(True, False, f'calendar_row:{row_id}:absent', 'row_not_found')
     if len(rows) != 1 or rows[0].get('id') != row_id:
         raise CheckUnavailable('reader_partial')
     row = rows[0]
-    if row.get('gym_id') != ctx.gym_key:
+    if row.get('gym_id') != echo_gym_key:
         raise CheckUnavailable('scope_mismatch')
     status = row.get('status')
     if not isinstance(status, str) or not _STATUS.fullmatch(status):
@@ -159,18 +225,30 @@ def _check_forward_book_grade_at_least(ctx):
     minimum = ctx.params.get('min_total')
     if isinstance(minimum, bool) or not isinstance(minimum, int) or not 0 <= minimum <= 100:
         raise CheckRefused('bad_params')
+    echo_gym_key = _resolve_echo_gym_key(ctx.read, ctx.gym_key)
     rows = _read_rows(ctx, 'gym_social_grades',
-                      {'gym_id': f'eq.{ctx.gym_key}', 'window': 'eq.forward_book',
+                      {'gym_id': f'eq.{echo_gym_key}', 'window': 'eq.forward_book',
                        'select': 'gym_id,total,graded_at',
                        'order': 'graded_at.desc', 'limit': '1'}, 1)
     if not rows:
         return Observation(True, False, 'forward_book_grade:none', 'grade_not_found')
     row = rows[0]
-    if row.get('gym_id') != ctx.gym_key:
+    if row.get('gym_id') != echo_gym_key:
         raise CheckUnavailable('scope_mismatch')
     total = row.get('total')
     if isinstance(total, bool) or not isinstance(total, int) or not 0 <= total <= 100:
         raise CheckUnavailable('reader_partial')
+    graded_at = _parse_utc_timestamp(row.get('graded_at'))
+    observed_at = ctx.observed_at
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise CheckUnavailable('observer_clock_unreadable')
+    age = observed_at.astimezone(timezone.utc) - graded_at
+    if age < timedelta(0):
+        return Observation(True, False, f'forward_book_grade:{total}',
+                           'grade_from_future')
+    if age > _FORWARD_BOOK_MAX_AGE:
+        return Observation(True, False, f'forward_book_grade:{total}',
+                           'grade_stale')
     if total < minimum:
         return Observation(True, False, f'forward_book_grade:{total}',
                            'grade_below_minimum')
@@ -182,8 +260,9 @@ def _check_media_source_active(ctx):
     folder_id = ctx.params.get('folder_id')
     if not isinstance(folder_id, str) or not _FOLDER_ID.fullmatch(folder_id):
         raise CheckRefused('bad_params')
+    echo_gym_key = _resolve_echo_gym_key(ctx.read, ctx.gym_key)
     rows = _read_rows(ctx, 'media_source',
-                      {'folder_id': f'eq.{folder_id}', 'gym_id': f'eq.{ctx.gym_key}',
+                      {'folder_id': f'eq.{folder_id}', 'gym_id': f'eq.{echo_gym_key}',
                        'select': 'id,gym_id,folder_id,active,revoked_externally,sync_status',
                        'limit': '2'}, 2)
     if not rows:
@@ -192,10 +271,11 @@ def _check_media_source_active(ctx):
     if len(rows) != 1:
         raise CheckUnavailable('source_ambiguous')
     row = rows[0]
-    if row.get('gym_id') != ctx.gym_key or row.get('folder_id') != folder_id:
+    if row.get('gym_id') != echo_gym_key or row.get('folder_id') != folder_id:
         raise CheckUnavailable('scope_mismatch')
-    status = row.get('sync_status')
-    status = status if isinstance(status, str) and _STATUS.fullmatch(status) else 'unknown'
+    raw_status = row.get('sync_status')
+    status = (raw_status if isinstance(raw_status, str)
+              and _STATUS.fullmatch(raw_status) else 'unknown')
     evidence = f'media_source:{folder_id}:{status}'
     if row.get('active') is not True:
         return Observation(True, False, evidence, 'source_inactive')
@@ -203,6 +283,8 @@ def _check_media_source_active(ctx):
         return Observation(True, False, evidence, 'source_revoked')
     if status == 'failed':
         return Observation(True, False, evidence, 'source_sync_failed')
+    if status not in _HEALTHY_MEDIA_SYNC_STATUSES:
+        return Observation(True, False, evidence, 'source_sync_not_ready')
     return Observation(True, True, evidence)
 
 
@@ -275,7 +357,7 @@ def observe(check_id, *, gym_key, request_key, merged_sha, params=None, deps=Non
     if spec is None:
         # Refused before any identity handling: nothing dynamic ever runs.
         return record(UNVERIFIED, reason='unknown_check')
-    if not _GYM_KEY.fullmatch(gym_key):
+    if not _PORTAL_GYM_ID.fullmatch(gym_key):
         return record(UNVERIFIED, reason='bad_gym_key')
     if not _REQUEST_KEY.fullmatch(request_key):
         return record(UNVERIFIED, reason='bad_request_key')
@@ -289,7 +371,7 @@ def observe(check_id, *, gym_key, request_key, merged_sha, params=None, deps=Non
     if not callable(read):
         return record(UNKNOWN, reason='reader_unavailable')
     ctx = CheckCtx(gym_key=gym_key, request_key=request_key, merged_sha=merged_sha,
-                   params=params, read=read)
+                   params=params, read=read, observed_at=captured)
     try:
         seen = spec.run(ctx)
     except CheckRefused as refused:
