@@ -167,6 +167,9 @@ def test_explicit_consent_denial_stays_out_with_guard_and_bridge_off(monkeypatch
     _photo(photo)
     dam.write_sidecar(str(photo), {"approved": True, "moderation": "clean",
                                    "people": True, "consent": "denied"})
+    # macOS can create this resource-fork sidecar on a non-APFS volume.  It
+    # must not look like a consent-free second image beside the denied photo.
+    (gym / "._one.jpg").write_bytes(b"AppleDouble metadata")
     assert client_content.pick_image("gymx_ig", "2026-09-19", str(gym)) is None
     assert client_month_run._client_media_count(str(gym)) == 0
     monkeypatch.setenv("AGENT_MEDIA_BRIDGE_ALERTS", "true")
@@ -246,6 +249,7 @@ def test_bridge_off_keeps_legacy_planner_count(monkeypatch, tmp_path):
     gym = tmp_path / "gymx"
     gym.mkdir()
     (gym / "legacy.jpg").write_bytes(b"legacy fixture")
+    (gym / "._legacy.jpg").write_bytes(b"AppleDouble metadata")
     assert client_month_run._client_media_count(str(gym)) == 1
 
 

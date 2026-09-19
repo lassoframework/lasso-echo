@@ -88,7 +88,8 @@ def _client_media_count(library_path):
             full = os.path.join(path, name)
             if not os.path.isfile(full):
                 continue
-            if (os.path.splitext(name)[1].lower() in _MEDIA_EXTS
+            if (not name.startswith("._")
+                    and os.path.splitext(name)[1].lower() in _MEDIA_EXTS
                     and not explicitly_refused_local(full)):
                 count += 1
     except OSError:
