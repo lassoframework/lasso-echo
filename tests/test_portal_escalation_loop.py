@@ -47,7 +47,7 @@ class Bus:
     """Enough of bus.py for both halves: the worker's writes and the outbox's dispatch."""
 
     def __init__(self, tickets=()):
-        self.tickets = {t["id"]: dict(t) for t in tickets}
+        self.tickets = {t["id"]: {"request_version": 0, **dict(t)} for t in tickets}
         self.msgs = []
         self.tables = {}
 
@@ -58,6 +58,37 @@ class Bus:
     def set_ticket(self, tid, **fields):
         self.tickets[tid].update(fields)
         return dict(self.tickets[tid])
+
+    def resolve_current_delivery(self, tid, expected_request_version,
+                                 expected_status, expected_classification,
+                                 expected_product, expected_client_id,
+                                 expected_bot_identity, expected_slack_user_id,
+                                 expected_slack_channel_id, expected_slack_thread_ts):
+        ticket = self.tickets.get(tid)
+        allowed = ticket and (
+            expected_status == "verification"
+            and expected_classification in {
+                "answerable_question", "code_fix", "action_request"}
+            or expected_status == "merged"
+            and expected_classification == "code_fix")
+        expected = {
+            "status": expected_status,
+            "classification": expected_classification,
+            "product": expected_product,
+            "client_id": expected_client_id,
+            "bot_identity": expected_bot_identity,
+            "slack_user_id": expected_slack_user_id,
+            "slack_channel_id": expected_slack_channel_id,
+            "slack_thread_ts": expected_slack_thread_ts,
+        }
+        if (not allowed or ticket.get("request_version") != expected_request_version
+                or ticket.get("escalated", False) is not False
+                or ticket.get("hold_tier") is not None
+                or any(ticket.get(field) != value for field, value in expected.items())):
+            return None
+        ticket["status"] = "resolved"
+        ticket["resolved_at"] = datetime.now(timezone.utc).isoformat()
+        return dict(ticket)
 
     def find_new_tickets(self, *, product, source, limit=20):
         return [dict(t) for t in self.tickets.values()
@@ -102,6 +133,12 @@ class Bus:
         m = {"id": f"in-{len(self.msgs)}", "direction": "inbound",
              "attachments": kw.get("meta") or {}, **kw}
         self.msgs.append(m)
+        ticket = self.tickets.get(kw.get("ticket_id"))
+        if ticket is not None:
+            ticket["request_version"] = int(ticket.get("request_version") or 0) + 1
+            if ticket.get("status") == "resolved":
+                ticket["status"] = "verification"
+                ticket["resolved_at"] = None
         return m, False
 
     def inbound_count(self, tid):

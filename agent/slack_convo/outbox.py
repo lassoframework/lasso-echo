@@ -1351,6 +1351,10 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         release_key = ((ticket.get("verification_after") or {}).get("fixer") or {}).get("request_key")
         if not current_key or release_key != current_key:
             return refuse_fix("customer request changed or could not be verified")
+        request_version = ticket.get("request_version")
+        if (not isinstance(request_version, int) or isinstance(request_version, bool)
+                or request_version < 0):
+            return refuse_fix("customer request version is unavailable")
         if not str(ticket.get("slack_channel_id") or "").startswith(("C", "G")):
             return refuse_fix("customer fix has no group conversation for Blake to join")
     # MINOR 4 (audit 7): `surface` was the ticket's SOURCE ("website_tab"), which is not one
@@ -1366,6 +1370,7 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
               "surface": surface, "resolved_by": approved_by, "resolve_notice": True,
               **({"fixer": True, "request_key": current_key,
+                  "request_version": request_version,
                   "pr_url": ticket.get("fix_pr_url")} if customer_fix else {})})
     # MINOR 5 (audit 7): the ticket used to be stamped resolved HERE, before the notice had
     # been delivered -- so a post failure left a ticket permanently asserting it was resolved
