@@ -387,12 +387,10 @@ def test_account_and_story_mapping(armed):
 
 # ---- one bad row never blocks the rest -------------------------------------
 
-def test_publish_failure_reverts_and_others_still_publish(armed):
+def test_timeout_after_provider_accept_holds_claim_and_others_still_publish(
+        armed, monkeypatch):
     class _Boom(Exception):
         pass
-
-    def _raise(draft, account):
-        raise _Boom("meta 500")
 
     store = _FakeStore([_row("bad"), _row("good")])
     # publisher: 'bad' raises, 'good' publishes.
@@ -402,16 +400,23 @@ def test_publish_failure_reverts_and_others_still_publish(armed):
     def publisher(draft, account):
         calls.append(draft.draft_id)
         if draft.draft_id == "bad":
-            raise _Boom("meta 500")
+            raise _Boom("timeout after accept")
         return PublishResult(ok=True, mode="published", media_id="M")
 
+    monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *a, **kw: None)
     summary = cap.publish_due(RUN_DATE, store=store, publisher=publisher, now=LATE_NOW)
 
     assert summary["published"] == ["good"]
     assert summary["failed"] == ["bad"]
-    assert store.failed_calls == ["bad"]                 # claim reverted
-    assert store.rows["bad"]["status"] == "pending"      # retryable
+    assert store.failed_calls == []
+    assert store.rows["bad"]["status"] == "publishing"
+    assert summary["held"] is True
+    assert summary["recovery_required"] == ["bad"]
     assert store.rows["good"]["status"] == "published"
+    assert calls == ["bad", "good"]
+
+    cap.publish_due(RUN_DATE, store=store, publisher=publisher, now=LATE_NOW)
+    assert calls == ["bad", "good"]
 
 
 # ---- Slack notice ----------------------------------------------------------
@@ -1476,27 +1481,54 @@ def test_expired_sweep_excludes_google_business_rows():
 # by the existing publish-exception path, or a direct ops_alerts.alert call, or a
 # kv-deduped per-gym-per-day stamp — never a NEW unbounded alert path.
 
-def test_soft_failure_now_feeds_the_repeat_failure_counter(armed, monkeypatch):
-    """DEFECT 1: a SOFT failure (publisher returns normally with ok=False / a
-    non-'published' mode, never raises) used to fall through with only a print —
-    _note_repeat_failure was wired ONLY to the neighbouring exception branch, so a
-    row stuck soft-failing looped every tick forever with nobody told. Now it counts
-    the same way: silent for the first REPEAT_FAILURE_ALERT_AT-1 ticks, then ONE
-    alert naming ok/mode. mark_publish_failed reverts to pending each tick, so the
-    row is due again next call — simulating the real ~1-min retry loop."""
+def test_ambiguous_failed_result_holds_and_alerts_without_retry(armed, monkeypatch):
     sent = _capture_alerts(monkeypatch)
     store = _FakeStore([_row("soft")])
     pub = _FakePublisher(PublishResult(ok=False, mode="failed", detail="ig 400"))
 
-    for _ in range(cap.REPEAT_FAILURE_ALERT_AT - 1):
-        summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
-        assert sent == []                          # silent below threshold
-        assert store.rows["soft"]["status"] == "pending"   # retryable, not lost
-
     summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert "soft" in summary["failed"]
-    assert len(sent) == 1                           # threshold alert, exactly one
-    assert "ok=False" in sent[0] and "mode='failed'" in sent[0]
+    assert summary["recovery_required"] == ["soft"]
+    assert store.rows["soft"]["status"] == "publishing"
+    assert len(sent) == 1
+    assert "AMBIGUOUS" in sent[0] and "ok=False" in sent[0]
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert len(pub.calls) == 1
+
+
+def test_explicit_provider_rejection_proving_no_post_reverts_for_retry(
+        armed, monkeypatch):
+    from types import SimpleNamespace
+
+    result = SimpleNamespace(ok=False, mode="rejected", media_id="",
+                             detail="validation rejected before create",
+                             definitive_no_post=True)
+    store = _FakeStore([_row("definite")])
+    pub = _FakePublisher(result)
+    monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *a, **kw: None)
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["failed"] == ["definite"]
+    assert summary["recovery_required"] == []
+    assert store.rows["definite"]["status"] == "pending"
+    assert store.failed_calls == ["definite"]
+
+
+def test_failed_result_without_explicit_no_post_contract_never_reclaims(
+        armed, monkeypatch):
+    result = PublishResult(ok=False, mode="rejected", detail="provider said no")
+    store = _FakeStore([_row("uncertain")])
+    pub = _FakePublisher(result)
+    monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *a, **kw: None)
+
+    first = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    second = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert first["recovery_required"] == ["uncertain"]
+    assert second["published"] == []
+    assert store.rows["uncertain"]["status"] == "publishing"
+    assert len(pub.calls) == 1
 
 
 def test_soft_failure_alert_does_not_storm_past_threshold(armed, monkeypatch):

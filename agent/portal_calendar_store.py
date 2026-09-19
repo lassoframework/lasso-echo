@@ -1594,7 +1594,7 @@ class SupabaseCalendarStore:
         return r.json() or []
 
     def mark_published(self, row_id, media_id, published_at,
-                       allow_missing_post_id=False):
+                       allow_missing_post_id=False, expected_claim_token=None):
         """
         Record a successful publish: status='published', published_at=<now iso>,
         late_post_id=<media_id>. Filtered by id AND status='publishing' (audit
@@ -1621,6 +1621,13 @@ class SupabaseCalendarStore:
                      "id. A post we cannot identify cannot be verified or reconciled; "
                      "the row stays claimed and the caller reverts it for retry.")
         params = {"id": f"eq.{row_id}", "status": "eq.publishing"}
+        if expected_claim_token:
+            try:
+                from uuid import UUID
+                expected_claim_token = str(UUID(str(expected_claim_token)))
+            except (TypeError, ValueError, AttributeError):
+                raise PortalStoreError(422, "publish claim token is invalid")
+            params["publish_claim_token"] = f"eq.{expected_claim_token}"
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -1632,6 +1639,7 @@ class SupabaseCalendarStore:
                 "status": "published",
                 "published_at": published_at,
                 "late_post_id": media_id,
+                "publish_claim_token": None,
             },
             timeout=30,
         )

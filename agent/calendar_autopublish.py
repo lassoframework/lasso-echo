@@ -633,6 +633,28 @@ def _alert_publish_blocked(gym_id, row_id, code, reverted=True,
         pass
 
 
+def _alert_ambiguous_publish(gym_id, row_id, detail):
+    """A network attempt may have reached the provider. Keep its owned claim held."""
+    try:
+        from . import ops_alerts
+        ops_alerts.alert(
+            f"calendar row {row_id} (gym {gym_id}) has an AMBIGUOUS publish outcome: "
+            f"{detail}. The row remains in 'publishing' and will NOT retry automatically. "
+            "Reconcile with the provider before releasing the claim.")
+    except Exception:
+        pass
+
+
+def _result_proves_no_post(result):
+    """Explicit publisher contract for a provider rejection before creation.
+
+    False by default. A generic ok=False, a timeout, or an unknown mode is not proof.
+    Publisher adapters may opt in only when the provider contract guarantees no post
+    exists, using `definitive_no_post=True` on the result object.
+    """
+    return getattr(result, "definitive_no_post", False) is True
+
+
 def _clear_publish_blocked(gym_id):
     """Re-arm the deduped publish-blocked alerts for a gym (called when a row
     passes the guard: the state changed). Best effort; never raises."""
@@ -1181,18 +1203,15 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 else:
                     result = zernio_publish(draft, account, scheduled_for=None)
             except Exception as e:
-                # A real publish error: revert the claim so it retries next run. A CLIENT
-                # row (approved_only) reverts to 'approved' so a transient failure never
-                # forces the client to re-approve; LASSO reverts to 'pending' (unchanged).
-                try:
-                    store.mark_publish_failed(
-                        row_id, revert_status="approved" if approved_only else "pending")
-                except Exception as re:
-                    print(f"[calendar-autopublish] revert failed for row {row_id}: "
-                          f"{type(re).__name__}: {re}")
+                # Once a publisher is called, an exception is ambiguous: a timeout may
+                # arrive after the provider accepted the post. Retrying can create a
+                # duplicate, so retain the owned claim for reconciliation.
                 failed.append(row_id)
+                recovery_required.append(row_id)
                 print(f"[calendar-autopublish] publish failed for row {row_id}: "
                       f"{type(e).__name__}: {e}")
+                _alert_ambiguous_publish(gym_id, row_id,
+                                         f"publisher raised {type(e).__name__}")
                 _note_repeat_failure(row_id, gym_id, e)
                 continue
 
@@ -1209,6 +1228,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 # keeps its historic 3-arg shape for every other store implementation.
                 _mp_kwargs = ({"allow_missing_post_id": True}
                               if getattr(result, "dedup", False) else {})
+                if claim_token:
+                    _mp_kwargs["expected_claim_token"] = claim_token
                 store.mark_published(row_id, getattr(result, "media_id", ""),
                                      _now_iso(now), **_mp_kwargs)
             except Exception as e:
@@ -1240,24 +1261,30 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             published_accounts.add(account.key)
             if daily_cap:
                 _bump_pub_count(gym_id, run_date)
-        else:
-            try:
-                store.mark_publish_failed(
-                    row_id, revert_status="approved" if approved_only else "pending")
-            except Exception as e:
-                print(f"[calendar-autopublish] revert failed for row {row_id}: "
-                      f"{type(e).__name__}: {e}")
+        elif mode == "would_publish" or _result_proves_no_post(result):
+            # `would_publish` is the publisher's pre-network kill-switch contract.
+            # A provider rejection may also opt into definitive_no_post only when its
+            # API guarantees that no post exists. Both are safe to retry.
+            _reason = ("publisher gate prevented network attempt" if mode == "would_publish"
+                       else f"provider rejection proved no post: {getattr(result, 'detail', '')}")
+            reverted = _revert_to_pending(
+                store, row_id, reject_reason=_reason, gym_id=gym_id,
+                expected_claim_token=claim_token,
+                revert_status="approved" if approved_only else "pending")
+            if not reverted:
+                recovery_required.append(row_id)
             failed.append(row_id)
-            # DEFECT 1 (audit 2026-08-30): a SOFT failure (publisher returned
-            # normally with ok=False or mode != 'published', e.g. 'would_publish')
-            # used to fall through here with no counter and no alert at all — only
-            # the neighbouring EXCEPTION branch above called _note_repeat_failure,
-            # so a row stuck soft-failing (never raising) looped every ~1-min tick
-            # forever, completely invisibly. Feed it into the SAME strike counter,
-            # naming ok/mode so the eventual alert says what actually happened.
             _note_repeat_failure(
                 row_id, gym_id,
                 RuntimeError(f"soft publish failure: ok={ok!r} mode={mode!r}"))
+        else:
+            # A normal return is still ambiguous unless the adapter explicitly proves
+            # no post exists. Keep the claim so a later tick cannot resend it.
+            failed.append(row_id)
+            recovery_required.append(row_id)
+            detail = f"publisher returned ok={ok!r} mode={mode!r}"
+            _alert_ambiguous_publish(gym_id, row_id, detail)
+            _note_repeat_failure(row_id, gym_id, RuntimeError(detail))
 
     # ONE lightweight Slack "posted" notice, matching the auto-approve notice style.
     # Only sent when something actually published. Never carries a token or secret.

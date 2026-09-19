@@ -213,6 +213,22 @@ def test_old_claim_cannot_rollback_same_row_after_second_worker_reclaims(
     assert row["publish_claim_token"] is None
 
 
+def test_mark_published_filters_by_owned_claim_token(monkeypatch):
+    token = "22222222-2222-4222-8222-222222222222"
+    updated = {"id": "row-1", "status": "published", "gym_id": "lasso"}
+    http = _FakeHTTP(patch_resp=_Resp(200, [updated]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    pcs.SupabaseCalendarStore().mark_published(
+        "row-1", "provider-1", "2026-08-10T12:00:00Z",
+        expected_claim_token=token)
+
+    _, _, params, _, body = http.calls[0]
+    assert params["status"] == "eq.publishing"
+    assert params["publish_claim_token"] == f"eq.{token}"
+    assert body["publish_claim_token"] is None
+
+
 def _row(row_id, gym_id="lasso", post_date="2026-08-06", account="instagram",
          status="pending", caption=None, image_url="https://cdn/x.jpg",
          pillar="education"):
