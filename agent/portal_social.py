@@ -565,7 +565,10 @@ def _media_bridge_status(account_key, *, now=None):
     try:
         snapshot = media_bridge.shared_snapshot(base)
         if snapshot is media_bridge._SHARED_RUNWAY_UNAVAILABLE:
-            fallback, notice_state = _local_media_bridge_payload(base, now=now)
+            if media_bridge.local_runway_fallback_enabled():
+                fallback, notice_state = _local_media_bridge_payload(base, now=now)
+            else:
+                fallback, notice_state = _neutral_media_bridge_state()
         elif snapshot is None:
             # A shared read cannot distinguish a missing row from an outage or a
             # not-yet-projected worker transition.  Never call that runway clear.

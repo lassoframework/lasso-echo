@@ -13,13 +13,14 @@ browser client.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 import re
 
 from . import config
 
 
 _TABLE = "media_runway_state"
+_UPSERT_RPC = "upsert_media_runway_state"
 _TIMEOUT_SECONDS = 10
 _EPISODE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -176,7 +177,7 @@ class SharedMediaRunwayStore:
             response = self._client().get(
                 self._rest(),
                 params={"gym_id": f"eq.{tenant}",
-                        "select": "gym_id,fallback_episode,notice_state,updated_at",
+                        "select": "gym_id,revision,fallback_episode,notice_state,updated_at",
                         "limit": "1"},
                 headers=self._headers(), timeout=_TIMEOUT_SECONDS)
             if getattr(response, "status_code", 500) >= 400:
@@ -184,47 +185,80 @@ class SharedMediaRunwayStore:
             rows = response.json() or []
             if len(rows) != 1 or rows[0].get("gym_id") != tenant:
                 return None
+            revision = rows[0].get("revision")
+            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+                return None
             fallback = _fallback_projection(rows[0].get("fallback_episode"))
             notice = _notice_projection(rows[0].get("notice_state"))
             if fallback is _INVALID or notice is _INVALID:
                 return None
-            return {"gym_id": tenant,
+            return {"gym_id": tenant, "revision": revision,
                     "fallback_episode": None if fallback is _CLEAR else fallback,
                     "notice_state": notice, "updated_at": rows[0].get("updated_at")}
         except Exception:
             return None
 
-    def upsert(self, gym_id, fallback_episode, notice_state):
-        """Atomically replace one tenant's two safe projections.
+    def compare_and_swap(self, gym_id, *, expected_revision, revision,
+                         fallback_episode, notice_state):
+        """Publish a snapshot only when the shared revision is still expected.
 
-        Both values are validated before any HTTP call.  ``on_conflict=gym_id``
-        keeps retries idempotent and the represented row must echo the same tenant
-        key before this method reports success.
+        The worker reads the shared row first and uses this compare-and-swap to
+        reserve a strictly newer revision for its authoritative local snapshot.
+        A concurrent winner makes this call return ``False``; callers then re-read
+        both stores and retry instead of overwriting the winner from stale state.
         """
         tenant = _tenant(gym_id)
         fallback = _fallback_projection(fallback_episode)
         notice = _notice_projection(notice_state)
-        if (not tenant or fallback is _INVALID or notice is _INVALID
+        if (not tenant or isinstance(expected_revision, bool)
+                or not isinstance(expected_revision, int) or expected_revision < 0
+                or isinstance(revision, bool) or not isinstance(revision, int)
+                or revision <= expected_revision
+                or fallback is _INVALID or notice is _INVALID
                 or not self.available()):
             return False
         try:
             response = self._client().post(
-                self._rest(), params={"on_conflict": "gym_id"},
+                f"{self._url}/rest/v1/rpc/{_UPSERT_RPC}",
                 headers=self._headers({
                     "Content-Type": "application/json",
-                    "Prefer": "resolution=merge-duplicates,return=representation",
                 }),
-                json=[{"gym_id": tenant,
-                       "fallback_episode": None if fallback is _CLEAR else fallback,
-                       "notice_state": notice,
-                       "updated_at": datetime.now(timezone.utc).isoformat()}],
+                json={"p_gym_id": tenant,
+                      "p_expected_revision": expected_revision,
+                      "p_revision": revision,
+                      "p_fallback_episode": None if fallback is _CLEAR else fallback,
+                      "p_notice_state": notice},
                 timeout=_TIMEOUT_SECONDS)
             if getattr(response, "status_code", 500) >= 400:
                 return False
             rows = response.json() or []
-            return len(rows) == 1 and rows[0].get("gym_id") == tenant
+            if (len(rows) != 1 or rows[0].get("gym_id") != tenant
+                    or rows[0].get("revision") != revision):
+                return False
+            returned_fallback = _fallback_projection(rows[0].get("fallback_episode"))
+            returned_notice = _notice_projection(rows[0].get("notice_state"))
+            expected_fallback = None if fallback is _CLEAR else fallback
+            return (returned_fallback is not _INVALID
+                    and returned_notice is not _INVALID
+                    and (None if returned_fallback is _CLEAR else returned_fallback)
+                    == expected_fallback
+                    and returned_notice == notice)
         except Exception:
             return False
+
+    def upsert(self, gym_id, revision, fallback_episode, notice_state, *,
+               expected_revision=None):
+        """Compatibility name for callers that supply an explicit CAS guard.
+
+        Unguarded writes are deliberately rejected.  Keeping the method prevents
+        an older caller from crashing during a rolling deploy without restoring
+        the stale-overwrite behavior that the revision protocol exists to prevent.
+        """
+        if expected_revision is None:
+            return False
+        return self.compare_and_swap(
+            gym_id, expected_revision=expected_revision, revision=revision,
+            fallback_episode=fallback_episode, notice_state=notice_state)
 
 
 def default_store():
