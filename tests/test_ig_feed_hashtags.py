@@ -3,7 +3,8 @@ IG feed hashtag fold (agent/ig_feed_hashtags.py + the fold seam in
 agent/real_calendar_mirror._real_row), all offline.
 
 The stored IG feed caption must end with exactly ONE final line of 3-5 hashtags
-drawn ONLY from the gym's approved VoiceDoc; the portal preview and the Zernio
+drawn from the gym's approved VoiceDoc or explicit operator-approved Account
+fallback; the portal preview and the Zernio
 wire share that stored base caption when optional mentions are disabled. Facebook rows, story rows, and
 terminal-status rows are never touched; re-runs are byte-identical; a tag
 already in the caption is never duplicated; a doc with fewer than 3 usable tags
@@ -21,8 +22,9 @@ from agent import backfill_ig_hashtags as bih
 from agent import client_month_run as cmr
 from agent import real_calendar_mirror as rcm
 from agent import real_month_planner as rmp
-from agent.drafter import Draft, DraftStatus
-from agent.voice import load_voice
+from agent.drafter import Draft, DraftStatus, TemplateGenerator, draft_post
+from agent.voice import VoiceDoc, load_voice
+from agent.accounts import Account, Platform, approved_hashtags_for, get_account
 
 
 VOICE_RAW = """# Brand Bible
@@ -104,6 +106,78 @@ def test_no_approved_tags_or_no_voice_leaves_caption_untouched(tmp_path):
     empty_voice = _voice(raw="# Doc\n\nNo tags here.\n", tmp_path=tmp_path)
     assert igfh.ensure_feed_tag_line("Body.", empty_voice) == "Body."
     assert igfh.ensure_feed_tag_line("Body.", None) == "Body."
+
+
+def test_eng_owner_approved_fallback_is_used_only_when_voice_tags_are_empty():
+    eng = Account(
+        key="eng_ig", display_name="ENG", platform=Platform.INSTAGRAM,
+        token_env="ENG_TOKEN", target_id_env="ENG_ID",
+        approved_hashtags=[
+            "#CrossFitENG", "#HYROXENG", "#CapeCoralFitness",
+            "#CrossFit", "#HYROX",
+        ],
+    )
+    assert approved_hashtags_for(eng, []) == [
+        "#CrossFitENG", "#HYROXENG", "#CapeCoralFitness",
+        "#CrossFit", "#HYROX",
+    ]
+    assert approved_hashtags_for(eng, ["#ClientChoice"]) == ["#ClientChoice"]
+
+
+def test_unconfigured_accounts_never_receive_invented_fallback_tags():
+    account = Account(
+        key="other_ig", display_name="Other", platform=Platform.INSTAGRAM,
+        token_env="OTHER_TOKEN", target_id_env="OTHER_ID",
+    )
+    assert approved_hashtags_for(account, []) == []
+
+
+def test_numeric_only_heading_is_not_a_reach_hashtag():
+    account = Account(
+        key="mflh_ig", display_name="MFLH", platform=Platform.INSTAGRAM,
+        token_env="MFLH_TOKEN", target_id_env="MFLH_ID",
+    )
+    assert approved_hashtags_for(account, ["#1"]) == []
+
+
+def test_registered_eng_account_has_exact_owner_approved_fallback():
+    eng = get_account("eng_ig")
+    assert approved_hashtags_for(eng, []) == [
+        "#CrossFitENG", "#HYROXENG", "#CapeCoralFitness",
+        "#CrossFit", "#HYROX",
+    ]
+
+
+def test_draft_post_uses_eng_fallback_for_instagram_only(monkeypatch):
+    from agent import pixel_gate
+
+    monkeypatch.setattr(pixel_gate, "gate_creative", lambda creative: (True, ""))
+    voice = VoiceDoc(raw="Approved ENG voice without a tag section.", hashtags=[])
+    creative = SimpleNamespace(
+        path="eng/member.jpg", public_url="https://cdn/member.jpg",
+        client_note="Start where you are. Our coaches will guide you.",
+        slides=[], slide_urls=[],
+    )
+    eng = get_account("eng_ig")
+    draft = draft_post(
+        eng, creative, "2026-09-20T07:30:00-04:00",
+        voice=voice, generator=TemplateGenerator(),
+    )
+    assert draft.hashtags == [
+        "#CrossFitENG", "#HYROXENG", "#CapeCoralFitness",
+        "#CrossFit", "#HYROX",
+    ]
+
+    fb = Account(
+        key="eng_fb_test", display_name="ENG FB", platform=Platform.FACEBOOK_PAGE,
+        token_env="ENG_FB_TOKEN", target_id_env="ENG_FB_ID",
+        approved_hashtags=list(eng.approved_hashtags),
+    )
+    fb_draft = draft_post(
+        fb, creative, "2026-09-20T07:30:00-04:00",
+        voice=voice, generator=TemplateGenerator(),
+    )
+    assert fb_draft.hashtags == []
 
 
 def test_empty_caption_stays_empty(tmp_path):
