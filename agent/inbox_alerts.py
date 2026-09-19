@@ -147,13 +147,30 @@ def _identity(source, provider, account_id, container_id, item_id):
 # ---- the per-gym sweep (injectable zernio; read only) -----------------------------
 
 
+def _complete_read_or_incomplete(zernio, complete_name, ordinary_name, *args):
+    """Use a bounded proof reader when available.
+
+    Older injected adapters may only expose the ordinary one-page reader.  They
+    still support the historical alert card path, but their evidence is marked
+    incomplete so it can never become a reconcilable FIXER snapshot.  A present
+    complete reader that errors is deliberately not retried through the ordinary
+    method: doing so would hide a failed proof read behind partial data.
+    """
+    from .fixer_reply_reconciliation import pagination_complete
+    complete_reader = getattr(zernio, complete_name, None)
+    if callable(complete_reader):
+        payload = complete_reader(*args) or {}
+        return payload, pagination_complete(payload)
+    payload = getattr(zernio, ordinary_name)(*args) or {}
+    return payload, False
+
+
 def _comment_items(gym_id, zernio, profile_id, now):
     """Unhandled comment items on the gym's recent posts. One thread call per
     commented post; a failed thread fetch skips THAT post only."""
     items = []
-    from .fixer_reply_reconciliation import pagination_complete
-    listing = zernio.list_inbox_comments(profile_id) or {}
-    complete = pagination_complete(listing)
+    listing, complete = _complete_read_or_incomplete(
+        zernio, "list_inbox_comments_complete", "list_inbox_comments", profile_id)
     for post in listing.get("data") or []:
         if not isinstance(post, dict):
             continue
@@ -163,12 +180,13 @@ def _comment_items(gym_id, zernio, profile_id, now):
         if post_age is None or post_age > POST_LOOKBACK_DAYS:
             continue
         try:
-            thread = zernio.inbox_post_comments(
-                post.get("id"), post.get("accountId")) or {}
+            thread, thread_complete = _complete_read_or_incomplete(
+                zernio, "inbox_post_comments_complete", "inbox_post_comments",
+                post.get("id"), post.get("accountId"))
         except Exception:
             complete = False
             continue  # one bad thread never drops the gym's other posts
-        complete = complete and pagination_complete(thread)
+        complete = complete and thread_complete
         for c in thread.get("comments") or []:
             if not isinstance(c, dict) or not needs_reply(c):
                 continue
@@ -200,9 +218,9 @@ def _comment_items(gym_id, zernio, profile_id, now):
 
 
 def _mention_items(gym_id, zernio, profile_id, now):
-    from .fixer_reply_reconciliation import pagination_complete
     items = []
-    listing = zernio.list_inbox_mentions(profile_id) or {}
+    listing, complete = _complete_read_or_incomplete(
+        zernio, "list_inbox_mentions_complete", "list_inbox_mentions", profile_id)
     for m in listing.get("data") or []:
         if not isinstance(m, dict):
             continue
@@ -224,15 +242,15 @@ def _mention_items(gym_id, zernio, profile_id, now):
                 m.get("postId") or m.get("mediaId") or m.get("id"), m.get("id")),
             "provider_evidence": {"reply_state_supported": False},
         })
-    return items, pagination_complete(listing)
+    return items, complete
 
 
 def _review_items(gym_id, zernio, profile_id, now):
     """Recent reviews with NO reply yet. hasReply is the platform's own flag —
     never guessed."""
-    from .fixer_reply_reconciliation import pagination_complete
     items = []
-    listing = zernio.list_inbox_reviews(profile_id) or {}
+    listing, complete = _complete_read_or_incomplete(
+        zernio, "list_inbox_reviews_complete", "list_inbox_reviews", profile_id)
     for r in listing.get("data") or []:
         if not isinstance(r, dict) or r.get("hasReply"):
             continue
@@ -250,7 +268,7 @@ def _review_items(gym_id, zernio, profile_id, now):
                 r.get("id"), r.get("id")),
             "provider_evidence": {"has_reply": r.get("hasReply") is True},
         })
-    return items, pagination_complete(listing)
+    return items, complete
 
 
 def sweep_gym(gym_id, zernio, now):

@@ -861,6 +861,25 @@ class ZernioClient:
             params["platform"] = str(platform)
         return self._get("/v1/inbox/comments", params)
 
+    def list_inbox_comments_complete(self, profile_id, limit=50, platform=None,
+                                     max_pages=None, max_items=None):
+        """Return every inbox post for a profile, or raise without completeness proof.
+
+        The comment alert snapshot must establish that its post listing was
+        exhaustive before it can claim the resulting per-post thread reads are
+        complete.  Keep the ordinary one-page method above for callers that do
+        not need that proof.
+        """
+        params = {"profileId": str(profile_id)}
+        if platform:
+            params["platform"] = str(platform)
+        return self._complete_inbox_pages(
+            "/v1/inbox/comments", params, "data",
+            lambda row: ("comment_listing", str(row.get("platform") or ""),
+                         str(row.get("accountId") or ""),
+                         str(row.get("id") or "")),
+            limit=limit, max_pages=max_pages, max_items=max_items)
+
     def inbox_post_comments(self, post_id, account_id, limit=25):
         """GET /v1/inbox/comments/{postId}?accountId=... -> {comments:[{id,
         message, createdTime, from:{name, username, isOwner}, replyCount,
@@ -892,6 +911,24 @@ class ZernioClient:
         meta}. READ ONLY."""
         return self._get("/v1/inbox/mentions",
                          {"profileId": profile_id, "limit": int(limit)})
+
+    def list_inbox_mentions_complete(self, profile_id, limit=25,
+                                     max_pages=None, max_items=None):
+        """Return every inbox mention, or raise without completeness proof.
+
+        Mentions are never auto-resolved, but an immutable snapshot still needs
+        a complete source read so a later reconciliation cannot mistake a
+        partial capture for a coherent inbox state.
+        """
+        profile_id = str(profile_id)
+        return self._complete_inbox_pages(
+            "/v1/inbox/mentions", {"profileId": profile_id}, "data",
+            lambda row: ("mention_listing", str(row.get("platform") or ""),
+                         str(row.get("accountId") or ""),
+                         str(row.get("postId") or row.get("mediaId")
+                             or row.get("id") or ""),
+                         str(row.get("id") or "")),
+            limit=limit, max_pages=max_pages, max_items=max_items)
 
     def list_inbox_reviews(self, profile_id, limit=25):
         """GET /v1/inbox/reviews?profileId=... -> {data:[{id, platform,

@@ -187,14 +187,15 @@ def test_transport_failure_in_complete_reader_never_proves_resolution():
 
 
 def _complete_zernio(pages):
-    """Captured-provider-shaped pages keyed by the page query Zernio receives."""
+    """Captured-provider-shaped pages keyed by page or ``(path, page)``."""
     calls = []
     client = Z.ZernioClient.__new__(Z.ZernioClient)
 
     def read(path, params=None):
         calls.append((path, dict(params or {})))
         page = int((params or {}).get("page", 0))
-        value = pages[page]
+        key = (path, page)
+        value = pages[key] if key in pages else pages[page]
         if isinstance(value, Exception):
             raise value
         return value
@@ -215,6 +216,13 @@ def _review_page(page, limit, total, pages, rows):
             "pagination": {"page": page, "limit": limit,
                            "total": total, "pages": pages},
             "summary": {"captured_provider_shape": True}}
+
+
+def _inbox_page(page, limit, total, pages, rows):
+    return {"data": rows,
+            "pagination": {"page": page, "limit": limit,
+                           "total": total, "pages": pages},
+            "meta": {"captured_provider_shape": True}}
 
 
 def test_complete_comment_reader_proves_a_single_captured_provider_page():
@@ -241,6 +249,35 @@ def test_complete_review_reader_reads_multiple_pages_and_deduplicates_identity()
     assert result["data"] == [first, second]
     assert result["pagination"]["complete"] is True
     assert [params["page"] for _path, params in calls] == [1, 2]
+
+
+def test_complete_comment_listing_and_mentions_read_multiple_raw_provider_pages():
+    posts = [
+        {"id": "post-1", "platform": "instagram", "accountId": "account-1"},
+        {"id": "post-2", "platform": "instagram", "accountId": "account-1"},
+        {"id": "post-3", "platform": "instagram", "accountId": "account-1"},
+    ]
+    mentions = [
+        {"id": "mention-1", "platform": "instagram", "accountId": "account-1"},
+        {"id": "mention-2", "platform": "instagram", "accountId": "account-1"},
+        {"id": "mention-3", "platform": "instagram", "accountId": "account-1"},
+    ]
+    client, calls = _complete_zernio({
+        ("/v1/inbox/comments", 1): _inbox_page(1, 2, 3, 2, posts[:2]),
+        ("/v1/inbox/comments", 2): _inbox_page(2, 2, 3, 2, posts[2:]),
+        ("/v1/inbox/mentions", 1): _inbox_page(1, 2, 3, 2, mentions[:2]),
+        ("/v1/inbox/mentions", 2): _inbox_page(2, 2, 3, 2, mentions[2:]),
+    })
+    listed = client.list_inbox_comments_complete(PROFILE, limit=2)
+    found_mentions = client.list_inbox_mentions_complete(PROFILE, limit=2)
+    assert listed["data"] == posts
+    assert found_mentions["data"] == mentions
+    assert listed["pagination"]["complete"] is True
+    assert found_mentions["pagination"]["complete"] is True
+    assert [(path, params["page"]) for path, params in calls] == [
+        ("/v1/inbox/comments", 1), ("/v1/inbox/comments", 2),
+        ("/v1/inbox/mentions", 1), ("/v1/inbox/mentions", 2),
+    ]
 
 
 @pytest.mark.parametrize("payload", [
@@ -315,23 +352,23 @@ class CompleteInboxProvider:
     def find_profile_id(self, gym):
         return PROFILE
 
-    def list_inbox_comments(self, profile_id, **kwargs):
+    def list_inbox_comments_complete(self, profile_id, **kwargs):
         return {"data": [{"id": "post-1", "accountId": "account-1",
                           "platform": "instagram", "commentCount": 1,
                           "createdTime": NOW.isoformat(), "permalink": "https://example/post"}],
                 "pagination": {"complete": True}}
 
-    def inbox_post_comments(self, post_id, account_id, **kwargs):
+    def inbox_post_comments_complete(self, post_id, account_id, **kwargs):
         return {"comments": [{"id": "comment-1", "platform": "instagram",
                               "message": "Can I try a class?", "createdTime": NOW.isoformat(),
                               "from": {"isOwner": False}, "replies": [],
                               "isHidden": False}],
                 "pagination": {"complete": True}}
 
-    def list_inbox_mentions(self, profile_id, **kwargs):
+    def list_inbox_mentions_complete(self, profile_id, **kwargs):
         return {"data": [], "pagination": {"complete": True}}
 
-    def list_inbox_reviews(self, profile_id, **kwargs):
+    def list_inbox_reviews_complete(self, profile_id, **kwargs):
         return {"data": [], "pagination": {"complete": True}}
 
 
@@ -352,3 +389,52 @@ def test_new_delivered_alert_carries_a_durable_snapshot_id(monkeypatch):
     assert snapshots[snapshot_id]["complete"] is True
     assert f"Evidence snapshot: {snapshot_id}" in sent[0]
     assert snapshots[snapshot_id]["items"][0]["identity"] == _identity()
+
+
+def test_raw_complete_capture_is_immutable_and_reconciles_after_owner_reply(monkeypatch):
+    """A live-shaped multi-page read, not adapter-provided ``complete`` metadata."""
+    monkeypatch.setenv("AGENT_INBOX_ALERTS", "true")
+    quiet_posts = [{"id": f"quiet-{i}", "accountId": "account-1",
+                    "platform": "instagram", "commentCount": 0,
+                    "createdTime": NOW.isoformat(), "permalink": "https://example/quiet"}
+                   for i in range(50)]
+    active_post = {"id": "post-1", "accountId": "account-1",
+                   "platform": "instagram", "commentCount": 1,
+                   "createdTime": NOW.isoformat(), "permalink": "https://example/post"}
+    pending_comment = {"id": "comment-1", "platform": "instagram",
+                       "message": "Can I try a class?", "createdTime": NOW.isoformat(),
+                       "from": {"isOwner": False}, "replies": [], "isHidden": False}
+    pages = {
+        ("/v1/inbox/comments", 1): _inbox_page(1, 50, 51, 2, quiet_posts),
+        ("/v1/inbox/comments", 2): _inbox_page(2, 50, 51, 2, [active_post]),
+        ("/v1/inbox/comments/post-1", 1): _comment_page(
+            1, 25, 1, 1, [pending_comment]),
+        ("/v1/inbox/mentions", 1): _inbox_page(1, 25, 0, 0, []),
+        ("/v1/inbox/reviews", 1): _review_page(1, 25, 0, 0, []),
+    }
+    provider, calls = _complete_zernio(pages)
+    provider.find_profile_id = lambda gym: PROFILE if gym == GYM else None
+    snapshots, kv = {}, {}
+    result = inbox_alerts.run(
+        gyms=[GYM], zernio=provider, now=NOW, notifier=lambda *_: True,
+        kv_get=lambda key, default="": kv.get(key, default),
+        kv_set=lambda key, value: kv.__setitem__(key, value),
+        snapshot_store=snapshots)
+    summary = result["gyms"][0]
+    snapshot_id = summary["reply_snapshot_id"]
+    original = snapshots[snapshot_id]
+    assert summary["reply_snapshot_complete"] is True
+    assert original["complete"] is True
+    assert ("/v1/inbox/comments", {"profileId": PROFILE, "page": 2, "limit": 50}) in calls
+    assert original["items"][0]["provider_evidence"] == {
+        "is_hidden": False, "owner_reply_ids": []}
+
+    pages[("/v1/inbox/comments/post-1", 1)] = _comment_page(
+        1, 25, 1, 1, [dict(pending_comment, replies=[
+            {"id": "owner-reply", "from": {"isOwner": True}}])])
+    reconciliation = R.reconcile_snapshot(snapshot_id, GYM, zernio=provider,
+                                           store=snapshots, now=NOW)
+    assert reconciliation["complete"] is True
+    assert reconciliation["resolved"] is True
+    # The saved capture remains its original, immutable provider evidence.
+    assert snapshots[snapshot_id] == original
