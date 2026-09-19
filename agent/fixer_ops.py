@@ -227,7 +227,10 @@ def _business_reader(deps):
     bus = deps.get("bus")
     if callable(getattr(bus, "_get", None)):
         return bus._get
-    from .fixer_business_evidence import read_rest
+    # The production PostgREST reader lives with the other bounded, read-only
+    # FIXER evidence adapters.  fixer_business_evidence deliberately owns no
+    # transport or environment access of its own.
+    from .fixer_evidence import read_rest
     return read_rest
 
 

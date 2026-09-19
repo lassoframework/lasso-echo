@@ -903,7 +903,15 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     # in #fixer alone is not participation in the client's channel. Read membership at
     # dispatch; Slack read failures, one-to-one DMs and unsupported channel types hold.
     channel = ticket.get("slack_channel_id")
-    fixer_customer_slack = bool(customer_fix)
+    # A grounded answer authored by FIXER is intentionally exempt from the
+    # code-fix deployment proof above, but it is still a FIXER customer
+    # outbound.  Blake's membership and visible inclusion apply to every such
+    # Slack message, not only to code-fix completion notices.
+    fixer_customer_slack = bool(
+        channel
+        and recipient_kind not in ("staff", "coach")
+        and (customer_fix or att.get("fixer"))
+    )
     if fixer_customer_slack:
         try:
             member = bool(channel and channel.startswith(("C", "G")) and member_check and
@@ -965,9 +973,11 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             if not stored or stored.get("body") != sent_body:
                 raise RuntimeError("FIXER Slack body update was not confirmed")
             row = {**row, "body": sent_body}
-        # Membership, claiming, and body persistence can each take long enough for
-        # another customer message or a changed verification record to arrive.
-        # Re-read both immediately before the irreversible Slack call.
+    if customer_fix:
+        # Claiming and body persistence can each take long enough for another
+        # customer message or a changed verification record to arrive. Re-read
+        # deployment and request identity immediately before a code-fix notice.
+        # Grounded answer-only rows bypass only this deployment-proof branch.
         fresh = bus.ticket(ticket["id"])
         try:
             current_key = _current_fixer_request_key(bus, fresh) if fresh else None

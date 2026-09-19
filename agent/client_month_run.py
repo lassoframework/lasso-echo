@@ -2062,35 +2062,22 @@ def _span_scoped_delete_claim(store, base_key, months, span_first, span_last,
     return total
 
 
-def _out_of_span_preserve_dates(store, base_key, months, span_first, span_last,
-                                preserve_dates=(), log=None):
-    """Return this gym's dates outside the requested replacement span.
+def _out_of_span_preserve_dates(months, span_first, span_last,
+                                preserve_dates=()):
+    """Return *every* calendar date outside the requested replacement span.
 
-    ``delete_month`` is month-grained.  A mid-month rebuild must therefore add
-    every existing out-of-span date to ``preserve_dates`` before deleting, or
-    it would silently erase unrelated calendar rows.  If the bounded read is
-    unavailable, return ``None`` so the caller can fail closed rather than do a
-    destructive partial-month write.
+    The complete date set closes the read/delete race: even an out-of-span row
+    inserted on a previously empty day after our snapshot is protected by the
+    database delete predicate.  Existing rows do not need to be enumerated.
     """
-    list_month = getattr(store, "list_month", None)
-    if list_month is None:
-        return None
+    import calendar
+    from datetime import date
     keep = {str(d)[:10] for d in (preserve_dates or ()) if str(d or "")[:10]}
     for month in months:
-        try:
-            rows = list_month(base_key, month) or []
-        except Exception as exc:  # noqa: BLE001
-            if log:
-                log(f"{base_key}: out-of-span preservation read failed for "
-                    f"{month} ({type(exc).__name__}); refusing the rebuild")
-            return None
-        for row in rows:
-            if not isinstance(row, dict):
-                return None
-            if str(row.get("gym_id")) != str(base_key):
-                continue
-            pd = str(row.get("post_date") or "")[:10]
-            if pd and (pd < span_first or pd > span_last):
+        year, number = (int(part) for part in month.split("-", 1))
+        for day in range(1, calendar.monthrange(year, number)[1] + 1):
+            pd = date(year, number, day).isoformat()
+            if pd < span_first or pd > span_last:
                 keep.add(pd)
     return keep
 
@@ -2316,13 +2303,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                                                span_first, span_last,
                                                preserve_dates=locked_days, log=log)
         delete_preserve = _out_of_span_preserve_dates(
-            store, base_key, months, span_first, span_last,
-            preserve_dates=locked_days, log=log)
-        # Legacy stores/test doubles may not expose a bounded read. Preserve
-        # their historical behavior; the production Portal store does expose
-        # list_month and therefore always takes the safe bounded path above.
-        if delete_preserve is None:
-            delete_preserve = {str(d)[:10] for d in (locked_days or ()) if d}
+            months, span_first, span_last, preserve_dates=locked_days)
+        bounded_delete_read = callable(getattr(store, "list_month", None))
         delete_month = getattr(store, "delete_month", None)
         for month in months:
             if delete_month is not None:
@@ -2330,6 +2312,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                     deleted += delete_month(base_key, month,
                                             preserve_dates=delete_preserve) or 0
                 except TypeError:      # older store/test fakes without the kwarg
+                    if bounded_delete_read:
+                        raise RuntimeError("bounded store cannot preserve dates")
                     deleted += delete_month(base_key, month) or 0
         insert_rows = getattr(store, "insert_rows", None)
         if insert_rows is not None and clean_rows:

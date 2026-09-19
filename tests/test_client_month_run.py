@@ -41,7 +41,7 @@ class _FakeStore:
         self.deleted = []
         self.inserted = []
 
-    def delete_month(self, base_key, month):
+    def delete_month(self, base_key, month, preserve_dates=()):
         self.deleted.append((base_key, month))
         return 0
 

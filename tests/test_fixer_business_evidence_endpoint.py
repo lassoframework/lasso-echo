@@ -110,6 +110,49 @@ def test_success_returns_only_canonical_fresh_bound_record_and_performs_no_write
     assert reader.writes == 0
 
 
+def test_production_composition_uses_bounded_http_reader_without_injected_deps(
+        monkeypatch):
+    """The live route must compose from config plus HTTP, without a test-only bus."""
+    reader = Reader()
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, rows):
+            self._body = json.dumps(rows).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def iter_content(self, _chunk_size):
+            yield self._body
+
+    def get(url, *, params, headers, timeout, stream, allow_redirects):
+        table = url.rsplit("/", 1)[-1]
+        calls.append((table, dict(params), dict(headers), timeout, stream,
+                      allow_redirects))
+        return Response(reader(table, params))
+
+    monkeypatch.setattr("agent.config.supabase_url", lambda: "https://db.example")
+    monkeypatch.setattr("agent.config.supabase_service_key", lambda: "service-key")
+    monkeypatch.setattr("requests.get", get)
+
+    status, body = FO.handle(
+        "POST", FO.BUSINESS_EVIDENCE_PATH, headers(),
+        json.dumps(payload()).encode(), deps={}, now=NOW, log=lambda *_: None)
+
+    assert status == 200 and body["verified"] is True
+    assert [table for table, *_ in calls] == [
+        "support_tickets", "support_messages", "echo_intake_tokens",
+        "echo_intake_tokens", "content_calendar"]
+    assert all(call[2]["apikey"] == "service-key" for call in calls)
+    assert all(call[4] is True and call[5] is False for call in calls)
+
+
 def test_valid_negative_observation_is_canonical_200_never_coerced_to_success():
     reader = Reader(calendar=[{
         "id": "calendar_row_99", "gym_id": ECHO_KEY, "status": "approved"}])

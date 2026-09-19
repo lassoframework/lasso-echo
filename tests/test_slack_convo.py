@@ -1689,6 +1689,82 @@ def test_fixer_customer_slack_reply_requires_blake_in_destination(
                if (m.get("attachments") or {}).get("kind") == A.KIND_ESCALATION)
 
 
+def test_grounded_fixer_answer_requires_blake_in_destination_without_deploy_proof(
+        monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {
+        "id": tid, "status": "verification", "product": "echo",
+        "classification": "answerable_question", "escalated": False,
+        "bot_identity": "echo", "identity_kind": "client",
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        # Grounding verifies the answer; there is deliberately no FIXER
+        # deployment record because this is not a code-fix completion.
+        "verification_after": {"facts": {"instagram": "connected"}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client",
+                       body="Is Instagram connected?")
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="Instagram is connected.",
+        delivery_status="ready", kind=A.KIND_ANSWER,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True})
+    post, calls = _posted()
+
+    summary = OB.run_once(
+        bus, post, identity=IDS.get("echo"), log=lambda *_: None,
+        member_check=lambda _channel, _user: False)
+
+    assert bus.message(row["id"])["delivery_status"] == "suppressed"
+    assert summary["suppressed"] == 1
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
+    assert any("verified Blake membership" in message["body"]
+               for message in bus.messages_for(tid)
+               if (message.get("attachments") or {}).get("kind") == A.KIND_ESCALATION)
+
+
+def test_grounded_fixer_answer_includes_blake_without_requiring_deploy_proof(
+        monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {
+        "id": tid, "status": "verification", "product": "echo",
+        "classification": "answerable_question", "escalated": False,
+        "bot_identity": "echo", "identity_kind": "client",
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        "verification_after": {"facts": {"instagram": "connected"}},
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client",
+                       body="Is Instagram connected?")
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="Instagram is connected.",
+        delivery_status="ready", kind=A.KIND_ANSWER,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True})
+    post, calls = _posted()
+
+    summary = OB.run_once(
+        bus, post, identity=IDS.get("echo"), log=lambda *_: None,
+        member_check=lambda channel, user: channel == "C_CLIENT"
+        and user == OB.config.APPROVER_SLACK_ID)
+
+    expected = f"<@{OB.config.APPROVER_SLACK_ID}> Instagram is connected."
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert bus.message(row["id"])["body"] == expected
+    assert summary["resolved"] == 1
+    assert [call["text"] for call in calls if call["channel"] == "C_CLIENT"] == [expected]
+
+
 def test_slack_membership_read_paginates_and_fails_closed(monkeypatch):
     import types
     pages = []

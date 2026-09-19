@@ -271,3 +271,41 @@ def test_store_without_a_bounded_read_keeps_the_legacy_claim():
     assert res["ok"] is True
     assert res["deleted"] == 14
     assert res["deleted_total"] == 14
+
+
+def test_bounded_read_failure_cannot_erase_out_of_span_days():
+    class _Unreadable(_RestageStore):
+        def list_month(self, base_key, month):
+            raise RuntimeError("temporary read outage")
+
+    store = _Unreadable(_seeded_store().rows)
+    res = cmr._apply(BASE, _incoming(), START, DAYS, store, lambda m: None)
+    assert res["ok"] is True
+    assert {r["id"] for r in store.rows} >= {
+        "outofspan01", "outofspan02"}
+
+
+def test_concurrent_new_out_of_span_date_is_preserved_without_snapshot_help():
+    class _Concurrent(_RestageStore):
+        def delete_month(self, base_key, month, preserve_dates=()):
+            if month == "2026-09":
+                self.rows.append(_row("concurrent01", "2026-09-08"))
+            return super().delete_month(base_key, month, preserve_dates=preserve_dates)
+
+    store = _Concurrent(_seeded_store().rows)
+    res = cmr._apply(BASE, _incoming(), START, DAYS, store, lambda m: None)
+    assert res["ok"] is True
+    assert "concurrent01" in {r["id"] for r in store.rows}
+
+
+def test_bounded_store_without_preserve_support_fails_before_deleting():
+    class _OldDelete(_RestageStore):
+        def delete_month(self, base_key, month):
+            pytest.fail("the legacy delete body must not run after kwarg rejection")
+
+    store = _OldDelete(_seeded_store().rows)
+    res = cmr._apply(BASE, _incoming(), START, DAYS, store, lambda m: None)
+    assert res["ok"] is False
+    assert res["deleted"] == 0
+    assert {r["id"] for r in store.rows} >= {
+        "oldinspan01", "oldinspan02", "outofspan01", "outofspan02"}
