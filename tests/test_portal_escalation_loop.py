@@ -22,6 +22,8 @@ from agent.slack_convo import identities as IDS
 from agent.slack_convo import outbox as OB
 
 ECHO = IDS.IDENTITIES["echo"]
+BUSINESS_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+BUSINESS_ROW_ID = "row-portal-123"
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +47,7 @@ class Bus:
     def __init__(self, tickets=()):
         self.tickets = {t["id"]: dict(t) for t in tickets}
         self.msgs = []
+        self.tables = {}
 
     # tickets
     def ticket(self, tid):
@@ -61,6 +64,36 @@ class Bus:
 
     def find_fixing_tickets(self, *, product, limit=20):
         return [dict(t) for t in self.tickets.values() if t.get("status") == "fixing"]
+
+    # bounded PostgREST-style read used by the independently re-run business check
+    def _get(self, table, params):
+        if not isinstance(params, dict):
+            return []
+        try:
+            limit = int(params.get("limit", 0))
+        except (TypeError, ValueError):
+            return []
+        if limit < 0:
+            return []
+        rows = self.tables.get(table, [])
+        if not isinstance(rows, list):
+            return []
+        result = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            matches = True
+            for key, expected in params.items():
+                if key in {"select", "order", "limit"}:
+                    continue
+                if not isinstance(expected, str) or not expected.startswith("eq."):
+                    return []
+                if row.get(key) != expected[3:]:
+                    matches = False
+                    break
+            if matches:
+                result.append(dict(row))
+        return result[:limit]
 
     # messages
     def record_inbound(self, **kw):
@@ -249,7 +282,8 @@ def test_a_conversational_row_on_a_portal_ticket_is_delivered_to_the_portal_thre
 
 def _fix_proof():
     return {"exit_code": 0, "incomplete": False, "fixer": {
-        "merged_sha": "abc123", "deployment_check": {"verified": True, "sha": "abc123"}}}
+        "merged_sha": BUSINESS_SHA,
+        "deployment_check": {"verified": True, "sha": BUSINESS_SHA}}}
 
 
 def _verify_business(bus):
@@ -257,10 +291,13 @@ def _verify_business(bus):
     request_key = OB._current_fixer_request_key(bus, bus.ticket("t-1"))
     release["request_key"] = request_key
     release["business_postcondition"] = {
-        "source": "independent_business_check", "verified": True,
-        "symptom_resolved": True, "check_id": "business-check-1",
-        "evidence": "Observed the reported symptom resolved for this request",
-        "request_key": request_key, "merged_sha": release["merged_sha"]}
+        "check_id": "calendar_row_status",
+        "params": {"row_id": BUSINESS_ROW_ID, "expected_status": "published"}}
+    bus.tables["content_calendar"] = [{
+        "id": BUSINESS_ROW_ID,
+        "gym_id": bus.ticket("t-1")["client_id"],
+        "status": "published",
+    }]
 
 
 def test_healthy_deployment_with_unresolved_business_symptom_cannot_notify():
@@ -271,7 +308,9 @@ def test_healthy_deployment_with_unresolved_business_symptom_cannot_notify():
                        author_type="client", author_id="owner@gym.com", body="broken", meta={})
     _verify_business(bus)
     release = bus.tickets["t-1"]["verification_after"]["fixer"]
-    release["business_postcondition"]["symptom_resolved"] = False
+    # The fresh, tenant-scoped read is authoritative.  Stamped inline fields do
+    # not matter once the source row no longer proves the declared condition.
+    bus.tables["content_calendar"][0]["status"] = "pending"
     assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
                                      log=lambda *a: None)
     assert [m for m in bus.of_kind(A.KIND_STATUS)
@@ -290,28 +329,7 @@ def test_healthy_deployment_with_unresolved_business_symptom_cannot_notify():
     assert not any(item["channel"] == "G_CLIENT" for item in sent)
 
 
-def test_business_evidence_must_match_request_and_merged_sha():
-    bus = Bus([_ticket(classification="code_fix", status="merged",
-                       fix_pr_url="https://example.test/pr/1",
-                       verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
-    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
-                       author_type="client", author_id="owner@gym.com", body="broken", meta={})
-    _verify_business(bus)
-    business = bus.tickets["t-1"]["verification_after"]["fixer"]["business_postcondition"]
-    for field, stale in (("request_key", "old-request"), ("merged_sha", "old-sha"),
-                         ("evidence", ""), ("check_id", ""),
-                         ("source", "deployment_check")):
-        original = business[field]
-        business[field] = stale
-        assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
-                                         log=lambda *a: None), field
-        business[field] = original
-    assert bus.of_kind(A.KIND_STATUS) == []
-
-
-@pytest.mark.parametrize("bad", [True, 42, ["observed"], {"proof": "yes"}, "  "])
-@pytest.mark.parametrize("field", ["check_id", "evidence"])
-def test_business_evidence_requires_text_at_manual_and_dispatch(field, bad):
+def test_business_pointer_and_fresh_read_must_verify_before_notify():
     bus = Bus([_ticket(classification="code_fix", status="merged",
                        fix_pr_url="https://example.test/pr/1",
                        verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
@@ -319,7 +337,44 @@ def test_business_evidence_requires_text_at_manual_and_dispatch(field, bad):
                        author_type="client", author_id="owner@gym.com", body="broken", meta={})
     _verify_business(bus)
     release = bus.tickets["t-1"]["verification_after"]["fixer"]
-    release["business_postcondition"][field] = bad
+    original = release["business_postcondition"]
+    for pointer in (
+            {"check_id": "", "params": dict(original["params"])},
+            {"check_id": "unknown_check", "params": dict(original["params"])},
+            {"check_id": "calendar_row_status", "params": {}},
+            {"check_id": "calendar_row_status",
+             "params": {"row_id": BUSINESS_ROW_ID, "expected_status": "PUBLISHED"}},
+    ):
+        release["business_postcondition"] = pointer
+        assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                         log=lambda *a: None), pointer
+    release["business_postcondition"] = original
+    bus.tables["content_calendar"][0]["status"] = "pending"
+    assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
+                                     log=lambda *a: None)
+    assert bus.of_kind(A.KIND_STATUS) == []
+
+
+@pytest.mark.parametrize("pointer", [
+    {"check_id": True, "params": {}},
+    {"check_id": 42, "params": {}},
+    {"check_id": ["calendar_row_status"], "params": {}},
+    {"check_id": {"check": "calendar_row_status"}, "params": {}},
+    {"check_id": "  ", "params": {}},
+    {"check_id": "calendar_row_status", "params": True},
+    {"check_id": "calendar_row_status", "params": 42},
+    {"check_id": "calendar_row_status", "params": []},
+    {"check_id": "calendar_row_status", "params": "  "},
+])
+def test_business_pointer_requires_valid_shape_at_manual_and_dispatch(pointer):
+    bus = Bus([_ticket(classification="code_fix", status="merged",
+                       fix_pr_url="https://example.test/pr/1",
+                       verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com", body="broken", meta={})
+    _verify_business(bus)
+    release = bus.tickets["t-1"]["verification_after"]["fixer"]
+    release["business_postcondition"] = pointer
     assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
                                      log=lambda *a: None)
     row = bus.record_outbound(

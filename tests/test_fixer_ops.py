@@ -401,17 +401,25 @@ def test_volume_bound_actions_refuse_honestly_on_a_host_without_it(armed):
 
 def test_swap_media_passes_the_row_and_a_fixer_actor(armed):
     seen = {}
-    row = {"id": "row-abc-123", "gym_id": GYM, "image_url": "https://img/new.jpg"}
+    row = {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
+           "account": "instagram", "format": "feed", "status": "pending",
+           "image_url": "https://img/new.jpg"}
 
     class Store:
         def get_row(self, account_key, row_id):
             assert (account_key, row_id) == (GYM, "row-abc-123")
             return row
 
+        def list_month(self, account_key, month):
+            assert (account_key, month) == (GYM, "2026-09")
+            return [row]
+
     def handler(account_key, draft_id, actor_id, **kw):
         seen.update(account_key=account_key, draft_id=draft_id, actor_id=actor_id)
         return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,
-                     "free": True, "image_public_url": "https://img/new.jpg"}
+                     "free": True, "image_public_url": "https://img/new.jpg",
+                     "siblings_swapped": [], "siblings_left": [],
+                     "sibling_results": []}
 
     status, body = _post("swap_media", _body(row_id="row-abc-123"),
                          deps={"bus": FakeBus(), "handle_swap_media": handler,
@@ -430,18 +438,27 @@ def test_swap_media_passes_the_row_and_a_fixer_actor(armed):
 
 def test_swap_media_does_not_claim_success_when_readback_disagrees(armed):
     calls = []
+    stale = {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
+             "account": "instagram", "format": "feed", "status": "pending",
+             "image_url": "https://img/old.jpg"}
 
     class Store:
         def get_row(self, account_key, row_id):
-            return {"id": row_id, "gym_id": account_key, "image_url": "https://img/old.jpg"}
+            return dict(stale)
+
+        def list_month(self, account_key, month):
+            return [dict(stale)]
 
     def handler(*args):
         calls.append(args)
-        return 200, {"ok": True, "image_public_url": "https://img/new.jpg"}
+        return 200, {"ok": True, "image_public_url": "https://img/new.jpg",
+                     "siblings_swapped": [], "siblings_left": [],
+                     "sibling_results": []}
 
     status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
         "bus": FakeBus(), "handle_swap_media": handler, "calendar_store": Store()})
     assert status == 409 and body["error"] == "postcondition_unconfirmed"
+    assert "calendar readback unconfirmed" in body["summary"]
     assert len(calls) == 1
 
 
@@ -450,9 +467,16 @@ def test_swap_media_does_not_claim_success_when_readback_disagrees(armed):
     {"siblings_left": ["sibling-1"]},
 ])
 def test_swap_media_does_not_verify_unread_or_failed_sibling_writes(armed, sibling_result):
+    row = {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
+           "account": "instagram", "format": "feed", "status": "pending",
+           "image_url": "https://img/new.jpg"}
+
     class Store:
         def get_row(self, account_key, row_id):
-            return {"id": row_id, "gym_id": account_key, "image_url": "https://img/new.jpg"}
+            return dict(row)
+
+        def list_month(self, account_key, month):
+            return [dict(row)]
 
     status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
         "bus": FakeBus(), "calendar_store": Store(),
@@ -464,10 +488,14 @@ def test_swap_media_does_not_verify_unread_or_failed_sibling_writes(armed, sibli
 
 def test_swap_media_verifies_thumbnail_and_each_successful_sibling(armed):
     rows = {
-        "row-abc-123": {"id": "row-abc-123", "gym_id": GYM,
+        "row-abc-123": {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
+                        "account": "instagram", "format": "feed", "status": "pending",
+                        "source_media_asset_id": "asset-1",
                         "image_url": "https://img/full.jpg",
                         "thumbnail_url": "https://img/thumb.jpg"},
-        "sibling-1": {"id": "sibling-1", "gym_id": GYM,
+        "sibling-1": {"id": "sibling-1", "gym_id": GYM, "post_date": "2026-09-12",
+                      "account": "instagram", "format": "story", "status": "pending",
+                      "source_media_asset_id": "asset-1",
                       "image_url": "https://img/sibling-full.jpg",
                       "thumbnail_url": "https://img/sibling-thumb.jpg"},
     }
@@ -476,6 +504,10 @@ def test_swap_media_verifies_thumbnail_and_each_successful_sibling(armed):
         def get_row(self, account_key, row_id):
             row = rows.get(row_id)
             return dict(row) if row and row["gym_id"] == account_key else None
+
+        def list_month(self, account_key, month):
+            return [dict(r) for r in rows.values()
+                    if r["gym_id"] == account_key and r["post_date"].startswith(month)]
 
     status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
         "bus": FakeBus(), "calendar_store": Store(),
@@ -497,14 +529,26 @@ def test_swap_media_verifies_thumbnail_and_each_successful_sibling(armed):
 
 
 def test_swap_media_requires_public_media_identity_to_verify(armed):
+    row = {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
+           "account": "instagram", "format": "feed", "status": "pending",
+           "image_url": "https://img/old.jpg"}
+    get_row_calls = []
+
     class Store:
         def get_row(self, account_key, row_id):
-            pytest.fail("missing media identity should not trigger a readback")
+            get_row_calls.append(row_id)
+            return dict(row)
+
+        def list_month(self, account_key, month):
+            return [dict(row)]
 
     status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
         "bus": FakeBus(), "calendar_store": Store(),
         "handle_swap_media": lambda *args: (200, {"ok": True, "video_url": "https://img/new.mp4"})})
     assert status == 409 and body["error"] == "postcondition_unconfirmed"
+    assert get_row_calls == ["row-abc-123"], \
+        "the pre-swap derivation reads the row once; a missing media identity " \
+        "triggers no post-handler readback"
 
 
 class FakeCalendarStore:
@@ -940,11 +984,18 @@ def test_keyed_replay_returns_the_durable_receipt_and_never_reruns_swap(armed):
     class Store:
         def get_row(self, account_key, row_id):
             return {"id": row_id, "gym_id": account_key,
+                    "post_date": "2026-09-12", "account": "instagram",
+                    "format": "feed", "status": "pending",
                     "image_url": "https://img/new.jpg"}
+
+        def list_month(self, account_key, month):
+            return [self.get_row(account_key, "row-abc-123")]
 
     def handler(account_key, draft_id, actor_id, **kw):
         calls.append(draft_id)
-        return 200, {"ok": True, "image_public_url": "https://img/new.jpg"}
+        return 200, {"ok": True, "image_public_url": "https://img/new.jpg",
+                     "siblings_swapped": [], "siblings_left": [],
+                     "sibling_results": []}
 
     deps = {"bus": FakeBus(), "receipt_store": store, "calendar_store": Store(),
             "handle_swap_media": handler}
@@ -1243,3 +1294,450 @@ def test_keyed_receipts_carry_no_unproven_verified_flag(armed):
     assert status == 200 and body["receipt"]["status"] == "done"
     assert body["result"].get("postcondition_verified") is not True
     assert store2["rsv-k3-000002"]["result"].get("postcondition_verified") is not True
+
+
+# ---- round 4: independent postcondition evidence -------------------------------------------
+# release_denied_assets re-proves the sweep (gym-scoped use-ledger + strict denied-row
+# calendar re-read + per-asset usage counters); restage_month's terminal job re-proves
+# the build (independent before/after comparison of the gym-scoped calendar rows across
+# the requested span). Verified is reachable ONLY through those readbacks.
+
+DENY_DATE = "2026-09-12"
+PREV_LAST_USED = "2026-08-01T00:00:00+00:00"
+
+
+def _use_record(asset_id, **kw):
+    rec = {"asset_id": asset_id, "gym_id": GYM, "prev_used_count": 2,
+           "prev_last_used_at": PREV_LAST_USED, "staged_at": "2026-09-10T00:00:00+00:00",
+           "rolled_back": False}
+    rec.update(kw)
+    return rec
+
+
+class FakeUseLedger:
+    """Gym-scoped gym_media_use readback fake; mutable so a fake sweep can apply its
+    rollback exactly the way rollback_use would."""
+
+    def __init__(self, records_by_date):
+        self.records = {d: [dict(r) for r in recs]
+                        for d, recs in records_by_date.items()}
+        self.calls = []
+
+    def read(self, gym_key):
+        self.calls.append(gym_key)
+        if gym_key != GYM:
+            pytest.fail(f"tenant scope crossed: ledger read for {gym_key}")
+        return [(d, [dict(r) for r in recs]) for d, recs in self.records.items()]
+
+    def roll_all_back(self):
+        for recs in self.records.values():
+            for r in recs:
+                r["rolled_back"] = True
+
+
+def _denied_row(asset_id, status="denied"):
+    return {"id": f"row-{asset_id}", "gym_id": GYM, "post_date": DENY_DATE,
+            "status": status, "pillar": "results",
+            "source_media_asset_id": asset_id}
+
+
+def _release_deps(ledger, rows_read, asset_read, observe):
+    return {"bus": FakeBus(), "volume_available": lambda: True,
+            "denial_ledger_read": ledger.read if ledger is not None else (lambda g: None),
+            "denial_rows_read": rows_read, "asset_read": asset_read,
+            "observe_denials": observe}
+
+
+def test_release_denied_assets_verifies_on_genuine_independent_readback(armed):
+    ledger = FakeUseLedger({DENY_DATE: [_use_record("asset-1")]})
+    rows_calls = []
+
+    def rows_read(gym_key, post_date):
+        rows_calls.append((gym_key, post_date))
+        return [_denied_row("asset-1")]
+
+    def asset_read(asset_id):
+        assert asset_id == "asset-1"
+        return {"id": "asset-1", "gym_id": GYM, "used_count": 2,
+                "last_used_at": PREV_LAST_USED}
+
+    def observe(**kw):
+        ledger.roll_all_back()           # the real sweep's effect, applied by the fake
+        return {"checked": 1, "rolled_back": 1}
+
+    status, body = _post("release_denied_assets", _body(),
+                         deps=_release_deps(ledger, rows_read, asset_read, observe))
+    assert status == 200
+    result = body["result"]
+    assert result["rolled_back"] == 1
+    assert result["postcondition_verified"] is True
+    assert "evidence_note" not in result
+    assert ledger.calls == [GYM, GYM], "pre-sweep derivation + post-sweep re-read"
+    assert rows_calls == [(GYM, DENY_DATE)]
+
+
+def test_release_denied_assets_keyed_receipt_commits_the_verified_readback(armed):
+    ledger = FakeUseLedger({DENY_DATE: [_use_record("asset-1")]})
+    store = {}
+
+    def observe(**kw):
+        ledger.roll_all_back()
+        return {"checked": 1, "rolled_back": 1}
+
+    deps = _release_deps(ledger, lambda g, d: [_denied_row("asset-1")],
+                         lambda a: {"id": a, "gym_id": GYM, "used_count": 2,
+                                    "last_used_at": PREV_LAST_USED}, observe)
+    deps["receipt_store"] = store
+    status, body = _post("release_denied_assets", _keyed_body(), deps=deps)
+    assert status == 200 and body["receipt"]["status"] == "done"
+    assert body["result"]["postcondition_verified"] is True
+    assert store[KEY]["result"]["postcondition_verified"] is True
+
+
+def test_release_denied_assets_unverified_when_the_ledger_rollback_is_missing(armed):
+    # the sweep CLAIMS a rollback but the post-sweep ledger read disagrees
+    ledger = FakeUseLedger({DENY_DATE: [_use_record("asset-1")]})
+    deps = _release_deps(ledger, lambda g, d: [_denied_row("asset-1")],
+                         lambda a: {"id": a, "gym_id": GYM, "used_count": 2,
+                                    "last_used_at": PREV_LAST_USED},
+                         lambda **kw: {"checked": 1, "rolled_back": 1})
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert status == 200
+    assert body["result"]["postcondition_verified"] is False
+    assert "not rolled back" in body["result"]["evidence_note"]
+
+
+def test_release_denied_assets_unverified_when_counters_do_not_match(armed):
+    ledger = FakeUseLedger({DENY_DATE: [_use_record("asset-1")]})
+
+    def observe(**kw):
+        ledger.roll_all_back()
+        return {"checked": 1, "rolled_back": 1}
+
+    deps = _release_deps(ledger, lambda g, d: [_denied_row("asset-1")],
+                         lambda a: {"id": a, "gym_id": GYM, "used_count": 3,
+                                    "last_used_at": PREV_LAST_USED},
+                         observe)
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert status == 200
+    assert body["result"]["postcondition_verified"] is False
+    assert "usage counters" in body["result"]["evidence_note"]
+
+
+def test_release_denied_assets_unverified_when_the_sweep_claims_differ(armed):
+    ledger = FakeUseLedger({DENY_DATE: [_use_record("asset-1")]})
+
+    def observe(**kw):
+        ledger.roll_all_back()
+        return {"checked": 1, "rolled_back": 0}   # under-claim (also covered: over-claim)
+
+    deps = _release_deps(ledger, lambda g, d: [_denied_row("asset-1")],
+                         lambda a: {"id": a, "gym_id": GYM, "used_count": 2,
+                                    "last_used_at": PREV_LAST_USED}, observe)
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert body["result"]["postcondition_verified"] is False
+    assert "claims 0 rollback date(s)" in body["result"]["evidence_note"]
+
+    ledger2 = FakeUseLedger({DENY_DATE: [_use_record("asset-1")]})
+    deps2 = _release_deps(ledger2, lambda g, d: [_denied_row("asset-1")],
+                          lambda a: {"id": a, "gym_id": GYM, "used_count": 2,
+                                     "last_used_at": PREV_LAST_USED},
+                          lambda **kw: {"checked": 1, "rolled_back": 2})
+    status, body = _post("release_denied_assets", _body(), deps=deps2)
+    assert body["result"]["postcondition_verified"] is False
+
+
+def test_release_denied_assets_unverified_when_any_readback_fails(armed):
+    good_asset = lambda a: {"id": a, "gym_id": GYM, "used_count": 2,  # noqa: E731
+                            "last_used_at": PREV_LAST_USED}
+    good_rows = lambda g, d: [_denied_row("asset-1")]  # noqa: E731
+
+    def observe(**kw):
+        return {"checked": 1, "rolled_back": 1}
+
+    # 1. the use-ledger has no bounded readback to give (returns None)
+    ledger = FakeUseLedger({DENY_DATE: [_use_record("asset-1")]})
+    deps = _release_deps(None, good_rows, good_asset, observe)
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert body["result"]["postcondition_verified"] is False
+    assert "unavailable" in body["result"]["evidence_note"]
+
+    # 2. the strict calendar re-read faults (store down is not 'no rows')
+    def rows_down(g, d):
+        raise FO._ReadbackUnavailable("calendar readback failed: 500")
+
+    deps = _release_deps(ledger, rows_down, good_asset, observe)
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert body["result"]["postcondition_verified"] is False
+
+    # 3. the asset counter readback faults after a genuine ledger rollback
+    def roll(**kw):
+        ledger.roll_all_back()
+        return {"checked": 1, "rolled_back": 1}
+
+    def asset_down(a):
+        raise FO._ReadbackUnavailable("media asset store is unavailable")
+
+    deps = _release_deps(ledger, good_rows, asset_down, roll)
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert body["result"]["postcondition_verified"] is False
+    assert "counter readback failed" in body["result"]["evidence_note"]
+
+
+def test_release_denied_assets_unverified_on_a_cross_tenant_asset(armed):
+    ledger = FakeUseLedger({DENY_DATE: [_use_record("asset-1")]})
+
+    def observe(**kw):
+        ledger.roll_all_back()
+        return {"checked": 1, "rolled_back": 1}
+
+    deps = _release_deps(ledger, lambda g, d: [_denied_row("asset-1")],
+                         lambda a: {"id": a, "gym_id": OTHER_GYM, "used_count": 2,
+                                    "last_used_at": PREV_LAST_USED},
+                         observe)
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert body["result"]["postcondition_verified"] is False
+    assert "not this gym's" in body["result"]["evidence_note"]
+
+
+def test_release_denied_assets_never_verifies_a_date_level_asset_mismatch(armed):
+    """A denied calendar row for A cannot certify rollback of staged B."""
+    ledger = FakeUseLedger({DENY_DATE: [_use_record("asset-staged-b")]})
+
+    def observe(**kw):
+        # Mirrors the legacy date-wide side effect.  The stronger wrapper still
+        # must withhold verification because no exact asset binding was proven.
+        ledger.roll_all_back()
+        return {"checked": 1, "rolled_back": 1}
+
+    deps = _release_deps(
+        ledger, lambda g, d: [_denied_row("asset-denied-a")],
+        lambda a: {"id": a, "gym_id": GYM, "used_count": 2,
+                   "last_used_at": PREV_LAST_USED}, observe)
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert status == 200
+    assert body["result"]["postcondition_verified"] is False
+    assert "assets do not exactly match" in body["result"]["evidence_note"]
+
+
+def test_release_denied_assets_zero_rollback_still_verifies_nothing(armed):
+    # nothing demands a rollback: a live gym-media row remains on the date
+    ledger = FakeUseLedger({DENY_DATE: [_use_record("asset-1")]})
+    rows = lambda g, d: [_denied_row("asset-1"), _denied_row("asset-2", status="pending")]  # noqa: E731
+    deps = _release_deps(ledger, rows,
+                         lambda a: {"id": a, "gym_id": GYM, "used_count": 2,
+                                    "last_used_at": PREV_LAST_USED},
+                         lambda **kw: {"checked": 1, "rolled_back": 0})
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert status == 200 and body["result"]["rolled_back"] == 0
+    assert body["result"]["postcondition_verified"] is False
+    assert "not a release" in body["result"]["evidence_note"]
+
+
+def test_release_denied_assets_unverified_without_any_configured_readback(armed):
+    # no readback deps and no creds/volume: the default readers fail closed
+    deps = {"bus": FakeBus(), "volume_available": lambda: True,
+            "observe_denials": lambda **kw: {"checked": 4, "rolled_back": 2}}
+    status, body = _post("release_denied_assets", _body(), deps=deps)
+    assert status == 200 and body["result"]["rolled_back"] == 2
+    assert body["result"]["postcondition_verified"] is False
+    assert body["result"]["evidence_note"]
+
+
+def test_default_denial_ledger_read_is_bounded_to_the_exact_tenant_prefix():
+    from agent import db
+    db.kv_set("gym_media_use:gymaaa:2026-09-12", json.dumps([_use_record("a1")]))
+    db.kv_set("gym_media_use:gymaaa2:2026-09-12", json.dumps([_use_record("b1")]))
+    db.kv_set("gym_media_use:gymaab:2026-09-12", json.dumps([_use_record("c1")]))
+    out = FO._default_denial_ledger_read("gymaaa")
+    assert out is not None
+    assert [d for d, _ in out] == ["2026-09-12"], "prefix neighbours never leak in"
+    assert out[0][1][0]["asset_id"] == "a1"
+
+
+def test_default_denial_rows_read_fails_closed_without_a_configured_plane():
+    with pytest.raises(FO._ReadbackUnavailable):
+        FO._default_denial_rows_read(GYM, DENY_DATE)
+
+
+# -- restage_month terminal verification ---------------------------------------------------
+
+def _cal_row(rid, **kw):
+    row = {"id": rid, "gym_id": GYM, "post_date": "2026-09-12", "account": "instagram",
+           "format": "feed", "status": "pending", "caption": f"caption {rid}",
+           "image_url": f"https://img/{rid}.jpg", "video_url": None, "slot_index": 0,
+           "source_media_asset_id": None}
+    row.update(kw)
+    return row
+
+
+class FakeCalendarMonthStore:
+    """list_month readback fake; the build fake mutates `rows` the way the real
+    delete-then-insert apply would. Id-less (partial) rows are kept so the
+    readback's partial-payload refusal can be exercised."""
+
+    def __init__(self, rows):
+        self.rows = {r["id"]: dict(r) for r in rows if r.get("id")}
+        self.partial = [dict(r) for r in rows if not r.get("id")]
+        self.calls = []
+
+    def list_month(self, account_key, month):
+        self.calls.append((account_key, month))
+        if account_key != GYM:
+            pytest.fail(f"tenant scope crossed: calendar read for {account_key}")
+        out = [dict(r) for r in self.rows.values()
+               if str(r.get("post_date") or "").startswith(month)]
+        out.extend(dict(r) for r in self.partial
+                   if str(r.get("post_date") or "").startswith(month))
+        return out
+
+
+def _restage_verify_deps(bus, jobs, store, build):
+    return {"bus": bus, "jobs": jobs, "volume_available": lambda: True,
+            "thread_runner": lambda fn: fn(),
+            "sync_sources": lambda gym, budget: [],
+            "observe_denials": lambda **kw: {"checked": 0, "rolled_back": 0},
+            "calendar_store": store, "build_month": build}
+
+
+def test_restage_month_terminal_job_verifies_on_independent_calendar_agreement(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+    store = FakeCalendarMonthStore([_cal_row("row-old-1")])
+    months_touched = {"2026-09"}
+
+    def build(gym_key, start, days):
+        del store.rows["row-old-1"]
+        store.rows["row-new-1"] = _cal_row("row-new-1")
+        store.rows["row-new-2"] = _cal_row("row-new-2")
+        return {"ok": True, "upserted": 2, "inserted": 2, "deleted": 1,
+                "months": sorted(months_touched), "postcondition_verified": True}
+
+    status, body = _post("restage_month", _body(days=7, start_date="2026-09-12"),
+                         deps=_restage_verify_deps(bus, jobs, store, build))
+    assert status == 202
+    job = jobs.get(body["job_id"])
+    assert job["status"] == "done"
+    assert job["result"]["postcondition_verified"] is True
+    assert "evidence_note" not in job["result"]
+    assert "postcondition_verified" not in job["result"]["build"], \
+        "the builder's self-certification is stripped even on a verified job"
+    assert store.calls and all(g == GYM for g, _ in store.calls)
+
+
+def test_restage_month_terminal_job_unverified_when_counts_disagree(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+    store = FakeCalendarMonthStore([_cal_row("row-old-1")])
+
+    def build(gym_key, start, days):
+        store.rows["row-new-1"] = _cal_row("row-new-1")   # one new row, claims two
+        return {"ok": True, "upserted": 2, "inserted": 2, "deleted": 0}
+
+    status, body = _post("restage_month", _body(days=7, start_date="2026-09-12"),
+                         deps=_restage_verify_deps(bus, jobs, store, build))
+    job = jobs.get(body["job_id"])
+    assert job["status"] == "done"
+    assert job["result"]["postcondition_verified"] is False
+    assert "claims 2 upserted" in job["result"]["evidence_note"]
+
+
+def test_restage_month_terminal_job_unverified_when_a_row_moves_under_it(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+    store = FakeCalendarMonthStore([_cal_row("row-old-1")])
+
+    def build(gym_key, start, days):
+        store.rows["row-old-1"]["status"] = "approved"    # an outside edit mid-build
+        store.rows["row-new-1"] = _cal_row("row-new-1")
+        return {"ok": True, "upserted": 1, "inserted": 1, "deleted": 0}
+
+    status, body = _post("restage_month", _body(days=7, start_date="2026-09-12"),
+                         deps=_restage_verify_deps(bus, jobs, store, build))
+    job = jobs.get(body["job_id"])
+    assert job["status"] == "done"
+    assert job["result"]["postcondition_verified"] is False
+    assert "changed while the build ran" in job["result"]["evidence_note"]
+
+
+def test_restage_month_terminal_job_unverified_on_a_noop_build(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+    store = FakeCalendarMonthStore([_cal_row("row-old-1")])
+    build = lambda g, s, d: {"ok": True, "upserted": 0, "inserted": 0, "deleted": 0,  # noqa: E731
+                             "noop_shrink": True}
+    status, body = _post("restage_month", _body(days=7, start_date="2026-09-12"),
+                         deps=_restage_verify_deps(bus, jobs, store, build))
+    job = jobs.get(body["job_id"])
+    assert job["status"] == "done"
+    assert job["result"]["postcondition_verified"] is False, \
+        "a no-op build restaged nothing; there is no postcondition to verify"
+    assert "no-op" in job["result"]["evidence_note"]
+
+
+def test_restage_month_terminal_job_unverified_on_partial_or_foreign_readback(armed):
+    for rows, note in [
+        ([_cal_row("row-partial-1")], "partial row"),        # id stripped below
+        ([_cal_row("row-alien-1", gym_id=OTHER_GYM)], "tenant scope"),
+    ]:
+        bus, jobs = FakeBus(), FO.Jobs()
+        if "partial" in rows[0]["id"]:
+            rows[0].pop("id")
+        store = FakeCalendarMonthStore(rows)
+        build = lambda g, s, d: {"ok": True, "upserted": 0, "deleted": 0}  # noqa: E731
+        status, body = _post("restage_month", _body(days=7, start_date="2026-09-12"),
+                             deps=_restage_verify_deps(bus, jobs, store, build))
+        job = jobs.get(body["job_id"])
+        assert job["status"] == "done"
+        assert job["result"]["postcondition_verified"] is False
+        assert note in job["result"]["evidence_note"]
+
+
+def test_restage_month_terminal_job_unverified_when_the_readback_is_unavailable(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+
+    class DownStore:
+        def list_month(self, account_key, month):
+            raise RuntimeError("supabase down")
+
+    class NoBoundedRead:
+        pass
+
+    build = lambda g, s, d: {"ok": True, "upserted": 1, "deleted": 0}  # noqa: E731
+    for store in (DownStore(), NoBoundedRead()):
+        status, body = _post("restage_month", _body(days=7, start_date="2026-09-12"),
+                             deps=_restage_verify_deps(bus, jobs, store, build))
+        job = jobs.get(body["job_id"])
+        assert job["status"] == "done"
+        assert job["result"]["postcondition_verified"] is False
+        assert "readback unavailable" in job["result"]["evidence_note"]
+
+
+def test_restage_month_readback_is_bounded_to_the_requested_span(armed):
+    bus, jobs = FakeBus(), FO.Jobs()
+    store = FakeCalendarMonthStore([_cal_row("row-old-1")])
+    build = lambda g, s, d: {"ok": True, "upserted": 0, "deleted": 0}  # noqa: E731
+    status, body = _post("restage_month", _body(days=31, start_date="2026-09-20"),
+                         deps=_restage_verify_deps(bus, jobs, store, build))
+    assert status == 202
+    months_read = {m for _, m in store.calls}
+    assert months_read == {"2026-09", "2026-10"}, "exactly the requested span, gym-scoped"
+
+
+def test_restage_readback_follows_pages_and_refuses_an_ambiguous_full_unpaged_response():
+    class Pages:
+        def __init__(self):
+            self.calls = []
+
+        def list_month(self, gym_key, month, cursor=None):
+            self.calls.append((gym_key, month, cursor))
+            if cursor is None:
+                return {"rows": [{"id": "one"}], "next": "cursor-two"}
+            return {"rows": [{"id": "two"}], "next": None}
+
+    pages = Pages()
+    assert FO._read_month_rows(pages, GYM, "2026-09") == [{"id": "one"}, {"id": "two"}]
+    assert pages.calls == [(GYM, "2026-09", None), (GYM, "2026-09", "cursor-two")]
+
+    class FullUnpaged:
+        def list_month(self, gym_key, month):
+            return [{}] * FO._MAX_UNPAGED_MONTH_ROWS
+
+    with pytest.raises(FO._ReadbackUnavailable, match="may be truncated"):
+        FO._read_month_rows(FullUnpaged(), GYM, "2026-09")
