@@ -12,11 +12,19 @@ from tests.gym_media_fakes import FakeMediaStore, make_asset  # noqa: E402
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
 
 
+def reviewed_asset(*args, **kwargs):
+    row = make_asset(*args, **kwargs)
+    row.update(review_status="approved", reviewed_by="operator",
+               reviewed_at="2026-08-26T00:00:00Z", moderation_status="clean",
+               consent_status="not_required")
+    return row
+
+
 def test_picks_least_used_longest_unused():
     store = FakeMediaStore(assets=[
-        make_asset("a", used_count=3, last_used_at="2026-01-01T00:00:00+00:00"),
-        make_asset("b", used_count=0, last_used_at=None),
-        make_asset("c", used_count=1, last_used_at="2026-02-01T00:00:00+00:00"),
+        reviewed_asset("a", used_count=3, last_used_at="2026-01-01T00:00:00+00:00"),
+        reviewed_asset("b", used_count=0, last_used_at=None),
+        reviewed_asset("c", used_count=1, last_used_at="2026-02-01T00:00:00+00:00"),
     ])
     got = sel.pick_media("pierce", store=store, now=NOW)
     assert got["id"] == "b"           # used_count 0, never used
@@ -50,8 +58,8 @@ def test_ineligible_and_unprobed_never_selectable():
 
 def test_kind_preference_filters():
     store = FakeMediaStore(assets=[
-        make_asset("v1", kind="video"),
-        make_asset("p1", kind="photo"),
+        reviewed_asset("v1", kind="video"),
+        reviewed_asset("p1", kind="photo"),
     ])
     got = sel.pick_media("pierce", kind_preference="photo", store=store, now=NOW)
     assert got["id"] == "p1"

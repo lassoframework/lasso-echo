@@ -201,6 +201,45 @@ class SupabaseMediaStore:
             raise MediaStoreError(r.status_code, self._scrubbed(r))
         return True
 
+    def update_indexed_asset_if_hash(self, gym_id, asset_id, old_hash, fields):
+        """CAS for a Drive content swap, including approval invalidation.
+
+        Review RPC also locks the row and checks the hash, so either ordering
+        invalidates an old review or refuses the stale decision.
+        """
+        if not gym_id or "content_hash" not in fields:
+            raise MediaStoreError(400, "hash update requires tenant and new hash")
+        params = {"id": f"eq.{asset_id}", "gym_id": f"eq.{gym_id}",
+                  "content_hash": f"eq.{old_hash}" if old_hash is not None else "is.null"}
+        r = self._client().patch(
+            self._rest(_ASSET_TABLE), params=params,
+            json=dict(fields),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}), timeout=30)
+        if r.status_code >= 400:
+            raise MediaStoreError(r.status_code, self._scrubbed(r))
+        if len(r.json() or []) != 1:
+            raise MediaStoreError(409, "asset changed during Drive indexing")
+        return True
+
+    def update_review_asset(self, gym_id, asset_id, fields, *,
+                            expected_content_hash, expected_review_status,
+                            expected_reviewed_at):
+        """Atomic tenant-scoped review CAS plus immutable decision event.
+
+        The RPC is an additive migration and is service-role-only. If it has not
+        been applied, the call fails closed without updating a review.
+        """
+        result = self._rpc("record_gym_media_review", {
+            "p_gym_id": gym_id, "p_asset_id": asset_id,
+            "p_expected_hash": expected_content_hash,
+            "p_expected_status": expected_review_status,
+            "p_expected_reviewed_at": expected_reviewed_at,
+            "p_fields": dict(fields)})
+        if result is not True:
+            raise MediaStoreError(409, "asset changed during review")
+        return True
+
 
 def default_store():
     return SupabaseMediaStore()

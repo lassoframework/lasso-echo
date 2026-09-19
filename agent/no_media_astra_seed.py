@@ -52,7 +52,7 @@ import os
 from . import config
 
 SEED_MAX_PER_RUN = 3
-SEED_DAYS_AHEAD = 7
+SEED_DAYS_AHEAD = 2
 _SCRAPE_MARK_PREFIX = "deep_brain_scraped_"
 
 # CLIENT-SAFE REVIEW MARK (2026-09-11): every row this module inserts is
@@ -160,14 +160,27 @@ def seed_gaps(base, account, store, *, log=None, today=None,
     log = log or (lambda *_: None)
     if not enabled() or store is None or account is None:
         return 0
-    facts = _ensure_deep_brain_facts(base, log)
-    if not facts:
+    from .client_infographic_fill import real_media_depleted
+    depleted = real_media_depleted(base, now=today)
+    if not depleted:
         return 0
+    from .media_bridge import bridge_days
+    allowed_days = set(bridge_days(base, now=today, days_ahead=days_ahead))
+    if depleted:
+        from .media_bridge import retry_existing_notice
+        retry_existing_notice(base, account, store, logger=log)
 
     from .client_infographic_fill import _empty_upcoming_days
-    tz_name = getattr(account, "tz", None) or "America/New_York"
-    days = _empty_upcoming_days(store, base, tz_name, days_ahead, now=today)
+    tz_name = config.posting_timezone_for(base)
+    days = [day for day in _empty_upcoming_days(
+        store, base, tz_name, min(days_ahead, 2), now=today) if day in allowed_days]
     if not days:
+        return 0
+    if depleted:
+        from .media_bridge import notify_bridge
+        notify_bridge(base, account, logger=log)
+    facts = _ensure_deep_brain_facts(base, log)
+    if not facts:
         return 0
 
     rows = []
@@ -209,4 +222,7 @@ def seed_gaps(base, account, store, *, log=None, today=None,
         return 0
     log(f"{base}: no-media Astra seed inserted {len(inserted)} grounded "
         "infographic draft(s) from its own scraped site/Instagram")
+    if inserted and depleted:
+        from .media_bridge import notify_bridge
+        notify_bridge(base, account, logger=log)
     return len(inserted)

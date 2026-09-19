@@ -18,9 +18,11 @@ Exactly-once design (the claim):
     'pending' -> 'publishing' and returns True only if THIS call won the claim.
     A False means another run/worker already has it, so we SKIP.
   - On a real 'published' result, mark_published(id, media_id, now) records it.
-  - On failure OR a 'would_publish' result (a gate was off inside publish),
-    mark_publish_failed(id) reverts the claim to 'pending' so it retries next run
-    and records nothing. A row that already has published_at is NEVER re-published.
+  - A publisher exception or ordinary non-published result is ambiguous after the
+    network boundary, so the owned claim stays 'publishing' for reconciliation.
+    Only a pre-network 'would_publish' result (or an explicitly proven no-post
+    rejection) reverts the claim for a safe retry. A row that already has
+    published_at is NEVER re-published.
 
 Nothing here logs a token or secret. The manual approval path is untouched.
 """
@@ -508,10 +510,11 @@ def _planned_mentions(caption, gym_id, category):
     return handles
 
 
-def _revert_to_pending(store, row_id, reject_reason=""):
+def _revert_to_pending(store, row_id, reject_reason="", revert_status="pending",
+                       gym_id=None, expected_claim_token=None):
     """Revert a row out of the 'publishing' claim after a PRE-NETWORK block.
 
-    Returns True only when the row is genuinely back in pending.
+    Returns True only when the store confirms the pre-network rollback.
 
     Why a failure here must never be swallowed: the atomic claim flips a row to
     'publishing' BEFORE the guard runs, and mark_publishing only ever re-claims a
@@ -529,27 +532,84 @@ def _revert_to_pending(store, row_id, reject_reason=""):
     """
     try:
         try:
-            store.mark_publish_failed(row_id, revert_status="pending",
-                                      reject_reason=reject_reason)
+            reverted = store.mark_publish_failed(row_id, revert_status=revert_status,
+                                                 reject_reason=reject_reason,
+                                                 gym_id=gym_id,
+                                                 expected_claim_token=expected_claim_token)
         except TypeError:
-            # older store / test fakes without the reject_reason kwarg
-            store.mark_publish_failed(row_id, revert_status="pending")
+            # Only legacy injectable stores lack the tenant-aware signature.
+            # Never retry a real Supabase store without its tenant filter.
+            from .portal_calendar_store import SupabaseCalendarStore
+            if isinstance(store, SupabaseCalendarStore):
+                raise
+            try:
+                reverted = store.mark_publish_failed(
+                    row_id, revert_status=revert_status,
+                    reject_reason=reject_reason)
+            except TypeError:
+                reverted = store.mark_publish_failed(
+                    row_id, revert_status=revert_status)
+        # SupabaseCalendarStore returns None when the conditional update matched no
+        # row. The row may still be publishing, or its status/tenant/provider fields
+        # may have changed. Neither case confirms a rollback.
+        if not reverted:
+            raise RuntimeError("publish rollback was not confirmed")
         return True
     except Exception as e:  # noqa: BLE001 - a stranded row must never be silent
         try:
             from . import ops_alerts
             ops_alerts.alert(
-                f"calendar row {row_id} is STRANDED in 'publishing': it was blocked "
+                f"calendar row {row_id} has a STRANDED or changed publish claim: it was blocked "
                 f"BEFORE any publish attempt ({reject_reason or 'caption cooldown'}) "
-                f"but the revert to pending failed ({type(e).__name__}). The post did "
-                f"NOT go out, so flipping this row back to pending is safe and cannot "
-                f"double-post. Until then the row is invisible to the publish lane.")
+                f"but the conditional revert to {revert_status} was unconfirmed "
+                f"({type(e).__name__}). This worker's post did NOT go out. Inspect the "
+                "current tenant, status and provider fields before any manual recovery.")
         except Exception:
             pass
         return False
 
 
-def _alert_publish_blocked(gym_id, row_id, code, reverted=True):
+def _drive_asset_usable_at_send(row, gym_id):
+    """Fetch current review evidence for a Drive-backed calendar row, fail closed."""
+    asset_id = str(row.get("source_media_asset_id") or "").strip()
+    if not asset_id:
+        # Older staged rows may have lost the asset ID. Hold rows whose surviving
+        # metadata still identifies the Drive lane; a CDN URL without such a marker
+        # cannot establish origin and needs an inventory reconciliation.
+        from urllib.parse import urlparse
+        markers = ("drive", "gym_media", "gym-media", "gymmedia")
+        for field in ("draft_type", "source_type", "media_source", "source",
+                      "source_fragments"):
+            value = row.get(field)
+            values = value if isinstance(value, (list, tuple)) else (value,)
+            if any(any(marker in str(item or "").lower() for marker in markers)
+                   for item in values):
+                return False
+        for field in ("source_media_url", "image_url", "thumbnail_url"):
+            url = str(row.get(field) or "")
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            path = parsed.path.lower()
+            if (host in {"drive.google.com", "docs.google.com"}
+                    or host.endswith(".drive.google.com")
+                    or any(f"/{marker}/" in f"{path}/" for marker in markers)
+                    or any(path.rsplit("/", 1)[-1].startswith(f"{marker}_")
+                           for marker in markers)):
+                return False
+        return True
+    try:
+        from . import media_source_store, gym_media_selector
+        asset = media_source_store.default_store().get_asset(asset_id)
+        return (bool(asset) and str(asset.get("gym_id")) == str(gym_id)
+                and gym_media_selector.is_usable(asset))
+    except Exception as e:  # noqa: BLE001 - unavailable review evidence holds send
+        print(f"[calendar-autopublish] media review read failed for row "
+              f"{row.get('id')}: {type(e).__name__}")
+        return False
+
+
+def _alert_publish_blocked(gym_id, row_id, code, reverted=True,
+                           revert_status="pending"):
     """ONE deduped ops alert per (gym, violation code): kv key
     publish_blocked:<gym>:<code> fires once and stays quiet until the state
     changes (_clear_publish_blocked re-arms it when a row for the gym passes
@@ -564,15 +624,37 @@ def _alert_publish_blocked(gym_id, row_id, code, reverted=True):
         if db.kv_get(key):
             return
         db.kv_set(key, str(row_id or "1"))
-        _state = ("reverted to pending with reject_reason" if reverted else
-                  "REVERT FAILED -- the row is stranded in 'publishing' and the "
-                  "publish lane can no longer see it")
+        _state = (f"reverted to {revert_status} with reject_reason" if reverted else
+                  "REVERT FAILED -- the row may be stranded in 'publishing' or "
+                  "changed; inspect it before retry")
         ops_alerts.alert(
             f"publish guard: row {row_id} (gym {gym_id}) blocked at the publish "
             f"boundary ({code}); {_state}. Further "
             f"'{code}' blocks for this gym stay quiet until a post publishes clean.")
     except Exception:
         pass
+
+
+def _alert_ambiguous_publish(gym_id, row_id, detail):
+    """A network attempt may have reached the provider. Keep its owned claim held."""
+    try:
+        from . import ops_alerts
+        ops_alerts.alert(
+            f"calendar row {row_id} (gym {gym_id}) has an AMBIGUOUS publish outcome: "
+            f"{detail}. The row remains in 'publishing' and will NOT retry automatically. "
+            "Reconcile with the provider before releasing the claim.")
+    except Exception:
+        pass
+
+
+def _result_proves_no_post(result):
+    """Explicit publisher contract for a provider rejection before creation.
+
+    False by default. A generic ok=False, a timeout, or an unknown mode is not proof.
+    Publisher adapters may opt in only when the provider contract guarantees no post
+    exists, using `definitive_no_post=True` on the result object.
+    """
+    return getattr(result, "definitive_no_post", False) is True
 
 
 def _clear_publish_blocked(gym_id):
@@ -706,6 +788,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
     skipped = []
     failed = []
     waiting = []            # slot not arrived yet: left pending for a later run
+    recovery_required = []  # pre-network block claimed a row, but rollback was unconfirmed
     published_accounts = set()
 
     # ANTI-FLOOD (2026-08-24): when a client gym's publishing is repaired after a stall
@@ -893,6 +976,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # used, so catch-up rows dated on different prior days share today's
         # capacity. Postgres serializes distinct rows/workers in one transaction.
         # This applies to both manual approval and autonomous client lanes.
+        claim_token = None
         try:
             claim_slot = getattr(store, "claim_publish_slot", None)
             if callable(claim_slot):
@@ -922,6 +1006,10 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             # cadence is full. Leave it untouched for calendar review.
             (waiting if callable(claim_slot) else skipped).append(row_id)
             continue
+        # The production owned-claim RPC returns a fresh UUID per successful
+        # claim. Legacy injected stores return True and use their own rollback
+        # behavior; Supabase rollback refuses to run without this token.
+        claim_token = won if isinstance(won, str) else None
 
         # CONTENT IDEMPOTENCY, WRITTEN BEFORE THE NETWORK CALL (2026-09-05 incident).
         #
@@ -952,7 +1040,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 skipped.append(row_id)
                 print(f"[calendar-autopublish] content ledger unreadable for {row_id} "
                       f"({type(exc).__name__}); refusing to publish; duplicate cleanup not attempted")
-                _release_content_ledger_claim(store, gym_id, row, "content_ledger_unreadable")
+                _release_content_ledger_claim(
+                    store, gym_id, row, "content_ledger_unreadable", claim_token)
                 continue
             # Same ROW re-entering this path is the row-claim's business, not a content
             # duplicate: mark_publishing already owns exactly-once for one row. What this
@@ -964,7 +1053,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             if _seen:
                 _seen = str(_seen).split("|", 1)[-1]
                 skipped.append(row_id)
-                _duplicate_marked = _mark_duplicate_content(store, gym_id, row_id, _seen)
+                _duplicate_marked = _mark_duplicate_content(
+                    store, gym_id, row_id, _seen, claim_token)
                 _idx_alert = (
                     f"DUPLICATE CONTENT REFUSED: {gym_id} {account.platform} row "
                     f"{row_id} ({row.get('post_date')}) carries a caption already "
@@ -989,7 +1079,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 print(f"[calendar-autopublish] content stamp failed for {row_id} "
                       f"({type(e).__name__}); refusing to publish rather than risk a "
                       f"duplicate")
-                _release_content_ledger_claim(store, gym_id, row, "content_stamp_failed")
+                _release_content_ledger_claim(
+                    store, gym_id, row, "content_stamp_failed", claim_token)
                 continue
 
         draft = _draft_for(row)
@@ -1017,12 +1108,17 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             # block (caption_ledger same-date rule).
             if _cl.is_blocked(gym_id, _cap, row.get("post_date", ""),
                               db=None):
-                if _revert_to_pending(row_id=row_id, store=store,
-                                      reject_reason="caption cooldown"):
+                _reverted = _revert_to_pending(row_id=row_id, store=store,
+                                               gym_id=gym_id,
+                                               expected_claim_token=claim_token,
+                                               reject_reason="caption cooldown")
+                if _reverted:
                     _oa.alert(
                         f"publish recheck: row {row_id} caption on cooldown, "
                         f"reverted to pending"
                     )
+                else:
+                    recovery_required.append(row_id)
                 # a failed revert already alerted (loudly, and with the fact that
                 # the post never went out) inside _revert_to_pending
                 failed.append(row_id)
@@ -1038,7 +1134,11 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             if _viols:
                 _reason = "publish_guard: " + ", ".join(_viols)
                 _reverted = _revert_to_pending(row_id=row_id, store=store,
+                                               gym_id=gym_id,
+                                               expected_claim_token=claim_token,
                                                reject_reason=_reason)
+                if not _reverted:
+                    recovery_required.append(row_id)
                 for _code in _viols:
                     _alert_publish_blocked(gym_id, row_id, _code,
                                            reverted=_reverted)
@@ -1047,6 +1147,22 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             # Guard passed: the block state changed, so re-arm the deduped
             # alerts for this gym (a future violation alerts again).
             _clear_publish_blocked(gym_id)
+
+        # Review evidence can change after staging or even after this row was
+        # claimed. Read it freshly at the last pre-network boundary for BOTH
+        # external publishers. Calendar approval cannot substitute for asset review.
+        if not _drive_asset_usable_at_send(row, gym_id):
+            _reason = "media_asset_review_required"
+            _reverted = _revert_to_pending(
+                store, row_id, reject_reason=_reason, gym_id=gym_id,
+                expected_claim_token=claim_token,
+                revert_status="approved" if approved_only else "pending")
+            if not _reverted:
+                recovery_required.append(row_id)
+            _alert_publish_blocked(gym_id, row_id, _reason, reverted=_reverted,
+                                   revert_status="approved" if approved_only else "pending")
+            failed.append(row_id)
+            continue
 
         # CAPTION TRACE (pure logging, WIRING.md 2026-08-27): stage-by-stage
         # visible-length for the outbound caption, so a caption that goes
@@ -1092,25 +1208,22 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 else:
                     result = zernio_publish(draft, account, scheduled_for=None)
             except Exception as e:
-                # A real publish error: revert the claim so it retries next run. A CLIENT
-                # row (approved_only) reverts to 'approved' so a transient failure never
-                # forces the client to re-approve; LASSO reverts to 'pending' (unchanged).
-                try:
-                    store.mark_publish_failed(
-                        row_id, revert_status="approved" if approved_only else "pending")
-                except Exception as re:
-                    print(f"[calendar-autopublish] revert failed for row {row_id}: "
-                          f"{type(re).__name__}: {re}")
+                # Once a publisher is called, an exception is ambiguous: a timeout may
+                # arrive after the provider accepted the post. Retrying can create a
+                # duplicate, so retain the owned claim for reconciliation.
                 failed.append(row_id)
+                recovery_required.append(row_id)
                 print(f"[calendar-autopublish] publish failed for row {row_id}: "
                       f"{type(e).__name__}: {e}")
+                _alert_ambiguous_publish(gym_id, row_id,
+                                         f"publisher raised {type(e).__name__}")
                 _note_repeat_failure(row_id, gym_id, e)
                 continue
 
         ok = getattr(result, "ok", False)
         mode = getattr(result, "mode", "")
         # ONLY a real 'published' counts. 'would_publish' means a gate was off inside
-        # publish() -> treat as NOT published and revert the claim (retryable).
+        # publish() before the network call, so it can safely revert the claim.
         if ok and mode == "published":
             try:
                 # Only a Zernio 409 content-hash dedup may be stamped published with no
@@ -1120,6 +1233,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 # keeps its historic 3-arg shape for every other store implementation.
                 _mp_kwargs = ({"allow_missing_post_id": True}
                               if getattr(result, "dedup", False) else {})
+                if claim_token:
+                    _mp_kwargs["expected_claim_token"] = claim_token
                 store.mark_published(row_id, getattr(result, "media_id", ""),
                                      _now_iso(now), **_mp_kwargs)
             except Exception as e:
@@ -1151,24 +1266,30 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             published_accounts.add(account.key)
             if daily_cap:
                 _bump_pub_count(gym_id, run_date)
-        else:
-            try:
-                store.mark_publish_failed(
-                    row_id, revert_status="approved" if approved_only else "pending")
-            except Exception as e:
-                print(f"[calendar-autopublish] revert failed for row {row_id}: "
-                      f"{type(e).__name__}: {e}")
+        elif mode == "would_publish" or _result_proves_no_post(result):
+            # `would_publish` is the publisher's pre-network kill-switch contract.
+            # A provider rejection may also opt into definitive_no_post only when its
+            # API guarantees that no post exists. Both are safe to retry.
+            _reason = ("publisher gate prevented network attempt" if mode == "would_publish"
+                       else f"provider rejection proved no post: {getattr(result, 'detail', '')}")
+            reverted = _revert_to_pending(
+                store, row_id, reject_reason=_reason, gym_id=gym_id,
+                expected_claim_token=claim_token,
+                revert_status="approved" if approved_only else "pending")
+            if not reverted:
+                recovery_required.append(row_id)
             failed.append(row_id)
-            # DEFECT 1 (audit 2026-08-30): a SOFT failure (publisher returned
-            # normally with ok=False or mode != 'published', e.g. 'would_publish')
-            # used to fall through here with no counter and no alert at all — only
-            # the neighbouring EXCEPTION branch above called _note_repeat_failure,
-            # so a row stuck soft-failing (never raising) looped every ~1-min tick
-            # forever, completely invisibly. Feed it into the SAME strike counter,
-            # naming ok/mode so the eventual alert says what actually happened.
             _note_repeat_failure(
                 row_id, gym_id,
                 RuntimeError(f"soft publish failure: ok={ok!r} mode={mode!r}"))
+        else:
+            # A normal return is still ambiguous unless the adapter explicitly proves
+            # no post exists. Keep the claim so a later tick cannot resend it.
+            failed.append(row_id)
+            recovery_required.append(row_id)
+            detail = f"publisher returned ok={ok!r} mode={mode!r}"
+            _alert_ambiguous_publish(gym_id, row_id, detail)
+            _note_repeat_failure(row_id, gym_id, RuntimeError(detail))
 
     # ONE lightweight Slack "posted" notice, matching the auto-approve notice style.
     # Only sent when something actually published. Never carries a token or secret.
@@ -1182,7 +1303,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                   f"{type(e).__name__}: {e}")
 
     return {"ok": True, "published": published, "skipped": skipped,
-            "failed": failed, "waiting": waiting, "date": run_date}
+            "failed": failed, "waiting": waiting,
+            "held": bool(recovery_required),
+            "recovery_required": recovery_required, "date": run_date}
 
 
 REPEAT_FAILURE_ALERT_AT = 5     # consecutive failures before a human is alerted
@@ -1283,13 +1406,27 @@ def _published_content_key(account, row):
         return ""
 
 
-def _release_content_ledger_claim(store, gym_id, row, reason):
+def _release_content_ledger_claim(store, gym_id, row, reason,
+                                  expected_claim_token=None):
     """Retry after a PRE-NETWORK ledger fault without revoking a manual approval."""
     row_id = row["id"]
     previous = "approved" if row.get("status") == "approved" else "pending"
     try:
         fn = getattr(store, "release_content_ledger_claim", None)
-        updated = fn(gym_id, row_id, previous, reason) if fn else None
+        if not fn:
+            updated = None
+        else:
+            try:
+                updated = fn(
+                    gym_id, row_id, previous, reason,
+                    expected_claim_token=expected_claim_token)
+            except TypeError:
+                # Legacy injected test stores predate owned claim UUIDs. Production
+                # Supabase transitions must never fall back to a tokenless write.
+                from .portal_calendar_store import SupabaseCalendarStore
+                if isinstance(store, SupabaseCalendarStore):
+                    raise
+                updated = fn(gym_id, row_id, previous, reason)
         if (isinstance(updated, dict) and str(updated.get("id")) == str(row_id)
                 and str(updated.get("gym_id")) == str(gym_id)
                 and updated.get("status") == previous):
@@ -1306,7 +1443,8 @@ def _release_content_ledger_claim(store, gym_id, row, reason):
     return False
 
 
-def _mark_duplicate_content(store, gym_id, row_id, seen_at):
+def _mark_duplicate_content(store, gym_id, row_id, seen_at,
+                            expected_claim_token=None):
     """Take a refused duplicate OUT of the publish lane, reversibly.
 
     mark_publishing already flipped the row to 'publishing'; leaving it there would strand
@@ -1319,7 +1457,19 @@ def _mark_duplicate_content(store, gym_id, row_id, seen_at):
     reason = f"duplicate content refused: previous content claim {seen_at}"
     try:
         fn = getattr(store, "mark_duplicate_content", None)
-        updated = fn(gym_id, row_id, reason) if fn else None
+        if not fn:
+            updated = None
+        else:
+            try:
+                updated = fn(
+                    gym_id, row_id, reason,
+                    expected_claim_token=expected_claim_token)
+            except TypeError:
+                # Keep bounded fake adapters usable without weakening the real store.
+                from .portal_calendar_store import SupabaseCalendarStore
+                if isinstance(store, SupabaseCalendarStore):
+                    raise
+                updated = fn(gym_id, row_id, reason)
         if not (isinstance(updated, dict) and str(updated.get("id")) == str(row_id)
                 and str(updated.get("gym_id")) == str(gym_id)
                 and updated.get("status") == "deleted"):

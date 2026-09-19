@@ -74,13 +74,23 @@ def _client_media_count(library_path):
     path = library_path
     if not path or not os.path.isdir(path):
         return 0
+    from .media_bridge import enabled as bridge_enabled
+    if bridge_enabled():
+        from .library import list_creatives
+        from .client_media_sync import usable_local_creative
+        base = os.path.basename(os.path.normpath(path))
+        return sum(usable_local_creative(c, base + "_ig")
+                   for c in list_creatives(path))
     count = 0
+    from .client_media_sync import explicitly_refused_local
     try:
         for name in os.listdir(path):
             full = os.path.join(path, name)
             if not os.path.isfile(full):
                 continue
-            if os.path.splitext(name)[1].lower() in _MEDIA_EXTS:
+            if (not name.startswith("._")
+                    and os.path.splitext(name)[1].lower() in _MEDIA_EXTS
+                    and not explicitly_refused_local(full)):
                 count += 1
     except OSError:
         return 0

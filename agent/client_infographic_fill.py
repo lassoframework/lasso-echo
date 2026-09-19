@@ -26,7 +26,7 @@ from datetime import date, timedelta
 
 from . import config
 
-FILL_DAYS_AHEAD = 7          # look this many days ahead for empty days
+FILL_DAYS_AHEAD = 2          # look this many days ahead for empty days
 FILL_MAX_PER_RUN = 2         # cards per scan pass (drip, never flood)
 
 # CLIENT-SAFE REVIEW MARK (2026-09-11, same requirement as no_media_astra_seed.py's
@@ -49,6 +49,67 @@ def _with_review_mark(category):
     base = (category or "educational").strip() or "educational"
     return f"{base}{_NEEDS_CLIENT_SAFE_REVIEW_SUFFIX}"
 _ARCHETYPES = ("flow", "split", "hero", "path", "headline")
+
+
+def real_media_depleted(base, *, now=None):
+    """Return True only when Echo can confirm this gym has no usable real media.
+
+    A calendar gap is deliberately not evidence of depletion: a gym may have uploads
+    waiting for a later planner pass.  The alert lane is therefore fail-closed.  A
+    usable file in the client library suppresses it; an unreadable library or an
+    unavailable active Drive inventory also suppresses it rather than asking a client
+    to upload media Echo may already have.
+
+    When the Drive lane is active, its selector is the inventory contract.  Its
+    pickable set already applies the eligibility, coach-hide, and reuse rules used by
+    the planner, so an empty set means there is no Drive photo or video left for a
+    new post right now.
+    """
+    from . import rotation
+    from .library import list_creatives
+    from .client_media_sync import usable_local_creative
+
+    library_path = os.path.join(config.LIBRARY_PATH, base)
+    try:
+        names = os.listdir(library_path)
+    except FileNotFoundError:
+        names = []
+    except OSError:
+        return False
+    try:
+        served = rotation.load_served().get(f"{base}_ig", [])
+        used = {str(row.get("key")) for row in served}
+        local = []
+        for creative in list_creatives(library_path):
+            if usable_local_creative(creative, f"{base}_ig", used=used):
+                local.append(creative.path)
+        from .media_bridge import observe_local_inventory
+        observe_local_inventory(base, local)
+    except Exception:
+        return False
+
+    if not (config.gym_drive_stage_enabled()
+            and config.gym_drive_connect_active_for(base)):
+        return not local
+    try:
+        from . import gym_media_index, gym_media_selector
+        media_store = gym_media_index.default_store()
+        if not media_store.available():
+            return False
+        # pickable() intentionally converts store errors to [] for planning.
+        # For a client depletion notice, distinguish a failed read from empty.
+        assets = media_store.list_assets(base)
+        class Snapshot:
+            def available(self):
+                return True
+            def list_assets(self, gym):
+                return assets
+        drive = gym_media_selector.pickable(base, store=Snapshot(), now=now)
+        from .media_bridge import observe_drive_inventory
+        observe_drive_inventory(base, [a.get("id") for a in drive])
+        return not local and not drive
+    except Exception:  # noqa: BLE001 - inventory uncertainty must never alert a client
+        return False
 
 
 def fill_enabled() -> bool:
@@ -114,13 +175,26 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
     from .client_month_run import _to_rows
     from .drafter import Draft, DraftStatus
 
+    depleted = real_media_depleted(base, now=now)
+    if not depleted:
+        return {"ok": True, "filled": 0, "reason": "usable media available"}
+    from .media_bridge import bridge_days
+    allowed_days = set(bridge_days(base, now=now, days_ahead=days_ahead))
+    if depleted:
+        from .media_bridge import retry_existing_notice
+        retry_existing_notice(base, account, store, logger=log)
+
+    tz_name = config.posting_timezone_for(base)
+    gaps = [day for day in _empty_upcoming_days(
+        store, base, tz_name, min(days_ahead, 2), now=now) if day in allowed_days]
+    if not gaps:
+        return {"ok": True, "filled": 0, "gaps": 0}
+    if depleted:
+        from .media_bridge import notify_bridge
+        notify_bridge(base, account, logger=log)
     sources = client_sources.approved_sources(f"{base}_ig") or []
     if not sources:
         return {"ok": False, "reason": "no sources"}
-    tz_name = config.posting_timezone_for(base)
-    gaps = _empty_upcoming_days(store, base, tz_name, days_ahead, now=now)
-    if not gaps:
-        return {"ok": True, "filled": 0, "gaps": 0}
 
     client = creative_studio._default_client()
     if client is None:
@@ -256,4 +330,7 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         return {"ok": False, "reason": f"insert failed: {type(e).__name__}"}
     log(f"{base}: filled {filled} empty day(s) with approved-source infographic "
         f"card(s) ({inserted} pending row(s); {len(gaps)} gap(s) seen)")
+    if inserted and depleted:
+        from .media_bridge import notify_bridge
+        notify_bridge(base, account, logger=log)
     return {"ok": True, "filled": filled, "rows": inserted, "gaps": len(gaps)}

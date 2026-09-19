@@ -387,12 +387,10 @@ def test_account_and_story_mapping(armed):
 
 # ---- one bad row never blocks the rest -------------------------------------
 
-def test_publish_failure_reverts_and_others_still_publish(armed):
+def test_timeout_after_provider_accept_holds_claim_and_others_still_publish(
+        armed, monkeypatch):
     class _Boom(Exception):
         pass
-
-    def _raise(draft, account):
-        raise _Boom("meta 500")
 
     store = _FakeStore([_row("bad"), _row("good")])
     # publisher: 'bad' raises, 'good' publishes.
@@ -402,16 +400,23 @@ def test_publish_failure_reverts_and_others_still_publish(armed):
     def publisher(draft, account):
         calls.append(draft.draft_id)
         if draft.draft_id == "bad":
-            raise _Boom("meta 500")
+            raise _Boom("timeout after accept")
         return PublishResult(ok=True, mode="published", media_id="M")
 
+    monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *a, **kw: None)
     summary = cap.publish_due(RUN_DATE, store=store, publisher=publisher, now=LATE_NOW)
 
     assert summary["published"] == ["good"]
     assert summary["failed"] == ["bad"]
-    assert store.failed_calls == ["bad"]                 # claim reverted
-    assert store.rows["bad"]["status"] == "pending"      # retryable
+    assert store.failed_calls == []
+    assert store.rows["bad"]["status"] == "publishing"
+    assert summary["held"] is True
+    assert summary["recovery_required"] == ["bad"]
     assert store.rows["good"]["status"] == "published"
+    assert calls == ["bad", "good"]
+
+    cap.publish_due(RUN_DATE, store=store, publisher=publisher, now=LATE_NOW)
+    assert calls == ["bad", "good"]
 
 
 # ---- Slack notice ----------------------------------------------------------
@@ -791,13 +796,20 @@ def test_mark_published_writes_status_time_and_media():
 
 
 def test_mark_publish_failed_reverts_to_pending_only():
-    http = _RecordingHTTP(patch_resp=_Resp(200, [{"id": "a"}]))
+    token = "11111111-1111-4111-8111-111111111111"
+    http = _RecordingHTTP(patch_resp=_Resp(
+        200, [{"id": "a", "gym_id": "lasso", "status": "pending"}]))
     store = _store(http)
-    store.mark_publish_failed("a")
+    store.mark_publish_failed(
+        "a", gym_id="lasso", expected_claim_token=token)
 
     _, _url, params, _headers, body = http.calls[0]
     assert params["id"] == "eq.a"
-    assert body == {"status": "pending", "publish_reservation_day": None}
+    assert params["gym_id"] == "eq.lasso"
+    assert params["status"] == "eq.publishing"
+    assert params["publish_claim_token"] == f"eq.{token}"
+    assert body == {"status": "pending", "publish_reservation_day": None,
+                    "publish_claim_token": None}
 
 
 def test_account_for_skips_non_ig_fb_platforms():
@@ -1476,27 +1488,54 @@ def test_expired_sweep_excludes_google_business_rows():
 # by the existing publish-exception path, or a direct ops_alerts.alert call, or a
 # kv-deduped per-gym-per-day stamp — never a NEW unbounded alert path.
 
-def test_soft_failure_now_feeds_the_repeat_failure_counter(armed, monkeypatch):
-    """DEFECT 1: a SOFT failure (publisher returns normally with ok=False / a
-    non-'published' mode, never raises) used to fall through with only a print —
-    _note_repeat_failure was wired ONLY to the neighbouring exception branch, so a
-    row stuck soft-failing looped every tick forever with nobody told. Now it counts
-    the same way: silent for the first REPEAT_FAILURE_ALERT_AT-1 ticks, then ONE
-    alert naming ok/mode. mark_publish_failed reverts to pending each tick, so the
-    row is due again next call — simulating the real ~1-min retry loop."""
+def test_ambiguous_failed_result_holds_and_alerts_without_retry(armed, monkeypatch):
     sent = _capture_alerts(monkeypatch)
     store = _FakeStore([_row("soft")])
     pub = _FakePublisher(PublishResult(ok=False, mode="failed", detail="ig 400"))
 
-    for _ in range(cap.REPEAT_FAILURE_ALERT_AT - 1):
-        summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
-        assert sent == []                          # silent below threshold
-        assert store.rows["soft"]["status"] == "pending"   # retryable, not lost
-
     summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert "soft" in summary["failed"]
-    assert len(sent) == 1                           # threshold alert, exactly one
-    assert "ok=False" in sent[0] and "mode='failed'" in sent[0]
+    assert summary["recovery_required"] == ["soft"]
+    assert store.rows["soft"]["status"] == "publishing"
+    assert len(sent) == 1
+    assert "AMBIGUOUS" in sent[0] and "ok=False" in sent[0]
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert len(pub.calls) == 1
+
+
+def test_explicit_provider_rejection_proving_no_post_reverts_for_retry(
+        armed, monkeypatch):
+    from types import SimpleNamespace
+
+    result = SimpleNamespace(ok=False, mode="rejected", media_id="",
+                             detail="validation rejected before create",
+                             definitive_no_post=True)
+    store = _FakeStore([_row("definite")])
+    pub = _FakePublisher(result)
+    monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *a, **kw: None)
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["failed"] == ["definite"]
+    assert summary["recovery_required"] == []
+    assert store.rows["definite"]["status"] == "pending"
+    assert store.failed_calls == ["definite"]
+
+
+def test_failed_result_without_explicit_no_post_contract_never_reclaims(
+        armed, monkeypatch):
+    result = PublishResult(ok=False, mode="rejected", detail="provider said no")
+    store = _FakeStore([_row("uncertain")])
+    pub = _FakePublisher(result)
+    monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *a, **kw: None)
+
+    first = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    second = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert first["recovery_required"] == ["uncertain"]
+    assert second["published"] == []
+    assert store.rows["uncertain"]["status"] == "publishing"
+    assert len(pub.calls) == 1
 
 
 def test_soft_failure_alert_does_not_storm_past_threshold(armed, monkeypatch):
@@ -1774,6 +1813,71 @@ def test_duplicate_refusal_reports_real_cleanup_without_publishing(armed, monkey
     assert any(("soft-deleted" if cleanup_ok else "Cleanup was not confirmed") in s for s in alerts)
 
 
+@pytest.mark.parametrize("rollback_result", [False, None])
+def test_unconfirmed_pre_network_rollback_is_held_without_send_or_reclaim(
+        armed, monkeypatch, rollback_result):
+    """A zero-row rollback must be visible as recovery work, never a successful revert."""
+    class ZeroRowRollbackStore(_FakeStore):
+        def mark_publish_failed(self, row_id, revert_status="pending", reject_reason=""):
+            self.failed_calls.append(row_id)
+            return rollback_result
+
+    store = ZeroRowRollbackStore([_row("stranded")])
+    alerts = []
+    monkeypatch.setattr(cap, "_drive_asset_usable_at_send", lambda *_: False)
+    monkeypatch.setattr(cap, "_alert_publish_blocked",
+                        lambda *args, **kwargs: alerts.append((args, kwargs)))
+    publisher = _FakePublisher()
+
+    result = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                             now=LATE_NOW, catch_all=True)
+
+    assert result["failed"] == ["stranded"]
+    assert result["held"] is True
+    assert result["recovery_required"] == ["stranded"]
+    assert store.rows["stranded"]["status"] == "publishing"
+    assert publisher.calls == []
+    assert alerts[0][1]["reverted"] is False
+
+    # An unconfirmed rollback leaves its claim in place, so another tick cannot post it.
+    retry = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                            now=LATE_NOW, catch_all=True)
+    assert retry["published"] == []
+    assert publisher.calls == []
+
+
+def test_pre_network_rollback_supplies_tenant_and_holds_on_cas_miss(
+        armed, monkeypatch):
+    token = "11111111-1111-4111-8111-111111111111"
+
+    class ConditionalRollbackStore(_FakeStore):
+        def claim_publish_slot(self, row_id, gym_id, day, timezone_name,
+                               capacity, approved_only):
+            return token if self.mark_publishing(row_id) else None
+
+        def mark_publish_failed(self, row_id, revert_status="pending",
+                                reject_reason=None, gym_id=None,
+                                expected_claim_token=None):
+            self.rollback_args = (row_id, revert_status, reject_reason,
+                                  gym_id, expected_claim_token)
+            return None  # concurrent status change, zero rows updated
+
+    store = ConditionalRollbackStore([_row("raced")])
+    monkeypatch.setattr(cap, "_drive_asset_usable_at_send", lambda *_: False)
+    monkeypatch.setattr(cap, "_alert_publish_blocked", lambda *a, **kw: None)
+    monkeypatch.setattr(cap, "_published_content_key", lambda *a: "")
+    publisher = _FakePublisher()
+
+    result = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                             now=LATE_NOW, catch_all=True)
+
+    assert store.rollback_args == ("raced", "pending",
+                                   "media_asset_review_required", "lasso", token)
+    assert result["held"] is True
+    assert result["recovery_required"] == ["raced"]
+    assert publisher.calls == []
+
+
 @pytest.mark.parametrize("previous", ["pending", "approved"])
 def test_content_stamp_failure_releases_for_retry_and_preserves_approval(armed, monkeypatch, previous):
     class FailedStampLedger:
@@ -1790,3 +1894,66 @@ def test_content_stamp_failure_releases_for_retry_and_preserves_approval(armed, 
     assert result["skipped"] == ["stamp-failure"]
     assert store.rows["stamp-failure"]["status"] == previous
     assert store.rows["stamp-failure"]["reject_reason"] == "content_stamp_failed"
+
+
+@pytest.mark.parametrize("ledger_mode", ["read", "write", "duplicate"])
+def test_owned_claim_token_reaches_each_pre_network_ledger_transition(
+        armed, monkeypatch, ledger_mode):
+    """End-to-end publisher wiring must carry the exact claim UUID to cleanup."""
+    token = "33333333-3333-4333-8333-333333333333"
+
+    class OwnedTransitionStore(_FakeStore):
+        def claim_publish_slot(self, row_id, gym_id, day, timezone_name,
+                               capacity, approved_only):
+            row = self.rows[row_id]
+            row.update(status="publishing", publish_claim_token=token)
+            return token
+
+        def release_content_ledger_claim(self, gym_id, row_id, previous, reason,
+                                         expected_claim_token=None):
+            self.transition = ("release", gym_id, row_id, previous, reason,
+                               expected_claim_token)
+            if expected_claim_token != self.rows[row_id].get("publish_claim_token"):
+                return None
+            row = self.rows[row_id]
+            row.update(status=previous, publish_claim_token=None,
+                       reject_reason=reason)
+            return dict(row)
+
+        def mark_duplicate_content(self, gym_id, row_id, reason,
+                                   expected_claim_token=None):
+            self.transition = ("duplicate", gym_id, row_id, reason,
+                               expected_claim_token)
+            if expected_claim_token != self.rows[row_id].get("publish_claim_token"):
+                return None
+            row = self.rows[row_id]
+            row.update(status="deleted", publish_claim_token=None,
+                       reject_reason=reason)
+            return dict(row)
+
+    class Ledger:
+        def get(self, key, default=""):
+            if ledger_mode == "read":
+                raise RuntimeError("read unavailable")
+            if ledger_mode == "duplicate":
+                return "another-row|2026-09-18T12:00:00Z"
+            return ""
+
+        def set(self, key, value):
+            if ledger_mode == "write":
+                raise RuntimeError("write unavailable")
+
+    store = OwnedTransitionStore([_row(f"owned-{ledger_mode}")])
+    monkeypatch.setattr(cap, "_kv_default", lambda: Ledger())
+    publisher = _FakePublisher()
+
+    result = cap.publish_due(
+        RUN_DATE, store=store, publisher=publisher,
+        notifier=_FakeNotifier(), now=LATE_NOW)
+
+    assert publisher.calls == []
+    assert result["skipped"] == [f"owned-{ledger_mode}"]
+    assert store.transition[-1] == token
+    assert store.rows[f"owned-{ledger_mode}"]["publish_claim_token"] is None
+    expected_status = "deleted" if ledger_mode == "duplicate" else "pending"
+    assert store.rows[f"owned-{ledger_mode}"]["status"] == expected_status

@@ -58,12 +58,71 @@ _ig account ("gritx_ig") is the generation/source key; the _fb account is the mi
 
 import json
 import os
+import subprocess
 
 from . import config
 
 # Media extensions we sync (mirror client_month_run._MEDIA_EXTS: the same set that
 # counts as a gym having uploaded usable creative).
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+
+
+def _valid_media_file(path):
+    """Reject corrupt payloads before they can count as fresh creative."""
+    try:
+        if os.path.splitext(path)[1].lower() in {".mp4", ".mov"}:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "json", path],
+                capture_output=True, timeout=15, check=True)
+            streams = json.loads(probe.stdout).get("streams") or []
+            return bool(streams and streams[0].get("width") and streams[0].get("height"))
+        from PIL import Image
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError, KeyError):
+        return False
+
+
+def usable_local_creative(creative, account_key, *, used=None):
+    """Shared publishable inventory predicate for planner and bridge."""
+    from . import dam, rotation, vision
+    if used is None:
+        from . import rotation
+        used = {str(row.get("key")) for row in
+                rotation.load_served().get(account_key, [])}
+    name = os.path.basename(creative.path)
+    if explicitly_refused_local(creative.path):
+        return False
+    if name in rotation.style_exclusions(os.path.dirname(creative.path)):
+        return False
+    # Bridge inventory is a new, publishable-inventory contract, so while it is
+    # armed it fails closed on an unclassified people status.  Leaving the
+    # bridge off retains the legacy inventory behavior for existing libraries.
+    from .media_bridge import enabled as bridge_enabled
+    if (name.startswith(("igfill_", "no_media_", "seed_"))
+            or name in used or dam.rotation_key(creative.path) in used
+            or dam.consent_blocked(creative.path, strict=bridge_enabled())
+            or not _valid_media_file(creative.path)):
+        return False
+    side = dam.read_sidecar(creative.path)
+    if (side.get("approved") is not True or side.get("review")
+            or side.get("moderation") not in ("clean", "approved")):
+        return False
+    if config.vision_enabled_for(account_key):
+        return (creative.media_type == "image" and
+                vision.auto_plannable(vision.stored_analysis(creative.path))[0])
+    return creative.media_type in ("image", "video")
+
+
+def explicitly_refused_local(path):
+    """An explicit owner or review refusal applies even when optional guards are off."""
+    from . import dam
+    side = dam.read_sidecar(path)
+    return (side.get("approved") is False
+            or str(side.get("consent") or "").strip().lower() == "denied"
+            or str(side.get("moderation") or "").strip().lower() == "rejected")
 
 # The R2 upload layout. Fresh uploads (intake_web.handle_upload) carry two sidecar
 # kinds under incoming/; ingest (intake_ingest) stages processed media under
@@ -115,6 +174,44 @@ def _library_dir(base_key, out_dir=None):
     if out_dir:
         return out_dir
     return os.path.join(config.LIBRARY_PATH, base_key)
+
+
+def _record_new_uploads(base_key, names):
+    """Durably identify an upload never seen by this gym's sync lane.
+
+    The first pass establishes a baseline without rearming an alert for old R2
+    contents.  Later passes atomically claim only new basenames.  This marker is
+    separate per gym and survives worker restarts, so rebuilding a local library
+    from old intake objects cannot look like a fresh client upload.
+    """
+    names = sorted({str(n) for n in names if n})
+    from . import db
+    key = f"media_bridge_uploads_{base_key}"
+    conn = db.connect()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT value FROM kv WHERE key=?', (key,)).fetchone()
+        seen = set(json.loads(row['value'])) if row and row['value'] else set()
+        if not row:
+            conn.execute('INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)',
+                         (key, json.dumps(names)))
+            conn.commit()
+            return False
+        if not names:
+            conn.commit()
+            return False
+        fresh = [name for name in names if name not in seen]
+        if fresh:
+            seen.update(fresh)
+            conn.execute('INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)',
+                         (key, json.dumps(sorted(seen))))
+        conn.commit()
+        return bool(fresh)
+    except Exception:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
 
 
 def _public_url_for_key(key):
@@ -340,7 +437,13 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
             name = os.path.basename(key)
             chosen.setdefault(name, key)
 
-    if not listed_any or not chosen:
+    if len(listed) != len(prefixes):
+        return {"synced": 0, "skipped": 0}
+    if not chosen:
+        # Persist an empty baseline.  This makes the first upload after an
+        # otherwise idle scan a true new upload while still keeping an old R2
+        # backlog on an uninitialized gym baseline-only.
+        _record_new_uploads(base_key, [])
         return {"synced": 0, "skipped": 0}
 
     lib_dir = _library_dir(base_key, out_dir)
@@ -350,12 +453,15 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
 
     synced = 0
     skipped = 0
+    accepted = []
     for name in sorted(chosen):
         key = chosen[name]
         target = os.path.join(lib_dir, name)
         # IDEMPOTENT: already in the library -> never re-download.
         if os.path.exists(target):
             skipped += 1
+            if _valid_media_file(target):
+                accepted.append(key)
             continue
         try:
             data = r2.get_bytes(key)
@@ -374,9 +480,22 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
                        client_context=contexts.get(name, ""),
                        consent=bool(consents.get(name)))
         synced += 1
+        if _valid_media_file(target):
+            accepted.append(key)
 
     if synced or skipped:
         log(f"{base_key}: synced {synced} new media, skipped {skipped} already present")
+
+    # The shared usable-inventory observer owns episode rearm. It atomically
+    # records the accepted identity and closes the old episode after approval.
+    # Object history remains for intake diagnostics, never as delivery proof.
+    if accepted:
+        try:
+            from .client_infographic_fill import real_media_depleted
+            if not real_media_depleted(base_key):
+                _record_new_uploads(base_key, accepted)
+        except Exception as exc:  # noqa: BLE001
+            log(f"{base_key}: media bridge rearm failed: {type(exc).__name__}")
 
     # ECHO VISION ingest hook (§2.1): analyze newly-synced images once, on the gym's DAM
     # sidecar, so content-scoring + grounding have data before planning. Idempotent (an

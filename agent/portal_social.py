@@ -450,6 +450,67 @@ def _base_of_account(account_key):
     return key
 
 
+def _media_bridge_status(account_key, *, now=None):
+    """Read-only tenant media status for the portal. Unknown is never zero."""
+    base = _base_of_account(account_key)
+    from . import gym_media_selector as selector, media_bridge
+    from .media_source_store import default_store
+
+    try:
+        store = default_store()
+        if not store.available():
+            raise RuntimeError("media store unavailable")
+        assets = store.list_assets(base)
+        pending = sum((a.get("review_status") or "pending_review") == "pending_review"
+                      for a in assets)
+        publishable = sum(selector.is_usable(a) for a in assets)
+        review = {"status": "awaiting" if pending else "ready",
+                  "pending_review_count": pending,
+                  "publishable_count": publishable}
+    except Exception:
+        review = {"status": "unknown", "pending_review_count": None,
+                  "publishable_count": None, "reason": "media inventory unavailable"}
+
+    try:
+        state = media_bridge.episode(base, now=now, create=False)
+        if state:
+            from .calendar_autopublish import _local_now
+            today = _local_now(now, config.posting_timezone_for(base)).date()
+            active = today.isoformat() <= state["end"]
+            fallback = {"active": active, "episode_id": state["id"],
+                        "depleted_on": state["depleted_on"],
+                        "dates": [state["start"], state["end"]] if active else [],
+                        "drafts_need_review": active}
+        else:
+            fallback = {"active": False, "depleted_on": None, "dates": [],
+                        "drafts_need_review": False}
+        # An expired episode is historical, not proof of a current client notice.
+        current = state if state and fallback["active"] else None
+        notices = media_bridge.notice_status(base) if current else []
+        notice = next((n for n in notices if n.get("episode_id") == current["id"]), None) if current else None
+        status = notice.get("status") if notice else "none"
+        if status not in {"none", "unresolved", "ready", "sent"}:
+            status = "unresolved"
+        notice_state = {"status": status,
+                        "episode_id": current["id"] if current else None,
+                        "created_at": notice.get("created_at") if notice else None,
+                        "delivery_confirmed": bool(status == "sent" and notice.get("ts"))}
+    except Exception:
+        fallback = {"active": None, "depleted_on": None, "dates": [],
+                    "drafts_need_review": None, "status": "unknown"}
+        notice_state = {"status": "unknown", "delivery_confirmed": False}
+
+    try:
+        from . import ghl_intake
+        upload_url = ghl_intake.upload_link_for(base) or ""
+    except Exception:
+        upload_url = ""
+    return {"media_review": review, "fallback_episode": fallback,
+            "notice_state": notice_state,
+            "upload_action": {"url": upload_url, "label": "Upload media",
+                              "received_means_indexed": False}}
+
+
 # ---- B12: a post the client already rejected must leave their calendar ----------
 # THE DEFECT: a client denies a post, Echo issues a replacement (deny backfill,
 # client_month_run.backfill_denied_slots), and the ORIGINAL row stays on the calendar
@@ -535,6 +596,7 @@ def _handle_social_supabase(account_key, month, now=None):
         # uploaded media; upload_url is the per-gym tokenized link. LASSO is never flagged.
         "awaiting_media": awaiting_media,
         "upload_url": upload_url,
+        **_media_bridge_status(account_key, now=now),
     }
 
 
@@ -596,6 +658,7 @@ def handle_social(account_key, month, reader=None, now=None):
         # uploaded media; upload_url is the per-gym tokenized link. LASSO is never flagged.
         "awaiting_media": awaiting_media,
         "upload_url": upload_url,
+        **_media_bridge_status(account_key, now=now),
     }
 
 

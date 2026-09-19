@@ -293,16 +293,16 @@ def publish(draft, account, client=None, scheduled_for=None,
     # the post. Returning ok=True here stamped status='published' with an empty
     # late_post_id: unverifiable by publish_confirm, invisible to any reconcile, and
     # indistinguishable in the portal from a post that really went live. Refuse it.
-    # The caller reverts the claim and retries next run, which is SAFE because Zernio's
-    # own 24h content-hash dedup answers a genuine double-send with a 409 that IS
-    # handled as published above. Failing closed can at worst re-ask; the old behaviour
-    # could silently lose a post forever.
+    # The caller holds the owned claim for reconciliation because a 2xx response can
+    # still represent an accepted post whose id was lost in the response. Retrying
+    # immediately could duplicate it. A later verified recovery can resolve the row;
+    # the old behaviour could silently lose a post forever.
     if not str(post_id or "").strip():
         raise ZernioPublishError(
             f"{account.key}: Zernio returned no post id for this create "
             "(2xx with an unparseable body). Refusing to mark it published — a post "
-            "we cannot identify cannot be verified or reconciled. The row reverts and "
-            "retries; Zernio's 24h dedup makes the retry safe.")
+            "we cannot identify, verify, or reconcile. The row remains held for "
+            "manual recovery; automatic retry could duplicate the post.")
     return PublishResult(ok=True, mode="published", media_id=post_id,
                          detail="scheduled" if scheduled_for else "published now")
 

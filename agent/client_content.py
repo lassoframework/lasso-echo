@@ -182,8 +182,12 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     for a gym at its creative cap" only describes the fallback pass; it was never gated on
     the gym actually being at that cap."""
     from . import dam
+    from .media_bridge import enabled as bridge_enabled
+    from .client_media_sync import explicitly_refused_local, usable_local_creative
+    if not bridge_enabled():
+        usable_local_creative = lambda creative, account: not explicitly_refused_local(creative.path)
     imgs = [c for c in list_creatives(library_path)
-            if c.media_type in ("image", "video")]
+            if usable_local_creative(c, account_key)]
     excl = rotation.style_exclusions(library_path)
     imgs = [c for c in imgs if _image_key(c) not in excl]
     if exclude_keys:

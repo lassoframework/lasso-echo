@@ -3,6 +3,12 @@
 - [~] LASSO quality Stories now request a native 9:16, 1080x1920 composition from the image engine. The former 4:5 panel inset is removed; feed generation remains 4:5. The Astra brief asks for full-frame Story design with essential copy in x=6–94%, y=10–85%, leaving Instagram UI clearance; pixel review treats broad empty bands around a centered feed card as a major failure.
 - [~] Regression checks cover Story surface, target pixels, reviewed pixels, saved full-frame output, and rejection of the old 17–80% text restriction. Full suite in the repo virtual environment: 7604 passed, 1 skipped. Live and pending calendar rows still need separate LASSO-only replacement and human approval; this code change does not edit or publish them.
 
+## Echo client media alert and rolling two-day infographic fallback (2026-09-18, local patch)
+
+- [~] Client media depletion bridge added locally. `AGENT_MEDIA_BRIDGE_ALERTS` defaults OFF; delivery requires an explicit per-client Slack channel and the existing Echo client-reply gate. No client Slack routes are configured in this checkout.
+- [~] Client infographic fill and no-media Astra seed now inspect at most the next two days. The depletion alert is fail-closed around local media and active Drive inventory, tenant-scoped, debounced, retryable after failed delivery, and re-armed only by a newly observed intake upload. Cached no-creative fallback display URLs are tenant-scoped and durable.
+- [~] Focused validation: 43 tests passed with `PYTHONPATH=.` across the media bridge, upload re-arm, fallback, and rolling-horizon paths. A broader suite run had one intermittent SQLite migration race; the affected single test passed when rerun. This is local code and test evidence only: no Slack delivery, merge, deploy, or production verification has occurred.
+
 ## Automatic portrait reels rollout (2026-09-15)
 
 - [~] Native B treatment, measured portrait framing, approved copy/music and durable worker staging transferred onto current main. Existing approval and publishing settings remain unchanged.

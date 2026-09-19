@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import pytest
 from agent import fixer_evidence as e
 from agent import fixer_ops
+from tests.gym_media_fakes import bound_review_fields
 TICKET='234b8861-9fa9-5673-a2bd-10bbdc412b86'
 GYM='testgym'
 NOW=datetime(2026,9,15,18,tzinfo=timezone.utc)
@@ -89,7 +90,8 @@ def test_actual_sqlite_reads_cannot_initialize_or_modify(tmp_path):
 def test_media_inventory_uses_real_eligibility_and_cooldown():
  deps,tables,_=fixture()
  tables['media_asset']=[
-  {'id':'1','gym_id':GYM,'kind':'photo','eligible':True,'excluded_by_coach':False,'last_used_at':None},
+  {'id':'1','gym_id':GYM,'kind':'photo','eligible':True,'excluded_by_coach':False,'last_used_at':None,
+   **bound_review_fields('1', GYM)},
   {'id':'2','gym_id':GYM,'kind':'video','eligible':True,'excluded_by_coach':True},
   {'id':'3','gym_id':GYM,'kind':'video','eligible':True,'last_used_at':'2026-09-10T00:00:00Z'},
   {'id':'4','gym_id':GYM,'kind':'photo','eligible':None},

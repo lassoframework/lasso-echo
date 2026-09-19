@@ -61,6 +61,28 @@ def _parse_ts(s):
         return None
 
 
+def _clean_moderation_evidence(asset):
+    """Only evidence for this exact Drive file and byte version can clear it.
+
+    This validates binding, not the identity of a scan provider. A trusted scan
+    producer is still required before operators can safely populate evidence.
+    """
+    evidence = asset.get("moderation_json")
+    if asset.get("moderation_status") != "clean" or not isinstance(evidence, dict):
+        return False
+    content_hash = str(asset.get("content_hash") or "").strip()
+    if not content_hash or not asset.get("id") or not asset.get("gym_id"):
+        return False
+    return (evidence.get("verdict") == "clean"
+            and isinstance(evidence.get("provider"), str)
+            and bool(evidence["provider"].strip())
+            and evidence.get("content_hash") == content_hash
+            and evidence.get("asset_id") == asset["id"]
+            and evidence.get("gym_id") == asset["gym_id"]
+            and evidence.get("people_detected") is asset.get("people_detected")
+            and _parse_ts(evidence.get("observed_at")) is not None)
+
+
 def is_usable(asset):
     """Is this media_asset row one this selector would ever hand to a post?
 
@@ -78,6 +100,32 @@ def is_usable(asset):
     if a.get("eligible") is not True:        # null (unprobed) and false fail closed
         return False
     if a.get("excluded_by_coach"):
+        return False
+    if a.get("review_status") != "approved":
+        return False
+    if not a.get("reviewed_by") or not _parse_ts(a.get("reviewed_at")):
+        return False
+    if not str(a.get("content_hash") or "").strip():
+        return False
+    if a.get("review_content_hash") != a.get("content_hash"):
+        return False
+    if not _clean_moderation_evidence(a):
+        return False
+    people = a.get("people_detected")
+    if people is False:
+        return a.get("consent_status") == "not_required"
+    if people is not True or a.get("consent_status") != "granted":
+        return False
+    if not str(a.get("consent_member_ref") or "").strip():
+        return False
+    if not str(a.get("release_ref") or "").strip():
+        return False
+    expiry = _parse_ts(a.get("consent_expires_at"))
+    if expiry is None:
+        return False
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if expiry <= datetime.now(timezone.utc):
         return False
     return True
 

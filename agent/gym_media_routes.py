@@ -423,6 +423,18 @@ def handle_list_assets(account_key, *, store=None):
          "reject_reason": a.get("reject_reason"), "aspect": a.get("aspect"),
          "crop_hint": a.get("crop_hint"), "used_count": a.get("used_count"),
          "last_used_at": a.get("last_used_at"),
+         "source_id": a.get("source_id"),
+         "review_status": a.get("review_status") or "pending_review",
+         "moderation_status": a.get("moderation_status") or "pending",
+         "moderation_json": a.get("moderation_json"),
+         "people_detected": a.get("people_detected"),
+         "consent_status": a.get("consent_status") or "pending",
+         "consent_member_ref": a.get("consent_member_ref"),
+         "release_ref": a.get("release_ref"),
+         "consent_expires_at": a.get("consent_expires_at"),
+         "reviewed_by": a.get("reviewed_by"),
+         "reviewed_at": a.get("reviewed_at"),
+         "review_note": a.get("review_note"),
          "thumb_url": f"/media/thumb/{a.get('id')}"}
         for a in assets]}
 

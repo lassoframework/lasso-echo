@@ -8,6 +8,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from agent.integrations.drive_client import DriveFile, FOLDER_MIME  # noqa: E402
 
 
+def bound_review_fields(asset_id, gym_id, content_hash="fixture-hash"):
+    """A complete offline review fixture for one exact Drive byte version."""
+    return {"content_hash": content_hash, "review_content_hash": content_hash,
+            "review_status": "approved", "reviewed_by": "test-reviewer",
+            "reviewed_at": "2026-09-01T12:00:00+00:00",
+            "moderation_status": "clean", "moderation_json": {
+                "provider": "offline-test", "verdict": "clean",
+                "asset_id": asset_id, "gym_id": gym_id,
+                "content_hash": content_hash, "people_detected": False,
+                "observed_at": "2026-09-01T12:00:00+00:00"},
+            "people_detected": False, "consent_status": "not_required"}
+
+
 class FakeMediaStore:
     """In-memory media_source + media_asset store with the SupabaseMediaStore
     interface. list_assets REQUIRES a gym_id (tenant isolation)."""
@@ -18,6 +31,7 @@ class FakeMediaStore:
         self._up = up
         self.updates = []
         self.source_updates = []
+        self.review_events = []
 
     def available(self):
         return self._up
@@ -94,6 +108,29 @@ class FakeMediaStore:
     def update_asset(self, asset_id, fields):
         self.assets.setdefault(asset_id, {"id": asset_id}).update(fields)
         self.updates.append((asset_id, dict(fields)))
+        return True
+
+    def update_indexed_asset_if_hash(self, gym_id, asset_id, old_hash, fields):
+        asset = self.assets.get(asset_id)
+        if not asset or asset.get("gym_id") != gym_id or asset.get("content_hash") != old_hash:
+            raise RuntimeError("asset changed during Drive indexing")
+        return self.update_asset(asset_id, fields)
+
+    def update_review_asset(self, gym_id, asset_id, fields, *,
+                            expected_content_hash, expected_review_status,
+                            expected_reviewed_at):
+        asset = self.assets.get(asset_id)
+        if (not asset or asset.get("gym_id") != gym_id or
+                asset.get("content_hash") != expected_content_hash or
+                asset.get("review_status") != expected_review_status or
+                asset.get("reviewed_at") != expected_reviewed_at):
+            raise RuntimeError("asset changed during review")
+        self.review_events.append({"gym_id": gym_id, "asset_id": asset_id,
+                                   "content_hash": expected_content_hash,
+                                   "prior_status": asset.get("review_status"),
+                                   "decision": fields["review_status"],
+                                   "reviewed_by": fields["reviewed_by"]})
+        self.update_asset(asset_id, fields)
         return True
 
 
@@ -200,6 +237,8 @@ def make_asset(fid="a1", gym_id="pierce", source_id="src1", kind="photo",
                title="team.jpg", size=2_000_000, eligible=True,
                excluded_by_coach=False, used_count=0, last_used_at=None,
                content_hash="h1", reject=None, mime="image/jpeg"):
+    # Historical selector/planner fixtures represent media ready for use. New
+    # quarantine tests explicitly override these fields to pending/unknown.
     return {"id": fid, "source_id": source_id, "gym_id": gym_id, "kind": kind,
             "title": title, "mime_type": mime, "size_bytes": size,
             "content_hash": content_hash, "duration_sec": None, "width": 1080,
@@ -208,7 +247,16 @@ def make_asset(fid="a1", gym_id="pierce", source_id="src1", kind="photo",
             "excluded_by_coach": excluded_by_coach, "reject_reason": reject,
             "used_count": used_count, "last_used_at": last_used_at,
             "drive_modified": "2026-08-01T00:00:00Z",
-            "indexed_at": "2026-08-27T00:00:00+00:00"}
+            "indexed_at": "2026-08-27T00:00:00+00:00",
+            "review_status": "approved", "reviewed_by": "test-operator",
+            "reviewed_at": "2026-08-27T00:00:00Z",
+            "moderation_status": "clean",
+            "review_content_hash": content_hash,
+            "moderation_json": {"provider": "test", "verdict": "clean",
+                                "content_hash": content_hash, "asset_id": fid,
+                                "gym_id": gym_id, "people_detected": False,
+                                "observed_at": "2026-08-27T00:00:00Z"},
+            "people_detected": False, "consent_status": "not_required"}
 
 
 def make_source(sid="src1", gym_id="pierce", folder_id="fold1", active=True,

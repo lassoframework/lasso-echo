@@ -551,9 +551,12 @@ def test_approved_row_is_claimable_regression(monkeypatch):
     assert out["published"] == ["rA"], f"approved row was not published: {out}"
 
 
-def test_failed_client_publish_reverts_to_approved(monkeypatch):
-    """A transient Zernio failure must revert the CLIENT row to 'approved' (not
-    'pending'), so the client never has to re-approve."""
+def test_failed_client_publish_holds_claim_for_reconciliation(monkeypatch):
+    """An ambiguous Zernio failure holds the CLIENT claim for reconciliation.
+
+    Retrying after a timeout can duplicate a post that reached the provider, so
+    the row stays in ``publishing`` and the next run must not resend it.
+    """
     _arm(monkeypatch)
     monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
     rows = [{"id": "rB", "gym_id": "eng", "account": "instagram", "status": "approved",
@@ -566,8 +569,10 @@ def test_failed_client_publish_reverts_to_approved(monkeypatch):
     out = cap.publish_due("2026-08-13", gym_id="eng", store=store, approved_only=True,
                           zernio_publish=boom, catch_all=True)
     assert out["failed"] == ["rB"]
-    assert store.reverts == [("rB", "approved")]           # NOT pending
-    assert store._rows["rB"]["status"] == "approved"       # ready to retry, no re-approve
+    assert out["held"] is True
+    assert out["recovery_required"] == ["rB"]
+    assert store.reverts == []
+    assert store._rows["rB"]["status"] == "publishing"
 
 
 def test_exactly_once_across_two_ticks(monkeypatch):
