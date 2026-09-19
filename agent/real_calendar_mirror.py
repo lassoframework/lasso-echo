@@ -30,10 +30,20 @@ HARD GUARDS:
   * A draft with no real hosted creative URL (creative_public_url) is skipped: the
     portal never shows an empty card, and the demo/real split stays honest.
   * Nothing here publishes. It writes calendar rows only.
+
+IG FEED HASHTAG FOLD (fix/instagram-hashtag-reach-20260919): when an INSTAGRAM
+FEED draft is folded into a row, the stored caption is normalized to end with
+exactly ONE final hashtag line of 3-5 tags from the draft's already-approved
+hashtag selection (agent/ig_feed_hashtags.py owns the pure caption rule). The portal preview and the Zernio
+publish wire both use the stored hashtag-bearing base caption. The existing
+optional mention lane may append allowlisted @handles at publish time. Facebook rows, story rows, and rows whose
+status is terminal (published/publishing/denied/killed/failed) are never
+touched; an empty caption stays empty; a re-run is byte-identical.
 """
 
 from . import config
 from . import demo_calendar_queue as _demo
+from .accounts import Platform
 
 
 # The portal-facing statuses Echo's draft states map to on the content_calendar row.
@@ -54,6 +64,46 @@ def _draft_status(draft):
     raw = getattr(draft, "status", None)
     val = getattr(raw, "value", raw)
     return _STATUS_MAP.get(str(val or "").lower(), "pending")
+
+
+# Terminal row states a mirror must never caption-edit: a denied row is the
+# tombstone of a skipped/superseded/expired draft (a human said no), and
+# published/publishing/killed/failed can only arrive as a RAW draft status (the
+# map above never produces them) — both views are checked so no edit can ever
+# land on a terminal row.
+_LOCKED_ROW_STATUSES = frozenset(
+    {"published", "publishing", "denied", "killed", "failed"})
+
+
+def _status_locked(draft):
+    """True when this draft's row must never be caption-edited: the mapped portal
+    status OR the raw draft status is terminal."""
+    raw = getattr(draft, "status", None)
+    raw = getattr(raw, "value", raw)
+    return (str(raw or "").lower() in _LOCKED_ROW_STATUSES
+            or _draft_status(draft) in _LOCKED_ROW_STATUSES)
+
+
+def caption_for_draft(draft, caption=None):
+    """Return the stored caption for one draft without any I/O.
+
+    The drafter has already selected approved hashtags from the gym's VoiceDoc.
+    Reusing that exact list here keeps staging faithful to the reviewed draft and
+    prevents calendar construction from silently changing copy when a voice file
+    changes or cannot be read. Facebook and stories deliberately retain their
+    clean caption.
+    """
+    clean = (getattr(draft, "caption", "") if caption is None else caption) or ""
+    if (_draft_format(draft) != "feed"
+            or getattr(draft, "platform", "") != Platform.INSTAGRAM
+            or not clean.strip() or _status_locked(draft)):
+        return clean
+    tags = getattr(draft, "hashtags", None) or []
+    if not tags:
+        return clean
+    from . import ig_feed_hashtags
+    return ig_feed_hashtags.ensure_feed_tag_line(
+        clean, approved_tags=tags, selected_tags=tags)
 
 
 def _draft_format(draft):
@@ -82,23 +132,35 @@ def _pillar(draft):
     return (getattr(draft, "category", "") or "").strip()
 
 
-def _real_row(account_key, draft):
+def _real_row(account_key, draft, caption=None):
     """One real draft folded into the content_calendar row shape. gym_id == account_key;
     account == the draft's platform; format from is_story/draft_type. No field invented:
     an empty caption stays empty.
+
+    IG FEED HASHTAG FOLD: an Instagram FEED draft on a non-terminal status gets its
+    stored caption normalized to end with one final line of 3-5 approved VoiceDoc
+    hashtags (agent/ig_feed_hashtags.ensure_feed_tag_line) — the exact tags the
+    drafter selected at draft time. Facebook rows and story rows are never touched (stories stay empty-body
+    by design), and a terminal row (published/publishing/denied/killed/failed)
+    is never edited. When the draft carries no approved tags, its caption is
+    left byte-for-byte as supplied.
 
     The row carries NO `id`: content_calendar.id is a Postgres uuid the DB generates
     (gen_random_uuid), and there is no draft_id column, so writing a draft's id as the
     row id fails with 22P02 and writes 0 rows. The write path is delete-then-insert, and
     /social + the approve/deny actions key off the DB-returned uuid, not the draft id.
     The draft's own id is exposed separately via _row_source_id for the demo-id guard."""
+    clean_caption = getattr(draft, "caption", "") if caption is None else caption
+    fmt = _draft_format(draft)
+    platform = getattr(draft, "platform", "") or ""
+    caption = caption_for_draft(draft, clean_caption)
     row = {
         "gym_id": account_key,
-        "account": getattr(draft, "platform", "") or "",
+        "account": platform,
         "post_date": _post_date(draft),
         "pillar": _pillar(draft),
-        "format": _draft_format(draft),
-        "caption": getattr(draft, "caption", "") or "",
+        "format": fmt,
+        "caption": caption,
         "image_url": getattr(draft, "creative_public_url", "") or "",
         "status": _draft_status(draft),
     }
@@ -158,7 +220,7 @@ def collect_real_drafts(account_key, store):
     Excluded: demo drafts (id namespace), drafts with no creative_public_url, and drafts
     with no resolvable post_date (nothing to place on a calendar day).
 
-    PURE: reads only store.list_for_account(account_key); no writes, no network.
+    PURE of writes and network: reads only store.list_for_account(account_key).
     """
     if not account_key or store is None:
         return []

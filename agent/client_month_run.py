@@ -1988,6 +1988,7 @@ def _to_rows(base_key, drafts):
     Rows carry NO id. gym_id is forced to base_key. A draft with no post_date is dropped."""
     rows = []
     for draft in drafts or []:
+        clean_caption = getattr(draft, "caption", "") or ""
         row = _row_from_draft(base_key, draft)
         if not row.get("post_date"):
             continue
@@ -1997,6 +1998,7 @@ def _to_rows(base_key, drafts):
                 "instagram", "ig", ""):
             fb = dict(row)
             fb["account"] = "facebook"
+            fb["caption"] = clean_caption
             rows.append(fb)
     return rows
 
