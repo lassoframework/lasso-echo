@@ -18,8 +18,10 @@ calendar-boundary helper built alongside this command. This module owns only
 the sweep around it -- which rows are eligible, how the gym's VoiceDoc is
 resolved, the dry-run report, and the approval-safe write. In short (see
 ig_feed_hashtags' own docstring for the full contract):
-  * Tags come ONLY from the gym's own approved VoiceDoc (voice.load_voice ->
-    VoiceDoc.hashtags, hex colors already filtered there). Nothing is invented;
+  * Tags come from the gym's approved VoiceDoc (voice.load_voice ->
+    VoiceDoc.hashtags, hex colors already filtered there) or an explicit
+    operator-approved account fallback when the doc has no usable tags. Nothing
+    is invented;
     a gym with no approved tags is SKIPPED, never patched.
   * The selection is the drafter's OWN (drafter._select_hashtags: brand tier
     first, deterministic rotation, capped at TemplateGenerator.HASHTAG_LIMIT =
@@ -173,15 +175,22 @@ def _voice_for_base(base):
     callers (runner.draft_for_new_upload, portal_social._voice_for): the
     registry account (<base>_ig else <base>), then durable-first voice path
     resolution via client_media_sync._resolve_client_voice_path, then
-    voice.load_voice. None when the doc is missing/empty -- the caller SKIPS
-    the gym (no voice doc, no tags; never invent)."""
+    voice.load_voice. A voice doc with no usable hashtag section may use the
+    account's explicit operator-approved fallback. None when the doc is
+    missing/empty -- the caller SKIPS the gym (no voice doc, never invent)."""
     try:
-        from .accounts import get_account
+        from dataclasses import replace
+
+        from .accounts import approved_hashtags_for, get_account
         from .client_media_sync import _resolve_client_voice_path
         account = get_account(f"{base}_ig") or get_account(base)
         repo_path = (account.voice_doc_path() if account is not None
                      else f"brand_voice/{base}/lasso_voice.md")
-        return load_voice(_resolve_client_voice_path(base, repo_path))
+        loaded = load_voice(_resolve_client_voice_path(base, repo_path))
+        if loaded is None:
+            return None
+        tags = approved_hashtags_for(account, loaded.hashtags)
+        return replace(loaded, hashtags=tags)
     except Exception:  # noqa: BLE001 - an unreadable bible is 'cannot tag', not a crash
         return None
 

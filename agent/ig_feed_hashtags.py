@@ -16,10 +16,11 @@ at the calendar boundary: the tags land IN the stored base caption once, so the
 portal and publisher use the same hashtag copy before any optional mentions.
 
 THE CONTRACT (ensure_feed_tag_line):
-  * Tags come ONLY from the gym's approved VoiceDoc (agent/voice.py —
-    VoiceDoc.hashtags, hex colors already filtered out by the extractor).
-    Nothing is invented here; a voice doc with no usable tags leaves the
-    caption byte-identical.
+  * Tags come from the gym's approved VoiceDoc (agent/voice.py —
+    VoiceDoc.hashtags, hex colors already filtered out by the extractor), or
+    from an explicit operator-approved Account fallback already carried on the
+    draft. Nothing is invented here; no approved source leaves the caption
+    byte-identical.
   * The selection is the drafter's OWN (drafter._select_hashtags): brand tier
     first, deterministic rotation keyed on the creative's filename stem, capped
     at TemplateGenerator.HASHTAG_LIMIT (5). Same stem -> same tags -> a re-run

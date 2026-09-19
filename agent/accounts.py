@@ -13,6 +13,7 @@ ACCOUNTS or override the target ids via env. Tokens are set by Blake's own hand.
 import contextlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 
 from .trust import TrustLevel, default_trust_for_new_account
@@ -54,6 +55,11 @@ class Account:
     # meta_direct. Changing this flips the publish step ONLY: drafting,
     # approvals, calendar, trust ladder are all identical either way.
     publish_route: str = "meta_direct"
+    # Owner-approved Instagram reach tags used only when the durable voice doc
+    # contains no usable hashtag set. Keep this empty by default so Echo never
+    # invents tags for a client. Values here are explicit account configuration,
+    # not model output.
+    approved_hashtags: list = field(default_factory=list)
 
     def get_token(self):
         """Read the token at call time. Never logged, never surfaced.
@@ -109,6 +115,37 @@ class Account:
         return f"<Account {self.key} platform={self.platform} trust={self.trust.name}>"
 
 
+_HASHTAG_TOKEN = re.compile(r"^#[A-Za-z0-9_]+$")
+
+
+def approved_hashtags_for(account, voice_hashtags=()):
+    """Return this account's approved hashtag source without inventing copy.
+
+    The voice doc wins whenever it has usable tags. A configured account-level
+    list is only a fallback for a known client whose owner/operator has approved
+    reach tags separately. Numeric-only tokens such as ``#1`` are headings or
+    ranking claims, not useful reach tags, and are rejected from both sources.
+    """
+    def _clean(values):
+        out, seen = [], set()
+        for value in values or ():
+            if not isinstance(value, str) or not _HASHTAG_TOKEN.fullmatch(value):
+                continue
+            if value[1:].isdigit():
+                continue
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(value)
+        return out
+
+    voice = _clean(voice_hashtags)
+    if voice:
+        return voice
+    return _clean(getattr(account, "approved_hashtags", ()) if account else ())
+
+
 # Stage 1 LASSO accounts. token/id values come from env, set by hand.
 ACCOUNTS = [
     Account(
@@ -162,6 +199,17 @@ ACCOUNTS = [
         voice_doc="brand_voice/eng/lasso_voice.md",
         social_proof_doc="brand_voice/eng/social_proof.md",
         library_prefix="content_library/eng",
+        # Blake approved adding Instagram tags for ENG on 2026-09-19. Each tag
+        # is grounded in the configured gym name, modality, or Cape Coral
+        # location above. The list is an IG-only fallback; the voice doc wins
+        # if ENG later supplies its own hashtag set.
+        approved_hashtags=[
+            "#CrossFitENG",
+            "#HYROXENG",
+            "#CapeCoralFitness",
+            "#CrossFit",
+            "#HYROX",
+        ],
         slack_channel="",            # the client's approval channel id, by hand
         approvers=[],                # approver Slack ids, by hand
         active=False,                # Client gyms stay active=False (like gritx/topfuel):

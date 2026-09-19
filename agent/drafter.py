@@ -19,7 +19,7 @@ from . import config
 from . import content_planner
 from . import media_host
 from . import ops_alerts
-from .accounts import Platform
+from .accounts import Platform, approved_hashtags_for
 from .voice import load_voice
 
 
@@ -1203,6 +1203,13 @@ def draft_post(account, creative, scheduled_for, voice=None,
             status=DraftStatus.BLOCKED,
             blocked_reason="Caption standard (section 9): empty caption. Voice doc or content plan returned no text.",
         )
+
+    # An explicitly configured account fallback closes the rare case where a
+    # client's durable voice doc has no hashtag section. This is Instagram-only:
+    # Facebook and GBP retain their existing copy behavior. The helper also
+    # rejects numeric-only heading fragments such as ``#1``.
+    if account.platform == Platform.INSTAGRAM:
+        hashtags = approved_hashtags_for(account, hashtags)
 
     # Per-platform variant (flag OFF -> unchanged): selection only, from the same
     # approved set. FB keeps at most 2 tags; IG keeps its existing cap of 5.
