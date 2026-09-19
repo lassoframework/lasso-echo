@@ -62,6 +62,7 @@ TOKEN_READ_ALLOWLIST = {
     "gym_identity.py",              # name/market tokens for ONE base's grounding
     "fixer_evidence.py",            # exact ticket -> ONE gym alias; never enumerates clients
     "fixer_business_evidence.py",   # exact authenticated business check -> ONE gym mapping
+    "fixer_business_seed_client.py",  # exact Echo key -> ONE portal UUID; bidirectional eq filters
     "fixer_ops.py",                 # exact ticket gym_id -> ONE account key before ops action
     "intake_web.py",                # the row for ONE signed link's key
     "social_intake_reader.py",      # resolve ONE intake's raw key to its token key

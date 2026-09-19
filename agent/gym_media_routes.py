@@ -100,6 +100,53 @@ def _drive():
     return _dc.DriveClient()
 
 
+def _queue_media_fixer_ticket(gym, folder_id, incident_kind, source=None, *,
+                               bus=None, sender=None, log=print):
+    """Create one row-first FIXER ticket for an exact media-domain failure.
+
+    This is deliberately separate from the route response.  Missing or
+    ambiguous tenant identity, malformed source state, transport failure, and
+    an unconfirmed Scout response all fail closed for FIXER intake and are
+    audit-logged; none changes what the coach's media request returns.
+    """
+    from . import fixer_business_seed_client as _fixer
+    snapshot = source if isinstance(source, dict) else {}
+    try:
+        event = _fixer.media_incident_event(
+            gym_key=gym,
+            folder_id=folder_id,
+            incident_kind=incident_kind,
+            source_id=str(snapshot.get("id") or ""),
+            prior_sync_status=str(snapshot.get("sync_status") or ""),
+            prior_sync_requested_at=str(snapshot.get("sync_requested_at") or ""),
+            bus=bus,
+        )
+        result = (sender or _fixer.send)(event)
+    except Exception as exc:  # noqa: BLE001 - media response must remain independent
+        log(f"[gym-media] FIXER intake refused gym={gym} folder={folder_id} "
+            f"incident={incident_kind} reason={type(exc).__name__}")
+        return None
+    if result.ok:
+        log(f"[gym-media] FIXER intake confirmed gym={gym} folder={folder_id} "
+            f"incident={incident_kind} ticket={result.ticket_id} "
+            f"outcome={result.outcome}")
+    else:
+        log(f"[gym-media] FIXER intake unconfirmed gym={gym} folder={folder_id} "
+            f"incident={incident_kind} reason={result.reason}")
+    return result
+
+
+def _record_media_fixer_failure(gym, folder_id, incident_kind, source=None,
+                                fixer_ticket=None):
+    """Best-effort ticket hook that can never alter the user-facing operation."""
+    try:
+        callback = fixer_ticket or _queue_media_fixer_ticket
+        callback(gym, folder_id, incident_kind, source)
+    except Exception as exc:  # noqa: BLE001 - caller's failure remains authoritative
+        print(f"[gym-media] FIXER intake hook failed gym={gym} folder={folder_id} "
+              f"incident={incident_kind} reason={type(exc).__name__}")
+
+
 # ---- POST /media/check-connection --------------------------------------------
 def handle_check_connection(account_key, folder_url, *, drive=None, store=None):
     """POST /media/check-connection {folder_url}
@@ -176,7 +223,7 @@ def handle_check_connection(account_key, folder_url, *, drive=None, store=None):
 
 # ---- POST /media/sources (bind after confirm) --------------------------------
 def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
-                       store=None):
+                       store=None, fixer_ticket=None):
     """POST /media/sources {folder_url, actor_id?}
 
     Bind a confirmed folder to this gym. Enforces the hijack rail (§1.5a: a
@@ -217,8 +264,14 @@ def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
         if existing.get("active"):
             try:
                 if not store.request_sync(existing["id"], gym):
+                    _record_media_fixer_failure(
+                        gym, folder_id, "existing_source_sync_queue_failed",
+                        existing, fixer_ticket)
                     return 503, {"ok": False, "error": "could not queue media indexing"}
             except Exception:
+                _record_media_fixer_failure(
+                    gym, folder_id, "existing_source_sync_queue_failed",
+                    existing, fixer_ticket)
                 return 503, {"ok": False, "error": "could not queue media indexing"}
             return 200, {"ok": True, "source_id": existing.get("id"),
                          "folder_name": existing.get("folder_name") or "",
@@ -270,8 +323,14 @@ def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
             if str(concurrent.get("gym_id") or "") == gym and concurrent.get("active"):
                 try:
                     if not store.request_sync(concurrent["id"], gym):
+                        _record_media_fixer_failure(
+                            gym, folder_id, "existing_source_sync_queue_failed",
+                            concurrent, fixer_ticket)
                         return 503, {"ok": False, "error": "could not queue media indexing"}
                 except Exception:  # noqa: BLE001 - bind is real, but indexing unconfirmed
+                    _record_media_fixer_failure(
+                        gym, folder_id, "existing_source_sync_queue_failed",
+                        concurrent, fixer_ticket)
                     return 503, {"ok": False, "error": "could not queue media indexing"}
                 return 200, {"ok": True, "source_id": concurrent.get("id"),
                              "folder_name": concurrent.get("folder_name") or "",
@@ -283,6 +342,8 @@ def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
             f"Connect Google Drive bind failed for gym {gym!r}, folder {folder_id!r}; "
             f"no folder binding could be confirmed. Store error: "
             f"{ops_alerts.scrub(str(e))[:200]}")
+        _record_media_fixer_failure(
+            gym, folder_id, "source_persist_unconfirmed", None, fixer_ticket)
         return 503, {"ok": False, "case": "store_unavailable",
                      "error": "could not save the folder connection; please retry"}
     try:
@@ -290,6 +351,8 @@ def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
             raise RuntimeError("source could not be queued")
     except Exception:
         # The source is bound. A repeat bind requests indexing on that same row.
+        _record_media_fixer_failure(
+            gym, folder_id, "new_source_sync_queue_failed", row, fixer_ticket)
         return 503, {"ok": False, "source_id": source_id,
                      "error": "folder connected but media indexing could not be queued; retry connect"}
     return 200, {"ok": True, "source_id": source_id,

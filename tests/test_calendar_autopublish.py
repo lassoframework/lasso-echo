@@ -22,6 +22,8 @@ Coverage:
 import os
 import sys
 import threading
+from types import SimpleNamespace
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -1600,6 +1602,95 @@ def test_mark_published_write_failure_alerts_directly(armed, monkeypatch):
     assert len(sent) == 1
     assert "PUBLISHED live" in sent[0]
     assert "supabase write timeout" in sent[0]
+
+
+def test_published_state_conflict_seeds_exact_row_first_fixer_event():
+    """Only the explicit guarded 409 after a real provider success is actionable.
+
+    The seed carries the exact calendar row and tenant-bound expected terminal state,
+    never an error string or an inferred target from a support message.
+    """
+    row = _row("calendar_conflict_123", status="publishing")
+    row["gym_id"] = "chateau"
+    sent = []
+
+    def event_builder(**kwargs):
+        sent.append(("event", kwargs))
+        return {"event": kwargs}
+
+    def sender(event):
+        sent.append(("send", event))
+        return SimpleNamespace(ok=True)
+
+    result = cap._submit_published_state_conflict(
+        gym_id="chateau", row=row,
+        error=pcs.PortalStoreError(409, "refusing to stamp published over conflict"),
+        resolve_client_id=lambda gym: (
+            "22222222-2222-4222-8222-222222222222" if gym == "chateau" else None),
+        event_builder=event_builder, sender=sender,
+    )
+
+    assert result is True
+    event = sent[0][1]
+    assert event == {
+        "submission_key": str(uuid5(
+            NAMESPACE_URL,
+            "lasso:fixer:calendar-published-state-conflict:v1:chateau:"
+            "calendar_conflict_123",
+        )),
+        "client_id": "22222222-2222-4222-8222-222222222222",
+        "row_id": "calendar_conflict_123",
+        "expected_status": "published",
+    }
+    assert sent[1] == ("send", {"event": event})
+
+
+@pytest.mark.parametrize("error, gym_id", [
+    (RuntimeError("supabase write timeout"), "chateau"),
+    (pcs.PortalStoreError(503, "temporarily unavailable"), "chateau"),
+    (pcs.PortalStoreError(409, "state conflict"), "other-gym"),
+])
+def test_published_state_conflict_never_infers_ticket_from_transient_or_wrong_tenant(
+        error, gym_id):
+    called = []
+    row = _row("calendar_conflict_456", status="publishing")
+    row["gym_id"] = "chateau"
+
+    assert cap._submit_published_state_conflict(
+        gym_id=gym_id, row=row, error=error,
+        resolve_client_id=lambda _: called.append("resolve"),
+        event_builder=lambda **_: called.append("event"),
+        sender=lambda _: called.append("send"),
+    ) is False
+    assert called == []
+
+
+@pytest.mark.parametrize("ticket_accepted", [True, False])
+def test_mark_published_state_conflict_submits_without_changing_claim(
+        armed, monkeypatch, ticket_accepted):
+    class _ConflictStore(_FakeStore):
+        def mark_published(self, row_id, media_id, published_at):
+            raise pcs.PortalStoreError(
+                409, "row changed out of publishing; refusing terminal write")
+
+    seen = []
+    monkeypatch.setattr(
+        cap, "_submit_published_state_conflict",
+        lambda **kwargs: seen.append(kwargs) or ticket_accepted,
+    )
+    store = _ConflictStore([_row("calendar-conflict-live")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["failed"] == ["calendar-conflict-live"]
+    assert summary["published"] == []
+    assert store.rows["calendar-conflict-live"]["status"] == "publishing"
+    assert len(seen) == 1
+    assert seen[0]["gym_id"] == "lasso"
+    assert seen[0]["row"]["id"] == "calendar-conflict-live"
+    assert isinstance(seen[0]["error"], pcs.PortalStoreError)
+    assert seen[0]["error"].status == 409
 
 
 def test_mark_published_write_failure_alert_does_not_storm_across_ticks(armed, monkeypatch):
