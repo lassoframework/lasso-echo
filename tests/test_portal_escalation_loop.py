@@ -24,6 +24,8 @@ from agent.slack_convo import outbox as OB
 ECHO = IDS.IDENTITIES["echo"]
 BUSINESS_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 BUSINESS_ROW_ID = "row-portal-123"
+BUSINESS_PORTAL_GYM_ID = "11111111-1111-4111-8111-111111111111"
+BUSINESS_ECHO_GYM_KEY = "gym-one"
 
 
 @pytest.fixture(autouse=True)
@@ -293,9 +295,13 @@ def _verify_business(bus):
     release["business_postcondition"] = {
         "check_id": "calendar_row_status",
         "params": {"row_id": BUSINESS_ROW_ID, "expected_status": "published"}}
+    bus.tables["echo_intake_tokens"] = [{
+        "gym_id": BUSINESS_PORTAL_GYM_ID,
+        "echo_account_key": BUSINESS_ECHO_GYM_KEY,
+    }]
     bus.tables["content_calendar"] = [{
         "id": BUSINESS_ROW_ID,
-        "gym_id": bus.ticket("t-1")["client_id"],
+        "gym_id": BUSINESS_ECHO_GYM_KEY,
         "status": "published",
     }]
 
@@ -463,7 +469,8 @@ def test_escalated_question_hold_overrides_question_exception(monkeypatch):
 
 
 def test_code_fix_resolve_requires_release_and_blake_in_conversation():
-    bus = Bus([_ticket(classification="code_fix", status="hold")])
+    bus = Bus([_ticket(classification="code_fix", status="hold",
+                       client_id=BUSINESS_PORTAL_GYM_ID)])
     assert not OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
                                      log=lambda *a: None)
     assert bus.of_kind(A.KIND_STATUS) == []
@@ -493,6 +500,7 @@ def test_code_fix_resolve_requires_release_and_blake_in_conversation():
 
 def test_verified_fix_notice_names_blake_in_group_dm():
     bus = Bus([_ticket(classification="code_fix", status="merged",
+                       client_id=BUSINESS_PORTAL_GYM_ID,
                        fix_pr_url="https://example.test/pr/1",
                        verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
