@@ -1239,6 +1239,12 @@ def test_restage_month_ops_notice_delivery_gate(monkeypatch, defect):
 
 BUSINESS_SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"  # 40 lowercase hex
 BUSINESS_ROW_ID = "row-abc-123"
+# Business-postcondition fixtures use the same identity boundary as production:
+# support tickets carry the portal gym UUID, while Echo's evidence tables use
+# the authoritative Echo account key resolved through echo_intake_tokens.
+BUSINESS_PORTAL_GYM_ID = "11111111-1111-4111-8111-111111111111"
+BUSINESS_OTHER_PORTAL_GYM_ID = "22222222-2222-4222-8222-222222222222"
+BUSINESS_ECHO_GYM_KEY = "gym-one"
 
 
 def _fixer_business_pointer(row_id=BUSINESS_ROW_ID, expected="published"):
@@ -1253,6 +1259,9 @@ def _seed_business_readback(bus, gym="gym-one", row_id=BUSINESS_ROW_ID,
                             status="published"):
     """The authoritative side of the pointer: what the dispatch-time observation
     reads back through the bounded reader."""
+    bus.tables.setdefault("echo_intake_tokens", []).append(
+        {"gym_id": BUSINESS_PORTAL_GYM_ID,
+         "echo_account_key": BUSINESS_ECHO_GYM_KEY})
     bus.tables.setdefault("content_calendar", []).append(
         {"id": row_id, "gym_id": gym, "status": status})
 
@@ -1288,7 +1297,7 @@ def test_business_fix_notice_requires_authoritative_observation(monkeypatch, def
     pr = "https://github.com/lassoframework/lasso-echo/pull/999"
     bus.tickets[tid] = {
         "id": tid, "status": "merged", "bot_identity": "echo", "identity_kind": "client",
-        "client_id": "gym-one", "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        "client_id": BUSINESS_PORTAL_GYM_ID, "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
         "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
             "deployment_check": {"verified": True, "sha": sha}}},
@@ -1360,7 +1369,7 @@ def test_business_fix_notice_requires_authoritative_observation(monkeypatch, def
         monkeypatch.setattr(FBE, "observe", lambda *a, **k:
                             _fabricated_observation(key, sha, captured_at=future))
     elif defect == "gym_mismatch":
-        bus.set_ticket(tid, client_id="gym-two")
+        bus.set_ticket(tid, client_id=BUSINESS_OTHER_PORTAL_GYM_ID)
     elif defect == "stale_request":
         bus.record_inbound(ticket_id=tid, author_type="client", body="Wait, still broken")
     elif defect == "sha_not_hex":
@@ -1401,7 +1410,7 @@ def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
     pr = "https://github.com/lassoframework/lasso-echo/pull/999"
     bus.tickets[tid] = {
         "id": tid, "status": "hold", "bot_identity": "echo", "identity_kind": "client",
-        "client_id": "gym-one",
+        "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
                                         "deployment_check": {"verified": True, "sha": sha}}},
@@ -1466,7 +1475,7 @@ def test_fixer_old_request_notice_cannot_post_or_resolve_after_correction(monkey
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
         "id": tid, "status": "merged", "bot_identity": "echo",
-        "identity_kind": "client", "client_id": "gym-one",
+        "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
             "deployment_check": {"verified": True, "sha": sha}}},
@@ -1501,7 +1510,7 @@ def test_fixer_correction_during_slack_post_keeps_ticket_open(monkeypatch):
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
         "id": tid, "status": "merged", "bot_identity": "echo",
-        "identity_kind": "client", "client_id": "gym-one",
+        "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
             "deployment_check": {"verified": True, "sha": sha}}},
@@ -1538,7 +1547,7 @@ def test_fixer_correction_before_slack_post_suppresses_old_notice(monkeypatch, w
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
         "id": tid, "status": "merged", "bot_identity": "echo",
-        "identity_kind": "client", "client_id": "gym-one",
+        "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
             "deployment_check": {"verified": True, "sha": sha}}},
@@ -1593,7 +1602,7 @@ def test_fixer_unreadable_request_thread_suppresses_notice(monkeypatch):
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
         "id": tid, "status": "merged", "bot_identity": "echo",
-        "identity_kind": "client", "client_id": "gym-one",
+        "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
             "deployment_check": {"verified": True, "sha": sha}}},
@@ -1652,7 +1661,7 @@ def test_fixer_customer_slack_reply_requires_blake_in_destination(
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
         "id": tid, "status": "merged", "bot_identity": "echo",
-        "identity_kind": "client", "client_id": "gym-one",
+        "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": channel, "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
             "deployment_check": {"verified": True, "sha": sha}}},
@@ -1707,7 +1716,7 @@ def test_fixer_customer_slack_reply_does_not_send_if_exact_body_cannot_be_saved(
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
         "id": tid, "status": "merged", "bot_identity": "echo",
-        "identity_kind": "client", "client_id": "gym-one",
+        "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
             "deployment_check": {"verified": True, "sha": sha}}},
