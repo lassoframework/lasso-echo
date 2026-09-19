@@ -1126,10 +1126,14 @@ def to_calendar_rows(drafts, account_key):
     row reads 'feed' and a story row reads 'story' with the plan's pillar."""
     rows = []
     for draft in drafts or []:
-        row = _mirror._real_row(account_key, draft)
+        # Keep the clean platform-neutral body beside the Instagram row. The
+        # IG row gets its approved tag line at the mirror seam, while the FB
+        # clone below must retain this original body.
+        clean_caption = getattr(draft, "caption", "") or ""
         if account_key == 'lasso' and config.lasso_editorial_calendar_enabled() and not draft.is_story:
             from .lasso_editorial import editorial_caption
-            row['caption'] = editorial_caption(draft)
+            clean_caption = editorial_caption(draft)
+        row = _mirror._real_row(account_key, draft, caption=clean_caption)
         if not row["post_date"]:
             continue
         # status is normalized to the portal vocabulary by the mirror; the planner's
@@ -1144,6 +1148,7 @@ def to_calendar_rows(drafts, account_key):
                 "instagram", "ig", ""):
             fb = dict(row)
             fb["account"] = "facebook"
+            fb["caption"] = clean_caption
             rows.append(fb)
     if account_key == 'lasso' and config.lasso_editorial_calendar_enabled():
         from .calendar_autopublish import scheduled_iso_for_row

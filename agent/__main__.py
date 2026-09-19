@@ -974,6 +974,7 @@ _COMMANDS = {
         ("dam-scan", "scan/tag the library"),
         ("contact-sheet", "creative contact sheet"),
         ("backfill-insights", "pull insights for published posts"),
+        ("backfill-ig-hashtags", "fold each gym's APPROVED 3-5 hashtag line into FUTURE unpublished IG FEED calendar rows missing it; DRY-RUN by default, --apply keeps pending rows pending and resets changed approved rows for reapproval; never touches published/publishing/denied/killed/failed, stories, or FB -- (--gym <base,...> | --all)"),
         ("vision-backfill", "ECHO_VISION_SPEC: analyze a gym's EXISTING library images "
                             "before adding it to AGENT_VISION_GYMS (--account <key> "
                             "[--force]); a gym flipped on with an unanalyzed library "
@@ -2292,6 +2293,20 @@ def main(argv=None):
         else:
             from .backfill import backfill_insights
             backfill_insights(acct_f, since, dry=dry)
+    elif cmd == "backfill-ig-hashtags":
+        # IG FEED HASHTAG BACKFILL (2026-09-19): fold each gym's APPROVED 3-5
+        # hashtag line (from its own VoiceDoc, never invented) into the STORED
+        # caption of FUTURE, UNPUBLISHED Instagram feed rows missing it, so the
+        # portal preview and the Zernio wire body are the same exact copy.
+        # DRY-RUN by default; --apply uses an expected-status and publish-record
+        # guard. Pending stays pending; changed approved copy resets to pending
+        # so the client approves the exact final caption.
+        # Never touches published/publishing/denied/killed/failed rows, stories,
+        # or Facebook rows; idempotent (a second --apply reports 0 changes).
+        #   python -m agent backfill-ig-hashtags --gym eng            # dry-run
+        #   python -m agent backfill-ig-hashtags --all --apply        # write
+        from . import backfill_ig_hashtags as _bih
+        sys.exit(_bih.cli(argv[1:]))
     elif cmd == "vision-backfill":
         # ECHO_VISION_SPEC §9 precondition: analyze_and_store never runs on a daily
         # schedule (there is no job wired to it), so a gym added to AGENT_VISION_GYMS

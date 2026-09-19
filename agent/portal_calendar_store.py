@@ -678,6 +678,47 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def patch_caption_for_hashtag_backfill(self, account_key, row_id, new_caption,
+                                           *, expected_status):
+        """Atomically patch a safe future IG row during the one-off hashtag backfill.
+
+        ``expected_status`` is intentionally a positive allowlist. A pending row
+        stays pending; an approved row becomes pending because its client-visible
+        copy changed and requires a fresh approval. The REST filters make a stale
+        read harmless if another worker has claimed, published, denied, killed,
+        failed, or otherwise changed the row before this request reaches Supabase.
+        """
+        expected = str(expected_status or "").strip().lower()
+        if expected not in ("pending", "approved"):
+            return None
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+            "status": f"eq.{expected}",
+            "published_at": "is.null",
+            "late_post_id": "is.null",
+            "variant_status": "eq.active",
+        }
+        payload = {"caption": new_caption}
+        if expected == "approved":
+            payload["status"] = "pending"
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     # ---- auto-publisher: read + exactly-once claim/update -------------------
     # These serve the scheduled calendar auto-publisher (calendar_autopublish.py).
     # They never publish; they only read the day's rows and flip status atomically
