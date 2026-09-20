@@ -718,7 +718,17 @@ def build_content_brief(headline, facts, *, cta="", surface="feed post",
         f"{pixels or (config.STORY_PIXELS if story else config.IMAGE_PIXELS)}. "
         "Clear hierarchy, deliberate visual detail, readable supporting copy at "
         "360 pixels wide. Reflow to fit; never clip or shrink required copy away.",
-        "For Stories keep essential copy within x=6 to 94 percent and y=10 to 85 percent, leaving clearance for Instagram's top and bottom controls."
+        ("STORY TEXT GRID, mandatory: every glyph and logo wordmark must fit inside "
+         "x=7.5 to 92.5 percent and y=10 to 85 percent. These are bounding box limits, "
+         "not anchor points. Reserve separate vertical rows inside that safe region: "
+         "wordmark y=10 to 14 percent; headline y=16 to 30 percent; explanatory visual "
+         "and supporting facts y=33 to 68 percent; CTA y=72 to 77 percent; destination "
+         "URL y=79 to 83 percent. Keep at least 2 percent clear space between rows. "
+         "Wrap or tighten headline leading so its rightmost glyph stays at or left of "
+         "x=92.5 percent. Scale or crop only the nonessential illustration if space is "
+         "needed; preserve every supplied word and readable type size. Nothing essential, "
+         "including the wordmark, CTA icon, CTA text, or URL, may enter the top or bottom "
+         "interface bands reserved for Instagram's top and bottom controls.")
         if story else "Keep essential text within comfortable feed margins.",
         ("For Stories compose directly on the full 9:16 canvas. Extend the designed "
          "background and visual elements through the frame, while keeping essential "
