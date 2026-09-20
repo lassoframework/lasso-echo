@@ -11,9 +11,10 @@ NO FABRICATION, NO CROPPED FEED CARDS: a Story is only ever built from a GENUINE
 9:16 asset. Either a premade *_story sibling next to the day's approved creative,
 or a purpose-built 9:16 variant that creative_studio renders from the SAME
 approved text (its hook + body lines ride on the feed draft's source_fragments);
-aspect is per-use, so the feed target stays 4:5. If neither genuine 9:16 asset is
-available, Echo SKIPS the Story for the day (returns None) and fires one ops
-alert. It NEVER reuses or crops the day's 4:5 / 1:1 feed image into a Story frame.
+aspect is per-use, so the feed target stays 4:5. If the reviewed LASSO studio lane
+cannot produce that asset, Echo retains a needs-media Story draft for recovery.
+Other creatives without a genuine 9:16 source are skipped. It NEVER reuses or
+crops the day's 4:5 / 1:1 feed image into a Story frame.
 Stories carry no caption text.
 
 Publishing is unaffected here: this module never posts. A Story publish goes
@@ -115,6 +116,26 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                     return _story_draft(account, day_key, draft_id, feed_draft,
                                         art["path"], hosted, fragments,
                                         image_engine=art.get("route", ""))
+            elif config.lasso_infographic_quality_enabled(account.key) and image_copy:
+                # A reviewed LASSO Story must never bypass the pixel-quality gate with
+                # an unreviewed local render. Preserve the planned slot as needs-media
+                # instead, so it remains recoverable and cannot auto-publish.
+                reason = (
+                    "Story Studio could not produce a reviewed 9:16 asset. "
+                    "This Story is held for purpose-built media; the feed card was not "
+                    "cropped or reused.")
+                ops_alerts.alert(
+                    f"story draft held for {account.key} on {day_key}: {reason}")
+                return Draft(
+                    draft_id=draft_id, account_key=account.key,
+                    platform=account.platform, caption="", hashtags=[],
+                    creative_path="", creative_public_url="",
+                    scheduled_for=schedule.scheduled_for(day_key, slot="morning"),
+                    status=DraftStatus.PENDING, blocked_reason=reason,
+                    source_fragments=fragments, infographic_copy=dict(image_copy),
+                    is_story=True, day_key=day_key, draft_type="story",
+                    needs_media=True, force_approval=True,
+                    warnings=[reason])
 
     # No genuine 9:16 asset available: SKIP the Story for the day. Never reuse or
     # crop the day's feed image into a Story frame.
