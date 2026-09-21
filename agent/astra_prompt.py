@@ -681,15 +681,24 @@ def story_text_grid(pixels=None) -> str:
             raise ValueError("Invalid dimensions")
     except (TypeError, ValueError):
         width, height = map(int, config.STORY_PIXELS.lower().split("x"))
+    wordmark_top = round(height * (196 / 1920))
+    wordmark_bottom = round(height * (226 / 1920))
+    divider_y = round(height * (1580 / 1920))
+    destination_top = round(height * (1590 / 1920))
+    destination_bottom = round(height * (1624 / 1920))
     return (
         "STORY SAFE AREA: this is a full-frame composition, not a feed poster. "
         "Every glyph of required copy, logo, CTA and destination must fit inside "
         "the reviewer's hard outer limits x=0.06 to 0.94 and y=0.10 to 0.85 "
         "(y=10 to 85 percent, clear of Instagram top and bottom controls). "
-        "Use x=8 to 92 percent for every text block. Keep the logo or wordmark "
-        "entirely within y=10 to 14 percent; keep headline and supporting copy "
-        "within y=15 to 74 percent; keep the complete CTA within y=75 to 81 percent; "
-        "and reserve y=82 to 84.5 percent for the complete destination. These are "
+        "Use x=8 to 92 percent for every text block. Keep the complete logo or "
+        "wordmark in a compact 30 pixel tall band, never above the safe region: "
+        f"its bounding box must be y={wordmark_top} to {wordmark_bottom} px. "
+        "Keep headline and supporting copy within y=15 to 74 percent and keep the "
+        "complete CTA within y=75 to 81 percent. Put the footer divider at "
+        f"approximately y={divider_y} px, then place every glyph of the complete "
+        f"destination within y={destination_top} to {destination_bottom} px. "
+        "Nothing essential may extend below that destination band. These are "
         "bounding-box limits, not text anchors or prescribed visual rows. For this "
         + f"{width}x{height}" + " output, the primary-content text box is "
         f"x {round(width * .08)} to {round(width * .92)} px and "
