@@ -185,12 +185,13 @@ def build_story_draft(account, day_key, *, feed_draft=None,
     if _is_studio_creative(feed_draft):
         reason = (f"no purpose-built 9:16 asset: the studio render failed for "
                   f"{_basename} and no premade *_story sibling exists")
-        ops_alerts.alert(
-            f"story draft skipped for {account.key} on {day_key}: the studio render "
-            f"came back dark for {_basename} (no purpose-built 9:16 studio asset and "
-            f"no premade *_story sibling). A Story is never a cropped feed card."
-        )
         if surface_gap:
+            ops_alerts.alert(
+                f"story draft blocked for {account.key} on {day_key}: the studio render "
+                f"came back dark for {_basename} (no purpose-built 9:16 studio asset and "
+                f"no premade *_story sibling). The slot is retained and the next daily "
+                f"run retries a fresh 9:16 render. A Story is never a cropped feed card."
+            )
             return Draft(
                 draft_id=draft_id, account_key=account.key, platform=account.platform,
                 caption="", hashtags=[], creative_path="", creative_public_url="",
@@ -198,6 +199,11 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                 status=DraftStatus.BLOCKED, blocked_reason=reason,
                 source_fragments=fragments, is_story=True,
             )
+        ops_alerts.alert(
+            f"story draft skipped for {account.key} on {day_key}: the studio render "
+            f"came back dark for {_basename} (no purpose-built 9:16 studio asset and "
+            f"no premade *_story sibling). A Story is never a cropped feed card."
+        )
     else:
         print(f"[stories] skip {account.key} {day_key}: no 9:16 sibling for "
               f"{_basename} (feed still posts; story is supplementary, by design)")
