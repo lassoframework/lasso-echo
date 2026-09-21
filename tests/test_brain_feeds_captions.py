@@ -32,6 +32,7 @@ was handed is captured), no network, no database.
 
 import os
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -65,7 +66,9 @@ class _Rollup:
     test dropped the item — never because the fake did."""
 
     def __init__(self, guidance_items):
-        self.row = {"run_at": "2026-09-06T02:00:00+00:00",
+        # Consumer tests need fresh guidance regardless of the wall-clock date.
+        # The stale-rollup test below explicitly overrides this timestamp.
+        self.row = {"run_at": datetime.now(timezone.utc).isoformat(),
                     "window_start": "2026-06-08", "window_end": "2026-09-06",
                     "window_days": 90, "guidance": list(guidance_items)}
 

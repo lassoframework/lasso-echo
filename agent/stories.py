@@ -27,6 +27,28 @@ import re
 from . import config, creative_studio, media_host, ops_alerts, schedule
 from .drafter import Draft, DraftStatus, _make_id
 
+# Terminal-failure stages the creative studio is expected to report through
+# failure_info that are QUALITY rejections (the card was rendered and graded,
+# then withheld). A reported failure in one of these stages means the studio
+# already emitted its own ops alert for this call, so the story layer must NOT
+# fire a second, redundant "studio came back dark" alert. Any stage outside
+# this set is UNKNOWN to this module and is never suppressed.
+_QUALITY_FAILURE_STAGES = frozenset({
+    "quality", "quality_grade", "content_quality", "grade", "grade_gate",
+    "house_style", "review",
+})
+
+
+def _quality_failure_reported(failure_info):
+    """True only when failure_info says this call's terminal failure was a
+    QUALITY rejection AND an ops alert was already reported for it. Both
+    conditions are required: an unreported failure must still alert here, and
+    an unknown stage must never be silently swallowed."""
+    info = failure_info or {}
+    if not info.get("reported"):
+        return False
+    return str(info.get("stage") or "").strip().lower() in _QUALITY_FAILURE_STAGES
+
 
 def _story_out_path(headline, unique=False):
     """A Story-specific output path so the 9:16 render never overwrites the day's
@@ -101,12 +123,17 @@ def build_story_draft(account, day_key, *, feed_draft=None,
         copy_opts = ({"cta": image_copy.get("cta", ""), "footer": image_copy.get("footer")}
                      if image_copy else {})
         if facts:
+            # failure_info is a fresh dict per call: the studio populates it for
+            # terminal failures (reason, stage, reported). draft_id rides through
+            # so a failed story render is traceable in the studio's own logs.
+            failure_info = {}
             art = creative_studio.generate(
                 headline, facts, client=nano_client,
                 account_key=account.key,
                 out_path=_story_out_path(headline, unique=config.lasso_infographic_quality_enabled(account.key)),
                 aspect=config.STORY_ASPECT, pixels=config.STORY_PIXELS,
-                surface="Story", **copy_opts,
+                surface="Story", draft_id=draft_id, failure_info=failure_info,
+                **copy_opts,
             )
             if art:
                 hosted = media_host.host_media(art["path"], account.key,
@@ -115,6 +142,30 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                     return _story_draft(account, day_key, draft_id, feed_draft,
                                         art["path"], hosted, fragments,
                                         image_engine=art.get("route", ""))
+                # HOSTING failure, distinct from a render failure: the 9:16 render
+                # itself succeeded. Say so accurately instead of blaming the studio.
+                ops_alerts.alert(
+                    f"story draft skipped for {account.key} on {day_key}: the 9:16 "
+                    f"studio render succeeded but hosting returned no public URL. "
+                    f"Enable AGENT_HOSTING_ENABLED or add public_url."
+                )
+                return None
+            if _quality_failure_reported(failure_info):
+                # The studio already emitted its quality alert for this call; a
+                # second "studio came back dark" story alert would be redundant
+                # and misleading. LOG the skip distinctly instead.
+                print(f"[stories] skip {account.key} {day_key}: 9:16 story render "
+                      f"withheld by the content quality gate ("
+                      f"{str(failure_info.get('reason', ''))[:200]}). Studio alert "
+                      f"already recorded for draft {draft_id}; no duplicate story alert.")
+                return None
+            if (failure_info.get("reported")
+                    and failure_info.get("stage") == "render_unavailable"):
+                print(f"[stories] skip {account.key} {day_key}: rendering unavailable; "
+                      f"studio already recorded draft {draft_id}; no duplicate alert.")
+                return None
+            # Unknown or unreported failure: fall through to the standard skip
+            # handling below, which fires exactly one honest ops alert.
 
     # No genuine 9:16 asset available: SKIP the Story for the day. Never reuse or
     # crop the day's feed image into a Story frame.

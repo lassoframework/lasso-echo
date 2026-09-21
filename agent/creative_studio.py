@@ -1039,10 +1039,66 @@ def spend_allowed(account_key=None, day=None):
     return True
 
 
+def _failure_sidecar_path(out_path, headline, content_quality):
+    """The durable failure-evidence path beside the requested output. The full
+    scrubbed grade reason is written here on a terminal quality failure (never
+    db.audit, which truncates at 500 chars, and never AGENT_GENERATION_RECORD,
+    which is unset in production)."""
+    if out_path:
+        return str(out_path) + ".failure.json"
+    slug = re.sub(r"[^a-z0-9]+", "_", (headline or "infographic").lower()).strip("_") or "infographic"
+    if content_quality:
+        import uuid
+        slug += "_" + uuid.uuid4().hex
+    return os.path.join(config.LIBRARY_PATH, f"nano_{slug}.png.failure.json")
+
+
+def _write_failure_sidecar(path, payload):
+    """Persist the full failure evidence; a sidecar error is logged and swallowed
+    so it can NEVER turn a FAIL into success or conceal the failure."""
+    try:
+        from pathlib import Path
+        import json
+        from .ops_alerts import scrub
+        def scrub_values(value):
+            if isinstance(value, str):
+                return scrub(value)
+            if isinstance(value, dict):
+                # Hash fields are evidence, not secrets: a 64-char hex digest
+                # must survive scrubbing so the failed candidate stays provable.
+                return {k: (v if k in {"candidate_sha256", "image_sha256"} and isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) else scrub_values(v))
+                        for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [scrub_values(v) for v in value]
+            return value
+        Path(path).write_text(json.dumps(scrub_values(payload), indent=2, default=str))
+        return path
+    except Exception as exc:  # noqa: BLE001 - evidence loss must not mask the failure
+        print(f"[creative-studio] FAILURE SIDECAR write failed for {path} "
+              f"({type(exc).__name__}: {exc}); the failure itself stands.")
+        return ""
+
+
+def _report_terminal_failure(failure_info, *, reason, stage, out_path=""):
+    """Populate the caller's failure_info for one terminal failure. `reported`
+    is True because the caller path has already emitted its ops alert/audit
+    (the single bounded quality alert for grade failures, or
+    image_engine.mark_needs_human for render-unavailable)."""
+    if failure_info is not None:
+        failure_info.update({"reason": reason, "stage": stage, "reported": True,
+                             "sidecar": out_path or ""})
+
+
+def _bounded_alert_reason(reason, limit=300):
+    """One line, whitespace-collapsed, bounded grade reason safe for an alert."""
+    return " ".join(str(reason or "").split())[:limit]
+
+
 def generate(headline, facts, client=None, out_path=None,
              aspect=None, pixels=None, surface=None, archetype=None,
              palette=None, canvas=None, layout=None, account_key=None,
-             bypass_cap=False, draft_id="", reference_kind=None, cta="", footer=None, art_direction=""):
+             bypass_cap=False, draft_id="", reference_kind=None, cta="", footer=None, art_direction="",
+             failure_info=None):
     """
     Generate a LASSO infographic from APPROVED input. Returns {"path", "prompt"} on
     success, or None when it must not run:
@@ -1063,7 +1119,16 @@ def generate(headline, facts, client=None, out_path=None,
     this call), rides through to image_engine.generate_image's logs so a
     generation attempt is traceable in the logs too, not only after the fact
     via the DB.
+
+    `failure_info` (optional dict, 2026-09-21 channel repair): cleared at call
+    entry, populated ONLY on a terminal failure with `reason` (the full grade
+    reason), `stage` ("quality" for a grade-gate terminal failure,
+    "render_unavailable" when every engine failed), and `reported` (True when
+    an ops alert/audit was already emitted for THIS call, so a caller must not
+    duplicate it). Success leaves the dict empty.
     """
+    if failure_info is not None:
+        failure_info.clear()
     if not config.creative_studio_enabled():
         return None
     if not facts:
@@ -1082,6 +1147,10 @@ def generate(headline, facts, client=None, out_path=None,
         from .infographic_copy_style import display_text
         from .infographic_evidence import brain_snapshot
         source_snapshot = brain_snapshot()
+        # Blake's September 21 copy correction also applies when a Story is
+        # regenerated from an older feed draft's saved infographic_copy.
+        if str(headline).strip() == "You did not open a gym to run ads at 11pm.":
+            headline = "You did not open a gym to run your own ads."
         headline = _scrub_dashes(display_text(headline))
         facts = [_scrub_dashes(display_text(f)) for f in facts]
         cta = _scrub_dashes(display_text(cta))
@@ -1121,7 +1190,7 @@ def generate(headline, facts, client=None, out_path=None,
     reference_note = _reference_note_for(ref_kind, references)
     reference_ids = [r.get("id", "") for r in references]
 
-    def _do_generate(p, corrective=None):
+    def _do_generate(p, corrective=None, repair_image_bytes=None):
         # ASTRA FIRST (retry once with backoff), then the UNCHANGED Gemini path,
         # then "needs human". Each engine gets its own prompt: Astra reads the
         # creative brief, Gemini reads the classic single-prompt text.
@@ -1137,8 +1206,21 @@ def generate(headline, facts, client=None, out_path=None,
                 failures=["Approved LASSO content brief is invalid"])
             return None
         call_opts["engine_prompts"] = {"astra": brief, "gemini": p}
-        if references:
+        story_quality = (config.lasso_infographic_quality_enabled(account_key)
+                         and "story" in str(render_surface).lower())
+        if references and not story_quality:
             call_opts["reference_images"] = references
+        # Feed-shaped craft examples remain with the independent reviewer;
+        # Story generation chooses its own full-frame composition.
+        if repair_image_bytes is not None:
+            # The EXACT pixels the reviewer just rejected ride the corrective
+            # retry so the engine repairs the real candidate, never prose alone.
+            call_opts["repair_image_bytes"] = repair_image_bytes
+            call_opts.setdefault("repair_image_mime", "image/png")
+            # The rejected candidate is the only edit target. Feed-shaped craft
+            # benchmarks were pulling Story repairs back into their old layout.
+            # They remain available to the independent reviewer below.
+            call_opts.pop("reference_images", None)
         generated = _image_engine.generate_image(
             p, call_opts, gemini_client=client,
             account_key=account_key or "", subject=headline or "",
@@ -1149,6 +1231,9 @@ def generate(headline, facts, client=None, out_path=None,
     if result is None:
         # Every engine failed; image_engine already marked it NEEDS HUMAN (ops
         # alert + audit row). None keeps the caller's existing behavior.
+        _report_terminal_failure(
+            failure_info, reason="image generation failed on every engine; marked needs human",
+            stage="render_unavailable")
         return None
     image_bytes = result.image_bytes
     original_bytes = image_bytes
@@ -1212,13 +1297,46 @@ def generate(headline, facts, client=None, out_path=None,
                 corrective_feedback=corrective_feedback, attempt=_attempt,
                 final_status="retrying")
             if _attempt >= _MAX_ATTEMPTS:
+                # ONE bounded contextual quality alert (account, surface, draft,
+                # attempts, short reason). The full scrubbed reason lives in the
+                # sidecar, never in the alert and never in db.audit (500-char cap).
                 from . import ops_alerts as _ops
+                import hashlib
                 _ops.alert(
-                    f"house-style fail: {headline or '(no headline)'} failed "
-                    f"the grade gate {_MAX_ATTEMPTS} times (last status="
-                    f"{gr.status}: {gr.reason}). Card withheld, routed to "
-                    "human review."
+                    f"quality fail: account={account_key or '(none)'} "
+                    f"surface={surface or 'feed post'} draft={draft_id or '(none)'} "
+                    f"attempts={_MAX_ATTEMPTS} status={gr.status}: "
+                    f"{_bounded_alert_reason(gr.reason)}. Card withheld."
                 )
+                sidecar_payload = {
+                    "status": gr.status,
+                    "reason": gr.reason,
+                    "scores": gr.scores,
+                    "attempts": _attempt,
+                    "corrective_feedback": corrective_feedback,
+                    "account_key": account_key or "",
+                    "surface": surface or "feed post",
+                    "draft_id": draft_id or "",
+                    "headline": headline,
+                    "facts": list(facts or []),
+                    "cta": cta,
+                    "footer": footer if footer is not None else _astra_url_footer(),
+                    "candidate_sha256": hashlib.sha256(image_bytes).hexdigest(),
+                    "candidate_bytes_len": len(image_bytes or b""),
+                    "review_history": review_history,
+                    "final_status": "needs_human",
+                }
+                if content_quality:
+                    try:
+                        from .infographic_evidence import POLICY_VERSION as _pv
+                        sidecar_payload["policy_version"] = _pv
+                    except Exception:  # noqa: BLE001 - evidence module optional here
+                        pass
+                sidecar_path = _write_failure_sidecar(
+                    _failure_sidecar_path(out_path, headline, content_quality),
+                    sidecar_payload)
+                _report_terminal_failure(failure_info, reason=gr.reason,
+                                         stage="quality", out_path=sidecar_path)
                 _generation_log_attempt(
                     draft_id=draft_id, account_key=account_key, headline=headline,
                     facts=facts, cta=cta, prompt=prompt, reference_ids=reference_ids,
@@ -1232,8 +1350,16 @@ def generate(headline, facts, client=None, out_path=None,
             prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
                                   surface=surface, archetype=archetype, palette=palette,
                                   canvas=canvas, layout=layout)
-            result = _do_generate(prompt, corrective=corrective_feedback)
+            # The corrective retry receives the EXACT pixels just rejected (LASSO
+            # content-quality scope) plus the concrete review feedback, never
+            # prose alone. Initial requests stay repair-free.
+            result = _do_generate(prompt, corrective=corrective_feedback,
+                                  repair_image_bytes=image_bytes if content_quality else None)
             if result is None:
+                _report_terminal_failure(
+                    failure_info,
+                    reason="image generation failed on every engine during corrective retry; marked needs human",
+                    stage="render_unavailable")
                 return None
             image_bytes = result.image_bytes
             prompt = result.prompt_used or prompt
@@ -1270,6 +1396,10 @@ def generate(headline, facts, client=None, out_path=None,
                     f"grade gate {_MAX_ATTEMPTS} times. "
                     f"Questions: {', '.join(sorted(set(failed_qs)))}. Card withheld."
                 )
+                _report_terminal_failure(
+                    failure_info,
+                    reason="legacy grade gate failed: " + ", ".join(sorted(set(failed_qs))),
+                    stage="quality")
                 return None
             _attempt += 1
             prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
@@ -1277,6 +1407,10 @@ def generate(headline, facts, client=None, out_path=None,
                                   canvas=canvas, layout=layout)
             result = _do_generate(prompt)
             if result is None:
+                _report_terminal_failure(
+                    failure_info,
+                    reason="image generation failed on every engine during retry; marked needs human",
+                    stage="render_unavailable")
                 return None
             image_bytes = result.image_bytes
             prompt = result.prompt_used or prompt

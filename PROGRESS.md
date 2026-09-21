@@ -1,3 +1,10 @@
+## Echo Story retries and channel alerts (2026-09-21, release pending)
+
+- [~] LASSO Story generation follows the content-led Astra standard: creative freedom without fixed rows or feed-shaped input examples, complete approved copy, full-frame art, interior text clearance and unchanged independent pixel grading. Corrective requests edit the exact last rejected candidate and retain size-aware bounds.
+- [~] Terminal quality failures retain full scrubbed review sidecars and produce one bounded contextual alert. Already-reported provider failures also avoid duplicate dark-render alerts; hosting failures remain distinct.
+- [~] Approved headline corrected to “You did not open a gym to run your own ads.” in both source documents and demo hooks. Regeneration from older saved feed copy applies the same approved correction. Existing published assets are not mutated.
+- [~] Four K2.8 low-effort workers delivered bounded packages, integrated and independently reviewed by Astra and Grok ECHO. Full local suite before the final audit adjustments: 8276 passed, 1 skipped. Audit adjustments: 256 focused checks passed plus 8 copy/retry checks. Two actual provider Story samples passed on their first attempt at 94 and 93, with final pixels inspected by Astra. Final-commit CI and deployment remain pending.
+
 ## LASSO infographic Story canvas repair (2026-09-18)
 
 - [~] LASSO quality Stories now request a native 9:16, 1080x1920 composition from the image engine. The former 4:5 panel inset is removed; feed generation remains 4:5. The Astra brief asks for full-frame Story design with essential copy in x=6–94%, y=10–85%, leaving Instagram UI clearance; pixel review treats broad empty bands around a centered feed card as a major failure.

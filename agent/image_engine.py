@@ -69,6 +69,22 @@ _COST_ALERT_KEY_PREFIX = "image_cost_alerted_"
 # typo, and a typo must announce itself rather than quietly demote to Gemini.
 KNOWN_ENGINES = ("astra", "gemini")
 
+# Labels for the Echo channel-repair retry request. The repair image is the
+# EXACT rejected candidate from the previous attempt; the instruction is
+# correction-only. Benchmark references get their own label whenever a repair
+# candidate rides in the same request, so the two are never conflated.
+REPAIR_CANDIDATE_INSTRUCTION = (
+    "REJECTED CANDIDATE: the image below is the exact previous attempt at this "
+    "brief. It FAILED quality review. Do not reproduce it as-is. Apply ONLY the "
+    "corrections described in the review feedback above; keep every other "
+    "element, the copy, and the composition requirements unchanged."
+)
+BENCHMARK_REFERENCE_LABEL = (
+    "BENCHMARK REFERENCE ({id}): craftsmanship example only, never a layout, "
+    "palette or copy target. Approved source copy and the requested placement "
+    "bounds take precedence. It is NOT the rejected candidate."
+)
+
 # One warning per process when the key is absent (spec: "log a single warning").
 _missing_key_warned = False
 # One warning per process for an unrecognised IMAGE_ENGINE value.
@@ -400,24 +416,68 @@ class AstraImageEngine(ImageEngine):
             if input_fidelity_used:
                 tool["input_fidelity"] = input_fidelity_used
 
-        # `input`: a plain string when there are no references (byte-for-byte the
-        # old shape, so every existing non-reference call is unchanged), or a
-        # content-item array carrying the brief text plus each reference as a
-        # real `input_image` item (per the Responses API multi-image input
-        # shape: {"type": "input_image", "image_url": "data:...;base64,..."}) so
-        # the reference actually reaches the model as image data, not just a
+        # Repair path (Echo channel repair, 2026-09-21): opts may carry the
+        # EXACT bytes of a previously rejected candidate so a corrective retry
+        # can be reviewed against the real pixels, not just prose. The repair
+        # image rides as its own `input_image` with an explicit rejected-
+        # candidate label and a correction-only instruction. It is INDEPENDENT
+        # of the benchmark reference count/flag: it is never counted against
+        # max_refs and never gated by the reference-images switch. The bytes
+        # must be supplied by the caller (previous failed candidate); nothing
+        # here fetches a public URL for repair.
+        repair = opts.get("repair_image_bytes") or b""
+        if repair:
+            # An attached image alone leaves the provider free to generate a new
+            # layout. A corrective retry must actually edit its rejected input.
+            tool["action"] = "edit"
+            input_fidelity_used = config.astra_input_fidelity()
+            if input_fidelity_used:
+                tool["input_fidelity"] = input_fidelity_used
+        repair_mime = str(opts.get("repair_image_mime") or "image/png").strip() \
+            or "image/png"
+
+        def _as_b64(raw):
+            """bytes -> base64 ascii; a str is assumed to already be base64."""
+            if not raw:
+                return ""
+            if isinstance(raw, str):
+                return raw
+            import base64 as _b64
+            return _b64.b64encode(bytes(raw)).decode("ascii")
+
+        # `input`: a plain string when there are no references and no repair
+        # image (byte-for-byte the old shape, so every existing plain call is
+        # unchanged), or a content-item array carrying the brief text plus each
+        # image as a real `input_image` item (per the Responses API multi-image
+        # input shape: {"type": "input_image", "image_url": "data:...;base64,..."})
+        # so the image actually reaches the model as image data, not just a
         # filename mentioned in text.
         reference_ids_used = []
-        if references:
+        if references or repair:
             content = [{"type": "input_text", "text": brief}]
+            if repair:
+                content.append({
+                    "type": "input_text",
+                    "text": REPAIR_CANDIDATE_INSTRUCTION,
+                })
+                content.append({
+                    "type": "input_image",
+                    "image_url": f"data:{repair_mime};base64,{_as_b64(repair)}",
+                })
             for ref in references:
-                b64 = ref.get("b64")
-                if not b64 and ref.get("bytes"):
-                    import base64 as _b64
-                    b64 = _b64.b64encode(ref["bytes"]).decode("ascii")
+                b64 = _as_b64(ref.get("b64") or ref.get("bytes"))
                 if not b64:
                     continue
                 mime = ref.get("mime") or "image/png"
+                if repair:
+                    # With a repair candidate in the request, label each
+                    # benchmark reference explicitly so the model never
+                    # confuses a target/example with the rejected candidate.
+                    ref_id = str(ref.get("id") or "benchmark")
+                    content.append({
+                        "type": "input_text",
+                        "text": BENCHMARK_REFERENCE_LABEL.format(id=ref_id),
+                    })
                 content.append({
                     "type": "input_image",
                     "image_url": f"data:{mime};base64,{b64}",
