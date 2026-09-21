@@ -11,11 +11,14 @@ Behind AGENT_CALENDAR_GRADE flag. Run via: python3 -m agent jobs grade_sweep
 SELF-FIX MODE (AGENT_GRADE_SELF_FIX, default OFF; Blake's 2026-08-27 ruling
 "it should fix it on its own without sending me alot of slacks"). Flag OFF ->
 everything above is byte-for-byte unchanged. Flag ON:
-  * a forward book below A is first self-remediated (agent/jobs/grade_fix.py)
-    and then REGRADED; the final grade is what lands in gym_social_grades.
+  * a forward book below A, or an A book whose score regressed since the previous
+    run, is first self-remediated (agent/jobs/grade_fix.py) and then REGRADED;
+    the final grade is what lands in gym_social_grades. Stable A books retain
+    the narrow body-sameness check and are otherwise untouched.
     Remediation runs in up to _MAX_FIX_PASSES passes per sweep: another pass
-    runs only while the regraded score IMPROVED and is still below A (heavy
-    lanes keep their own once-per-gym-per-day kv stamp inside grade_fix);
+    runs only while the regraded score or defect count IMPROVED and the repair
+    target has not been reached (heavy lanes keep their own once-per-gym-per-day
+    kv stamp inside grade_fix);
   * trailing_30 is graded + stored but NEVER alerts (history is not fixable);
   * a still-below-A forward book alerts ONLY when the (score, defect set)
     differs from the last alerted state for that gym (kv stamp) AND at most
@@ -535,10 +538,23 @@ def run(gyms=None, store=None, now=None, alert_fn=None, business_seed_fn=None) -
             prev_total = _previous_grade(store, gym_id, "forward_book")
             f_grade = grade_month(forward_rows, profile=profile)
             fix = None
-            if self_fix and f_grade.total < A_THRESHOLD:
-                # Self-remediate, re-read, regrade — up to _MAX_FIX_PASSES
-                # passes, another only while the score IMPROVED and the book
-                # is still below A. The FINAL grade is what gets stored.
+            started_below_a = f_grade.total < A_THRESHOLD
+            # A regression is itself a repair trigger, even when the resulting
+            # score still has an A letter. Previously the drop guard could report
+            # structural defects being rebuilt into a 96 -> 93 book while the
+            # self-fix gate skipped them solely because 93 remained >= A_THRESHOLD.
+            # Stable A books keep the narrow body-only pass below.
+            repairing_drop = (
+                self_fix
+                and prev_total is not None
+                and f_grade.total < prev_total
+            )
+            if self_fix and (f_grade.total < A_THRESHOLD or repairing_drop):
+                # Self-remediate, re-read, regrade — up to _MAX_FIX_PASSES.
+                # Below-A books stop on reaching A. Regressed A books instead
+                # keep going while defects are being removed, so the letter
+                # threshold cannot terminate the very repair the drop triggered.
+                # The FINAL grade is what gets stored.
                 fix = {"ok": True, "passes": 0, "gap_fill": "none",
                        "actions": []}
                 fix["trajectory"] = [(f_grade.total, len(f_grade.defects or []))]
@@ -572,15 +588,19 @@ def run(gyms=None, store=None, now=None, alert_fn=None, business_seed_fn=None) -
                     # improvement. Stopping when neither moves IS the floor.
                     improved = (f_grade.total > pass_prev_total
                                 or len(f_grade.defects or []) < prev_defects)
+                    reached_target = (
+                        f_grade.total >= A_THRESHOLD and not repairing_drop
+                    )
                     if (not step.get("ok")
-                            or f_grade.total >= A_THRESHOLD
+                            or reached_target
                             or not improved):
                         break
             elif self_fix:
-                # BOOK ALREADY >= A (Blake's ruling, 2026-09-07): the full
-                # remediation suite above stays gated on total < A_THRESHOLD
-                # exactly as before -- an A-graded book does not need its
-                # duplicate/overcap/craft/audience passes re-run. But
+                # STABLE BOOK ALREADY >= A (Blake's ruling, 2026-09-07): the
+                # full remediation suite above stays quiet unless this run
+                # regressed from the previously stored A score. A stable
+                # A-graded book does not need its duplicate/overcap/craft/
+                # audience passes re-run. But
                 # calendar_grade's "total" does not weight body sameness, so a
                 # book can sit at a perfect A while still carrying a real
                 # near-duplicate BODY pair forever, since this branch is the
@@ -609,7 +629,8 @@ def run(gyms=None, store=None, now=None, alert_fn=None, business_seed_fn=None) -
             if not self_fix:
                 _alert_low_grade(gym_id, "forward_book", f_grade, alert_fn)
             else:
-                if fix is not None and f_grade.total >= A_THRESHOLD:
+                if (fix is not None and started_below_a
+                        and f_grade.total >= A_THRESHOLD):
                     fixed_gyms.append(gym_id)
                 if f_grade.total < A_THRESHOLD:
                     held_gyms.append(gym_id)
