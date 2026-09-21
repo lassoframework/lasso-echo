@@ -1101,7 +1101,8 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # approval card, clearly labeled STORY. Book story takes this slot when
             # scheduled; auto-generated story is skipped on book story days.
             if not _book_story_posted:
-                story = build_story_draft(account, day_key, feed_draft=feed_draft)
+                story = build_story_draft(
+                    account, day_key, feed_draft=feed_draft, surface_gap=True)
                 if story is not None:
                     if idempotent:
                         story, existing_story = _reconcile(story, day_key, "story", store, poster)

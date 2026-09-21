@@ -68,7 +68,7 @@ def _is_studio_creative(feed_draft):
 
 
 def build_story_draft(account, day_key, *, feed_draft=None,
-                      nano_client=None, s3_client=None):
+                      nano_client=None, s3_client=None, surface_gap=False):
     """
     Build one PENDING Story draft for `account` from the day's feed draft. A Story
     is ONLY ever built from a genuine 9:16 asset (a premade *_story sibling, or a
@@ -78,7 +78,11 @@ def build_story_draft(account, day_key, *, feed_draft=None,
       - AGENT_STORIES_ENABLED is OFF (the default), or
       - the schedule says this day does not post, or
       - there is no PENDING feed draft to anchor the day's approved text/creative, or
-      - no genuine 9:16 asset is available (skipped, with one ops alert fired).
+      - no genuine 9:16 asset is available and ``surface_gap`` is false.
+
+    The daily runner passes ``surface_gap=True``. In that mode a failed studio render
+    becomes a BLOCKED Story draft with no media, so the normal store/card path retains
+    an actionable, idempotently reconciled gap for the slot instead of dropping it.
     """
     if not config.stories_enabled():
         return None
@@ -179,11 +183,21 @@ def build_story_draft(account, day_key, *, feed_draft=None,
     #     supplementary. LOG only, never Slack (this was the entire storm).
     _basename = os.path.basename(feed_draft.creative_path or "(no path)")
     if _is_studio_creative(feed_draft):
+        reason = (f"no purpose-built 9:16 asset: the studio render failed for "
+                  f"{_basename} and no premade *_story sibling exists")
         ops_alerts.alert(
             f"story draft skipped for {account.key} on {day_key}: the studio render "
             f"came back dark for {_basename} (no purpose-built 9:16 studio asset and "
             f"no premade *_story sibling). A Story is never a cropped feed card."
         )
+        if surface_gap:
+            return Draft(
+                draft_id=draft_id, account_key=account.key, platform=account.platform,
+                caption="", hashtags=[], creative_path="", creative_public_url="",
+                scheduled_for=schedule.scheduled_for(day_key, slot="morning"),
+                status=DraftStatus.BLOCKED, blocked_reason=reason,
+                source_fragments=fragments, is_story=True,
+            )
     else:
         print(f"[stories] skip {account.key} {day_key}: no 9:16 sibling for "
               f"{_basename} (feed still posts; story is supplementary, by design)")
