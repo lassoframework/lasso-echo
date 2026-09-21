@@ -102,6 +102,13 @@ def test_worker_mirrors_episode_and_portal_reads_shared_snapshot(monkeypatch, tm
     monkeypatch.setattr("agent.media_source_store.default_store", lambda: MediaStore())
     monkeypatch.setattr("agent.config.posting_timezone_for", lambda base: "UTC")
     now = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
+    # Reconciliation also projects the worker snapshot using the implicit clock.
+    # Keep that clock aligned with this scenario; explicit expiry checks below
+    # still advance time and exercise the real production expiration logic.
+    from agent import calendar_autopublish
+    local_now = calendar_autopublish._local_now
+    monkeypatch.setattr(calendar_autopublish, "_local_now",
+                        lambda value=None, tz_name=None: local_now(value or now, tz_name))
 
     state = media_bridge.episode("gymx", now=now)
     mirrored = shared.rows["gymx"]
