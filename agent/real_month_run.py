@@ -224,7 +224,11 @@ def _real_story_builder(account):
                 feed_draft.infographic_copy={
                     'headline':'From Gym Marketing Made Simple',
                     'facts':claims[:3], 'cta':'Listen to Gym Marketing Made Simple'}
-        return stories.build_story_draft(acct, day_key, feed_draft=feed_draft)
+        # Month-ahead builds must retain a failed 9:16 render as a BLOCKED
+        # story slot, just like the daily runner. Without surface_gap=True this
+        # path emitted an alert and silently omitted the date from the plan.
+        return stories.build_story_draft(
+            acct, day_key, feed_draft=feed_draft, surface_gap=True)
 
     return _story
 
