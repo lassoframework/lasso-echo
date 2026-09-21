@@ -681,11 +681,15 @@ def story_text_grid(pixels=None) -> str:
             raise ValueError("Invalid dimensions")
     except (TypeError, ValueError):
         width, height = map(int, config.STORY_PIXELS.lower().split("x"))
-    wordmark_top = round(height * (196 / 1920))
-    wordmark_bottom = round(height * (226 / 1920))
-    divider_y = round(height * (1580 / 1920))
-    destination_top = round(height * (1590 / 1920))
-    destination_bottom = round(height * (1624 / 1920))
+    # Target bands sit deliberately inside the reviewer's hard limits. The old
+    # 196 px wordmark top and 1624 px destination bottom left only 4 px and 8 px
+    # of clearance on a 1080x1920 Story. Normal image-model placement drift could
+    # therefore turn a nominally compliant brief into the same repeated failure.
+    wordmark_top = round(height * (212 / 1920))
+    wordmark_bottom = round(height * (242 / 1920))
+    divider_y = round(height * (1550 / 1920))
+    destination_top = round(height * (1570 / 1920))
+    destination_bottom = round(height * (1605 / 1920))
     return (
         "STORY SAFE AREA: this is a full-frame composition, not a feed poster. "
         "Every glyph of required copy, logo, CTA and destination must fit inside "
@@ -694,8 +698,10 @@ def story_text_grid(pixels=None) -> str:
         "Use x=8 to 92 percent for every text block. Keep the complete logo or "
         "wordmark in a compact 30 pixel tall band, never above the safe region: "
         f"its bounding box must be y={wordmark_top} to {wordmark_bottom} px. "
-        "Keep headline and supporting copy within y=15 to 74 percent and keep the "
-        "complete CTA within y=75 to 81 percent. Put the footer divider at "
+        "These target bands include an interior buffer from the hard limits. Do not "
+        "treat y=0.10 or y=0.85 as placement targets. Keep headline and supporting "
+        "copy within y=15 to 74 percent and keep the complete CTA within y=76 to "
+        "80 percent. Put the footer divider at "
         f"approximately y={divider_y} px, then place every glyph of the complete "
         f"destination within y={destination_top} to {destination_bottom} px. "
         "Nothing essential may extend below that destination band. These are "
