@@ -224,7 +224,13 @@ def _real_story_builder(account):
                 feed_draft.infographic_copy={
                     'headline':'From Gym Marketing Made Simple',
                     'facts':claims[:3], 'cta':'Listen to Gym Marketing Made Simple'}
-        return stories.build_story_draft(acct, day_key, feed_draft=feed_draft)
+        # The month planner must retain a failed Story slot as an actionable BLOCKED
+        # draft. Without surface_gap=True, stories.py returns None after a dark render,
+        # so build_month_drafts silently omits the calendar row even though the feed
+        # remains. The blocked draft keeps the honest render reason and empty media;
+        # it never falls back to cropping the feed card.
+        return stories.build_story_draft(
+            acct, day_key, feed_draft=feed_draft, surface_gap=True)
 
     return _story
 
