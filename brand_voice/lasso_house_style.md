@@ -1,6 +1,26 @@
 # LASSO House Style System
 
 Source of truth for every infographic Echo generates.
+
+## LASSO content-led background direction (2026-09-22)
+
+For the LASSO-only `AGENT_LASSO_INFOGRAPHIC_QUALITY` path, the content-led
+brief in `agent/astra_prompt.py` supersedes the legacy template picker below.
+Recent output repeats white and off white fields. New briefs explicitly favor
+substantial dark, colored, split, photographic or tactile backgrounds. Navy,
+charcoal, red and sky blue are useful directions, not a mandatory palette.
+White and cream remain occasional deliberate choices, or an explicit visual
+request. A colored border or dark footer on a white poster is not variety.
+
+Choose composition from the content; avoid automatically repeating headline,
+object, footer. References establish craft, not background or layout. Retain
+the LASSO identity, complete approved copy, strong contrast and Story safe
+regions. Corrective edits preserve the rejected candidate's coherent design
+while repairing review failures. This is prompt guidance, not a guaranteed
+calendar rotation; existing rendered posts are unchanged.
+
+## Legacy style system
+
 Version: 1.2 (2026-09-13)
 
 **v1.2 changes the default.** Cream is no longer THE canvas, it is one of seven.
