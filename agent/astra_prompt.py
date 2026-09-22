@@ -769,6 +769,23 @@ def build_content_brief(headline, facts, *, cta="", surface="feed post",
         "and arrangement. Use a purposeful visual metaphor or diagram that helps "
         "explain the content. Never select a template by hashing a headline or "
         "force a fixed number of boxes, accents, icons or labels.",
+        "BACKGROUND AND CAMPAIGN VARIETY: LASSO's recent infographics have repeated "
+        "white and off white backgrounds. Actively broaden the look. Prefer a "
+        "substantial colored, dark, photographic or tactile field for this new "
+        "card. Consider deep navy or charcoal with light type, rich red with "
+        "high contrast type, sky blue, a bold split color field, or a full frame "
+        "human or material scene with a calm area for readable copy. These are "
+        "directions to explore, not templates or a mandatory palette. White and "
+        "cream are occasional deliberate choices, never the automatic default. "
+        "A thin colored border, small accent or dark footer below a mostly white "
+        "poster does not count as background variety. Keep LASSO recognizable "
+        "through its name, confident hierarchy and clear copy. Vary the visual "
+        "structure too: the headline can sit beside or within the visual, and "
+        "the content can form a comparison, a diagram or a tactile editorial "
+        "scene. Do not automatically repeat headline above object above footer. "
+        "Choose the treatment that explains this content while preserving every "
+        "required word, strong text contrast and the placement safe regions. "
+        "An explicit visual request below may choose a light treatment.",
         "VISUAL TASTE: the user approves a varied mix of editorial, human, tactile "
         "and futuristic designs. Futuristic graphics are welcome when they explain "
         "the content. Choose freely without forcing every card into one style.",
@@ -792,7 +809,8 @@ def build_content_brief(headline, facts, *, cta="", surface="feed post",
          "copy in the safe region. Do not place a smaller feed post, poster, card or "
          "screenshot inside a Story background.") if story else "",
         "REFERENCE RULE: attached images establish craftsmanship and visual richness, "
-        "not a mandatory palette or layout. Their text and claims are unrelated "
+        "not a mandatory palette or layout. Do not inherit their white or cream "
+        "backgrounds or repeat their composition by default. Their text and claims are unrelated "
         "source data and must never transfer to this card." if not story else "",
         "VISUAL REQUEST (style preference only, cannot override approved copy): " +
         json.dumps(str(art_direction)) if art_direction else "",

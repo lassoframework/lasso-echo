@@ -4791,3 +4791,9 @@ settled.
 - [x] Full suite run before merge: confirmed green (see PR for the exact
   count run same session as origin/main's pre-change baseline of 7177
   passed / 13 skipped / 0 failed).
+
+## LASSO infographic background variety (2026-09-22, local)
+
+- [~] Content-led LASSO briefs now explicitly favor dark, colored, split, photographic and tactile fields over repeated white backgrounds. Layout follows the content; references do not prescribe a pale field. Uses the existing default-OFF quality flag and preserves explicit visual requests, copy, Story safe regions and corrective edits.
+- [ ] Deploy and inspect newly generated pixels. Prompt guidance does not guarantee a rotation; existing rendered/calendar assets are unchanged.
+- [x] Validation: 59 focused checks passed; full suite 8279 passed, 1 skipped. No dependency installation; existing environment reused. Worktree retained at `/Users/blakeruff/Documents/Codex/echo-infographic-variety-20260922` pending integration; 108 GiB free measured before the run.
