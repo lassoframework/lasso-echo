@@ -9,7 +9,7 @@ WEIGHTS = {"concept": 20, "hierarchy": 20, "readability": 20,
 def evaluate(image_bytes, *, headline, facts, cta="", footer="", surface=None, vision_client=None):
     if vision_client is None:
         return GradeResult({}, False, [], status="UNGRADED", reason="No image reviewer available")
-    placement = ("Story: ALL essential text including headline, supporting facts, CTA and URL must lie entirely inside normalized x=0.06 to 0.94 and y=0.10 to 0.85, leaving clearance for Instagram's top and bottom controls. Text above or below this safe region is a MAJOR failure even if readable on the raw image. Estimate each text block against image dimensions and report which block crosses the boundary. When a CTA, divider or destination crosses the bottom boundary, direct the edit to rebuild that complete lower text group with the destination entirely at y=0.73 to 0.76 and background art only below y=0.80. Do not recommend a minimal move that merely touches y=0.85. Also inspect the full frame: a feed-size poster centered inside a 9:16 canvas, with broad empty top and bottom bands, is a MAJOR visual failure even when the file measures 1080x1920. The background and visual composition should fill the Story canvas while text remains in the safe region. "
+    placement = ("Story: ALL rendered text and brand words, including any logo or wordmark, headline, supporting facts, CTA and URL, are mandatory placement elements and must lie entirely inside normalized x=0.06 to 0.94 and y=0.10 to 0.85, leaving clearance for Instagram's top and bottom controls. A logo or wordmark is never supplementary for this check. Text above or below this safe region is a MAJOR failure even if readable on the raw image. Estimate each text block against image dimensions and add every boundary crossing to placement_violations. For any top-boundary failure, direct the edit to erase and redraw the complete affected wordmark or text group at y=0.14 to 0.16. For any side-boundary failure, direct the edit to erase and reflow the complete affected aligned text group inside x=0.11 to 0.89. When a CTA, divider or destination crosses the bottom boundary, direct the edit to rebuild that complete lower text group with the destination entirely at y=0.73 to 0.76 and background art only below y=0.80. Do not recommend a minimal move that merely touches a hard boundary. Also inspect the full frame: a feed-size poster centered inside a 9:16 canvas, with broad empty top and bottom bands, is a MAJOR visual failure even when the file measures 1080x1920. The background and visual composition should fill the Story canvas while text remains in the safe region. "
                  if "story" in str(surface).lower() else
                  "Feed: check all essential text is comfortably inset from the edges with no clipping. ")
     question = (placement +
@@ -26,7 +26,10 @@ def evaluate(image_bytes, *, headline, facts, cta="", footer="", surface=None, v
         "originality /15, product or CTA integration /10. Check at phone scale. "
         "Return ONLY JSON: {\"scores\": {\"concept\":0,\"hierarchy\":0,"
         "\"readability\":0,\"craft\":0,\"originality\":0,\"integration\":0},"
-        "\"copy_complete\":false,\"copy_accurate\":false,\"placement_safe\":false,\"issues\":[]}. "
+        "\"copy_complete\":false,\"copy_accurate\":false,\"placement_safe\":false,"
+        "\"placement_violations\":[{\"element\":\"wordmark\",\"bounds\":\"x=... y=...\","
+        "\"correction\":\"...\"}],\"issues\":[]}. Return placement_violations as an "
+        "empty list only when every mandatory placement element is fully safe. "
         "If the total score is below 90, issues MUST include specific visual edits: "
         "identify the exact element, its defect, and how to improve it. Avoid "
         "generic directions such as improve craft or originality. "
@@ -54,12 +57,22 @@ def evaluate(image_bytes, *, headline, facts, cta="", footer="", surface=None, v
                 or not isinstance(i.get("correction"), str)
                 or not i["correction"].strip() for i in issues):
             raise ValueError("Invalid issue list")
+        placement_violations = data.get("placement_violations")
+        if not isinstance(placement_violations, list) or any(
+                not isinstance(v, dict)
+                or not isinstance(v.get("element"), str) or not v["element"].strip()
+                or not isinstance(v.get("bounds"), str) or not v["bounds"].strip()
+                or not isinstance(v.get("correction"), str) or not v["correction"].strip()
+                for v in placement_violations):
+            raise ValueError("Invalid placement evidence")
     except Exception:
         return GradeResult({}, False, [], status="UNGRADED", reason="Image review failed or returned invalid evidence")
     passed = (sum(scores.values()) >= 90 and data["copy_complete"]
               and data["copy_accurate"] and data["placement_safe"]
+              and not placement_violations
               and not any(i["severity"] in ("critical", "major") for i in issues))
-    reason = "; ".join(i["correction"] for i in issues)
+    reason = "; ".join([i["correction"] for i in issues]
+                       + [v["correction"] for v in placement_violations])
     if not data["placement_safe"]:
         reason += "; Move every essential text block into the placement safe region, including headline and CTA/URL. Preserve all copy."
     if not data["copy_complete"]:
