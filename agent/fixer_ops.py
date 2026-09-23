@@ -56,6 +56,13 @@ CONTRACT (the FIXER builder reads this block):
       200 {"category": "ready"|"missing"|"ambiguous"|"user-email-missing"|
            "portal-unavailable"}
       This is portal-read-only: no Slack lookup, link mint, ticket record, or DM.
+  GET  /ops/actions/swap_media/candidates/<gym_key>?row_id=<pending calendar row>
+      (same header)
+      200 {"ok": true, "gym_key": "...", "candidates": [{"id": "...",
+           "row_id": "...", "review_state": "reviewed", "selectable": true}]}
+      Bounded worker-only readiness read. It reads the exact waiting calendar row and
+      returns only Drive assets the existing swap selector can hand out now. It never
+      materializes, hosts, uploads, reserves, writes a ticket note, or changes a ledger.
   GET  /ops/actions/evidence/...           (same header)
       Bounded read-only diagnostics (agent/fixer_evidence.py). Never runs an action;
       503 volume_unavailable on a host without the worker volume, 503
@@ -574,6 +581,98 @@ def _resend_connect_link_readiness(gym_key, deps):
                         "portal-unavailable"}:
         category = "portal-unavailable"
     return 200, {"category": category}
+
+
+def _swap_media_candidates_readiness(gym_key, row_id, deps, *, now=None):
+    """Read-only, fail-closed answer to "can this exact row be swapped now?".
+
+    The response deliberately contains Drive asset ids only. Local-library candidates
+    need materialization before they have a durable asset identity, and this endpoint
+    must never cause that work.  Drive candidates are selected by the same
+    gym_media_selector.pickable predicate the swap uses: eligibility, human review,
+    consent, moderation evidence, cooldown, and in-month exclusions all remain one
+    implementation.
+    """
+    if _GYM_KEY.fullmatch(gym_key) is None or _ROW_ID.fullmatch(row_id) is None:
+        return 400, {"error": "bad_request", "detail": "gym_key and row_id required"}
+    try:
+        from datetime import date, timedelta
+        from . import config, gym_media_index, gym_media_selector, media_guard
+
+        store = deps.get("calendar_store")
+        if store is None:
+            from .portal_calendar_store import SupabaseCalendarStore
+            store = SupabaseCalendarStore()
+        row = store.get_row(gym_key, row_id)
+        if row is None:
+            return 404, {"error": "row_not_found", "gym_key": gym_key, "row_id": row_id}
+        if (not isinstance(row, dict) or row.get("id") != row_id
+                or row.get("gym_id") != gym_key):
+            return 503, {"error": "calendar_store_unavailable"}
+        if str(row.get("status") or "").strip().lower() not in ("pending", "coach_review"):
+            return 409, {"error": "row_not_swappable", "gym_key": gym_key, "row_id": row_id}
+        try:
+            post_date = date.fromisoformat(str(row.get("post_date") or "")[:10])
+        except ValueError:
+            return 503, {"error": "calendar_store_unavailable"}
+
+        # media_guard.book_state intentionally degrades open for planning. Read every
+        # month it would consult first, validate tenant identity, then replay that
+        # bounded snapshot into it so readiness never labels a source fault as zero.
+        month_rows = {}
+        start = post_date - timedelta(days=config.media_repeat_window_days())
+        for month in media_guard._months_between(start, post_date):
+            rows = store.list_month(gym_key, month)
+            if not isinstance(rows, list) or any(
+                    not isinstance(item, dict) or item.get("gym_id") != gym_key
+                    for item in rows):
+                return 503, {"error": "calendar_store_unavailable"}
+            month_rows[month] = [dict(item) for item in rows]
+
+        class _SnapshotStore:
+            def list_month(self, account_key, month):
+                if account_key != gym_key or month not in month_rows:
+                    raise RuntimeError("calendar snapshot scope mismatch")
+                return [dict(item) for item in month_rows[month]]
+
+        asset_state = media_guard.book_state(
+            gym_key, _SnapshotStore(), post_date, 1,
+            key_fn=media_guard.row_asset_key,
+        )
+        blocked_ids = set(asset_state)
+        current_asset = media_guard.row_asset_key(row)
+        if current_asset:
+            blocked_ids.add(current_asset)
+
+        media_store = deps.get("media_store") or gym_media_index.default_store()
+        if not callable(getattr(media_store, "available", None)) or not media_store.available():
+            return 503, {"error": "media_store_unavailable"}
+        # Probe the source explicitly because pickable intentionally treats a source
+        # failure as an empty planning pool. This endpoint must distinguish that from
+        # a definitive zero-candidate read.
+        assets = media_store.list_assets(gym_key)
+        if (not isinstance(assets, list) or any(not isinstance(asset, dict) for asset in assets)
+                or any(asset.get("gym_id") != gym_key for asset in assets)):
+            return 503, {"error": "media_store_unavailable"}
+        candidates = gym_media_selector.pickable(
+            gym_key, store=media_store, now=now, exclude_ids=tuple(blocked_ids))
+        if not isinstance(candidates, list):
+            return 503, {"error": "media_store_unavailable"}
+        response = []
+        for asset in candidates:
+            asset_id = asset.get("id") if isinstance(asset, dict) else None
+            # Defense in depth: do not rely on a count or a selector implementation
+            # detail to represent an asset as selectable.
+            if (not isinstance(asset_id, str) or not asset_id
+                    or asset.get("gym_id") != gym_key
+                    or asset_id in blocked_ids
+                    or not gym_media_selector.is_usable(asset)):
+                return 503, {"error": "media_store_unavailable"}
+            response.append({"id": asset_id, "row_id": row_id,
+                             "review_state": "reviewed", "selectable": True})
+        return 200, {"ok": True, "gym_key": gym_key, "candidates": response}
+    except Exception:  # noqa: BLE001 - readiness must never turn an outage into empty
+        return 503, {"error": "media_readiness_unavailable"}
 
 
 # -- reset_recreate_budget ---------------------------------------------------------------
@@ -1944,6 +2043,18 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         if method != "GET":
             return 405, {"error": "method_not_allowed"}
         return _resend_connect_link_readiness(m.group(1), deps)
+    m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/swap_media/candidates/([^/]{{1,256}})$", path)
+    if m:
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        try:
+            query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True)
+        except ValueError:
+            return 400, {"error": "bad_request", "detail": "row_id required"}
+        if set(query) != {"row_id"} or len(query["row_id"]) != 1 or not query["row_id"][0]:
+            return 400, {"error": "bad_request", "detail": "row_id required"}
+        return _swap_media_candidates_readiness(m.group(1), query["row_id"][0], deps,
+                                                now=now)
     # The key segment is captured loosely on purpose: the contract is that a MALFORMED
     # key (wrong charset, wrong length) is 400 bad_reservation_key, decided by the
     # receipt store's validator -- a route that pre-filters to well-formed keys would
