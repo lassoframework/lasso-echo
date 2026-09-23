@@ -1519,10 +1519,17 @@ def test_completed_swap_notice_rechecks_worker_receipt_and_current_asset(monkeyp
     assert bus.ticket(tid)["status"] == "resolved" and result["resolved"] == 1
     assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
 
-    # The legacy ops_action path may send only when it reaches this SAME
-    # receipt-backed check; a successful handler payload cannot bypass it.
+    # A direct ops swap has no PR or deployment SHA. Its before-state points to
+    # the worker receipt; dispatch must still independently read that receipt,
+    # the calendar row, and the approved asset before it can send.
     bus.tickets[tid]["status"] = "verification"
     bus.tickets[tid]["classification"] = "action_request"
+    bus.tickets[tid]["fix_pr_url"] = None
+    bus.tickets[tid]["verification_before"] = {
+        "fixer": {"ops_action": {"reservation_key": receipt_key}}}
+    release.pop("business_postcondition")
+    release.pop("merged_sha")
+    release.pop("deployment_check")
     release["postcondition_verified"] = True
     release["ops_action"] = {
         "ok": True, "identityVerified": True, "action": "swap_media",
@@ -1545,14 +1552,45 @@ def test_completed_swap_notice_rechecks_worker_receipt_and_current_asset(monkeyp
     assert bus.message(ops_notice["id"])["delivery_status"] == "posted"
     assert ops_result["resolved"] == 1 and bus.ticket(tid)["status"] == "resolved"
 
+    bus.tickets[tid]["status"] = "verification"
+    for field, blocked in (
+            ("classification", "code_fix"), ("classification", None),
+            ("fix_pr_url", pr), ("escalated", True), ("escalated", None),
+            ("hold_tier", "manual")):
+        original = bus.tickets[tid][field]
+        bus.tickets[tid][field] = blocked
+        assert not OB._verified_fix_notice(bus.ticket(tid), ops_notice["attachments"],
+                                           A.KIND_STATUS, bus=bus, now=at)
+        bus.tickets[tid][field] = original
+    before_ops = bus.tickets[tid]["verification_before"]["fixer"]["ops_action"]
+    before_ops["reservation_key"] = "other-proof-001"
+    assert not OB._verified_fix_notice(bus.ticket(tid), ops_notice["attachments"],
+                                       A.KIND_STATUS, bus=bus, now=at)
+    before_ops["reservation_key"] = receipt_key
+    row["source_media_asset_id"] = "other_asset"
+    assert not OB._verified_fix_notice(bus.ticket(tid), ops_notice["attachments"],
+                                       A.KIND_STATUS, bus=bus, now=at)
+    row["source_media_asset_id"] = asset_id
+    worker_store.clear()
+    assert not OB._verified_fix_notice(bus.ticket(tid), ops_notice["attachments"],
+                                       A.KIND_STATUS, bus=bus, now=at)
+    worker_store[receipt_key] = receipt
+
     # A newer message invalidates the old receipt even when the calendar row
     # still shows the swapped photo. The sender must resolve the new request.
     bus.now = at + timedelta(seconds=1)
     bus.record_inbound(ticket_id=tid, author_type="client", body="Still broken")
     bus.tables["support_messages"] = [m for m in bus.msgs if m["direction"] == "inbound"]
-    bus.tickets[tid]["status"] = "merged"
     new_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
-    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = new_key
+    release["request_key"] = new_key
+    assert not OB._verified_fix_notice(bus.ticket(tid), ops_notice["attachments"],
+                                       A.KIND_STATUS, bus=bus, now=bus.now)
+    bus.tickets[tid]["status"] = "merged"
+    release["merged_sha"] = BUSINESS_SHA
+    release["deployment_check"] = {"verified": True, "sha": BUSINESS_SHA}
+    release["business_postcondition"] = {
+        "check_id": "media_swap_completed",
+        "params": {"reservation_key": receipt_key, "row_id": row_id}}
     newer = bus.record_outbound(
         ticket_id=tid, author_type="echo", body="It is fixed again.",
         delivery_status="ready", kind=A.KIND_STATUS,
