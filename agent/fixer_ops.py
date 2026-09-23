@@ -654,8 +654,19 @@ def _swap_media_candidates_readiness(gym_key, row_id, deps, *, now=None):
         if (not isinstance(assets, list) or any(not isinstance(asset, dict) for asset in assets)
                 or any(asset.get("gym_id") != gym_key for asset in assets)):
             return 503, {"error": "media_store_unavailable"}
+        # Reuse the validated snapshot. A second live read inside pickable could
+        # fail or drift and turn a source fault into a definitive empty pool.
+        class _SnapshotMediaStore:
+            def available(self):
+                return True
+
+            def list_assets(self, account_key):
+                if account_key != gym_key:
+                    raise RuntimeError("media snapshot scope mismatch")
+                return [dict(asset) for asset in assets]
+
         candidates = gym_media_selector.pickable(
-            gym_key, store=media_store, now=now, exclude_ids=tuple(blocked_ids))
+            gym_key, store=_SnapshotMediaStore(), now=now, exclude_ids=tuple(blocked_ids))
         if not isinstance(candidates, list):
             return 503, {"error": "media_store_unavailable"}
         response = []
