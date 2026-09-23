@@ -25,8 +25,23 @@ pending drafts a day carries; approval and publish gates are untouched.
 from . import config, db
 
 
-def resolve_posts_per_day(base_key, store=None):
-    """The EFFECTIVE posts-per-day for one gym base: 1 or 2.
+def _lasso_summit_daily_applies(base_key, day=None):
+    """LASSO Summit daily extra (Blake 2026-09-23): True only for the canonical
+    LASSO base while AGENT_LASSO_SUMMIT_DAILY_ENABLED is on AND `day` (default
+    today) is inside the dated Sep 23 - Nov 8 2026 window. Never raises; any
+    failure degrades to the pre-feature resolution."""
+    try:
+        # Exact canonical match, mirroring the SQL gate (p_gym_id = 'lasso'):
+        # case/whitespace variants and lasso_demo do NOT get the extra capacity.
+        return (config.lasso_summit_daily_enabled(day)
+                and str(base_key or "") == "lasso")
+    except Exception:
+        return False
+
+
+def resolve_posts_per_day(base_key, store=None, *, day=None):
+    """The EFFECTIVE posts-per-day for one gym base: 1 or 2 (3 for LASSO during
+    the dated Summit daily-extra window only).
 
     Flag off -> 1 unconditionally. Flag on: the SHARED PLANE wins
     (echo_gym_settings.posts_per_day via an injectable store exposing
@@ -39,6 +54,8 @@ def resolve_posts_per_day(base_key, store=None):
     no way to clear it (db.set_posts_per_day only accepts 1 or 2, so there is no
     'unset'), silently overriding what the owner actually chose. The kv stays as the
     offline/degraded fallback for when the shared plane is unconfigured or down."""
+    if _lasso_summit_daily_applies(base_key, day):
+        return config.LASSO_SUMMIT_DAILY_CAPACITY
     if not config.cadence_2x_enabled():
         return 1
     if not base_key:
@@ -60,11 +77,14 @@ def resolve_posts_per_day(base_key, store=None):
     return 1
 
 
-def resolve_posts_per_day_live(base_key):
+def resolve_posts_per_day_live(base_key, *, day=None):
     """resolve_posts_per_day against the LIVE shared plane: constructs the Supabase
     store when the portal-calendar plane is configured (the worker's normal posture),
     else resolves from local kv only. Flag off -> 1 before any I/O. Never raises;
-    every failure degrades to the current behavior (1)."""
+    every failure degrades to the current behavior (1). The LASSO Summit daily extra
+    (3, dated window only) resolves before any store I/O, like the flag-off path."""
+    if _lasso_summit_daily_applies(base_key, day):
+        return config.LASSO_SUMMIT_DAILY_CAPACITY
     if not config.cadence_2x_enabled():
         return 1
     store = None

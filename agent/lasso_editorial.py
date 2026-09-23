@@ -63,6 +63,106 @@ def editorial_slots(slots):
     return normalized
 
 
+def normalize_summit_daily(slots, enabled_fn):
+    """Finalize the dated 2 regular + 1 Summit feed shape after editorial labels.
+
+    Editorial and campaign overrides run first. On each enabled day, any Summit
+    already occupying a regular or sprint slot is moved to cadence ordinal 2 and
+    its original sprint identity/asset index is retained. The vacated regular
+    slot is filled by a non-Summit editorial theme. Exactly two regular stories
+    remain paired to ordinals 0/1; the additive Summit feed has no third story.
+    """
+    from collections import defaultdict
+
+    by_day = defaultdict(list)
+    day_order = []
+    for slot in slots:
+        if slot.post_date not in by_day:
+            day_order.append(slot.post_date)
+        by_day[slot.post_date].append(slot)
+
+    result = []
+    regular_pool = ("echo", "website", "podcast", "doctrine", "book")
+    for day_key in day_order:
+        day_slots = by_day[day_key]
+        if not enabled_fn(day_key):
+            result.extend(day_slots)
+            continue
+
+        feeds = [s for s in day_slots if s.fmt == "feed"]
+        stories = [s for s in day_slots if s.fmt == "story"]
+        # Prefer a real sprint/campaign Summit asset, then an editorial Summit,
+        # then the provisional additive marker if an older planner supplied one.
+        summit = next((s for s in feeds if s.is_sprint and s.category == "summit"), None)
+        if summit is None:
+            summit = next((s for s in feeds if s.category == "summit"), None)
+        if summit is None:
+            summit = next((s for s in feeds if s.summit_daily), None)
+        if summit is None:
+            prototype = feeds[0]
+            summit = replace(prototype, category="summit", fmt="feed",
+                             overridden=True, is_sprint=False, slot_index=0)
+        summit = replace(summit, category="summit", fmt="feed", cadence_slot=2,
+                         summit_daily=True, overridden=True)
+
+        regular = [s for s in feeds if s is not summit and not s.is_sprint
+                   and s.category != "summit" and not s.summit_daily]
+        # Object identity is lost when `summit` is replaced above, so remove the
+        # chosen source by its original scheduling identity as well.
+        chosen_key = (getattr(summit, "is_sprint", False), summit.slot_index,
+                      summit.category if summit.is_sprint else None)
+        if summit.is_sprint:
+            regular = [s for s in regular
+                       if not (s.is_sprint and s.slot_index == chosen_key[1])]
+
+        selected = {}
+        for slot in regular:
+            ordinal = slot.cadence_slot
+            if ordinal in (0, 1) and ordinal not in selected:
+                selected[ordinal] = slot
+        used = {s.category for s in selected.values()}
+        prototype = next(iter(selected.values()), feeds[0])
+        weekday_pair = WEEK[date.fromisoformat(day_key).weekday()]
+        for ordinal in (0, 1):
+            if ordinal in selected:
+                continue
+            preferred = weekday_pair[ordinal]
+            candidates = (preferred,) + regular_pool
+            category = next((c for c in candidates
+                             if c != "summit" and c not in used), "doctrine")
+            selected[ordinal] = replace(
+                prototype, category=category, fmt="feed", cadence_slot=ordinal,
+                is_sprint=False, slot_index=0, summit_daily=False,
+                overridden=True, video_preferred=category == "podcast")
+            used.add(category)
+
+        # A Summit that occupied a regular ordinal must be replaced there.
+        for ordinal, slot in list(selected.items()):
+            if slot.category == "summit" or slot.summit_daily:
+                category = next(c for c in regular_pool if c not in used)
+                selected[ordinal] = replace(
+                    slot, category=category, is_sprint=False, slot_index=0,
+                    summit_daily=False, overridden=True,
+                    video_preferred=category == "podcast")
+                used.add(category)
+
+        story_by_ordinal = {s.cadence_slot: s for s in stories
+                            if not s.is_sprint and s.cadence_slot in (0, 1)}
+        story_proto = next(iter(story_by_ordinal.values()), stories[0] if stories else prototype)
+        regular_stories = []
+        for ordinal in (0, 1):
+            feed = selected[ordinal]
+            story = story_by_ordinal.get(ordinal, story_proto)
+            regular_stories.append(replace(
+                story, category=feed.category, fmt="story", cadence_slot=ordinal,
+                is_sprint=False, slot_index=0, summit_daily=False,
+                overridden=feed.overridden, video_preferred=feed.video_preferred))
+
+        result.extend([selected[0], selected[1], summit])
+        result.extend(regular_stories)
+    return result
+
+
 def source_pillar(category, day_key, doc):
     names = doc.pillars_with_copy()
     import json

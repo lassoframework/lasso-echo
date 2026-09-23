@@ -1249,6 +1249,43 @@ def summit_campaign_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_SUMMIT_CAMPAIGN_ENABLED", "false"))
 
 
+# ---------------------------------------------------------------------------
+# LASSO Summit DAILY EXTRA (Blake's explicit ruling, 2026-09-23): during the
+# dated Nashville Growth Summit run-up window ONLY, LASSO's base accounts carry
+# TWO regular feed posts PLUS one EXTRA Summit feed post per day (3 total).
+# The Summit post is ADDITIONAL — it never replaces a regular slot, and the
+# capacity-3 allowance is LASSO-only (canonical gym_id 'lasso') and only inside
+# the explicit campaign dates below. Default OFF: with the flag unset every
+# resolution is byte-for-byte today's behavior. Client gyms keep 1/2.
+LASSO_SUMMIT_DAILY_START = "2026-09-23"   # first day of the extra-Summit window
+LASSO_SUMMIT_DAILY_END = "2026-11-08"     # last day (mirrors SUMMIT_END_DATE)
+LASSO_SUMMIT_DAILY_CAPACITY = 3           # 2 regular + 1 Summit, never more
+
+
+def lasso_summit_daily_enabled(day=None) -> bool:
+    """LASSO Summit daily-extra switch (AGENT_LASSO_SUMMIT_DAILY_ENABLED, default
+    OFF). True ONLY when the flag is set AND `day` (a date or YYYY-MM-DD string;
+    default: today, the publish-day resolution the publisher needs) falls inside
+    the inclusive window LASSO_SUMMIT_DAILY_START..LASSO_SUMMIT_DAILY_END. Any
+    unparseable day degrades to False — a broken clock never expands capacity.
+    """
+    if not _truthy(os.environ.get("AGENT_LASSO_SUMMIT_DAILY_ENABLED", "false")):
+        return False
+    try:
+        from datetime import date as _date
+        from datetime import datetime as _dt
+        if day is None:
+            d = _dt.now().date()
+        elif isinstance(day, _date):
+            d = day
+        else:
+            d = _date.fromisoformat(str(day)[:10])
+        return (_date.fromisoformat(LASSO_SUMMIT_DAILY_START)
+                <= d <= _date.fromisoformat(LASSO_SUMMIT_DAILY_END))
+    except Exception:
+        return False
+
+
 def trust_dryrun_enabled() -> bool:
     """
     Trust DRY RUN switch. OFF by default. ON, every draft that WOULD have

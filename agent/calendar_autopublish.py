@@ -147,6 +147,14 @@ def slot_time_for_row(row, n=None):
     the pre-cadence hash path, byte-for-byte. Stories keep their midday slot."""
     fmt = (row.get("format") or "feed").strip().lower()
     si = row.get("slot_index")
+    # LASSO Summit daily runway: the extra FEED owns a third, distinct local
+    # slot.  Scope this by both tenant and the row's explicit calendar day so
+    # enabling the campaign cannot change clients or spill beyond its window.
+    # Stories retain the existing 12:30 slot.
+    if (fmt == "feed" and si == 2
+            and _lasso_summit_daily_enabled(row.get("gym_id"),
+                                            row.get("post_date"))):
+        return "12:00"
     if (fmt == "feed" and si in (0, 1) and config.cadence_2x_enabled()):
         return config.cadence_slot_times()[int(si)]
     if n is None:
@@ -154,6 +162,38 @@ def slot_time_for_row(row, n=None):
     if not SPRINT_SLOT_TIMES:
         return "00:00"
     return SPRINT_SLOT_TIMES[slot_index_for_row(row, n) % len(SPRINT_SLOT_TIMES)]
+
+
+def _lasso_summit_daily_enabled(account_key, day_key):
+    """Fail-closed adapter for the LASSO-only, date-scoped third feed flag."""
+    if str(account_key or "").strip().lower() != "lasso" or not day_key:
+        return False
+    enabled = getattr(config, "lasso_summit_daily_enabled", None)
+    if not callable(enabled):
+        return False
+    try:
+        return bool(enabled(str(day_key)[:10]))
+    except (TypeError, ValueError):
+        return False
+
+
+def _publish_capacity(gym_id, row, store, local_claim_day):
+    """Effective atomic publish capacity for this row on its actual local day."""
+    from .cadence import resolve_posts_per_day
+    try:
+        capacity = resolve_posts_per_day(gym_id, store, day=local_claim_day)
+    except TypeError:
+        # Compatibility for narrow injected resolvers predating the dated API.
+        # The production resolver accepts `day` and always takes the path above.
+        capacity = resolve_posts_per_day(gym_id, store)
+    is_feed = (row.get("format") or "feed").strip().lower() == "feed"
+    if (is_feed
+            and _lasso_summit_daily_enabled(gym_id, local_claim_day)):
+        return max(capacity, 3)
+    # The temporary third slot belongs to the extra Summit feed only. Stories
+    # retain their existing capacity even though the dated cadence resolver
+    # correctly reports three for LASSO as a whole.
+    return capacity if is_feed else min(capacity, 2)
 
 
 def assign_slots(rows):
@@ -1038,12 +1078,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         try:
             claim_slot = getattr(store, "claim_publish_slot", None)
             if callable(claim_slot):
-                from .cadence import resolve_posts_per_day
                 # Refresh after preflight: a long render/reframe can cross the
                 # gym's midnight before this atomic reservation.
                 reservation_day = _local_now(now, gym_tz).date().isoformat()
                 won = claim_slot(row_id, gym_id, reservation_day, gym_tz,
-                                 resolve_posts_per_day(gym_id, store), approved_only)
+                                 _publish_capacity(gym_id, row, store,
+                                                   reservation_day), approved_only)
             else:
                 # Legacy injectable test stores have no RPC. The production
                 # Supabase store always exposes claim_publish_slot and fails
