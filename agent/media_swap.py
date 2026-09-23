@@ -60,13 +60,13 @@ from .media_types import (VIDEO_EXTS as _VIDEO_EXTS,           # ONE definition 
 # outcome here is a normal thing that can happen to a real gym.
 REASON_NO_LIBRARY = "no_library"
 REASON_NO_FRESH_PHOTO = "no_fresh_photo"
+REASON_ASSET_PREP = "asset_preparation_failed"
 REASON_HOSTING = "hosting_unavailable"
 REASON_STORY_REBURN = "story_reburn_failed"
 
 REASON_TIMEOUT = "swap_timeout"
 
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
-_MAX_MATERIALIZE_ATTEMPTS = 3      # a corrupt download / failed probe tries the next
 SWAP_TRANSCODE_TIMEOUT_SEC = 45    # the ONE transcode a portal request may wait on
 SWAP_REQUEST_DEADLINE_SEC = 75     # the whole request: downloads + probes + transcode + burn
 SWAP_DOWNLOAD_TIMEOUT_SEC = 20     # one Drive download
@@ -528,7 +528,16 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
     deadline = _Deadline(SWAP_REQUEST_DEADLINE_SEC, clock)
     work = tempfile.mkdtemp(prefix="mediaswap_")
     try:
-        for cand in cands[:_MAX_MATERIALIZE_ATTEMPTS]:
+        # Swift River, 2026-09-23: the old loop tried only the first three
+        # candidates and then reported no_fresh_photo ("all photos were used") even
+        # when ~500 eligible assets remained and only preparation had failed. Walk
+        # EVERY ordered candidate, bounded by the finite selector result and, far
+        # earlier, by the shared request deadline and the one-transcode budget. Only say
+        # no_fresh_photo when the SELECTOR returned nothing pickable (handled above).
+        # Candidates that existed but could not be prepared in time are a retryable
+        # asset-preparation failure, never a false exhaustion report.
+        prep_failures = 0
+        for cand in cands:
             if deadline.expired():
                 say(f"{base_key}: swap request deadline passed before candidate "
                     f"{cand.get('key')}; nothing written")
@@ -542,6 +551,7 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                 say(f"{base_key}: {exc}; nothing written")
                 return {"ok": False, "reason": REASON_TIMEOUT}
             if not mat or not mat.get("path"):
+                prep_failures += 1
                 continue
             path = mat["path"]
             # Drive assets host under the gym base (builder parity, so the same bytes
@@ -597,7 +607,11 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                 say(f"{base_key}: {exc}; nothing written")
                 return {"ok": False, "reason": REASON_TIMEOUT}
             return out
-        return {"ok": False, "reason": REASON_NO_FRESH_PHOTO}
+        say(f"{base_key}: {prep_failures} of {len(cands)} "
+            "swap candidates could not be prepared (download/probe/conversion); "
+            "retryable, nothing written")
+        return {"ok": False, "reason": REASON_ASSET_PREP,
+                "candidates_tried": prep_failures}
     finally:
         _cleanup(work)
 
@@ -761,6 +775,11 @@ def client_message(reason, base_key=""):
     if reason == REASON_STORY_REBURN:
         return ("Echo could not rebuild the story card on the new media, so nothing "
                 "was changed. Try again shortly. Your recreates were not touched.")
+    if reason == REASON_ASSET_PREP:
+        return ("Echo found fresh media to swap in but could not get it ready in "
+                "time (a download or conversion did not finish), so nothing was "
+                "changed. Try again in a few minutes. Your recreates were not "
+                "touched.")
     if reason == REASON_TIMEOUT:
         return ("Echo could not prepare a fresh photo or video within the time it "
                 "allows itself, so nothing was changed. Try again in a minute. Your "
@@ -776,4 +795,4 @@ __all__ = ["enabled", "pick_replacement", "candidates_for", "order_candidates",
            "SWAP_DOWNLOAD_TIMEOUT_SEC", "REASON_TIMEOUT", "SwapDeadline",
            "library_path_for", "client_message", "is_video",
            "REASON_NO_LIBRARY", "REASON_NO_FRESH_PHOTO", "REASON_HOSTING",
-           "REASON_STORY_REBURN"]
+           "REASON_STORY_REBURN", "REASON_ASSET_PREP"]
