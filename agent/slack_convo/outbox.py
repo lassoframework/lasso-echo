@@ -382,6 +382,56 @@ def _business_postcondition_observed(bus, ticket, business, merged_sha, now=None
                                      request_key=current_key, merged_sha=merged_sha))
 
 
+def _ops_media_swap_observed(bus, ticket, row_id, now=None):
+    """Re-read a direct keyed swap's receipt and business state at dispatch.
+
+    The before-state supplies only the reservation pointer. A successful ops
+    payload, or a copied business verdict, cannot certify itself. The observer
+    checks the durable receipt on this worker and freshly reads the exact
+    tenant's calendar row and approved asset.
+    """
+    before = (ticket.get("verification_before") or {}).get("fixer") or {}
+    operation = before.get("ops_action") or {}
+    reservation_key = operation.get("reservation_key") if isinstance(operation, dict) else None
+    if (not isinstance(reservation_key, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", reservation_key)
+            or not isinstance(row_id, str) or not row_id
+            or bus is None):
+        return False
+    gym_key = ticket.get("client_id")
+    if not isinstance(gym_key, str) or not gym_key:
+        return False
+    try:
+        current_key = _current_fixer_request_key(bus, ticket)
+        deps = _business_evidence_deps(bus, "media_swap_completed")
+        if not current_key or deps is None:
+            return False
+        from .. import fixer_business_evidence as _fbe
+        observed = _fbe.observe_ops_media_swap(
+            gym_key=gym_key, request_key=current_key,
+            params={"reservation_key": reservation_key, "row_id": row_id},
+            deps=deps, ticket_id=str(ticket.get("id") or ""), now=now)
+    except Exception:  # noqa: BLE001 - receipt/read failure is not proof
+        return False
+    if not isinstance(observed, dict):
+        return False
+    captured = _parse_ts(observed.get("captured_at"))
+    ref = now or datetime.now(timezone.utc)
+    age = (ref - captured).total_seconds() if captured is not None else None
+    return (observed.get("schema_version") == 1
+            and observed.get("source") == _fbe.SOURCE
+            and observed.get("check_id") == "media_swap_completed"
+            and observed.get("gym_key") == gym_key
+            and observed.get("request_key") == current_key
+            and observed.get("merged_sha") == ""
+            and observed.get("outcome") == _fbe.VERIFIED
+            and observed.get("verified") is True
+            and observed.get("symptom_resolved") is True
+            and age is not None
+            and -_BUSINESS_EVIDENCE_FUTURE_SKEW_SECONDS <= age
+            <= BUSINESS_EVIDENCE_MAX_AGE_SECONDS)
+
+
 def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
     """Only the current fix's resolve notice may tell a customer it is handled.
 
@@ -415,6 +465,14 @@ def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
             return _restage_month_verified(operation, ticket)
         if action != "swap_media":
             return True
+        # A direct ops completion cannot borrow the code-fix lane or overrule a
+        # fresh human hold. A queued notice is rechecked against the current
+        # ticket at dispatch, after the FIXER produced its ops result.
+        if (ticket.get("classification") not in {"ops_fix", "action_request"}
+                or ticket.get("fix_pr_url")
+                or ticket.get("escalated") is not False
+                or ticket.get("hold_tier") is not None):
+            return False
         args = operation.get("args") or {}
         result = operation.get("result") or {}
         if not isinstance(args, dict) or not isinstance(result, dict):
@@ -435,17 +493,7 @@ def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
                      bool(result["video_url"].strip())))
         if not payload_ok:
             return False
-        business = release.get("business_postcondition") or {}
-        merged_sha = release.get("merged_sha")
-        if (not isinstance(business, dict)
-                or business.get("check_id") != "media_swap_completed"
-                or not isinstance(business.get("params"), dict)
-                or business["params"].get("row_id") != row_id
-                or not isinstance(merged_sha, str)
-                or not _RELEASE_SHA.fullmatch(merged_sha)):
-            return False
-        return _business_postcondition_observed(bus, ticket, business, merged_sha,
-                                                now=now)
+        return _ops_media_swap_observed(bus, ticket, row_id, now=now)
     # A healthy deployment proves the code is live, not that this owner's symptom
     # is gone. The stamped business_postcondition is only a pointer to the check that
     # must be re-run at dispatch time; its stamped verdict and prose are untrusted.

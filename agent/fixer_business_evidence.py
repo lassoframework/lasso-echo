@@ -1,8 +1,9 @@
 """
 fixer_business_evidence.py -- independent business postcondition evidence.
 
-A bounded, tenant-scoped, READ-ONLY observer for the FIXER release loop. A healthy
-deploy proves the code is live, not that the owner's symptom is gone; the customer
+A bounded, tenant-scoped, READ-ONLY observer for the FIXER release loop and
+keyed media swaps. A healthy deploy proves the code is live, not that the
+owner's symptom is gone; the customer
 closure gate (slack_convo/outbox._verified_fix_notice) therefore requires a
 business_postcondition record with source 'independent_business_check', verified and
 symptom_resolved True, a check id, a short evidence identifier, and the exact
@@ -10,7 +11,8 @@ request_key and merged_sha of the release being closed. This module produces tho
 records: every observation durably binds the request identity (request_key), the
 tenant (gym_key) and the release identity (merged_sha) to an outcome, with a
 captured_at timestamp. Nothing here writes to that consumer; the field names simply
-line up so a future wiring step is a pass-through.
+line up with the outbox contract. Direct media swaps use a separate receipt-bound
+entry point and do not claim a code release SHA.
 
 Hard rules (fail closed, all of them):
   - Only checks explicitly registered in CHECKS can run. An unknown check id returns
@@ -567,6 +569,26 @@ def _record(check_id, gym_key, request_key, merged_sha, captured_at, outcome,
 
 def observe(check_id, *, gym_key, request_key, merged_sha, params=None, deps=None,
             ticket_id=None, now=None):
+    return _observe(check_id, gym_key=gym_key, request_key=request_key,
+                    merged_sha=merged_sha, params=params, deps=deps,
+                    ticket_id=ticket_id, now=now, ops_swap=False)
+
+
+def observe_ops_media_swap(*, gym_key, request_key, params, deps, ticket_id,
+                           now=None):
+    """Read back a keyed swap without inventing a code release SHA.
+
+    Only the registered media_swap_completed check may use this route. Its durable
+    receipt binds the ticket, tenant, request, and row; the ordinary code-fix
+    observe() route retains its mandatory merged release identity.
+    """
+    return _observe('media_swap_completed', gym_key=gym_key,
+                    request_key=request_key, merged_sha='', params=params,
+                    deps=deps, ticket_id=ticket_id, now=now, ops_swap=True)
+
+
+def _observe(check_id, *, gym_key, request_key, merged_sha, params=None, deps=None,
+             ticket_id=None, now=None, ops_swap=False):
     """Run one registered check and return the durable evidence dict.
 
     Never raises into the caller: every failure mode is recorded in the object
@@ -591,7 +613,7 @@ def observe(check_id, *, gym_key, request_key, merged_sha, params=None, deps=Non
         return record(UNVERIFIED, reason='bad_gym_key')
     if not _REQUEST_KEY.fullmatch(request_key):
         return record(UNVERIFIED, reason='bad_request_key')
-    if not _RELEASE_SHA.fullmatch(merged_sha):
+    if not ops_swap and not _RELEASE_SHA.fullmatch(merged_sha):
         return record(UNVERIFIED, reason='bad_release_id')
     if params is None:
         params = {}
