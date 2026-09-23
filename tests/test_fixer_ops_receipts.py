@@ -68,6 +68,8 @@ class FakeBus:
             return [self.ticket_row] if self.ticket_row and params["id"] == f"eq.{TICKET}" else []
         if table == "echo_intake_tokens":
             return self.token_rows
+        if table == "support_messages":
+            return []
         raise AssertionError(f"unexpected table: {table}")
 
     def record_outbound(self, **kw):
@@ -668,6 +670,9 @@ def test_post_write_ambiguous_readback_marks_receipt_unknown_and_blocks_retry(
         action_deps = deps_factory(receipt_store)
     deps = {"bus": FakeBus(), "receipt_store": receipt_store, **action_deps}
     body = _body(reservation_key=KEY, **args)
+    if action == "swap_media":
+        body["request_key"] = FO._business_request_key(deps["bus"]._get,
+                                                       deps["bus"].ticket_row)
 
     status, result = _post(action, body, deps=deps)
     assert status == 503 and result["error"] == "reservation_outcome_unknown"

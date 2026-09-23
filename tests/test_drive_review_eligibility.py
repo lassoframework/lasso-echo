@@ -36,12 +36,16 @@ def test_existing_unreviewed_asset_stays_visible_but_not_pickable(monkeypatch):
     monkeypatch.setattr("agent.gym_media_routes._armed", lambda _: True)
     status, body = handle_list_assets("gym1", store=store)
     assert status == 200 and body["assets"][0]["review_status"] == "pending_review"
+    assert body["assets"][0]["review_ready"] is False
     assert gym_media_selector.pickable("gym1", store=store) == []
     assert store.get_asset("drive1") is not None
 
 
-def test_reviewed_clean_no_people_asset_is_selectable():
+def test_reviewed_clean_no_people_asset_is_selectable(monkeypatch):
     store = FakeMediaStore(assets=[approved()])
+    monkeypatch.setattr("agent.gym_media_routes._armed", lambda _: True)
+    status, body = handle_list_assets("gym1", store=store)
+    assert status == 200 and body["assets"][0]["review_ready"] is True
     assert gym_media_selector.pickable("gym1", store=store)[0]["id"] == "drive1"
 
 

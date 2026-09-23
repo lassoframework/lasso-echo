@@ -240,6 +240,54 @@ class SupabaseMediaStore:
             raise MediaStoreError(409, "asset changed during review")
         return True
 
+    _MODERATION_FIELDS = {
+        "moderation_status", "moderation_json", "people_detected",
+        "consent_status",
+    }
+
+    def update_moderation_asset(self, gym_id, asset_id, fields, *,
+                                expected_content_hash):
+        """Conditional moderation-evidence write (plain PATCH, no RPC).
+
+        Fails with 409 when the asset was edited or already moderated since the
+        producer read it, and refuses to write the operator-review columns.
+        """
+        if not gym_id or not expected_content_hash:
+            raise MediaStoreError(
+                400, "moderation update requires tenant and expected hash")
+        if set(fields) != self._MODERATION_FIELDS:
+            raise MediaStoreError(400, "moderation update requires only evidence fields")
+        status = fields["moderation_status"]
+        people = fields["people_detected"]
+        consent = fields["consent_status"]
+        evidence = fields["moderation_json"]
+        if (status not in {"clean", "flagged"}
+                or people is not None and not isinstance(people, bool)
+                or consent != ("not_required" if status == "clean" and people is False
+                               else "pending")
+                or not isinstance(evidence, dict)
+                or evidence.get("content_hash") != expected_content_hash
+                or evidence.get("asset_id") != asset_id
+                or evidence.get("gym_id") != gym_id
+                or evidence.get("people_detected") is not people
+                or evidence.get("verdict") not in {"clean", "unsafe", "unknown"}
+                or (status == "clean") != (evidence.get("verdict") == "clean")):
+            raise MediaStoreError(400, "invalid moderation evidence")
+        params = {"id": f"eq.{asset_id}", "gym_id": f"eq.{gym_id}",
+                  "content_hash": f"eq.{expected_content_hash}",
+                  "review_status": "eq.pending_review",
+                  "moderation_status": "eq.pending"}
+        r = self._client().patch(
+            self._rest(_ASSET_TABLE), params=params,
+            json=dict(fields),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}), timeout=30)
+        if r.status_code >= 400:
+            raise MediaStoreError(r.status_code, self._scrubbed(r))
+        if len(r.json() or []) != 1:
+            raise MediaStoreError(409, "asset changed during moderation")
+        return True
+
 
 def default_store():
     return SupabaseMediaStore()

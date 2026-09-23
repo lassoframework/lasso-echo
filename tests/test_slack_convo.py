@@ -17,6 +17,7 @@ Everything runs against FakeBus, which emulates the two unique indexes migration
 under test, not adapter memory. No network anywhere.
 """
 import os
+import hashlib
 import json
 import sys
 import uuid
@@ -32,6 +33,7 @@ from agent.slack_convo import identities as IDS  # noqa: E402
 from agent.slack_convo import identity_gate as IG  # noqa: E402
 from agent.slack_convo import outbox as OB  # noqa: E402
 from agent.slack_convo.bus import Bus, BusError  # noqa: E402
+from tests.gym_media_fakes import make_asset  # noqa: E402
 
 
 # ---- fakes ------------------------------------------------------------------------------
@@ -1039,16 +1041,12 @@ def test_swap_media_ops_notice_delivery_gate(monkeypatch, defect):
     post, calls = _posted()
     summary = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
                           member_check=lambda channel, user: defect != "not_member")
-    if defect is None:
-        assert bus.message(notice["id"])["delivery_status"] == "posted"
-        assert bus.ticket(tid)["status"] == "resolved"
-        assert summary["resolved"] == 1
-        assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
-    else:
-        assert bus.message(notice["id"])["delivery_status"] == "suppressed"
-        assert bus.ticket(tid)["status"] == "verification"
-        assert summary["resolved"] == 0
-        assert not any(call["channel"] == "C_CLIENT" for call in calls)
+    # Even the pristine legacy payload is a self-report. Without a durable
+    # media_swap_completed pointer and current receipt readback it cannot close.
+    assert bus.message(notice["id"])["delivery_status"] == "suppressed"
+    assert bus.ticket(tid)["status"] == "verification"
+    assert summary["resolved"] == 0
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
 
 
 @pytest.mark.parametrize("defect", [
@@ -1128,16 +1126,10 @@ def test_swap_media_nonempty_sibling_evidence_gate(monkeypatch, defect):
     post, calls = _posted()
     summary = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
                           member_check=lambda channel, user: True)
-    if defect is None:
-        assert bus.message(notice["id"])["delivery_status"] == "posted"
-        assert bus.ticket(tid)["status"] == "resolved"
-        assert summary["resolved"] == 1
-        assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
-    else:
-        assert bus.message(notice["id"])["delivery_status"] == "suppressed"
-        assert bus.ticket(tid)["status"] == "verification"
-        assert summary["resolved"] == 0
-        assert not any(call["channel"] == "C_CLIENT" for call in calls)
+    assert bus.message(notice["id"])["delivery_status"] == "suppressed"
+    assert bus.ticket(tid)["status"] == "verification"
+    assert summary["resolved"] == 0
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
 
 
 def test_swap_siblings_never_includes_the_target_row():
@@ -1461,6 +1453,116 @@ def test_business_fix_notice_requires_authoritative_observation(monkeypatch, def
         assert bus.ticket(tid)["status"] == "merged"
         assert summary["resolved"] == 0
         assert not any(call["channel"] == "C_CLIENT" for call in calls)
+
+
+def test_completed_swap_notice_rechecks_worker_receipt_and_current_asset(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    from agent import fixer_ops_receipts as FR
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    row_id, asset_id, receipt_key = BUSINESS_ROW_ID, "drive_asset_1", "swap-proof-001"
+    pr = "https://github.com/lassoframework/lasso-echo/pull/999"
+    bus.tickets[tid] = {
+        "id": tid, "product": "echo", "status": "merged", "classification": "code_fix",
+        "bot_identity": "echo", "identity_kind": "client", "slack_user_id": "U_CLIENT",
+        "escalated": False, "hold_tier": None, "client_id": BUSINESS_PORTAL_GYM_ID,
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "request_version": 0,
+        "verification_after": {"exit_code": 0, "fixer": {
+            "merged_sha": BUSINESS_SHA,
+            "deployment_check": {"verified": True, "sha": BUSINESS_SHA}}},
+    }
+    inbound, _ = bus.record_inbound(ticket_id=tid, author_type="client",
+                                    body="Please swap this photo")
+    key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    release = bus.tickets[tid]["verification_after"]["fixer"]
+    release["request_key"] = key
+    release["business_postcondition"] = {
+        "check_id": "media_swap_completed",
+        "params": {"reservation_key": receipt_key, "row_id": row_id}}
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    row = {"id": row_id, "gym_id": BUSINESS_ECHO_GYM_KEY, "status": "pending",
+           "caption": "Keep this copy", "image_url": "https://img/new.jpg",
+           "source_media_asset_id": asset_id}
+    asset = make_asset(asset_id, gym_id=BUSINESS_ECHO_GYM_KEY)
+    asset.update(consent_member_ref=None, release_ref=None, consent_expires_at=None)
+    bus.tables.update({
+        "echo_intake_tokens": [{"gym_id": BUSINESS_PORTAL_GYM_ID,
+                                "echo_account_key": BUSINESS_ECHO_GYM_KEY}],
+        "support_messages": [inbound],
+        "content_calendar": [row], "media_asset": [asset]})
+    receipt = {"schema_version": 1, "key": receipt_key, "action": "swap_media",
+               "gym_key": BUSINESS_ECHO_GYM_KEY, "ticket_id": tid, "status": "done",
+               "request_key": key,
+               "created_at": (bus.now + timedelta(seconds=1)).isoformat(),
+               "finished_at": (bus.now + timedelta(seconds=2)).isoformat(),
+               "result": {"row_id": row_id, "postcondition_verified": True,
+                          "swap_proof": {"row_id": row_id,
+                                         "before_image_sha256": digest("https://img/old.jpg"),
+                                         "after_image_sha256": digest(row["image_url"]),
+                                         "caption_sha256": digest(row["caption"]),
+                                         "before_asset_id": None,
+                                         "after_asset_id": asset_id}}}
+    worker_store = {receipt_key: receipt}
+    monkeypatch.setattr(FR, "default_store", lambda: worker_store)
+    notice = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="The photo swap is working.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "pr_url": pr, "resolve_notice": True,
+              "request_key": key, "request_version": bus.ticket(tid)["request_version"]})
+    post, calls = _posted()
+    at = bus.now + timedelta(seconds=3)
+    result = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                         member_check=lambda *_: True, now=at)
+    assert bus.message(notice["id"])["delivery_status"] == "posted"
+    assert bus.ticket(tid)["status"] == "resolved" and result["resolved"] == 1
+    assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
+
+    # The legacy ops_action path may send only when it reaches this SAME
+    # receipt-backed check; a successful handler payload cannot bypass it.
+    bus.tickets[tid]["status"] = "verification"
+    bus.tickets[tid]["classification"] = "action_request"
+    release["postcondition_verified"] = True
+    release["ops_action"] = {
+        "ok": True, "identityVerified": True, "action": "swap_media",
+        "args": {"row_id": row_id}, "tenantVerified": True,
+        "tenantId": BUSINESS_PORTAL_GYM_ID,
+        "result": {"ok": True, "action": "swap-media", "draft_id": row_id,
+                   "postcondition_verified": True,
+                   "image_public_url": row["image_url"], "media_kind": "image",
+                   "siblings_swapped": [], "siblings_left": []}}
+    ops_notice = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="The photo has been changed.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "resolve_notice": True,
+              "ops_action": "swap_media", "request_key": key,
+              "request_version": bus.ticket(tid)["request_version"]})
+    ops_result = OB.run_once(bus, post, identity=IDS.get("echo"),
+                             log=lambda *a: None, member_check=lambda *_: True,
+                             now=at)
+    assert bus.message(ops_notice["id"])["delivery_status"] == "posted"
+    assert ops_result["resolved"] == 1 and bus.ticket(tid)["status"] == "resolved"
+
+    # A newer message invalidates the old receipt even when the calendar row
+    # still shows the swapped photo. The sender must resolve the new request.
+    bus.now = at + timedelta(seconds=1)
+    bus.record_inbound(ticket_id=tid, author_type="client", body="Still broken")
+    bus.tables["support_messages"] = [m for m in bus.msgs if m["direction"] == "inbound"]
+    bus.tickets[tid]["status"] = "merged"
+    new_key = OB._current_fixer_request_key(bus, bus.ticket(tid))
+    bus.tickets[tid]["verification_after"]["fixer"]["request_key"] = new_key
+    newer = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="It is fixed again.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "pr_url": pr, "resolve_notice": True,
+              "request_key": new_key, "request_version": bus.ticket(tid)["request_version"]})
+    result = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
+                         member_check=lambda *_: True, now=bus.now)
+    assert bus.message(newer["id"])["delivery_status"] == "suppressed"
+    assert result["resolved"] == 0 and bus.ticket(tid)["status"] == "merged"
 
 
 def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):

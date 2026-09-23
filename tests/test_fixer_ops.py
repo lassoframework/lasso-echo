@@ -4,6 +4,7 @@ Auth (401 / 503), the catalog, each action's happy path against fakes, the org-f
 refusal, unknown actions, the volume preflight, the background job and its status route,
 the ticket record and the audit line, and the intake_web transport."""
 import io
+import hashlib
 import json
 import os
 import sys
@@ -30,6 +31,7 @@ class FakeBus:
         self.token_rows = tokens if tokens is not None else []
         self.reverse_token_rows = reverse_tokens
         self.error = error
+        self.request_messages = []
 
     def _get(self, table, params):
         if self.error:
@@ -40,6 +42,8 @@ class FakeBus:
             if "echo_account_key" in params and self.reverse_token_rows is not None:
                 return self.reverse_token_rows
             return self.token_rows
+        if table == "support_messages":
+            return [dict(row) for row in self.request_messages]
         raise AssertionError(f"unexpected table: {table}")
 
     def record_outbound(self, **kw):
@@ -871,6 +875,12 @@ def _keyed_body(key=KEY, gym=GYM, ticket=TICKET, **args):
     return {"gym_key": gym, "ticket_id": ticket, "args": args, "reservation_key": key}
 
 
+def _keyed_swap_body(key=KEY, **args):
+    bus = FakeBus()
+    current = FO._business_request_key(bus._get, bus.ticket_row)
+    return {**_keyed_body(key=key, **args), "request_key": current}
+
+
 def _ok_reset(calls):
     def reset(key):
         calls.append(key)
@@ -930,12 +940,13 @@ def test_a_failed_receipt_replay_is_an_explicit_409_and_runs_nothing(armed):
 
 def test_an_unknown_receipt_refuses_replay_and_runs_nothing(armed):
     store = {}
-    FR.begin(store, KEY, "swap_media", GYM, TICKET, {"row_id": "row-abc-123"})
+    FR.begin(store, KEY, "swap_media", GYM, TICKET, {"row_id": "row-abc-123"},
+             request_key=_keyed_swap_body()["request_key"])
     FR.mark_unknown(store, KEY, "response lost after the write; outcome undetermined")
     calls = []
     deps = {"bus": FakeBus(), "receipt_store": store,
             "handle_swap_media": lambda *a, **kw: calls.append(a) or (200, {"ok": True})}
-    status, body = _post("swap_media", _keyed_body(row_id="row-abc-123"), deps=deps)
+    status, body = _post("swap_media", _keyed_swap_body(row_id="row-abc-123"), deps=deps)
     assert status == 409 and body["error"] == "reservation_outcome_unknown"
     assert calls == [], "an unknown outcome is NEVER automatically retried"
 
@@ -999,11 +1010,11 @@ def test_keyed_replay_returns_the_durable_receipt_and_never_reruns_swap(armed):
 
     deps = {"bus": FakeBus(), "receipt_store": store, "calendar_store": Store(),
             "handle_swap_media": handler}
-    status, first = _post("swap_media", _keyed_body(row_id="row-abc-123"), deps=deps)
+    status, first = _post("swap_media", _keyed_swap_body(row_id="row-abc-123"), deps=deps)
     assert status == 200 and first["receipt"]["status"] == "done"
     assert not first.get("replayed")
 
-    status, replay = _post("swap_media", _keyed_body(row_id="row-abc-123"), deps=deps)
+    status, replay = _post("swap_media", _keyed_swap_body(row_id="row-abc-123"), deps=deps)
     assert status == 200 and replay["ok"] is True
     assert replay["replayed"] is True
     assert replay["receipt"]["key"] == KEY and replay["receipt"]["status"] == "done"
@@ -1011,6 +1022,129 @@ def test_keyed_replay_returns_the_durable_receipt_and_never_reruns_swap(armed):
     assert replay["result"] == first["result"]
     assert calls == ["row-abc-123"], "the wrapped action ran exactly once across the replay"
     assert "replay" not in store[KEY], "the replay marker is response-only, never persisted"
+    deps["bus"].request_messages.append({
+        "id": "new-message", "ticket_id": TICKET, "direction": "inbound",
+        "author_type": "client", "created_at": "2026-09-23T12:00:00Z",
+        "body": "Still broken", "attachments": {}})
+    stale_status, stale = _post("swap_media",
+                                _keyed_swap_body(row_id="row-abc-123"), deps=deps)
+    assert stale_status == 409 and stale["error"] == "request_identity_mismatch"
+    assert calls == ["row-abc-123"]
+
+
+def test_keyed_swap_receipt_captures_independent_before_after_identity_and_caption(armed):
+    receipts = {}
+    row = {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
+           "account": "instagram", "format": "feed", "status": "pending",
+           "caption": "The exact approved copy", "image_url": "https://img/old.jpg",
+           "source_media_asset_id": None}
+
+    class Store:
+        def get_row(self, account_key, row_id):
+            assert account_key == GYM and row_id == row["id"]
+            return dict(row)
+
+        def list_month(self, account_key, month):
+            assert account_key == GYM and month == "2026-09"
+            return [dict(row)]
+
+    def handler(*_args):
+        row.update(image_url="https://img/new.jpg",
+                   source_media_asset_id="drive-asset-1")
+        return 200, {"ok": True, "image_public_url": row["image_url"],
+                     "swap_proof": {"row_id": row["id"], "forged": True},
+                     "siblings_swapped": [], "siblings_left": [],
+                     "sibling_results": []}
+
+    status, body = _post("swap_media", _keyed_swap_body(row_id=row["id"]), deps={
+        "bus": FakeBus(), "receipt_store": receipts,
+        "calendar_store": Store(), "handle_swap_media": handler})
+    assert status == 200 and body["receipt"]["status"] == "done"
+    proof = receipts[KEY]["result"]["swap_proof"]
+    assert proof == {
+        "row_id": row["id"],
+        "before_image_sha256": hashlib.sha256(b"https://img/old.jpg").hexdigest(),
+        "after_image_sha256": hashlib.sha256(b"https://img/new.jpg").hexdigest(),
+        "caption_sha256": hashlib.sha256(b"The exact approved copy").hexdigest(),
+        "before_asset_id": None, "after_asset_id": "drive-asset-1"}
+
+
+def test_keyed_swap_receipt_never_claims_completion_when_caption_changed(armed):
+    receipts = {}
+    row = {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
+           "account": "instagram", "format": "feed", "status": "pending",
+           "caption": "Before", "image_url": "https://img/old.jpg"}
+
+    class Store:
+        def get_row(self, *_args):
+            return dict(row)
+
+        def list_month(self, *_args):
+            return [dict(row)]
+
+    def handler(*_args):
+        row.update(caption="After", image_url="https://img/new.jpg",
+                   source_media_asset_id="drive-asset-1")
+        return 200, {"ok": True, "image_public_url": row["image_url"],
+                     "swap_proof": {"row_id": row["id"], "forged": True},
+                     "siblings_swapped": [], "siblings_left": [],
+                     "sibling_results": []}
+
+    status, body = _post("swap_media", _keyed_swap_body(row_id=row["id"]), deps={
+        "bus": FakeBus(), "receipt_store": receipts,
+        "calendar_store": Store(), "handle_swap_media": handler})
+    assert status == 200 and body["receipt"]["status"] == "done"
+    assert "swap_proof" not in receipts[KEY]["result"]
+
+
+def test_keyed_swap_requires_exact_current_request_before_reserving(armed):
+    calls, receipts = [], {}
+    deps = {"bus": FakeBus(), "receipt_store": receipts,
+            "handle_swap_media": lambda *a: calls.append(a) or (200, {"ok": True})}
+    missing = _keyed_body(row_id="row-abc-123")
+    assert _post("swap_media", missing, deps=deps)[0] == 400
+    bad_key = {**_keyed_swap_body(row_id="row-abc-123"),
+               "reservation_key": "bad key"}
+    status, body = _post("swap_media", bad_key, deps=deps)
+    assert status == 400 and body["error"] == "bad_reservation_key"
+    stale = {**_keyed_swap_body(row_id="row-abc-123"), "request_key": "a" * 64}
+    status, body = _post("swap_media", stale, deps=deps)
+    assert status == 409 and body["error"] == "request_identity_mismatch"
+    assert calls == [] and receipts == {}
+
+
+def test_queued_swap_new_inbound_before_action_fails_durable_reservation(armed):
+    class ChangingBus(FakeBus):
+        def __init__(self):
+            super().__init__()
+            self.message_reads = 0
+
+        def _get(self, table, params):
+            if table == "support_messages":
+                self.message_reads += 1
+                if self.message_reads > 1:
+                    return [{"id": "new-message", "ticket_id": TICKET,
+                             "direction": "inbound", "author_type": "client",
+                             "created_at": "2026-09-23T12:00:00Z",
+                             "body": "Actually, another issue", "attachments": {}}]
+                return []
+            return super()._get(table, params)
+
+    calls, receipts, bus = [], {}, ChangingBus()
+    body = _keyed_swap_body(row_id="row-abc-123")
+    status, result = _post("swap_media", body, deps={
+        "bus": bus, "receipt_store": receipts,
+        "handle_swap_media": lambda *a: calls.append(a) or (200, {"ok": True})})
+    assert status == 409 and result["error"] == "request_identity_mismatch"
+    assert calls == [] and receipts[KEY]["status"] == "failed"
+    assert receipts[KEY]["request_key"] == body["request_key"]
+
+
+def test_keyed_swap_receipt_binds_request_key_to_payload_hash(armed):
+    assert FR.payload_hash("swap_media", GYM, TICKET, {"row_id": "row-abc-123"},
+                           request_key="a" * 64) != FR.payload_hash(
+                               "swap_media", GYM, TICKET, {"row_id": "row-abc-123"},
+                               request_key="b" * 64)
 
 
 # -- 4. wrong tenant / key / ticket -----------------------------------------------------------

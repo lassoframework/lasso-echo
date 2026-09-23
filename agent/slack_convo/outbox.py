@@ -304,7 +304,7 @@ _BUSINESS_EVIDENCE_FUTURE_SKEW_SECONDS = 300
 _RELEASE_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
-def _business_evidence_deps(bus):
+def _business_evidence_deps(bus, check_id=None):
     """The bounded, read-only reader fixer_business_evidence.observe() requires,
     adapted from the support bus's own bounded PostgREST-style read (the same one
     _person_for_card uses). The registered checks pass their own explicit limit in
@@ -318,7 +318,17 @@ def _business_evidence_deps(bus):
     def read(table, params):
         return get(table, params)
 
-    return {"read": read}
+    deps = {"read": read}
+    if check_id == "media_swap_completed":
+        # The Slack outbox runs on the Echo worker with its durable SQLite
+        # volume. Keyed FIXER swaps intended for automatic closure must run on
+        # that same worker. A receipt written on intake-web's separate volume
+        # will be absent here and the observer will fail closed.
+        from .. import fixer_ops_receipts as receipts
+        store = receipts.default_store()
+        deps["receipt_read"] = lambda key, echo_key: receipts.get_receipt(
+            store, key, echo_key)
+    return deps
 
 
 def _business_postcondition_observed(bus, ticket, business, merged_sha, now=None):
@@ -346,13 +356,14 @@ def _business_postcondition_observed(bus, ticket, business, merged_sha, now=None
         return False
     if not current_key:
         return False
-    deps = _business_evidence_deps(bus)
+    deps = _business_evidence_deps(bus, check_id)
     if deps is None:
         return False
     try:
         from .. import fixer_business_evidence as _fbe
         observed = _fbe.observe(check_id, gym_key=gym_key, request_key=current_key,
-                                merged_sha=merged_sha, params=params, deps=deps, now=now)
+                                merged_sha=merged_sha, params=params, deps=deps,
+                                ticket_id=str(ticket.get("id") or ""), now=now)
     except Exception:  # noqa: BLE001 - an observer fault is not evidence
         return False
     if not isinstance(observed, dict):
@@ -374,10 +385,9 @@ def _business_postcondition_observed(bus, ticket, business, merged_sha, now=None
 def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
     """Only the current fix's resolve notice may tell a customer it is handled.
 
-    The ops_action branches are pure payload validation and need no reader. The
-    business_postcondition branch additionally re-runs the independent observation
-    at dispatch time; a caller that cannot supply the bus fails CLOSED there, never
-    skips the check."""
+    Most ops_action branches retain their existing payload gates. A swap_media
+    resolution also requires the same durable business observation as the code
+    fix branch; its handler result alone cannot prove the photo changed."""
     verification = ticket.get("verification_after") or {}
     release = verification.get("fixer") or {}
     deployment = release.get("deployment_check") or {}
@@ -412,7 +422,7 @@ def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
         row_id = args.get("row_id")
         media_url = result.get("image_public_url")
         media_kind = result.get("media_kind")
-        return (isinstance(row_id, str) and bool(row_id.strip())
+        payload_ok = (isinstance(row_id, str) and bool(row_id.strip())
                 and result.get("ok") is True
                 and result.get("action") == "swap-media"
                 and result.get("postcondition_verified") is True
@@ -423,6 +433,19 @@ def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
                      or media_kind == "video" and
                      isinstance(result.get("video_url"), str) and
                      bool(result["video_url"].strip())))
+        if not payload_ok:
+            return False
+        business = release.get("business_postcondition") or {}
+        merged_sha = release.get("merged_sha")
+        if (not isinstance(business, dict)
+                or business.get("check_id") != "media_swap_completed"
+                or not isinstance(business.get("params"), dict)
+                or business["params"].get("row_id") != row_id
+                or not isinstance(merged_sha, str)
+                or not _RELEASE_SHA.fullmatch(merged_sha)):
+            return False
+        return _business_postcondition_observed(bus, ticket, business, merged_sha,
+                                                now=now)
     # A healthy deployment proves the code is live, not that this owner's symptom
     # is gone. The stamped business_postcondition is only a pointer to the check that
     # must be re-run at dispatch time; its stamped verdict and prose are untrusted.

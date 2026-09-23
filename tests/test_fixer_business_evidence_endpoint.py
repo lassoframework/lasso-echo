@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from agent import fixer_ops as FO
+from tests.gym_media_fakes import make_asset
 
 SECRET = "observer-secret"
 TICKET_ID = "11111111-1111-4111-8111-111111111111"
@@ -74,10 +75,13 @@ class Reader:
         raise AssertionError(f"unexpected table {table}")
 
 
-def post(value, reader, *, secret=SECRET, now=NOW):
+def post(value, reader, *, secret=SECRET, now=NOW, receipt_store=None):
+    deps = {"business_evidence": {"read": reader}}
+    if receipt_store is not None:
+        deps["receipt_store"] = receipt_store
     return FO.handle(
         "POST", FO.BUSINESS_EVIDENCE_PATH, headers(secret),
-        json.dumps(value).encode(), deps={"business_evidence": {"read": reader}},
+        json.dumps(value).encode(), deps=deps,
         now=now, log=lambda *_: None)
 
 
@@ -108,6 +112,63 @@ def test_success_returns_only_canonical_fresh_bound_record_and_performs_no_write
         "support_tickets", "support_messages", "echo_intake_tokens",
         "echo_intake_tokens", "content_calendar"]
     assert reader.writes == 0
+
+
+def test_completed_swap_route_requires_keyed_receipt_and_current_drive_proof():
+    row_id, asset_id, key = "calendar_row_99", "drive_asset_1", "swap-aimee-001"
+    before_url, after_url, caption = "https://img/old.jpg", "https://img/new.jpg", "Copy"
+    digest = lambda value: hashlib.sha256(value.encode()).hexdigest()
+    asset = make_asset(asset_id, gym_id=ECHO_KEY)
+    asset.update(consent_member_ref=None, release_ref=None, consent_expires_at=None)
+    receipt = {
+        "schema_version": 1, "key": key, "action": "swap_media", "gym_key": ECHO_KEY,
+        "ticket_id": TICKET_ID, "status": "done",
+        "request_key": REQUEST_KEY,
+        "created_at": "2026-09-19T11:30:00+00:00", "finished_at": NOW.isoformat(),
+        "result": {"row_id": row_id, "postcondition_verified": True,
+                   "swap_proof": {"row_id": row_id,
+                                  "before_image_sha256": digest(before_url),
+                                  "after_image_sha256": digest(after_url),
+                                  "caption_sha256": digest(caption),
+                                  "before_asset_id": None, "after_asset_id": asset_id}},
+    }
+
+    class SwapReader(Reader):
+        def __call__(self, table, params):
+            if table == "media_asset":
+                self.calls.append((table, dict(params)))
+                return [dict(asset)]
+            return super().__call__(table, params)
+
+    reader = SwapReader(calendar=[{
+        "id": row_id, "gym_id": ECHO_KEY, "status": "pending",
+        "caption": caption, "image_url": after_url,
+        "source_media_asset_id": asset_id}])
+    request = payload(check_id="media_swap_completed",
+                      params={"reservation_key": key, "row_id": row_id})
+    status, body = post(request, reader, receipt_store={key: receipt})
+    assert status == 200 and body["verified"] is True
+    assert body["symptom_resolved"] is True
+    assert body["evidence"] == f"media_swap:{row_id}:{asset_id}"
+    assert reader.writes == 0
+
+    for invalid in ({"reservation_key": key, "row_id": "bad"},
+                    {"reservation_key": key, "row_id": row_id, "extra": True}):
+        bad_reader = SwapReader()
+        status, body = post(payload(check_id="media_swap_completed", params=invalid),
+                            bad_reader, receipt_store={key: receipt})
+        assert status == 400 and body["error"] == "bad_request"
+        assert bad_reader.calls == []
+
+
+@pytest.mark.parametrize("params", [{"min_count": 0}, {"min_count": True},
+                                   {"min_count": 2}, {"min_count": 1, "proof": "yes"}])
+def test_candidate_diagnostic_rejects_nonexact_params_before_any_read(params):
+    reader = Reader()
+    status, body = post(payload(check_id="media_swap_candidate_available",
+                                params=params), reader)
+    assert status == 400 and body["error"] == "bad_request"
+    assert reader.calls == []
 
 
 def test_production_composition_uses_bounded_http_reader_without_injected_deps(

@@ -12,6 +12,7 @@ every time, and a person reconciles it by hand.
 The receipt shape:
     {"schema_version": 1, "key", "action", "gym_key", "ticket_id", "payload_hash",
      "status": "reserved"|"done"|"failed"|"unknown",
+     "request_key"?: current requester SHA for keyed swap_media,
      "created_at": ISO utc, "result": None|{...}, "error": None|str,
      "finished_at": None|ISO utc}
 
@@ -35,6 +36,7 @@ from datetime import datetime, timezone
 
 STORE_PREFIX = "ops_receipt_"
 KEY_RE = re.compile(r"[A-Za-z0-9_-]{8,128}")
+REQUEST_KEY_RE = re.compile(r"[0-9a-f]{64}")
 
 _LOCK = threading.Lock()
 
@@ -54,10 +56,16 @@ def _validate_key(key):
         raise ReceiptError("bad_reservation_key", 400)
 
 
-def payload_hash(action, gym_key, ticket_id, args):
+def payload_hash(action, gym_key, ticket_id, args, request_key=None):
     """sha256 hex of the canonical reservation payload -- the identity a replay must match."""
+    payload = {"action": action, "gym_key": gym_key, "ticket_id": ticket_id,
+               "args": args}
+    if request_key is not None:
+        if not isinstance(request_key, str) or not REQUEST_KEY_RE.fullmatch(request_key):
+            raise ReceiptError("bad_request_key", 400)
+        payload["request_key"] = request_key
     canonical = json.dumps(
-        {"action": action, "gym_key": gym_key, "ticket_id": ticket_id, "args": args},
+        payload,
         sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -82,15 +90,17 @@ def _save(store, key, receipt):
         raise ReceiptError("store_unavailable", 503) from e
 
 
-def begin(store, key, action, gym_key, ticket_id, args):
+def begin(store, key, action, gym_key, ticket_id, args, request_key=None):
     """Reserve `key` for this exact payload, or replay/conflict against the existing receipt."""
     _validate_key(key)
-    digest = payload_hash(action, gym_key, ticket_id, args)
+    digest = payload_hash(action, gym_key, ticket_id, args, request_key=request_key)
     with _LOCK:
         proposed = {"schema_version": 1, "key": key, "action": action,
                     "gym_key": gym_key, "ticket_id": ticket_id, "payload_hash": digest,
                     "status": "reserved", "created_at": _now_iso(),
                     "result": None, "error": None, "finished_at": None}
+        if request_key is not None:
+            proposed["request_key"] = request_key
         # The production store claims under SQLite BEGIN IMMEDIATE. A Python lock
         # alone does not protect another Echo process using the same volume.
         existing = store.reserve(key, proposed) if hasattr(store, "reserve") else _load(store, key)

@@ -466,7 +466,7 @@ def handle_disconnect_source(account_key, source_id, *, store=None):
 # ---- GET /media/assets?gym ---------------------------------------------------
 def handle_list_assets(account_key, *, store=None):
     """GET /media/assets — this gym's assets for the portal media tab. Response:
-      {assets: [{id, kind, title, eligible, excluded_by_coach, reject_reason,
+      {assets: [{id, kind, title, eligible, review_ready, excluded_by_coach, reject_reason,
                  aspect, crop_hint, used_count, last_used_at,
                  thumb_url}]}"""
     if not _armed(account_key):
@@ -482,6 +482,7 @@ def handle_list_assets(account_key, *, store=None):
     return 200, {"assets": [
         {"id": a.get("id"), "kind": a.get("kind"), "title": a.get("title"),
          "eligible": a.get("eligible"),
+         "review_ready": _sel.is_usable(a),
          "excluded_by_coach": bool(a.get("excluded_by_coach")),
          "reject_reason": a.get("reject_reason"), "aspect": a.get("aspect"),
          "crop_hint": a.get("crop_hint"), "used_count": a.get("used_count"),
