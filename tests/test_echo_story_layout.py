@@ -3,17 +3,19 @@ import pytest
 from agent.astra_prompt import build_content_brief
 
 
-@pytest.mark.parametrize('pixels,box', [
-    ('1080x1920', 'x 86 to 994 px and y 288 to 1498 px'),
-    ('1440x2560', 'x 115 to 1325 px and y 384 to 1997 px'),
-    ('not-a-size', 'x 86 to 994 px and y 288 to 1498 px'),
+@pytest.mark.parametrize('pixels,box,wordmark', [
+    ('1080x1920', 'x 119 to 961 px and y 346 to 1229 px', 'y=269 to 307 px'),
+    ('1440x2560', 'x 158 to 1282 px and y 461 to 1638 px', 'y=358 to 410 px'),
+    ('not-a-size', 'x 119 to 961 px and y 346 to 1229 px', 'y=269 to 307 px'),
 ])
-def test_story_uses_interior_clearance_with_creative_freedom(pixels, box):
+def test_story_uses_interior_clearance_with_creative_freedom(pixels, box, wordmark):
     headline = 'You did not open a gym to run your own ads.'
     brief = build_content_brief(headline, ['Approved fact one', 'Approved fact two'],
         cta='Save this post', footer='LASSOFRAMEWORK.COM', surface='Story', pixels=pixels)
     assert box in brief
     assert 'x=0.06 to 0.94 and y=0.10 to 0.85' in brief
+    assert 'Use x=11 to 89 percent for every text block' in brief
+    assert wordmark in brief
     assert 'no prescribed rows' in brief
     assert 'full freedom over colors, typography' in brief
     assert 'meaningful illustration' in brief
@@ -38,7 +40,7 @@ def test_corrective_brief_focuses_on_edit_with_all_approved_copy():
                      'LASSOFRAMEWORK.COM', 'Move the URL up'):
         assert required in brief
     assert brief.startswith('EDIT the attached rejected candidate')
-    assert 'y=15 to 78 percent' in brief
+    assert 'y=18 to 64 percent' in brief
     assert 'meaningful illustration' in brief
-    assert 'x 86 to 994 px and y 288 to 1498 px' in brief
+    assert 'x 119 to 961 px and y 346 to 1229 px' in brief
     assert 'IGNORE ME' not in brief

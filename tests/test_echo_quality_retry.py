@@ -94,6 +94,10 @@ def test_retry_sends_exact_latest_rejected_pixels(monkeypatch, tmp_path):
     # exact bytes rejected at attempt 2 (latest rejected pixels, not the first).
     assert engine.calls[1][1]["repair_image_bytes"] == b"candidate-bytes-1"
     assert engine.calls[2][1]["repair_image_bytes"] == b"candidate-bytes-2"
+    second_brief = engine.calls[1][1]["engine_prompts"]["astra"]
+    assert "first rejection: wordmark too high" in second_brief
+    assert "erase and redraw the complete wordmark within y=14 to 16 percent" in second_brief
+    assert "affected aligned text group within x=11 to 89 percent" in second_brief
     # Reviewer saw every candidate; success produced no failure sidecar/alert.
     assert reviewed == [b"candidate-bytes-1", b"candidate-bytes-2", b"candidate-bytes-3"]
     assert not (tmp_path / "card.png.failure.json").exists()

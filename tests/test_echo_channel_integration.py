@@ -44,6 +44,11 @@ def test_story_retries_use_reviewed_pixels_and_one_terminal_alert(monkeypatch, t
         passes = eventual_pass and len(reviewed) == 2
         grade = dict(scores=dict(infographic_review.WEIGHTS), copy_complete=True,
                      copy_accurate=True, placement_safe=passes,
+                     placement_violations=[] if passes else [{
+                         'element': 'destination URL',
+                         'bounds': 'x=0.10 to 0.50, y=0.84 to 0.87',
+                         'correction': 'Move the complete URL above y=1632 pixels.',
+                     }],
                      issues=[] if passes else [{'severity':'major',
                          'correction':'Move the complete URL above y=1632 pixels.'}])
         return 200, json.dumps({'id':f'review-{len(reviewed)}', 'output':[

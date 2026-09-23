@@ -33,7 +33,8 @@ class Vision:
 
 def review_response(**overrides):
     data = dict(scores=dict(infographic_review.WEIGHTS), copy_complete=True,
-                copy_accurate=True, placement_safe=True, issues=[])
+                copy_accurate=True, placement_safe=True,
+                placement_violations=[], issues=[])
     data.update(overrides)
     return json.dumps(data)
 
@@ -104,6 +105,9 @@ def test_story_safe_region_is_required_even_with_perfect_copy_and_score():
         def ask_image(self, image_bytes, question):
             assert "y=0.10 to 0.85" in question
             assert "y=0.17 to 0.80" not in question
+            assert "destination entirely at y=0.73 to 0.76" in question
+            assert "Do not recommend a minimal move" in question
+            assert "logo or wordmark is never supplementary" in question
             return review_response(placement_safe=False)
     result = infographic_review.evaluate(b"candidate", headline="Approved", facts=["Fact"],
         surface="story", vision_client=StoryVision())
@@ -117,6 +121,77 @@ def test_story_brief_uses_full_height_safe_region():
     assert 'y=10 to 85 percent' in brief
     assert 'y=17 to 80 percent' not in brief
     assert 'top and bottom controls' in brief
+
+
+def test_story_generation_targets_have_material_clearance_from_review_boundary():
+    brief = astra_prompt.story_text_grid('1080x1920')
+    # Review still accepts the full 10..85% safe region, but generation targets
+    # leave enough room for the placement drift seen in real provider output.
+    assert 'y=0.10 to 0.85' in brief
+    assert 'y=269 to 307 px' in brief
+    assert 'approximately y=1382 px' in brief
+    assert 'y=1402 to 1459 px' in brief
+    assert 'y=18 to 64 percent' in brief
+    assert 'CTA within y=67 to 70 percent' in brief
+    assert 'x 119 to 961 px' in brief
+    assert 'y 346 to 1229 px' in brief
+
+
+def test_story_corrective_brief_rebuilds_unsafe_lower_group_from_rejected_pixels():
+    brief = astra_prompt.build_content_brief(
+        'Hook', ['Approved fact'], cta='Take the next step',
+        footer='lassoframework.com', surface='Story', pixels='1080x1920',
+        corrective='Move the URL upward because it crosses y=0.85.')
+    assert 'EDIT the attached rejected candidate image' in brief
+    assert 'erase and rebuild the complete lower text group' in brief
+    assert 'erase and redraw the complete wordmark within y=14 to 16 percent' in brief
+    assert 'affected aligned text group within x=11 to 89 percent' in brief
+    assert 'CTA, divider and destination' in brief
+    assert 'bottom 20 percent of the canvas must contain background art only' in brief
+    assert 'Move the URL upward because it crosses y=0.85.' in brief
+
+
+def test_feed_corrective_brief_does_not_inherit_story_footer_rebuild_contract():
+    brief = astra_prompt.build_content_brief(
+        'Hook', ['Approved fact'], cta='Take the next step',
+        footer='lassoframework.com', surface='feed post', pixels='1080x1350',
+        corrective='Move the footer away from the edge.')
+    assert 'EDIT the attached rejected candidate image' in brief
+    assert 'Keep all essential copy comfortably inset from the feed edges.' in brief
+    assert 'erase and rebuild the complete lower text group' not in brief
+    assert 'bottom 20 percent of the canvas' not in brief
+    assert 'STORY SAFE AREA' not in brief
+
+
+def test_structured_placement_violation_blocks_contradictory_safe_verdict():
+    class ContradictoryVision:
+        def ask_image(self, image_bytes, question):
+            return review_response(
+                placement_safe=True,
+                placement_violations=[{
+                    'element': 'LASSO wordmark',
+                    'bounds': 'x=0.079 to 0.257, y=0.095 to 0.110',
+                    'correction': 'Redraw the wordmark at y=0.14 to 0.16.',
+                }],
+                issues=[{
+                    'severity': 'minor',
+                    'correction': 'Move the wordmark down.',
+                }])
+    result = infographic_review.evaluate(
+        b'candidate', headline='Approved', facts=['Fact'], surface='story',
+        vision_client=ContradictoryVision())
+    assert not result.passed
+    assert result.status == 'FAIL'
+    assert 'Redraw the wordmark at y=0.14 to 0.16.' in result.reason
+
+
+def test_missing_structured_placement_evidence_fails_closed():
+    data = json.loads(review_response())
+    del data['placement_violations']
+    result = infographic_review.evaluate(
+        b'actual-candidate', headline='Approved', facts=['Required fact'],
+        vision_client=Vision(json.dumps(data)))
+    assert result.status == 'UNGRADED'
 
 
 def test_persisted_draft_retains_required_image_copy():
