@@ -385,10 +385,9 @@ def _business_postcondition_observed(bus, ticket, business, merged_sha, now=None
 def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
     """Only the current fix's resolve notice may tell a customer it is handled.
 
-    The ops_action branches are pure payload validation and need no reader. The
-    business_postcondition branch additionally re-runs the independent observation
-    at dispatch time; a caller that cannot supply the bus fails CLOSED there, never
-    skips the check."""
+    Most ops_action branches retain their existing payload gates. A swap_media
+    resolution also requires the same durable business observation as the code
+    fix branch; its handler result alone cannot prove the photo changed."""
     verification = ticket.get("verification_after") or {}
     release = verification.get("fixer") or {}
     deployment = release.get("deployment_check") or {}
@@ -423,7 +422,7 @@ def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
         row_id = args.get("row_id")
         media_url = result.get("image_public_url")
         media_kind = result.get("media_kind")
-        return (isinstance(row_id, str) and bool(row_id.strip())
+        payload_ok = (isinstance(row_id, str) and bool(row_id.strip())
                 and result.get("ok") is True
                 and result.get("action") == "swap-media"
                 and result.get("postcondition_verified") is True
@@ -434,6 +433,19 @@ def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
                      or media_kind == "video" and
                      isinstance(result.get("video_url"), str) and
                      bool(result["video_url"].strip())))
+        if not payload_ok:
+            return False
+        business = release.get("business_postcondition") or {}
+        merged_sha = release.get("merged_sha")
+        if (not isinstance(business, dict)
+                or business.get("check_id") != "media_swap_completed"
+                or not isinstance(business.get("params"), dict)
+                or business["params"].get("row_id") != row_id
+                or not isinstance(merged_sha, str)
+                or not _RELEASE_SHA.fullmatch(merged_sha)):
+            return False
+        return _business_postcondition_observed(bus, ticket, business, merged_sha,
+                                                now=now)
     # A healthy deployment proves the code is live, not that this owner's symptom
     # is gone. The stamped business_postcondition is only a pointer to the check that
     # must be re-run at dispatch time; its stamped verdict and prose are untrusted.

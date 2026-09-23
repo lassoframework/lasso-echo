@@ -31,6 +31,7 @@ def proof_receipt(**changes):
     value = {
         'schema_version': 1, 'key': KEY, 'action': 'swap_media',
         'gym_key': ECHO_GYM, 'ticket_id': TICKET, 'status': 'done',
+        'request_key': 'a' * 64,
         'created_at': '2026-09-23T11:25:00Z',
         'finished_at': '2026-09-23T11:30:00Z',
         'result': {'row_id': ROW_ID, 'postcondition_verified': True,
@@ -83,7 +84,7 @@ class Reader:
 def observe(check_id, reader, *, receipt=None, params=None, ticket_id=TICKET):
     if params is None:
         params = {'reservation_key': KEY, 'row_id': ROW_ID}
-    return be.observe(check_id, gym_key=PORTAL_GYM, request_key='r' * 64,
+    return be.observe(check_id, gym_key=PORTAL_GYM, request_key='a' * 64,
                       merged_sha='b' * 40, params=params,
                       deps={'read': reader,
                             'receipt_read': lambda key, gym: receipt or proof_receipt()},
@@ -106,6 +107,8 @@ def test_completed_swap_requires_receipt_and_fresh_approved_drive_row():
 @pytest.mark.parametrize('patch,reason', [
     ({'ticket_id': '33333333-3333-4333-8333-333333333333'}, 'receipt_binding_mismatch'),
     ({'gym_key': 'othergym'}, 'receipt_binding_mismatch'),
+    ({'request_key': 'b' * 64}, 'receipt_request_mismatch'),
+    ({'request_key': None}, 'receipt_request_mismatch'),
     ({'status': 'unknown'}, 'receipt_not_done'),
     ({'result': {'row_id': ROW_ID, 'postcondition_verified': True}}, 'receipt_unproven'),
 ])

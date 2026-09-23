@@ -421,6 +421,9 @@ def _check_media_swap_completed(ctx):
             or receipt.get('ticket_id') != ctx.ticket_id
             or receipt.get('action') != 'swap_media'):
         raise CheckUnavailable('receipt_binding_mismatch')
+    if receipt.get('request_key') != ctx.request_key:
+        return Observation(True, False, f'media_swap:{row_id}:stale',
+                           'receipt_request_mismatch')
     # A new inbound complaint changes the current request. A receipt from before
     # that complaint cannot close it merely because the row still carries old
     # swapped media. Include all inbound rows conservatively, including staff

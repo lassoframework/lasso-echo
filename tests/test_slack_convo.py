@@ -1041,16 +1041,12 @@ def test_swap_media_ops_notice_delivery_gate(monkeypatch, defect):
     post, calls = _posted()
     summary = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
                           member_check=lambda channel, user: defect != "not_member")
-    if defect is None:
-        assert bus.message(notice["id"])["delivery_status"] == "posted"
-        assert bus.ticket(tid)["status"] == "resolved"
-        assert summary["resolved"] == 1
-        assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
-    else:
-        assert bus.message(notice["id"])["delivery_status"] == "suppressed"
-        assert bus.ticket(tid)["status"] == "verification"
-        assert summary["resolved"] == 0
-        assert not any(call["channel"] == "C_CLIENT" for call in calls)
+    # Even the pristine legacy payload is a self-report. Without a durable
+    # media_swap_completed pointer and current receipt readback it cannot close.
+    assert bus.message(notice["id"])["delivery_status"] == "suppressed"
+    assert bus.ticket(tid)["status"] == "verification"
+    assert summary["resolved"] == 0
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
 
 
 @pytest.mark.parametrize("defect", [
@@ -1130,16 +1126,10 @@ def test_swap_media_nonempty_sibling_evidence_gate(monkeypatch, defect):
     post, calls = _posted()
     summary = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
                           member_check=lambda channel, user: True)
-    if defect is None:
-        assert bus.message(notice["id"])["delivery_status"] == "posted"
-        assert bus.ticket(tid)["status"] == "resolved"
-        assert summary["resolved"] == 1
-        assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
-    else:
-        assert bus.message(notice["id"])["delivery_status"] == "suppressed"
-        assert bus.ticket(tid)["status"] == "verification"
-        assert summary["resolved"] == 0
-        assert not any(call["channel"] == "C_CLIENT" for call in calls)
+    assert bus.message(notice["id"])["delivery_status"] == "suppressed"
+    assert bus.ticket(tid)["status"] == "verification"
+    assert summary["resolved"] == 0
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
 
 
 def test_swap_siblings_never_includes_the_target_row():
@@ -1503,6 +1493,7 @@ def test_completed_swap_notice_rechecks_worker_receipt_and_current_asset(monkeyp
         "content_calendar": [row], "media_asset": [asset]})
     receipt = {"schema_version": 1, "key": receipt_key, "action": "swap_media",
                "gym_key": BUSINESS_ECHO_GYM_KEY, "ticket_id": tid, "status": "done",
+               "request_key": key,
                "created_at": (bus.now + timedelta(seconds=1)).isoformat(),
                "finished_at": (bus.now + timedelta(seconds=2)).isoformat(),
                "result": {"row_id": row_id, "postcondition_verified": True,
@@ -1527,6 +1518,32 @@ def test_completed_swap_notice_rechecks_worker_receipt_and_current_asset(monkeyp
     assert bus.message(notice["id"])["delivery_status"] == "posted"
     assert bus.ticket(tid)["status"] == "resolved" and result["resolved"] == 1
     assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
+
+    # The legacy ops_action path may send only when it reaches this SAME
+    # receipt-backed check; a successful handler payload cannot bypass it.
+    bus.tickets[tid]["status"] = "verification"
+    bus.tickets[tid]["classification"] = "action_request"
+    release["postcondition_verified"] = True
+    release["ops_action"] = {
+        "ok": True, "identityVerified": True, "action": "swap_media",
+        "args": {"row_id": row_id}, "tenantVerified": True,
+        "tenantId": BUSINESS_PORTAL_GYM_ID,
+        "result": {"ok": True, "action": "swap-media", "draft_id": row_id,
+                   "postcondition_verified": True,
+                   "image_public_url": row["image_url"], "media_kind": "image",
+                   "siblings_swapped": [], "siblings_left": []}}
+    ops_notice = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="The photo has been changed.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "fixer": True,
+              "released_by": "fixer", "resolve_notice": True,
+              "ops_action": "swap_media", "request_key": key,
+              "request_version": bus.ticket(tid)["request_version"]})
+    ops_result = OB.run_once(bus, post, identity=IDS.get("echo"),
+                             log=lambda *a: None, member_check=lambda *_: True,
+                             now=at)
+    assert bus.message(ops_notice["id"])["delivery_status"] == "posted"
+    assert ops_result["resolved"] == 1 and bus.ticket(tid)["status"] == "resolved"
 
     # A newer message invalidates the old receipt even when the calendar row
     # still shows the swapped photo. The sender must resolve the new request.

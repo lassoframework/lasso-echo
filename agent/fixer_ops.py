@@ -15,7 +15,8 @@ CONTRACT (the FIXER builder reads this block):
                 Content-Type: application/json
       body      {"gym_key": "<echo account key>", "ticket_id": "<support_tickets.id>",
                  "args": {...},                             (args per action, below)
-                 "reservation_key"?: "<8-128 [A-Za-z0-9_-]>"}
+                 "reservation_key"?: "<8-128 [A-Za-z0-9_-]>",
+                 "request_key"?: "<current requester SHA for keyed swap_media>"}
       reservation_key is OPTIONAL. Absent: behavior is exactly as before. Present: the
       action runs AT MOST ONCE per key -- a durable receipt (agent/fixer_ops_receipts,
       sqlite kv on the volume host, prefix ops_receipt_) is reserved BEFORE any side
@@ -28,6 +29,9 @@ CONTRACT (the FIXER builder reads this block):
       different payload is 409 reservation_conflict. Keyed restage_month is refused
       because its background job registry is not durable. Keyed 2xx bodies carry
       "receipt": {...}; unkeyed calls retain their existing response shape.
+      A keyed swap_media additionally requires the caller's current request_key.
+      Echo re-reads that key before reservation and before the swap, stores it in
+      the receipt and its payload hash, and rejects a stale queued request.
       200 {"ok": true, "action": ..., "gym_key": ..., "ticket_id": ..., "result": {...}}
       202 {"ok": true, "action": "restage_month", "job_id": "...", "status": "running", ...}
       400 {"error": "bad_request", "detail": ...}          malformed body / bad args
@@ -274,6 +278,22 @@ def _business_request_key(read, ticket):
     identity = requester or [ticket.get("id"), ticket.get("created_at"),
                              ticket.get("raw_text")]
     return hashlib.sha256(encode(identity).encode("utf-8")).hexdigest()
+
+
+def _current_swap_request_key(deps, ticket_id):
+    """Read the current requester identity before a keyed swap can reserve/write."""
+    read = _business_reader(deps)
+    try:
+        rows = read("support_tickets", {
+            "id": f"eq.{ticket_id}",
+            "select": "id,product,client_id,created_at,raw_text", "limit": "2"})
+    except Exception:
+        return None
+    if (not isinstance(rows, list) or len(rows) != 1
+            or not isinstance(rows[0], dict) or rows[0].get("id") != ticket_id
+            or rows[0].get("product") != "echo"):
+        return None
+    return _business_request_key(read, rows[0])
 
 
 def _run_business_evidence(raw_body, deps, now=None):
@@ -1677,8 +1697,8 @@ def _ticket_tenant(gym_key, ticket_id, deps):
 # dispatch
 # --------------------------------------------------------------------------------------
 
-def run_action(action, gym_key, ticket_id, args, *, reservation_key=None, deps=None,
-               log=print):
+def run_action(action, gym_key, ticket_id, args, *, reservation_key=None,
+               expected_request_key=None, deps=None, log=print):
     """Validate, run, record. Returns (status, body). Auth is the transport's job."""
     deps = dict(deps or {})
     action = str(action or "").strip()
@@ -1728,6 +1748,19 @@ def run_action(action, gym_key, ticket_id, args, *, reservation_key=None, deps=N
         # The existing job registry is in memory. A 202 launch cannot be a
         # durable completed receipt, and a restart cannot prove job completion.
         return 409, {"error": "reservation_background_unsupported", "action": action}
+    bound_request_key = None
+    if action == "swap_media" and reservation_key is not None:
+        if (not isinstance(reservation_key, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", reservation_key)):
+            return 400, {"error": "bad_reservation_key"}
+        if (not isinstance(expected_request_key, str)
+                or not _BUSINESS_REQUEST_KEY.fullmatch(expected_request_key)):
+            return 400, {"error": "bad_request_key"}
+        bound_request_key = _current_swap_request_key(deps, ticket_id)
+        if bound_request_key is None:
+            return 503, {"error": "request_identity_unavailable"}
+        if bound_request_key != expected_request_key:
+            return 409, {"error": "request_identity_mismatch"}
     # Durable reservation (optional): begin BEFORE any side effect; a replay returns
     # the stored result without re-executing; an unknown outcome is never retried.
     # The key is validated by the receipt store EXACTLY as supplied -- no coercion,
@@ -1742,7 +1775,7 @@ def run_action(action, gym_key, ticket_id, args, *, reservation_key=None, deps=N
             if receipt_store is None:
                 receipt_store = receipts.default_store()
             receipt = receipts.begin(receipt_store, reservation_key, action, gym_key,
-                                     ticket_id, args)
+                                     ticket_id, args, request_key=bound_request_key)
         except receipts.ReceiptError as e:
             _audit(action, gym_key, ticket_id, e.status,
                    f"reservation refused: {e.code}", log)
@@ -1754,6 +1787,22 @@ def run_action(action, gym_key, ticket_id, args, *, reservation_key=None, deps=N
                     "ticket_id": ticket_id, "result": receipt.get("result"),
                     "receipt": receipt, "replayed": True}
             return receipt.get("http_status", 200), body
+        if action == "swap_media":
+            latest_key = _current_swap_request_key(deps, ticket_id)
+            latest_tenant_refusal = _ticket_tenant(gym_key, ticket_id, deps)
+            if latest_key != bound_request_key or latest_tenant_refusal:
+                # The reservation is durable and no side effect has run. Mark it
+                # failed so the stale queued action cannot be replayed later.
+                try:
+                    receipts.fail(receipt_store, reservation_key,
+                                  "request_identity_changed_before_action")
+                except receipts.ReceiptError:
+                    return 503, {"error": "receipt_finalize_unavailable"}
+                if latest_tenant_refusal:
+                    return latest_tenant_refusal
+                return (503 if latest_key is None else 409), {
+                    "error": ("request_identity_unavailable" if latest_key is None
+                              else "request_identity_mismatch")}
     ctx = Ctx(gym_key=gym_key, ticket_id=ticket_id, args=args, deps=deps, log=log)
     try:
         status, result = spec.run(ctx)
@@ -1939,4 +1988,4 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         return 400, {"error": "bad_request", "detail": "body must be an object"}
     return run_action(m.group(1), body.get("gym_key"), body.get("ticket_id"),
                       body.get("args"), reservation_key=body.get("reservation_key"),
-                      deps=deps, log=log)
+                      expected_request_key=body.get("request_key"), deps=deps, log=log)

@@ -123,6 +123,7 @@ def test_completed_swap_route_requires_keyed_receipt_and_current_drive_proof():
     receipt = {
         "schema_version": 1, "key": key, "action": "swap_media", "gym_key": ECHO_KEY,
         "ticket_id": TICKET_ID, "status": "done",
+        "request_key": REQUEST_KEY,
         "created_at": "2026-09-19T11:30:00+00:00", "finished_at": NOW.isoformat(),
         "result": {"row_id": row_id, "postcondition_verified": True,
                    "swap_proof": {"row_id": row_id,
