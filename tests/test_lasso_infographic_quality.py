@@ -104,6 +104,8 @@ def test_story_safe_region_is_required_even_with_perfect_copy_and_score():
         def ask_image(self, image_bytes, question):
             assert "y=0.10 to 0.85" in question
             assert "y=0.17 to 0.80" not in question
+            assert "destination entirely at y=0.73 to 0.76" in question
+            assert "Do not recommend a minimal move" in question
             return review_response(placement_safe=False)
     result = infographic_review.evaluate(b"candidate", headline="Approved", facts=["Fact"],
         surface="story", vision_client=StoryVision())
@@ -117,6 +119,31 @@ def test_story_brief_uses_full_height_safe_region():
     assert 'y=10 to 85 percent' in brief
     assert 'y=17 to 80 percent' not in brief
     assert 'top and bottom controls' in brief
+
+
+def test_story_generation_targets_have_material_clearance_from_review_boundary():
+    brief = astra_prompt.story_text_grid('1080x1920')
+    # Review still accepts the full 10..85% safe region, but generation targets
+    # leave enough room for the placement drift seen in real provider output.
+    assert 'y=0.10 to 0.85' in brief
+    assert 'y=230 to 269 px' in brief
+    assert 'approximately y=1382 px' in brief
+    assert 'y=1402 to 1459 px' in brief
+    assert 'y=15 to 64 percent' in brief
+    assert 'CTA within y=67 to 70 percent' in brief
+    assert 'y 288 to 1229 px' in brief
+
+
+def test_story_corrective_brief_rebuilds_unsafe_lower_group_from_rejected_pixels():
+    brief = astra_prompt.build_content_brief(
+        'Hook', ['Approved fact'], cta='Take the next step',
+        footer='lassoframework.com', surface='Story', pixels='1080x1920',
+        corrective='Move the URL upward because it crosses y=0.85.')
+    assert 'EDIT the attached rejected candidate image' in brief
+    assert 'erase and rebuild the complete lower text group' in brief
+    assert 'CTA, divider and destination' in brief
+    assert 'bottom 20 percent of the canvas must contain background art only' in brief
+    assert 'Move the URL upward because it crosses y=0.85.' in brief
 
 
 def test_persisted_draft_retains_required_image_copy():
