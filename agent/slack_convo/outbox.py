@@ -304,7 +304,7 @@ _BUSINESS_EVIDENCE_FUTURE_SKEW_SECONDS = 300
 _RELEASE_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
-def _business_evidence_deps(bus):
+def _business_evidence_deps(bus, check_id=None):
     """The bounded, read-only reader fixer_business_evidence.observe() requires,
     adapted from the support bus's own bounded PostgREST-style read (the same one
     _person_for_card uses). The registered checks pass their own explicit limit in
@@ -318,7 +318,17 @@ def _business_evidence_deps(bus):
     def read(table, params):
         return get(table, params)
 
-    return {"read": read}
+    deps = {"read": read}
+    if check_id == "media_swap_completed":
+        # The Slack outbox runs on the Echo worker with its durable SQLite
+        # volume. Keyed FIXER swaps intended for automatic closure must run on
+        # that same worker. A receipt written on intake-web's separate volume
+        # will be absent here and the observer will fail closed.
+        from .. import fixer_ops_receipts as receipts
+        store = receipts.default_store()
+        deps["receipt_read"] = lambda key, echo_key: receipts.get_receipt(
+            store, key, echo_key)
+    return deps
 
 
 def _business_postcondition_observed(bus, ticket, business, merged_sha, now=None):
@@ -346,13 +356,14 @@ def _business_postcondition_observed(bus, ticket, business, merged_sha, now=None
         return False
     if not current_key:
         return False
-    deps = _business_evidence_deps(bus)
+    deps = _business_evidence_deps(bus, check_id)
     if deps is None:
         return False
     try:
         from .. import fixer_business_evidence as _fbe
         observed = _fbe.observe(check_id, gym_key=gym_key, request_key=current_key,
-                                merged_sha=merged_sha, params=params, deps=deps, now=now)
+                                merged_sha=merged_sha, params=params, deps=deps,
+                                ticket_id=str(ticket.get("id") or ""), now=now)
     except Exception:  # noqa: BLE001 - an observer fault is not evidence
         return False
     if not isinstance(observed, dict):

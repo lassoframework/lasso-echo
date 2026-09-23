@@ -217,6 +217,14 @@ def _business_params_valid(check_id, params):
         return (set(params) == {"folder_id"}
                 and isinstance(params.get("folder_id"), str)
                 and _BUSINESS_FOLDER_ID.fullmatch(params["folder_id"]) is not None)
+    if check_id == "media_swap_candidate_available":
+        return set(params) == {"min_count"} and type(params.get("min_count")) is int and params["min_count"] == 1
+    if check_id == "media_swap_completed":
+        return (set(params) == {"reservation_key", "row_id"}
+                and isinstance(params.get("reservation_key"), str)
+                and re.fullmatch(r"[A-Za-z0-9_-]{8,128}", params["reservation_key"]) is not None
+                and isinstance(params.get("row_id"), str)
+                and _BUSINESS_ROW_ID.fullmatch(params["row_id"]) is not None)
     return False
 
 
@@ -316,9 +324,18 @@ def _run_business_evidence(raw_body, deps, now=None):
         return 409, {"error": "request_identity_mismatch"}
 
     from . import fixer_business_evidence as evidence
+    receipt_read = None
+    if check_id == "media_swap_completed":
+        from . import fixer_ops_receipts as receipts
+        receipt_store = deps.get("receipt_store")
+        if receipt_store is None:
+            receipt_store = receipts.default_store()
+        receipt_read = lambda key, echo_key: receipts.get_receipt(receipt_store, key, echo_key)
     record = evidence.observe(
         check_id, gym_key=client_id, request_key=request_key,
-        merged_sha=merged_sha, params=params, deps={"read": read}, now=now)
+        merged_sha=merged_sha, params=params,
+        deps={"read": read, "receipt_read": receipt_read},
+        ticket_id=ticket_id, now=now)
     if not isinstance(record, dict):
         return 503, {"error": "evidence_unavailable"}
     # Explicit response allowlist. Params are expectations, not proof; returning
@@ -976,7 +993,7 @@ def _derive_swap_sibling_ids(store, gym_key, rid):
         if not _ROW_ID.match(sid) or sid == rid or sid in out:
             raise _ReadbackUnavailable("grouping rule returned a malformed sibling set")
         out.add(sid)
-    return out
+    return out, dict(row)
 
 
 def _run_swap_media(ctx):
@@ -990,18 +1007,20 @@ def _run_swap_media(ctx):
     # truth. A store that cannot support the derivation fails closed below.
     store = None
     expected_siblings = None
+    before_row = None
     sibling_note = "independent sibling derivation unavailable"
     try:
         store = _dep(ctx, "calendar_store", lambda: __import__(
             "agent.portal_calendar_store", fromlist=["SupabaseCalendarStore"]
         ).SupabaseCalendarStore())
-        expected_siblings = _derive_swap_sibling_ids(store, ctx.gym_key, rid)
+        expected_siblings, before_row = _derive_swap_sibling_ids(store, ctx.gym_key, rid)
     except Exception as e:  # noqa: BLE001 - evidence fault, never a swap blocker
         sibling_note = (f"independent sibling derivation unavailable: "
                         f"{type(e).__name__}: {str(e)[:160]}")
     status, body = handler(ctx.gym_key, rid, f"{ACTOR}:{ctx.ticket_id}")
     body = dict(body or {})
-    body.setdefault("row_id", rid)
+    body["row_id"] = rid
+    body.pop("swap_proof", None)  # only our independent readback may create this
     if int(status) == 200 and body.get("ok") is True:
         if expected_siblings is None:
             return 409, {"error": "postcondition_unconfirmed", "row_id": rid,
@@ -1079,6 +1098,32 @@ def _run_swap_media(ctx):
                                      "siblings do not match the independently "
                                      "derived set")}
         body["postcondition_verified"] = True
+        # The keyed durable receipt carries this independently read before/after
+        # identity. Only a changed, still-waiting Drive row with unchanged caption
+        # can later satisfy media_swap_completed; other successful swaps remain
+        # operational successes without this specific business proof.
+        before_image = before_row.get("image_url") if before_row else None
+        after_image = confirmed.get("image_url")
+        before_caption = before_row.get("caption") if before_row else None
+        after_caption = confirmed.get("caption")
+        asset_id = confirmed.get("source_media_asset_id")
+        if (isinstance(before_image, str) and bool(before_image)
+                and isinstance(after_image, str) and bool(after_image)
+                and before_image != after_image
+                and isinstance(before_caption, str)
+                and after_caption == before_caption
+                and confirmed.get("status") in ("pending", "coach_review")
+                and isinstance(asset_id, str) and bool(asset_id)
+                and asset_id != (before_row.get("source_media_asset_id") or "")):
+            digest = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
+            body["swap_proof"] = {
+                "row_id": rid,
+                "before_image_sha256": digest(before_image),
+                "after_image_sha256": digest(after_image),
+                "caption_sha256": digest(before_caption),
+                "before_asset_id": before_row.get("source_media_asset_id") or None,
+                "after_asset_id": asset_id,
+            }
         body["captured_at"] = _now_iso()
     body["summary"] = (f"swap-media on row {rid}: "
                        + ("ok" if body.get("ok") else f"refused ({body.get('error', status)})"))

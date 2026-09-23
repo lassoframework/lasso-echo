@@ -4,6 +4,7 @@ Auth (401 / 503), the catalog, each action's happy path against fakes, the org-f
 refusal, unknown actions, the volume preflight, the background job and its status route,
 the ticket record and the audit line, and the intake_web transport."""
 import io
+import hashlib
 import json
 import os
 import sys
@@ -1011,6 +1012,71 @@ def test_keyed_replay_returns_the_durable_receipt_and_never_reruns_swap(armed):
     assert replay["result"] == first["result"]
     assert calls == ["row-abc-123"], "the wrapped action ran exactly once across the replay"
     assert "replay" not in store[KEY], "the replay marker is response-only, never persisted"
+
+
+def test_keyed_swap_receipt_captures_independent_before_after_identity_and_caption(armed):
+    receipts = {}
+    row = {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
+           "account": "instagram", "format": "feed", "status": "pending",
+           "caption": "The exact approved copy", "image_url": "https://img/old.jpg",
+           "source_media_asset_id": None}
+
+    class Store:
+        def get_row(self, account_key, row_id):
+            assert account_key == GYM and row_id == row["id"]
+            return dict(row)
+
+        def list_month(self, account_key, month):
+            assert account_key == GYM and month == "2026-09"
+            return [dict(row)]
+
+    def handler(*_args):
+        row.update(image_url="https://img/new.jpg",
+                   source_media_asset_id="drive-asset-1")
+        return 200, {"ok": True, "image_public_url": row["image_url"],
+                     "swap_proof": {"row_id": row["id"], "forged": True},
+                     "siblings_swapped": [], "siblings_left": [],
+                     "sibling_results": []}
+
+    status, body = _post("swap_media", _keyed_body(row_id=row["id"]), deps={
+        "bus": FakeBus(), "receipt_store": receipts,
+        "calendar_store": Store(), "handle_swap_media": handler})
+    assert status == 200 and body["receipt"]["status"] == "done"
+    proof = receipts[KEY]["result"]["swap_proof"]
+    assert proof == {
+        "row_id": row["id"],
+        "before_image_sha256": hashlib.sha256(b"https://img/old.jpg").hexdigest(),
+        "after_image_sha256": hashlib.sha256(b"https://img/new.jpg").hexdigest(),
+        "caption_sha256": hashlib.sha256(b"The exact approved copy").hexdigest(),
+        "before_asset_id": None, "after_asset_id": "drive-asset-1"}
+
+
+def test_keyed_swap_receipt_never_claims_completion_when_caption_changed(armed):
+    receipts = {}
+    row = {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
+           "account": "instagram", "format": "feed", "status": "pending",
+           "caption": "Before", "image_url": "https://img/old.jpg"}
+
+    class Store:
+        def get_row(self, *_args):
+            return dict(row)
+
+        def list_month(self, *_args):
+            return [dict(row)]
+
+    def handler(*_args):
+        row.update(caption="After", image_url="https://img/new.jpg",
+                   source_media_asset_id="drive-asset-1")
+        return 200, {"ok": True, "image_public_url": row["image_url"],
+                     "swap_proof": {"row_id": row["id"], "forged": True},
+                     "siblings_swapped": [], "siblings_left": [],
+                     "sibling_results": []}
+
+    status, body = _post("swap_media", _keyed_body(row_id=row["id"]), deps={
+        "bus": FakeBus(), "receipt_store": receipts,
+        "calendar_store": Store(), "handle_swap_media": handler})
+    assert status == 200 and body["receipt"]["status"] == "done"
+    assert "swap_proof" not in receipts[KEY]["result"]
 
 
 # -- 4. wrong tenant / key / ticket -----------------------------------------------------------
