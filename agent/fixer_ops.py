@@ -56,6 +56,14 @@ CONTRACT (the FIXER builder reads this block):
       200 {"category": "ready"|"missing"|"ambiguous"|"user-email-missing"|
            "portal-unavailable"}
       This is portal-read-only: no Slack lookup, link mint, ticket record, or DM.
+  GET  /ops/actions/swap_media/candidates/<gym_key>?row_id=<pending calendar row>
+      (same header)
+      200 {"ok": true, "gym_key": "...", "candidates": [{"id": "...",
+           "row_id": "...", "source": "drive"|"local", "selectable": true,
+           "review_state": "reviewed" (Drive only)}]}
+      Bounded worker-only readiness read. It reads the exact waiting calendar row and
+      returns local and Drive assets the existing swap selector can hand out now. It never
+      materializes, hosts, uploads, reserves, writes a ticket note, or changes a ledger.
   GET  /ops/actions/evidence/...           (same header)
       Bounded read-only diagnostics (agent/fixer_evidence.py). Never runs an action;
       503 volume_unavailable on a host without the worker volume, 503
@@ -574,6 +582,107 @@ def _resend_connect_link_readiness(gym_key, deps):
                         "portal-unavailable"}:
         category = "portal-unavailable"
     return 200, {"category": category}
+
+
+def _swap_media_candidates_readiness(gym_key, row_id, deps, *, now=None):
+    """Read-only, fail-closed answer to "can this exact row be swapped now?".
+
+    Reuse the swap's combined local and Drive selector on validated snapshots.
+    This does not materialize a selected asset; the candidate id is a Drive asset
+    id or a local library key. Drive review, consent, moderation and cooldown
+    gates remain in gym_media_selector.pickable.
+    """
+    if _GYM_KEY.fullmatch(gym_key) is None or _ROW_ID.fullmatch(row_id) is None:
+        return 400, {"error": "bad_request", "detail": "gym_key and row_id required"}
+    try:
+        from datetime import date, timedelta
+        from . import config, gym_media_index, gym_media_selector, media_guard, media_swap
+
+        store = deps.get("calendar_store")
+        if store is None:
+            from .portal_calendar_store import SupabaseCalendarStore
+            store = SupabaseCalendarStore()
+        row = store.get_row(gym_key, row_id)
+        if row is None:
+            return 404, {"error": "row_not_found", "gym_key": gym_key, "row_id": row_id}
+        if (not isinstance(row, dict) or row.get("id") != row_id
+                or row.get("gym_id") != gym_key):
+            return 503, {"error": "calendar_store_unavailable"}
+        if str(row.get("status") or "").strip().lower() not in ("pending", "coach_review"):
+            return 409, {"error": "row_not_swappable", "gym_key": gym_key, "row_id": row_id}
+        try:
+            post_date = date.fromisoformat(str(row.get("post_date") or "")[:10])
+        except ValueError:
+            return 503, {"error": "calendar_store_unavailable"}
+
+        # media_guard.book_state intentionally degrades open for planning. Read every
+        # month it would consult first, validate tenant identity, then replay that
+        # bounded snapshot into it so readiness never labels a source fault as zero.
+        month_rows = {}
+        start = post_date - timedelta(days=config.media_repeat_window_days())
+        for month in media_guard._months_between(start, post_date):
+            rows = store.list_month(gym_key, month)
+            if not isinstance(rows, list) or any(
+                    not isinstance(item, dict) or item.get("gym_id") != gym_key
+                    for item in rows):
+                return 503, {"error": "calendar_store_unavailable"}
+            month_rows[month] = [dict(item) for item in rows]
+
+        class _SnapshotStore:
+            def list_month(self, account_key, month):
+                if account_key != gym_key or month not in month_rows:
+                    raise RuntimeError("calendar snapshot scope mismatch")
+                return [dict(item) for item in month_rows[month]]
+
+        media_store = deps.get("media_store") or gym_media_index.default_store()
+        if not callable(getattr(media_store, "available", None)) or not media_store.available():
+            return 503, {"error": "media_store_unavailable"}
+        # Probe the source explicitly because pickable intentionally treats a source
+        # failure as an empty planning pool. This endpoint must distinguish that from
+        # a definitive zero-candidate read.
+        assets = media_store.list_assets(gym_key)
+        if (not isinstance(assets, list) or any(not isinstance(asset, dict) for asset in assets)
+                or any(asset.get("gym_id") != gym_key for asset in assets)):
+            return 503, {"error": "media_store_unavailable"}
+        # Reuse the validated snapshot. A second live read inside pickable could
+        # fail or drift and turn a source fault into a definitive empty pool.
+        class _SnapshotMediaStore:
+            def available(self):
+                return True
+
+            def list_assets(self, account_key):
+                if account_key != gym_key:
+                    raise RuntimeError("media snapshot scope mismatch")
+                return [dict(asset) for asset in assets]
+
+        library = media_swap.library_path_for(gym_key)
+        candidates = media_swap.candidates_for(
+            gym_key, row, store=_SnapshotStore(), lib=library,
+            media_store=_SnapshotMediaStore(), now=now)
+        if not isinstance(candidates, list):
+            return 503, {"error": "media_store_unavailable"}
+        response = []
+        for asset in candidates:
+            source = asset.get("source") if isinstance(asset, dict) else None
+            asset_id = asset.get("key") if isinstance(asset, dict) else None
+            if not isinstance(asset_id, str) or not asset_id:
+                return 503, {"error": "media_store_unavailable"}
+            if source == "drive":
+                original = asset.get("asset") or {}
+                if (original.get("gym_id") != gym_key or original.get("id") != asset_id
+                        or not gym_media_selector.is_usable(original)):
+                    return 503, {"error": "media_store_unavailable"}
+                response.append({"id": asset_id, "row_id": row_id,
+                                 "source": "drive", "review_state": "reviewed",
+                                 "selectable": True})
+            elif source == "local" and asset.get("path"):
+                response.append({"id": asset_id, "row_id": row_id,
+                                 "source": "local", "selectable": True})
+            else:
+                return 503, {"error": "media_store_unavailable"}
+        return 200, {"ok": True, "gym_key": gym_key, "candidates": response}
+    except Exception:  # noqa: BLE001 - readiness must never turn an outage into empty
+        return 503, {"error": "media_readiness_unavailable"}
 
 
 # -- reset_recreate_budget ---------------------------------------------------------------
@@ -1944,6 +2053,18 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         if method != "GET":
             return 405, {"error": "method_not_allowed"}
         return _resend_connect_link_readiness(m.group(1), deps)
+    m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/swap_media/candidates/([^/]{{1,256}})$", path)
+    if m:
+        if method != "GET":
+            return 405, {"error": "method_not_allowed"}
+        try:
+            query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True)
+        except ValueError:
+            return 400, {"error": "bad_request", "detail": "row_id required"}
+        if set(query) != {"row_id"} or len(query["row_id"]) != 1 or not query["row_id"][0]:
+            return 400, {"error": "bad_request", "detail": "row_id required"}
+        return _swap_media_candidates_readiness(m.group(1), query["row_id"][0], deps,
+                                                now=now)
     # The key segment is captured loosely on purpose: the contract is that a MALFORMED
     # key (wrong charset, wrong length) is 400 bad_reservation_key, decided by the
     # receipt store's validator -- a route that pre-filters to well-formed keys would
