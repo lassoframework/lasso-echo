@@ -176,6 +176,12 @@ class PlanSlot:
     # the pre-video shape byte for byte. The builder honors this preference; the honesty
     # guard is unchanged (a slot with no groundable clip still falls through, never faked).
     video_preferred: bool = False
+    # LASSO SUMMIT DAILY EXTRA (Blake 2026-09-23): True on the ONE additive Summit
+    # feed slot the dated Sep 23 - Nov 8 window adds to a LASSO day alongside its
+    # two regular feed slots. When a sprint or weekly Summit already exists, that
+    # exact slot moves to ordinal 2 and the vacated regular ordinal receives a
+    # non-Summit topic. Default False keeps the pre-feature shape byte for byte.
+    summit_daily: bool = False
 
 
 # The non-sprint platform cap: platform may own at most this fraction of the NON-sprint
@@ -410,10 +416,23 @@ def _base_summit_weekday():
     return ""
 
 
+_LASSO_SUMMIT_DAILY_ACCOUNTS = ("lasso", "lasso_ig", "lasso_fb")
+
+
+def _default_summit_daily_fn(day_key):
+    """The Summit daily-extra predicate (Blake 2026-09-23): True only inside the
+    dated Sep 23 - Nov 8 2026 window while AGENT_LASSO_SUMMIT_DAILY_ENABLED is on.
+    Missing/broken config degrades to False (the pre-feature plan)."""
+    try:
+        return bool(config.lasso_summit_daily_enabled(day_key))
+    except Exception:
+        return False
+
+
 def plan_month(account_key, start_date, days=30, *, book_dates=None,
                summit_day_fn=None, welcome_dates=None, sprint_day_fn=None,
                sprint_feed_count_fn=None, posts_per_day=1, video_mix=None,
-               reels_floor=None, testimonial=None):
+               reels_floor=None, testimonial=None, summit_daily_fn=None):
     """A deterministic month plan: for each of `days` consecutive dates from start_date,
     the resolved category (weekly rotation + sprint/book/summit/welcome overrides) and its
     feed + paired story slots.
@@ -454,6 +473,11 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
         sprint_day_fn = lambda dk: dk in _sprint  # noqa: E731
     if sprint_feed_count_fn is None:
         sprint_feed_count_fn = _default_sprint_feed_count
+    # SUMMIT DAILY EXTRA: LASSO-base accounts only; flag off -> the predicate is
+    # False for every date and the plan is byte-for-byte the pre-feature shape.
+    if summit_daily_fn is None:
+        summit_daily_fn = _default_summit_daily_fn
+    _summit_daily_on = str(account_key or "").strip().lower() in _LASSO_SUMMIT_DAILY_ACCOUNTS
     book_dates = set(book_dates) if book_dates is not None else _default_book_dates()
     welcome_dates = set(welcome_dates or ())
 
@@ -556,7 +580,9 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
         # resolved category is podcast; the builder honors it, the honesty guard is
         # unchanged (no clip -> fall through, never faked).
         _vp = bool(mark_video and category == "podcast")
-        if int(posts_per_day or 1) == 2:
+        # Capacity 3 is two regular feeds plus the separately normalized Summit
+        # extra. It must still build the ordinary 2x pair here.
+        if int(posts_per_day or 1) >= 2:
             slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
                                   base_category=base, overridden=overridden,
                                   cadence_slot=0, video_preferred=_vp))
@@ -571,19 +597,23 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
             slots.append(PlanSlot(post_date=d, category=second, fmt=STORY,
                                   base_category=base, overridden=True,
                                   cadence_slot=1, video_preferred=_vp2))
-            continue
-        slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
-                              base_category=base, overridden=overridden,
-                              video_preferred=_vp))
-        slots.append(PlanSlot(post_date=d, category=category, fmt=STORY,
-                              base_category=base, overridden=overridden,
-                              video_preferred=_vp))
+        else:
+            slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
+                                  base_category=base, overridden=overridden,
+                                  video_preferred=_vp))
+            slots.append(PlanSlot(post_date=d, category=category, fmt=STORY,
+                                  base_category=base, overridden=overridden,
+                                  video_preferred=_vp))
     if config.lasso_editorial_calendar_enabled() and account_key in ("lasso", "lasso_ig", "lasso_fb"):
-        from .lasso_editorial import editorial_slots
-        return editorial_slots(slots)
-    slots = _cap_platform(slots, video_mix=mark_video)
-    if reels_floor:
-        slots = _apply_reels_floor(slots)
+        from .lasso_editorial import editorial_slots, normalize_summit_daily
+        slots = editorial_slots(slots)
+    else:
+        slots = _cap_platform(slots, video_mix=mark_video)
+        if reels_floor:
+            slots = _apply_reels_floor(slots)
+    if _summit_daily_on:
+        from .lasso_editorial import normalize_summit_daily
+        slots = normalize_summit_daily(slots, summit_daily_fn)
     return slots
 
 
@@ -826,6 +856,26 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
                 continue
             draft = _stamp(draft, slot, FEED)
             sprint_feed_by_slot[(slot.post_date, slot.slot_index)] = draft
+            drafts.append(draft)
+            continue
+        if slot.summit_daily:
+            # The additive ordinal-2 feed has its own approved, dated catalog.
+            # It never falls back to a regular pillar, which could silently turn
+            # the required Summit post into unrelated content.
+            try:
+                from .lasso_daily_summit import build_daily_summit
+                daily_target = target if target is not None else account
+                draft = build_daily_summit(daily_target, slot.post_date)
+            except Exception as exc:  # noqa: BLE001 - one missing dated asset holds one slot
+                log(f"skip {slot.post_date} Summit daily feed: "
+                    f"{type(exc).__name__}: {exc}")
+                draft = None
+            if draft is None:
+                log(f"skip {slot.post_date} Summit daily feed: no approved dated asset")
+                continue
+            draft = _stamp(draft, slot, FEED)
+            feed_by_date[(slot.post_date, slot.cadence_slot)] = draft
+            built_category[(slot.post_date, slot.cadence_slot)] = "summit"
             drafts.append(draft)
             continue
         draft, built_cat = _build_feed_with_fallback(

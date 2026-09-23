@@ -184,10 +184,10 @@ def _real_row(account_key, draft, caption=None):
     src_asset = getattr(draft, "source_media_asset_id", "") or ""
     if src_asset:
         row["source_media_asset_id"] = src_asset
-    # 2x cadence (CADENCE_SPEC.md D6): a draft built on a 2x day carries its slot
-    # ordinal (0 = AM, 1 = PM) so publish-time slot times are deterministic. Stamped
-    # ONLY by a 2x build (cadence_slot_index attribute); every 1x draft omits the key,
-    # keeping the pre-cadence row shape byte-for-byte.
+    # Planned cadence: a draft carries its slot ordinal so publish-time slot times
+    # are deterministic. Ordinals 0/1 are the regular AM/PM feeds; LASSO's guarded,
+    # dated Summit runway may add ordinal 2. Preserve the planner's ordinal exactly.
+    # Every 1x draft omits the key, keeping the pre-cadence row shape byte-for-byte.
     slot_i = getattr(draft, "cadence_slot_index", None)
     if slot_i is not None:
         row["slot_index"] = int(slot_i)

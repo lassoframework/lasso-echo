@@ -2627,7 +2627,27 @@ def preserve_and_prune(store, account_key, months, rows):
     if (account_key == "lasso" and config.lasso_editorial_calendar_enabled()
             and callable(getattr(store, "list_month", None))):
         from .cadence import resolve_posts_per_day
-        capacity = resolve_posts_per_day(account_key, store)
+        def capacity_for(row):
+            """Third capacity exists only for LASSO feed rows in the dated window."""
+            day_key = str(row.get("post_date") or "")[:10]
+            try:
+                base_capacity = resolve_posts_per_day(account_key, store, day=day_key)
+            except TypeError:
+                # Compatibility for injected legacy resolvers in offline callers.
+                base_capacity = resolve_posts_per_day(account_key, store)
+            if (str(account_key).strip().lower() == "lasso"
+                    and str(row.get("format") or "feed").strip().lower() == "feed"):
+                enabled = getattr(config, "lasso_summit_daily_enabled", None)
+                if callable(enabled):
+                    try:
+                        if enabled(day_key):
+                            return max(base_capacity, 3)
+                    except (TypeError, ValueError):
+                        pass
+            # Summit's third slot is feed-only. The dated cadence resolver may
+            # report three for LASSO, but paired stories retain their existing
+            # two-slot capacity.
+            return min(base_capacity, 2)
         existing = []
         # A failed preservation read must never risk an approved post.
         for month in months:
@@ -2646,17 +2666,20 @@ def preserve_and_prune(store, account_key, months, rows):
                 continue
             active_count[key] += 1
             ordinal = row.get("slot_index")
-            if ordinal not in (0, 1):
+            capacity = capacity_for(row)
+            if ordinal not in range(capacity):
                 ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
             occupied[key].add(ordinal)
         kept = []
         for row in rows or []:
             key = _slot_key(row)
+            capacity = capacity_for(row)
             ordinal = row.get("slot_index")
             if ordinal is None:
                 ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
                 row = dict(row, slot_index=ordinal)
-            if active_count[key] >= capacity or ordinal in occupied[key]:
+            if (ordinal not in range(capacity) or active_count[key] >= capacity
+                    or ordinal in occupied[key]):
                 continue
             if any((row.get("caption") and row.get("caption") == old.get("caption"))
                    or (row.get("image_url") and row.get("image_url") == old.get("image_url"))
