@@ -175,3 +175,36 @@ def test_apply_move_refuses_other_live_summit_before_write(tmp_path):
     receipts = stage.apply(plan, object(), tmp_path, current_day_fn=lambda *_: rows, move_fn=lambda *_: calls.append(1))
     assert receipts[0]["status"] == "conflict_existing_summit_or_slot"
     assert calls == []
+
+
+def test_campaign_shape_audit_requires_two_regular_and_one_summit_on_each_platform():
+    def read(_store, day):
+        rows = []
+        for account in ("instagram", "facebook"):
+            for slot, pillar in ((0, "book"), (1, "platform"), (2, "summit")):
+                if day == "2026-09-24" and account == "facebook" and slot == 1:
+                    continue
+                rows.append({"id": f"{day}:{account}:{slot}", "account": account,
+                             "pillar": pillar, "slot_index": slot, "status": "pending",
+                             "variant_status": "active"})
+        return rows
+
+    report = stage.campaign_shape_report(object(), current_day_fn=read)
+    assert report["total"] == 94
+    assert report["complete"] == 93
+    gap = next(item for item in report["days"] if item["date"] == "2026-09-24"
+               and item["account"] == "facebook")
+    assert gap["status"] == "partial"
+    assert gap["regular_slots"] == [0]
+    assert gap["summit_slots"] == [2]
+
+
+def test_campaign_shape_audit_rejects_third_regular_and_misplaced_summit():
+    def read(_store, _day):
+        return [{"id": str(slot), "account": "instagram", "pillar": pillar,
+                 "slot_index": slot, "status": "pending", "variant_status": "active"}
+                for slot, pillar in ((0, "book"), (1, "website"), (2, "book"))]
+
+    report = stage.campaign_shape_report(object(), current_day_fn=read)
+    assert report["complete"] == 0
+    assert report["days"][0]["regular_slots"] == [0, 1, 2]

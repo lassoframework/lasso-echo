@@ -211,6 +211,42 @@ def _assert_one_summit(rows, account):
         raise RuntimeError("current day does not contain exactly one Summit at ordinal 2")
 
 
+def campaign_shape_report(store, *, current_day_fn=None):
+    """Read back every campaign day; only 0/1 regular plus 2 Summit is complete."""
+    reader = current_day_fn or _current_day
+    first, last = date.fromisoformat(START), date.fromisoformat(END)
+    days = []
+    for ordinal in range(first.toordinal(), last.toordinal() + 1):
+        day = date.fromordinal(ordinal).isoformat()
+        try:
+            rows = reader(store, day)
+        except Exception as exc:
+            for account in TARGET_ACCOUNTS:
+                days.append({"date": day, "account": account, "status": "read_error",
+                             "error": type(exc).__name__})
+            continue
+        for account in TARGET_ACCOUNTS:
+            active = [row for row in rows
+                      if str(row.get("account") or "").lower() == account
+                      and str(row.get("variant_status") or "active").lower() == "active"
+                      and str(row.get("status") or "pending").lower() in OCCUPYING]
+            regular = [row for row in active if str(row.get("pillar") or "").lower() != "summit"]
+            summit = [row for row in active if str(row.get("pillar") or "").lower() == "summit"]
+            regular_slots = sorted((row.get("slot_index") for row in regular),
+                                   key=lambda value: (value is None, str(value)))
+            summit_slots = [row.get("slot_index") for row in summit]
+            complete = (len(active) == 3 and regular_slots == [0, 1]
+                        and summit_slots == [2])
+            days.append({"date": day, "account": account,
+                         "status": "complete" if complete else "partial",
+                         "regular_slots": regular_slots, "summit_slots": summit_slots,
+                         "active_row_ids": [row.get("id") for row in active]})
+    return {"scope": {"gym_id": TARGET_GYM, "start": START, "end": END,
+                      "accounts": list(TARGET_ACCOUNTS)},
+            "complete": sum(day["status"] == "complete" for day in days),
+            "total": len(days), "days": days}
+
+
 def _cas_move(store, expected, values):
     params = {"id": "eq." + str(expected["id"]), "gym_id": "eq.lasso", "post_date": "eq." + expected["post_date"],
               "account": "eq." + expected["account"], "format": "eq.feed", "status": "eq." + expected["status"],
@@ -305,7 +341,14 @@ def main(argv=None):
     parser.add_argument("--snapshot", default=str(DEFAULT_SNAPSHOT)); parser.add_argument("--three-slot-plan", default=str(DEFAULT_THREE_SLOT_PLAN))
     parser.add_argument("--catalog", default=str(DEFAULT_CATALOG)); parser.add_argument("--output", required=True)
     parser.add_argument("--apply", action="store_true"); parser.add_argument("--receipt-dir")
+    parser.add_argument("--audit-only", action="store_true", help="read current campaign shape without writes")
     args = parser.parse_args(argv)
+    if args.audit_only:
+        from agent.portal_calendar_store import SupabaseCalendarStore
+        report = campaign_shape_report(SupabaseCalendarStore())
+        Path(args.output).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        print(json.dumps({"complete": report["complete"], "total": report["total"]}))
+        return 0 if report["complete"] == report["total"] else 1
     artifacts = None
     try:
         from agent.infographic_artifacts import ArtifactStore
@@ -318,9 +361,14 @@ def main(argv=None):
         if not args.receipt_dir: raise SystemExit("--apply requires --receipt-dir")
         from agent.portal_calendar_store import SupabaseCalendarStore
         receipts = apply(plan, SupabaseCalendarStore(), args.receipt_dir)
-        print(json.dumps({"applied": sum(r["status"] == "applied" for r in receipts), "receipts": len(receipts)}))
+        report = campaign_shape_report(SupabaseCalendarStore())
+        (Path(args.receipt_dir) / "campaign-day-shape.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n")
+        print(json.dumps({"applied": sum(r["status"] == "applied" for r in receipts),
+                          "receipts": len(receipts), "complete_days": report["complete"],
+                          "total_days": report["total"]}))
     print(json.dumps({"mode": plan["mode"], "actions": len(plan["actions"]), "blocked": len(plan["blocked"])}))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
