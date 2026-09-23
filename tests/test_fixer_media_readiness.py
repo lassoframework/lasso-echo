@@ -108,9 +108,23 @@ def test_media_readiness_returns_only_a_real_eligible_asset_and_never_writes():
     status, body = _get(_path(), calendar, assets)
     assert status == 200
     assert body == {"ok": True, "gym_key": GYM, "candidates": [
-        {"id": "asset-ok", "row_id": ROW, "review_state": "reviewed", "selectable": True}]}
+            {"id": "asset-ok", "row_id": ROW, "source": "drive",
+             "review_state": "reviewed", "selectable": True}]}
     assert all(call[0] in {"get_row", "list_month"} for call in calendar.calls)
     assert assets.calls.count("available") >= 1
+
+
+def test_media_readiness_includes_new_local_swap_candidate(monkeypatch):
+    from agent import media_swap
+
+    monkeypatch.setattr(media_swap, "local_candidates", lambda *args, **kwargs: [
+        {"source": "local", "key": "new-photo.jpg", "path": "/library/new-photo.jpg",
+         "kind": "photo", "last_used": "", "used_count": 0, "name": "new-photo.jpg"}
+    ])
+    status, body = _get(_path(), _Calendar(_row()), _Assets([]))
+    assert status == 200
+    assert body["candidates"] == [{"id": "new-photo.jpg", "row_id": ROW,
+                                     "source": "local", "selectable": True}]
 
 
 def test_media_readiness_zero_is_a_definitive_success_when_every_asset_is_excluded():

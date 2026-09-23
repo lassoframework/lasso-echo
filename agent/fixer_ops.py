@@ -59,9 +59,10 @@ CONTRACT (the FIXER builder reads this block):
   GET  /ops/actions/swap_media/candidates/<gym_key>?row_id=<pending calendar row>
       (same header)
       200 {"ok": true, "gym_key": "...", "candidates": [{"id": "...",
-           "row_id": "...", "review_state": "reviewed", "selectable": true}]}
+           "row_id": "...", "source": "drive"|"local", "selectable": true,
+           "review_state": "reviewed" (Drive only)}]}
       Bounded worker-only readiness read. It reads the exact waiting calendar row and
-      returns only Drive assets the existing swap selector can hand out now. It never
+      returns local and Drive assets the existing swap selector can hand out now. It never
       materializes, hosts, uploads, reserves, writes a ticket note, or changes a ledger.
   GET  /ops/actions/evidence/...           (same header)
       Bounded read-only diagnostics (agent/fixer_evidence.py). Never runs an action;
@@ -586,18 +587,16 @@ def _resend_connect_link_readiness(gym_key, deps):
 def _swap_media_candidates_readiness(gym_key, row_id, deps, *, now=None):
     """Read-only, fail-closed answer to "can this exact row be swapped now?".
 
-    The response deliberately contains Drive asset ids only. Local-library candidates
-    need materialization before they have a durable asset identity, and this endpoint
-    must never cause that work.  Drive candidates are selected by the same
-    gym_media_selector.pickable predicate the swap uses: eligibility, human review,
-    consent, moderation evidence, cooldown, and in-month exclusions all remain one
-    implementation.
+    Reuse the swap's combined local and Drive selector on validated snapshots.
+    This does not materialize a selected asset; the candidate id is a Drive asset
+    id or a local library key. Drive review, consent, moderation and cooldown
+    gates remain in gym_media_selector.pickable.
     """
     if _GYM_KEY.fullmatch(gym_key) is None or _ROW_ID.fullmatch(row_id) is None:
         return 400, {"error": "bad_request", "detail": "gym_key and row_id required"}
     try:
         from datetime import date, timedelta
-        from . import config, gym_media_index, gym_media_selector, media_guard
+        from . import config, gym_media_index, gym_media_selector, media_guard, media_swap
 
         store = deps.get("calendar_store")
         if store is None:
@@ -635,15 +634,6 @@ def _swap_media_candidates_readiness(gym_key, row_id, deps, *, now=None):
                     raise RuntimeError("calendar snapshot scope mismatch")
                 return [dict(item) for item in month_rows[month]]
 
-        asset_state = media_guard.book_state(
-            gym_key, _SnapshotStore(), post_date, 1,
-            key_fn=media_guard.row_asset_key,
-        )
-        blocked_ids = set(asset_state)
-        current_asset = media_guard.row_asset_key(row)
-        if current_asset:
-            blocked_ids.add(current_asset)
-
         media_store = deps.get("media_store") or gym_media_index.default_store()
         if not callable(getattr(media_store, "available", None)) or not media_store.available():
             return 503, {"error": "media_store_unavailable"}
@@ -665,22 +655,31 @@ def _swap_media_candidates_readiness(gym_key, row_id, deps, *, now=None):
                     raise RuntimeError("media snapshot scope mismatch")
                 return [dict(asset) for asset in assets]
 
-        candidates = gym_media_selector.pickable(
-            gym_key, store=_SnapshotMediaStore(), now=now, exclude_ids=tuple(blocked_ids))
+        library = media_swap.library_path_for(gym_key)
+        candidates = media_swap.candidates_for(
+            gym_key, row, store=_SnapshotStore(), lib=library,
+            media_store=_SnapshotMediaStore(), now=now)
         if not isinstance(candidates, list):
             return 503, {"error": "media_store_unavailable"}
         response = []
         for asset in candidates:
-            asset_id = asset.get("id") if isinstance(asset, dict) else None
-            # Defense in depth: do not rely on a count or a selector implementation
-            # detail to represent an asset as selectable.
-            if (not isinstance(asset_id, str) or not asset_id
-                    or asset.get("gym_id") != gym_key
-                    or asset_id in blocked_ids
-                    or not gym_media_selector.is_usable(asset)):
+            source = asset.get("source") if isinstance(asset, dict) else None
+            asset_id = asset.get("key") if isinstance(asset, dict) else None
+            if not isinstance(asset_id, str) or not asset_id:
                 return 503, {"error": "media_store_unavailable"}
-            response.append({"id": asset_id, "row_id": row_id,
-                             "review_state": "reviewed", "selectable": True})
+            if source == "drive":
+                original = asset.get("asset") or {}
+                if (original.get("gym_id") != gym_key or original.get("id") != asset_id
+                        or not gym_media_selector.is_usable(original)):
+                    return 503, {"error": "media_store_unavailable"}
+                response.append({"id": asset_id, "row_id": row_id,
+                                 "source": "drive", "review_state": "reviewed",
+                                 "selectable": True})
+            elif source == "local" and asset.get("path"):
+                response.append({"id": asset_id, "row_id": row_id,
+                                 "source": "local", "selectable": True})
+            else:
+                return 503, {"error": "media_store_unavailable"}
         return 200, {"ok": True, "gym_key": gym_key, "candidates": response}
     except Exception:  # noqa: BLE001 - readiness must never turn an outage into empty
         return 503, {"error": "media_readiness_unavailable"}
