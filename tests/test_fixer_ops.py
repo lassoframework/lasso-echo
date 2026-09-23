@@ -57,8 +57,17 @@ def _hdr(secret=SECRET):
 
 
 def _post(action, body, *, deps=None, secret=SECRET, logs=None):
+    # The production contract requires an immutable ticket binding for every
+    # swap. Legacy handler unit tests keep their focused setup while exercising
+    # that contract; explicit rejection coverage calls FO.handle directly.
+    deps = dict(deps or {})
+    if action == "swap_media" and "reservation_key" not in body:
+        bus = deps.setdefault("bus", FakeBus())
+        deps.setdefault("receipt_store", {})
+        body = {**body, "reservation_key": KEY,
+                "request_key": FO._business_request_key(bus._get, bus.ticket_row)}
     return FO.handle("POST", f"{FO.ROUTE_PREFIX}/{action}", _hdr(secret),
-                     json.dumps(body).encode(), deps=deps or {},
+                     json.dumps(body).encode(), deps=deps,
                      log=(logs.append if logs is not None else (lambda *a: None)))
 
 
@@ -440,6 +449,35 @@ def test_swap_media_passes_the_row_and_a_fixer_actor(armed):
     assert _post("swap_media", _body(), deps={"bus": FakeBus()})[0] == 400, "row_id required"
 
 
+def test_swap_media_defaults_to_the_fixer_scoped_handler(armed, monkeypatch):
+    """Production must not route an authenticated ops action through the dark portal."""
+    seen = {}
+    row = {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
+           "account": "instagram", "format": "feed", "status": "pending",
+           "image_url": "https://img/new.jpg"}
+
+    class Store:
+        def get_row(self, account_key, row_id):
+            return dict(row) if account_key == GYM and row_id == row["id"] else None
+
+        def list_month(self, account_key, month):
+            return [dict(row)] if account_key == GYM and month == "2026-09" else []
+
+    from agent import portal_social
+
+    def fixer_handler(account_key, draft_id, actor_id):
+        seen.update(account_key=account_key, draft_id=draft_id, actor_id=actor_id)
+        return 200, {"ok": True, "image_public_url": "https://img/new.jpg",
+                     "siblings_swapped": [], "siblings_left": [], "sibling_results": []}
+
+    monkeypatch.setattr(portal_social, "handle_fixer_swap_media", fixer_handler)
+    status, body = _post("swap_media", _body(row_id="row-abc-123"),
+                         deps={"bus": FakeBus(), "calendar_store": Store()})
+    assert status == 200 and body["result"]["postcondition_verified"] is True
+    assert seen == {"account_key": GYM, "draft_id": "row-abc-123",
+                    "actor_id": f"fixer:{TICKET}"}
+
+
 def test_swap_media_does_not_claim_success_when_readback_disagrees(armed):
     calls = []
     stale = {"id": "row-abc-123", "gym_id": GYM, "post_date": "2026-09-12",
@@ -461,7 +499,8 @@ def test_swap_media_does_not_claim_success_when_readback_disagrees(armed):
 
     status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
         "bus": FakeBus(), "handle_swap_media": handler, "calendar_store": Store()})
-    assert status == 409 and body["error"] == "postcondition_unconfirmed"
+    assert status == 503 and body["error"] == "reservation_outcome_unknown"
+    assert body["detail"] == "postcondition_unconfirmed"
     assert "calendar readback unconfirmed" in body["summary"]
     assert len(calls) == 1
 
@@ -487,7 +526,8 @@ def test_swap_media_does_not_verify_unread_or_failed_sibling_writes(armed, sibli
         "handle_swap_media": lambda *args: (200, {
             "ok": True, "image_public_url": "https://img/new.jpg",
             **sibling_result})})
-    assert status == 409 and body["error"] == "postcondition_unconfirmed"
+    assert status == 503 and body["error"] == "reservation_outcome_unknown"
+    assert body["detail"] == "postcondition_unconfirmed"
 
 
 def test_swap_media_verifies_thumbnail_and_each_successful_sibling(armed):
@@ -549,7 +589,8 @@ def test_swap_media_requires_public_media_identity_to_verify(armed):
     status, body = _post("swap_media", _body(row_id="row-abc-123"), deps={
         "bus": FakeBus(), "calendar_store": Store(),
         "handle_swap_media": lambda *args: (200, {"ok": True, "video_url": "https://img/new.mp4"})})
-    assert status == 409 and body["error"] == "postcondition_unconfirmed"
+    assert status == 503 and body["error"] == "reservation_outcome_unknown"
+    assert body["detail"] == "postcondition_unconfirmed"
     assert get_row_calls == ["row-abc-123"], \
         "the pre-swap derivation reads the row once; a missing media identity " \
         "triggers no post-handler readback"
@@ -1113,6 +1154,33 @@ def test_keyed_swap_requires_exact_current_request_before_reserving(armed):
     assert calls == [] and receipts == {}
 
 
+def test_fixer_only_swap_requires_bound_reservation_and_ticket_identity(armed):
+    """The dark-portal Fixer handler is never reachable from an unbound request."""
+    calls = []
+    bus = FakeBus()
+    raw_unkeyed = json.dumps(_body(row_id="row-abc-123")).encode()
+    status, body = FO.handle("POST", f"{FO.ROUTE_PREFIX}/swap_media", _hdr(), raw_unkeyed,
+                             deps={"bus": bus,
+                                   "handle_swap_media": lambda *a: calls.append(a) or (200, {})},
+                             log=lambda *a: None)
+    assert status == 409 and body["error"] == "swap_media_requires_reservation"
+    assert calls == []
+
+    client_id = "a0fcb10f-73dc-4e56-b6ca-61ac9bc9470f"
+    tenant_bus = FakeBus(
+        ticket={"id": TICKET, "product": "echo", "source": "slack_conversation",
+                "client_id": client_id},
+        tokens=[{"gym_id": client_id, "echo_account_key": GYM}],
+        reverse_tokens=[{"gym_id": client_id, "echo_account_key": GYM}],
+    )
+    wrong_tenant = {**_keyed_swap_body(row_id="row-abc-123"), "gym_key": OTHER_GYM}
+    status, body = _post("swap_media", wrong_tenant, deps={
+        "bus": tenant_bus, "receipt_store": {},
+        "handle_swap_media": lambda *a: calls.append(a) or (200, {})})
+    assert status == 409 and body["error"] == "ticket_tenant_mismatch"
+    assert calls == []
+
+
 def test_queued_swap_new_inbound_before_action_fails_durable_reservation(armed):
     class ChangingBus(FakeBus):
         def __init__(self):
@@ -1310,7 +1378,8 @@ def test_swap_media_is_unverified_when_the_readback_is_missing_or_raises(armed):
         status, body = _post("swap_media", _body(row_id="row-abc-123"),
                              deps={"bus": FakeBus(), "handle_swap_media": ok_handler,
                                    "calendar_store": store})
-        assert status == 409 and body["error"] == "postcondition_unconfirmed"
+        assert status == 503 and body["error"] == "reservation_outcome_unknown"
+        assert body["detail"] == "postcondition_unconfirmed"
         assert body.get("postcondition_verified") is not True
 
 

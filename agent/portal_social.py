@@ -768,11 +768,13 @@ def _load_owned_draft(account_key, draft_id, store):
     return draft, None
 
 
-def _action_gates(account_key, draft_id, actor_id, reader):
+def _action_gates(account_key, draft_id, actor_id, reader,
+                  allow_portal_social_disabled=False,
+                  allow_client_billing_inactive=False):
     """The flag / ids / Stripe-active gates shared by BOTH data planes. Returns None to
     proceed, or (status, body) to short-circuit. Ownership is checked separately (the
     two planes prove ownership against different stores)."""
-    if not config.portal_social_enabled():
+    if not allow_portal_social_disabled and not config.portal_social_enabled():
         return _disabled("action")
     if not account_key:
         return (400, {"ok": False, "error": "missing account_key"})
@@ -780,7 +782,7 @@ def _action_gates(account_key, draft_id, actor_id, reader):
         return (400, {"ok": False, "error": "draft_id required"})
     if not actor_id:
         return (400, {"ok": False, "error": "actor_id required"})
-    if not is_social_active(account_key, reader=reader):
+    if not allow_client_billing_inactive and not is_social_active(account_key, reader=reader):
         return (402, {"ok": False, "error": "social plan is not active",
                       "account_key": account_key})
     return None
@@ -1136,9 +1138,44 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
 
     Flag: config.media_swap_free_enabled() (ECHO_MEDIA_SWAP_FREE, default OFF).
     Flag off -> 403 and not one store read is issued."""
-    short = _action_gates(account_key, draft_id, actor_id, reader)
+    return _handle_swap_media(account_key, draft_id, actor_id, reader=reader,
+                              sb_store=sb_store, picker=picker)
+
+
+def handle_fixer_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=None,
+                            picker=None):
+    """Run the same guarded photo swap from the authenticated Fixer ops lane.
+
+    The client portal can remain dark while a support ticket is repaired. This
+    bypasses the client portal's feature and Stripe view gates after the existing
+    fail-closed Echo-client entitlement verifies the tenant. The media-swap flag,
+    tenant-scoped row read, status, consent/picker, and server-side write guards
+    still apply. It is intentionally not routed by the public portal HTTP handler.
+    """
+    return _handle_swap_media(account_key, draft_id, actor_id, reader=reader,
+                              sb_store=sb_store, picker=picker,
+                              allow_portal_social_disabled=True,
+                              require_fixer_entitlement=True)
+
+
+def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=None,
+                       picker=None, allow_portal_social_disabled=False,
+                       require_fixer_entitlement=False):
+    """Shared implementation for public and authenticated Fixer swap requests."""
+    short = _action_gates(account_key, draft_id, actor_id, reader,
+                          allow_portal_social_disabled=allow_portal_social_disabled,
+                          allow_client_billing_inactive=require_fixer_entitlement)
     if short is not None:
         return short
+    if require_fixer_entitlement:
+        try:
+            from . import echo_clients
+            entitled = echo_clients.is_echo_client(account_key)
+        except Exception:  # noqa: BLE001 - entitlement uncertainty must refuse
+            entitled = False
+        if not entitled:
+            return 403, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": "not_echo_client", "account_key": account_key}
     from . import media_swap as _ms
     if not _ms.enabled():
         return 403, {"ok": False, "action": "swap-media", "draft_id": draft_id,
