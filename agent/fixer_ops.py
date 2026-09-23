@@ -17,7 +17,8 @@ CONTRACT (the FIXER builder reads this block):
                  "args": {...},                             (args per action, below)
                  "reservation_key"?: "<8-128 [A-Za-z0-9_-]>",
                  "request_key"?: "<current requester SHA for keyed swap_media>"}
-      reservation_key is OPTIONAL. Absent: behavior is exactly as before. Present: the
+      reservation_key is OPTIONAL except for swap_media, which requires a current
+      request_key and durable reservation before its Fixer-only execution path. Present: the
       action runs AT MOST ONCE per key -- a durable receipt (agent/fixer_ops_receipts,
       sqlite kv on the volume host, prefix ops_receipt_) is reserved BEFORE any side
       effect, then committed with the result, failed on a refusal, or marked unknown
@@ -28,8 +29,8 @@ CONTRACT (the FIXER builder reads this block):
       reserved, failed, and unknown receipts refuse replay. A key reused with a
       different payload is 409 reservation_conflict. Keyed restage_month is refused
       because its background job registry is not durable. Keyed 2xx bodies carry
-      "receipt": {...}; unkeyed calls retain their existing response shape.
-      A keyed swap_media additionally requires the caller's current request_key.
+      "receipt": {...}; other unkeyed actions retain their existing response shape.
+      swap_media requires the caller's current request_key.
       Echo re-reads that key before reservation and before the swap, stores it in
       the receipt and its payload hash, and rejects a stale queued request.
       200 {"ok": true, "action": ..., "gym_key": ..., "ticket_id": ..., "result": {...}}
@@ -1129,8 +1130,13 @@ def _run_swap_media(ctx):
     rid = _row_id(ctx)
     if not rid:
         return 400, {"error": "bad_request", "detail": "args.row_id required"}
-    handler = _dep(ctx, "handle_swap_media", lambda: __import__(
-        "agent.portal_social", fromlist=["handle_swap_media"]).handle_swap_media)
+    # Test doubles retain the historical dependency key. Production uses the
+    # dedicated Fixer entrypoint, which can operate while the client portal is
+    # deliberately dark and still preserves every non-portal gate.
+    handler = ctx.deps.get("handle_swap_media")
+    if handler is None:
+        handler = __import__("agent.portal_social", fromlist=["handle_fixer_swap_media"] \
+            ).handle_fixer_swap_media
     # Derive the expected sibling set INDEPENDENTLY, before the swap: the
     # handler's siblings_swapped list is a self-report and is never the source of
     # truth. A store that cannot support the derivation fails closed below.
@@ -1858,7 +1864,9 @@ def run_action(action, gym_key, ticket_id, args, *, reservation_key=None,
         # durable completed receipt, and a restart cannot prove job completion.
         return 409, {"error": "reservation_background_unsupported", "action": action}
     bound_request_key = None
-    if action == "swap_media" and reservation_key is not None:
+    if action == "swap_media":
+        if reservation_key is None:
+            return 409, {"error": "swap_media_requires_reservation"}
         if (not isinstance(reservation_key, str)
                 or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", reservation_key)):
             return 400, {"error": "bad_reservation_key"}

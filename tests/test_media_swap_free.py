@@ -171,6 +171,54 @@ def test_flag_off_the_swap_endpoint_403s_and_never_reads_the_store(monkeypatch):
     assert body["ok"] is False
 
 
+def test_fixer_swap_can_repair_one_row_while_the_client_portal_is_dark(monkeypatch):
+    """The authenticated ops lane uses Echo entitlement while the portal is dark."""
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    monkeypatch.setenv("AGENT_PORTAL_SOCIAL_ENABLED", "false")
+    store = _Store([_row("p1")])
+    _wire(monkeypatch, store)
+    from agent import echo_clients
+    monkeypatch.setattr(echo_clients, "is_echo_client", lambda *_args, **_kwargs: True)
+
+    status, _ = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                     picker=_picker)
+    assert status == 404 and store.swaps == []
+
+    status, body = ps.handle_fixer_swap_media("zanshin", "p1", "fixer:ticket-1",
+                                               sb_store=store, picker=_picker)
+    assert status == 200 and body["ok"] is True
+    assert store._rows["p1"]["image_url"] == "https://cdn/new.jpg"
+
+
+def test_fixer_swap_uses_echo_entitlement_when_client_billing_is_unavailable(monkeypatch):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    monkeypatch.setenv("AGENT_PORTAL_SOCIAL_ENABLED", "false")
+    store = _Store([_row("p1")])
+    _wire(monkeypatch, store)
+    monkeypatch.setattr(ps, "is_social_active", lambda *args, **kwargs: False)
+    from agent import echo_clients
+    monkeypatch.setattr(echo_clients, "is_echo_client", lambda *_args, **_kwargs: True)
+
+    status, body = ps.handle_fixer_swap_media("zanshin", "p1", "fixer:ticket-1",
+                                               sb_store=store, picker=_picker)
+    assert status == 200 and body["ok"] is True
+    assert store._rows["p1"]["image_url"] == "https://cdn/new.jpg"
+
+
+def test_fixer_swap_refuses_when_echo_entitlement_is_unavailable(monkeypatch):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    monkeypatch.setenv("AGENT_PORTAL_SOCIAL_ENABLED", "false")
+    store = _Store([_row("p1")])
+    _wire(monkeypatch, store)
+    from agent import echo_clients
+    monkeypatch.setattr(echo_clients, "is_echo_client", lambda *_args, **_kwargs: False)
+
+    status, body = ps.handle_fixer_swap_media("zanshin", "p1", "fixer:ticket-1",
+                                               sb_store=store, picker=_picker)
+    assert status == 403 and body["error"] == "not_echo_client"
+    assert store.swaps == []
+
+
 def test_flag_off_the_media_intent_is_ignored_and_the_deny_charges(monkeypatch):
     store = _Store([_row("p1")])
     _wire(monkeypatch, store)
