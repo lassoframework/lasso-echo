@@ -36,6 +36,10 @@ no-ops while config.portal_echo_tickets_enabled() is off:
 Both passes are pure given their injected dependencies -- no import of a live Slack
 client or the live bus at module scope, so they are fully unit-testable offline.
 """
+import json
+import os
+import time
+
 from . import config
 from .slack_convo import adapter as _a
 from .slack_convo import classifier as _cls
@@ -53,6 +57,98 @@ from .slack_convo import outreach as _out
 # unchanged; a caller wiring a second (product, identity) pair passes them explicitly.
 PRODUCT = "echo"
 SOURCE = "website_tab"
+_INTAKE_PAGE_LIMIT = 20
+_INTAKE_MAX_SWEEP_SECONDS = 24 * 60 * 60
+_intake_now = time.time
+
+
+# ---------------------------------------------------------------------------
+# Intake keyset cursor (2026-09-23 starvation fix)
+#
+# The old poll re-read the same oldest-20 window every pass, so 20 permanently-failing
+# (or probe/test) rows starved every fresh customer ticket behind them. The cursor below
+# is what makes the window BOUNDED AND FAIR: bus.find_new_tickets(after=cursor) walks
+# strictly FORWARD through the unclassified queue in (created_at, id) order -- keyset,
+# never OFFSET, so a concurrent insert can never shift the page and silently skip a row --
+# and the cursor is advanced past EVERY raw row of the page, processed or not. A ticket
+# that throws stays 'new' and is retried on the next sweep, after the tickets behind it
+# have had their turn; it no longer monopolises the window.
+#
+# Restart behaviour: the cursor is persisted atomically (tmp + os.replace) under
+# config.data_dir() -- the same durable volume db.db_path uses -- keyed per
+# (product, source, identity) leg, so the portal->scout and echo->echo legs paginate
+# independently and a redeploy resumes where the last pass left off instead of restarting
+# at the poison block. A crash mid-pass replays at most the current page: rows that
+# SUCCEEDED changed status/classification and are never re-fetched, and the inbound-row
+# guard in _intake_one prevents a duplicated message for a row that failed later, so a
+# replay can never double-process a successful ticket. A missing or corrupt cursor file
+# is a cold start from the top of the queue -- safe for the same reason, and fail-closed:
+# it can re-attempt work, never fabricate a delivery.
+# ---------------------------------------------------------------------------
+
+# Last known cursor state per configured path. This keeps pagination fair while the
+# durable volume is temporarily unwritable; it is deliberately process-local and never
+# changes any ticket/send safety decision.
+_INTAKE_CURSOR_CACHE = {}
+
+
+def _intake_cursor_path():
+    return os.path.join(config.data_dir(), "echo_intake_cursor.json")
+
+
+def _intake_leg_key(product, source, identity_name):
+    return f"{product}|{source}|{identity_name}"
+
+
+def _load_intake_cursors(path):
+    cache_key = os.path.abspath(path)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:  # noqa: BLE001 - missing/corrupt state is a safe cold start
+        data = {}
+    # A malformed leg is discarded independently so it cannot reset another leg.
+    data = {key: value for key, value in data.items()
+            if isinstance(value, dict)
+            and isinstance(value.get("created_at"), str) and value["created_at"]
+            and isinstance(value.get("id"), str) and value["id"]}
+    # If persistence failed earlier in this process, its newer state wins over the
+    # older on-disk snapshot. Valid untouched legs from disk remain available.
+    data.update(_INTAKE_CURSOR_CACHE.get(cache_key, {}))
+    _INTAKE_CURSOR_CACHE[cache_key] = dict(data)
+    return data
+
+
+def _save_intake_cursors(path, cursors, *, log=print):
+    cache_key = os.path.abspath(path)
+    safe_cursors = {key: value for key, value in cursors.items()
+                    if isinstance(value, dict)
+                    and isinstance(value.get("created_at"), str) and value["created_at"]
+                    and isinstance(value.get("id"), str) and value["id"]}
+    # Record first: even a write or atomic replace failure must not restart the
+    # in-process queue at the oldest page on the next poll.
+    _INTAKE_CURSOR_CACHE[cache_key] = dict(safe_cursors)
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(safe_cursors, f)
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - memory fallback is safe; operator must see loss of durability
+        log(f"[echo-ticket-worker] cursor persistence failed path={path}; "
+            f"using process memory: {type(exc).__name__}: {exc}")
+
+
+def _fetch_intake_page(bus, *, product, source, cursor):
+    """One bounded page of new tickets, keyset-forward of `cursor` when one exists.
+    `after` is only passed when set: older bus fakes with the pre-pagination signature
+    keep working unchanged."""
+    kw = {"product": product, "source": source}
+    if cursor:
+        kw["after"] = {"created_at": cursor["created_at"], "id": cursor["id"]}
+    return bus.find_new_tickets(**kw)
 
 
 def resolve_client_identity(ticket, *, slack_lookup_email, slack_user_info, portal_lookup,
@@ -146,15 +242,45 @@ def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open
                post_first_message, write_hold_notice, product=PRODUCT, source=SOURCE,
                identity_name="echo", operator_ids=(), fetch_state=None, llm=None,
                classify_llm=None, mark_message=None, claim_message=None, stamp_ticket=None,
-               log=print):
+               cursor_path=None, log=print):
     """First pass: NEW, unclassified tickets for (product, source), dispatched under
     identity_name. Never runs if the config flag is off. Defaults preserve the
     original Echo-only behavior; D47 generalized this for a second (product,
-    identity) pair (portal -> scout) without touching Echo's call site."""
+    identity) pair (portal -> scout) without touching Echo's call site.
+
+    2026-09-23 starvation fix: the page is one keyset-forward WINDOW (see the cursor
+    note above), not the permanent oldest-20. The persisted cursor advances past every
+    raw row of the page -- failed tickets included -- so a poison block is walked past
+    and a fresh ticket behind it is reached within ceil(queue_depth / page_size) polls;
+    when a poll past the tail returns nothing, the cursor wraps to the top and the
+    still-'new' failures get their next attempt."""
     if not config.portal_echo_tickets_enabled():
         return {"processed": 0}
     ident = _ids.IDENTITIES[identity_name]
-    tickets = bus.find_new_tickets(product=product, source=source)
+    path = cursor_path or _intake_cursor_path()
+    leg = _intake_leg_key(product, source, identity_name)
+    cursors = _load_intake_cursors(path)
+    cursor = cursors.get(leg) or None
+    now = _intake_now()
+    sweep_started_at = (cursor.get("_sweep_started_at")
+                        if cursor and isinstance(cursor.get("_sweep_started_at"), (int, float))
+                        else now)
+    if cursor and now - sweep_started_at >= _INTAKE_MAX_SWEEP_SECONDS:
+        # Under a sustained full queue the tail may never arrive. Periodically begin a
+        # new sweep so old failed rows get another chance without pinning the worker.
+        cursor = None
+        sweep_started_at = now
+    tickets = _fetch_intake_page(bus, product=product, source=source, cursor=cursor)
+    raw_last = getattr(tickets, "raw_last", None)
+    raw_count = getattr(tickets, "raw_count", len(tickets))
+    if raw_count == 0 and cursor:
+        # The tail: nothing past the cursor. Wrap to the top so the tickets that failed
+        # earlier in the sweep (still status='new') are retried.
+        cursor = None
+        sweep_started_at = now
+        tickets = _fetch_intake_page(bus, product=product, source=source, cursor=None)
+        raw_last = getattr(tickets, "raw_last", None)
+        raw_count = getattr(tickets, "raw_count", len(tickets))
     processed = 0
     for ticket in tickets:
         tid = ticket["id"]
@@ -175,6 +301,26 @@ def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open
         except Exception as e:  # noqa: BLE001 -- one bad ticket must never starve the rest
             log(f"[echo-ticket-worker] intake failed ticket={tid}: "
                 f"{type(e).__name__}: {e}")
+    # Advance the leg's cursor past the last RAW row of this page -- succeeded, failed
+    # and locally test-filtered rows alike (raw_last comes from the unfiltered page, so
+    # probe rows the strict filter removed still move the window forward). A plain-list
+    # result from an older fake carries no page facts: the cursor simply stays put, which
+    # is the pre-fix behaviour for those callers. Persisted once per pass; a crash before
+    # this point replays at most the current page, which is safe (see the cursor note).
+    new_cursor = None
+    if isinstance(raw_last, dict) and raw_last.get("created_at") and raw_last.get("id"):
+        new_cursor = {"created_at": str(raw_last["created_at"]), "id": str(raw_last["id"]),
+                      "_sweep_started_at": sweep_started_at}
+    # A short page reached the current tail even if a new row arrives before the next
+    # poll. Clear the cursor now so failures earlier in the sweep are retried next time.
+    if raw_count < _INTAKE_PAGE_LIMIT:
+        new_cursor = None
+    if new_cursor is not None:
+        cursors[leg] = new_cursor
+    else:
+        cursors.pop(leg, None)
+    if new_cursor is not None or leg in _load_intake_cursors(path):
+        _save_intake_cursors(path, cursors, log=log)
     return {"processed": processed}
 
 

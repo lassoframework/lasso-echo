@@ -55,6 +55,23 @@ def _is_unique_violation(status_code, text):
     return "23505" in t or "duplicate key" in t or "unique" in t
 
 
+class TicketPage(list):
+    """find_new_tickets' result: a plain list of work-ready rows, plus the two facts a
+    keyset-paginating caller needs about the RAW page they were filtered from:
+
+      * raw_count -- rows the database returned before the local strict test filter;
+      * raw_last  -- the last raw row (the cursor advances past it, so a run of rows the
+        filter removed still moves the window forward instead of being re-fetched forever).
+
+    A subclass rather than a tuple so every pre-pagination caller and test fake that
+    treats the result as a list is unaffected."""
+
+    def __init__(self, rows=(), *, raw_count=0, raw_last=None):
+        super().__init__(rows)
+        self.raw_count = raw_count
+        self.raw_last = raw_last
+
+
 class Bus:
     def __init__(self, url=None, service_key=None, http=None):
         self._url = (url if url is not None else config.supabase_url())
@@ -279,22 +296,61 @@ class Bus:
             raise BusError(409, "seeded ops-fix readback identity mismatch")
         return stored, duplicate
 
-    def find_new_tickets(self, *, product, source, limit=20):
+    def find_new_tickets(self, *, product, source, limit=20, after=None):
         """D46: the portal-ticket worker's poll query. A non-Slack-sourced ticket
         (product/source given explicitly, never a wildcard) that has not been classified
         yet -- `status=eq.new` AND `classification=is.null` together are what "not yet
         picked up by anything" means for this bus; a ticket already routed to a
         classification (question/code_fix/action_request) or otherwise past 'new' is
-        never re-fetched here, so a slow worker restart can never double-process one."""
-        rows = self._get(_TICKETS, {
+        never re-fetched here, so a slow worker restart can never double-process one.
+
+        2026-09-23 starvation fix: the window is now BOUNDED AND FAIR, not "the oldest 20
+        forever".
+
+          * `is_test=eq.false` is filtered SERVER-SIDE (the column exists since migration
+            support_tickets_is_test_20260905, not-null default false), so a block of
+            flagged probe rows no longer fills the page before the local strict filter
+            ever runs. If an older database without the column answers 400, the query is
+            retried once without that filter -- the local strict predicate below still
+            applies either way, and any other error (auth, transport) raises unchanged.
+          * `after` is an optional KEYSET cursor {"created_at", "id"}: only rows strictly
+            past it are returned (created_at, id ascending -- id is the tiebreak so equal
+            timestamps cannot skip or repeat a row). Keyset, never OFFSET: an offset page
+            shifts under concurrent inserts and silently skips rows. The caller
+            (echo_ticket_worker.intake_pass) owns advancing and persisting the cursor,
+            so a page of permanently-failing rows is walked PAST instead of monopolising
+            every poll, and the cursor wraps to the top once the tail is reached.
+
+        Returns a TicketPage: a plain list of the work-ready rows (strict test filter
+        applied), carrying `.raw_count` / `.raw_last` facts about the unfiltered page so
+        the caller can advance its cursor past rows the filter removed."""
+        params = {
             "product": f"eq.{product}", "source": f"eq.{source}", "status": "eq.new",
-            "classification": "is.null", "select": "*",
-            "order": "created_at.asc", "limit": str(int(limit))})
+            "classification": "is.null", "is_test": "eq.false", "select": "*",
+            "order": "created_at.asc,id.asc", "limit": str(int(limit))}
+        if after:
+            ts = str(after.get("created_at") or "").replace('"', "")
+            tid = str(after.get("id") or "").replace('"', "")
+            if ts and tid:
+                params["or"] = (f'(created_at.gt."{ts}",'
+                                f'and(created_at.eq."{ts}",id.gt."{tid}"))')
+        try:
+            rows = self._get(_TICKETS, params)
+        except BusError as e:
+            if e.status != 400 or "is_test" not in params:
+                raise
+            # is_test may not exist yet on an older database; drop the server-side filter
+            # (never the status/classification predicates) and rely on the strict local
+            # predicate below, the same fallback count_tickets_for_user_today uses.
+            params.pop("is_test")
+            rows = self._get(_TICKETS, params)
         # 2026-09-05: our own arming probes are never work. Eight of them sat in #fixer
         # looking exactly like unhandled client tickets; a re-run of this poll must not put
         # any of them back on a card. testdata.py is the single predicate for that, shared
         # with every report and metric so they can never disagree.
-        return _td.exclude_test_strict(rows)
+        return TicketPage(_td.exclude_test_strict(rows),
+                          raw_count=len(rows),
+                          raw_last=(rows[-1] if rows else None))
 
     def find_fixing_tickets(self, *, product, limit=20):
         """The second-stage poll: code_fix tickets already dispatched to the fixer
