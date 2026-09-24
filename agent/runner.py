@@ -691,6 +691,12 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     """
     _trust_startup_warning()
     results = []
+    # The scheduler distinguishes a genuinely silent posting-day run from the
+    # calendar-authority mode that intentionally suppresses legacy LASSO cards.
+    # Track every cadence-eligible account and only report an expected zero when
+    # ALL of them reached that explicit cardless path.
+    posting_accounts = []
+    intentionally_cardless_accounts = []
 
     if not config.master_enabled():
         # agent disarmed. say nothing publicly; just report state to the caller.
@@ -820,6 +826,7 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # card for this account (default 7 days/week, no skip days).
             if not schedule.should_post_on(day_key):
                 continue
+            posting_accounts.append(account.key)
             # Channel ownership guard: a client account with no slack_channel
             # would route its approval cards to the shared default — LASSO's
             # internal channel — silently. That never happens: the account
@@ -893,6 +900,8 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 config.calendar_autopublish_enabled()
                 and account.key.startswith("lasso")
                 and draft is None)
+            if _skip_legacy_lasso_daily:
+                intentionally_cardless_accounts.append(account.key)
 
             # Category frequency + consecutive caps (category_cap.py, both OFF by
             # default). Campaign builders are gated; the fallback never blocks.
@@ -1802,4 +1811,16 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     except Exception as e:
         print(f"[client-content] needs-media digest flush failed: {type(e).__name__}: {e}")
 
-    return {"status": "drafted", "drafts": results}
+    expected_no_cards = (
+        bool(posting_accounts)
+        and set(posting_accounts) <= set(intentionally_cardless_accounts)
+    )
+    return {
+        "status": "drafted",
+        "drafts": results,
+        "expected_no_cards": expected_no_cards,
+        "expected_no_cards_reason": (
+            "calendar autopublish owns every eligible account; legacy cards suppressed"
+            if expected_no_cards else ""
+        ),
+    }
