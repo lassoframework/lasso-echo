@@ -277,11 +277,10 @@ def _podcast_auto_due(now, last_date, target_hour):
 
 def _fire_daily(store, today, run=run_daily):
     """
-    One scheduled fire, LOUD on every no-card outcome. Any result other than a
-    drafted run with at least one card (on a posting day) raises one ops alert, so
-    a silent no-card morning is impossible while AGENT_OPS_ALERTS_ENABLED is true.
-    A skip day (schedule.should_post_on false) drafting zero cards is EXPECTED and
-    does not alert.
+    One scheduled fire, LOUD on every unexpected no-card outcome. A posting-day
+    run with no cards raises one ops alert unless run_daily proves that every eligible
+    account reached the calendar-authority path that intentionally suppresses legacy
+    cards. A skip day drafting zero cards is expected and does not alert.
     """
     try:
         out = run(store=store)
@@ -295,7 +294,8 @@ def _fire_daily(store, today, run=run_daily):
     if status != "drafted":
         ops_alerts.alert(f"scheduled draft run produced no cards - status '{status}' "
                          "(check AGENT_ENABLED and the voice doc)")
-    elif not drafts and schedule.should_post_on(today):
+    elif (not drafts and schedule.should_post_on(today)
+          and not bool((out or {}).get("expected_no_cards"))):
         ops_alerts.alert("scheduled draft run produced no cards - drafted 0 drafts "
                          "on a posting day")
     return out
