@@ -3301,3 +3301,22 @@ def test_inbound_events_run_on_a_bounded_pool(monkeypatch):
                     "message")
     w._pool.shutdown(wait=True)
     assert len(bus.tickets) == 20
+
+
+def test_mflh_answer_in_hold_lane_is_not_a_code_release():
+    ticket = {'id': '52c2373b-d15a-4fca-b110-3b681bf7cde5',
+              'source': 'slack_conversation', 'product': 'echo',
+              'classification': 'answerable_question', 'status': 'verification',
+              'hold_tier': 'routine', 'escalated': True,
+              'verification_after': {'hold': True, 'fixer': {'outcome': 'answer'}}}
+    att = {'fixer': True, 'triage': 'answer'}
+    body = 'Facebook, Instagram, and Google Business are connected.'
+    assert not OB._customer_fix_reply(ticket, att, body)
+    assert OB._fixer_grounded_question_answer(ticket, att, A.KIND_ANSWER, body)
+    # Routing does not waive hold/content/request identity eligibility.
+    assert not OB._direct_answerable_question(ticket, body)
+    ticket.update(escalated=False, hold_tier=None, verification_after={'facts': {}})
+    assert OB._direct_answerable_question(ticket, body)
+    ticket['fix_pr_url'] = 'https://github.com/lassoframework/lasso-echo/pull/217'
+    assert OB._customer_fix_reply(ticket, att, body)
+    assert not OB._direct_answerable_question(ticket, body)

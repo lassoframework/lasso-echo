@@ -1204,8 +1204,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             # rule (report-card build 2026-08-28). Same-date records are the
             # row's own staging stamp / its cross-post siblings and never
             # block (caption_ledger same-date rule).
-            if _cl.is_blocked(gym_id, _cap, row.get("post_date", ""),
-                              db=None):
+            # Match planner and publisher semantics: the cooldown switch owns
+            # this ledger, and stories have no outbound caption. Calendar grade
+            # alone must not activate a stale ledger or self-block a story.
+            if (config.caption_cooldown_enabled() and not _is_story_row(row)
+                    and _cl.is_blocked(gym_id, _cap, row.get("post_date", ""),
+                                       db=None)):
                 _reverted = _revert_to_pending(row_id=row_id, store=store,
                                                gym_id=gym_id,
                                                expected_claim_token=claim_token,
@@ -1665,6 +1669,7 @@ def client_gym_bases():
     echo_intake_tokens. Hardcoded ACCOUNTS bases are trusted without a plane read.
     Fails closed: an unreadable client universe yields the hardcoded bases only."""
     from .accounts import all_accounts
+    from .account_key_resolve import resolve as resolve_key
     from . import echo_clients
     from .account_key_doctor import _is_internal_base
     seen, bases = set(), []
@@ -1677,6 +1682,7 @@ def client_gym_bases():
             if base.endswith(suf):
                 base = base[: -len(suf)]
                 break
+        base = resolve_key(base)
         if base and not _is_internal_base(base) and base not in seen:
             seen.add(base)
             bases.append(base)

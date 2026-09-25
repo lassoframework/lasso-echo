@@ -352,3 +352,54 @@ def test_unreplied_recent_review_is_carded(monkeypatch):
     urls = [i["url"] for i in summary["items"]]
     assert urls == ["https://facebook.com/r1"]
     assert summary["items"][0]["source"] == "review"
+
+
+def test_pagination_contract_failure_keeps_alert_visible_but_unverifiable(monkeypatch):
+    _armed(monkeypatch)
+    class PartialProvider(FakeZernio):
+        def list_inbox_comments_complete(self, profile_id, **kwargs):
+            raise inbox_alerts.ZernioPaginationError('invalid_pagination_shape')
+    z = PartialProvider(profiles={'topfuel': 'p'}, posts={'p': [_post('post')]},
+                        threads={'post': [_comment('When is class?')]})
+    kv, snapshots, cards = FakeKv(), {}, []
+    out = run(gyms=['topfuel'], zernio=z, now=NOW,
+              notifier=lambda gym, text: cards.append(text),
+              kv_get=kv.get, kv_set=kv.set, snapshot_store=snapshots)
+    assert out['cards_sent'] == 1
+    assert 'Partial inbox view' in cards[0]
+    assert out['gyms'][0]['reply_snapshot_complete'] is False
+    assert all(s['complete'] is False for s in snapshots.values())
+
+
+def test_retired_reverb_keys_never_read_or_notify(monkeypatch):
+    _armed(monkeypatch)
+    class NoReads:
+        def find_profile_id(self, gym):
+            raise AssertionError('retired gym must not be swept')
+    kv = FakeKv()
+    out = run(gyms=['crossfitreverb30b5b2', 'crossfitreverb6cdf33_ig'],
+              zernio=NoReads(), now=NOW, notifier=lambda *_: 1/0,
+              kv_get=kv.get, kv_set=kv.set)
+    assert out['cards_sent'] == 0
+    assert all('retired' in x['skipped'] for x in out['gyms'])
+    assert not kv.store
+
+
+def test_default_notifier_requires_receipt_and_bypasses_generic_suppression(monkeypatch):
+    from agent import ops_alerts
+    monkeypatch.setattr(inbox_alerts, '_coach_channel', lambda _: None)
+    calls = []
+    def suppressed(text, **kwargs):
+        calls.append(kwargs)
+        return None
+    monkeypatch.setattr(ops_alerts, 'alert', suppressed)
+    assert inbox_alerts._default_notifier('gym', 'REPLY NEEDED at gym:') is False
+    assert calls == [{'force': True}]
+    monkeypatch.setattr(ops_alerts, 'alert', lambda *a, **k: {'ok': True, 'ts': '1.2'})
+    assert inbox_alerts._default_notifier('gym', 'card') is True
+
+
+def test_member_text_cannot_suppress_reply_needed_crosspost():
+    from agent import ops_triage
+    assert ops_triage.classify('ECHO ALERT: REPLY NEEDED at gym: 1 member comment(s)\n'
+                              '1. [COMMENT] no action needed') == ops_triage.NEEDS_TRIAGE

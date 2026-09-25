@@ -35,6 +35,7 @@ truncated page, a gym whose rows disagree, a key that maps nowhere -- returns th
 UNCHANGED, which is exactly the pre-fix behaviour. Remapping is only ever done on an exact
 match against a complete, unambiguous reading.
 """
+import uuid
 import threading
 import time
 
@@ -188,11 +189,20 @@ def _build(get=None, now_fn=None):
             derived = _norm(_base_key(raw_ids.get(gid, gid), name))
         except Exception:  # noqa: BLE001 - a underivable gym simply gets no entry
             continue
-        if not derived or derived == live_key or derived in live:
-            continue  # nothing to map, or the derived key is itself somebody's live key
-        if derived in mapping and mapping[derived] != live_key:
-            collided.add(derived)  # two gyms deriving one key: refuse both, never guess
-        mapping[derived] = live_key
+        aliases = {derived}
+        # Portal links also use slug + raw UUID prefix. Bind that exact alias to
+        # this UUID's token row, with the same collision/live-owner checks.
+        try:
+            raw_uuid = str(uuid.UUID(gid))
+            aliases.add(_norm(_slugify_name(name) + raw_uuid[:6]))
+        except (ValueError, AttributeError):
+            pass
+        for alias in aliases:
+            if not alias or alias == live_key or alias in live:
+                continue
+            if alias in mapping and mapping[alias] != live_key:
+                collided.add(alias)
+            mapping[alias] = live_key
     for key in collided:
         mapping.pop(key, None)
     # A TARGET held by MORE THAN ONE GYM is unsafe, even though its SOURCE is unique.
