@@ -427,3 +427,40 @@ def test_update_moderation_asset_zero_rows_is_409():
         store.update_moderation_asset(GYM, ASSET_ID, _valid_fields(),
                                       expected_content_hash="h1")
     assert ei.value.status == 409
+
+@pytest.mark.parametrize('people', [False, True])
+def test_scheduled_pass_records_evidence_without_approval(monkeypatch, people):
+    from agent.jobs.moderate_pending_gym_media import run
+    from datetime import datetime
+    asset, store, drive = _setup(source_id='source')
+    store.list_sources = lambda: [{'id': 'source', 'gym_id': GYM}]
+    monkeypatch.setattr(config, 'gym_drive_connect_active_for', lambda gym: gym == GYM)
+    result = run(store=store, drive=drive, vision=_vision(_clean_json(people)),
+                 now=datetime.fromisoformat(NOW))
+    assert result['recorded'] == 1
+    row = store.get_asset(ASSET_ID)
+    assert row['review_status'] == 'pending_review'
+    assert row['consent_status'] == ('pending' if people else 'not_required')
+    assert not selector.is_usable(row)
+
+
+def test_scheduled_pass_is_bounded_and_failures_do_not_starve(monkeypatch):
+    from agent.jobs import moderate_pending_gym_media as job
+    from datetime import datetime, timedelta
+    asset, store, drive = _setup(source_id='source')
+    store.list_sources = lambda: [{'id': 'source', 'gym_id': GYM}]
+    store.list_assets = lambda *a, **kw: [dict(asset, id=str(i)) for i in range(7)]
+    monkeypatch.setattr(config, 'gym_drive_connect_active_for', lambda gym: True)
+    seen = []
+    def fail(gym, aid, **kw):
+        seen.append(aid)
+        raise RuntimeError('private response must not be logged')
+    monkeypatch.setattr(job.moderation, 'moderate_asset', fail)
+    for day in range(7):
+        result = job.run(store=store, drive=drive, vision=lambda *a: '', limit=2,
+                         now=datetime.fromisoformat(NOW) + timedelta(days=day))
+        assert result['attempted'] == 2
+        assert result['failures'] == ['RuntimeError', 'RuntimeError']
+    assert set(seen) == {str(i) for i in range(7)}
+    monkeypatch.setattr(config, 'gym_drive_connect_active_for', lambda gym: False)
+    assert job.run(store=store, drive=drive, vision=lambda *a: '')['attempted'] == 0

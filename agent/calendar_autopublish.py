@@ -1669,6 +1669,7 @@ def client_gym_bases():
     echo_intake_tokens. Hardcoded ACCOUNTS bases are trusted without a plane read.
     Fails closed: an unreadable client universe yields the hardcoded bases only."""
     from .accounts import all_accounts
+    from .account_key_resolve import resolve as resolve_key
     from . import echo_clients
     from .account_key_doctor import _is_internal_base
     seen, bases = set(), []
@@ -1681,6 +1682,7 @@ def client_gym_bases():
             if base.endswith(suf):
                 base = base[: -len(suf)]
                 break
+        base = resolve_key(base)
         if base and not _is_internal_base(base) and base not in seen:
             seen.add(base)
             bases.append(base)

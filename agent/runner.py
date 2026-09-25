@@ -1437,6 +1437,15 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"gym media Drive sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # Populate hash-bound evidence after indexing. This does not approve media;
+    # the existing operator review/consent boundary still controls publishing.
+    if config.gym_drive_connect_enabled() or config.gym_drive_connect_gyms():
+        try:
+            from .jobs.moderate_pending_gym_media import run as _moderation_run
+            print(f"[gym-moderation] {_moderation_run()}")
+        except Exception as e:
+            print(f"[gym-moderation] failed: {type(e).__name__}")
+
     # ACCOUNT-KEY DOCTOR (AGENT_ACCOUNT_KEY_DOCTOR_ALERTS, default OFF -> alert
     # suppressed, report still computed): nightly READ-ONLY coverage check that every
     # social-product gym's base still resolves to exactly one non-archived gyms row

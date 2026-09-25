@@ -109,6 +109,13 @@ def portal_deliverable(ticket):
             and bool(str(t.get("client_id") or "").strip()))
 
 
+def _question_without_code_fix(ticket, att=None):
+    t, a = ticket or {}, att or {}
+    return (str(t.get("classification") or "").lower() == "answerable_question"
+            and not t.get("fix_pr_url") and not a.get("pr_url")
+            and a.get("triage") != "code_fix")
+
+
 def _direct_answerable_question(ticket, body=""):
     """A grounded question answer is not a code-fix completion.
 
@@ -117,8 +124,7 @@ def _direct_answerable_question(ticket, body=""):
     authorship so ordinary Echo answers retain their existing behavior.
     """
     t = ticket or {}
-    classification = str(t.get("classification") or "").lower()
-    direct_question = (classification == "answerable_question"
+    direct_question = (_question_without_code_fix(t)
                        and t.get("status") == "verification"
                        and t.get("escalated") is not True
                        and not t.get("hold_tier")
@@ -132,7 +138,7 @@ def _fixer_grounded_question_answer(ticket, att, kind, body=""):
     """True only for the narrow FIXER question-answer deployment exemption."""
     return (kind == _a.KIND_ANSWER
             and bool((att or {}).get("fixer"))
-            and _direct_answerable_question(ticket, body))
+            and _question_without_code_fix(ticket, att))
 
 
 def _customer_fix_reply(ticket, att, body=""):
@@ -150,7 +156,7 @@ def _customer_fix_reply(ticket, att, body=""):
     # conversation checks. Treating every `fixer: true` row as a code-fix
     # completion sent it into the deployment gate, where it could never pass
     # because an answer has no PR or release evidence.
-    if _direct_answerable_question(ticket, body):
+    if _question_without_code_fix(ticket, att):
         return False
     classification = str(ticket.get("classification") or "").lower()
     portal_handoff = (ticket.get("product") == "echo"
@@ -158,7 +164,9 @@ def _customer_fix_reply(ticket, att, body=""):
                       and (ticket.get("escalated") is True
                            or bool(ticket.get("hold_tier"))
                            or bool((ticket.get("verification_after") or {}).get("hold"))))
-    return classification == "code_fix" or bool(att.get("fixer")) or portal_handoff
+    return (classification == "code_fix" or bool(ticket.get("fix_pr_url"))
+            or bool(att.get("pr_url")) or att.get("triage") == "code_fix"
+            or bool(att.get("fixer")) or portal_handoff)
 
 
 def _swap_siblings_verified(result, row_id):
