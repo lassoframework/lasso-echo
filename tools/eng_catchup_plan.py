@@ -5,7 +5,7 @@ cadence slots {platform, format, scheduled_at}; rows are an authoritative export
 Does not import agent modules, access credentials, contact services or write DBs.
 """
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta, time, date, timezone
 import json
 from zoneinfo import ZoneInfo
 
@@ -88,9 +88,95 @@ def plan(data, expected=37):
             'count': len(result), 'mode': 'offline proposal; no writes'}
 
 
+def text_rows(text):
+    """Parse the supplied read-only pipe export; never infer publication proof."""
+    rows = []
+    for line in text.splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        fields = [v.strip() for v in line.split('|')]
+        if len(fields) != 10:
+            raise ValueError('expected ten export columns')
+        rid, day, platform, fmt, label, idx, scheduled, status, reason, asset = fields
+        rows.append(dict(id=rid, gym_id='eng', post_date=day, platform=platform,
+                         format=fmt, time_slot=label,
+                         slot_index=None if idx == '-' else int(idx),
+                         scheduled_at=None if scheduled == '-' else scheduled.replace(' ', 'T') + ':00+00:00',
+                         status=status, reject_reason=None if reason == '-' else reason,
+                         source_media_asset_id=None if asset == '-' else asset))
+    if len({r['id'] for r in rows}) != len(rows):
+        raise ValueError('duplicate row IDs')
+    return rows
+
+
+def forward_plan(rows, review_finished_at):
+    """Move the whole export forward, oldest day/slot bundle first.
+
+    One original feed+story bundle per local day keeps each shared media asset
+    on one date and avoids the two exported stories colliding at 16:30 UTC.
+    Conservative total cap: at most TWO rows per platform/day, including story.
+    Future bundles follow every missed bundle. No live state is read or changed.
+    """
+    cutoff = stamp(review_finished_at).astimezone(timezone.utc)
+    tz = ZoneInfo('America/New_York')
+    groups, untouched = {}, []
+    for row in rows:
+        if row['platform'] == 'googlebusiness':
+            untouched.append(row['id'])
+            continue
+        if (row['platform'] not in ('facebook', 'instagram')
+                or row['format'] not in ('feed', 'story')
+                or row['status'] not in ('approved', 'pending')
+                or row.get('late_post_id')):
+            raise ValueError('unsupported or already publishing/published row')
+        idx = row['slot_index'] if row['slot_index'] is not None else 0
+        if idx not in (0, 1):
+            raise ValueError('unsupported slot index')
+        groups.setdefault((row['post_date'], idx), []).append(row)
+    next_day = cutoff.astimezone(tz).date()
+    result = []
+    asset_days = {}
+    for (old_day, idx), group in sorted(groups.items()):
+        day = max(next_day, date.fromisoformat(old_day))
+        counts, slots = {}, set()
+        for row in group:
+            counts[row['platform']] = counts.get(row['platform'], 0) + 1
+            slot = (row['platform'], row['format'])
+            if slot in slots or counts[row['platform']] > 2:
+                raise ValueError('bundle exceeds per-platform cadence')
+            slots.add(slot)
+        def scheduled(row):
+            hour = 16 if row['format'] == 'story' else (11 if idx == 0 else 22)
+            local = datetime.combine(day, time(hour - 4, 30), tzinfo=tz)
+            return local.astimezone(timezone.utc)
+        while any(scheduled(r) <= cutoff for r in group):
+            day += timedelta(days=1)
+        for row in sorted(group, key=lambda r: (r['platform'], r['format'], r['id'])):
+            asset = row['source_media_asset_id']
+            if asset and asset in asset_days and asset_days[asset] != day:
+                raise ValueError('asset reused on different dates; operator review required')
+            if asset:
+                asset_days[asset] = day
+            result.append(dict(row, old_post_date=old_day,
+                               old_scheduled_at=row['scheduled_at'],
+                               post_date=day.isoformat(), scheduled_at=scheduled(row).isoformat(),
+                               proposed_slot_index=idx, required_status='pending'))
+        next_day = day + timedelta(days=1)
+    return dict(gym_id='eng', timezone='America/New_York', posts_per_day=2,
+                review_finished_at=cutoff.isoformat(), count=len(result), rows=result,
+                untouched_gbp_ids=untouched,
+                review_asset_ids=list(asset_days), mode='offline conditional proposal; no writes')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('input')
+    parser.add_argument('--rows-text', action='store_true', help='shift the full pipe export oldest-first')
+    parser.add_argument('--review-finished-at', help='offset-aware review cutoff; required with --rows-text')
     args = parser.parse_args()
+    if args.rows_text and not args.review_finished_at:
+        parser.error('--rows-text requires --review-finished-at')
     with open(args.input) as f:
-        print(json.dumps(plan(json.load(f)), indent=2))
+        output = (forward_plan(text_rows(f.read()), args.review_finished_at)
+                  if args.rows_text else plan(json.load(f)))
+    print(json.dumps(output, indent=2))

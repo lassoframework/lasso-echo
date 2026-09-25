@@ -1,0 +1,72 @@
+# ENG content_calendar rows 2026-09-19..2026-10-01 (status approved/pending), pulled 2026-09-25 ~4:05 PM CT from Supabase lasso-ops-portal (read-only)
+# id | post_date | account | format | time_slot | slot_index | scheduled_at(UTC) | status | reject_reason(trunc) | source_media_asset_id
+7c3f42fc-cbf0-46ff-be3a-82a53aa8b2f2 | 2026-09-19 | facebook | feed | evening | 0 | 2026-09-19 11:30 | approved | media_asset_review_required | 1ISLY8etTldUnYaiA-_NuQb4ih_3aVByx
+82ffeb39-9581-4aea-a8ae-c8ddbdefbf62 | 2026-09-19 | facebook | feed | evening | 1 | 2026-09-19 22:30 | approved | media_asset_review_required | 1IeLs9KFJecJaeS9A9O5kpZhZftBjfBvK
+9c20ac76-a560-4e52-8cde-30436925ca4d | 2026-09-19 | instagram | feed | evening | 0 | 2026-09-19 11:30 | pending | - | 1ISLY8etTldUnYaiA-_NuQb4ih_3aVByx
+df8e6793-5216-40c7-b1a0-9cff8bb3f6e8 | 2026-09-19 | instagram | feed | evening | 1 | 2026-09-19 22:30 | pending | RESTORED 2026-09-05 (AUD-001) | 1IeLs9KFJecJaeS9A9O5kpZhZftBjfBvK
+258f1572-5141-4518-ad98-ca4eed473e24 | 2026-09-19 | instagram | story | early_morning | 0 | 2026-09-19 16:30 | approved | media_asset_review_required | 1ISLY8etTldUnYaiA-_NuQb4ih_3aVByx
+8b7da4b2-9d71-45d6-952a-c5b601d14c60 | 2026-09-19 | instagram | story | early_morning | 1 | 2026-09-19 16:30 | approved | media_asset_review_required | 1IeLs9KFJecJaeS9A9O5kpZhZftBjfBvK
+7d27c79d-3e66-4dbc-a57a-2a67089ce088 | 2026-09-20 | facebook | feed | evening | 0 | 2026-09-20 11:30 | approved | media_asset_review_required | 1JJ8Ij1KX77-G4lvWY_mPvun4tbpFTkmb
+7df9bb93-bbfb-4543-bd6c-0cbd698d0b4d | 2026-09-20 | facebook | feed | evening | 1 | 2026-09-20 22:30 | approved | media_asset_review_required | 1J_xVfhYww0Nene2KBR-lU--p0_f8EVHH
+0d3fd8ff-04d2-4472-86b8-943344ec0373 | 2026-09-20 | instagram | feed | evening | 0 | 2026-09-20 11:30 | approved | media_asset_review_required | 1JJ8Ij1KX77-G4lvWY_mPvun4tbpFTkmb
+089e7d66-6335-42f8-8e1e-bf852b050f7d | 2026-09-20 | instagram | feed | evening | 1 | 2026-09-20 22:30 | approved | media_asset_review_required | 1J_xVfhYww0Nene2KBR-lU--p0_f8EVHH
+c896c7fb-42e9-4964-bf74-9d442d0a2982 | 2026-09-20 | instagram | story | early_morning | 0 | 2026-09-20 16:30 | approved | media_asset_review_required | 1JJ8Ij1KX77-G4lvWY_mPvun4tbpFTkmb
+7874bc11-84f5-4064-bca6-d8f34d0f47a0 | 2026-09-20 | instagram | story | early_morning | 1 | 2026-09-20 16:30 | approved | media_asset_review_required | 1J_xVfhYww0Nene2KBR-lU--p0_f8EVHH
+3c7aee8d-cf1c-4de1-9cb5-dfc75594729e | 2026-09-21 | facebook | feed | evening | 0 | 2026-09-21 11:30 | approved | media_asset_review_required | 1JbkMsrK0NJ57hTD3EaFJ2G_L2TF3r9ve
+47355bab-4033-40ed-892b-fad8cc9e7cd6 | 2026-09-21 | facebook | feed | evening | 1 | 2026-09-21 22:30 | approved | media_asset_review_required | 1JlW7EZSMaIgqtwN6C5ixqWTo7uE7p_97
+b7d6384c-fd8b-4bf1-8922-b22ea1846823 | 2026-09-21 | instagram | feed | evening | 0 | 2026-09-21 11:30 | approved | media_asset_review_required | 1JbkMsrK0NJ57hTD3EaFJ2G_L2TF3r9ve
+bc517a94-1f4d-456d-bcf0-af1c02bf8d2f | 2026-09-21 | instagram | feed | evening | 1 | 2026-09-21 22:30 | approved | media_asset_review_required | 1JlW7EZSMaIgqtwN6C5ixqWTo7uE7p_97
+9c80ffef-e7f3-4ddd-b850-4f6604c2a3b8 | 2026-09-21 | instagram | story | early_morning | 0 | 2026-09-21 16:30 | approved | media_asset_review_required | 1JbkMsrK0NJ57hTD3EaFJ2G_L2TF3r9ve
+ae83660c-660e-46a1-9a9b-5c199b9c636d | 2026-09-21 | instagram | story | early_morning | 1 | 2026-09-21 16:30 | approved | media_asset_review_required | 1JlW7EZSMaIgqtwN6C5ixqWTo7uE7p_97
+b3d7dfcd-664e-4b70-a3b4-bd91caacf110 | 2026-09-22 | facebook | feed | evening | 0 | 2026-09-22 11:30 | approved | media_asset_review_required | 1Jn0XUPS7d1iFp_hoDhiUdrl6s4uO0x0O
+ce4fcb31-0ff2-443a-aed5-f611299307ed | 2026-09-22 | facebook | feed | evening | 1 | 2026-09-22 22:30 | approved | media_asset_review_required | 1JzhLF5DrtjOU-320OCqQS0wjpAhNY-vL
+4d3d2a4b-8eac-424c-90d5-9ef1221668cd | 2026-09-22 | instagram | feed | evening | 0 | 2026-09-22 11:30 | approved | media_asset_review_required | 1Jn0XUPS7d1iFp_hoDhiUdrl6s4uO0x0O
+5d3c1c74-2d16-4da0-90bb-0ab7aace26d8 | 2026-09-22 | instagram | feed | evening | 1 | 2026-09-22 22:30 | approved | media_asset_review_required | 1JzhLF5DrtjOU-320OCqQS0wjpAhNY-vL
+aabfff6d-e69e-4977-b22e-c32da9f8c53c | 2026-09-22 | instagram | story | early_morning | 0 | 2026-09-22 16:30 | approved | media_asset_review_required | 1Jn0XUPS7d1iFp_hoDhiUdrl6s4uO0x0O
+65f5e4f7-ce68-43c3-8914-11c82dd4778c | 2026-09-22 | instagram | story | early_morning | 1 | 2026-09-22 16:30 | approved | media_asset_review_required | 1JzhLF5DrtjOU-320OCqQS0wjpAhNY-vL
+061723fa-b2d3-4c65-bf32-3ec9b89b114f | 2026-09-23 | facebook | feed | evening | 0 | 2026-09-23 11:30 | approved | media_asset_review_required | 1K4PfaQQ5rS4DOtqY2F750xEDuiyiiWj0
+9b8f2bec-4ad2-41d2-a352-62445dc01311 | 2026-09-23 | facebook | feed | evening | 1 | 2026-09-23 22:30 | approved | media_asset_review_required | 1K9ShcrckXcGRu774jpilrEtK6O7SIwKb
+f4ce2767-6ce7-413e-a4bb-7fab8aa51676 | 2026-09-23 | instagram | feed | evening | 0 | 2026-09-23 11:30 | approved | media_asset_review_required | 1K4PfaQQ5rS4DOtqY2F750xEDuiyiiWj0
+6546fb8a-2f90-4bac-84a3-3e204b4a7439 | 2026-09-23 | instagram | feed | evening | 1 | 2026-09-23 22:30 | approved | media_asset_review_required | 1K9ShcrckXcGRu774jpilrEtK6O7SIwKb
+164146ba-e725-42a3-9d9d-ae588d7d0022 | 2026-09-23 | instagram | story | early_morning | 0 | 2026-09-23 16:30 | approved | media_asset_review_required | 1K4PfaQQ5rS4DOtqY2F750xEDuiyiiWj0
+415a44a0-b331-43d6-aa2a-6f617be9688d | 2026-09-23 | instagram | story | early_morning | 1 | 2026-09-23 16:30 | approved | media_asset_review_required | 1K9ShcrckXcGRu774jpilrEtK6O7SIwKb
+65db6c55-8fba-46c4-a938-87e0ea74ceee | 2026-09-24 | facebook | feed | evening | 0 | 2026-09-24 11:30 | approved | media_asset_review_required | 1KMomDcCtsPhx1e38-gMuQA96XazVcope
+91461810-d152-4d8e-a77a-961a51b621e5 | 2026-09-24 | facebook | feed | evening | 1 | 2026-09-24 22:30 | approved | media_asset_review_required | 1KNEEPhzg7DjUDxZeagt1QilueLDgLPER
+f45b8500-05f1-4733-9c3d-766d4f0d09d6 | 2026-09-24 | instagram | feed | evening | 0 | 2026-09-24 11:30 | approved | media_asset_review_required | 1KMomDcCtsPhx1e38-gMuQA96XazVcope
+71f998f4-928a-43d2-b30e-9e83b07a6bbc | 2026-09-24 | instagram | feed | evening | 1 | 2026-09-24 22:30 | approved | media_asset_review_required | 1KNEEPhzg7DjUDxZeagt1QilueLDgLPER
+5f0a65b5-af1a-4a3b-820b-e6badc4a6a75 | 2026-09-24 | instagram | story | early_morning | 0 | 2026-09-24 16:30 | approved | media_asset_review_required | 1KMomDcCtsPhx1e38-gMuQA96XazVcope
+07c4bd77-c3ea-435e-ad92-c9025bedf5d8 | 2026-09-24 | instagram | story | early_morning | 1 | 2026-09-24 16:30 | approved | media_asset_review_required | 1KNEEPhzg7DjUDxZeagt1QilueLDgLPER
+c0f8dee9-a1fb-4e6f-bd3d-c06fed941ea0 | 2026-09-25 | facebook | feed | evening | 0 | 2026-09-25 11:30 | approved | media_asset_review_required | 1KOu-LBym_FLdYZgMB2eeOAo6_b8LpqEt
+0303dfec-00e3-47cd-95cb-dc8ebdb6d263 | 2026-09-25 | facebook | feed | evening | 1 | 2026-09-25 22:30 | approved | - | 1KWqwxxOIkQxjco2cIDA3p4ft_-LhqiXF
+f21d719f-8900-4271-841a-a7a6ef8b3373 | 2026-09-25 | instagram | feed | evening | 0 | 2026-09-25 11:30 | pending | RESTORED 2026-09-05 (AUD-001) | 1KOu-LBym_FLdYZgMB2eeOAo6_b8LpqEt
+84921fa4-2bdd-4cbb-bb1a-d469e7671e07 | 2026-09-25 | instagram | feed | evening | 1 | 2026-09-25 22:30 | approved | - | 1KWqwxxOIkQxjco2cIDA3p4ft_-LhqiXF
+f9fd0dbc-d415-4c9f-9879-6c075c0bf269 | 2026-09-25 | instagram | story | early_morning | 0 | 2026-09-25 16:30 | approved | media_asset_review_required | 1KOu-LBym_FLdYZgMB2eeOAo6_b8LpqEt
+6884694b-647b-4835-b1d4-64d41628ab26 | 2026-09-25 | instagram | story | early_morning | 1 | 2026-09-25 16:30 | approved | media_asset_review_required | 1KWqwxxOIkQxjco2cIDA3p4ft_-LhqiXF
+030d264c-f55e-422a-8075-09a526509daa | 2026-09-26 | facebook | feed | evening | 0 | - | approved | - | 1KyMLHofZY-J6LAXcRhfyJNlAYw9gvXUA
+81b9c13b-0b37-41b5-a182-65ccf7ea2a33 | 2026-09-26 | facebook | feed | evening | 1 | - | approved | RESTORED (AUD-001) | 1KzqSt7rivUDlylPgSKNcchBsw-0-wcWN
+efa91ac5-63c7-4e75-b822-c6fa34e7242e | 2026-09-26 | googlebusiness | update | evening | - | - | approved | - | -
+332c8cc7-b3c8-4309-b29c-74b92b7321f7 | 2026-09-26 | instagram | feed | evening | 0 | - | approved | - | 1KyMLHofZY-J6LAXcRhfyJNlAYw9gvXUA
+4cfd8c86-226a-4ece-890b-b7fb2ebca2de | 2026-09-26 | instagram | feed | evening | 1 | - | approved | RESTORED (AUD-001) | 1KzqSt7rivUDlylPgSKNcchBsw-0-wcWN
+bcaec31c-aefb-42df-ab82-54e698ca692d | 2026-09-26 | instagram | story | early_morning | 0 | - | approved | RESTORED (AUD-001) | 1KyMLHofZY-J6LAXcRhfyJNlAYw9gvXUA
+0c3cb1da-6410-44bb-9777-f336845d754c | 2026-09-26 | instagram | story | early_morning | 1 | - | approved | - | 1KzqSt7rivUDlylPgSKNcchBsw-0-wcWN
+53947e19-1507-4c50-bbbb-3bbec90d7d28 | 2026-09-27 | facebook | feed | evening | 0 | - | approved | RESTORED (AUD-001) | 1L3LG8-Ef-DOmA6AUuTPkCF6lcOE5pgPg
+3c54a244-856f-4f81-a951-7eb78ca7d1c4 | 2026-09-27 | facebook | feed | evening | 1 | - | approved | - | 1LAioP9G4jh5o2S9SixOryz1Yv1xxsCOD
+9e6a32fd-edfb-4739-9ef8-b995bc9358d7 | 2026-09-27 | instagram | feed | evening | 0 | - | approved | - | 1L3LG8-Ef-DOmA6AUuTPkCF6lcOE5pgPg
+ae81ef7d-fe4a-459e-9676-0e7e1c7981dc | 2026-09-27 | instagram | feed | evening | 1 | - | approved | RESTORED (AUD-001) | 1LAioP9G4jh5o2S9SixOryz1Yv1xxsCOD
+c6dc93ba-418c-4a44-a418-e1bfa0b9ba43 | 2026-09-27 | instagram | story | early_morning | 0 | - | approved | RESTORED (AUD-001) | 1L3LG8-Ef-DOmA6AUuTPkCF6lcOE5pgPg
+7499a64a-7c43-46a7-821d-0c763893d524 | 2026-09-27 | instagram | story | early_morning | 1 | - | approved | - | 1LAioP9G4jh5o2S9SixOryz1Yv1xxsCOD
+1980621d-65d3-44d1-a9e0-f5d0a6e20103 | 2026-09-28 | facebook | feed | evening | 0 | - | approved | - | 1LIZl7HnzI_snUGEtZ-GNmFnn5HaVRqpz
+680e58f8-93ff-4f9b-86a4-bbfadb80a7c2 | 2026-09-28 | facebook | feed | evening | 1 | - | approved | RESTORED (AUD-001) | 1LKh2znmh4T4OM9zfMYVT_VXzijcXcsq1
+c10aada1-ff2b-476d-a910-18417ce677c0 | 2026-09-28 | instagram | feed | evening | 0 | - | approved | - | 1LIZl7HnzI_snUGEtZ-GNmFnn5HaVRqpz
+e7a2dae5-a8c0-4268-bae6-5eea1d720362 | 2026-09-28 | instagram | feed | evening | 1 | - | approved | RESTORED (AUD-001) | 1LKh2znmh4T4OM9zfMYVT_VXzijcXcsq1
+7300553b-d2af-4c78-abf1-7071e21c4302 | 2026-09-28 | instagram | story | early_morning | 0 | - | approved | - | 1LIZl7HnzI_snUGEtZ-GNmFnn5HaVRqpz
+8382635a-3d5a-4bd9-9103-42ab57167c89 | 2026-09-28 | instagram | story | early_morning | 1 | - | approved | RESTORED (AUD-001) | 1LKh2znmh4T4OM9zfMYVT_VXzijcXcsq1
+5e473a53-9c8e-4c6c-b036-53aaeb033997 | 2026-09-29 | facebook | feed | evening | 0 | - | pending | - | 1AM_R952sdKirpSipm0MnvRsWebGE8DLt
+6dcf45af-b12a-4674-86a9-105cb19e4cfe | 2026-09-29 | googlebusiness | update | evening | - | - | pending | - | -
+db275400-8202-41bf-ac9c-140a9ca5d937 | 2026-09-29 | instagram | feed | evening | - | - | pending | - | -
+3b38495c-d5ca-40e1-9204-eedffd5cf937 | 2026-09-29 | instagram | story | early_morning | - | - | pending | - | -
+43911246-a3e5-4c23-a78a-d1204905da85 | 2026-09-30 | facebook | feed | evening | - | - | pending | - | -
+fc82bac7-dc88-4b59-b5ca-5c5d2f85f43d | 2026-09-30 | instagram | feed | evening | 0 | - | pending | publish_guard: multi_ask | 1EyMHiJU9AND8zRMmaoEBIbKcuT8nquFl
+fd592056-f1d6-472b-9539-c8141eb1057e | 2026-09-30 | instagram | story | early_morning | - | - | pending | - | -
+ad13192a-5b57-4011-ad29-53cc2f29763e | 2026-10-01 | facebook | feed | evening | 1 | - | pending | publish_guard: multi_ask | 1HdXBsirSUbImkfr_isjhn9pWTjUkHT61
+998ca871-68e2-4626-9792-44bbb05140f4 | 2026-10-01 | instagram | feed | evening | 1 | - | pending | publish_guard: multi_ask | 1HdXBsirSUbImkfr_isjhn9pWTjUkHT61

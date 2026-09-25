@@ -36,3 +36,34 @@ def test_unknown_or_overbooked_schedule_refused(fault):
         data['slots'].pop(0)
     with pytest.raises(ValueError):
         m.plan(data, expected=37 if fault == 'wrong_count' else 2)
+
+
+def export_rows():
+    return m.text_rows((Path(__file__).parents[1] / 'docs/eng-rows-20260925.txt').read_text())
+
+
+def test_actual_eng_export_moves_all_missed_before_future_without_flood():
+    from collections import Counter
+    rows = export_rows()
+    out = m.forward_plan(rows, '2026-09-26T00:00:00-04:00')
+    assert out['count'] == 68
+    assert len(out['untouched_gbp_ids']) == 2
+    assert len(out['review_asset_ids']) == 23
+    assert sum(r['reject_reason'] == 'media_asset_review_required' for r in out['rows']) == 37
+    assert max(Counter((r['platform'], r['post_date']) for r in out['rows']).values()) <= 2
+    assert len({(r['platform'], r['scheduled_at']) for r in out['rows']}) == 68
+    missed = [r for r in out['rows'] if r['old_post_date'] <= '2026-09-25']
+    future = [r for r in out['rows'] if r['old_post_date'] > '2026-09-25']
+    assert len(missed) == 42 and len(future) == 26
+    assert max(r['scheduled_at'] for r in missed) < min(r['scheduled_at'] for r in future)
+    for asset in out['review_asset_ids']:
+        assert len({r['post_date'] for r in out['rows'] if r['source_media_asset_id'] == asset}) == 1
+    assert out['rows'][0]['scheduled_at'] == '2026-09-26T11:30:00+00:00'
+    assert out['rows'][-1]['scheduled_at'] == '2026-10-18T22:30:00+00:00'
+
+
+@pytest.mark.parametrize('cutoff', ['2026-09-26T07:30:00-04:00', '2026-09-29T19:00:00-04:00'])
+def test_later_review_shifts_whole_plan_strictly_after_completion(cutoff):
+    out = m.forward_plan(export_rows(), cutoff)
+    assert all(m.stamp(r['scheduled_at']) > m.stamp(cutoff) for r in out['rows'])
+    assert out['rows'][0]['post_date'] > cutoff[:10]
