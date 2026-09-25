@@ -2048,3 +2048,25 @@ def test_owned_claim_token_reaches_each_pre_network_ledger_transition(
     assert store.rows[f"owned-{ledger_mode}"]["publish_claim_token"] is None
     expected_status = "deleted" if ledger_mode == "duplicate" else "pending"
     assert store.rows[f"owned-{ledger_mode}"]["status"] == expected_status
+
+
+@pytest.mark.parametrize('cooldown,fmt,blocked', [
+    (False, 'feed', False), (True, 'story', False), (True, 'feed', True),
+])
+def test_calendar_grade_obeys_caption_cooldown_switch_and_story_exemption(
+        armed, monkeypatch, cooldown, fmt, blocked):
+    from agent import caption_ledger, publish_guard
+    monkeypatch.setenv('AGENT_CALENDAR_GRADE', 'true')
+    monkeypatch.setenv('AGENT_CAPTION_COOLDOWN', str(cooldown).lower())
+    checked = []
+    monkeypatch.setattr(caption_ledger, 'is_blocked',
+                        lambda *a, **k: checked.append(a) or True)
+    monkeypatch.setattr(publish_guard, 'check', lambda _: [])
+    store = _FakeStore([_row('cooldown-row', fmt=fmt, status='approved')])
+    pub = _FakePublisher()
+    result = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                             notifier=_FakeNotifier(), now=LATE_NOW,
+                             approved_only=True)
+    assert bool(checked) is blocked
+    assert len(pub.calls) == (0 if blocked else 1)
+    assert store.rows['cooldown-row']['status'] == ('pending' if blocked else 'published')

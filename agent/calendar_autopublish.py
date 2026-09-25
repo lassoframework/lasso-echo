@@ -1204,8 +1204,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             # rule (report-card build 2026-08-28). Same-date records are the
             # row's own staging stamp / its cross-post siblings and never
             # block (caption_ledger same-date rule).
-            if _cl.is_blocked(gym_id, _cap, row.get("post_date", ""),
-                              db=None):
+            # Match planner and publisher semantics: the cooldown switch owns
+            # this ledger, and stories have no outbound caption. Calendar grade
+            # alone must not activate a stale ledger or self-block a story.
+            if (config.caption_cooldown_enabled() and not _is_story_row(row)
+                    and _cl.is_blocked(gym_id, _cap, row.get("post_date", ""),
+                                       db=None)):
                 _reverted = _revert_to_pending(row_id=row_id, store=store,
                                                gym_id=gym_id,
                                                expected_claim_token=claim_token,
