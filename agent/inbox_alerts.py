@@ -41,7 +41,7 @@ import unicodedata
 from datetime import datetime, timezone
 
 from . import config
-from .zernio import ZernioClient, _parse_iso
+from .zernio import ZernioClient, ZernioPaginationError, _parse_iso
 
 # An unanswered comment keeps appearing on the daily card (max one card/day)
 # until someone replies or it ages past this window — the nag IS the feature.
@@ -53,6 +53,21 @@ POST_LOOKBACK_DAYS = 30
 REVIEW_LOOKBACK_DAYS = 14
 MAX_ITEMS_PER_CARD = 5
 SNIPPET_LEN = 100
+
+# Operator-confirmed cancellation, 2026-09-14. Cover both historical keys;
+# suppress alerts only, without deleting accounts, evidence, or queued work.
+ALERT_RETIRED_BASES = frozenset({
+    "crossfitreverb", "crossfitreverb6cdf33", "crossfitreverb30b5b2",
+})
+
+
+def alerts_retired(gym_id):
+    base = str(gym_id or "").strip().lower()
+    for suffix in ("_ig", "_fb", "_gbp"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    return base in ALERT_RETIRED_BASES
 
 
 # ---- classification (pure) --------------------------------------------------------
@@ -153,13 +168,18 @@ def _complete_read_or_incomplete(zernio, complete_name, ordinary_name, *args):
     Older injected adapters may only expose the ordinary one-page reader.  They
     still support the historical alert card path, but their evidence is marked
     incomplete so it can never become a reconcilable FIXER snapshot.  A present
-    complete reader that errors is deliberately not retried through the ordinary
-    method: doing so would hide a failed proof read behind partial data.
+    pagination proof failure may fall back for visibility only. Its evidence
+    stays incomplete and cannot authorize reconciliation or ticket resolution.
+    Transport/auth failures still surface as errors without a second request.
     """
     from .fixer_reply_reconciliation import pagination_complete
     complete_reader = getattr(zernio, complete_name, None)
     if callable(complete_reader):
-        payload = complete_reader(*args) or {}
+        try:
+            payload = complete_reader(*args) or {}
+        except ZernioPaginationError:
+            payload = getattr(zernio, ordinary_name)(*args) or {}
+            return payload, False
         return payload, pagination_complete(payload)
     payload = getattr(zernio, ordinary_name)(*args) or {}
     return payload, False
@@ -365,11 +385,13 @@ def _default_notifier(gym_id, text):
         ch = None if gym_id == "lasso" else _coach_channel(gym_id)
         if ch:
             from .slack_surface import SlackPoster
-            SlackPoster(channel=ch).post_notice(text)
+            receipt = SlackPoster(channel=ch).post_notice(text)
         else:
             from . import ops_alerts
-            ops_alerts.alert(text)
-        return True
+            # This lane has its own flag and daily receipt-based dedupe. A
+            # generic repeat/noise gate must not eat an unanswered-work card.
+            receipt = ops_alerts.alert(text, force=True)
+        return bool(receipt and receipt.get("ok") and receipt.get("ts"))
     except Exception as exc:  # noqa: BLE001
         print(f"[inbox-alerts] card post failed for {gym_id}: "
               f"{type(exc).__name__}")
@@ -415,6 +437,10 @@ def run(gyms=None, zernio=None, now=None, notifier=None, kv_get=None, kv_set=Non
     for gym_id in gyms:
         stamp = f"inbox_alert_{gym_id}_{day}"
         try:
+            if alerts_retired(gym_id):
+                results.append({"gym_id": gym_id, "ok": True,
+                                "skipped": "reply alerts retired by operator"})
+                continue
             if kv_get(stamp):
                 results.append({"gym_id": gym_id, "ok": True,
                                 "skipped": "card already sent today"})
@@ -425,6 +451,8 @@ def run(gyms=None, zernio=None, now=None, notifier=None, kv_get=None, kv_set=Non
                 continue
             card = build_card(gym_id, summary.get("items") or [])
             if card:
+                if not summary.get("complete"):
+                    card += "\nPartial inbox view; additional unanswered items may exist. Manual verification required."
                 # Preserve the exact provider evidence behind this new alert.  The
                 # snapshot is read-only evidence, not permission to act.  Storage
                 # failure leaves the existing alert path working but makes this
