@@ -156,14 +156,15 @@ def _customer_fix_reply(ticket, att, body=""):
     # conversation checks. Treating every `fixer: true` row as a code-fix
     # completion sent it into the deployment gate, where it could never pass
     # because an answer has no PR or release evidence.
-    if _question_without_code_fix(ticket, att):
-        return False
     classification = str(ticket.get("classification") or "").lower()
     portal_handoff = (ticket.get("product") == "echo"
                       and portal_deliverable(ticket)
                       and (ticket.get("escalated") is True
                            or bool(ticket.get("hold_tier"))
                            or bool((ticket.get("verification_after") or {}).get("hold"))))
+    # A held/escalated portal handoff still overrides the no-code question exception.
+    if _question_without_code_fix(ticket, att) and not portal_handoff:
+        return False
     return (classification == "code_fix" or bool(ticket.get("fix_pr_url"))
             or bool(att.get("pr_url")) or att.get("triage") == "code_fix"
             or bool(att.get("fixer")) or portal_handoff)
