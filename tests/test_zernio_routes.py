@@ -31,11 +31,31 @@ CONNECTED_IG = {
 }
 
 
+def test_map_status_grant_expiry_boundary():
+    # Deterministic before/at/after the fixture's real grant expiry. The expiry check is
+    # (now - connectedAt) > expires_in, so AT expiry the account is still connected and
+    # only strictly after does it flip to expired.
+    from datetime import datetime, timedelta, timezone
+    expiry = datetime(2026, 9, 27, 13, 14, 3, 205000, tzinfo=timezone.utc)
+    for delta, expect_expired in ((timedelta(days=-1), False),
+                                  (timedelta(0), False),        # exactly at expiry: still valid
+                                  (timedelta(seconds=1), True)):
+        out = z.map_status({"accounts": [CONNECTED_IG]}, now=expiry + delta)
+        ig = out["platforms"]["instagram"]
+        assert ig["expired"] is expect_expired, f"at {delta}: {ig}"
+        assert ig["expires_at"] == "2026-09-27T13:14:03.205000+00:00"
+
+
 # =============================================================================
 # PURE MAPPERS
 # =============================================================================
 def test_map_status_connected_ig_with_handle():
-    out = z.map_status({"accounts": [CONNECTED_IG]})
+    from datetime import datetime, timezone
+    # Pin the clock to BEFORE the fixture's grant expiry (2026-09-27T13:14:03.205Z): today the
+    # fixture would read expired, but this test pins the CONNECTED shape, not the expiry logic
+    # (the boundary itself is covered deterministically above).
+    out = z.map_status({"accounts": [CONNECTED_IG]},
+                       now=datetime(2026, 9, 26, tzinfo=timezone.utc))
     assert out["platforms"]["instagram"] == {
         "connected": True, "handle": "lassoframework", "expired": False,
         # P-10: the REAL grant expiry off the fixture, not a placeholder. IG/FB grants
@@ -689,7 +709,15 @@ def test_status_not_provisioned_is_all_not_connected_no_client_call(db_env):
     assert body["platforms"]["facebook"]["connected"] is False
 
 
-def test_status_folds_live_shape(db_env):
+def test_status_folds_live_shape(db_env, monkeypatch):
+    from datetime import datetime, timezone
+    # The handler takes no clock, so pin zernio's datetime module-wide FOR THIS TEST ONLY.
+    # Connected-shape assertion: the pinned now is before the fixture's grant expiry.
+    class _PinnedNow(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 26, tzinfo=timezone.utc)
+    monkeypatch.setattr(z, "datetime", _PinnedNow)
     _db.gym_upsert("gymA", zernio_profile_id="P1")
     fake = _FakeClient(accounts={"accounts": [CONNECTED_IG]})
     status, body = zr.handle_social_status("gymA", client=fake)

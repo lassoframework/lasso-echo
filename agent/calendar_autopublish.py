@@ -1266,6 +1266,24 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             failed.append(row_id)
             continue
 
+        # Client-specific media reuse rules apply across EVERY outbound platform,
+        # even when a planner used a legacy/small-library fallback.
+        from .media_reuse_policy import publish_hold_reason
+        _reuse_reason = publish_hold_reason(
+            row, gym_id, store, now=now,
+            library_path=getattr(account, "library_path", None))
+        if _reuse_reason:
+            _reverted = _revert_to_pending(
+                store, row_id, reject_reason=_reuse_reason, gym_id=gym_id,
+                expected_claim_token=claim_token,
+                revert_status="approved" if approved_only else "pending")
+            if not _reverted:
+                recovery_required.append(row_id)
+            _alert_publish_blocked(gym_id, row_id, _reuse_reason, reverted=_reverted,
+                                   revert_status="approved" if approved_only else "pending")
+            failed.append(row_id)
+            continue
+
         # CAPTION TRACE (pure logging, WIRING.md 2026-08-27): stage-by-stage
         # visible-length for the outbound caption, so a caption that goes
         # missing between the row and the API call is grep-able as

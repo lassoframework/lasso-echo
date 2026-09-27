@@ -132,9 +132,11 @@ def is_usable(asset):
 
 def base_gym_key(account_key):
     """The gym base key a per-platform account key rolls up to (pierce_ig ->
-    pierce), matching podcast_selector.base_gym_key / real_month_run."""
+    pierce), matching podcast_selector.base_gym_key / real_month_run. '_gbp'
+    is stripped too: a Google Business Profile lane key must roll up to the
+    same base so a GBP-used asset shares the gym's pool and reuse history."""
     base = str(account_key or "")
-    for suf in ("_ig", "_fb"):
+    for suf in ("_ig", "_fb", "_gbp"):
         if base.endswith(suf):
             return base[: -len(suf)]
     return base
@@ -161,6 +163,9 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
         return []
 
     cutoff = now - timedelta(days=REUSE_COOLDOWN_DAYS)
+    from .media_reuse_policy import reuse_months, months_before
+    if reuse_months(base):
+        cutoff = months_before(now, reuse_months(base))
     month = now.strftime("%Y-%m")
     excl = {str(i) for i in (exclude_ids or ()) if i}
 
