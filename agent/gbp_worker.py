@@ -49,7 +49,24 @@ def build_gbp_payload_for_row(row, connection):
     )
 
 
-def publish_gbp_row(row, connection, *, client, draft=True):
+def _media_reuse_hold(row, *, now=None, history_store=None, media_store=None):
+    """Nine-month media-reuse guard at the GBP outbound boundary (same policy as the
+    calendar_autopublish lane). Only gyms with a nonzero reuse_months policy touch the
+    database — and only then, only for a real (non-draft) send; every other client and
+    every rehearsal runs with zero extra reads."""
+    from .media_reuse_policy import publish_hold_reason, reuse_months
+    gym_id = row.get("gym_id")
+    if not reuse_months(gym_id):
+        return None
+    if history_store is None:
+        from .portal_calendar_store import SupabaseCalendarStore
+        history_store = SupabaseCalendarStore()
+    return publish_hold_reason(row, gym_id, history_store, now=now,
+                               media_store=media_store)
+
+
+def publish_gbp_row(row, connection, *, client, draft=True, now=None,
+                    history_store=None, media_store=None):
     """Send one approved GBP row through Zernio. Re-validates the hard rails at send
     time (belt-and-suspenders over the planner) and refuses to ship a violation.
 
@@ -89,6 +106,12 @@ def publish_gbp_row(row, connection, *, client, draft=True):
     except gbp.GbpPayloadError as e:
         return {"ok": False, "status": "failed", "late_post_id": "",
                 "reject_reason": f"payload: {e}", "mode": ""}
+    if not draft:
+        hold = _media_reuse_hold(row, now=now, history_store=history_store,
+                                 media_store=media_store)
+        if hold:
+            return {"ok": False, "status": "approved", "late_post_id": "",
+                    "reject_reason": hold, "held": "media_reuse", "mode": ""}
     # §7.2 / G7: ONE retry on a TRANSIENT transport error at SEND time. A send that raised
     # never went live, so re-sending once cannot double-post (unlike a reconcile re-send).
     # A policy/other error is NOT retried (it would just fail again). Second failure -> the
@@ -209,7 +232,8 @@ def resolve_connection(connections, gbp_location_id=None):
                        f"(location={gbp_location_id or 'any'})")
 
 
-def publish_photo_drop(row, connection, *, client, draft=True, alert=None):
+def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
+                       now=None, history_store=None, media_store=None):
     """§6.4 photo drop: add the image to the GBP gallery via Zernio gmb-media. This
     endpoint is SYNCHRONOUS with NO webhook and no caption — 2xx -> published now,
     error -> failed + reason + alert. No caption gate (a gallery photo has no text). In
@@ -226,6 +250,11 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None):
     if draft:
         return {"ok": True, "status": "published", "late_post_id": "",
                 "reject_reason": "", "mode": "draft"}
+    hold = _media_reuse_hold(row, now=now, history_store=history_store,
+                             media_store=media_store)
+    if hold:
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": hold, "held": "media_reuse", "mode": ""}
     try:
         resp = client.create_gmb_media(connection["zernio_account_id"],
                                        row["image_url"])
@@ -294,7 +323,8 @@ def in_publish_window(now, tz_str):
     return local.weekday() < 5 and 8 <= local.hour < 10
 
 
-def publish_one(row, connections, *, client, draft=True, alert=None, now=None):
+def publish_one(row, connections, *, client, draft=True, alert=None, now=None,
+                history_store=None, media_store=None):
     """Publish one approved GBP row: connection precheck (§7.1) + routing + send. Returns
     the status transition dict {status, late_post_id, reject_reason}. A needs_reconnect
     gym HOLDS silently (status stays 'approved'); a routing failure or rail violation
@@ -324,14 +354,19 @@ def publish_one(row, connections, *, client, draft=True, alert=None, now=None):
         return {"status": "approved", "late_post_id": "", "reject_reason": "",
                 "held": "outside_window"}
     is_photo = str(row.get("format") or "").lower() == "photo"
-    res = (publish_photo_drop(row, conn, client=client, draft=draft, alert=alert)
+    res = (publish_photo_drop(row, conn, client=client, draft=draft, alert=alert,
+                             now=now, history_store=history_store,
+                             media_store=media_store)
            if is_photo
-           else publish_gbp_row(row, conn, client=client, draft=draft))
+           else publish_gbp_row(row, conn, client=client, draft=draft, now=now,
+                                history_store=history_store,
+                                media_store=media_store))
     if not res["ok"] and not res.get("held") and alert and not is_photo:
         alert(f"GBP send failed for {row.get('gym_id')} row {row.get('id')}: "
               f"{res['reject_reason']}")
     return {"status": res["status"], "late_post_id": res["late_post_id"],
             "reject_reason": res["reject_reason"],
+            "held": res.get("held") or "",
             # CARRY THE MODE. publish_gbp_row returns status='published' for a DRAFT
             # too, and the ONLY thing distinguishing a rehearsal from a real post is
             # this field — which this dict used to drop on the floor. That is why
@@ -341,7 +376,8 @@ def publish_one(row, connections, *, client, draft=True, alert=None, now=None):
             "gbp_location_id": conn.get("gbp_location_id")}   # for the G3 metrics bump
 
 
-def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None):
+def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None,
+                    history_store=None, media_store=None):
     """Publish lane: send every APPROVED, due googlebusiness row (draft in this run).
     Groups by gym, reads its connections once, routes + sends each row, and writes the
     status back (published / failed+reason; needs_reconnect holds silently). Returns a
@@ -377,7 +413,9 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                     continue
             try:
                 res = publish_one(row, conns, client=client, draft=draft, alert=alert,
-                                  now=(now or _utcnow()))
+                                  now=(now or _utcnow()),
+                                  history_store=history_store,
+                                  media_store=media_store)
             except Exception as e:  # noqa: BLE001
                 failed += 1
                 store.mark_failed(row.get("id"), f"worker error: {type(e).__name__}")

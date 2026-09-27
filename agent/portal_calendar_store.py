@@ -257,6 +257,39 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def list_media_publish_history(self, account_key, since):
+        """Complete cross-platform send history for a strict reuse decision.
+
+        Include archived variants and in-flight claims. Pagination avoids a
+        silently truncated nine-month history under PostgREST's response cap.
+
+        A row already stamped 'published' but lacking published_at CONSERVATIVELY
+        participates: PostgREST's gte filter silently drops NULLs, which used to
+        let a published row slip the reuse window and re-send a nine-month-old
+        asset. The and(status.eq.published,published_at.is.null) arm admits only
+        actually-published rows with a NULL stamp — a pending/draft row has no
+        published_at either and must never count as send history.
+        """
+        rows = []
+        while True:
+            params = {"gym_id": f"eq.{account_key}",
+                      "or": f"(published_at.gte.{since},"
+                            f"and(status.eq.published,published_at.is.null),"
+                            f"status.eq.publishing)",
+                      "order": "id", "limit": "500", "offset": str(len(rows))}
+            r = self._client().get(self._rest(_TABLE), params=params,
+                                   headers=self._headers(), timeout=30)
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, "media history unavailable")
+            page = r.json()
+            if not isinstance(page, list):
+                raise PortalStoreError(502, "invalid media history")
+            rows.extend(page)
+            if len(page) < 500:
+                return rows
+            if len(rows) >= 10000:
+                raise PortalStoreError(502, "media history exceeds safe read bound")
+
     def list_variant_candidates(self, account_key, month):
         """The gym's 'candidate' rows (variant_status='candidate') whose
         post_date falls inside `month` — the complement of list_month's
