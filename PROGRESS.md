@@ -3,7 +3,8 @@
 - [~] Zanshin photo reuse now observes nine calendar months at selection and again before Instagram, Facebook, Google Business posts and gallery sends. History spans platforms and archived variants, includes in-flight claims and undated published rows, and fails closed when identity or history cannot be verified. Original media files are retained; archive means ineligible for reuse during the window.
 - [~] Portal requests to replace website photography route to a website code fix instead of an ungroundable question. The Bolton Club's exact new upload still needs identification before its site photos can be replaced.
 - [x] Kimi low-effort swarm changes independently reviewed and tested: 998 focused tests passed, 6 skipped, with outbound network denied by the OS sandbox. Tests cover actual calendar and GBP send boundaries, cross-platform identity, pagination and calendar-month arithmetic.
-- [ ] Merge, deploy and verify the live client behavior. Support tickets have not been marked resolved and no customer messages were sent.
+- [x] Full CI initially passed 8,508 tests but exposed two existing connection-shape tests whose fixed grant expired on September 27. Those two clocks are now scoped deterministically; an explicit before/at/after expiry assertion preserves production behavior.
+- [ ] Final-commit CI, merge, deploy and verify the live client behavior. Support tickets have not been marked resolved and no customer messages were sent.
 
 ## Echo Story retries and channel alerts (2026-09-21, release pending)
 
