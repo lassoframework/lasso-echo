@@ -73,18 +73,22 @@ def publish_hold_reason(row, gym_id, store, *, now=None, library_path=None,
             raise ValueError("reuse check requires an aware clock")
         cutoff = months_before(now.astimezone(timezone.utc), months)
         from . import media_source_store
-        if not library_path:
-            from .media_swap import library_path_for
-            library_path = library_path_for(gym_id)
         media_store = media_store or media_source_store.default_store()
         assets = media_store.list_assets(gym_id)
         if not isinstance(assets, list):
             raise ValueError("media inventory unavailable")
         assets = [a for a in assets if a.get("gym_id") == gym_id]
+        history = store.list_media_publish_history(gym_id, cutoff.isoformat())
+        if not isinstance(history, list):
+            raise ValueError("media history unavailable")
+        if not library_path and any(
+                str(item.get(field) or "").split("?", 1)[0].endswith("__feed.jpg")
+                for item in [row, *history] for field in ("image_url", "source_media_url")):
+            from .media_swap import library_path_for
+            library_path = library_path_for(gym_id)
         keys = _keys(row, assets, library_path)
         if not keys:
             return "media_reuse_identity_missing"
-        history = store.list_media_publish_history(gym_id, cutoff.isoformat())
         for other in history:
             if str(other.get("id")) == str(row.get("id")):
                 continue
