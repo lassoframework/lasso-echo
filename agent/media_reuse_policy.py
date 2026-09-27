@@ -31,12 +31,20 @@ def _keys(row, assets, library_path):
     asset_id = str(row.get("source_media_asset_id") or "")
     if asset_id:
         keys.add("asset:" + asset_id)
+    unresolved_reframe = False
+    raw_source = media_guard.media_key(row.get("source_media_url"))
     for field in ("source_media_url", "image_url"):
         key = media_guard.media_key(row.get(field))
         if key:
             keys.add("file:" + key)
-            for raw in media_guard.reframe_map(library_path, {key}).values():
+            resolved = media_guard.reframe_map(library_path, {key})
+            for raw in resolved.values():
                 keys.add("file:" + raw)
+            if key.endswith("__feed.jpg") and not resolved:
+                unresolved_reframe = True
+    if (unresolved_reframe and not asset_id
+            and (not raw_source or raw_source.endswith("__feed.jpg"))):
+        raise ValueError("reframed photo has no verifiable original identity")
     # Bind duplicate Drive uploads and pre-asset-id rows to their content hash.
     for asset in assets:
         names = {media_guard.media_key(asset.get(f)) for f in ("title", "rendition_url")}
@@ -65,6 +73,9 @@ def publish_hold_reason(row, gym_id, store, *, now=None, library_path=None,
             raise ValueError("reuse check requires an aware clock")
         cutoff = months_before(now.astimezone(timezone.utc), months)
         from . import media_source_store
+        if not library_path:
+            from .media_swap import library_path_for
+            library_path = library_path_for(gym_id)
         media_store = media_store or media_source_store.default_store()
         assets = media_store.list_assets(gym_id)
         if not isinstance(assets, list):

@@ -221,3 +221,31 @@ def test_publish_due_gbp_counts_held_and_releases_claim():
     assert ("row_held", "approved") in store.released, \
         "a held row must be released back to approved, never stranded in publishing"
     assert c.post_calls == []
+
+
+def test_google_gallery_resolves_prior_feed_crop_to_raw_photo(monkeypatch):
+    from agent import media_swap, media_guard
+    seen = []
+    monkeypatch.setattr(media_swap, "library_path_for", lambda gym: "/tenant/zanshin" if gym == _GYM else "")
+    def resolve(library, keys):
+        seen.append(library)
+        return {"abc__feed.jpg": "photo_a.jpg"} if library == "/tenant/zanshin" and "abc__feed.jpg" in keys else {}
+    monkeypatch.setattr(media_guard, "reframe_map", resolve)
+    c = _FakeClient()
+    history = _HistoryStore([{"id": "old", "gym_id": _GYM, "image_url": "https://cdn/abc__feed.jpg"}])
+    out = gw.publish_photo_drop(_photo_row(), _conn(), client=c, draft=False,
+                               history_store=history, media_store=_MediaStore())
+    assert out["reject_reason"] == "media_reuse_nine_month_hold"
+    assert c.media_calls == []
+    assert seen and set(seen) == {"/tenant/zanshin"}
+
+
+def test_google_gallery_holds_when_prior_crop_original_is_unavailable(monkeypatch):
+    from agent import media_swap
+    monkeypatch.setattr(media_swap, "library_path_for", lambda gym: "")
+    c = _FakeClient()
+    history = _HistoryStore([{"id": "old", "gym_id": _GYM, "image_url": "https://cdn/abc__feed.jpg"}])
+    out = gw.publish_photo_drop(_photo_row(), _conn(), client=c, draft=False,
+                               history_store=history, media_store=_MediaStore())
+    assert out["reject_reason"] == "media_reuse_history_unavailable"
+    assert c.media_calls == []
