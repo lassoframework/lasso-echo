@@ -18,8 +18,11 @@ from agent.caption_ledger import (
     concept_is_on_cooldown,
     is_on_cooldown,
     ledger_key,
+    move_staged_date,
     record_concept_used,
     record_staged,
+    verbatim_key,
+    verbatim_hash,
 )
 
 
@@ -184,6 +187,37 @@ def test_record_staged_increments_uses():
     record = json.loads(db.kv_get(key))
     assert record["uses"] == 2
     assert record["last_used"] == "2026-10-01"
+
+
+def test_move_staged_date_replaces_only_the_rescheduled_stamp():
+    db = _FakeDB()
+    gym_id = "eng"
+    text = "A newly staged caption"
+    record_staged(gym_id, text, "2026-08-01", db=db)
+    record_staged(gym_id, text, "2026-09-29", db=db)
+
+    move_staged_date(gym_id, text, "2026-09-29", "2026-10-04", db=db)
+
+    fuzzy = json.loads(db.kv_get(ledger_key(gym_id, caption_hash(text))))
+    verbatim = json.loads(db.kv_get(verbatim_key(gym_id, verbatim_hash(text))))
+    assert fuzzy == {"last_used": "2026-10-04", "uses": 2}
+    assert verbatim == {"dates": ["2026-08-01", "2026-10-04"], "uses": 2}
+
+
+def test_move_staged_date_preserves_stamp_owned_by_another_row():
+    db = _FakeDB()
+    gym_id = "eng"
+    text = "A shared cross-platform caption"
+    record_staged(gym_id, text, "2026-09-29", db=db)
+
+    move_staged_date(
+        gym_id, text, "2026-09-29", "2026-10-04", db=db,
+        preserve_old_fuzzy=True, preserve_old_verbatim=True)
+
+    fuzzy = json.loads(db.kv_get(ledger_key(gym_id, caption_hash(text))))
+    verbatim = json.loads(db.kv_get(verbatim_key(gym_id, verbatim_hash(text))))
+    assert fuzzy["last_used"] == "2026-09-29"
+    assert verbatim["dates"] == ["2026-09-29", "2026-10-04"]
 
 
 # ---------------------------------------------------------------------------

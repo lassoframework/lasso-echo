@@ -1204,6 +1204,53 @@ def test_swap_media_zero_match_returns_none(monkeypatch):
     assert payload == {"image_url": "u"}   # source_media_url omitted when not given
 
 
+@pytest.mark.parametrize("peer_caption,preserve", [
+    ("Shared caption", True),
+    ("Different caption", False),
+])
+def test_redate_moves_ledger_stamp_only_after_matching_old_date_peers_leave(
+        monkeypatch, peer_caption, preserve):
+    """The IG/FB/story bundle shares one caption stamp.
+
+    Moving one sibling must retain the old stamp while another matching row still
+    owns it; the last sibling may move it.  This also preserves a genuinely
+    published duplicate on the old date.
+    """
+    old = {"id": "row-1", "gym_id": "eng", "post_date": "2026-09-29",
+           "caption": "Shared caption", "status": "approved"}
+    updated = dict(old, post_date="2026-10-04", scheduled_at=None)
+
+    class _RedateHTTP(_FakeHTTP):
+        def __init__(self):
+            super().__init__(patch_resp=_Resp(200, [updated]))
+            self.reads = 0
+
+        def get(self, url, params=None, headers=None, timeout=None):
+            self.calls.append(("get", url, params or {}, headers or {}))
+            self.reads += 1
+            return (_Resp(200, [old]) if self.reads == 1
+                    else _Resp(200, [{"caption": peer_caption}]))
+
+    http = _RedateHTTP()
+    moved = []
+    monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: True)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    monkeypatch.setattr(
+        "agent.caption_ledger.move_staged_date",
+        lambda *args, **kwargs: moved.append((args, kwargs)))
+
+    out = pcs.SupabaseCalendarStore().patch_post_date("row-1", "2026-10-04")
+
+    assert out == updated
+    assert http.calls[1][2]["post_date"] == "eq.2026-09-29"  # CAS old date
+    assert http.calls[2][2]["id"] == "neq.row-1"
+    assert moved[0][0] == ("eng", "Shared caption", "2026-09-29", "2026-10-04")
+    assert moved[0][1] == {
+        "preserve_old_fuzzy": preserve,
+        "preserve_old_verbatim": preserve,
+    }
+
+
 # ---- CROSS-DAY MEDIA BELT on insert_rows (fleet audit, 2026-08-31) -------------
 #
 # agent/media_guard.py shipped calling itself "the shared cross-day media guard for
