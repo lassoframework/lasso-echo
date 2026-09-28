@@ -99,7 +99,7 @@ def test_missing_fields_block_with_list(tmp_path, monkeypatch, capsys):
     printed = capsys.readouterr().out
     assert "BLOCKED" in printed and "ever guessed" in printed
     assert "2. Who you talk to" in printed
-    assert "9. Consent policy" in printed
+    assert "9. Media policy" in printed
     # nothing was created
     assert not (tmp_path / "drafts").exists()
     assert not (tmp_path / "content_library").exists()
