@@ -353,6 +353,42 @@ def test_calendar_null_caption_and_image(monkeypatch):
     assert d["pillar"] is None
 
 
+def test_calendar_hides_the_same_client_statuses_as_social(monkeypatch):
+    rows = [
+        _row("live", status="pending"),
+        _row("denied", status="denied"),
+        _row("killed", status="killed"),
+        _row("deleted", status="deleted"),
+        _row("coach", status="coach_review"),
+    ]
+    http = _FakeHTTP(get_resp=_Resp(200, rows))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+
+    assert status == 200
+    assert [d["draft_id"] for d in body["drafts"]] == ["live"]
+
+
+def test_calendar_visibility_escape_hatch_keeps_coach_review_private(monkeypatch):
+    monkeypatch.setenv("ECHO_PORTAL_SHOW_REJECTED", "true")
+    rows = [
+        _row("live", status="pending"),
+        _row("denied", status="denied"),
+        _row("killed", status="killed"),
+        _row("deleted", status="deleted"),
+        _row("coach", status="coach_review"),
+    ]
+    http = _FakeHTTP(get_resp=_Resp(200, rows))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+
+    assert status == 200
+    assert [d["draft_id"] for d in body["drafts"]] == [
+        "live", "denied", "killed", "deleted"]
+
+
 # ---- 2. month filter correctness ----------------------------------------------
 
 def test_calendar_month_filter_bounds(monkeypatch):
@@ -602,6 +638,52 @@ def test_no_creds_uses_sqlite_path(monkeypatch):
     assert status == 200
     assert hit["db"] is True, "SQLite path must run when creds absent"
     assert body["drafts"] == []
+
+
+def test_sqlite_calendar_filters_hidden_status_before_legacy_decode(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    raw_rows = [
+        {"draft_id": "live", "status": "pending"},
+        {"draft_id": "denied", "status": "denied"},
+        {"draft_id": "killed", "status": "killed"},
+        {"draft_id": "deleted", "status": "deleted"},
+        {"draft_id": "coach", "status": "coach_review"},
+    ]
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *args, **kwargs):
+            class _Cursor:
+                def fetchall(self):
+                    return raw_rows
+            return _Cursor()
+
+    decoded = []
+
+    def _decode(row):
+        decoded.append(row["draft_id"])
+        return type("Draft", (), {
+            "draft_id": row["draft_id"], "day_key": "2026-08-01",
+            "draft_type": "feed", "status": row["status"],
+            "platform": "instagram", "caption": "caption",
+            "creative_public_url": None, "scheduled_for": None,
+            "blocked_reason": None,
+        })()
+
+    monkeypatch.setattr("agent.portal_routes._db.connect", lambda: _FakeConn())
+    monkeypatch.setattr("agent.store._row_to_draft", _decode)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+
+    assert status == 200
+    assert decoded == ["live"]
+    assert [d["draft_id"] for d in body["drafts"]] == ["live"]
 
 
 def test_no_creds_action_uses_portal_approvals(monkeypatch):
