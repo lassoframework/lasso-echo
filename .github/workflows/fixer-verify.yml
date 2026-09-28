@@ -1,0 +1,61 @@
+name: FIXER isolated verification
+run-name: FIXER verify ${{ inputs.verification_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact commit to verify
+        required: true
+        type: string
+      verification_id:
+        description: Unique correlation identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate target
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: case "$TARGET_SHA" in (*[!0-9a-fA-F]*|'') exit 1;; esac; test "${#TARGET_SHA}" -eq 40
+
+      - name: Check out trusted verifier controls
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          path: control
+          persist-credentials: false
+
+      - name: Check out exact target
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha }}
+          path: target
+          persist-credentials: false
+
+      - name: Build credential-free verifier image
+        run: |
+          mkdir -p "$RUNNER_TEMP/fixer-build/src"
+          rsync -a --exclude=.git "$GITHUB_WORKSPACE/target/" "$RUNNER_TEMP/fixer-build/src/"
+          cp "$GITHUB_WORKSPACE/control/.github/fixer-verifier/echo.Dockerfile" "$RUNNER_TEMP/fixer-build/Dockerfile"
+          docker build --tag fixer-verify:"${{ github.run_id }}" "$RUNNER_TEMP/fixer-build"
+
+      - name: Prove outbound network is disabled
+        run: |
+          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+            fixer-verify:"${{ github.run_id }}" \
+            sh -c 'if python -c "import socket; socket.create_connection((\"1.1.1.1\", 443), timeout=5)"; then exit 1; else exit 0; fi'
+
+      - name: Run pinned verification
+        run: |
+          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 1024 --memory 6g --tmpfs /tmp:rw,noexec,nosuid,size=1g \
+            --env HOME=/tmp/fixer-home --env NODE_ENV=test \
+            fixer-verify:"${{ github.run_id }}"
