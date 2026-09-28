@@ -126,6 +126,32 @@ def test_calendar_filters_by_month(monkeypatch):
     assert "aug-d1" not in ids, "August draft must not appear in July calendar"
 
 
+@pytest.mark.parametrize("show_rejected,expected", [
+    (False, ["live"]),
+    (True, ["deleted", "denied", "killed", "live"]),
+])
+def test_calendar_store_path_uses_client_visibility_guard(
+        monkeypatch, show_rejected, expected):
+    monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+    monkeypatch.setenv("ECHO_PORTAL_SHOW_REJECTED", str(show_rejected).lower())
+
+    class _UnfilteredStore:
+        def list_pending(self):
+            return [
+                _FakeDraft("live", "gymA", "2026-07-01", status="pending"),
+                _FakeDraft("denied", "gymA", "2026-07-02", status="denied"),
+                _FakeDraft("killed", "gymA", "2026-07-03", status="killed"),
+                _FakeDraft("deleted", "gymA", "2026-07-04", status="deleted"),
+                _FakeDraft("coach", "gymA", "2026-07-05", status="coach_review"),
+            ]
+
+    status, body = portal_routes.handle_portal_calendar(
+        "gymA", "2026-07", store=_UnfilteredStore())
+
+    assert status == 200
+    assert sorted(d["draft_id"] for d in body["drafts"]) == expected
+
+
 def test_calendar_bad_month_returns_400(monkeypatch):
     monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
     status, body = portal_routes.handle_portal_calendar("gymA", "not-a-month")

@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from . import config, db as _db
 from . import portal_approvals as _pa
 from . import portal_calendar_store as _pcs
+from .portal_visibility import client_visible as _client_visible
 from . import rotation as _rotation
 from .drafter import DraftStatus
 
@@ -613,21 +614,6 @@ def _media_bridge_status(account_key, *, now=None):
 # publisher still excludes them (portal_calendar_store.due_rows), and every derived
 # signal (low_creative, days_remaining, awaiting_media, recreate_budget) is computed
 # from the SAME row set as before so no banner changes behavior.
-_CLIENT_HIDDEN_STATUSES = ("coach_review", "denied", "killed", "deleted")
-
-
-def _client_visible(rows):
-    """The rows a gym owner should see on their own calendar. Hides content they have
-    already rejected (denied / killed), content that was removed (deleted), and content
-    a coach has not released yet (coach_review, the pre-existing rule)."""
-    from . import config as _cfg
-    hidden = _CLIENT_HIDDEN_STATUSES
-    if getattr(_cfg, "portal_show_rejected", None) and _cfg.portal_show_rejected():
-        hidden = ("coach_review",)          # escape hatch: the historical behavior
-    return [r for r in (rows or [])
-            if str((r or {}).get("status") or "").strip().lower() not in hidden]
-
-
 def _handle_social_supabase(account_key, month, now=None):
     """/social from the SHARED content_calendar table (the live portal data plane).
     Reads every row for THIS gym in the month via the same SupabaseCalendarStore that
