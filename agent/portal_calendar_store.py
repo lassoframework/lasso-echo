@@ -890,11 +890,28 @@ class SupabaseCalendarStore:
         only a row still waiting (pending/approved, never published) may move — a row
         mid-claim or already live is refused (zero rows -> None). Status untouched, so
         an approved row stays approved (the gym's approval is preserved)."""
+        before = self._client().get(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}",
+                    "status": "in.(pending,approved)",
+                    "published_at": "is.null",
+                    "select": "id,gym_id,post_date,caption"},
+            headers=self._headers(), timeout=30)
+        if before.status_code >= 400:
+            raise PortalStoreError(before.status_code,
+                                   _scrub((before.text or "")[:200]))
+        current = before.json() or []
+        if len(current) != 1:
+            return None
+        old = current[0]
+        old_post_date = str(old.get("post_date") or "")[:10]
+
         r = self._client().patch(
             self._rest(_TABLE),
             params={"id": f"eq.{row_id}",
                     "status": "in.(pending,approved)",
-                    "published_at": "is.null"},
+                    "published_at": "is.null",
+                    "post_date": f"eq.{old_post_date}"},
             headers=self._headers({
                 "Content-Type": "application/json",
                 "Prefer": "return=representation",
@@ -905,7 +922,44 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        if config.caption_cooldown_enabled():
+            try:
+                from . import caption_ledger
+                # A caption/date stamp is shared by the IG feed, FB mirror and
+                # paired story, and it may also represent a real historical use.
+                # Move the old stamp only after the LAST matching row leaves that
+                # date.  Otherwise re-dating one sibling would erase duplicate
+                # evidence owned by another row.  A failed evidence read preserves
+                # the old stamp (safe hold) rather than weakening the guard.
+                peers = self._client().get(
+                    self._rest(_TABLE),
+                    params={"gym_id": f"eq.{old.get('gym_id')}",
+                            "post_date": f"eq.{old_post_date}",
+                            "id": f"neq.{row_id}",
+                            "select": "caption"},
+                    headers=self._headers(), timeout=30)
+                if peers.status_code >= 400:
+                    raise PortalStoreError(
+                        peers.status_code, _scrub((peers.text or "")[:200]))
+                other_captions = [str(x.get("caption") or "")
+                                  for x in (peers.json() or [])]
+                caption = str(old.get("caption") or "")
+                fuzzy = caption_ledger.caption_hash(caption)
+                verbatim = caption_ledger.verbatim_hash(caption)
+                caption_ledger.move_staged_date(
+                    str(old.get("gym_id") or ""), caption,
+                    old_post_date, str(new_post_date)[:10],
+                    preserve_old_fuzzy=any(
+                        caption_ledger.caption_hash(c) == fuzzy
+                        for c in other_captions),
+                    preserve_old_verbatim=bool(verbatim) and any(
+                        caption_ledger.verbatim_hash(c) == verbatim
+                        for c in other_captions))
+            except Exception:
+                pass
+        return rows[0]
 
     def stamp_scheduled(self, row_id, scheduled_at_iso):
         """Record the row's planned go-live time (content_calendar.scheduled_at) so the
