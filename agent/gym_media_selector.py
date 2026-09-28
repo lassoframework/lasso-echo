@@ -17,6 +17,11 @@ gym-media rails:
     ('media pool empty for {gym} — ask for photos'). Never reuse a cooling-down
     asset to fill a gap.
 
+The automatic planner keeps those rules without exception. ``cooldown_fallback``
+is a separate, explicit-user-action lane used only by the portal media swap: after
+the normal pool is exhausted it can return the least-recently-used safe asset that
+is not on the live forward book. Explicit client reuse promises remain hard gates.
+
 used_count / last_used_at are stamped ONLY at stage time (stamp_use, called by the
 builder once the PENDING row is assembled) and ROLLED BACK on a coach deny
 (rollback_use / observe_denials), so a denied post returns to the pool.
@@ -183,6 +188,51 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
     candidates.sort(key=lambda a: (
         int(a.get("used_count") or 0),
         _parse_ts(a.get("last_used_at")) or _floor,      # NULLS FIRST
+        str(a.get("id") or "")))
+    return candidates
+
+
+def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=()):
+    """Usable assets ordered for a user-requested swap after the normal pool is
+    exhausted, without applying the 90-day or same-month clocks.
+
+    This is deliberately narrower than :func:`pickable`: callers must pass every
+    asset already carried by the live forward book in ``exclude_ids``.  The
+    selector still enforces tenant ownership, byte-bound review/moderation, coach
+    exclusions, and kind preference.  A gym with an explicit long-term reuse
+    policy (currently Zanshin's nine calendar months) gets no fallback at all.
+
+    Month planning and automatic publishing never call this helper.  It exists so
+    a person asking Echo for a different photo is not deadlocked merely because a
+    small otherwise-safe library is inside the generic rotation cooldown.
+    """
+    base = base_gym_key(gym_id)
+    from .media_reuse_policy import reuse_months
+    if reuse_months(base):
+        return []
+    store = store or _idx.default_store()
+    if not store.available():
+        return []
+    try:
+        assets = store.list_assets(base)
+    except Exception as e:  # noqa: BLE001 - a read failure is no fallback
+        print(f"[gym-media-selector] fallback asset read failed for {base}: "
+              f"{type(e).__name__}: {e}")
+        return []
+    excl = {str(i) for i in (exclude_ids or ()) if i}
+    candidates = []
+    for asset in assets:
+        if str(asset.get("gym_id") or "") != base:
+            continue
+        if not is_usable(asset) or str(asset.get("id")) in excl:
+            continue
+        if kind_preference and asset.get("kind") != kind_preference:
+            continue
+        candidates.append(asset)
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    candidates.sort(key=lambda a: (
+        _parse_ts(a.get("last_used_at")) or floor,
+        int(a.get("used_count") or 0),
         str(a.get("id") or "")))
     return candidates
 
