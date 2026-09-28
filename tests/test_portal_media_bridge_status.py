@@ -18,6 +18,7 @@ def test_media_summary_counts_review_separately_and_scopes_tenant(monkeypatch):
     expired.update(people_detected=True, consent_status="granted",
                    consent_member_ref="m1", release_ref="r1",
                    consent_expires_at="2020-01-01T00:00:00Z")
+    expired["moderation_json"]["people_detected"] = True
     class Store:
         def available(self): return True
         def list_assets(self, gym):
@@ -28,7 +29,7 @@ def test_media_summary_counts_review_separately_and_scopes_tenant(monkeypatch):
     monkeypatch.setattr("agent.ghl_intake.upload_link_for", lambda gym: "/u/token" if gym == "gymx" else "")
     out = portal_social._media_bridge_status("gymx_ig")
     assert out["media_review"] == {"status": "awaiting", "pending_review_count": 1,
-                                    "publishable_count": 1}
+                                    "publishable_count": 2}
     assert out["upload_action"] == {"url": "/u/token", "label": "Upload media",
                                      "received_means_indexed": False}
 

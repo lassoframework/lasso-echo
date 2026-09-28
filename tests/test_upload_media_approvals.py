@@ -56,21 +56,21 @@ def test_human_approval_records_clean_moderation_and_rearms_only_after_write(mon
     assert calls == [("gymx", "upload.jpg", True)]
 
 
-def test_upload_cannot_be_autoapproved_or_bypass_consent_or_moderation(monkeypatch, tmp_path):
+def test_upload_approval_ignores_release_metadata_but_requires_moderation(monkeypatch, tmp_path):
     asset = _setup(monkeypatch, tmp_path, consent="pending")
     calls = []
     monkeypatch.setattr(media_bridge, "rearm_for_new_upload",
                         lambda base, identity, *, usable: calls.append((base, identity, usable)))
 
     status, _ = approvals.approve("gymx", "upload.jpg", "U_REVIEWER", moderation="clean")
-    assert status == 409
-    assert dam.read_sidecar(str(asset)).get("approved") is not True
+    assert status == 200
+    assert dam.read_sidecar(str(asset)).get("approved") is True
 
-    dam.write_sidecar(str(asset), {"consent": "granted"})
+    dam.write_sidecar(str(asset), {"approved": False})
     status, _ = approvals.approve("gymx", "upload.jpg", "U_REVIEWER", moderation="")
     assert status == 400
     assert dam.read_sidecar(str(asset)).get("approved") is not True
-    assert calls == []
+    assert calls == [("gymx", "upload.jpg", True)]
 
 
 def test_only_configured_human_approver_can_transition_media(monkeypatch, tmp_path):

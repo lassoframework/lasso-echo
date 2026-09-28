@@ -131,11 +131,9 @@ def _rearm_after_approval(base, account_key, path, asset_name):
 def _approve_locked(account_key, asset_name, actor_id, *, moderation="", note=""):
     """Record one human clean-review decision for an uploaded asset.
 
-    Consent must already have been recorded by the upload checkbox/sync lane.
     ``moderation`` is deliberately not defaulted: the reviewer must explicitly
     submit ``clean`` as their moderation outcome.  No upload reaches eligibility
-    by calling this function without an authorized human, consent, and that
-    explicit outcome.
+    without an authorized human and that explicit outcome.
     """
     if not config.portal_approvals_enabled():
         return 403, {"ok": False, "error": "portal approvals are disabled"}
@@ -159,8 +157,6 @@ def _approve_locked(account_key, asset_name, actor_id, *, moderation="", note=""
         return 409, {"ok": False, "error": "media is not valid for approval"}
 
     side = dam.read_sidecar(path)
-    if str(side.get("consent") or "").lower() != "granted":
-        return 409, {"ok": False, "error": "recorded consent is required before approval"}
     if str(moderation or "").strip().lower() != "clean":
         return 400, {"ok": False, "error": "explicit clean moderation review is required"}
 
@@ -194,7 +190,7 @@ def _approve_locked(account_key, asset_name, actor_id, *, moderation="", note=""
         return 503, {"ok": False, "error": "approval sidecar write failed"}
 
     # This is intentionally after the durable approval write.  A raw upload, a
-    # consent checkbox, or a sync pass can never close a media-bridge episode.
+    # A raw upload or sync pass can never close a media-bridge episode.
     try:
         _rearm_after_approval(base, getattr(account, "key", "") or account_key,
                               path, asset_name)
@@ -210,12 +206,8 @@ def main(argv=None):
     parser.add_argument("--actor", required=True, help="configured reviewer ID; verified by operator")
     parser.add_argument("--moderation", required=True, choices=["clean"],
                         help="explicit visual moderation result")
-    parser.add_argument("--consent-reviewed", action="store_true",
-                        help="attest that the recorded consent was reviewed")
     parser.add_argument("--note", default="", help="short operator review note")
     args = parser.parse_args(argv)
-    if not args.consent_reviewed:
-        parser.error("--consent-reviewed is required")
     status, result = approve(args.account, args.asset, args.actor,
                              moderation=args.moderation, note=args.note)
     print(json.dumps(result, sort_keys=True))

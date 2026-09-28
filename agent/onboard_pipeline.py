@@ -8,7 +8,7 @@ Takes a COMPLETED intake (knowledge/intake_template.md structure, sections 1 to
   - the DRAFT brand bible + social proof via the existing draft-bible path
     (brand_voice/drafts/<key>/, never auto-activated)
   - the Account config entry + brand_voice/<key>/ templates via add-client
-  - content_library/<key>/ with a consent-guard README
+  - content_library/<key>/ with media-safety guidance
   - the welcome kit PDF (existing generator path)
   - the printed GO LIVE checklist: exactly the by-hand steps remaining
     (secrets, the connect link, the first approval)
@@ -30,17 +30,16 @@ REQUIRED_SECTIONS = {
     6: "Social proof",
     7: "CTAs, links, and hashtags",
     8: "Posting preferences",
-    9: "Consent policy",
+    9: "Media policy",
 }
 
 CONSENT_README = """# {name} content library
 
 Drop approved photos and clips here (or let the intake link file them).
 
-CONSENT GUARD: when AGENT_CONSENT_GUARD_ENABLED is armed, an asset showing
-people is selectable ONLY with consent recorded as granted in its sidecar.
-Unknown consent means excluded, by design. Record consent per the client's
-consent policy from their intake (section 9).
+PHOTO RELEASES: releases are not required for publishing. Every image must still
+pass byte-bound safety moderation. Unsafe, unreadable, failed-scan, changed, or
+unreviewed media remains blocked.
 """
 
 GO_LIVE = """GO LIVE CHECKLIST for {key} (exactly what remains, all by hand):
@@ -104,7 +103,7 @@ def onboard(intake_path, key, name=None, root="."):
     # 2. account entry + voice/proof templates + library folder
     scaffold = onboard_scaffold.add_client(key, name, root=root)
 
-    # 3. consent-guard README in the client library
+    # 3. media-safety README in the client library
     readme = os.path.join(root, "content_library", key, "README.md")
     if not os.path.exists(readme):
         with open(readme, "w", encoding="utf-8") as fh:

@@ -56,7 +56,7 @@ def test_exclusions_write_causes(monkeypatch, tmp_path):
     rotation.choose("lasso_ig", "2026-07-06", lib)
     rows = db.audit_rows(day="2026-07-06")
     reasons = {r["subject"]: r["reason"] for r in rows if r["kind"] == "exclusion"}
-    assert "consent guard" in reasons["lasso_p2_face.jpg"]
+    assert "lasso_p2_face.jpg" not in reasons
     assert "fabrication gate" in reasons["lasso_p3_stat.jpg"]
 
 

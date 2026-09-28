@@ -1,14 +1,9 @@
 """
-DAM v1: consent tracking, perceptual near-dupe collapse, auto-tag.
-Flags: AGENT_CONSENT_GUARD_ENABLED, AGENT_AUTOTAG_ENABLED (both default OFF).
+DAM v1: legacy consent records, perceptual near-dupe collapse, auto-tag.
 
-CONSENT GUARD (fail safe, absolute): an asset explicitly marked people=true may
-only be selected when its sidecar also says consent="granted", regardless of
-the optional guard flag. With the flag ON (or strict=True for new callers), an
-unknown people status also excludes the asset; the card path can never see it.
-The people flag is set by the auto-tag pass or by hand in the sidecar. NOTE:
-arming the guard on an untagged library excludes everything until assets are
-tagged; that is the fail safe working, not a bug.
+Photo releases are not a publishing gate. Older sidecars and audit rows keep
+their consent history, but selection ignores it. Safety moderation, explicit
+review rejection, file validation and hash-bound review remain independent gates.
 
 NEAR-DUPE COLLAPSE: dam-scan computes a perceptual hash per image (alongside
 the sha256 exact dedupe ingest already does) and writes a shared dupe_group
@@ -58,23 +53,8 @@ def write_sidecar(creative_path, updates):
 
 # ---- consent guard ------------------------------------------------------------------
 def consent_blocked(creative_path, *, strict=False):
-    """
-    True when the consent guard must EXCLUDE this asset.
-
-    An explicit people=true marker is always a hard gate: only consent="granted"
-    may pass, regardless of the legacy optional guard flag.  With the legacy
-    guard enabled, unknown people status also fails closed.  ``strict=True``
-    applies that unknown-status fail-closed rule to new callers (such as the
-    media bridge) even when the legacy flag is off.  The default preserves the
-    flag-off behavior for untagged/unknown legacy inventory.
-    """
-    side = read_sidecar(creative_path)
-    people = side.get("people", None)
-    if people is False:
-        return False
-    if people is True:
-        return str(side.get("consent", "")).lower() != "granted"
-    return bool(strict or config.consent_guard_enabled())  # unknown = fail closed
+    """Compatibility hook: releases never exclude an asset from publishing."""
+    return False
 
 
 def set_consent(creative_path, status, member_ref="", granted_by="", note=""):

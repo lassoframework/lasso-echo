@@ -7,9 +7,8 @@ the Part 5 queue staged, and that queue is OFF by default). Per STAGED row:
   1. PERCEPTUAL dedupe on top of the queue's sha256: an 8x8 average hash match
      against the tenant's accepted media marks the row duplicate (near-identical
      re-shots never pile up). sha256 already blocked exact bytes at receive.
-  2. CONSENT GUARD hook: consent(data, name, tenant) -> (ok, reason). The
-     default passes (a stub interface, like intake moderation); a real checker
-     slots in without touching the pipeline. Refused = row rejected + one notice.
+  2. The legacy consent hook remains callable for compatibility, but its result
+     does not gate filing. Photo releases are not required.
   3. CAPTION GATE: a row with no texted sentence is NOT filed. It flips to
      awaiting_caption, ONE auto-ask fires (ops alert naming tenant + file), and
      the media cannot be drafted from (it never reaches the library) until
@@ -143,14 +142,8 @@ def process(s3_client=None, phash=None, consent=None, thumbnail=None,
             out["duplicates"] += 1
             continue
 
-        # 2. consent guard
-        ok, reason = consent(data, row["name"], tenant)
-        if not ok:
-            media_inbox.set_status(rid, "rejected")
-            ops_alerts.alert(f"media worker: {tenant} file {row['name']} refused "
-                             f"by the consent guard ({reason}); not filed.")
-            out["rejected"] += 1
-            continue
+        # 2. Legacy compatibility hook. Its result is intentionally ignored.
+        consent(data, row["name"], tenant)
 
         # 3. caption gate: no sentence = not filed, one auto-ask, drafting blocked
         note = (row["caption_note"] or "").strip()

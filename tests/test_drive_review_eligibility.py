@@ -1,5 +1,3 @@
-from datetime import datetime, timedelta, timezone
-
 import pytest
 
 from agent import gym_media_review, gym_media_selector
@@ -49,21 +47,16 @@ def test_reviewed_clean_no_people_asset_is_selectable(monkeypatch):
     assert gym_media_selector.pickable("gym1", store=store)[0]["id"] == "drive1"
 
 
-@pytest.mark.parametrize("change", [
-    {"consent_status": "pending"}, {"consent_status": "denied"},
-    {"release_ref": None}, {"consent_member_ref": None},
-    {"consent_expires_at": None},
-    {"consent_expires_at": "2020-01-01T00:00:00Z"},
+@pytest.mark.parametrize("legacy_consent", [
+    {}, {"consent_status": "pending"}, {"consent_status": "denied"},
+    {"consent_status": "granted", "release_ref": "old-release",
+     "consent_member_ref": "old-member", "consent_expires_at": "2020-01-01T00:00:00Z"},
 ])
-def test_people_asset_requires_live_release(change):
+def test_clean_reviewed_people_asset_never_requires_release(legacy_consent):
     row = approved()
-    row.update(people_detected=True, consent_status="granted",
-               consent_member_ref="member-1", release_ref="release-1",
-               consent_expires_at=(datetime.now(timezone.utc) + timedelta(days=2)).isoformat())
+    row.update(people_detected=True, **legacy_consent)
     row["moderation_json"]["people_detected"] = True
     assert gym_media_selector.is_usable(row)
-    row.update(change)
-    assert not gym_media_selector.is_usable(row)
 
 
 @pytest.mark.parametrize("status", ["pending", "flagged", "rejected", None])
@@ -80,6 +73,14 @@ def test_operator_approval_requires_evidence_and_records_actor():
                                           store=store, operator="local-user")
     assert result["review_status"] == "approved"
     assert store.get_asset("drive1")["reviewed_by"] == "local-user"
+    assert store.get_asset("drive1")["consent_status"] == "not_required"
     with pytest.raises(ValueError):
         gym_media_review.review_asset("other-gym", "drive1", "reject",
+                                      store=store, operator="local-user")
+
+
+def test_release_request_is_not_a_supported_review_action():
+    store = FakeMediaStore(assets=[asset()])
+    with pytest.raises(ValueError, match="unknown action"):
+        gym_media_review.review_asset("gym1", "drive1", "request_release",
                                       store=store, operator="local-user")

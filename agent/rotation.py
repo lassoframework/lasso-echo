@@ -451,10 +451,6 @@ def choose(account_key, day_key, library_path, poster=None):
         if base.startswith("lasso_v2_") and os.path.splitext(base)[0].endswith("_story"):
             continue  # a generated 9:16 story VARIANT (regen convention) is never a
             # feed candidate; a topic card that merely ends in "story" still rotates
-        if dam.consent_blocked(c.path):
-            db.audit("exclusion", base, "consent guard (fail safe)",
-                     account_key, day_key)
-            continue  # consent guard (fail safe): the card path never sees it
         if not is_gate_clean(getattr(c, "client_note", ""), approved_claims):
             excluded_dirty += 1
             db.audit("exclusion", base, "fabrication gate (uncleared claim in note)",

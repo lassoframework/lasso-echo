@@ -16,10 +16,9 @@ from . import gym_media_selector as selector
 from .media_source_store import default_store
 
 
-def review_asset(gym_id, asset_id, action, *, store, operator,
-                 note=None, release_ref=None, member_ref=None, expires_at=None):
+def review_asset(gym_id, asset_id, action, *, store, operator, note=None):
     """Record a local operator decision, scoped to the existing gym and asset."""
-    if action not in {"approve", "reject", "request_release"}:
+    if action not in {"approve", "reject"}:
         raise ValueError("unknown action")
     if not str(operator or "").strip():
         raise ValueError("operator identity is required")
@@ -34,24 +33,13 @@ def review_asset(gym_id, asset_id, action, *, store, operator,
     fields = {"reviewed_by": operator, "reviewed_at": now,
               "review_note": note, "review_content_hash": content_hash}
     if action == "approve":
-        candidate = dict(asset, **fields, review_status="approved")
-        if release_ref or member_ref or expires_at:
-            if asset.get("people_detected") is not True:
-                raise ValueError("release fields only apply to people assets")
-            candidate.update(consent_status="granted", release_ref=release_ref,
-                             consent_member_ref=member_ref,
-                             consent_expires_at=expires_at)
+        candidate = dict(asset, **fields, review_status="approved",
+                         consent_status="not_required")
         if not selector.is_usable(candidate):
-            raise ValueError("approval requires technical eligibility, clean moderation evidence, known people status and valid consent")
-        fields.update(review_status="approved")
-        if release_ref or member_ref or expires_at:
-            fields.update(consent_status="granted", release_ref=release_ref,
-                          consent_member_ref=member_ref,
-                          consent_expires_at=expires_at)
-    elif action == "reject":
-        fields["review_status"] = "rejected"
+            raise ValueError("approval requires technical eligibility and clean moderation evidence")
+        fields.update(review_status="approved", consent_status="not_required")
     else:
-        fields.update(review_status="pending_review", consent_status="pending")
+        fields["review_status"] = "rejected"
 
     # A conditional gym filter prevents the global Drive ID from being updated
     # if another tenant owns it. This CLI is the sole review writer.
@@ -69,19 +57,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("gym_id")
     parser.add_argument("asset_id")
-    parser.add_argument("action", choices=("approve", "reject", "request_release"))
+    parser.add_argument("action", choices=("approve", "reject"))
     parser.add_argument("--note")
-    parser.add_argument("--release-ref")
-    parser.add_argument("--member-ref")
-    parser.add_argument("--expires-at", help="ISO 8601 timestamp with timezone")
     args = parser.parse_args(argv)
     if not sys.stdin.isatty():
         parser.error("review requires an interactive operator shell")
     operator = getpass.getuser()
     result = review_asset(args.gym_id, args.asset_id, args.action,
                           store=default_store(), operator=operator,
-                          note=args.note, release_ref=args.release_ref,
-                          member_ref=args.member_ref, expires_at=args.expires_at)
+                          note=args.note)
     print(json.dumps({"asset_id": args.asset_id, "gym_id": args.gym_id,
                       "review_status": result["review_status"],
                       "reviewed_by": operator}))

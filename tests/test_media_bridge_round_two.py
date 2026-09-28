@@ -156,7 +156,7 @@ def test_style_exclusion_is_absent_from_planner_count_and_depletion(monkeypatch,
     assert client_infographic_fill.real_media_depleted("gymx")
 
 
-def test_explicit_consent_denial_stays_out_with_guard_and_bridge_off(monkeypatch, tmp_path):
+def test_explicit_consent_denial_does_not_block_clean_approved_media(monkeypatch, tmp_path):
     from agent import client_content, client_month_run, rotation
     monkeypatch.delenv("AGENT_CONSENT_GUARD_ENABLED", raising=False)
     monkeypatch.delenv("AGENT_MEDIA_BRIDGE_ALERTS", raising=False)
@@ -167,22 +167,20 @@ def test_explicit_consent_denial_stays_out_with_guard_and_bridge_off(monkeypatch
     _photo(photo)
     dam.write_sidecar(str(photo), {"approved": True, "moderation": "clean",
                                    "people": True, "consent": "denied"})
-    # macOS can create this resource-fork sidecar on a non-APFS volume.  It
-    # must not look like a consent-free second image beside the denied photo.
+    # macOS can create this resource-fork sidecar on a non-APFS volume.
     (gym / "._one.jpg").write_bytes(b"AppleDouble metadata")
-    assert client_content.pick_image("gymx_ig", "2026-09-19", str(gym)) is None
-    assert client_month_run._client_media_count(str(gym)) == 0
+    assert client_content.pick_image("gymx_ig", "2026-09-19", str(gym)) is not None
+    assert client_month_run._client_media_count(str(gym)) == 1
     monkeypatch.setenv("AGENT_MEDIA_BRIDGE_ALERTS", "true")
     monkeypatch.setattr(config, "LIBRARY_PATH", str(tmp_path))
     monkeypatch.setattr(config, "gym_drive_stage_enabled", lambda: False)
     monkeypatch.setattr(config, "vision_enabled_for", lambda _: False)
-    assert client_content.pick_image("gymx_ig", "2026-09-19", str(gym)) is None
-    assert client_month_run._client_media_count(str(gym)) == 0
-    assert client_infographic_fill.real_media_depleted("gymx")
+    assert client_content.pick_image("gymx_ig", "2026-09-19", str(gym)) is not None
+    assert client_month_run._client_media_count(str(gym)) == 1
+    assert not client_infographic_fill.real_media_depleted("gymx")
 
 
-def test_bridge_inventory_fails_closed_for_unknown_or_pending_people(monkeypatch, tmp_path):
-    """Neither unclassified nor pending-consent media can hide depletion."""
+def test_bridge_inventory_ignores_unknown_or_pending_consent(monkeypatch, tmp_path):
     from agent import client_content, client_media_sync, client_month_run, rotation
     from agent.library import Creative
     monkeypatch.delenv("AGENT_CONSENT_GUARD_ENABLED", raising=False)
@@ -205,26 +203,34 @@ def test_bridge_inventory_fails_closed_for_unknown_or_pending_people(monkeypatch
         Creative(path=str(unknown), media_type="image"), "gymx_ig", used=set())
 
     monkeypatch.setenv("AGENT_MEDIA_BRIDGE_ALERTS", "true")
-    assert client_month_run._client_media_count(str(gym)) == 0
-    assert client_content.pick_image("gymx_ig", "2026-09-19", str(gym)) is None
-    assert client_infographic_fill.real_media_depleted("gymx") is True
+    assert client_month_run._client_media_count(str(gym)) == 2
+    assert client_content.pick_image("gymx_ig", "2026-09-19", str(gym)) is not None
+    assert client_infographic_fill.real_media_depleted("gymx") is False
 
 
-def test_drive_explicit_refusals_are_not_pickable_or_usable():
+def test_drive_safety_refusals_block_but_legacy_consent_does_not():
     from agent import gym_media_selector
+    observed = "2026-09-19T12:00:00+00:00"
     base = {"id": "one", "gym_id": "gymx", "kind": "photo",
-            "eligible": True, "excluded_by_coach": False}
+            "eligible": True, "excluded_by_coach": False, "approved": True,
+            "review_status": "approved", "reviewed_by": "automatic_moderation",
+            "reviewed_at": observed, "content_hash": "abc",
+            "review_content_hash": "abc", "moderation_status": "clean",
+            "people_detected": True,
+            "moderation_json": {"verdict": "clean", "provider": "test",
+                                "content_hash": "abc", "asset_id": "one",
+                                "gym_id": "gymx", "people_detected": True,
+                                "observed_at": observed}}
     class Store:
         def available(self):
             return True
         def list_assets(self, gym):
             return [dict(base, **refusal) for refusal in
-                    ({"approved": False}, {"moderation": "rejected"},
-                     {"consent": "denied"})]
+                    ({"eligible": False}, {"moderation_status": "flagged"})]
     assert gym_media_selector.pickable("gymx", store=Store()) == []
-    for refusal in ({"approved": False}, {"moderation": "rejected"},
-                    {"consent": "denied"}):
+    for refusal in ({"eligible": False}, {"moderation_status": "flagged"}):
         assert not gym_media_selector.is_usable(dict(base, **refusal))
+    assert gym_media_selector.is_usable(dict(base, consent_status="denied"))
 
 
 def test_failed_drive_inventory_read_cannot_confirm_depletion(monkeypatch, tmp_path):
