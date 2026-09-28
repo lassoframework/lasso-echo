@@ -127,12 +127,26 @@ def test_media_readiness_includes_new_local_swap_candidate(monkeypatch):
                                      "source": "local", "selectable": True}]
 
 
-def test_media_readiness_zero_is_a_definitive_success_when_every_asset_is_excluded():
+def test_media_readiness_reports_safe_cooldown_fallback_when_fresh_pool_is_empty():
     calendar = _Calendar(_row(), [_row(id="row002", source_media_asset_id="asset-book")])
     assets = _Assets([
         _asset("asset-book"),
         _asset("asset-unreviewed", review_status="pending"),
         _asset("asset-used", last_used_at="2026-09-10T00:00:00+00:00"),
+        _asset("asset-current"),
+    ])
+    status, body = _get(_path(), calendar, assets)
+    assert status == 200
+    assert body == {"ok": True, "gym_key": GYM, "candidates": [
+        {"id": "asset-used", "row_id": ROW, "source": "drive",
+         "review_state": "reviewed", "selectable": True}]}
+
+
+def test_media_readiness_zero_is_definitive_when_no_safe_fallback_exists():
+    calendar = _Calendar(_row(), [_row(id="row002", source_media_asset_id="asset-book")])
+    assets = _Assets([
+        _asset("asset-book"),
+        _asset("asset-unreviewed", review_status="pending"),
         _asset("asset-current"),
     ])
     status, body = _get(_path(), calendar, assets)

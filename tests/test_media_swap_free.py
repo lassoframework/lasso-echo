@@ -396,6 +396,48 @@ def test_drive_candidates_come_from_the_pickable_pool_minus_the_book():
     assert cands[0]["kind"] == "video" and cands[0]["source"] == "drive"
 
 
+def test_swift_river_swap_recovers_from_cooldown_without_reusing_live_book_media():
+    """A small library with every safe asset inside the generic 90-day cooldown
+    must still answer a user-requested swap. The current asset and another active
+    row's asset stay hard-blocked; the oldest remaining asset is the fallback."""
+    from datetime import datetime, timedelta, timezone
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    now = datetime(2026, 9, 28, tzinfo=timezone.utc)
+    assets = [
+        make_asset("current", gym_id="swiftrivercrossfit", used_count=1,
+                   last_used_at=(now - timedelta(days=20)).isoformat()),
+        make_asset("booked", gym_id="swiftrivercrossfit", used_count=1,
+                   last_used_at=(now - timedelta(days=80)).isoformat()),
+        make_asset("oldest-safe", gym_id="swiftrivercrossfit", used_count=3,
+                   last_used_at=(now - timedelta(days=70)).isoformat()),
+        make_asset("newer-safe", gym_id="swiftrivercrossfit", used_count=1,
+                   last_used_at=(now - timedelta(days=5)).isoformat()),
+    ]
+    media_store = FakeMediaStore(assets=assets)
+    row = dict(_row("p1", gym_id="swiftrivercrossfit"),
+               source_media_asset_id="current")
+    cands = msw.candidates_for(
+        "swiftrivercrossfit", row, store=_Store(), lib="", book_state={},
+        asset_state={"booked": {("2026-09-22", "pending")}},
+        media_store=media_store, now=now)
+    assert [c["key"] for c in cands] == ["oldest-safe", "newer-safe"]
+    assert all(c["reuse_fallback"] is True for c in cands)
+
+
+def test_zanshin_nine_month_policy_refuses_the_same_exhaustion_fallback():
+    from datetime import datetime, timedelta, timezone
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    now = datetime(2026, 9, 28, tzinfo=timezone.utc)
+    media_store = FakeMediaStore(assets=[
+        make_asset("cooling", gym_id="zanshinfitness630e22",
+                   last_used_at=(now - timedelta(days=200)).isoformat())])
+    row = _row("p1", gym_id="zanshinfitness630e22")
+    cands = msw.candidates_for(
+        "zanshinfitness630e22", row, store=_Store(), lib="", book_state={},
+        asset_state={}, media_store=media_store, now=now)
+    assert cands == [], "the explicit nine-month no-repeat promise is a hard gate"
+
+
 def test_a_drive_video_swap_carries_the_video_row_shape(monkeypatch):
     """A swapped-in Drive video ships exactly like a Drive-built video row: the
     hosted video as image_url (publisher types it 'video' by extension), a poster as

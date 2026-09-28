@@ -43,6 +43,31 @@ def test_used_this_month_excluded():
     assert sel.pick_media("pierce", store=store, now=NOW) is None
 
 
+def test_user_requested_fallback_uses_oldest_safe_cooling_asset_only():
+    """Automatic picks keep the 90-day rule, while an explicit swap can recover
+    from exhaustion. Assets on the live book remain excluded and the oldest prior
+    use wins so recovery maximizes spacing."""
+    store = FakeMediaStore(assets=[
+        reviewed_asset("oldest", gym_id="swiftrivercrossfit", used_count=4,
+                       last_used_at=(NOW - timedelta(days=70)).isoformat()),
+        reviewed_asset("newer", gym_id="swiftrivercrossfit", used_count=1,
+                       last_used_at=(NOW - timedelta(days=10)).isoformat()),
+        reviewed_asset("on-book", gym_id="swiftrivercrossfit", used_count=2,
+                       last_used_at=(NOW - timedelta(days=80)).isoformat()),
+    ])
+    assert sel.pickable("swiftrivercrossfit", store=store, now=NOW) == []
+    got = sel.cooldown_fallback(
+        "swiftrivercrossfit", store=store, exclude_ids=("on-book",))
+    assert [a["id"] for a in got] == ["oldest", "newer"]
+
+
+def test_explicit_nine_month_client_never_gets_cooldown_fallback():
+    store = FakeMediaStore(assets=[
+        reviewed_asset("recent", gym_id="zanshinfitness630e22",
+                       last_used_at=(NOW - timedelta(days=100)).isoformat())])
+    assert sel.cooldown_fallback("zanshinfitness630e22", store=store) == []
+
+
 def test_excluded_by_coach_never_selectable():
     store = FakeMediaStore(assets=[make_asset("a", excluded_by_coach=True)])
     assert sel.pick_media("pierce", store=store, now=NOW) is None
