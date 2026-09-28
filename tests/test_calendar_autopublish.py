@@ -22,6 +22,7 @@ Coverage:
 import os
 import sys
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, uuid5
 
@@ -42,6 +43,16 @@ RUN_DATE = "2026-08-10"
 # (FIX 1) never withholds a row; the spacing behavior itself is covered in its
 # own section below with earlier `now` values.
 LATE_NOW = "2026-08-10T23:59:00-04:00"
+
+
+def test_now_iso_serializes_injected_datetime_for_supabase_json():
+    now = datetime(2026, 9, 28, 21, 19, 32, 750000, tzinfo=timezone.utc)
+
+    assert cap._now_iso(now) == "2026-09-28T21:19:32.750000+00:00"
+
+
+def test_now_iso_preserves_existing_iso_string():
+    assert cap._now_iso(LATE_NOW) == LATE_NOW
 
 
 # ---- fakes -----------------------------------------------------------------
