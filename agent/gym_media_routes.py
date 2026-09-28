@@ -492,6 +492,7 @@ def handle_list_assets(account_key, *, store=None):
          "moderation_status": a.get("moderation_status") or "pending",
          "moderation_json": a.get("moderation_json"),
          "people_detected": a.get("people_detected"),
+         "release_required": False,
          "consent_status": a.get("consent_status") or "pending",
          "consent_member_ref": a.get("consent_member_ref"),
          "release_ref": a.get("release_ref"),

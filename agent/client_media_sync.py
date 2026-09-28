@@ -97,13 +97,8 @@ def usable_local_creative(creative, account_key, *, used=None):
         return False
     if name in rotation.style_exclusions(os.path.dirname(creative.path)):
         return False
-    # Bridge inventory is a new, publishable-inventory contract, so while it is
-    # armed it fails closed on an unclassified people status.  Leaving the
-    # bridge off retains the legacy inventory behavior for existing libraries.
-    from .media_bridge import enabled as bridge_enabled
     if (name.startswith(("igfill_", "no_media_", "seed_"))
             or name in used or dam.rotation_key(creative.path) in used
-            or dam.consent_blocked(creative.path, strict=bridge_enabled())
             or not _valid_media_file(creative.path)):
         return False
     side = dam.read_sidecar(creative.path)
@@ -121,7 +116,6 @@ def explicitly_refused_local(path):
     from . import dam
     side = dam.read_sidecar(path)
     return (side.get("approved") is False
-            or str(side.get("consent") or "").strip().lower() == "denied"
             or str(side.get("moderation") or "").strip().lower() == "rejected")
 
 # The R2 upload layout. Fresh uploads (intake_web.handle_upload) carry two sidecar

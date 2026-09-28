@@ -111,22 +111,10 @@ def is_usable(asset):
         return False
     if not _clean_moderation_evidence(a):
         return False
-    people = a.get("people_detected")
-    if people is False:
-        return a.get("consent_status") == "not_required"
-    if people is not True or a.get("consent_status") != "granted":
-        return False
-    if not str(a.get("consent_member_ref") or "").strip():
-        return False
-    if not str(a.get("release_ref") or "").strip():
-        return False
-    expiry = _parse_ts(a.get("consent_expires_at"))
-    if expiry is None:
-        return False
-    if expiry.tzinfo is None:
-        expiry = expiry.replace(tzinfo=timezone.utc)
-    if expiry <= datetime.now(timezone.utc):
-        return False
+    # Photo releases are not a publishing requirement. Safety moderation remains
+    # byte-bound and fail-closed above. Clean automatic moderation approves the
+    # exact reviewed hash. Legacy consent columns remain readable for old rows but
+    # never decide whether a clean, reviewed asset can publish.
     return True
 
 

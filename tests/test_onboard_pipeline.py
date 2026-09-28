@@ -1,6 +1,6 @@
 """
 One-command onboarding tests. Asserts: a complete fixture intake produces the
-FULL scaffold (draft bible + proof, account entry printed, consent-guard
+FULL scaffold (draft bible + proof, account entry printed, media-safety
 README, welcome kit PDF, go live checklist); a missing section BLOCKS with the
 list and creates nothing.
 """
@@ -69,10 +69,10 @@ def test_full_scaffold_from_fixture_intake(tmp_path, monkeypatch, capsys):
     assert os.path.exists(out["bible"]) and os.path.exists(out["proof"])
     bible = open(out["bible"], encoding="utf-8").read()
     assert "Straight talk, warm, zero hype." in bible
-    # consent-guard README in the client library
+    # media-safety README in the client library
     readme = open(os.path.join(str(tmp_path), "content_library", "iron_path",
                                "README.md"), encoding="utf-8").read()
-    assert "CONSENT GUARD" in readme
+    assert "PHOTO RELEASES" in readme
     # welcome kit PDF, real and branded
     assert os.path.getsize(out["kit"]) > 1000
     text = pdf_report.pdf_text(out["kit"])
@@ -99,7 +99,7 @@ def test_missing_fields_block_with_list(tmp_path, monkeypatch, capsys):
     printed = capsys.readouterr().out
     assert "BLOCKED" in printed and "ever guessed" in printed
     assert "2. Who you talk to" in printed
-    assert "9. Consent policy" in printed
+    assert "9. Media policy" in printed
     # nothing was created
     assert not (tmp_path / "drafts").exists()
     assert not (tmp_path / "content_library").exists()

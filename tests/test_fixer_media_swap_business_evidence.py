@@ -130,7 +130,7 @@ def test_completed_swap_requires_unchanged_current_row(row_patch):
 
 @pytest.mark.parametrize('asset_patch', [
     {'review_status': 'pending_review'}, {'moderation_status': 'pending'},
-    {'consent_status': 'pending'}, {'review_content_hash': 'old-bytes'},
+    {'excluded_by_coach': True}, {'review_content_hash': 'old-bytes'},
 ])
 def test_completed_swap_requires_current_selector_approval(asset_patch):
     result = observe('media_swap_completed', Reader(asset=approved_asset(**asset_patch)))

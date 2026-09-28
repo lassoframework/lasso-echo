@@ -108,10 +108,6 @@ def classify_creatives(account_key, library_path):
         if not rotation.is_gate_clean(getattr(c, "client_note", ""), approved_claims):
             excluded[base] = "fabrication gate (uncleared claim in the note)"
             continue
-        from . import dam
-        if dam.consent_blocked(c.path):
-            excluded[base] = "consent blocked"
-            continue
         eligible.append(c)
     return eligible, excluded
 
