@@ -164,7 +164,7 @@ Now the FALLBACK engine. Everything below is unchanged.
 | AGENT_GEMINI_DAILY_CAP | 40 | code | Generation calls/day/account under the cap, either engine. |
 | AGENT_OCR_CHECK_ENABLED | false | BLAKE | Headline OCR warning (never blocks). |
 | AGENT_AUTOTAG_ENABLED | false | BLAKE | DAM auto-tag on ingest. |
-| AGENT_CONSENT_GUARD_ENABLED | false | BLAKE | People=consent gate. |
+| AGENT_CONSENT_GUARD_ENABLED | false | retired | Compatibility-only; photo releases never gate publishing. |
 
 ## Hosting (R2/S3)
 

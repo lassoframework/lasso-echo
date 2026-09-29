@@ -28,6 +28,10 @@ time, in filename order. What this module does now:
                 creative served inside the repeat window (rotation ledger).
   ORDER       = least recently used first (never used wins), then least used,
                 then name for determinism.
+  EXHAUSTION  = for gyms without an explicit long-term reuse promise, a manual
+                swap may relax only the generic rotation cooldown and choose the
+                least-recently-used safe asset outside the live forward book.
+                Zanshin's nine-month policy remains a hard gate.
   VIDEO FIRST = when the row's current media is a still and a video candidate
                 exists, the swap hands back a video. A follower asking for a
                 different picture of the same nine stills is asking for footage.
@@ -190,8 +194,14 @@ def _local_video_servable(path):
     return not _idx.needs_rendition(pseudo, info)
 
 
-def local_candidates(base_key, lib, post_date, blocked_keys):
-    """The gym's local-library creatives a swap may use for a row on post_date."""
+def local_candidates(base_key, lib, post_date, blocked_keys, *, allow_recent=False):
+    """The gym's local-library creatives a swap may use for a row on post_date.
+
+    ``allow_recent`` is the user-requested exhaustion lane. It relaxes only the
+    generic served-ledger cooldown; media already carried by the live book remains
+    blocked by ``blocked_keys``. Explicit client reuse policies are checked by the
+    caller before this lane is reachable.
+    """
     if not lib or not os.path.isdir(lib):
         return []
     from . import dam, rotation
@@ -224,21 +234,25 @@ def local_candidates(base_key, lib, post_date, blocked_keys):
         except Exception:  # noqa: BLE001
             rk = key
         last = served.get(rk, "")
-        if last and floor and last >= floor:
+        if not allow_recent and last and floor and last >= floor:
             continue                      # served inside the repeat window
         out.append({"source": "local", "kind": kind, "key": key, "path": path,
                     "last_used": last, "used_count": 1 if last else 0, "name": key})
     return out
 
 
-def drive_candidates(base_key, blocked_ids, *, media_store=None, now=None):
+def drive_candidates(base_key, blocked_ids, *, media_store=None, now=None,
+                     allow_cooling=False):
     """The gym's Drive-pool assets a swap may use: gym_media_selector.pickable (eligible,
     not hidden, outside the 90-day cooldown, not used this month), minus everything
     already on the book. Never raises; an unarmed store is an empty list."""
     try:
         from . import gym_media_selector as _sel
-        assets = _sel.pickable(base_key, store=media_store, now=now,
-                               exclude_ids=tuple(blocked_ids))
+        picker = _sel.cooldown_fallback if allow_cooling else _sel.pickable
+        kwargs = {"store": media_store, "exclude_ids": tuple(blocked_ids)}
+        if not allow_cooling:
+            kwargs["now"] = now
+        assets = picker(base_key, **kwargs)
     except Exception:  # noqa: BLE001
         return []
     out = []
@@ -318,6 +332,23 @@ def candidates_for(base_key, row, *, store, lib, book_state=None, asset_state=No
         blocked_ids.add(current_asset)
     cands = local_candidates(base_key, lib, pd, blocked_keys)
     cands += drive_candidates(base_key, blocked_ids, media_store=media_store, now=now)
+    if not cands:
+        # A user-requested swap must not deadlock a small library merely because
+        # every otherwise-safe asset is inside the generic 30/90-day rotation
+        # clocks. Keep anything on another active/in-flight day excluded, then use
+        # the least-recently-used safe asset. Explicit client policies remain hard:
+        # Zanshin's nine-month no-repeat promise never reaches this fallback.
+        from .media_reuse_policy import reuse_months
+        if not reuse_months(base_key):
+            cands = local_candidates(base_key, lib, pd, blocked_keys,
+                                     allow_recent=True)
+            cands += drive_candidates(base_key, blocked_ids, media_store=media_store,
+                                      now=now, allow_cooling=True)
+            for cand in cands:
+                cand["reuse_fallback"] = True
+            if cands:
+                say(f"{base_key}: fresh swap pool exhausted; using least-recently-used "
+                    "media outside the live forward book")
     return order_candidates(cands, current_is_video=is_video(current))
 
 

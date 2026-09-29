@@ -1,9 +1,9 @@
 """Tests for agent/gym_media_moderation.py — the bounded Drive-media moderation
-EVIDENCE producer — and the store's conditional update_moderation_asset write.
+evidence and automatic approval producer — and the store's conditional write.
 
 Fully offline: the drive fake writes known bytes to the tmp path, the store is
-in-memory, and vision is an injected callable. The producer must NEVER approve
-(review_status stays 'pending_review') and must fail closed (ok=False, no write)
+in-memory, and vision is an injected callable. Only a clean, current-hash verdict approves; all degraded inputs fail closed
+(ok=False, no write)
 on every degraded input.
 """
 import hashlib
@@ -49,7 +49,7 @@ def _pending_asset(blob=PHOTO_BYTES, **over):
 
 class ModerationFakeStore(FakeMediaStore):
     """FakeMediaStore plus the conditional update_moderation_asset write, mirroring
-    SupabaseMediaStore semantics: refuses review columns, requires tenant+hash,
+    SupabaseMediaStore semantics: requires complete atomic state, tenant+hash,
     and raises MediaStoreError(409) when the row no longer matches."""
 
     def __init__(self, *a, conflict=False, **kw):
@@ -64,9 +64,7 @@ class ModerationFakeStore(FakeMediaStore):
              "fields": dict(fields), "expected_content_hash": expected_content_hash})
         if self._conflict:
             raise MediaStoreError(409, "asset changed during moderation")
-        forbidden = {"review_status", "reviewed_by", "reviewed_at",
-                     "review_note", "review_content_hash"} & set(fields)
-        if not gym_id or not expected_content_hash or forbidden:
+        if not gym_id or not expected_content_hash:
             raise MediaStoreError(400, "bad moderation write")
         asset = self.assets.get(asset_id)
         if (not asset or asset.get("gym_id") != gym_id or
@@ -94,7 +92,7 @@ def _setup(blob=PHOTO_BYTES, **asset_over):
 
 
 # ---- 1. clean photo, no people ------------------------------------------------
-def test_clean_no_people_writes_evidence_but_never_approves():
+def test_clean_no_people_writes_evidence_and_auto_approves():
     asset, store, drive = _setup()
     out = mod.moderate_asset(GYM, ASSET_ID, store=store, drive=drive,
                              vision=_vision(_clean_json(False)), now_iso=NOW)
@@ -116,19 +114,19 @@ def test_clean_no_people_writes_evidence_but_never_approves():
     assert ev["gym_id"] == GYM
     assert ev["people_detected"] is False
     assert ev["observed_at"] == NOW
-    # Selector contract: the evidence validates, but is_usable still requires
-    # operator review — moderation evidence alone never selects a photo.
     assert selector._clean_moderation_evidence(row) is True
-    assert row["review_status"] == "pending_review"
-    assert selector.is_usable(row) is False
+    assert row["review_status"] == "approved"
+    assert row["reviewed_by"] == "automatic_moderation"
+    assert row["review_content_hash"] == row["content_hash"]
+    assert selector.is_usable(row) is True
 
     call = store.moderation_updates[-1]
-    assert "review_status" not in call["fields"]
+    assert call["fields"]["review_status"] == "approved"
     assert call["expected_content_hash"] == asset["content_hash"]
 
 
 # ---- 2. clean photo WITH people -----------------------------------------------
-def test_clean_with_people_keeps_consent_pending_and_unusable():
+def test_clean_with_people_auto_approves_without_release_requirement():
     asset, store, drive = _setup()
     out = mod.moderate_asset(GYM, ASSET_ID, store=store, drive=drive,
                              vision=_vision(_clean_json(True)), now_iso=NOW)
@@ -136,9 +134,9 @@ def test_clean_with_people_keeps_consent_pending_and_unusable():
     row = store.get_asset(ASSET_ID)
     assert row["moderation_status"] == "clean"
     assert row["people_detected"] is True
-    assert row["consent_status"] == "pending"
+    assert row["consent_status"] == "not_required"
     assert selector._clean_moderation_evidence(row) is True
-    assert selector.is_usable(row) is False  # no consent grant, no review
+    assert selector.is_usable(row) is True
 
 
 # ---- 3. unsafe / unknown verdicts ----------------------------------------------
@@ -215,10 +213,7 @@ def test_unparseable_or_ambiguous_output_fails_closed(raw):
     assert store.get_asset(ASSET_ID)["moderation_status"] == "pending"
 
 
-def test_people_detected_null_with_clean_is_ambiguous_no_write():
-    # people_detected=null is a valid parse (consent stays pending, row records
-    # None) — but here assert the AMBIGUOUS contract: null does NOT become a
-    # no-people clean, and the row is not usable.
+def test_people_detected_null_with_clean_auto_approves():
     asset, store, drive = _setup()
     raw = json.dumps({"verdict": "clean", "people_detected": None})
     out = mod.moderate_asset(GYM, ASSET_ID, store=store, drive=drive,
@@ -227,8 +222,8 @@ def test_people_detected_null_with_clean_is_ambiguous_no_write():
     row = store.get_asset(ASSET_ID)
     assert row["moderation_status"] == "clean"
     assert row["people_detected"] is None
-    assert row["consent_status"] == "pending"
-    assert selector.is_usable(row) is False
+    assert row["consent_status"] == "not_required"
+    assert selector.is_usable(row) is True
 
 
 def test_default_vision_unarmed_without_api_key(monkeypatch):
@@ -311,22 +306,15 @@ def test_missing_asset_fails_closed():
     assert out["reason"] == "asset not found"
 
 
-# ---- 9. no auto-approval: moderation + selector, then operator review -----------
-def test_moderation_then_operator_approve_makes_usable_end_to_end():
+# ---- 9. automatic approval is usable end to end -------------------------------
+def test_clean_moderation_makes_usable_end_to_end():
     asset, store, drive = _setup()
     out = mod.moderate_asset(GYM, ASSET_ID, store=store, drive=drive,
                              vision=_vision(_clean_json(False)), now_iso=NOW)
     assert out["ok"] is True
     row = store.get_asset(ASSET_ID)
-    assert selector.is_usable(row) is False  # evidence alone is not approval
-
-    fields = gym_media_review.review_asset(GYM, ASSET_ID, "approve",
-                                           store=store, operator="op-1")
-    assert fields["review_status"] == "approved"
-    final = store.get_asset(ASSET_ID)
-    assert final["review_status"] == "approved"
-    assert final["review_content_hash"] == final["content_hash"]
-    assert selector.is_usable(final) is True  # ONLY after the operator path
+    assert row["review_status"] == "approved"
+    assert selector.is_usable(row) is True
 
 
 # ---- 8. SupabaseMediaStore.update_moderation_asset unit tests (fake http) --------
@@ -357,23 +345,26 @@ def _store(http):
 
 def _valid_fields(hash_value="h1"):
     return {"moderation_status": "clean", "people_detected": False,
-            "consent_status": "not_required",
+            "consent_status": "not_required", "review_status": "approved",
+            "reviewed_by": "automatic_moderation", "reviewed_at": NOW,
+            "review_content_hash": hash_value,
             "moderation_json": {"verdict": "clean", "provider": "gemini:test",
                                 "content_hash": hash_value, "asset_id": ASSET_ID,
                                 "gym_id": GYM, "people_detected": False,
                                 "observed_at": NOW}}
 
 
-def test_update_moderation_asset_refuses_review_columns():
+def test_update_moderation_asset_requires_complete_atomic_fields():
     http = _FakeHttp(_Resp(200, [{"id": ASSET_ID}]))
     store = _store(http)
-    for col in ("review_status", "reviewed_by", "reviewed_at",
-                "review_note", "review_content_hash"):
+    for col in ("review_status", "reviewed_by", "reviewed_at", "review_content_hash"):
+        fields = _valid_fields()
+        fields.pop(col)
         with pytest.raises(MediaStoreError) as ei:
-            store.update_moderation_asset(GYM, ASSET_ID, {col: "x"},
-                                          expected_content_hash="h")
+            store.update_moderation_asset(GYM, ASSET_ID, fields,
+                                          expected_content_hash="h1")
         assert ei.value.status == 400
-    assert http.calls == []  # refused before any HTTP
+    assert http.calls == []
 
 
 @pytest.mark.parametrize("field,value", [
@@ -429,7 +420,7 @@ def test_update_moderation_asset_zero_rows_is_409():
     assert ei.value.status == 409
 
 @pytest.mark.parametrize('people', [False, True])
-def test_scheduled_pass_records_evidence_without_approval(monkeypatch, people):
+def test_scheduled_pass_records_evidence_and_approves(monkeypatch, people):
     from agent.jobs.moderate_pending_gym_media import run
     from datetime import datetime
     asset, store, drive = _setup(source_id='source')
@@ -439,9 +430,9 @@ def test_scheduled_pass_records_evidence_without_approval(monkeypatch, people):
                  now=datetime.fromisoformat(NOW))
     assert result['recorded'] == 1
     row = store.get_asset(ASSET_ID)
-    assert row['review_status'] == 'pending_review'
-    assert row['consent_status'] == ('pending' if people else 'not_required')
-    assert not selector.is_usable(row)
+    assert row['review_status'] == 'approved'
+    assert row['consent_status'] == 'not_required'
+    assert selector.is_usable(row)
 
 
 def test_scheduled_pass_is_bounded_and_failures_do_not_starve(monkeypatch):

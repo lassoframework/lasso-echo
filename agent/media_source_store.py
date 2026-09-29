@@ -242,7 +242,8 @@ class SupabaseMediaStore:
 
     _MODERATION_FIELDS = {
         "moderation_status", "moderation_json", "people_detected",
-        "consent_status",
+        "consent_status", "review_status", "reviewed_by", "reviewed_at",
+        "review_content_hash",
     }
 
     def update_moderation_asset(self, gym_id, asset_id, fields, *,
@@ -261,17 +262,21 @@ class SupabaseMediaStore:
         people = fields["people_detected"]
         consent = fields["consent_status"]
         evidence = fields["moderation_json"]
+        clean = status == "clean"
         if (status not in {"clean", "flagged"}
                 or people is not None and not isinstance(people, bool)
-                or consent != ("not_required" if status == "clean" and people is False
-                               else "pending")
+                or consent != ("not_required" if status == "clean" else "pending")
                 or not isinstance(evidence, dict)
                 or evidence.get("content_hash") != expected_content_hash
                 or evidence.get("asset_id") != asset_id
                 or evidence.get("gym_id") != gym_id
                 or evidence.get("people_detected") is not people
                 or evidence.get("verdict") not in {"clean", "unsafe", "unknown"}
-                or (status == "clean") != (evidence.get("verdict") == "clean")):
+                or clean != (evidence.get("verdict") == "clean")
+                or fields["review_status"] != ("approved" if clean else "pending_review")
+                or fields["reviewed_by"] != ("automatic_moderation" if clean else None)
+                or fields["reviewed_at"] != (evidence.get("observed_at") if clean else None)
+                or fields["review_content_hash"] != (expected_content_hash if clean else None)):
             raise MediaStoreError(400, "invalid moderation evidence")
         params = {"id": f"eq.{asset_id}", "gym_id": f"eq.{gym_id}",
                   "content_hash": f"eq.{expected_content_hash}",

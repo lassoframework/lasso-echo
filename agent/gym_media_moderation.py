@@ -5,10 +5,9 @@ Downloads ONE pending gym-media photo, verifies its bytes against the indexed
 Drive content hash, asks a vision provider for a strict safety/people verdict,
 and records the parsed verdict as moderation evidence on the media_asset row.
 
-This module is NOT a reviewer and NOT an approver:
-  * review_status is NEVER written — it stays 'pending_review'. Operator review
-    (agent/gym_media_review.py) remains the sole approval writer. Nothing here
-    approves, posts, or stages anything.
+For photos, a byte-bound clean verdict is the approval decision. The same
+conditional write records the moderation evidence and approves that exact hash.
+Unsafe, unknown, failed, or stale-hash scans remain pending and unusable.
   * Evidence is written ONLY to a row that is review_status='pending_review' AND
     moderation_status='pending', via the store's conditional
     update_moderation_asset (content-hash pinned); a concurrent sync or second
@@ -146,22 +145,23 @@ def build_evidence(provider, verdict, asset, people_detected, observed_at):
 
 
 def _outcome_fields(verdict, people, provider, asset, observed_at):
-    """Map a parsed verdict to the media_asset field update. review_status is
-    never among them. people_detected is recorded ONLY as a strict bool (a null
-    provider answer records None — consent then stays pending and unusable)."""
+    """Map a parsed verdict to one atomic evidence and approval update."""
     evidence = build_evidence(provider, verdict, asset, people, observed_at)
     fields = {"moderation_json": evidence,
               "people_detected": people if isinstance(people, bool) else None}
-    if verdict == "clean" and people is False:
-        fields.update(moderation_status="clean", consent_status="not_required")
-    elif verdict == "clean":
-        # People present (or unreadable): clean content, but a release is still
-        # required — consent stays pending for operator review to grant.
-        fields.update(moderation_status="clean", consent_status="pending")
+    if verdict == "clean":
+        # Photo releases are not required. People detection remains evidence for
+        # review and diagnostics, but it does not create a separate consent gate.
+        fields.update(moderation_status="clean", consent_status="not_required",
+                      review_status="approved", reviewed_by="automatic_moderation",
+                      reviewed_at=observed_at,
+                      review_content_hash=asset["content_hash"])
     else:
         # 'unsafe' or 'unknown' both quarantine the asset pending a human look;
         # neither can ever clear it.
-        fields.update(moderation_status="flagged", consent_status="pending")
+        fields.update(moderation_status="flagged", consent_status="pending",
+                      review_status="pending_review", reviewed_by=None,
+                      reviewed_at=None, review_content_hash=None)
     return fields
 
 

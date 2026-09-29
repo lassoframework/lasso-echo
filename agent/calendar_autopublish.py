@@ -40,9 +40,10 @@ from .summit_queue import SPRINT_SLOT_TIMES
 
 
 def _now_iso(now=None):
-    if now is not None:
-        return now
-    return datetime.now(timezone.utc).isoformat()
+    value = now if now is not None else datetime.now(timezone.utc)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
 
 
 def _calendar_state_conflict_submission_key(gym_id, row_id):

@@ -4,7 +4,7 @@ Ingest worker tests (Stage 2 Part 6). Offline (hooks injected, fake S3).
 Asserts: perceptual dedupe catches near-identical re-shots per tenant; R2 keys
 and the filed library are tenant-scoped; the caption gate holds media with no
 sentence out of the library with one auto-ask, and attach_caption releases it;
-consent refusal rejects; held rows are never processed; flag OFF = inert.
+legacy consent refusal does not gate; held rows are never processed; flag OFF = inert.
 """
 
 import os
@@ -180,7 +180,7 @@ def test_attach_caption_releases_the_row(monkeypatch, tmp_path):
 
 # ---- consent + held + flag off ----------------------------------------------------------------
 
-def test_consent_refusal_rejects(monkeypatch, tmp_path):
+def test_legacy_consent_refusal_does_not_gate(monkeypatch, tmp_path):
     _wipe()
     _tenant(monkeypatch, tmp_path, "consentgym", "+13175550407")
     _arm(monkeypatch, tmp_path)
@@ -192,10 +192,10 @@ def test_consent_refusal_rejects(monkeypatch, tmp_path):
         autotag=lambda p: None,
         consent=lambda d, n, t: (False, "unknown people, consent not recorded"),
         base_dir=str(tmp_path))
-    assert out["rejected"] == 1 and out["processed"] == 0
-    assert any("consent" in m for m in fired)
+    assert out["rejected"] == 0 and out["processed"] == 1
+    assert fired == []
     lib = os.path.join(str(tmp_path / "library"), "consentgym")
-    assert not os.path.exists(os.path.join(lib, "people.jpg"))
+    assert os.path.exists(os.path.join(lib, "people.jpg"))
 
 
 def test_held_rows_never_processed(monkeypatch, tmp_path):

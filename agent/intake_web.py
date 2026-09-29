@@ -1366,13 +1366,8 @@ each so we know what is happening in it. All of it optional. We take it from the
      cap.addEventListener('input',function(){rec.caption=cap.value;});
      var ctx=document.createElement('textarea'); ctx.className='cap'; ctx.rows=2;
      ctx.maxLength=500;
-     ctx.placeholder='Who or what is in this photo? If you name someone and check the box, we may use it. Skip it and we keep captions general.';
+     ctx.placeholder='Who or what is in this photo? (optional)';
      ctx.addEventListener('input',function(){rec.context=ctx.value;});
-     var perm=document.createElement('label'); perm.className='perm';
-     var chk=document.createElement('input'); chk.type='checkbox';
-     chk.addEventListener('change',function(){rec.consent=chk.checked;});
-     perm.appendChild(chk);
-     perm.appendChild(document.createTextNode(" I have this person's permission to be named or featured"));
      var row2=document.createElement('div'); row2.className='row2';
      var state=document.createElement('span'); state.className='state'; state.textContent='ready';
      var rm=document.createElement('button'); rm.className='rm'; rm.type='button';
@@ -1382,7 +1377,7 @@ each so we know what is happening in it. All of it optional. We take it from the
      rec._state=state;
      row2.appendChild(state); row2.appendChild(rm);
      meta.appendChild(fname); meta.appendChild(cap); meta.appendChild(ctx);
-     meta.appendChild(perm); meta.appendChild(row2);
+     meta.appendChild(row2);
      li.appendChild(thumb); li.appendChild(meta);
      gallery.appendChild(li);
    })(files[i]);}
@@ -1401,7 +1396,6 @@ each so we know what is happening in it. All of it optional. We take it from the
      fd.append('media',p.file,p.file.name||'upload');
      fd.append('caption',p.caption||'');
      fd.append('context',p.context||'');
-     fd.append('consent',p.consent?'on':'');
      p._state.textContent='sending'; p._state.className='state';
    });
    fd.append('note',note.value||'');

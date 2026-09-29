@@ -23,9 +23,9 @@ Missed bundles occupy Sep 26–Oct 9; future bundles shift to Oct 10–18.
 ## Review these assets first (deduplicated)
 
 A01–A14 cover the entire missed backlog; A15–A23 cover shifted future rows.
-Verify current hash-bound moderation, real image and consent for every asset;
-none is auto-approved. Recognizable people require genuine release/member/expiry
-evidence. Clean no-people assets still need human approval.
+Verify current hash-bound moderation and the real image for every asset;
+clean, hash-bound moderation automatically approves the exact file. Photo releases
+are not required. Unsafe, unreadable, failed-scan, or changed files remain blocked.
 
 | Ref | Media asset ID |
 |---|---|
@@ -154,8 +154,6 @@ After separate deployment, Blake's existing interactive asset paths are:
 python -m agent.jobs.moderate_gym_media eng --asset-id "$ASSET_ID"
 python -m agent.jobs.moderate_gym_media eng --asset-id "$ASSET_ID" --apply
 python -m agent.gym_media_review eng "$ASSET_ID" approve --note 'Inspected current image and evidence'
-# People: only when actual consent references exist:
-python -m agent.gym_media_review eng "$ASSET_ID" approve --release-ref "$RELEASE_REF" --member-ref "$MEMBER_REF" --expires-at "$CONSENT_EXPIRES_AT" --note 'Verified image consent'
 ```
 
 These live-writing operator commands were **not run**. Do not batch-approve.
@@ -166,4 +164,4 @@ rows through Oct 18 (or the recalculated end date): this export stops Oct 1, so
 any additional/new rows must join the tail and be rescheduled, never collide.
 Do not reset publishing claims, delete rows, or enable a past-date backlog.
 Apply the reviewed manifest through the calendar editor only after that inventory
-check; approval, media reuse, caption, consent and normal publish guards still apply.
+check; approval, media reuse, caption and normal publish guards still apply.

@@ -353,6 +353,42 @@ def test_calendar_null_caption_and_image(monkeypatch):
     assert d["pillar"] is None
 
 
+def test_calendar_hides_the_same_client_statuses_as_social(monkeypatch):
+    rows = [
+        _row("live", status="pending"),
+        _row("denied", status="denied"),
+        _row("killed", status="killed"),
+        _row("deleted", status="deleted"),
+        _row("coach", status="coach_review"),
+    ]
+    http = _FakeHTTP(get_resp=_Resp(200, rows))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+
+    assert status == 200
+    assert [d["draft_id"] for d in body["drafts"]] == ["live"]
+
+
+def test_calendar_visibility_escape_hatch_keeps_coach_review_private(monkeypatch):
+    monkeypatch.setenv("ECHO_PORTAL_SHOW_REJECTED", "true")
+    rows = [
+        _row("live", status="pending"),
+        _row("denied", status="denied"),
+        _row("killed", status="killed"),
+        _row("deleted", status="deleted"),
+        _row("coach", status="coach_review"),
+    ]
+    http = _FakeHTTP(get_resp=_Resp(200, rows))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+
+    assert status == 200
+    assert [d["draft_id"] for d in body["drafts"]] == [
+        "live", "denied", "killed", "deleted"]
+
+
 # ---- 2. month filter correctness ----------------------------------------------
 
 def test_calendar_month_filter_bounds(monkeypatch):
@@ -602,6 +638,52 @@ def test_no_creds_uses_sqlite_path(monkeypatch):
     assert status == 200
     assert hit["db"] is True, "SQLite path must run when creds absent"
     assert body["drafts"] == []
+
+
+def test_sqlite_calendar_filters_hidden_status_before_legacy_decode(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    raw_rows = [
+        {"draft_id": "live", "status": "pending"},
+        {"draft_id": "denied", "status": "denied"},
+        {"draft_id": "killed", "status": "killed"},
+        {"draft_id": "deleted", "status": "deleted"},
+        {"draft_id": "coach", "status": "coach_review"},
+    ]
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *args, **kwargs):
+            class _Cursor:
+                def fetchall(self):
+                    return raw_rows
+            return _Cursor()
+
+    decoded = []
+
+    def _decode(row):
+        decoded.append(row["draft_id"])
+        return type("Draft", (), {
+            "draft_id": row["draft_id"], "day_key": "2026-08-01",
+            "draft_type": "feed", "status": row["status"],
+            "platform": "instagram", "caption": "caption",
+            "creative_public_url": None, "scheduled_for": None,
+            "blocked_reason": None,
+        })()
+
+    monkeypatch.setattr("agent.portal_routes._db.connect", lambda: _FakeConn())
+    monkeypatch.setattr("agent.store._row_to_draft", _decode)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+
+    assert status == 200
+    assert decoded == ["live"]
+    assert [d["draft_id"] for d in body["drafts"]] == ["live"]
 
 
 def test_no_creds_action_uses_portal_approvals(monkeypatch):
@@ -1120,6 +1202,53 @@ def test_swap_media_zero_match_returns_none(monkeypatch):
     assert pcs.SupabaseCalendarStore().swap_media("gritx", "id-m", "u") is None
     _m, _u, _params, _h, payload = http.calls[0]
     assert payload == {"image_url": "u"}   # source_media_url omitted when not given
+
+
+@pytest.mark.parametrize("peer_caption,preserve", [
+    ("Shared caption", True),
+    ("Different caption", False),
+])
+def test_redate_moves_ledger_stamp_only_after_matching_old_date_peers_leave(
+        monkeypatch, peer_caption, preserve):
+    """The IG/FB/story bundle shares one caption stamp.
+
+    Moving one sibling must retain the old stamp while another matching row still
+    owns it; the last sibling may move it.  This also preserves a genuinely
+    published duplicate on the old date.
+    """
+    old = {"id": "row-1", "gym_id": "eng", "post_date": "2026-09-29",
+           "caption": "Shared caption", "status": "approved"}
+    updated = dict(old, post_date="2026-10-04", scheduled_at=None)
+
+    class _RedateHTTP(_FakeHTTP):
+        def __init__(self):
+            super().__init__(patch_resp=_Resp(200, [updated]))
+            self.reads = 0
+
+        def get(self, url, params=None, headers=None, timeout=None):
+            self.calls.append(("get", url, params or {}, headers or {}))
+            self.reads += 1
+            return (_Resp(200, [old]) if self.reads == 1
+                    else _Resp(200, [{"caption": peer_caption}]))
+
+    http = _RedateHTTP()
+    moved = []
+    monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: True)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    monkeypatch.setattr(
+        "agent.caption_ledger.move_staged_date",
+        lambda *args, **kwargs: moved.append((args, kwargs)))
+
+    out = pcs.SupabaseCalendarStore().patch_post_date("row-1", "2026-10-04")
+
+    assert out == updated
+    assert http.calls[1][2]["post_date"] == "eq.2026-09-29"  # CAS old date
+    assert http.calls[2][2]["id"] == "neq.row-1"
+    assert moved[0][0] == ("eng", "Shared caption", "2026-09-29", "2026-10-04")
+    assert moved[0][1] == {
+        "preserve_old_fuzzy": preserve,
+        "preserve_old_verbatim": preserve,
+    }
 
 
 # ---- CROSS-DAY MEDIA BELT on insert_rows (fleet audit, 2026-08-31) -------------
