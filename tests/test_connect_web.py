@@ -11,6 +11,8 @@ import json
 import os
 import sys
 import urllib.parse
+import threading
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -45,6 +47,30 @@ class FakeGraph:
                              "instagram_business_account":
                                  {"username": "ironpathgym", "id": "IG9"}})
         return FakeResp({})
+
+
+def test_public_healthz_reports_railway_build_identity(monkeypatch):
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "def456")
+    monkeypatch.setenv("RAILWAY_SERVICE_NAME", "echo-worker")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-appear")
+    from http.server import ThreadingHTTPServer
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), connect_web._handler_class())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_address[1]}/healthz", timeout=5) as resp:
+            payload = json.loads(resp.read())
+            assert resp.status == 200
+        assert payload == {
+            "ok": True,
+            "deployment": {"commit": "def456", "service": "echo-worker"},
+        }
+        assert "must-not-appear" not in json.dumps(payload)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def _arm(monkeypatch):

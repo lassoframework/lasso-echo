@@ -188,7 +188,7 @@ Connected</p>
 
 
 # ---- the thin stdlib server (started by the listener when armed) -------------------
-def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure core
+def _handler_class():
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
@@ -230,9 +230,18 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
             return True
 
         def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/healthz":
+                self._send_json(200, {
+                    "ok": True,
+                    "deployment": {
+                        "commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA"),
+                        "service": os.environ.get("RAILWAY_SERVICE_NAME"),
+                    },
+                })
+                return
             if self._ops_actions("GET"):
                 return
-            parsed = urllib.parse.urlparse(self.path)
             # Admin tracker: /admin/tracker/<token>[/handoff] (read-only, token-gated)
             import re as _re
             m = _re.match(r"^/admin/tracker/([A-Za-z0-9_-]{8,})(/handoff)?$",
@@ -268,9 +277,14 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
         def log_message(self, fmt, *args):  # never log query strings (codes/state)
             print(f"[connect] {self.command} {urllib.parse.urlparse(self.path).path}")
 
+    return Handler
+
+
+def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure core
+    from http.server import ThreadingHTTPServer
     port = int(port or os.environ.get("AGENT_CONNECT_PORT", "8090"))
     print(f"[connect] serving on :{port}")
-    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", port), _handler_class()).serve_forever()
 
 
 def _queue_grade_baseline(page_id, page_name, ig_username, poster=None):
