@@ -742,6 +742,68 @@ class ZernioClient:
             page += 1
         return posts
 
+    def posts_range_complete(self, profile_id, start, end, page_limit=50, max_pages=20):
+        """Return posts in ``[start, end]`` only with completeness proof.
+
+        This is the absence-authorizing reader for stale publish reconciliation.
+        It is deliberately stricter than ``posts_window``: an incoherent page
+        contract, an unparseable ordering timestamp, or hitting the request bound
+        before the requested range is covered raises ``ZernioPaginationError``.
+        A caller must treat that as ambiguity, never as proof a post is absent.
+        """
+        start = start if isinstance(start, datetime) else _parse_iso(start)
+        end = end if isinstance(end, datetime) else _parse_iso(end)
+        if isinstance(start, datetime) and start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if isinstance(end, datetime) and end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start is None or end is None or start > end:
+            raise ValueError("posts range requires valid ordered timestamps")
+        limit = max(1, min(int(page_limit), 100))
+        bound = max(1, int(max_pages))
+        posts = []
+        seen_count = 0
+        previous_oldest = None
+        complete = False
+        for page in range(1, bound + 1):
+            response = self.list_posts(profile_id, page=page, limit=limit) or {}
+            pagination = response.get("pagination")
+            if not isinstance(pagination, dict):
+                raise ZernioPaginationError("posts response omitted pagination")
+            batch = [p for p in (response.get("posts") or []) if isinstance(p, dict)]
+            if not batch:
+                complete = True
+                break
+            seen_count += len(batch)
+            stamps = []
+            for post in batch:
+                stamp = _parse_iso(post.get("scheduledFor") or post.get("createdAt"))
+                if stamp is None:
+                    raise ZernioPaginationError("post omitted an ordering timestamp")
+                stamps.append(stamp)
+                if start <= stamp <= end:
+                    posts.append(post)
+            newest, oldest = max(stamps), min(stamps)
+            if previous_oldest is not None and newest > previous_oldest:
+                raise ZernioPaginationError("posts pages were not newest-first")
+            previous_oldest = oldest
+            if oldest < start:
+                complete = True
+                break
+            try:
+                total = int(pagination.get("total"))
+                pages = int(pagination.get("pages"))
+            except (TypeError, ValueError):
+                raise ZernioPaginationError("posts pagination totals were invalid")
+            if total < seen_count or pages < page:
+                raise ZernioPaginationError("posts pagination totals were invalid")
+            if page >= pages or seen_count >= total:
+                complete = True
+                break
+        if not complete:
+            raise ZernioPaginationError("posts range exceeded the bounded page budget")
+        return posts
+
     def analytics(self, profile_id, page=1, limit=50, source=None):
         """GET /v1/analytics?profileId=... -> the analytics JSON (read-only add-on).
 
