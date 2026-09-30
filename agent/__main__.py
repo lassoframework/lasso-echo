@@ -173,6 +173,7 @@ def _status():
     print(f"  deny_backfill  : {config.deny_backfill_enabled()}  (env AGENT_DENY_BACKFILL; a gym AT its creative cap gets a FRESH replacement for each DENIED feed day — a NEW caption on a REUSED photo, never the denied post's own photo and never an approved/published one; INSERT-only, PENDING, all A+/banned/fabrication gates enforced; OFF => a denied slot stays empty at cap)")
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
     print(f"  summit_daily   : {config.lasso_summit_daily_enabled()}  (env AGENT_LASSO_SUMMIT_DAILY_ENABLED; LASSO-only third feed from 2026-09-23 through 2026-11-08; default OFF)")
+    print(f"  lasso_3x       : {config.lasso_three_feed_enabled()}  (env AGENT_LASSO_3X_ENABLED; durable LASSO-only third feed; default OFF)")
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
     print(f"  welcome_tmpl   : {config.welcome_templates_enabled()}  (env AGENT_WELCOME_TEMPLATES_ENABLED)")
     print(f"  welcome_posts  : {config.welcome_posts_enabled()}  (env AGENT_WELCOME_POSTS_ENABLED; needs STRIPE_API_KEY)")

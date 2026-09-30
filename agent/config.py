@@ -1262,6 +1262,17 @@ LASSO_SUMMIT_DAILY_END = "2026-11-08"     # last day (mirrors SUMMIT_END_DATE)
 LASSO_SUMMIT_DAILY_CAPACITY = 3           # 2 regular + 1 Summit, never more
 
 
+def lasso_three_feed_enabled() -> bool:
+    """Durable LASSO-only three-feed cadence.
+
+    This switch is intentionally separate from the dated Summit campaign. It expands
+    only the canonical internal LASSO calendar; client gyms remain constrained to their
+    existing 1/2 setting. The default is OFF so deploying code cannot change cadence
+    until operations explicitly arms AGENT_LASSO_3X_ENABLED.
+    """
+    return _truthy(os.environ.get("AGENT_LASSO_3X_ENABLED", "false"))
+
+
 def lasso_summit_daily_enabled(day=None) -> bool:
     """LASSO Summit daily-extra switch (AGENT_LASSO_SUMMIT_DAILY_ENABLED, default
     OFF). True ONLY when the flag is set AND `day` (a date or YYYY-MM-DD string;

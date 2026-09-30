@@ -85,6 +85,34 @@ def test_account_state_time_expiry():
     assert z.account_state(acct, now=datetime.now(timezone.utc)) == "expired"
 
 
+def test_account_state_refreshed_ig_uses_absolute_grant_expiry():
+    """A refreshed grant must not expire on its original connection deadline."""
+    from datetime import datetime, timezone
+    acct = {
+        "_id": "acct_ig", "platform": "instagram", "isActive": True,
+        "enabled": True, "needsReconnection": False, "platformStatus": "active",
+        "tokenExpiresAt": "2026-11-16T13:17:49.905Z",
+        "metadata": {
+            "connectedAt": "2026-07-29T13:14:04.205Z",
+            "lastTokenRefreshAt": "2026-09-17T13:17:49.905Z",
+            "expires_in": 5183999,
+        },
+    }
+    now = datetime(2026, 9, 30, 20, 0, tzinfo=timezone.utc)
+    assert z.account_state(acct, now=now) == "connected"
+    assert z.account_id_for({"accounts": [acct]}, "instagram") == "acct_ig"
+
+
+def test_account_state_past_absolute_ig_grant_is_expired():
+    from datetime import datetime, timezone
+    acct = {"_id": "acct_ig", "platform": "instagram", "isActive": True,
+            "tokenExpiresAt": "2026-09-29T00:00:00Z",
+            "metadata": {"connectedAt": "2026-09-01T00:00:00Z",
+                         "expires_in": 5183999}}
+    assert z.account_state(
+        acct, now=datetime(2026, 9, 30, tzinfo=timezone.utc)) == "expired"
+
+
 def test_map_status_missing_platform_is_not_connected_no_handle():
     out = z.map_status({"accounts": []})
     assert out["platforms"]["facebook"] == {"connected": False, "handle": None,

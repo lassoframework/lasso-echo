@@ -636,6 +636,27 @@ def _daily_scheduler(store):
                 # that died between the claim and the publish leaves a row stuck;
                 # this surfaces it to a human instead of silent forever-orphaning.
                 calendar_autopublish.sweep_stuck_publishing()
+                # Provider-backed stale-claim repair (hourly): a complete,
+                # tenant-scoped Zernio read may stamp a proven live post or release
+                # a proven absent one. Ambiguous/incomplete reads remain held. This
+                # never sends a post and is rate-bounded independently of the
+                # one-minute publisher loop.
+                if config.zernio_publish_enabled():
+                    try:
+                        import time as _time
+                        from . import db as _db, stale_claim_reconciler as _scr
+                        _scr_ts = float(_db.kv_get("stale_claim_reconcile_ts") or 0)
+                        if _time.time() - _scr_ts > 3600:
+                            _db.kv_set("stale_claim_reconcile_ts", str(_time.time()))
+                            _scr_result = _scr.reconcile()
+                            if _scr_result["published"] or _scr_result["released"]:
+                                print("[stale-claim-reconcile] "
+                                      f"published={len(_scr_result['published'])} "
+                                      f"released={len(_scr_result['released'])} "
+                                      f"held={len(_scr_result['held'])}")
+                    except Exception as _scr_exc:
+                        print(f"[stale-claim-reconcile] skipped: "
+                              f"{type(_scr_exc).__name__}: {_scr_exc}")
                 # EXPIRED-ROW watchdog (alert-only): approved/pending rows aged past
                 # the catch-up window can never publish and nothing else reports them
                 # (11 approved LASSO posts and 26 GritX rows died exactly this way).

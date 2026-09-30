@@ -1653,7 +1653,8 @@ class SupabaseCalendarStore:
             # but the filter is added anyway so a future bug elsewhere can never
             # turn this into a false stale-claim alert on a variant row.
             "variant_status": "eq.active",
-            "select": "id,gym_id,account,post_date",
+            "select": "id,gym_id,account,format,post_date,scheduled_at,caption,"
+                      "image_url,publish_claim_token,publish_reservation_day",
         }
         r = self._client().get(
             self._rest(_TABLE),
@@ -1664,6 +1665,47 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
+
+    def reconcile_stale_published(self, account_key, row_id, claim_token,
+                                  media_id, published_at):
+        """Stamp one provider-confirmed live stale claim with a tenant-scoped CAS."""
+        if not all(str(v or "").strip() for v in
+                   (account_key, row_id, claim_token, media_id, published_at)):
+            raise PortalStoreError(422, "stale publish reconciliation identity is incomplete")
+        try:
+            from uuid import UUID
+            claim_token = str(UUID(str(claim_token)))
+        except (TypeError, ValueError, AttributeError):
+            raise PortalStoreError(422, "stale publish reconciliation token is invalid")
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
+                    "status": "eq.publishing", "published_at": "is.null",
+                    "late_post_id": "is.null",
+                    "publish_claim_token": f"eq.{claim_token}"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"status": "published", "published_at": str(published_at),
+                  "late_post_id": str(media_id), "publish_claim_token": None},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return next((row for row in rows
+                     if str(row.get("id")) == str(row_id)
+                     and str(row.get("gym_id")) == str(account_key)
+                     and row.get("status") == "published"
+                     and str(row.get("late_post_id") or "") == str(media_id)), None)
+
+    def release_stale_publish_claim(self, account_key, row_id, claim_token, reason):
+        """Release one provider-confirmed absent claim with a tenant-scoped CAS.
+
+        ``approved`` is the conservative retry state: it preserves manual client
+        approval and remains eligible for an autonomous account.
+        """
+        return self._transition_unpublished_claim(
+            account_key, row_id, "approved", reason, claim_token)
 
     def delete_rows(self, account_key, row_ids):
         """Hard-delete specific rows for ONE gym. Filtered by BOTH id AND gym_id so a
@@ -2724,13 +2766,12 @@ def preserve_and_prune(store, account_key, months, rows):
                 base_capacity = resolve_posts_per_day(account_key, store)
             if (str(account_key).strip().lower() == "lasso"
                     and str(row.get("format") or "feed").strip().lower() == "feed"):
-                enabled = getattr(config, "lasso_summit_daily_enabled", None)
-                if callable(enabled):
-                    try:
-                        if enabled(day_key):
-                            return max(base_capacity, 3)
-                    except (TypeError, ValueError):
-                        pass
+                try:
+                    if config.lasso_three_feed_enabled() or \
+                            config.lasso_summit_daily_enabled(day_key):
+                        return max(base_capacity, 3)
+                except (TypeError, ValueError):
+                    pass
             # Summit's third slot is feed-only. The dated cadence resolver may
             # report three for LASSO, but paired stories retain their existing
             # two-slot capacity.

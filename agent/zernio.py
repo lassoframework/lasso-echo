@@ -742,6 +742,68 @@ class ZernioClient:
             page += 1
         return posts
 
+    def posts_range_complete(self, profile_id, start, end, page_limit=50, max_pages=20):
+        """Return posts in ``[start, end]`` only with completeness proof.
+
+        This is the absence-authorizing reader for stale publish reconciliation.
+        It is deliberately stricter than ``posts_window``: an incoherent page
+        contract, an unparseable ordering timestamp, or hitting the request bound
+        before the requested range is covered raises ``ZernioPaginationError``.
+        A caller must treat that as ambiguity, never as proof a post is absent.
+        """
+        start = start if isinstance(start, datetime) else _parse_iso(start)
+        end = end if isinstance(end, datetime) else _parse_iso(end)
+        if isinstance(start, datetime) and start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if isinstance(end, datetime) and end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start is None or end is None or start > end:
+            raise ValueError("posts range requires valid ordered timestamps")
+        limit = max(1, min(int(page_limit), 100))
+        bound = max(1, int(max_pages))
+        posts = []
+        seen_count = 0
+        previous_oldest = None
+        complete = False
+        for page in range(1, bound + 1):
+            response = self.list_posts(profile_id, page=page, limit=limit) or {}
+            pagination = response.get("pagination")
+            if not isinstance(pagination, dict):
+                raise ZernioPaginationError("posts response omitted pagination")
+            batch = [p for p in (response.get("posts") or []) if isinstance(p, dict)]
+            if not batch:
+                complete = True
+                break
+            seen_count += len(batch)
+            stamps = []
+            for post in batch:
+                stamp = _parse_iso(post.get("scheduledFor") or post.get("createdAt"))
+                if stamp is None:
+                    raise ZernioPaginationError("post omitted an ordering timestamp")
+                stamps.append(stamp)
+                if start <= stamp <= end:
+                    posts.append(post)
+            newest, oldest = max(stamps), min(stamps)
+            if previous_oldest is not None and newest > previous_oldest:
+                raise ZernioPaginationError("posts pages were not newest-first")
+            previous_oldest = oldest
+            if oldest < start:
+                complete = True
+                break
+            try:
+                total = int(pagination.get("total"))
+                pages = int(pagination.get("pages"))
+            except (TypeError, ValueError):
+                raise ZernioPaginationError("posts pagination totals were invalid")
+            if total < seen_count or pages < page:
+                raise ZernioPaginationError("posts pagination totals were invalid")
+            if page >= pages or seen_count >= total:
+                complete = True
+                break
+        if not complete:
+            raise ZernioPaginationError("posts range exceeded the bounded page budget")
+        return posts
+
     def analytics(self, profile_id, page=1, limit=50, source=None):
         """GET /v1/analytics?profileId=... -> the analytics JSON (read-only add-on).
 
@@ -1059,7 +1121,9 @@ def account_state(acct, now=None):
     # We only trip on an UNAMBIGUOUS truthy signal (never on absence), so a list that merely omits
     # these fields still reads connected — the anti-flap rule the IG fix depends on is preserved.
     if acct.get("tokenExpired") is True or acct.get("needsReconnect") is True \
-            or md.get("tokenExpired") is True or md.get("needsReconnect") is True:
+            or acct.get("needsReconnection") is True \
+            or md.get("tokenExpired") is True or md.get("needsReconnect") is True \
+            or md.get("needsReconnection") is True:
         return "expired"
     _st = str(acct.get("status") or acct.get("connectionStatus")
               or md.get("status") or "").strip().lower()
@@ -1073,10 +1137,33 @@ def account_state(acct, now=None):
         now = now or datetime.now(timezone.utc)
         if exp_at < now:
             return "expired"
-    # Token expiry is a NEGATIVE and takes precedence: connectedAt + expires_in in the past -> expired.
+    # IG/FB grants are refreshed in place. Zernio keeps metadata.connectedAt as the
+    # ORIGINAL connection time while moving tokenExpiresAt/lastTokenRefreshAt forward.
+    # Treating connectedAt + expires_in as authoritative after a refresh incorrectly
+    # expires a healthy account every ~60 days (LASSO IG, 2026-09-27). For IG/FB an
+    # absolute tokenExpiresAt is the freshest source: a future value proves the old
+    # derived expiry is stale; a past value is an honest reconnect signal. Google
+    # Business is deliberately excluded because its tokenExpiresAt is the rolling
+    # one-hour access token that Zernio refreshes behind the API (C15).
+    platform = str(acct.get("platform") or "").strip().lower()
+    token_exp_at = None
+    if platform != "googlebusiness":
+        token_exp_at = _parse_iso(acct.get("tokenExpiresAt")
+                                  or md.get("tokenExpiresAt"))
+        if token_exp_at is not None:
+            now = now or datetime.now(timezone.utc)
+            if token_exp_at < now:
+                return "expired"
+
+    # Derived token expiry remains the fallback when no absolute IG/FB grant expiry
+    # is reported. Anchor it to the latest successful refresh, not the original
+    # connection, so refreshed grants do not flap to expired on the old deadline.
     exp = md.get("expires_in")
-    connected_at = _parse_iso(acct.get("connectedAt") or md.get("connectedAt"))
-    if isinstance(exp, (int, float)) and connected_at is not None:
+    connected_at = _parse_iso(md.get("lastTokenRefreshAt")
+                              or acct.get("lastTokenRefreshAt")
+                              or acct.get("connectedAt") or md.get("connectedAt"))
+    if token_exp_at is None and isinstance(exp, (int, float)) \
+            and not isinstance(exp, bool) and connected_at is not None:
         now = now or datetime.now(timezone.utc)
         if (now - connected_at).total_seconds() > float(exp):
             return "expired"
