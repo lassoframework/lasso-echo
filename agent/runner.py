@@ -1437,8 +1437,8 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"gym media Drive sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
-    # Populate hash-bound evidence after indexing. This does not approve media;
-    # the existing operator review/consent boundary still controls publishing.
+    # Populate hash-bound evidence after indexing. Clean evidence approves only
+    # that exact asset hash; unsafe, unreadable, or changed media stays blocked.
     if config.gym_drive_connect_enabled() or config.gym_drive_connect_gyms():
         try:
             from .jobs.moderate_pending_gym_media import run as _moderation_run
