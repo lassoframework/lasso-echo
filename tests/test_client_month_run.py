@@ -179,16 +179,16 @@ def test_builds_paused_real_photo_rows_with_fb_mirror(tmp_path):
 
 
 def test_feed_autofit_reframes_feed_but_never_the_story(monkeypatch, tmp_path):
-    # AGENT_FEED_AUTOFIT on + STORY_FORMAT off: the FEED gets the 1080x1080 square, but the
-    # paired STORY must keep the RAW photo (never a square pillarboxed into a 9:16 slot).
+    # AGENT_FEED_AUTOFIT on + STORY_FORMAT off: the FEED gets the 1080x1350 card, but the
+    # paired STORY must keep the RAW photo (never a feed card pillarboxed into a 9:16 slot).
     monkeypatch.setenv("AGENT_FEED_AUTOFIT", "true")
     monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
     monkeypatch.delenv("AGENT_STORY_FORMAT", raising=False)   # story-format OFF (baseline)
     from agent import feed_image, media_host
-    # every feed photo is treated as out-of-spec -> reframed to a sentinel square asset
+    # every feed photo is treated as out-of-spec -> reframed to a sentinel 4:5 asset
     monkeypatch.setattr(feed_image, "get_or_make_feed_image",
                         lambda p, lib, logger=None: "/REFRAMED__feed.jpg")
-    # host_media: the square asset -> a SQUARE url; any other path -> a raw-photo url
+    # host_media: the feed asset -> a formatted url; any other path -> a raw-photo url
     monkeypatch.setattr(media_host, "host_media",
                         lambda path, key, client=None: ("https://cdn/SQUARE.jpg"
                                                         if str(path).endswith("__feed.jpg")
@@ -203,7 +203,7 @@ def test_feed_autofit_reframes_feed_but_never_the_story(monkeypatch, tmp_path):
     feeds = [r for r in store.inserted if r["format"] == "feed"]
     stories = [r for r in store.inserted if r["format"] == "story"]
     assert feeds and stories
-    # FEED carries the reframed square...
+    # FEED carries the reframed 4:5 card...
     assert all(r["image_url"] == "https://cdn/SQUARE.jpg" for r in feeds)
     # ...but the STORY never does — it keeps the raw photo url.
     assert all(r["image_url"] != "https://cdn/SQUARE.jpg" for r in stories)

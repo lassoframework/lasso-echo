@@ -521,8 +521,8 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
     # client sees a real frame. Display-only; best effort.
     _attach_video_poster(account, feed, library_path, log)
     # FEED AUTOFIT (AGENT_FEED_AUTOFIT, OFF by default): an out-of-spec feed PHOTO is
-    # re-framed to 1080x1080. Snapshot the pre-autofit media FIRST so the paired story
-    # never inherits the square feed card.
+    # re-framed to 1080x1350. Snapshot the pre-autofit media FIRST so the paired story
+    # never inherits the formatted feed card.
     _pre_autofit_url = getattr(feed, "creative_public_url", "")
     _maybe_format_feed(account, feed, library_path, log)
     _mark_feed(feed)
@@ -530,7 +530,7 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
 
     # PAIRED STORY on the SAME photo (cloned from the feed; no second media consumed).
     story = _story_from_feed(feed)
-    # The story must NOT carry the feed's SQUARE autofit reframe: restore the pre-autofit
+    # The story must NOT carry the feed's 4:5 autofit reframe: restore the pre-autofit
     # media (story-format ON rebuilds a fresh 1080x1920; this keeps it correct when OFF).
     if getattr(story, "creative_public_url", "") != _pre_autofit_url:
         try:
@@ -1774,7 +1774,7 @@ def _localize_creative(story, feed, path, log):
 
     Reads story.creative_public_url FIRST, never the feed's: _finish_feed_with_story
     snapshots the pre-autofit media onto the story precisely so a story is not built
-    from the SQUARE 1080x1080 feed card. Localizing from the feed would re-introduce
+    from the 4:5 1080x1350 feed card. Localizing from the feed would re-introduce
     that bug for every Drive story whenever AGENT_FEED_AUTOFIT is armed (it is)."""
     url = ((getattr(story, "creative_public_url", "") or "").strip()
            or (getattr(feed, "creative_public_url", "") or "").strip())
@@ -1851,7 +1851,7 @@ def _maybe_format_story(account, story, feed, library_path, log):
     # content_calendar.source_media_url only when AGENT_STORY_SOURCE_MEDIA is on (the column
     # exists). Read the STORY's url, not the feed's: _finish_feed_with_story has already
     # restored the PRE-AUTOFIT media onto the story, whereas feed.creative_public_url may
-    # by now be the SQUARE 1080x1080 autofit card — storing that made every edited-caption
+    # by now be the 4:5 1080x1350 autofit card — storing that made every edited-caption
     # re-burn come back cropped to the feed shape (both flags are armed in production).
     if config.story_source_media_enabled():
         story.source_media_url = ((getattr(story, "creative_public_url", "") or "")
@@ -1900,7 +1900,7 @@ def _maybe_format_story(account, story, feed, library_path, log):
 
 
 def _maybe_format_feed(account, feed, library_path, log):
-    """AGENT_FEED_AUTOFIT: re-frame an OUT-OF-SPEC feed PHOTO into an in-spec 1080x1080 card
+    """AGENT_FEED_AUTOFIT: re-frame an OUT-OF-SPEC feed PHOTO into an in-spec 1080x1350 card
     so the platform never hard-crops the subject. ENHANCE-only: an in-spec photo, a video,
     hosting-off, or any failure keeps the raw media (this never DROPS a post, unlike the story
     caption guard). Mutates feed.creative_public_url in place on success."""
@@ -1938,7 +1938,7 @@ def _maybe_format_feed(account, feed, library_path, log):
             if getattr(feed, "thumbnail_url", ""):
                 feed.thumbnail_url = ""               # the reframe IS the media
             log(f"feed autofit applied for {os.path.basename(src)} "
-                "(odd ratio -> 1080x1080)")
+                "(odd ratio -> 1080x1350)")
     except Exception as exc:  # noqa: BLE001 - never crash the build; keep the raw photo
         # name whichever source we actually had: a Drive creative has no local path.
         label = os.path.basename(path) or os.path.basename(hosted_src.split("?")[0]) \
