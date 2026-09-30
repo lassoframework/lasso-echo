@@ -2724,13 +2724,12 @@ def preserve_and_prune(store, account_key, months, rows):
                 base_capacity = resolve_posts_per_day(account_key, store)
             if (str(account_key).strip().lower() == "lasso"
                     and str(row.get("format") or "feed").strip().lower() == "feed"):
-                enabled = getattr(config, "lasso_summit_daily_enabled", None)
-                if callable(enabled):
-                    try:
-                        if enabled(day_key):
-                            return max(base_capacity, 3)
-                    except (TypeError, ValueError):
-                        pass
+                try:
+                    if config.lasso_three_feed_enabled() or \
+                            config.lasso_summit_daily_enabled(day_key):
+                        return max(base_capacity, 3)
+                except (TypeError, ValueError):
+                    pass
             # Summit's third slot is feed-only. The dated cadence resolver may
             # report three for LASSO, but paired stories retain their existing
             # two-slot capacity.

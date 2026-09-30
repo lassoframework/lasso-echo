@@ -1059,7 +1059,9 @@ def account_state(acct, now=None):
     # We only trip on an UNAMBIGUOUS truthy signal (never on absence), so a list that merely omits
     # these fields still reads connected — the anti-flap rule the IG fix depends on is preserved.
     if acct.get("tokenExpired") is True or acct.get("needsReconnect") is True \
-            or md.get("tokenExpired") is True or md.get("needsReconnect") is True:
+            or acct.get("needsReconnection") is True \
+            or md.get("tokenExpired") is True or md.get("needsReconnect") is True \
+            or md.get("needsReconnection") is True:
         return "expired"
     _st = str(acct.get("status") or acct.get("connectionStatus")
               or md.get("status") or "").strip().lower()
@@ -1073,10 +1075,33 @@ def account_state(acct, now=None):
         now = now or datetime.now(timezone.utc)
         if exp_at < now:
             return "expired"
-    # Token expiry is a NEGATIVE and takes precedence: connectedAt + expires_in in the past -> expired.
+    # IG/FB grants are refreshed in place. Zernio keeps metadata.connectedAt as the
+    # ORIGINAL connection time while moving tokenExpiresAt/lastTokenRefreshAt forward.
+    # Treating connectedAt + expires_in as authoritative after a refresh incorrectly
+    # expires a healthy account every ~60 days (LASSO IG, 2026-09-27). For IG/FB an
+    # absolute tokenExpiresAt is the freshest source: a future value proves the old
+    # derived expiry is stale; a past value is an honest reconnect signal. Google
+    # Business is deliberately excluded because its tokenExpiresAt is the rolling
+    # one-hour access token that Zernio refreshes behind the API (C15).
+    platform = str(acct.get("platform") or "").strip().lower()
+    token_exp_at = None
+    if platform != "googlebusiness":
+        token_exp_at = _parse_iso(acct.get("tokenExpiresAt")
+                                  or md.get("tokenExpiresAt"))
+        if token_exp_at is not None:
+            now = now or datetime.now(timezone.utc)
+            if token_exp_at < now:
+                return "expired"
+
+    # Derived token expiry remains the fallback when no absolute IG/FB grant expiry
+    # is reported. Anchor it to the latest successful refresh, not the original
+    # connection, so refreshed grants do not flap to expired on the old deadline.
     exp = md.get("expires_in")
-    connected_at = _parse_iso(acct.get("connectedAt") or md.get("connectedAt"))
-    if isinstance(exp, (int, float)) and connected_at is not None:
+    connected_at = _parse_iso(md.get("lastTokenRefreshAt")
+                              or acct.get("lastTokenRefreshAt")
+                              or acct.get("connectedAt") or md.get("connectedAt"))
+    if token_exp_at is None and isinstance(exp, (int, float)) \
+            and not isinstance(exp, bool) and connected_at is not None:
         now = now or datetime.now(timezone.utc)
         if (now - connected_at).total_seconds() > float(exp):
             return "expired"

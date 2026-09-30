@@ -34,11 +34,15 @@ MON = "2026-10-05"
 
 SQL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                         "migrations", "lasso_summit_daily_capacity_20260923.sql")
+DURABLE_SQL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "migrations",
+    "lasso_three_feed_capacity_20260930.sql")
 
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.delenv("AGENT_LASSO_SUMMIT_DAILY_ENABLED", raising=False)
+    monkeypatch.delenv("AGENT_LASSO_3X_ENABLED", raising=False)
     monkeypatch.delenv("ECHO_CADENCE_2X_ENABLED", raising=False)
     monkeypatch.delenv("AGENT_LASSO_VIDEO_MIX", raising=False)
     monkeypatch.delenv("AGENT_LASSO_REELS_FLOOR", raising=False)
@@ -142,6 +146,41 @@ def test_cadence_live_lasso_window(monkeypatch):
     assert cadence.resolve_posts_per_day_live("lasso", day="2026-10-15") == 3
     assert cadence.resolve_posts_per_day_live("lasso", day="2026-11-09") == 1
     assert cadence.resolve_posts_per_day_live("tough_temple", day="2026-10-15") == 1
+
+
+def test_durable_lasso_three_feed_cadence_after_summit(monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    assert cadence.resolve_posts_per_day("lasso", _Store(1), day="2026-11-09") == 3
+    assert cadence.resolve_posts_per_day_live("lasso", day="2027-01-15") == 3
+    assert cadence.resolve_posts_per_day("tough_temple", _Store(2),
+                                         day="2027-01-15") == 1
+
+
+def test_durable_lasso_three_feed_plan_is_three_feeds_two_stories(monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    monkeypatch.setenv("AGENT_LASSO_EDITORIAL_CALENDAR", "true")
+    plan = rmp.plan_month("lasso", "2026-11-09", days=3, posts_per_day=3,
+                          book_dates=set(), summit_day_fn=lambda _d: False,
+                          sprint_day_fn=lambda _d: False,
+                          sprint_feed_count_fn=lambda _d: 0,
+                          welcome_dates=set(), video_mix=False,
+                          reels_floor=False, testimonial=False,
+                          summit_daily_fn=lambda _d: False)
+    for day_key, slots in _by_date(plan).items():
+        feeds = [s for s in slots if s.fmt == "feed"]
+        stories = [s for s in slots if s.fmt == "story"]
+        assert [s.cadence_slot for s in feeds] == [0, 1, 2], day_key
+        assert len({s.category for s in feeds}) == 3, day_key
+        assert {s.cadence_slot for s in stories} == {0, 1}, day_key
+        assert not any(s.summit_daily for s in slots)
+
+    client = rmp.plan_month(
+        "tough_temple", "2026-11-09", days=1, posts_per_day=3,
+        book_dates=set(), summit_day_fn=lambda _d: False,
+        sprint_day_fn=lambda _d: False, sprint_feed_count_fn=lambda _d: 0,
+        welcome_dates=set(), video_mix=False, reels_floor=False,
+        testimonial=False, summit_daily_fn=lambda _d: False)
+    assert len([s for s in client if s.fmt == "feed"]) == 2
 
 
 # ---- planner shape ----------------------------------------------------------
@@ -338,6 +377,15 @@ def test_sql_capacity_3_lasso_window_only():
     assert m, "capacity-3 gate (lasso + 2026-09-23..2026-11-08) missing"
     # No other gym id is granted 3 anywhere in the migration.
     assert sql.count("p_gym_id = 'lasso'") == 1
+
+
+def test_durable_sql_capacity_3_remains_lasso_only_without_date_limit():
+    sql = open(DURABLE_SQL_PATH).read()
+    assert "p_capacity < 1 or p_capacity > 3" in sql
+    assert "if p_capacity = 3 and p_gym_id <> 'lasso'" in sql
+    assert "slot_index = 2" in sql and "gym_id = 'lasso'" in sql
+    assert "post_date between" not in sql
+    assert "coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed') <> 'feed'" in sql
 
 
 def test_sql_slot_two_and_capacity_three_are_feed_only():

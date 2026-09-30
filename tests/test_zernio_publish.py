@@ -575,6 +575,29 @@ def test_failed_client_publish_holds_claim_for_reconciliation(monkeypatch):
     assert store._rows["rB"]["status"] == "publishing"
 
 
+def test_preflight_reconnect_failure_releases_owned_claim(monkeypatch):
+    """A missing connected account is proved pre-network and is safe to retry."""
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
+    rows = [{"id": "r-preflight", "gym_id": "eng", "account": "instagram",
+             "status": "approved", "post_date": "2026-08-13", "format": "feed",
+             "image_url": "https://r2/i.jpg", "caption": "hi"}]
+    store = FakeStore(rows)
+
+    def disconnected(*_args, **_kwargs):
+        from agent.zernio_publisher import ZernioPreflightError
+        raise ZernioPreflightError("no connected instagram account; reconnect required")
+
+    out = cap.publish_due(
+        "2026-08-13", gym_id="eng", store=store, approved_only=True,
+        zernio_publish=disconnected, catch_all=True)
+    assert out["failed"] == ["r-preflight"]
+    assert out["held"] is False
+    assert out["recovery_required"] == []
+    assert store.reverts == [("r-preflight", "approved")]
+    assert store._rows["r-preflight"]["status"] == "approved"
+
+
 def test_exactly_once_across_two_ticks(monkeypatch):
     """A published row is never re-published on a second tick (published_at set +
     status published => not claimable)."""

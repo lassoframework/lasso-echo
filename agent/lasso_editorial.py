@@ -17,6 +17,12 @@ WEEK = (
 def editorial_slots(slots):
     out = []
     for slot in slots:
+        # The durable third LASSO feed is already assigned a distinct fallback
+        # pillar by the planner. WEEK intentionally has only the AM/PM pair, so
+        # preserve ordinal 2 here; the dated Summit normalizer may replace it later.
+        if slot.cadence_slot == 2:
+            out.append(slot)
+            continue
         # Dated campaigns and welcome posts remain authoritative.
         if slot.is_sprint or (slot.overridden and slot.category in ("book", "welcome")
                               and slot.cadence_slot != 1):
@@ -60,6 +66,19 @@ def editorial_slots(slots):
                     if (day,normalized[i].cadence_slot) not in by_slot:
                         normalized[i]=replace(normalized[i],category='doctrine',video_preferred=False)
                         break
+            # A durable three-feed day is planned before editorial relabels the
+            # AM/PM pair. If that relabel makes ordinal 2 duplicate either one,
+            # repoint only the third feed to the first unused approved pillar.
+            third = next((i for i in ix
+                          if fmt == 'feed' and normalized[i].cadence_slot == 2), None)
+            if third is not None:
+                used = {normalized[i].category for i in ix if i != third}
+                if normalized[third].category in used:
+                    pool = ('echo', 'website', 'podcast', 'doctrine', 'book')
+                    category = next(c for c in pool if c not in used)
+                    normalized[third] = replace(
+                        normalized[third], category=category,
+                        video_preferred=category == 'podcast')
     return normalized
 
 
