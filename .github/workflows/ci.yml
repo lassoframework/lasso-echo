@@ -10,7 +10,10 @@ jobs:
   pytest:
     name: pytest
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The full suite now exercises several real ffmpeg paths and can exceed
+    # fifteen minutes on a slower hosted runner. Keep the guard meaningful by
+    # allowing it to finish instead of cancelling around the 90% mark.
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
