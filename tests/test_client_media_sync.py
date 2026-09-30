@@ -771,12 +771,34 @@ def test_equal_media_and_feeds_is_idempotent_skip():
 
     from datetime import date
     out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2,
-                                now=date(2026, 8, 10))
+                                now=date(2026, 8, 1))
     assert out["ok"] is True
     assert out["skipped_existing"] == 1
     assert out["generated"] == 0
     # media still synced, but NO calendar write (no delete, no insert)
     assert store.inserted == [] and store.deleted == []
+
+
+def test_past_feeds_and_built_marker_do_not_suppress_forward_refill():
+    """Swift River: old September rows and a matching legacy marker are not October."""
+    from datetime import date
+    from agent import db
+
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    r2 = _r2_with_uploads("gritx", n=13)
+    past = _existing_feed_calendar("gritx", "2026-09", 13)
+    store = FakeStore(existing={("gritx", "2026-09"): past})
+    db.kv_set("built_media_gritx", "13")
+
+    out = cms.scan_and_generate(
+        clients=["gritx"], store=store, r2=r2,
+        now=date(2026, 10, 1), days=14)
+
+    assert out["generated"] == 1
+    forward = _feed_ig_rows(store.inserted)
+    assert len(forward) == 13
+    assert all("2026-10-01" <= row["post_date"] < "2026-10-15" for row in forward)
 
 
 def test_sample_rows_never_block_the_real_build():

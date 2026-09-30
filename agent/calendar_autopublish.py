@@ -311,7 +311,7 @@ def _normalize_feed_image(row, account, store):
     'approved' and the post stranded forever while the portal still read 'Published').
 
     If the row's hosted image is outside IG/FB's accepted feed ratio, re-frame it into an
-    in-spec 1080x1080 card, re-host, and swap image_url so the platform accepts it. Works
+    in-spec 1080x1350 card, re-host, and swap image_url so the platform accepts it. Works
     from the hosted url alone (fetch -> reframe -> host), so it heals rows built before
     AGENT_FEED_AUTOFIT.
 
@@ -370,7 +370,7 @@ def _normalize_feed_image(row, account, store):
         updated = dict(row)
         updated["image_url"] = hosted
         print(f"[calendar-autopublish] feed preflight reframed out-of-aspect image for "
-              f"row {row.get('id')} ({w}x{h}) -> in-spec 1080x1080")
+              f"row {row.get('id')} ({w}x{h}) -> in-spec 1080x1350")
         return updated
     except Exception as e:  # noqa: BLE001 - known-bad image + reframe failed -> HOLD
         print(f"[calendar-autopublish] feed preflight failed to fix out-of-aspect row "
@@ -1057,7 +1057,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             continue
 
         # FEED ASPECT PREFLIGHT: a feed photo outside IG/FB's accepted ratio is re-framed
-        # to an in-spec 1080x1080 card BEFORE the network call, so Zernio never 400s on
+        # to an in-spec 1080x1350 card BEFORE the network call, so Zernio never 400s on
         # aspect ratio (ENG/Dale 2026-08-24). No-op for a story (framed by its burner) and
         # for an already-in-spec image. Done before the claim so a re-host failure never
         # burns the exactly-once claim. A None return means the image is CONFIRMED

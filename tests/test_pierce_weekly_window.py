@@ -27,7 +27,7 @@ def test_week_store_preserves_unapproved_rows_outside_week():
                                preserve_dates=("2026-09-21",)) == 1
 
 
-def test_week_count_excludes_older_published_feeds():
+def test_every_store_count_excludes_rows_outside_requested_span():
     class Store:
         def list_month(self, base, month):
             return [{"post_date": "2026-09-18", "format": "feed",
@@ -38,6 +38,6 @@ def test_week_count_excludes_older_published_feeds():
                      "account": "instagram", "status": "pending"}]
 
     first = date(2026, 9, 19)
-    assert _existing_feed_count(Store(), "piercefitness", first, 7) == (2, True)
+    assert _existing_feed_count(Store(), "piercefitness", first, 7) == (1, True)
     assert _existing_feed_count(_PierceWeekStore(Store(), first, 7),
                                 "piercefitness", first, 7) == (2, True)

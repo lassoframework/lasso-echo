@@ -820,11 +820,15 @@ def _parse_banned_from_bible(raw):
 
 
 def _existing_feed_count(store, base_key, start, days):
-    """(count, ok): how many ACTIVE FEED rows the gym has in content_calendar across
-    the planned span's months. 'Active' excludes denied/killed/deleted rows so that a
+    """(count, ok): how many ACTIVE FEED rows the gym has inside the exact planned span.
+    'Active' excludes denied/killed/deleted rows so that a
     denied post no longer blocks its own replacement: once the count drops below the
     build target the scanner fires and generates a fresh replacement. Mirrors the build
     query which also excludes denied+killed (portal_calendar_store line ~321).
+
+    The month reads are only transport bounds. Rows before ``start`` or on/after
+    ``start + days`` do not fill the forward plan. Counting whole months let Swift River's
+    old September feeds suppress an otherwise-empty October refill.
 
     A FEED row is the unit that consumes one photo (a story pairs on the same photo and
     an FB mirror duplicates the same feed), so counting DISTINCT feed post_dates on
@@ -837,6 +841,8 @@ def _existing_feed_count(store, base_key, start, days):
         return 0, False
     from datetime import timedelta
     from .onboarding_demo import is_sample_row
+    span_first = start.isoformat()
+    span_last = (start + timedelta(days=days)).isoformat()
     months = sorted({(start + timedelta(days=i)).isoformat()[:7] for i in range(days)})
     feed_dates = set()
     weekly_feeds = 0
@@ -848,11 +854,8 @@ def _existing_feed_count(store, base_key, start, days):
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            # The standard count intentionally covers whole calendar months.
-            # Pierce's weekly store narrows it to the actual review block so
-            # older published feeds cannot suppress the next week's build.
-            if isinstance(store, _PierceWeekStore) and \
-                    str(row.get("post_date"))[:10] not in store._dates:
+            post_date = str(row.get("post_date") or "")[:10]
+            if not (span_first <= post_date < span_last):
                 continue
             status = str(row.get("status", "")).lower()
             # Mirror the build query: denied/killed rows are gone — don't count them
@@ -880,7 +883,7 @@ def _existing_feed_count(store, base_key, start, days):
             if fmt == "feed" and acct in ("instagram", "ig", ""):
                 if isinstance(store, _PierceWeekStore):
                     weekly_feeds += 1
-                feed_dates.add(row.get("post_date") or row.get("id") or len(feed_dates))
+                feed_dates.add(post_date)
     return (weekly_feeds if isinstance(store, _PierceWeekStore)
             else len(feed_dates)), True
 
@@ -1309,48 +1312,13 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # frequent scan never storms the channel; re-fires only if the count moves.
             if 0 < media_count < feed_budget:
                 _alert_thin_creative(base, media_count, feed_budget, log)
-            # ANTI-CHURN (TopFuel, 2026-08-25): rebuild ONLY when there is a real reason.
-            # A gym whose build_target counts un-plannable photo clusters can NEVER reach
-            # build_target (existing_feeds stays below it forever), so without this it rebuilt
-            # every scan — now a no-op thanks to the never-shrink guard in _apply, but still
-            # wasteful (it re-runs caption generation each pass). We remember the media_count
-            # we last built for; an already-built gym (existing_feeds > 0) whose library has
-            # NOT grown is left alone. It rebuilds again only when NEW media arrives.
-            try:
-                from . import db as _db
-                _built_marker = int(_db.kv_get(f"built_media_{base}") or 0)
-            except Exception:  # noqa: BLE001
-                _built_marker = 0
-            # media_count > 0 required: for a Drive-only gym (media_count is
-            # STRUCTURALLY always 0 — it never reflects the connected Drive pool) this
-            # marker comparison is meaningless and 0 <= 0 is unconditionally true, so
-            # without this guard ANY pre-existing calendar rows (even unrelated onboarding
-            # SAMPLE placeholders, status=draft/no image) would false-positive
-            # "already built" and permanently block the Drive lane from ever running
-            # (Dean Holcomb / CrossFit Reverb, 2026-08-31: 42 sample rows already on the
-            # calendar tripped this on the very first post-fix scan).
-            _already_built_for_media = (media_count > 0 and existing_feeds > 0
-                                        and media_count <= _built_marker)
-            if not cadence_changed and (existing_feeds >= build_target
-                                        or _already_built_for_media):
+            # A historical "built for N media" marker cannot prove the CURRENT forward
+            # span is full. Swift River had 13 clean media and 13 old September feeds but
+            # zero October IG rows; the marker suppressed every rolling refill. The exact
+            # forward count above is the idempotence authority.
+            if not cadence_changed and existing_feeds >= build_target:
                 # Already built out to the media the gym supports (capped at `days`):
-                # idempotent. An unchanged library never rebuilds again. Remember the media
-                # count we are built for, so a gym that never reaches build_target (some
-                # clusters un-plannable) does not rebuild again until NEW media arrives.
-                # MARKER-DEADLOCK GUARD (audit 2026-08-25 MAJOR): stamp ONLY when the gym
-                # is MEDIA-capped (media_count <= days => every photo is placeable into
-                # this month). A DAYS-capped gym (more media than days) must NOT stamp —
-                # an at-cap gym that uploads 20 photos would stamp media_count=50 with
-                # zero of them built, then _already_built_for_media blocks every future
-                # rebuild until the library exceeds 50. For days-capped gyms the
-                # existing_feeds >= build_target check alone is the idempotence guard,
-                # and when the month window slides (feeds drop) the rebuild fires again.
-                if media_count <= feed_budget:
-                    try:
-                        from . import db as _db
-                        _db.kv_set(f"built_media_{base}", str(media_count))
-                    except Exception:  # noqa: BLE001
-                        pass
+                # idempotent. An unchanged, full forward span never rebuilds again.
                 #
                 # DENIED-SLOT BACKFILL (AGENT_DENY_BACKFILL, OFF by default): a gym AT cap
                 # can never grow, so a human-denied post would leave a permanently empty
@@ -1432,8 +1400,6 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                     log(f"{base}: calendar was not generated ({reason}); 0 rows written")
                     continue
                 generated += 1
-                # Remember the media count this build covered, so the next scan does not
-                # rebuild until NEW media arrives (anti-churn; pairs with never-shrink).
                 # Stamp the cadence this build APPLIED (CADENCE_SPEC.md D7) ONLY when
                 # the store was actually written (audit 2026-08-27 MAJOR: stamping a
                 # noop_shrink/noop_empty build silently dropped the client's toggle
@@ -1441,7 +1407,6 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # retries it).
                 try:
                     from . import db as _db
-                    _db.kv_set(f"built_media_{base}", str(media_count))
                     if _applied:
                         _db.kv_set(f"cadence_applied_{base}", str(ppd))
                 except Exception:  # noqa: BLE001
