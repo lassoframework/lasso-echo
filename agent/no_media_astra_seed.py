@@ -166,8 +166,10 @@ def seed_gaps(base, account, store, *, log=None, today=None,
         return 0
     from .media_bridge import bridge_days
     allowed_days = set(bridge_days(base, now=today, days_ahead=days_ahead))
+    existing_notice = False
     if depleted:
-        from .media_bridge import retry_existing_notice
+        from .media_bridge import episode, retry_existing_notice
+        existing_notice = bool(episode(base, now=today, create=False))
         retry_existing_notice(base, account, store, logger=log)
 
     from .client_infographic_fill import _empty_upcoming_days
@@ -176,7 +178,7 @@ def seed_gaps(base, account, store, *, log=None, today=None,
         store, base, tz_name, min(days_ahead, 2), now=today) if day in allowed_days]
     if not days:
         return 0
-    if depleted:
+    if depleted and not existing_notice:
         from .media_bridge import notify_bridge
         notify_bridge(base, account, logger=log)
     facts = _ensure_deep_brain_facts(base, log)
