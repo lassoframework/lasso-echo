@@ -25,6 +25,7 @@ from tests.gym_media_fakes import FakeDrive, FakeMediaStore, make_asset  # noqa:
 GYM = "pierce"
 ASSET_ID = "mod-asset-1"
 PHOTO_BYTES = b"\x89PNG-fake-photo-bytes-for-moderation" * 16
+VIDEO_BYTES = b"fake-video-bytes-for-moderation" * 32
 NOW = "2026-09-23T12:00:00+00:00"
 
 
@@ -91,6 +92,14 @@ def _setup(blob=PHOTO_BYTES, **asset_over):
     return asset, store, drive
 
 
+def _video_setup(blob=VIDEO_BYTES, **asset_over):
+    asset = _pending_asset(blob, kind="video", mime_type="video/mp4",
+                           title="clip.mp4", **asset_over)
+    store = ModerationFakeStore(assets=[asset])
+    drive = FakeDrive(blobs={ASSET_ID: blob})
+    return asset, store, drive
+
+
 # ---- 1. clean photo, no people ------------------------------------------------
 def test_clean_no_people_writes_evidence_and_auto_approves():
     asset, store, drive = _setup()
@@ -137,6 +146,106 @@ def test_clean_with_people_auto_approves_without_release_requirement():
     assert row["consent_status"] == "not_required"
     assert selector._clean_moderation_evidence(row) is True
     assert selector.is_usable(row) is True
+
+
+def test_clean_video_requires_every_bounded_frame_and_approves_exact_hash():
+    asset, store, drive = _video_setup()
+    seen = []
+
+    def vision(payload, mime):
+        seen.append((payload, mime))
+        return _clean_json(payload == b"frame-2")
+
+    out = mod.moderate_asset(
+        GYM, ASSET_ID, store=store, drive=drive, vision=vision, now_iso=NOW,
+        video_sampler=lambda _path: [b"frame-1", b"frame-2", b"frame-3"])
+
+    assert out["ok"] is True and out["verdict"] == "clean"
+    assert out["people_detected"] is True
+    assert seen == [(b"frame-1", "image/jpeg"),
+                    (b"frame-2", "image/jpeg"),
+                    (b"frame-3", "image/jpeg")]
+    row = store.get_asset(ASSET_ID)
+    assert row["review_status"] == "approved"
+    assert row["review_content_hash"] == asset["content_hash"]
+    assert row["moderation_json"]["provider"].endswith(":video-frames-3")
+    assert selector.is_usable(row) is True
+
+
+@pytest.mark.parametrize("verdict", ["unsafe", "unknown"])
+def test_any_nonclean_video_frame_quarantines_the_exact_video(verdict):
+    _asset, store, drive = _video_setup()
+    replies = iter([_clean_json(False),
+                    json.dumps({"verdict": verdict, "people_detected": True}),
+                    _clean_json(False)])
+    out = mod.moderate_asset(
+        GYM, ASSET_ID, store=store, drive=drive,
+        vision=lambda *_a: next(replies), now_iso=NOW,
+        video_sampler=lambda _path: [b"a", b"b", b"c"])
+    assert out["ok"] is True and out["verdict"] == verdict
+    row = store.get_asset(ASSET_ID)
+    assert row["moderation_status"] == "flagged"
+    assert row["review_status"] == "pending_review"
+    assert selector.is_usable(row) is False
+
+
+def test_video_sampling_or_frame_verdict_failure_writes_nothing():
+    _asset, store, drive = _video_setup()
+    out = mod.moderate_asset(
+        GYM, ASSET_ID, store=store, drive=drive,
+        vision=_vision(_clean_json(False)), now_iso=NOW,
+        video_sampler=lambda _path: [])
+    assert out["ok"] is False and "sampling failed" in out["reason"]
+    assert store.moderation_updates == []
+
+    out = mod.moderate_asset(
+        GYM, ASSET_ID, store=store, drive=drive,
+        vision=_vision("not json"), now_iso=NOW,
+        video_sampler=lambda _path: [b"a", b"b", b"c"])
+    assert out["ok"] is False and "provider verdict" in out["reason"]
+    assert store.moderation_updates == []
+
+
+def test_default_video_sampler_uses_three_bounded_timestamps(monkeypatch, tmp_path):
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(VIDEO_BYTES)
+    monkeypatch.setattr(mod._idx, "probe_video",
+                        lambda _path, timeout: {"duration_sec": 100})
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stderr = b""
+        stdout = b"jpeg"
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return Proc()
+
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    assert mod._sample_video_frames(path) == [b"jpeg", b"jpeg", b"jpeg"]
+    assert [call[0][call[0].index("-ss") + 1] for call in calls] == [
+        "10.000", "50.000", "90.000"]
+    assert all(call[1]["timeout"] == mod.VIDEO_SAMPLE_TIMEOUT_SEC for call in calls)
+
+
+def test_default_video_sampler_fails_closed_when_any_frame_is_missing(monkeypatch,
+                                                                      tmp_path):
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(VIDEO_BYTES)
+    monkeypatch.setattr(mod._idx, "probe_video",
+                        lambda _path, timeout: {"duration_sec": 20})
+    outputs = iter([b"jpeg", b"", b"jpeg"])
+
+    class Proc:
+        returncode = 0
+        stderr = b""
+
+        def __init__(self):
+            self.stdout = next(outputs)
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *_a, **_kw: Proc())
+    assert mod._sample_video_frames(path) == []
 
 
 # ---- 3. unsafe / unknown verdicts ----------------------------------------------
@@ -271,12 +380,12 @@ def test_unexpected_store_error_propagates():
 
 
 # ---- additional fail-closed gates ------------------------------------------------
-def test_non_photo_skipped_without_write():
-    asset, store, drive = _setup(kind="video", mime="video/mp4")
+def test_unsupported_media_kind_skipped_without_write():
+    asset, store, drive = _setup(kind="audio", mime="audio/mpeg")
     out = mod.moderate_asset(GYM, ASSET_ID, store=store, drive=drive,
                              vision=_vision(_clean_json(False)), now_iso=NOW)
     assert out["ok"] is False
-    assert "not a photo" in out["reason"]
+    assert "not moderatable" in out["reason"]
     assert store.moderation_updates == []
 
 
@@ -433,6 +542,22 @@ def test_scheduled_pass_records_evidence_and_approves(monkeypatch, people):
     assert row['review_status'] == 'approved'
     assert row['consent_status'] == 'not_required'
     assert selector.is_usable(row)
+
+
+def test_scheduled_pass_includes_pending_videos(monkeypatch):
+    from agent.jobs import moderate_pending_gym_media as job
+    from datetime import datetime
+    asset, store, drive = _video_setup(source_id="source")
+    store.list_sources = lambda: [{"id": "source", "gym_id": GYM}]
+    monkeypatch.setattr(config, "gym_drive_connect_active_for", lambda gym: gym == GYM)
+    seen = []
+    monkeypatch.setattr(
+        job.moderation, "moderate_asset",
+        lambda gym, aid, **_kw: seen.append((gym, aid)) or {"ok": True})
+    result = job.run(store=store, drive=drive, vision=lambda *a: "",
+                     now=datetime.fromisoformat(NOW))
+    assert result["attempted"] == result["recorded"] == 1
+    assert seen == [(GYM, asset["id"])]
 
 
 def test_scheduled_pass_is_bounded_and_failures_do_not_starve(monkeypatch):

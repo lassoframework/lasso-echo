@@ -1,9 +1,11 @@
 """
 gym_media_moderation.py — bounded moderation EVIDENCE producer for gym Drive media.
 
-Downloads ONE pending gym-media photo, verifies its bytes against the indexed
-Drive content hash, asks a vision provider for a strict safety/people verdict,
-and records the parsed verdict as moderation evidence on the media_asset row.
+Downloads ONE pending gym-media asset and verifies its bytes against the indexed
+Drive content hash. Photos are scanned directly. Videos are reduced to three
+bounded representative JPEG frames (10%, 50%, 90% of the clip) and every frame
+must pass the same strict safety/people verdict before the exact video hash is
+approved. The parsed verdict is recorded on the media_asset row.
 
 For photos, a byte-bound clean verdict is the approval decision. The same
 conditional write records the moderation evidence and approves that exact hash.
@@ -17,7 +19,7 @@ Fail-closed (returns ok=False with a reason, never raises, and never writes) on:
   * asset missing, or asset.gym_id != the caller's gym (cross-tenant)
   * no content_hash on the row (bytes can never be bound to evidence)
   * review_status != 'pending_review' or moderation_status != 'pending'
-  * non-photo assets (videos carry motion/audio this prompt does not judge)
+  * a video that cannot be probed or yield every bounded sample frame
   * downloaded bytes whose recomputed MD5 differs from the row's content_hash
     (hash drift: the file changed since indexing — stale evidence is poison)
   * vision provider unarmed (no API key), non-JSON output, missing/extra-ambiguous
@@ -37,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +62,8 @@ _MODERATION_PROMPT = (
     "\"people_detected\": true|false|null}.")
 
 _VERDICTS = ("clean", "unsafe", "unknown")
+VIDEO_SAMPLE_COUNT = 3
+VIDEO_SAMPLE_TIMEOUT_SEC = 15
 
 
 def _fail(asset_id, gym_id, reason):
@@ -128,6 +133,45 @@ def _md5_hex(path):
     return h.hexdigest()
 
 
+def _sample_video_frames(path, *, count=VIDEO_SAMPLE_COUNT,
+                         timeout=VIDEO_SAMPLE_TIMEOUT_SEC):
+    """Return bounded representative JPEG frames from one video.
+
+    The source hash is checked by ``moderate_asset`` before this runs. Sampling is
+    fail-closed: duration must be known, ffmpeg must return one non-empty frame at
+    every requested timestamp, and each subprocess has its own timeout. Keeping the
+    frames at <=1280 px bounds both provider input and memory use.
+    """
+    try:
+        info = _idx.probe_video(str(path), timeout=timeout)
+        duration = float((info or {}).get("duration_sec") or 0)
+    except Exception:  # noqa: BLE001 - an unreadable clip cannot be approved
+        return []
+    if duration <= 0 or count < 1:
+        return []
+    ratios = (0.1, 0.5, 0.9) if count == 3 else tuple(
+        (i + 1) / (count + 1) for i in range(count))
+    frames = []
+    for ratio in ratios:
+        # Stay just inside the end boundary; seeking exactly to EOF is allowed to
+        # return success with no frame on some containers.
+        at = min(max(duration * ratio, 0.0), max(0.0, duration - 0.05))
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-ss", f"{at:.3f}", "-i", str(path), "-frames:v", "1",
+                 "-vf", "scale=1280:-2:force_original_aspect_ratio=decrease",
+                 "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+                timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if proc.returncode != 0 or not proc.stdout:
+            return []
+        frames.append(proc.stdout)
+    return frames
+
+
 def build_evidence(provider, verdict, asset, people_detected, observed_at):
     """The moderation_json payload, shaped to EXACTLY what
     gym_media_selector._clean_moderation_evidence validates, plus the provider
@@ -165,14 +209,16 @@ def _outcome_fields(verdict, people, provider, asset, observed_at):
     return fields
 
 
-def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None):
+def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None,
+                   video_sampler=None):
     """Produce moderation evidence for ONE pending asset and conditionally write
     it. Returns {ok, asset_id, gym_id, moderation_status?, people_detected?,
     reason?}; never raises for an expected degrade (see module docstring).
 
     vision: injectable callable image_bytes -> raw provider text (default:
     default_vision(), None -> fail closed). now_iso: injectable clock for tests.
-    drive: a DriveClient-shaped object with download(file_id, dest) -> Path."""
+    drive: a DriveClient-shaped object with download(file_id, dest) -> Path.
+    video_sampler: injectable path -> [jpeg bytes] adapter used by offline tests."""
     gym_id = str(gym_id or "").strip()
     asset_id = str(asset_id or "").strip()
     now_iso = now_iso or datetime.now(timezone.utc).isoformat()
@@ -191,9 +237,10 @@ def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None)
     if asset.get("moderation_status") not in ("pending",):
         return _fail(asset_id, gym_id,
                      f"already moderated ({asset.get('moderation_status')!r})")
-    if asset.get("kind") != _idx.KIND_PHOTO:
+    kind = asset.get("kind")
+    if kind not in (_idx.KIND_PHOTO, _idx.KIND_VIDEO):
         return _fail(asset_id, gym_id,
-                     f"kind {asset.get('kind')!r} is not a photo — skipped")
+                     f"kind {kind!r} is not moderatable — skipped")
 
     if vision is None:
         vision = default_vision()
@@ -202,7 +249,8 @@ def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None)
                      f"no vision provider armed (missing {config.NANO_API_KEY_ENV})")
 
     tmp_dir = tempfile.mkdtemp(prefix="gymmod_")
-    tmp_path = Path(tmp_dir) / "moderation.bin"
+    suffix = Path(str(asset.get("title") or "")).suffix or ".bin"
+    tmp_path = Path(tmp_dir) / f"moderation{suffix}"
     try:
         drive.download(asset_id, tmp_path)
         digest = _md5_hex(tmp_path)
@@ -210,8 +258,26 @@ def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None)
             return _fail(asset_id, gym_id,
                          "hash drift: downloaded bytes no longer match the "
                          "indexed content_hash — evidence refused")
-        raw = vision(tmp_path.read_bytes(),
-                     str(asset.get("mime_type") or "image/jpeg"))
+        if kind == _idx.KIND_VIDEO:
+            sampler = video_sampler or _sample_video_frames
+            frames = sampler(tmp_path)
+            if (not isinstance(frames, (list, tuple))
+                    or len(frames) != VIDEO_SAMPLE_COUNT
+                    or any(not isinstance(frame, bytes) or not frame for frame in frames)):
+                return _fail(asset_id, gym_id,
+                             "video frame sampling failed — no evidence written")
+            scans = [(frame, "image/jpeg") for frame in frames]
+        else:
+            scans = [(tmp_path.read_bytes(),
+                      str(asset.get("mime_type") or "image/jpeg"))]
+        parsed_scans = []
+        for payload, mime_type in scans:
+            parsed = parse_verdict(vision(payload, mime_type))
+            if parsed is None:
+                return _fail(
+                    asset_id, gym_id,
+                    "unparseable or ambiguous provider verdict — no evidence written")
+            parsed_scans.append(parsed)
     except Exception as e:  # noqa: BLE001 - drive/vision failure is a degrade
         return _fail(asset_id, gym_id,
                      f"download/scan failed: {type(e).__name__}")
@@ -222,16 +288,20 @@ def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None)
         except OSError:
             pass
 
-    parsed = parse_verdict(raw)
-    if parsed is None:
-        return _fail(asset_id, gym_id,
-                     "unparseable or ambiguous provider verdict — no evidence written")
-    verdict, people = parsed
-    if verdict == "unknown":
-        # Explicit fail-closed verdict: recorded as flagged so a human looks.
-        pass
+    verdicts = [item[0] for item in parsed_scans]
+    if "unsafe" in verdicts:
+        verdict = "unsafe"
+    elif "unknown" in verdicts:
+        verdict = "unknown"
+    else:
+        verdict = "clean"
+    detected = [item[1] for item in parsed_scans]
+    people = True if True in detected else (False if all(v is False for v in detected)
+                                             else None)
 
     provider = f"gemini:{config.OCR_MODEL}"
+    if kind == _idx.KIND_VIDEO:
+        provider += f":video-frames-{len(parsed_scans)}"
     fields = _outcome_fields(verdict, people, provider, asset, now_iso)
     try:
         store.update_moderation_asset(

@@ -1,8 +1,8 @@
-"""Scheduled bounded evidence pass. Never approves, publishes, or sends alerts.
+"""Scheduled bounded evidence pass. Never publishes or sends alerts.
 
-Uses the existing Drive-connect gym allowlist. Human review remains mandatory,
-including clean no-people photos. Rotation prevents a broken first asset from
-starving the rest of a backlog; failed scans remain pending for later retries.
+Uses the existing Drive-connect gym allowlist. Clean hash-bound photo or video
+evidence approves the exact asset version. Rotation prevents a broken first asset
+from starving the rest of a backlog; failed scans remain pending for later retries.
 """
 from datetime import datetime, timezone
 
@@ -30,7 +30,7 @@ def run(*, store=None, drive=None, vision=None, limit=50, now=None):
         if not config.gym_drive_connect_active_for(gym):
             continue
         for asset in store.list_assets(gym, source_id=source["id"]):
-            if (asset.get("gym_id") == gym and asset.get("kind") == "photo"
+            if (asset.get("gym_id") == gym and asset.get("kind") in ("photo", "video")
                     and asset.get("review_status") == "pending_review"
                     and asset.get("moderation_status") == "pending"
                     and asset.get("content_hash")):
