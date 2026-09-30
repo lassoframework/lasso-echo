@@ -147,7 +147,7 @@ def _sample_video_frames(path, *, count=VIDEO_SAMPLE_COUNT,
         duration = float((info or {}).get("duration_sec") or 0)
     except Exception:  # noqa: BLE001 - an unreadable clip cannot be approved
         return []
-    if duration <= 0 or count < 1:
+    if duration < 1 or count < 1:
         return []
     ratios = (0.1, 0.5, 0.9) if count == 3 else tuple(
         (i + 1) / (count + 1) for i in range(count))
@@ -158,11 +158,12 @@ def _sample_video_frames(path, *, count=VIDEO_SAMPLE_COUNT,
         at = min(max(duration * ratio, 0.0), max(0.0, duration - 0.05))
         try:
             proc = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                  "-ss", f"{at:.3f}", "-i", str(path), "-frames:v", "1",
                  "-vf", "scale=1280:-2:force_original_aspect_ratio=decrease",
                  "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, check=False,
                 timeout=timeout)
         except (OSError, subprocess.SubprocessError):
             return []

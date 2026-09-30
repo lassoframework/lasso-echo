@@ -164,13 +164,14 @@ def seed_gaps(base, account, store, *, log=None, today=None,
     depleted = real_media_depleted(base, now=today)
     if not depleted:
         return 0
-    from .media_bridge import bridge_days
+    from .media_bridge import bridge_days, episode, retry_existing_notice
+    # Read before bridge_days creates a new episode.  Existing episodes retry
+    # their durable outbox entry; new episodes send one notice after a real
+    # calendar gap is confirmed below.
+    existing_notice = bool(episode(base, now=today, create=False))
     allowed_days = set(bridge_days(base, now=today, days_ahead=days_ahead))
-    existing_notice = False
-    if depleted:
-        from .media_bridge import episode, retry_existing_notice
-        existing_notice = bool(episode(base, now=today, create=False))
-        retry_existing_notice(base, account, store, logger=log)
+    if existing_notice:
+        retry_existing_notice(base, account, store, now=today, logger=log)
 
     from .client_infographic_fill import _empty_upcoming_days
     tz_name = config.posting_timezone_for(base)
@@ -224,7 +225,4 @@ def seed_gaps(base, account, store, *, log=None, today=None,
         return 0
     log(f"{base}: no-media Astra seed inserted {len(inserted)} grounded "
         "infographic draft(s) from its own scraped site/Instagram")
-    if inserted and depleted:
-        from .media_bridge import notify_bridge
-        notify_bridge(base, account, logger=log)
     return len(inserted)

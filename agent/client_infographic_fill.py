@@ -178,20 +178,20 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
     depleted = real_media_depleted(base, now=now)
     if not depleted:
         return {"ok": True, "filled": 0, "reason": "usable media available"}
-    from .media_bridge import bridge_days
+    from .media_bridge import bridge_days, episode, retry_existing_notice
+    existing_notice = bool(episode(base, now=now, create=False))
     allowed_days = set(bridge_days(base, now=now, days_ahead=days_ahead))
-    if depleted:
-        from .media_bridge import retry_existing_notice
-        retry_existing_notice(base, account, store, logger=log)
+    if existing_notice:
+        retry_existing_notice(base, account, store, now=now, logger=log)
 
     tz_name = config.posting_timezone_for(base)
     gaps = [day for day in _empty_upcoming_days(
         store, base, tz_name, min(days_ahead, 2), now=now) if day in allowed_days]
     if not gaps:
         return {"ok": True, "filled": 0, "gaps": 0}
-    if depleted:
+    if not existing_notice:
         from .media_bridge import notify_bridge
-        notify_bridge(base, account, logger=log)
+        notify_bridge(base, account, now=now, logger=log)
     sources = client_sources.approved_sources(f"{base}_ig") or []
     if not sources:
         return {"ok": False, "reason": "no sources"}
