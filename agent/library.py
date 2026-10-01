@@ -15,6 +15,14 @@ from dataclasses import dataclass, field
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
 
+# Generated derivative caches that live inside a gym's library are not client
+# carousel bundles.  action_reel writes poster frames and edited clips under
+# <library>/reels/.  Treating that folder as a carousel hands the directory path
+# to media_host, which cannot publish it and can collapse an otherwise healthy
+# month build to zero rows.  Keep this narrow so named client carousel folders
+# continue to work.
+_RESERVED_DERIVATIVE_DIRS = frozenset({"reels"})
+
 
 def _is_appledouble(name):
     """True for macOS metadata sidecars, never client-uploaded creative.
@@ -96,6 +104,8 @@ def list_creatives(library_path):
             continue
         full = os.path.join(library_path, name)
         if os.path.isdir(full):
+            if name.lower() in _RESERVED_DERIVATIVE_DIRS:
+                continue
             # CROSS-GYM ISOLATION: a subfolder that is itself a registered gym's
             # content library root is that gym's OWN media, never a carousel for
             # whoever is scanning the parent (LASSO). Skip it. This is a pure
