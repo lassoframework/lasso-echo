@@ -153,8 +153,8 @@ def slot_time_for_row(row, n=None):
     # enabling the campaign cannot change clients or spill beyond its window.
     # Stories retain the existing 12:30 slot.
     if (fmt == "feed" and si == 2
-            and _lasso_summit_daily_enabled(row.get("gym_id"),
-                                            row.get("post_date"))):
+            and _lasso_three_feed_enabled(row.get("gym_id"),
+                                          row.get("post_date"))):
         return "12:00"
     if (fmt == "feed" and si in (0, 1) and config.cadence_2x_enabled()):
         return config.cadence_slot_times()[int(si)]
@@ -178,6 +178,18 @@ def _lasso_summit_daily_enabled(account_key, day_key):
         return False
 
 
+def _lasso_three_feed_enabled(account_key, day_key):
+    """LASSO's durable third feed, with the dated Summit flag as compatibility."""
+    if str(account_key or "").strip().lower() != "lasso" or not day_key:
+        return False
+    try:
+        if config.lasso_three_feed_enabled():
+            return True
+    except Exception:
+        pass
+    return _lasso_summit_daily_enabled(account_key, day_key)
+
+
 def _publish_capacity(gym_id, row, store, local_claim_day):
     """Effective atomic publish capacity for this row on its actual local day."""
     from .cadence import resolve_posts_per_day
@@ -189,7 +201,7 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
         capacity = resolve_posts_per_day(gym_id, store)
     is_feed = (row.get("format") or "feed").strip().lower() == "feed"
     if (is_feed
-            and _lasso_summit_daily_enabled(gym_id, local_claim_day)):
+            and _lasso_three_feed_enabled(gym_id, local_claim_day)):
         return max(capacity, 3)
     # The temporary third slot belongs to the extra Summit feed only. Stories
     # retain their existing capacity even though the dated cadence resolver
@@ -1329,6 +1341,25 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 else:
                     result = zernio_publish(draft, account, scheduled_for=None)
             except Exception as e:
+                # A deterministic Zernio preflight refusal (missing/expired account,
+                # profile/page/media) happens before create_post is called, so it is
+                # safe to release the owned claim for a later tick after repair. Keep
+                # post-create exceptions held: a timeout or malformed 2xx may have
+                # created a real post and an automatic retry could duplicate it.
+                if getattr(e, "definitive_no_post", False):
+                    _reason = f"provider preflight proved no post: {type(e).__name__}: {e}"
+                    _reverted = _revert_to_pending(
+                        store, row_id, reject_reason=_reason, gym_id=gym_id,
+                        expected_claim_token=claim_token,
+                        revert_status="approved" if approved_only else "pending")
+                    if not _reverted:
+                        recovery_required.append(row_id)
+                    _alert_publish_blocked(
+                        gym_id, row_id, _reason, reverted=_reverted,
+                        revert_status="approved" if approved_only else "pending")
+                    failed.append(row_id)
+                    _note_repeat_failure(row_id, gym_id, e)
+                    continue
                 # Once a publisher is called, an exception is ambiguous: a timeout may
                 # arrive after the provider accepted the post. Retrying can create a
                 # duplicate, so retain the owned claim for reconciliation.

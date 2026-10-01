@@ -112,3 +112,22 @@ def test_publish_capacity_uses_actual_local_claim_day_and_stays_feed_only(monkey
     assert autopublish._publish_capacity("lasso", feed, Store(), "2026-11-09") == 2
     assert autopublish._publish_capacity("lasso", story, Store(), WINDOW_DAY) == 2
     assert autopublish._publish_capacity("client", feed, Store(), WINDOW_DAY) == 2
+
+
+def test_durable_lasso_third_slot_survives_after_campaign(monkeypatch):
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: True)
+    monkeypatch.setattr(config, "lasso_summit_daily_enabled", lambda _day=None: False)
+    monkeypatch.setattr(config, "cadence_2x_enabled", lambda: True)
+    monkeypatch.setattr(config, "cadence_slot_times", lambda: ("07:30", "18:30"))
+
+    class Store:
+        def gym_posts_per_day(self, _):
+            return 2
+
+    row = {"gym_id": "lasso", "post_date": "2027-01-15",
+           "format": "feed", "slot_index": 2, "id": "durable"}
+    assert autopublish.slot_time_for_row(row) == "12:00"
+    assert autopublish._publish_capacity(
+        "lasso", row, Store(), "2027-01-15") == 3
+    assert autopublish._publish_capacity(
+        "client", row, Store(), "2027-01-15") == 2

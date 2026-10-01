@@ -580,8 +580,10 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
         # resolved category is podcast; the builder honors it, the honesty guard is
         # unchanged (no clip -> fall through, never faked).
         _vp = bool(mark_video and category == "podcast")
-        # Capacity 3 is two regular feeds plus the separately normalized Summit
-        # extra. It must still build the ordinary 2x pair here.
+        # Capacity 3 keeps the ordinary 2x pair and adds one feed-only ordinal.
+        # During the dated Summit window normalize_summit_daily replaces that
+        # ordinal with the campaign Summit feed. Outside the campaign, the durable
+        # LASSO-only 3x switch keeps a varied real pillar in that slot.
         if int(posts_per_day or 1) >= 2:
             slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
                                   base_category=base, overridden=overridden,
@@ -597,6 +599,18 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
             slots.append(PlanSlot(post_date=d, category=second, fmt=STORY,
                                   base_category=base, overridden=True,
                                   cadence_slot=1, video_preferred=_vp2))
+            _durable_three = False
+            if str(account_key or "").strip().lower() in _LASSO_SUMMIT_DAILY_ACCOUNTS:
+                try:
+                    _durable_three = bool(config.lasso_three_feed_enabled())
+                except Exception:
+                    _durable_three = False
+            if int(posts_per_day or 1) >= 3 and _durable_three:
+                third = _next_fallback_category(second)
+                _vp3 = bool(mark_video and third == "podcast")
+                slots.append(PlanSlot(post_date=d, category=third, fmt=FEED,
+                                      base_category=base, overridden=True,
+                                      cadence_slot=2, video_preferred=_vp3))
         else:
             slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
                                   base_category=base, overridden=overridden,
