@@ -11,12 +11,14 @@ NOW = datetime(2026, 9, 30, 20, 0, tzinfo=timezone.utc)
 TOKEN = "00000000-0000-4000-8000-000000000001"
 
 
-def row(row_id="row-1", gym="gym-a", image="https://cdn/a.png"):
-    return {"id": row_id, "gym_id": gym, "account": "instagram",
+def row(row_id="row-1", gym="gym-a", image="https://cdn/a.png", **overrides):
+    value = {"id": row_id, "gym_id": gym, "account": "instagram",
             "format": "feed", "post_date": "2026-09-30",
             "scheduled_at": "2026-09-30T16:00:00Z", "caption": "Exact words",
             "image_url": image, "publish_claim_token": TOKEN,
             "publish_reservation_day": "2026-09-30"}
+    value.update(overrides)
+    return value
 
 
 def live_post(post_id="provider-1", image="https://cdn/a.png"):
@@ -92,6 +94,19 @@ def test_exact_live_match_stamps_and_exact_absence_releases(armed):
     assert out["provider_reads"] == 1
 
 
+def test_posted_is_a_terminal_live_status_like_normal_confirmation(armed):
+    r = row()
+    post = live_post()
+    post["platforms"][0]["status"] = "posted"
+    store = Store([r])
+    out = scr.reconcile(
+        store=store, provider=Provider({"profile-a": [post]}), kv=old_kv(r),
+        now=NOW, alert=lambda _message: None)
+    assert out["published"][0]["id"] == "row-1"
+    assert [x[1] for x in store.published] == ["row-1"]
+    assert not store.released
+
+
 def test_incomplete_provider_read_and_missing_media_never_authorize_release(armed):
     r = row()
     store = Store([r])
@@ -117,6 +132,43 @@ def test_not_old_enough_and_missing_tenant_binding_remain_held(armed):
                         alert=lambda _message: None)
     assert not provider.calls and not store.published and not store.released
     assert out["held"] == [{"id": "row-2", "reason": "no_tenant_profile_binding"}]
+
+
+def test_missing_scheduled_at_uses_atomic_reservation_day(armed):
+    r = row(scheduled_at=None)
+    store = Store([r])
+    provider = Provider({"profile-a": []})
+    out = scr.reconcile(store=store, provider=provider, kv=old_kv(r),
+                        now=NOW, alert=lambda _message: None)
+    assert [x[1] for x in store.released] == ["row-1"]
+    assert out["released"][0]["id"] == "row-1"
+    # Midnight minus the safety day, rather than holding forever for optional
+    # display metadata that failed to stamp.
+    assert provider.calls[0][1].isoformat() == "2026-09-29T00:00:00+00:00"
+
+
+def test_legacy_row_without_schedule_or_reservation_uses_post_date(armed):
+    r = row(scheduled_at=None, publish_reservation_day=None)
+    store = Store([r])
+    provider = Provider({"profile-a": []})
+    scr.reconcile(store=store, provider=provider, kv=old_kv(r),
+                  now=NOW, alert=lambda _message: None)
+    assert [x[1] for x in store.released] == ["row-1"]
+
+
+def test_legacy_client_profile_falls_back_to_publishers_local_binding(
+        armed, monkeypatch):
+    r = row(gym="legacy-gym")
+    store = Store([r])
+    provider = Provider({"profile-legacy": []})
+    monkeypatch.setattr(
+        scr, "_local_profile_id",
+        lambda gym, platform: "profile-legacy"
+        if (gym, platform) == ("legacy-gym", "instagram") else None)
+    out = scr.reconcile(store=store, provider=provider, kv=old_kv(r),
+                        now=NOW, alert=lambda _message: None)
+    assert out["released"][0]["id"] == "row-1"
+    assert provider.calls[0][0] == "profile-legacy"
 
 
 class PagedClient(ZernioClient):

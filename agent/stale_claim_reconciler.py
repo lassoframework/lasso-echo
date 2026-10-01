@@ -116,7 +116,11 @@ def classify(row, posts):
     platform_id = str(entry.get("platformPostId") or "").strip()
     status = str(entry.get("status") or post.get("status") or "").lower()
     published_at = entry.get("publishedAt") or post.get("publishedAt")
-    if status == "published" and post_id and platform_id and _dt(published_at):
+    # Zernio has returned both terminal labels on its read APIs.  The normal
+    # post-publish confirmation path already treats them identically, so stale
+    # recovery must do the same or a provider-confirmed live client post can
+    # remain in ``publishing`` and reserve capacity indefinitely.
+    if status in ("published", "posted") and post_id and platform_id and _dt(published_at):
         return "live", {"post_id": post_id, "platform_post_id": platform_id,
                         "published_at": _dt(published_at).isoformat()}
     if status in ("failed", "deleted", "rejected") and not platform_id:
@@ -134,6 +138,44 @@ def _old_enough(row, kv, now):
         return True
     first = _dt(seen)
     return bool(first and (now - first).total_seconds() >= 2 * 3600)
+
+
+def _claim_anchor(row):
+    """Best known time boundary for the provider absence read.
+
+    ``scheduled_at`` is display metadata and its write is deliberately best
+    effort.  A calendar row can therefore own a real publish claim without it.
+    The reservation day is written atomically with the claim and is the better
+    anchor for catch-up rows; ``post_date`` is the legacy fallback.  Midnight
+    UTC plus the caller's one-day lookback safely covers every supported gym
+    timezone without inventing a precise send time.
+    """
+    reserved = str(row.get("publish_reservation_day") or "")[:10]
+    if reserved:
+        parsed = _dt(reserved + "T00:00:00Z")
+        if parsed:
+            return parsed
+    scheduled = _dt(row.get("scheduled_at"))
+    if scheduled:
+        return scheduled
+    day = str(row.get("post_date") or "")[:10]
+    return _dt(day + "T00:00:00Z") if day else None
+
+
+def _local_profile_id(gym, platform=None):
+    """Legacy-volume fallback matching the publisher's account/base lookup."""
+    try:
+        from . import db
+        base = str(gym or "").strip()
+        suffix = "_fb" if str(platform or "").lower() == "facebook" else "_ig"
+        for key in (base + suffix, base):
+            row = db.gym_get(key) or {}
+            value = row.get("zernio_profile_id")
+            if value:
+                return str(value)
+        return None
+    except Exception:
+        return None
 
 
 def reconcile(*, store=None, provider=None, kv=None, now=None, alert=None):
@@ -163,8 +205,8 @@ def reconcile(*, store=None, provider=None, kv=None, now=None, alert=None):
     for row in rows:
         rid, gym = str(row.get("id") or ""), str(row.get("gym_id") or "")
         token = str(row.get("publish_claim_token") or "")
-        scheduled = _dt(row.get("scheduled_at"))
-        if not rid or not gym or not token or not scheduled:
+        anchor = _claim_anchor(row)
+        if not rid or not gym or not token or not anchor:
             result["held"].append({"id": rid, "reason": "missing_claim_identity"})
             continue
         # LASSO can use the direct Meta publisher. Zernio absence says nothing
@@ -173,20 +215,26 @@ def reconcile(*, store=None, provider=None, kv=None, now=None, alert=None):
         if gym == "lasso" and not config.lasso_via_zernio_enabled():
             result["held"].append({"id": rid, "reason": "non_zernio_publish_route"})
             continue
-        if now - scheduled > timedelta(days=MAX_ROW_AGE_DAYS):
+        if now - anchor > timedelta(days=MAX_ROW_AGE_DAYS):
             result["held"].append({"id": rid, "reason": "outside_provider_window"})
             continue
         try:
             profile = store.gym_zernio_profile_id(gym)
-        except Exception as exc:
+        except Exception:
             profile = None
+        # Older client gyms published successfully from their durable worker
+        # volume before the shared settings column existed.  The live publisher
+        # still resolves those exact tenant-base rows, so the reconciler must do
+        # the same or their stale claims can never be repaired.
+        profile = profile or _local_profile_id(gym, row.get("account"))
         if not profile:
             result["held"].append({"id": rid, "reason": "no_tenant_profile_binding"})
             continue
-        grouped[(gym, str(profile))].append(row)
+        grouped[(gym, str(profile))].append((row, anchor))
 
-    for (gym, profile), tenant_rows in grouped.items():
-        start = min(_dt(r["scheduled_at"]) for r in tenant_rows) - timedelta(days=1)
+    for (gym, profile), tenant_items in grouped.items():
+        tenant_rows = [row for row, _anchor in tenant_items]
+        start = min(anchor for _row, anchor in tenant_items) - timedelta(days=1)
         try:
             posts = provider.posts_range_complete(
                 profile, start, now, page_limit=PAGE_SIZE, max_pages=MAX_PROVIDER_PAGES)

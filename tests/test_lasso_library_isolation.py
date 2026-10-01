@@ -82,6 +82,27 @@ def test_legitimate_carousel_bundle_still_works(tmp_path, registered_gyms):
     assert len(carousels[0].slides) == 3
 
 
+def test_generated_reels_cache_is_not_a_carousel_but_real_bundle_still_is(
+        tmp_path, registered_gyms):
+    """action_reel's derivative cache must never enter the publishable library."""
+    parent = tmp_path / "content_library"
+    reels = parent / "reels"
+    bundle = parent / "member_story_carousel"
+    reels.mkdir(parents=True)
+    bundle.mkdir()
+    for index in range(2):
+        (reels / f"poster_{index}.jpg").write_bytes(b"generated")
+        (bundle / f"slide_{index}.jpg").write_bytes(b"client")
+
+    creatives = list_creatives(str(parent))
+    carousels = [c for c in creatives if c.media_type == "carousel"]
+
+    assert [os.path.basename(c.path) for c in carousels] == [
+        "member_story_carousel"
+    ]
+    assert len(carousels[0].slides) == 2
+
+
 def test_is_client_gym_asset(registered_gyms):
     assert is_client_gym_asset("/data/content_library/eng/Robin_trio.jpg")
     assert is_client_gym_asset("content_library/gritx/photo.jpg")

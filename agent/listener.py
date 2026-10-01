@@ -309,6 +309,64 @@ def _client_media_scan_due(now_mono, last_mono, interval_secs):
     return (now_mono - last_mono) >= interval_secs
 
 
+_client_media_worker_lock = threading.Lock()
+_client_media_worker = None
+
+
+def _client_media_worker_active():
+    """True while the one allowed fleet media scan is still running.
+
+    Media generation is network and render heavy.  It must never run inline on the
+    scheduler thread: that same thread owns the minute client-publish lane.  Keep the
+    guard process-local because this protects one listener's event loop; the existing
+    build lock remains the cross-process/per-gym write guard.
+    """
+    with _client_media_worker_lock:
+        return bool(_client_media_worker and _client_media_worker.is_alive())
+
+
+def _run_client_media_worker(scan):
+    """Failure-isolated body for the background client-media worker."""
+    global _client_media_worker
+    try:
+        scan()
+    except Exception as e:
+        print(f"[client-media-sync] frequent lane failed: {type(e).__name__}: {e}")
+        try:
+            ops_alerts.alert(
+                f"client media frequent lane failed: {type(e).__name__}: {e}."
+                " The draft run is unaffected.")
+        except Exception as alert_error:
+            print(f"[client-media-sync] failure alert failed: "
+                  f"{type(alert_error).__name__}: {alert_error}")
+    finally:
+        current = threading.current_thread()
+        with _client_media_worker_lock:
+            if _client_media_worker is current:
+                _client_media_worker = None
+
+
+def _start_client_media_worker(scan):
+    """Start exactly one daemon scan; return False when one is already active."""
+    global _client_media_worker
+    with _client_media_worker_lock:
+        if _client_media_worker and _client_media_worker.is_alive():
+            return False
+        worker = threading.Thread(
+            target=_run_client_media_worker,
+            args=(scan,),
+            name="client-media-sync",
+            daemon=True,
+        )
+        _client_media_worker = worker
+        try:
+            worker.start()
+        except Exception:
+            _client_media_worker = None
+            raise
+    return True
+
+
 def run_client_media_lane(*, now_mono, last_mono, interval_secs, scan=None):
     """The listener's FREQUENT client-media lane: PROMPTLY sync each onboarded client
     gym's R2 uploads and auto-build its DRAFT calendar the moment it uploads, instead
@@ -319,21 +377,35 @@ def run_client_media_lane(*, now_mono, last_mono, interval_secs, scan=None):
     Self-guarded on AGENT_CLIENT_MEDIA_SYNC (scan_and_generate also re-checks the flag
     and no-ops when off, belt and suspenders). Throttled to interval_secs so a ~60s
     loop does not hammer R2; a scan with nothing new is a cheap no-op either way
-    (scan_and_generate skips gyms whose media count == existing feed count). Fully
-    isolated in try/except: a scan failure never kills the scheduler loop, exactly
-    like every other lane. DRAFTS ONLY: nothing here publishes (scan_and_generate has
-    no publish path)."""
+    (scan_and_generate skips gyms whose media count == existing feed count). The scan
+    runs in one guarded daemon worker so slow Drive/R2/render calls cannot block the
+    scheduler's minute publish lane, and another scan can never overlap it. Worker and
+    thread-start failures are isolated from the loop. DRAFTS ONLY: nothing here
+    publishes (scan_and_generate has no publish path)."""
     if not config.client_media_sync_enabled():
         return last_mono
     if not _client_media_scan_due(now_mono, last_mono, interval_secs):
         return last_mono
     scan = scan or _default_client_media_scan
     try:
-        scan()
+        started = _start_client_media_worker(scan)
     except Exception as e:
-        print(f"[client-media-sync] frequent lane failed: {type(e).__name__}: {e}")
-        ops_alerts.alert(f"client media frequent lane failed: {type(e).__name__}: {e}."
-                         " The draft run is unaffected.")
+        print(f"[client-media-sync] worker start failed: {type(e).__name__}: {e}")
+        try:
+            ops_alerts.alert(
+                f"client media frequent worker failed to start: "
+                f"{type(e).__name__}: {e}. The draft run is unaffected.")
+        except Exception as alert_error:
+            print(f"[client-media-sync] startup alert failed: "
+                  f"{type(alert_error).__name__}: {alert_error}")
+        # Preserve the old failure throttle: a broken start must not hot-loop every
+        # scheduler tick.
+        return now_mono
+    if not started:
+        # A long scan may outlive the normal interval. Do not advance the marker:
+        # once it finishes, the next scheduler tick is immediately eligible to scan
+        # again instead of waiting another whole interval.
+        return last_mono
     return now_mono
 
 
