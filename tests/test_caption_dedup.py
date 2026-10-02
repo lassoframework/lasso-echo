@@ -130,6 +130,11 @@ class _FakeHTTP:
         self.posted.append(json)
         return _FakeResp(list(json or []))
 
+    def get(self, url, headers=None, params=None, timeout=None):
+        # Story reconciliation reads the calendar before inserting a fresh slot.
+        # This fixture starts with an empty calendar.
+        return _FakeResp([])
+
 
 def _store(http):
     from agent.portal_calendar_store import SupabaseCalendarStore
@@ -180,6 +185,7 @@ def test_insert_rows_blocks_intra_batch_dup_but_allows_same_date_pack(
 
 def test_insert_rows_flag_off_is_byte_for_byte(monkeypatch, ledger_db):
     monkeypatch.delenv("AGENT_CAPTION_COOLDOWN", raising=False)
+    monkeypatch.setenv("AGENT_MEDIA_CROSS_DAY_GUARD", "false")
     monkeypatch.delenv("AGENT_EMPTY_CAPTION_GUARD", raising=False)
     cl.record_staged("lasso", "Already shipped hook.", "2026-06-01", db=ledger_db)
     http = _FakeHTTP()
