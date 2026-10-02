@@ -5,7 +5,9 @@
 -- history) into held review events; ambiguous reservations are NEVER
 -- promoted to published without evidence-based reconciliation.
 -- Rollback: DROP visual_group_backfill_gym(text,boolean) and
--- visual_group_conflict_report(text). Preserve additive permanent usage/history.
+-- visual_group_conflict_report(text). The scene-link table, component helper
+-- and union RPC roll back with the schema migration; link rows are permanent
+-- evidence after activation, never a data-rollback target. Preserve additive permanent usage/history.
 -- Do not delete historical published usage as a data rollback.
 
 create or replace function public.visual_group_backfill_gym(
@@ -18,6 +20,10 @@ declare r public.content_calendar; a record; g text; n integer; l public.visual_
   v_tenant text;
 begin
   if nullif(btrim(p_gym_id),'') is null or p_dry_run is null then raise exception 'gym and dry-run required'; end if;
+  -- Normalize the key once: the tenant resolution above tolerated surrounding
+  -- whitespace, but the calendar scan below previously compared the raw
+  -- argument and silently backfilled zero rows while reporting success.
+  p_gym_id:=btrim(p_gym_id);
   -- Fail closed on unmapped calendar keys (e.g. retired key
   -- zz-retired-20260904-f574c06c): no groups, aliases, ledger rows or events
   -- are ever minted for a key with no canonical tenant mapping.
@@ -50,8 +56,15 @@ begin
         if public.visual_group_resolve_row(r) is null then
           raise exception 'visual_group_identity_unresolved' using errcode='23514';
         end if;
-      exception when check_violation then
-        v_reason:=sqlerrm; g:=null; blocked:=true;
+      exception when check_violation or unique_violation then
+        v_reason:=sqlerrm; blocked:=true;
+        -- A conflicting or unknown identity behind an ambiguous reservation
+        -- is still an ambiguous hold: keep the review event in the report's
+        -- ambiguous queue (with claim evidence) instead of a generic
+        -- 'backfill' hold that the unresolved-history filter cannot see.
+        v_amb_hold:=is_ambiguous or exists(select 1 from public.visual_group_usage_ledger la
+          where la.gym_id=v_tenant and la.group_key=g and la.state<>'released' and la.ambiguous);
+        g:=null;
       end;
       -- An unresolved row or scene review is not publication evidence merely
       -- because an older writer stamped status=published. This includes an
@@ -65,6 +78,17 @@ begin
       -- becomes a held review event; preceding rows are never lost.
       begin
         perform 1 from public.visual_group where gym_id=v_tenant and group_key=g for update;
+        -- Linked same-scene authority: a human-confirmed union shares one date
+        -- across the whole component. A backfilled row whose date disagrees
+        -- with a linked member's active/published claim is unsafe and held
+        -- for review; existing history is reported, never rewritten. The
+        -- per-row savepoint turns this raise into one held review event.
+        if exists(select 1 from public.visual_group_usage_ledger sl
+          where sl.gym_id=v_tenant and sl.group_key<>g and sl.state<>'released'
+            and sl.reserved_date is distinct from day
+            and sl.group_key in (select public.visual_group_scene_members(v_tenant,g))) then
+          raise exception 'linked_scene_cross_date_hold' using errcode='23514';
+        end if;
         select * into l from public.visual_group_usage_ledger where gym_id=v_tenant and group_key=g for update;
         l_amb:=found and l.ambiguous;
         if is_pub then
@@ -144,12 +168,16 @@ begin
           end if;
         end if;
         if not blocked then grouped:=grouped+1; end if;
-      exception when check_violation or raise_exception then
+      exception when check_violation or raise_exception or unique_violation then
         -- Recoverable per-row conflict: roll back ONLY this row's
         -- ledger/sibling/calendar writes and record a review hold below.
         blocked:=true; v_reason:=sqlerrm; v_amb_hold:=v_amb_hold or l_amb or is_ambiguous;
       end;
       end if;
+      -- Any held row whose group reservation or own markers are ambiguous is
+      -- reported in the ambiguous queue (with claim evidence), even when the
+      -- block itself was an alias/scene/date conflict.
+      v_amb_hold:=v_amb_hold or l_amb or is_ambiguous;
       if blocked then
         held:=held+1;
         review_details:=case when is_ambiguous or v_amb_hold then jsonb_build_object('reason',v_reason,
@@ -167,7 +195,7 @@ begin
               media_not_ready_reason=coalesce(media_not_ready_reason,v_reason),
               status=case when status='approved' then 'pending' else status end
             where id=r.id;
-          exception when check_violation or raise_exception then
+          exception when check_violation or raise_exception or unique_violation then
             null; -- review_hold event below is the durable conflict record
           end;
         end if;
@@ -213,17 +241,37 @@ returns jsonb language sql stable security definer set search_path = public as $
     having count(distinct post_date)>1
   ) select jsonb_build_object('per_gym',coalesce((select jsonb_agg(to_jsonb(c) order by gym_id) from coverage c),'[]'::jsonb),
     'cross_date_conflicts',coalesce((select jsonb_agg(to_jsonb(c) order by gym_id,resolved_group) from conflicts c),'[]'::jsonb),
-    'unresolved_published_history',coalesce((select jsonb_agg(to_jsonb(e) order by id) from public.visual_group_member_event e
+    'scene_cross_date_conflicts',coalesce((select jsonb_agg(to_jsonb(sc) order by sc.gym_id,sc.component) from (
+      select gym_id,component,
+        array_agg(distinct group_key order by group_key) as group_keys,
+        array_agg(distinct coalesce(reserved_date,'0001-01-01'::date) order by coalesce(reserved_date,'0001-01-01'::date)) as dates,
+        array_agg(distinct state order by state) as states
+      from (
+        select l.gym_id,l.group_key,l.reserved_date,l.state,
+          (select array_agg(m order by m) from public.visual_group_scene_members(l.gym_id,l.group_key) members(m)) as component
+        from public.visual_group_usage_ledger l
+        where l.state<>'released'
+          and (p_gym_id is null or l.gym_id=public.visual_group_tenant_id(p_gym_id)::text)
+      ) comp
+      where array_length(component,1)>1
+      group by gym_id,component
+      having count(distinct coalesce(reserved_date,'0001-01-01'::date))>1
+    ) sc),'[]'::jsonb),
+    'unresolved_published_history',coalesce((select jsonb_agg(to_jsonb(e) - 'hold_rank' order by e.id) from (
+      select e.*,row_number() over (partition by e.alias_value order by e.id desc) as hold_rank from public.visual_group_member_event e
       where action='review_hold' and actor='backfill_published_review' and (p_gym_id is null or gym_id=public.visual_group_tenant_id(p_gym_id)::text)
       and not exists(select 1 from public.visual_group_member_event resolved where resolved.gym_id=e.gym_id
-        and resolved.alias_value=e.alias_value and resolved.actor='backfill_published' and resolved.action='confirmed' and resolved.id>e.id)),'[]'::jsonb),
-    'unresolved_ambiguous_history',coalesce((select jsonb_agg(to_jsonb(e) order by id) from public.visual_group_member_event e
+        and resolved.alias_value=e.alias_value and resolved.actor='backfill_published' and resolved.action='confirmed' and resolved.id>e.id)
+    ) e where hold_rank=1),'[]'::jsonb),
+    'unresolved_ambiguous_history',coalesce((select jsonb_agg(to_jsonb(e) - 'hold_rank' order by e.id) from (
+      select e.*,row_number() over (partition by e.alias_value order by e.id desc) as hold_rank from public.visual_group_member_event e
       where action='review_hold' and actor in ('backfill_ambiguous_review','runtime_ambiguous_review') and (p_gym_id is null or gym_id=public.visual_group_tenant_id(p_gym_id)::text)
       and not exists(select 1 from public.visual_group_member_event resolved where resolved.gym_id=e.gym_id
         and resolved.alias_value=e.alias_value and resolved.actor=case when e.actor='runtime_ambiguous_review' then 'runtime_ambiguous_reconciled' else 'backfill_ambiguous' end and resolved.action='confirmed' and resolved.id>e.id)
-      and not exists(select 1 from public.visual_group_reconciliation r where r.gym_id=e.gym_id and e.id=any(r.hold_event_ids))),'[]'::jsonb),
+      and not exists(select 1 from public.visual_group_reconciliation r where r.gym_id=e.gym_id and e.id=any(r.hold_event_ids))
+    ) e where hold_rank=1),'[]'::jsonb),
     'activation_ready',false,
-    'activation_blockers',jsonb_build_array('tenant alias registration of every covered calendar key and owner ruling on unmapped keys','safe scene union/redirect','per-sibling derivative payloads','transactional activation write barrier and locked coverage recheck'),
+    'activation_blockers',jsonb_build_array('tenant alias registration of every covered calendar key and owner ruling on unmapped keys','owner review of reported scene cross-date conflicts','transactional activation write barrier and locked coverage recheck'),
     'policy','Exact identities only. pHash 7-30 requires review. JCK_6328/JCK_6331 distance 28 may share a group only after manual confirmation. Published history is immutable.');
 $$;
 revoke all on function public.visual_group_backfill_gym(text,boolean) from public,anon,authenticated;

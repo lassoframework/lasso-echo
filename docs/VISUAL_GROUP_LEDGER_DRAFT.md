@@ -17,6 +17,7 @@ has been applied. The application guard scaffold in PR232 remains default OFF.
 | Canceled unsent releases only final sibling | Membership rows track active claims under group lock. Last unsent cancel/delete releases a reserved ledger. `publishing`, `failed`, tokens or provider IDs are treated conservatively as ambiguous. Group/sibling flags are sticky; ordinary writes cannot clear flags or release them. Evidence-only reconciliation binds original IDs and each attempt UUID, preserves other active/uncertain siblings, and makes confirmed delivery permanent. | Sibling cancellation; failed retention; orphan cleanup; timeout/wrong-ID refusal; separate GBP/Story attempts; reconciliation/delete race |
 | Stable IDs/unique aliases/review decisions | Alias registration locks an absent alias before creating its group, avoiding orphan races. Existing aliases/groups and decision history cannot be mutated. Exact aliases only; latest pending scene-review events hold claims until explicit confirm/reject. | Alias race, duplicate registration, stable group, grants/sequence permissions, pHash-28 pair kept separate and explicit scene review |
 | Historical/future backfill precedes activation | Dry-run default rolls back all writes. Per-row savepoint prevents partial alias bindings on conflict. Published calendar history is unchanged; published evidence is append-only. Active rows and archived/candidate ambiguous sends reserve; unresolved history remains a gym-wide activation blocker after deletion. Row readiness considers only that row/its aliases. Only a row with its own unresolved conflict is held/demoted; verified hydration clears owned visual holds and preserves unrelated holds/approval. | Dry-run/real/idempotent backfill; alias conflicts; future reservations; unknown history; unrelated approved rows; hold recovery |
+| Manual same-scene union across distinct group keys | `visual_group_link_scene(gym, a, b, evidence, actor)` is service-role only and requires a named human reviewer plus non-empty evidence; it is never inferred from pHash (the JCK_6328/JCK_6331 distance-28 pair links only by manual evidence). Append-only normalized edges (`visual_group_scene_link`, a<b) are immutable, transitive (one equivalence component per canonical tenant), same-tenant only (cross-tenant/unknown keys raise), cycle-safe and idempotent (re-linking a connected pair is a no-op returning `idempotent=true`). Unions lock the union of both endpoint components in deterministic key order, serializing with reservations, publishes and reverse-order concurrent unions. Claims, swaps and confirmed deliveries treat the component as one scene: pending members share one date across channels, another date fails atomically, an ambiguous member retains the component claim, and any published member makes the component permanently used on every linked key. Group keys, aliases and published ledger/history are never reassigned, deleted or rewritten. | 2- and 3-group components; same-day siblings; published old-group/new-group refusal; cross-tenant refusal; union racing an independent different-day claim; reverse union lock order; ambiguous member retention; historical conflict reporting; linked-scene backfill hold (all pending the lead's real-PostgreSQL run) |
 | Planner rebuild cannot drop repeat holds | INSERT/UPSERT without the prior group or hold still resolves known URL aliases. Later-date reuse refuses the write, preserving existing calendar/ledger. | Swift River/GBP-style rebuild and UPSERT regression |
 
 ## Canonical tenant alias identity (PR235 package, 2026-10-02)
@@ -159,7 +160,24 @@ were repaired in the backfill lane only:
 Behavioral invariants are unchanged: dry run remains the default and rolls
 back all writes, the function is idempotent (repeat runs add no duplicate
 events), enforcement stays OFF and is never toggled, and execute remains
-service-role only. Static PL/pgSQL block-balance checks pass; live PostgreSQL
+service-role only.
+
+**P2 independent-review repairs (backfill lane, 2026-10-02):** (4) both
+per-row savepoints and the hold-write savepoint also catch `unique_violation`,
+so one row's unique conflict (e.g. an alias-registry race) becomes a held
+review event instead of aborting the whole gym backfill. (5) any held row
+whose group reservation or own markers are ambiguous is written with
+`v_amb_hold` (`actor='backfill_ambiguous_review'`, claim-evidence JSON), so it
+is visible to the report's `unresolved_ambiguous_history` filter even when the
+block itself was an alias/scene/date conflict. (6) `p_gym_id` is trimmed once
+before tenant resolution and the calendar scan, so a whitespace-padded key no
+longer silently backfills zero rows while reporting success. (8) the report's
+`unresolved_published_history` and `unresolved_ambiguous_history` now keep only
+the latest unresolved hold per row (`alias_value`), so repeated or superseded
+holds do not double-count a row. (7) regression tests assert the
+`historical_cross_date_visual_repeat` backfill report reason and the
+`cross_date_conflicts` report output, plus the cross-alias published-conflict
+hold counting once in unresolved history. Static PL/pgSQL block-balance checks pass; live PostgreSQL
 validation is pending on the integration lead (this lane's sandbox blocks the
 local server socket/shared memory).
 
@@ -168,9 +186,10 @@ are now implemented in this lane by `visual_group_swap_siblings_media` (above),
 with the legacy shared-media RPC routed through the same owner-only per-row
 replacement helper; date-only redate is unchanged. All derivatives must resolve
 to one common scene. The public service-role wrappers validate and lock the
-complete unsent, unapproved sibling set; direct helper execution is denied. The backfill-owned conflict report still
-hardcodes this item in `activation_blockers` until the backfill file is updated
-by its own lane.
+complete unsent, unapproved sibling set; direct helper execution is denied. The backfill-owned conflict report no longer lists this item in
+`activation_blockers` (removed by the backfill lane on 2026-10-02 after the
+independent dual-child review); `activation_ready` remains `false` for the
+remaining blockers.
 
 ### Per-sibling RPC independent repair
 
@@ -302,3 +321,48 @@ Remove the calendar trigger and new RPC/helpers in dependency order, then the
 sibling table and additive schema only when nothing relies on it. Removing a
 function is reversible; deleting historical ledger data is not an acceptable
 rollback after activation. Do not DROP PR230 functions or weaken its guards.
+
+### Manual same-scene union package (2026-10-02, draft)
+
+Ground truth: `global-media-release-plan-20261002.md` line 50 ("Safe scene
+group union ... remain missing") and the draft ledger code in this lane.
+
+- `migrations/DRAFT_visual_group_schema_20261002.sql` gains the append-only
+  `visual_group_scene_link` edge table (normalized a<b, both ends FK to
+  `visual_group`, immutable trigger coverage, RLS service-role only), the
+  recursive cycle-safe `visual_group_scene_members` component helper, and the
+  guarded `visual_group_link_scene` RPC. The RPC demands a non-blank human
+  actor and non-empty evidence object, refuses identical/unknown/foreign
+  (cross-tenant) group keys, locks the union of both endpoint components in
+  key order with a bounded recompute loop, inserts one edge plus a
+  `scene_linked` member event (new allowed `action` value) on first link only,
+  and returns the merged component, any existing cross-date conflicts,
+  published and ambiguous member keys. Nothing is ever inferred from pHash.
+- `migrations/DRAFT_visual_group_claim_trigger_20261002.sql` extends the
+  claim path (`visual_group_sync_row`), both swap paths
+  (`visual_group_apply_media_swap`) and confirmed-delivery reconciliation with
+  component-wide date authority under sorted group locks: a non-released
+  ledger row on ANY linked member pins the whole component to one date; an
+  ambiguous member retains that claim; a published member makes the scene
+  permanently used on every key. Unlinked groups take the identical code path
+  with a singleton component, so prior behavior is unchanged.
+- `migrations/DRAFT_visual_group_backfill_20261002.sql` holds new unsafe rows
+  whose date disagrees with a linked member's active/published claim
+  (`linked_scene_cross_date_hold`, one per-row held review event inside the
+  existing savepoint), and `visual_group_conflict_report` gains
+  `scene_cross_date_conflicts` (per-component dates/states, NULL historical
+  dates counted) while `activation_ready` stays false and the former
+  `safe scene union/redirect` blocker becomes `owner review of reported scene
+  cross-date conflicts`. Existing cross-date history is reported, never
+  rewritten.
+- All three migrations remain DRAFT/unapplied with enforcement default OFF;
+  no flags are armed and no production SQL was run.
+- Verification in this lane: 9 static release-boundary checks pass; the 10 new
+  real-PostgreSQL cases (2-group shared date/other-date refusal, 3-group
+  transitivity and cycle-safe idempotent re-link, published old-group/new-group
+  refusal and ledger immutability, union-vs-different-day-claim race with
+  conflict-report fallback, reverse-order union race without deadlock,
+  ambiguous-member claim retention, historical cross-date conflict reporting
+  with activation blocked and no rewrite, backfill linked-scene hold with
+  idempotent repeat) are written but UNRUN here: this sandbox denies the local
+  server's shared-memory call, so the lead runs the live suite.

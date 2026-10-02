@@ -220,7 +220,7 @@ $$;
 create or replace function public.visual_group_sync_row(
   p_old public.content_calendar,p_new public.content_calendar,p_op text
 ) returns void language plpgsql security definer set search_path = public as $$
-declare l public.visual_group_usage_ledger%rowtype; k record; need_claim boolean; finalized boolean;
+declare l public.visual_group_usage_ledger%rowtype; need_claim boolean; finalized boolean;
 begin
   -- Canonical tenant identity boundary. Internal ledger/sibling/event tables
   -- are keyed by canonical tenant UUID; content_calendar keeps its raw key.
@@ -232,12 +232,10 @@ begin
   if p_op <> 'delete' and nullif(btrim(p_new.gym_id),'') is not null then
     p_new.gym_id := public.visual_group_tenant_id(p_new.gym_id)::text;
   end if;
-  -- Lock ALL affected existing stable groups in order, including cross-gym
-  -- moves. A group missing from visual_group is never accepted as identity.
-  for k in select g.gym_id,g.group_key from public.visual_group g
-    where (g.gym_id=p_old.gym_id and g.group_key=p_old.visual_group_key)
-       or (g.gym_id=p_new.gym_id and g.group_key=p_new.visual_group_key)
-    order by g.gym_id,g.group_key for update loop null; end loop;
+  -- Acquire the complete old/new component closure before any group writes.
+  perform public.visual_group_lock_scene_components(jsonb_build_array(
+    jsonb_build_object('gym_id',p_old.gym_id,'group_key',p_old.visual_group_key),
+    jsonb_build_object('gym_id',p_new.gym_id,'group_key',p_new.visual_group_key)));
 
   if p_op='update' and public.visual_group_row_ambiguous(p_new) and p_old.visual_group_key is not null
      and public.visual_group_enforcement_on(p_old.gym_id) then
@@ -272,6 +270,20 @@ begin
   need_claim := public.visual_group_row_active(p_new) or public.visual_group_row_ambiguous(p_new) or finalized;
   if not need_claim or p_new.visual_group_key is null or p_new.post_date is null then return; end if;
 
+  -- Linked same-scene authority: a human-confirmed union shares ONE date
+  -- across every component member. Lock member groups in deterministic key
+  -- order (the same order unions use) so this claim serializes with
+  -- concurrent unions and member reservations; then refuse any date that
+  -- disagrees with a non-released member claim. An ambiguous member retains
+  -- the component claim (its ledger row is non-released until evidence-based
+  -- reconciliation); pending members may share the date across channels.
+  -- Complete component locks were acquired before endpoint mutations above.
+  if exists(select 1 from public.visual_group_usage_ledger cl
+    where cl.gym_id=p_new.gym_id and cl.state<>'released'
+      and cl.reserved_date is distinct from p_new.post_date
+      and cl.group_key in (select public.visual_group_scene_members(p_new.gym_id,p_new.visual_group_key))) then
+    raise exception 'linked visual scene is used on another date' using errcode='23514';
+  end if;
   select * into l from public.visual_group_usage_ledger
     where gym_id=p_new.gym_id and group_key=p_new.visual_group_key for update;
   if found and l.state <> 'released' and l.reserved_date is distinct from p_new.post_date then
@@ -367,11 +379,15 @@ begin
       -- writing the ledger. A concurrent decision event's FK key-share lock
       -- must commit before we re-read whether the candidate remains held.
       resolved:=public.visual_group_resolve_row(new);
-      perform 1 from public.visual_group g where
-        (g.gym_id=new_tenant and g.group_key in (new.visual_group_key,resolved)) or
-        (tg_op='UPDATE' and g.gym_id=old_tenant and g.group_key=old.visual_group_key)
-        order by g.gym_id,g.group_key for update;
-      resolved := public.visual_group_resolve_row(new);
+      perform public.visual_group_lock_scene_components(jsonb_build_array(
+        jsonb_build_object('gym_id',new_tenant,'group_key',new.visual_group_key),
+        jsonb_build_object('gym_id',new_tenant,'group_key',resolved),
+        jsonb_build_object('gym_id',old_tenant,'group_key',case when tg_op='UPDATE' then old.visual_group_key end)));
+      -- Identity hydration while waiting must retry, never add a lower-key
+      -- component after retaining the first component's locks.
+      if public.visual_group_resolve_row(new) is distinct from resolved then
+        raise exception 'visual identity changed while locking; retry transaction' using errcode='55P03';
+      end if;
       if finalized and public.visual_group_finalization_requires_evidence(
           case when tg_op='UPDATE' then old end,new)
          and not public.visual_group_finalization_evidenced(
@@ -506,18 +522,18 @@ begin
     payload:=payload||jsonb_build_array(to_jsonb(replacement));
     if resolved<>p_old_group and not(resolved=any(targets)) then targets:=targets||resolved; end if;
   end loop;
-  -- Enumerate keys before locking; each statement locks exactly one group.
-  -- This makes A->B and B->A use the same order independently of the query
-  -- planner's row-lock plan. Calendar rows remain locked by the wrapper.
-  for t in select distinct k from unnest(array[p_old_group]||targets) keys(k)
-    order by k loop
-    perform 1 from public.visual_group where gym_id=v_tenant and group_key=t for update;
-    if not found then
-      raise exception 'swap scene group disappeared' using errcode='23514';
-    end if;
-  end loop;
+  -- Lock old/replacement linked components in one sorted pass.
+  perform public.visual_group_lock_scene_components((select jsonb_agg(
+    jsonb_build_object('gym_id',v_tenant,'group_key',scene_key.group_key))
+    from unnest(array[p_old_group]||targets) scene_key(group_key)));
   select * into l from public.visual_group_usage_ledger
     where gym_id=v_tenant and group_key=p_old_group for update;
+  if exists(select 1 from public.visual_group_usage_ledger sl
+      where sl.gym_id=v_tenant and sl.group_key<>p_old_group and sl.state<>'released'
+        and sl.reserved_date is distinct from p_new_date
+        and sl.group_key in (select public.visual_group_scene_members(v_tenant,p_old_group))) then
+    raise exception 'linked scene component holds a different date' using errcode='23514';
+  end if;
   if not found or l.state<>'reserved' or l.ambiguous or l.reserved_date is distinct from old_date or exists(
     select 1 from public.visual_group_usage_sibling where gym_id=v_tenant and group_key=p_old_group
       and state='active' and not(calendar_row_id=any(p_row_ids))) or exists(
@@ -535,6 +551,11 @@ begin
     select * into l from public.visual_group_usage_ledger where gym_id=v_tenant and group_key=t for update;
     if found and (l.state<>'released' or l.ambiguous) then
       raise exception 'replacement group is reserved, published or ambiguous; cross-date reuse refused' using errcode='23514';
+    end if;
+    if exists(select 1 from public.visual_group_usage_ledger sl
+        where sl.gym_id=v_tenant and sl.group_key<>t and (sl.state<>'released' or sl.ambiguous)
+          and sl.group_key in (select public.visual_group_scene_members(v_tenant,t))) then
+      raise exception 'replacement group is linked to an occupied scene component' using errcode='23514';
     end if;
     if exists(select 1 from public.visual_group_usage_sibling s where s.gym_id=v_tenant and s.group_key=t
         and s.state='active' and not(s.calendar_row_id=any(p_row_ids))) or exists(
@@ -621,7 +642,8 @@ begin
     return public.visual_group_apply_media_swap(p_gym_id,p_new_date,per_row,p_row_ids,g);
   end if;
   -- Date-only operation has no replacement group to lock.
-  perform 1 from public.visual_group where gym_id=v_tenant and group_key=g for update;
+  perform public.visual_group_lock_scene_components(jsonb_build_array(
+    jsonb_build_object('gym_id',v_tenant,'group_key',g)));
   select * into l from public.visual_group_usage_ledger where gym_id=v_tenant and group_key=g for update;
   if not found or l.state<>'reserved' or l.ambiguous or l.reserved_date<>old_date or exists(
     select 1 from public.visual_group_usage_sibling where gym_id=v_tenant and group_key=g
@@ -698,7 +720,7 @@ create or replace function public.visual_group_reconcile_ambiguous(
   p_evidence jsonb,p_actor text
 ) returns jsonb language plpgsql security definer set search_path = public as $$
 declare c public.content_calendar; live boolean; expected jsonb; v_attempts jsonb;
-  groups text[]; holds bigint[]; receipt_id uuid; k text; v_ledger public.visual_group_usage_ledger%rowtype;
+  groups text[]; holds bigint[]; receipt_id uuid; v_reconciled_group text; v_ledger public.visual_group_usage_ledger%rowtype;
   pub_at timestamptz; checked_at timestamptz; provider_id text; prior public.visual_group_reconciliation%rowtype;
   calendar_updated boolean:=false; v_tenant text;
 begin
@@ -756,8 +778,9 @@ begin
     raise exception 'non-delivery group does not belong to original reservation';
   end if;
   if p_group_key is not null and not p_group_key=any(groups) then groups:=array_append(groups,p_group_key); end if;
-  perform 1 from public.visual_group where gym_id=v_tenant and group_key=any(groups)
-    order by gym_id,group_key for update;
+  perform public.visual_group_lock_scene_components((select coalesce(jsonb_agg(
+    jsonb_build_object('gym_id',v_tenant,'group_key',scene_key.group_key)),'[]'::jsonb)
+    from unnest(groups) scene_key(group_key)));
   if p_group_key is not null and not exists(select 1 from public.visual_group where gym_id=v_tenant and group_key=p_group_key) then
     raise exception 'unknown delivered group';
   end if;
@@ -852,6 +875,13 @@ begin
     returning id into receipt_id;
   -- A definitive delivery is permanent even if its calendar row was deleted.
   if p_outcome='confirmed_published' then
+    -- All original/delivered components were locked before endpoint ledgers.
+    if exists(select 1 from public.visual_group_usage_ledger cl
+      where cl.gym_id=v_tenant and cl.state<>'released' and cl.group_key<>p_group_key
+        and cl.reserved_date is distinct from p_date
+        and cl.group_key in (select public.visual_group_scene_members(v_tenant,p_group_key))) then
+      raise exception 'confirmed scene date conflicts with linked scene component';
+    end if;
     select * into v_ledger from public.visual_group_usage_ledger where gym_id=v_tenant and group_key=p_group_key for update;
     if found and v_ledger.state<>'released' and v_ledger.reserved_date is distinct from p_date then raise exception 'confirmed scene date conflict'; end if;
     if not found then
@@ -872,13 +902,17 @@ begin
       late_post_id=p_evidence->>'provider_post_id' where id=p_row_id;
     calendar_updated:=true;
   end if;
-  foreach k in array groups loop
-    if public.visual_group_group_reconciled(v_tenant,k) then
+  foreach v_reconciled_group in array groups loop
+    if public.visual_group_group_reconciled(v_tenant,v_reconciled_group) then
+      -- Only uncertainty metadata changes on permanent usage, after the last
+      -- unresolved sibling is conclusively reconciled. Keep all usage fields.
+      update public.visual_group_usage_ledger set ambiguous=false
+        where gym_id=v_tenant and group_key=v_reconciled_group and state='published' and ambiguous;
       update public.visual_group_usage_ledger set ambiguous=false,
-        state=case when exists(select 1 from public.visual_group_usage_sibling s where s.gym_id=v_tenant and s.group_key=k and s.state='active')
+        state=case when exists(select 1 from public.visual_group_usage_sibling s where s.gym_id=v_tenant and s.group_key=v_reconciled_group and s.state='active')
           then 'reserved' else 'released' end,
-        released_at=case when not exists(select 1 from public.visual_group_usage_sibling s where s.gym_id=v_tenant and s.group_key=k and s.state='active') then now() end
-        where gym_id=v_tenant and group_key=k and state<>'published';
+        released_at=case when not exists(select 1 from public.visual_group_usage_sibling s where s.gym_id=v_tenant and s.group_key=v_reconciled_group and s.state='active') then now() end
+        where gym_id=v_tenant and group_key=v_reconciled_group and state<>'published';
     end if;
   end loop;
   return jsonb_build_object('receipt_id',receipt_id,'outcome',p_outcome,'calendar_updated',calendar_updated,'idempotent',false);
@@ -896,7 +930,7 @@ begin
        'visual_group_finalization_requires_evidence','visual_group_finalization_evidenced','visual_group_sync_row',
        'visual_group_guard_trigger','visual_group_sibling_keep_ambiguity',
        'visual_group_tenant_id','visual_group_tenant_strict','visual_group_tenant_register',
-       'visual_group_sibling_reconciled','visual_group_group_reconciled','visual_group_row_reconciled_here','visual_group_reconcile_ambiguous','visual_group_swap_siblings','visual_group_swap_redate',
+       'visual_group_sibling_reconciled','visual_group_group_reconciled','visual_group_row_reconciled_here','visual_group_reconcile_ambiguous','visual_group_swap_siblings','visual_group_swap_redate','visual_group_scene_members','visual_group_link_scene',
        'visual_group_swap_siblings_media','visual_group_apply_media_swap') loop
     execute format('revoke all on function %s from public,anon,authenticated',f.signature);
     if f.proname in ('visual_group_apply_media_swap','visual_group_sync_row') then

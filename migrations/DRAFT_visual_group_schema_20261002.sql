@@ -166,7 +166,7 @@ create table if not exists public.visual_group_member_event (
   alias_kind  text,
   alias_value text,
   action      text        not null check (action in
-    ('confirmed','rejected','auto_merged','review_hold')),
+    ('confirmed','rejected','auto_merged','review_hold','scene_linked')),
   actor       text        not null default 'system',
   check (group_key is not null or action = 'review_hold'),
   reason      text,
@@ -206,7 +206,7 @@ create table if not exists public.visual_group_usage_ledger (
 alter table public.visual_group_usage_ledger add column if not exists ambiguous boolean not null default false;
 
 comment on table public.visual_group_usage_ledger is
-  'One row per (gym, group). Same-date IG/FB/Story/GBP siblings share it; a different date while state<>''released'' is rejected; state=''published'' rows are immutable forever.';
+  'One row per (gym, group). Same-date IG/FB/Story/GBP siblings share it; a different date while state<>''released'' is rejected; state=''published'' usage fields are immutable forever; uncertainty metadata clears only with terminal evidence.';
 
 -- backfill/coverage scans: which rows of the ledger sit on a given date/state
 create index if not exists visual_group_usage_ledger_date_idx
@@ -286,12 +286,13 @@ begin
     raise exception 'ambiguous usage requires evidence-based reconciliation' using errcode='23514';
   end if;
   if old.state = 'published' then
-    raise exception
-      'visual_group_usage_ledger published row is immutable (gym_id=%, group_key=%)',
-      old.gym_id, old.group_key
-      using errcode = 'raise_exception';
-  end if;
-  if tg_op = 'UPDATE' and new.state = 'published' and old.state = 'published' then
+    -- Permanent usage fields never change. The only permitted metadata repair
+    -- is clearing uncertainty after every original attempt has terminal proof.
+    if tg_op='UPDATE' and old.ambiguous and not new.ambiguous
+       and (to_jsonb(new)-'ambiguous') = (to_jsonb(old)-'ambiguous')
+       and public.visual_group_group_reconciled(old.gym_id,old.group_key) then
+      return new;
+    end if;
     raise exception
       'visual_group_usage_ledger published row is immutable (gym_id=%, group_key=%)',
       old.gym_id, old.group_key
@@ -416,6 +417,169 @@ begin
 end;
 $$;
 
+
+-- ---------------------------------------------------------------------------
+-- 5. Manual same-scene union across distinct group keys (DRAFT, service-role)
+-- ---------------------------------------------------------------------------
+-- A human reviewer may confirm that two DIFFERENT stable group keys (distinct
+-- exact files, e.g. the Swift River JCK_6328/JCK_6331 pair at pHash distance
+-- 28) show one scene. The union is never inferred from pHash, distance or any
+-- automatic heuristic: only this explicit service-role RPC creates links, and
+-- it requires non-empty human evidence. Group keys, aliases and published
+-- ledger/history stay exactly as they are; a link never reassigns or deletes
+-- an alias/group and never rewrites history. The relation is transitive
+-- (links form one equivalence component per tenant), same-tenant only,
+-- cycle-safe (re-linking an already connected pair is an idempotent no-op),
+-- persistent (append-only, immutable below) and idempotent.
+create table if not exists public.visual_group_scene_link (
+  gym_id      text        not null,
+  group_key_a text        not null,
+  group_key_b text        not null,
+  evidence    jsonb       not null,
+  created_by  text        not null,
+  created_at  timestamptz not null default now(),
+  primary key (gym_id, group_key_a, group_key_b),
+  check (group_key_a < group_key_b),
+  foreign key (gym_id, group_key_a)
+    references public.visual_group (gym_id, group_key),
+  foreign key (gym_id, group_key_b)
+    references public.visual_group (gym_id, group_key)
+);
+
+comment on table public.visual_group_scene_link is
+  'Append-only human-confirmed same-scene edges between distinct group keys of one canonical tenant. Normalized (a<b). Never updated or deleted; never created from pHash inference.';
+
+create index if not exists visual_group_scene_link_b_idx
+  on public.visual_group_scene_link (gym_id, group_key_b);
+
+-- Transitive same-scene component of one group. Recursive walk with UNION
+-- dedup, so cyclic edge sets terminate. Stable identity read; callers that
+-- mutate must lock the component's group rows in key order first.
+create or replace function public.visual_group_scene_members(p_gym_id text, p_group_key text)
+returns setof text language sql stable security definer set search_path = public as $$
+  with recursive walk(group_key) as (
+    select p_group_key
+    union
+    select case when l.group_key_a = w.group_key then l.group_key_b else l.group_key_a end
+      from public.visual_group_scene_link l
+      join walk w on l.gym_id = p_gym_id and w.group_key in (l.group_key_a, l.group_key_b)
+  ) select group_key from walk;
+$$;
+
+-- Lock complete components BEFORE endpoint/ledger locks. Each statement locks
+-- one row, independent of planner order. A concurrent union may have changed
+-- the closure while we waited: refuse/retry the entire transaction instead of
+-- taking newly discovered (possibly lower) keys with old locks still held.
+-- Private implementation helper; input identities are canonical internal keys.
+create or replace function public.visual_group_lock_scene_components(p_targets jsonb)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_members jsonb; v_recheck jsonb; v_item jsonb;
+begin
+  select coalesce(jsonb_agg(to_jsonb(component_group) order by component_group.gym_id,component_group.group_key),'[]'::jsonb)
+    into v_members from (
+      select distinct g.gym_id,g.group_key
+      from jsonb_to_recordset(p_targets) t(gym_id text,group_key text)
+      cross join lateral public.visual_group_scene_members(t.gym_id,t.group_key) m(group_key)
+      join public.visual_group g on g.gym_id=t.gym_id and g.group_key=m.group_key
+      where t.gym_id is not null and t.group_key is not null) component_group;
+  for v_item in select value from jsonb_array_elements(v_members) loop
+    perform 1 from public.visual_group
+      where gym_id=v_item->>'gym_id' and group_key=v_item->>'group_key' for update;
+  end loop;
+  select coalesce(jsonb_agg(to_jsonb(component_group) order by component_group.gym_id,component_group.group_key),'[]'::jsonb)
+    into v_recheck from (
+      select distinct g.gym_id,g.group_key
+      from jsonb_to_recordset(p_targets) t(gym_id text,group_key text)
+      cross join lateral public.visual_group_scene_members(t.gym_id,t.group_key) m(group_key)
+      join public.visual_group g on g.gym_id=t.gym_id and g.group_key=m.group_key
+      where t.gym_id is not null and t.group_key is not null) component_group;
+  if v_recheck is distinct from v_members then
+    raise exception 'scene component changed while locking; retry transaction' using errcode='55P03';
+  end if;
+end;
+$$;
+revoke all on function public.visual_group_lock_scene_components(jsonb) from public,anon,authenticated,service_role;
+
+-- Explicit human-confirmed union. Both groups must already belong to THIS
+-- canonical tenant (cross-tenant union raises; unknown keys raise). Locks the
+-- union of both endpoint components in deterministic key order -- the same
+-- (gym_id, group_key) order the calendar guard and swap RPCs use -- so unions
+-- serialize with reservations, publishes and concurrent reverse-order unions
+-- without deadlock. Existing cross-date usage between the merged components
+-- is refused while armed, or reported while OFF (blocking activation);
+-- published ledger rows and history are never rewritten.
+create or replace function public.visual_group_link_scene(
+  p_gym_id text, p_group_a text, p_group_b text, p_evidence jsonb, p_actor text
+) returns jsonb language plpgsql security definer set search_path = public as $$
+declare v_tenant text; v_a text; v_b text; v_members text[];
+  v_connected boolean; v_dates date[]; v_pub text[]; v_amb text[]; v_unknown_date boolean;
+begin
+  v_tenant := public.visual_group_tenant_strict(p_gym_id)::text;
+  if nullif(btrim(p_actor), '') is null then
+    raise exception 'a named human reviewer is required for a same-scene union' using errcode = '22023';
+  end if;
+  if p_evidence is null or jsonb_typeof(p_evidence) is distinct from 'object' or p_evidence = '{}'::jsonb then
+    raise exception 'human confirmation evidence is required; a scene union is never inferred from pHash distance alone (JCK_6328/JCK_6331 distance 28 needs manual evidence)' using errcode = '22023';
+  end if;
+  if nullif(btrim(p_group_a), '') is null or nullif(btrim(p_group_b), '') is null
+     or btrim(p_group_a) = btrim(p_group_b) then
+    raise exception 'two distinct group keys are required' using errcode = '22023';
+  end if;
+  v_a := least(btrim(p_group_a), btrim(p_group_b));
+  v_b := greatest(btrim(p_group_a), btrim(p_group_b));
+  -- Same-tenant only: a key registered only under another tenant, or not at
+  -- all, can never be linked here.
+  if not exists(select 1 from public.visual_group where gym_id = v_tenant and group_key = v_a)
+     or not exists(select 1 from public.visual_group where gym_id = v_tenant and group_key = v_b) then
+    raise exception 'scene union groups must both be registered under this canonical tenant' using errcode = '23514';
+  end if;
+  perform public.visual_group_lock_scene_components(jsonb_build_array(
+    jsonb_build_object('gym_id',v_tenant,'group_key',v_a),
+    jsonb_build_object('gym_id',v_tenant,'group_key',v_b)));
+  select array_agg(m order by m) into v_members from (
+    select a2.m from public.visual_group_scene_members(v_tenant,v_a) a2(m)
+    union select b2.m from public.visual_group_scene_members(v_tenant,v_b) b2(m)) u(m);
+  -- Armed tenants must remain claim-safe immediately after a human union.
+  -- OFF tenants may link conflicting historical scenes for review/reporting.
+  select count(distinct reserved_date)>1, bool_or(reserved_date is null)
+    into v_connected,v_unknown_date from public.visual_group_usage_ledger
+    where gym_id=v_tenant and group_key=any(v_members) and state<>'released';
+  if exists(select 1 from public.gym_visual_guard_settings where gym_id=v_tenant and enforce)
+     and (v_connected or coalesce(v_unknown_date,false)) then
+    raise exception 'armed tenant scene union conflicts with occupied dates; disable and reconcile history first'
+      using errcode='23514';
+  end if;
+  v_connected := exists(select 1 from public.visual_group_scene_members(v_tenant, v_a) m where m = v_b);
+  if not v_connected then
+    insert into public.visual_group_scene_link (gym_id, group_key_a, group_key_b, evidence, created_by)
+      values (v_tenant, v_a, v_b, p_evidence, btrim(p_actor));
+    -- Append-only audit: the partner key rides as a manual_scene alias value.
+    insert into public.visual_group_member_event
+      (gym_id, group_key, alias_kind, alias_value, action, actor, reason)
+      values (v_tenant, v_a, 'manual_scene', v_b, 'scene_linked', btrim(p_actor), p_evidence::text);
+  end if;
+  -- Report, never rewrite: any existing cross-date usage inside the merged
+  -- component is returned to the caller and surfaces in the conflict report.
+  select array_agg(distinct l.reserved_date order by l.reserved_date),
+         array_agg(distinct l.group_key order by l.group_key) filter (where l.state = 'published'),
+         array_agg(distinct l.group_key order by l.group_key) filter (where l.ambiguous)
+    into v_dates, v_pub, v_amb
+    from public.visual_group_usage_ledger l
+   where l.gym_id = v_tenant and l.state <> 'released'
+     and l.group_key in (select m from public.visual_group_scene_members(v_tenant, v_a) m(m));
+  return jsonb_build_object(
+    'tenant', v_tenant,
+    'linked', not v_connected,
+    'idempotent', v_connected,
+    'component', (select array_agg(m order by m) from public.visual_group_scene_members(v_tenant, v_a) m(m)),
+    'cross_date_conflicts', case when coalesce(cardinality(v_dates), 0) > 1 then to_jsonb(v_dates) else '[]'::jsonb end,
+    'published_group_keys', coalesce(to_jsonb(v_pub), '[]'::jsonb),
+    'ambiguous_group_keys', coalesce(to_jsonb(v_amb), '[]'::jsonb),
+    'activation_note', case when coalesce(cardinality(v_dates), 0) > 1
+      then 'existing cross-date usage is reported and blocks activation; history is never rewritten' end);
+end;
+$$;
+
 -- Group and alias identity bindings, and decision history, are immutable.
 -- Registration adds members; no UPDATE can silently retarget an existing alias.
 create or replace function public.visual_group_block_identity_mutation()
@@ -425,7 +589,7 @@ $$;
 do $$
 declare t text;
 begin
-  foreach t in array array['visual_group','visual_group_alias','visual_group_member_event','visual_group_reconciliation','tenant_alias'] loop
+  foreach t in array array['visual_group','visual_group_alias','visual_group_member_event','visual_group_reconciliation','tenant_alias','visual_group_scene_link'] loop
     execute format('drop trigger if exists visual_group_identity_immutable on public.%I',t);
     execute format('create trigger visual_group_identity_immutable before update or delete on public.%I for each row execute function public.visual_group_block_identity_mutation()',t);
   end loop;
@@ -462,3 +626,16 @@ grant select on public.visual_group, public.visual_group_alias,
   public.gym_visual_guard_settings to service_role;
 revoke all on sequence public.visual_group_member_event_id_seq from public,anon,authenticated,service_role;
 grant usage,select on sequence public.visual_group_member_event_id_seq to service_role;
+
+alter table public.visual_group_scene_link enable row level security;
+drop policy if exists visual_group_scene_link_service_role on public.visual_group_scene_link;
+create policy visual_group_scene_link_service_role on public.visual_group_scene_link
+  for all to service_role using (true) with check (true);
+revoke all on public.visual_group_scene_link from public,anon,authenticated,service_role;
+-- Links are written only through visual_group_link_scene, which enforces
+-- human evidence, same-tenant membership and deterministic component locks.
+grant select on public.visual_group_scene_link to service_role;
+revoke all on function public.visual_group_scene_members(text,text) from public,anon,authenticated;
+grant execute on function public.visual_group_scene_members(text,text) to service_role;
+revoke all on function public.visual_group_link_scene(text,text,text,jsonb,text) from public,anon,authenticated;
+grant execute on function public.visual_group_link_scene(text,text,text,jsonb,text) to service_role;

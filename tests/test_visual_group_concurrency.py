@@ -294,6 +294,55 @@ def test_backfill_alias_conflict_does_not_leave_partial_binding_or_orphan():
     assert sql(f'select count(*) from public.visual_group where gym_id={q(canon(g))}')=='2'
 
 
+def test_cross_date_historical_repeat_is_reported_in_backfill_and_conflict_report():
+    # P2 review #7: a second published row of the same visual on a different
+    # date must surface as historical_cross_date_visual_repeat in the backfill
+    # report AND as a cross_date_conflicts entry in the conflict report, while
+    # the permanent ledger keeps the original publication date and published
+    # calendar history is untouched.
+    g=gym(False)
+    first=insert(g,date='2026-09-01',status='published') # NULL published_at
+    second=insert(g,date='2026-10-06',status='published') # same canonical URL
+    report=backfill(g)
+    assert 'historical_cross_date_visual_repeat' in [c['reason'] for c in report['conflict_rows']]
+    l=ledger(g)
+    assert len(l)==1 and l[0]['state']=='published' and l[0]['reserved_date']=='2026-09-01'
+    assert report['published_rows_finalized']==1 and report['rows_held_for_review']==0
+    coverage=json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))
+    conflicts=[c for c in coverage['cross_date_conflicts'] if c['gym_id']==g and c['resolved_group']==l[0]['group_key']]
+    assert len(conflicts)==1, 'expected exactly one reported cross-date conflict for the group'
+    assert conflicts[0]['dates']==['2026-09-01','2026-10-06']
+    assert set(conflicts[0]['row_ids'])=={first,second}
+    assert coverage['unresolved_published_history']==[]
+    assert coverage['activation_ready'] is False
+
+
+def test_cross_alias_published_conflict_hold_counts_once_in_unresolved_history():
+    # P2 review #8: a published row whose alias keys map to different groups is
+    # held once, mints no new bindings, survives repeat backfills without
+    # duplicate events, and the conflict report counts the row only once even
+    # when a newer unresolved hold exists for it.
+    g=gym(False)
+    alias(g,'https://test/a.jpg');alias(g,'drive_b',kind='drive_id')
+    rid=insert(g,url='https://test/a.jpg',status='published')
+    sql(f"update public.content_calendar set drive_file_id='drive_b' where id={q(rid)}")
+    report=backfill(g)
+    assert report['rows_held_for_review']==1
+    assert 'visual_group_alias_conflict' in [c['reason'] for c in report['conflict_rows']]
+    # No partial bindings, no minted ledger rows, published calendar untouched.
+    assert sql(f"select count(*) from public.visual_group where gym_id={q(canon(g))}")=='2'
+    assert ledger(g)==[]
+    assert rows(g)[0]['media_not_ready_reason'] is None
+    backfill(g) # idempotent repeat: still exactly one hold event for the row
+    holds=f"select count(*) from public.visual_group_member_event where gym_id={q(canon(g))} and alias_value={q(rid)} and action='review_hold'"
+    assert sql(holds)=='1'
+    # A newer unresolved hold for the same row must not double-count.
+    sql(f"insert into public.visual_group_member_event(gym_id,group_key,alias_value,action,actor,reason) values({q(canon(g))},NULL,{q(rid)},'review_hold','backfill_published_review','owner_second_look')")
+    coverage=json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))
+    assert [e['alias_value'] for e in coverage['unresolved_published_history']].count(rid)==1
+    assert coverage['activation_ready'] is False
+
+
 def test_planner_rebuild_cannot_drop_cross_date_hold_or_upsert_old_media():
     g=gym();group=alias(g,'https://test/one.jpg');old=insert(g,group,date='2026-09-01')
     sql(f"update public.content_calendar set status='published',published_at=now() where id={q(old)}")
@@ -1503,7 +1552,7 @@ def test_proven_unsent_sibling_can_reconcile_after_other_delivery_without_releas
     if deleted_unsent:sql(f"delete from public.content_calendar where id={q(unsent)}")
     result=reconcile(current,unsent,scene,proof)
     assert result['calendar_updated'] is (not deleted_unsent)
-    assert ledger(old)==usage and rows(current)[0]==confirmed
+    assert ledger(old)==[{**usage[0], 'ambiguous': False}] and rows(current)[0]==confirmed
     if deleted_unsent:assert rows(old)==[]
     else:assert rows(old)[0]['status']=='killed'
     membership=json.loads(sql(f"select to_jsonb(s) from public.visual_group_usage_sibling s where gym_id={q(canon(old))} and calendar_row_id={q(unsent)}::uuid"))
@@ -1530,3 +1579,186 @@ def test_permanent_scene_does_not_allow_false_non_delivery_reconciliation(bad_bi
     with pytest.raises(RuntimeError):reconcile(g,row_id,group,proof)
     assert rows(g)==before and ledger(g)==usage and usage[0]['state']=='published'
     assert next(r for r in rows(g) if r['id']==sent)['status']=='published'
+
+
+def link(g, a, b, actor='blake', proof=None):
+    proof = proof or {'basis': 'human visual review of both exact files'}
+    return json.loads(sql(f"select public.visual_group_link_scene({q(g)},{q(a)},{q(b)},{q(json.dumps(proof))}::jsonb,{q(actor)})"))
+
+
+def links(g):
+    return json.loads(sql(f"select coalesce(jsonb_agg(to_jsonb(l) order by l.group_key_a,l.group_key_b),'[]') from public.visual_group_scene_link l where gym_id={q(canon(g))}"))
+
+
+def test_scene_link_requires_human_evidence_and_registered_tenant_groups():
+    g = gym(); a = alias(g, 'https://test/one.jpg'); b = alias(g, 'https://test/two.jpg')
+    for stmt in [
+        f"select public.visual_group_link_scene({q(g)},{q(a)},{q(b)},'{{}}'::jsonb,'blake')",
+        f"select public.visual_group_link_scene({q(g)},{q(a)},{q(b)},null,'blake')",
+        f"select public.visual_group_link_scene({q(g)},{q(a)},{q(b)},{q(json.dumps({'basis':'x'}))}::jsonb,'  ')",
+        f"select public.visual_group_link_scene({q(g)},{q(a)},{q(a)},{q(json.dumps({'basis':'x'}))}::jsonb,'blake')",
+        f"select public.visual_group_link_scene({q(g)},{q(a)},'vg_missing',{q(json.dumps({'basis':'x'}))}::jsonb,'blake')",
+        f"select public.visual_group_link_scene({q(g)},null,{q(b)},{q(json.dumps({'basis':'x'}))}::jsonb,'blake')",
+    ]:
+        with pytest.raises(RuntimeError):
+            sql(stmt)
+    # Cross-tenant refusal: a key registered only under another canonical
+    # tenant cannot be linked here, and the reverse call fails there too.
+    g2 = gym(); foreign = alias(g2, 'https://test/foreign.jpg')
+    with pytest.raises(RuntimeError):
+        sql(f"select public.visual_group_link_scene({q(g)},{q(a)},{q(foreign)},{q(json.dumps({'basis':'x'}))}::jsonb,'blake')")
+    with pytest.raises(RuntimeError):
+        sql(f"select public.visual_group_link_scene({q(g2)},{q(foreign)},{q(a)},{q(json.dumps({'basis':'x'}))}::jsonb,'blake')")
+    assert links(g) == [] and links(g2) == []
+
+
+def test_scene_union_two_group_shared_date_other_date_fails():
+    g = gym(); a = alias(g, 'https://test/one.jpg'); b = alias(g, 'https://test/two.jpg')
+    result = link(g, a, b)
+    assert result['linked'] is True and result['idempotent'] is False
+    assert result['component'] == sorted([a, b]) and result['cross_date_conflicts'] == []
+    insert(g, a, date='2026-10-05', account='instagram', url='https://test/one.jpg')
+    # Pending members share one date across channels, even on a different key.
+    insert(g, b, date='2026-10-05', account='facebook', url='https://test/two.jpg')
+    insert(g, b, date='2026-10-05', account='story', url='https://test/two.jpg')
+    # Another date on any member fails atomically: no row, no ledger write.
+    with pytest.raises(RuntimeError):
+        insert(g, b, date='2026-10-06', url='https://test/two.jpg')
+    with pytest.raises(RuntimeError):
+        insert(g, a, date='2026-10-06', url='https://test/one.jpg')
+    assert len(rows(g)) == 3 and len(ledger(g)) == 2
+    # Union metadata is persistent, immutable and idempotent.
+    repeat = link(g, b, a)  # reverse argument order normalizes to one edge
+    assert repeat['idempotent'] is True and len(links(g)) == 1
+    with pytest.raises(RuntimeError):
+        sql(f"update public.visual_group_scene_link set group_key_b={q(a)} where gym_id={q(canon(g))}")
+    with pytest.raises(RuntimeError):
+        sql(f"delete from public.visual_group_scene_link where gym_id={q(canon(g))}")
+
+
+def test_scene_union_three_group_transitive_cycle_safe():
+    g = gym()
+    a = alias(g, 'https://test/one.jpg'); b = alias(g, 'https://test/two.jpg'); c = alias(g, 'https://test/three.jpg')
+    link(g, a, b); link(g, b, c)
+    assert sorted(link(g, a, c)['component']) == sorted([a, b, c])
+    insert(g, a, date='2026-10-05', url='https://test/one.jpg')
+    # Transitivity: C sees A's reservation through B.
+    insert(g, c, date='2026-10-05', account='story', url='https://test/three.jpg')
+    with pytest.raises(RuntimeError):
+        insert(g, c, date='2026-10-09', url='https://test/three.jpg')
+    # Cycle-safe: re-linking an already connected pair is an idempotent no-op,
+    # never an error, duplicate edge or infinite walk.
+    assert link(g, a, c)['idempotent'] is True
+    assert link(g, c, a)['idempotent'] is True
+    assert len(links(g)) == 2
+    assert sql(f"select count(*) from public.visual_group_member_event where gym_id={q(canon(g))} and action='scene_linked'") == '2'
+
+
+def test_scene_union_published_old_group_new_group_refusal():
+    g = gym(); a = alias(g, 'https://test/one.jpg'); b = alias(g, 'https://test/two.jpg')
+    rid = insert(g, a, date='2026-10-05', url='https://test/one.jpg')
+    sql(f"update public.content_calendar set status='published',published_at=now() where id={q(rid)}")
+    link(g, a, b)
+    # The scene is permanently used: a linked NEW group key refuses any other
+    # date, while the published old-group ledger stays byte-identical.
+    with pytest.raises(RuntimeError):
+        insert(g, b, date='2026-10-06', url='https://test/two.jpg')
+    insert(g, b, date='2026-10-05', account='facebook', url='https://test/two.jpg')
+    frozen = ledger(g)
+    with pytest.raises(RuntimeError):
+        sql(f"update public.visual_group_usage_ledger set reserved_date='2026-10-07' where gym_id={q(canon(g))} and group_key={q(a)}")
+    assert ledger(g) == frozen
+    # Link rows survive with published history; old aliases/groups untouched.
+    assert len(links(g)) == 1 and len(rows(g)) == 2
+
+
+def test_scene_union_race_independent_different_day_claim():
+    g = gym(); a = alias(g, 'https://test/one.jpg'); b = alias(g, 'https://test/two.jpg')
+    insert(g, a, date='2026-10-05', url='https://test/one.jpg')
+    claim = f"insert into public.content_calendar(gym_id,post_date,account,image_url,visual_group_key,status) values({q(g)},'2026-10-06','facebook','https://test/two.jpg',{q(b)},'pending')"
+    union = f"select public.visual_group_link_scene({q(g)},{q(a)},{q(b)},{q(json.dumps({'basis':'human'}))}::jsonb,'blake')"
+    (union_out, union_err), (claim_out, claim_err) = race(union, claim)
+    assert union_err is None, (union_err, claim_err)
+    result = json.loads(union_out.splitlines()[-1])
+    if claim_err is None:
+        # The independent claim committed first: the union still succeeds
+        # (identity truth) but MUST report the cross-date conflict it merged.
+        assert len(result['cross_date_conflicts']) == 2, result
+        report = json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))
+        assert len(report['scene_cross_date_conflicts']) == 1 and report['activation_ready'] is False
+    else:
+        # The union won the serialization: the different-day claim fails
+        # atomically and the component keeps one date.
+        assert result['cross_date_conflicts'] == [], result
+        assert json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))['scene_cross_date_conflicts'] == []
+        assert {r['post_date'] for r in rows(g)} == {'2026-10-05'}
+
+
+def test_scene_union_reverse_order_lock_race_no_deadlock():
+    g = gym(); a = alias(g, 'https://test/one.jpg'); b = alias(g, 'https://test/two.jpg')
+    forward = f"select public.visual_group_link_scene({q(g)},{q(a)},{q(b)},{q(json.dumps({'basis':'h'}))}::jsonb,'blake')"
+    reverse = f"select public.visual_group_link_scene({q(g)},{q(b)},{q(a)},{q(json.dumps({'basis':'h'}))}::jsonb,'blake')"
+    result = race(forward, reverse)
+    assert all(err is None for _, err in result), result
+    outcomes = [json.loads(out.splitlines()[-1]) for out, _ in result]
+    assert sorted(o['linked'] for o in outcomes) == [False, True]
+    assert len(links(g)) == 1
+
+
+def test_scene_union_ambiguous_member_retains_component_claim():
+    g = gym(); a = alias(g, 'https://test/one.jpg'); b = alias(g, 'https://test/two.jpg')
+    rid = insert(g, a, date='2026-10-05', url='https://test/one.jpg')
+    sql(f"update public.content_calendar set status='publishing',publish_claim_token=gen_random_uuid() where id={q(rid)}")
+    assert ledger(g)[0]['ambiguous'] is True
+    result = link(g, a, b)
+    assert result['ambiguous_group_keys'] == [a]
+    # The ambiguous member still holds the scene's date on every linked key.
+    with pytest.raises(RuntimeError):
+        insert(g, b, date='2026-10-06', url='https://test/two.jpg')
+    insert(g, b, date='2026-10-05', account='story', url='https://test/two.jpg')
+    assert len(ledger(g)) == 2
+
+
+def test_scene_union_historical_conflict_reported_blocks_activation_no_rewrite():
+    g = gym(); a = alias(g, 'https://test/one.jpg'); b = alias(g, 'https://test/two.jpg')
+    r1 = insert(g, a, date='2026-10-05', url='https://test/one.jpg')
+    r2 = insert(g, b, date='2026-10-06', url='https://test/two.jpg')
+    sql(f"update public.content_calendar set status='published',published_at=now() where id in ({q(r1)},{q(r2)})")
+    frozen = ledger(g)
+    # Historical discovery can link conflicting occupied dates only while OFF.
+    sql(f'update public.gym_visual_guard_settings set enforce=false where gym_id={q(canon(g))}')
+    result = link(g, a, b)
+    # Pre-existing cross-date published history is reported, never rewritten.
+    assert result['cross_date_conflicts'] == ['2026-10-05', '2026-10-06']
+    assert sorted(result['published_group_keys']) == sorted([a, b])
+    report = json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))
+    assert report['activation_ready'] is False
+    scene = report['scene_cross_date_conflicts']
+    assert len(scene) == 1 and sorted(scene[0]['group_keys']) == sorted([a, b])
+    assert scene[0]['dates'] == ['2026-10-05', '2026-10-06']
+    assert ledger(g) == frozen and len(links(g)) == 1
+    # And no member can move to a third date while the conflict stands.
+    sql(f'update public.gym_visual_guard_settings set enforce=true where gym_id={q(canon(g))}')
+    with pytest.raises(RuntimeError):
+        insert(g, a, date='2026-10-07', url='https://test/one.jpg')
+    with pytest.raises(RuntimeError):
+        insert(g, b, date='2026-10-07', url='https://test/two.jpg')
+
+
+def test_backfill_holds_new_future_row_under_linked_scene_authority():
+    g = gym(False)
+    a = alias(g, 'https://test/one.jpg'); b = alias(g, 'https://test/two.jpg')
+    link(g, a, b)
+    insert(g, a, date='2026-10-05', url='https://test/one.jpg')
+    future = insert(g, b, date='2026-10-06', account='facebook', url='https://test/two.jpg')
+    report = backfill(g)
+    assert report['rows_grouped'] == 1 and report['rows_held_for_review'] == 1
+    held = [r for r in rows(g) if r['id'] == future][0]
+    assert held['media_not_ready_reason'] == 'linked_scene_cross_date_hold'
+    assert len(ledger(g)) == 1
+    # Repeat runs stay idempotent: no duplicate holds, no new ledger rows.
+    before = rows(g)
+    events = sql(f'select count(*) from public.visual_group_member_event where gym_id={q(canon(g))}')
+    backfill(g)
+    assert rows(g) == before and len(ledger(g)) == 1
+    assert sql(f'select count(*) from public.visual_group_member_event where gym_id={q(canon(g))}') == events
