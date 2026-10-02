@@ -349,6 +349,12 @@ def candidates_for(base_key, row, *, store, lib, book_state=None, asset_state=No
             if cands:
                 say(f"{base_key}: fresh swap pool exhausted; using least-recently-used "
                     "media outside the live forward book")
+    # Visual-group no-repeat guard (AGENT_MEDIA_GROUP_GUARD, default OFF = no-op):
+    # a candidate whose visual group is used/reserved on another date is dropped,
+    # as is any candidate whose identity cannot be verified; nothing is recycled
+    # across dates and an empty result takes the existing no-fresh-photo path.
+    from . import media_group_guard as _mgg
+    cands = _mgg.filter_swap_candidates(base_key, pd, cands, log=say)
     return order_candidates(cands, current_is_video=is_video(current))
 
 

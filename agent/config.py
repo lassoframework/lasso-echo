@@ -1450,6 +1450,22 @@ def media_swap_free_enabled() -> bool:
     return _truthy(os.environ.get("ECHO_MEDIA_SWAP_FREE", "false"))
 
 
+def media_group_guard_enabled() -> bool:
+    """AGENT_MEDIA_GROUP_GUARD, default OFF. Per-gym visual group no-repeat guard.
+
+    ON: the selector, the portal media swap, and the outbound publish gates
+    (calendar_autopublish + gbp_worker) refuse to reuse a visual group across
+    dates and fail CLOSED on unverifiable identity (agent/media_group_guard.py,
+    mirroring migrations/DRAFT_media_group_usage_20261002.sql). OFF (default):
+    byte-for-byte today's behavior.
+
+    Do not arm until the DRAFT migration is applied and historical media has
+    been backfill-clustered (docs/MEDIA_GROUP_RESERVATION.md) — with an empty
+    registry the guard holds every unverifiable candidate by design.
+    """
+    return _truthy(os.environ.get("AGENT_MEDIA_GROUP_GUARD", "false"))
+
+
 def caption_recreate_scoped_enabled() -> bool:
     """ECHO_CAPTION_RECREATE_SCOPED, default OFF. The client-initiated SCOPED caption
     recreate (partial-regen, piece 1/2 of "rotate only copy or image" — Blake,

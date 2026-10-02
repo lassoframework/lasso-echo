@@ -65,6 +65,16 @@ def _media_reuse_hold(row, *, now=None, history_store=None, media_store=None):
                                media_store=media_store)
 
 
+def _media_group_hold(row, *, media_store=None):
+    """Visual-group no-repeat guard at the GBP outbound boundary
+    (AGENT_MEDIA_GROUP_GUARD, default OFF = no hold). Mirrors the reuse hold's
+    fail-closed posture: a group used on another date, or an unverifiable
+    identity, never sends."""
+    from . import media_group_guard as _mgg
+    return _mgg.publish_hold_reason(row, row.get("gym_id"),
+                                    media_store=media_store)
+
+
 def publish_gbp_row(row, connection, *, client, draft=True, now=None,
                     history_store=None, media_store=None):
     """Send one approved GBP row through Zernio. Re-validates the hard rails at send
@@ -112,6 +122,10 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
         if hold:
             return {"ok": False, "status": "approved", "late_post_id": "",
                     "reject_reason": hold, "held": "media_reuse", "mode": ""}
+        group_hold = _media_group_hold(row, media_store=media_store)
+        if group_hold:
+            return {"ok": False, "status": "approved", "late_post_id": "",
+                    "reject_reason": group_hold, "held": "media_group", "mode": ""}
     # §7.2 / G7: ONE retry on a TRANSIENT transport error at SEND time. A send that raised
     # never went live, so re-sending once cannot double-post (unlike a reconcile re-send).
     # A policy/other error is NOT retried (it would just fail again). Second failure -> the
@@ -255,6 +269,10 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
     if hold:
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": hold, "held": "media_reuse", "mode": ""}
+    group_hold = _media_group_hold(row, media_store=media_store)
+    if group_hold:
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": group_hold, "held": "media_group", "mode": ""}
     try:
         resp = client.create_gmb_media(connection["zernio_account_id"],
                                        row["image_url"])

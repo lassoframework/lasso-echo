@@ -189,7 +189,8 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
         int(a.get("used_count") or 0),
         _parse_ts(a.get("last_used_at")) or _floor,      # NULLS FIRST
         str(a.get("id") or "")))
-    return candidates
+    from . import media_group_guard as _mgg
+    return [a for a in candidates if _mgg.selector_candidate_allowed(base, a)]
 
 
 def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=()):
@@ -234,7 +235,11 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
         _parse_ts(a.get("last_used_at")) or floor,
         int(a.get("used_count") or 0),
         str(a.get("id") or "")))
-    return candidates
+    # Even in the relaxed lane a permanently-published visual group is never
+    # recycled and unknown identity holds (AGENT_MEDIA_GROUP_GUARD; flag OFF
+    # leaves the list untouched).
+    from . import media_group_guard as _mgg
+    return [a for a in candidates if _mgg.selector_candidate_allowed(base, a)]
 
 
 def pool_kinds(gym_id, *, store=None, now=None, exclude_ids=()):

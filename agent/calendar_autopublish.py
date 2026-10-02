@@ -1297,6 +1297,24 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             failed.append(row_id)
             continue
 
+        # Visual-group no-repeat re-check (AGENT_MEDIA_GROUP_GUARD, default OFF =
+        # no hold). A row whose visual group is used/reserved on a DIFFERENT date
+        # — or whose identity cannot be verified — holds with the same fail-closed
+        # revert machinery as the reuse gate above.
+        from . import media_group_guard as _mgg
+        _group_reason = _mgg.publish_hold_reason(row, gym_id)
+        if _group_reason:
+            _reverted = _revert_to_pending(
+                store, row_id, reject_reason=_group_reason, gym_id=gym_id,
+                expected_claim_token=claim_token,
+                revert_status="approved" if approved_only else "pending")
+            if not _reverted:
+                recovery_required.append(row_id)
+            _alert_publish_blocked(gym_id, row_id, _group_reason, reverted=_reverted,
+                                   revert_status="approved" if approved_only else "pending")
+            failed.append(row_id)
+            continue
+
         # CAPTION TRACE (pure logging, WIRING.md 2026-08-27): stage-by-stage
         # visible-length for the outbound caption, so a caption that goes
         # missing between the row and the API call is grep-able as
