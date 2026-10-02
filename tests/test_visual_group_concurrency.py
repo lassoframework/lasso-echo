@@ -408,3 +408,117 @@ def test_reapplying_draft_migrations_preserves_usage_and_does_not_arm_gyms():
         sql((ROOT/'migrations'/f'DRAFT_visual_group_{name}_20261002.sql').read_text())
     assert ledger(g)==frozen
     assert sql("select column_default from information_schema.columns where table_schema='public' and table_name='gym_visual_guard_settings' and column_name='enforce'")=='false'
+
+
+@pytest.mark.parametrize('uncertain_status', ['publishing', 'failed'])
+def test_ambiguity_cannot_be_cleared_by_resetting_status_token_or_provider(uncertain_status):
+    g=gym();group=alias(g,'https://test/one.jpg');rid=insert(g,group,account='google_business')
+    sql(f"update public.content_calendar set status={q(uncertain_status)},publish_claim_token=gen_random_uuid(),late_post_id='uncertain-provider-id' where id={q(rid)}")
+    assert ledger(g)[0]['ambiguous'] is True
+    with pytest.raises(RuntimeError):
+        sql(f"update public.content_calendar set status='pending',publish_claim_token=null,late_post_id=null where id={q(rid)}")
+    assert rows(g)[0]['status']==uncertain_status
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    assert ledger(g)[0]['state']=='reserved' and ledger(g)[0]['ambiguous'] is True
+    with pytest.raises(RuntimeError):insert(g,group,date='2026-10-06',account='google_business')
+
+
+def test_sticky_ambiguity_survives_offline_marker_clear_and_calendar_delete():
+    g=gym();group=alias(g,'https://test/one.jpg');rid=insert(g,group,account='story')
+    sql(f"update public.content_calendar set status='publishing',publish_claim_token=gen_random_uuid() where id={q(rid)}")
+    sql(f'update public.gym_visual_guard_settings set enforce=false where gym_id={q(g)}')
+    sql(f"update public.content_calendar set status='pending',publish_claim_token=null,late_post_id=null where id={q(rid)}")
+    sql(f'update public.gym_visual_guard_settings set enforce=true where gym_id={q(g)}')
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    assert ledger(g)[0]['state']=='reserved' and ledger(g)[0]['ambiguous'] is True
+    with pytest.raises(RuntimeError):insert(g,group,date='2026-10-06',account='story')
+
+
+def test_insert_unknown_delivered_image_cannot_use_different_known_sources():
+    g=gym();one=alias(g,'source_one',kind='source_asset');two=alias(g,'source_two',kind='source_asset')
+    for day,group,source,channel in [('2026-10-05',one,'source_one','google_business'),('2026-10-06',two,'source_two','story')]:
+        rid=str(uuid.uuid4())
+        sql(f"insert into public.content_calendar(id,gym_id,post_date,image_url,source_media_asset_id,visual_group_key,status,account) values({q(rid)},{q(g)},{q(day)},'https://test/unknown-delivered.jpg',{q(source)},{q(group)},'pending',{q(channel)})")
+    assert all(r['visual_group_key'] is None and r['media_not_ready_reason']=='visual_group_identity_unresolved' for r in rows(g))
+    assert ledger(g)==[]
+    for r in rows(g):
+        with pytest.raises(RuntimeError):sql(f"update public.content_calendar set status='publishing' where id={q(r['id'])}")
+
+
+def test_registered_delivered_derivatives_require_complete_consistent_lineage():
+    g=gym();group=alias(g,'source_one',kind='source_asset')
+    alias(g,'https://test/feed.jpg',group);alias(g,'https://test/story-9x16.jpg',group)
+    for url,channel in [('https://test/feed.jpg','google_business'),('https://test/story-9x16.jpg','story')]:
+        rid=str(uuid.uuid4())
+        sql(f"insert into public.content_calendar(id,gym_id,post_date,image_url,source_media_asset_id,status,account) values({q(rid)},{q(g)},'2026-10-05',{q(url)},'source_one','pending',{q(channel)})")
+    assert len(ledger(g))==1 and all(r['visual_group_key']==group for r in rows(g))
+    # Even a registered delivered URL cannot silently ignore a new unknown or
+    # conflicting source/byte/Drive alias supplied on the calendar row.
+    for source in ('unknown_source','source_other'):
+        if source=='source_other':alias(g,source,kind='source_asset')
+        rid=str(uuid.uuid4())
+        sql(f"insert into public.content_calendar(id,gym_id,post_date,image_url,source_media_asset_id,status,account) values({q(rid)},{q(g)},'2026-10-06','https://test/story-9x16.jpg',{q(source)},'pending','story')")
+        assert next(r for r in rows(g) if r['id']==rid)['media_not_ready_reason']=='visual_group_identity_unresolved'
+    with pytest.raises(RuntimeError):insert(g,group,date='2026-10-06',url='https://test/story-9x16.jpg',account='story')
+
+
+@pytest.mark.parametrize('variant,status,channel', [('archived','publishing','google_business'),('candidate','failed','story')])
+def test_backfill_retains_ambiguous_nonactive_variants(variant,status,channel):
+    g=gym(False);rid=insert(g,status=status,account=channel)
+    sql(f"update public.content_calendar set variant_status={q(variant)},publish_claim_token=gen_random_uuid(),late_post_id='uncertain' where id={q(rid)}")
+    backfill(g)
+    assert ledger(g)[0]['state']=='reserved' and ledger(g)[0]['ambiguous'] is True
+    assert sql(f"select ambiguous from public.visual_group_usage_sibling where gym_id={q(g)} and calendar_row_id={q(rid)}")=='t'
+    sql(f'insert into public.gym_visual_guard_settings values({q(g)},true,now())')
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    assert ledger(g)[0]['state']=='reserved'
+    with pytest.raises(RuntimeError):insert(g,date='2026-10-06',account=channel)
+
+
+def test_backfill_unknown_archived_ambiguity_is_durable_activation_blocker():
+    g=gym(False);rid=insert(g,status='failed',url=None,account='story')
+    sql(f"update public.content_calendar set variant_status='archived',late_post_id='unknown-provider' where id={q(rid)}")
+    report=backfill(g)
+    assert report['rows_held_for_review']==1
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    report=json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))
+    assert len(report['unresolved_ambiguous_history'])==1 and report['activation_ready'] is False
+    alias(g,'https://test/one.jpg')
+    sql(f'insert into public.gym_visual_guard_settings values({q(g)},true,now())')
+    held=insert(g)
+    assert rows(g)[0]['media_not_ready_reason']=='visual_group_scene_review_required'
+    with pytest.raises(RuntimeError):sql(f"update public.content_calendar set status='approved' where id={q(held)}")
+
+
+def test_runtime_unknown_failed_media_is_durable_hold_and_keeps_prior_claim():
+    g=gym();group=alias(g,'https://test/one.jpg');rid=insert(g,group,account='google_business')
+    sql(f"update public.content_calendar set status='failed',image_url='https://test/unknown-result.jpg',visual_group_key=null,late_post_id='uncertain-provider-result' where id={q(rid)}")
+    assert rows(g)[0]['visual_group_key'] is None
+    assert ledger(g)[0]['ambiguous'] is True and ledger(g)[0]['state']=='reserved'
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    report=json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))
+    assert len(report['unresolved_ambiguous_history'])==1
+    assert ledger(g)[0]['state']=='reserved'
+    with pytest.raises(RuntimeError):sql(f"update public.visual_group_usage_ledger set ambiguous=false,state='released' where gym_id={q(g)}")
+
+
+def test_sticky_ambiguous_claim_can_finalize_then_calendar_delete_permanently():
+    g=gym();group=alias(g,'https://test/one.jpg');rid=insert(g,group,account='story')
+    sql(f"update public.content_calendar set status='publishing',publish_claim_token=gen_random_uuid() where id={q(rid)}")
+    with pytest.raises(RuntimeError):sql(f"update public.visual_group_usage_sibling set ambiguous=false where gym_id={q(g)}")
+    sql(f"update public.content_calendar set status='published',published_at=now() where id={q(rid)}")
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    assert ledger(g)[0]['state']=='published' and ledger(g)[0]['ambiguous'] is True
+
+
+def test_shared_media_rpc_refuses_distinct_story_derivative_but_redate_preserves_it():
+    g=gym();group=alias(g,'https://test/feed.jpg');alias(g,'https://test/story-9x16.jpg',group)
+    alias(g,'https://test/replacement.jpg',group)
+    feed=insert(g,group,url='https://test/feed.jpg',account='google_business')
+    story=insert(g,group,url='https://test/story-9x16.jpg',account='instagram')
+    sql(f"update public.content_calendar set format='story' where id={q(story)}")
+    media=q(json.dumps({'image_url':'https://test/replacement.jpg','visual_group_key':group}))+'::jsonb'
+    with pytest.raises(RuntimeError):sql(f"select public.visual_group_swap_siblings({q(g)},{ids_array([feed,story])},'2026-10-06',{media})")
+    before={r['id']:r['image_url'] for r in rows(g)}
+    assert sql(f"select public.visual_group_swap_redate({q(g)},{ids_array([feed,story])},'2026-10-06')")=='2'
+    assert {r['id']:r['image_url'] for r in rows(g)}==before

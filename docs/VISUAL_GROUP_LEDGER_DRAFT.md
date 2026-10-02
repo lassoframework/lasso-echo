@@ -12,11 +12,11 @@ has been applied. The application guard scaffold in PR232 remains default OFF.
 | One scene/date per gym, same-day channel siblings | Stable group row is locked before ledger INSERT, so missing-ledger races serialize. Same-date IG/FB/Story/GBP siblings can join before or after first publish. Different dates refuse the whole write. | First-use different-date race; concurrent same-date siblings; four channel siblings following publish; cross-gym isolation |
 | Confirmed publish remains used permanently | Published ledger rows cannot UPDATE/DELETE. Calendar deletion preserves usage. Historical published rows with NULL `published_at` are included. A historical date unknowable from both dates becomes NULL only in published ledger state and blocks every dated reuse of that scene. | Publish/delete races; same-row DELETE winning does not fabricate confirmation; immutable ledger after calendar deletion; status-only history and unknown dates |
 | Calendar mutation and reservation are one transaction | BEFORE trigger validates current exact identities, real dates and holds before approval, claim or finalize. It throws on unsafe send transitions so PR230 cannot return a token after a trigger stamps a hold. | Stale unheld approved row through unchanged PR230 RPC; finalize bypasses; null dates; held/blank Story |
-| Media swaps cannot retain stale scene identity | Group key is validated against aliases. Changed media cannot rely solely on unchanged carried source aliases: a changed exact alias must confirm the same scene. Unknown pending identity is visibly held. | Stale key URL swap; carried-forward stale source asset; held row hydration |
+| Media swaps cannot retain stale scene identity | Delivered image URL must have its own registered alias; every supplied source/byte/Drive/R2 identity must be registered and agree. A known source cannot certify an unknown delivered image on INSERT. Group key is validated against aliases. Changed media cannot rely solely on unchanged carried source aliases: a changed exact alias must confirm the same scene. Unknown pending identity is visibly held. | Stale key URL swap; carried-forward stale source asset; held row hydration |
 | Bulk operation changes all siblings or none | `visual_group_swap_siblings(gym, ids, date, media_json)` requires the complete active, unsent same-date group; rejects duplicate IDs, missing/foreign/published/ambiguous rows. It locks old/replacement groups in key order. Replacement clears omitted media identity fields. `visual_group_swap_redate` is its date-only wrapper. | Partial set refusal; full redate; redate racing new candidate; conflicting media swap rollback; replacement release |
-| Canceled unsent releases only final sibling | Membership rows track active claims under group lock. Last unsent cancel/delete releases a reserved ledger. `publishing`, `failed`, tokens or provider IDs are treated conservatively as ambiguous; deletion keeps membership and reservation. | Sibling cancellation and failed/ambiguous retention; variant archive/reactivation; draft reservation |
+| Canceled unsent releases only final sibling | Membership rows track active claims under group lock. Last unsent cancel/delete releases a reserved ledger. `publishing`, `failed`, tokens or provider IDs are treated conservatively as ambiguous. Group/sibling flags are sticky; ordinary writes cannot clear flags or release them. Status/marker resets refuse; deletion retains uncertainty and reservation. | Sibling cancellation and failed/ambiguous retention; variant archive/reactivation; draft reservation |
 | Stable IDs/unique aliases/review decisions | Alias registration locks an absent alias before creating its group, avoiding orphan races. Existing aliases/groups and decision history cannot be mutated. Exact aliases only; latest pending scene-review events hold claims until explicit confirm/reject. | Alias race, duplicate registration, stable group, grants/sequence permissions, pHash-28 pair kept separate and explicit scene review |
-| Historical/future backfill precedes activation | Dry-run default rolls back all writes. Per-row savepoint prevents partial alias bindings on conflict. Published calendar history is unchanged; published evidence is append-only. Active rows reserve, later dates receive a durable hold and approved rows become pending. Unknown historical identity remains a durable gym-wide review blocker even after row deletion. | Dry-run/real/idempotent backfill; alias conflicts; future reservations; status-only publications; unknown events; deletion retaining historical blocker |
+| Historical/future backfill precedes activation | Dry-run default rolls back all writes. Per-row savepoint prevents partial alias bindings on conflict. Published calendar history is unchanged; published evidence is append-only. Active rows and archived/candidate ambiguous sends reserve; unresolved ambiguity is a durable activation blocker even after calendar deletion. Later dates receive a durable hold and approved rows become pending. Unknown historical identity remains a durable gym-wide review blocker even after row deletion. | Dry-run/real/idempotent backfill; alias conflicts; future reservations; status-only publications; unknown events; deletion retaining historical blocker |
 | Planner rebuild cannot drop repeat holds | INSERT/UPSERT without the prior group or hold still resolves known URL aliases. Later-date reuse refuses the write, preserving existing calendar/ledger. | Swift River/GBP-style rebuild and UPSERT regression |
 
 ## Migration order and contracts
@@ -61,13 +61,47 @@ of the same row was false: DELETE can commit first and UPDATE can affect zero
 rows. The repaired test conditions permanence on a confirmed UPDATE; a separate
 race finalizes one sibling while deleting another and requires permanent usage.
 
-Final focused run: **87 passed in 6.20s** (29 real PostgreSQL cases, five
+Initial focused run: **87 passed in 6.20s** (29 real PostgreSQL cases, five
 static release-boundary checks, and existing Story/approval/duplicate-claim
 regressions). PostgreSQL 17.11 was restarted after the run: all 30 ledger rows,
 including eight permanently published rows, retained the same full-row
 fingerprint. The task-owned server was then stopped; local data and the
 verification receipt are retained for independent review. No production DB was
 connected by these checks.
+
+## Independent review repair
+
+Three P1 findings were repaired after commit `805a89a`: uncertainty could be
+cleared by changing status/markers; INSERT could accept an unknown delivered URL
+through a known source; and backfill skipped ambiguous inactive variants.
+The repair persists sticky ambiguity in the ledger and sibling table, refuses
+ordinary clear/release/reset writes, requires a verified delivered URL plus all
+consistent aliases, and includes ambiguous archived/candidate rows in backfill.
+Known GBP/Story derivative aliases may share one scene/date; unknown delivered
+media remains held. Unknown failed results also preserve the prior scene claim
+and append durable uncertainty evidence before calendar deletion.
+
+After these repairs, **98 focused tests passed in 7.87s**, including 40 real
+PostgreSQL cases. A fresh server restart retained the complete ledger, sticky
+sibling flags and append-only event fingerprints unchanged; the local server
+was stopped again with review data retained.
+
+The following integration requirements are **unimplemented release blockers**:
+
+- Safe union/redirect for separate, already-bound scene groups, preserving all
+  stable aliases, reservations, permanent usage and audit evidence. The current
+  registration/confirmation RPC rejects rebinding; it does not implement union.
+- Per-sibling media replacement payloads that preserve feed/Story derivatives.
+  Current shared-media RPC refuses a replacement when existing sibling URLs or
+  formats differ; date-only redate remains atomic and preserves the URLs.
+- A transactional activation write barrier and coverage recheck, including
+  concurrent INSERT/UPSERT against the final backfill/enable boundary. The
+  current backfill snapshot and direct settings toggle do not provide this.
+
+`visual_group_conflict_report` therefore always returns `activation_ready=false`
+and lists these blockers. A green local suite cannot authorize production
+activation, even for an otherwise covered gym. No evidence-based uncertainty
+release or union shortcut is provided by this repair.
 
 ## Remaining release gates and risks
 

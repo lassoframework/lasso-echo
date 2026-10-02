@@ -9,7 +9,7 @@ create or replace function public.visual_group_backfill_gym(
   p_gym_id text,p_dry_run boolean default true
 ) returns jsonb language plpgsql security definer set search_path = public as $$
 declare r public.content_calendar; a record; g text; n integer; l public.visual_group_usage_ledger%rowtype;
-  day date; is_pub boolean; blocked boolean; v_reason text;
+  day date; is_pub boolean; is_ambiguous boolean; blocked boolean; v_reason text;
   report jsonb:='[]'; grouped integer:=0; held integer:=0; finalized integer:=0; reserved integer:=0;
 begin
   if nullif(btrim(p_gym_id),'') is null or p_dry_run is null then raise exception 'gym and dry-run required'; end if;
@@ -18,10 +18,11 @@ begin
   if public.visual_group_enforcement_on(p_gym_id) then raise exception 'backfill requires enforcement OFF'; end if;
   begin
     for r in select * from public.content_calendar where gym_id=p_gym_id
-      and (status='published' or published_at is not null or public.visual_group_row_active(content_calendar))
+      and (status='published' or published_at is not null or public.visual_group_row_active(content_calendar) or public.visual_group_row_ambiguous(content_calendar))
       order by (status='published' or published_at is not null) desc,
         published_at nulls last,post_date nulls last,id for update loop
       is_pub:=r.status='published' or r.published_at is not null;
+      is_ambiguous:=public.visual_group_row_ambiguous(r);
       day:=coalesce(r.post_date,(r.published_at at time zone 'UTC')::date);
       v_reason:=null; blocked:=false; g:=null;
       -- Per-row savepoint: an alias conflict rolls back ALL new bindings/groups
@@ -37,6 +38,9 @@ begin
         for a in select * from public.visual_group_row_aliases(r) order by alias_kind,alias_value loop
           g:=public.visual_group_register_alias(p_gym_id,a.alias_kind,a.alias_value,g);
         end loop;
+        if public.visual_group_resolve_row(r) is null then
+          raise exception 'visual_group_identity_unresolved' using errcode='23514';
+        end if;
       exception when check_violation then
         v_reason:=sqlerrm; g:=null; blocked:=true;
       end;
@@ -77,16 +81,21 @@ begin
         else
           if not found then
             insert into public.visual_group_usage_ledger
-              (gym_id,group_key,reserved_date,calendar_row_id,channel,state)
-              values(p_gym_id,g,day,r.id,r.account,'reserved'); reserved:=reserved+1;
+              (gym_id,group_key,reserved_date,calendar_row_id,channel,state,ambiguous)
+              values(p_gym_id,g,day,r.id,r.account,'reserved',is_ambiguous); reserved:=reserved+1;
           elsif l.state='released' then
             update public.visual_group_usage_ledger set state='reserved',reserved_date=day,
-              released_at=null,reserved_at=now() where gym_id=p_gym_id and group_key=g;
+              released_at=null,reserved_at=now(),ambiguous=ambiguous or is_ambiguous where gym_id=p_gym_id and group_key=g;
             reserved:=reserved+1;
           end if;
-          insert into public.visual_group_usage_sibling(gym_id,group_key,calendar_row_id,channel)
-            values(p_gym_id,g,r.id,r.account) on conflict(gym_id,group_key,calendar_row_id)
-            do update set state='active',released_at=null,channel=excluded.channel;
+          insert into public.visual_group_usage_sibling(gym_id,group_key,calendar_row_id,channel,ambiguous)
+            values(p_gym_id,g,r.id,r.account,is_ambiguous) on conflict(gym_id,group_key,calendar_row_id)
+            do update set state='active',released_at=null,channel=excluded.channel,
+              ambiguous=public.visual_group_usage_sibling.ambiguous or excluded.ambiguous;
+          if is_ambiguous then
+            update public.visual_group_usage_ledger set ambiguous=true
+              where gym_id=p_gym_id and group_key=g and state<>'published' and not ambiguous;
+          end if;
         end if;
         grouped:=grouped+1;
         if not is_pub then
@@ -105,9 +114,9 @@ begin
           where id=r.id;
         end if;
         if not exists(select 1 from public.visual_group_member_event where gym_id=p_gym_id
-          and action='review_hold' and actor=case when is_pub then 'backfill_published_review' else 'backfill' end and alias_value=r.id::text and reason=v_reason) then
+          and action='review_hold' and actor=case when is_pub then 'backfill_published_review' when is_ambiguous then 'backfill_ambiguous_review' else 'backfill' end and alias_value=r.id::text and reason=v_reason) then
           insert into public.visual_group_member_event(gym_id,group_key,alias_value,action,actor,reason)
-            values(p_gym_id,g,r.id::text,'review_hold',case when is_pub then 'backfill_published_review' else 'backfill' end,v_reason);
+            values(p_gym_id,g,r.id::text,'review_hold',case when is_pub then 'backfill_published_review' when is_ambiguous then 'backfill_ambiguous_review' else 'backfill' end,v_reason);
         end if;
       end if;
       if v_reason is not null then
@@ -129,7 +138,7 @@ returns jsonb language sql stable security definer set search_path = public as $
   with rows as (
     select c.*,public.visual_group_resolve_row(c) as resolved_group,
       (c.status='published' or c.published_at is not null) as is_pub,
-      public.visual_group_row_active(c) as active
+      (public.visual_group_row_active(c) or public.visual_group_row_ambiguous(c)) as active
     from public.content_calendar c where p_gym_id is null or c.gym_id=p_gym_id
   ), coverage as (
     select gym_id,count(*) filter(where active or is_pub) as live_rows,
@@ -150,6 +159,12 @@ returns jsonb language sql stable security definer set search_path = public as $
       where action='review_hold' and actor='backfill_published_review' and (p_gym_id is null or gym_id=p_gym_id)
       and not exists(select 1 from public.visual_group_member_event resolved where resolved.gym_id=e.gym_id
         and resolved.alias_value=e.alias_value and resolved.actor='backfill_published' and resolved.action='confirmed' and resolved.id>e.id)),'[]'::jsonb),
+    'unresolved_ambiguous_history',coalesce((select jsonb_agg(to_jsonb(e) order by id) from public.visual_group_member_event e
+      where action='review_hold' and actor in ('backfill_ambiguous_review','runtime_ambiguous_review') and (p_gym_id is null or gym_id=p_gym_id)
+      and not exists(select 1 from public.visual_group_member_event resolved where resolved.gym_id=e.gym_id
+        and resolved.alias_value=e.alias_value and resolved.actor=case when e.actor='runtime_ambiguous_review' then 'runtime_ambiguous_reconciled' else 'backfill_ambiguous' end and resolved.action='confirmed' and resolved.id>e.id)),'[]'::jsonb),
+    'activation_ready',false,
+    'activation_blockers',jsonb_build_array('canonical tenant integration','safe scene union/redirect','per-sibling derivative payloads','transactional activation write barrier and locked coverage recheck'),
     'policy','Exact identities only. pHash 7-30 requires review. JCK_6328/JCK_6331 distance 28 may share a group only after manual confirmation. Published history is immutable.');
 $$;
 revoke all on function public.visual_group_backfill_gym(text,boolean) from public,anon,authenticated;

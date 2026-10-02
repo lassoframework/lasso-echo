@@ -8,15 +8,35 @@ create table if not exists public.visual_group_usage_sibling (
   gym_id text not null, group_key text not null, calendar_row_id uuid not null,
   channel text, state text not null default 'active' check(state in ('active','released')),
   created_at timestamptz not null default now(), released_at timestamptz,
+  ambiguous boolean not null default false,
   primary key(gym_id,group_key,calendar_row_id),
   foreign key(gym_id,group_key) references public.visual_group_usage_ledger(gym_id,group_key)
 );
+alter table public.visual_group_usage_sibling add column if not exists ambiguous boolean not null default false;
 alter table public.visual_group_usage_sibling enable row level security;
 drop policy if exists service_role_all on public.visual_group_usage_sibling;
 create policy service_role_all on public.visual_group_usage_sibling
   for all to service_role using(true) with check(true);
 revoke all on public.visual_group_usage_sibling from public,anon,authenticated,service_role;
 grant select,insert,update,delete on public.visual_group_usage_sibling to service_role;
+
+-- Ordinary writes cannot erase sticky uncertainty or free its membership.
+-- A confirmed published group is permanently occupied, so retiring a sibling
+-- after confirmation is safe while its ambiguity evidence stays retained.
+create or replace function public.visual_group_sibling_keep_ambiguity()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  if old.ambiguous and (tg_op='DELETE' or not new.ambiguous or
+      (new.state='released' and not exists(select 1 from public.visual_group_usage_ledger l
+        where l.gym_id=old.gym_id and l.group_key=old.group_key and l.state='published'))) then
+    raise exception 'ambiguous sibling requires evidence-based reconciliation' using errcode='23514';
+  end if;
+  return coalesce(new,old);
+end;
+$$;
+drop trigger if exists visual_group_sibling_sticky_ambiguity on public.visual_group_usage_sibling;
+create trigger visual_group_sibling_sticky_ambiguity before update or delete
+  on public.visual_group_usage_sibling for each row execute function public.visual_group_sibling_keep_ambiguity();
 
 create or replace function public.visual_group_enforcement_on(p_gym_id text)
 returns boolean language sql stable security definer set search_path = public as $$
@@ -39,9 +59,18 @@ language sql immutable set search_path = public as $$
 $$;
 create or replace function public.visual_group_resolve_row(p_row public.content_calendar)
 returns text language sql stable security definer set search_path = public as $$
-  select case when count(distinct a.group_key)=1 then min(a.group_key) end
-  from public.visual_group_row_aliases(p_row) r join public.visual_group_alias a
-    on a.gym_id=p_row.gym_id and a.alias_kind=r.alias_kind and a.alias_value=r.alias_value;
+  -- Delivered media must be registered independently. A known source asset
+  -- cannot bless an unknown image on INSERT or UPDATE. Every supplied exact
+  -- identity must be known and agree with delivered identity/verified lineage.
+  select delivered.group_key from public.visual_group_alias delivered
+    where delivered.gym_id=p_row.gym_id and delivered.alias_kind='canonical_url'
+      and delivered.alias_value=nullif(btrim(p_row.image_url),'')
+      and not exists(
+        select 1 from public.visual_group_row_aliases(p_row) r
+        left join public.visual_group_alias a on a.gym_id=p_row.gym_id
+          and a.alias_kind=r.alias_kind and a.alias_value=r.alias_value
+        where a.group_key is null or a.group_key<>delivered.group_key
+      );
 $$;
 -- A pending perceptual/manual scene decision is not resolved by an exact URL.
 -- Latest confirm/reject of that candidate closes its review hold. Unknown
@@ -54,16 +83,17 @@ returns boolean language sql stable security definer set search_path = public as
       and (exists(select 1 from public.visual_group_row_aliases(p_row) a
         where a.alias_kind=e.alias_kind and a.alias_value=e.alias_value)
         or (e.alias_kind is null and e.alias_value=p_row.id::text
-          and e.actor not in ('backfill','backfill_published_review')))
+          and e.actor not in ('backfill','backfill_published_review','backfill_ambiguous_review')))
       and not exists(select 1 from public.visual_group_member_event newer
         where newer.gym_id=e.gym_id and newer.alias_kind is not distinct from e.alias_kind
           and newer.alias_value=e.alias_value and newer.id>e.id and newer.action in ('confirmed','rejected'))
   ) or exists(
     select 1 from public.visual_group_member_event e where e.gym_id=p_row.gym_id
-      and e.actor='backfill_published_review' and e.group_key is null
+      and e.actor in ('backfill_published_review','backfill_ambiguous_review','runtime_ambiguous_review')
       and not exists(select 1 from public.visual_group_member_event resolved
         where resolved.gym_id=e.gym_id and resolved.alias_value=e.alias_value
-          and resolved.actor='backfill_published' and resolved.action='confirmed' and resolved.id>e.id)
+          and resolved.actor=case when e.actor='runtime_ambiguous_review' then 'runtime_ambiguous_reconciled' when e.actor='backfill_ambiguous_review' then 'backfill_ambiguous' else 'backfill_published' end
+          and resolved.action='confirmed' and resolved.id>e.id)
   );
 $$;
 create or replace function public.visual_group_row_active(p_row public.content_calendar)
@@ -72,10 +102,12 @@ returns boolean language sql immutable set search_path = public as $$
     p_row.status in ('draft','pending','approved','coach_review','publishing','failed'),false);
 $$;
 create or replace function public.visual_group_row_ambiguous(p_row public.content_calendar)
-returns boolean language sql immutable set search_path = public as $$
+returns boolean language sql stable security definer set search_path = public as $$
   select coalesce(p_row.published_at is null and p_row.status <> 'published' and
     (p_row.status in ('publishing','failed') or p_row.publish_claim_token is not null
-     or p_row.late_post_id is not null),false);
+     or p_row.late_post_id is not null or exists(
+       select 1 from public.visual_group_usage_sibling s where s.gym_id=p_row.gym_id
+         and s.calendar_row_id=p_row.id and s.ambiguous)),false);
 $$;
 
 create or replace function public.visual_group_sync_row(
@@ -90,9 +122,17 @@ begin
        or (g.gym_id=p_new.gym_id and g.group_key=p_new.visual_group_key)
     order by g.gym_id,g.group_key for update loop null; end loop;
 
+  if p_op='update' and public.visual_group_row_ambiguous(p_new) and p_old.visual_group_key is not null
+     and public.visual_group_enforcement_on(p_old.gym_id) then
+    update public.visual_group_usage_sibling set ambiguous=true where gym_id=p_old.gym_id
+      and group_key=p_old.visual_group_key and calendar_row_id=p_old.id and not ambiguous;
+    update public.visual_group_usage_ledger set ambiguous=true where gym_id=p_old.gym_id
+      and group_key=p_old.visual_group_key and state<>'published' and not ambiguous;
+  end if;
   if p_op in ('update','delete') and p_old.visual_group_key is not null
      and public.visual_group_enforcement_on(p_old.gym_id)
      and not public.visual_group_row_ambiguous(p_old)
+     and (p_op='delete' or not public.visual_group_row_ambiguous(p_new))
      and (p_op='delete' or (not public.visual_group_row_active(p_new) and p_new.status is distinct from 'published' and p_new.published_at is null)
        or p_old.gym_id is distinct from p_new.gym_id
        or p_old.visual_group_key is distinct from p_new.visual_group_key
@@ -101,13 +141,13 @@ begin
       where gym_id=p_old.gym_id and group_key=p_old.visual_group_key
         and calendar_row_id=p_old.id and state='active';
     update public.visual_group_usage_ledger set state='released',released_at=now()
-      where gym_id=p_old.gym_id and group_key=p_old.visual_group_key and state='reserved'
+      where gym_id=p_old.gym_id and group_key=p_old.visual_group_key and state='reserved' and not ambiguous
         and not exists(select 1 from public.visual_group_usage_sibling s
           where s.gym_id=p_old.gym_id and s.group_key=p_old.visual_group_key and s.state='active');
   end if;
   if p_op='delete' or not public.visual_group_enforcement_on(p_new.gym_id) then return; end if;
   finalized := p_new.status='published' or p_new.published_at is not null;
-  need_claim := public.visual_group_row_active(p_new) or finalized;
+  need_claim := public.visual_group_row_active(p_new) or public.visual_group_row_ambiguous(p_new) or finalized;
   if not need_claim or p_new.visual_group_key is null or p_new.post_date is null then return; end if;
 
   select * into l from public.visual_group_usage_ledger
@@ -117,23 +157,26 @@ begin
   end if;
   if not found then
     insert into public.visual_group_usage_ledger
-      (gym_id,group_key,reserved_date,calendar_row_id,channel,state,published_at)
+      (gym_id,group_key,reserved_date,calendar_row_id,channel,state,published_at,ambiguous)
       values(p_new.gym_id,p_new.visual_group_key,p_new.post_date,p_new.id,p_new.account,
         case when finalized then 'published' else 'reserved' end,
-        case when finalized then coalesce(p_new.published_at,now()) end);
+        case when finalized then coalesce(p_new.published_at,now()) end,
+        public.visual_group_row_ambiguous(p_new));
   elsif l.state <> 'published' then
     update public.visual_group_usage_ledger set
       reserved_date=p_new.post_date, state=case when finalized then 'published' else 'reserved' end,
       released_at=null, reserved_at=case when l.state='released' then now() else reserved_at end,
-      published_at=case when finalized then coalesce(p_new.published_at,now()) end
+      published_at=case when finalized then coalesce(p_new.published_at,now()) end,
+      ambiguous=ambiguous or public.visual_group_row_ambiguous(p_new)
       where gym_id=p_new.gym_id and group_key=p_new.visual_group_key;
   end if;
   -- Published ledger is never updated. Any legitimate same-date channel
   -- sibling may join, even if its first creation follows another publish.
-  insert into public.visual_group_usage_sibling(gym_id,group_key,calendar_row_id,channel,state)
-    values(p_new.gym_id,p_new.visual_group_key,p_new.id,p_new.account,'active')
+  insert into public.visual_group_usage_sibling(gym_id,group_key,calendar_row_id,channel,state,ambiguous)
+    values(p_new.gym_id,p_new.visual_group_key,p_new.id,p_new.account,'active',public.visual_group_row_ambiguous(p_new))
     on conflict(gym_id,group_key,calendar_row_id) do update set
-      state='active',released_at=null,channel=excluded.channel;
+      state='active',released_at=null,channel=excluded.channel,
+      ambiguous=public.visual_group_usage_sibling.ambiguous or excluded.ambiguous;
 end;
 $$;
 
@@ -163,13 +206,14 @@ begin
       raise exception 'confirmed or ambiguous send identity/date cannot change' using errcode='23514';
     end if;
     if public.visual_group_row_ambiguous(old) and
-       (new.variant_status is distinct from old.variant_status or new.status in ('denied','killed')) then
+       (new.variant_status is distinct from old.variant_status or
+        (new.published_at is null and new.status not in ('publishing','failed','published'))) then
       raise exception 'ambiguous send needs explicit reconciliation' using errcode='23514';
     end if;
   end if;
   if public.visual_group_enforcement_on(new.gym_id) then
     finalized := new.status='published' or new.published_at is not null;
-    need_claim := public.visual_group_row_active(new) or finalized;
+    need_claim := public.visual_group_row_active(new) or public.visual_group_row_ambiguous(new) or finalized;
     if need_claim then
       -- Take stable identity locks BEFORE readiness reads, not just before
       -- writing the ledger. A concurrent decision event's FK key-share lock
@@ -216,6 +260,16 @@ begin
       elsif new.media_not_ready_reason in ('visual_group_identity_unresolved','visual_group_date_unresolved','visual_group_scene_review_required') then
         new.media_not_ready_reason := null;
       end if;
+      if public.visual_group_row_ambiguous(new) and
+         (new.visual_group_key is null or new.post_date is null) and not exists(
+           select 1 from public.visual_group_member_event e where e.gym_id=new.gym_id
+             and e.actor='runtime_ambiguous_review' and e.alias_value=new.id::text) then
+        insert into public.visual_group_member_event(gym_id,group_key,alias_value,action,actor,reason)
+          values(new.gym_id,new.visual_group_key,new.id::text,'review_hold','runtime_ambiguous_review',
+            jsonb_build_object('reason','ambiguous_send_identity_or_date_unresolved',
+              'calendar_row_id',new.id,'image_url',new.image_url,'post_date',new.post_date,
+              'status',new.status,'late_post_id',new.late_post_id)::text);
+      end if;
       -- BEFORE trigger holds must not allow PR230's claim RPC to return a
       -- token after its pre-read. Refuse the entire approval/claim/finalize.
       if (new.status in ('approved','publishing') or finalized) and
@@ -259,6 +313,14 @@ begin
        or published_at is not null or status='published')) then
     raise exception 'requires one complete unsent same-date sibling group' using errcode='23514';
   end if;
+  if p_media is not null and (
+    select count(distinct image_url)>1 or
+      count(distinct coalesce(nullif(lower(btrim(format)),''),'feed'))>1
+    from public.content_calendar where gym_id=p_gym_id and id=any(p_row_ids)
+  ) then
+    raise exception 'distinct sibling derivatives require per-row replacement payloads; unsupported until integration'
+      using errcode='23514';
+  end if;
   -- Take old + replacement group locks BEFORE validating the full membership.
   -- Replacement is resolved from aliases, not a caller's arbitrary key.
   if p_media is not null then
@@ -279,7 +341,7 @@ begin
   perform 1 from public.visual_group where gym_id=p_gym_id and
     group_key in (g,replacement.visual_group_key) order by gym_id,group_key for update;
   select * into l from public.visual_group_usage_ledger where gym_id=p_gym_id and group_key=g for update;
-  if not found or l.state<>'reserved' or l.reserved_date<>old_date or exists(
+  if not found or l.state<>'reserved' or l.ambiguous or l.reserved_date<>old_date or exists(
     select 1 from public.visual_group_usage_sibling where gym_id=p_gym_id and group_key=g
       and state='active' and not(calendar_row_id=any(p_row_ids))) or exists(
     select 1 from public.content_calendar where gym_id=p_gym_id and visual_group_key=g
@@ -316,7 +378,7 @@ begin
     where n.nspname='public' and p.proname in
       ('visual_group_enforcement_on','visual_group_row_aliases','visual_group_resolve_row',
        'visual_group_row_active','visual_group_row_review_pending','visual_group_row_ambiguous','visual_group_sync_row',
-       'visual_group_guard_trigger','visual_group_swap_siblings','visual_group_swap_redate') loop
+       'visual_group_guard_trigger','visual_group_sibling_keep_ambiguity','visual_group_swap_siblings','visual_group_swap_redate') loop
     execute format('revoke all on function %s from public,anon,authenticated',f.signature);
     execute format('grant execute on function %s to service_role',f.signature);
   end loop;

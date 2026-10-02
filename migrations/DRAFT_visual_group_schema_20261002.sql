@@ -75,10 +75,14 @@ create table if not exists public.visual_group_usage_ledger (
   reserved_at     timestamptz not null default now(),
   published_at    timestamptz,
   released_at     timestamptz,
+  ambiguous       boolean not null default false,
   primary key (gym_id, group_key),
   foreign key (gym_id, group_key)
     references public.visual_group (gym_id, group_key)
 );
+
+-- Sticky uncertainty is never cleared by ordinary calendar writes.
+alter table public.visual_group_usage_ledger add column if not exists ambiguous boolean not null default false;
 
 comment on table public.visual_group_usage_ledger is
   'One row per (gym, group). Same-date IG/FB/Story/GBP siblings share it; a different date while state<>''released'' is rejected; state=''published'' rows are immutable forever.';
@@ -125,6 +129,9 @@ language plpgsql
 set search_path = public
 as $$
 begin
+  if old.ambiguous and (tg_op='DELETE' or not new.ambiguous or new.state='released') then
+    raise exception 'ambiguous usage requires evidence-based reconciliation' using errcode='23514';
+  end if;
   if old.state = 'published' then
     raise exception
       'visual_group_usage_ledger published row is immutable (gym_id=%, group_key=%)',
