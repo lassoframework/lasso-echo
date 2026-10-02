@@ -13,7 +13,7 @@ has been applied. The application guard scaffold in PR232 remains default OFF.
 | Confirmed publish remains used permanently | Published ledger rows cannot UPDATE/DELETE. Calendar deletion preserves usage. Historical published rows with NULL `published_at` are included. A historical date unknowable from both dates becomes NULL only in published ledger state and blocks every dated reuse of that scene. | Publish/delete races; same-row DELETE winning does not fabricate confirmation; immutable ledger after calendar deletion; status-only history and unknown dates |
 | Calendar mutation and reservation are one transaction | BEFORE trigger validates current exact identities, real dates and holds before approval, claim or finalize. It throws on unsafe send transitions so PR230 cannot return a token after a trigger stamps a hold. | Stale unheld approved row through unchanged PR230 RPC; finalize bypasses; null dates; held/blank Story |
 | Media swaps cannot retain stale scene identity | Delivered image URL must have its own registered alias; every supplied source/byte/Drive/R2 identity must be registered and agree. A known source cannot certify an unknown delivered image on INSERT. Group key is validated against aliases. Changed media cannot rely solely on unchanged carried source aliases: a changed exact alias must confirm the same scene. Unknown pending identity is visibly held. | Stale key URL swap; carried-forward stale source asset; held row hydration |
-| Bulk operation changes all siblings or none | `visual_group_swap_siblings(gym, ids, date, media_json)` requires the complete active, unsent same-date group; rejects duplicate IDs, missing/foreign/published/ambiguous rows. It locks old/replacement groups in key order. Replacement clears omitted media identity fields. `visual_group_swap_redate` is its date-only wrapper. | Partial set refusal; full redate; redate racing new candidate; conflicting media swap rollback; replacement release |
+| Bulk operation changes all siblings or none | `visual_group_swap_siblings(gym, ids, date, media_json)` requires the complete active, unsent same-date group; rejects duplicate IDs, missing/foreign/published/ambiguous rows. It locks old/replacement groups in key order. Replacement clears omitted media identity fields. `visual_group_swap_redate` is its date-only wrapper. `visual_group_swap_siblings_media(gym, rows_json, date)` accepts a distinct complete media payload per expected row (`{"calendar_row_id", "media"}` once per sibling), preserving feed vs Story image_url/source identity/format derivatives; one transaction locks the exact sibling rows, the old group and its one replacement scene in a single sorted pass, and rejects missing/extra/duplicate/stale row IDs, cross-tenant rows, mixed old group/date, conflicting registered aliases, approved/publishing/published or ambiguous rows, unresolved scene review, unrelated replacement scenes, unsupported supplied identity columns, and any occupied target group with no partial writes. The legacy shared-media form routes through the same per-row path (`visual_group_apply_media_swap`). | Partial set refusal; full redate; redate racing new candidate; conflicting media swap rollback; replacement release; distinct derivative per-row swap; missing/extra/duplicate/cross-tenant row refusal; conflict rollback; cross-date race |
 | Canceled unsent releases only final sibling | Membership rows track active claims under group lock. Last unsent cancel/delete releases a reserved ledger. `publishing`, `failed`, tokens or provider IDs are treated conservatively as ambiguous. Group/sibling flags are sticky; ordinary writes cannot clear flags or release them. Evidence-only reconciliation binds original IDs and each attempt UUID, preserves other active/uncertain siblings, and makes confirmed delivery permanent. | Sibling cancellation; failed retention; orphan cleanup; timeout/wrong-ID refusal; separate GBP/Story attempts; reconciliation/delete race |
 | Stable IDs/unique aliases/review decisions | Alias registration locks an absent alias before creating its group, avoiding orphan races. Existing aliases/groups and decision history cannot be mutated. Exact aliases only; latest pending scene-review events hold claims until explicit confirm/reject. | Alias race, duplicate registration, stable group, grants/sequence permissions, pHash-28 pair kept separate and explicit scene review |
 | Historical/future backfill precedes activation | Dry-run default rolls back all writes. Per-row savepoint prevents partial alias bindings on conflict. Published calendar history is unchanged; published evidence is append-only. Active rows and archived/candidate ambiguous sends reserve; unresolved history remains a gym-wide activation blocker after deletion. Row readiness considers only that row/its aliases. Only a row with its own unresolved conflict is held/demoted; verified hydration clears owned visual holds and preserves unrelated holds/approval. | Dry-run/real/idempotent backfill; alias conflicts; future reservations; unknown history; unrelated approved rows; hold recovery |
@@ -26,7 +26,9 @@ has been applied. The application guard scaffold in PR232 remains default OFF.
    settings, nullable calendar key; registration/confirmation/rejection RPCs.
 2. `DRAFT_visual_group_claim_trigger_20261002.sql`: membership table, exact row
    identity helpers, transactional trigger, complete sibling swap/redate RPCs,
-   evidence-only ambiguity reconciliation RPC and exact attempt bindings.
+   the per-row distinct-derivative sibling media swap RPC with its shared
+   per-row replacement helper, evidence-only ambiguity reconciliation RPC and
+   exact attempt bindings.
 3. `DRAFT_visual_group_backfill_20261002.sql`: default dry-run backfill and
    read-only coverage/conflict report. Backfill refuses an enforced gym.
 
@@ -87,14 +89,52 @@ PostgreSQL cases. A fresh server restart retained the complete ledger, sticky
 sibling flags and append-only event fingerprints unchanged; the local server
 was stopped again with review data retained.
 
-The following integration requirements are **unimplemented release blockers**:
+Per-sibling media replacement payloads that preserve feed/Story derivatives
+are now implemented in this lane by `visual_group_swap_siblings_media` (above),
+with the legacy shared-media RPC routed through the same owner-only per-row
+replacement helper; date-only redate is unchanged. All derivatives must resolve
+to one common scene. The public service-role wrappers validate and lock the
+complete unsent, unapproved sibling set; direct helper execution is denied. The backfill-owned conflict report still
+hardcodes this item in `activation_blockers` until the backfill file is updated
+by its own lane.
+
+### Per-sibling RPC independent repair
+
+The initial builder edits failed two real PostgreSQL cases because a PL/pgSQL
+variable conflicted with a SQL column name. Independent inspection also found
+an executable internal helper bypassing wrapper checks, old-before-target group
+lock inversion, and permission to split one old scene into unrelated new scenes.
+These are repaired: the helper is owner-only, old and replacement groups lock in
+an explicit sorted key loop with one row-lock statement per key before
+full-membership/readiness validation, every derivative
+resolves to one replacement scene, and non-null identities absent from the real
+calendar schema refuse instead of being silently ignored. Pending scene review
+also refuses the entire swap under the group locks.
+
+The operation preserves each row's account and format, supplies its own delivered
+URL/source lineage, and clears omitted media identity columns. It accepts only
+unoccupied/released replacement groups (or its own old scene); joining an already
+occupied scene or splitting scenes is outside this operation. Ordinary same-date
+channel INSERTs remain governed by the existing trigger. Calendar, sibling and
+ledger writes roll back together on every refusal.
+
+Focused verification: **139 passed in 17.64s**, including 81 real PostgreSQL
+cases. Service wrappers/private-helper permissions, derivative lineage and
+omitted identity clearing, common-scene enforcement, pending review, unsupported
+identity columns and actual optional-column types, rollback, opposite swaps
+through both RPCs under alternate planner settings (4 cases, 16 races),
+cross-date claims and concurrent
+new sibling membership are exercised. Restart fingerprints for all 88 ledger
+rows, sibling state, events and 14 reconciliation receipts matched exactly. The
+existing local PostgreSQL cluster is stopped and retained; receipt:
+`work/visual-ledger-pg-local/per-sibling-sorted-loop-verification-receipt.json`. No new cluster
+was initialized and no production SQL or flag was applied.
+
+The following integration requirements remain **unimplemented release blockers**:
 
 - Safe union/redirect for separate, already-bound scene groups, preserving all
   stable aliases, reservations, permanent usage and audit evidence. The current
   registration/confirmation RPC rejects rebinding; it does not implement union.
-- Per-sibling media replacement payloads that preserve feed/Story derivatives.
-  Current shared-media RPC refuses a replacement when existing sibling URLs or
-  formats differ; date-only redate remains atomic and preserves the URLs.
 - A transactional activation write barrier and coverage recheck, including
   concurrent INSERT/UPSERT against the final backfill/enable boundary. The
   current backfill snapshot and direct settings toggle do not provide this.

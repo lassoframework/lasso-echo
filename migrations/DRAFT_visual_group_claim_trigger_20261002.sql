@@ -348,14 +348,138 @@ drop trigger if exists content_calendar_visual_group_guard on public.content_cal
 create trigger content_calendar_visual_group_guard before insert or update or delete
   on public.content_calendar for each row execute function public.visual_group_guard_trigger();
 
+-- Per-row replacement media application shared by both swap RPCs. The caller
+-- has already validated and locked the expected active unsent same-date
+-- calendar rows. Full membership is checked under sorted old+target group
+-- locks here. Each row's replacement identity is resolved
+-- only from registered exact aliases on the fully replaced media fields;
+-- omitted optional identities are cleared so a stale source/byte alias cannot
+-- bless an unrelated new image. Every distinct target group is locked in key
+-- order and must be unreserved or released and unambiguous, with no active
+-- siblings outside this set: occupied, published or ambiguous targets and any
+-- cross-date reuse reject the whole write before any calendar row is touched.
+create or replace function public.visual_group_apply_media_swap(
+  p_gym_id text,p_new_date date,p_rows jsonb,p_row_ids uuid[],p_old_group text
+) returns integer language plpgsql security definer set search_path = public as $$
+declare item jsonb; media jsonb; r public.content_calendar; replacement public.content_calendar;
+  resolved text; new_scene text; old_date date; targets text[]:='{}'; t text; l public.visual_group_usage_ledger%rowtype;
+  payload jsonb:='[]'::jsonb; cols text[]:=array['id','visual_group_key','image_url'];
+  v_col text; assignments text; n integer;
+begin
+  if jsonb_typeof(p_rows) is distinct from 'array'
+     or jsonb_array_length(p_rows)<>cardinality(p_row_ids)
+     or exists(select 1 from jsonb_array_elements(p_rows) e
+        where jsonb_typeof(e.value) is distinct from 'object'
+           or e.value->>'calendar_row_id' is null
+           or jsonb_typeof(e.value->'media') is distinct from 'object'
+           or exists(select 1 from jsonb_object_keys(e.value) k where k not in ('calendar_row_id','media'))
+           or exists(select 1 from jsonb_object_keys(e.value->'media') k
+             where k not in ('image_url','source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key','visual_group_key')))
+     or (select count(*) from (select distinct (e.value->>'calendar_row_id')::uuid id
+         from jsonb_array_elements(p_rows) e) d)<>cardinality(p_row_ids)
+     or exists(select 1 from jsonb_array_elements(p_rows) e
+        where not ((e.value->>'calendar_row_id')::uuid=any(p_row_ids))) then
+    raise exception 'media payload must cover each sibling row exactly once with valid fields' using errcode='22023';
+  end if;
+  for item in select e.value from jsonb_array_elements(p_rows) e order by e.value->>'calendar_row_id' loop
+    media:=item->'media';
+    for v_col in select jsonb_object_keys(media) loop
+      if media->v_col<>'null'::jsonb and not exists(select 1 from information_schema.columns
+        where table_schema='public' and table_name='content_calendar' and column_name=v_col) then
+        raise exception 'replacement identity field is not supported by calendar schema: %',v_col using errcode='23514';
+      end if;
+    end loop;
+    select * into r from public.content_calendar
+      where gym_id=p_gym_id and id=(item->>'calendar_row_id')::uuid;
+    old_date:=r.post_date;
+    replacement:=jsonb_populate_record(r,
+      jsonb_build_object('image_url',null,'source_media_url',null,'source_media_asset_id',null,
+        'drive_file_id',null,'byte_hash',null,'r2_key',null,'visual_group_key',null)||media);
+    resolved:=public.visual_group_resolve_row(replacement);
+    if resolved is null or nullif(btrim(replacement.image_url),'') is null
+       or (media->>'visual_group_key' is not null and media->>'visual_group_key'<>resolved) then
+      raise exception 'replacement identity is unresolved or registered aliases conflict' using errcode='23514';
+    end if;
+    replacement.visual_group_key:=resolved;
+    if new_scene is not null and new_scene<>resolved then
+      raise exception 'all sibling derivatives must resolve to one verified replacement scene' using errcode='23514';
+    end if;
+    new_scene:=resolved;
+    payload:=payload||jsonb_build_array(to_jsonb(replacement));
+    if resolved<>p_old_group and not(resolved=any(targets)) then targets:=targets||resolved; end if;
+  end loop;
+  -- Enumerate keys before locking; each statement locks exactly one group.
+  -- This makes A->B and B->A use the same order independently of the query
+  -- planner's row-lock plan. Calendar rows remain locked by the wrapper.
+  for t in select distinct k from unnest(array[p_old_group]||targets) keys(k)
+    order by k loop
+    perform 1 from public.visual_group where gym_id=p_gym_id and group_key=t for update;
+    if not found then
+      raise exception 'swap scene group disappeared' using errcode='23514';
+    end if;
+  end loop;
+  select * into l from public.visual_group_usage_ledger
+    where gym_id=p_gym_id and group_key=p_old_group for update;
+  if not found or l.state<>'reserved' or l.ambiguous or l.reserved_date is distinct from old_date or exists(
+    select 1 from public.visual_group_usage_sibling where gym_id=p_gym_id and group_key=p_old_group
+      and state='active' and not(calendar_row_id=any(p_row_ids))) or exists(
+    select 1 from public.content_calendar where gym_id=p_gym_id and visual_group_key=p_old_group
+      and public.visual_group_row_active(content_calendar) and not(id=any(p_row_ids))) then
+    raise exception 'partial, stale, published or ambiguous sibling set' using errcode='23514';
+  end if;
+  for item in select e.value from jsonb_array_elements(payload) e loop
+    replacement:=jsonb_populate_record(null::public.content_calendar,item);
+    if public.visual_group_row_review_pending(replacement) then
+      raise exception 'replacement scene review is unresolved' using errcode='23514';
+    end if;
+  end loop;
+  foreach t in array targets loop
+    select * into l from public.visual_group_usage_ledger where gym_id=p_gym_id and group_key=t for update;
+    if found and (l.state<>'released' or l.ambiguous) then
+      raise exception 'replacement group is reserved, published or ambiguous; cross-date reuse refused' using errcode='23514';
+    end if;
+    if exists(select 1 from public.visual_group_usage_sibling s where s.gym_id=p_gym_id and s.group_key=t
+        and s.state='active' and not(s.calendar_row_id=any(p_row_ids))) or exists(
+      select 1 from public.content_calendar oc where oc.gym_id=p_gym_id and oc.visual_group_key=t
+        and public.visual_group_row_active(oc) and not(oc.id=any(p_row_ids))) then
+      raise exception 'replacement group has active siblings outside this set' using errcode='23514';
+    end if;
+  end loop;
+  -- Pre-move the old reservation date so the per-row trigger never reads its
+  -- own group as reserved on the old date mid-update.
+  update public.visual_group_usage_ledger set reserved_date=p_new_date
+    where gym_id=p_gym_id and group_key=p_old_group and state='reserved';
+  foreach v_col in array array['source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key'] loop
+    if exists(select 1 from information_schema.columns
+      where table_schema='public' and table_name='content_calendar' and column_name=v_col) then
+      cols:=cols||v_col;
+    end if;
+  end loop;
+  select string_agg(format('%I=t.%I',column_name,column_name),',' order by ord) into assignments
+    from unnest(cols) with ordinality u(column_name,ord) where column_name not in ('id','visual_group_key');
+  -- Preserve actual optional-column types; not every identity column on an
+  -- integration schema must be text. The replacement record is already typed.
+  execute format('update public.content_calendar c set post_date=$1,visual_group_key=t.visual_group_key,%s
+      from jsonb_populate_recordset(null::public.content_calendar,$2) t where c.gym_id=$3 and c.id=t.id',
+      assignments)
+    using p_new_date,payload,p_gym_id;
+  get diagnostics n=row_count;
+  if n<>cardinality(p_row_ids) then
+    raise exception 'stale sibling row set' using errcode='23514';
+  end if;
+  return n;
+end;
+$$;
+
 -- Shared atomic operation for complete, unsent sibling sets. NULL p_media is
--- date-only. Replacement media clears omitted optional identities, preventing
--- an old source/byte alias from blessing an unrelated new image.
+-- date-only. Non-NULL p_media is the legacy single shared-media form, routed
+-- through the per-row replacement path with the same payload for every row;
+-- siblings with distinct feed/Story derivatives must use
+-- visual_group_swap_siblings_media so each row keeps its own media identity.
 create or replace function public.visual_group_swap_siblings(
   p_gym_id text,p_row_ids uuid[],p_new_date date,p_media jsonb default null
 ) returns integer language plpgsql security definer set search_path = public as $$
-declare n integer; g text; old_date date; l public.visual_group_usage_ledger%rowtype;
-  assignments text:=''; c text; r public.content_calendar; replacement public.content_calendar;
+declare n integer; g text; old_date date; l public.visual_group_usage_ledger%rowtype; per_row jsonb;
 begin
   if not public.visual_group_enforcement_on(p_gym_id) or p_new_date is null
      or cardinality(p_row_ids) is null or cardinality(p_row_ids)=0
@@ -379,28 +503,20 @@ begin
       count(distinct coalesce(nullif(lower(btrim(format)),''),'feed'))>1
     from public.content_calendar where gym_id=p_gym_id and id=any(p_row_ids)
   ) then
-    raise exception 'distinct sibling derivatives require per-row replacement payloads; unsupported until integration'
-      using errcode='23514';
+    raise exception 'distinct sibling derivatives require per-row payloads via visual_group_swap_siblings_media' using errcode='23514';
   end if;
-  -- Take old + replacement group locks BEFORE validating the full membership.
-  -- Replacement is resolved from aliases, not a caller's arbitrary key.
+  if p_media is not null and (
+    jsonb_typeof(p_media)<>'object' or exists(select 1 from jsonb_object_keys(p_media) k
+      where k not in ('image_url','source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key','visual_group_key'))) then
+    raise exception 'invalid media fields' using errcode='22023';
+  end if;
   if p_media is not null then
-    if jsonb_typeof(p_media)<>'object' or exists(select 1 from jsonb_object_keys(p_media) k
-      where k not in ('image_url','source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key','visual_group_key')) then
-      raise exception 'invalid media fields' using errcode='22023';
-    end if;
-    select * into r from public.content_calendar where id=p_row_ids[1];
-    replacement := jsonb_populate_record(r,
-      jsonb_build_object('image_url',null,'source_media_url',null,'source_media_asset_id',null,
-        'drive_file_id',null,'byte_hash',null,'r2_key',null,'visual_group_key',null)||p_media);
-    replacement.visual_group_key := public.visual_group_resolve_row(replacement);
-    if replacement.visual_group_key is null or nullif(btrim(replacement.image_url),'') is null
-       or (p_media->>'visual_group_key' is not null and p_media->>'visual_group_key'<>replacement.visual_group_key) then
-      raise exception 'replacement identity is unresolved' using errcode='23514';
-    end if;
+    select jsonb_agg(jsonb_build_object('calendar_row_id',id,'media',p_media) order by id)
+      into per_row from unnest(p_row_ids) u(id);
+    return public.visual_group_apply_media_swap(p_gym_id,p_new_date,per_row,p_row_ids,g);
   end if;
-  perform 1 from public.visual_group where gym_id=p_gym_id and
-    group_key in (g,replacement.visual_group_key) order by gym_id,group_key for update;
+  -- Date-only operation has no replacement group to lock.
+  perform 1 from public.visual_group where gym_id=p_gym_id and group_key=g for update;
   select * into l from public.visual_group_usage_ledger where gym_id=p_gym_id and group_key=g for update;
   if not found or l.state<>'reserved' or l.ambiguous or l.reserved_date<>old_date or exists(
     select 1 from public.visual_group_usage_sibling where gym_id=p_gym_id and group_key=g
@@ -409,26 +525,59 @@ begin
       and public.visual_group_row_active(content_calendar) and not(id=any(p_row_ids))) then
     raise exception 'partial, stale, published or ambiguous sibling set' using errcode='23514';
   end if;
-  if p_media is null or replacement.visual_group_key=g then
-    update public.visual_group_usage_ledger set reserved_date=p_new_date where gym_id=p_gym_id and group_key=g;
-  end if;
-  if p_media is null then
-    update public.content_calendar set post_date=p_new_date where gym_id=p_gym_id and id=any(p_row_ids);
-  else
-    foreach c in array array['image_url','source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key'] loop
-      if exists(select 1 from information_schema.columns where table_schema='public' and table_name='content_calendar' and column_name=c) then
-        assignments:=assignments||format(', %I = (jsonb_populate_record(null::public.content_calendar,$3)).%I',c,c);
-      end if;
-    end loop;
-    execute 'update public.content_calendar set post_date=$1,visual_group_key=$2'||assignments||
-      ' where gym_id=$4 and id=any($5)' using p_new_date,replacement.visual_group_key,to_jsonb(replacement),p_gym_id,p_row_ids;
-  end if;
+  update public.visual_group_usage_ledger set reserved_date=p_new_date where gym_id=p_gym_id and group_key=g;
+  update public.content_calendar set post_date=p_new_date where gym_id=p_gym_id and id=any(p_row_ids);
   return n;
 end;
 $$;
 create or replace function public.visual_group_swap_redate(p_gym_id text,p_row_ids uuid[],p_new_date date)
 returns integer language sql security definer set search_path = public as $$
   select public.visual_group_swap_siblings(p_gym_id,p_row_ids,p_new_date,null);
+$$;
+
+-- Atomic same-date sibling swap with a distinct complete media payload per
+-- expected row. p_rows is a JSON array of {"calendar_row_id", "media"} objects
+-- covering the exact active unsent sibling set once each; per-row media
+-- preserves feed vs Story image_url/source identity/format derivatives. One
+-- transaction locks the exact sibling rows, the old group and every involved
+-- replacement group. Missing/extra/stale row IDs, cross-tenant rows, mixed old
+-- group/date, conflicting registered aliases, approved/publishing/published or
+-- ambiguous rows, and any occupied target group (cross-date reuse) reject the
+-- entire write; there are no partial writes.
+create or replace function public.visual_group_swap_siblings_media(
+  p_gym_id text,p_rows jsonb,p_new_date date
+) returns integer language plpgsql security definer set search_path = public as $$
+declare n integer; g text; old_date date; ids uuid[];
+begin
+  if not public.visual_group_enforcement_on(p_gym_id) or p_new_date is null
+     or jsonb_typeof(p_rows) is distinct from 'array' or jsonb_array_length(p_rows)=0
+     or exists(select 1 from jsonb_array_elements(p_rows) e
+        where jsonb_typeof(e.value) is distinct from 'object'
+           or e.value->>'calendar_row_id' is null
+           or jsonb_typeof(e.value->'media') is distinct from 'object'
+           or exists(select 1 from jsonb_object_keys(e.value) k where k not in ('calendar_row_id','media'))) then
+    raise exception 'invalid per-row sibling media operation' using errcode='23514';
+  end if;
+  select array_agg((e.value->>'calendar_row_id')::uuid order by (e.value->>'calendar_row_id')::uuid)
+    into ids from jsonb_array_elements(p_rows) e;
+  if ids is null or cardinality(ids)<>(select count(distinct id) from unnest(ids) a(id)) then
+    raise exception 'duplicate sibling row payload' using errcode='23514';
+  end if;
+  perform 1 from public.content_calendar where gym_id=p_gym_id and id=any(ids)
+    order by id for update;
+  select count(*),min(visual_group_key),min(post_date) into n,g,old_date
+    from public.content_calendar where gym_id=p_gym_id and id=any(ids);
+  if n<>cardinality(ids) or g is null or old_date is null or exists(
+    select 1 from public.content_calendar where id=any(ids) and
+      (gym_id<>p_gym_id or visual_group_key is distinct from g or post_date is distinct from old_date
+       or variant_status is distinct from 'active'
+       or status not in ('draft','pending','coach_review')
+       or published_at is not null or publish_claim_token is not null or late_post_id is not null
+       or public.visual_group_row_ambiguous(content_calendar))) then
+    raise exception 'requires one complete unsent, unapproved, unambiguous same-date sibling set' using errcode='23514';
+  end if;
+  return public.visual_group_apply_media_swap(p_gym_id,p_new_date,p_rows,ids,g);
+end;
 $$;
 
 -- Explicit terminal-provider evidence only. This RPC records a trusted service
@@ -602,18 +751,25 @@ begin
 end;
 $$;
 
--- All RPCs/helpers are private to service_role; trigger runs as its owner.
+-- RPCs are private to service_role; the swap implementation helper is owner-only.
 do $$
 declare f record;
 begin
-  for f in select p.oid::regprocedure as signature from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+  for f in select p.oid::regprocedure as signature,p.proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace
     where n.nspname='public' and p.proname in
       ('visual_group_enforcement_on','visual_group_row_aliases','visual_group_resolve_row',
        'visual_group_row_active','visual_group_row_review_pending','visual_group_row_ambiguous','visual_group_sync_row',
        'visual_group_guard_trigger','visual_group_sibling_keep_ambiguity',
-       'visual_group_sibling_reconciled','visual_group_group_reconciled','visual_group_row_reconciled_here','visual_group_reconcile_ambiguous','visual_group_swap_siblings','visual_group_swap_redate') loop
+       'visual_group_sibling_reconciled','visual_group_group_reconciled','visual_group_row_reconciled_here','visual_group_reconcile_ambiguous','visual_group_swap_siblings','visual_group_swap_redate',
+       'visual_group_swap_siblings_media','visual_group_apply_media_swap') loop
     execute format('revoke all on function %s from public,anon,authenticated',f.signature);
-    execute format('grant execute on function %s to service_role',f.signature);
+    if f.proname='visual_group_apply_media_swap' then
+      -- Internal helper trusts row validation by the public wrappers. A direct
+      -- service call could otherwise bypass approved/full-set safeguards.
+      execute format('revoke all on function %s from service_role',f.signature);
+    else
+      execute format('grant execute on function %s to service_role',f.signature);
+    end if;
   end loop;
 end;
 $$;

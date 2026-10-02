@@ -752,3 +752,218 @@ def test_unknown_deleted_delivery_binds_original_provider_and_becomes_permanent(
     assert json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))['unresolved_ambiguous_history']==[]
     sql(f'insert into public.gym_visual_guard_settings values({q(g)},true,now())')
     with pytest.raises(RuntimeError):insert(g,scene,date='2026-10-06',url='https://test/recovered-story.jpg')
+
+
+def media_payload(items):
+    return q(json.dumps([{'calendar_row_id': rid, 'media': media} for rid, media in items])) + '::jsonb'
+
+
+def test_per_row_media_swap_preserves_distinct_feed_and_story_derivatives():
+    g=gym();group=alias(g,'https://test/old-feed.jpg');alias(g,'https://test/old-story.jpg',group)
+    feed=insert(g,group,url='https://test/old-feed.jpg')
+    story=insert(g,group,url='https://test/old-story.jpg',account='facebook')
+    sql(f"update public.content_calendar set format='story' where id={q(story)}")
+    scene=alias(g,'https://test/new-feed.jpg')
+    alias(g,'https://test/new-story-9x16.jpg',scene)
+    alias(g,'asset-new-feed',scene,kind='source_asset')
+    payload=media_payload([
+        (feed,{'image_url':'https://test/new-feed.jpg','source_media_asset_id':'asset-new-feed'}),
+        (story,{'image_url':'https://test/new-story-9x16.jpg','visual_group_key':scene}),
+    ])
+    assert sql(f"select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06')")=='2'
+    by_id={r['id']:r for r in rows(g)}
+    assert by_id[feed]['image_url']=='https://test/new-feed.jpg'
+    assert by_id[feed]['source_media_asset_id']=='asset-new-feed'
+    assert by_id[story]['image_url']=='https://test/new-story-9x16.jpg' and by_id[story]['format']=='story'
+    assert all(r['visual_group_key']==scene and r['post_date']=='2026-10-06' for r in by_id.values())
+    led={l['group_key']:l for l in ledger(g)}
+    assert led[group]['state']=='released'
+    assert led[scene]['state']=='reserved' and led[scene]['reserved_date']=='2026-10-06'
+
+
+def test_per_row_media_swap_missing_extra_duplicate_and_cross_tenant_rows_rejected():
+    g=gym();group=alias(g,'https://test/one.jpg')
+    one=insert(g,group);two=insert(g,group,account='facebook')
+    alias(g,'https://test/new.jpg')
+    ok={'image_url':'https://test/new.jpg'}
+    before=rows(g);before_ledger=ledger(g)
+    with pytest.raises(RuntimeError):
+        sql(f"select public.visual_group_swap_siblings_media({q(g)},{media_payload([(one,ok)])},'2026-10-06')")
+    with pytest.raises(RuntimeError):
+        sql(f"select public.visual_group_swap_siblings_media({q(g)},{media_payload([(one,ok),(two,ok),(str(uuid.uuid4()),ok)])},'2026-10-06')")
+    with pytest.raises(RuntimeError):
+        sql(f"select public.visual_group_swap_siblings_media({q(g)},{media_payload([(one,ok),(one,ok)])},'2026-10-06')")
+    other=gym();og=alias(other,'https://test/other.jpg');foreign=insert(other,og,url='https://test/other.jpg')
+    with pytest.raises(RuntimeError):
+        sql(f"select public.visual_group_swap_siblings_media({q(g)},{media_payload([(one,ok),(foreign,ok)])},'2026-10-06')")
+    assert rows(g)==before and ledger(g)==before_ledger
+
+
+def test_per_row_media_swap_conflict_rolls_back_everything():
+    g=gym();group=alias(g,'https://test/one.jpg')
+    one=insert(g,group);two=insert(g,group,account='facebook')
+    occupied=alias(g,'https://test/taken.jpg')
+    insert(g,occupied,date='2026-10-09',url='https://test/taken.jpg')
+    alias(g,'https://test/free.jpg')
+    before=rows(g);before_ledger=ledger(g)
+    payload=media_payload([(one,{'image_url':'https://test/free.jpg'}),(two,{'image_url':'https://test/taken.jpg'})])
+    with pytest.raises(RuntimeError):
+        sql(f"select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06')")
+    assert rows(g)==before and ledger(g)==before_ledger
+
+
+def test_per_row_media_swap_rejects_conflicting_aliases_and_unready_states():
+    g=gym();group=alias(g,'https://test/one.jpg')
+    one=insert(g,group);two=insert(g,group,account='facebook')
+    alias(g,'https://test/new.jpg')
+    alias(g,'hash-b',kind='byte_hash')  # registered to a different group
+    conflict={'image_url':'https://test/new.jpg','byte_hash':'hash-b'}
+    ok={'image_url':'https://test/new.jpg'}
+    before={r['id']:(r['image_url'],r['post_date'],r['visual_group_key']) for r in rows(g)}
+    with pytest.raises(RuntimeError):
+        sql(f"select public.visual_group_swap_siblings_media({q(g)},{media_payload([(one,conflict),(two,ok)])},'2026-10-06')")
+    sql(f"update public.content_calendar set status='approved' where id={q(one)}")
+    with pytest.raises(RuntimeError):
+        sql(f"select public.visual_group_swap_siblings_media({q(g)},{media_payload([(one,ok),(two,ok)])},'2026-10-06')")
+    sql(f"update public.content_calendar set status='pending' where id={q(one)}")
+    sql(f"update public.content_calendar set status='publishing',publish_claim_token=gen_random_uuid() where id={q(two)}")
+    with pytest.raises(RuntimeError):
+        sql(f"select public.visual_group_swap_siblings_media({q(g)},{media_payload([(one,ok),(two,ok)])},'2026-10-06')")
+    after={r['id']:(r['image_url'],r['post_date'],r['visual_group_key']) for r in rows(g)}
+    assert after==before
+    by_id={r['id']:r for r in rows(g)}
+    assert by_id[one]['status']=='pending' and by_id[two]['status']=='publishing'
+
+
+def test_per_row_media_swap_racing_cross_date_claim_has_one_authority():
+    g=gym();group=alias(g,'https://test/one.jpg')
+    one=insert(g,group);two=insert(g,group,account='facebook')
+    scene=alias(g,'https://test/new.jpg')
+    payload=media_payload([(one,{'image_url':'https://test/new.jpg'}),(two,{'image_url':'https://test/new.jpg'})])
+    result=race(f"select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06')",
+      f"insert into public.content_calendar(gym_id,post_date,image_url,status) values({q(g)},'2026-10-09','https://test/new.jpg','pending')")
+    assert sum(err is None for _,err in result)==1,result
+    led={l['group_key']:l for l in ledger(g)}
+    moved={r['post_date'] for r in rows(g) if r['id'] in (one,two)}
+    if result[0][1] is None:
+        assert led[scene]['reserved_date']=='2026-10-06' and moved=={'2026-10-06'}
+    else:
+        assert led[scene]['reserved_date']=='2026-10-09' and moved=={'2026-10-05'}
+
+
+def test_per_row_swap_internal_helper_cannot_bypass_public_wrapper_guards():
+    g=gym();group=alias(g,'https://test/one.jpg');one=insert(g,group);two=insert(g,group,account='facebook')
+    sql(f"update public.content_calendar set status='approved' where id={q(one)}")
+    alias(g,'https://test/new.jpg')
+    payload=media_payload([(one,{'image_url':'https://test/new.jpg'})])
+    before=rows(g);before_ledger=ledger(g)
+    with pytest.raises(RuntimeError):
+        sql(f"set role service_role; select public.visual_group_apply_media_swap({q(g)},'2026-10-06',{payload},{ids_array([one])},{q(group)})")
+    assert sql("select has_function_privilege('service_role','public.visual_group_apply_media_swap(text,date,jsonb,uuid[],text)','EXECUTE')")=='f'
+    assert rows(g)==before and ledger(g)==before_ledger
+
+
+def test_per_row_swap_service_wrapper_allowed_and_authenticated_refused():
+    g=gym();group=alias(g,'https://test/one.jpg');one=insert(g,group);two=insert(g,group,account='facebook')
+    alias(g,'https://test/new.jpg')
+    payload=media_payload([(one,{'image_url':'https://test/new.jpg'}),(two,{'image_url':'https://test/new.jpg'})])
+    with pytest.raises(RuntimeError):
+        sql(f"set role authenticated; select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06')")
+    assert sql(f"set role service_role; select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06')")=='2'
+
+
+def test_per_row_swap_cannot_split_old_scene_into_unrelated_new_scenes():
+    g=gym();group=alias(g,'https://test/one.jpg');one=insert(g,group);two=insert(g,group,account='facebook')
+    alias(g,'https://test/new-feed.jpg');alias(g,'https://test/unrelated-story.jpg')
+    before=rows(g);before_ledger=ledger(g)
+    payload=media_payload([(one,{'image_url':'https://test/new-feed.jpg'}),(two,{'image_url':'https://test/unrelated-story.jpg'})])
+    with pytest.raises(RuntimeError):sql(f"select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06')")
+    assert rows(g)==before and ledger(g)==before_ledger
+
+
+def test_per_row_swap_clears_omitted_old_identity_and_preserves_supplied_derivative_lineage():
+    g=gym();old=alias(g,'https://test/old-feed.jpg');alias(g,'https://test/old-story.jpg',old)
+    alias(g,'old-asset',old,kind='source_asset');alias(g,'old-hash',old,kind='byte_hash')
+    feed=insert(g,old,url='https://test/old-feed.jpg');story=insert(g,old,url='https://test/old-story.jpg',account='facebook')
+    sql(f"update public.content_calendar set source_media_asset_id='old-asset',byte_hash='old-hash' where gym_id={q(g)}")
+    sql(f"update public.content_calendar set format='story' where id={q(story)}")
+    scene=alias(g,'https://test/new-feed.jpg');alias(g,'https://test/new-story.jpg',scene);alias(g,'https://test/new-raw.jpg',scene)
+    payload=media_payload([(feed,{'image_url':'https://test/new-feed.jpg'}),
+      (story,{'image_url':'https://test/new-story.jpg','source_media_url':'https://test/new-raw.jpg'})])
+    assert sql(f"select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06')")=='2'
+    by_id={r['id']:r for r in rows(g)}
+    assert all(r['source_media_asset_id'] is None and r['byte_hash'] is None for r in by_id.values())
+    assert by_id[feed]['source_media_url'] is None and by_id[story]['source_media_url']=='https://test/new-raw.jpg'
+    assert by_id[story]['format']=='story'
+
+
+def test_per_row_swap_pending_scene_review_refuses_all_rows():
+    g=gym();old=alias(g,'https://test/one.jpg');one=insert(g,old);two=insert(g,old,account='facebook')
+    scene=alias(g,'https://test/new.jpg')
+    sql(f"insert into public.visual_group_member_event(gym_id,group_key,alias_kind,alias_value,action) values({q(g)},{q(scene)},'canonical_url','https://test/new.jpg','review_hold')")
+    before=rows(g);before_ledger=ledger(g)
+    payload=media_payload([(one,{'image_url':'https://test/new.jpg'}),(two,{'image_url':'https://test/new.jpg'})])
+    with pytest.raises(RuntimeError):sql(f"select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06')")
+    assert rows(g)==before and ledger(g)==before_ledger
+
+
+@pytest.mark.parametrize('left_kind,right_kind,planner',[
+    ('per_row','legacy','set local enable_seqscan=off'),
+    ('legacy','per_row','set local enable_indexscan=off; set local enable_bitmapscan=off'),
+    ('per_row','per_row','set local enable_sort=off'),
+    ('legacy','legacy','set local enable_seqscan=off; set local enable_bitmapscan=off'),
+])
+def test_opposite_per_row_and_legacy_swaps_refuse_without_lock_inversion(left_kind,right_kind,planner):
+    g=gym();a=alias(g,'https://test/a.jpg');b=alias(g,'https://test/b.jpg')
+    one=insert(g,a,url='https://test/a.jpg');two=insert(g,b,url='https://test/b.jpg')
+    def swap(kind,rid,url):
+        if kind=='per_row':
+            call=f"select public.visual_group_swap_siblings_media({q(g)},{media_payload([(rid,{'image_url':url})])},'2026-10-06')"
+        else:
+            call=f"select public.visual_group_swap_siblings({q(g)},{ids_array([rid])},'2026-10-06',{q(json.dumps({'image_url':url}))}::jsonb)"
+        return planner+'; '+call
+    left=swap(left_kind,one,'https://test/b.jpg');right=swap(right_kind,two,'https://test/a.jpg')
+    before=rows(g);before_ledger=ledger(g)
+    for _ in range(4):
+        result=race(left,right)
+        # Both targets are occupied: the only valid outcome is the domain
+        # refusal after serialized locks, never a deadlock/timeout or success.
+        assert all(error is not None and 'replacement group is reserved, published or ambiguous' in error for _,error in result),result
+        assert rows(g)==before and ledger(g)==before_ledger
+
+
+def test_per_row_swap_refuses_supplied_identity_column_absent_from_real_schema():
+    g=gym();old=alias(g,'https://test/one.jpg');rid=insert(g,old)
+    scene=alias(g,'https://test/new.jpg');alias(g,'conflicting-r2-key',kind='r2_key')
+    payload=media_payload([(rid,{'image_url':'https://test/new.jpg','r2_key':'conflicting-r2-key'})])
+    before=rows(g);before_ledger=ledger(g)
+    with pytest.raises(RuntimeError):
+        sql(f"begin; alter table public.content_calendar drop column r2_key; select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06'); commit")
+    assert rows(g)==before and ledger(g)==before_ledger
+    assert sql("select count(*) from information_schema.columns where table_schema='public' and table_name='content_calendar' and column_name='r2_key'")=='1'
+
+
+def test_per_row_swap_full_membership_is_checked_under_old_group_lock():
+    g=gym();old=alias(g,'https://test/one.jpg');one=insert(g,old);two=insert(g,old,account='facebook')
+    scene=alias(g,'https://test/new.jpg')
+    payload=media_payload([(one,{'image_url':'https://test/new.jpg'}),(two,{'image_url':'https://test/new.jpg'})])
+    result=race(f"select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06')",
+      f"insert into public.content_calendar(gym_id,post_date,image_url,status,account) values({q(g)},'2026-10-05','https://test/one.jpg','pending','google_business')")
+    assert result[1][1] is None,result
+    by_id={r['id']:r for r in rows(g)}
+    if result[0][1] is None:
+        assert all(by_id[rid]['visual_group_key']==scene and by_id[rid]['post_date']=='2026-10-06' for rid in (one,two))
+        assert next(r for r in rows(g) if r['id'] not in (one,two))['visual_group_key']==old
+    else:
+        assert all(r['visual_group_key']==old and r['post_date']=='2026-10-05' for r in rows(g))
+    assert len(rows(g))==3
+
+
+def test_per_row_swap_uses_actual_optional_column_types():
+    g=gym();old=alias(g,'https://test/one.jpg');rid=insert(g,old)
+    scene=alias(g,'https://test/new.jpg');drive=str(uuid.uuid4());alias(g,drive,scene,kind='drive_id')
+    payload=media_payload([(rid,{'image_url':'https://test/new.jpg','drive_file_id':drive})])
+    before=rows(g);before_ledger=ledger(g)
+    result=sql(f"begin; alter table public.content_calendar alter column drive_file_id type uuid using null::uuid; select public.visual_group_swap_siblings_media({q(g)},{payload},'2026-10-06'); select drive_file_id from public.content_calendar where id={q(rid)}; rollback")
+    assert result.splitlines()==['1',drive]
+    assert rows(g)==before and ledger(g)==before_ledger
