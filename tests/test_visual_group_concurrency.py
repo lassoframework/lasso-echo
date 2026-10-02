@@ -386,9 +386,9 @@ def test_unknown_published_identity_hold_survives_calendar_deletion():
     assert len(report['unresolved_published_history'])==1
     alias(g,'https://test/one.jpg')
     sql(f'insert into public.gym_visual_guard_settings values({q(g)},true,now())')
-    held=insert(g)
-    assert rows(g)[0]['media_not_ready_reason']=='visual_group_scene_review_required'
-    with pytest.raises(RuntimeError):sql(f"update public.content_calendar set status='approved' where id={q(held)}")
+    held=insert(g,status='approved')
+    assert rows(g)[0]['media_not_ready_reason'] is None and rows(g)[0]['status']=='approved'
+    assert json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))['activation_ready'] is False
 
 
 def test_scene_review_commit_while_claim_waits_is_rechecked_under_group_lock():
@@ -485,9 +485,9 @@ def test_backfill_unknown_archived_ambiguity_is_durable_activation_blocker():
     assert len(report['unresolved_ambiguous_history'])==1 and report['activation_ready'] is False
     alias(g,'https://test/one.jpg')
     sql(f'insert into public.gym_visual_guard_settings values({q(g)},true,now())')
-    held=insert(g)
-    assert rows(g)[0]['media_not_ready_reason']=='visual_group_scene_review_required'
-    with pytest.raises(RuntimeError):sql(f"update public.content_calendar set status='approved' where id={q(held)}")
+    held=insert(g,status='approved')
+    assert rows(g)[0]['media_not_ready_reason'] is None and rows(g)[0]['status']=='approved'
+    assert json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))['activation_ready'] is False
 
 
 def test_runtime_unknown_failed_media_is_durable_hold_and_keeps_prior_claim():
@@ -522,3 +522,233 @@ def test_shared_media_rpc_refuses_distinct_story_derivative_but_redate_preserves
     before={r['id']:r['image_url'] for r in rows(g)}
     assert sql(f"select public.visual_group_swap_redate({q(g)},{ids_array([feed,story])},'2026-10-06')")=='2'
     assert {r['id']:r['image_url'] for r in rows(g)}==before
+
+
+def evidence(g, rid, group, day='2026-10-05', outcome='confirmed_not_sent'):
+    claims=json.loads(sql(f"select coalesce(jsonb_agg(jsonb_build_object('group_key',s.group_key,'attempt_id',s.attempt_id::text,'claim_token',s.original_claim_token::text,'provider_post_id',s.original_provider_post_id,'image_url',s.original_image_url) order by group_key),'[]') from public.visual_group_usage_sibling s where gym_id={q(g)} and calendar_row_id={q(rid)} and ambiguous"))
+    holds=json.loads(sql(f"select coalesce(jsonb_agg(jsonb_build_object('hold_event_id',e.id,'claim_token',case when left(btrim(e.reason),1)='{{' then e.reason::jsonb->>'publish_claim_token' end,'provider_post_id',case when left(btrim(e.reason),1)='{{' then e.reason::jsonb->>'late_post_id' end,'calendar_date',case when left(btrim(e.reason),1)='{{' then e.reason::jsonb->>'post_date' end,'image_url',case when left(btrim(e.reason),1)='{{' then e.reason::jsonb->>'image_url' end) order by id),'[]') from public.visual_group_member_event e where gym_id={q(g)} and alias_value={q(rid)} and action='review_hold' and actor in ('backfill_ambiguous_review','runtime_ambiguous_review') and not exists(select 1 from public.visual_group_reconciliation r where r.gym_id=e.gym_id and e.id=any(r.hold_event_ids))"))
+    return {'source':'provider_terminal_readback','gym_id':g,'calendar_row_id':rid,'group_key':group,
+      'calendar_date':day,'provider':'synthetic-isolated-test-provider','request_id':'terminal-request-'+rid,
+      'receipt_ref':'fixture://terminal-receipt/'+rid,'terminal':True,'will_retry':False,
+      'delivery':'not_delivered' if outcome=='confirmed_not_sent' else 'delivered',
+      'provider_status':'failed_before_delivery' if outcome=='confirmed_not_sent' else 'published',
+      'checked_at':sql('select now()'),'published_at':sql("select now()-interval '1 minute'"),
+      'provider_post_id':claims[0]['provider_post_id'] if claims and claims[0]['provider_post_id'] else 'confirmed-provider-'+rid,
+      'delivered_url':claims[0]['image_url'] if claims else None,'claims':claims,'hold_claims':holds}
+
+
+def reconcile(g,rid,group,proof,outcome='confirmed_not_sent',day='2026-10-05',role=None):
+    statement=f"select public.visual_group_reconcile_ambiguous({q(g)},{q(rid)},{q(outcome)},{q(group)},{q(day)},{q(json.dumps(proof))}::jsonb,'independent-provider-verifier')"
+    return json.loads(sql((f'set role {role}; ' if role else '')+statement))
+
+
+def uncertain(g, group, channel='google_business'):
+    rid=insert(g,group,account=channel)
+    sql(f"update public.content_calendar set status='failed',publish_claim_token=gen_random_uuid(),late_post_id={q('provider-'+rid)} where id={q(rid)}")
+    return rid
+
+
+def test_explicit_non_delivery_evidence_releases_deleted_orphan_and_is_idempotent():
+    g=gym();group=alias(g,'https://test/one.jpg');rid=uncertain(g,group)
+    proof=evidence(g,rid,group)
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    assert ledger(g)[0]['ambiguous'] is True
+    result=reconcile(g,rid,group,proof,role='service_role')
+    assert result['outcome']=='confirmed_not_sent' and result['calendar_updated'] is False
+    assert ledger(g)[0]['state']=='released' and ledger(g)[0]['ambiguous'] is False
+    assert sql(f"select state||':'||ambiguous::text from public.visual_group_usage_sibling where gym_id={q(g)} and calendar_row_id={q(rid)}")=='released:false'
+    assert reconcile(g,rid,group,proof)['idempotent'] is True
+    assert sql(f'select count(*) from public.visual_group_reconciliation where gym_id={q(g)}')=='1'
+    insert(g,group,date='2026-10-06')
+
+
+def test_live_reconciliation_cancels_terminal_unsent_and_retains_other_sibling():
+    g=gym();group=alias(g,'https://test/one.jpg');rid=uncertain(g,group,channel='story');other=insert(g,group,account='facebook')
+    result=reconcile(g,rid,group,evidence(g,rid,group))
+    assert result['calendar_updated'] is True
+    affected=next(r for r in rows(g) if r['id']==rid)
+    assert affected['status']=='killed' and affected['publish_claim_token'] is None and affected['late_post_id'] is None
+    assert ledger(g)[0]['state']=='reserved' and ledger(g)[0]['ambiguous'] is False
+    sql(f'delete from public.content_calendar where id={q(other)}')
+    assert ledger(g)[0]['state']=='released'
+
+
+@pytest.mark.parametrize('change',[{'source':'timeout'},{'provider_status':'not_found'}, {'terminal':False},{'will_retry':True},{'delivery':'unknown'},{'receipt_ref':''},{'calendar_row_id':'00000000-0000-0000-0000-000000000000'}])
+def test_timeout_inconclusive_or_unbound_evidence_cannot_release(change):
+    g=gym();group=alias(g,'https://test/one.jpg');rid=uncertain(g,group)
+    proof=evidence(g,rid,group);proof.update(change)
+    with pytest.raises(RuntimeError):reconcile(g,rid,group,proof)
+    assert ledger(g)[0]['ambiguous'] is True and ledger(g)[0]['state']=='reserved'
+    assert sql(f'select count(*) from public.visual_group_reconciliation where gym_id={q(g)}')=='0'
+
+
+def test_wrong_original_ids_and_readonly_receipt_table_do_not_bypass():
+    g=gym();group=alias(g,'https://test/one.jpg');rid=uncertain(g,group);proof=evidence(g,rid,group)
+    proof['claims'][0]['claim_token']=str(uuid.uuid4())
+    with pytest.raises(RuntimeError):reconcile(g,rid,group,proof)
+    proof=evidence(g,rid,group);proof['claims'][0]['provider_post_id']='foreign-provider'
+    with pytest.raises(RuntimeError):reconcile(g,rid,group,proof)
+    with pytest.raises(RuntimeError):sql("set role service_role; insert into public.visual_group_reconciliation(gym_id) values('forged')")
+    with pytest.raises(RuntimeError):reconcile(g,rid,group,evidence(g,rid,group),role='authenticated')
+    with pytest.raises(RuntimeError):sql(f"update public.content_calendar set publish_claim_token=gen_random_uuid() where id={q(rid)}")
+    assert ledger(g)[0]['ambiguous'] is True
+
+
+def test_confirmed_delivery_for_deleted_sibling_is_permanent():
+    g=gym();group=alias(g,'https://test/one.jpg');rid=uncertain(g,group,channel='story')
+    proof=evidence(g,rid,group,outcome='confirmed_published')
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    result=reconcile(g,rid,group,proof,outcome='confirmed_published')
+    assert result['outcome']=='confirmed_published' and ledger(g)[0]['state']=='published'
+    with pytest.raises(RuntimeError):insert(g,group,date='2026-10-06')
+    bad=evidence(g,rid,group)
+    with pytest.raises(RuntimeError):reconcile(g,rid,group,bad)
+    with pytest.raises(RuntimeError):sql(f'delete from public.visual_group_reconciliation where gym_id={q(g)}')
+
+
+def test_confirmed_delivery_updates_live_calendar_with_original_provider_binding():
+    g=gym();group=alias(g,'https://test/one.jpg');rid=uncertain(g,group)
+    proof=evidence(g,rid,group,outcome='confirmed_published')
+    result=reconcile(g,rid,group,proof,outcome='confirmed_published')
+    assert result['calendar_updated'] is True and rows(g)[0]['status']=='published'
+    assert ledger(g)[0]['state']=='published'
+
+
+def test_old_receipt_cannot_release_a_later_attempt_on_same_calendar_row():
+    g=gym();group=alias(g,'https://test/one.jpg');rid=uncertain(g,group);proof=evidence(g,rid,group)
+    first_attempt=proof['claims'][0]['attempt_id'];reconcile(g,rid,group,proof)
+    sql(f"update public.content_calendar set status='pending' where id={q(rid)}")
+    sql(f"update public.content_calendar set status='failed',publish_claim_token=gen_random_uuid(),late_post_id='next-provider-attempt' where id={q(rid)}")
+    assert evidence(g,rid,group)['claims'][0]['attempt_id']!=first_attempt
+    with pytest.raises(RuntimeError):reconcile(g,rid,group,proof)
+    assert ledger(g)[0]['state']=='reserved' and ledger(g)[0]['ambiguous'] is True
+
+
+def test_backfill_unknown_history_does_not_demote_unrelated_approved_and_self_heals():
+    g=gym(False);unknown=insert(g,status='published',url=None,date='2026-09-01')
+    approved=insert(g,status='approved',url='https://test/unrelated-approved.jpg',date='2026-10-06',account='google_business')
+    first=backfill(g)
+    unaffected=next(r for r in rows(g) if r['id']==approved)
+    assert unaffected['status']=='approved' and unaffected['media_not_ready_reason'] is None
+    assert len(json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))['unresolved_published_history'])==1
+    snapshot=rows(g);events=sql(f'select count(*) from public.visual_group_member_event where gym_id={q(g)}')
+    backfill(g)
+    assert rows(g)==snapshot and sql(f'select count(*) from public.visual_group_member_event where gym_id={q(g)}')==events
+    # A stale visual scene hold from an older backfill can clear on verified
+    # hydration; approval is preserved rather than silently revoked/regranted.
+    sql(f"update public.content_calendar set media_not_ready_reason='visual_group_scene_review_required' where id={q(approved)}")
+    backfill(g)
+    assert next(r for r in rows(g) if r['id']==approved)['media_not_ready_reason'] is None
+    assert next(r for r in rows(g) if r['id']==approved)['status']=='approved'
+
+
+def test_deleted_unknown_ambiguous_hold_reconciles_only_captured_provider_ids():
+    g=gym(False);rid=insert(g,status='failed',url=None,account='story')
+    sql(f"update public.content_calendar set variant_status='archived',publish_claim_token=gen_random_uuid(),late_post_id='original-unknown-provider' where id={q(rid)}")
+    backfill(g);proof=evidence(g,rid,None)
+    assert proof['claims']==[] and proof['hold_claims'][0]['provider_post_id']=='original-unknown-provider'
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    bad=json.loads(json.dumps(proof));bad['hold_claims'][0]['provider_post_id']='foreign-provider'
+    with pytest.raises(RuntimeError):reconcile(g,rid,None,bad)
+    reconcile(g,rid,None,proof)
+    report=json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))
+    assert report['unresolved_ambiguous_history']==[] and report['activation_ready'] is False
+
+
+def reconcile_statement(g, rid, group, proof, outcome='confirmed_not_sent'):
+    return f"select public.visual_group_reconcile_ambiguous({q(g)},{q(rid)},{q(outcome)},{q(group)},'2026-10-05',{q(json.dumps(proof))}::jsonb,'independent-provider-verifier')"
+
+
+@pytest.mark.parametrize('delete_first', [False, True])
+def test_reconciliation_serializes_with_calendar_deletion(delete_first):
+    g=gym();group=alias(g,'https://test/one.jpg');rid=uncertain(g,group,channel='google_business')
+    proof=evidence(g,rid,group)
+    cancel=f'delete from public.content_calendar where id={q(rid)}'
+    certify=reconcile_statement(g,rid,group,proof)
+    if delete_first:certify='select pg_sleep(0.05); '+certify
+    else:cancel='select pg_sleep(0.05); '+cancel
+    result=race(certify,cancel)
+    assert all(err is None for _,err in result),result
+    assert rows(g)==[] and ledger(g)[0]['state']=='released' and ledger(g)[0]['ambiguous'] is False
+    assert sql(f'select count(*) from public.visual_group_reconciliation where gym_id={q(g)}')=='1'
+
+
+def test_each_ambiguous_sibling_requires_its_own_terminal_evidence():
+    g=gym();group=alias(g,'https://test/one.jpg');one=uncertain(g,group,channel='google_business');two=uncertain(g,group,channel='story')
+    first=evidence(g,one,group);second=evidence(g,two,group)
+    sql(f'delete from public.content_calendar where gym_id={q(g)}')
+    reconcile(g,one,group,first)
+    assert ledger(g)[0]['state']=='reserved' and ledger(g)[0]['ambiguous'] is True
+    with pytest.raises(RuntimeError):insert(g,group,date='2026-10-06')
+    reconcile(g,two,group,second)
+    assert ledger(g)[0]['state']=='released' and ledger(g)[0]['ambiguous'] is False
+    insert(g,group,date='2026-10-06')
+
+
+def test_unrelated_group_and_missing_original_request_markers_cannot_release():
+    g=gym();group=alias(g,'https://test/one.jpg');other=alias(g,'https://test/other.jpg');rid=uncertain(g,group)
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    proof=evidence(g,rid,other)
+    with pytest.raises(RuntimeError):reconcile(g,rid,other,proof)
+    assert ledger(g)[0]['ambiguous'] is True
+    absent=gym();scene=alias(absent,'https://test/one.jpg');row=insert(absent,scene,status='failed')
+    with pytest.raises(RuntimeError):reconcile(absent,row,scene,evidence(absent,row,scene))
+    assert ledger(absent)[0]['ambiguous'] is True
+
+
+def test_deleted_unknown_receipts_serialize_and_conflicting_proof_cannot_double_resolve():
+    g=gym(False);rid=insert(g,status='failed',url=None,account='story')
+    sql(f"update public.content_calendar set late_post_id='unknown-original-provider' where id={q(rid)}")
+    backfill(g);proof=evidence(g,rid,None)
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    statement=reconcile_statement(g,rid,None,proof)
+    result=race(statement,statement)
+    assert all(err is None for _,err in result),result
+    assert {json.loads(output)['idempotent'] for output,_ in result}=={False,True}
+    second=dict(proof,receipt_ref='different-terminal-readback')
+    with pytest.raises(RuntimeError):reconcile(g,rid,None,second)
+    assert sql(f'select count(*) from public.visual_group_reconciliation where gym_id={q(g)}')=='1'
+
+
+def test_backfill_new_attempt_captures_new_original_ids_after_prior_reconciliation():
+    g=gym();group=alias(g,'https://test/one.jpg');rid=uncertain(g,group)
+    reconcile(g,rid,group,evidence(g,rid,group))
+    sql(f'update public.gym_visual_guard_settings set enforce=false where gym_id={q(g)}')
+    token=str(uuid.uuid4())
+    sql(f"update public.content_calendar set status='failed',publish_claim_token={q(token)},late_post_id='next-offline-provider' where id={q(rid)}")
+    backfill(g)
+    claim=evidence(g,rid,group)['claims'][0]
+    assert claim['claim_token']==token and claim['provider_post_id']=='next-offline-provider'
+    reconcile(g,rid,group,evidence(g,rid,group))
+    assert ledger(g)[0]['state']=='released' and ledger(g)[0]['ambiguous'] is False
+
+
+@pytest.mark.parametrize('replay_rpc', [False, True])
+def test_receipt_transaction_cannot_reset_new_unknown_attempt_with_reused_markers(replay_rpc):
+    g=gym();rid=insert(g,url='https://test/unknown.jpg')
+    token=str(uuid.uuid4())
+    sql(f"update public.content_calendar set status='failed',publish_claim_token={q(token)},late_post_id='unknown-original-provider' where id={q(rid)}")
+    proof=evidence(g,rid,None)
+    reset=reconcile_statement(g,rid,None,proof) if replay_rpc else f"update public.content_calendar set status='pending',publish_claim_token=null,late_post_id=null where id={q(rid)}"
+    with pytest.raises(RuntimeError):
+        sql('begin; '+reconcile_statement(g,rid,None,proof)+f"; update public.content_calendar set status='failed',publish_claim_token={q(token)},late_post_id='unknown-original-provider' where id={q(rid)}; "+reset+'; commit')
+    assert rows(g)[0]['status']=='failed'
+    assert sql(f'select count(*) from public.visual_group_reconciliation where gym_id={q(g)}')=='0'
+
+
+def test_unknown_deleted_delivery_binds_original_provider_and_becomes_permanent():
+    g=gym(False);rid=insert(g,status='failed',url=None,account='story')
+    sql(f"update public.content_calendar set late_post_id='unknown-original-provider' where id={q(rid)}")
+    backfill(g)
+    sql(f'delete from public.content_calendar where id={q(rid)}')
+    scene=alias(g,'https://test/recovered-story.jpg')
+    proof=evidence(g,rid,scene,outcome='confirmed_published')
+    proof['delivered_url']='https://test/recovered-story.jpg'
+    with pytest.raises(RuntimeError):reconcile(g,rid,scene,proof,outcome='confirmed_published')
+    assert ledger(g)==[]
+    proof['provider_post_id']='unknown-original-provider'
+    result=reconcile(g,rid,scene,proof,outcome='confirmed_published')
+    assert result['calendar_updated'] is False and ledger(g)[0]['state']=='published'
+    assert json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))['unresolved_ambiguous_history']==[]
+    sql(f'insert into public.gym_visual_guard_settings values({q(g)},true,now())')
+    with pytest.raises(RuntimeError):insert(g,scene,date='2026-10-06',url='https://test/recovered-story.jpg')

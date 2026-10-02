@@ -91,6 +91,26 @@ comment on table public.visual_group_usage_ledger is
 create index if not exists visual_group_usage_ledger_date_idx
   on public.visual_group_usage_ledger (gym_id, reserved_date, state);
 
+-- Owner-written immutable reconciliation receipts. Service role may read,
+-- but cannot INSERT/UPDATE/DELETE; only the validated RPC writes receipts.
+create table if not exists public.visual_group_reconciliation (
+  id uuid primary key default gen_random_uuid(), gym_id text not null,
+  calendar_row_id uuid not null,
+  outcome text not null check(outcome in ('confirmed_not_sent','confirmed_published')),
+  delivered_group_key text, reserved_groups text[] not null,
+  attempts jsonb not null, hold_event_ids bigint[] not null,
+  original_claim jsonb not null, evidence jsonb not null, actor text not null,
+  transaction_id bigint not null default txid_current(),
+  created_at timestamptz not null default now(),
+  unique(gym_id,calendar_row_id,evidence)
+);
+alter table public.visual_group_reconciliation enable row level security;
+drop policy if exists visual_group_reconciliation_service_read on public.visual_group_reconciliation;
+create policy visual_group_reconciliation_service_read on public.visual_group_reconciliation
+  for select to service_role using(true);
+revoke all on public.visual_group_reconciliation from public,anon,authenticated,service_role;
+grant select on public.visual_group_reconciliation to service_role;
+
 create table if not exists public.gym_visual_guard_settings (
   gym_id     text        primary key,
   enforce    boolean     not null default false,
@@ -129,7 +149,13 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  if old.ambiguous and (tg_op='DELETE' or not new.ambiguous or new.state='released') then
+  if old.ambiguous and tg_op='UPDATE' and
+      (new.gym_id<>old.gym_id or new.group_key<>old.group_key or new.reserved_date is distinct from old.reserved_date) then
+    raise exception 'ambiguous reservation identity/date is immutable' using errcode='23514';
+  end if;
+  if old.ambiguous and (tg_op='DELETE' or
+      ((not new.ambiguous or new.state='released') and
+        not public.visual_group_group_reconciled(old.gym_id,old.group_key))) then
     raise exception 'ambiguous usage requires evidence-based reconciliation' using errcode='23514';
   end if;
   if old.state = 'published' then
@@ -262,7 +288,7 @@ $$;
 do $$
 declare t text;
 begin
-  foreach t in array array['visual_group','visual_group_alias','visual_group_member_event'] loop
+  foreach t in array array['visual_group','visual_group_alias','visual_group_member_event','visual_group_reconciliation'] loop
     execute format('drop trigger if exists visual_group_identity_immutable on public.%I',t);
     execute format('create trigger visual_group_identity_immutable before update or delete on public.%I for each row execute function public.visual_group_block_identity_mutation()',t);
   end loop;

@@ -14,9 +14,9 @@ has been applied. The application guard scaffold in PR232 remains default OFF.
 | Calendar mutation and reservation are one transaction | BEFORE trigger validates current exact identities, real dates and holds before approval, claim or finalize. It throws on unsafe send transitions so PR230 cannot return a token after a trigger stamps a hold. | Stale unheld approved row through unchanged PR230 RPC; finalize bypasses; null dates; held/blank Story |
 | Media swaps cannot retain stale scene identity | Delivered image URL must have its own registered alias; every supplied source/byte/Drive/R2 identity must be registered and agree. A known source cannot certify an unknown delivered image on INSERT. Group key is validated against aliases. Changed media cannot rely solely on unchanged carried source aliases: a changed exact alias must confirm the same scene. Unknown pending identity is visibly held. | Stale key URL swap; carried-forward stale source asset; held row hydration |
 | Bulk operation changes all siblings or none | `visual_group_swap_siblings(gym, ids, date, media_json)` requires the complete active, unsent same-date group; rejects duplicate IDs, missing/foreign/published/ambiguous rows. It locks old/replacement groups in key order. Replacement clears omitted media identity fields. `visual_group_swap_redate` is its date-only wrapper. | Partial set refusal; full redate; redate racing new candidate; conflicting media swap rollback; replacement release |
-| Canceled unsent releases only final sibling | Membership rows track active claims under group lock. Last unsent cancel/delete releases a reserved ledger. `publishing`, `failed`, tokens or provider IDs are treated conservatively as ambiguous. Group/sibling flags are sticky; ordinary writes cannot clear flags or release them. Status/marker resets refuse; deletion retains uncertainty and reservation. | Sibling cancellation and failed/ambiguous retention; variant archive/reactivation; draft reservation |
+| Canceled unsent releases only final sibling | Membership rows track active claims under group lock. Last unsent cancel/delete releases a reserved ledger. `publishing`, `failed`, tokens or provider IDs are treated conservatively as ambiguous. Group/sibling flags are sticky; ordinary writes cannot clear flags or release them. Evidence-only reconciliation binds original IDs and each attempt UUID, preserves other active/uncertain siblings, and makes confirmed delivery permanent. | Sibling cancellation; failed retention; orphan cleanup; timeout/wrong-ID refusal; separate GBP/Story attempts; reconciliation/delete race |
 | Stable IDs/unique aliases/review decisions | Alias registration locks an absent alias before creating its group, avoiding orphan races. Existing aliases/groups and decision history cannot be mutated. Exact aliases only; latest pending scene-review events hold claims until explicit confirm/reject. | Alias race, duplicate registration, stable group, grants/sequence permissions, pHash-28 pair kept separate and explicit scene review |
-| Historical/future backfill precedes activation | Dry-run default rolls back all writes. Per-row savepoint prevents partial alias bindings on conflict. Published calendar history is unchanged; published evidence is append-only. Active rows and archived/candidate ambiguous sends reserve; unresolved ambiguity is a durable activation blocker even after calendar deletion. Later dates receive a durable hold and approved rows become pending. Unknown historical identity remains a durable gym-wide review blocker even after row deletion. | Dry-run/real/idempotent backfill; alias conflicts; future reservations; status-only publications; unknown events; deletion retaining historical blocker |
+| Historical/future backfill precedes activation | Dry-run default rolls back all writes. Per-row savepoint prevents partial alias bindings on conflict. Published calendar history is unchanged; published evidence is append-only. Active rows and archived/candidate ambiguous sends reserve; unresolved history remains a gym-wide activation blocker after deletion. Row readiness considers only that row/its aliases. Only a row with its own unresolved conflict is held/demoted; verified hydration clears owned visual holds and preserves unrelated holds/approval. | Dry-run/real/idempotent backfill; alias conflicts; future reservations; unknown history; unrelated approved rows; hold recovery |
 | Planner rebuild cannot drop repeat holds | INSERT/UPSERT without the prior group or hold still resolves known URL aliases. Later-date reuse refuses the write, preserving existing calendar/ledger. | Swift River/GBP-style rebuild and UPSERT regression |
 
 ## Migration order and contracts
@@ -25,7 +25,8 @@ has been applied. The application guard scaffold in PR232 remains default OFF.
    per-gym aliases, append-only decision events, usage ledger, default-OFF gym
    settings, nullable calendar key; registration/confirmation/rejection RPCs.
 2. `DRAFT_visual_group_claim_trigger_20261002.sql`: membership table, exact row
-   identity helpers, transactional trigger, complete sibling swap/redate RPCs.
+   identity helpers, transactional trigger, complete sibling swap/redate RPCs,
+   evidence-only ambiguity reconciliation RPC and exact attempt bindings.
 3. `DRAFT_visual_group_backfill_20261002.sql`: default dry-run backfill and
    read-only coverage/conflict report. Backfill refuses an enforced gym.
 
@@ -100,8 +101,59 @@ The following integration requirements are **unimplemented release blockers**:
 
 `visual_group_conflict_report` therefore always returns `activation_ready=false`
 and lists these blockers. A green local suite cannot authorize production
-activation, even for an otherwise covered gym. No evidence-based uncertainty
-release or union shortcut is provided by this repair.
+activation, even for an otherwise covered gym. No union shortcut is provided.
+
+## F1/F2 reconciliation and row hold repair
+
+`visual_group_reconcile_ambiguous(gym, row_id, outcome, group, date, evidence,
+actor)` is available only to `service_role`. Its owner writes immutable receipts;
+service role can SELECT the receipt table but cannot directly insert or mutate
+it. `confirmed_not_sent` cancels a live row and releases its membership, including
+deleted or archived orphans, only after conclusive terminal non-delivery.
+`confirmed_published` records permanent usage even when the calendar row was
+deleted. A live row becomes published when its exact aliases and scene review
+are ready; otherwise the ledger remains permanent and `calendar_updated=false`
+signals that calendar review is still required.
+
+The evidence contract requires `source=provider_terminal_readback`, exact gym,
+row, group and calendar date, provider/request ID/receipt reference, checked time,
+`terminal=true` and `will_retry=false`. Non-delivery must be explicitly
+`failed_before_delivery` or `canceled_before_delivery`; timeout, not-found,
+unknown delivery and possible retry all refuse. A confirmed delivery must bind
+the registered delivered URL, original provider ID and confirmed publish time.
+`claims` must equal every current ambiguous membership's group, attempt UUID,
+original claim token, original provider post ID and image URL. `hold_claims`
+must equal each unresolved unknown-history event ID and its original markers,
+date and image. Missing recoverable original claim/provider IDs refuse release
+and require separate evidence recovery. This draft offers no blanket unlock.
+
+Receipts are idempotent for the exact evidence and original attempt. A later
+attempt receives a new UUID; an old receipt cannot release it. Row/group locks
+serialize live reconciliation with ordinary writes, and a per-row advisory lock
+serializes receipts for unknown deleted orphans. Each uncertain sibling requires
+its own evidence; resolving one cannot release another. Permanent published
+usage cannot be reclassified as unsent.
+
+**Provider trust boundary:** SQL validates and binds the supplied receipt but
+does not contact or authenticate the provider. The trusted service verifier must
+fetch and retain actual authoritative terminal readback conclusively proving
+delivery or non-delivery for the original request, including that it cannot
+retry. The local tests use synthetic fixtures; provider adapter wiring and live
+evidence verification remain release gates.
+
+F2 removes gym-wide historical review events from per-row readiness. Unresolved
+history still blocks activation in the coverage report. Verified backfill can
+clear its own stale identity/date/scene/repeat holds without touching another
+readiness reason or silently restoring a previously demoted approval. Unrelated
+approved rows stay approved; repeat backfill does not add duplicate events.
+
+F1/F2 focused result: **122 passed in 13.86s**, including 64 real PostgreSQL
+cases and the unchanged PR230 Story/approval/duplicate-claim regressions. The
+fresh PostgreSQL 17.11 restart retained all 61 ledger rows (12 published), sibling
+attempts, append-only history and 14 immutable receipts with identical full-row
+fingerprints. The local server is stopped; data and
+`work/visual-ledger-pg-local/f1f2-verification-receipt.json` remain for review.
+No production connection or provider readback was performed by these tests.
 
 ## Remaining release gates and risks
 
@@ -120,8 +172,8 @@ release or union shortcut is provided by this repair.
   authoritative transaction or production concurrency guarantee.
 - Perceptual classifier hydration, all-gym exact identity inventory, manual
   reconciliation of aliases already assigned to different immutable groups,
-  explicit evidence-based resolution of ambiguous sends, and portal display of
-  holds are separate integration work. A pHash review candidate must persist its
+  provider verifier integration for evidence-based resolution of ambiguous
+  sends, and portal display of holds are separate integration work. A pHash review candidate must persist its
   hold decision; providing an unreviewed group key does not certify similarity.
 - Ambiguous sends retain reservations conservatively, including deletion. This
   layer does not offer a privileged release-without-evidence shortcut.
