@@ -107,7 +107,10 @@ def test_horizon_days_default_and_override(monkeypatch):
 def _row(days_out, gym="eng", pillar="doctrine", event_id=None, fmt="feed"):
     r = {"gym_id": gym, "post_date": _d(days_out), "account": "instagram",
          "format": fmt, "caption": "Real caption. Sign up today.",
-         "image_url": "https://cdn/x.jpg", "status": "pending", "pillar": pillar}
+         # distinct photo per staged DATE: the default-ON ONE PHOTO ONE DAY belt
+         # (media guard) must not confound the horizon-belt assertions below
+         "image_url": f"https://cdn/x-{days_out}d.jpg",
+         "status": "pending", "pillar": pillar}
     if event_id:
         r["event_id"] = event_id
     return r
@@ -170,9 +173,10 @@ def test_belt_row_without_post_date_passes_through():
 # ---------------------------------------------------------------------------
 
 class _FakeResp:
-    def __init__(self, payload):
-        self.status_code = 201
+    def __init__(self, payload, status_code=201, headers=None):
+        self.status_code = status_code
         self._payload = payload
+        self.headers = dict(headers or {})
         self.text = ""
 
     def json(self):
@@ -186,6 +190,12 @@ class _FakeHTTP:
     def post(self, url, headers=None, json=None, params=None, timeout=None):
         self.posted.append(json)
         return _FakeResp(list(json or []))
+
+    def get(self, url, headers=None, params=None, timeout=None):
+        # The fail-closed held-slot read (Prefer count=exact) requires a
+        # COMPLETE empty response: 200 + Content-Range */0 certifying zero
+        # retained holds, or every active proposal is refused.
+        return _FakeResp([], status_code=200, headers={"Content-Range": "*/0"})
 
 
 def _sb_store(http):

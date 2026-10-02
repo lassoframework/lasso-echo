@@ -2021,8 +2021,8 @@ def _span_scoped_delete_claim(store, base_key, months, span_first, span_last,
     agree and a genuine whole-month restage could never verify.
 
     The count mirrors delete_month's filter exactly (wipeable or NULL status,
-    active variant, post_date not preserved), restricted to the planned span
-    and to rows belonging to base_key (tenant binding: a foreign row is never
+    active variant, no recorded media hold, post_date not preserved), restricted
+    to the planned span and to rows belonging to base_key (a foreign row is never
     this build's deletion). It is a CLAIM, never self-certification: the
     verifier recounts independently, so any divergence from what the delete
     actually removed in-span verifies False (fail closed).
@@ -2058,6 +2058,8 @@ def _span_scoped_delete_claim(store, base_key, months, span_first, span_last,
             variant = str(row.get("variant_status") or "active").lower()
             if variant != "active":
                 continue                    # candidates/archived rows are never deleted
+            if row.get("media_not_ready_reason") is not None:
+                continue                    # delete_month preserves recorded media holds
             total += 1
     return total
 
