@@ -183,17 +183,22 @@ def _default_poster():
     return SlackPoster()
 
 
-def record_story_hold(draft, message, *, bus=None):
-    """Persist provenance without a Slack send, including already-alerted failures."""
+def record_story_hold(row, *, bus=None):
+    """Persist only confirmed shared calendar provenance, without a Slack send.
+
+    An unconfirmed seed leaves the visible held row/reason as the durable retry
+    signal. The next planner pass retries that exact row before slot dedupe.
+    """
     if not config.ops_fix_triage_enabled() or not config.ops_alerts_enabled():
         return False
     try:
         from . import fixer_business_seed as seeds
-        seed = seeds.prepare_story_hold_seed(draft, bus=bus)
-        seeds.persist(seed, scrub(message), bus=bus)
+        seed = seeds.prepare_story_hold_seed(row, bus=bus)
+        seeds.persist(seed, seeds.story_hold_message(row), bus=bus)
         return True
     except Exception as exc:
-        print(f"[ops-alerts] Story hold provenance unconfirmed: {type(exc).__name__}")
+        print(f"[ops-alerts] Story hold provenance unconfirmed row={row.get('id', '')}: "
+              f"{type(exc).__name__}; shared media hold retained for next planner retry")
         return False
 
 
@@ -234,8 +239,8 @@ def alert(message, poster=None, force=False, business_seed=None, seed_bus=None,
     # needs to exist. A failed structured write falls back to the existing
     # echosupport cross-post below, never to a fabricated partial ticket.
     seeded_ticket = False
-    if story_hold is not None:
-        seeded_ticket = record_story_hold(story_hold, message, bus=seed_bus)
+    # A composing Story has no confirmed shared target yet. Its caller defers
+    # support intake until the calendar write and reconciliation finish.
     if business_seed is not None and config.ops_fix_triage_enabled():
         try:
             from . import fixer_business_seed as _business_seed

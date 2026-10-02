@@ -1,8 +1,9 @@
 ## Story hold FIXER provenance (2026-10-02)
 
-- [~] Future retained Story render/hosting/quality holds seed a deterministic service-authenticated support ticket with exact tenant, source slot, submission UUID and Scout request hash. Studio text alerts remain; the Story caller owns support intake to avoid an unbound duplicate. Existing OPS-FIX and ops-alert flags gate this path.
-- [~] Recovery observation opens the actual configured Echo draft DB read-only and requires the exact tenant/account/day/draft to contain hosted Story media with the hold cleared. Missing/unavailable storage and changed requester identity fail closed. Focused Echo tests: 218 passed; paired Scout producer tests: 21 passed. Parent review and deployment pending.
-- [ ] Historical da4b0dc4 remains merged/businessPending: no trusted original target or live historical slot exists. No production DB repair or fabricated proof is included.
+- [~] Future retained Story holds seed support only after confirmed shared content_calendar insertion, with exact row UUID, calendar tenant/account/date, source event, submission UUID and Scout request hash. The central insertion hook covers daily mirrors and month-ahead builders. Composer holds never seed before reconciliation; studio text alerts remain.
+- [~] Recovery observes only that exact shared Supabase row, so intake-web needs no worker volume. Hosted Story media, cleared hold, unchanged target fields and current requester identity are required. Missing/replaced rows and partial reads fail closed. The retained shared hold is the actionable retry signal; the next planner pass retries persisted holds before slot dedupe.
+- [~] Independent review identified and repaired the earlier local-volume and pre-reconcile source mismatches. Focused Echo tests: 230 passed; paired Scout tests: 21 passed. Fresh review and deployment pending.
+- [ ] Historical da4b0dc4 remains merged/businessPending: no trusted original target or live historical slot exists. No production DB repair or fabricated proof is included. Exact row replacement remains unconfirmed; no broad slot substitution closes its ticket.
 
 ## Echo Story needs-media hold (2026-10-02, local patch, review pending)
 

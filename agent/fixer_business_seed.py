@@ -119,57 +119,72 @@ def prepare_grade_drop_seed(*, gym_key: str, min_total: int, observed_total: int
     )
 
 
+
 STORY_SOURCE = "echo.stories.media_hold"
-STORY_CHECK = "story_draft_media_ready"
-_ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{2,79}_(?:ig|fb)\Z")
-_DRAFT = re.compile(r"[a-f0-9]{10}\Z")
+STORY_CHECK = "story_calendar_media_ready"
+_ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,79}\Z")
 
 
-def validate_story_slot(account_key, draft_id, source_day):
-    """Validate the domain's stable account/day/draft identity."""
-    from .drafter import _make_id
-    if not isinstance(account_key, str) or not _ACCOUNT.fullmatch(account_key):
+def validate_story_target(row_id, calendar_gym_key, account, post_date):
+    """Validate the actual shared calendar target, never a local draft identity."""
+    if not isinstance(row_id, str) or not _UUID.fullmatch(row_id):
+        raise SeedError("invalid Story calendar row")
+    if not isinstance(calendar_gym_key, str) or not _GYM.fullmatch(calendar_gym_key):
+        raise SeedError("invalid Story calendar tenant")
+    if not isinstance(account, str) or not _ACCOUNT.fullmatch(account):
         raise SeedError("invalid Story account")
-    occurred_at = _source_at(source_day)
-    day = occurred_at[:10]
-    if source_day != day:
-        raise SeedError("invalid Story slot date")
-    if (not isinstance(draft_id, str) or not _DRAFT.fullmatch(draft_id)
-            or draft_id != _make_id(account_key, "story", day)):
-        raise SeedError("invalid Story slot identity")
+    day = _source_at(post_date)[:10]
+    if post_date != day:
+        raise SeedError("invalid Story calendar date")
     return day
 
 
-def story_hold_seed(*, account_key, draft_id, source_day, client_id):
-    """One immutable, domain-owned Story slot. No alert prose selects its target."""
-    day = validate_story_slot(account_key, draft_id, source_day)
-    occurred_at = _source_at(day)
+def story_hold_seed(*, row_id, calendar_gym_key, account, post_date, created_at, client_id):
+    """One persisted held row, bound to its exact UUID and immutable identity."""
+    from datetime import datetime, timezone
+    validate_story_target(row_id, calendar_gym_key, account, post_date)
     if not isinstance(client_id, str) or not _UUID.fullmatch(client_id):
         raise SeedError("invalid portal client UUID")
+    try:
+        stamp = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError()
+        occurred_at = stamp.astimezone(timezone.utc).isoformat()
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise SeedError("invalid shared Story creation time") from exc
+    gym_key = calendar_gym_key
+    if gym_key.endswith(("_ig", "_fb")):
+        gym_key = gym_key.rsplit("_", 1)[0]
     event = {"schema_version": SCHEMA_VERSION, "source": STORY_SOURCE,
-             "occurred_at": occurred_at, "gym_key": account_key.rsplit("_", 1)[0],
-             "account_key": account_key, "draft_id": draft_id, "source_day": day}
+             "occurred_at": occurred_at, "gym_key": gym_key,
+             "row_id": row_id, "calendar_gym_key": calendar_gym_key,
+             "account": account, "post_date": post_date}
     return {**event, "client_id": client_id,
             "source_event_id": hashlib.sha256(_canonical(event).encode()).hexdigest(),
             "check_id": STORY_CHECK,
-            "params": {"account_key": account_key, "draft_id": draft_id, "day_key": day}}
+            "params": {"row_id": row_id, "calendar_gym_key": calendar_gym_key,
+                       "account": account, "post_date": post_date}}
 
 
-def prepare_story_hold_seed(draft, *, bus=None):
-    if (getattr(draft, "draft_type", "") != "story"
-            or getattr(getattr(draft, "status", None), "value", None) != "blocked"
-            or getattr(draft, "is_story", False) is not True
-            or getattr(draft, "needs_media", False) is not True
-            or getattr(draft, "force_approval", False) is not True
-            or getattr(draft, "creative_public_url", "")
-            or getattr(draft, "creative_path", "")):
-        raise SeedError("not an authoritative Story media hold")
-    account = getattr(draft, "account_key", "")
-    if not _ACCOUNT.fullmatch(account):
-        raise SeedError("invalid Story account")
-    return story_hold_seed(account_key=account, draft_id=draft.draft_id,
-                           source_day=draft.day_key,
-                           client_id=resolve_portal_client_id(account.rsplit("_", 1)[0], bus=bus))
+def prepare_story_hold_seed(row, *, bus=None):
+    if (not isinstance(row, dict) or row.get("format") != "story"
+            or row.get("status") != "pending" or row.get("image_url") not in (None, "")
+            or not isinstance(row.get("media_not_ready_reason"), str)
+            or not row["media_not_ready_reason"].startswith("Story media not ready:")):
+        raise SeedError("not a persisted Story media hold")
+    key = row.get("gym_id", "")
+    base = key.rsplit("_", 1)[0] if key.endswith(("_ig", "_fb")) else key
+    return story_hold_seed(row_id=row.get("id"), calendar_gym_key=key,
+                           account=row.get("account"), post_date=row.get("post_date"),
+                           created_at=row.get("created_at"),
+                           client_id=resolve_portal_client_id(base, bus=bus))
+
+
+def story_hold_message(row):
+    """Stable display copy; mutable failure prose never changes request identity."""
+    return (f"Story media hold for {row['gym_id']} ({row['account']}) on "
+            f"{row['post_date']}: shared calendar row {row['id']} has no hosted Story media. "
+            "The retained slot requires purpose-built Story media and human approval.")
 
 
 def valid_story_ticket(row):
@@ -187,10 +202,10 @@ def valid_story_ticket(row):
 
 def _validate_seed(seed: dict) -> dict:
     if isinstance(seed, dict) and seed.get("source") == STORY_SOURCE:
-        rebuilt = story_hold_seed(account_key=seed.get("account_key"),
-                                  draft_id=seed.get("draft_id"),
-                                  source_day=seed.get("source_day"),
-                                  client_id=seed.get("client_id"))
+        rebuilt = story_hold_seed(row_id=seed.get("row_id"),
+                                  calendar_gym_key=seed.get("calendar_gym_key"),
+                                  account=seed.get("account"), post_date=seed.get("post_date"),
+                                  created_at=seed.get("occurred_at"), client_id=seed.get("client_id"))
         if seed != rebuilt:
             raise SeedError("Story seed identity mismatch")
         return rebuilt

@@ -90,10 +90,8 @@ def _needs_media_hold(account, day_key, draft_id, feed_draft, fragments, reason,
     )
     if alert_message:
         ops_alerts.alert(alert_message, story_hold=draft)
-    else:
-        # The studio already alerted this failure. Record only the structured
-        # ticket, preserving its existing no-duplicate-alert behavior.
-        ops_alerts.record_story_hold(draft, reason)
+    # Shared calendar persistence records provenance after reconciliation.
+    # A temporary composer hold cannot create a support incident.
     return draft
 
 

@@ -2114,6 +2114,10 @@ class SupabaseCalendarStore:
         # story has three legitimate rows on one date. Keying on the date alone called
         # 441 rows duplicates when only 155 were, and superseding on it would have
         # destroyed live client content.
+        # A previously inserted hold is the durable retry signal when its
+        # support seed failed. Retry confirmed held rows before slot dedupe can
+        # drop a repeated planner proposal; READY preserved rows never emit.
+        _retry_story_hold_provenance(self, account_key, payload)
         payload = _dedupe_slots(self, account_key, payload)
         if not payload:
             return []
@@ -2134,6 +2138,7 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         out = r.json() or []
         inserted = [x for x in out if str(x.get("gym_id")) == str(account_key)]
+        _record_confirmed_story_holds(account_key, inserted)
         # Wave 3 (AGENT_CAPTION_COOLDOWN): stamp each successfully staged row in
         # the caption ledger so future planner runs see the cooldown. Failure is
         # non-fatal (the rows were already inserted; the ledger is a best-effort
@@ -2494,6 +2499,57 @@ def _dedupe_slots(store, account_key, payload, *, existing=None):
         print(f"[slot-dedupe] {account_key}: dropped {in_batch} in-batch duplicate(s) "
               f"and {dropped_live} slot(s) already live; staged {len(deduped)}")
     return deduped
+
+
+def _is_story_media_hold(row):
+    return (isinstance(row, dict) and row.get("format") == "story"
+            and row.get("status") == "pending" and row.get("image_url") in (None, "")
+            and isinstance(row.get("media_not_ready_reason"), str)
+            and row["media_not_ready_reason"].startswith("Story media not ready:"))
+
+
+def _record_confirmed_story_holds(calendar_gym_key, rows):
+    """Only confirmed shared rows may originate a support incident."""
+    try:
+        if not config.ops_fix_triage_enabled() or not config.ops_alerts_enabled():
+            return
+        from . import ops_alerts
+        for row in rows:
+            if _is_story_media_hold(row) and row.get("gym_id") == calendar_gym_key:
+                ops_alerts.record_story_hold(row)
+    except Exception as exc:
+        # The primary portal-visible held row is already durable. Never turn a
+        # failed support seed into a failed calendar insertion or a fake ticket.
+        print(f"[calendar] Story support provenance unconfirmed: {type(exc).__name__}; "
+              "shared media holds retained for next planner retry")
+
+
+def _retry_story_hold_provenance(store, calendar_gym_key, proposed):
+    """Retry only persisted holds for slots a planner is actually revisiting.
+
+    No new outbox table or worker-volume dependency: the shared held calendar
+    row/reason is the actionable queue. Read failure leaves it intact. This also
+    covers a restart after calendar insert but before support seed confirmation.
+    """
+    try:
+        if not config.ops_fix_triage_enabled() or not config.ops_alerts_enabled():
+            return
+        held = [row for row in proposed if _is_story_media_hold(row)]
+        if not held:
+            return
+        dates = [row["post_date"] for row in held]
+        existing = store.rows_in_range(calendar_gym_key, min(dates), max(dates))
+        if not isinstance(existing, list) or len(existing) >= 1000:
+            raise ValueError("unconfirmed hold read")
+        slot = lambda r: (r.get("account"), r.get("post_date"), r.get("format"),
+                          r.get("time_slot"), r.get("slot_index"))
+        wanted = {slot(row) for row in held}
+        actual = [row for row in existing if isinstance(row, dict)
+                  and row.get("gym_id") == calendar_gym_key and slot(row) in wanted]
+        _record_confirmed_story_holds(calendar_gym_key, actual)
+    except Exception as exc:
+        print(f"[calendar] Story support retry read unconfirmed: {type(exc).__name__}; "
+              "shared media holds retained")
 
 
 def _live_slots_for(store, account_key, dates):
