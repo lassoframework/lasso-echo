@@ -2119,6 +2119,11 @@ class SupabaseCalendarStore:
         # drop a repeated planner proposal; READY preserved rows never emit.
         _retry_story_hold_provenance(self, account_key, payload)
         payload, recovered = _reconcile_story_media_holds(self, account_key, payload)
+        # Retained holds own their exact slot until explicit recovery or wipe.
+        # Story recovery above uses its retained UUID; this barrier governs NEW
+        # rows of every format. Caption/image changes cannot bypass it, and it
+        # does not collapse numbered slots or channel siblings.
+        payload = _preserve_held_slots(self, account_key, payload)
         payload = _dedupe_slots(self, account_key, payload)
         if not payload:
             return recovered
@@ -2214,8 +2219,13 @@ class SupabaseCalendarStore:
         preserve_human (default True): only WIPEABLE rows (fresh machine drafts:
         pending / draft / queued / NULL status) are deleted. Any row a human or the
         publisher has touched (approved, denied, killed, published, publishing, failed)
-        is LEFT IN PLACE, so a nightly rebuild can never revert a client's approval. Pass
-        preserve_human=False only for a deliberate full wipe of a gym's month.
+        is LEFT IN PLACE, so a nightly rebuild can never revert a client's approval.
+        The same guard preserves an active row carrying a recorded
+        media_not_ready_reason (a media hold such as
+        cross_date_media_repeat_needs_new_visual). Wiping the row would erase
+        the hold and allow a rebuild to stage the rejected visual again.
+        Pass preserve_human=False only for a deliberate full wipe of a gym's
+        month (which also deletes media-hold rows).
 
         preserve_dates: post_dates whose rows are NOT deleted at all (even wipeable
         ones). The client builder passes its LOCKED days here: a day whose feed the
@@ -2269,6 +2279,11 @@ class SupabaseCalendarStore:
             # delete only the never-touched drafts: status IS NULL OR status IN wipeable.
             in_list = ",".join(_WIPEABLE_STATUSES)
             params["or"] = f"(status.is.null,status.in.({in_list}))"
+            # MEDIA-HOLD GUARD: a wipeable-status row with a recorded reason
+            # remains held across rebuilds. Server-side is.null protects the
+            # decision in the same DELETE statement; a read-then-delete could
+            # race a newly applied media hold.
+            params["media_not_ready_reason"] = "is.null"
         r = self._client().delete(
             self._rest(_TABLE),
             params=params,
@@ -2472,6 +2487,61 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+
+def _held_slot_key(row):
+    """Exact persisted slot; nullable fields have no database defaults."""
+    return tuple(row.get(k) for k in
+                 ("gym_id", "post_date", "account", "format", "time_slot", "slot_index"))
+
+
+def _preserve_held_slots(store, account_key, payload):
+    """Refuse new active rows over a retained held slot, in every format.
+
+    Story recovery already used its retained-UUID/CAS path. Query the hold
+    column directly, including draft/NULL-status holds omitted by grade reads.
+    A complete count is required: a partial/unreadable response cannot certify
+    that any proposed slot is free. This is a read barrier, not a database
+    concurrency guarantee; a newly created hold after this read needs the
+    enduring transactional ledger.
+    """
+    candidates = [r for r in payload if r.get("variant_status", "active") == "active"
+                  and r.get("post_date")]
+    if not candidates:
+        return payload
+    dates = sorted({str(r["post_date"]) for r in candidates})
+    fields = {"gym_id", "post_date", "account", "format", "time_slot", "slot_index",
+              "variant_status", "media_not_ready_reason"}
+    try:
+        response = store._client().get(
+            store._rest(_TABLE),
+            params={"gym_id": f"eq.{account_key}",
+                    "post_date": f"in.({','.join(dates)})",
+                    "variant_status": "eq.active",
+                    "media_not_ready_reason": "not.is.null",
+                    "select": ",".join(sorted(fields)), "limit": "1000"},
+            headers=store._headers({"Prefer": "count=exact"}), timeout=30)
+        if response.status_code >= 400:
+            raise ValueError("held-slot read failed")
+        retained = response.json()
+        total = getattr(response, "headers", {}).get("Content-Range", "").rsplit("/", 1)[-1]
+        if not isinstance(retained, list) or not total.isdigit() or int(total) != len(retained):
+            raise ValueError("incomplete held-slot read")
+        if any(not isinstance(r, dict) or not fields.issubset(r)
+               or r["gym_id"] != account_key or r["post_date"] not in dates
+               or r["variant_status"] != "active" or r["media_not_ready_reason"] is None
+               for r in retained):
+            raise ValueError("invalid held-slot scope")
+        held = {_held_slot_key(r) for r in retained}
+        kept = [r for r in payload if r not in candidates or _held_slot_key(r) not in held]
+    except Exception as exc:
+        print(f"[calendar] held-slot read unconfirmed: {type(exc).__name__}; "
+              "active slot staging refused; retry required")
+        return [r for r in payload if r not in candidates]
+    dropped = len(payload) - len(kept)
+    if dropped:
+        print(f"[calendar] retained media holds refused {dropped} exact-slot proposal(s)")
+    return kept
+
 
 def _dedupe_slot_key(row):
     """The identity of a calendar row for duplicate purposes, or None when it cannot be

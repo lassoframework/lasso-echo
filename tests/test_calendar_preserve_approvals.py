@@ -101,6 +101,33 @@ def test_delete_month_full_wipe_when_preserve_off(monkeypatch):
     assert "or" not in params            # no status guard -> deletes everything
 
 
+def test_delete_month_preserves_media_hold_rows(monkeypatch):
+    """A wipeable-status row with a recorded media_not_ready_reason remains
+    held across rebuilds. The server-side is.null filter avoids a race with
+    another process applying the hold before the DELETE runs."""
+    http = _FakeHTTP(delete_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    pcs.SupabaseCalendarStore().delete_month("eng", "2026-08")
+    _, _, params, _, _ = next(call for call in http.calls
+                              if call[0] == "delete")
+    assert params["media_not_ready_reason"] == "is.null"
+    # gym/date scoping and the status guard are untouched alongside the hold guard
+    assert params["gym_id"] == "eq.eng"
+    assert params["or"] == "(status.is.null,status.in.(pending,draft,queued))"
+
+
+def test_delete_month_full_wipe_also_deletes_media_holds(monkeypatch):
+    """preserve_human=False is a deliberate full wipe: NO status guard and NO
+    media-hold guard, so rows held on media_not_ready_reason are deleted too."""
+    http = _FakeHTTP(delete_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    pcs.SupabaseCalendarStore().delete_month("eng", "2026-08", preserve_human=False)
+    _, _, params, _, _ = next(call for call in http.calls
+                              if call[0] == "delete")
+    assert "or" not in params
+    assert "media_not_ready_reason" not in params
+
+
 # ---- locked_slots --------------------------------------------------------
 
 def test_locked_slots_returns_only_human_owned(monkeypatch):
@@ -254,3 +281,177 @@ def test_client_apply_passes_locked_days_to_delete():
         "2026-08-01", "2026-08-12", "2026-08-18", "2026-08-31"))
     assert all(day not in preserved for day in (
         "2026-08-14", "2026-08-15", "2026-08-16", "2026-08-17"))
+
+
+class _StateHTTP:
+    """Model the actual DELETE predicates and the new counted held-slot read."""
+    def __init__(self, rows):
+        from copy import deepcopy
+        self.rows = deepcopy(rows)
+        self.calls = []
+        self.hold_read = None
+
+    def get(self, url, params=None, **kw):
+        from copy import deepcopy
+        params = params or {}
+        self.calls.append(('get', params))
+        if url.endswith('support_tickets'):
+            selected = []
+        else:
+            selected = [r for r in self.rows if
+                        r['gym_id'] == params['gym_id'][3:]
+                        and r.get('variant_status') == 'active']
+            dates = params.get('post_date', '')
+            if isinstance(dates, str) and dates.startswith('in.('):
+                wanted = set(dates[4:-1].split(','))
+                selected = [r for r in selected if r['post_date'] in wanted]
+            elif isinstance(dates, list):
+                selected = [r for r in selected if dates[0][4:] <= r['post_date'] <= dates[1][4:]]
+            if params.get('media_not_ready_reason') == 'not.is.null':
+                if self.hold_read is not None:
+                    return self.hold_read
+                selected = [r for r in selected if r['media_not_ready_reason'] is not None]
+        response = _Resp(200, deepcopy(selected))
+        response.headers = {'Content-Range': f'*/{len(selected)}'}
+        return response
+
+    def delete(self, url, params=None, **kw):
+        params = params or {}
+        self.calls.append(('delete', params))
+        bounds = params['post_date']
+        exclude = set(bounds[2][8:-1].split(',')) if len(bounds) == 3 else set()
+        removed = [r for r in self.rows if r['gym_id'] == params['gym_id'][3:]
+                   and bounds[0][4:] <= r['post_date'] <= bounds[1][4:]
+                   and r['post_date'] not in exclude and r['variant_status'] == 'active'
+                   and ('or' not in params or r['status'] is None or r['status'] in pcs._WIPEABLE_STATUSES)
+                   and ('media_not_ready_reason' not in params or r['media_not_ready_reason'] is None)]
+        self.rows = [r for r in self.rows if r not in removed]
+        return _Resp(200, removed)
+
+    def post(self, url, json=None, **kw):
+        from copy import deepcopy
+        import uuid
+        saved = [dict(r, id=str(uuid.uuid4()), variant_status=r.get('variant_status', 'active'),
+                      media_not_ready_reason=r.get('media_not_ready_reason'),
+                      time_slot=r.get('time_slot'), slot_index=r.get('slot_index')) for r in json]
+        self.calls.append(('post', deepcopy(saved)))
+        self.rows.extend(deepcopy(saved))
+        return _Resp(201, saved)
+
+
+def _persisted(**overrides):
+    row = dict(_row(), id='retained-uuid', variant_status='active', time_slot=None,
+               slot_index=None, image_url='https://cdn/rejected.jpg', caption='Old caption',
+               media_not_ready_reason='cross_date_media_repeat_needs_new_visual')
+    row.update(overrides)
+    return row
+
+
+def _state_store(monkeypatch, rows):
+    monkeypatch.setenv('AGENT_PLAN_HORIZON_DAYS', '0')
+    monkeypatch.setenv('AGENT_MEDIA_CROSS_DAY_GUARD', 'false')
+    monkeypatch.setenv('AGENT_EMPTY_CAPTION_GUARD', 'false')
+    monkeypatch.setenv('AGENT_CAPTION_COOLDOWN', 'false')
+    monkeypatch.setenv('AGENT_SLOT_DEDUPE', 'false')
+    http = _StateHTTP(rows)
+    store = pcs.SupabaseCalendarStore(url='https://proj.supabase.co', service_key='offline-test', http=http)
+    return store, http
+
+
+@pytest.mark.parametrize('account,fmt', [('instagram', 'feed'), ('googlebusiness', 'photo')])
+@pytest.mark.parametrize('status', ['pending', 'draft', None])
+def test_rebuild_retains_hold_and_refuses_changed_content_in_exact_slot(monkeypatch, account, fmt, status):
+    held = _persisted(account=account, format=fmt, status=status)
+    ready = _persisted(id='ready', post_date='2026-08-14', media_not_ready_reason=None)
+    store, http = _state_store(monkeypatch, [held, ready])
+    assert store.delete_month('eng', '2026-08') == 1
+    assert http.rows == [held]
+    proposal = dict(held, id='new-proposal', status='pending', caption='New generated caption',
+                    image_url='https://cdn/new.jpg', media_not_ready_reason=None)
+    assert store.insert_rows('eng', [proposal]) == []
+    assert http.rows == [held]
+    assert not any(method == 'post' for method, _ in http.calls)
+
+
+def test_held_slot_barrier_preserves_numbered_slots_time_slots_and_channel_siblings(monkeypatch):
+    held = _persisted(slot_index=0, time_slot='morning')
+    store, http = _state_store(monkeypatch, [held])
+    blocked = dict(held, caption='New caption', media_not_ready_reason=None)
+    allowed = [dict(blocked, slot_index=1), dict(blocked, slot_index=None),
+               dict(blocked, account='facebook'), dict(blocked, time_slot='evening'),
+               dict(blocked, format='photo'), dict(blocked, post_date='2026-08-14')]
+    result = store.insert_rows('eng', [blocked] + allowed)
+    assert len(result) == len(allowed)
+    assert {pcs._held_slot_key(r) for r in result} == {pcs._held_slot_key(r) for r in allowed}
+    assert http.rows[0] == held
+
+
+def test_null_slot_fields_are_exact_and_not_inferred_as_morning_or_zero(monkeypatch):
+    held = _persisted()
+    store, http = _state_store(monkeypatch, [held])
+    proposal = dict(held, media_not_ready_reason=None)
+    assert len(store.insert_rows('eng', [proposal, dict(proposal, time_slot='morning'),
+                                       dict(proposal, slot_index=0)])) == 2
+    assert http.rows[0] == held
+
+
+def test_deliberate_full_wipe_removes_hold_and_then_allows_exact_slot(monkeypatch):
+    held = _persisted()
+    foreign = _persisted(id='foreign', gym_id='other')
+    archived = _persisted(id='archived', variant_status='archived')
+    outside = _persisted(id='outside', post_date='2026-09-01')
+    store, http = _state_store(monkeypatch, [held, foreign, archived, outside])
+    assert store.delete_month('eng', '2026-08', preserve_human=False) == 1
+    assert http.rows == [foreign, archived, outside]
+    assert len(store.insert_rows('eng', [dict(held, media_not_ready_reason=None)])) == 1
+
+
+@pytest.mark.parametrize('failure', ['http', 'missing_count', 'partial', 'missing_fields', 'malformed', 'foreign'])
+def test_uncertain_held_slot_read_refuses_feed_and_gbp_staging(monkeypatch, failure):
+    store, http = _state_store(monkeypatch, [])
+    response = _Resp(503 if failure == 'http' else 200, [])
+    response.headers = {'Content-Range': '*/0'}
+    if failure == 'missing_count':response.headers = {}
+    if failure == 'partial':response.headers = {'Content-Range': '0-0/2'}
+    if failure == 'missing_fields':response._payload = [{'gym_id': 'eng'}];response.headers = {'Content-Range': '0-0/1'}
+    if failure == 'malformed':response._payload = [_persisted() | {'slot_index': []}];response.headers = {'Content-Range': '0-0/1'}
+    if failure == 'foreign':response._payload = [_persisted(gym_id='other')];response.headers = {'Content-Range': '0-0/1'}
+    http.hold_read = response
+    assert store.insert_rows('eng', [dict(_persisted(), media_not_ready_reason=None),
+                                    dict(_persisted(account='googlebusiness', format='photo'), media_not_ready_reason=None)]) == []
+    assert http.rows == []
+
+
+def test_barrier_does_not_block_story_recovery_or_candidate_variants(monkeypatch):
+    store, _ = _state_store(monkeypatch, [_persisted()])
+    proposed = [dict(_persisted(), format='story', media_not_ready_reason=None),
+                dict(_persisted(), variant_status='candidate', media_not_ready_reason=None)]
+    assert pcs._preserve_held_slots(store, 'eng', proposed) == proposed
+
+
+@pytest.mark.parametrize('fmt', ['feed', 'update', 'story', None])
+def test_held_slot_barrier_applies_to_every_exact_format(monkeypatch, fmt):
+    held = _persisted(format=fmt)
+    store, _ = _state_store(monkeypatch, [held])
+    blocked = dict(held, caption='New generated caption', media_not_ready_reason=None)
+    sibling = dict(blocked, slot_index=1)
+    assert pcs._preserve_held_slots(store, 'eng', [blocked, sibling]) == [sibling]
+
+
+@pytest.mark.parametrize('account,fmt', [('instagram', 'feed'), ('googlebusiness', 'update')])
+def test_client_apply_data_state_keeps_hold_replaces_ready_and_reports_real_delete_count(monkeypatch, account, fmt):
+    from datetime import date
+    from agent.client_month_run import _apply
+    from agent import cadence
+    held = _persisted(account=account, format=fmt, time_slot='evening')
+    ready = _persisted(id='ready', post_date='2026-08-14', media_not_ready_reason=None)
+    store, http = _state_store(monkeypatch, [held, ready])
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 1)
+    proposals = [dict(held, media_not_ready_reason=None, caption='New held-slot proposal'),
+                 dict(ready, caption='New ready-slot caption')]
+    result = _apply('eng', proposals, date(2026, 8, 13), 19, store, lambda m: None)
+    assert result['ok'] is True
+    assert result['deleted'] == result['deleted_total'] == result['inserted'] == 1
+    assert http.rows[0] == held
+    assert len(http.rows) == 2 and http.rows[1]['caption'] == 'New ready-slot caption'
+    assert http.rows[1]['id'] != ready['id']

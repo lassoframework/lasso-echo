@@ -16,6 +16,7 @@ attach once the Phase 2 migration lands (gbp_* columns + gym_gbp_connections). T
 thin wrappers over these pure functions.
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 
 from . import config, gbp
@@ -112,11 +113,15 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
         if hold:
             return {"ok": False, "status": "approved", "late_post_id": "",
                     "reject_reason": hold, "held": "media_reuse", "mode": ""}
-    # §7.2 / G7: ONE retry on a TRANSIENT transport error at SEND time. A send that raised
-    # never went live, so re-sending once cannot double-post (unlike a reconcile re-send).
-    # A policy/other error is NOT retried (it would just fail again). Second failure -> the
-    # caller's failed path.
+    # A transport exception does not prove that Zernio rejected the create. It may
+    # have accepted the post before the response was lost. Never issue a second
+    # create or release the claimed row until provider readback resolves it.
     from .zernio import post_id_of
+
+    def _ambiguous(reason):
+        return {"ok": False, "status": "publishing", "late_post_id": "",
+                "reject_reason": reason, "held": "ambiguous_send", "mode": ""}
+
 
     def _dedup_success(exc):
         """Zernio 409 = its 24h content-hash dedup: this exact content ALREADY posted.
@@ -126,38 +131,58 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
         if getattr(exc, "status", None) != 409:
             return None
         from .zernio_publisher import _existing_post_id
+        existing = _existing_post_id(getattr(exc, "detail", ""))
+        if not existing:
+            return _ambiguous("Zernio duplicate response omitted the existing post id")
         return {"ok": True, "status": "published",
-                "late_post_id": _existing_post_id(getattr(exc, "detail", "")),
+                "late_post_id": existing,
                 "reject_reason": "", "mode": "draft" if draft else "live",
                 "dedup": True}
 
     try:
         resp = client.create_post_raw(payload, draft=draft)
-    except Exception as e1:  # noqa: BLE001
-        dedup = _dedup_success(e1)
+    except Exception as exc:  # noqa: BLE001
+        dedup = _dedup_success(exc)
         if dedup:
             return dedup
-        if not _is_transient_error(e1):
+        no_post = _no_post_validation(exc)
+        if no_post is not None:
             return {"ok": False, "status": "failed", "late_post_id": "",
-                    "reject_reason": _plain_reason(str(e1)) or "send error", "mode": ""}
-        try:
-            resp = client.create_post_raw(payload, draft=draft)   # the one retry
-        except Exception as e2:  # noqa: BLE001
-            dedup = _dedup_success(e2)
-            if dedup:
-                return dedup
+                    "reject_reason": no_post, "mode": ""}
+        if getattr(exc, "definitive_no_post", False):
             return {"ok": False, "status": "failed", "late_post_id": "",
-                    "reject_reason": "Google could not publish this post after a retry.",
-                    "mode": ""}
-    return {"ok": True, "status": "published", "late_post_id": post_id_of(resp),
+                    "reject_reason": _plain_reason(str(exc)) or "send error", "mode": ""}
+        return _ambiguous(f"Zernio create outcome unknown: {type(exc).__name__}")
+    post_id = post_id_of(resp)
+    if not post_id:
+        return _ambiguous("Zernio create returned no post id")
+    return {"ok": True, "status": "published", "late_post_id": post_id,
             "reject_reason": "", "mode": "draft" if draft else "live"}
 
 
-def _is_transient_error(exc):
-    """True when an exception's text looks like a transient transport error (5xx / timeout
-    / rate limit) that a single retry might clear — never a policy rejection."""
-    low = str(exc or "").lower()
-    return any(w in low for w in _TRANSPORT_WORDS)
+def _no_post_validation(exc):
+    """Per Zernio error-handling docs, branch on the stable JSON envelope type/code,
+    never on error text. A received ZernioError with HTTP 400 or 422 AND a parsed JSON
+    detail body whose type is 'invalid_request_error' proves validation/precondition
+    failure — the create was rejected and NOTHING was stored. That is the only
+    conclusive no-post branch: 409 is handled separately when it names an existing post,
+    platform_error may be provider-side, 429/5xx are transient, and an unparseable
+    body stays ambiguous."""
+    from .zernio import ZernioError
+    if not isinstance(exc, ZernioError):
+        return None
+    if exc.status not in (400, 422):
+        return None
+    try:
+        body = json.loads(exc.detail)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    if body.get("type") != "invalid_request_error":
+        return None
+    reason = body.get("message") or body.get("code") or "invalid request"
+    return f"zernio validation rejected the create: {_plain_reason(str(reason))}"
 
 
 # --- §7.2 reconcile classifier --------------------------------------------
@@ -422,6 +447,14 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                 continue
             if res.get("held"):
                 held += 1
+                if res["held"] == "ambiguous_send":
+                    # Keep the durable publishing claim. Only provider readback
+                    # can decide whether this attempt was delivered.
+                    if alert:
+                        alert(f"GBP send outcome unknown for {gym} row {row.get('id')}; "
+                              "publishing claim retained for manual provider readback. "
+                              f"{res.get('reject_reason') or ''}")
+                    continue
                 if claim is not None:
                     # release the claim: a held row (needs_reconnect etc.) must go back
                     # to 'approved' so it retries once the hold clears, never strand in

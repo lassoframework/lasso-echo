@@ -111,9 +111,10 @@ def test_is_blocked_combines_cooldown_and_verbatim():
 # ---------------------------------------------------------------------------
 
 class _FakeResp:
-    def __init__(self, payload):
-        self.status_code = 201
+    def __init__(self, payload, status_code=201, headers=None):
+        self.status_code = status_code
         self._payload = payload
+        self.headers = dict(headers or {})
         self.text = ""
 
     def json(self):
@@ -131,9 +132,10 @@ class _FakeHTTP:
         return _FakeResp(list(json or []))
 
     def get(self, url, headers=None, params=None, timeout=None):
-        # Story reconciliation reads the calendar before inserting a fresh slot.
-        # This fixture starts with an empty calendar.
-        return _FakeResp([])
+        # The fail-closed held-slot read (Prefer count=exact) requires a
+        # COMPLETE empty response: 200 + Content-Range */0 certifying zero
+        # retained holds on this empty calendar fixture.
+        return _FakeResp([], status_code=200, headers={"Content-Range": "*/0"})
 
 
 def _store(http):
