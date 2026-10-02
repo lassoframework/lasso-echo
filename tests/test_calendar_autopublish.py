@@ -773,12 +773,16 @@ def test_due_rows_rest_filter():
 
 def test_mark_publishing_atomic_claim_params_and_true_on_one_row():
     # PostgREST returned exactly one representation row -> the claim was won.
-    http = _RecordingHTTP(patch_resp=_Resp(200, [{"id": "a", "status": "publishing"}]))
+    # The media-hold prefetch GET sees a ready row, so the claim PATCH proceeds.
+    http = _RecordingHTTP(
+        get_resp=_Resp(200, [{"id": "a", "image_url": "https://cdn/x.jpg",
+                              "media_not_ready_reason": None}]),
+        patch_resp=_Resp(200, [{"id": "a", "status": "publishing"}]))
     store = _store(http)
     won = store.mark_publishing("a")
 
     assert won is True
-    _, _url, params, _headers, body = http.calls[0]
+    _, _url, params, _headers, body = [c for c in http.calls if c[0] == "patch"][0]
     # the conditional claim: unclaimed (pending OR client-approved) + unpublished ONLY.
     # 'approved' became claimable with the Zernio client lane (a client approves BEFORE
     # the publish lane picks the row up); exactly-once holds because a claimed row is
