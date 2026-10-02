@@ -399,8 +399,8 @@ def test_g5_publish_inside_window_sends():
     assert out["published"] == 1 and store.published
 
 
-def test_g7_send_time_transient_retry_succeeds():
-    # a transient error at SEND raises once, the ONE retry succeeds -> published.
+def test_g7_send_time_transport_error_holds_without_retry():
+    # The first create may have succeeded despite a lost response.
     calls = {"n": 0}
 
     class _C:
@@ -408,22 +408,29 @@ def test_g7_send_time_transient_retry_succeeds():
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("502 temporarily unavailable")
-            return {"_id": "zpNew", "post": {"platforms": [
-                {"platform": "googlebusiness", "status": "published"}]}}
     res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
-    assert res["ok"] and res["status"] == "published" and calls["n"] == 2
+    assert not res["ok"] and res["status"] == "publishing"
+    assert res["held"] == "ambiguous_send" and calls["n"] == 1
 
 
-def test_g7_send_time_second_failure_is_failed():
+def test_g7_timeout_keeps_claim_and_alerts_without_false_published_stamp():
+    calls = {"n": 0}
     class _C:
         def create_post_raw(self, payload, **k):
-            raise RuntimeError("request timeout")     # both the send and the retry fail
-    res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
-    assert res["ok"] is False and res["status"] == "failed"
-    assert "after a retry" in res["reject_reason"]
+            calls["n"] += 1
+            raise RuntimeError("request timeout")
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _ClaimStore([row], {"lasso": [_c()]})
+    alerts = []
+    out = gw.publish_due_gbp(store, _C(), run_date="2026-09-01", draft=False,
+                             alert=alerts.append)
+    assert calls["n"] == 1 and out["held"] == 1
+    assert store.claims == ["r1"]
+    assert store.status == [] and store.failed == [] and store.published == []
+    assert any("outcome unknown" in message for message in alerts)
 
 
-def test_g7_policy_send_error_not_retried():
+def test_g7_post_create_error_without_no_post_proof_is_ambiguous():
     calls = {"n": 0}
 
     class _C:
@@ -431,7 +438,107 @@ def test_g7_policy_send_error_not_retried():
             calls["n"] += 1
             raise RuntimeError("policy violation: phone number in post")
     res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
-    assert res["ok"] is False and calls["n"] == 1     # a policy error is NOT retried
+    assert res["held"] == "ambiguous_send" and calls["n"] == 1
+
+
+def test_g7_zernio_400_invalid_request_error_is_conclusive_failed():
+    from agent.zernio import ZernioError
+    calls = {"n": 0}
+
+    class _C:
+        def create_post_raw(self, payload, **k):
+            calls["n"] += 1
+            raise ZernioError(400, '{"type": "invalid_request_error",'
+                                   ' "code": "invalid_field", "message": "bad location id"}')
+    res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
+    assert res["status"] == "failed" and not res.get("held")
+    assert "invalid_request_error" in res["reject_reason"] or "validation" in res["reject_reason"]
+    assert calls["n"] == 1  # one POST only; never a second create
+
+
+def test_g7_zernio_422_invalid_request_error_is_conclusive_failed():
+    from agent.zernio import ZernioError
+    calls = {"n": 0}
+
+    class _C:
+        def create_post_raw(self, payload, **k):
+            calls["n"] += 1
+            raise ZernioError(422, '{"type": "invalid_request_error",'
+                                   ' "code": "unprocessable", "message": "image url unreachable"}')
+    res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
+    assert res["status"] == "failed" and not res.get("held")
+    assert calls["n"] == 1
+
+
+def test_g7_zernio_409_idempotency_conflict_not_classified_as_no_post():
+    from agent.zernio import ZernioError
+    calls = {"n": 0}
+
+    class _C:
+        def create_post_raw(self, payload, **k):
+            calls["n"] += 1
+            raise ZernioError(409, '{"type": "idempotency_conflict"}')
+    res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
+    assert res["held"] == "ambiguous_send" and calls["n"] == 1
+
+
+def test_g7_zernio_400_platform_error_stays_ambiguous():
+    from agent.zernio import ZernioError
+    calls = {"n": 0}
+
+    class _C:
+        def create_post_raw(self, payload, **k):
+            calls["n"] += 1
+            raise ZernioError(400, '{"type": "platform_error", "message": "google flaked"}')
+    res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
+    assert res["held"] == "ambiguous_send" and calls["n"] == 1
+
+
+def test_g7_zernio_429_and_5xx_stay_ambiguous():
+    from agent.zernio import ZernioError
+    for status, body in ((429, '{"type": "invalid_request_error", "message": "slow down"}'),
+                         (503, '{"type": "invalid_request_error", "message": "down"}')):
+        calls = {"n": 0}
+
+        class _C:
+            def create_post_raw(self, payload, **k):
+                calls["n"] += 1
+                raise ZernioError(status, body)
+        res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
+        assert res["held"] == "ambiguous_send" and calls["n"] == 1
+
+
+def test_g7_zernio_400_malformed_body_stays_ambiguous():
+    from agent.zernio import ZernioError
+    calls = {"n": 0}
+
+    class _C:
+        def create_post_raw(self, payload, **k):
+            calls["n"] += 1
+            raise ZernioError(400, "bad request")
+    res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
+    assert res["held"] == "ambiguous_send" and calls["n"] == 1
+
+
+def test_g7_explicit_no_post_exception_remains_failed():
+    class _NoPostError(RuntimeError):
+        definitive_no_post = True
+    class _C:
+        def create_post_raw(self, payload, **k):
+            raise _NoPostError("pre-network rejection")
+    res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
+    assert res["status"] == "failed" and not res.get("held")
+
+
+def test_g7_unparseable_create_response_holds_without_published_stamp():
+    class _C:
+        def create_post_raw(self, payload, **k):
+            return {"post": {"status": "pending"}}
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _ClaimStore([row], {"lasso": [_c()]})
+    out = gw.publish_due_gbp(store, _C(), run_date="2026-09-01", draft=False)
+    assert out["held"] == 1 and store.published == []
+    assert store.failed == [] and store.status == []
 
 
 def test_g7_reconcile_transient_keeps_polling_never_resends():
@@ -529,6 +636,18 @@ def test_zernio_409_dedup_is_success_not_failure():
     assert out["ok"] and out["status"] == "published"
     assert out["late_post_id"] == "zdup_1"
     assert out.get("dedup") is True
+
+
+def test_zernio_409_without_existing_id_holds_claim():
+    from agent.zernio import ZernioError
+    class _C:
+        def create_post_raw(self, payload, **k):
+            raise ZernioError(409, '{"error":"duplicate"}')
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _ClaimStore([row], {"lasso": [_c()]})
+    out = gw.publish_due_gbp(store, _C(), run_date="2026-09-01", draft=False)
+    assert out["held"] == 1
+    assert store.published == [] and store.failed == [] and store.status == []
 
 
 class _ClaimStore(_Store):
