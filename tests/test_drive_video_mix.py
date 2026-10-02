@@ -418,11 +418,13 @@ def test_swap_media_carries_thumbnail_and_asset_id_and_nothing_else(monkeypatch)
     assert params["status"] == "in.(pending,coach_review)"
     assert payload == {"image_url": "https://cdn/squat.mp4",
                        "thumbnail_url": "https://cdn/squat__poster.jpg",
-                       "source_media_asset_id": "v1"}, "status/caption must never ride along"
+                       "source_media_asset_id": "v1",
+                       "media_not_ready_reason": None}, "status/caption must never ride along"
     # clearing: None values are sent so a stale poster / asset id is nulled
     http.calls.clear()
     pcs.SupabaseCalendarStore().swap_media(
         "tt", "id-m", "https://cdn/new.jpg",
         extra_fields={"thumbnail_url": None, "source_media_asset_id": None})
     assert http.calls[0][4] == {"image_url": "https://cdn/new.jpg",
-                                "thumbnail_url": None, "source_media_asset_id": None}
+                                "thumbnail_url": None, "source_media_asset_id": None,
+                                "media_not_ready_reason": None}
