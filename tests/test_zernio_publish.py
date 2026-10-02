@@ -17,6 +17,7 @@ Asserts:
 
 import os
 import sys
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -214,6 +215,34 @@ def test_publish_ig_resolves_and_posts(monkeypatch):
     assert call["page_id"] is None                        # IG has no page
     assert call["platform"] == "instagram"                # platforms[] entry
     assert call["story"] is False                         # feed, not story
+
+
+def test_publish_refuses_instagram_handle_that_differs_from_gym_intake(monkeypatch):
+    _arm(monkeypatch)
+    client = FakeZernioClient(accounts={"accounts": [
+        {"_id": "personal", "platform": "instagram",
+         "metadata": {"profileData": {"username": "alexkonicke"}}},
+    ]})
+    with pytest.raises(zernio_publisher.ZernioPublishError,
+                       match="@alexkonicke.*@crossfitchateau"):
+        zernio_publisher.publish(
+            _draft(), _ig_account("crossfitchateau813e78"), client=client,
+            profile_resolver=lambda _: "chateau_profile",
+            expected_handle_resolver=lambda _: "CrossFitChateau")
+    assert client.created == []
+
+
+def test_publish_allows_verified_gym_instagram_handle(monkeypatch):
+    _arm(monkeypatch)
+    client = FakeZernioClient(accounts={"accounts": [
+        {"_id": "gym", "platform": "instagram",
+         "metadata": {"profileData": {"username": "crossfitchateau"}}},
+    ]})
+    result = zernio_publisher.publish(
+        _draft(), _ig_account("crossfitchateau813e78"), client=client,
+        profile_resolver=lambda _: "chateau_profile",
+        expected_handle_resolver=lambda _: "@CrossFitChateau")
+    assert result.ok and client.created[0]["account_id"] == "gym"
 
 
 def test_publish_story_flows_content_type_and_no_caption(monkeypatch):
