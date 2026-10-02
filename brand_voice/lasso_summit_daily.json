@@ -1,0 +1,823 @@
+{
+  "campaign": "LASSO Growth Summit daily feed addition",
+  "date_range": {
+    "start": "2026-09-23",
+    "end": "2026-11-08"
+  },
+  "cadence": "One additional Summit feed post each day alongside two regular feed posts, with a third feed post on November 7 and November 8.",
+  "sources": [
+    {
+      "name": "Summit campaign brief",
+      "path": "brand_voice/knowledge/04_summit_campaign.md",
+      "used_for": "Event identity, November 7 and 8 dates, Virgin Hotels Nashville, 100-seat capacity, and complete 2027 growth playbook."
+    },
+    {
+      "name": "User creative ruling",
+      "reference": "2026-09-23",
+      "used_for": "People-first daily creative, approved urgency sentence, varied color and composition, and event-day limits."
+    },
+    {
+      "name": "Live Instagram reference",
+      "url": "https://www.instagram.com/p/DdTm-FwDlCL/",
+      "checked_on": "2026-09-23",
+      "used_for": "Bold condensed black and red type, small LASSO wordmark, restrained editorial treatment, and clear event hierarchy."
+    }
+  ],
+  "creative_direction": "AI promotional illustration of generic fitness-business owners, never actual attendees or live event reportage. Use authentic-looking mixed adults in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, in groups of two to six around conference worktables, breakout conversations, notebooks, and planning materials. Rotate portrait, wide, table close, and small-group perspectives. Use bold condensed LASSO typography, a small LASSO wordmark, and a clear lockup with the event identity, date, venue, and CTA URL. Favor rich red, navy, sky, coral, warm cream, and black in varied proportions. No business suits, bodybuilding training, empty-chair renders, chrome, neon, or named people.",
+  "visual_concepts": [
+    {
+      "id": "table_plan",
+      "direction": "Portrait crop of three owners marking a shared 2027 plan at a navy table."
+    },
+    {
+      "id": "breakout_pair",
+      "direction": "Wide two-person breakout conversation beside a coral paper wall and notebooks."
+    },
+    {
+      "id": "workbook_close",
+      "direction": "Table-level close crop of hands, sneakers, notebooks, and a red planning card."
+    },
+    {
+      "id": "window_group",
+      "direction": "Four-person small group near hotel windows with warm architectural light."
+    },
+    {
+      "id": "standing_huddle",
+      "direction": "Three owners in a casual standing huddle over a sky-blue workshop board."
+    },
+    {
+      "id": "audience_circle",
+      "direction": "Five-person semicircle listening and taking notes, with no stage or venue claim."
+    },
+    {
+      "id": "note_exchange",
+      "direction": "Two operators trading marked-up notebook pages at a cream and navy table."
+    },
+    {
+      "id": "plan_review",
+      "direction": "Six-person worktable review with red folders, coffee, and natural conversation."
+    },
+    {
+      "id": "arrival_walk",
+      "direction": "Portrait walking conversation of two casually dressed owners carrying notebooks in a generic hotel corridor."
+    },
+    {
+      "id": "day_workshop",
+      "direction": "Generic promotional workshop scene, never presented as live event coverage."
+    }
+  ],
+  "posts": [
+    {
+      "date": "2026-09-23",
+      "visual_concept": "table_plan",
+      "caption": "A stronger 2027 begins when the plan leaves your head and reaches the table. Build yours at the LASSO Growth Summit in Nashville. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Build the next year",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait, three generic gym owners in unbranded workout attire marking one shared notebook. Matte cream with black type, rich red date block, small LASSO wordmark. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-09-24",
+      "visual_concept": "breakout_pair",
+      "caption": "Seats are selling fast. Get your tickets now. Two days in Nashville can give your next year real shape. Meet serious gym owners at the LASSO Growth Summit on November 7 and 8. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Seats are selling fast.",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get your tickets now.",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Wide two-person breakout, casual hoodies and joggers, coral wall and navy table. Bold condensed black and red headline. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-09-25",
+      "visual_concept": "workbook_close",
+      "caption": "Your 2027 plan deserves more than a tab left open. Bring the real questions to Nashville and build a complete growth playbook. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Put the work down",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Table close of diverse hands, pens, unbranded sleeves and notebooks. Sky field, red paper edge, warm cream type panel. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-09-26",
+      "visual_concept": "window_group",
+      "caption": "The best ideas get sharper in a room built for operators. Join us at Virgin Hotels Nashville for the LASSO Growth Summit. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Get in the room",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Four-owner window group, leggings, T-shirts, sneakers, notebooks. Navy ground with coral and cream typography. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-09-27",
+      "visual_concept": "standing_huddle",
+      "caption": "Good growth plans have a point of view. Find yours with 100 serious operators in Nashville this November. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Find your next move",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Three-person standing huddle around a sky workshop board. Red headline, compact black event lockup. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-09-28",
+      "visual_concept": "audience_circle",
+      "caption": "A complete 2027 growth playbook is easier to build beside people doing the work too. Join the LASSO Growth Summit in Nashville. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Build beside operators",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Five-person listening circle in fitness casualwear, seen from an elevated angle. Coral field, navy type, cream details. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-09-29",
+      "visual_concept": "note_exchange",
+      "caption": "The right conversation can change the way you see your gym. Make space for it on November 7 and 8 in Nashville. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Bring better questions",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait pair exchanging marked-up notebook pages. Warm cream, black, and restrained red editorial layout. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-09-30",
+      "visual_concept": "plan_review",
+      "caption": "A room of 100 serious operators is a useful place to pressure-test the plan. See you at the LASSO Growth Summit in Nashville. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Pressure-test the plan",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Wide six-person table review, red folders and navy tabletop. Keep people generic and promotional. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-01",
+      "visual_concept": "arrival_walk",
+      "caption": "Seats are selling fast. Get your tickets now. October is the moment to choose what kind of year you want to build. Start with two days at the LASSO Growth Summit. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Seats are selling fast.",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get your tickets now.",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait walking conversation between two gym owners in casual athletic clothes. Sky background, coral date block, black headline. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-02",
+      "visual_concept": "table_plan",
+      "caption": "Your plan needs a calendar, a table, and people who will challenge it. Find all three in Nashville this November. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Give the plan a table",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait trio at a planning table, red and cream papers over deep navy. Small LASSO wordmark. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-03",
+      "visual_concept": "breakout_pair",
+      "caption": "Growth looks different when you can talk it through with another owner. Join the conversation at the LASSO Growth Summit. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Talk through the work",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Wide pair in casual workout attire, a notebook open between them. Matte coral and navy composition. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-04",
+      "visual_concept": "workbook_close",
+      "caption": "The gym owner who plans early gets more choices later. Bring your next moves to Nashville on November 7 and 8. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Plan before the rush",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Close tabletop with hands annotating a calendar, sneakers tucked under table. Cream base, red rules, black condensed headline. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-05",
+      "visual_concept": "window_group",
+      "caption": "A weekend away from the daily grind can bring the business back into focus. Join the LASSO Growth Summit in Nashville. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Step back. See more.",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Four-person workshop group by windows, bright sky and warm cream palette with a rich red headline band. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-06",
+      "visual_concept": "standing_huddle",
+      "caption": "Your next level needs a plan your whole team can understand. Build the foundation at the LASSO Growth Summit. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Make growth clearer",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Three generic owners standing around a workshop board, unbranded hoodies and leggings. Navy, sky, and coral blocks. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-07",
+      "visual_concept": "audience_circle",
+      "caption": "The room matters when you are working on the next chapter. Spend November 7 and 8 with serious operators in Nashville. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "The room changes things",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Small audience circle from table height, natural gestures and notebooks. Rich red floor, cream lockup, black type. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-08",
+      "visual_concept": "note_exchange",
+      "caption": "Seats are selling fast. Get your tickets now. Bring the questions that have been sitting in the back of your notebook. Nashville is where the next version of the plan begins. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Seats are selling fast.",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get your tickets now.",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Two owners pass notes across a sky-blue table. Condensed red headline and small black LASSO lockup. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-09",
+      "visual_concept": "plan_review",
+      "caption": "Two days. One focused room. A complete 2027 growth playbook to take home. Join the LASSO Growth Summit in Nashville. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Make the weekend count",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Wide group around a worktable with visible planning pages, navy and warm cream with a red graphic anchor. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-10",
+      "visual_concept": "arrival_walk",
+      "caption": "Nashville is the destination. A clearer growth plan is the reason. Join us November 7 and 8 at Virgin Hotels Nashville. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Make Nashville useful",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait duo walking and talking with notebooks, generic hotel architecture only. Coral background, black headline, sky detail. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-11",
+      "visual_concept": "table_plan",
+      "caption": "The next year will arrive either way. Meet it with a plan built alongside 100 serious operators. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Meet 2027 prepared",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait group planning around red and cream worksheets. Black condensed type over navy shape. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-12",
+      "visual_concept": "breakout_pair",
+      "caption": "A fresh perspective can make an old problem move. Find that perspective at the LASSO Growth Summit in Nashville. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "See the problem differently",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Wide two-person chat, casual fitness wear, coral notebook and cream chair. No suits, no staged testimonial pose. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-13",
+      "visual_concept": "workbook_close",
+      "caption": "Big goals need more than motivation. They need a sequence. Build yours in Nashville this November. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Turn goals into sequence",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Table close of multi-colored planning cards, hands, notebook margin and athletic sleeves. Sky and navy with red type. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-14",
+      "visual_concept": "window_group",
+      "caption": "Your gym is worth a weekend spent building the next version of it. Join the LASSO Growth Summit at Virgin Hotels Nashville. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Give your gym the weekend",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Four-person conversation near windows, warm cream, navy shadows, coral date tab and small LASSO wordmark. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-15",
+      "visual_concept": "standing_huddle",
+      "caption": "Seats are selling fast. Get your tickets now. When the plan gets specific, the next step gets easier. Work on both at the LASSO Growth Summit. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Seats are selling fast.",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get your tickets now.",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Three-person huddle over a red planning board. Dark navy background, cream event facts, black and red headline. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-16",
+      "visual_concept": "audience_circle",
+      "caption": "The best operators keep learning in public. Join a room made for that kind of work in Nashville. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Keep learning in public",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Five-owner group listening with notebooks, table-level perspective. Sky and coral with matte black type. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-17",
+      "visual_concept": "note_exchange",
+      "caption": "The plan becomes real when you can explain it across the table. Come build that clarity in Nashville. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Make the plan shareable",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait exchange of notebook pages between two owners. Cream surface, navy footer, red headline and LASSO wordmark. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-18",
+      "visual_concept": "plan_review",
+      "caption": "A room full of people who understand the work is a powerful place to build. Join us November 7 and 8. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Build with people who get it",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Wide six-person table review, diverse adults in unbranded athletic clothes. Red tabletop accent, navy and cream editorial fields. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-19",
+      "visual_concept": "arrival_walk",
+      "caption": "The work you do in Nashville can shape the decisions you make all year. Join the LASSO Growth Summit. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Make the next decision easier",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait arrival conversation, notebook in hand, generic modern corridor. Sky field with black and red condensed typography. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-20",
+      "visual_concept": "table_plan",
+      "caption": "Seats are selling fast. Get your tickets now. Build a complete 2027 growth playbook at the LASSO Growth Summit in Nashville. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Seats are selling fast.",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get your tickets now.",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait trio actively building a plan at a navy table, red headline and cream event information panel. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-21",
+      "visual_concept": "breakout_pair",
+      "caption": "Two focused days in Nashville can reset how you approach growth. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Make room for momentum",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Wide breakout pair with coffee and notebooks, coral background, navy event lockup, bold black type. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-22",
+      "visual_concept": "workbook_close",
+      "caption": "Bring your planning notebook to Nashville and leave with a clearer playbook. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Bring the notebook",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Table close of marked-up notebook and hands in casual athletic sleeves, sky and rich red composition. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-23",
+      "visual_concept": "window_group",
+      "caption": "Spend November 7 and 8 around operators who are building on purpose. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Build on purpose",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Four-person window group around planning materials. Navy, cream, and coral blocks with small LASSO wordmark. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-24",
+      "visual_concept": "standing_huddle",
+      "caption": "Seats are selling fast. Get your tickets now. The next year needs more than good intentions. Work the plan in Nashville. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Seats are selling fast.",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get your tickets now.",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Standing three-person huddle over a sky board, red type against warm cream, navy footer. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-25",
+      "visual_concept": "audience_circle",
+      "caption": "A better growth plan is waiting for the room where it gets tested. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Test the plan in room",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Five-person listening circle, natural conference-workshop moment. Coral base, black condensed headline, cream facts. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-26",
+      "visual_concept": "note_exchange",
+      "caption": "Let a sharper conversation shape the next version of your gym. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Make the conversation count",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait pair passing notes at a small table, navy and sky with a rich red event date strip. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-27",
+      "visual_concept": "plan_review",
+      "caption": "Seats are selling fast. Get your tickets now. Join 100 serious operators for two days of focused planning in Nashville. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Seats are selling fast.",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get your tickets now.",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Wide six-person plan review, unbranded workout attire, cream and navy composition with a red headline block. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-28",
+      "visual_concept": "arrival_walk",
+      "caption": "The summit is close enough to put on the calendar and far enough to prepare your best questions. Join us in Nashville. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Bring your best questions",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait walking pair carrying notebooks, generic interior architecture. Red, warm cream, and black editorial type. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-29",
+      "visual_concept": "table_plan",
+      "caption": "Your gym does not need another vague goal. It needs a 2027 growth playbook built for the work ahead. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Trade vague for useful",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait three-person worktable, bold black headline over cream with navy and coral planning materials. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-30",
+      "visual_concept": "breakout_pair",
+      "caption": "A weekend of real strategy can create months of better decisions. Meet us at Virgin Hotels Nashville on November 7 and 8. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Make strategy practical",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Wide two-person strategy talk, T-shirts and joggers, sky background with navy type and red date marker. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-10-31",
+      "visual_concept": "workbook_close",
+      "caption": "November is almost here. Make the work you do before the year ends count for the year ahead. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Make November useful",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Close notebook spread with hand-drawn planning marks, sneakers at table edge. Coral and cream with black condensed type. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-11-01",
+      "visual_concept": "window_group",
+      "caption": "This week in Nashville. Bring the questions that deserve more than a quick answer and build the next plan with us. Get tickets at lassoframework.com/summit",
+      "on_image": {
+      "headline": "This week in Nashville",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Four-person planning group by windows, no event-reportage implication. Navy field, red headline, cream facts. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-11-02",
+      "visual_concept": "standing_huddle",
+      "caption": "Seats are selling fast. Get your tickets now. The calendar is about to turn. Give your gym a plan with enough detail to use on Monday. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Seats are selling fast.",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get your tickets now.",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Three-owner huddle around a workshop board, deep red background with sky and cream accents. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-11-03",
+      "visual_concept": "audience_circle",
+      "caption": "The LASSO Growth Summit puts serious operators in one place for two focused days. Nashville is this Saturday and Sunday. Claim your seat at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Two days. One useful room.",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Claim your seat",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Five-person circle listening and taking notes, perspective from behind a notebook. Cream, navy, and coral. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-11-04",
+      "visual_concept": "note_exchange",
+      "caption": "The right plan makes the next conversation with your team easier. Build it at the LASSO Growth Summit this weekend. Get tickets at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Set up the next conversation",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Get tickets",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait pair with notes and a red folder, casual athletic wear. Bold black type and compact LASSO lockup. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-11-05",
+      "visual_concept": "plan_review",
+      "caption": "Two days until the LASSO Growth Summit. Make Nashville the place where your 2027 growth playbook gets built. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Two days to the plan",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Wide six-person planning review, generic promotional scene only. Sky base, navy type, red CTA block. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-11-06",
+      "visual_concept": "arrival_walk",
+      "caption": "Tomorrow, the LASSO Growth Summit begins at Virgin Hotels Nashville. Bring your questions and get ready to build a complete 2027 growth playbook. Register at lassoframework.com/summit",
+      "on_image": {
+        "headline": "Tomorrow, we build",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "Register",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "Portrait arrival conversation with notebooks. Warm cream field, red headline, navy event identity and URL. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-11-07",
+      "visual_concept": "day_workshop",
+      "caption": "Day one of the LASSO Growth Summit is here. November 7 is for focused planning at Virgin Hotels Nashville.",
+      "on_image": {
+        "headline": "Day one build the plan",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "LASSO Growth Summit",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "AI promotional workshop illustration of four generic gym owners planning at a table. Do not imply this is live coverage or actual attendees. Navy, red, and warm cream. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    },
+    {
+      "date": "2026-11-08",
+      "visual_concept": "day_workshop",
+      "caption": "Day two of the LASSO Growth Summit is here. November 8 is for carrying the plan forward at Virgin Hotels Nashville.",
+      "on_image": {
+        "headline": "Day two carry it forward",
+        "facts": [
+          "LASSO Growth Summit",
+          "November 7 and 8, 2026",
+          "Virgin Hotels Nashville"
+        ],
+        "cta": "LASSO Growth Summit",
+        "footer": "LASSOFRAMEWORK.COM/SUMMIT"
+      },
+      "art_direction": "AI promotional workshop illustration of a five-person table review, generic people and no event-reportage claim. Sky, coral, navy, and cream. AI promotional illustration of generic mixed adult gym owners in unbranded T-shirts, hoodies, joggers, leggings, and sneakers, actively working in a realistic conference setting with notebooks and planning materials. Use natural human bodies and candid interaction, not posed portraits. Distinct camera angle and substantial varied red, navy, sky, coral, cream, and black color composition. Bold condensed black and red LASSO typography, small LASSO wordmark, clear event identity, date, venue, CTA URL. No named people, likenesses, actual event photos, business suits, bodybuilding training, empty chairs, chrome, or neon."
+    }
+  ]
+}

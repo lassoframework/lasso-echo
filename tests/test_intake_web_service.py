@@ -55,6 +55,19 @@ def test_healthz_answers_while_dark(server):
     payload = json.loads(body)
     assert payload["ok"] is True
     assert payload["intake_enabled"] is False
+    assert payload["deployment"] == {"commit": None, "service": None}
+
+
+def test_healthz_exposes_only_railway_build_identity(server, monkeypatch):
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "abc123")
+    monkeypatch.setenv("RAILWAY_SERVICE_NAME", "intake-web")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-appear")
+    status, body = _get(server, "/healthz")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["deployment"] == {"commit": "abc123", "service": "intake-web"}
+    assert "UNRELATED_SECRET" not in body.decode()
+    assert "must-not-appear" not in body.decode()
 
 
 def test_healthz_reports_armed_flag(server, monkeypatch):

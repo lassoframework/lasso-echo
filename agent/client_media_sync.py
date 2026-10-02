@@ -58,12 +58,65 @@ _ig account ("gritx_ig") is the generation/source key; the _fb account is the mi
 
 import json
 import os
+import subprocess
 
 from . import config
 
 # Media extensions we sync (mirror client_month_run._MEDIA_EXTS: the same set that
 # counts as a gym having uploaded usable creative).
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+
+
+def _valid_media_file(path):
+    """Reject corrupt payloads before they can count as fresh creative."""
+    try:
+        if os.path.splitext(path)[1].lower() in {".mp4", ".mov"}:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "json", path],
+                capture_output=True, timeout=15, check=True)
+            streams = json.loads(probe.stdout).get("streams") or []
+            return bool(streams and streams[0].get("width") and streams[0].get("height"))
+        from PIL import Image
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError, KeyError):
+        return False
+
+
+def usable_local_creative(creative, account_key, *, used=None):
+    """Shared publishable inventory predicate for planner and bridge."""
+    from . import dam, rotation, vision
+    if used is None:
+        from . import rotation
+        used = {str(row.get("key")) for row in
+                rotation.load_served().get(account_key, [])}
+    name = os.path.basename(creative.path)
+    if explicitly_refused_local(creative.path):
+        return False
+    if name in rotation.style_exclusions(os.path.dirname(creative.path)):
+        return False
+    if (name.startswith(("igfill_", "no_media_", "seed_"))
+            or name in used or dam.rotation_key(creative.path) in used
+            or not _valid_media_file(creative.path)):
+        return False
+    side = dam.read_sidecar(creative.path)
+    if (side.get("approved") is not True or side.get("review")
+            or side.get("moderation") not in ("clean", "approved")):
+        return False
+    if config.vision_enabled_for(account_key):
+        return (creative.media_type == "image" and
+                vision.auto_plannable(vision.stored_analysis(creative.path))[0])
+    return creative.media_type in ("image", "video")
+
+
+def explicitly_refused_local(path):
+    """An explicit owner or review refusal applies even when optional guards are off."""
+    from . import dam
+    side = dam.read_sidecar(path)
+    return (side.get("approved") is False
+            or str(side.get("moderation") or "").strip().lower() == "rejected")
 
 # The R2 upload layout. Fresh uploads (intake_web.handle_upload) carry two sidecar
 # kinds under incoming/; ingest (intake_ingest) stages processed media under
@@ -115,6 +168,44 @@ def _library_dir(base_key, out_dir=None):
     if out_dir:
         return out_dir
     return os.path.join(config.LIBRARY_PATH, base_key)
+
+
+def _record_new_uploads(base_key, names):
+    """Durably identify an upload never seen by this gym's sync lane.
+
+    The first pass establishes a baseline without rearming an alert for old R2
+    contents.  Later passes atomically claim only new basenames.  This marker is
+    separate per gym and survives worker restarts, so rebuilding a local library
+    from old intake objects cannot look like a fresh client upload.
+    """
+    names = sorted({str(n) for n in names if n})
+    from . import db
+    key = f"media_bridge_uploads_{base_key}"
+    conn = db.connect()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT value FROM kv WHERE key=?', (key,)).fetchone()
+        seen = set(json.loads(row['value'])) if row and row['value'] else set()
+        if not row:
+            conn.execute('INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)',
+                         (key, json.dumps(names)))
+            conn.commit()
+            return False
+        if not names:
+            conn.commit()
+            return False
+        fresh = [name for name in names if name not in seen]
+        if fresh:
+            seen.update(fresh)
+            conn.execute('INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)',
+                         (key, json.dumps(sorted(seen))))
+        conn.commit()
+        return bool(fresh)
+    except Exception:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
 
 
 def _public_url_for_key(key):
@@ -340,7 +431,13 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
             name = os.path.basename(key)
             chosen.setdefault(name, key)
 
-    if not listed_any or not chosen:
+    if len(listed) != len(prefixes):
+        return {"synced": 0, "skipped": 0}
+    if not chosen:
+        # Persist an empty baseline.  This makes the first upload after an
+        # otherwise idle scan a true new upload while still keeping an old R2
+        # backlog on an uninitialized gym baseline-only.
+        _record_new_uploads(base_key, [])
         return {"synced": 0, "skipped": 0}
 
     lib_dir = _library_dir(base_key, out_dir)
@@ -350,12 +447,15 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
 
     synced = 0
     skipped = 0
+    accepted = []
     for name in sorted(chosen):
         key = chosen[name]
         target = os.path.join(lib_dir, name)
         # IDEMPOTENT: already in the library -> never re-download.
         if os.path.exists(target):
             skipped += 1
+            if _valid_media_file(target):
+                accepted.append(key)
             continue
         try:
             data = r2.get_bytes(key)
@@ -374,9 +474,22 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
                        client_context=contexts.get(name, ""),
                        consent=bool(consents.get(name)))
         synced += 1
+        if _valid_media_file(target):
+            accepted.append(key)
 
     if synced or skipped:
         log(f"{base_key}: synced {synced} new media, skipped {skipped} already present")
+
+    # The shared usable-inventory observer owns episode rearm. It atomically
+    # records the accepted identity and closes the old episode after approval.
+    # Object history remains for intake diagnostics, never as delivery proof.
+    if accepted:
+        try:
+            from .client_infographic_fill import real_media_depleted
+            if not real_media_depleted(base_key):
+                _record_new_uploads(base_key, accepted)
+        except Exception as exc:  # noqa: BLE001
+            log(f"{base_key}: media bridge rearm failed: {type(exc).__name__}")
 
     # ECHO VISION ingest hook (§2.1): analyze newly-synced images once, on the gym's DAM
     # sidecar, so content-scoring + grounding have data before planning. Idempotent (an
@@ -707,11 +820,15 @@ def _parse_banned_from_bible(raw):
 
 
 def _existing_feed_count(store, base_key, start, days):
-    """(count, ok): how many ACTIVE FEED rows the gym has in content_calendar across
-    the planned span's months. 'Active' excludes denied/killed/deleted rows so that a
+    """(count, ok): how many ACTIVE FEED rows the gym has inside the exact planned span.
+    'Active' excludes denied/killed/deleted rows so that a
     denied post no longer blocks its own replacement: once the count drops below the
     build target the scanner fires and generates a fresh replacement. Mirrors the build
     query which also excludes denied+killed (portal_calendar_store line ~321).
+
+    The month reads are only transport bounds. Rows before ``start`` or on/after
+    ``start + days`` do not fill the forward plan. Counting whole months let Swift River's
+    old September feeds suppress an otherwise-empty October refill.
 
     A FEED row is the unit that consumes one photo (a story pairs on the same photo and
     an FB mirror duplicates the same feed), so counting DISTINCT feed post_dates on
@@ -724,8 +841,11 @@ def _existing_feed_count(store, base_key, start, days):
         return 0, False
     from datetime import timedelta
     from .onboarding_demo import is_sample_row
+    span_first = start.isoformat()
+    span_last = (start + timedelta(days=days)).isoformat()
     months = sorted({(start + timedelta(days=i)).isoformat()[:7] for i in range(days)})
     feed_dates = set()
+    weekly_feeds = 0
     for month in months:
         try:
             rows = list_month(base_key, month) or []
@@ -733,6 +853,9 @@ def _existing_feed_count(store, base_key, start, days):
             return 0, False
         for row in rows:
             if not isinstance(row, dict):
+                continue
+            post_date = str(row.get("post_date") or "")[:10]
+            if not (span_first <= post_date < span_last):
                 continue
             status = str(row.get("status", "")).lower()
             # Mirror the build query: denied/killed rows are gone — don't count them
@@ -758,8 +881,11 @@ def _existing_feed_count(store, base_key, start, days):
             # count one per feed post_date on instagram (skip the facebook mirror and
             # every story so the count equals photos placed, not total rows).
             if fmt == "feed" and acct in ("instagram", "ig", ""):
-                feed_dates.add(row.get("post_date") or row.get("id") or len(feed_dates))
-    return len(feed_dates), True
+                if isinstance(store, _PierceWeekStore):
+                    weekly_feeds += 1
+                feed_dates.add(post_date)
+    return (weekly_feeds if isinstance(store, _PierceWeekStore)
+            else len(feed_dates)), True
 
 
 def _alert_thin_creative(base_key, media_count, days, log):
@@ -882,6 +1008,45 @@ def _clear_stall(base_key, stage):
         pass
 
 
+def pierce_weekly_window(today):
+    """The seven-day Pierce review block, Saturday through Friday.
+
+    On Friday, stage the next block so Bryan can review it before posting.
+    On other days, inspect the current block and repair it only if needed.
+    """
+    from datetime import timedelta
+
+    offset = (today.weekday() - 5) % 7
+    first = today - timedelta(days=offset)
+    if today.weekday() == 4:
+        first += timedelta(days=7)
+    return first, 7
+
+
+class _PierceWeekStore:
+    """Keep a monthly builder's delete scoped to the Pierce review week."""
+
+    def __init__(self, store, first, days):
+        from datetime import timedelta
+
+        self._store = store
+        self._dates = {(first + timedelta(days=i)).isoformat()
+                       for i in range(days)}
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def delete_month(self, account_key, month, *, preserve_dates=()):
+        if account_key != "piercefitness":
+            raise ValueError("Pierce weekly store cannot mutate another gym")
+        rows = self._store.list_month(account_key, month)
+        outside = {str(r.get("post_date"))[:10] for r in rows
+                   if str(r.get("post_date"))[:10] not in self._dates}
+        return self._store.delete_month(
+            account_key, month,
+            preserve_dates=tuple(set(preserve_dates) | outside))
+
+
 def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                       logger=None):
     """For each onboarded client gym: sync its uploaded media, then build its DRAFT
@@ -948,6 +1113,16 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
 
     for base in bases:
         try:
+            # Pierce reviews one week at a time. Friday stages the coming
+            # Saturday-Friday block; the rest of the week only repairs a
+            # missing block. This is tenant scoped and opt-in for rollout.
+            weekly_pierce = (base == "piercefitness" and
+                             os.getenv("AGENT_PIERCE_WEEKLY", "").lower()
+                             in ("1", "true", "yes", "on"))
+            plan_start, plan_days = ((start, days) if not weekly_pierce else
+                                     pierce_weekly_window(start))
+            plan_store = (_PierceWeekStore(store, plan_start, plan_days)
+                          if weekly_pierce and store is not None else store)
             sync = sync_uploads(base, r2=r2, logger=log)
             synced_total += sync.get("synced", 0)
 
@@ -1045,7 +1220,8 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 awaiting += 1
                 # NO PHOTOS AT ALL: the exact "if they don't upload" case — fill
                 # upcoming days with approved-source infographic cards (self-gated).
-                _maybe_infographic_fill(base, account, store, log)
+                if not weekly_pierce:
+                    _maybe_infographic_fill(base, account, store, log)
                 _maybe_seed_onboarding_demo(base, store, log)
                 results.append({"base": base, "status": "awaiting_media",
                                 "synced": sync.get("synced", 0)})
@@ -1082,7 +1258,8 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # 179-photo gym is built out to its 30-feed cap, existing_feeds (30) >=
             # build_target (30) -> SKIP, no rebuild. A GENUINE media increase below the
             # cap still grows; a library already at/over the cap never churns again.
-            existing_feeds, read_ok = _existing_feed_count(store, base, start, days)
+            existing_feeds, read_ok = _existing_feed_count(
+                plan_store, base, plan_start, plan_days)
             if read_ok:
                 # RE-ARM ON RECOVERY (2026-09-02). calendar_unreadable is the one stall
                 # stage that heals ITSELF: it means a shared dependency (Supabase) was
@@ -1118,7 +1295,7 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             except Exception:  # noqa: BLE001
                 _cadence_applied = "1"
             cadence_changed = str(ppd) != _cadence_applied
-            feed_budget = days * ppd
+            feed_budget = plan_days * ppd
             # A Drive-only gym (media_count == 0, drive_lane_may_cover True — the branch
             # above already returned/continued for every other media_count == 0 case) has
             # no local media to cap the target against; target the full feed budget so
@@ -1135,48 +1312,13 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # frequent scan never storms the channel; re-fires only if the count moves.
             if 0 < media_count < feed_budget:
                 _alert_thin_creative(base, media_count, feed_budget, log)
-            # ANTI-CHURN (TopFuel, 2026-08-25): rebuild ONLY when there is a real reason.
-            # A gym whose build_target counts un-plannable photo clusters can NEVER reach
-            # build_target (existing_feeds stays below it forever), so without this it rebuilt
-            # every scan — now a no-op thanks to the never-shrink guard in _apply, but still
-            # wasteful (it re-runs caption generation each pass). We remember the media_count
-            # we last built for; an already-built gym (existing_feeds > 0) whose library has
-            # NOT grown is left alone. It rebuilds again only when NEW media arrives.
-            try:
-                from . import db as _db
-                _built_marker = int(_db.kv_get(f"built_media_{base}") or 0)
-            except Exception:  # noqa: BLE001
-                _built_marker = 0
-            # media_count > 0 required: for a Drive-only gym (media_count is
-            # STRUCTURALLY always 0 — it never reflects the connected Drive pool) this
-            # marker comparison is meaningless and 0 <= 0 is unconditionally true, so
-            # without this guard ANY pre-existing calendar rows (even unrelated onboarding
-            # SAMPLE placeholders, status=draft/no image) would false-positive
-            # "already built" and permanently block the Drive lane from ever running
-            # (Dean Holcomb / CrossFit Reverb, 2026-08-31: 42 sample rows already on the
-            # calendar tripped this on the very first post-fix scan).
-            _already_built_for_media = (media_count > 0 and existing_feeds > 0
-                                        and media_count <= _built_marker)
-            if not cadence_changed and (existing_feeds >= build_target
-                                        or _already_built_for_media):
+            # A historical "built for N media" marker cannot prove the CURRENT forward
+            # span is full. Swift River had 13 clean media and 13 old September feeds but
+            # zero October IG rows; the marker suppressed every rolling refill. The exact
+            # forward count above is the idempotence authority.
+            if not cadence_changed and existing_feeds >= build_target:
                 # Already built out to the media the gym supports (capped at `days`):
-                # idempotent. An unchanged library never rebuilds again. Remember the media
-                # count we are built for, so a gym that never reaches build_target (some
-                # clusters un-plannable) does not rebuild again until NEW media arrives.
-                # MARKER-DEADLOCK GUARD (audit 2026-08-25 MAJOR): stamp ONLY when the gym
-                # is MEDIA-capped (media_count <= days => every photo is placeable into
-                # this month). A DAYS-capped gym (more media than days) must NOT stamp —
-                # an at-cap gym that uploads 20 photos would stamp media_count=50 with
-                # zero of them built, then _already_built_for_media blocks every future
-                # rebuild until the library exceeds 50. For days-capped gyms the
-                # existing_feeds >= build_target check alone is the idempotence guard,
-                # and when the month window slides (feeds drop) the rebuild fires again.
-                if media_count <= feed_budget:
-                    try:
-                        from . import db as _db
-                        _db.kv_set(f"built_media_{base}", str(media_count))
-                    except Exception:  # noqa: BLE001
-                        pass
+                # idempotent. An unchanged, full forward span never rebuilds again.
                 #
                 # DENIED-SLOT BACKFILL (AGENT_DENY_BACKFILL, OFF by default): a gym AT cap
                 # can never grow, so a human-denied post would leave a permanently empty
@@ -1192,7 +1334,7 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                         if voice is not None:
                             from .client_month_run import backfill_denied_slots
                             bf = backfill_denied_slots(
-                                account, base, start.isoformat(), days,
+                                account, base, plan_start.isoformat(), plan_days,
                                 voice=voice, library_path=lib_dir, store=store,
                                 banned_words=_banned_words_for(base), logger=log)
                             backfilled = bf.get("backfilled", 0)
@@ -1203,7 +1345,8 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # exhausted / reuse-blocked): fill upcoming EMPTY days with
                 # approved-source infographic cards (self-gated, insert-only — a real
                 # photo day is never touched).
-                _maybe_infographic_fill(base, account, store, log)
+                if not weekly_pierce:
+                    _maybe_infographic_fill(base, account, store, log)
                 results.append({"base": base, "status": "has_calendar",
                                 "synced": sync.get("synced", 0),
                                 "media_count": media_count,
@@ -1236,23 +1379,34 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             banned = _banned_words_for(base)
             from .client_month_run import build_client_month
             built = build_client_month(
-                account, base, start.isoformat(), days,
-                voice=voice, library_path=lib_dir, store=store,
+                account, base, plan_start.isoformat(), plan_days,
+                voice=voice, library_path=lib_dir,
+                store=plan_store,
                 banned_words=banned, logger=log,
                 allow_reshape=cadence_changed)
             if built.get("ok"):
+                # A guarded no-op is not a generated calendar. Treating noop_empty as
+                # success hid live zero-row gyms behind generated=1 and let recovery
+                # tickets resolve without any calendar evidence. Keep cadence pending
+                # and report the honest not-built result so the missing input remains
+                # visible and retryable.
+                _applied = not (built.get("noop_shrink") or built.get("noop_empty"))
+                if not _applied:
+                    reason = "noop_empty" if built.get("noop_empty") else "noop_shrink"
+                    results.append({"base": base, "status": "not_built",
+                                    "reason": reason,
+                                    "synced": sync.get("synced", 0),
+                                    "upserted": 0})
+                    log(f"{base}: calendar was not generated ({reason}); 0 rows written")
+                    continue
                 generated += 1
-                # Remember the media count this build covered, so the next scan does not
-                # rebuild until NEW media arrives (anti-churn; pairs with never-shrink).
                 # Stamp the cadence this build APPLIED (CADENCE_SPEC.md D7) ONLY when
                 # the store was actually written (audit 2026-08-27 MAJOR: stamping a
                 # noop_shrink/noop_empty build silently dropped the client's toggle
                 # forever — an un-applied cadence must stay pending so the next scan
                 # retries it).
-                _applied = not (built.get("noop_shrink") or built.get("noop_empty"))
                 try:
                     from . import db as _db
-                    _db.kv_set(f"built_media_{base}", str(media_count))
                     if _applied:
                         _db.kv_set(f"cadence_applied_{base}", str(ppd))
                 except Exception:  # noqa: BLE001

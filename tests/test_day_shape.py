@@ -225,6 +225,135 @@ def test_escape_hatch_restores_the_old_silent_behaviour(monkeypatch):
     assert len(day_shape.day_violations(rows)) == 1
 
 
+# ---- SLOT CAPACITY (2026-09-11, the 141-group lasso duplicate-active audit) --------
+#
+# day_violations()/assert_day_distinct only ever fire on a SHARED caption or photo.
+# The lasso 2026-08-08 seed put 2-4 DISTINCT-content rows into one
+# (account, post_date, format) slot -- different pillar, different caption, every
+# one a genuinely different post -- so that guard saw nothing wrong, and each row
+# was its own one-row 0318 variant group so the unique index saw nothing wrong
+# either. slot_overflow_violations()/assert_slot_capacity() is the belt that
+# actually catches this shape: too many rows in one slot, regardless of content.
+
+def test_two_distinct_posts_in_one_slot_is_a_slot_capacity_violation():
+    """The exact 2026-08-08 lasso shape: two GENUINELY DIFFERENT posts (different
+    pillar, caption and photo -- day_shape sees nothing wrong here) still overfill
+    a 1x/day slot."""
+    rows = [_row(caption="Summit sprint: day 3 of the kickoff.", image_url="a.jpg",
+                 pillar="summit"),
+            _row(caption="Platform post: every lead, every follow up.",
+                 image_url="b.jpg", pillar="platform")]
+    assert day_shape.assert_day_distinct(rows) == []  # NOT caught by the old guard
+    with pytest.raises(day_shape.SlotCapacityViolation) as exc:
+        day_shape.assert_slot_capacity(rows)
+    v = exc.value.violations[0]
+    assert v.count == 2 and v.capacity == 1
+    assert set(v.pillars) == {"summit", "platform"}
+
+
+def test_three_and_four_way_overflow_is_reported_with_its_real_count():
+    rows = [_row(caption=f"post {i}", image_url=f"{i}.jpg", pillar=f"p{i}")
+            for i in range(4)]
+    with pytest.raises(day_shape.SlotCapacityViolation) as exc:
+        day_shape.assert_slot_capacity(rows)
+    assert exc.value.violations[0].count == 4
+
+
+def test_a_single_post_in_the_slot_passes():
+    assert day_shape.assert_slot_capacity([_row()]) == []
+
+
+def test_one_feed_and_one_story_same_day_is_not_a_slot_capacity_violation():
+    """format is part of the slot key: a feed and its paired story are two
+    different slots, exactly like assert_day_distinct's own Facebook-mirror /
+    paired-story exemptions."""
+    rows = [_row(fmt="feed", caption="feed caption", image_url="feed.jpg"),
+            _row(fmt="story", caption="story caption", image_url="story.mp4")]
+    assert day_shape.assert_slot_capacity(rows) == []
+
+
+def test_facebook_and_instagram_same_day_is_not_a_slot_capacity_violation():
+    """account is part of the slot key, matching assert_day_distinct."""
+    rows = [_row(account="instagram", caption="a", image_url="a.jpg"),
+            _row(account="facebook", caption="b", image_url="b.jpg")]
+    assert day_shape.assert_slot_capacity(rows) == []
+
+
+def test_two_different_gyms_same_day_never_collide():
+    rows = [_row(gym_id="eng", caption="a", image_url="a.jpg"),
+            _row(gym_id="gritx", caption="b", image_url="b.jpg")]
+    assert day_shape.assert_slot_capacity(rows) == []
+
+
+def test_a_candidate_row_never_competes_for_the_slot():
+    """0318 variant pairing: a v2 regen candidate sits BESIDE the active row on
+    purpose. It must never trip the slot-capacity guard -- that would make the
+    variant-pairing feature itself unusable."""
+    rows = [_row(caption="the live post", image_url="a.jpg",
+                 variant_status="active"),
+            _row(caption="an alternate not yet picked", image_url="b.jpg",
+                 variant_status="candidate")]
+    assert day_shape.assert_slot_capacity(rows) == []
+
+
+def test_deleted_rows_never_occupy_a_slot():
+    rows = [_row(caption="a", image_url="a.jpg"),
+            _row(caption="b", image_url="b.jpg", status="deleted")]
+    assert day_shape.assert_slot_capacity(rows) == []
+
+
+def test_a_2x_day_gym_gets_capacity_two_not_one():
+    """capacity is the CALLER's job (cadence.resolve_posts_per_day per gym) -- a
+    2x/day gym (gritx-shape, real production cadence, nothing to do with the
+    proof/invitation role pairing) legitimately runs 2 distinct posts through
+    one slot."""
+    rows = [_row(caption="proof post", image_url="a.jpg", pillar="community"),
+            _row(caption="invitation post", image_url="b.jpg", pillar="offer")]
+    assert day_shape.assert_slot_capacity(rows, capacity=2) == []
+    # A third row in the same slot still overflows even at capacity 2.
+    rows.append(_row(caption="a third post", image_url="c.jpg", pillar="summit"))
+    with pytest.raises(day_shape.SlotCapacityViolation) as exc:
+        day_shape.assert_slot_capacity(rows, capacity=2)
+    assert exc.value.violations[0].count == 3 and exc.value.violations[0].capacity == 2
+
+
+def test_capacity_defaults_to_one_when_the_caller_passes_nothing():
+    rows = [_row(caption="a", image_url="a.jpg"), _row(caption="b", image_url="b.jpg")]
+    with pytest.raises(day_shape.SlotCapacityViolation) as exc:
+        day_shape.assert_slot_capacity(rows)
+    assert exc.value.violations[0].capacity == 1
+
+
+def test_real_month_planner_and_client_month_resolve_capacity_from_cadence():
+    """Both write lanes must derive `capacity` from cadence.resolve_posts_per_day
+    (the gym's REAL configured cadence). A blanket capacity of 2 gated on
+    day_shape_roles_enabled() (that flag is the separate proof/invitation
+    content-pairing feature, off fleet-wide today) would have been WRONG in the
+    other direction: it does nothing to stop a 1x/day gym from double-booking a
+    slot, which is the exact 2026-08-08 lasso defect this guard exists for."""
+    import inspect
+    src = inspect.getsource(__import__("agent.real_month_planner", fromlist=["x"]))
+    assert "cadence.resolve_posts_per_day(account_key, sb_store)" in src
+    src2 = inspect.getsource(__import__("agent.client_month_run", fromlist=["x"]))
+    assert "cadence.resolve_posts_per_day(base_key, store)" in src2
+
+
+def test_slot_capacity_escape_hatch_matches_day_shapes_own():
+    rows = [_row(caption="a", image_url="a.jpg"), _row(caption="b", image_url="b.jpg")]
+    assert day_shape.assert_slot_capacity(rows, enabled=False) == []
+
+
+def test_slot_capacity_names_the_gym_and_date_in_its_message():
+    rows = [_row(gym_id="lasso", post_date="2026-08-10", account="instagram",
+                 caption="a", image_url="a.jpg", pillar="summit"),
+            _row(gym_id="lasso", post_date="2026-08-10", account="instagram",
+                 caption="b", image_url="b.jpg", pillar="platform")]
+    with pytest.raises(day_shape.SlotCapacityViolation) as exc:
+        day_shape.assert_slot_capacity(rows)
+    msg = exc.value.violations[0].message()
+    assert "lasso" in msg and "2026-08-10" in msg
+
+
 def test_the_producer_half_ships_off():
     assert config.day_shape_roles_enabled() is False
     assert config.opening_formula_cap_enabled() is False
@@ -340,9 +469,10 @@ def test_build_client_month_still_writes_a_clean_two_slot_month(monkeypatch,
 
 
 class _FakeLassoStore:
-    def __init__(self):
+    def __init__(self, ppd=None):
         self.deleted = []
         self.inserted = []
+        self._ppd = ppd
 
     def delete_month(self, gym_id, month):
         self.deleted.append((gym_id, month))
@@ -352,15 +482,18 @@ class _FakeLassoStore:
         self.inserted.extend(rows)
         return rows
 
+    def gym_posts_per_day(self, base_key):
+        return self._ppd
 
-def _lasso_apply(monkeypatch, rows):
+
+def _lasso_apply(monkeypatch, rows, ppd=None):
     from agent import real_month_planner as rmp
 
     monkeypatch.setattr(rmp, "to_calendar_rows", lambda drafts, key: list(rows))
     monkeypatch.setattr(rmp, "preserve_and_prune", None, raising=False)
     monkeypatch.setattr("agent.portal_calendar_store.preserve_and_prune",
                         lambda store, key, months, rs: (rs, []))
-    store = _FakeLassoStore()
+    store = _FakeLassoStore(ppd=ppd)
     return rmp.apply_month_plan("lasso", [object()], store), store
 
 
@@ -400,11 +533,51 @@ def test_a_day_a_coach_already_owns_cannot_trip_the_guard(monkeypatch):
 
 
 def test_lasso_month_lane_still_writes_a_clean_month(monkeypatch):
+    """A single post for the slot always writes clean, regardless of cadence."""
     rows = [_row(gym_id="lasso", account="facebook", post_date="2026-09-16",
-                 caption="One platform, every lead.", image_url="a.jpg"),
-            _row(gym_id="lasso", account="facebook", post_date="2026-09-16",
-                 caption="One room, two days, your 2027 plan.", image_url="b.jpg")]
+                 caption="One platform, every lead.", image_url="a.jpg")]
     out, store = _lasso_apply(monkeypatch, rows)
+    assert out["ok"] is True
+    assert len(store.inserted) == 1
+
+
+def test_lasso_1x_day_now_refuses_two_distinct_posts_in_one_slot(monkeypatch):
+    """SLOT CAPACITY (2026-09-11, the 141-group lasso duplicate-active audit):
+    this used to be `test_lasso_month_lane_still_writes_a_clean_month`, and it
+    asserted `ok is True` for exactly this shape -- two DIFFERENT captions, same
+    gym/account/date/format, no cadence override. day_violations() never flagged
+    it (the captions genuinely differ), so it sailed through as "clean". That is
+    precisely how the 2026-08-08 seed put 2-4 distinct posts into 141-147 lasso
+    slots, four of which (2026-08-10 IG feed+story) were confirmed PUBLISHED
+    twice each via distinct late_post_id values on the real accounts. lasso has
+    no configured 2x cadence (no gym_posts_per_day override, ECHO_CADENCE_2X_ENABLED
+    unset in this harness, matching prod), so capacity is 1 and this must now
+    FAIL the pass instead of quietly writing a duplicate slot."""
+    rows = [_row(gym_id="lasso", account="facebook", post_date="2026-09-16",
+                 caption="One platform, every lead.", image_url="a.jpg",
+                 pillar="platform"),
+            _row(gym_id="lasso", account="facebook", post_date="2026-09-16",
+                 caption="One room, two days, your 2027 plan.", image_url="b.jpg",
+                 pillar="summit")]
+    out, store = _lasso_apply(monkeypatch, rows)
+    assert out["ok"] is False
+    assert out["reason"] == "day shape: slot over capacity"
+    assert store.inserted == [] and store.deleted == []
+
+
+def test_lasso_writes_two_distinct_posts_only_if_its_own_cadence_says_two(monkeypatch):
+    """The escape valve: if lasso's OWN cadence setting (the shared plane's
+    gym_posts_per_day, exactly like any other gym) is genuinely 2, the same two
+    distinct posts write cleanly -- the guard defers to the gym's real
+    configuration, it does not invent a rule of its own."""
+    monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
+    rows = [_row(gym_id="lasso", account="facebook", post_date="2026-09-16",
+                 caption="One platform, every lead.", image_url="a.jpg",
+                 pillar="platform"),
+            _row(gym_id="lasso", account="facebook", post_date="2026-09-16",
+                 caption="One room, two days, your 2027 plan.", image_url="b.jpg",
+                 pillar="summit")]
+    out, store = _lasso_apply(monkeypatch, rows, ppd=2)
     assert out["ok"] is True
     assert len(store.inserted) == 2
 

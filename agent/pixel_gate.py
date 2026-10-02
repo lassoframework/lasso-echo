@@ -57,6 +57,12 @@ def uncleared_sentences(text, approved_claims=None):
     (or exactly equal) an approved claim line. "80% more conversions" is NOT a
     substring of "lift conversions up to 80 percent", so it fails; the approved
     wording passes.
+
+    Matching is case-insensitive: OCR output from designed graphics frequently
+    uses title case or all-caps for stylistic reasons (e.g. "71.9% Booking Rate
+    vs. 18.5% Industry Average" on a stat card), while approved claims are
+    recorded in sentence case. The CONTENT of the claim is what determines
+    approval, not the designer's font-case choice.
     """
     text = (text or "").strip()
     if not text:
@@ -67,7 +73,8 @@ def uncleared_sentences(text, approved_claims=None):
         s = s.strip()
         if not s or not _CLAIM_RE.search(s):
             continue
-        if not any(s in c or c in s for c in claims):
+        s_low = s.lower()
+        if not any(s_low in c.lower() or c.lower() in s_low for c in claims):
             out.append(s)
     return out
 

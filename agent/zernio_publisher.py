@@ -49,7 +49,14 @@ class PublishResult:
 
 
 class ZernioPublishError(Exception):
-    pass
+    # A generic provider/create failure is ambiguous: the post may exist.
+    definitive_no_post = False
+
+
+class ZernioPreflightError(ZernioPublishError):
+    """A deterministic refusal raised before create_post is called."""
+
+    definitive_no_post = True
 
 
 _PLATFORM = {
@@ -103,9 +110,14 @@ def publish(draft, account, client=None, scheduled_for=None,
         return PublishResult(ok=True, mode="would_publish",
                              detail="draft-only (publish or zernio-publish flag OFF)")
 
+    from .publish_billing_gate import publishing_blocked
+    from .portal_social import _base_of_account
+    if publishing_blocked(_base_of_account(account.key)):
+        raise ZernioPreflightError("Echo publishing held: account revoked or subscription canceled")
+
     platform = _PLATFORM.get(getattr(account, "platform", ""), "")
     if not platform:
-        raise ZernioPublishError(f"unsupported platform for {account.key}")
+        raise ZernioPreflightError(f"unsupported platform for {account.key}")
 
     # NO PHOTO = NO POST (the "approved with no image" class, closed at the wire).
     # zernio.create_post simply OMITS mediaItems when the url list is empty, and Zernio
@@ -130,7 +142,7 @@ def publish(draft, account, client=None, scheduled_for=None,
     url = (getattr(draft, "creative_public_url", "") or "").strip()
     media_urls = [url] if url else []
     if not media_urls:
-        raise ZernioPublishError(
+        raise ZernioPreflightError(
             f"{account.key}: refusing to publish a {platform} post with NO media "
             "(empty creative url). Zernio would publish it as a caption-only text "
             "post to the gym's real feed. Attach the image or hold the row.")
@@ -141,13 +153,13 @@ def publish(draft, account, client=None, scheduled_for=None,
 
     profile_id = profile_resolver(account.key)
     if not profile_id:
-        raise ZernioPublishError(
+        raise ZernioPreflightError(
             f"{account.key}: no Zernio profile id stored; the gym must connect first.")
 
     accounts_json = client.list_accounts(profile_id)
     account_id = zernio.account_id_for(accounts_json, platform)
     if not account_id:
-        raise ZernioPublishError(
+        raise ZernioPreflightError(
             f"{account.key}: no connected {platform} account under the gym's Zernio "
             "profile; reconnect required.")
 
@@ -155,7 +167,7 @@ def publish(draft, account, client=None, scheduled_for=None,
     if platform == "facebook":
         page_id = page_resolver(account.key)
         if not page_id:
-            raise ZernioPublishError(
+            raise ZernioPreflightError(
                 f"{account.key}: no Facebook page selected; the gym must pick a page.")
 
     # STORY: the draft's own type decides the Zernio contentType (IG/FB Story vs feed).
@@ -288,16 +300,16 @@ def publish(draft, account, client=None, scheduled_for=None,
     # the post. Returning ok=True here stamped status='published' with an empty
     # late_post_id: unverifiable by publish_confirm, invisible to any reconcile, and
     # indistinguishable in the portal from a post that really went live. Refuse it.
-    # The caller reverts the claim and retries next run, which is SAFE because Zernio's
-    # own 24h content-hash dedup answers a genuine double-send with a 409 that IS
-    # handled as published above. Failing closed can at worst re-ask; the old behaviour
-    # could silently lose a post forever.
+    # The caller holds the owned claim for reconciliation because a 2xx response can
+    # still represent an accepted post whose id was lost in the response. Retrying
+    # immediately could duplicate it. A later verified recovery can resolve the row;
+    # the old behaviour could silently lose a post forever.
     if not str(post_id or "").strip():
         raise ZernioPublishError(
             f"{account.key}: Zernio returned no post id for this create "
             "(2xx with an unparseable body). Refusing to mark it published — a post "
-            "we cannot identify cannot be verified or reconciled. The row reverts and "
-            "retries; Zernio's 24h dedup makes the retry safe.")
+            "we cannot identify, verify, or reconcile. The row remains held for "
+            "manual recovery; automatic retry could duplicate the post.")
     return PublishResult(ok=True, mode="published", media_id=post_id,
                          detail="scheduled" if scheduled_for else "published now")
 

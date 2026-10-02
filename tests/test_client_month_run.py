@@ -41,7 +41,7 @@ class _FakeStore:
         self.deleted = []
         self.inserted = []
 
-    def delete_month(self, base_key, month):
+    def delete_month(self, base_key, month, preserve_dates=()):
         self.deleted.append((base_key, month))
         return 0
 
@@ -179,16 +179,16 @@ def test_builds_paused_real_photo_rows_with_fb_mirror(tmp_path):
 
 
 def test_feed_autofit_reframes_feed_but_never_the_story(monkeypatch, tmp_path):
-    # AGENT_FEED_AUTOFIT on + STORY_FORMAT off: the FEED gets the 1080x1080 square, but the
-    # paired STORY must keep the RAW photo (never a square pillarboxed into a 9:16 slot).
+    # AGENT_FEED_AUTOFIT on + STORY_FORMAT off: the FEED gets the 1080x1350 card, but the
+    # paired STORY must keep the RAW photo (never a feed card pillarboxed into a 9:16 slot).
     monkeypatch.setenv("AGENT_FEED_AUTOFIT", "true")
     monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
     monkeypatch.delenv("AGENT_STORY_FORMAT", raising=False)   # story-format OFF (baseline)
     from agent import feed_image, media_host
-    # every feed photo is treated as out-of-spec -> reframed to a sentinel square asset
+    # every feed photo is treated as out-of-spec -> reframed to a sentinel 4:5 asset
     monkeypatch.setattr(feed_image, "get_or_make_feed_image",
                         lambda p, lib, logger=None: "/REFRAMED__feed.jpg")
-    # host_media: the square asset -> a SQUARE url; any other path -> a raw-photo url
+    # host_media: the feed asset -> a formatted url; any other path -> a raw-photo url
     monkeypatch.setattr(media_host, "host_media",
                         lambda path, key, client=None: ("https://cdn/SQUARE.jpg"
                                                         if str(path).endswith("__feed.jpg")
@@ -203,7 +203,7 @@ def test_feed_autofit_reframes_feed_but_never_the_story(monkeypatch, tmp_path):
     feeds = [r for r in store.inserted if r["format"] == "feed"]
     stories = [r for r in store.inserted if r["format"] == "story"]
     assert feeds and stories
-    # FEED carries the reframed square...
+    # FEED carries the reframed 4:5 card...
     assert all(r["image_url"] == "https://cdn/SQUARE.jpg" for r in feeds)
     # ...but the STORY never does — it keeps the raw photo url.
     assert all(r["image_url"] != "https://cdn/SQUARE.jpg" for r in stories)
@@ -699,6 +699,87 @@ def test_deny_backfill_replaces_denied_feed_with_reused_photo(monkeypatch, tmp_p
     assert ig_feed[0]["caption"].strip()
 
 
+# ---- 9b2. denied-slot backfill is serialized against build_client_month AND itself
+# (independent audit, 2026-09-11, CrossFit Reverb): reproduces the real deployed
+# timeline (18:29-19:27 UTC) where a build_client_month rebuild placed fresh rows on
+# 2026-09-24, and backfill_denied_slots independently rolled a denied-slot replacement
+# forward onto that SAME day minutes later, stacking a second 4-row batch nobody's
+# day-collision check saw coming. ----
+
+def test_deny_backfill_refuses_while_a_build_is_in_progress(monkeypatch, tmp_path):
+    """The exact gap: a build_client_month rebuild for this gym is (still) holding the
+    lock -- e.g. another process's rebuild that has not released yet -- so this backfill
+    pass must be refused cleanly rather than stacking a duplicate replacement onto a day
+    the in-flight rebuild is about to (or just did) place content on."""
+    from agent import build_lock
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+    assert build_lock.acquire("gritx", holder="in-flight-rebuild") is True
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is False
+    assert out["reason"] == "build_in_progress"
+    assert store.inserted == [], (
+        "a gym mid-rebuild must never have a backfill batch stacked onto it")
+
+
+def test_deny_backfill_refuses_a_concurrent_second_backfill_pass(monkeypatch, tmp_path):
+    """Two backfill passes for the SAME gym must never run concurrently either --
+    the second is refused instead of independently rolling its own replacement
+    forward onto a day the first pass just claimed."""
+    from agent import build_lock
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+    assert build_lock.acquire("gritx", holder="other-backfill-pass") is True
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is False
+    assert out["reason"] == "build_in_progress"
+    assert store.inserted == []
+
+
+def test_deny_backfill_lock_releases_after_a_successful_pass(monkeypatch, tmp_path):
+    """The lock must not outlive the backfill pass that acquired it: a legitimate
+    later pass (the next scan cycle) must be able to proceed once this one finishes."""
+    from agent import build_lock
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    assert build_lock.is_locked("gritx") is False
+
+
+def test_deny_backfill_does_not_race_build_client_month_for_same_gym(monkeypatch, tmp_path):
+    """End-to-end regression for the actual defect: a build_client_month call still
+    holding the gym's lock must block a concurrent backfill_denied_slots call for
+    that SAME gym (build_client_month acquires this same lock internally), closing
+    exactly the 2026-09-24 stacking window seen in production."""
+    from agent import build_lock
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    # Simulate build_client_month's own lock acquisition mid-rebuild (it holds the
+    # SAME per-gym lock -- see build_client_month's use of agent.build_lock).
+    assert build_lock.acquire("gritx", holder="build_client_month-in-flight") is True
+    out = cmr.backfill_denied_slots(
+        _account(), "gritx", "2026-08-19", days=30, voice=_voice(),
+        library_path=lib, store=_FakeStoreLM({("gritx", "2026-08"):
+                                              [_denied_feed_row("2026-08-19")]}),
+        banned_words=())
+    assert out["ok"] is False
+    assert out["reason"] == "build_in_progress"
+
+
 # ---- 9c. denied-slot backfill tries the connected Drive pool FIRST (2026-09-07) ----
 
 def test_deny_backfill_prefers_a_connected_drive_pool_over_local_reuse(monkeypatch, tmp_path):
@@ -1124,3 +1205,38 @@ def test_apply_shrink_guard_counts_preserved_locked_days(tmp_path):
                      locked_days=locked)
     assert not res.get("noop_shrink"), "post-merge growth must proceed, not no-op"
     assert store.inserted, "the grow build's rows must be written"
+
+
+def test_concurrent_rebuild_for_same_gym_is_refused_not_raced(tmp_path):
+    """Ticket 4941e162 (CrossFit Reverb): a second build_client_month call for the
+    SAME gym while the first is still "in flight" (lock held, never released) must
+    be refused cleanly -- never race a delete+insert against the first call's. This
+    is the regression for the duplicate/near-duplicate pending rows Dean saw."""
+    from agent import build_lock
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+    # Simulate an already in-flight build for this gym (another process/run holds it).
+    assert build_lock.acquire("gritx", holder="other-run") is True
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is False
+    assert out["reason"] == "build_in_progress"
+    assert store.deleted == [] and store.inserted == [], (
+        "a gym already mid-build must never have its month touched by a second call")
+
+
+def test_lock_is_released_after_a_successful_build_so_the_next_call_can_run(tmp_path):
+    """The lock must not be held past the build that acquired it: a legitimate next
+    rebuild (nightly scan the following night, a human-triggered restage) must be
+    able to proceed once the in-flight build actually finishes."""
+    from agent import build_lock
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    assert build_lock.is_locked("gritx") is False

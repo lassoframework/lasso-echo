@@ -1,11 +1,11 @@
 """
-feed_image.py — auto-fit a client's feed PHOTO into an in-spec square card.
+feed_image.py — auto-fit a client's feed PHOTO into an in-spec 4:5 card.
 
 A gym owner sometimes uploads an oddly-cropped or panoramic photo (Dale, 2026-08-18: "the
 photo is not to size"). Instagram/Facebook only accept a feed aspect ratio between ~0.8 (4:5
 portrait) and ~1.91 (landscape); anything outside that range gets hard-cropped by the platform
 so the subject is chopped. This module detects an out-of-spec photo and re-frames it into a
-clean 1080x1080 card: the WHOLE photo is contained (never cropped further) on a blurred cover
+clean 1080x1350 card: the WHOLE photo is contained (never cropped further) on a blurred cover
 fill of itself, exactly like the story formatter (no black bars, no distortion).
 
 In-spec photos are left ALONE (returns None -> the raw photo posts unchanged), so a good
@@ -20,7 +20,10 @@ from . import config
 # Instagram/Facebook accepted feed aspect ratios (width / height). Outside this the platform
 # hard-crops, so we re-frame. 4:5 = 0.8 (tallest), 1.91:1 = 1.91 (widest).
 MIN_RATIO, MAX_RATIO = 0.8, 1.91
-FEED_W = FEED_H = 1080                    # square: the universally safe feed frame (IG + FB)
+FEED_W, FEED_H = 1080, 1350               # 4:5: Instagram's tallest supported feed frame
+# The output geometry is part of the cache contract. Keep old 1080x1080 derivatives in the
+# legacy directory and render a fresh 4:5 card instead of silently reusing square media.
+_CACHE_VERSION = "4x5-v1"
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 
@@ -34,13 +37,13 @@ def needs_autofit(width, height):
 
 
 def build_feed_image(photo_path, out_path):
-    """Render a 1080x1080 feed card: the whole photo CONTAINED (never cropped) on a blurred,
+    """Render a 1080x1350 feed card: the whole photo CONTAINED (never cropped) on a blurred,
     darkened cover fill of itself. Returns out_path, or raises on an unreadable image (the
     caller treats any exception as fall-back-to-raw)."""
     from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
     base = Image.open(photo_path).convert("RGB")
-    # BACKGROUND: cover the whole square, blur + darken (no bars, ever).
+    # BACKGROUND: cover the whole 4:5 frame, blur + darken (no bars, ever).
     bg = ImageOps.fit(base, (FEED_W, FEED_H), Image.LANCZOS).filter(
         ImageFilter.GaussianBlur(38))
     canvas = ImageEnhance.Brightness(bg).enhance(0.5).convert("RGB")
@@ -58,7 +61,7 @@ def build_feed_image(photo_path, out_path):
 def make_feed_safe_from_bytes(img_bytes, out_path):
     """PUBLISH-TIME preflight from raw image bytes (no local source file needed).
 
-    Returns out_path holding an in-spec 1080x1080 card when the bytes are an out-of-spec
+    Returns out_path holding an in-spec 1080x1350 card when the bytes are an out-of-spec
     photo; returns None when the image is ALREADY in-spec (post it unchanged) or is not a
     usable still image. Never raises — any failure returns None so the caller posts the
     original. This is the belt to build_feed_image's suspenders: it guarantees no
@@ -85,9 +88,10 @@ def make_feed_safe_from_bytes(img_bytes, out_path):
 
 
 def get_or_make_feed_image(photo_path, library_path, *, logger=None):
-    """A hosted-ready 1080x1080 feed card for an OUT-OF-SPEC photo (cached in
-    <library>/feedfit/), or None when: the flag is off, the file is not a usable photo, the
-    photo is already in-spec (posts unchanged), or the render fails. NEVER raises."""
+    """A hosted-ready 1080x1350 feed card for an OUT-OF-SPEC photo (cached in
+    <library>/feedfit/<geometry-version>/), or None when: the flag is off, the file is not
+    a usable photo, the photo is already in-spec (posts unchanged), or the render fails.
+    NEVER raises."""
     log = logger or (lambda m: print(f"[feed-image] {m}"))
     if not config.feed_autofit_enabled():
         return None
@@ -100,7 +104,7 @@ def get_or_make_feed_image(photo_path, library_path, *, logger=None):
         if not needs_autofit(w, h):
             return None                                  # already in-spec: post the raw photo
         import hashlib
-        cache_dir = os.path.join(str(library_path), "feedfit")
+        cache_dir = os.path.join(str(library_path), "feedfit", _CACHE_VERSION)
         os.makedirs(cache_dir, exist_ok=True)
         with open(photo_path, "rb") as fh:
             key = hashlib.sha256(fh.read()).hexdigest()[:12]

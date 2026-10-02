@@ -195,7 +195,22 @@ def clear(base_key, *, store=None, log=None):
     log = log or (lambda m: print(f"[onboarding-demo] {m}"))
     if not base_key or store is None:
         return 0
-    existing = _existing_rows(store, base_key)
+    # Real builds can land after sample cards have crossed a month boundary.  The
+    # normal onboarding read intentionally looks only at the current/future runway,
+    # but cleanup must also see recent past months or those old SAMPLE cards remain
+    # visible beside the real calendar forever.
+    reader = getattr(store, "list_month", None)
+    if not callable(reader):
+        return 0
+    today = date.today()
+    months = sorted({(today + timedelta(days=d)).strftime("%Y-%m")
+                     for d in (-90, -60, -30, 0, 15, 30, 45)})
+    existing = []
+    for month in months:
+        try:
+            existing.extend(reader(base_key, month) or [])
+        except Exception:  # noqa: BLE001 - cleanup must never sink a real build
+            return 0
     if not existing:
         return 0
     ids = [r.get("id") for r in existing if is_sample_row(r) and r.get("id")]

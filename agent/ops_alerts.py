@@ -164,7 +164,7 @@ def _default_poster():
     return SlackPoster()
 
 
-def alert(message, poster=None, force=False):
+def alert(message, poster=None, force=False, business_seed=None, seed_bus=None):
     """
     Post one ops alert line to the Slack channel. Returns the Slack response, or
     None when dormant. Flag OFF -> None, no client touched (unless `force`, used
@@ -194,6 +194,21 @@ def alert(message, poster=None, force=False):
                 return None
         except Exception:  # noqa: BLE001 - a classifier fault must never eat an alert
             pass
+    # A structured business seed is a row-first automation trigger, not Slack
+    # prose. Persist it before the repeat gate: the Slack line may legitimately
+    # be suppressed as a repeat while the deterministic support ticket still
+    # needs to exist. A failed structured write falls back to the existing
+    # echosupport cross-post below, never to a fabricated partial ticket.
+    seeded_ticket = False
+    if business_seed is not None and config.ops_fix_triage_enabled():
+        try:
+            from . import fixer_business_seed as _business_seed
+            _business_seed.persist(business_seed, scrub(message), bus=seed_bus)
+            seeded_ticket = True
+        except Exception as e:  # noqa: BLE001 - primary alert/fallback must survive
+            print(f"[ops-alerts] structured ops-fix seed failed: "
+                  f"{type(e).__name__}: {scrub(e)}")
+
     # SLACK REPEAT GATE (Blake, 2026-09-04: "why do i keep getting this?"). The gate
     # above asks whether a human ever needs this shape; this one asks whether a human has
     # already been told this exact thing recently and nothing has changed. Runs LAST of
@@ -219,7 +234,8 @@ def alert(message, poster=None, force=False):
         # An alert must never take the pipeline down with it.
         print(f"[ops-alerts] failed to post alert: {type(e).__name__}: {scrub(e)}")
         return None
-    _maybe_cross_post_ops_fix(text, poster)
+    if not seeded_ticket:
+        _maybe_cross_post_ops_fix(text, poster)
     return result
 
 

@@ -4,13 +4,14 @@ Echo support ticket to the real pipeline.
 
 Ground truth (Blake's own words): "with echo if someone submits a support echo should
 receive that then echo should fix it verify the fix and then send slack message with
-them and me in the message." This module is the "receive" + "dispatch" + "notify once
-verified" half; the actual fix + verify for a code_fix is the SAME ops-fix-triage.js
-worker every Slack-sourced code_fix already uses (D3/D14) -- this does not bypass that,
-or its hold gate. A code_fix from a client is ALWAYS held behind Blake's #fixer tap,
-exactly like every other code_fix in this system; D14's invariant is untouched. What
-changes is that once that worker has verified a real fix, THIS module is what notices
-and sends the client (and Blake) the verified result, automatically.
+them and me in the message." This module receives and classifies the portal
+ticket; the actual code fix is owned by Scout's FIXER worker. The original
+fixer_request remains held for an internal audit trail. Blake's later
+2026-09-18 portal-intake direction permits Scout to verify that authenticated
+bridge record and queue this narrow code-fix source autonomously. Scout owns
+that fix and customer handoff; this module's legacy fixed_pass currently
+refuses code-fix notification because it has no registered fix-verdict writer.
+Customer contact still waits for a verified live fix with Blake present.
 
 PROVENANCE (D42/D45): a ticket from source='website_tab' is trustworthy because
 lasso-ops-portal's /api/gyms/[gymId]/support route stamps `reporter` from the
@@ -28,13 +29,17 @@ no-ops while config.portal_echo_tickets_enabled() is off:
   1. intake_pass(): NEW, unclassified website_tab/echo tickets -> resolve identity,
      classify, dispatch (a grounded question gets an immediate answer + outreach; a
      code_fix gets a HELD fixer_request card, same as any other code_fix).
-  2. fixed_pass(): tickets already dispatched to the fixer worker (status='fixing')
-     whose verification has since landed -> outreach with the VERIFIED result as the
-     first message. A not-yet-verified ticket is left exactly as-is for next cycle.
+  2. fixed_pass(): legacy verification consumer; currently refuses code-fix
+     notification because FIX_VERIFICATION_PRODUCERS is empty. Scout's newer
+     portal handoff owns its post-deploy customer notice.
 
 Both passes are pure given their injected dependencies -- no import of a live Slack
 client or the live bus at module scope, so they are fully unit-testable offline.
 """
+import json
+import os
+import time
+
 from . import config
 from .slack_convo import adapter as _a
 from .slack_convo import classifier as _cls
@@ -43,7 +48,6 @@ from .slack_convo import identity_gate as _ig
 from .slack_convo import outbox as _ob
 from .slack_convo import outreach as _out
 
-_EPOCH_ISO = "1970-01-01T00:00:00+00:00"
 
 # D47 (Blake, 2026-09-04): generalized from Echo-only to any (product, identity) pair
 # routed through the identity map -- portal tickets (product='portal', the generic
@@ -53,6 +57,98 @@ _EPOCH_ISO = "1970-01-01T00:00:00+00:00"
 # unchanged; a caller wiring a second (product, identity) pair passes them explicitly.
 PRODUCT = "echo"
 SOURCE = "website_tab"
+_INTAKE_PAGE_LIMIT = 20
+_INTAKE_MAX_SWEEP_SECONDS = 24 * 60 * 60
+_intake_now = time.time
+
+
+# ---------------------------------------------------------------------------
+# Intake keyset cursor (2026-09-23 starvation fix)
+#
+# The old poll re-read the same oldest-20 window every pass, so 20 permanently-failing
+# (or probe/test) rows starved every fresh customer ticket behind them. The cursor below
+# is what makes the window BOUNDED AND FAIR: bus.find_new_tickets(after=cursor) walks
+# strictly FORWARD through the unclassified queue in (created_at, id) order -- keyset,
+# never OFFSET, so a concurrent insert can never shift the page and silently skip a row --
+# and the cursor is advanced past EVERY raw row of the page, processed or not. A ticket
+# that throws stays 'new' and is retried on the next sweep, after the tickets behind it
+# have had their turn; it no longer monopolises the window.
+#
+# Restart behaviour: the cursor is persisted atomically (tmp + os.replace) under
+# config.data_dir() -- the same durable volume db.db_path uses -- keyed per
+# (product, source, identity) leg, so the portal->scout and echo->echo legs paginate
+# independently and a redeploy resumes where the last pass left off instead of restarting
+# at the poison block. A crash mid-pass replays at most the current page: rows that
+# SUCCEEDED changed status/classification and are never re-fetched, and the inbound-row
+# guard in _intake_one prevents a duplicated message for a row that failed later, so a
+# replay can never double-process a successful ticket. A missing or corrupt cursor file
+# is a cold start from the top of the queue -- safe for the same reason, and fail-closed:
+# it can re-attempt work, never fabricate a delivery.
+# ---------------------------------------------------------------------------
+
+# Last known cursor state per configured path. This keeps pagination fair while the
+# durable volume is temporarily unwritable; it is deliberately process-local and never
+# changes any ticket/send safety decision.
+_INTAKE_CURSOR_CACHE = {}
+
+
+def _intake_cursor_path():
+    return os.path.join(config.data_dir(), "echo_intake_cursor.json")
+
+
+def _intake_leg_key(product, source, identity_name):
+    return f"{product}|{source}|{identity_name}"
+
+
+def _load_intake_cursors(path):
+    cache_key = os.path.abspath(path)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:  # noqa: BLE001 - missing/corrupt state is a safe cold start
+        data = {}
+    # A malformed leg is discarded independently so it cannot reset another leg.
+    data = {key: value for key, value in data.items()
+            if isinstance(value, dict)
+            and isinstance(value.get("created_at"), str) and value["created_at"]
+            and isinstance(value.get("id"), str) and value["id"]}
+    # If persistence failed earlier in this process, its newer state wins over the
+    # older on-disk snapshot. Valid untouched legs from disk remain available.
+    data.update(_INTAKE_CURSOR_CACHE.get(cache_key, {}))
+    _INTAKE_CURSOR_CACHE[cache_key] = dict(data)
+    return data
+
+
+def _save_intake_cursors(path, cursors, *, log=print):
+    cache_key = os.path.abspath(path)
+    safe_cursors = {key: value for key, value in cursors.items()
+                    if isinstance(value, dict)
+                    and isinstance(value.get("created_at"), str) and value["created_at"]
+                    and isinstance(value.get("id"), str) and value["id"]}
+    # Record first: even a write or atomic replace failure must not restart the
+    # in-process queue at the oldest page on the next poll.
+    _INTAKE_CURSOR_CACHE[cache_key] = dict(safe_cursors)
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(safe_cursors, f)
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - memory fallback is safe; operator must see loss of durability
+        log(f"[echo-ticket-worker] cursor persistence failed path={path}; "
+            f"using process memory: {type(exc).__name__}: {exc}")
+
+
+def _fetch_intake_page(bus, *, product, source, cursor):
+    """One bounded page of new tickets, keyset-forward of `cursor` when one exists.
+    `after` is only passed when set: older bus fakes with the pre-pagination signature
+    keep working unchanged."""
+    kw = {"product": product, "source": source}
+    if cursor:
+        kw["after"] = {"created_at": cursor["created_at"], "id": cursor["id"]}
+    return bus.find_new_tickets(**kw)
 
 
 def resolve_client_identity(ticket, *, slack_lookup_email, slack_user_info, portal_lookup,
@@ -125,7 +221,10 @@ def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print
     ("Can we add our group sessions schedule to the website?") was stuck in exactly
     this loop from the moment AGENT_PORTAL_ECHO_TICKETS_ENABLED first armed."""
     tid = ticket.get("id")
-    bus.set_ticket(tid, status="hold", escalated=True)
+    # Round 3 (audit of PR #107): classification is cleared explicitly. The QUESTION branch
+    # stamps answerable_question before an undelivered answer lands here, and the FIXER's
+    # poll (hold + escalated + classification NULL) would skip that ticket forever.
+    bus.set_ticket(tid, status="hold", escalated=True, classification=None)
     bus.record_outbound(
         ticket_id=tid, author_type="system",
         body=f"Portal ticket {tid} ({identity_name}) could not be routed "
@@ -133,96 +232,55 @@ def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print
              f"{(ticket.get('raw_text') or '')[:300]}",
         delivery_status="ready", kind=_a.KIND_ESCALATION,
         meta={"identity": identity_name, "surface": "portal_ticket_bridge"})
-    acknowledge_submitter(bus, ticket, identity_name=identity_name, who=who,
-                          outreach=outreach, log=log)
+    # Portal incidents stay internal until the fix is merged, deployed and verified,
+    # and Blake is included in the eventual customer conversation. An ACK here can
+    # immediately open a group DM or queue a portal-thread message.
     log(f"[ticket-worker/{identity_name}] escalated ticket={tid} reason={reason}")
-
-
-def acknowledge_submitter(bus, ticket, *, identity_name="echo", who=None, outreach=None,
-                          log=print):
-    """D48 (Blake, 2026-09-05): an escalation must never be silence for the person who
-    wrote in.
-
-    Found live on three real portal tickets: each one reached #fixer correctly and each one
-    left its submitter with nothing at all -- no "we got it", and no word when it was dealt
-    with. The Slack-initiated path has always sent this acknowledgement (adapter.py emits
-    ACK/TEMPLATE_NO_ANSWER_YET inline); the portal bridge never did, because it escalates and
-    returns before any client-facing row is written.
-
-    Best channel available, in order:
-      1. a Slack group DM (Blake + the client + this bot) when we resolved the person to a
-         real client -- the same outreach.initiate the answered path uses, so the DM thread
-         becomes the ticket thread and everything after this lands there too;
-      2. the portal support thread they submitted from, which outbox.py now delivers to.
-
-    Written exactly once per ticket: an ack already on the row (including the one
-    outreach.initiate writes for itself) means this has been done. Returns True when an
-    acknowledgement exists after this call."""
-    tid = ticket.get("id")
-    if _has_outbound_kind(bus, tid, _a.KIND_ACK, log=log):
-        return True
-    # M1 (audit 2): a group DM to a client is a client-facing send and obeys the same flags
-    # as every other one. With them off this falls through to the portal-thread row below,
-    # which the outbox gates in the usual way -- the client is still acknowledged, through a
-    # surface that respects the trust ladder.
-    dm_allowed = (config.slack_convo_identity_enabled(identity_name)
-                  and config.slack_convo_client_reply_armed(identity_name))
-    if (dm_allowed and outreach and who is not None and who.kind == _ig.CLIENT
-            and who.slack_user_id):
-        result = _out.initiate(
-            _verified_ticket_dict(ticket), who, outreach["ident"],
-            open_group_dm=outreach["open_group_dm"],
-            post_first_message=outreach["post_first_message"],
-            record_outbound=bus.record_outbound, stamp_ticket=outreach.get("stamp_ticket"),
-            message_text=_a.TEMPLATE_NO_ANSWER_YET, mark_message=outreach.get("mark_message"),
-            claim_message=outreach.get("claim_message"), log=log)
-        if getattr(result, "delivered", False):
-            return True
-        # C2 (audit 2): this used to return True on `opened`, which is True even when the
-        # post FAILED -- so the client got nothing AND the portal-thread fallback below was
-        # skipped, on the one path whose entire job is making sure they hear something.
-        log(f"[ticket-worker/{identity_name}] escalation ack not delivered "
-            f"ticket={tid} reason={result.reason}; falling back to the portal thread")
-    bus.record_outbound(
-        ticket_id=tid, author_type=identity_name, body=_a.TEMPLATE_NO_ANSWER_YET,
-        delivery_status="ready", kind=_a.KIND_ACK,
-        meta={"identity": identity_name, "surface": "portal_ticket_bridge",
-              "recipient_kind": "client"})
-    return True
-
-
-def _has_outbound_kind(bus, tid, kind, *, log=print):
-    """Fails CLOSED (True, "already sent") on a bus fault -- the same convention
-    adapter._outbound_kind_ever uses: a read failure must never license a second send."""
-    try:
-        return bus.count_outbound_kind_since(tid, kind, _EPOCH_ISO) > 0
-    except AttributeError:
-        pass
-    except Exception as e:  # noqa: BLE001
-        log(f"[ticket-worker] ack lookup failed ticket={tid}: {type(e).__name__}")
-        return True
-    try:
-        return any(m.get("direction") == "outbound"
-                   and (m.get("attachments") or {}).get("kind") == kind
-                   for m in bus.messages(tid, limit=200))
-    except Exception as e:  # noqa: BLE001
-        log(f"[ticket-worker] ack lookup failed ticket={tid}: {type(e).__name__}")
-        return True
 
 
 def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open_group_dm,
                post_first_message, write_hold_notice, product=PRODUCT, source=SOURCE,
                identity_name="echo", operator_ids=(), fetch_state=None, llm=None,
                classify_llm=None, mark_message=None, claim_message=None, stamp_ticket=None,
-               log=print):
+               cursor_path=None, log=print):
     """First pass: NEW, unclassified tickets for (product, source), dispatched under
     identity_name. Never runs if the config flag is off. Defaults preserve the
     original Echo-only behavior; D47 generalized this for a second (product,
-    identity) pair (portal -> scout) without touching Echo's call site."""
+    identity) pair (portal -> scout) without touching Echo's call site.
+
+    2026-09-23 starvation fix: the page is one keyset-forward WINDOW (see the cursor
+    note above), not the permanent oldest-20. The persisted cursor advances past every
+    raw row of the page -- failed tickets included -- so a poison block is walked past
+    and a fresh ticket behind it is reached within ceil(queue_depth / page_size) polls;
+    when a poll past the tail returns nothing, the cursor wraps to the top and the
+    still-'new' failures get their next attempt."""
     if not config.portal_echo_tickets_enabled():
         return {"processed": 0}
     ident = _ids.IDENTITIES[identity_name]
-    tickets = bus.find_new_tickets(product=product, source=source)
+    path = cursor_path or _intake_cursor_path()
+    leg = _intake_leg_key(product, source, identity_name)
+    cursors = _load_intake_cursors(path)
+    cursor = cursors.get(leg) or None
+    now = _intake_now()
+    sweep_started_at = (cursor.get("_sweep_started_at")
+                        if cursor and isinstance(cursor.get("_sweep_started_at"), (int, float))
+                        else now)
+    if cursor and now - sweep_started_at >= _INTAKE_MAX_SWEEP_SECONDS:
+        # Under a sustained full queue the tail may never arrive. Periodically begin a
+        # new sweep so old failed rows get another chance without pinning the worker.
+        cursor = None
+        sweep_started_at = now
+    tickets = _fetch_intake_page(bus, product=product, source=source, cursor=cursor)
+    raw_last = getattr(tickets, "raw_last", None)
+    raw_count = getattr(tickets, "raw_count", len(tickets))
+    if raw_count == 0 and cursor:
+        # The tail: nothing past the cursor. Wrap to the top so the tickets that failed
+        # earlier in the sweep (still status='new') are retried.
+        cursor = None
+        sweep_started_at = now
+        tickets = _fetch_intake_page(bus, product=product, source=source, cursor=None)
+        raw_last = getattr(tickets, "raw_last", None)
+        raw_count = getattr(tickets, "raw_count", len(tickets))
     processed = 0
     for ticket in tickets:
         tid = ticket["id"]
@@ -243,6 +301,26 @@ def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open
         except Exception as e:  # noqa: BLE001 -- one bad ticket must never starve the rest
             log(f"[echo-ticket-worker] intake failed ticket={tid}: "
                 f"{type(e).__name__}: {e}")
+    # Advance the leg's cursor past the last RAW row of this page -- succeeded, failed
+    # and locally test-filtered rows alike (raw_last comes from the unfiltered page, so
+    # probe rows the strict filter removed still move the window forward). A plain-list
+    # result from an older fake carries no page facts: the cursor simply stays put, which
+    # is the pre-fix behaviour for those callers. Persisted once per pass; a crash before
+    # this point replays at most the current page, which is safe (see the cursor note).
+    new_cursor = None
+    if isinstance(raw_last, dict) and raw_last.get("created_at") and raw_last.get("id"):
+        new_cursor = {"created_at": str(raw_last["created_at"]), "id": str(raw_last["id"]),
+                      "_sweep_started_at": sweep_started_at}
+    # A short page reached the current tail even if a new row arrives before the next
+    # poll. Clear the cursor now so failures earlier in the sweep are retried next time.
+    if raw_count < _INTAKE_PAGE_LIMIT:
+        new_cursor = None
+    if new_cursor is not None:
+        cursors[leg] = new_cursor
+    else:
+        cursors.pop(leg, None)
+    if new_cursor is not None or leg in _load_intake_cursors(path):
+        _save_intake_cursors(path, cursors, log=log)
     return {"processed": processed}
 
 
@@ -336,29 +414,35 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
             # "a member tweaked her back, what do we tell her?" posted to a client's group DM
             # with no tap. Both paths now call the SAME shared decision so they cannot drift
             # apart again.
-            forbidden = not _a.may_auto_answer(ticket.get("raw_text") or "", answer["body"])
+            # D72 (2026-09-11): the verdict carries a tier, and a held answer is never
+            # silent to the team -- hold_answer_for_team writes the team card and
+            # escalates the ticket with the tier visible (needs_review clears the
+            # classification so the FIXER's poll picks it up). Portal tickets suppress
+            # its customer template until verification and Blake's handoff.
+            verdict = _a.auto_answer_verdict(ticket.get("raw_text") or "", answer["body"])
             armed = (config.slack_convo_auto_answer_armed(identity_name)
                      and config.slack_convo_client_reply_armed(identity_name))
-            if forbidden or not armed:
-                why = ("hard line (billing, hours or schedule, injury or liability): this "
-                       "never auto answers, whatever the flags say" if forbidden else
-                       f"SLACK_CONVO_{identity_name.upper()}_AUTO_ANSWER is off: a grounded "
-                       f"answer needs your tap")
+            if verdict.held or not armed:
+                held_verdict = (verdict if verdict.held else
+                                _a.AnswerVerdict(False, _a.HOLD_TIER_UNARMED,
+                                                 "auto_answer_not_armed"))
                 row = bus.record_outbound(
                     ticket_id=tid, author_type=identity_name, body=answer["body"],
                     delivery_status="held", kind=_a.KIND_ANSWER,
                     meta={"identity": identity_name, "recipient_kind": who.kind,
                           "surface": "portal_ticket_bridge",
-                          "auto_answer_forbidden": bool(forbidden)})
-                bus.set_ticket(tid, status="hold", escalated=True)
-                if write_hold_notice:
-                    write_hold_notice(ident_name=identity_name, tid=tid,
-                                      recipient_kind=who.kind,
-                                      user=who.slack_user_id or "", account_key=who.account_key,
-                                      kind=_a.KIND_ANSWER, body=answer["body"],
-                                      held_message_id=(row or {}).get("id"),
-                                      surface="portal_ticket_bridge", why=why)
-                log(f"[echo-ticket-worker] answer HELD ticket={tid} why={why}")
+                          "auto_answer_forbidden": bool(
+                              verdict.tier == _a.HOLD_TIER_ORG_FLOOR),
+                          "hold_tier": held_verdict.tier, "hold_rule": held_verdict.rule})
+                fresh = bus.ticket(tid) or {"id": tid}
+                _a.hold_answer_for_team(
+                    bus, ticket=fresh, ident_name=identity_name, recipient_kind=who.kind,
+                    user=who.slack_user_id or "", account_key=who.account_key,
+                    surface="portal_ticket_bridge", body=answer["body"],
+                    held_message_id=(row or {}).get("id"), verdict=held_verdict,
+                    write_hold_notice_fn=write_hold_notice or None,
+                    unarmed_flag=f"SLACK_CONVO_{identity_name.upper()}_AUTO_ANSWER",
+                    client_notice=False, log=log)
                 return
             result = _out.initiate(
                 _verified_ticket_dict(ticket), who, ident,
@@ -367,7 +451,16 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 message_text=answer["body"], mark_message=mark_message,
                 claim_message=claim_message, log=log)
             if getattr(result, "delivered", False):
-                bus.set_ticket(tid, status="resolved")
+                # Round 2 (MAJOR 6): an answer that promised a PERSON will follow up must
+                # not close the ticket -- it goes to the FIXER with the follow-up marker
+                # instead (same disposition the Slack adapter and the outbox use).
+                if _a.promises_human_follow_up(answer["body"]):
+                    _a.route_follow_up_promise(bus, bus.ticket(tid) or {"id": tid},
+                                               ident_name=identity_name, body=answer["body"],
+                                               recipient_kind=who.kind,
+                                               surface="portal_ticket_bridge", log=log)
+                else:
+                    bus.set_ticket(tid, status="resolved")
                 # M1: the one path that sends a model answer with NO tap at all produced no
                 # receipt, so the very thing Blake asked to see was the one thing invisible.
                 try:
@@ -394,20 +487,14 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
         return
 
     if classification == _cls.CODE_FIX:
-        # Same HELD fixer_request path every Slack-sourced code_fix uses (D14) --
-        # a client's code_fix is ALWAYS held behind Blake's #fixer tap, no exception
-        # for this source. This worker only automates the NOTIFY step once the
-        # existing worker (ops-fix-triage.js) has actually verified a fix. NOTE
-        # (D10, unchanged): that desktop worker trusts only Echo's bot_id today, so
-        # a non-Echo identity's fixer_request will queue correctly here but not yet
-        # execute -- the same documented limitation every other non-Echo code_fix
-        # path in this system already carries.
+        # Preserve the HELD fixer_request as durable internal evidence. Scout's
+        # narrow authenticated portal bridge may independently verify it and
+        # queue the original ticket without releasing this internal row.
         bus.set_ticket(tid, classification=_cls.CODE_FIX, status="fixing")
-        # Finding 10 (audit 3): D48's rule is that an escalation is never silence, and this
-        # is the branch the client waits on longest. The Slack path has always acked a
-        # code_fix inline; this one returned without writing the client anything at all.
-        acknowledge_submitter(bus, ticket, who=who, identity_name=identity_name,
-                              outreach=outreach, log=log)
+        # Customer contact for a code fix waits for merge, verified deployment,
+        # and a conversation that includes Blake. The held internal request is
+        # the durable intake signal; an early acknowledgement would violate that
+        # customer-contact gate before the FIXER has changed anything.
         text = _a.fixer_request_text(ident, tid, ticket.get("raw_text") or "", who,
                                     who.slack_user_id)
         row = bus.record_outbound(ticket_id=tid, author_type="system", body=text,

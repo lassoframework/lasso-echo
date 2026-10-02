@@ -47,6 +47,7 @@ from . import portal_social as _ps
 from . import portal_events as _pe
 from . import zernio_routes as _zr
 from . import story_studio_routes as _ss
+from . import fixer_ops as _fixer_ops
 
 _TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
 _TRACKER_TOKEN_ENV = "AGENT_TRACKER_TOKEN"   # name only; value is set by hand
@@ -91,7 +92,7 @@ PORTAL_POST_ACTIONS = ("approve", "edit", "deny", "kill", "swap-media",
                        # touching it; pick-variant promotes <id> (itself the
                        # candidate) to active. "variants" is a GET, not a POST
                        # action, and is routed separately below.
-                       "regen-variant", "pick-variant")
+                       "regen-variant", "regen-variant-brief", "pick-variant")
 
 
 def client_for_token(token):
@@ -1365,13 +1366,8 @@ each so we know what is happening in it. All of it optional. We take it from the
      cap.addEventListener('input',function(){rec.caption=cap.value;});
      var ctx=document.createElement('textarea'); ctx.className='cap'; ctx.rows=2;
      ctx.maxLength=500;
-     ctx.placeholder='Who or what is in this photo? If you name someone and check the box, we may use it. Skip it and we keep captions general.';
+     ctx.placeholder='Who or what is in this photo? (optional)';
      ctx.addEventListener('input',function(){rec.context=ctx.value;});
-     var perm=document.createElement('label'); perm.className='perm';
-     var chk=document.createElement('input'); chk.type='checkbox';
-     chk.addEventListener('change',function(){rec.consent=chk.checked;});
-     perm.appendChild(chk);
-     perm.appendChild(document.createTextNode(" I have this person's permission to be named or featured"));
      var row2=document.createElement('div'); row2.className='row2';
      var state=document.createElement('span'); state.className='state'; state.textContent='ready';
      var rm=document.createElement('button'); rm.className='rm'; rm.type='button';
@@ -1381,7 +1377,7 @@ each so we know what is happening in it. All of it optional. We take it from the
      rec._state=state;
      row2.appendChild(state); row2.appendChild(rm);
      meta.appendChild(fname); meta.appendChild(cap); meta.appendChild(ctx);
-     meta.appendChild(perm); meta.appendChild(row2);
+     meta.appendChild(row2);
      li.appendChild(thumb); li.appendChild(meta);
      gallery.appendChild(li);
    })(files[i]);}
@@ -1400,7 +1396,6 @@ each so we know what is happening in it. All of it optional. We take it from the
      fd.append('media',p.file,p.file.name||'upload');
      fd.append('caption',p.caption||'');
      fd.append('context',p.context||'');
-     fd.append('consent',p.consent?'on':'');
      p._state.textContent='sending'; p._state.className='state';
    });
    fd.append('note',note.value||'');
@@ -2146,6 +2141,9 @@ def build_server(port=None):
             m = re.match(pat + r"sources/([A-Za-z0-9_-]+)/disconnect$", path)
             if m:
                 return m.group(1), "sources-disconnect", m.group(2)
+            m = re.match(pat + r"sources/([A-Za-z0-9_-]+)/sync$", path)
+            if m:
+                return m.group(1), "sources-sync", m.group(2)
             m = re.match(pat + r"assets$", path)
             if m:
                 return m.group(1), "assets", None
@@ -2219,7 +2217,29 @@ def build_server(port=None):
                 return m.group(1), ("handoff" if m.group(2) else "tracker")
             return None, None
 
+        def _ops_actions(self, method):
+            """D72: the FIXER's ops-action lane, /ops/actions/*. fixer_ops owns auth (the
+            X-Fixer-Ops-Secret header, constant time), validation, the catalog and the
+            ticket record; this is the transport only. Returns True when it answered."""
+            if not self.path.split("?")[0].startswith(_fixer_ops.ROUTE_PREFIX):
+                return False
+            raw = b""
+            if method == "POST":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > _fixer_ops.MAX_BODY_BYTES:
+                    self._send_json({"error": "too_large"}, 413)
+                    return True
+                raw = self.rfile.read(length) if length else b""
+            answered = _fixer_ops.handle(method, self.path, self.headers.get, raw)
+            if answered is None:
+                return False
+            status, body = answered
+            self._send_json(body, status)
+            return True
+
         def do_GET(self):
+            if self._ops_actions("GET"):
+                return
             # Portal gym status: GET /portal/gym/<account_key>
             # Gated by AGENT_PORTAL_APPROVALS. Returns JSON. No token in path.
             # AUTH REQUIRED (audit 2026-08-25 CRITICAL): the response reconstructs the gym's
@@ -2337,7 +2357,9 @@ def build_server(port=None):
                     status, body = _ss.handle_get_story(account_key, _ss_arg)
                 else:
                     # a GET on /studio/story is the LIST read (create-story is a POST).
-                    status, body = _ss.handle_list_stories(account_key)
+                    from urllib.parse import urlparse, parse_qs
+                    automatic_only = parse_qs(urlparse(self.path).query).get('automatic') == ['1']
+                    status, body = _ss.handle_list_stories(account_key, automatic_only=automatic_only)
                 return self._send_json(body, status)
 
             # Zernio social-connect read routes (Blake ruling 2026-07-29: Zernio is the vendor;
@@ -2466,7 +2488,11 @@ def build_server(port=None):
             # Reveals liveness + flag state only, never tokens or clients.
             if self.path.split("?")[0] == "/healthz":
                 body = json.dumps({"ok": True,
-                                   "intake_enabled": config.intake_enabled()}).encode()
+                                   "intake_enabled": config.intake_enabled(),
+                                   "deployment": {
+                                       "commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA"),
+                                       "service": os.environ.get("RAILWAY_SERVICE_NAME"),
+                                   }}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -2543,6 +2569,10 @@ def build_server(port=None):
             self.end_headers()
 
         def do_POST(self):
+            # D72: FIXER ops actions, POST /ops/actions/<action>. Answered in full by
+            # fixer_ops (auth first, then validation); see that module's contract block.
+            if self._ops_actions("POST"):
+                return
             # LISTENER HEARTBEAT: POST /ops/heartbeat {source, ts, sig}
             #
             # A desktop service Echo depends on (scout-listener, which picks support
@@ -2613,7 +2643,7 @@ def build_server(port=None):
             # per-gym inside gym_media_routes (403 when off for this gym).
             mt_token, mt_kind, mt_arg = self._media_route()
             if mt_token is not None and mt_kind in (
-                    "check-connection", "sources", "sources-disconnect",
+                    "check-connection", "sources", "sources-disconnect", "sources-sync",
                     "asset-hide", "asset-unhide"):
                 # CSRF/Origin rail: mirror every other portal write route. A cross-origin
                 # POST is refused unless it is the allowed portal origin (server-to-server
@@ -2648,6 +2678,8 @@ def build_server(port=None):
                         actor_id=body.get("actor_id", ""))
                 elif mt_kind == "sources-disconnect":
                     status, resp = _gm.handle_disconnect_source(account_key, mt_arg)
+                elif mt_kind == "sources-sync":
+                    status, resp = _gm.handle_request_source_sync(account_key, mt_arg)
                 else:  # asset-hide / asset-unhide
                     status, resp = _gm.handle_hide_asset(
                         account_key, mt_arg, hide=(mt_kind == "asset-hide"))
@@ -2957,6 +2989,9 @@ def build_server(port=None):
                 elif ps_action == "regen-variant":
                     status, resp = _ps.handle_regen_variant(account_key, ps_post_id,
                                                             actor_id)
+                elif ps_action == "regen-variant-brief":
+                    status, resp = _ps.handle_regen_variant_from_brief(
+                        account_key, ps_post_id, actor_id, brief=body.get("brief", ""))
                 elif ps_action == "pick-variant":
                     status, resp = _ps.handle_pick_variant(account_key, ps_post_id,
                                                            actor_id)

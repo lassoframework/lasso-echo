@@ -219,6 +219,11 @@ def publish(draft, account, http=None):
         return PublishResult(ok=True, mode="would_publish",
                              detail="stories flag OFF (draft only)")
 
+    from .publish_billing_gate import publishing_blocked
+    from .portal_social import _base_of_account
+    if publishing_blocked(_base_of_account(account.key)):
+        raise SocialApiPublishError("Echo publishing held: account revoked or subscription canceled")
+
     # 3) Fast idempotency: an already-published posts row => no-op.
     done, prior_id = _already_published(draft)
     if done:

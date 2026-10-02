@@ -74,7 +74,7 @@ Body: Ads, lead nurture, your website, your social, and your reporting.
 Body: LASSO puts it all in one place, done for you, so you stop duct taping tools together.
 
 ### Pillar: Sales are now
-Hook: You did not open a gym to run ads at 11pm.
+Hook: You did not open a gym to run your own ads.
 Body: The job is closing members, not building funnels.
 Body: We get the leads and nurture them. You do the one thing only you can do: sell.
 

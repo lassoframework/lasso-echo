@@ -237,6 +237,16 @@ class ZernioError(Exception):
         super().__init__(f"zernio {status}: {detail}")
 
 
+class ZernioPaginationError(ValueError):
+    """A paged provider read that cannot safely establish a complete result.
+
+    The FIXER reconciliation lane may only clear an alert when it has read the
+    whole relevant provider collection.  This is deliberately distinct from an
+    HTTP failure: a 200 response with an incoherent page contract is still not
+    evidence that a row was absent.
+    """
+
+
 class ZernioClient:
     """Thin Zernio v1 client. `http` is injectable for tests (defaults to lazy `requests`)."""
 
@@ -327,6 +337,126 @@ class ZernioClient:
     #: condition must never depend on a field the API may not send. 50 pages = 5000
     #: profiles, far past any real LASSO org, and at worst 50 x 30s rather than a hang.
     _PROFILE_MAX_PAGES = 50
+
+    # Inbox reads are synchronous and only used to prove a specific alert state.
+    # Keep their worst case bounded even if Zernio returns a nonsensical total.
+    _INBOX_COMPLETE_MAX_PAGES = 20
+    _INBOX_COMPLETE_MAX_ITEMS = 500
+
+    @staticmethod
+    def _strict_pagination_int(value, field):
+        """Return a provider pagination integer or reject an ambiguous shape."""
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ZernioPaginationError(f"invalid_pagination_{field}")
+        return value
+
+    @staticmethod
+    def _stable_provider_row(row):
+        """A deterministic comparison used only to validate duplicate identities."""
+        import json
+        try:
+            return json.dumps(row, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ZernioPaginationError("unserializable_provider_row") from exc
+
+    def _complete_inbox_pages(self, path, params, rows_key, identity_for_row, *,
+                              limit, max_pages=None, max_items=None):
+        """Read a Zernio inbox collection only when page metadata proves exhaustion.
+
+        This helper intentionally accepts no short-page or omitted-field shortcut.
+        The provider must return coherent ``page``, ``limit``, ``total``, and
+        ``pages`` fields for every requested page.  We request each page in order,
+        cap both requests and advertised rows, and return ``complete: true`` only
+        after every row implied by that contract was received.  A repeated full
+        provider identity is de-duplicated only when its full row is byte-for-byte
+        equivalent; conflicting duplicates are ambiguous and fail closed.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        max_pages = (self._INBOX_COMPLETE_MAX_PAGES if max_pages is None
+                     else max_pages)
+        max_items = (self._INBOX_COMPLETE_MAX_ITEMS if max_items is None
+                     else max_items)
+        if (isinstance(max_pages, bool) or not isinstance(max_pages, int)
+                or max_pages <= 0):
+            raise ValueError("max_pages must be a positive integer")
+        if (isinstance(max_items, bool) or not isinstance(max_items, int)
+                or max_items <= 0):
+            raise ValueError("max_items must be a positive integer")
+
+        first = None
+        expected_total = expected_pages = None
+        output = []
+        seen = {}
+        for wanted_page in range(1, max_pages + 1):
+            request_params = dict(params)
+            request_params.update({"page": wanted_page, "limit": limit})
+            payload = self._get(path, request_params)
+            if not isinstance(payload, dict):
+                raise ZernioPaginationError("invalid_pagination_payload")
+            rows = payload.get(rows_key)
+            pagination = payload.get("pagination")
+            if not isinstance(rows, list) or not isinstance(pagination, dict):
+                raise ZernioPaginationError("invalid_pagination_shape")
+            page = self._strict_pagination_int(pagination.get("page"), "page")
+            response_limit = self._strict_pagination_int(
+                pagination.get("limit"), "limit")
+            total = self._strict_pagination_int(pagination.get("total"), "total")
+            pages = self._strict_pagination_int(pagination.get("pages"), "pages")
+            if page != wanted_page or response_limit != limit:
+                raise ZernioPaginationError("non_advancing_or_mismatched_page")
+            if total > max_items or pages > max_pages:
+                raise ZernioPaginationError("pagination_cap_exceeded")
+
+            # A non-empty collection has exactly ceil(total / limit) pages.  For
+            # an empty collection, providers commonly use either 0 or 1 pages;
+            # both are exhaustive when page one is empty.
+            expected_page_count = ((total + limit - 1) // limit) if total else 0
+            if total:
+                if pages != expected_page_count:
+                    raise ZernioPaginationError("inconsistent_pagination_totals")
+            elif pages not in (0, 1):
+                raise ZernioPaginationError("inconsistent_pagination_totals")
+            if first is None:
+                first = payload
+                expected_total, expected_pages = total, pages
+            elif (total, pages) != (expected_total, expected_pages):
+                raise ZernioPaginationError("inconsistent_pagination_totals")
+
+            raw_expected = 0 if total == 0 else min(
+                limit, total - ((wanted_page - 1) * limit))
+            if wanted_page > max(pages, 1) or len(rows) != raw_expected:
+                raise ZernioPaginationError("incomplete_or_ambiguous_page")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ZernioPaginationError("invalid_provider_row")
+                identity = identity_for_row(row)
+                if (not isinstance(identity, tuple) or not identity
+                        or any(not isinstance(value, str) or not value
+                               for value in identity)):
+                    raise ZernioPaginationError("invalid_provider_identity")
+                stable = self._stable_provider_row(row)
+                previous = seen.get(identity)
+                if previous is None:
+                    seen[identity] = stable
+                    output.append(row)
+                elif previous != stable:
+                    raise ZernioPaginationError("ambiguous_duplicate_provider_identity")
+
+            # We have read every page asserted by the provider, including page one
+            # for an empty result.  This is the only place this helper returns
+            # ``complete: true``.
+            if wanted_page == max(pages, 1):
+                if len(output) != expected_total:
+                    raise ZernioPaginationError(
+                        "duplicate_or_missing_provider_identity")
+                out = dict(first)
+                out[rows_key] = output
+                out["pagination"] = dict(pagination, complete=True,
+                                         pages_read=wanted_page)
+                return out
+        raise ZernioPaginationError("pagination_cap_exceeded")
 
     def list_profiles(self):
         """GET /v1/profiles -> {profiles:[{_id,name,...}], total, skip, limit}, ALL pages.
@@ -612,16 +742,79 @@ class ZernioClient:
             page += 1
         return posts
 
-    def analytics(self, profile_id, skip=0, limit=50, source=None):
+    def posts_range_complete(self, profile_id, start, end, page_limit=50, max_pages=20):
+        """Return posts in ``[start, end]`` only with completeness proof.
+
+        This is the absence-authorizing reader for stale publish reconciliation.
+        It is deliberately stricter than ``posts_window``: an incoherent page
+        contract, an unparseable ordering timestamp, or hitting the request bound
+        before the requested range is covered raises ``ZernioPaginationError``.
+        A caller must treat that as ambiguity, never as proof a post is absent.
+        """
+        start = start if isinstance(start, datetime) else _parse_iso(start)
+        end = end if isinstance(end, datetime) else _parse_iso(end)
+        if isinstance(start, datetime) and start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if isinstance(end, datetime) and end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start is None or end is None or start > end:
+            raise ValueError("posts range requires valid ordered timestamps")
+        limit = max(1, min(int(page_limit), 100))
+        bound = max(1, int(max_pages))
+        posts = []
+        seen_count = 0
+        previous_oldest = None
+        complete = False
+        for page in range(1, bound + 1):
+            response = self.list_posts(profile_id, page=page, limit=limit) or {}
+            pagination = response.get("pagination")
+            if not isinstance(pagination, dict):
+                raise ZernioPaginationError("posts response omitted pagination")
+            batch = [p for p in (response.get("posts") or []) if isinstance(p, dict)]
+            if not batch:
+                complete = True
+                break
+            seen_count += len(batch)
+            stamps = []
+            for post in batch:
+                stamp = _parse_iso(post.get("scheduledFor") or post.get("createdAt"))
+                if stamp is None:
+                    raise ZernioPaginationError("post omitted an ordering timestamp")
+                stamps.append(stamp)
+                if start <= stamp <= end:
+                    posts.append(post)
+            newest, oldest = max(stamps), min(stamps)
+            if previous_oldest is not None and newest > previous_oldest:
+                raise ZernioPaginationError("posts pages were not newest-first")
+            previous_oldest = oldest
+            if oldest < start:
+                complete = True
+                break
+            try:
+                total = int(pagination.get("total"))
+                pages = int(pagination.get("pages"))
+            except (TypeError, ValueError):
+                raise ZernioPaginationError("posts pagination totals were invalid")
+            if total < seen_count or pages < page:
+                raise ZernioPaginationError("posts pagination totals were invalid")
+            if page >= pages or seen_count >= total:
+                complete = True
+                break
+        if not complete:
+            raise ZernioPaginationError("posts range exceeded the bounded page budget")
+        return posts
+
+    def analytics(self, profile_id, page=1, limit=50, source=None):
         """GET /v1/analytics?profileId=... -> the analytics JSON (read-only add-on).
 
         Shape (probed live): {hasAnalyticsAccess, overview, accounts:[...], posts:[...],
-        pagination}. `posts` is a page of up to `limit` (newest first); pass `skip` to page.
+        pagination}. `posts` is a page of up to `limit` (newest first). The live API
+        ignores `skip`; use its page parameter, as list_posts does.
         `source` (optional, e.g. "all") asks Zernio to include EXTERNAL posts too
         (isExternal: true — posts Echo did not publish). Omitted by default so every
         existing caller's request is byte-identical to before Wave 7.
         """
-        params = {"profileId": profile_id, "skip": int(skip), "limit": int(limit)}
+        params = {"profileId": profile_id, "page": int(page), "limit": int(limit)}
         if source:
             params["source"] = str(source)
         return self._get("/v1/analytics", params)
@@ -642,7 +835,7 @@ class ZernioClient:
         if isinstance(days, (int, float)) and days > 0:
             cutoff = datetime.now(timezone.utc) - timedelta(days=float(days))
 
-        first = self.analytics(profile_id, skip=0, limit=page_limit, source=source) or {}
+        first = self.analytics(profile_id, page=1, limit=page_limit, source=source) or {}
         merged = dict(first)
         posts = list(first.get("posts") or [])
         pagination = first.get("pagination") or {}
@@ -672,7 +865,7 @@ class ZernioClient:
             if page >= max_pages:
                 pages_capped = True
                 break
-            nxt = self.analytics(profile_id, skip=len(posts), limit=page_limit, source=source) or {}
+            nxt = self.analytics(profile_id, page=page + 1, limit=page_limit, source=source) or {}
             more = list(nxt.get("posts") or [])
             if not more:
                 break
@@ -733,6 +926,25 @@ class ZernioClient:
             params["platform"] = str(platform)
         return self._get("/v1/inbox/comments", params)
 
+    def list_inbox_comments_complete(self, profile_id, limit=50, platform=None,
+                                     max_pages=None, max_items=None):
+        """Return every inbox post for a profile, or raise without completeness proof.
+
+        The comment alert snapshot must establish that its post listing was
+        exhaustive before it can claim the resulting per-post thread reads are
+        complete.  Keep the ordinary one-page method above for callers that do
+        not need that proof.
+        """
+        params = {"profileId": str(profile_id)}
+        if platform:
+            params["platform"] = str(platform)
+        return self._complete_inbox_pages(
+            "/v1/inbox/comments", params, "data",
+            lambda row: ("comment_listing", str(row.get("platform") or ""),
+                         str(row.get("accountId") or ""),
+                         str(row.get("id") or "")),
+            limit=limit, max_pages=max_pages, max_items=max_items)
+
     def inbox_post_comments(self, post_id, account_id, limit=25):
         """GET /v1/inbox/comments/{postId}?accountId=... -> {comments:[{id,
         message, createdTime, from:{name, username, isOwner}, replyCount,
@@ -741,11 +953,47 @@ class ZernioClient:
         return self._get(f"/v1/inbox/comments/{post_id}",
                          {"accountId": account_id, "limit": int(limit)})
 
+    def inbox_post_comments_complete(self, post_id, account_id, limit=25,
+                                     max_pages=None, max_items=None):
+        """Return every comment for one post, or raise without claiming completeness.
+
+        This is the FIXER-specific proof read.  It is deliberately separate from
+        :meth:`inbox_post_comments`, whose existing callers may only need one
+        ordinary page.  The full identity includes the fixed post and account as
+        well as Zernio's platform and comment id, so duplicate rows from adjacent
+        pages cannot make an alert appear resolved twice.
+        """
+        post_id, account_id = str(post_id), str(account_id)
+        return self._complete_inbox_pages(
+            f"/v1/inbox/comments/{post_id}", {"accountId": account_id},
+            "comments",
+            lambda row: ("comment", str(row.get("platform") or ""),
+                         account_id, post_id, str(row.get("id") or "")),
+            limit=limit, max_pages=max_pages, max_items=max_items)
+
     def list_inbox_mentions(self, profile_id, limit=25):
         """GET /v1/inbox/mentions?profileId=... -> {data:[...], pagination,
         meta}. READ ONLY."""
         return self._get("/v1/inbox/mentions",
                          {"profileId": profile_id, "limit": int(limit)})
+
+    def list_inbox_mentions_complete(self, profile_id, limit=25,
+                                     max_pages=None, max_items=None):
+        """Return every inbox mention, or raise without completeness proof.
+
+        Mentions are never auto-resolved, but an immutable snapshot still needs
+        a complete source read so a later reconciliation cannot mistake a
+        partial capture for a coherent inbox state.
+        """
+        profile_id = str(profile_id)
+        return self._complete_inbox_pages(
+            "/v1/inbox/mentions", {"profileId": profile_id}, "data",
+            lambda row: ("mention_listing", str(row.get("platform") or ""),
+                         str(row.get("accountId") or ""),
+                         str(row.get("postId") or row.get("mediaId")
+                             or row.get("id") or ""),
+                         str(row.get("id") or "")),
+            limit=limit, max_pages=max_pages, max_items=max_items)
 
     def list_inbox_reviews(self, profile_id, limit=25):
         """GET /v1/inbox/reviews?profileId=... -> {data:[{id, platform,
@@ -754,6 +1002,22 @@ class ZernioClient:
         aggregated. Verified live 2026-08-26. READ ONLY."""
         return self._get("/v1/inbox/reviews",
                          {"profileId": profile_id, "limit": int(limit)})
+
+    def list_inbox_reviews_complete(self, profile_id, limit=25,
+                                    max_pages=None, max_items=None):
+        """Return every review for a profile, or raise without completeness proof.
+
+        The normal review listing remains a one-page primitive for existing inbox
+        work.  Reply reconciliation uses this bounded reader so an item absent
+        from page one can never be mistaken for a missing or unresolved review.
+        """
+        profile_id = str(profile_id)
+        return self._complete_inbox_pages(
+            "/v1/inbox/reviews", {"profileId": profile_id}, "data",
+            lambda row: ("review", str(row.get("platform") or ""),
+                         str(row.get("accountId") or ""),
+                         str(row.get("id") or ""), str(row.get("id") or "")),
+            limit=limit, max_pages=max_pages, max_items=max_items)
 
     def instagram_demographics(self, account_id, metric="follower_demographics",
                                timeframe="this_month", breakdown=None):
@@ -857,7 +1121,9 @@ def account_state(acct, now=None):
     # We only trip on an UNAMBIGUOUS truthy signal (never on absence), so a list that merely omits
     # these fields still reads connected — the anti-flap rule the IG fix depends on is preserved.
     if acct.get("tokenExpired") is True or acct.get("needsReconnect") is True \
-            or md.get("tokenExpired") is True or md.get("needsReconnect") is True:
+            or acct.get("needsReconnection") is True \
+            or md.get("tokenExpired") is True or md.get("needsReconnect") is True \
+            or md.get("needsReconnection") is True:
         return "expired"
     _st = str(acct.get("status") or acct.get("connectionStatus")
               or md.get("status") or "").strip().lower()
@@ -871,10 +1137,33 @@ def account_state(acct, now=None):
         now = now or datetime.now(timezone.utc)
         if exp_at < now:
             return "expired"
-    # Token expiry is a NEGATIVE and takes precedence: connectedAt + expires_in in the past -> expired.
+    # IG/FB grants are refreshed in place. Zernio keeps metadata.connectedAt as the
+    # ORIGINAL connection time while moving tokenExpiresAt/lastTokenRefreshAt forward.
+    # Treating connectedAt + expires_in as authoritative after a refresh incorrectly
+    # expires a healthy account every ~60 days (LASSO IG, 2026-09-27). For IG/FB an
+    # absolute tokenExpiresAt is the freshest source: a future value proves the old
+    # derived expiry is stale; a past value is an honest reconnect signal. Google
+    # Business is deliberately excluded because its tokenExpiresAt is the rolling
+    # one-hour access token that Zernio refreshes behind the API (C15).
+    platform = str(acct.get("platform") or "").strip().lower()
+    token_exp_at = None
+    if platform != "googlebusiness":
+        token_exp_at = _parse_iso(acct.get("tokenExpiresAt")
+                                  or md.get("tokenExpiresAt"))
+        if token_exp_at is not None:
+            now = now or datetime.now(timezone.utc)
+            if token_exp_at < now:
+                return "expired"
+
+    # Derived token expiry remains the fallback when no absolute IG/FB grant expiry
+    # is reported. Anchor it to the latest successful refresh, not the original
+    # connection, so refreshed grants do not flap to expired on the old deadline.
     exp = md.get("expires_in")
-    connected_at = _parse_iso(acct.get("connectedAt") or md.get("connectedAt"))
-    if isinstance(exp, (int, float)) and connected_at is not None:
+    connected_at = _parse_iso(md.get("lastTokenRefreshAt")
+                              or acct.get("lastTokenRefreshAt")
+                              or acct.get("connectedAt") or md.get("connectedAt"))
+    if token_exp_at is None and isinstance(exp, (int, float)) \
+            and not isinstance(exp, bool) and connected_at is not None:
         now = now or datetime.now(timezone.utc)
         if (now - connected_at).total_seconds() > float(exp):
             return "expired"
@@ -1250,6 +1539,56 @@ _RETRYABLE_STATUS = (408, 429, 500, 502, 503, 504)
 _RECONNECT_STATUS = (401, 403)
 
 
+def _extract_google_validation_reason(raw_detail):
+    """Extract the specific reason/field from a nested Zernio/Google GMB v4 error body.
+
+    Google wraps validation errors in two layers:
+      outer JSON:  {"error": "Invalid request to Google Business Profile: <google_json>"}
+      inner JSON:  {"error": {"details": [{"@type": "...ValidationError",
+                               "errorDetails": [{"field": "...", "reason": "..."}]}]}}
+
+    The compact form (no @type wrapper) puts reason/field directly in the details entry.
+    Both shapes are handled.
+
+    Returns a short string like "PHOTO_URL_INACCESSIBLE (sourceUrl)" or None on any parse
+    failure (truncated body, non-Google error, unexpected structure). Never raises.
+    """
+    import json as _json
+    try:
+        outer = _json.loads(raw_detail or "")
+        if not isinstance(outer, dict):
+            return None
+        inner_str = outer.get("error") or ""
+        if not isinstance(inner_str, str):
+            return None
+        prefix = "Invalid request to Google Business Profile: "
+        if prefix in inner_str:
+            google_json_str = inner_str[inner_str.index(prefix) + len(prefix):]
+        else:
+            google_json_str = inner_str
+        inner = _json.loads(google_json_str)
+        details = (inner.get("error") or {}).get("details") or []
+        for d in details:
+            if not isinstance(d, dict):
+                continue
+            # v4 verbose: @type + errorDetails nesting
+            for ed in (d.get("errorDetails") or []):
+                if not isinstance(ed, dict):
+                    continue
+                reason = str(ed.get("reason") or "").strip()
+                field = str(ed.get("field") or "").strip()
+                if reason or field:
+                    return f"{reason} ({field})" if (reason and field) else (reason or field)
+            # compact form: reason/field at top level of the details entry
+            reason = str(d.get("reason") or "").strip()
+            field = str(d.get("field") or "").strip()
+            if reason or field:
+                return f"{reason} ({field})" if (reason and field) else (reason or field)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def describe_error(exc, *, endpoint=None, account_id=None):
     """Unwrap an exception raised by a Zernio call into a structured, actionable dict.
 
@@ -1282,6 +1621,18 @@ def describe_error(exc, *, endpoint=None, account_id=None):
         detail = scrub(f"{type(exc).__name__}: {raw_detail}")[:900]
     except Exception:  # noqa: BLE001
         detail = type(exc).__name__
+
+    # Nested Zernio/Google errors bury the specific validation reason (e.g.
+    # PHOTO_URL_INACCESSIBLE) hundreds of chars into the verbose body, past the 400-char
+    # downstream truncation in error_summary. Parse it out and prepend it so the actual
+    # cause is always visible in alerts and in the database reject_reason column.
+    google_reason = _extract_google_validation_reason(raw_detail or "")
+    if google_reason:
+        try:
+            google_reason = scrub(google_reason)
+        except Exception:  # noqa: BLE001
+            pass
+        detail = f"{google_reason} | {detail}"[:900]
 
     if status is None:
         # A transport failure (timeout, DNS, reset) never reached Zernio and is the

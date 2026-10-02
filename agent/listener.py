@@ -277,11 +277,10 @@ def _podcast_auto_due(now, last_date, target_hour):
 
 def _fire_daily(store, today, run=run_daily):
     """
-    One scheduled fire, LOUD on every no-card outcome. Any result other than a
-    drafted run with at least one card (on a posting day) raises one ops alert, so
-    a silent no-card morning is impossible while AGENT_OPS_ALERTS_ENABLED is true.
-    A skip day (schedule.should_post_on false) drafting zero cards is EXPECTED and
-    does not alert.
+    One scheduled fire, LOUD on every unexpected no-card outcome. A posting-day
+    run with no cards raises one ops alert unless run_daily proves that every eligible
+    account reached the calendar-authority path that intentionally suppresses legacy
+    cards. A skip day drafting zero cards is expected and does not alert.
     """
     try:
         out = run(store=store)
@@ -295,7 +294,8 @@ def _fire_daily(store, today, run=run_daily):
     if status != "drafted":
         ops_alerts.alert(f"scheduled draft run produced no cards - status '{status}' "
                          "(check AGENT_ENABLED and the voice doc)")
-    elif not drafts and schedule.should_post_on(today):
+    elif (not drafts and schedule.should_post_on(today)
+          and not bool((out or {}).get("expected_no_cards"))):
         ops_alerts.alert("scheduled draft run produced no cards - drafted 0 drafts "
                          "on a posting day")
     return out
@@ -309,6 +309,64 @@ def _client_media_scan_due(now_mono, last_mono, interval_secs):
     return (now_mono - last_mono) >= interval_secs
 
 
+_client_media_worker_lock = threading.Lock()
+_client_media_worker = None
+
+
+def _client_media_worker_active():
+    """True while the one allowed fleet media scan is still running.
+
+    Media generation is network and render heavy.  It must never run inline on the
+    scheduler thread: that same thread owns the minute client-publish lane.  Keep the
+    guard process-local because this protects one listener's event loop; the existing
+    build lock remains the cross-process/per-gym write guard.
+    """
+    with _client_media_worker_lock:
+        return bool(_client_media_worker and _client_media_worker.is_alive())
+
+
+def _run_client_media_worker(scan):
+    """Failure-isolated body for the background client-media worker."""
+    global _client_media_worker
+    try:
+        scan()
+    except Exception as e:
+        print(f"[client-media-sync] frequent lane failed: {type(e).__name__}: {e}")
+        try:
+            ops_alerts.alert(
+                f"client media frequent lane failed: {type(e).__name__}: {e}."
+                " The draft run is unaffected.")
+        except Exception as alert_error:
+            print(f"[client-media-sync] failure alert failed: "
+                  f"{type(alert_error).__name__}: {alert_error}")
+    finally:
+        current = threading.current_thread()
+        with _client_media_worker_lock:
+            if _client_media_worker is current:
+                _client_media_worker = None
+
+
+def _start_client_media_worker(scan):
+    """Start exactly one daemon scan; return False when one is already active."""
+    global _client_media_worker
+    with _client_media_worker_lock:
+        if _client_media_worker and _client_media_worker.is_alive():
+            return False
+        worker = threading.Thread(
+            target=_run_client_media_worker,
+            args=(scan,),
+            name="client-media-sync",
+            daemon=True,
+        )
+        _client_media_worker = worker
+        try:
+            worker.start()
+        except Exception:
+            _client_media_worker = None
+            raise
+    return True
+
+
 def run_client_media_lane(*, now_mono, last_mono, interval_secs, scan=None):
     """The listener's FREQUENT client-media lane: PROMPTLY sync each onboarded client
     gym's R2 uploads and auto-build its DRAFT calendar the moment it uploads, instead
@@ -319,21 +377,35 @@ def run_client_media_lane(*, now_mono, last_mono, interval_secs, scan=None):
     Self-guarded on AGENT_CLIENT_MEDIA_SYNC (scan_and_generate also re-checks the flag
     and no-ops when off, belt and suspenders). Throttled to interval_secs so a ~60s
     loop does not hammer R2; a scan with nothing new is a cheap no-op either way
-    (scan_and_generate skips gyms whose media count == existing feed count). Fully
-    isolated in try/except: a scan failure never kills the scheduler loop, exactly
-    like every other lane. DRAFTS ONLY: nothing here publishes (scan_and_generate has
-    no publish path)."""
+    (scan_and_generate skips gyms whose media count == existing feed count). The scan
+    runs in one guarded daemon worker so slow Drive/R2/render calls cannot block the
+    scheduler's minute publish lane, and another scan can never overlap it. Worker and
+    thread-start failures are isolated from the loop. DRAFTS ONLY: nothing here
+    publishes (scan_and_generate has no publish path)."""
     if not config.client_media_sync_enabled():
         return last_mono
     if not _client_media_scan_due(now_mono, last_mono, interval_secs):
         return last_mono
     scan = scan or _default_client_media_scan
     try:
-        scan()
+        started = _start_client_media_worker(scan)
     except Exception as e:
-        print(f"[client-media-sync] frequent lane failed: {type(e).__name__}: {e}")
-        ops_alerts.alert(f"client media frequent lane failed: {type(e).__name__}: {e}."
-                         " The draft run is unaffected.")
+        print(f"[client-media-sync] worker start failed: {type(e).__name__}: {e}")
+        try:
+            ops_alerts.alert(
+                f"client media frequent worker failed to start: "
+                f"{type(e).__name__}: {e}. The draft run is unaffected.")
+        except Exception as alert_error:
+            print(f"[client-media-sync] startup alert failed: "
+                  f"{type(alert_error).__name__}: {alert_error}")
+        # Preserve the old failure throttle: a broken start must not hot-loop every
+        # scheduler tick.
+        return now_mono
+    if not started:
+        # A long scan may outlive the normal interval. Do not advance the marker:
+        # once it finishes, the next scheduler tick is immediately eligible to scan
+        # again instead of waiting another whole interval.
+        return last_mono
     return now_mono
 
 
@@ -452,6 +524,68 @@ def _print_scheduled_lanes():
         print(f"[scheduler] {name}: {state}")
 
 
+def _auto_reels_tick(worker, now):
+    """Render off the scheduler thread so a slow montage never delays publishing ticks."""
+    if not config.auto_reels_enabled() or (worker is not None and worker.is_alive()):
+        return worker
+
+    def run():
+        try:
+            from . import auto_reels
+            for outcome in auto_reels.poll(now=now):
+                # Sanitized transition-deduped status (held/exhausted/staged/pre-claim).
+                # Never Slack/client; never raw exception text or URLs.
+                auto_reels.report_outcome(outcome)
+        except Exception as exc:
+            print(f"[auto-reels] pass failed: {type(exc).__name__}")
+
+    worker = threading.Thread(target=run, name="echo-auto-reels", daemon=True)
+    worker.start()
+    return worker
+
+
+def _refresh_shared_media_runway():
+    """Project current client runway state in the isolated startup worker."""
+    try:
+        from .media_bridge import refresh_all_shared_status
+        summary = refresh_all_shared_status()
+        print("[media-bridge] startup shared runway refresh "
+              f"checked={summary['checked']} materialized={summary['materialized']} "
+              f"mirrored={summary['mirrored']} failed={summary['failed']}")
+        return summary
+    except Exception as exc:
+        # This read-model refresh is best effort.  The daily scheduler must still
+        # start so the durable worker state and all unrelated lanes keep running.
+        print(f"[media-bridge] startup shared runway refresh failed: "
+              f"{type(exc).__name__}")
+        return None
+
+
+_SHARED_MEDIA_REFRESH_LOCK = threading.Lock()
+_shared_media_refresh_started = False
+
+
+def _start_shared_media_runway_refresh():
+    """Start the best-effort reconciliation once without delaying listener boot."""
+    global _shared_media_refresh_started
+    with _SHARED_MEDIA_REFRESH_LOCK:
+        if _shared_media_refresh_started:
+            return False
+        _shared_media_refresh_started = True
+        worker = threading.Thread(
+            target=_refresh_shared_media_runway,
+            name="shared-media-runway-refresh", daemon=True)
+        try:
+            worker.start()
+        except Exception as exc:
+            # Thread startup itself is also failure-isolated.  Keep the once flag
+            # set: startup should not spin or repeatedly retry a broken runtime.
+            print(f"[media-bridge] startup refresh worker failed: "
+                  f"{type(exc).__name__}")
+            return False
+    return True
+
+
 def _daily_scheduler(store):
     """
     Minimal in-process daily trigger. Fires run_daily once per day at the target
@@ -478,6 +612,7 @@ def _daily_scheduler(store):
     last_inbox = 0.0
     last_cms = 0.0
     last_portal_echo = 0.0
+    auto_reels_worker = None
     while True:
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
@@ -573,6 +708,27 @@ def _daily_scheduler(store):
                 # that died between the claim and the publish leaves a row stuck;
                 # this surfaces it to a human instead of silent forever-orphaning.
                 calendar_autopublish.sweep_stuck_publishing()
+                # Provider-backed stale-claim repair (hourly): a complete,
+                # tenant-scoped Zernio read may stamp a proven live post or release
+                # a proven absent one. Ambiguous/incomplete reads remain held. This
+                # never sends a post and is rate-bounded independently of the
+                # one-minute publisher loop.
+                if config.zernio_publish_enabled():
+                    try:
+                        import time as _time
+                        from . import db as _db, stale_claim_reconciler as _scr
+                        _scr_ts = float(_db.kv_get("stale_claim_reconcile_ts") or 0)
+                        if _time.time() - _scr_ts > 3600:
+                            _db.kv_set("stale_claim_reconcile_ts", str(_time.time()))
+                            _scr_result = _scr.reconcile()
+                            if _scr_result["published"] or _scr_result["released"]:
+                                print("[stale-claim-reconcile] "
+                                      f"published={len(_scr_result['published'])} "
+                                      f"released={len(_scr_result['released'])} "
+                                      f"held={len(_scr_result['held'])}")
+                    except Exception as _scr_exc:
+                        print(f"[stale-claim-reconcile] skipped: "
+                              f"{type(_scr_exc).__name__}: {_scr_exc}")
                 # EXPIRED-ROW watchdog (alert-only): approved/pending rows aged past
                 # the catch-up window can never publish and nothing else reports them
                 # (11 approved LASSO posts and 26 GritX rows died exactly this way).
@@ -635,10 +791,13 @@ def _daily_scheduler(store):
             except Exception as e:
                 print(f"[intake] ingest pass failed: {type(e).__name__}: {e}")
         # Portal Echo ticket bridge (D46): dormant unless
-        # AGENT_PORTAL_ECHO_TICKETS_ENABLED. Picks up a portal-submitted Echo support
-        # ticket, classifies it, dispatches it (grounded answer + outreach, or a HELD
-        # fixer_request behind Blake's tap same as any other code_fix), then a second
-        # pass notifies once a dispatched fix is verified. An error never kills the
+        # AGENT_PORTAL_ECHO_TICKETS_ENABLED. Picks up portal-submitted Echo and
+        # Portal support tickets, classifies them, and dispatches a grounded
+        # answer or a HELD fixer_request as a durable internal record. The
+        # legacy fixed_pass refuses notification without a verdict producer.
+        # Scout may queue an authenticated portal code_fix from that record
+        # under Blake's later
+        # 2026-09-18 ruling. An error never kills the
         # loop; a wired-real Slack client/bus is built lazily inside so an unarmed
         # deploy never even imports the Slack SDK for this lane.
         if (config.portal_echo_tickets_enabled()
@@ -710,6 +869,8 @@ def _daily_scheduler(store):
                           + ", ".join(r["base"] for r in mapped))
             except Exception as e:
                 print(f"[intake-sync] pass failed: {type(e).__name__}: {e}")
+        # Claims/debounce are durable; rendering does not block this scheduler.
+        auto_reels_worker = _auto_reels_tick(auto_reels_worker, now)
         # Opus Clip poll: FULLY INERT unless BOTH AGENT_OPUS_ENABLED and
         # AGENT_OPUS_POLL_ENABLED are armed. Errors alert (inside pull), never crash.
         if (config.opus_enabled() and config.opus_poll_enabled()
@@ -1068,9 +1229,21 @@ def run_listener():
             raise
         print(f"[slack-convo] attach failed: {type(_ce).__name__}: {_ce}")
 
+    # Cross-service runway reconciliation belongs to listener startup, independent
+    # of whether this process owns scheduled jobs.  Its daemon may spend the HTTP
+    # timeout budget without delaying Socket Mode, interrupted-draw recovery, or
+    # scheduler heartbeats.
+    _start_shared_media_runway_refresh()
+
     if str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}:
         threading.Thread(target=_daily_scheduler, args=(store,), daemon=True).start()
         print("Daily scheduler started.")
+
+    if config.gym_drive_connect_enabled() or config.gym_drive_connect_gyms():
+        from .jobs.queued_gym_media import serve as _serve_gym_media_queue
+        threading.Thread(target=_serve_gym_media_queue, name="gym-media-queue",
+                         daemon=True).start()
+        print("Gym media indexing queue started.")
 
     print("Echo listener online (Socket Mode). Draft-only:", not config.publish_enabled())
     SocketModeHandler(app, app_token).start()

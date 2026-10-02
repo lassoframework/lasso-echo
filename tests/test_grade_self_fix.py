@@ -338,7 +338,10 @@ def test_unfillable_gap_recorded_once(monkeypatch):
             gap_filler=lambda *a, **k: "no_media", db=kv,
             logger=logs.append)
     # Recorded exactly once, no matter how many sweeps see the same gap
-    assert kv.data.get("grade_gap_known_gritx_2026-09-09") == "1"
+    for day in ("2026-09-02", "2026-09-03", "2026-09-04", "2026-09-05",
+                "2026-09-06", "2026-09-07", "2026-09-08"):
+        assert kv.data.get(f"grade_gap_known_gritx_{day}") == "1"
+    assert kv.data.get("grade_gap_known_gritx_2026-09-09") is None
     assert sum("recorded once" in l for l in logs) == 1
 
 
@@ -1331,3 +1334,17 @@ def test_stuck_text_names_the_defect_that_will_not_move_and_the_flat_trajectory(
     assert "<@U06EPUUCL13>" in msg
     assert "3 pass(es)" in msg
     assert "nothing was fabricated" in msg
+
+
+def test_media_starvation_alert_names_retained_dates():
+    from types import SimpleNamespace
+    grade = SimpleNamespace(total=79, letter="C",
+                            defects=[("consistency", "2026-09-09", "gap of 7 days before 2026-09-09")],
+                            exempt={})
+    text = grade_sweep._held_alert_text(
+        "gritx", grade,
+        {"actions": [], "gap_fill": "no_media",
+         "gap_dates": ["2026-09-02", "2026-09-03"]})
+    assert "no eligible unused media" in text
+    assert "2026-09-02, 2026-09-03" in text
+    assert text.count("\n") <= 3

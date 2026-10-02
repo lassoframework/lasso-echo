@@ -19,7 +19,7 @@ from . import config
 from . import content_planner
 from . import media_host
 from . import ops_alerts
-from .accounts import Platform
+from .accounts import Platform, approved_hashtags_for
 from .voice import load_voice
 
 
@@ -52,6 +52,7 @@ class Draft:
     blocked_reason: str = ""
     # source spans we composed FROM, kept for the no-fabrication test + audit
     source_fragments: list = field(default_factory=list)
+    infographic_copy: dict = field(default_factory=dict)
     # carousel support: local slide paths + their public URLs (empty for singles)
     slides: list = field(default_factory=list)
     slide_urls: list = field(default_factory=list)
@@ -90,6 +91,17 @@ class Draft:
     # every existing draft behaves exactly as before. This only ever STRENGTHENS
     # the gate (adds a required approval); it never bypasses one.
     force_approval: bool = False
+    # TRACEABILITY (Blake, 2026-09-13): which image engine + model actually
+    # generated this draft's creative, e.g. "astra:gpt-image-2.5-sunburst" or
+    # "gemini:gemini-2.5-flash-image". Empty for a draft with no generated
+    # image (a client-uploaded photo, a library creative, a caption-only
+    # draft). Set from creative_studio.generate()'s "route" field (or built
+    # directly from an image_engine.ImageResult as "{engine}:{model}" by a
+    # caller that talks to image_engine.generate_image itself). Carried
+    # through to the posts table by postlog.log_post at publish time, so a
+    # SPECIFIC published post can be traced back to the engine that made it,
+    # not just "Astra was in use during some window."
+    image_engine: str = ""
 
 
 def _make_id(account_key, creative_path, scheduled_for):
@@ -227,6 +239,32 @@ def _strip_llm_scaffold(text):
               "belongs in the caption")
         out = body.strip()
     return out
+
+
+_HOOK_MAX_CHARS = 125
+
+
+def _bound_opening_hook(text, max_chars=_HOOK_MAX_CHARS):
+    """Keep the first real caption line within the grade gate without losing copy.
+
+    The model can ignore a character instruction.  In that case, move the overflow
+    onto the following line at a word boundary.  This preserves every source-grounded
+    word while preventing a future calendar from being born with hook_too_long.
+    """
+    lines = (text or "").splitlines()
+    for index, raw in enumerate(lines):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if len(line) <= max_chars:
+            return text
+        cut = line.rfind(" ", 0, max_chars + 1)
+        if cut <= 0:
+            cut = max_chars
+        head, tail = line[:cut].rstrip(), line[cut:].lstrip()
+        lines[index:index + 1] = [head, tail]
+        return "\n".join(lines).strip()
+    return text
 
 
 def _call_llm_caption(system, user):
@@ -630,6 +668,7 @@ class StoryBrandGenerator:
         "member moment from the photo, sometimes a myth to bust. Even with limited "
         "source material, make the OPENING WORDS feel fresh, not a repeat of a stock "
         "hook. Be punchy and direct.\n"
+        "- The first line is the hook and MUST be 125 characters or fewer.\n"
         "- Body max 260 characters (hashtags and CTA appended separately).\n"
         "- Output ONLY the caption body text. No CTA. No hashtags. No quotes.\n"
         "- Never explain your choices. No trailing rationale and no bracketed "
@@ -938,7 +977,8 @@ class StoryBrandGenerator:
                    if form_block else "Max 260 characters. ")
                 + "Caption body only."
             )
-            return _strip_llm_scaffold(_call_llm_caption(self._SYSTEM, user) or "")
+            clean = _strip_llm_scaffold(_call_llm_caption(self._SYSTEM, user) or "")
+            return _bound_opening_hook(clean)
 
         try:
             body = _compose()
@@ -1163,6 +1203,13 @@ def draft_post(account, creative, scheduled_for, voice=None,
             status=DraftStatus.BLOCKED,
             blocked_reason="Caption standard (section 9): empty caption. Voice doc or content plan returned no text.",
         )
+
+    # An explicitly configured account fallback closes the rare case where a
+    # client's durable voice doc has no hashtag section. This is Instagram-only:
+    # Facebook and GBP retain their existing copy behavior. The helper also
+    # rejects numeric-only heading fragments such as ``#1``.
+    if account.platform == Platform.INSTAGRAM:
+        hashtags = approved_hashtags_for(account, hashtags)
 
     # Per-platform variant (flag OFF -> unchanged): selection only, from the same
     # approved set. FB keeps at most 2 tags; IG keeps its existing cap of 5.

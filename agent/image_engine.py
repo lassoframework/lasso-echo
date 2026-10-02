@@ -69,6 +69,22 @@ _COST_ALERT_KEY_PREFIX = "image_cost_alerted_"
 # typo, and a typo must announce itself rather than quietly demote to Gemini.
 KNOWN_ENGINES = ("astra", "gemini")
 
+# Labels for the Echo channel-repair retry request. The repair image is the
+# EXACT rejected candidate from the previous attempt; the instruction is
+# correction-only. Benchmark references get their own label whenever a repair
+# candidate rides in the same request, so the two are never conflated.
+REPAIR_CANDIDATE_INSTRUCTION = (
+    "REJECTED CANDIDATE: the image below is the exact previous attempt at this "
+    "brief. It FAILED quality review. Do not reproduce it as-is. Apply ONLY the "
+    "corrections described in the review feedback above; keep every other "
+    "element, the copy, and the composition requirements unchanged."
+)
+BENCHMARK_REFERENCE_LABEL = (
+    "BENCHMARK REFERENCE ({id}): craftsmanship example only, never a layout, "
+    "palette or copy target. Approved source copy and the requested placement "
+    "bounds take precedence. It is NOT the rejected candidate."
+)
+
 # One warning per process when the key is absent (spec: "log a single warning").
 _missing_key_warned = False
 # One warning per process for an unrecognised IMAGE_ENGINE value.
@@ -98,6 +114,16 @@ class ImageResult:
     revised_prompt: str = ""
     latency_ms: int = 0
     prompt_used: str = ""
+    # Resolved request settings actually sent (Blake, 2026-09-13, RECORD KEEPING).
+    # "" / [] means the field was not sent (provider default applied) — these are
+    # what generation_log persists so a past run's real settings are queryable,
+    # never reconstructed after the fact.
+    quality_used: str = ""
+    reasoning_effort_used: str = ""
+    input_fidelity_used: str = ""
+    reference_ids_used: list = field(default_factory=list)
+    brief_model: str = ""
+    response_id: str = ""
 
     def ok(self) -> bool:
         return bool(self.image_bytes) or bool(self.image_url)
@@ -367,14 +393,104 @@ class AstraImageEngine(ImageEngine):
         opts = dict(opts or {})
         brief = self.prompt_for(prompt, opts)
         image_model = select_astra_model(opts)
-        brief_model = astra_brief_model()
+        brief_model = "gpt-6-astra" if opts.get("require_astra") else astra_brief_model()
         target_size = size_for(opts)
         # The tool only accepts dimensions divisible by 16; send the snapped
         # size and scale the result back to the caller's target below.
         size = snap_size(target_size)
 
         tool = {"type": "image_generation", "model": image_model, "size": size}
-        payload = {"model": brief_model, "input": brief, "tools": [tool]}
+        quality_used = config.astra_image_quality()
+        if quality_used:
+            tool["quality"] = quality_used
+
+        references = list(opts.get("reference_images") or [])
+        max_refs = config.astra_reference_max()
+        if references and max_refs:
+            references = references[:max_refs]
+        else:
+            references = []
+        input_fidelity_used = ""
+        if references:
+            input_fidelity_used = config.astra_input_fidelity()
+            if input_fidelity_used:
+                tool["input_fidelity"] = input_fidelity_used
+
+        # Repair path (Echo channel repair, 2026-09-21): opts may carry the
+        # EXACT bytes of a previously rejected candidate so a corrective retry
+        # can be reviewed against the real pixels, not just prose. The repair
+        # image rides as its own `input_image` with an explicit rejected-
+        # candidate label and a correction-only instruction. It is INDEPENDENT
+        # of the benchmark reference count/flag: it is never counted against
+        # max_refs and never gated by the reference-images switch. The bytes
+        # must be supplied by the caller (previous failed candidate); nothing
+        # here fetches a public URL for repair.
+        repair = opts.get("repair_image_bytes") or b""
+        if repair:
+            # An attached image alone leaves the provider free to generate a new
+            # layout. A corrective retry must actually edit its rejected input.
+            tool["action"] = "edit"
+            input_fidelity_used = config.astra_input_fidelity()
+            if input_fidelity_used:
+                tool["input_fidelity"] = input_fidelity_used
+        repair_mime = str(opts.get("repair_image_mime") or "image/png").strip() \
+            or "image/png"
+
+        def _as_b64(raw):
+            """bytes -> base64 ascii; a str is assumed to already be base64."""
+            if not raw:
+                return ""
+            if isinstance(raw, str):
+                return raw
+            import base64 as _b64
+            return _b64.b64encode(bytes(raw)).decode("ascii")
+
+        # `input`: a plain string when there are no references and no repair
+        # image (byte-for-byte the old shape, so every existing plain call is
+        # unchanged), or a content-item array carrying the brief text plus each
+        # image as a real `input_image` item (per the Responses API multi-image
+        # input shape: {"type": "input_image", "image_url": "data:...;base64,..."})
+        # so the image actually reaches the model as image data, not just a
+        # filename mentioned in text.
+        reference_ids_used = []
+        if references or repair:
+            content = [{"type": "input_text", "text": brief}]
+            if repair:
+                content.append({
+                    "type": "input_text",
+                    "text": REPAIR_CANDIDATE_INSTRUCTION,
+                })
+                content.append({
+                    "type": "input_image",
+                    "image_url": f"data:{repair_mime};base64,{_as_b64(repair)}",
+                })
+            for ref in references:
+                b64 = _as_b64(ref.get("b64") or ref.get("bytes"))
+                if not b64:
+                    continue
+                mime = ref.get("mime") or "image/png"
+                if repair:
+                    # With a repair candidate in the request, label each
+                    # benchmark reference explicitly so the model never
+                    # confuses a target/example with the rejected candidate.
+                    ref_id = str(ref.get("id") or "benchmark")
+                    content.append({
+                        "type": "input_text",
+                        "text": BENCHMARK_REFERENCE_LABEL.format(id=ref_id),
+                    })
+                content.append({
+                    "type": "input_image",
+                    "image_url": f"data:{mime};base64,{b64}",
+                })
+                reference_ids_used.append(str(ref.get("id") or ""))
+            input_payload = [{"role": "user", "content": content}]
+        else:
+            input_payload = brief
+
+        payload = {"model": brief_model, "input": input_payload, "tools": [tool]}
+        reasoning_effort_used = config.astra_reasoning_effort()
+        if reasoning_effort_used:
+            payload["reasoning"] = {"effort": reasoning_effort_used}
 
         started = time.monotonic()
         status, body = self._post(payload)
@@ -428,7 +544,11 @@ class AstraImageEngine(ImageEngine):
         return ImageResult(
             image_bytes=image_bytes, image_url=image_url, model=image_model,
             engine=self.name, cost_estimate=cost_estimate(self.name, image_model),
-            revised_prompt=revised, latency_ms=latency_ms, prompt_used=brief)
+            revised_prompt=revised, latency_ms=latency_ms, prompt_used=brief,
+            quality_used=quality_used, reasoning_effort_used=reasoning_effort_used,
+            input_fidelity_used=input_fidelity_used,
+            reference_ids_used=reference_ids_used, brief_model=brief_model,
+            response_id=str(data.get("id") or ""))
 
 
 def fetch_image_bytes(url, timeout=60):
@@ -616,7 +736,7 @@ def _attempts_for(engine):
 
 
 def generate_image(prompt, opts=None, *, gemini_client=None, account_key="",
-                   subject="", sleep=None):
+                   subject="", sleep=None, draft_id=""):
     """Run the fallback chain for ONE image.
 
     Astra -> retry once with backoff -> Gemini -> mark "needs human".
@@ -624,12 +744,29 @@ def generate_image(prompt, opts=None, *, gemini_client=None, account_key="",
     Returns an ImageResult on success. Returns None ONLY after mark_needs_human
     has fired the ops alert and written the audit row, so a calendar slot can
     never fail silently. Never raises into the caller.
+
+    `draft_id` (Blake, 2026-09-13, TRACEABILITY) is the caller's own draft id
+    when it is already known at generation time (every caller in this repo
+    computes its draft_id before or independent of calling generate_image, so
+    this is always available to pass). It rides on every log line below so a
+    SPECIFIC card's generation attempt is traceable in the logs, not just
+    provable in aggregate over a time window. `media_id` is NOT logged here:
+    Meta/the publisher assigns it only after this call returns and the asset
+    is hosted + published, so a caller looking up "which engine made post X"
+    joins on draft_id against the `posts` table (see db.post_engine_for),
+    where media_id and image_engine both live on the same published row.
     """
     opts = dict(opts or {})
     sleep = sleep or time.sleep
     failures = []
+    who = f"draft={draft_id or '(none)'} account={account_key or '(none)'}"
 
-    for engine in engine_chain(gemini_client):
+    require_astra = config.lasso_infographic_quality_enabled(account_key)
+    if require_astra:
+        opts["require_astra"] = True
+    chain = ([AstraImageEngine(os.environ.get(OPENAI_API_KEY_ENV, ""))]
+             if require_astra else engine_chain(gemini_client))
+    for engine in chain:
         tries = _attempts_for(engine)
         for attempt in range(1, tries + 1):
             try:
@@ -637,20 +774,22 @@ def generate_image(prompt, opts=None, *, gemini_client=None, account_key="",
             except ImageEngineError as exc:
                 detail = exc.detail()
                 failures.append(f"{engine.name} attempt {attempt}/{tries}: {detail}")
-                _log(f"FAILED engine={engine.name} attempt={attempt}/{tries} {detail}")
+                _log(f"FAILED {who} engine={engine.name} attempt={attempt}/{tries} "
+                     f"{detail}")
             except Exception as exc:  # noqa: BLE001 - a provider bug may not kill the run
                 from . import ops_alerts
                 detail = ops_alerts.scrub(f"{type(exc).__name__}: {exc}")
                 failures.append(f"{engine.name} attempt {attempt}/{tries}: {detail}")
-                _log(f"FAILED engine={engine.name} attempt={attempt}/{tries} {detail}")
+                _log(f"FAILED {who} engine={engine.name} attempt={attempt}/{tries} "
+                     f"{detail}")
             else:
                 if not result.ok():
                     failures.append(
                         f"{engine.name} attempt {attempt}/{tries}: empty result")
-                    _log(f"FAILED engine={engine.name} attempt={attempt}/{tries} "
+                    _log(f"FAILED {who} engine={engine.name} attempt={attempt}/{tries} "
                          "empty result")
                 else:
-                    _log(f"ok engine={result.engine} model={result.model!r} "
+                    _log(f"ok {who} engine={result.engine} model={result.model!r} "
                          f"latency_ms={result.latency_ms} "
                          f"cost_est=${result.cost_estimate:.3f}")
                     record_cost(result.cost_estimate, account_key=account_key)
@@ -658,11 +797,12 @@ def generate_image(prompt, opts=None, *, gemini_client=None, account_key="",
             if attempt < tries:
                 sleep(ASTRA_RETRY_BACKOFF_SECS * attempt)
 
-    mark_needs_human(subject=subject, account_key=account_key, failures=failures)
+    mark_needs_human(subject=subject, account_key=account_key, failures=failures,
+                     draft_id=draft_id)
     return None
 
 
-def mark_needs_human(subject="", account_key="", failures=(), day=None):
+def mark_needs_human(subject="", account_key="", failures=(), day=None, draft_id=""):
     """Every engine failed: mark the asset for a HUMAN in the approval queue.
 
     Three surfaces, because a silent miss is the failure mode this repo has been
@@ -679,13 +819,15 @@ def mark_needs_human(subject="", account_key="", failures=(), day=None):
     detail = "; ".join(str(f) for f in failures) or "no engine was available"
     label = str(subject or "").strip() or "(no headline)"
     who = account_key or "the shared pool"
-    line = (f"NEEDS HUMAN: image generation failed on EVERY engine for {who}: "
-            f"{label}. No asset was produced and the slot is NOT filled. "
-            f"Attempts: {detail}")
+    draft_tag = f"draft={draft_id or '(none)'} "
+    line = (f"NEEDS HUMAN: {draft_tag}image generation failed on EVERY engine "
+            f"for {who}: {label}. No asset was produced and the slot is NOT "
+            f"filled. Attempts: {detail}")
     _log(line)
     try:
         from . import db as _db
-        _db.audit("image_needs_human", label, detail, account_key, day)
+        _db.audit("image_needs_human", label,
+                 f"draft_id={draft_id or ''}; {detail}", account_key, day)
     except Exception as exc:  # noqa: BLE001 - marking must never break the run
         _log(f"audit write for needs-human failed: {type(exc).__name__}: {exc}")
     try:
@@ -694,7 +836,7 @@ def mark_needs_human(subject="", account_key="", failures=(), day=None):
     except Exception as exc:  # noqa: BLE001
         _log(f"ops alert for needs-human failed: {type(exc).__name__}: {exc}")
     return {"needs_human": True, "subject": label, "account_key": account_key,
-            "day": day, "detail": detail}
+            "day": day, "detail": detail, "draft_id": draft_id}
 
 
 # ---------------------------------------------------------------------------

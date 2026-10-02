@@ -15,6 +15,25 @@ from dataclasses import dataclass, field
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
 
+# Generated derivative caches that live inside a gym's library are not client
+# carousel bundles.  action_reel writes poster frames and edited clips under
+# <library>/reels/.  Treating that folder as a carousel hands the directory path
+# to media_host, which cannot publish it and can collapse an otherwise healthy
+# month build to zero rows.  Keep this narrow so named client carousel folders
+# continue to work.
+_RESERVED_DERIVATIVE_DIRS = frozenset({"reels"})
+
+
+def _is_appledouble(name):
+    """True for macOS metadata sidecars, never client-uploaded creative.
+
+    macOS writes an ``._<filename>`` companion beside a file when that file is
+    created or copied onto a non-APFS volume.  Its extension still looks like
+    a photo or video, so treating it as a creative can bypass the real file's
+    review and consent state.
+    """
+    return os.path.basename(str(name or "")).startswith("._")
+
 
 @dataclass
 class Creative:
@@ -81,8 +100,12 @@ def list_creatives(library_path):
         return creatives
     gym_roots = _gym_library_dirnames()
     for name in sorted(os.listdir(library_path)):
+        if _is_appledouble(name):
+            continue
         full = os.path.join(library_path, name)
         if os.path.isdir(full):
+            if name.lower() in _RESERVED_DERIVATIVE_DIRS:
+                continue
             # CROSS-GYM ISOLATION: a subfolder that is itself a registered gym's
             # content library root is that gym's OWN media, never a carousel for
             # whoever is scanning the parent (LASSO). Skip it. This is a pure
@@ -120,7 +143,8 @@ def _load_carousel(folder):
     slides = sorted(
         os.path.join(folder, n)
         for n in os.listdir(folder)
-        if os.path.isfile(os.path.join(folder, n))
+        if not _is_appledouble(n)
+        and os.path.isfile(os.path.join(folder, n))
         and os.path.splitext(n)[1].lower() in IMAGE_EXTS
     )
     if len(slides) < 2:

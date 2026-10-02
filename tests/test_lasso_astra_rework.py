@@ -37,12 +37,24 @@ def _row(row_id, gym_id="lasso", status="pending", variant_status="active",
 
 
 class _Store:
-    def __init__(self, rows_by_month):
+    def __init__(self, rows_by_month, candidates_by_month=None):
         self._rows_by_month = rows_by_month
+        # Mirrors the REAL SupabaseCalendarStore split: list_month NEVER
+        # returns a candidate row (variant_status=active is server-side
+        # filtered); list_variant_candidates is the separate complement
+        # query. A test that puts a candidate here without also registering
+        # it in candidates_by_month is testing something list_month would
+        # never actually see in production.
+        self._candidates_by_month = candidates_by_month or {}
         self.created = []
 
     def list_month(self, gym_id, month):
         return [dict(r) for r in self._rows_by_month.get(month, [])
+                if r.get("gym_id") == gym_id
+                and str(r.get("variant_status") or "active") != "candidate"]
+
+    def list_variant_candidates(self, gym_id, month):
+        return [dict(r) for r in self._candidates_by_month.get(month, [])
                 if r.get("gym_id") == gym_id]
 
     def create_variant_candidate(self, account_key, anchor_row, image_url, **kw):
@@ -82,6 +94,39 @@ def test_find_candidates_excludes_non_active_variant_status():
     store = _Store(rows)
     found = lar.find_candidates(store, gym_id="lasso", months=["2026-09"])
     assert found == []
+
+
+def test_find_candidates_excludes_anchors_that_already_have_a_candidate():
+    """A slot whose ANCHOR already has a linked candidate from an earlier pass
+    (a SEPARATE candidate row, found via list_variant_candidates — NOT via
+    list_month, which never returns candidate rows in production) must not be
+    re-worked into a duplicate candidate. Real production gap found
+    2026-09-11: the anchor row stays variant_status='active' forever
+    (create_variant_candidate never touches it), so without this exclusion a
+    re-run of the sweep would double-generate for every already-processed
+    slot -- and a first cut of this fix looked for the candidate inside
+    list_month's own results, where it can never appear."""
+    rows = {"2026-09": [
+        _row("anchor-1"),
+        _row("anchor-2"),   # no candidate yet -> still eligible
+    ]}
+    candidates = {"2026-09": [
+        {"id": "cand-1", "gym_id": "lasso", "variant_status": "candidate",
+         "variant_of": "anchor-1", "post_date": "2026-09-15"},
+    ]}
+    store = _Store(rows, candidates_by_month=candidates)
+    found = lar.find_candidates(store, gym_id="lasso", months=["2026-09"])
+    assert [r["id"] for r in found] == ["anchor-2"]
+
+
+def test_already_has_candidate_ignores_a_store_without_the_method():
+    """Backward compatible: a store/fake with no list_variant_candidates
+    method (older test doubles) is treated as 'no known candidates', not a
+    crash."""
+    class _BareStore:
+        def list_month(self, gym_id, month):
+            return []
+    assert lar._already_has_candidate(_BareStore(), "lasso", ["2026-09"]) == set()
 
 
 def test_find_candidates_excludes_other_gyms():

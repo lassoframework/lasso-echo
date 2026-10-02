@@ -246,6 +246,52 @@ def record_published(gym_id: str, caption_text: str, date_str: str,
         pass
 
 
+def move_staged_date(gym_id: str, caption_text: str, old_date: str,
+                     new_date: str, db=None, *, preserve_old_fuzzy=False,
+                     preserve_old_verbatim=False) -> None:
+    """Move this caption's staging stamp when its waiting calendar row is re-dated.
+
+    The publish-time cooldown treats a stamp on another date as a real duplicate.
+    Leaving the old stamp behind therefore makes a legitimate reschedule block
+    itself. Preserve all other dates because they can represent real, distinct
+    uses; replace only ``old_date`` with ``new_date`` and do not increment uses.
+    The caller may preserve either old stamp when another row with the same
+    normalized caption still occupies ``old_date``.  That distinction matters for
+    a real historical use: moving one waiting row must not erase the other row's
+    duplicate evidence.  Best effort, matching the other ledger writers.
+    """
+    try:
+        if not caption_text or not old_date or not new_date or old_date == new_date:
+            return
+        _db = db if db is not None else _default_db()
+
+        h = caption_hash(caption_text)
+        key = ledger_key(gym_id, h)
+        raw = _kv_get(_db, key)
+        fuzzy = json.loads(raw) if raw else {"last_used": "", "uses": 1}
+        if (not preserve_old_fuzzy
+                and ((fuzzy.get("last_used") or "") == old_date
+                     or not fuzzy.get("last_used"))):
+            fuzzy["last_used"] = new_date
+        _kv_set(_db, key, json.dumps(fuzzy))
+
+        vh = verbatim_hash(caption_text)
+        if not vh:
+            return
+        vkey = verbatim_key(gym_id, vh)
+        raw = _kv_get(_db, vkey)
+        verbatim = json.loads(raw) if raw else {"dates": [], "uses": 1}
+        dates = [str(d) for d in (verbatim.get("dates") or [])]
+        if not preserve_old_verbatim:
+            dates = [new_date if d == old_date else d for d in dates]
+        if new_date not in dates:
+            dates.append(new_date)
+        verbatim["dates"] = sorted(set(dates))[-_VERBATIM_MAX_DATES:]
+        _kv_set(_db, vkey, json.dumps(verbatim))
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Concept-level cooldown (doctrine / education concept pool)
 # ---------------------------------------------------------------------------

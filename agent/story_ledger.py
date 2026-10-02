@@ -127,7 +127,7 @@ def record_render(content_hash, *, gym_id="", story_render_id="", http=None):
     return ch
 
 
-def is_echo_render(content_hash, *, http=None) -> bool:
+def is_echo_render(content_hash, *, http=None, strict=False) -> bool:
     """True when this content_hash is one of Echo's OWN past Story renders (so a file
     with these bytes must NEVER be re-ingested as raw and re-composed/reposted). Checks
     Supabase first (durable, cross-service); on a not-configured / unreachable store it
@@ -136,6 +136,8 @@ def is_echo_render(content_hash, *, http=None) -> bool:
     if not ch:
         return False
     hit = _sb_has(ch, http=http)
+    if strict and hit is None and all(_supabase_conf()):
+        raise ValueError('Shared render ledger is unavailable')
     if hit is True:
         return True
     if hit is None:  # store not configured / unreachable -> kv fallback

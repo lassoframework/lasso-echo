@@ -158,8 +158,8 @@ def test_autonomous_gym_publishes_pending_on_its_own(monkeypatch):
     assert store.published == ["p1"]                    # pending published on its own
 
 
-def test_kv_autonomy_also_arms_the_gym(monkeypatch):
-    """Echo's own kv autonomy flag (POST /portal/<token>/autonomy) arms the lane too."""
+def test_stale_local_autonomy_cannot_override_unknown_shared_mode(monkeypatch):
+    """A stale local ON is not authority to publish when the shared mode is unknown."""
     _arm_lane(monkeypatch)
     monkeypatch.setattr(cap, "client_gym_bases", lambda: ["eng"])
     from agent import db as _db
@@ -167,7 +167,7 @@ def test_kv_autonomy_also_arms_the_gym(monkeypatch):
     store = _LaneStore([_row("p1b", "eng", "pending")], autonomy={"eng": None})
     out = cap.publish_client_gyms("2026-08-13", store=store,
                                   zernio_publish=_fake_zernio_ok)
-    assert out[0]["autonomous"] is True and store.published == ["p1b"]
+    assert out[0]["autonomous"] is False and store.published == []
 
 
 def test_non_autonomous_gym_still_requires_approval(monkeypatch):
@@ -206,6 +206,8 @@ def test_autonomy_read_error_defaults_to_approval_required(monkeypatch):
     monkeypatch.setattr(_db, "is_autonomous",
                         lambda k: (_ for _ in ()).throw(RuntimeError("kv down")))
     store = _LaneStore([_row("p3", "eng", "pending")], autonomy={"eng": True})
+    monkeypatch.setattr(store, "gym_autonomy",
+                        lambda k: (_ for _ in ()).throw(RuntimeError("shared read down")))
     out = cap.publish_client_gyms("2026-08-13", store=store,
                                   zernio_publish=_fake_zernio_ok)
     assert out[0]["autonomous"] is False               # safe side on error
@@ -303,3 +305,15 @@ def test_run_daily_dedupes_and_goes_quiet_when_caught_up(monkeypatch):
                                   kv=kv, alert=lambda m, **k: alerts.append(m),
                                   recent_gyms=_gyms(), coverage=lambda s, t: dict(bad))
     assert r4 and not r4["all_caught_up"] and len(alerts) == 2
+
+
+def test_manual_shared_mode_wins_over_stale_local_auto(monkeypatch):
+    _arm_lane(monkeypatch)
+    monkeypatch.setattr(cap, "client_gym_bases", lambda: ["eng"])
+    from agent import db
+    monkeypatch.setattr(db, "is_autonomous", lambda k: True)
+    store = _LaneStore([_row("manual-now", "eng", "pending")], autonomy={"eng": False})
+    out = cap.publish_client_gyms("2026-08-13", store=store,
+                                 zernio_publish=_fake_zernio_ok)
+    assert out[0]["autonomous"] is False
+    assert store.published == []

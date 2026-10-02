@@ -18,6 +18,7 @@ before this file existed.
 |---|---|---|---|
 | AGENT_ENABLED | false | BLAKE | Master switch. Nothing drafts while off. |
 | AGENT_PUBLISH_ENABLED | false | BLAKE | Publish gate. Code default stays false forever; armed only in Railway. |
+| AGENT_LASSO_3X_ENABLED | false | BLAKE | Durable third daily feed for canonical LASSO only; client gyms remain capped at 1x/2x. Requires `lasso_three_feed_capacity_20260930.sql`. |
 | AGENT_APPROVER_SLACK_ID | U06EPUUCL13 | code | The global approver. |
 | AGENT_OPS_ALERTS_ENABLED | false | BLAKE | One ECHO ALERT line per pipeline failure. |
 | AGENT_IDEMPOTENT_DRAFTS_ENABLED | false | BLAKE | One draft per (account, day, type); supersede/expire cards. |
@@ -144,6 +145,9 @@ accident, which looks identical to working.
 | AGENT_GEMINI_COST_PER_IMAGE_USD | 0.039 | code | ESTIMATED USD per Gemini image. |
 | AGENT_IMAGE_DAILY_COST_ALERT_USD | 10.00 | code | One ops alert per day once estimated image spend crosses this. |
 | AGENT_IMAGE_URL_FOOTER | LASSOFRAMEWORK.COM | code | The URL rendered in the brief's footer block. |
+| AGENT_LASSO_ASTRA_DEFAULT | false | BLAKE | LASSO's own b2b content pillar tries the Astra-first `daily_studio` infographic builder FIRST, falling back to library rotation only when it returns None (matches platform/doctrine pillars, which already defaulted to Astra). Also gates `python -m agent lasso-astra-rework` (regenerate the image only on existing non-video calendar slots) and the "type a brief" manual regen path. ARMED true in prod 2026-09-11. |
+| AGENT_NO_MEDIA_ASTRA_SEED | false | BLAKE | For a gym with ZERO real uploaded media and zero approved client sources, auto-runs that gym's deep-brain scrape and drafts a few gym-specific Astra infographic candidates instead of the generic fact-free onboarding sample. Rows land `content_calendar` status=`pending`, same human approval gate as every other post. One scrape attempt per gym (kv-marked). Built to cover CrossFit Chateau's real zero-media case first. ARMED true in prod 2026-09-11. |
+| ECHO_VARIANT_PAIRING | false | BLAKE | Astra v2 side-by-side variant regen (migration 0318): review + pick a v2 image for an existing scheduled post without overwriting the live creative. Portal review UI shipped in PR #614. ARMED true in prod 2026-09-11 — the fleet-wide ~1,000+ September post regen sweep this was originally gated on has NOT been run yet; the flag is live ahead of that sweep. |
 
 ## Creative studio (Gemini)
 
@@ -161,7 +165,7 @@ Now the FALLBACK engine. Everything below is unchanged.
 | AGENT_GEMINI_DAILY_CAP | 40 | code | Generation calls/day/account under the cap, either engine. |
 | AGENT_OCR_CHECK_ENABLED | false | BLAKE | Headline OCR warning (never blocks). |
 | AGENT_AUTOTAG_ENABLED | false | BLAKE | DAM auto-tag on ingest. |
-| AGENT_CONSENT_GUARD_ENABLED | false | BLAKE | People=consent gate. |
+| AGENT_CONSENT_GUARD_ENABLED | false | retired | Compatibility-only; photo releases never gate publishing. |
 
 ## Hosting (R2/S3)
 
@@ -187,6 +191,8 @@ Now the FALLBACK engine. Everything below is unchanged.
 | PORT | 8080 | code | Railway sets it on the web service. |
 | AGENT_INTAKE_MAX_FILE_MB / AGENT_INTAKE_MAX_REQUEST_MB | code defaults | code | |
 | AGENT_INTAKE_RATE_PER_MINUTE | code default | code | Per-IP rate limit. |
+| AGENT_MEDIA_BRIDGE_ALERTS | false | BLAKE | Arms one durable client Slack notice per media-depletion episode and a maximum two-day review-held infographic fallback. Keep off until every intended gym has a verified route. |
+| AGENT_MEDIA_BRIDGE_CHANNELS | `{}` | BLAKE | JSON object mapping an exact gym key to its client Slack channel id. A missing or invalid route fails closed and sends nothing. |
 | AGENT_INTAKE_POLL_MINUTES | 5 | code | Worker pass interval. |
 | AGENT_DOC_INTAKE_ENABLED | false | BLAKE | PDF -> held draft posts. |
 | AGENT_MEDIA_INBOX_ENABLED / AGENT_MEDIA_INBOX_DIR | false / code | BLAKE | Provider-agnostic texted-media queue. |

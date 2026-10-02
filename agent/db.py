@@ -26,6 +26,10 @@ import sqlite3
 import threading
 
 _lock = threading.Lock()
+# Schema setup opens a connection and may run additive ALTER TABLE migrations.  It
+# must be separate from _lock: several helpers already hold _lock while calling
+# connect(), so reusing it here would deadlock those callers.
+_schema_lock = threading.Lock()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS drafts (
@@ -34,7 +38,8 @@ CREATE TABLE IF NOT EXISTS drafts (
 CREATE TABLE IF NOT EXISTS posts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id TEXT, account_key TEXT,
   platform TEXT, caption TEXT, media_id TEXT, permalink TEXT, mode TEXT,
-  creative_key TEXT, archetype TEXT, set_name TEXT, published_at TEXT);
+  creative_key TEXT, archetype TEXT, set_name TEXT, published_at TEXT,
+  image_engine TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS served (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account_key TEXT, key TEXT,
   pillar TEXT, date TEXT, archetype TEXT, set_name TEXT);
@@ -93,6 +98,20 @@ CREATE TABLE IF NOT EXISTS socialapi_claims (
   draft_id TEXT, account_key TEXT, status TEXT DEFAULT 'in_flight',
   post_id TEXT DEFAULT '', claimed_at TEXT DEFAULT (datetime('now')),
   PRIMARY KEY (draft_id, account_key));
+CREATE TABLE IF NOT EXISTS generation_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  draft_id TEXT DEFAULT '', account_key TEXT DEFAULT '', kind TEXT DEFAULT '',
+  headline TEXT DEFAULT '', cta TEXT DEFAULT '', facts_json TEXT DEFAULT '[]',
+  brief TEXT DEFAULT '', reference_ids_json TEXT DEFAULT '[]',
+  engine TEXT DEFAULT '', model TEXT DEFAULT '', route TEXT DEFAULT '',
+  quality_used TEXT DEFAULT '', reasoning_effort_used TEXT DEFAULT '',
+  input_fidelity_used TEXT DEFAULT '', revised_prompt TEXT DEFAULT '',
+  original_sha256 TEXT DEFAULT '', final_path TEXT DEFAULT '',
+  final_sha256 TEXT DEFAULT '',
+  grade_status TEXT DEFAULT '', grade_scores_json TEXT DEFAULT '{}',
+  grade_reason TEXT DEFAULT '', corrective_feedback TEXT DEFAULT '',
+  attempt INTEGER DEFAULT 1, final_status TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now')));
 """
 
 
@@ -111,6 +130,17 @@ _POST_METRIC_COLUMNS = ("likes", "comments", "saves", "shares", "views", "reach"
 
 def connect(path=None):
     """A WAL-mode connection with the schema ensured. Callers close it."""
+    # Two listener threads can first-open the same SQLite file at once.  Without
+    # serialization, each can observe a missing additive column and one loses
+    # with "duplicate column name" (or journal-mode's immediate lock error).
+    # This lock covers setup only; callers receive independent connections for
+    # their normal concurrent work.
+    with _schema_lock:
+        return _connect_initialized(path)
+
+
+def _connect_initialized(path=None):
+    """Open one connection after this process has exclusive schema setup access."""
     conn = sqlite3.connect(path or db_path(), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -121,6 +151,16 @@ def connect(path=None):
     for col in _POST_METRIC_COLUMNS:
         if col not in have:
             conn.execute(f"ALTER TABLE posts ADD COLUMN {col} INTEGER")
+    # additive posts migration (Blake 2026-09-13): which image engine + model
+    # actually generated this post's creative (e.g. "astra:gpt-image-2.5-
+    # sunburst"), so a SPECIFIC published post can be traced to the engine
+    # that made it, not just proven in aggregate over a time window. Existing
+    # rows stay '' (unknown; predate this column).
+    if "image_engine" not in have:
+        try:
+            conn.execute("ALTER TABLE posts ADD COLUMN image_engine TEXT DEFAULT ''")
+        except Exception:
+            pass
     # additive gyms migration: intake_token_encrypted added for reversible
     # encryption at rest (AGENT_INTAKE_ENC_KEY); existing rows stay as-is.
     gyms_have = {r["name"] for r in conn.execute("PRAGMA table_info(gyms)")}
@@ -448,6 +488,89 @@ def socialapi_claim_release(draft_id, account_key):
             "DELETE FROM socialapi_claims WHERE draft_id=? AND account_key=?",
             (draft_id, account_key))
         conn.commit()
+
+
+def record_generation(**fields):
+    """Persist one Astra/Gemini generation attempt (spec section 7: approved
+    source copy, the full assembled brief, reference ids, model + request
+    settings, revised_prompt, image hashes, grade results + corrective
+    feedback, attempt count, final status). ONLY called going forward from new
+    code (agent/generation_log.py) — no past generation is ever backfilled here.
+    Any secret must already be scrubbed by the caller; this function does not
+    scrub (it is not itself a secret-adjacent surface: briefs/prompts/grades
+    hold no credentials by construction elsewhere in this repo). Never raises:
+    a logging failure must not lose or block a real generation."""
+    import json as _json
+    cols = ("draft_id", "account_key", "kind", "headline", "cta", "facts_json",
+            "brief", "reference_ids_json", "engine", "model", "route",
+            "quality_used", "reasoning_effort_used", "input_fidelity_used",
+            "revised_prompt", "original_sha256", "final_path", "final_sha256",
+            "grade_status", "grade_scores_json", "grade_reason",
+            "corrective_feedback", "attempt", "final_status")
+    row = {c: fields.get(c, "") for c in cols}
+    if "facts" in fields:
+        row["facts_json"] = _json.dumps(fields["facts"] or [])
+    if "reference_ids" in fields:
+        row["reference_ids_json"] = _json.dumps(fields["reference_ids"] or [])
+    if "grade_scores" in fields:
+        row["grade_scores_json"] = _json.dumps(fields["grade_scores"] or {})
+    row["attempt"] = int(fields.get("attempt") or 1)
+    try:
+        with _lock, connect() as conn:
+            placeholders = ", ".join("?" for _ in cols)
+            conn.execute(
+                f"INSERT INTO generation_records ({', '.join(cols)}) "
+                f"VALUES ({placeholders})",
+                tuple(row[c] for c in cols))
+            conn.commit()
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    except Exception as exc:  # noqa: BLE001 - a log write must never lose a card
+        print(f"[db] record_generation failed: {type(exc).__name__}: {exc}")
+        return None
+
+
+def get_generation(record_id, conn=None):
+    """One generation record by id, with the JSON columns decoded, or None."""
+    import json as _json
+    own = conn is None
+    conn = conn or connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM generation_records WHERE id=?", (record_id,)).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        for jc in ("facts_json", "reference_ids_json", "grade_scores_json"):
+            try:
+                d[jc[:-5]] = _json.loads(d.get(jc) or ("[]" if jc != "grade_scores_json" else "{}"))
+            except Exception:
+                d[jc[:-5]] = [] if jc != "grade_scores_json" else {}
+        return d
+    finally:
+        if own:
+            conn.close()
+
+
+def list_generations(draft_id=None, account_key=None, limit=50, conn=None):
+    """Recent generation records, newest first, optionally filtered."""
+    own = conn is None
+    conn = conn or connect()
+    try:
+        where, params = [], []
+        if draft_id:
+            where.append("draft_id=?")
+            params.append(draft_id)
+        if account_key:
+            where.append("account_key=?")
+            params.append(account_key)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        rows = conn.execute(
+            f"SELECT id FROM generation_records {clause} "
+            f"ORDER BY id DESC LIMIT ?", (*params, int(limit))).fetchall()
+        return [get_generation(r["id"], conn=conn) for r in rows]
+    finally:
+        if own:
+            conn.close()
 
 
 def audit(kind, subject, reason, account_key="", day=""):
@@ -960,3 +1083,36 @@ def audit_rows(day=None, account_key=None, limit=500):
     params.append(limit)
     with connect() as conn:
         return [dict(r) for r in conn.execute(q, params).fetchall()]
+
+
+def post_engine_for(draft_id=None, media_id=None, limit=20):
+    """TRACEABILITY (Blake, 2026-09-13): which engine generated ONE specific
+    published post, looked up by draft_id or media_id against the `posts`
+    table (the row postlog.log_post writes at publish time, carrying
+    `image_engine` = "{engine}:{model}", e.g. "astra:gpt-image-2.5-sunburst").
+
+    Exactly one of draft_id / media_id must be given (both is an error: a
+    lookup should name ONE post, not intersect two identifiers that might
+    not agree). Returns a list of matching rows (draft_id, account_key,
+    platform, mode, published_at, media_id, permalink, image_engine),
+    newest first — normally one row, but a draft can legitimately log more
+    than once (e.g. a retried publish), so every match is returned rather
+    than silently picking one. Empty list when nothing matches or the DB is
+    unreadable; never raises."""
+    if bool(draft_id) == bool(media_id):
+        raise ValueError("post_engine_for: pass exactly one of draft_id or media_id")
+    q = ("SELECT draft_id, account_key, platform, mode, published_at, media_id, "
+         "permalink, image_engine FROM posts WHERE ")
+    if draft_id:
+        q += "draft_id=?"
+        param = draft_id
+    else:
+        q += "media_id=?"
+        param = media_id
+    q += " ORDER BY id DESC LIMIT ?"
+    try:
+        with connect() as conn:
+            return [dict(r) for r in conn.execute(q, (param, limit)).fetchall()]
+    except Exception as e:  # noqa: BLE001 - a lookup tool never crashes the caller
+        print(f"[db] post_engine_for lookup failed: {type(e).__name__}: {e}")
+        return []

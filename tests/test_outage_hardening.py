@@ -129,6 +129,7 @@ class _StoreThatReverts:
 
     def mark_publish_failed(self, row_id, revert_status=None, reject_reason=None):
         self.calls.append((row_id, revert_status, reject_reason))
+        return True
 
 
 def test_failed_revert_alerts_and_reports_false(monkeypatch):
@@ -174,6 +175,7 @@ def test_revert_falls_back_for_stores_without_reject_reason(monkeypatch):
 
         def mark_publish_failed(self, row_id, revert_status=None):
             self.calls.append((row_id, revert_status))
+            return True
 
     store = _Old()
     assert ca._revert_to_pending(store=store, row_id="r2", reject_reason="x") is True

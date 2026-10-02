@@ -113,6 +113,62 @@ def _rest_get(path, params, *, url, key, http=None):
         return None
 
 
+def _rest_read(path, params, *, url, key, http=None):
+    """Like _rest_get, but retain whether a failed result was unavailable.
+
+    The resend path intentionally collapses every failure to ``None`` so it can
+    escalate safely. The read-only readiness endpoint must distinguish a portal
+    outage from owner data that needs to be fixed, without returning that data.
+    """
+    q = _up.urlencode(params)
+    try:
+        resp = _http(http).get(
+            f"{url}/rest/v1/{path}?{q}",
+            headers={"apikey": key, "Authorization": f"Bearer {key}",
+                     "Accept": "application/json"})
+    except Exception:
+        return False, None
+    if getattr(resp, "status_code", 599) >= 400:
+        return False, None
+    try:
+        return True, resp.json()
+    except Exception:
+        return False, None
+
+
+def owner_readiness(gym_id, *, http=None):
+    """Return a non-sensitive owner prerequisite category for a connect-link resend.
+
+    This is deliberately a portal read only. It makes no Slack request, link mint,
+    write, or notification. Keep its lookup shape aligned with resolve_owner_email:
+    one distinct client_owner assignment with one nonblank app-user email is ready.
+    """
+    url = config.supabase_url()
+    key = config.supabase_service_key()
+    if not url or not key or not gym_id:
+        return "portal-unavailable"
+    ok, assignments = _rest_read(
+        "gym_assignments",
+        {"gym_id": f"eq.{gym_id}", "relationship": "eq.client_owner",
+         "select": "app_user_id"},
+        url=url, key=key, http=http)
+    if not ok:
+        return "portal-unavailable"
+    user_ids = sorted({a.get("app_user_id") for a in assignments or []
+                       if a.get("app_user_id")})
+    if not user_ids:
+        return "missing"
+    if len(user_ids) > 1:
+        return "ambiguous"
+    ok, users = _rest_read("app_users", {"id": f"eq.{user_ids[0]}", "select": "email"},
+                          url=url, key=key, http=http)
+    if not ok:
+        return "portal-unavailable"
+    if not users or not str((users[0] or {}).get("email") or "").strip():
+        return "user-email-missing"
+    return "ready"
+
+
 def resolve_owner_email(gym_id, *, http=None):
     """The gym's client_owner email, resolved from the portal's OWN records
     (gym_assignments joined to app_users) -- never a guess. Returns None when the
@@ -179,8 +235,16 @@ def _slack_send(channel, text, *, token, http=None):
             data=json.dumps({"channel": channel, "text": text}))
         body = resp.json()
     except Exception:
-        return False
-    return bool(body.get("ok"))
+        return None
+    if not body.get("ok"):
+        return None
+    return {
+        "sent": True,
+        "provider": "slack",
+        "channel": channel,
+        "ts": body.get("ts"),
+        "message_id": body.get("message_id"),
+    }
 
 
 def _default_is_client(gym_id, base_key):
@@ -192,7 +256,7 @@ def _default_is_client(gym_id, base_key):
 
 
 def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None,
-                   is_client=None):
+                   is_client=None, force=False, return_receipt=False):
     """Send a newly-registered gym's owner its connect link, once. Returns True only
     when a message was actually sent this call. OFF unless
     config.auto_connect_link_enabled(). Never raises; every failure path ESCALATES
@@ -202,8 +266,15 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
 
     ECHO CLIENTS ONLY (2026-09-11): a gym `is_client` (default: echo_clients, by
     gym_id or base key) does not vouch for is REFUSED before any lookup, DM or link
-    mint, with ONE alert per gym ever (kv `connect_link_refused_<base>`)."""
-    if not config.auto_connect_link_enabled():
+    mint, with ONE alert per gym ever (kv `connect_link_refused_<base>`).
+
+    `force=True` (D72, the FIXER's `resend_connect_link` ops action): an explicit
+    operator RESEND. It skips the auto-send flag (this is not the automatic first send
+    the flag governs) and the once-ever dedupe stamp -- and NOTHING else: the Echo-client
+    gate above applies to a forced resend exactly as to the automatic send (the live
+    incident that DM'd 36 non-clients came through this function). Callers of the
+    automatic send are byte-for-byte unchanged."""
+    if not force and not config.auto_connect_link_enabled():
         return False
     base_key = str(base_key or "").strip()
     gym_name = str(gym_name or "").strip()
@@ -234,11 +305,12 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
         return False
 
     dedupe_key = f"connect_link_sent_{base_key}"
-    try:
-        if db.kv_get(dedupe_key):
-            return False
-    except Exception:
-        pass  # a dedupe READ failure must not block a first-ever send
+    if not force:
+        try:
+            if db.kv_get(dedupe_key):
+                return False
+        except Exception:
+            pass  # a dedupe READ failure must not block a first-ever send
 
     token = os.environ.get(config.SLACK_BOT_TOKEN_ENV, "")
     if not token:
@@ -288,7 +360,8 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
         return False
 
     text = _CONNECT_MESSAGE.format(name=email.split("@")[0], gym=gym_name, link=link)
-    if not _slack_send(channel, text, token=token, http=http):
+    send_receipt = _slack_send(channel, text, token=token, http=http)
+    if not send_receipt:
         alert(f"auto connect-link for {base_key}: Slack DM to {email} failed to "
               f"send. Send the connect link by hand: {link}")
         return False
@@ -297,4 +370,7 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
         db.kv_set(dedupe_key, "1")
     except Exception:
         pass  # the message is already sent; a stamp failure risks one resend, not silence
-    return True
+    # Preserve the long-standing boolean return for existing callers. The FIXER
+    # ops lane explicitly asks for the provider receipt so it can verify delivery
+    # without treating a no-exception return as proof.
+    return send_receipt if return_receipt else True

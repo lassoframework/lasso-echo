@@ -62,6 +62,238 @@ class _FakeHTTP:
         return self._delete_resp
 
 
+@pytest.mark.parametrize("row_gym,row_status,published_at,late_post_id", [
+    ("other-gym", "publishing", None, None),
+    ("lasso", "denied", None, None),
+    ("lasso", "published", "2026-08-10T12:00:00Z", "provider-1"),
+    ("lasso", "publishing", None, "provider-1"),
+])
+def test_publish_rollback_cas_refuses_changed_or_cross_tenant_row(
+        monkeypatch, row_gym, row_status, published_at, late_post_id):
+    """A concurrent decision or publication wins over a stale worker rollback."""
+    token = "11111111-1111-4111-8111-111111111111"
+    current = {"id": "row-1", "gym_id": row_gym, "status": row_status,
+               "publish_claim_token": token,
+               "published_at": published_at, "late_post_id": late_post_id}
+
+    class ConditionalHTTP(_FakeHTTP):
+        def patch(self, url, params=None, headers=None, json=None, timeout=None):
+            self.calls.append(("patch", url, params, headers, json))
+            match = (params["id"] == "eq.row-1"
+                     and params["gym_id"] == f"eq.{current['gym_id']}"
+                     and params["status"] == f"eq.{current['status']}"
+                     and params["published_at"] == "is.null"
+                     and current["published_at"] is None
+                     and params["late_post_id"] == "is.null"
+                     and current["late_post_id"] is None
+                     and params["publish_claim_token"] == f"eq.{current['publish_claim_token']}")
+            if match:
+                current.update(json)
+            return _Resp(200, [dict(current)] if match else [])
+
+    http = ConditionalHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    result = pcs.SupabaseCalendarStore().mark_publish_failed(
+        "row-1", gym_id="lasso", expected_claim_token=token,
+        reject_reason="publish_guard: media_review")
+
+    assert result is None
+    assert current["gym_id"] == row_gym
+    assert current["status"] == row_status
+    assert current["published_at"] == published_at
+    assert current["late_post_id"] == late_post_id
+    params = http.calls[0][2]
+    assert params == {"id": "eq.row-1", "gym_id": "eq.lasso",
+                      "status": "eq.publishing", "published_at": "is.null",
+                      "late_post_id": "is.null",
+                      "publish_claim_token": f"eq.{token}"}
+
+
+def test_publish_rollback_cas_restores_owned_unpublished_claim(monkeypatch):
+    updated = {"id": "row-1", "gym_id": "lasso", "status": "approved"}
+    token = "11111111-1111-4111-8111-111111111111"
+    http = _FakeHTTP(patch_resp=_Resp(200, [updated]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().mark_publish_failed(
+        "row-1", revert_status="approved", gym_id="lasso",
+        expected_claim_token=token,
+        reject_reason="media_asset_review_required")
+
+    assert result == updated
+    _, _, params, _, body = http.calls[0]
+    assert params["gym_id"] == "eq.lasso"
+    assert params["status"] == "eq.publishing"
+    assert params["publish_claim_token"] == f"eq.{token}"
+    assert body == {"status": "approved", "publish_reservation_day": None,
+                    "publish_claim_token": None,
+                    "reject_reason": "media_asset_review_required"}
+
+
+def test_tenant_rollback_without_owner_token_refuses_write(monkeypatch):
+    http = _FakeHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    with pytest.raises(pcs.PortalStoreError):
+        pcs.SupabaseCalendarStore().mark_publish_failed("row-1", gym_id="lasso")
+    assert http.calls == []
+
+
+@pytest.mark.parametrize("method,args", [
+    ("mark_duplicate_content", ("lasso", "row-1", "duplicate")),
+    ("release_content_ledger_claim", ("lasso", "row-1", "pending", "fault")),
+])
+@pytest.mark.parametrize("token", [None, "not-a-uuid"])
+def test_pre_network_claim_transitions_require_valid_owner_token(
+        monkeypatch, method, args, token):
+    http = _FakeHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    with pytest.raises(pcs.PortalStoreError):
+        getattr(pcs.SupabaseCalendarStore(), method)(
+            *args, expected_claim_token=token)
+    assert http.calls == []
+
+
+def test_tenant_rollback_rejects_invalid_owner_token(monkeypatch):
+    http = _FakeHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    with pytest.raises(pcs.PortalStoreError):
+        pcs.SupabaseCalendarStore().mark_publish_failed(
+            "row-1", gym_id="lasso", expected_claim_token="not-a-uuid")
+    assert http.calls == []
+
+
+def test_owned_claim_rpc_missing_fails_closed(monkeypatch):
+    http = _FakeHTTP(post_resp=_Resp(404, text="missing RPC"))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    with pytest.raises(pcs.PortalStoreError):
+        pcs.SupabaseCalendarStore().claim_publish_slot(
+            "row-1", "lasso", "2026-08-10", "America/New_York", 2, True)
+    assert http.calls[0][1].endswith("/rpc/claim_calendar_publish_slot_owned")
+
+
+def test_old_claim_cannot_rollback_same_row_after_second_worker_reclaims(
+        monkeypatch):
+    first = "11111111-1111-4111-8111-111111111111"
+    second = "22222222-2222-4222-8222-222222222222"
+    row = {"id": "row-1", "gym_id": "lasso", "status": "approved",
+           "published_at": None, "late_post_id": None,
+           "publish_claim_token": None}
+
+    class TwoClaimHTTP(_FakeHTTP):
+        def __init__(self):
+            super().__init__()
+            self.tokens = iter((first, second))
+
+        def post(self, url, params=None, headers=None, json=None, timeout=None):
+            assert url.endswith("/rpc/claim_calendar_publish_slot_owned")
+            assert row["status"] in ("pending", "approved")
+            row["status"] = "publishing"
+            row["publish_claim_token"] = next(self.tokens)
+            return _Resp(200, row["publish_claim_token"])
+
+        def patch(self, url, params=None, headers=None, json=None, timeout=None):
+            self.calls.append(("patch", url, params, headers, json))
+            matches = (params["id"] == "eq.row-1"
+                       and params["gym_id"] == "eq.lasso"
+                       and params["status"] == f"eq.{row['status']}"
+                       and params["publish_claim_token"] ==
+                       f"eq.{row['publish_claim_token']}"
+                       and row["published_at"] is None
+                       and row["late_post_id"] is None)
+            if matches:
+                row.update(json)
+            return _Resp(200, [dict(row)] if matches else [])
+
+    http = TwoClaimHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    store = pcs.SupabaseCalendarStore()
+    claim1 = store.claim_publish_slot("row-1", "lasso", "2026-08-10",
+                                      "America/New_York", 2, True)
+    assert claim1 == first
+    # Another authorized recovery released the first claim before worker 1
+    # received its block result. Worker 2 then claimed the same row.
+    row.update(status="approved", publish_claim_token=None)
+    claim2 = store.claim_publish_slot("row-1", "lasso", "2026-08-10",
+                                      "America/New_York", 2, True)
+    assert claim2 == second
+
+    stale = store.mark_publish_failed("row-1", gym_id="lasso",
+                                      expected_claim_token=claim1)
+    assert stale is None
+    assert row["status"] == "publishing"
+    assert row["publish_claim_token"] == claim2
+    owned = store.mark_publish_failed("row-1", gym_id="lasso",
+                                      expected_claim_token=claim2)
+    assert owned["status"] == "pending"
+    assert row["publish_claim_token"] is None
+
+
+@pytest.mark.parametrize("transition,target_status,args", [
+    ("mark_duplicate_content", "deleted", ("duplicate",)),
+    ("release_content_ledger_claim", "pending", ("pending", "ledger fault")),
+])
+def test_old_claim_cannot_run_pre_network_transition_after_aba_reclaim(
+        monkeypatch, transition, target_status, args):
+    first = "11111111-1111-4111-8111-111111111111"
+    second = "22222222-2222-4222-8222-222222222222"
+    row = {"id": "row-1", "gym_id": "lasso", "status": "publishing",
+           "published_at": None, "late_post_id": None,
+           "publish_claim_token": second}
+
+    class ClaimCASHTTP(_FakeHTTP):
+        def patch(self, url, params=None, headers=None, json=None, timeout=None):
+            self.calls.append(("patch", url, params, headers, json))
+            matches = (
+                params == {"id": "eq.row-1", "gym_id": "eq.lasso",
+                           "status": "eq.publishing", "published_at": "is.null",
+                           "late_post_id": "is.null",
+                           "publish_claim_token": f"eq.{row['publish_claim_token']}"}
+                and row["status"] == "publishing"
+                and row["published_at"] is None
+                and row["late_post_id"] is None
+            )
+            if matches:
+                row.update(json)
+            return _Resp(200, [dict(row)] if matches else [])
+
+    http = ClaimCASHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    store = pcs.SupabaseCalendarStore()
+
+    stale = getattr(store, transition)(
+        "lasso", "row-1", *args, expected_claim_token=first)
+    assert stale is None
+    assert row["status"] == "publishing"
+    assert row["publish_claim_token"] == second
+
+    owned = getattr(store, transition)(
+        "lasso", "row-1", *args, expected_claim_token=second)
+    assert owned["status"] == target_status
+    assert row["status"] == target_status
+    assert row["publish_claim_token"] is None
+    _, _, params, _, body = http.calls[-1]
+    assert params["gym_id"] == "eq.lasso"
+    assert params["status"] == "eq.publishing"
+    assert params["publish_claim_token"] == f"eq.{second}"
+    assert body["publish_claim_token"] is None
+
+
+def test_mark_published_filters_by_owned_claim_token(monkeypatch):
+    token = "22222222-2222-4222-8222-222222222222"
+    updated = {"id": "row-1", "status": "published", "gym_id": "lasso"}
+    http = _FakeHTTP(patch_resp=_Resp(200, [updated]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    pcs.SupabaseCalendarStore().mark_published(
+        "row-1", "provider-1", "2026-08-10T12:00:00Z",
+        expected_claim_token=token)
+
+    _, _, params, _, body = http.calls[0]
+    assert params["status"] == "eq.publishing"
+    assert params["publish_claim_token"] == f"eq.{token}"
+    assert body["publish_claim_token"] is None
+
+
 def _row(row_id, gym_id="lasso", post_date="2026-08-06", account="instagram",
          status="pending", caption=None, image_url="https://cdn/x.jpg",
          pillar="education"):
@@ -119,6 +351,42 @@ def test_calendar_null_caption_and_image(monkeypatch):
     assert d["caption"] is None
     assert d["creative_public_url"] is None
     assert d["pillar"] is None
+
+
+def test_calendar_hides_the_same_client_statuses_as_social(monkeypatch):
+    rows = [
+        _row("live", status="pending"),
+        _row("denied", status="denied"),
+        _row("killed", status="killed"),
+        _row("deleted", status="deleted"),
+        _row("coach", status="coach_review"),
+    ]
+    http = _FakeHTTP(get_resp=_Resp(200, rows))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+
+    assert status == 200
+    assert [d["draft_id"] for d in body["drafts"]] == ["live"]
+
+
+def test_calendar_visibility_escape_hatch_keeps_coach_review_private(monkeypatch):
+    monkeypatch.setenv("ECHO_PORTAL_SHOW_REJECTED", "true")
+    rows = [
+        _row("live", status="pending"),
+        _row("denied", status="denied"),
+        _row("killed", status="killed"),
+        _row("deleted", status="deleted"),
+        _row("coach", status="coach_review"),
+    ]
+    http = _FakeHTTP(get_resp=_Resp(200, rows))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+
+    assert status == 200
+    assert [d["draft_id"] for d in body["drafts"]] == [
+        "live", "denied", "killed", "deleted"]
 
 
 # ---- 2. month filter correctness ----------------------------------------------
@@ -370,6 +638,52 @@ def test_no_creds_uses_sqlite_path(monkeypatch):
     assert status == 200
     assert hit["db"] is True, "SQLite path must run when creds absent"
     assert body["drafts"] == []
+
+
+def test_sqlite_calendar_filters_hidden_status_before_legacy_decode(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    raw_rows = [
+        {"draft_id": "live", "status": "pending"},
+        {"draft_id": "denied", "status": "denied"},
+        {"draft_id": "killed", "status": "killed"},
+        {"draft_id": "deleted", "status": "deleted"},
+        {"draft_id": "coach", "status": "coach_review"},
+    ]
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *args, **kwargs):
+            class _Cursor:
+                def fetchall(self):
+                    return raw_rows
+            return _Cursor()
+
+    decoded = []
+
+    def _decode(row):
+        decoded.append(row["draft_id"])
+        return type("Draft", (), {
+            "draft_id": row["draft_id"], "day_key": "2026-08-01",
+            "draft_type": "feed", "status": row["status"],
+            "platform": "instagram", "caption": "caption",
+            "creative_public_url": None, "scheduled_for": None,
+            "blocked_reason": None,
+        })()
+
+    monkeypatch.setattr("agent.portal_routes._db.connect", lambda: _FakeConn())
+    monkeypatch.setattr("agent.store._row_to_draft", _decode)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+
+    assert status == 200
+    assert decoded == ["live"]
+    assert [d["draft_id"] for d in body["drafts"]] == ["live"]
 
 
 def test_no_creds_action_uses_portal_approvals(monkeypatch):
@@ -890,6 +1204,53 @@ def test_swap_media_zero_match_returns_none(monkeypatch):
     assert payload == {"image_url": "u"}   # source_media_url omitted when not given
 
 
+@pytest.mark.parametrize("peer_caption,preserve", [
+    ("Shared caption", True),
+    ("Different caption", False),
+])
+def test_redate_moves_ledger_stamp_only_after_matching_old_date_peers_leave(
+        monkeypatch, peer_caption, preserve):
+    """The IG/FB/story bundle shares one caption stamp.
+
+    Moving one sibling must retain the old stamp while another matching row still
+    owns it; the last sibling may move it.  This also preserves a genuinely
+    published duplicate on the old date.
+    """
+    old = {"id": "row-1", "gym_id": "eng", "post_date": "2026-09-29",
+           "caption": "Shared caption", "status": "approved"}
+    updated = dict(old, post_date="2026-10-04", scheduled_at=None)
+
+    class _RedateHTTP(_FakeHTTP):
+        def __init__(self):
+            super().__init__(patch_resp=_Resp(200, [updated]))
+            self.reads = 0
+
+        def get(self, url, params=None, headers=None, timeout=None):
+            self.calls.append(("get", url, params or {}, headers or {}))
+            self.reads += 1
+            return (_Resp(200, [old]) if self.reads == 1
+                    else _Resp(200, [{"caption": peer_caption}]))
+
+    http = _RedateHTTP()
+    moved = []
+    monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: True)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    monkeypatch.setattr(
+        "agent.caption_ledger.move_staged_date",
+        lambda *args, **kwargs: moved.append((args, kwargs)))
+
+    out = pcs.SupabaseCalendarStore().patch_post_date("row-1", "2026-10-04")
+
+    assert out == updated
+    assert http.calls[1][2]["post_date"] == "eq.2026-09-29"  # CAS old date
+    assert http.calls[2][2]["id"] == "neq.row-1"
+    assert moved[0][0] == ("eng", "Shared caption", "2026-09-29", "2026-10-04")
+    assert moved[0][1] == {
+        "preserve_old_fuzzy": preserve,
+        "preserve_old_verbatim": preserve,
+    }
+
+
 # ---- CROSS-DAY MEDIA BELT on insert_rows (fleet audit, 2026-08-31) -------------
 #
 # agent/media_guard.py shipped calling itself "the shared cross-day media guard for
@@ -1029,3 +1390,21 @@ def test_media_belt_rides_the_existing_flag_and_costs_nothing_when_off(monkeypat
     assert len(_staged(http_off)) == 2, "flag OFF: the batch passes through untouched"
     assert not [c for c in http_off.calls if c[0] == "get"], \
         "flag OFF must not pay for a single book read"
+
+
+def test_insert_rows_stable_uuid_is_opt_in_and_tenant_scoped():
+    import uuid
+    stable = str(uuid.uuid4())
+    http = _FakeHTTP(post_resp=_Resp(201, [{"id": stable, "gym_id": "lasso"}]))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co", service_key="test", http=http)
+    store.insert_rows("lasso", [{"id": stable, "gym_id": "foreign", "caption": "Training", "format": "feed"}], preserve_ids=True)
+    sent = [c for c in http.calls if c[0] == "post"][0][4][0]
+    assert sent["id"] == stable and sent["gym_id"] == "lasso"
+
+def test_insert_rows_rejects_non_uuid_before_network_when_preserving():
+    import pytest
+    http = _FakeHTTP()
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co", service_key="test", http=http)
+    with pytest.raises(ValueError):
+        store.insert_rows("lasso", [{"id": "not-a-uuid"}], preserve_ids=True)
+    assert not http.calls

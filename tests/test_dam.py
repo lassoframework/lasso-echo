@@ -1,9 +1,8 @@
 """
 DAM v1 tests. Offline, adversarial, zero spend (injected phash + reader).
-Asserts: consent exclusion is ABSOLUTE (a consented=false asset is never
-selected even as the only asset); unknown fails safe; near-dupes collapse to
-one rotation key so the window blocks the group; auto-tag writes sidecars with
-review=true on low confidence; everything inert while the flags are OFF.
+Asserts: legacy consent metadata never blocks an otherwise usable asset;
+near-dupes collapse to one rotation key so the window blocks the group; auto-tag
+writes sidecars with review=true on low confidence.
 """
 
 import json
@@ -35,8 +34,8 @@ def _arm_rotation(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENT_KNOWLEDGE_ENABLED", raising=False)
 
 
-# ---- consent guard: absolute, fail safe -------------------------------------------
-def test_consent_denied_never_selected_even_as_only_asset(monkeypatch, tmp_path):
+# ---- legacy consent metadata does not gate publishing ----------------------------
+def test_consent_denied_can_be_selected_as_only_asset(monkeypatch, tmp_path):
     _arm_rotation(monkeypatch, tmp_path)
     monkeypatch.setenv("AGENT_CONSENT_GUARD_ENABLED", "true")
     lib = _lib(tmp_path, [
@@ -44,14 +43,10 @@ def test_consent_denied_never_selected_even_as_only_asset(monkeypatch, tmp_path)
          {"people": True, "consent": "denied"}),
     ])
     kind, payload = rotation.choose("lasso_ig", "2026-07-06", lib)
-    assert payload is None                      # the ONLY asset, still never selected
-    # across the week too
-    for day in ("2026-07-07", "2026-07-08"):
-        k, c = rotation.choose("lasso_ig", day, lib)
-        assert c is None
+    assert payload is not None
 
 
-def test_unknown_people_or_consent_fails_safe(monkeypatch, tmp_path):
+def test_unknown_people_or_consent_never_blocks(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_CONSENT_GUARD_ENABLED", "true")
     lib = _lib(tmp_path, [
         ("a.jpg", "n", None),                                # no sidecar at all
@@ -62,14 +57,29 @@ def test_unknown_people_or_consent_fails_safe(monkeypatch, tmp_path):
     ])
     blocked = {n: dam.consent_blocked(os.path.join(lib, n))
                for n in ("a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg")}
-    assert blocked == {"a.jpg": True, "b.jpg": True, "c.jpg": True,
-                       "d.jpg": False, "e.jpg": False}
+    assert blocked == {name: False for name in blocked}
 
 
-def test_consent_guard_inert_when_off(monkeypatch, tmp_path):
+def test_explicit_people_never_requires_consent(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENT_CONSENT_GUARD_ENABLED", raising=False)
-    lib = _lib(tmp_path, [("a.jpg", "n", {"people": True, "consent": "denied"})])
-    assert dam.consent_blocked(os.path.join(lib, "a.jpg")) is False
+    lib = _lib(tmp_path, [
+        ("pending.jpg", "n", {"people": True, "consent": "pending"}),
+        ("absent.jpg", "n", {"people": True}),
+        ("denied.jpg", "n", {"people": True, "consent": "denied"}),
+        ("granted.jpg", "n", {"people": True, "consent": "granted"}),
+    ])
+    assert dam.consent_blocked(os.path.join(lib, "pending.jpg")) is False
+    assert dam.consent_blocked(os.path.join(lib, "absent.jpg")) is False
+    assert dam.consent_blocked(os.path.join(lib, "denied.jpg")) is False
+    assert dam.consent_blocked(os.path.join(lib, "granted.jpg")) is False
+
+
+def test_strict_bridge_mode_also_ignores_release_metadata(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENT_CONSENT_GUARD_ENABLED", raising=False)
+    lib = _lib(tmp_path, [("untagged.jpg", "n", None)])
+    path = os.path.join(lib, "untagged.jpg")
+    assert dam.consent_blocked(path) is False  # legacy flag-off behavior
+    assert dam.consent_blocked(path, strict=True) is False
 
 
 # ---- near-dupe collapse ---------------------------------------------------------------
@@ -80,6 +90,10 @@ def test_near_dupes_collapse_rotation_keys(monkeypatch, tmp_path):
         ("lasso_p1_shot_b.jpg", "clean", None),   # near-identical to shot_a
         ("lasso_p2_other.jpg", "clean", None),
     ])
+    # AppleDouble metadata can appear on macOS-mounted temporary volumes.  It
+    # keeps an image extension and must not enter the image scan or group.
+    (tmp_path / "library" / "._lasso_p1_shot_a.jpg").write_bytes(b"img-shot metadata")
+    (tmp_path / "library" / "._lasso_p1_shot_b.jpg").write_bytes(b"img-shot metadata")
     fake_phash = lambda data: ("SAME" if b"shot" in data else "OTHER")
     groups = dam.mark_near_dupes(lib, phash=fake_phash)
     assert list(groups.values()) == [["lasso_p1_shot_a.jpg", "lasso_p1_shot_b.jpg"]]

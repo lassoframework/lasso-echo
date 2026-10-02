@@ -123,6 +123,41 @@ def test_bind_personal_domain_does_not_conflict():
     assert status == 200 and body["ok"] is True
 
 
+def test_bind_lasso_owned_chateau_folder_does_not_conflict_with_another_client():
+    """Agency-owned folders span clients: ENG's LASSO-owned folder cannot
+    prevent Chateau's separate folder from being connected and queued."""
+    store = FakeMediaStore(sources=[make_source("eng-src", gym_id="eng",
+                                               folder_id="different-folder")])
+    store.sources["eng-src"]["owner_email"] = "coach@lassoframework.com"
+    drive = FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                            "owner_email": "blake@lassoframework.com",
+                            "case": "my_drive"})
+    status, body = gm.handle_bind_source("crossfitchateau813e78", f".../folders/{FID}",
+                                         drive=drive, store=store)
+    assert status == 200 and body["ok"] is True and body["sync_status"] == "queued"
+    source = store.sources[body["source_id"]]
+    assert source["gym_id"] == "crossfitchateau813e78"
+    assert source["folder_id"] == FID
+    assert source["sync_status"] == "queued"
+
+
+def test_bind_lasso_owned_exact_folder_collision_still_refused(monkeypatch):
+    alerts = []
+    monkeypatch.setattr("agent.gym_media_index.dedup_alert",
+                        lambda key, message: alerts.append(key))
+    store = FakeMediaStore(sources=[make_source("eng-src", gym_id="eng",
+                                               folder_id=FID)])
+    store.sources["eng-src"]["owner_email"] = "coach@lassoframework.com"
+    status, body = gm.handle_bind_source(
+        "crossfitchateau813e78", f".../folders/{FID}",
+        drive=FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                              "owner_email": "blake@lassoframework.com",
+                              "case": "my_drive"}), store=store)
+    assert status == 409 and body["case"] == "already_bound"
+    assert list(store.sources) == ["eng-src"]
+    assert alerts == [f"hijack:{FID}"]
+
+
 def test_bind_success_writes_source():
     store = FakeMediaStore()
     drive = FakeDrive(meta={"name": "Team Photos", "owner_email": "o@pierce.com",
@@ -133,6 +168,201 @@ def test_bind_success_writes_source():
     src = list(store.sources.values())[0]
     assert src["gym_id"] == "pierce" and src["folder_id"] == FID
     assert src["active"] is True
+    assert src["sync_status"] == "queued"
+
+
+def test_bind_insert_failure_without_binding_is_not_already_connected(monkeypatch):
+    """A rejected DB write must not tell a client with an empty library that the
+    folder is connected (the CrossFit Chateau contradiction)."""
+    class RejectingStore(FakeMediaStore):
+        def insert_source(self, row):
+            raise RuntimeError("schema write failed")
+
+    alerts = []
+    fixer_calls = []
+    monkeypatch.setattr("agent.gym_media_index.dedup_alert",
+                        lambda key, message: alerts.append((key, message)))
+    store = RejectingStore()
+    drive = FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                            "owner_email": "alex@gmail.com", "case": "my_drive"})
+    status, body = gm.handle_bind_source("crossfitchateau813e78", f".../folders/{FID}",
+                                         drive=drive, store=store,
+                                         fixer_ticket=lambda *args: fixer_calls.append(args))
+    assert status == 503 and body["ok"] is False
+    assert body["case"] == "store_unavailable"
+    assert "already" not in body["error"]
+    assert store.list_sources("crossfitchateau813e78") == []
+    assert len(alerts) == 1 and "schema write failed" in alerts[0][1]
+    assert len(fixer_calls) == 1
+    assert fixer_calls[0][:3] == (
+        "crossfitchateau813e78", FID, "source_persist_unconfirmed")
+
+
+def test_bind_insert_race_with_other_gym_preserves_global_ownership():
+    class RacingStore(FakeMediaStore):
+        calls = 0
+
+        def find_source_by_folder(self, folder_id):
+            self.calls += 1
+            return None if self.calls == 1 else super().find_source_by_folder(folder_id)
+
+        def insert_source(self, row):
+            self.sources["winner"] = make_source("winner", gym_id="othergym",
+                                                  folder_id=FID)
+            raise RuntimeError("unique constraint")
+
+    store = RacingStore()
+    status, body = gm.handle_bind_source("crossfitchateau813e78", f".../folders/{FID}",
+                                         drive=FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                                                               "owner_email": "alex@gmail.com",
+                                                               "case": "my_drive"}), store=store)
+    assert status == 409 and body["case"] == "already_bound"
+    assert store.sources["winner"]["gym_id"] == "othergym"
+
+
+def test_bind_insert_committed_but_transport_failed_confirms_same_gym_and_syncs():
+    class CommittedStore(FakeMediaStore):
+        def insert_source(self, row):
+            super().insert_source(row)
+            raise TimeoutError("response lost")
+
+    store = CommittedStore()
+    status, body = gm.handle_bind_source("crossfitchateau813e78", f".../folders/{FID}",
+                                         drive=FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                                                               "owner_email": "alex@gmail.com",
+                                                               "case": "my_drive"}), store=store)
+    assert status == 200 and body["ok"] is True and body["already"] is True
+    assert body["sync_status"] == "queued"
+    assert store.sources[body["source_id"]]["sync_status"] == "queued"
+
+
+def test_bind_queue_failure_is_honest_and_retryable():
+    class OnceFailStore(FakeMediaStore):
+        attempts = 0
+
+        def request_sync(self, source_id, gym_id):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("unavailable")
+            return super().request_sync(source_id, gym_id)
+
+    store = OnceFailStore()
+    drive = FakeDrive(meta={"name": "Team", "owner_email": "o@pierce.com"})
+    status, body = gm.handle_bind_source("pierce", f".../folders/{FID}",
+                                         drive=drive, store=store)
+    assert status == 503 and body["ok"] is False
+    assert len(store.sources) == 1
+    status, body = gm.handle_bind_source("pierce", f".../folders/{FID}",
+                                         drive=drive, store=store)
+    assert status == 200 and body["sync_status"] == "queued"
+    assert len(store.sources) == 1
+
+
+def test_already_connected_but_indexing_failure_queues_exact_fixer_ticket():
+    """Alex-style contradiction: the binding exists, but indexing cannot queue.
+
+    The route keeps its existing honest 503 while the internal FIXER hook gets
+    the canonical gym, exact provider folder, and authoritative source snapshot.
+    """
+    class QueueRejectingStore(FakeMediaStore):
+        def request_sync(self, source_id, gym_id):
+            return False
+
+    source = make_source("srcA", gym_id="crossfitchateau813e78", folder_id=FID)
+    source.update({"sync_status": "failed",
+                   "sync_requested_at": "2026-09-19T15:04:05+00:00"})
+    calls = []
+    status, body = gm.handle_bind_source(
+        "crossfitchateau813e78", f".../folders/{FID}",
+        drive=FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS", "case": "my_drive"}),
+        store=QueueRejectingStore(sources=[source]),
+        fixer_ticket=lambda *args: calls.append(args))
+    assert status == 503
+    assert body == {"ok": False, "error": "could not queue media indexing"}
+    assert len(calls) == 1
+    gym, folder_id, incident, snapshot = calls[0]
+    assert (gym, folder_id, incident) == (
+        "crossfitchateau813e78", FID, "existing_source_sync_queue_failed")
+    assert snapshot["id"] == "srcA" and snapshot["gym_id"] == gym
+
+
+def test_new_binding_queue_failure_keeps_response_and_records_exact_source():
+    class QueueRejectingStore(FakeMediaStore):
+        def request_sync(self, source_id, gym_id):
+            raise RuntimeError("queue unavailable")
+
+    calls = []
+    status, body = gm.handle_bind_source(
+        "crossfitchateau813e78", f".../folders/{FID}",
+        drive=FakeDrive(meta={"name": "CHATEAU PHOTOS/VIDEOS",
+                              "owner_email": "alex@gmail.com", "case": "my_drive"}),
+        store=QueueRejectingStore(), fixer_ticket=lambda *args: calls.append(args))
+    assert status == 503 and body["ok"] is False
+    assert body["error"] == (
+        "folder connected but media indexing could not be queued; retry connect")
+    assert len(calls) == 1
+    gym, folder_id, incident, snapshot = calls[0]
+    assert (gym, folder_id, incident) == (
+        "crossfitchateau813e78", FID, "new_source_sync_queue_failed")
+    assert snapshot["folder_id"] == FID and snapshot["gym_id"] == gym
+    assert snapshot["id"] == body["source_id"]
+
+
+def test_media_fixer_hook_builds_row_first_event_and_refuses_ambiguous_tenant():
+    from agent import fixer_business_seed_client as fixer_client
+
+    class Bus:
+        def __init__(self, mapped):
+            self.mapped = mapped
+
+        def portal_client_id(self, gym_key):
+            return self.mapped
+
+    sent, logs = [], []
+
+    def sender(event):
+        sent.append(event)
+        return fixer_client.SendResult(
+            True, "", "33333333-3333-4333-8333-333333333333", "a" * 64,
+            "created")
+
+    source = {"id": "srcA", "gym_id": "crossfitchateau813e78",
+              "folder_id": FID, "sync_status": "failed",
+              "sync_requested_at": "2026-09-19T15:04:05+00:00"}
+    result = gm._queue_media_fixer_ticket(
+        "crossfitchateau813e78", FID, "existing_source_sync_queue_failed",
+        source, bus=Bus("22222222-2222-4222-8222-222222222222"),
+        sender=sender, log=logs.append)
+    assert result.ok is True and len(sent) == 1
+    assert sent[0]["client_id"] == "22222222-2222-4222-8222-222222222222"
+    assert sent[0]["params"] == {"folder_id": FID}
+    assert "ticket=33333333-3333-4333-8333-333333333333" in logs[0]
+
+    refused = gm._queue_media_fixer_ticket(
+        "crossfitchateau813e78", FID, "existing_source_sync_queue_failed",
+        source, bus=Bus(None), sender=sender, log=logs.append)
+    assert refused is None
+    assert len(sent) == 1, "an ambiguous tenant must not reach FIXER intake"
+    assert "BusinessSeedError" in logs[-1]
+
+
+def test_source_status_is_tenant_scoped():
+    store = FakeMediaStore(sources=[make_source("a", gym_id="pierce"),
+                                    make_source("b", gym_id="other")])
+    store.sources["a"]["sync_status"] = "indexing"
+    status, body = gm.handle_list_sources("pierce", store=store)
+    assert status == 200
+    assert [s["id"] for s in body["sources"]] == ["a"]
+    assert body["sources"][0]["sync_status"] == "indexing"
+
+
+def test_retry_request_rejects_other_gym():
+    store = FakeMediaStore(sources=[make_source("a", gym_id="pierce")])
+    status, body = gm.handle_request_source_sync("other", "a", store=store)
+    assert status == 404 and not body["ok"]
+    assert "sync_status" not in store.sources["a"]
+    status, body = gm.handle_request_source_sync("pierce", "a", store=store)
+    assert status == 200 and body["sync_status"] == "queued"
 
 
 # ---- disconnect never deletes ------------------------------------------------

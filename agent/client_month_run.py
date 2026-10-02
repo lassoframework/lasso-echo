@@ -74,13 +74,23 @@ def _client_media_count(library_path):
     path = library_path
     if not path or not os.path.isdir(path):
         return 0
+    from .media_bridge import enabled as bridge_enabled
+    if bridge_enabled():
+        from .library import list_creatives
+        from .client_media_sync import usable_local_creative
+        base = os.path.basename(os.path.normpath(path))
+        return sum(usable_local_creative(c, base + "_ig")
+                   for c in list_creatives(path))
     count = 0
+    from .client_media_sync import explicitly_refused_local
     try:
         for name in os.listdir(path):
             full = os.path.join(path, name)
             if not os.path.isfile(full):
                 continue
-            if os.path.splitext(name)[1].lower() in _MEDIA_EXTS:
+            if (not name.startswith("._")
+                    and os.path.splitext(name)[1].lower() in _MEDIA_EXTS
+                    and not explicitly_refused_local(full)):
                 count += 1
     except OSError:
         return 0
@@ -171,7 +181,65 @@ def _locked_calendar_state(base_key, start, days, store, log, library_path=None)
                                            library_path=library_path)
     except Exception as exc:  # noqa: BLE001 - the guard must never sink a build
         log(f"cross-day media guard read skipped ({type(exc).__name__})")
+    # Resolve autofit reframe basenames (sha12__feed.jpg) in `used` back to the
+    # original library file basename that pick_image's os.path.basename() exclusion
+    # checks against. surviving_keys does this via resolve_raw_keys, but if
+    # surviving_keys partially degrades (Supabase blink, store read failure) reframe
+    # names land in `used` without their raw counterparts. pick_image keys by
+    # os.path.basename(creative.path) and never sees __feed.jpg names in the library,
+    # so a reframe in `used` without its raw counterpart silently fails to exclude the
+    # original file, and the planner re-picks a photo already on the gym's book.
+    if library_path:
+        try:
+            from . import media_guard as _mg
+            for raw in _mg.reframe_map(library_path, used).values():
+                used.add(raw)
+        except Exception as exc:  # noqa: BLE001 - resolution is best-effort, never a block
+            log(f"reframe-to-basename resolution skipped ({type(exc).__name__})")
     return locked_days, used
+
+
+def _surviving_pillar_counts(base_key, start, days, store, log):
+    """Pillar counts for human-owned posts that survive this rebuild.
+
+    Count POSTS in the same units as calendar_grade: same-date IG/FB/story rows with
+    the same caption are one post. Pending/draft/queued rows are excluded because this
+    rebuild replaces them. A read failure returns an empty count; the build-local
+    balancing guard still prevents a new single-pillar batch.
+    """
+    from collections import Counter
+    from datetime import timedelta
+    from .caption_ledger import caption_hash
+    from .portal_calendar_store import _WIPEABLE_STATUSES
+
+    counts = Counter()
+    list_month = getattr(store, "list_month", None)
+    if list_month is None:
+        return counts
+    months = sorted({(start + timedelta(days=i)).isoformat()[:7]
+                     for i in range(max(1, days))})
+    seen = set()
+    for month in months:
+        try:
+            rows = list_month(base_key, month) or []
+        except Exception as exc:  # noqa: BLE001 - balancing degrades to build-local state
+            log(f"pillar-mix read failed for {month}: {type(exc).__name__}")
+            continue
+        for row in rows:
+            status = str((row or {}).get("status") or "").lower()
+            if (not status or status in _WIPEABLE_STATUSES
+                    or status not in ("approved", "publishing", "published", "coach_review")):
+                continue
+            category = str(row.get("pillar") or row.get("category") or "").strip().lower()
+            if not category:
+                continue
+            key = (str(row.get("post_date") or "")[:10],
+                   caption_hash(row.get("caption") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            counts[category] += 1
+    return counts
 
 
 def _edited_story_captions(base_key, start, days, store, log):
@@ -233,7 +301,8 @@ def _has_real_creative(draft):
 def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log,
                          exclude_keys=(), avoid_openings=(), allow_reuse=False,
                          angle="", avoid_angles=(), avoid_captions=(),
-                         recent_formulas=(), require_media=True):
+                         recent_formulas=(), require_media=True,
+                         avoid_categories=()):
     """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
     whose caption carries NO banned word, preferring a different approved source/category
     over dropping the day.
@@ -292,6 +361,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
         return " ".join((text or "").split()).strip().lower()
 
     _avoid = {_norm_caption(c) for c in (avoid_captions or ()) if (c or "").strip()}
+    _avoid_categories = {str(c or "").strip().lower()
+                         for c in (avoid_categories or ()) if str(c or "").strip()}
     _formula_cap = bool(recent_formulas) and config.opening_formula_cap_enabled()
     _formula_max = config.opening_formula_max_run() if _formula_cap else 0
     # The best draft that cleared every HARD gate but repeats the opening frame. It is
@@ -307,6 +378,13 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
 
     def _accept(d):
         if d is None:
+            return False
+        # FORWARD-BOOK MIX: when a pillar is already heavier than another approved
+        # pillar, keep walking the real source rotation instead of adding another post
+        # to the heavy pillar. This is selection only: the accepted pillar still comes
+        # from its own approved source and its label remains truthful.
+        category = str(getattr(d, "category", "") or "").strip().lower()
+        if category and category in _avoid_categories:
             return False
         # 2x uniqueness: never the same concept twice in one day (CADENCE_SPEC D5).
         if _avoid and _norm_caption(getattr(d, "caption", "")) in _avoid:
@@ -443,8 +521,8 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
     # client sees a real frame. Display-only; best effort.
     _attach_video_poster(account, feed, library_path, log)
     # FEED AUTOFIT (AGENT_FEED_AUTOFIT, OFF by default): an out-of-spec feed PHOTO is
-    # re-framed to 1080x1080. Snapshot the pre-autofit media FIRST so the paired story
-    # never inherits the square feed card.
+    # re-framed to 1080x1350. Snapshot the pre-autofit media FIRST so the paired story
+    # never inherits the formatted feed card.
     _pre_autofit_url = getattr(feed, "creative_public_url", "")
     _maybe_format_feed(account, feed, library_path, log)
     _mark_feed(feed)
@@ -452,7 +530,7 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
 
     # PAIRED STORY on the SAME photo (cloned from the feed; no second media consumed).
     story = _story_from_feed(feed)
-    # The story must NOT carry the feed's SQUARE autofit reframe: restore the pre-autofit
+    # The story must NOT carry the feed's 4:5 autofit reframe: restore the pre-autofit
     # media (story-format ON rebuilds a fresh 1080x1920; this keeps it correct when OFF).
     if getattr(story, "creative_public_url", "") != _pre_autofit_url:
         try:
@@ -1070,6 +1148,30 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
                 "upserted": 0, "days": 0, "skipped_banned": 0,
                 "media_count": media_count}
 
+    # PER-GYM BUILD LOCK (ticket 4941e162, CrossFit Reverb, 2026-09-11): refuse a
+    # SECOND concurrent rebuild for the same gym rather than race it. Ground truth
+    # in content_calendar showed five separate insert timestamps inside two hours,
+    # several landing near-duplicate captions on the SAME post_date side by side --
+    # only possible when two build_client_month calls (the nightly client_media_sync
+    # scan, a FIXER-triggered manual restage, a stale-run retry that was never
+    # actually killed) overlapped: delete_month then insert is idempotent ACROSS
+    # serial reruns, never across CONCURRENT ones. See agent/build_lock.py. A gym
+    # already mid-build answers a clean no-op, never a partial/duplicated write.
+    from . import build_lock as _build_lock
+    _lock_holder = f"{os.getpid()}:{id(store)}"
+    if not _build_lock.acquire(base_key, holder=_lock_holder):
+        log(f"{base_key}: rebuild already in progress for this gym; skipping "
+            "this call rather than racing it (see agent/build_lock.py)")
+        return {"ok": False, "reason": "build_in_progress", "upserted": 0,
+                "days": 0, "skipped_banned": 0, "media_count": media_count}
+    # HEARTBEAT (2026-09-11 follow-up audit): a legitimate build can run well
+    # past any static timeout (transcodes + captions + vision calls stack up,
+    # see agent/build_lock.py's module docstring for the cited worst case).
+    # Renewing on an interval, independent of build phase, means staleness is
+    # judged by "still heartbeating" rather than "still under some fixed
+    # ceiling" -- this MUST be stopped before release() in the finally below.
+    _heartbeat = _build_lock.start_heartbeat(base_key, holder=_lock_holder)
+
     # LOCKED-CALENDAR AWARENESS: read the gym's EXISTING human-owned rows (approved /
     # published / denied / killed — anything a rebuild must preserve) across the span
     # BEFORE planning, so the rebuild composes with them instead of fighting them:
@@ -1119,12 +1221,16 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             # Nothing landed (a no-op, a gate refusal, a raise, or a delete whose
             # insert then failed): this build's own Drive picks never became rows.
             _rollback_new_drive_drafts(drafts, log)
-            if not _res.get("deleted"):
+            if not _res.get("deleted_total", _res.get("deleted")):
                 # ...and the OLD rows survive, so their released assets are stamped
-                # again. (deleted>0 with no insert: the old rows are gone, so their
-                # assets stay free, which is correct.)
+                # again. (deleted_total>0 with no insert: the old rows are gone, so
+                # their assets stay free, which is correct. The raw month-grained
+                # count is used here, not the span-scoped verifier claim: a delete
+                # that wiped only out-of-span rows still destroyed those rows.)
                 _restore_released_drive_assets(base_key, released_drive, log)
         client_content.clear_drive_pool_cache()
+        _heartbeat.stop()
+        _build_lock.release(base_key, holder=_lock_holder)
 
 
 def _build_client_month_body(account, base_key, start, days, *, voice, library_path,
@@ -1195,6 +1301,15 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     _WIDE_OPENING_WINDOW = 12       # widened opening-avoid window when angle rotation is on
     recent_angles = []              # accepted angles, oldest..newest
     angle_idx = 0                   # advances only on an ACCEPTED feed (dense round-robin)
+    # FORWARD-BOOK PILLAR BALANCE. Seed from approved/published posts that the rebuild
+    # must preserve, then update once per accepted feed. The least-used approved pillar
+    # is always eligible; heavier pillars are passed over while the bounded neighbour
+    # walk asks the existing source builder for a real underweight alternative.
+    pillar_counts = _surviving_pillar_counts(base_key, start, days, store, log)
+    available_pillars = tuple(str(p or "").strip().lower()
+                              for p in client_content._pillars_for(  # noqa: SLF001
+                                  getattr(account, "key", "") or base_key)
+                              if str(p or "").strip())
     built_feeds = 0
     # Days the uploaded-media path placed a feed on. The gym-drive lane (below) fills
     # only the GAPS, so a Drive post never doubles up a day that already has a photo.
@@ -1227,6 +1342,9 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                     if not getattr(d, "is_story", False):
                         pre_captions.setdefault(str(getattr(d, "day_key", ""))[:10], []).append(
                             (getattr(d, "caption", "") or "").strip())
+                        _pre_cat = str(getattr(d, "category", "") or "").strip().lower()
+                        if _pre_cat:
+                            pillar_counts[_pre_cat] += 1
                 # a day whose EVERY slot the pre-pass owns is a covered day
                 for dk in {d for d, _s in covered_slots}:
                     if all((dk, s) in covered_slots for s in range(slots_per_day)):
@@ -1281,13 +1399,21 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 day_avoid_angles = tuple(day_shape.angles_for_role(
                     day_shape.role_for_slot(1 - slot_i)))
                 opening_window = _WIDE_OPENING_WINDOW
+            # Select from an underweight approved pillar before queuing the row. This
+            # keeps 2x builds from choosing one day-level pillar for both slots and
+            # prevents surviving approved rows from being amplified by a rebuild.
+            _mix_floor = (min(pillar_counts.get(p, 0) for p in available_pillars)
+                          if available_pillars else 0)
+            _heavy_pillars = {p for p in available_pillars
+                              if pillar_counts.get(p, 0) > _mix_floor}
             feed, feed_drop = _clean_draft_for_day(
                 account, day_key, voice, library_path, banned_words, log,
                 exclude_keys=used_keys,
                 avoid_openings=recent_openings[-opening_window:],
                 angle=day_angle, avoid_angles=day_avoid_angles,
                 avoid_captions=tuple(day_captions),
-                recent_formulas=tuple(recent_formulas[-_FORMULA_WINDOW:]))
+                recent_formulas=tuple(recent_formulas[-_FORMULA_WINDOW:]),
+                avoid_categories=_heavy_pillars)
             if feed is None:
                 if feed_drop:
                     skipped_banned += 1
@@ -1383,6 +1509,9 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                     except Exception:  # noqa: BLE001 - a frozen draft never blocks
                         pass
             drafts.extend(day_drafts)
+            _accepted_pillar = str(getattr(feed, "category", "") or "").strip().lower()
+            if _accepted_pillar:
+                pillar_counts[_accepted_pillar] += 1
             built_feeds += 1
             day_built += 1
             covered_days.add(day_key)   # the gym-drive lane skips days already filled
@@ -1645,7 +1774,7 @@ def _localize_creative(story, feed, path, log):
 
     Reads story.creative_public_url FIRST, never the feed's: _finish_feed_with_story
     snapshots the pre-autofit media onto the story precisely so a story is not built
-    from the SQUARE 1080x1080 feed card. Localizing from the feed would re-introduce
+    from the 4:5 1080x1350 feed card. Localizing from the feed would re-introduce
     that bug for every Drive story whenever AGENT_FEED_AUTOFIT is armed (it is)."""
     url = ((getattr(story, "creative_public_url", "") or "").strip()
            or (getattr(feed, "creative_public_url", "") or "").strip())
@@ -1722,7 +1851,7 @@ def _maybe_format_story(account, story, feed, library_path, log):
     # content_calendar.source_media_url only when AGENT_STORY_SOURCE_MEDIA is on (the column
     # exists). Read the STORY's url, not the feed's: _finish_feed_with_story has already
     # restored the PRE-AUTOFIT media onto the story, whereas feed.creative_public_url may
-    # by now be the SQUARE 1080x1080 autofit card — storing that made every edited-caption
+    # by now be the 4:5 1080x1350 autofit card — storing that made every edited-caption
     # re-burn come back cropped to the feed shape (both flags are armed in production).
     if config.story_source_media_enabled():
         story.source_media_url = ((getattr(story, "creative_public_url", "") or "")
@@ -1771,7 +1900,7 @@ def _maybe_format_story(account, story, feed, library_path, log):
 
 
 def _maybe_format_feed(account, feed, library_path, log):
-    """AGENT_FEED_AUTOFIT: re-frame an OUT-OF-SPEC feed PHOTO into an in-spec 1080x1080 card
+    """AGENT_FEED_AUTOFIT: re-frame an OUT-OF-SPEC feed PHOTO into an in-spec 1080x1350 card
     so the platform never hard-crops the subject. ENHANCE-only: an in-spec photo, a video,
     hosting-off, or any failure keeps the raw media (this never DROPS a post, unlike the story
     caption guard). Mutates feed.creative_public_url in place on success."""
@@ -1809,7 +1938,7 @@ def _maybe_format_feed(account, feed, library_path, log):
             if getattr(feed, "thumbnail_url", ""):
                 feed.thumbnail_url = ""               # the reframe IS the media
             log(f"feed autofit applied for {os.path.basename(src)} "
-                "(odd ratio -> 1080x1080)")
+                "(odd ratio -> 1080x1350)")
     except Exception as exc:  # noqa: BLE001 - never crash the build; keep the raw photo
         # name whichever source we actually had: a Drive creative has no local path.
         label = os.path.basename(path) or os.path.basename(hosted_src.split("?")[0]) \
@@ -1861,6 +1990,7 @@ def _to_rows(base_key, drafts):
     Rows carry NO id. gym_id is forced to base_key. A draft with no post_date is dropped."""
     rows = []
     for draft in drafts or []:
+        clean_caption = getattr(draft, "caption", "") or ""
         row = _row_from_draft(base_key, draft)
         if not row.get("post_date"):
             continue
@@ -1870,8 +2000,86 @@ def _to_rows(base_key, drafts):
                 "instagram", "ig", ""):
             fb = dict(row)
             fb["account"] = "facebook"
+            fb["caption"] = clean_caption
             rows.append(fb)
     return rows
+
+
+def _span_scoped_delete_claim(store, base_key, months, span_first, span_last,
+                              preserve_dates=(), log=None):
+    """How many of THIS gym's rows the month-grained delete in _apply will remove
+    INSIDE the planned day-span [span_first, span_last] — the exact unit the
+    independent restage verification measures with its own before/after
+    readback (agent/fixer_ops.run_restage_month's terminal job).
+
+    portal_calendar_store.delete_month wipes the WHOLE calendar month, so its
+    raw return count also covers wipeable rows on days outside the requested
+    span (2026-09-01..09-18 when restaging 21 days from 2026-09-19). Reporting
+    that month-scoped number as the build's deleted claim made span-scoped
+    evidence impossible: the verifier's snapshots only ever contain in-span
+    rows, so the claimed and independently measured deleted counts could never
+    agree and a genuine whole-month restage could never verify.
+
+    The count mirrors delete_month's filter exactly (wipeable or NULL status,
+    active variant, post_date not preserved), restricted to the planned span
+    and to rows belonging to base_key (tenant binding: a foreign row is never
+    this build's deletion). It is a CLAIM, never self-certification: the
+    verifier recounts independently, so any divergence from what the delete
+    actually removed in-span verifies False (fail closed).
+
+    Returns None when the store cannot support a bounded read (no list_month,
+    a read failure, or a partial row); the caller then reports the store's own
+    count, exactly as before, and the verifier's comparison still decides."""
+    from .portal_calendar_store import _WIPEABLE_STATUSES
+    list_month = getattr(store, "list_month", None)
+    if list_month is None:
+        return None
+    keep = {str(d)[:10] for d in (preserve_dates or ()) if str(d or "")[:10]}
+    total = 0
+    for month in months:
+        try:
+            rows = list_month(base_key, month) or []
+        except Exception as exc:  # noqa: BLE001 - an unreadable store claims nothing new
+            if log:
+                log(f"{base_key}: span-scoped delete evidence read failed for "
+                    f"{month} ({type(exc).__name__}); reporting the store's own count")
+            return None
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            if str(row.get("gym_id")) != str(base_key):
+                continue                    # tenant binding: never another gym's row
+            pd = str(row.get("post_date") or "")[:10]
+            if not pd or pd < span_first or pd > span_last or pd in keep:
+                continue
+            status = str(row.get("status") or "").lower()
+            if status and status not in _WIPEABLE_STATUSES:
+                continue                    # human-owned rows survive (preserve_human)
+            variant = str(row.get("variant_status") or "active").lower()
+            if variant != "active":
+                continue                    # candidates/archived rows are never deleted
+            total += 1
+    return total
+
+
+def _out_of_span_preserve_dates(months, span_first, span_last,
+                                preserve_dates=()):
+    """Return *every* calendar date outside the requested replacement span.
+
+    The complete date set closes the read/delete race: even an out-of-span row
+    inserted on a previously empty day after our snapshot is protected by the
+    database delete predicate.  Existing rows do not need to be enumerated.
+    """
+    import calendar
+    from datetime import date
+    keep = {str(d)[:10] for d in (preserve_dates or ()) if str(d or "")[:10]}
+    for month in months:
+        year, number = (int(part) for part in month.split("-", 1))
+        for day in range(1, calendar.monthrange(year, number)[1] + 1):
+            pd = date(year, number, day).isoformat()
+            if pd < span_first or pd > span_last:
+                keep.add(pd)
+    return keep
 
 
 def _apply(base_key, rows, start, days, store, log, locked_days=(),
@@ -1879,6 +2087,14 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     """Delete-then-insert, gym-scoped, across every month the rows land in PLUS the full
     planned span. Rows are inserted WITHOUT an id (DB mints the uuid). Mirrors
     apply_month_plan. Refuses the demo gym id. Never raises out.
+
+    Result counts: "deleted" is the SPAN-SCOPED claim (rows the delete removed
+    inside the planned day-span, see _span_scoped_delete_claim) so the
+    independent restage verification can confirm it against its own span-scoped
+    readback; "deleted_total" is the store's raw month-grained count (the full
+    truth of what was wiped, kept for the build's own release/restore
+    bookkeeping). Stores that cannot support a bounded read report the raw
+    count in both, exactly as before.
 
     locked_days: post_dates the builder SKIPPED because a human owns their feed. Those
     days' still-pending sibling rows (FB mirror + story on the approved feed's photo)
@@ -1973,6 +2189,38 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                     "reason": "day shape: same post twice in one day",
                     "day_shape_violations": [v.message() for v in exc.violations],
                     "upserted": 0, "inserted": 0, "deleted": 0, "months": months}
+
+        # SLOT CAPACITY (2026-09-11, the 141-group lasso duplicate-active audit).
+        # day_shape.assert_day_distinct only refuses two rows sharing a caption or
+        # photo; it does nothing for two rows that are each genuinely distinct
+        # content but still both land 'active' in the same (account, post_date,
+        # format) slot. That is the exact shape of the 2026-08-08 seed defect
+        # (see day_shape.py's SLOT CAPACITY section) -- ported here so every
+        # delete-then-insert rebuild lane carries the same belt, not just
+        # real_month_planner's.
+        from . import cadence as _cadence
+        _slot_capacity = _cadence.resolve_posts_per_day(base_key, store)
+        try:
+            day_shape.assert_slot_capacity(
+                clean_rows, enabled=config.day_shape_assert_enabled(),
+                capacity=_slot_capacity)
+        except day_shape.SlotCapacityViolation as exc:
+            for v in exc.violations:
+                log(f"SLOT CAPACITY FAIL: {v.message()}")
+            try:
+                from . import ops_alerts
+                ops_alerts.alert(
+                    f"{base_key}: month build STOPPED and wrote nothing. "
+                    f"{len(exc.violations)} slot(s) would have held more posts "
+                    f"than the day's cadence allows. "
+                    f"First: {exc.violations[0].message()}")
+            except Exception:  # noqa: BLE001 - the alert never sinks the report
+                pass
+            return {"ok": False,
+                    "reason": "day shape: slot over capacity",
+                    "slot_capacity_violations": [v.message() for v in exc.violations],
+                    "upserted": 0, "inserted": 0, "deleted": 0, "months": months}
+
         # CTA SELF-QUESTION GATE (ECHO_CTA_SELF_QUESTION_GATE, default ON). Same
         # plan-time, same fail-closed shape as the day-shape assertion above:
         # nothing is deleted, nothing is inserted, when any row carries the
@@ -2045,13 +2293,27 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             return {"ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
                     "months": months, "noop_shrink": True,
                     "existing_feeds": existing_feeds, "new_feeds": new_feeds}
+        # SPAN-SCOPED DELETED CLAIM (restage postcondition): computed from a
+        # bounded read BEFORE the delete, in the same unit the independent
+        # verifier measures. None when the store cannot support the read --
+        # the raw count is then reported, and the verifier still decides.
+        span_first = start.isoformat()
+        span_last = (start + timedelta(days=max(1, int(days)) - 1)).isoformat()
+        span_claim = _span_scoped_delete_claim(store, base_key, months,
+                                               span_first, span_last,
+                                               preserve_dates=locked_days, log=log)
+        delete_preserve = _out_of_span_preserve_dates(
+            months, span_first, span_last, preserve_dates=locked_days)
+        bounded_delete_read = callable(getattr(store, "list_month", None))
         delete_month = getattr(store, "delete_month", None)
         for month in months:
             if delete_month is not None:
                 try:
                     deleted += delete_month(base_key, month,
-                                            preserve_dates=locked_days) or 0
+                                            preserve_dates=delete_preserve) or 0
                 except TypeError:      # older store/test fakes without the kwarg
+                    if bounded_delete_read:
+                        raise RuntimeError("bounded store cannot preserve dates")
                     deleted += delete_month(base_key, month) or 0
         insert_rows = getattr(store, "insert_rows", None)
         if insert_rows is not None and clean_rows:
@@ -2061,11 +2323,64 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
                 "upserted": inserted, "deleted": deleted, "months": months}
     return {"ok": True, "upserted": inserted, "inserted": inserted,
-            "deleted": deleted, "months": months}
+            "deleted": deleted if span_claim is None else span_claim,
+            "deleted_total": deleted, "months": months}
 
 
 def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
                           library_path=None, store, banned_words=(), logger=None):
+    """Thin per-gym-locked wrapper around _backfill_denied_slots_body (below).
+
+    PER-GYM BUILD LOCK (independent audit, 2026-09-11, CrossFit Reverb): this
+    function is INSERT-only and was never wrapped by agent/build_lock.py, unlike
+    build_client_month. Ground truth in the deployed echo service's own logs
+    (2026-09-11 18:29-19:27 UTC) showed a full build_client_month rebuild placing
+    fresh rows on 2026-09-24 at 18:49:34, then THIS function independently
+    replacing a denied 2026-09-21 slot by "rolling forward" onto that SAME
+    2026-09-24 at 19:20:40 -- a second, fully independent 4-row batch stacked on
+    a day the rebuild had just filled seconds/minutes earlier. Not a classic
+    race (the two calls did not overlap in time): backfill_denied_slots's own
+    day-collision check (denybf_dayused_<base>_<day>) deliberately ignores rows
+    from ANY other path by design (the Dale/ENG fix above), so it had no way to
+    know the rebuild had just claimed that day. Serializing this function against
+    build_client_month (and against itself) with the SAME per-gym lock closes the
+    window: a backfill pass that starts while a rebuild for the same gym is still
+    writing (or another backfill pass is) is refused cleanly instead of stacking
+    a duplicate batch onto whatever day the other call just placed content on.
+    """
+    log = logger or (lambda m: print(f"[deny-backfill] {m}"))
+    if not config.deny_backfill_enabled():
+        return {"ok": False, "reason": "AGENT_DENY_BACKFILL off", "backfilled": 0}
+    if account is None or not base_key or store is None or voice is None:
+        return {"ok": False, "reason": "missing account, base_key, store, or voice",
+                "backfilled": 0}
+    list_month = getattr(store, "list_month", None)
+    insert_rows = getattr(store, "insert_rows", None)
+    if list_month is None or insert_rows is None:
+        return {"ok": False, "reason": "store cannot read/insert", "backfilled": 0}
+    from . import build_lock as _build_lock
+    _lock_holder = f"{os.getpid()}:{id(store)}"
+    if not _build_lock.acquire(base_key, holder=_lock_holder):
+        log(f"{base_key}: a build or another backfill pass is already in progress "
+            "for this gym; skipping this backfill rather than stacking onto "
+            "whatever day it just placed content on (see agent/build_lock.py)")
+        return {"ok": False, "reason": "build_in_progress", "backfilled": 0}
+    # HEARTBEAT: same reasoning as build_client_month above -- a backfill pass
+    # calls the same caption/vision paths per slot, so it gets the same
+    # renew-on-interval treatment instead of racing a long pass's own lock.
+    _heartbeat = _build_lock.start_heartbeat(base_key, holder=_lock_holder)
+    try:
+        return _backfill_denied_slots_body(
+            account, base_key, start_date, days, voice=voice,
+            library_path=library_path, store=store, banned_words=banned_words,
+            logger=log)
+    finally:
+        _heartbeat.stop()
+        _build_lock.release(base_key, holder=_lock_holder)
+
+
+def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice,
+                                library_path=None, store, banned_words=(), logger=None):
     """Give each DENIED feed POST a FRESH 1:1 replacement (a NEW caption on a REUSED photo)
     for a gym that is AT its creative cap — where the monthly grow-to-cap build is a no-op
     and the denied slot would otherwise stay empty forever (the portal's "recreating" state

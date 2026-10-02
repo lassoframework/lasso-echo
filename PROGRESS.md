@@ -1,3 +1,50 @@
+## Support channel repairs (2026-09-27, deployment pending)
+
+- [~] Zanshin photo reuse now observes nine calendar months at selection and again before Instagram, Facebook, Google Business posts and gallery sends. History spans platforms and archived variants, includes in-flight claims and undated published rows, and fails closed when identity or history cannot be verified. Original media files are retained; archive means ineligible for reuse during the window.
+- [~] Portal requests to replace website photography route to a website code fix instead of an ungroundable question. The Bolton Club's exact new upload still needs identification before its site photos can be replaced.
+- [x] Kimi low-effort swarm changes independently reviewed and tested: 998 focused tests passed, 6 skipped, with outbound network denied by the OS sandbox. Tests cover actual calendar and GBP send boundaries, cross-platform identity, pagination and calendar-month arithmetic.
+- [x] Full CI initially passed 8,508 tests but exposed two existing connection-shape tests whose fixed grant expired on September 27. Those two clocks are now scoped deterministically; an explicit before/at/after expiry assertion preserves production behavior.
+- [ ] Final-commit CI, merge, deploy and verify the live client behavior. Support tickets have not been marked resolved and no customer messages were sent.
+
+## Echo Story retries and channel alerts (2026-09-21, release pending)
+
+- [~] LASSO Story generation follows the content-led Astra standard: creative freedom without fixed rows or feed-shaped input examples, complete approved copy, full-frame art, interior text clearance and unchanged independent pixel grading. Corrective requests edit the exact last rejected candidate and retain size-aware bounds.
+- [~] Terminal quality failures retain full scrubbed review sidecars and produce one bounded contextual alert. Already-reported provider failures also avoid duplicate dark-render alerts; hosting failures remain distinct.
+- [~] Approved headline corrected to “You did not open a gym to run your own ads.” in both source documents and demo hooks. Regeneration from older saved feed copy applies the same approved correction. Existing published assets are not mutated.
+- [~] Four K2.8 low-effort workers delivered bounded packages, integrated and independently reviewed by Astra and Grok ECHO. Full local suite before the final audit adjustments: 8276 passed, 1 skipped. Audit adjustments: 256 focused checks passed plus 8 copy/retry checks. Two actual provider Story samples passed on their first attempt at 94 and 93, with final pixels inspected by Astra. Final-commit CI and deployment remain pending.
+
+## LASSO infographic Story canvas repair (2026-09-18)
+
+- [~] LASSO quality Stories now request a native 9:16, 1080x1920 composition from the image engine. The former 4:5 panel inset is removed; feed generation remains 4:5. The Astra brief asks for full-frame Story design with essential copy in x=6–94%, y=10–85%, leaving Instagram UI clearance; pixel review treats broad empty bands around a centered feed card as a major failure.
+- [~] Regression checks cover Story surface, target pixels, reviewed pixels, saved full-frame output, and rejection of the old 17–80% text restriction. Full suite in the repo virtual environment: 7604 passed, 1 skipped. Live and pending calendar rows still need separate LASSO-only replacement and human approval; this code change does not edit or publish them.
+
+## Echo client media alert and rolling two-day infographic fallback (2026-09-18, local patch)
+
+- [~] Client media depletion bridge added locally. `AGENT_MEDIA_BRIDGE_ALERTS` defaults OFF; delivery requires an explicit per-client Slack channel and the existing Echo client-reply gate. No client Slack routes are configured in this checkout.
+- [~] Client infographic fill and no-media Astra seed now inspect at most the next two days. The depletion alert is fail-closed around local media and active Drive inventory, tenant-scoped, debounced, retryable after failed delivery, and re-armed only by a newly observed intake upload. Cached no-creative fallback display URLs are tenant-scoped and durable.
+- [~] Focused validation: 43 tests passed with `PYTHONPATH=.` across the media bridge, upload re-arm, fallback, and rolling-horizon paths. A broader suite run had one intermittent SQLite migration race; the affected single test passed when rerun. This is local code and test evidence only: no Slack delivery, merge, deploy, or production verification has occurred.
+
+## Automatic portrait reels rollout (2026-09-15)
+
+- [~] Native B treatment, measured portrait framing, approved copy/music and durable worker staging transferred onto current main. Existing approval and publishing settings remain unchanged.
+- [~] Fleet scope behind default OFF `AGENT_AUTO_REELS_ALL_ACCOUNTS`; reads current non-demo mapped accounts, fails closed on unavailable roster. New accounts join after the five minute roster refresh.
+- [~] Portal status projection, long-pass heartbeat and automatic render temp cleanup built. Production FFmpeg 6 HDR compatibility path tested on the running server.
+- [x] Shared `auto_reel_status` migration applied; browser roles have no table privileges.
+- [ ] Merge, deploy both Echo services and portal, arm fleet flags, verify live status and per-account readiness.
+
+## LASSO calendar podcast and cadence repair (2026-09-14)
+
+- [~] Preserve morning/evening ordinals through fallback; pair each Story with its own feed; reject repeated captions within a day before staging.
+- [~] LASSO editorial calendar behind `AGENT_LASSO_EDITORIAL_CALENDAR` (default OFF): book, Summit, podcast, Echo, websites and teaching. Dated Summit campaigns remain authoritative. Echo/websites copy is compiled from the read only LASSO Brain into `brand_voice/lasso_editorial.md`.
+- [~] LASSO rebuilds preserve approved posts while admitting a distinct free second slot within the saved cadence. Legacy sprint rows receive free ordinals; lowering cadence does not add posts.
+- [~] Podcast month builds reserve clips without consuming usage until calendar insertion succeeds. Selection uses the scheduled day, respects existing cooldowns, and includes real poster frames. Paragraph notes can supply verbatim sentence claims.
+- [ ] Deploy, arm the editorial flag, rebuild the next 30 days, and verify persisted distinct daily feed slots and real video URLs.
+- [ ] Separate conference name/source remains requested; no separate conference dates invented.
+
+## Slack ticket ownership repair (2026-09-14)
+
+- [~] Existing ticket replies are consumed only by their stamped bot identity, including resolved threads and DM lookup. Concurrent thread creation rechecks the winner before consuming inbound event identity. Legacy missing ownership remains unchanged. Sixteen focused regression checks pass; deployment pending.
+
 # Echo Build Tracker
 
 Living tracker for the Echo social agent build. This markdown is the source of
@@ -6,7 +53,218 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-09-03
+Last updated: 2026-09-13
+
+---
+
+## Echo cancellation publishing gate (2026-09-14)
+
+- [~] Revocation checked before cached billing and at calendar, Zernio, GBP post/photo send paths. Known revocation survives unavailable or malformed storage.
+- [~] Canonical Echo products replace any-subscription entitlement; explicit subscription gym metadata is scoped, unreadable mapping remains unknown. Old permissive cache is invalidated.
+- [~] Focused regression tests cover mixed subscriptions, cross-gym scope, mapping failure, revocation and direct send holds. Deployment and Dean live verification pending.
+
+## LASSO content-led Astra upgrade (2026-09-14, in progress)
+
+- [~] LASSO-only AGENT_LASSO_INFOGRAPHIC_QUALITY flag (default OFF); content-led brief with creative freedom and required supporting copy/CTA.
+- [~] Strict gpt-6-astra route with no Gemini fallback in this scope.
+- [~] Pixel review rubric rejects omissions, inaccuracies, major issues and scores below 90; malformed reviews are UNGRADED.
+- [~] Attached user reference images packaged for production requests.
+- [~] Portal manual/regenerate requests select copy from compiled Brain with source hash. LASSO calendar fill uses common reviewed generation. Remaining fallback/campaign paths and durable audit records pending.
+- [~] Independent audit found library reuse and durable portal evidence gaps. Library rotation now requires current Astra review evidence bound to exact image bytes and rechecks before drafting. Durable portal evidence remains pending. Full-suite wave 3 passed 7306 tests with 1 skipped before the latest punctuation and reuse changes.
+- [~] Five distinct Brain-sourced feed samples generated using gpt-6-astra + Sunburst; actual corrective retries observed (attempts 1,2,3,1,3). All five independently reviewed at 92–94/100, without blocking visual or copy issues. The earlier Story panel inset passed pixel review at 93/100 but later proved visibly undersized in Instagram; see the 2026-09-18 repair above. Eight additional Brain-sourced feed examples and an editorial replacement are available in the rating gallery. Review issues now require severity; minor polish does not force paid retries when every mandatory gate passes. Fourteen focused quality checks passed; full-suite wave 3 running. Latest full suite: 7302 passed, 1 skipped; 69 subsequent targeted checks passed. Not deployed or scheduled.
+- [~] Shared artifact provenance implemented for variant and display paths. Additive migration infographic_artifacts_20260914 applied to verified portal Supabase project. Live permissions verified service access with no browser-role grants. Thirty-two focused checks passed. Live actual-image persistence passed with fresh-client retrieval and cross-tenant isolation. Shared job-claim migration applied and live transaction assertions verified first claim succeeds, duplicate fails, other tenant independent. Runtime deployment remains pending.
+- [ ] Verify deployment and LASSO scheduling through portal and Zernio.
+
+Baseline at 4843d2f: 7291 passed, 1 skipped. First focused run: 119 passed. These are offline tests, not proof of live generation or deployment.
+
+## Astra style freedom: cream is no longer THE canvas (2026-09-13, flag OFF)
+
+Blake: "I want to give Astra more freedom, all the infographics look the same in
+context, feel and look. Take off canvas has to be cream and let it have more
+freedom in look and feel."
+
+**Root cause was not the cream rule alone.** The Astra brief
+(`astra_prompt.build_infographic_brief`) never received a canvas, a palette, or a
+variant at all. It always composed from two hardcoded constants:
+
+- `creative_studio.BRAND_PALETTE`, which opens "Cream #FAF6F0: THE canvas ... the
+  card background is always cream ... NEVER a full bleed solid color slab"
+- `FLAT_EDITORIAL_SPEC`, which demanded exactly three vector elements ("Three, not
+  two and not five") plus a CTA button block that was *always* the single red element
+
+Same field, same furniture, same accent, on every card Echo has ever drawn through
+Astra. The four-canvas variant system in `creative_studio` existed but the Astra
+path never called it. Sameness by construction, not model behavior.
+
+### What shipped
+
+`agent/astra_prompt.py` gains a style system, `agent/config.py` the flag:
+
+- **7 canvas modes** — cream, navy, split, sky, ink, red, duotone. Built from the
+  locked LASSO V3 colors only; this widens which color carries the FIELD, it adds
+  no color to the brand.
+- **7 composition modes** — flat_editorial (the former only option), type_poster,
+  data_story, diagram, split_screen, stack, device. The CTA button and the three
+  element metaphor are now features of `flat_editorial` alone; six of seven carry
+  no button.
+- **6 accent placements** — one accent element is still the law, only *where* it
+  lands is free. On the red field the accent flips to white.
+- **`ART_DIRECTION_LATITUDE`** — an explicit clause telling the model it is art
+  directing one card in a campaign, not filling a template.
+- **Weighted selection** — an unweighted pick put the loud RED field on ~27% of a
+  month. Weighted: navy/cream ~20% each, red ~6%. All seven still get used.
+  Deterministic per card key, so a re-render of an approved card is stable.
+
+### Gates and rules: unchanged
+
+Flag OFF (the default) returns the old brief **byte for byte**, verified against
+`git show HEAD` in a throwaway worktree. Still locked ON and OFF: the LASSO V3
+color values, two type families, the no-dash rule, no fabrication, the readability
+bar, the six-question grade gate, and the human approval gate. The prompt-level
+ban on "centered composition" / "symmetric layout" was **not** weakened; all 294
+canvas x composition x accent briefs pass `_check_prompt_hard_rules` as written.
+
+### Arm it
+
+```
+AGENT_ASTRA_STYLE_FREEDOM=true
+```
+
+**Armed in production 2026-09-13** on the `echo` service (Railway project
+`lasso-echo`, production env). Redeploy `30cf4bce` SUCCESS at 02:29 UTC.
+
+**It is INERT until this branch merges to main.** That redeploy is running commit
+`411ac2cf`, which is this branch's own parent, and `astra_style_freedom_enabled()`
+does not exist there. The env var is set and waiting; the code that reads it ships
+with this branch. Merge to main, let the service redeploy, and the freedom system
+goes live on the next draw.
+
+**Scope widened to every account (2026-09-13, same day, Blake's follow-up
+ruling): "This applies to the real production system — LASSO's own account
+plus any client gym using the auto-infographic path."** The LASSO-only scope
+above held for about a day. `AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS` default is
+now `*` (every account); set it to `lasso` to restore the LASSO-only scope by
+hand without a code change. See `brand_voice/lasso_house_style.md` section 12
+for the full account-scope contract, and
+`agent/config.py:astra_style_freedom_enabled_for()` for the code.
+
+Because the master flag was ALREADY armed in production (see above) waiting
+on this code, widening the default scope takes effect on every client gym's
+freedom-scoped card the moment this merges and the service redeploys — not
+just LASSO's. That is the intended effect of today's ruling, not a side
+effect: see "Gym brand latitude" below for what a client gym's freed card
+actually gets (never LASSO's palette, never LASSO's voice doc).
+
+### Gym brand latitude (2026-09-13, same day)
+
+Blake's fuller ask: "does not need to follow all the colors of cream
+background and just needs to create whatever it wants with the brain." Widening
+the account scope alone was not enough — every canvas mode, LASSO's own
+included, still named LASSO's own locked hex values, so a client gym in
+freedom scope would have been "freed" into LASSO's palette, not its own. Fixed
+in `agent/astra_prompt.py`:
+
+- `gym_brand_latitude(canvas)` replaces `LOCKED_BRAND_COLORS` +
+  `CANVAS_MODES[canvas]` for any non-LASSO account (`is_lasso_account`): no
+  LASSO hex value is named; Astra picks the gym's own palette, grounded in its
+  own voice + approved context, with only the canvas's qualitative FIELD
+  ENERGY carried over for structure/variety.
+- `accent_law_free` keeps the "exactly one accent, never scattered" law
+  without pinning it to red.
+- `_voice_path_for` resolves a client gym's OWN durable voice doc
+  (`client_media_sync._resolve_client_voice_path`) instead of
+  `config.VOICE_DOC_PATH` (LASSO's own doc), which every Astra brief —
+  client gym included — read unconditionally before this.
+- `client_infographic_fill.py` (the client-gym auto-infographic path) now
+  builds the real Astra brief via `creative_studio._astra_brief_for` and
+  passes it as `opts["engine_prompts"]["astra"]`. Before this fix, Astra
+  silently received the Gemini-style prompt instead — which literally says
+  "Design a clean, minimal, premium LASSO-branded infographic" — because
+  `image_engine.prompt_for` falls back to the shared prompt when no
+  `engine_prompts["astra"]` key is set.
+
+Genuine guardrails are untouched for a gym card: the banned list (no
+illustrated scenes/cartoons/stock photorealism outside duotone), the
+readability bar, no fabrication, the no-dash rule, the LASSO avatar-scope
+rules referenced elsewhere in this repo. LASSO's own account is unchanged:
+it still gets the locked LASSO V3 hex palette and its 7-canvas system,
+because those are LASSO's real colors, not a template imposed on someone
+else's brand. See `brand_voice/lasso_house_style.md` section 12 for the full
+writeup, and `tests/test_astra_style_freedom.py` for the new gym-latitude
+tests.
+
+### Image engine traceability (2026-09-13)
+
+Blake reviewed a real published Astra card and wanted PER-POST proof, not
+just aggregate proof that Astra was in use during some window:
+
+- `Draft.image_engine` (new field, `agent/drafter.py`): "{engine}:{model}"
+  (e.g. `astra:gpt-image-2.5-sunburst`), set from `creative_studio.generate()`'s
+  existing `route` field (or built directly from an `image_engine.ImageResult`
+  by a caller, like `client_infographic_fill.py`, that talks to
+  `image_engine.generate_image` itself). Threaded through the main
+  Draft-producing pipelines: `daily_studio`, `client_infographic_fill`,
+  `book_campaign`, `doc_intake`, `podcast_month`/`podcast_cards`/
+  `podcast_release`, `stories`, `summit`.
+- `posts.image_engine` (new column, `agent/db.py`, additive migration):
+  `postlog.log_post` now accepts and persists `image_engine`; both live
+  publish call sites (`approvals.py`, `runner.py`) pass
+  `getattr(draft, "image_engine", "")` through.
+- `[image-engine]` log lines (`agent/image_engine.py`) now carry
+  `draft={id} account={key}` on every attempt (ok, FAILED, and NEEDS HUMAN),
+  not just the engine/model/cost they already carried. `draft_id` is threaded
+  from `creative_studio.generate(..., draft_id=...)` for every caller that
+  computes its draft id early (all of the pipelines listed above except the
+  podcast/book/summit set at the log-line level, which still get the
+  engine/model/cost/account_key on the log line and full image_engine
+  attribution in the DB, just not the draft_id in the log line itself — a
+  disclosed, deliberate scope cut).
+- `python -m agent post-engine --draft-id <id>` / `--media-id <id>` (new CLI,
+  `db.post_engine_for`): looks up which engine + model generated one specific
+  published post from the `posts` table.
+
+**Known, deliberate gaps** (out of scope for this pass, flagged rather than
+silently left): `generate_social_proof` (quote cards) and the two
+`video_editor.py` still-card generators don't thread `image_engine`/`draft_id`
+— they are a different, secondary creative surface, not the primary feed/story
+post path. Once a generated image lands in the reusable creative LIBRARY
+(`regen_library.py`, `variant_regen*.py`) and gets picked by a later caller as
+a plain "library creative," its original engine attribution is not carried
+forward — that would require a library-wide sidecar scheme, a larger change
+left for a follow-up if Blake wants library reuse traced too.
+
+### Render one card by hand
+
+`python -m agent render-card` renders a single card through the REAL engine chain
+(gpt-6-astra reads the brief, gpt-image-2.5-sunburst draws it), so a look can be
+checked without waiting for a calendar slot. Publishes nothing, queues nothing,
+and BLOCKS without a headline plus at least one approved fact.
+
+```
+python -m agent render-card \
+  --headline "Paid ads are not magic. They are math." \
+  --fact "The Three Levers of Growth: churn, sales, leads" \
+  --cta "Save this for later." --canvas ink --composition type_poster
+```
+
+`--locked` renders the same card with freedom OFF for an A/B. `--brief-only`
+prints the brief and costs nothing. Each render writes a PNG plus a `.txt`
+sidecar carrying the brief as sent, the style selection, the engine and model
+that served it, and Astra's own revised prompt when the provider returns one.
+
+### Files
+
+- `agent/astra_prompt.py` — the style system + a style-aware brief
+- `agent/config.py` — `astra_style_freedom_enabled()`, default OFF
+- `agent/__main__.py` — the flag on the `status` line
+- `brand_voice/lasso_house_style.md` — v1.2, new Section 12
+- `tests/test_astra_style_freedom.py` — 18 tests, including all 294 combinations
+
+### Open decision NOT resolved here
+
+**Brand palette** stays open. This change moves which locked color carries the
+field; it does not pick new brand colors. If the palette decision lands later, the
+canvas modes are the place it applies. The publish-path decision is untouched.
 
 ---
 
@@ -4463,11 +4721,87 @@ untouched; only the SELECT filters needed `variant_status=eq.active` added.
   `variant_regen` fact-extraction + failure reasons. 28 tests, all offline.
 
 ### Not yet done
-- [ ] Portal (Next.js) review UI: side-by-side variants + a pick button on the
-  staff/client calendar surface. Backend is usable via curl/Postman today; no
-  human-facing button yet.
-- [ ] Migration 0318 not yet applied to prod (`ooqcvmcjspeltuuhcvlh`) — ships via
-  the portal's normal `deploy-migrate.mjs` ledger, not applied by hand or via
-  Supabase MCP (that would desync the ledger — see the portal migrations README).
-- [ ] `ECHO_VARIANT_PAIRING` stays OFF until the fleet-wide Astra regen sweep
-  (~1,000+ September posts) is ready to use it.
+(Update 2026-09-11: the three items below were marked "not yet done" but portal
+PR #614 already shipped the review UI + applied migration 0318 to prod that
+same morning, and `ECHO_VARIANT_PAIRING` is now `true` on the live `echo`
+Railway service — this section was stale, not current state. Verified live:
+`content_calendar.variant_of`/`variant_status` columns, the
+`content_calendar_swap_variant` RPC, and the `content_calendar_one_active_per_group`
+unique index all exist in prod; `ops.lassoframework.com` is serving the PR #614
+build. Leaving the original lines struck through for history.)
+
+- ~~Portal (Next.js) review UI: side-by-side variants + a pick button on the
+  staff/client calendar surface.~~ Shipped in portal PR #614, live on
+  `ops.lassoframework.com`.
+- ~~Migration 0318 not yet applied to prod.~~ Applied 2026-09-11 12:26:53 UTC,
+  confirmed in `public.schema_migrations`.
+- ~~`ECHO_VARIANT_PAIRING` stays OFF until the fleet-wide Astra regen sweep is
+  ready.~~ Armed `true` in prod 2026-09-11. The ~1,000+ September post regen
+  sweep itself has NOT been run yet — that is the one real remaining item from
+  this list.
+
+## build_lock heartbeat: the static 15-minute timeout was never checked against a real worst case (Blake, 2026-09-11 follow-up)
+
+PR #113/#115 (same day) shipped `agent/build_lock.py`'s per-gym advisory lock
+around `build_client_month` / `backfill_denied_slots` (ticket 4941e162,
+CrossFit Reverb) with a fixed `STALE_SECONDS = 15 * 60`. Blake flagged,
+unresolved, that this number was picked without checking it against the
+actual worst-case LEGITIMATE build runtime. Audited it and the concern was
+real:
+
+- `agent/config.py` `rendition_max_per_build()` defaults to 8;
+  `agent/gym_media_index.py` `RENDITION_TIMEOUT_SEC = 180` per clip -- 8 x 180s
+  = 24 minutes of transcode budget ALONE, already past 15 minutes.
+- On top of that: `agent/drafter.py` calls Claude for each caption
+  (`_call_llm_caption`, no per-call timeout override -> the anthropic SDK's
+  own ~600s default) up to FOUR times per caption (initial compose + up to
+  three conditional retries: opening-collision, dropped-name, figure-gate),
+  for up to 31 days x 2 cadence slots (`agent/plan_horizon.py`,
+  `AGENT_PLAN_HORIZON_DAYS` default 31) = up to 62 captions, i.e. up to ~248
+  LLM calls in one build.
+- The Drive media lane (`agent/gym_media_builder.py`'s "trying the next
+  asset" loop) can also call `agent/vision.py`'s Gemini reader with NO
+  explicit timeout kwarg at all, per candidate photo, for every day the
+  Drive lane fills in.
+
+Conclusion: a precise "worst legitimate runtime" number is not knowable from
+a static code read — two of the slow paths (Claude, Gemini) carry no
+explicit timeout in this codebase at all, only SDK defaults, and the
+multipliers (retries x captions x candidates) stack. Picking a bigger static
+number just moves the goalpost to the next unaudited slow step. Flagging this
+plainly rather than picking an arbitrary "big enough" number and calling it
+settled.
+
+- [x] Replaced the static-timeout design with a heartbeat. `agent/build_lock.py`:
+  `heartbeat(base_key, holder)` re-stamps the lock (fail-open on a kv write
+  hiccup -- never raises, never releases early); `HeartbeatHandle` /
+  `start_heartbeat()` run it on a background thread every
+  `HEARTBEAT_INTERVAL_SECONDS` (45s) for as long as the holder is alive.
+  Staleness is now measured from "time since last heartbeat"
+  (`HEARTBEAT_STALE_SECONDS`, 4 minutes) instead of "time since acquisition",
+  so a live build of ANY length keeps proving it is alive, and a genuinely
+  crashed/silent holder is reclaimed in ~4 minutes instead of 15+.
+  `STALE_SECONDS` kept as a backward-compatible alias.
+- [x] Wired into both call sites in `agent/client_month_run.py`
+  (`build_client_month` and `backfill_denied_slots`): `start_heartbeat()`
+  right after `acquire()` succeeds, `.stop()` in the `finally` block BEFORE
+  `release()`.
+- [x] `tests/test_build_lock.py`: 6 new tests -- a simulated 40-minute build
+  that heartbeats every interval never loses its lock and keeps a second
+  caller refused throughout; a holder that stops heartbeating is reclaimed
+  within the new short window (and asserts that window is shorter than the
+  old 15-minute one); a heartbeat write failure returns False without
+  raising and without releasing/corrupting a still-live lock; a late
+  heartbeat from a holder that was legitimately reclaimed is refused rather
+  than clobbering the new owner; the background thread actually fires
+  renewals on its interval and stops cleanly. All 15 tests in the file pass
+  (9 original + 6 new).
+- [x] Full suite run before merge: confirmed green (see PR for the exact
+  count run same session as origin/main's pre-change baseline of 7177
+  passed / 13 skipped / 0 failed).
+
+## LASSO infographic background variety (2026-09-22, local)
+
+- [~] Content-led LASSO briefs now explicitly favor dark, colored, split, photographic and tactile fields over repeated white backgrounds. Layout follows the content; references do not prescribe a pale field. Uses the existing default-OFF quality flag and preserves explicit visual requests, copy, Story safe regions and corrective edits.
+- [ ] Deploy and inspect newly generated pixels. Prompt guidance does not guarantee a rotation; existing rendered/calendar assets are unchanged.
+- [x] Validation: 59 focused checks passed; full suite 8279 passed, 1 skipped. No dependency installation; existing environment reused. Worktree retained at `/Users/blakeruff/Documents/Codex/echo-infographic-variety-20260922` pending integration; 108 GiB free measured before the run.

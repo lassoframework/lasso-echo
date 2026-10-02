@@ -118,6 +118,27 @@ class SupabaseMediaStore:
             raise MediaStoreError(r.status_code, self._scrubbed(r))
         return True
 
+    def _rpc(self, name, payload):
+        r = self._client().post(
+            f"{self.url}/rest/v1/rpc/{name}", json=payload,
+            headers=self._headers({"Content-Type": "application/json"}), timeout=30)
+        if r.status_code >= 400:
+            raise MediaStoreError(r.status_code, self._scrubbed(r))
+        return r.json()
+
+    def request_sync(self, source_id, gym_id):
+        return bool(self._rpc("request_gym_media_sync",
+                              {"p_source_id": source_id, "p_gym_id": gym_id}))
+
+    def claim_sync(self):
+        rows = self._rpc("claim_gym_media_sync", {}) or []
+        return rows[0] if rows else None
+
+    def finish_sync(self, source_id, token, ok, error=None):
+        return bool(self._rpc("finish_gym_media_sync", {
+            "p_source_id": source_id, "p_token": token,
+            "p_ok": bool(ok), "p_error": error}))
+
     # ---- media_asset ----------------------------------------------------------
     def list_assets(self, gym_id, source_id=None):
         """Every asset for ONE gym (gym_id is REQUIRED — tenant isolation starts
@@ -151,6 +172,24 @@ class SupabaseMediaStore:
             raise MediaStoreError(r.status_code, self._scrubbed(r))
         return len(rows)
 
+    def insert_assets_ignore_conflicts(self, rows):
+        """Insert new Drive IDs without replacing the first source's ownership.
+
+        PostgREST returns only rows actually inserted under ignore-duplicates.
+        The caller re-reads every candidate after this call to handle races.
+        """
+        if not rows:
+            return set()
+        r = self._client().post(
+            self._rest(_ASSET_TABLE), params={"on_conflict": "id"},
+            json=list(rows),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "resolution=ignore-duplicates,return=representation"}),
+            timeout=30)
+        if r.status_code >= 400:
+            raise MediaStoreError(r.status_code, self._scrubbed(r))
+        return {row["id"] for row in (r.json() or [])}
+
     def update_asset(self, asset_id, fields):
         r = self._client().patch(
             self._rest(_ASSET_TABLE), params={"id": f"eq.{asset_id}"},
@@ -160,6 +199,98 @@ class SupabaseMediaStore:
             timeout=30)
         if r.status_code >= 400:
             raise MediaStoreError(r.status_code, self._scrubbed(r))
+        return True
+
+    def update_indexed_asset_if_hash(self, gym_id, asset_id, old_hash, fields):
+        """CAS for a Drive content swap, including approval invalidation.
+
+        Review RPC also locks the row and checks the hash, so either ordering
+        invalidates an old review or refuses the stale decision.
+        """
+        if not gym_id or "content_hash" not in fields:
+            raise MediaStoreError(400, "hash update requires tenant and new hash")
+        params = {"id": f"eq.{asset_id}", "gym_id": f"eq.{gym_id}",
+                  "content_hash": f"eq.{old_hash}" if old_hash is not None else "is.null"}
+        r = self._client().patch(
+            self._rest(_ASSET_TABLE), params=params,
+            json=dict(fields),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}), timeout=30)
+        if r.status_code >= 400:
+            raise MediaStoreError(r.status_code, self._scrubbed(r))
+        if len(r.json() or []) != 1:
+            raise MediaStoreError(409, "asset changed during Drive indexing")
+        return True
+
+    def update_review_asset(self, gym_id, asset_id, fields, *,
+                            expected_content_hash, expected_review_status,
+                            expected_reviewed_at):
+        """Atomic tenant-scoped review CAS plus immutable decision event.
+
+        The RPC is an additive migration and is service-role-only. If it has not
+        been applied, the call fails closed without updating a review.
+        """
+        result = self._rpc("record_gym_media_review", {
+            "p_gym_id": gym_id, "p_asset_id": asset_id,
+            "p_expected_hash": expected_content_hash,
+            "p_expected_status": expected_review_status,
+            "p_expected_reviewed_at": expected_reviewed_at,
+            "p_fields": dict(fields)})
+        if result is not True:
+            raise MediaStoreError(409, "asset changed during review")
+        return True
+
+    _MODERATION_FIELDS = {
+        "moderation_status", "moderation_json", "people_detected",
+        "consent_status", "review_status", "reviewed_by", "reviewed_at",
+        "review_content_hash",
+    }
+
+    def update_moderation_asset(self, gym_id, asset_id, fields, *,
+                                expected_content_hash):
+        """Conditional moderation-evidence write (plain PATCH, no RPC).
+
+        Fails with 409 when the asset was edited or already moderated since the
+        producer read it, and refuses to write the operator-review columns.
+        """
+        if not gym_id or not expected_content_hash:
+            raise MediaStoreError(
+                400, "moderation update requires tenant and expected hash")
+        if set(fields) != self._MODERATION_FIELDS:
+            raise MediaStoreError(400, "moderation update requires only evidence fields")
+        status = fields["moderation_status"]
+        people = fields["people_detected"]
+        consent = fields["consent_status"]
+        evidence = fields["moderation_json"]
+        clean = status == "clean"
+        if (status not in {"clean", "flagged"}
+                or people is not None and not isinstance(people, bool)
+                or consent != ("not_required" if status == "clean" else "pending")
+                or not isinstance(evidence, dict)
+                or evidence.get("content_hash") != expected_content_hash
+                or evidence.get("asset_id") != asset_id
+                or evidence.get("gym_id") != gym_id
+                or evidence.get("people_detected") is not people
+                or evidence.get("verdict") not in {"clean", "unsafe", "unknown"}
+                or clean != (evidence.get("verdict") == "clean")
+                or fields["review_status"] != ("approved" if clean else "pending_review")
+                or fields["reviewed_by"] != ("automatic_moderation" if clean else None)
+                or fields["reviewed_at"] != (evidence.get("observed_at") if clean else None)
+                or fields["review_content_hash"] != (expected_content_hash if clean else None)):
+            raise MediaStoreError(400, "invalid moderation evidence")
+        params = {"id": f"eq.{asset_id}", "gym_id": f"eq.{gym_id}",
+                  "content_hash": f"eq.{expected_content_hash}",
+                  "review_status": "eq.pending_review",
+                  "moderation_status": "eq.pending"}
+        r = self._client().patch(
+            self._rest(_ASSET_TABLE), params=params,
+            json=dict(fields),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}), timeout=30)
+        if r.status_code >= 400:
+            raise MediaStoreError(r.status_code, self._scrubbed(r))
+        if len(r.json() or []) != 1:
+            raise MediaStoreError(409, "asset changed during moderation")
         return True
 
 

@@ -11,6 +11,7 @@ from agent.client_dm_support import lane as L
 from agent.client_dm_support import no_ad_rail as N
 from agent.client_dm_support import probes as P
 from tests.test_client_dm_no_fakes import FaithfulBus, _ticket
+from tests.gym_media_fakes import bound_review_fields
 
 
 class Store:
@@ -33,7 +34,13 @@ def src(gym="crossfitlocal", sid="s1", active=True, revoked=False):
 
 def assets(n, gym="crossfitlocal", sid="s1", eligible=True):
     return [{"id": f"{gym}-{i}", "gym_id": gym, "source_id": sid,
-             "eligible": eligible, "excluded_by_coach": False} for i in range(n)]
+             "eligible": eligible, "excluded_by_coach": False,
+             # A library count and a client-facing "can post" claim must use the
+             # same strict selector proof as production. These fixture assets are
+             # explicitly reviewed, cleanly moderated, and confirmed no-people,
+             # so consent is genuinely not required.
+             **bound_review_fields(f"{gym}-{i}", gym)}
+            for i in range(n)]
 
 
 VOICE_TODO = ("### CTA rotation (cycle in order, one per post)\n"

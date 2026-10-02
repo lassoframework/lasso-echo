@@ -283,6 +283,7 @@ def _build_release_draft(account, day_key, ep, nano_client, s3_client):
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=[f"cite:podcast_ep{n}", ep["title"], about],
         day_key=day_key, draft_type="podcast",
+        image_engine=art.get("route", ""),
     )
 
 

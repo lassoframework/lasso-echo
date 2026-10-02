@@ -481,3 +481,18 @@ def test_named_member_ignores_the_appended_photo_hint():
     assert drafter._named_member(note) == ""
     assert drafter._dropped_name_for_age(
         note, "One of our members is in her 40s and crushing it.") == ""
+
+
+def test_long_opening_hook_is_bounded_without_losing_copy(monkeypatch):
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    body = ("Show up for the version of you who keeps choosing strength, confidence, "
+            "community, consistency, coaching, and meaningful progress every single day.")
+    monkeypatch.setattr(drafter, "_call_llm_caption", lambda *_: body)
+    caption, _hashtags, _fragments = StoryBrandGenerator().build(_voice(), _creative())
+    first = caption.splitlines()[0]
+    assert len(first) <= 125
+    assert "".join(body.split()) in "".join(caption.split())
+
+
+def test_system_prompt_makes_hook_limit_explicit():
+    assert "first line is the hook and MUST be 125 characters or fewer" in StoryBrandGenerator._SYSTEM

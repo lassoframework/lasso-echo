@@ -188,7 +188,7 @@ Connected</p>
 
 
 # ---- the thin stdlib server (started by the listener when armed) -------------------
-def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure core
+def _handler_class():
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
@@ -198,8 +198,50 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
             self.end_headers()
             self.wfile.write(html.encode("utf-8"))
 
+        def _send_json(self, status, obj):
+            import json as _json
+            body = _json.dumps(obj).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _ops_actions(self, method):
+            """D72: the FIXER's ops-action lane mounted INSIDE THE WORKER, which is the
+            process with the /data volume (media libraries, brand bibles, the kv that the
+            deny sweep and the recreate budget live in). Same fixer_ops.handle as
+            intake_web mounts on the web service; same secret header. True when answered."""
+            from . import fixer_ops as _fixer_ops
+            if not urllib.parse.urlparse(self.path).path.startswith(_fixer_ops.ROUTE_PREFIX):
+                return False
+            raw = b""
+            if method == "POST":
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length > _fixer_ops.MAX_BODY_BYTES:
+                    self._send_json(413, {"error": "too_large"})
+                    return True
+                raw = self.rfile.read(length) if length else b""
+            answered = _fixer_ops.handle(method, self.path, self.headers.get, raw)
+            if answered is None:
+                return False
+            status, body = answered
+            self._send_json(status, body)
+            return True
+
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/healthz":
+                self._send_json(200, {
+                    "ok": True,
+                    "deployment": {
+                        "commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA"),
+                        "service": os.environ.get("RAILWAY_SERVICE_NAME"),
+                    },
+                })
+                return
+            if self._ops_actions("GET"):
+                return
             # Admin tracker: /admin/tracker/<token>[/handoff] (read-only, token-gated)
             import re as _re
             m = _re.match(r"^/admin/tracker/([A-Za-z0-9_-]{8,})(/handoff)?$",
@@ -222,6 +264,8 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
                 self._send(404, "not found")
 
         def do_POST(self):
+            if self._ops_actions("POST"):
+                return
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/connect/select":
                 length = int(self.headers.get("Content-Length", 0) or 0)
@@ -233,9 +277,14 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
         def log_message(self, fmt, *args):  # never log query strings (codes/state)
             print(f"[connect] {self.command} {urllib.parse.urlparse(self.path).path}")
 
+    return Handler
+
+
+def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure core
+    from http.server import ThreadingHTTPServer
     port = int(port or os.environ.get("AGENT_CONNECT_PORT", "8090"))
     print(f"[connect] serving on :{port}")
-    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", port), _handler_class()).serve_forever()
 
 
 def _queue_grade_baseline(page_id, page_name, ig_username, poster=None):

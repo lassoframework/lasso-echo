@@ -24,6 +24,7 @@ NO fabrication: the caption is the notes Doc's own text or the slot dies.
 from __future__ import annotations
 
 import tempfile
+import re
 from pathlib import Path
 
 from . import config, podcast_caption as _cap, podcast_index as _idx
@@ -96,7 +97,8 @@ def _upload_clip(zc, path, filename, http=None):
 
 def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
                              zernio_client=None, probe_fn=None,
-                             allowlist_fn=None, now=None, feed_map=None):
+                             allowlist_fn=None, now=None, feed_map=None,
+                             exclude_ids=(), defer_use=False):
     """A PENDING podcast Draft for `day_key` from the Drive clip library, or
     None (the planner then falls through to the existing podcast logic). Only
     ever called when PODCAST_LIBRARY_STAGE is ON (the caller gates).
@@ -129,7 +131,7 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
     feed_map = _grounding_feed_map() if feed_map is None else dict(feed_map)
     feed_episodes = set(feed_map.keys())
 
-    tried = []
+    tried = list(exclude_ids)
     for _attempt in range(_MAX_CLIP_ATTEMPTS):
         asset = _sel.pick_clip(store=store, now=now, exclude_ids=tuple(tried),
                                feed_episodes=feed_episodes)
@@ -137,6 +139,12 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
             return None  # pool empty: pick_clip already fired the one deduped alert
         tried.append(asset["id"])
         episode = asset.get("episode")
+        # A clip filed under the wrong episode must not inherit unrelated notes.
+        named_episode = re.search(r"\bGMMS[-_ ]*(?:EP[-_ ]*)?(\d+)(?:[-_ .]|$)",
+                                  str(asset.get("title") or ""), re.I)
+        if named_episode and str(int(named_episode.group(1))) != str(episode):
+            print("[podcast-builder] clip filename and indexed episode disagree; skipping")
+            continue
 
         # Assemble grounding: RSS feed entry (primary) + Drive show-notes Doc
         # (supplement/fallback). Either source alone can ground the caption.
@@ -213,15 +221,21 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
                       f"({reject}); trying the next clip")
                 continue
 
-            public_url = _upload_clip(zernio_client, tmp_path, asset.get("title") or
-                                      f"gmms_{episode}_clip.mp4")
+            if config.lasso_editorial_calendar_enabled() and gym_base == 'lasso':
+                # Calendar videos need the same durable media storage as graphics.
+                from .media_host import host_media
+                public_url = host_media(tmp_path, gym_base)
+            else:
+                public_url = _upload_clip(zernio_client, tmp_path, asset.get("title") or
+                                          f"gmms_{episode}_clip.mp4")
             if not public_url:
                 return None  # vendor-side failure: not a clip problem, stop the slot
+            from .gym_media_builder import video_poster_url
+            thumbnail_url = video_poster_url(tmp_path, tmp_dir, gym_base)
         finally:
             try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-                Path(tmp_dir).rmdir()
+                import shutil
+                shutil.rmtree(tmp_dir)
             except OSError:
                 pass
 
@@ -246,6 +260,12 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
             source_fragments=ground_frags + [f"drive_clip:{asset['id']}"]
                              + [f"claim:{c}" for c in (meta or {}).get("claims", [])],
         )
+        draft.thumbnail_url = thumbnail_url
+        draft.source_media_asset_id = asset["id"]
+        draft.podcast_asset = dict(asset, width=info['width'], height=info['height'],
+                                   duration_sec=info['duration_sec'], aspect=aspect)
+        if defer_use:
+            return draft
         # Stamp ONLY now that the slot is staged; a coach deny rolls this back
         # (podcast_selector.on_draft_denied / observe_denials).
         try:

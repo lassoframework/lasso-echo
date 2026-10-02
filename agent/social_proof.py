@@ -142,7 +142,7 @@ def build_social_proof_draft(account, day_key, *, voice=None, voice_path=None,
     # Card image: the verified entry, feed 4:5 (the Story path re-renders 9:16
     # from source_fragments exactly as it does for daily studio cards).
     art = creative_studio.generate_social_proof(
-        entry.kind, entry.main, entry.support, entry.attribution, client=nano_client)
+        entry.kind, entry.main, entry.support, entry.attribution, client=nano_client, account_key=getattr(account, "key", account))
     if not art:
         print(f"[social-proof] {account.key}: card generation unavailable; "
               "normal draft path takes the day.")

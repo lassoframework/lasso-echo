@@ -80,3 +80,18 @@ def test_a_gym_with_a_row_for_the_day_is_not_short(monkeypatch):
     monkeypatch.setattr("agent.calendar_autopublish.client_gym_bases",
                         lambda: ["eng", "topfuel"])
     assert listener._gyms_short_on("2026-09-10") == ["topfuel"]
+
+
+def test_client_publish_universe_excludes_internal_personal_accounts(monkeypatch):
+    from types import SimpleNamespace
+    from agent import accounts, echo_clients
+    from agent.calendar_autopublish import client_gym_bases
+
+    monkeypatch.setattr(accounts, "all_accounts", lambda: [
+        SimpleNamespace(key="eng_ig"),
+        SimpleNamespace(key="blake_personal"),
+        SimpleNamespace(key="staff_personal"),
+    ])
+    monkeypatch.setattr(echo_clients, "only_client_bases", lambda bases: list(bases))
+
+    assert client_gym_bases() == ["eng"]

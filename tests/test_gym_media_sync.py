@@ -27,6 +27,50 @@ def test_sync_indexes_photos_and_videos(monkeypatch):
     assert store.assets["v1"]["eligible"] is None        # video unprobed
 
 
+def test_shared_drive_file_keeps_first_source_owner(monkeypatch):
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest", lambda *a, **k: None)
+    store = FakeMediaStore(assets=[make_asset("shared", gym_id="pierce",
+                                             source_id="src1")])
+    second = make_source("src2", gym_id="pierce", folder_id="fold2")
+    result = sync.sync_source(second, drive=FakeDrive(files=[photo("shared")]),
+                              store=store)
+    assert result["ok"] and result["inserted"] == 0
+    assert store.assets["shared"]["source_id"] == "src1"
+    assert not store.updates
+
+
+def test_cross_gym_drive_id_collision_fails_before_insert():
+    store = FakeMediaStore(assets=[make_asset("shared", gym_id="other",
+                                             source_id="other-src")])
+    try:
+        sync.sync_source(_src(), drive=FakeDrive(files=[photo("shared")]), store=store)
+    except ValueError as exc:
+        assert "another gym" in str(exc)
+    else:
+        raise AssertionError("cross-gym Drive id collision must fail")
+    assert store.assets["shared"]["gym_id"] == "other"
+
+
+def test_racing_source_keeps_shared_owner_and_indexes_unique_file(monkeypatch):
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest", lambda *a, **k: None)
+
+    class RacingStore(FakeMediaStore):
+        def insert_assets_ignore_conflicts(self, rows):
+            # The competing worker inserts after this worker's precheck.
+            self.assets["shared"] = make_asset("shared", gym_id="pierce",
+                                                source_id="src1")
+            return super().insert_assets_ignore_conflicts(rows)
+
+    store = RacingStore()
+    second = make_source("src2", gym_id="pierce", folder_id="fold2")
+    result = sync.sync_source(second,
+                              drive=FakeDrive(files=[photo("shared"), photo("unique")]),
+                              store=store)
+    assert result["ok"] and result["inserted"] == 1
+    assert store.assets["shared"]["source_id"] == "src1"
+    assert store.assets["unique"]["source_id"] == "src2"
+
+
 def test_sync_removed_file_flips_pending(monkeypatch):
     monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
                         lambda *a, **k: None)
@@ -41,6 +85,44 @@ def test_sync_removed_file_flips_pending(monkeypatch):
     assert store.assets["p_gone"]["eligible"] is False
     assert store.assets["p_gone"]["reject_reason"] == "removed_from_drive"
     assert "p_gone" in flipped
+
+
+def test_queued_import_does_not_change_vanished_asset_or_pending_post(monkeypatch):
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest", lambda *a, **k: None)
+    pending = {"media_asset_id": "p_gone", "status": "pending"}
+
+    def flip(_gym, ids, _log):
+        if ids:
+            pending["status"] = "media_not_ready"
+        return len(ids)
+
+    monkeypatch.setattr("agent.jobs.sync_gym_media._flip_pending_for_missing", flip)
+    original = make_asset("p_gone", gym_id="pierce", source_id="src1")
+    store = FakeMediaStore(assets=[original])
+    result = sync.sync_source(_src(), drive=FakeDrive(files=[]), store=store,
+                              sweep_missing=False)
+    assert result["ok"] is True
+    assert store.assets["p_gone"] == original
+    assert pending == {"media_asset_id": "p_gone", "status": "pending"}
+
+
+def test_queued_import_emits_no_client_digest_on_success_or_revocation(monkeypatch):
+    sent = []
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
+                        lambda *a, **k: sent.append("asset-or-revoked"))
+    monkeypatch.setattr("agent.config.story_classifier_enabled", lambda: True)
+    monkeypatch.setattr("agent.jobs.sync_gym_media._sort_ambiguous",
+                        lambda *a, **k: 0)
+    monkeypatch.setattr("agent.story_sort_queue.post_digest",
+                        lambda *a, **k: sent.append("sort"))
+    store = FakeMediaStore()
+    result = sync.sync_source(_src(), drive=FakeDrive(files=[photo("p1")]),
+                              store=store, sweep_missing=False, emit_digest=False)
+    assert result["ok"] and result["inserted"] == 1
+    revoked = sync.sync_source(_src(), drive=FakeDrive(walk_raises=_Resp(403)),
+                               store=store, sweep_missing=False, emit_digest=False)
+    assert revoked["revoked"] is True
+    assert sent == []
 
 
 def test_unshare_marks_revoked_and_notifies(monkeypatch):

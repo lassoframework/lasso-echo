@@ -1,7 +1,33 @@
 # LASSO House Style System
 
 Source of truth for every infographic Echo generates.
-Version: 1.1 (2026-07-17)
+
+## LASSO content-led background direction (2026-09-22)
+
+For the LASSO-only `AGENT_LASSO_INFOGRAPHIC_QUALITY` path, the content-led
+brief in `agent/astra_prompt.py` supersedes the legacy template picker below.
+Recent output repeats white and off white fields. New briefs explicitly favor
+substantial dark, colored, split, photographic or tactile backgrounds. Navy,
+charcoal, red and sky blue are useful directions, not a mandatory palette.
+White and cream remain occasional deliberate choices, or an explicit visual
+request. A colored border or dark footer on a white poster is not variety.
+
+Choose composition from the content; avoid automatically repeating headline,
+object, footer. References establish craft, not background or layout. Retain
+the LASSO identity, complete approved copy, strong contrast and Story safe
+regions. Corrective edits preserve the rejected candidate's coherent design
+while repairing review failures. This is prompt guidance, not a guaranteed
+calendar rotation; existing rendered posts are unchanged.
+
+## Legacy style system
+
+Version: 1.2 (2026-09-13)
+
+**v1.2 changes the default.** Cream is no longer THE canvas, it is one of seven.
+Astra now draws a canvas, a composition, and an accent placement per card instead
+of rendering one template every time. See Section 12. Everything the brand is
+built on stays locked: the colors, two type families, no dashes, no fabrication,
+the readability bar, and the human approval gate.
 
 All constants in `agent/creative_studio.py` that begin with `HOUSE_STYLE_`
 or reference this document must match the scaffold in Section 8 exactly.
@@ -19,14 +45,15 @@ The grade gate in Section 9 determines whether a card enters the approval queue.
 
 ## 2. Brand DNA (constant, never varies)
 
-Colors (LASSO V3, locked):
+Colors (LASSO V3, locked). Which color carries the FIELD varies per card (Section 12);
+the values themselves never do:
 
 | Token    | Hex       | Role                                               |
 |----------|-----------|----------------------------------------------------|
-| Cream    | #FAF6F0   | The default canvas field                           |
+| Cream    | #FAF6F0   | Canvas field, or type on a dark field              |
 | Navy     | #121E3C   | Headlines, structure, dark canvas base             |
 | Sky Blue | #5EB9E6   | Secondary accents, flow lines, supporting touches  |
-| Red      | #FF0000   | THE single accent. One element only. Never background. Never two. |
+| Red      | #FF0000   | THE single accent. One element only. Never two. May carry the whole field only in CANVAS MODE RED, where the single accent flips to white. |
 
 Typography: headlines set bold and large. Eyebrow and deck are smaller.
 Maximum two typefaces on any card. No slab serif. No script.
@@ -50,9 +77,18 @@ These rules apply to every card, every surface, every model:
 1. No em dashes, no en dashes, no hyphens in rendered text on cards.
 2. No "vendor" in rendered text or captions.
 3. The stat slab is retired: one colossal number as the card hero is banned.
-4. One red element maximum. Never a red background. Never two red elements.
-5. No centered symmetric compositions. Every card is left-aligned and asymmetric.
-6. No illustrated scenes, no cartoon figures, no metaphorical imagery, no AI-looking art. Visual elements are clean flat icons, structured data layouts, and step diagrams only.
+4. One accent element maximum. Never two. Red is that accent on every canvas
+   except CANVAS MODE RED, where red is the field and the single accent flips to
+   white. A red field is only ever a declared canvas mode, never a stray choice.
+5. Left-aligned and asymmetric is the DEFAULT and the fallback. A composition
+   mode in Section 12 may place type elsewhere when the mode calls for it, but no
+   prompt may ever instruct a "centered composition" or a "symmetric layout":
+   those exact phrases still raise in `creative_studio._check_prompt_hard_rules`.
+6. No illustrated scenes, no cartoon figures, no metaphorical imagery, no
+   AI-looking art. Visual elements are clean flat icons, structured data layouts,
+   diagrams, device mockups, and type. The ONE photography exception is CANVAS
+   MODE DUOTONE: a real documentary frame duotoned to the brand, never a posed
+   stock smile, never a composite, never a competitive athlete.
 7. No STEP 1 / STEP 2 / STEP 3 labels in the illustrated element.
 
 ---
@@ -88,13 +124,16 @@ detailed composition rules.
 
 ## 6. What Varies Per Card
 
-- CANVAS: cream (light, default) or navy (dark, cinematic) dominant field
+On the Gemini path (`creative_studio.build_prompt`):
+
+- CANVAS: one of four variant tokens (cream, navy, red, split)
 - LAYOUT: one of eight layout tokens (framework, contrast, checklist, poster,
-  chart, diagram, device, and the six archetypes)
+  chart, diagram, device) or one of six archetypes
 - SUBJECT: the concrete illustrated scene (varies by content pillar)
 
-Canvas and layout are set per-card from the variant system. Subject comes from
-the approved source doc only. Everything else is constant.
+On the Astra path (the default engine), see **Section 12**: seven canvases,
+seven compositions, six accent placements. Subject always comes from the approved
+source doc only. The brand grammar is constant on every path.
 
 ---
 
@@ -305,3 +344,113 @@ The following patterns are RETIRED. No new prompt may use them:
 Cards generated under old patterns are listed in
 `content_library/style_exclusions.json` and excluded from rotation until
 regenerated under this system.
+
+---
+
+## 12. The Astra Style Freedom System (v1.2)
+
+**Flag:** `AGENT_ASTRA_STYLE_FREEDOM`, default **OFF**.
+**Code:** `agent/astra_prompt.py`.
+**Why:** every Astra card looked the same because every Astra card *was* the same.
+The brief hardcoded one palette that named cream "THE canvas" and one composition
+that demanded exactly three vector elements plus a CTA button that was always the
+single red element. Same field, same furniture, same accent, every card. That is
+sameness by construction, not model behavior.
+
+With the flag OFF the brief is byte for byte what it was. With it ON, each card
+draws one canvas, one composition, and one accent placement.
+
+### Canvas modes (7)
+
+| Mode | Field | Type | Use it for |
+|---|---|---|---|
+| `cream` | Cream #FAF6F0 | Navy | The calm editorial default |
+| `navy` | Navy #121E3C | Cream and white | Moody, confident, cinematic |
+| `split` | Navy and cream, seamed | Flips per zone | Before and after, two truths |
+| `sky` | Sky Blue #5EB9E6 | Navy | Outcome and momentum ideas |
+| `ink` | Near black #0B1020 | Cream | The most serious, highest contrast |
+| `red` | Red #FF0000 | White and navy | Highest urgency. Accent flips to white |
+| `duotone` | Full bleed duotone photo | Reversed out | When a real human moment carries it |
+
+All seven are built from the locked LASSO V3 colors. This widens which color
+carries the field. It does **not** add a color to the brand.
+
+### Composition modes (7)
+
+`flat_editorial` (the former only option, now one of seven), `type_poster`,
+`data_story`, `diagram`, `split_screen`, `stack`, `device`. Full text in
+`astra_prompt.COMPOSITION_MODES`.
+
+The CTA button block and the three element metaphor are now features of
+`flat_editorial` only. Six of the seven modes carry no button at all.
+
+### Accent placements (6)
+
+`one_word`, `one_node`, `rule_line`, `arrow_tip`, `cta_button`, `corner_block`.
+Exactly one accent element remains the law. Only *where* it lands is free. That
+single rule is what keeps a run of varied cards reading as one brand.
+
+### Selection
+
+`style_for(key)` hashes the card key (the headline, by default) three times with
+three different salts, so canvas, composition, and accent do not move in lockstep.
+Deterministic: a re-render of an approved card returns the same look. A concept
+may pin any of the three by hand.
+
+### What did NOT change
+
+The LASSO V3 color values. Two type families, never more. No dashes in rendered
+text. No fabrication: a missing note still blocks the draft. The readability bar
+(thumbnail legible, high contrast). The six-question grade gate. The human
+approval gate. All 294 canvas and composition and accent combinations were
+verified against the grade gate and the hard copy rules before this shipped.
+
+### Account scope: every account by default (widened 2026-09-13)
+
+Blake, 2026-09-12: "This should only be for LASSO right now until a proven
+[out]." One day later, same ask restated with the explicit widening: "This
+applies to the real production system — LASSO's own account plus any client
+gym using the auto-infographic path." The master flag being ON does not by
+itself free every account's cards — it is still scoped per account — but the
+scope now defaults to everyone.
+
+**`AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS`**, default `*` (every account).
+Comma-separated account-key bases (an `_ig`/`_fb` suffix is stripped before
+the check, so `lasso_ig` and `lasso_fb` both mean `lasso`) still narrows the
+rollout back by hand — set it to `lasso` to restore the 2026-09-12 LASSO-only
+scope without a code change, or to a specific list (`lasso,eng,gritx`).
+
+A missing account_key (book_campaign, podcast, summit, stories, and the
+render-card CLI with no `--account`) is treated as `lasso`, since every
+unscoped caller in this repo IS LASSO's own content pipeline.
+
+`python -m agent render-card --account eng --brief-only` previews exactly what
+a given account gets in production, without touching Railway or waiting for a
+calendar slot.
+
+### A CLIENT GYM gets a DIFFERENT freed brief than LASSO's own account
+
+Freedom mode is not "LASSO's palette, reshuffled" once it reaches a client
+gym. Two things change for a non-LASSO account_key (`astra_prompt.
+is_lasso_account`) when it is in freedom scope:
+
+- **Its own voice, not LASSO's.** `_voice_path_for` resolves the gym's own
+  durable drafted voice doc (`<DATA_DIR>/brand_voice/<base>/lasso_voice.md`,
+  same resolver `client_media_sync._resolve_client_voice_path` uses for that
+  gym's captions), not `config.VOICE_DOC_PATH` (LASSO's own doc). Before
+  2026-09-13 every Astra brief, client gym included, read LASSO's voice doc
+  unconditionally.
+- **Real palette latitude, not LASSO's locked hex.** `gym_brand_latitude`
+  replaces `LOCKED_BRAND_COLORS` + a `CANVAS_MODES` entry: no LASSO hex value
+  is named anywhere in the brief. Astra chooses the field, supporting colors,
+  and accent color itself, grounded in that gym's own voice + approved
+  context, with only the field's ENERGY (calm/moody/urgent/etc, still varied
+  per card) carried over from the canvas system for structure.
+  `accent_law_free` keeps the "exactly one accent, never scattered"
+  discipline without naming red. Genuine guardrails — the banned list, the
+  readability bar, the no-fabrication line, the no-dash rule, the copy
+  hard-rule checks — are unchanged for a gym card.
+
+LASSO's own account is UNCHANGED by this: it still gets `LOCKED_BRAND_COLORS`
++ its 7-canvas system, because those ARE LASSO's real agency colors, not a
+template imposed on someone else's brand.

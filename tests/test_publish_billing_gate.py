@@ -11,6 +11,15 @@ import sys
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def available_revocation_store(monkeypatch):
+    """Billing cases assume a healthy, empty revocation denylist."""
+    from agent import intake_web
+    from types import SimpleNamespace
+    monkeypatch.setattr(intake_web, "_default_r2", lambda: SimpleNamespace(
+        get_bytes=lambda key: b'{"revoked": []}'))
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import publish_billing_gate as pbg  # noqa: E402
@@ -125,6 +134,14 @@ def test_lasso_is_not_counted_as_a_coverage_gap(monkeypatch):
     assert rep["total"] == 1 and rep["uncovered"] == ["eng"]
 
 
+def test_internal_personal_bases_are_not_billing_gaps_even_when_passed_explicitly(monkeypatch):
+    monkeypatch.setenv("AGENT_PUBLISH_BILLING_GATE", "true")
+    rep = _cov(["blake_personal", "another_personal", "lasso", "eng"])
+    assert rep["total"] == 1
+    assert rep["uncovered"] == ["eng"]
+    assert "blake_personal" not in pbg.inertness_message(rep)
+
+
 def test_an_armed_gate_covering_nothing_says_so(monkeypatch):
     monkeypatch.setenv("AGENT_PUBLISH_BILLING_GATE", "true")
     msg = pbg.inertness_message(_cov(["eng", "gritx"]))
@@ -200,3 +217,111 @@ def test_the_self_report_never_writes_or_raises(monkeypatch):
     src = inspect.getsource(pbg.coverage_report) + inspect.getsource(pbg.report_inertness)
     for forbidden in ("stripe.", "Subscription", "gym_upsert", "kv_set(f\"billgate_{"):
         assert forbidden not in src, f"the self-report must never touch billing ({forbidden})"
+
+
+def test_revoked_account_overrides_fresh_active_cache_and_survives_outage(monkeypatch):
+    from agent import db, intake_web
+    from types import SimpleNamespace
+    storage = SimpleNamespace(get_bytes=lambda key: b'{"revoked":["gymx"]}')
+    monkeypatch.setattr(intake_web, '_default_r2', lambda: storage)
+    pbg._store_state('gymx', 'ok', 1000)
+    monkeypatch.setenv('AGENT_PUBLISH_BILLING_GATE', 'false')
+    assert pbg.publishing_blocked('gymx', now=1100)
+    assert not pbg.publishing_blocked('other', now=1100)
+    storage.get_bytes = lambda key: (_ for _ in ()).throw(RuntimeError())
+    assert pbg.publishing_blocked('gymx', now=1200)
+    storage.get_bytes = lambda key: b'{}'
+    assert pbg.publishing_blocked('gymx', now=1250)
+    storage.get_bytes = lambda key: b'{"revoked": []}'
+    assert not pbg.publishing_blocked('gymx', now=1300)
+
+
+def test_mixed_subscriptions_never_grant_echo_from_ads(monkeypatch):
+    import stripe
+    from agent.portal_social import StripeSocialReader
+    from types import SimpleNamespace
+    def sub(product, status='active', gym=None):
+        return {'status': status, 'metadata': {'gym_id': gym} if gym else {},
+                'items': {'data': [{'price': {'product': product}}]}}
+    subscriptions = [sub('prod_ads', gym='unrelated-ads-gym'), sub('prod_V91b0T0zLNJza8', 'canceled')]
+    monkeypatch.setattr(stripe.Subscription, 'list', lambda **kw: SimpleNamespace(auto_paging_iter=lambda: iter(subscriptions)))
+    _gym(monkeypatch, product='')
+    reader = StripeSocialReader(api_key='test')
+    assert pbg._live_state('gymx', reader) == 'canceled'
+    subscriptions.append(sub('prod_V91b0T0zLNJza8', gym='different-gym'))
+    monkeypatch.setattr('agent.intake_web._supabase_token_gym', lambda base: {'gym_id': 'our-gym', 'echo_account_key': base})
+    assert pbg._live_state('gymx', reader) == 'canceled'
+    subscriptions.append(sub('prod_V1WmWwfIvFn3Rt', gym='our-gym'))
+    assert pbg._live_state('gymx', reader) == 'ok'
+    monkeypatch.setattr('agent.intake_web._supabase_token_gym', lambda base: None)
+    # A mapping outage is unknown, never cached as a positive cancellation.
+    assert pbg._live_state('gymx', reader) == 'ok'
+    with pytest.raises(RuntimeError, match='mapping unavailable'):
+        reader.echo_active('cus_1', {'prod_V91b0T0zLNJza8'}, 'gymx')
+
+
+def test_old_any_product_cache_is_not_reused(monkeypatch):
+    from agent import db
+    _gym(monkeypatch)
+    db.kv_set('billgate_gymx', 'ok')
+    db.kv_set('billgate_ts_gymx', '1000')
+    assert pbg.publishing_blocked('gymx', reader=_Reader(False), now=1100, alert=lambda msg: None)
+
+
+def test_revocation_blocks_direct_calendar_and_gbp_send_before_network(monkeypatch):
+    from agent import calendar_autopublish, gbp_worker, config
+    monkeypatch.setattr(pbg, 'publishing_blocked', lambda base: base == 'gymx')
+    monkeypatch.setattr(config, 'calendar_autopublish_enabled', lambda: True)
+    monkeypatch.setattr(config, 'publish_enabled', lambda: True)
+    result = calendar_autopublish.publish_due('2026-09-14', gym_id='gymx', store=object())
+    assert result['held'] and result['published'] == []
+    row = {'gym_id': 'gymx', 'image_url': 'https://example.invalid/photo.jpg'}
+    assert gbp_worker.publish_gbp_row(row, {}, client=object(), draft=False)['held'] == 'echo_access'
+    assert gbp_worker.publish_photo_drop(row, {}, client=object(), draft=False)['held'] == 'echo_access'
+
+
+def test_fresh_revocation_survives_cache_write_failure(monkeypatch):
+    from agent import db, intake_web
+    from types import SimpleNamespace
+    monkeypatch.setattr(intake_web, '_default_r2', lambda: SimpleNamespace(get_bytes=lambda key: b'{"revoked":["gymx"]}'))
+    monkeypatch.setattr(db, 'kv_set', lambda *args: (_ for _ in ()).throw(RuntimeError('db unavailable')))
+    monkeypatch.setattr(db, 'kv_get', lambda *args: '0')
+    assert pbg.account_revoked('gymx') is True
+
+
+def test_missing_denylist_object_fails_closed_for_client_but_not_exact_lasso(monkeypatch):
+    """R2 None means missing key/bucket, never a confirmed empty denylist."""
+    from agent import intake_web
+    from types import SimpleNamespace
+    storage = SimpleNamespace(get_bytes=lambda key: b'{"revoked":["lasso"]}')
+    monkeypatch.setattr(
+        intake_web, '_default_r2', lambda: storage,
+    )
+    # The exact LASSO policy exempts only an unreadable store; a fresh positive
+    # revocation remains authoritative even for that internal lane.
+    assert pbg.account_revoked('lasso') is True
+    storage.get_bytes = lambda key: None
+    assert pbg.account_revoked('gymx') is True
+    assert pbg.publishing_blocked('gymx') is True
+    assert pbg.account_revoked('lasso') is False
+    assert pbg.account_revoked('lasso-client') is True
+
+
+def test_confirmed_empty_denylist_is_distinct_from_missing_object(monkeypatch):
+    from agent import intake_web
+    from types import SimpleNamespace
+    monkeypatch.setattr(
+        intake_web, '_default_r2',
+        lambda: SimpleNamespace(get_bytes=lambda key: b'{"revoked": []}'),
+    )
+    assert pbg.account_revoked('gymx') is False
+
+
+def test_zernio_wire_revocation_refuses_before_client_access(monkeypatch):
+    from agent import config, zernio_publisher
+    from types import SimpleNamespace
+    monkeypatch.setattr(config, 'publish_enabled', lambda: True)
+    monkeypatch.setattr(config, 'zernio_publish_enabled', lambda: True)
+    monkeypatch.setattr(pbg, 'publishing_blocked', lambda base: base == 'gymx')
+    with pytest.raises(zernio_publisher.ZernioPublishError, match='held'):
+        zernio_publisher.publish(object(), SimpleNamespace(key='gymx_ig'), client=object())

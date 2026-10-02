@@ -93,6 +93,15 @@ _QUESTION_RE = re.compile(
     r"(\?\s*$)|^\s*(how|what|when|where|why|who|which|can you|could you|do you|does|is it|"
     r"are you|will|should i|did)\b", re.IGNORECASE)
 
+# A polite request to change website media is work, even with a question mark.
+# Keep how-to/capability questions in the answer lane and leave tenant/product
+# resolution to FIXER's verified triage; this rule grants no publishing authority.
+_WEBSITE_MEDIA_CHANGE_RE = re.compile(
+    r"(?:^|[.!?]\s*)(?:please\s+|(?:can|could|would)\s+(?:we|you)\s+"
+    r"(?:please\s+)?|(?:i|we)\s+(?:want|would like)\s+(?:you\s+)?to\s+)?"
+    r"(?:replace|swap|update|change|refresh)\b[^.!?]{0,100}\b"
+    r"(?:photos?|images?|pictures?|creative)\b", re.IGNORECASE)
+
 # Ranger only: a request to DO something to ads. Kept narrow on purpose.
 _ACTION_RE = re.compile(
     r"\b(pause|resume|unpause|turn (?:off|on)|scale|increase|decrease|raise|lower|"
@@ -322,6 +331,10 @@ def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=No
         return CANCEL_POST
     # RT-M2: breakage AND an Echo-domain noun. Breakage alone escalates to a human.
     if _BREAKAGE_RE.search(t) and _DOMAIN_RE.search(t):
+        return CODE_FIX
+    if (identity_product in {"portal", "websites", "scout"}
+            and _WEBSITE_RE.search(t) and not _NOT_WEBSITE_RE.search(t)
+            and _WEBSITE_MEDIA_CHANGE_RE.search(t)):
         return CODE_FIX
     if _QUESTION_RE.search(t):
         return QUESTION

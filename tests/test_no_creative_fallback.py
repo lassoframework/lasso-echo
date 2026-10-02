@@ -46,9 +46,13 @@ def _img_size(path):
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch, tmp_path):
     """The in-process url cache is process-global; clear it around every test so one
     test's hosted url never leaks into another's assertion."""
+    from datetime import datetime, timezone
+    from agent import calendar_autopublish
+    monkeypatch.setattr(calendar_autopublish, "_local_now", lambda *a: datetime(2026, 8, 9, tzinfo=timezone.utc))
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "display.sqlite"))
     ncf._URL_CACHE.clear()
     yield
     ncf._URL_CACHE.clear()
@@ -92,7 +96,7 @@ def test_existing_image_returned_unchanged_no_render_no_host(monkeypatch):
     def _h(*a, **k):
         calls.append("host"); return "Y"
 
-    post = {"caption": "We chase the leads. You close.", "pillar": "Sales are now",
+    post = {"day_key": "2026-08-10", "caption": "We chase the leads. You close.", "pillar": "Sales are now",
             "format": "feed", "image_url": "https://cdn.example.com/real.png"}
     out = ncf.display_image_for(post, renderer=_r, host=_h)
     assert out == "https://cdn.example.com/real.png"
@@ -101,7 +105,7 @@ def test_existing_image_returned_unchanged_no_render_no_host(monkeypatch):
 
 def test_existing_image_via_image_public_url_key(monkeypatch):
     monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")
-    post = {"caption": "x", "pillar": "y", "format": "feed",
+    post = {"day_key": "2026-08-10", "caption": "x", "pillar": "y", "format": "feed",
             "image_public_url": "https://cdn.example.com/real2.png"}
     assert ncf.display_image_for(post) == "https://cdn.example.com/real2.png"
 
@@ -124,7 +128,7 @@ def test_missing_image_with_caption_returns_hosted_url(monkeypatch, tmp_path):
         return out_path
 
     host, host_seen = _capturing_host()
-    post = {"caption": "We do the heavy lifting. Your social, done for you.",
+    post = {"day_key": "2026-08-10", "caption": "We do the heavy lifting. Your social, done for you.",
             "pillar": "We do the heavy lifting", "format": "feed", "image_url": None}
     out = ncf.display_image_for(post, out_dir=str(tmp_path),
                                renderer=_fake_renderer, host=host)
@@ -146,7 +150,7 @@ def test_missing_image_hosts_real_feed_infographic_1080(monkeypatch, tmp_path):
     # on disk and handed to the host; the hosted url is returned.
     monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")
     host, host_seen = _capturing_host()
-    post = {"caption": "One platform for your whole gym.",
+    post = {"day_key": "2026-08-10", "caption": "One platform for your whole gym.",
             "pillar": "All in one offer", "format": "feed", "image_url": ""}
     out = ncf.display_image_for(post, out_dir=str(tmp_path), host=host)
     assert out.startswith("https://cdn.example.com/hosted/")
@@ -156,7 +160,7 @@ def test_missing_image_hosts_real_feed_infographic_1080(monkeypatch, tmp_path):
 def test_missing_image_hosts_real_story_infographic_1080x1920(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")
     host, host_seen = _capturing_host()
-    post = {"caption": "One login. Every result.",
+    post = {"day_key": "2026-08-10", "caption": "One login. Every result.",
             "pillar": "The portal", "format": "story", "image_url": None}
     out = ncf.display_image_for(post, out_dir=str(tmp_path), host=host)
     assert out.startswith("https://cdn.example.com/hosted/")
@@ -167,7 +171,7 @@ def test_tenant_scopes_hosting(monkeypatch, tmp_path):
     # media_host tenant isolation: the gym's key scopes the hosted card.
     monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")
     host, host_seen = _capturing_host()
-    post = {"caption": "Built by gym owners.", "pillar": "Proof", "format": "feed",
+    post = {"day_key": "2026-08-10", "caption": "Built by gym owners.", "pillar": "Proof", "format": "feed",
             "image_url": None, "account_key": "gym_alpha"}
     ncf.display_image_for(post, out_dir=str(tmp_path), host=host)
     assert host_seen["tenant"] == "gym_alpha"
@@ -184,7 +188,7 @@ def test_pillar_only_no_caption_still_hosts_from_approved_text(monkeypatch, tmp_
         return out_path
 
     host, _ = _capturing_host()
-    post = {"caption": "", "pillar": "Sales are now", "format": "feed", "image_url": None}
+    post = {"day_key": "2026-08-10", "caption": "", "pillar": "Sales are now", "format": "feed", "image_url": None}
     out = ncf.display_image_for(post, out_dir=str(tmp_path), renderer=_fake, host=host)
     assert out.startswith("https://cdn.example.com/hosted/")
     assert seen["headline"] == "Sales are now"
@@ -204,14 +208,14 @@ def test_no_text_returns_none_no_render_no_host(monkeypatch):
     def _h(*a, **k):
         calls.append("host"); return "Y"
 
-    post = {"caption": "", "pillar": "", "format": "feed", "image_url": None}
+    post = {"day_key": "2026-08-10", "caption": "", "pillar": "", "format": "feed", "image_url": None}
     assert ncf.display_image_for(post, renderer=_r, host=_h) is None
     assert calls == []  # nothing rendered / hosted: no blank card, no fabricated copy
 
 
 def test_whitespace_only_text_returns_none(monkeypatch):
     monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")
-    post = {"caption": "   ", "pillar": "  ", "format": "feed", "image_url": None}
+    post = {"day_key": "2026-08-10", "caption": "   ", "pillar": "  ", "format": "feed", "image_url": None}
     assert ncf.display_image_for(post) is None
 
 
@@ -225,7 +229,7 @@ def test_host_returns_falsy_yields_none(monkeypatch, tmp_path):
     def _host_none(local_path, tenant):
         return None  # hosting unavailable / upload failed
 
-    post = {"caption": "One platform for your whole gym.",
+    post = {"day_key": "2026-08-10", "caption": "One platform for your whole gym.",
             "pillar": "All in one offer", "format": "feed", "image_url": None}
     out = ncf.display_image_for(post, out_dir=str(tmp_path), host=_host_none)
     assert out is None  # a clean empty state, never an unshowable local path
@@ -237,7 +241,7 @@ def test_hosting_disabled_default_host_yields_none(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")
     monkeypatch.setenv("AGENT_HOSTING_ENABLED", "false")
     assert config.hosting_enabled() is False
-    post = {"caption": "One platform for your whole gym.",
+    post = {"day_key": "2026-08-10", "caption": "One platform for your whole gym.",
             "pillar": "All in one offer", "format": "feed", "image_url": None}
     out = ncf.display_image_for(post, out_dir=str(tmp_path))
     assert out is None
@@ -254,7 +258,7 @@ def test_render_failure_degrades_to_none_never_raises(monkeypatch, tmp_path):
         raise OSError("cannot open resource: font missing")
 
     host, _ = _capturing_host()
-    post = {"caption": "One platform for your whole gym.",
+    post = {"day_key": "2026-08-10", "caption": "One platform for your whole gym.",
             "pillar": "All in one offer", "format": "feed", "image_url": None}
     # must NOT raise; degrades to the empty state
     out = ncf.display_image_for(post, out_dir=str(tmp_path), renderer=_boom, host=host)
@@ -288,7 +292,7 @@ def test_repeated_reads_reuse_hosted_url_no_rerender(monkeypatch, tmp_path):
         hosts["n"] += 1
         return "https://cdn.example.com/hosted/card.png"
 
-    post = {"id": 42, "caption": "One login. Every result.", "pillar": "The portal",
+    post = {"day_key": "2026-08-10", "id": 42, "caption": "One login. Every result.", "pillar": "The portal",
             "format": "feed", "image_url": None}
     a = ncf.display_image_for(post, out_dir=str(tmp_path), renderer=_r, host=_h)
     b = ncf.display_image_for(post, out_dir=str(tmp_path), renderer=_r, host=_h)
@@ -310,9 +314,9 @@ def test_changed_caption_rerenders(monkeypatch, tmp_path):
     def _h(local_path, tenant):
         return f"https://cdn.example.com/hosted/{renders['n']}.png"
 
-    p1 = {"id": 7, "caption": "First line.", "pillar": "Proof", "format": "feed",
+    p1 = {"day_key": "2026-08-10", "id": 7, "caption": "First line.", "pillar": "Proof", "format": "feed",
           "image_url": None}
-    p2 = {"id": 7, "caption": "A different line.", "pillar": "Proof", "format": "feed",
+    p2 = {"day_key": "2026-08-10", "id": 7, "caption": "A different line.", "pillar": "Proof", "format": "feed",
           "image_url": None}
     ncf.display_image_for(p1, out_dir=str(tmp_path), renderer=_r, host=_h)
     ncf.display_image_for(p2, out_dir=str(tmp_path), renderer=_r, host=_h)
@@ -333,7 +337,7 @@ def test_flag_off_no_fallback_even_when_image_missing(monkeypatch):
     def _h(*a, **k):
         calls.append("host"); return "Y"
 
-    post = {"caption": "One platform for your whole gym.",
+    post = {"day_key": "2026-08-10", "caption": "One platform for your whole gym.",
             "pillar": "All in one offer", "format": "feed", "image_url": None}
     assert ncf.display_image_for(post, renderer=_r, host=_h) is None
     assert calls == []  # flag OFF: no render, no host, unchanged behavior
@@ -341,7 +345,7 @@ def test_flag_off_no_fallback_even_when_image_missing(monkeypatch):
 
 def test_flag_off_existing_image_still_returned(monkeypatch):
     monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "false")
-    post = {"caption": "x", "pillar": "y", "format": "feed",
+    post = {"day_key": "2026-08-10", "caption": "x", "pillar": "y", "format": "feed",
             "image_url": "https://cdn.example.com/keep.png"}
     assert ncf.display_image_for(post) == "https://cdn.example.com/keep.png"
 
@@ -407,3 +411,48 @@ def test_portal_hook_on_keeps_existing_image(monkeypatch):
            "image_url": "https://cdn.example.com/hosted.png", "caption": "Built by owners."}
     post = ps._content_calendar_post(row)
     assert post["image_public_url"] == "https://cdn.example.com/hosted.png"
+
+
+@pytest.mark.parametrize("days_later", [1, 5])
+def test_saved_art_survives_restart_outside_creation_window(monkeypatch, days_later):
+    from datetime import datetime, timezone, timedelta
+    from agent import calendar_autopublish
+    monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")
+    post = {"id": 909, "day_key": "2026-08-10", "caption": "Train together.", "pillar": "Community"}
+    url = "https://cdn.example.com/gym_a/card.png"
+    assert ncf.display_image_for(post, tenant="gym_a", renderer=lambda *a, **k: "render.png",
+                                 host=lambda *a: url) == url
+    ncf._URL_CACHE.clear()
+    monkeypatch.setattr(calendar_autopublish, "_local_now", lambda *a: datetime(2026, 8, 9, tzinfo=timezone.utc) + timedelta(days=days_later))
+
+    def forbidden(*a, **k):
+        pytest.fail("Previously hosted art must be read without generation or hosting")
+
+    assert ncf.display_image_for(post, tenant="gym_a", renderer=forbidden, host=forbidden) == url
+    assert ncf.display_image_for(dict(post, caption="Changed copy."), tenant="gym_a", renderer=forbidden, host=forbidden) is None
+    assert ncf.display_image_for(post, tenant="gym_b", renderer=forbidden, host=forbidden) is None
+
+
+def test_memory_and_durable_cache_do_not_cross_tenants(monkeypatch):
+    monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")
+    post = {"id": 77, "day_key": "2026-08-10", "caption": "Train together."}
+    def render(*a, **k):
+        return "render.png"
+    def host(path, tenant):
+        return f"https://cdn.example.com/{tenant}/card.png"
+    for tenant in ("gym_a", "gym_b"):
+        assert ncf.display_image_for(post, tenant=tenant, renderer=render, host=host) == host("", tenant)
+    ncf._URL_CACHE.clear()
+    def forbidden(*a, **k):
+        pytest.fail("Must reuse durable URL for the matching tenant")
+    for tenant in ("gym_a", "gym_b"):
+        assert ncf.display_image_for(post, tenant=tenant, renderer=forbidden, host=forbidden) == host("", tenant)
+
+
+@pytest.mark.parametrize("day_key", ["2026-08-08", "2026-08-09", "2026-08-12"])
+def test_unsaved_art_outside_two_day_window_is_not_created(monkeypatch, day_key):
+    monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")
+    def forbidden(*a, **k):
+        pytest.fail("Historical, today and far-future art must not be generated")
+    post = {"id": 88, "day_key": day_key, "caption": "Train together."}
+    assert ncf.display_image_for(post, tenant="gym_a", renderer=forbidden, host=forbidden) is None

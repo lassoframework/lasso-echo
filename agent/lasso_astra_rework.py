@@ -30,6 +30,17 @@ SAFETY: capped per run (--limit), reports real generate/insert counts, never
 raises past one bad row (a single Astra failure is logged and skipped, the
 sweep continues). Every inserted row is 'pending' (create_variant_candidate's
 own contract) — nothing here publishes or swaps; a human picks in the portal.
+
+HARD SCOPE GUARD (2026-09-11, born from the CrossFit Chateau scope violation —
+a client gym got swept because scoping was left to the caller remembering to
+pass the right gym_id): this module runs ONLY for LASSO_ONLY_ALLOWLIST. The
+check lives INSIDE run() and INSIDE rework_row() themselves — not something a
+caller has to remember — so any attempt (direct call, future refactor, a typo'd
+gym_id) to run this specific mechanism against a non-allowlisted account raises
+ScopeViolation, logs clearly, and touches zero rows: no read, no Astra call, no
+insert. This guard is specific to THIS mechanism; it must never gate the
+separate no-media fallback (agent/no_media_astra_seed.py), which is intended to
+run on qualifying CLIENT gyms.
 """
 
 import argparse
@@ -40,6 +51,31 @@ from . import config
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".m4v")
 _NOT_ELIGIBLE_STATUS = ("published", "denied", "killed", "deleted")
 
+# HARD SCOPE GUARD: this mechanism is LASSO's own account only. Never add a
+# client gym_id here — that is exactly the class of mistake (CrossFit Chateau,
+# 2026-09-10) this guard exists to make structurally impossible.
+LASSO_ONLY_ALLOWLIST = frozenset({"lasso"})
+
+
+class ScopeViolation(RuntimeError):
+    """Raised when lasso_astra_rework is invoked against a gym_id outside
+    LASSO_ONLY_ALLOWLIST. Never caught internally: this must propagate and stop
+    the run cold."""
+
+
+def _enforce_lasso_only_scope(gym_id, log):
+    """THE gate. Real, inside the generation entrypoints themselves (run() and
+    rework_row()), not a convention a caller has to remember. Throws, logs
+    clearly, and guarantees the caller reads this before any store access."""
+    if gym_id not in LASSO_ONLY_ALLOWLIST:
+        msg = (f"lasso-astra-rework: SCOPE VIOLATION BLOCKED — refusing to run "
+               f"for gym_id={gym_id!r}. This mechanism is hard-scoped to "
+               f"{sorted(LASSO_ONLY_ALLOWLIST)} only; {gym_id!r} is a "
+               "non-allowlisted (client) account. No row was read, no Astra "
+               "call was made, nothing was written.")
+        log(msg)
+        raise ScopeViolation(msg)
+
 
 def _is_video_row(row):
     if row.get("thumbnail_url"):
@@ -48,12 +84,39 @@ def _is_video_row(row):
     return url.endswith(VIDEO_EXTENSIONS)
 
 
+def _already_has_candidate(store, gym_id, months):
+    """The set of anchor row ids that already have a linked candidate. REAL
+    PRODUCTION BUG found 2026-09-11: list_month() itself NEVER returns a
+    candidate row (variant_status=active is hard-filtered server-side — see
+    its own docstring), so a first cut of this dedup that looked for
+    candidates inside list_month's results silently found none, ever, and
+    would have re-processed every already-worked slot into a duplicate
+    candidate. This calls the dedicated list_variant_candidates instead (the
+    complement query), one month at a time same as list_month. A store/fake
+    without list_variant_candidates (getattr fallback) is treated as "no known
+    candidates" rather than raising, so older test fakes keep working, but the
+    real SupabaseCalendarStore always has it."""
+    ids = set()
+    lister = getattr(store, "list_variant_candidates", None)
+    if lister is None:
+        return ids
+    for month in (months or []):
+        for row in (lister(gym_id, month) or []):
+            if str(row.get("gym_id")) != gym_id:
+                continue
+            vo = row.get("variant_of")
+            if vo:
+                ids.add(vo)
+    return ids
+
+
 def find_candidates(store, gym_id="lasso", months=None):
     """Every LASSO row eligible for an Astra v2 rework pass: active, not
-    published/denied/killed/deleted, not already video. `months` is an
-    iterable of 'YYYY-MM' strings to scan (the caller decides the forward
-    span — see cli()); this function only filters, it does not choose dates."""
-    rows = []
+    published/denied/killed/deleted, not already video, not already carrying a
+    pending candidate from an earlier pass. `months` is an iterable of
+    'YYYY-MM' strings to scan (the caller decides the forward span — see
+    cli()); this function only filters, it does not choose dates."""
+    all_rows = []
     seen_ids = set()
     for month in (months or []):
         for row in (store.list_month(gym_id, month) or []):
@@ -63,22 +126,34 @@ def find_candidates(store, gym_id="lasso", months=None):
             seen_ids.add(rid)
             if str(row.get("gym_id")) != gym_id:
                 continue
-            if str(row.get("status") or "").lower() in _NOT_ELIGIBLE_STATUS:
-                continue
-            if str(row.get("variant_status") or "active") != "active":
-                continue
-            if _is_video_row(row):
-                continue
-            if not str(row.get("caption") or "").strip():
-                continue
-            rows.append(row)
+            all_rows.append(row)
+
+    reworked_already = _already_has_candidate(store, gym_id, months)
+
+    rows = []
+    for row in all_rows:
+        if row.get("id") in reworked_already:
+            continue
+        if str(row.get("status") or "").lower() in _NOT_ELIGIBLE_STATUS:
+            continue
+        if str(row.get("variant_status") or "active") != "active":
+            continue
+        if _is_video_row(row):
+            continue
+        if not str(row.get("caption") or "").strip():
+            continue
+        rows.append(row)
     return rows
 
 
 def rework_row(store, row, gym_id="lasso", regen_fn=None, log=None):
     """Generate one Astra v2 image for `row` and land it as a linked candidate.
-    Returns (True, candidate) or (False, reason). Never raises."""
+    Returns (True, candidate) or (False, reason). Never raises (except
+    ScopeViolation, which must propagate)."""
     log = log or (lambda *_: None)
+    _enforce_lasso_only_scope(gym_id, log)  # defense in depth: gated even if a
+                                             # caller reaches this directly,
+                                             # bypassing run().
     from . import variant_regen as _vr
     gen = regen_fn or _vr.generate_variant_image
     try:
@@ -107,6 +182,9 @@ def run(store, gym_id="lasso", months=None, limit=None, write=False, log=None):
     up to `limit` of them (None = no cap). Returns a summary dict. write=False
     is a dry-run: it reports what WOULD run and calls Astra for nothing."""
     log = log or print
+    _enforce_lasso_only_scope(gym_id, log)  # THE gate: checked before the flag,
+                                             # before find_candidates, before
+                                             # anything reads the store.
     if not config.variant_pairing_enabled():
         log("lasso-astra-rework: ECHO_VARIANT_PAIRING is off; nothing to do")
         return {"ok": False, "reason": "variant_pairing_disabled", "found": 0, "done": 0}

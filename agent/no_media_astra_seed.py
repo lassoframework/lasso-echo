@@ -52,8 +52,25 @@ import os
 from . import config
 
 SEED_MAX_PER_RUN = 3
-SEED_DAYS_AHEAD = 7
+SEED_DAYS_AHEAD = 2
 _SCRAPE_MARK_PREFIX = "deep_brain_scraped_"
+
+# CLIENT-SAFE REVIEW MARK (2026-09-11): every row this module inserts is
+# machine-generated from a scrape, ungrounded in any human-approved brand
+# voice yet -- it must read as MORE cautious than an ordinary pending draft,
+# not identical to one. status is already 'pending' (the same universal
+# approval gate every post clears), but a reviewer scanning the queue has no
+# way to tell "a human wrote/approved this brief" apart from "Echo scraped
+# this and took its best shot" without opening each row. This pillar value is
+# the real, visible distinction: distinct from every taxonomy pillar
+# (content_categories.GYM_PILLARS, day_shape.PROOF_PILLARS/
+# INVITATION_PILLARS all check FIXED, known lists and simply do not match this
+# value -- verified, not assumed), so it changes zero downstream rotation
+# logic, and it is returned to the portal UI as-is (portal_social.py serializes
+# `pillar` verbatim). calendar_autopublish.py additionally hard-blocks
+# autopublish on this exact pillar value below (defense in depth beyond the
+# approved_only client gate that already exists).
+NEEDS_CLIENT_SAFE_REVIEW_PILLAR = "deep_brain_needs_client_safe_review"
 
 
 def enabled() -> bool:
@@ -143,14 +160,30 @@ def seed_gaps(base, account, store, *, log=None, today=None,
     log = log or (lambda *_: None)
     if not enabled() or store is None or account is None:
         return 0
-    facts = _ensure_deep_brain_facts(base, log)
-    if not facts:
+    from .client_infographic_fill import real_media_depleted
+    depleted = real_media_depleted(base, now=today)
+    if not depleted:
         return 0
+    from .media_bridge import bridge_days, episode, retry_existing_notice
+    # Read before bridge_days creates a new episode.  Existing episodes retry
+    # their durable outbox entry; new episodes send one notice after a real
+    # calendar gap is confirmed below.
+    existing_notice = bool(episode(base, now=today, create=False))
+    allowed_days = set(bridge_days(base, now=today, days_ahead=days_ahead))
+    if existing_notice:
+        retry_existing_notice(base, account, store, now=today, logger=log)
 
     from .client_infographic_fill import _empty_upcoming_days
-    tz_name = getattr(account, "tz", None) or "America/New_York"
-    days = _empty_upcoming_days(store, base, tz_name, days_ahead, now=today)
+    tz_name = config.posting_timezone_for(base)
+    days = [day for day in _empty_upcoming_days(
+        store, base, tz_name, min(days_ahead, 2), now=today) if day in allowed_days]
     if not days:
+        return 0
+    if depleted and not existing_notice:
+        from .media_bridge import notify_bridge
+        notify_bridge(base, account, logger=log)
+    facts = _ensure_deep_brain_facts(base, log)
+    if not facts:
         return 0
 
     rows = []
@@ -179,8 +212,8 @@ def seed_gaps(base, account, store, *, log=None, today=None,
             continue
         rows.append({
             "gym_id": base, "account": "instagram", "post_date": day,
-            "format": "feed", "pillar": "deep_brain", "caption": headline,
-            "image_url": url, "status": "pending",
+            "format": "feed", "pillar": NEEDS_CLIENT_SAFE_REVIEW_PILLAR,
+            "caption": headline, "image_url": url, "status": "pending",
         })
 
     if not rows:

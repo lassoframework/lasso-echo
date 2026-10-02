@@ -21,6 +21,10 @@ Coverage:
 
 import os
 import sys
+import threading
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -39,6 +43,16 @@ RUN_DATE = "2026-08-10"
 # (FIX 1) never withholds a row; the spacing behavior itself is covered in its
 # own section below with earlier `now` values.
 LATE_NOW = "2026-08-10T23:59:00-04:00"
+
+
+def test_now_iso_serializes_injected_datetime_for_supabase_json():
+    now = datetime(2026, 9, 28, 21, 19, 32, 750000, tzinfo=timezone.utc)
+
+    assert cap._now_iso(now) == "2026-09-28T21:19:32.750000+00:00"
+
+
+def test_now_iso_preserves_existing_iso_string():
+    assert cap._now_iso(LATE_NOW) == LATE_NOW
 
 
 # ---- fakes -----------------------------------------------------------------
@@ -121,6 +135,48 @@ class _FakeStore:
             r["status"] = "pending"
         return r
 
+    def _transition_unpublished_claim(self, gym_id, row_id, status, reason):
+        row = self.rows.get(row_id)
+        if (not row or row.get("gym_id") != gym_id or row.get("status") != "publishing"
+                or row.get("published_at") is not None or row.get("late_post_id") is not None):
+            return None
+        row.update(status=status, reject_reason=reason)
+        return dict(row)
+
+    def mark_duplicate_content(self, gym_id, row_id, reason):
+        return self._transition_unpublished_claim(gym_id, row_id, "deleted", reason)
+
+    def release_content_ledger_claim(self, gym_id, row_id, previous, reason):
+        return self._transition_unpublished_claim(gym_id, row_id, previous, reason)
+
+
+class _AtomicSlotStore(_FakeStore):
+    """Offline model of the SQL advisory-lock reservation and row claim."""
+
+    def __init__(self, rows):
+        super().__init__(rows)
+        self._slot_lock = threading.Lock()
+
+    def claim_publish_slot(self, row_id, gym, day, timezone_name, capacity,
+                           approved_only):
+        with self._slot_lock:
+            row = self.rows[row_id]
+            if row.get("status") not in ("pending", "approved"):
+                return False
+            if approved_only and row["status"] != "approved":
+                return False
+            used = sum(r.get("status") in ("publishing", "published")
+                       and r.get("publish_reservation_day") == day
+                       for r in self.rows.values()
+                       if (r.get("gym_id"), r.get("account"), r.get("format")) ==
+                       (gym, row.get("account"), row.get("format")))
+            if used >= capacity:
+                return False
+            if not super().mark_publishing(row_id):
+                return False
+            row["publish_reservation_day"] = day
+            return True
+
 
 class _FakePublisher:
     """Records each publish call and returns a canned PublishResult per account."""
@@ -190,6 +246,53 @@ def test_already_published_row_is_skipped(armed):
     assert summary["published"] == ["fresh"]
     assert "done" not in store.publishing_calls          # never claimed
     assert [d.draft_id for d, _ in pub.calls] == ["fresh"]
+
+
+def test_needs_client_safe_review_pillar_never_autopublishes(armed):
+    """HARD BLOCK (2026-09-11): a row from the no-media Astra fallback
+    (pillar==no_media_astra_seed.NEEDS_CLIENT_SAFE_REVIEW_PILLAR) must never
+    auto-publish, even when every other gate would otherwise let it through:
+    status already 'approved' and catch_all bypassing the slot gate. Proves
+    the block is unconditional, not merely a side effect of approved_only/
+    trust already covering it (this test runs with approved_only OFF, the
+    LASSO-lane default that would otherwise auto-publish a pending/approved
+    row with no extra gate at all)."""
+    from agent import no_media_astra_seed as nmas
+    row = _row("needs-review", status="approved")
+    row["pillar"] = nmas.NEEDS_CLIENT_SAFE_REVIEW_PILLAR
+    ordinary = _row("ordinary", status="approved")
+    store = _FakeStore([row, ordinary])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True)
+
+    assert "needs-review" not in summary["published"]
+    assert "needs-review" in summary["skipped"]
+    assert "needs-review" not in store.publishing_calls   # never even claimed
+    assert "ordinary" in summary["published"]
+    assert [d.draft_id for d, _ in pub.calls] == ["ordinary"]
+
+
+def test_client_infographic_fill_suffixed_pillar_never_autopublishes(armed):
+    """HARD BLOCK covers client_infographic_fill.py too: its pillar is the
+    source's real category PLUS a suffix (e.g. 'offer::needs_client_safe_
+    review'), not an exact match to no_media_astra_seed's marker -- proves
+    the endswith() check, not just the == check, actually fires."""
+    from agent import client_infographic_fill as cif
+    row = _row("needs-review-2", status="approved")
+    row["pillar"] = "offer" + cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX
+    ordinary = _row("ordinary2", status="approved")
+    store = _FakeStore([row, ordinary])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True)
+
+    assert "needs-review-2" not in summary["published"]
+    assert "needs-review-2" in summary["skipped"]
+    assert "needs-review-2" not in store.publishing_calls
+    assert "ordinary2" in summary["published"]
 
 
 def test_lost_claim_is_not_published(armed):
@@ -297,12 +400,10 @@ def test_account_and_story_mapping(armed):
 
 # ---- one bad row never blocks the rest -------------------------------------
 
-def test_publish_failure_reverts_and_others_still_publish(armed):
+def test_timeout_after_provider_accept_holds_claim_and_others_still_publish(
+        armed, monkeypatch):
     class _Boom(Exception):
         pass
-
-    def _raise(draft, account):
-        raise _Boom("meta 500")
 
     store = _FakeStore([_row("bad"), _row("good")])
     # publisher: 'bad' raises, 'good' publishes.
@@ -312,16 +413,23 @@ def test_publish_failure_reverts_and_others_still_publish(armed):
     def publisher(draft, account):
         calls.append(draft.draft_id)
         if draft.draft_id == "bad":
-            raise _Boom("meta 500")
+            raise _Boom("timeout after accept")
         return PublishResult(ok=True, mode="published", media_id="M")
 
+    monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *a, **kw: None)
     summary = cap.publish_due(RUN_DATE, store=store, publisher=publisher, now=LATE_NOW)
 
     assert summary["published"] == ["good"]
     assert summary["failed"] == ["bad"]
-    assert store.failed_calls == ["bad"]                 # claim reverted
-    assert store.rows["bad"]["status"] == "pending"      # retryable
+    assert store.failed_calls == []
+    assert store.rows["bad"]["status"] == "publishing"
+    assert summary["held"] is True
+    assert summary["recovery_required"] == ["bad"]
     assert store.rows["good"]["status"] == "published"
+    assert calls == ["bad", "good"]
+
+    cap.publish_due(RUN_DATE, store=store, publisher=publisher, now=LATE_NOW)
+    assert calls == ["bad", "good"]
 
 
 # ---- Slack notice ----------------------------------------------------------
@@ -701,13 +809,20 @@ def test_mark_published_writes_status_time_and_media():
 
 
 def test_mark_publish_failed_reverts_to_pending_only():
-    http = _RecordingHTTP(patch_resp=_Resp(200, [{"id": "a"}]))
+    token = "11111111-1111-4111-8111-111111111111"
+    http = _RecordingHTTP(patch_resp=_Resp(
+        200, [{"id": "a", "gym_id": "lasso", "status": "pending"}]))
     store = _store(http)
-    store.mark_publish_failed("a")
+    store.mark_publish_failed(
+        "a", gym_id="lasso", expected_claim_token=token)
 
     _, _url, params, _headers, body = http.calls[0]
     assert params["id"] == "eq.a"
-    assert body == {"status": "pending"}                 # nothing else recorded
+    assert params["gym_id"] == "eq.lasso"
+    assert params["status"] == "eq.publishing"
+    assert params["publish_claim_token"] == f"eq.{token}"
+    assert body == {"status": "pending", "publish_reservation_day": None,
+                    "publish_claim_token": None}
 
 
 def test_account_for_skips_non_ig_fb_platforms():
@@ -946,6 +1061,148 @@ def test_client_row_waits_for_its_slot_then_publishes_now(armed, monkeypatch):
     assert s2["published"] == ["cx"]
     assert sent == [(store.rows["cx"].get("draft_id") or sent[0][0], None)] or \
            (len(sent) == 1 and sent[0][1] is None)
+
+
+def test_client_approved_rows_respect_platform_day_capacity(armed, monkeypatch):
+    """Separate approved FB rows cannot all publish on a 1x gym day."""
+    from agent import cadence
+
+    class _Acct:
+        key = "gymx_fb"; platform = "facebook"; display_name = "Gym X"
+
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    rows = [_row(rid, account="facebook", status="approved")
+            for rid in ("fb1", "fb2", "fb3")]
+    for row in rows:
+        row["gym_id"] = "gymx"
+    store = _AtomicSlotStore(rows)
+    sent = []
+    summary = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                              approved_only=True, catch_all=True,
+                              zernio_publish=_zern_capture(sent))
+    assert summary["published"] == ["fb1"]
+    assert set(summary["waiting"]) == {"fb2", "fb3"}
+    assert store.publishing_calls == ["fb1"]
+
+    # A real 2x preference still permits its second distinct feed.
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 2)
+    again = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                            approved_only=True, catch_all=True,
+                            zernio_publish=_zern_capture(sent))
+    assert again["published"] == ["fb2"]
+    assert again["waiting"] == ["fb3"]
+
+
+def test_client_slot_capacity_keeps_cross_platform_pair_and_approval_gate(
+        armed, monkeypatch):
+    from agent import cadence
+
+    class _Acct:
+        def __init__(self, platform):
+            self.key = f"gymx_{'fb' if platform == 'facebook' else 'ig'}"
+            self.platform = platform
+            self.display_name = "Gym X"
+
+    monkeypatch.setattr(cap, "_account_for",
+                        lambda row, gym_id: _Acct(row["account"]))
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    rows = [_row("ig", status="approved"),
+            _row("fb", account="facebook", status="approved"),
+            _row("unapproved", account="facebook", status="pending")]
+    for row in rows:
+        row["gym_id"] = "gymx"
+    store = _AtomicSlotStore(rows)
+    sent = []
+    summary = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                              approved_only=True, catch_all=True,
+                              zernio_publish=_zern_capture(sent))
+    assert set(summary["published"]) == {"ig", "fb"}
+    assert summary["waiting"] == ["unapproved"]
+    assert "unapproved" not in store.publishing_calls
+
+
+def test_autonomous_overlap_and_catchup_share_actual_day_capacity(armed, monkeypatch):
+    """Two workers must not send distinct rows from yesterday and today together."""
+    from agent import cadence
+
+    class _Acct:
+        key = "gymx_fb"; platform = "facebook"; display_name = "Gym X"
+
+    barrier = threading.Barrier(2)
+
+    class _ConcurrentStore(_AtomicSlotStore):
+        def due_rows(self, gym, run_date, catchup_days=0):
+            return [dict(r) for r in self.rows.values()
+                    if r.get("status") == "pending"]
+
+        def claim_publish_slot(self, *args):
+            barrier.wait(timeout=5)  # both workers enter before either can reserve
+            return super().claim_publish_slot(*args)
+
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    rows = [_row("yesterday", account="facebook", status="pending",
+                 post_date="2026-08-09"),
+            _row("today", account="facebook", status="pending")]
+    for row in rows:
+        row["gym_id"] = "gymx"
+    store = _ConcurrentStore(rows)
+    sent = []
+    results = []
+
+    def worker():
+        results.append(cap.publish_due(
+            RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+            approved_only=False, catchup_days=1, catch_all=True,
+            zernio_publish=_zern_capture(sent)))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(sent) == 1
+    assert sum(len(result["published"]) for result in results) == 1
+    assert {r.get("publish_reservation_day") for r in store.rows.values()
+            if r.get("status") == "published"} == {RUN_DATE}
+
+
+def test_slot_reservation_refreshes_local_day_after_preflight(armed, monkeypatch):
+    """A render crossing midnight reserves the day of the network send."""
+    from agent import cadence
+
+    class _Acct:
+        key = "gymx_ig"; platform = "instagram"; display_name = "Gym X"
+
+    class _RecordingStore(_AtomicSlotStore):
+        def claim_publish_slot(self, row_id, gym, day, timezone_name,
+                               capacity, approved_only):
+            self.claim_day = day
+            return super().claim_publish_slot(row_id, gym, day, timezone_name,
+                                              capacity, approved_only)
+
+    original_local_now = cap._local_now
+    calls = 0
+
+    def crossing_midnight(now, timezone_name):
+        nonlocal calls
+        calls += 1
+        instant = "2026-08-10T23:59:00-04:00" if calls == 1 else \
+                  "2026-08-11T00:01:00-04:00"
+        return original_local_now(instant, timezone_name)
+
+    monkeypatch.setattr(cap, "_local_now", crossing_midnight)
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda gym, store: 1)
+    row = _row("cross-midnight", status="approved")
+    row["gym_id"] = "gymx"
+    store = _RecordingStore([row])
+    cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                    approved_only=True, catch_all=True,
+                    zernio_publish=_zern_capture([]))
+    assert store.claim_day == "2026-08-11"
 
 
 def test_autonomous_client_also_publishes_now_at_slot(armed, monkeypatch):
@@ -1244,27 +1501,54 @@ def test_expired_sweep_excludes_google_business_rows():
 # by the existing publish-exception path, or a direct ops_alerts.alert call, or a
 # kv-deduped per-gym-per-day stamp — never a NEW unbounded alert path.
 
-def test_soft_failure_now_feeds_the_repeat_failure_counter(armed, monkeypatch):
-    """DEFECT 1: a SOFT failure (publisher returns normally with ok=False / a
-    non-'published' mode, never raises) used to fall through with only a print —
-    _note_repeat_failure was wired ONLY to the neighbouring exception branch, so a
-    row stuck soft-failing looped every tick forever with nobody told. Now it counts
-    the same way: silent for the first REPEAT_FAILURE_ALERT_AT-1 ticks, then ONE
-    alert naming ok/mode. mark_publish_failed reverts to pending each tick, so the
-    row is due again next call — simulating the real ~1-min retry loop."""
+def test_ambiguous_failed_result_holds_and_alerts_without_retry(armed, monkeypatch):
     sent = _capture_alerts(monkeypatch)
     store = _FakeStore([_row("soft")])
     pub = _FakePublisher(PublishResult(ok=False, mode="failed", detail="ig 400"))
 
-    for _ in range(cap.REPEAT_FAILURE_ALERT_AT - 1):
-        summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
-        assert sent == []                          # silent below threshold
-        assert store.rows["soft"]["status"] == "pending"   # retryable, not lost
-
     summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert "soft" in summary["failed"]
-    assert len(sent) == 1                           # threshold alert, exactly one
-    assert "ok=False" in sent[0] and "mode='failed'" in sent[0]
+    assert summary["recovery_required"] == ["soft"]
+    assert store.rows["soft"]["status"] == "publishing"
+    assert len(sent) == 1
+    assert "AMBIGUOUS" in sent[0] and "ok=False" in sent[0]
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert len(pub.calls) == 1
+
+
+def test_explicit_provider_rejection_proving_no_post_reverts_for_retry(
+        armed, monkeypatch):
+    from types import SimpleNamespace
+
+    result = SimpleNamespace(ok=False, mode="rejected", media_id="",
+                             detail="validation rejected before create",
+                             definitive_no_post=True)
+    store = _FakeStore([_row("definite")])
+    pub = _FakePublisher(result)
+    monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *a, **kw: None)
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["failed"] == ["definite"]
+    assert summary["recovery_required"] == []
+    assert store.rows["definite"]["status"] == "pending"
+    assert store.failed_calls == ["definite"]
+
+
+def test_failed_result_without_explicit_no_post_contract_never_reclaims(
+        armed, monkeypatch):
+    result = PublishResult(ok=False, mode="rejected", detail="provider said no")
+    store = _FakeStore([_row("uncertain")])
+    pub = _FakePublisher(result)
+    monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *a, **kw: None)
+
+    first = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    second = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert first["recovery_required"] == ["uncertain"]
+    assert second["published"] == []
+    assert store.rows["uncertain"]["status"] == "publishing"
+    assert len(pub.calls) == 1
 
 
 def test_soft_failure_alert_does_not_storm_past_threshold(armed, monkeypatch):
@@ -1329,6 +1613,95 @@ def test_mark_published_write_failure_alerts_directly(armed, monkeypatch):
     assert len(sent) == 1
     assert "PUBLISHED live" in sent[0]
     assert "supabase write timeout" in sent[0]
+
+
+def test_published_state_conflict_seeds_exact_row_first_fixer_event():
+    """Only the explicit guarded 409 after a real provider success is actionable.
+
+    The seed carries the exact calendar row and tenant-bound expected terminal state,
+    never an error string or an inferred target from a support message.
+    """
+    row = _row("calendar_conflict_123", status="publishing")
+    row["gym_id"] = "chateau"
+    sent = []
+
+    def event_builder(**kwargs):
+        sent.append(("event", kwargs))
+        return {"event": kwargs}
+
+    def sender(event):
+        sent.append(("send", event))
+        return SimpleNamespace(ok=True)
+
+    result = cap._submit_published_state_conflict(
+        gym_id="chateau", row=row,
+        error=pcs.PortalStoreError(409, "refusing to stamp published over conflict"),
+        resolve_client_id=lambda gym: (
+            "22222222-2222-4222-8222-222222222222" if gym == "chateau" else None),
+        event_builder=event_builder, sender=sender,
+    )
+
+    assert result is True
+    event = sent[0][1]
+    assert event == {
+        "submission_key": str(uuid5(
+            NAMESPACE_URL,
+            "lasso:fixer:calendar-published-state-conflict:v1:chateau:"
+            "calendar_conflict_123",
+        )),
+        "client_id": "22222222-2222-4222-8222-222222222222",
+        "row_id": "calendar_conflict_123",
+        "expected_status": "published",
+    }
+    assert sent[1] == ("send", {"event": event})
+
+
+@pytest.mark.parametrize("error, gym_id", [
+    (RuntimeError("supabase write timeout"), "chateau"),
+    (pcs.PortalStoreError(503, "temporarily unavailable"), "chateau"),
+    (pcs.PortalStoreError(409, "state conflict"), "other-gym"),
+])
+def test_published_state_conflict_never_infers_ticket_from_transient_or_wrong_tenant(
+        error, gym_id):
+    called = []
+    row = _row("calendar_conflict_456", status="publishing")
+    row["gym_id"] = "chateau"
+
+    assert cap._submit_published_state_conflict(
+        gym_id=gym_id, row=row, error=error,
+        resolve_client_id=lambda _: called.append("resolve"),
+        event_builder=lambda **_: called.append("event"),
+        sender=lambda _: called.append("send"),
+    ) is False
+    assert called == []
+
+
+@pytest.mark.parametrize("ticket_accepted", [True, False])
+def test_mark_published_state_conflict_submits_without_changing_claim(
+        armed, monkeypatch, ticket_accepted):
+    class _ConflictStore(_FakeStore):
+        def mark_published(self, row_id, media_id, published_at):
+            raise pcs.PortalStoreError(
+                409, "row changed out of publishing; refusing terminal write")
+
+    seen = []
+    monkeypatch.setattr(
+        cap, "_submit_published_state_conflict",
+        lambda **kwargs: seen.append(kwargs) or ticket_accepted,
+    )
+    store = _ConflictStore([_row("calendar-conflict-live")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["failed"] == ["calendar-conflict-live"]
+    assert summary["published"] == []
+    assert store.rows["calendar-conflict-live"]["status"] == "publishing"
+    assert len(seen) == 1
+    assert seen[0]["gym_id"] == "lasso"
+    assert seen[0]["row"]["id"] == "calendar-conflict-live"
+    assert isinstance(seen[0]["error"], pcs.PortalStoreError)
+    assert seen[0]["error"].status == 409
 
 
 def test_mark_published_write_failure_alert_does_not_storm_across_ticks(armed, monkeypatch):
@@ -1499,3 +1872,212 @@ def test_expired_row_with_full_book_is_retired_not_stranded(monkeypatch):
     assert store.redates == []
     assert store.status_sets == [("full1", "killed")]
     assert len(seen) == 1 and "No action needed" in seen[0] and "retired 1" in seen[0]
+
+
+def test_unreadable_content_ledger_neither_publishes_nor_deletes(armed, monkeypatch):
+    class UnreadableLedger:
+        def get(self, key, default=""):
+            raise RuntimeError("ledger unavailable")
+
+    store = _FakeStore([_row("ledger-read-failure")])
+    cleanup_calls = []
+    monkeypatch.setattr(cap, "_kv_default", lambda: UnreadableLedger())
+    monkeypatch.setattr(cap, "_mark_duplicate_content",
+                        lambda *args: cleanup_calls.append(args))
+    publisher = _FakePublisher()
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                              notifier=_FakeNotifier(), now=LATE_NOW)
+    assert summary["published"] == []
+    assert summary["skipped"] == ["ledger-read-failure"]
+    assert publisher.calls == []
+    assert cleanup_calls == []
+    assert store.rows["ledger-read-failure"]["status"] == "pending"
+
+
+@pytest.mark.parametrize("cleanup_ok", [True, False])
+def test_duplicate_refusal_reports_real_cleanup_without_publishing(armed, monkeypatch, cleanup_ok):
+    from agent import ops_alerts
+    class ClaimedLedger:
+        def get(self, key, default=""):
+            return "different-row|2026-09-10T12:00:00Z"
+    store = _FakeStore([_row("duplicate-row")])
+    if not cleanup_ok:
+        monkeypatch.setattr(store, "mark_duplicate_content", lambda *args: None)
+    monkeypatch.setattr(cap, "_kv_default", lambda: ClaimedLedger())
+    alerts = []
+    monkeypatch.setattr(ops_alerts, "alert", alerts.append)
+    publisher = _FakePublisher()
+    result = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                             notifier=_FakeNotifier(), now=LATE_NOW)
+    assert publisher.calls == []
+    assert result["skipped"] == ["duplicate-row"]
+    assert store.rows["duplicate-row"]["status"] == ("deleted" if cleanup_ok else "publishing")
+    assert any(("soft-deleted" if cleanup_ok else "Cleanup was not confirmed") in s for s in alerts)
+
+
+@pytest.mark.parametrize("rollback_result", [False, None])
+def test_unconfirmed_pre_network_rollback_is_held_without_send_or_reclaim(
+        armed, monkeypatch, rollback_result):
+    """A zero-row rollback must be visible as recovery work, never a successful revert."""
+    class ZeroRowRollbackStore(_FakeStore):
+        def mark_publish_failed(self, row_id, revert_status="pending", reject_reason=""):
+            self.failed_calls.append(row_id)
+            return rollback_result
+
+    store = ZeroRowRollbackStore([_row("stranded")])
+    alerts = []
+    monkeypatch.setattr(cap, "_drive_asset_usable_at_send", lambda *_: False)
+    monkeypatch.setattr(cap, "_alert_publish_blocked",
+                        lambda *args, **kwargs: alerts.append((args, kwargs)))
+    publisher = _FakePublisher()
+
+    result = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                             now=LATE_NOW, catch_all=True)
+
+    assert result["failed"] == ["stranded"]
+    assert result["held"] is True
+    assert result["recovery_required"] == ["stranded"]
+    assert store.rows["stranded"]["status"] == "publishing"
+    assert publisher.calls == []
+    assert alerts[0][1]["reverted"] is False
+
+    # An unconfirmed rollback leaves its claim in place, so another tick cannot post it.
+    retry = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                            now=LATE_NOW, catch_all=True)
+    assert retry["published"] == []
+    assert publisher.calls == []
+
+
+def test_pre_network_rollback_supplies_tenant_and_holds_on_cas_miss(
+        armed, monkeypatch):
+    token = "11111111-1111-4111-8111-111111111111"
+
+    class ConditionalRollbackStore(_FakeStore):
+        def claim_publish_slot(self, row_id, gym_id, day, timezone_name,
+                               capacity, approved_only):
+            return token if self.mark_publishing(row_id) else None
+
+        def mark_publish_failed(self, row_id, revert_status="pending",
+                                reject_reason=None, gym_id=None,
+                                expected_claim_token=None):
+            self.rollback_args = (row_id, revert_status, reject_reason,
+                                  gym_id, expected_claim_token)
+            return None  # concurrent status change, zero rows updated
+
+    store = ConditionalRollbackStore([_row("raced")])
+    monkeypatch.setattr(cap, "_drive_asset_usable_at_send", lambda *_: False)
+    monkeypatch.setattr(cap, "_alert_publish_blocked", lambda *a, **kw: None)
+    monkeypatch.setattr(cap, "_published_content_key", lambda *a: "")
+    publisher = _FakePublisher()
+
+    result = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                             now=LATE_NOW, catch_all=True)
+
+    assert store.rollback_args == ("raced", "pending",
+                                   "media_asset_review_required", "lasso", token)
+    assert result["held"] is True
+    assert result["recovery_required"] == ["raced"]
+    assert publisher.calls == []
+
+
+@pytest.mark.parametrize("previous", ["pending", "approved"])
+def test_content_stamp_failure_releases_for_retry_and_preserves_approval(armed, monkeypatch, previous):
+    class FailedStampLedger:
+        def get(self, key, default=""):
+            return ""
+        def set(self, key, value):
+            raise RuntimeError("write unavailable")
+    store = _FakeStore([_row("stamp-failure", status=previous)])
+    monkeypatch.setattr(cap, "_kv_default", lambda: FailedStampLedger())
+    publisher = _FakePublisher()
+    result = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
+                             notifier=_FakeNotifier(), now=LATE_NOW)
+    assert publisher.calls == []
+    assert result["skipped"] == ["stamp-failure"]
+    assert store.rows["stamp-failure"]["status"] == previous
+    assert store.rows["stamp-failure"]["reject_reason"] == "content_stamp_failed"
+
+
+@pytest.mark.parametrize("ledger_mode", ["read", "write", "duplicate"])
+def test_owned_claim_token_reaches_each_pre_network_ledger_transition(
+        armed, monkeypatch, ledger_mode):
+    """End-to-end publisher wiring must carry the exact claim UUID to cleanup."""
+    token = "33333333-3333-4333-8333-333333333333"
+
+    class OwnedTransitionStore(_FakeStore):
+        def claim_publish_slot(self, row_id, gym_id, day, timezone_name,
+                               capacity, approved_only):
+            row = self.rows[row_id]
+            row.update(status="publishing", publish_claim_token=token)
+            return token
+
+        def release_content_ledger_claim(self, gym_id, row_id, previous, reason,
+                                         expected_claim_token=None):
+            self.transition = ("release", gym_id, row_id, previous, reason,
+                               expected_claim_token)
+            if expected_claim_token != self.rows[row_id].get("publish_claim_token"):
+                return None
+            row = self.rows[row_id]
+            row.update(status=previous, publish_claim_token=None,
+                       reject_reason=reason)
+            return dict(row)
+
+        def mark_duplicate_content(self, gym_id, row_id, reason,
+                                   expected_claim_token=None):
+            self.transition = ("duplicate", gym_id, row_id, reason,
+                               expected_claim_token)
+            if expected_claim_token != self.rows[row_id].get("publish_claim_token"):
+                return None
+            row = self.rows[row_id]
+            row.update(status="deleted", publish_claim_token=None,
+                       reject_reason=reason)
+            return dict(row)
+
+    class Ledger:
+        def get(self, key, default=""):
+            if ledger_mode == "read":
+                raise RuntimeError("read unavailable")
+            if ledger_mode == "duplicate":
+                return "another-row|2026-09-18T12:00:00Z"
+            return ""
+
+        def set(self, key, value):
+            if ledger_mode == "write":
+                raise RuntimeError("write unavailable")
+
+    store = OwnedTransitionStore([_row(f"owned-{ledger_mode}")])
+    monkeypatch.setattr(cap, "_kv_default", lambda: Ledger())
+    publisher = _FakePublisher()
+
+    result = cap.publish_due(
+        RUN_DATE, store=store, publisher=publisher,
+        notifier=_FakeNotifier(), now=LATE_NOW)
+
+    assert publisher.calls == []
+    assert result["skipped"] == [f"owned-{ledger_mode}"]
+    assert store.transition[-1] == token
+    assert store.rows[f"owned-{ledger_mode}"]["publish_claim_token"] is None
+    expected_status = "deleted" if ledger_mode == "duplicate" else "pending"
+    assert store.rows[f"owned-{ledger_mode}"]["status"] == expected_status
+
+
+@pytest.mark.parametrize('cooldown,fmt,blocked', [
+    (False, 'feed', False), (True, 'story', False), (True, 'feed', True),
+])
+def test_calendar_grade_obeys_caption_cooldown_switch_and_story_exemption(
+        armed, monkeypatch, cooldown, fmt, blocked):
+    from agent import caption_ledger, publish_guard
+    monkeypatch.setenv('AGENT_CALENDAR_GRADE', 'true')
+    monkeypatch.setenv('AGENT_CAPTION_COOLDOWN', str(cooldown).lower())
+    checked = []
+    monkeypatch.setattr(caption_ledger, 'is_blocked',
+                        lambda *a, **k: checked.append(a) or True)
+    monkeypatch.setattr(publish_guard, 'check', lambda _: [])
+    store = _FakeStore([_row('cooldown-row', fmt=fmt, status='approved')])
+    pub = _FakePublisher()
+    result = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                             notifier=_FakeNotifier(), now=LATE_NOW,
+                             approved_only=True)
+    assert bool(checked) is blocked
+    assert len(pub.calls) == (0 if blocked else 1)
+    assert store.rows['cooldown-row']['status'] == ('pending' if blocked else 'published')

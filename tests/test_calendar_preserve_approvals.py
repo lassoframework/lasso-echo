@@ -173,7 +173,8 @@ class _ApplyStore:
     def locked_slots(self, account_key, month):
         return self._locked
 
-    def delete_month(self, account_key, month, *, preserve_human=True):
+    def delete_month(self, account_key, month, *, preserve_human=True,
+                     preserve_dates=()):
         # the lane must keep asking for a preserving delete, never a full wipe
         assert preserve_human is True
         self.deleted.append((account_key, month))
@@ -243,4 +244,10 @@ def test_client_apply_passes_locked_days_to_delete():
     store = _Rec()
     _apply("eng", [_row()], date(2026, 8, 13), 5, store, lambda m: None,
            locked_days={"2026-08-13"})
-    assert store.calls and store.calls[0][1] == ("2026-08-13",)
+    assert store.calls
+    preserved = set(store.calls[0][1])
+    assert "2026-08-13" in preserved
+    assert all(day in preserved for day in (
+        "2026-08-01", "2026-08-12", "2026-08-18", "2026-08-31"))
+    assert all(day not in preserved for day in (
+        "2026-08-14", "2026-08-15", "2026-08-16", "2026-08-17"))

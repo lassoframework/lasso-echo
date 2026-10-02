@@ -611,3 +611,38 @@ def test_a_padded_gym_id_derives_the_same_key_as_the_mint_sites():
         f"the resolver derived {list(mapping)} but the mint sites derive {expected!r} -- "
         f"a padded id must hash identically in both places")
     assert mapping[expected] == LIVE
+
+
+def test_mflh_raw_uuid_connect_alias_resolves_to_token_key():
+    gid = 'a0fcb10f-73dc-4e56-b6ca-61ac9bc9470f'
+    get = _plane([{'gym_id': gid, 'echo_account_key': 'mflhaa5139'}],
+                 [{'id': gid, 'name': 'MFLH'}])
+    assert akr.resolve('mflha0fcb1', get=get) == 'mflhaa5139'
+    assert akr.resolve('mflha0fcb1_ig', get=get) == 'mflhaa5139_ig'
+
+
+def test_raw_uuid_prefix_collision_never_remaps_either_gym():
+    ids = ['a0fcb100-0000-4000-8000-000000000001',
+           'a0fcb100-0000-4000-8000-000000000002']
+    get = _plane([{'gym_id': gid, 'echo_account_key': 'canonical' + str(i)}
+                  for i, gid in enumerate(ids)],
+                 [{'id': gid, 'name': 'MFLH'} for gid in ids])
+    assert akr.resolve('mflha0fcb1', get=get) == 'mflha0fcb1'
+
+
+def test_mflh_connect_boundary_and_fleet_discovery_use_canonical_key(monkeypatch):
+    from agent import intake_web, accounts, echo_clients, calendar_autopublish
+    from types import SimpleNamespace
+    gid = 'a0fcb10f-73dc-4e56-b6ca-61ac9bc9470f'
+    get = _plane([{'gym_id': gid, 'echo_account_key': 'mflhaa5139'}],
+                 [{'id': gid, 'name': 'MFLH'}])
+    state = akr._build(get=get)
+    monkeypatch.setattr(akr, '_state', lambda **kw: state)
+    monkeypatch.setattr(intake_web, 'is_revoked', lambda key: False)
+    assert intake_web._resolved_account_key('mflha0fcb1') == 'mflhaa5139'
+    monkeypatch.setattr(accounts, 'all_accounts', lambda: [
+        SimpleNamespace(key='mflha0fcb1_ig'), SimpleNamespace(key='mflhaa5139_fb')])
+    monkeypatch.setattr(echo_clients, 'only_client_bases', lambda bases: bases)
+    assert calendar_autopublish.client_gym_bases() == ['mflhaa5139']
+    monkeypatch.setattr(intake_web, 'is_revoked', lambda key: True)
+    assert intake_web._resolved_account_key('mflha0fcb1') == 'mflha0fcb1'

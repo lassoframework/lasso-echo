@@ -78,6 +78,9 @@ class FakeBus:
         self.patches.append((ticket_id, fields))
         self.tickets[ticket_id].update(fields)
 
+    def ticket(self, ticket_id):
+        return dict(self.tickets[ticket_id])
+
 
 def _ticket(**over):
     row = {
@@ -400,6 +403,25 @@ def test_intake_pass_escalates_a_question_that_cannot_be_grounded():
     assert log["opened"] == []
 
 
+def test_held_portal_answer_creates_team_card_without_customer_notice(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "false")
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?")])
+    log, open_dm, post = _calls()
+    notices, notice = _notices()
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda system, user: "Your Instagram is connected.",
+                  **_client_deps())
+
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert len(notices) == 1
+    assert [row["kind"] for row in bus.outbound] == [A.KIND_ANSWER]
+    assert bus.outbound[0]["delivery_status"] == "held"
+    assert log["opened"] == [] and log["posted"] == []
+
+
 # ---- intake_pass: code_fix -- D14's hold gate is untouched ---------------------------
 
 def test_intake_pass_holds_a_code_fix_behind_the_fixer_tap_same_as_any_other():
@@ -419,6 +441,7 @@ def test_intake_pass_holds_a_code_fix_behind_the_fixer_tap_same_as_any_other():
     assert notices[0]["kind"] == A.KIND_FIXER_REQUEST
     # No autonomous client message for a code_fix -- nothing is verified yet.
     assert log["opened"] == []
+    assert not [o for o in bus.outbound if o["kind"] in (A.KIND_ACK, A.KIND_STATUS, A.KIND_TEMPLATE)]
 
 
 # ---- fixed_pass -------------------------------------------------------------------

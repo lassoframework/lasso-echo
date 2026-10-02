@@ -17,6 +17,11 @@ gym-media rails:
     ('media pool empty for {gym} — ask for photos'). Never reuse a cooling-down
     asset to fill a gap.
 
+The automatic planner keeps those rules without exception. ``cooldown_fallback``
+is a separate, explicit-user-action lane used only by the portal media swap: after
+the normal pool is exhausted it can return the least-recently-used safe asset that
+is not on the live forward book. Explicit client reuse promises remain hard gates.
+
 used_count / last_used_at are stamped ONLY at stage time (stamp_use, called by the
 builder once the PENDING row is assembled) and ROLLED BACK on a coach deny
 (rollback_use / observe_denials), so a denied post returns to the pool.
@@ -61,6 +66,28 @@ def _parse_ts(s):
         return None
 
 
+def _clean_moderation_evidence(asset):
+    """Only evidence for this exact Drive file and byte version can clear it.
+
+    This validates binding, not the identity of a scan provider. A trusted scan
+    producer is still required before operators can safely populate evidence.
+    """
+    evidence = asset.get("moderation_json")
+    if asset.get("moderation_status") != "clean" or not isinstance(evidence, dict):
+        return False
+    content_hash = str(asset.get("content_hash") or "").strip()
+    if not content_hash or not asset.get("id") or not asset.get("gym_id"):
+        return False
+    return (evidence.get("verdict") == "clean"
+            and isinstance(evidence.get("provider"), str)
+            and bool(evidence["provider"].strip())
+            and evidence.get("content_hash") == content_hash
+            and evidence.get("asset_id") == asset["id"]
+            and evidence.get("gym_id") == asset["gym_id"]
+            and evidence.get("people_detected") is asset.get("people_detected")
+            and _parse_ts(evidence.get("observed_at")) is not None)
+
+
 def is_usable(asset):
     """Is this media_asset row one this selector would ever hand to a post?
 
@@ -79,14 +106,30 @@ def is_usable(asset):
         return False
     if a.get("excluded_by_coach"):
         return False
+    if a.get("review_status") != "approved":
+        return False
+    if not a.get("reviewed_by") or not _parse_ts(a.get("reviewed_at")):
+        return False
+    if not str(a.get("content_hash") or "").strip():
+        return False
+    if a.get("review_content_hash") != a.get("content_hash"):
+        return False
+    if not _clean_moderation_evidence(a):
+        return False
+    # Photo releases are not a publishing requirement. Safety moderation remains
+    # byte-bound and fail-closed above. Clean automatic moderation approves the
+    # exact reviewed hash. Legacy consent columns remain readable for old rows but
+    # never decide whether a clean, reviewed asset can publish.
     return True
 
 
 def base_gym_key(account_key):
     """The gym base key a per-platform account key rolls up to (pierce_ig ->
-    pierce), matching podcast_selector.base_gym_key / real_month_run."""
+    pierce), matching podcast_selector.base_gym_key / real_month_run. '_gbp'
+    is stripped too: a Google Business Profile lane key must roll up to the
+    same base so a GBP-used asset shares the gym's pool and reuse history."""
     base = str(account_key or "")
-    for suf in ("_ig", "_fb"):
+    for suf in ("_ig", "_fb", "_gbp"):
         if base.endswith(suf):
             return base[: -len(suf)]
     return base
@@ -113,6 +156,9 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
         return []
 
     cutoff = now - timedelta(days=REUSE_COOLDOWN_DAYS)
+    from .media_reuse_policy import reuse_months, months_before
+    if reuse_months(base):
+        cutoff = months_before(now, reuse_months(base))
     month = now.strftime("%Y-%m")
     excl = {str(i) for i in (exclude_ids or ()) if i}
 
@@ -142,6 +188,51 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
     candidates.sort(key=lambda a: (
         int(a.get("used_count") or 0),
         _parse_ts(a.get("last_used_at")) or _floor,      # NULLS FIRST
+        str(a.get("id") or "")))
+    return candidates
+
+
+def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=()):
+    """Usable assets ordered for a user-requested swap after the normal pool is
+    exhausted, without applying the 90-day or same-month clocks.
+
+    This is deliberately narrower than :func:`pickable`: callers must pass every
+    asset already carried by the live forward book in ``exclude_ids``.  The
+    selector still enforces tenant ownership, byte-bound review/moderation, coach
+    exclusions, and kind preference.  A gym with an explicit long-term reuse
+    policy (currently Zanshin's nine calendar months) gets no fallback at all.
+
+    Month planning and automatic publishing never call this helper.  It exists so
+    a person asking Echo for a different photo is not deadlocked merely because a
+    small otherwise-safe library is inside the generic rotation cooldown.
+    """
+    base = base_gym_key(gym_id)
+    from .media_reuse_policy import reuse_months
+    if reuse_months(base):
+        return []
+    store = store or _idx.default_store()
+    if not store.available():
+        return []
+    try:
+        assets = store.list_assets(base)
+    except Exception as e:  # noqa: BLE001 - a read failure is no fallback
+        print(f"[gym-media-selector] fallback asset read failed for {base}: "
+              f"{type(e).__name__}: {e}")
+        return []
+    excl = {str(i) for i in (exclude_ids or ()) if i}
+    candidates = []
+    for asset in assets:
+        if str(asset.get("gym_id") or "") != base:
+            continue
+        if not is_usable(asset) or str(asset.get("id")) in excl:
+            continue
+        if kind_preference and asset.get("kind") != kind_preference:
+            continue
+        candidates.append(asset)
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    candidates.sort(key=lambda a: (
+        _parse_ts(a.get("last_used_at")) or floor,
+        int(a.get("used_count") or 0),
         str(a.get("id") or "")))
     return candidates
 

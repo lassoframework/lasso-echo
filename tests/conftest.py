@@ -16,6 +16,35 @@ import os
 
 import pytest
 
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_default_r2: exercise intake_web._default_r2 without the healthy denylist mock",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _healthy_revocation_denylist(_isolated_db, monkeypatch, request):
+    """Offline success-path tests have a confirmed, empty R2 denylist.
+
+    Publishing now fails closed for a client when the denylist cannot be read.
+    The credential quarantine deliberately leaves R2 unconfigured, which models an
+    outage rather than a healthy empty control document. Individual revocation
+    outage tests override ``intake_web._default_r2`` after this fixture runs.
+    """
+    if request.node.get_closest_marker("real_default_r2"):
+        return
+
+    from types import SimpleNamespace
+    from agent import intake_web
+
+    monkeypatch.setattr(
+        intake_web,
+        "_default_r2",
+        lambda: SimpleNamespace(get_bytes=lambda _key: b'{"revoked": []}'),
+    )
+
 # CREDENTIAL QUARANTINE (2026-08-27, the gritx storm post-mortem): a suite run
 # INSIDE the production container executed tests against LIVE creds — flags were
 # armed (fixed by the AGENT_*/ECHO_* sweep below) but raw credentials are not

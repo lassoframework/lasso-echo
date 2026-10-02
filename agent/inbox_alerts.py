@@ -41,7 +41,7 @@ import unicodedata
 from datetime import datetime, timezone
 
 from . import config
-from .zernio import ZernioClient, _parse_iso
+from .zernio import ZernioClient, ZernioPaginationError, _parse_iso
 
 # An unanswered comment keeps appearing on the daily card (max one card/day)
 # until someone replies or it ages past this window — the nag IS the feature.
@@ -53,6 +53,21 @@ POST_LOOKBACK_DAYS = 30
 REVIEW_LOOKBACK_DAYS = 14
 MAX_ITEMS_PER_CARD = 5
 SNIPPET_LEN = 100
+
+# Operator-confirmed cancellation, 2026-09-14. Cover both historical keys;
+# suppress alerts only, without deleting accounts, evidence, or queued work.
+ALERT_RETIRED_BASES = frozenset({
+    "crossfitreverb", "crossfitreverb6cdf33", "crossfitreverb30b5b2",
+})
+
+
+def alerts_retired(gym_id):
+    base = str(gym_id or "").strip().lower()
+    for suffix in ("_ig", "_fb", "_gbp"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    return base in ALERT_RETIRED_BASES
 
 
 # ---- classification (pure) --------------------------------------------------------
@@ -133,14 +148,49 @@ def _snippet(text):
     return t[:SNIPPET_LEN]
 
 
+def _identity(source, provider, account_id, container_id, item_id):
+    """Composite provider identity carried into the immutable FIXER snapshot.
+
+    Missing fields are retained as nulls so snapshot construction can mark the
+    evidence incomplete.  Nothing in this alerting module guesses an account,
+    platform, post, review, or item id from a URL or display name.
+    """
+    return {"source": source, "provider": provider, "account_id": account_id,
+            "container_id": container_id, "item_id": item_id}
+
+
 # ---- the per-gym sweep (injectable zernio; read only) -----------------------------
+
+
+def _complete_read_or_incomplete(zernio, complete_name, ordinary_name, *args):
+    """Use a bounded proof reader when available.
+
+    Older injected adapters may only expose the ordinary one-page reader.  They
+    still support the historical alert card path, but their evidence is marked
+    incomplete so it can never become a reconcilable FIXER snapshot.  A present
+    pagination proof failure may fall back for visibility only. Its evidence
+    stays incomplete and cannot authorize reconciliation or ticket resolution.
+    Transport/auth failures still surface as errors without a second request.
+    """
+    from .fixer_reply_reconciliation import pagination_complete
+    complete_reader = getattr(zernio, complete_name, None)
+    if callable(complete_reader):
+        try:
+            payload = complete_reader(*args) or {}
+        except ZernioPaginationError:
+            payload = getattr(zernio, ordinary_name)(*args) or {}
+            return payload, False
+        return payload, pagination_complete(payload)
+    payload = getattr(zernio, ordinary_name)(*args) or {}
+    return payload, False
 
 
 def _comment_items(gym_id, zernio, profile_id, now):
     """Unhandled comment items on the gym's recent posts. One thread call per
     commented post; a failed thread fetch skips THAT post only."""
     items = []
-    listing = zernio.list_inbox_comments(profile_id) or {}
+    listing, complete = _complete_read_or_incomplete(
+        zernio, "list_inbox_comments_complete", "list_inbox_comments", profile_id)
     for post in listing.get("data") or []:
         if not isinstance(post, dict):
             continue
@@ -150,10 +200,13 @@ def _comment_items(gym_id, zernio, profile_id, now):
         if post_age is None or post_age > POST_LOOKBACK_DAYS:
             continue
         try:
-            thread = zernio.inbox_post_comments(
-                post.get("id"), post.get("accountId")) or {}
+            thread, thread_complete = _complete_read_or_incomplete(
+                zernio, "inbox_post_comments_complete", "inbox_post_comments",
+                post.get("id"), post.get("accountId"))
         except Exception:
+            complete = False
             continue  # one bad thread never drops the gym's other posts
+        complete = complete and thread_complete
         for c in thread.get("comments") or []:
             if not isinstance(c, dict) or not needs_reply(c):
                 continue
@@ -168,13 +221,26 @@ def _comment_items(gym_id, zernio, profile_id, now):
                 "text": _snippet(c.get("message")),
                 "url": c.get("url") or post.get("permalink") or "",
                 "age_days": age,
+                "created_at": c.get("createdTime"),
+                "provider_identity": _identity(
+                    "comment", c.get("platform") or post.get("platform"),
+                    post.get("accountId"), post.get("id"), c.get("id")),
+                "provider_evidence": {
+                    "is_hidden": c.get("isHidden") is True,
+                    "owner_reply_ids": [
+                        r.get("id") for r in (c.get("replies") or [])
+                        if isinstance(r, dict)
+                        and (r.get("from") or {}).get("isOwner") is True
+                        and isinstance(r.get("id"), str) and r.get("id")],
+                },
             })
-    return items
+    return items, complete
 
 
 def _mention_items(gym_id, zernio, profile_id, now):
     items = []
-    listing = zernio.list_inbox_mentions(profile_id) or {}
+    listing, complete = _complete_read_or_incomplete(
+        zernio, "list_inbox_mentions_complete", "list_inbox_mentions", profile_id)
     for m in listing.get("data") or []:
         if not isinstance(m, dict):
             continue
@@ -190,15 +256,21 @@ def _mention_items(gym_id, zernio, profile_id, now):
             "text": _snippet(text),
             "url": m.get("permalink") or m.get("url") or "",
             "age_days": age,
+            "created_at": m.get("createdTime") or m.get("publishedAt"),
+            "provider_identity": _identity(
+                "mention", m.get("platform"), m.get("accountId"),
+                m.get("postId") or m.get("mediaId") or m.get("id"), m.get("id")),
+            "provider_evidence": {"reply_state_supported": False},
         })
-    return items
+    return items, complete
 
 
 def _review_items(gym_id, zernio, profile_id, now):
     """Recent reviews with NO reply yet. hasReply is the platform's own flag —
     never guessed."""
     items = []
-    listing = zernio.list_inbox_reviews(profile_id) or {}
+    listing, complete = _complete_read_or_incomplete(
+        zernio, "list_inbox_reviews_complete", "list_inbox_reviews", profile_id)
     for r in listing.get("data") or []:
         if not isinstance(r, dict) or r.get("hasReply"):
             continue
@@ -210,8 +282,13 @@ def _review_items(gym_id, zernio, profile_id, now):
             "text": _snippet(r.get("text")),
             "url": r.get("reviewUrl") or "",
             "age_days": age,
+            "created_at": r.get("created"),
+            "provider_identity": _identity(
+                "review", r.get("platform"), r.get("accountId"),
+                r.get("id"), r.get("id")),
+            "provider_evidence": {"has_reply": r.get("hasReply") is True},
         })
-    return items
+    return items, complete
 
 
 def sweep_gym(gym_id, zernio, now):
@@ -223,14 +300,23 @@ def sweep_gym(gym_id, zernio, now):
                 "reason": "no Zernio profile for gym (reported, not guessed)"}
     items = []
     errors = []
+    source_status = {}
     for name, fn in (("comments", _comment_items),
                      ("mentions", _mention_items),
                      ("reviews", _review_items)):
+        source = name[:-1] if name.endswith("s") else name
         try:
-            items.extend(fn(gym_id, zernio, profile_id, now))
+            found, complete = fn(gym_id, zernio, profile_id, now)
+            items.extend(found)
+            source_status[source] = {"ok": True, "complete": complete is True}
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{name}: {type(exc).__name__}")
-    return {"gym_id": gym_id, "ok": True, "items": items, "errors": errors}
+            source_status[source] = {"ok": False, "complete": False,
+                                     "error": type(exc).__name__}
+    return {"gym_id": gym_id, "profile_id": profile_id, "ok": True,
+            "complete": all(s.get("ok") and s.get("complete")
+                            for s in source_status.values()),
+            "source_status": source_status, "items": items, "errors": errors}
 
 
 # ---- the card (pure) ---------------------------------------------------------------
@@ -299,11 +385,13 @@ def _default_notifier(gym_id, text):
         ch = None if gym_id == "lasso" else _coach_channel(gym_id)
         if ch:
             from .slack_surface import SlackPoster
-            SlackPoster(channel=ch).post_notice(text)
+            receipt = SlackPoster(channel=ch).post_notice(text)
         else:
             from . import ops_alerts
-            ops_alerts.alert(text)
-        return True
+            # This lane has its own flag and daily receipt-based dedupe. A
+            # generic repeat/noise gate must not eat an unanswered-work card.
+            receipt = ops_alerts.alert(text, force=True)
+        return bool(receipt and receipt.get("ok") and receipt.get("ts"))
     except Exception as exc:  # noqa: BLE001
         print(f"[inbox-alerts] card post failed for {gym_id}: "
               f"{type(exc).__name__}")
@@ -324,7 +412,8 @@ def _default_gyms():
 # ---- run ---------------------------------------------------------------------------
 
 
-def run(gyms=None, zernio=None, now=None, notifier=None, kv_get=None, kv_set=None):
+def run(gyms=None, zernio=None, now=None, notifier=None, kv_get=None, kv_set=None,
+        snapshot_store=None):
     """The daily sweep. Behind AGENT_INBOX_ALERTS (default OFF -> no-op, no
     client constructed, no network touched). Per gym: sweep, build the card,
     send AT MOST one per day (kv stamp inbox_alert_<gym>_<date>, written only
@@ -348,6 +437,10 @@ def run(gyms=None, zernio=None, now=None, notifier=None, kv_get=None, kv_set=Non
     for gym_id in gyms:
         stamp = f"inbox_alert_{gym_id}_{day}"
         try:
+            if alerts_retired(gym_id):
+                results.append({"gym_id": gym_id, "ok": True,
+                                "skipped": "reply alerts retired by operator"})
+                continue
             if kv_get(stamp):
                 results.append({"gym_id": gym_id, "ok": True,
                                 "skipped": "card already sent today"})
@@ -358,6 +451,23 @@ def run(gyms=None, zernio=None, now=None, notifier=None, kv_get=None, kv_set=Non
                 continue
             card = build_card(gym_id, summary.get("items") or [])
             if card:
+                if not summary.get("complete"):
+                    card += "\nPartial inbox view; additional unanswered items may exist. Manual verification required."
+                # Preserve the exact provider evidence behind this new alert.  The
+                # snapshot is read-only evidence, not permission to act.  Storage
+                # failure leaves the existing alert path working but makes this
+                # alert manual, exactly like pre-snapshot historical cards.
+                try:
+                    from .fixer_reply_reconciliation import build_snapshot, save_snapshot
+                    snapshot = build_snapshot(
+                        gym_id, summary.get("profile_id"), summary.get("items") or [],
+                        summary.get("source_status") or {}, now=now)
+                    save_snapshot(snapshot, store=snapshot_store)
+                    summary["reply_snapshot_id"] = snapshot["snapshot_id"]
+                    summary["reply_snapshot_complete"] = snapshot["complete"]
+                    card += f"\nEvidence snapshot: {snapshot['snapshot_id']}"
+                except Exception as exc:  # noqa: BLE001
+                    summary["reply_snapshot_error"] = type(exc).__name__
                 # AUD-108: STAMP ONLY WHAT WAS ACTUALLY SENT. The stamp is this
                 # gym's ONE card for the day, so writing it on a failed post throws
                 # the card away and stays quiet about it. A notifier that reports

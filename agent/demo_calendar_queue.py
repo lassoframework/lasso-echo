@@ -79,7 +79,7 @@ DEMO_POSTS = [
      "cta": "Save this for later."},
     {"num": 2, "date": "2026-08-07", "pillar": "Sales are now",
      "filename": "demo_02_sales_now.png", "is_story": True,
-     "hook": "You did not open a gym to run ads at 11pm.",
+     "hook": "You did not open a gym to run your own ads.",
      "body": ("The job is closing members, not building funnels. We get the leads and "
               "nurture them. You do the one thing only you can do: sell."),
      "cta": "Send this to a gym owner who needs it."},
@@ -172,7 +172,7 @@ DEMO_POSTS = [
      "cta": "Save this for later."},
     {"num": 17, "date": "2026-08-22", "pillar": "Sales are now",
      "filename": "demo_17_11pm_b.png", "is_story": True,
-     "hook": "You did not open a gym to run ads at 11pm.",
+     "hook": "You did not open a gym to run your own ads.",
      "body": ("The job is closing members, not building funnels. We get the leads and "
               "nurture them. You do the one thing only you can do: sell."),
      "cta": "Send this to a gym owner who needs it."},

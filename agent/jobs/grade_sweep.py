@@ -11,11 +11,14 @@ Behind AGENT_CALENDAR_GRADE flag. Run via: python3 -m agent jobs grade_sweep
 SELF-FIX MODE (AGENT_GRADE_SELF_FIX, default OFF; Blake's 2026-08-27 ruling
 "it should fix it on its own without sending me alot of slacks"). Flag OFF ->
 everything above is byte-for-byte unchanged. Flag ON:
-  * a forward book below A is first self-remediated (agent/jobs/grade_fix.py)
-    and then REGRADED; the final grade is what lands in gym_social_grades.
+  * a forward book below A, or an A book whose score regressed since the previous
+    run, is first self-remediated (agent/jobs/grade_fix.py) and then REGRADED;
+    the final grade is what lands in gym_social_grades. Stable A books retain
+    the narrow body-sameness check and are otherwise untouched.
     Remediation runs in up to _MAX_FIX_PASSES passes per sweep: another pass
-    runs only while the regraded score IMPROVED and is still below A (heavy
-    lanes keep their own once-per-gym-per-day kv stamp inside grade_fix);
+    runs only while the regraded score or defect count IMPROVED and the repair
+    target has not been reached (heavy lanes keep their own once-per-gym-per-day
+    kv stamp inside grade_fix);
   * trailing_30 is graded + stored but NEVER alerts (history is not fixable);
   * a still-below-A forward book alerts ONLY when the (score, defect set)
     differs from the last alerted state for that gym (kv stamp) AND at most
@@ -38,6 +41,7 @@ deduped to once per gym per day.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from datetime import date, timedelta, timezone, datetime
 
@@ -184,6 +188,25 @@ def _drop_alert_text(gym_id: str, prev_total: int, grade) -> str:
     )
 
 
+def _alert_with_business_seed(alert_fn, message: str, seed: dict | None):
+    """Pass structured evidence only to alert functions that declare support.
+
+    Existing tests and operator integrations commonly inject ``list.append`` or
+    another one-argument callable.  They keep receiving the exact alert text;
+    production ``ops_alerts.alert`` additionally receives the trusted seed.
+    """
+    if seed is not None:
+        try:
+            params = inspect.signature(alert_fn).parameters.values()
+            supports = any(p.name == "business_seed"
+                           or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        except (TypeError, ValueError):
+            supports = False
+        if supports:
+            return alert_fn(message, business_seed=seed)
+    return alert_fn(message)
+
+
 def _alert_low_grade(gym_id: str, window: str, grade, alert_fn) -> None:
     """Fire one ops alert when a grade drops below B (80). LEGACY path: only
     used when AGENT_GRADE_SELF_FIX is OFF (byte-for-byte today's behavior)."""
@@ -227,6 +250,10 @@ def _merge_fix(agg: dict, step: dict) -> dict:
     gap = (step or {}).get("gap_fill")
     if gap and gap != "none" and agg.get("gap_fill") in (None, "none"):
         agg["gap_fill"] = gap
+    for day in (step or {}).get("gap_dates") or []:
+        dates = agg.setdefault("gap_dates", [])
+        if day not in dates:
+            dates.append(day)
     agg["ok"] = bool(agg.get("ok", True)) and bool((step or {}).get("ok", False))
     agg["passes"] = int(agg.get("passes") or 0) + 1
     return agg
@@ -278,6 +305,14 @@ def _held_alert_text(gym_id: str, grade, fix: dict) -> str:
     caption legs, and a score that quietly excluded rows without saying so
     would be exactly the kind of dishonesty this grader is meant to end."""
     fixed_txt = "; ".join((fix or {}).get("actions") or []) or "nothing auto-fixable"
+    if (fix or {}).get("gap_fill") == "no_media":
+        dates = list((fix or {}).get("gap_dates") or [])
+        shown = ", ".join(dates[:10])
+        if len(dates) > 10:
+            shown += f", plus {len(dates) - 10} more"
+        fixed_txt += "; no eligible unused media; retained missing dates for retry"
+        if shown:
+            fixed_txt += f": {shown}"
     remaining = [str(d[2]) for d in (grade.defects or [])[:3]]
     lines = [
         f"calendar grade: {gym_id} forward book held at {grade.total} "
@@ -413,7 +448,7 @@ def _stuck_alert_text(gym_id, grade, fix, streak, approver_id=""):
     )
 
 
-def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
+def run(gyms=None, store=None, now=None, alert_fn=None, business_seed_fn=None) -> dict:
     """
     Main entry point: grade each gym's trailing 30 days and forward book.
 
@@ -422,6 +457,7 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
         store:     injectable calendar store (must implement rows_in_range)
         now:       injectable today date (YYYY-MM-DD string or date object)
         alert_fn:  injectable alert function (defaults to ops_alerts.alert)
+        business_seed_fn: injectable trusted grade-drop seed producer
 
     Returns:
         dict with per-gym results
@@ -434,6 +470,9 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
     if alert_fn is None:
         from agent import ops_alerts
         alert_fn = ops_alerts.alert
+    if business_seed_fn is None:
+        from agent.fixer_business_seed import prepare_grade_drop_seed
+        business_seed_fn = prepare_grade_drop_seed
 
     if store is None:
         try:
@@ -499,10 +538,23 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
             prev_total = _previous_grade(store, gym_id, "forward_book")
             f_grade = grade_month(forward_rows, profile=profile)
             fix = None
-            if self_fix and f_grade.total < A_THRESHOLD:
-                # Self-remediate, re-read, regrade — up to _MAX_FIX_PASSES
-                # passes, another only while the score IMPROVED and the book
-                # is still below A. The FINAL grade is what gets stored.
+            started_below_a = f_grade.total < A_THRESHOLD
+            # A regression is itself a repair trigger, even when the resulting
+            # score still has an A letter. Previously the drop guard could report
+            # structural defects being rebuilt into a 96 -> 93 book while the
+            # self-fix gate skipped them solely because 93 remained >= A_THRESHOLD.
+            # Stable A books keep the narrow body-only pass below.
+            repairing_drop = (
+                self_fix
+                and prev_total is not None
+                and f_grade.total < prev_total
+            )
+            if self_fix and (f_grade.total < A_THRESHOLD or repairing_drop):
+                # Self-remediate, re-read, regrade — up to _MAX_FIX_PASSES.
+                # Below-A books stop on reaching A. Regressed A books instead
+                # keep going while defects are being removed, so the letter
+                # threshold cannot terminate the very repair the drop triggered.
+                # The FINAL grade is what gets stored.
                 fix = {"ok": True, "passes": 0, "gap_fill": "none",
                        "actions": []}
                 fix["trajectory"] = [(f_grade.total, len(f_grade.defects or []))]
@@ -536,15 +588,19 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                     # improvement. Stopping when neither moves IS the floor.
                     improved = (f_grade.total > pass_prev_total
                                 or len(f_grade.defects or []) < prev_defects)
+                    reached_target = (
+                        f_grade.total >= A_THRESHOLD and not repairing_drop
+                    )
                     if (not step.get("ok")
-                            or f_grade.total >= A_THRESHOLD
+                            or reached_target
                             or not improved):
                         break
             elif self_fix:
-                # BOOK ALREADY >= A (Blake's ruling, 2026-09-07): the full
-                # remediation suite above stays gated on total < A_THRESHOLD
-                # exactly as before -- an A-graded book does not need its
-                # duplicate/overcap/craft/audience passes re-run. But
+                # STABLE BOOK ALREADY >= A (Blake's ruling, 2026-09-07): the
+                # full remediation suite above stays quiet unless this run
+                # regressed from the previously stored A score. A stable
+                # A-graded book does not need its duplicate/overcap/craft/
+                # audience passes re-run. But
                 # calendar_grade's "total" does not weight body sameness, so a
                 # book can sit at a perfect A while still carrying a real
                 # near-duplicate BODY pair forever, since this branch is the
@@ -573,7 +629,8 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
             if not self_fix:
                 _alert_low_grade(gym_id, "forward_book", f_grade, alert_fn)
             else:
-                if fix is not None and f_grade.total >= A_THRESHOLD:
+                if (fix is not None and started_below_a
+                        and f_grade.total >= A_THRESHOLD):
                     fixed_gyms.append(gym_id)
                 if f_grade.total < A_THRESHOLD:
                     held_gyms.append(gym_id)
@@ -607,7 +664,16 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                 dropped_gyms.append((gym_id, prev_total, f_grade.total))
                 if _should_alert_drop(gym_id, prev_total, f_grade.total,
                                       today_str):
-                    alert_fn(_drop_alert_text(gym_id, prev_total, f_grade))
+                    message = _drop_alert_text(gym_id, prev_total, f_grade)
+                    seed = None
+                    try:
+                        seed = business_seed_fn(
+                            gym_key=gym_id, min_total=prev_total,
+                            observed_total=f_grade.total, source_day=today_str)
+                    except Exception as exc:  # noqa: BLE001 - human alert still fires
+                        print(f"[grade-sweep] {gym_id}: trusted FIXER seed unavailable: "
+                              f"{type(exc).__name__}: {exc}")
+                    _alert_with_business_seed(alert_fn, message, seed)
                     alerted_gyms.append(gym_id)
 
             gym_result["forward_book"] = {

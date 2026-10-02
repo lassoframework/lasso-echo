@@ -15,6 +15,7 @@ from . import portal_approvals as _pa
 from . import portal_calendar_store as _pcs
 from .accounts import get_account
 from .library import list_creatives
+from .portal_visibility import client_visible as _client_visible
 
 
 def _flag_off(route):
@@ -50,7 +51,7 @@ def handle_portal_calendar(account_key, month, store=None):
         try:
             sb = _pcs.SupabaseCalendarStore()
             rows = sb.list_month(account_key, month)
-            drafts = [_pcs.map_row(r) for r in rows]
+            drafts = [_pcs.map_row(r) for r in _client_visible(rows)]
         except Exception as exc:
             return 500, {"error": f"store error: {type(exc).__name__}"}
         return 200, {"account_key": account_key, "month": month, "drafts": drafts}
@@ -59,7 +60,7 @@ def handle_portal_calendar(account_key, month, store=None):
         pending = store.list_pending()
         rows = [d for d in pending if d.account_key == account_key
                 and (d.day_key or "").startswith(prefix)]
-        drafts = [_draft_to_dict(d) for d in rows]
+        drafts = [_draft_to_dict(d) for d in _client_visible(rows)]
     else:
         try:
             with _db.connect() as conn:
@@ -69,8 +70,8 @@ def handle_portal_calendar(account_key, month, store=None):
                     "WHERE account_key=? AND day_key LIKE ?",
                     (account_key, prefix + "%")
                 ).fetchall()
-            drafts = [_draft_to_dict(_row_to_draft(r))
-                      for r in results if _row_to_draft(r) is not None]
+            loaded = [_row_to_draft(r) for r in _client_visible(results)]
+            drafts = [_draft_to_dict(d) for d in loaded if d is not None]
         except Exception as exc:
             return 500, {"error": f"db error: {type(exc).__name__}"}
 

@@ -469,7 +469,8 @@ def _post_and_save(draft, store, poster, idempotent):
             postlog.log_post(account_key=draft.account_key, platform=draft.platform,
                              caption=draft.caption,
                              media_id=getattr(result, "media_id", ""),
-                             mode=result.mode, draft_id=draft.draft_id)
+                             mode=result.mode, draft_id=draft.draft_id,
+                             image_engine=getattr(draft, "image_engine", "") or "")
             if _is_welcome and result.mode == "published":
                 from . import welcome_queue as _wq
                 _wq.record_welcome_published(draft)
@@ -506,7 +507,8 @@ def _post_and_save(draft, store, poster, idempotent):
             postlog.log_post(account_key=draft.account_key, platform=draft.platform,
                              caption=draft.caption,
                              media_id=getattr(result, "media_id", ""),
-                             mode=result.mode, draft_id=draft.draft_id)
+                             mode=result.mode, draft_id=draft.draft_id,
+                             image_engine=getattr(draft, "image_engine", "") or "")
             db.audit("trust_autopublish", draft.draft_id, why, draft.account_key,
                      draft.day_key)
             poster.post_notice(
@@ -689,6 +691,12 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     """
     _trust_startup_warning()
     results = []
+    # The scheduler distinguishes a genuinely silent posting-day run from the
+    # calendar-authority mode that intentionally suppresses legacy LASSO cards.
+    # Track every cadence-eligible account and only report an expected zero when
+    # ALL of them reached that explicit cardless path.
+    posting_accounts = []
+    intentionally_cardless_accounts = []
 
     if not config.master_enabled():
         # agent disarmed. say nothing publicly; just report state to the caller.
@@ -818,6 +826,7 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # card for this account (default 7 days/week, no skip days).
             if not schedule.should_post_on(day_key):
                 continue
+            posting_accounts.append(account.key)
             # Channel ownership guard: a client account with no slack_channel
             # would route its approval cards to the shared default — LASSO's
             # internal channel — silently. That never happens: the account
@@ -891,6 +900,8 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 config.calendar_autopublish_enabled()
                 and account.key.startswith("lasso")
                 and draft is None)
+            if _skip_legacy_lasso_daily:
+                intentionally_cardless_accounts.append(account.key)
 
             # Category frequency + consecutive caps (category_cap.py, both OFF by
             # default). Campaign builders are gated; the fallback never blocks.
@@ -983,6 +994,13 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # client/non-LASSO accounts are unaffected (_skip_legacy_lasso_daily False).
             if draft is None and not _skip_legacy_lasso_daily:
                 creative = pick_next(account, acct_lib, used_creatives_for(account.key))
+                if config.lasso_infographic_quality_enabled(account.key) and creative is not None:
+                    from .infographic_evidence import reviewed_asset
+                    if creative.media_type != "video":
+                        paths = creative.slides if creative.media_type == "carousel" else [creative.path]
+                        if not paths or not all(reviewed_asset(path) for path in paths):
+                            creative = None
+
                 # BRAND-INTEGRITY GUARD (any SHARED-PARENT account: LASSO + blake_personal
                 # + any future empty-library_prefix owned account): such an account resolves
                 # acct_lib to the shared content_library/ parent, which holds every client
@@ -1092,7 +1110,8 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # approval card, clearly labeled STORY. Book story takes this slot when
             # scheduled; auto-generated story is skipped on book story days.
             if not _book_story_posted:
-                story = build_story_draft(account, day_key, feed_draft=feed_draft)
+                story = build_story_draft(
+                    account, day_key, feed_draft=feed_draft, surface_gap=True)
                 if story is not None:
                     if idempotent:
                         story, existing_story = _reconcile(story, day_key, "story", store, poster)
@@ -1417,6 +1436,15 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             print(f"[gym-media] failed: {type(e).__name__}: {e}")
             ops_alerts.alert(f"gym media Drive sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
+
+    # Populate hash-bound evidence after indexing. Clean evidence approves only
+    # that exact asset hash; unsafe, unreadable, or changed media stays blocked.
+    if config.gym_drive_connect_enabled() or config.gym_drive_connect_gyms():
+        try:
+            from .jobs.moderate_pending_gym_media import run as _moderation_run
+            print(f"[gym-moderation] {_moderation_run()}")
+        except Exception as e:
+            print(f"[gym-moderation] failed: {type(e).__name__}")
 
     # ACCOUNT-KEY DOCTOR (AGENT_ACCOUNT_KEY_DOCTOR_ALERTS, default OFF -> alert
     # suppressed, report still computed): nightly READ-ONLY coverage check that every
@@ -1792,4 +1820,16 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     except Exception as e:
         print(f"[client-content] needs-media digest flush failed: {type(e).__name__}: {e}")
 
-    return {"status": "drafted", "drafts": results}
+    expected_no_cards = (
+        bool(posting_accounts)
+        and set(posting_accounts) <= set(intentionally_cardless_accounts)
+    )
+    return {
+        "status": "drafted",
+        "drafts": results,
+        "expected_no_cards": expected_no_cards,
+        "expected_no_cards_reason": (
+            "calendar autopublish owns every eligible account; legacy cards suppressed"
+            if expected_no_cards else ""
+        ),
+    }

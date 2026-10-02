@@ -171,6 +171,54 @@ def test_flag_off_the_swap_endpoint_403s_and_never_reads_the_store(monkeypatch):
     assert body["ok"] is False
 
 
+def test_fixer_swap_can_repair_one_row_while_the_client_portal_is_dark(monkeypatch):
+    """The authenticated ops lane uses Echo entitlement while the portal is dark."""
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    monkeypatch.setenv("AGENT_PORTAL_SOCIAL_ENABLED", "false")
+    store = _Store([_row("p1")])
+    _wire(monkeypatch, store)
+    from agent import echo_clients
+    monkeypatch.setattr(echo_clients, "is_echo_client", lambda *_args, **_kwargs: True)
+
+    status, _ = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                     picker=_picker)
+    assert status == 404 and store.swaps == []
+
+    status, body = ps.handle_fixer_swap_media("zanshin", "p1", "fixer:ticket-1",
+                                               sb_store=store, picker=_picker)
+    assert status == 200 and body["ok"] is True
+    assert store._rows["p1"]["image_url"] == "https://cdn/new.jpg"
+
+
+def test_fixer_swap_uses_echo_entitlement_when_client_billing_is_unavailable(monkeypatch):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    monkeypatch.setenv("AGENT_PORTAL_SOCIAL_ENABLED", "false")
+    store = _Store([_row("p1")])
+    _wire(monkeypatch, store)
+    monkeypatch.setattr(ps, "is_social_active", lambda *args, **kwargs: False)
+    from agent import echo_clients
+    monkeypatch.setattr(echo_clients, "is_echo_client", lambda *_args, **_kwargs: True)
+
+    status, body = ps.handle_fixer_swap_media("zanshin", "p1", "fixer:ticket-1",
+                                               sb_store=store, picker=_picker)
+    assert status == 200 and body["ok"] is True
+    assert store._rows["p1"]["image_url"] == "https://cdn/new.jpg"
+
+
+def test_fixer_swap_refuses_when_echo_entitlement_is_unavailable(monkeypatch):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    monkeypatch.setenv("AGENT_PORTAL_SOCIAL_ENABLED", "false")
+    store = _Store([_row("p1")])
+    _wire(monkeypatch, store)
+    from agent import echo_clients
+    monkeypatch.setattr(echo_clients, "is_echo_client", lambda *_args, **_kwargs: False)
+
+    status, body = ps.handle_fixer_swap_media("zanshin", "p1", "fixer:ticket-1",
+                                               sb_store=store, picker=_picker)
+    assert status == 403 and body["error"] == "not_echo_client"
+    assert store.swaps == []
+
+
 def test_flag_off_the_media_intent_is_ignored_and_the_deny_charges(monkeypatch):
     store = _Store([_row("p1")])
     _wire(monkeypatch, store)
@@ -346,6 +394,48 @@ def test_drive_candidates_come_from_the_pickable_pool_minus_the_book():
     cands = msw.drive_candidates("zanshin", {"v2"}, media_store=store)
     assert [c["key"] for c in cands] == ["v1"]
     assert cands[0]["kind"] == "video" and cands[0]["source"] == "drive"
+
+
+def test_swift_river_swap_recovers_from_cooldown_without_reusing_live_book_media():
+    """A small library with every safe asset inside the generic 90-day cooldown
+    must still answer a user-requested swap. The current asset and another active
+    row's asset stay hard-blocked; the oldest remaining asset is the fallback."""
+    from datetime import datetime, timedelta, timezone
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    now = datetime(2026, 9, 28, tzinfo=timezone.utc)
+    assets = [
+        make_asset("current", gym_id="swiftrivercrossfit", used_count=1,
+                   last_used_at=(now - timedelta(days=20)).isoformat()),
+        make_asset("booked", gym_id="swiftrivercrossfit", used_count=1,
+                   last_used_at=(now - timedelta(days=80)).isoformat()),
+        make_asset("oldest-safe", gym_id="swiftrivercrossfit", used_count=3,
+                   last_used_at=(now - timedelta(days=70)).isoformat()),
+        make_asset("newer-safe", gym_id="swiftrivercrossfit", used_count=1,
+                   last_used_at=(now - timedelta(days=5)).isoformat()),
+    ]
+    media_store = FakeMediaStore(assets=assets)
+    row = dict(_row("p1", gym_id="swiftrivercrossfit"),
+               source_media_asset_id="current")
+    cands = msw.candidates_for(
+        "swiftrivercrossfit", row, store=_Store(), lib="", book_state={},
+        asset_state={"booked": {("2026-09-22", "pending")}},
+        media_store=media_store, now=now)
+    assert [c["key"] for c in cands] == ["oldest-safe", "newer-safe"]
+    assert all(c["reuse_fallback"] is True for c in cands)
+
+
+def test_zanshin_nine_month_policy_refuses_the_same_exhaustion_fallback():
+    from datetime import datetime, timedelta, timezone
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    now = datetime(2026, 9, 28, tzinfo=timezone.utc)
+    media_store = FakeMediaStore(assets=[
+        make_asset("cooling", gym_id="zanshinfitness630e22",
+                   last_used_at=(now - timedelta(days=200)).isoformat())])
+    row = _row("p1", gym_id="zanshinfitness630e22")
+    cands = msw.candidates_for(
+        "zanshinfitness630e22", row, store=_Store(), lib="", book_state={},
+        asset_state={}, media_store=media_store, now=now)
+    assert cands == [], "the explicit nine-month no-repeat promise is a hard gate"
 
 
 def test_a_drive_video_swap_carries_the_video_row_shape(monkeypatch):
@@ -534,7 +624,9 @@ def test_swap_request_runs_at_most_one_transcode_across_all_candidates(monkeypat
         "zanshin", _row("p1"), store=_Store(), library_path="",
         candidates_fn=lambda g, r: cands, drive=drive,
         media_store=FakeMediaStore(assets=assets))
-    assert out == {"ok": False, "reason": msw.REASON_NO_FRESH_PHOTO}
+    assert out["ok"] is False and out["reason"] == msw.REASON_ASSET_PREP, (
+        "failed preparation is reported as such, never as a false 'all photos used'")
+    assert out.get("candidates_tried") == 3
     assert len(encoded) == 1, f"exactly one transcode per request, got {len(encoded)}"
     assert encoded[0] <= msw.SWAP_TRANSCODE_TIMEOUT_SEC
     assert len(drive.downloads) == 3, "candidates are still walked (cheap) once the budget is spent"
@@ -742,3 +834,89 @@ def test_the_portal_relay_path_for_swap_media_is_routable():
                r"(" + "|".join(intake_web.PORTAL_POST_ACTIONS) + r")$")
     m = re.match(pattern, "/portal/eyJhIjoiZW5nIn0.sig/posts/abc-123/swap-media")
     assert m and m.group(3) == "swap-media"
+
+
+# ---- Swift River regression: failed preparation is NOT exhaustion ---------------
+# Swift River was told "all photos were used" with ~500 uploaded. Root cause: the
+# swap tried only cands[:_MAX_MATERIALIZE_ATTEMPTS] (three) and, when download /
+# probe / conversion preparation failed on those, fell out of the loop returning
+# REASON_NO_FRESH_PHOTO -- a false exhaustion report. These tests pin the repair:
+# walk PAST the failed candidates to a usable one, and when nothing is usable say
+# preparation failed, never "no fresh photo".
+
+def test_three_failed_preparations_do_not_stop_the_swap_from_using_a_later_candidate():
+    """Candidates 1-3 fail download/probe/conversion preparation; candidate 4 is
+    usable. The swap MUST reach candidate 4 and succeed with it, not give up after
+    the leading three."""
+    # The successful candidate is deliberately beyond the former three-attempt
+    # cap and the intermediate finite 25-candidate cap.
+    cands = [_cand(f"c{i}.jpg") for i in range(40)]
+    attempted = []
+
+    def _flaky_materialize(cand):
+        attempted.append(cand["key"])
+        if cand["key"] != "c39.jpg":
+            return None                     # download / probe / conversion failed
+        return {"path": f"/tmp/{cand['key']}", "hosted": None}
+
+    out = msw.pick_replacement(
+        "zanshin", _row("p1"), store=_Store(), library_path="/lib",
+        candidates_fn=lambda g, r: cands, materialize_fn=_flaky_materialize,
+        host_fn=lambda p: "https://cdn/c39.jpg",
+        feed_fn=lambda p: "https://cdn/c39__feed.jpg")
+    assert attempted == [f"c{i}.jpg" for i in range(40)], (
+        "every candidate must be tried in order until one prepares")
+    assert out["ok"] is True and out["key"] == "c39.jpg"
+    assert out["image_url"] == "https://cdn/c39__feed.jpg"
+
+
+def test_all_candidates_failing_preparation_is_a_preparation_failure_not_exhaustion():
+    """When EVERY eligible candidate fails preparation, the answer must NOT be
+    REASON_NO_FRESH_PHOTO (that falsely tells the owner their library is used up).
+    It must be a distinct failure reason (a preparation-failure reason, or the
+    request timeout if the deadline genuinely passed -- not the case here)."""
+    cands = [_cand(f"c{i}.jpg") for i in range(5)]
+    out = msw.pick_replacement(
+        "zanshin", _row("p1"), store=_Store(), library_path="/lib",
+        candidates_fn=lambda g, r: cands,
+        materialize_fn=lambda c: None,      # nothing can be prepared
+        host_fn=lambda p: "https://cdn/unused.jpg")
+    assert out["ok"] is False
+    assert out["reason"] != msw.REASON_NO_FRESH_PHOTO, (
+        "failed preparation is not 'every photo is already used'")
+    assert out["reason"] != msw.REASON_TIMEOUT, "the deadline never expired here"
+    assert out["reason"] not in (msw.REASON_NO_LIBRARY, msw.REASON_HOSTING), (
+        "a library exists and hosting was never reached")
+
+
+def test_zero_pickable_candidates_still_reports_no_fresh_photo(monkeypatch):
+    """The genuine exhaustion message is preserved: with a real library on disk but
+    NOTHING pickable (everything on the book or inside the repeat window), the
+    answer stays REASON_NO_FRESH_PHOTO."""
+    lib = "/lib"
+    monkeypatch.setattr(msw.media_guard, "library_keys", lambda p: ["a.jpg"])
+    monkeypatch.setattr(msw.os.path, "isdir", lambda p: p == lib)
+    out = msw.pick_replacement(
+        "zanshin", _row("p1"), store=_Store(), library_path=lib,
+        candidates_fn=lambda g, r: [])
+    assert out == {"ok": False, "reason": msw.REASON_NO_FRESH_PHOTO}
+
+
+def test_candidate_walk_is_bounded_by_the_candidate_list_and_finite_deadlines():
+    """No unbounded iteration: with many unusable candidates the walk stops at the
+    end of the list (at most one preparation attempt per candidate), and every
+    request bound is a finite positive number."""
+    import math
+    cands = [_cand(f"c{i}.jpg") for i in range(25)]
+    attempted = []
+    out = msw.pick_replacement(
+        "zanshin", _row("p1"), store=_Store(), library_path="/lib",
+        candidates_fn=lambda g, r: cands,
+        materialize_fn=lambda c: attempted.append(c["key"]) or None)
+    assert out["ok"] is False
+    assert len(attempted) <= len(cands), "one attempt per candidate, then stop"
+    for bound in (msw.SWAP_REQUEST_DEADLINE_SEC, msw.SWAP_DOWNLOAD_TIMEOUT_SEC,
+                  msw.SWAP_TRANSCODE_TIMEOUT_SEC):
+        assert math.isfinite(bound) and bound > 0
+    dl = msw._Deadline(1.0, clock=lambda: 0.0)
+    assert math.isfinite(dl.remaining()) and dl.remaining() > 0

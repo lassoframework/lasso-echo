@@ -100,6 +100,53 @@ def _drive():
     return _dc.DriveClient()
 
 
+def _queue_media_fixer_ticket(gym, folder_id, incident_kind, source=None, *,
+                               bus=None, sender=None, log=print):
+    """Create one row-first FIXER ticket for an exact media-domain failure.
+
+    This is deliberately separate from the route response.  Missing or
+    ambiguous tenant identity, malformed source state, transport failure, and
+    an unconfirmed Scout response all fail closed for FIXER intake and are
+    audit-logged; none changes what the coach's media request returns.
+    """
+    from . import fixer_business_seed_client as _fixer
+    snapshot = source if isinstance(source, dict) else {}
+    try:
+        event = _fixer.media_incident_event(
+            gym_key=gym,
+            folder_id=folder_id,
+            incident_kind=incident_kind,
+            source_id=str(snapshot.get("id") or ""),
+            prior_sync_status=str(snapshot.get("sync_status") or ""),
+            prior_sync_requested_at=str(snapshot.get("sync_requested_at") or ""),
+            bus=bus,
+        )
+        result = (sender or _fixer.send)(event)
+    except Exception as exc:  # noqa: BLE001 - media response must remain independent
+        log(f"[gym-media] FIXER intake refused gym={gym} folder={folder_id} "
+            f"incident={incident_kind} reason={type(exc).__name__}")
+        return None
+    if result.ok:
+        log(f"[gym-media] FIXER intake confirmed gym={gym} folder={folder_id} "
+            f"incident={incident_kind} ticket={result.ticket_id} "
+            f"outcome={result.outcome}")
+    else:
+        log(f"[gym-media] FIXER intake unconfirmed gym={gym} folder={folder_id} "
+            f"incident={incident_kind} reason={result.reason}")
+    return result
+
+
+def _record_media_fixer_failure(gym, folder_id, incident_kind, source=None,
+                                fixer_ticket=None):
+    """Best-effort ticket hook that can never alter the user-facing operation."""
+    try:
+        callback = fixer_ticket or _queue_media_fixer_ticket
+        callback(gym, folder_id, incident_kind, source)
+    except Exception as exc:  # noqa: BLE001 - caller's failure remains authoritative
+        print(f"[gym-media] FIXER intake hook failed gym={gym} folder={folder_id} "
+              f"incident={incident_kind} reason={type(exc).__name__}")
+
+
 # ---- POST /media/check-connection --------------------------------------------
 def handle_check_connection(account_key, folder_url, *, drive=None, store=None):
     """POST /media/check-connection {folder_url}
@@ -176,7 +223,7 @@ def handle_check_connection(account_key, folder_url, *, drive=None, store=None):
 
 # ---- POST /media/sources (bind after confirm) --------------------------------
 def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
-                       store=None):
+                       store=None, fixer_ticket=None):
     """POST /media/sources {folder_url, actor_id?}
 
     Bind a confirmed folder to this gym. Enforces the hijack rail (§1.5a: a
@@ -215,9 +262,20 @@ def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
                          "error": "this folder is already connected to another gym"}
         # Same gym re-binding the same folder: idempotent success.
         if existing.get("active"):
+            try:
+                if not store.request_sync(existing["id"], gym):
+                    _record_media_fixer_failure(
+                        gym, folder_id, "existing_source_sync_queue_failed",
+                        existing, fixer_ticket)
+                    return 503, {"ok": False, "error": "could not queue media indexing"}
+            except Exception:
+                _record_media_fixer_failure(
+                    gym, folder_id, "existing_source_sync_queue_failed",
+                    existing, fixer_ticket)
+                return 503, {"ok": False, "error": "could not queue media indexing"}
             return 200, {"ok": True, "source_id": existing.get("id"),
                          "folder_name": existing.get("folder_name") or "",
-                         "already": True}
+                         "already": True, "sync_status": "queued"}
 
     # Read meta for name/owner + the ownership-sanity rail.
     try:
@@ -251,13 +309,54 @@ def handle_bind_source(account_key, folder_url, actor_id="", *, drive=None,
     try:
         store.insert_source(row)
     except Exception as e:  # noqa: BLE001 - a UNIQUE(folder_id) race lands here too
-        # The DB-level global UNIQUE is the last-resort hijack guard: if two binds
-        # race, the loser gets a store error here rather than a duplicate row.
-        return 409, {"ok": False, "case": "already_bound",
-                     "error": "this folder is already connected",
-                     "detail": ops_alerts.scrub(str(e))[:120]}
+        # A failed insert is not evidence of an existing binding. In particular,
+        # a PostgREST outage/schema error used to become a false 409 while the
+        # portal truthfully listed no connected folders. Re-read the GLOBAL
+        # folder binding: this also handles an ambiguous transport failure after
+        # the insert actually committed. Never reveal another gym's identity to
+        # the client or treat an unconfirmed write as success.
+        try:
+            concurrent = store.find_source_by_folder(folder_id)
+        except Exception:  # noqa: BLE001 - cannot prove ownership
+            concurrent = None
+        if concurrent:
+            if str(concurrent.get("gym_id") or "") == gym and concurrent.get("active"):
+                try:
+                    if not store.request_sync(concurrent["id"], gym):
+                        _record_media_fixer_failure(
+                            gym, folder_id, "existing_source_sync_queue_failed",
+                            concurrent, fixer_ticket)
+                        return 503, {"ok": False, "error": "could not queue media indexing"}
+                except Exception:  # noqa: BLE001 - bind is real, but indexing unconfirmed
+                    _record_media_fixer_failure(
+                        gym, folder_id, "existing_source_sync_queue_failed",
+                        concurrent, fixer_ticket)
+                    return 503, {"ok": False, "error": "could not queue media indexing"}
+                return 200, {"ok": True, "source_id": concurrent.get("id"),
+                             "folder_name": concurrent.get("folder_name") or "",
+                             "already": True, "sync_status": "queued"}
+            return 409, {"ok": False, "case": "already_bound",
+                         "error": "this folder is already connected"}
+        _idx.dedup_alert(
+            f"media_bind_failed:{gym}:{folder_id}",
+            f"Connect Google Drive bind failed for gym {gym!r}, folder {folder_id!r}; "
+            f"no folder binding could be confirmed. Store error: "
+            f"{ops_alerts.scrub(str(e))[:200]}")
+        _record_media_fixer_failure(
+            gym, folder_id, "source_persist_unconfirmed", None, fixer_ticket)
+        return 503, {"ok": False, "case": "store_unavailable",
+                     "error": "could not save the folder connection; please retry"}
+    try:
+        if not store.request_sync(source_id, gym):
+            raise RuntimeError("source could not be queued")
+    except Exception:
+        # The source is bound. A repeat bind requests indexing on that same row.
+        _record_media_fixer_failure(
+            gym, folder_id, "new_source_sync_queue_failed", row, fixer_ticket)
+        return 503, {"ok": False, "source_id": source_id,
+                     "error": "folder connected but media indexing could not be queued; retry connect"}
     return 200, {"ok": True, "source_id": source_id,
-                 "folder_name": meta.get("name") or ""}
+                 "folder_name": meta.get("name") or "", "sync_status": "queued"}
 
 
 def _owner_domain_conflict(store, gym, owner_email):
@@ -267,7 +366,7 @@ def _owner_domain_conflict(store, gym, owner_email):
     if "@" not in (owner_email or ""):
         return None
     domain = owner_email.split("@", 1)[1].strip().lower()
-    if not domain or domain in _PERSONAL_DOMAINS:
+    if not domain or domain in _PERSONAL_DOMAINS or domain in _SHARED_PROVIDER_DOMAINS:
         return None
     try:
         sources = store.list_sources()
@@ -285,9 +384,29 @@ def _owner_domain_conflict(store, gym, owner_email):
 
 _PERSONAL_DOMAINS = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.com",
                      "outlook.com", "icloud.com", "aol.com", "me.com", "proton.me"}
+# LASSO manages Drive folders for multiple client gyms. Its own domain is not
+# evidence of which gym owns a folder; the global folder_id uniqueness check
+# above remains authoritative and still refuses an exact cross-gym collision.
+_SHARED_PROVIDER_DOMAINS = {"lassoframework.com"}
 
 
 # ---- GET /media/sources?gym --------------------------------------------------
+def handle_request_source_sync(account_key, source_id, *, store=None):
+    """Retry an existing source without binding again or touching calendar rows."""
+    if not _armed(account_key):
+        return 403, {"ok": False, "error": "media connect is not enabled for this gym"}
+    store = store or _store()
+    if not store.available():
+        return 503, {"ok": False, "error": "media store unavailable"}
+    try:
+        queued = store.request_sync(source_id, _base(account_key))
+    except Exception:
+        return 503, {"ok": False, "error": "could not queue media indexing"}
+    if not queued:
+        return 404, {"ok": False, "error": "active source not found"}
+    return 200, {"ok": True, "source_id": source_id, "sync_status": "queued"}
+
+
 def handle_list_sources(account_key, *, store=None):
     """GET /media/sources — this gym's connected sources. Response:
       {sources: [{id, folder_id, folder_name, owner_email, active,
@@ -306,7 +425,11 @@ def handle_list_sources(account_key, *, store=None):
          "folder_name": s.get("folder_name"), "owner_email": s.get("owner_email"),
          "active": bool(s.get("active")),
          "revoked_externally": bool(s.get("revoked_externally")),
-         "sync_mode": s.get("sync_mode"), "connected_at": s.get("connected_at")}
+         "sync_mode": s.get("sync_mode"), "connected_at": s.get("connected_at"),
+         "sync_status": s.get("sync_status") or "idle",
+         "sync_requested_at": s.get("sync_requested_at"),
+         "sync_finished_at": s.get("sync_finished_at"),
+         "sync_error": s.get("sync_error")}
         for s in sources]}
 
 
@@ -343,7 +466,7 @@ def handle_disconnect_source(account_key, source_id, *, store=None):
 # ---- GET /media/assets?gym ---------------------------------------------------
 def handle_list_assets(account_key, *, store=None):
     """GET /media/assets — this gym's assets for the portal media tab. Response:
-      {assets: [{id, kind, title, eligible, excluded_by_coach, reject_reason,
+      {assets: [{id, kind, title, eligible, review_ready, excluded_by_coach, reject_reason,
                  aspect, crop_hint, used_count, last_used_at,
                  thumb_url}]}"""
     if not _armed(account_key):
@@ -359,10 +482,24 @@ def handle_list_assets(account_key, *, store=None):
     return 200, {"assets": [
         {"id": a.get("id"), "kind": a.get("kind"), "title": a.get("title"),
          "eligible": a.get("eligible"),
+         "review_ready": _sel.is_usable(a),
          "excluded_by_coach": bool(a.get("excluded_by_coach")),
          "reject_reason": a.get("reject_reason"), "aspect": a.get("aspect"),
          "crop_hint": a.get("crop_hint"), "used_count": a.get("used_count"),
          "last_used_at": a.get("last_used_at"),
+         "source_id": a.get("source_id"),
+         "review_status": a.get("review_status") or "pending_review",
+         "moderation_status": a.get("moderation_status") or "pending",
+         "moderation_json": a.get("moderation_json"),
+         "people_detected": a.get("people_detected"),
+         "release_required": False,
+         "consent_status": a.get("consent_status") or "pending",
+         "consent_member_ref": a.get("consent_member_ref"),
+         "release_ref": a.get("release_ref"),
+         "consent_expires_at": a.get("consent_expires_at"),
+         "reviewed_by": a.get("reviewed_by"),
+         "reviewed_at": a.get("reviewed_at"),
+         "review_note": a.get("review_note"),
          "thumb_url": f"/media/thumb/{a.get('id')}"}
         for a in assets]}
 

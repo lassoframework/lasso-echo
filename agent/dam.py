@@ -1,14 +1,9 @@
 """
-DAM v1: consent tracking, perceptual near-dupe collapse, auto-tag.
-Flags: AGENT_CONSENT_GUARD_ENABLED, AGENT_AUTOTAG_ENABLED (both default OFF).
+DAM v1: legacy consent records, perceptual near-dupe collapse, auto-tag.
 
-CONSENT GUARD (fail safe, absolute): with the flag ON, an asset may only be
-selected when its sidecar says people=false, OR people=true AND
-consent="granted". Missing people flag, missing consent, or consent anything
-other than "granted" EXCLUDES the asset; the card path can never see it. The
-people flag is set by the auto-tag pass or by hand in the sidecar. NOTE: arming
-the guard on an untagged library excludes everything until assets are tagged;
-that is the fail safe working, not a bug.
+Photo releases are not a publishing gate. Older sidecars and audit rows keep
+their consent history, but selection ignores it. Safety moderation, explicit
+review rejection, file validation and hash-bound review remain independent gates.
 
 NEAR-DUPE COLLAPSE: dam-scan computes a perceptual hash per image (alongside
 the sha256 exact dedupe ingest already does) and writes a shared dupe_group
@@ -57,21 +52,9 @@ def write_sidecar(creative_path, updates):
 
 
 # ---- consent guard ------------------------------------------------------------------
-def consent_blocked(creative_path):
-    """
-    True when the consent guard must EXCLUDE this asset. Flag OFF: never blocks.
-    Flag ON, fail safe: only people=false, or people=true with consent="granted",
-    may pass. Unknown people, unknown consent, denied consent: excluded.
-    """
-    if not config.consent_guard_enabled():
-        return False
-    side = read_sidecar(creative_path)
-    people = side.get("people", None)
-    if people is False:
-        return False
-    if people is True:
-        return str(side.get("consent", "")).lower() != "granted"
-    return True  # unknown = excluded while the guard is armed
+def consent_blocked(creative_path, *, strict=False):
+    """Compatibility hook: releases never exclude an asset from publishing."""
+    return False
 
 
 def set_consent(creative_path, status, member_ref="", granted_by="", note=""):
@@ -133,6 +116,13 @@ def mark_near_dupes(library_path, phash=None):
     phash = phash or _phash_default
     by_hash = {}
     for name in sorted(os.listdir(library_path) if os.path.isdir(library_path) else []):
+        # macOS writes AppleDouble metadata beside files on some volumes.  The
+        # metadata filename keeps the asset extension (for example,
+        # ``._member.jpg``), so extension filtering alone would treat it as an
+        # image and could make it the near-dupe group leader.  Skip this exact
+        # AppleDouble prefix while retaining ordinary hidden dotfiles.
+        if name.startswith("._"):
+            continue
         if os.path.splitext(name)[1].lower() not in (".jpg", ".jpeg", ".png", ".webp"):
             continue
         path = os.path.join(library_path, name)

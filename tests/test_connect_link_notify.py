@@ -178,6 +178,36 @@ def test_resolve_owner_email_no_creds_is_none(monkeypatch):
     assert cln.resolve_owner_email("g1", http=_FakeHttp()) is None
 
 
+@pytest.mark.parametrize("routes, expected", [
+    ({f"{REST}/rest/v1/gym_assignments": (200, [])}, "missing"),
+    ({f"{REST}/rest/v1/gym_assignments":
+      (200, [{"app_user_id": "user-1"}, {"app_user_id": "user-2"}])}, "ambiguous"),
+    ({f"{REST}/rest/v1/gym_assignments": (200, [{"app_user_id": "user-1"}]),
+      f"{REST}/rest/v1/app_users": (200, [])}, "user-email-missing"),
+    ({f"{REST}/rest/v1/gym_assignments": (200, [{"app_user_id": "user-1"}]),
+      f"{REST}/rest/v1/app_users": (200, [{"email": "  "}])}, "user-email-missing"),
+    ({f"{REST}/rest/v1/gym_assignments": (500, {"error": "boom"})}, "portal-unavailable"),
+])
+def test_owner_readiness_reports_non_sensitive_owner_categories(routes, expected):
+    assert cln.owner_readiness("g1", http=_FakeHttp(routes)) == expected
+
+
+def test_owner_readiness_accepts_duplicate_assignment_for_one_user():
+    http = _FakeHttp({
+        f"{REST}/rest/v1/gym_assignments":
+            (200, [{"app_user_id": "user-1"}, {"app_user_id": "user-1"}]),
+        f"{REST}/rest/v1/app_users": (200, [{"email": "owner@example.test"}]),
+    })
+    assert cln.owner_readiness("g1", http=http) == "ready"
+    assert all("slack.com" not in call[1] for call in http.calls)
+
+
+def test_owner_readiness_missing_creds_is_portal_unavailable(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    assert cln.owner_readiness("g1", http=_FakeHttp()) == "portal-unavailable"
+
+
 # ---- full happy path -------------------------------------------------------------
 
 def test_happy_path_sends_and_dedupes():
@@ -195,6 +225,21 @@ def test_happy_path_sends_and_dedupes():
     assert payload["channel"] == "C0NEWDM"
     assert "CrossFit Local" in payload["text"]
     assert "/portal/" in payload["text"] and "/connect" in payload["text"]
+
+
+def test_happy_path_can_return_provider_receipt_for_verified_ops():
+    http = _FakeHttp(_full_routes(email="chad@crossfitlocal.com", owner_id="U06LXAZHVBM"))
+    out = cln.notify_new_gym(
+        "crossfitlocal", "g1", "CrossFit Local",
+        http=http, db=_KV(), alert=lambda m: None, return_receipt=True,
+    )
+    assert out == {
+        "sent": True,
+        "provider": "slack",
+        "channel": "C0NEWDM",
+        "ts": "1.0",
+        "message_id": None,
+    }
 
 
 def test_happy_path_opens_dm_with_approver_and_owner():

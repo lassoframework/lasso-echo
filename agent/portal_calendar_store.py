@@ -257,6 +257,71 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def list_media_publish_history(self, account_key, since):
+        """Complete cross-platform send history for a strict reuse decision.
+
+        Include archived variants and in-flight claims. Pagination avoids a
+        silently truncated nine-month history under PostgREST's response cap.
+
+        A row already stamped 'published' but lacking published_at CONSERVATIVELY
+        participates: PostgREST's gte filter silently drops NULLs, which used to
+        let a published row slip the reuse window and re-send a nine-month-old
+        asset. The and(status.eq.published,published_at.is.null) arm admits only
+        actually-published rows with a NULL stamp — a pending/draft row has no
+        published_at either and must never count as send history.
+        """
+        rows = []
+        while True:
+            params = {"gym_id": f"eq.{account_key}",
+                      "or": f"(published_at.gte.{since},"
+                            f"and(status.eq.published,published_at.is.null),"
+                            f"status.eq.publishing)",
+                      "order": "id", "limit": "500", "offset": str(len(rows))}
+            r = self._client().get(self._rest(_TABLE), params=params,
+                                   headers=self._headers(), timeout=30)
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, "media history unavailable")
+            page = r.json()
+            if not isinstance(page, list):
+                raise PortalStoreError(502, "invalid media history")
+            rows.extend(page)
+            if len(page) < 500:
+                return rows
+            if len(rows) >= 10000:
+                raise PortalStoreError(502, "media history exceeds safe read bound")
+
+    def list_variant_candidates(self, account_key, month):
+        """The gym's 'candidate' rows (variant_status='candidate') whose
+        post_date falls inside `month` — the complement of list_month's
+        variant_status=active filter. Exists because list_month deliberately
+        NEVER returns a candidate row (see its own comment: a caller treating
+        the month as 'one row per logical post' must not double-count a
+        pending variant), so any caller that needs to know "does this anchor
+        already have a linked candidate" (e.g. lasso_astra_rework's dedup)
+        cannot get that from list_month at all. Real production bug found
+        2026-09-11: a first cut of that dedup silently no-op'd because it
+        tried to find candidate rows inside list_month's own results."""
+        year = int(month[:4])
+        mon = int(month[5:7])
+        last_day = _calendar.monthrange(year, mon)[1]
+        first = f"{month}-01"
+        last = f"{month}-{last_day:02d}"
+        params = {
+            "gym_id": f"eq.{account_key}",
+            "post_date": [f"gte.{first}", f"lte.{last}"],
+            "variant_status": "eq.candidate",
+            "order": "post_date",
+        }
+        r = self._client().get(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
     def has_owner_visible_rows(self, account_key):
         """GATE 2 (coach-screens-first-month): True if the gym has EVER had an owner-visible
         content_calendar row (any status EXCEPT 'coach_review', any account, any date). A
@@ -646,6 +711,47 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def patch_caption_for_hashtag_backfill(self, account_key, row_id, new_caption,
+                                           *, expected_status):
+        """Atomically patch a safe future IG row during the one-off hashtag backfill.
+
+        ``expected_status`` is intentionally a positive allowlist. A pending row
+        stays pending; an approved row becomes pending because its client-visible
+        copy changed and requires a fresh approval. The REST filters make a stale
+        read harmless if another worker has claimed, published, denied, killed,
+        failed, or otherwise changed the row before this request reaches Supabase.
+        """
+        expected = str(expected_status or "").strip().lower()
+        if expected not in ("pending", "approved"):
+            return None
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+            "status": f"eq.{expected}",
+            "published_at": "is.null",
+            "late_post_id": "is.null",
+            "variant_status": "eq.active",
+        }
+        payload = {"caption": new_caption}
+        if expected == "approved":
+            payload["status"] = "pending"
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     # ---- auto-publisher: read + exactly-once claim/update -------------------
     # These serve the scheduled calendar auto-publisher (calendar_autopublish.py).
     # They never publish; they only read the day's rows and flip status atomically
@@ -749,6 +855,34 @@ class SupabaseCalendarStore:
         rows = r.json() or []
         return len(rows) == 1
 
+    def claim_publish_slot(self, row_id, gym_id, local_day, timezone_name,
+                           capacity, approved_only):
+        """Atomically reserve a platform slot and return this claim's UUID token.
+
+        No split count/claim fallback: an unavailable RPC holds the post. The SQL
+        function serializes all workers for this gym with an advisory lock. A
+        distinct token on each successful claim prevents a stale worker from
+        reverting a later worker's claim of the same row.
+        """
+        r = self._client().post(
+            self._rest("rpc/claim_calendar_publish_slot_owned"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"p_row_id": row_id, "p_gym_id": gym_id,
+                  "p_day": local_day, "p_timezone": timezone_name,
+                  "p_capacity": capacity, "p_approved_only": approved_only},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        token = r.json()
+        if token is None:
+            return None
+        try:
+            from uuid import UUID
+            return str(UUID(str(token)))
+        except (TypeError, ValueError, AttributeError):
+            raise PortalStoreError(502, "calendar claim returned an invalid ownership token")
+
     def patch_post_date(self, row_id, new_post_date):
         """RE-DATE one waiting row (expired-row self-heal, Blake 2026-08-31: no human
         should have to re-date dead posts). Moves post_date forward and CLEARS
@@ -756,11 +890,28 @@ class SupabaseCalendarStore:
         only a row still waiting (pending/approved, never published) may move — a row
         mid-claim or already live is refused (zero rows -> None). Status untouched, so
         an approved row stays approved (the gym's approval is preserved)."""
+        before = self._client().get(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}",
+                    "status": "in.(pending,approved)",
+                    "published_at": "is.null",
+                    "select": "id,gym_id,post_date,caption"},
+            headers=self._headers(), timeout=30)
+        if before.status_code >= 400:
+            raise PortalStoreError(before.status_code,
+                                   _scrub((before.text or "")[:200]))
+        current = before.json() or []
+        if len(current) != 1:
+            return None
+        old = current[0]
+        old_post_date = str(old.get("post_date") or "")[:10]
+
         r = self._client().patch(
             self._rest(_TABLE),
             params={"id": f"eq.{row_id}",
                     "status": "in.(pending,approved)",
-                    "published_at": "is.null"},
+                    "published_at": "is.null",
+                    "post_date": f"eq.{old_post_date}"},
             headers=self._headers({
                 "Content-Type": "application/json",
                 "Prefer": "return=representation",
@@ -771,7 +922,44 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        if config.caption_cooldown_enabled():
+            try:
+                from . import caption_ledger
+                # A caption/date stamp is shared by the IG feed, FB mirror and
+                # paired story, and it may also represent a real historical use.
+                # Move the old stamp only after the LAST matching row leaves that
+                # date.  Otherwise re-dating one sibling would erase duplicate
+                # evidence owned by another row.  A failed evidence read preserves
+                # the old stamp (safe hold) rather than weakening the guard.
+                peers = self._client().get(
+                    self._rest(_TABLE),
+                    params={"gym_id": f"eq.{old.get('gym_id')}",
+                            "post_date": f"eq.{old_post_date}",
+                            "id": f"neq.{row_id}",
+                            "select": "caption"},
+                    headers=self._headers(), timeout=30)
+                if peers.status_code >= 400:
+                    raise PortalStoreError(
+                        peers.status_code, _scrub((peers.text or "")[:200]))
+                other_captions = [str(x.get("caption") or "")
+                                  for x in (peers.json() or [])]
+                caption = str(old.get("caption") or "")
+                fuzzy = caption_ledger.caption_hash(caption)
+                verbatim = caption_ledger.verbatim_hash(caption)
+                caption_ledger.move_staged_date(
+                    str(old.get("gym_id") or ""), caption,
+                    old_post_date, str(new_post_date)[:10],
+                    preserve_old_fuzzy=any(
+                        caption_ledger.caption_hash(c) == fuzzy
+                        for c in other_captions),
+                    preserve_old_verbatim=bool(verbatim) and any(
+                        caption_ledger.verbatim_hash(c) == verbatim
+                        for c in other_captions))
+            except Exception:
+                pass
+        return rows[0]
 
     def stamp_scheduled(self, row_id, scheduled_at_iso):
         """Record the row's planned go-live time (content_calendar.scheduled_at) so the
@@ -1465,7 +1653,8 @@ class SupabaseCalendarStore:
             # but the filter is added anyway so a future bug elsewhere can never
             # turn this into a false stale-claim alert on a variant row.
             "variant_status": "eq.active",
-            "select": "id,gym_id,account,post_date",
+            "select": "id,gym_id,account,format,post_date,scheduled_at,caption,"
+                      "image_url,publish_claim_token,publish_reservation_day",
         }
         r = self._client().get(
             self._rest(_TABLE),
@@ -1476,6 +1665,47 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
+
+    def reconcile_stale_published(self, account_key, row_id, claim_token,
+                                  media_id, published_at):
+        """Stamp one provider-confirmed live stale claim with a tenant-scoped CAS."""
+        if not all(str(v or "").strip() for v in
+                   (account_key, row_id, claim_token, media_id, published_at)):
+            raise PortalStoreError(422, "stale publish reconciliation identity is incomplete")
+        try:
+            from uuid import UUID
+            claim_token = str(UUID(str(claim_token)))
+        except (TypeError, ValueError, AttributeError):
+            raise PortalStoreError(422, "stale publish reconciliation token is invalid")
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
+                    "status": "eq.publishing", "published_at": "is.null",
+                    "late_post_id": "is.null",
+                    "publish_claim_token": f"eq.{claim_token}"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"status": "published", "published_at": str(published_at),
+                  "late_post_id": str(media_id), "publish_claim_token": None},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return next((row for row in rows
+                     if str(row.get("id")) == str(row_id)
+                     and str(row.get("gym_id")) == str(account_key)
+                     and row.get("status") == "published"
+                     and str(row.get("late_post_id") or "") == str(media_id)), None)
+
+    def release_stale_publish_claim(self, account_key, row_id, claim_token, reason):
+        """Release one provider-confirmed absent claim with a tenant-scoped CAS.
+
+        ``approved`` is the conservative retry state: it preserves manual client
+        approval and remains eligible for an autonomous account.
+        """
+        return self._transition_unpublished_claim(
+            account_key, row_id, "approved", reason, claim_token)
 
     def delete_rows(self, account_key, row_ids):
         """Hard-delete specific rows for ONE gym. Filtered by BOTH id AND gym_id so a
@@ -1534,7 +1764,7 @@ class SupabaseCalendarStore:
         return r.json() or []
 
     def mark_published(self, row_id, media_id, published_at,
-                       allow_missing_post_id=False):
+                       allow_missing_post_id=False, expected_claim_token=None):
         """
         Record a successful publish: status='published', published_at=<now iso>,
         late_post_id=<media_id>. Filtered by id AND status='publishing' (audit
@@ -1561,6 +1791,13 @@ class SupabaseCalendarStore:
                      "id. A post we cannot identify cannot be verified or reconciled; "
                      "the row stays claimed and the caller reverts it for retry.")
         params = {"id": f"eq.{row_id}", "status": "eq.publishing"}
+        if expected_claim_token:
+            try:
+                from uuid import UUID
+                expected_claim_token = str(UUID(str(expected_claim_token)))
+            except (TypeError, ValueError, AttributeError):
+                raise PortalStoreError(422, "publish claim token is invalid")
+            params["publish_claim_token"] = f"eq.{expected_claim_token}"
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -1572,6 +1809,7 @@ class SupabaseCalendarStore:
                 "status": "published",
                 "published_at": published_at,
                 "late_post_id": media_id,
+                "publish_claim_token": None,
             },
             timeout=30,
         )
@@ -1603,16 +1841,75 @@ class SupabaseCalendarStore:
                 pass  # ledger stamp failure is never fatal
         return rows[0]
 
-    def mark_publish_failed(self, row_id, revert_status="pending",
-                            reject_reason=None):
+    def mark_duplicate_content(self, account_key, row_id, reason,
+                               expected_claim_token=None):
+        """Retire a duplicate rejected BEFORE the publisher's network call.
+
+        Only the publisher-owned claim is eligible. Published rows and any row
+        with a provider id or publication timestamp remain untouched. This is a
+        reversible calendar soft delete, never deletion on a social platform.
         """
-        REVERT a claim after a publish failure (or a would_publish result): status
-        back to `revert_status` so the row is retried on the next run. LASSO rows
-        revert to 'pending' (the default, unchanged). A CLIENT row that was APPROVED
-        before the claim reverts to 'approved' so a transient Zernio failure never
-        forces the client to re-approve. Records NOTHING else (no media id, no
-        published_at), so a failed attempt never looks published. Filtered by id
-        only. Returns the updated row or None.
+        return self._transition_unpublished_claim(
+            account_key, row_id, "deleted", reason, expected_claim_token)
+
+    def release_content_ledger_claim(self, account_key, row_id, previous_status, reason,
+                                     expected_claim_token=None):
+        """A ledger read/write failed before any network call: retry the owned row."""
+        if previous_status not in ("pending", "approved"):
+            return None
+        return self._transition_unpublished_claim(
+            account_key, row_id, previous_status, reason, expected_claim_token)
+
+    def _transition_unpublished_claim(self, account_key, row_id, status, reason,
+                                      expected_claim_token):
+        """Change only the exact unpublished claim owned by this worker.
+
+        A row can be released and reclaimed while an older worker is still running.
+        The claim UUID is therefore part of the compare-and-swap identity; row id,
+        tenant and ``publishing`` status alone do not prevent an ABA overwrite.
+        """
+        if not str(account_key or "").strip():
+            raise PortalStoreError(422, "claim transition requires a gym id")
+        if not expected_claim_token:
+            raise PortalStoreError(422, "claim transition requires a claim token")
+        try:
+            from uuid import UUID
+            expected_claim_token = str(UUID(str(expected_claim_token)))
+        except (TypeError, ValueError, AttributeError):
+            raise PortalStoreError(422, "claim transition token is invalid")
+        response = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
+                    "status": "eq.publishing", "published_at": "is.null",
+                    "late_post_id": "is.null",
+                    "publish_claim_token": f"eq.{expected_claim_token}"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"status": status, "reject_reason": str(reason)[:500],
+                  "publish_reservation_day": None, "publish_claim_token": None},
+            timeout=30,
+        )
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, _scrub((response.text or "")[:200]))
+        rows = response.json() or []
+        return next((row for row in rows if str(row.get("id")) == str(row_id)
+                     and str(row.get("gym_id")) == str(account_key)
+                     and row.get("status") == status), None)
+
+    def mark_publish_failed(self, row_id, revert_status="pending",
+                            reject_reason=None, gym_id=None,
+                            expected_claim_token=None):
+        """
+        REVERT a claim after a PRE-NETWORK block (including a would_publish result)
+        or a provider result that explicitly proves no post exists. LASSO rows
+        revert to 'pending'. A CLIENT row that was APPROVED before the claim reverts
+        to 'approved', so a safe retry never forces the client to re-approve.
+        Ambiguous outcomes after a network call must not use this method because an
+        automatic retry could duplicate a live post. The update records no media id
+        or publication timestamp and matches only the exact tenant, row, publishing
+        status, and owned claim UUID. The UUID prevents a stale worker from changing
+        the row after it was released and claimed again. Returns the updated row or
+        None when the claim no longer matches.
 
         reject_reason (publish_guard wiring, 2026-08-27): when the publish guard
         blocks a row, its violation codes land on the row so the portal/human can
@@ -1621,10 +1918,23 @@ class SupabaseCalendarStore:
         """
         if revert_status not in ("pending", "approved"):
             revert_status = "pending"
-        body = {"status": revert_status}
+        if gym_id is None:
+            raise PortalStoreError(422, "publish rollback requires a gym id")
+        if not expected_claim_token:
+            raise PortalStoreError(422, "publish rollback requires a claim token")
+        try:
+            from uuid import UUID
+            expected_claim_token = str(UUID(str(expected_claim_token)))
+        except (TypeError, ValueError, AttributeError):
+            raise PortalStoreError(422, "rollback claim token is invalid")
+        body = {"status": revert_status, "publish_reservation_day": None,
+                "publish_claim_token": None}
         if reject_reason is not None:
             body["reject_reason"] = str(reject_reason)[:500]
-        params = {"id": f"eq.{row_id}"}
+        params = {"id": f"eq.{row_id}", "status": "eq.publishing",
+                  "published_at": "is.null", "late_post_id": "is.null"}
+        params["gym_id"] = f"eq.{gym_id}"
+        params["publish_claim_token"] = f"eq.{expected_claim_token}"
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -1638,11 +1948,14 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
-        return rows[0] if rows else None
+        return next((row for row in rows if str(row.get("id")) == str(row_id)
+                     and row.get("status") == revert_status
+                     and str(row.get("gym_id")) == str(gym_id)),
+                    None)
 
     # ---- mirror writes (real-drafts calendar mirror) ------------------------
     # These write calendar rows only. NOTHING here publishes to any social account.
-    def insert_rows(self, account_key, rows):
+    def insert_rows(self, account_key, rows, *, preserve_ids=False):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -1651,7 +1964,8 @@ class SupabaseCalendarStore:
         and the approve/deny actions key off the DB-returned uuid, not the draft id.
 
         Every row's gym_id is FORCED to account_key (a caller can never write another
-        gym's row through this store) and any stray `id` key is STRIPPED before the POST.
+        gym's row through this store). IDs are stripped by default. The explicit
+        preserve_ids option accepts validated UUIDs for crash-safe automatic jobs.
         No on_conflict/upsert: apply is delete-then-insert, so a plain insert is correct
         and idempotent. Returns the list of inserted row dicts (each with its new uuid).
 
@@ -1662,8 +1976,18 @@ class SupabaseCalendarStore:
         stuck at 1 day). We normalize every row to the UNION of keys across the batch,
         filling missing keys with None, so the batch is always uniform."""
         payload = []
+        from .copy_gate import bound_opening_hook
         for row in (rows or []):
             clean = {k: v for k, v in dict(row or {}).items() if k != "id"}
+            if "caption" in clean and clean["caption"] is not None:
+                # Every calendar-building lane converges here. Prompts and individual
+                # generators can miss the hook limit, so enforce the grader's exact
+                # first-line rule at the persistence boundary without dropping words.
+                clean["caption"] = bound_opening_hook(clean["caption"])
+            if preserve_ids:
+                import uuid
+                # Explicit stable UUIDs support crash-safe automatic render retries.
+                clean["id"] = str(uuid.UUID(str((row or {}).get("id") or "")))
             clean["gym_id"] = account_key  # gym scope: never trust a foreign gym_id
             payload.append(clean)
         # STAGE-TIME BELTS (report-card build, 2026-08-28; both flags default OFF,
@@ -2429,6 +2753,70 @@ def preserve_and_prune(store, account_key, months, rows):
     Returns (kept_rows, locked_slot_count). Safe when the store lacks locked_slots (a test
     fake): then nothing is locked and every row is kept. Never raises out (a read failure
     falls back to keeping all rows, matching the old behavior)."""
+    if (account_key == "lasso" and config.lasso_editorial_calendar_enabled()
+            and callable(getattr(store, "list_month", None))):
+        from .cadence import resolve_posts_per_day
+        def capacity_for(row):
+            """Third capacity exists only for LASSO feed rows in the dated window."""
+            day_key = str(row.get("post_date") or "")[:10]
+            try:
+                base_capacity = resolve_posts_per_day(account_key, store, day=day_key)
+            except TypeError:
+                # Compatibility for injected legacy resolvers in offline callers.
+                base_capacity = resolve_posts_per_day(account_key, store)
+            if (str(account_key).strip().lower() == "lasso"
+                    and str(row.get("format") or "feed").strip().lower() == "feed"):
+                try:
+                    if config.lasso_three_feed_enabled() or \
+                            config.lasso_summit_daily_enabled(day_key):
+                        return max(base_capacity, 3)
+                except (TypeError, ValueError):
+                    pass
+            # Summit's third slot is feed-only. The dated cadence resolver may
+            # report three for LASSO, but paired stories retain their existing
+            # two-slot capacity.
+            return min(base_capacity, 2)
+        existing = []
+        # A failed preservation read must never risk an approved post.
+        for month in months:
+            existing.extend(store.list_month(account_key, month) or [])
+        from collections import defaultdict
+        occupied = defaultdict(set)
+        active_count = defaultdict(int)
+        prior = defaultdict(list)
+        for row in existing:
+            status = str(row.get("status") or "").lower()
+            if not status or status in _WIPEABLE_STATUSES:
+                continue
+            key = _slot_key(row)
+            prior[key].append(row)
+            if status in ("denied", "killed"):
+                continue
+            active_count[key] += 1
+            ordinal = row.get("slot_index")
+            capacity = capacity_for(row)
+            if ordinal not in range(capacity):
+                ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
+            occupied[key].add(ordinal)
+        kept = []
+        for row in rows or []:
+            key = _slot_key(row)
+            capacity = capacity_for(row)
+            ordinal = row.get("slot_index")
+            if ordinal is None:
+                ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
+                row = dict(row, slot_index=ordinal)
+            if (ordinal not in range(capacity) or active_count[key] >= capacity
+                    or ordinal in occupied[key]):
+                continue
+            if any((row.get("caption") and row.get("caption") == old.get("caption"))
+                   or (row.get("image_url") and row.get("image_url") == old.get("image_url"))
+                   for old in prior[key]):
+                continue
+            kept.append(row)
+            occupied[key].add(ordinal)
+            active_count[key] += 1
+        return kept, len(prior)
     getter = getattr(store, "locked_slots", None)
     if getter is None:
         return list(rows or []), 0

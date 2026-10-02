@@ -28,6 +28,10 @@ time, in filename order. What this module does now:
                 creative served inside the repeat window (rotation ledger).
   ORDER       = least recently used first (never used wins), then least used,
                 then name for determinism.
+  EXHAUSTION  = for gyms without an explicit long-term reuse promise, a manual
+                swap may relax only the generic rotation cooldown and choose the
+                least-recently-used safe asset outside the live forward book.
+                Zanshin's nine-month policy remains a hard gate.
   VIDEO FIRST = when the row's current media is a still and a video candidate
                 exists, the swap hands back a video. A follower asking for a
                 different picture of the same nine stills is asking for footage.
@@ -60,13 +64,13 @@ from .media_types import (VIDEO_EXTS as _VIDEO_EXTS,           # ONE definition 
 # outcome here is a normal thing that can happen to a real gym.
 REASON_NO_LIBRARY = "no_library"
 REASON_NO_FRESH_PHOTO = "no_fresh_photo"
+REASON_ASSET_PREP = "asset_preparation_failed"
 REASON_HOSTING = "hosting_unavailable"
 REASON_STORY_REBURN = "story_reburn_failed"
 
 REASON_TIMEOUT = "swap_timeout"
 
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
-_MAX_MATERIALIZE_ATTEMPTS = 3      # a corrupt download / failed probe tries the next
 SWAP_TRANSCODE_TIMEOUT_SEC = 45    # the ONE transcode a portal request may wait on
 SWAP_REQUEST_DEADLINE_SEC = 75     # the whole request: downloads + probes + transcode + burn
 SWAP_DOWNLOAD_TIMEOUT_SEC = 20     # one Drive download
@@ -190,8 +194,14 @@ def _local_video_servable(path):
     return not _idx.needs_rendition(pseudo, info)
 
 
-def local_candidates(base_key, lib, post_date, blocked_keys):
-    """The gym's local-library creatives a swap may use for a row on post_date."""
+def local_candidates(base_key, lib, post_date, blocked_keys, *, allow_recent=False):
+    """The gym's local-library creatives a swap may use for a row on post_date.
+
+    ``allow_recent`` is the user-requested exhaustion lane. It relaxes only the
+    generic served-ledger cooldown; media already carried by the live book remains
+    blocked by ``blocked_keys``. Explicit client reuse policies are checked by the
+    caller before this lane is reachable.
+    """
     if not lib or not os.path.isdir(lib):
         return []
     from . import dam, rotation
@@ -224,21 +234,25 @@ def local_candidates(base_key, lib, post_date, blocked_keys):
         except Exception:  # noqa: BLE001
             rk = key
         last = served.get(rk, "")
-        if last and floor and last >= floor:
+        if not allow_recent and last and floor and last >= floor:
             continue                      # served inside the repeat window
         out.append({"source": "local", "kind": kind, "key": key, "path": path,
                     "last_used": last, "used_count": 1 if last else 0, "name": key})
     return out
 
 
-def drive_candidates(base_key, blocked_ids, *, media_store=None, now=None):
+def drive_candidates(base_key, blocked_ids, *, media_store=None, now=None,
+                     allow_cooling=False):
     """The gym's Drive-pool assets a swap may use: gym_media_selector.pickable (eligible,
     not hidden, outside the 90-day cooldown, not used this month), minus everything
     already on the book. Never raises; an unarmed store is an empty list."""
     try:
         from . import gym_media_selector as _sel
-        assets = _sel.pickable(base_key, store=media_store, now=now,
-                               exclude_ids=tuple(blocked_ids))
+        picker = _sel.cooldown_fallback if allow_cooling else _sel.pickable
+        kwargs = {"store": media_store, "exclude_ids": tuple(blocked_ids)}
+        if not allow_cooling:
+            kwargs["now"] = now
+        assets = picker(base_key, **kwargs)
     except Exception:  # noqa: BLE001
         return []
     out = []
@@ -318,6 +332,23 @@ def candidates_for(base_key, row, *, store, lib, book_state=None, asset_state=No
         blocked_ids.add(current_asset)
     cands = local_candidates(base_key, lib, pd, blocked_keys)
     cands += drive_candidates(base_key, blocked_ids, media_store=media_store, now=now)
+    if not cands:
+        # A user-requested swap must not deadlock a small library merely because
+        # every otherwise-safe asset is inside the generic 30/90-day rotation
+        # clocks. Keep anything on another active/in-flight day excluded, then use
+        # the least-recently-used safe asset. Explicit client policies remain hard:
+        # Zanshin's nine-month no-repeat promise never reaches this fallback.
+        from .media_reuse_policy import reuse_months
+        if not reuse_months(base_key):
+            cands = local_candidates(base_key, lib, pd, blocked_keys,
+                                     allow_recent=True)
+            cands += drive_candidates(base_key, blocked_ids, media_store=media_store,
+                                      now=now, allow_cooling=True)
+            for cand in cands:
+                cand["reuse_fallback"] = True
+            if cands:
+                say(f"{base_key}: fresh swap pool exhausted; using least-recently-used "
+                    "media outside the live forward book")
     return order_candidates(cands, current_is_video=is_video(current))
 
 
@@ -528,7 +559,16 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
     deadline = _Deadline(SWAP_REQUEST_DEADLINE_SEC, clock)
     work = tempfile.mkdtemp(prefix="mediaswap_")
     try:
-        for cand in cands[:_MAX_MATERIALIZE_ATTEMPTS]:
+        # Swift River, 2026-09-23: the old loop tried only the first three
+        # candidates and then reported no_fresh_photo ("all photos were used") even
+        # when ~500 eligible assets remained and only preparation had failed. Walk
+        # EVERY ordered candidate, bounded by the finite selector result and, far
+        # earlier, by the shared request deadline and the one-transcode budget. Only say
+        # no_fresh_photo when the SELECTOR returned nothing pickable (handled above).
+        # Candidates that existed but could not be prepared in time are a retryable
+        # asset-preparation failure, never a false exhaustion report.
+        prep_failures = 0
+        for cand in cands:
             if deadline.expired():
                 say(f"{base_key}: swap request deadline passed before candidate "
                     f"{cand.get('key')}; nothing written")
@@ -542,6 +582,7 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                 say(f"{base_key}: {exc}; nothing written")
                 return {"ok": False, "reason": REASON_TIMEOUT}
             if not mat or not mat.get("path"):
+                prep_failures += 1
                 continue
             path = mat["path"]
             # Drive assets host under the gym base (builder parity, so the same bytes
@@ -597,7 +638,11 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                 say(f"{base_key}: {exc}; nothing written")
                 return {"ok": False, "reason": REASON_TIMEOUT}
             return out
-        return {"ok": False, "reason": REASON_NO_FRESH_PHOTO}
+        say(f"{base_key}: {prep_failures} of {len(cands)} "
+            "swap candidates could not be prepared (download/probe/conversion); "
+            "retryable, nothing written")
+        return {"ok": False, "reason": REASON_ASSET_PREP,
+                "candidates_tried": prep_failures}
     finally:
         _cleanup(work)
 
@@ -761,6 +806,11 @@ def client_message(reason, base_key=""):
     if reason == REASON_STORY_REBURN:
         return ("Echo could not rebuild the story card on the new media, so nothing "
                 "was changed. Try again shortly. Your recreates were not touched.")
+    if reason == REASON_ASSET_PREP:
+        return ("Echo found fresh media to swap in but could not get it ready in "
+                "time (a download or conversion did not finish), so nothing was "
+                "changed. Try again in a few minutes. Your recreates were not "
+                "touched.")
     if reason == REASON_TIMEOUT:
         return ("Echo could not prepare a fresh photo or video within the time it "
                 "allows itself, so nothing was changed. Try again in a minute. Your "
@@ -776,4 +826,4 @@ __all__ = ["enabled", "pick_replacement", "candidates_for", "order_candidates",
            "SWAP_DOWNLOAD_TIMEOUT_SEC", "REASON_TIMEOUT", "SwapDeadline",
            "library_path_for", "client_message", "is_video",
            "REASON_NO_LIBRARY", "REASON_NO_FRESH_PHOTO", "REASON_HOSTING",
-           "REASON_STORY_REBURN"]
+           "REASON_STORY_REBURN", "REASON_ASSET_PREP"]

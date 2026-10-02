@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from . import config, db as _db
 from . import portal_approvals as _pa
 from . import portal_calendar_store as _pcs
+from .portal_visibility import client_visible as _client_visible
 from . import rotation as _rotation
 from .drafter import DraftStatus
 
@@ -134,6 +135,38 @@ class StripeSocialReader:
                     return True
         return False
 
+    def echo_active(self, customer_id, products, base):
+        """Echo products only; explicitly scoped subscriptions cannot cross gyms."""
+        import stripe
+        from .intake_web import _supabase_token_gym
+        stripe.api_key = self._key
+        subs = stripe.Subscription.list(customer=customer_id, status="all", limit=100,
+                                        expand=["data.items.data.price"])
+        gym = None
+        looked_up = False
+        for sub in subs.auto_paging_iter():
+            if sub.get("status") not in ("active", "trialing", "past_due"):
+                continue
+            matches = False
+            for item in (sub.get("items") or {}).get("data", []):
+                product = (item.get("price") or {}).get("product")
+                product = product.get("id") if isinstance(product, dict) else product
+                matches = matches or product in products
+            if not matches:
+                continue
+            metadata = sub.get("metadata") or {}
+            sub_gym = metadata.get("gym_id") or metadata.get("gymId")
+            if sub_gym:
+                if not looked_up:
+                    gym = _supabase_token_gym(base)
+                    looked_up = True
+                if gym is None:
+                    raise RuntimeError("Echo subscription gym mapping unavailable")
+                if gym.get("echo_account_key") != base or gym.get("gym_id") != sub_gym:
+                    continue
+            return True
+        return False
+
 
 def _stripe_customer_id(account_key):
     """The gym's Stripe customer id from its gyms row, or None. Never provisions."""
@@ -207,6 +240,17 @@ def _budget_state(account_key, now=None):
     used = recreate_spent(account_key, now)
     return {"limit": MONTHLY_RECREATE_BUDGET, "used": used,
             "remaining": max(0, MONTHLY_RECREATE_BUDGET - used)}
+
+
+def reset_recreate_budget(account_key, now=None):
+    """Operator action (D72, the FIXER's ops lane): zero THIS gym's spend for the current
+    month so the portal's deny / recreate-caption buttons work again. Idempotent -- a
+    second call on an already-zero month changes nothing. Returns {before, after}; the key
+    carries the account_key, so gym A's reset never touches gym B."""
+    before = _budget_state(account_key, now)
+    if before["used"]:
+        _db.kv_set(_budget_key(account_key, now), "0")
+    return {"before": before, "after": _budget_state(account_key, now)}
 
 
 # ==========================================================================
@@ -407,6 +451,150 @@ def _base_of_account(account_key):
     return key
 
 
+def _neutral_media_bridge_state():
+    """A shared-state read failed, so never claim an inactive runway."""
+    return (
+        {"active": None, "depleted_on": None, "dates": [],
+         "drafts_need_review": None, "status": "unknown"},
+        {"status": "unknown", "delivery_confirmed": False},
+    )
+
+
+def _media_bridge_payload(state, notice, base, *, now=None):
+    """Normalize worker-local or shared snapshots to the stable portal contract."""
+    if state:
+        from .calendar_autopublish import _local_now
+        today = _local_now(now, config.posting_timezone_for(base)).date()
+        active = today.isoformat() <= state["end"]
+        fallback = {"active": active, "episode_id": state["id"],
+                    "depleted_on": state["depleted_on"],
+                    "dates": [state["start"], state["end"]] if active else [],
+                    "drafts_need_review": active}
+    else:
+        active = False
+        fallback = {"active": False, "depleted_on": None, "dates": [],
+                    "drafts_need_review": False}
+
+    # An expired episode is historical, not proof of a current client notice.
+    current = state if state and active else None
+    if not current or (notice or {}).get("episode_id") != current["id"]:
+        notice = None
+    status = notice.get("status") if notice else "none"
+    if status not in {"none", "unresolved", "ready", "sent"}:
+        status = "unresolved"
+    return fallback, {
+        "status": status,
+        "episode_id": current["id"] if current else None,
+        "created_at": notice.get("created_at") if notice else None,
+        "delivery_confirmed": bool(status == "sent" and notice.get("ts")),
+    }
+
+
+def _shared_media_bridge_payload(fallback, notice, base, *, now=None):
+    """Use the store's already-validated portal projection without local dates."""
+    if fallback is None:
+        rendered = {"active": False, "depleted_on": None, "dates": [],
+                    "drafts_need_review": False}
+        current_id = None
+    elif not isinstance(fallback, dict):
+        raise ValueError("invalid shared fallback episode")
+    else:
+        from .calendar_autopublish import _local_now
+        dates = fallback.get("dates") or []
+        today = _local_now(now, config.posting_timezone_for(base)).date().isoformat()
+        active = bool(fallback.get("active") and dates and today <= dates[-1])
+        rendered = {
+            "active": active,
+            "episode_id": fallback.get("episode_id"),
+            "depleted_on": fallback.get("depleted_on"),
+            "dates": dates if active else [],
+            "drafts_need_review": bool(fallback.get("drafts_need_review") and active),
+        }
+        if fallback.get("status") == "unknown":
+            rendered["status"] = "unknown"
+        current_id = rendered["episode_id"] if rendered["active"] else None
+
+    if not isinstance(notice, dict):
+        raise ValueError("invalid shared notice state")
+    if rendered.get("status") == "unknown":
+        return rendered, {"status": "unknown", "delivery_confirmed": False}
+    if current_id is None or notice.get("episode_id") != current_id:
+        return rendered, {"status": "none", "episode_id": None,
+                          "created_at": None, "delivery_confirmed": False}
+    status = notice.get("status")
+    if status not in {"none", "unresolved", "ready", "sent", "unknown"}:
+        status = "unresolved"
+    return rendered, {
+        "status": status,
+        "episode_id": current_id,
+        "created_at": notice.get("created_at"),
+        "delivery_confirmed": bool(notice.get("delivery_confirmed")),
+    }
+
+
+def _local_media_bridge_payload(base, *, now=None):
+    """The historical single-service SQLite read, retained for local deployments."""
+    from . import media_bridge
+    state = media_bridge.episode(base, now=now, create=False)
+    notices = media_bridge.notice_status(base) if state else []
+    notice = next((row for row in notices if row.get("episode_id") == state["id"]), None) \
+        if state else None
+    return _media_bridge_payload(state, notice, base, now=now)
+
+
+def _media_bridge_status(account_key, *, now=None):
+    """Read-only tenant media status for the portal. Unknown is never zero."""
+    base = _base_of_account(account_key)
+    from . import gym_media_selector as selector, media_bridge
+    from .media_source_store import default_store
+
+    try:
+        store = default_store()
+        if not store.available():
+            raise RuntimeError("media store unavailable")
+        assets = store.list_assets(base)
+        pending = sum((a.get("review_status") or "pending_review") == "pending_review"
+                      for a in assets)
+        publishable = sum(selector.is_usable(a) for a in assets)
+        review = {"status": "awaiting" if pending else "ready",
+                  "pending_review_count": pending,
+                  "publishable_count": publishable}
+    except Exception:
+        review = {"status": "unknown", "pending_review_count": None,
+                  "publishable_count": None, "reason": "media inventory unavailable"}
+
+    try:
+        snapshot = media_bridge.shared_snapshot(base)
+        if snapshot is media_bridge._SHARED_RUNWAY_UNAVAILABLE:
+            if media_bridge.local_runway_fallback_enabled():
+                fallback, notice_state = _local_media_bridge_payload(base, now=now)
+            else:
+                fallback, notice_state = _neutral_media_bridge_state()
+        elif snapshot is None:
+            # A shared read cannot distinguish a missing row from an outage or a
+            # not-yet-projected worker transition.  Never call that runway clear.
+            fallback, notice_state = _neutral_media_bridge_state()
+        elif not isinstance(snapshot, dict):
+            raise ValueError("invalid shared runway snapshot")
+        else:
+            fallback, notice_state = _shared_media_bridge_payload(
+                snapshot.get("fallback_episode"), snapshot.get("notice_state"),
+                base, now=now,
+            )
+    except Exception:
+        fallback, notice_state = _neutral_media_bridge_state()
+
+    try:
+        from . import ghl_intake
+        upload_url = ghl_intake.upload_link_for(base) or ""
+    except Exception:
+        upload_url = ""
+    return {"media_review": review, "fallback_episode": fallback,
+            "notice_state": notice_state,
+            "upload_action": {"url": upload_url, "label": "Upload media",
+                              "received_means_indexed": False}}
+
+
 # ---- B12: a post the client already rejected must leave their calendar ----------
 # THE DEFECT: a client denies a post, Echo issues a replacement (deny backfill,
 # client_month_run.backfill_denied_slots), and the ORIGINAL row stays on the calendar
@@ -426,21 +614,6 @@ def _base_of_account(account_key):
 # publisher still excludes them (portal_calendar_store.due_rows), and every derived
 # signal (low_creative, days_remaining, awaiting_media, recreate_budget) is computed
 # from the SAME row set as before so no banner changes behavior.
-_CLIENT_HIDDEN_STATUSES = ("coach_review", "denied", "killed", "deleted")
-
-
-def _client_visible(rows):
-    """The rows a gym owner should see on their own calendar. Hides content they have
-    already rejected (denied / killed), content that was removed (deleted), and content
-    a coach has not released yet (coach_review, the pre-existing rule)."""
-    from . import config as _cfg
-    hidden = _CLIENT_HIDDEN_STATUSES
-    if getattr(_cfg, "portal_show_rejected", None) and _cfg.portal_show_rejected():
-        hidden = ("coach_review",)          # escape hatch: the historical behavior
-    return [r for r in (rows or [])
-            if str((r or {}).get("status") or "").strip().lower() not in hidden]
-
-
 def _handle_social_supabase(account_key, month, now=None):
     """/social from the SHARED content_calendar table (the live portal data plane).
     Reads every row for THIS gym in the month via the same SupabaseCalendarStore that
@@ -492,6 +665,7 @@ def _handle_social_supabase(account_key, month, now=None):
         # uploaded media; upload_url is the per-gym tokenized link. LASSO is never flagged.
         "awaiting_media": awaiting_media,
         "upload_url": upload_url,
+        **_media_bridge_status(account_key, now=now),
     }
 
 
@@ -553,6 +727,7 @@ def handle_social(account_key, month, reader=None, now=None):
         # uploaded media; upload_url is the per-gym tokenized link. LASSO is never flagged.
         "awaiting_media": awaiting_media,
         "upload_url": upload_url,
+        **_media_bridge_status(account_key, now=now),
     }
 
 
@@ -579,11 +754,13 @@ def _load_owned_draft(account_key, draft_id, store):
     return draft, None
 
 
-def _action_gates(account_key, draft_id, actor_id, reader):
+def _action_gates(account_key, draft_id, actor_id, reader,
+                  allow_portal_social_disabled=False,
+                  allow_client_billing_inactive=False):
     """The flag / ids / Stripe-active gates shared by BOTH data planes. Returns None to
     proceed, or (status, body) to short-circuit. Ownership is checked separately (the
     two planes prove ownership against different stores)."""
-    if not config.portal_social_enabled():
+    if not allow_portal_social_disabled and not config.portal_social_enabled():
         return _disabled("action")
     if not account_key:
         return (400, {"ok": False, "error": "missing account_key"})
@@ -591,7 +768,7 @@ def _action_gates(account_key, draft_id, actor_id, reader):
         return (400, {"ok": False, "error": "draft_id required"})
     if not actor_id:
         return (400, {"ok": False, "error": "actor_id required"})
-    if not is_social_active(account_key, reader=reader):
+    if not allow_client_billing_inactive and not is_social_active(account_key, reader=reader):
         return (402, {"ok": False, "error": "social plan is not active",
                       "account_key": account_key})
     return None
@@ -947,9 +1124,44 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
 
     Flag: config.media_swap_free_enabled() (ECHO_MEDIA_SWAP_FREE, default OFF).
     Flag off -> 403 and not one store read is issued."""
-    short = _action_gates(account_key, draft_id, actor_id, reader)
+    return _handle_swap_media(account_key, draft_id, actor_id, reader=reader,
+                              sb_store=sb_store, picker=picker)
+
+
+def handle_fixer_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=None,
+                            picker=None):
+    """Run the same guarded photo swap from the authenticated Fixer ops lane.
+
+    The client portal can remain dark while a support ticket is repaired. This
+    bypasses the client portal's feature and Stripe view gates after the existing
+    fail-closed Echo-client entitlement verifies the tenant. The media-swap flag,
+    tenant-scoped row read, status, consent/picker, and server-side write guards
+    still apply. It is intentionally not routed by the public portal HTTP handler.
+    """
+    return _handle_swap_media(account_key, draft_id, actor_id, reader=reader,
+                              sb_store=sb_store, picker=picker,
+                              allow_portal_social_disabled=True,
+                              require_fixer_entitlement=True)
+
+
+def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=None,
+                       picker=None, allow_portal_social_disabled=False,
+                       require_fixer_entitlement=False):
+    """Shared implementation for public and authenticated Fixer swap requests."""
+    short = _action_gates(account_key, draft_id, actor_id, reader,
+                          allow_portal_social_disabled=allow_portal_social_disabled,
+                          allow_client_billing_inactive=require_fixer_entitlement)
     if short is not None:
         return short
+    if require_fixer_entitlement:
+        try:
+            from . import echo_clients
+            entitled = echo_clients.is_echo_client(account_key)
+        except Exception:  # noqa: BLE001 - entitlement uncertainty must refuse
+            entitled = False
+        if not entitled:
+            return 403, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": "not_echo_client", "account_key": account_key}
     from . import media_swap as _ms
     if not _ms.enabled():
         return 403, {"ok": False, "action": "swap-media", "draft_id": draft_id,
@@ -1015,6 +1227,7 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
         # (a sibling approved between the read and this write matches nothing and is
         # reported as left).
         swapped, left = [draft_id], list(locked_siblings)
+        sibling_results = []
         for sib in siblings:
             sid = str(sib.get("id") or "")
             var = variants[sid]
@@ -1025,7 +1238,19 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
             except Exception as exc:  # noqa: BLE001 - one sibling never undoes the swap
                 print(f"[portal-social] sibling swap failed for {sid}: {type(exc).__name__}")
                 done = None
-            (swapped if done is not None else left).append(sid)
+            if done is not None:
+                swapped.append(sid)
+                sibling_kind = _media_kind(done.get("image_url", ""))
+                sibling_results.append({
+                    "id": sid,
+                    "image_public_url": (done.get("thumbnail_url")
+                                         or done.get("image_url", "")),
+                    "media_kind": sibling_kind,
+                    "video_url": (done.get("image_url", "")
+                                  if sibling_kind == "video" else None),
+                })
+            else:
+                left.append(sid)
         # The write landed: settle the Drive usage ledger + the served ledger so the
         # asset now on the row cools down, and the one it replaced returns to the pool
         # ONLY when no remaining row on the book still carries it. A failed re-read
@@ -1039,6 +1264,7 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
     return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,
                  "siblings_swapped": [s for s in swapped if s != draft_id],
                  "siblings_left": left,
+                 "sibling_results": sibling_results,
                  # Display url: a video row's poster frame, else the media itself (the
                  # same rule _post_from_row applies for the calendar card).
                  "image_public_url": (updated.get("thumbnail_url")
@@ -1689,22 +1915,14 @@ def _pending_ids_for(account_key, store):
 
 
 def handle_autonomy(account_key, autonomous, actor_id=None, store=None, reader=None):
-    """POST /portal/<token>/autonomy  body {"autonomous": true|false}.
+    """Persist automatic/manual handling for this gym's entire pending queue.
 
-    Flips per-account autonomy. On ON: persist the flag, then auto-approve EVERY
-    currently-pending post for THIS account through the SAME gated approve path a
-    manual approve uses (so publishing behaves identically and still obeys
-    AGENT_PUBLISH_ENABLED inside publish()). On OFF: clear the flag and un-approve
-    NOTHING. Returns {ok, autonomous, approved_count}.
-
-    Idempotent + null-safe: flipping ON twice re-persists ON and only approves posts
-    that are STILL pending (already-approved posts are not in the pending sweep, so
-    they never double publish and are not re-counted). A bad/empty account or an
-    approve failure never 500s: it returns a clean body.
-
-    Gates: flag OFF -> disabled (404); missing account -> 400; Stripe social product
-    not ACTIVE -> 402. TOKEN ISOLATION: only this account's pending drafts are ever
-    touched (a draft belonging to another gym is skipped)."""
+    Automatic mode publishes eligible pending posts at their scheduled times
+    without further approval. Saving the mode is not a permanent human approval:
+    it must not bulk-approve or publish the queue inside this request. Returning
+    to manual therefore stops automatic handling of still-pending posts, while
+    explicit approvals and posts already sent remain intact.
+    """
     if not config.portal_social_enabled():
         return _disabled("autonomy")
     if not account_key:
@@ -1762,20 +1980,7 @@ def handle_autonomy(account_key, autonomous, actor_id=None, store=None, reader=N
                      "account_key": account_key,
                      "shared_persisted": shared_persisted}
 
-    # ON: auto-approve every currently-pending post for THIS account via the same
-    # gated approve path a manual approve uses. Never fabricates a publish.
-    actor = actor_id or _autonomy_actor(account_key)
-    approved = 0
-    for draft_id in _pending_ids_for(account_key, store):
-        try:
-            result = _pa.approve(account_key, draft_id, actor, store=store)
-            if result.get("ok"):
-                approved += 1
-        except Exception:
-            # One bad draft never aborts the sweep or 500s the flip; the rest still
-            # auto-approve and the flag stays ON for future posts.
-            continue
-    return 200, {"ok": True, "autonomous": True, "approved_count": approved,
+    return 200, {"ok": True, "autonomous": True, "approved_count": 0,
                  "account_key": account_key, "shared_persisted": shared_persisted}
 
 

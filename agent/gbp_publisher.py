@@ -83,6 +83,11 @@ def publish(draft, account, http=None):
         return PublishResult(ok=True, mode="would_publish",
                              detail="draft-only (publish or GBP flag OFF)")
 
+    from .publish_billing_gate import publishing_blocked
+    base = str(account.key or "").removesuffix("_gbp")
+    if publishing_blocked(base):
+        raise GbpError("Echo publishing held: account revoked or subscription canceled")
+
     token = _token()
     if not token:
         raise MissingToken("No GBP access token set for this location.")

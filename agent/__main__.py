@@ -87,8 +87,24 @@ def _status():
     print(f"  content_brain  : {config.content_brain_enabled()}  (env AGENT_CONTENT_BRAIN_ENABLED)")
     print(f"  creative_studio: {config.creative_studio_enabled()}  (env AGENT_NANO_ENABLED)")
     print(f"  nano_flash     : {config.nano_flash_enabled()}  (env AGENT_NANO_FLASH_ENABLED)")
+    print(f"  astra_style_freedom: {config.astra_style_freedom_enabled()}  "
+          f"(env AGENT_ASTRA_STYLE_FREEDOM; scope={sorted(config.astra_style_freedom_accounts())} "
+          f"via AGENT_ASTRA_STYLE_FREEDOM_ACCOUNTS, default lasso only)")
+    print(f"  lasso_infographic_quality: {config.lasso_infographic_quality_enabled('lasso')}  (env AGENT_LASSO_INFOGRAPHIC_QUALITY)")
     print(f"  style_gate     : {config.style_gate_enabled()}  (env AGENT_STYLE_GATE_ENABLED)")
     print(f"  image_grade    : {config.image_grade_enabled()}  (env AGENT_IMAGE_GRADE_ENABLED)")
+    print(f"  real_grade_policy: {config.real_grade_policy_enabled()}  "
+          f"(env AGENT_REAL_GRADE_POLICY; single grade_gate.evaluate() policy, "
+          "real image-based Q3/Q6 + hard-block copy check, UNGRADED never a "
+          "silent pass; replaces the legacy prompt-keyword style_gate/image_grade "
+          "pair when armed)")
+    print(f"  astra_reference_images: {config.astra_reference_images_enabled()}  "
+          f"(env AGENT_ASTRA_REFERENCE_IMAGES; attaches approved reference "
+          "images as real input_image items on the Astra request)")
+    print(f"  generation_record: {config.generation_record_enabled()}  "
+          f"(env AGENT_GENERATION_RECORD; persists the full brief, reference "
+          "ids, model + request settings, grade result and attempt count per "
+          "generation, going forward only)")
     print(f"  hosting        : {config.hosting_enabled()}  (env AGENT_HOSTING_ENABLED)")
     print(f"  gbp            : {config.gbp_enabled()}  (env AGENT_GBP_ENABLED)")
     print(f"  gbp_conn_sync  : {config.gbp_conn_sync_enabled()}  (env AGENT_GBP_CONN_SYNC; once per loop, read each client gym's LIVE Google Business connection from Zernio and upsert its gym_gbp_connections row so the publish lane can route; reads Zernio + writes the connection row only, NEVER publishes; an inactive Zernio account flips the row to needs_reconnect)")
@@ -156,6 +172,8 @@ def _status():
     print(f"  media_cross_day_guard: {config.media_cross_day_guard_enabled()}  (env AGENT_MEDIA_CROSS_DAY_GUARD, DEFAULT ON; ONE PHOTO ONE DAY — a photo never sits on multiple different days of a gym's forward book (pending/approved/publishing/coach_review, IG/FB) and never repeats within {config.media_repeat_window_days()}d of a PUBLISHED use (env AGENT_MEDIA_REPEAT_WINDOW_DAYS); same-DATE siblings (FB mirror + paired story) are one post and always share; small libraries fall back to max-spacing reuse + one digest; enforced in the month build, deny-backfill and expired auto-redate; GBP keeps its own §3 windows)")
     print(f"  deny_backfill  : {config.deny_backfill_enabled()}  (env AGENT_DENY_BACKFILL; a gym AT its creative cap gets a FRESH replacement for each DENIED feed day — a NEW caption on a REUSED photo, never the denied post's own photo and never an approved/published one; INSERT-only, PENDING, all A+/banned/fabrication gates enforced; OFF => a denied slot stays empty at cap)")
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
+    print(f"  summit_daily   : {config.lasso_summit_daily_enabled()}  (env AGENT_LASSO_SUMMIT_DAILY_ENABLED; LASSO-only third feed from 2026-09-23 through 2026-11-08; default OFF)")
+    print(f"  lasso_3x       : {config.lasso_three_feed_enabled()}  (env AGENT_LASSO_3X_ENABLED; durable LASSO-only third feed; default OFF)")
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
     print(f"  welcome_tmpl   : {config.welcome_templates_enabled()}  (env AGENT_WELCOME_TEMPLATES_ENABLED)")
     print(f"  welcome_posts  : {config.welcome_posts_enabled()}  (env AGENT_WELCOME_POSTS_ENABLED; needs STRIPE_API_KEY)")
@@ -252,6 +270,7 @@ def _status():
     print(f"  token_watchdog : {config.token_watchdog_enabled()}  (env AGENT_TOKEN_WATCHDOG_ENABLED, "
           f"warn at {config.token_warn_days()} days)")
     print(f"  plan_month     : {config.plan_month_enabled()}  (env AGENT_PLAN_MONTH_ENABLED)")
+    print(f"  auto_reels     : {config.auto_reels_enabled()}  (env AGENT_AUTO_REELS_ENABLED; explicit gym pilots only)")
     print(f"  review_cycle   : {config.review_cycle_enabled()}  (env AGENT_REVIEW_CYCLE_ENABLED)")
     print(f"  weekly_report  : {config.weekly_report_enabled()}  (env AGENT_WEEKLY_REPORT_ENABLED)")
     print(f"  episode_inbox  : {config.episode_inbox_enabled()}  (env AGENT_EPISODE_INBOX_ENABLED)")
@@ -273,6 +292,7 @@ def _status():
     print(f"  acctkey_doctor : {config.account_key_doctor_alerts_enabled()}  (env AGENT_ACCOUNT_KEY_DOCTOR_ALERTS; gates ONLY the account-key doctor's ops ALERT on a social-product gym that fails to resolve — UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY — throttled per base; the read-only 'account-key-doctor' report always runs regardless)")
     print(f"  zernio_publish : {config.zernio_publish_enabled()}  (env AGENT_ZERNIO_PUBLISH)")
     print(f"  lasso_via_zernio: {config.lasso_via_zernio_enabled()}  (env AGENT_LASSO_VIA_ZERNIO; LASSO's own calendar rows publish through the SAME Zernio lane as the client gyms and the Meta-direct calendar lanes stand down, so exactly ONE lane owns a lasso row — kills the second-publisher taint in Zernio analytics (metrics_sync learning loop); needs 'python -m agent lasso-zernio-setup' first + AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED + AGENT_ZERNIO_PUBLISH; missing setup => HOLD with one deduped alert, never a Meta-direct fallback; OFF => byte-for-byte today's Meta-direct routing)")
+    print(f"  lasso_editorial_calendar: {config.lasso_editorial_calendar_enabled()}  (env AGENT_LASSO_EDITORIAL_CALENDAR; LASSO book, Summit, podcast, Echo and website calendar)")
     print(f"  lasso_video_mix: {config.lasso_video_mix_enabled()}  (env AGENT_LASSO_VIDEO_MIX; weave podcast VIDEO clips into LASSO's non-sprint rotation — thu/sun prefer a real Drive clip + a cap-safe Wed video slot — to move the grid off all-text-cards toward the >=40%-with-a-human target, at or under the 25% podcast cap; summit 10-day sprints untouched; rebuild with 'python -m agent lasso-remap --write'; OFF => byte-for-byte today's rotation)")
     print(f"  lasso_astra_default: {config.lasso_astra_default_enabled()}  (env AGENT_LASSO_ASTRA_DEFAULT; LASSO's b2b pillar tries the Astra-first daily_studio infographic builder FIRST, falling back to library rotation only when it returns None — matches platform/doctrine, which already default to Astra; rework the existing calendar with 'python -m agent lasso-astra-rework --write'; OFF => byte-for-byte today's rotation-first b2b behavior)")
     print(f"  social_baseline: {config.social_baseline_enabled()}  (env AGENT_SOCIAL_BASELINE; BEFORE/AFTER social metrics from the PUBLIC Instagram feed via Apify — once-only immutable pre-Echo baseline + fresh last-90 after-pull, the social-before-after CLI, and the SINCE ECHO STARTED block in the monthly retro digest; needs APIFY_TOKEN (inert without it, clear reason, never a crash); read-only, nothing publishes; Apify is pay-per-result ~$1.50-2.70/1000 items, a 90-day gym pull is cents)")
@@ -917,6 +937,7 @@ _COMMANDS = {
         ("draft-bible", "draft a brand bible from an intake doc"),
         ("intake-doc", "turn a client PDF into held draft posts"),
         ("intake-web", "the upload web surface (own service)"),
+        ("ops-action", "run one FIXER ops action (D72): <action> --gym K --ticket T [--args JSON]"),
         ("intake-link", "mint a gym's signed intake + upload links (--account <key>)"),
         ("intake-revoke", "kill one gym's signed link via the R2 denylist (--account <key>)"),
         ("intake-unrevoke", "restore one gym's revoked link (--account <key>)"),
@@ -955,6 +976,7 @@ _COMMANDS = {
         ("dam-scan", "scan/tag the library"),
         ("contact-sheet", "creative contact sheet"),
         ("backfill-insights", "pull insights for published posts"),
+        ("backfill-ig-hashtags", "fold each gym's APPROVED 3-5 hashtag line into FUTURE unpublished IG FEED calendar rows missing it; DRY-RUN by default, --apply keeps pending rows pending and resets changed approved rows for reapproval; never touches published/publishing/denied/killed/failed, stories, or FB -- (--gym <base,...> | --all)"),
         ("vision-backfill", "ECHO_VISION_SPEC: analyze a gym's EXISTING library images "
                             "before adding it to AGENT_VISION_GYMS (--account <key> "
                             "[--force]); a gym flipped on with an unanalyzed library "
@@ -987,9 +1009,11 @@ _COMMANDS = {
         ("account-key-doctor", "early-warning coverage check: for every social-product gym base, assert it resolves to exactly one live gym (+ Zernio profile); flag UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY stranding risks (read-only; --alert fires throttled ops alerts) [--base <base>]"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
+        ("render-card", "render ONE Astra card on demand through the real engine chain (gpt-6-astra reads the brief, Sunburst draws it). Publishes nothing, queues nothing; BLOCKS without --headline and at least one --fact. [--canvas/--composition/--accent to pin] [--account KEY to mirror production per-account scoping] [--locked for an A/B] [--brief-only to cost nothing]"),
         ("lasso-astra-rework", "regenerate the IMAGE (never the schedule) on LASSO's existing non-video, non-published calendar slots as linked Astra v2 candidates (ECHO_VARIANT_PAIRING); same dates/times/count untouched, nothing publishes; [--months YYYY-MM,...] [--limit N] [--write]"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
         ("ops-triage-classify", "classify one ops-alert line as noise/needs_triage (agent/ops_triage.py); prints exactly that word. Arg or stdin: python -m agent ops-triage-classify \"<alert text>\""),
+        ("post-engine", "TRACEABILITY: which engine + model generated ONE published post's creative, e.g. 'astra:gpt-image-2.5-sunburst' (db.post_engine_for). --draft-id <id> | --media-id <id>"),
     ],
     "trust & approvals": [
         ("trust", "show trust level for an account (--account <key>)"),
@@ -1668,6 +1692,40 @@ def main(argv=None):
         # SEPARATE web process (own Railway service). R2 only, never /data.
         from .intake_web import serve
         serve()
+    elif cmd == "ops-action":
+        # D72: the FIXER's ops-action catalog from a shell on the worker (the host with
+        # the /data volume), e.g. over `railway ssh -s echo`:
+        #   python -m agent ops-action restage_month --gym toughtemple52040e \
+        #       --ticket <support_tickets.id> --args '{"days": 21}'
+        # Same fixer_ops.run_action the HTTP routes call: same validation, same org-floor
+        # refusals, same ticket record and audit line. A background action is waited on.
+        import argparse as _ap
+        import json as _json
+        import time as _time
+        from . import fixer_ops as _fo
+        p = _ap.ArgumentParser(prog="python -m agent ops-action")
+        p.add_argument("action", help=", ".join(sorted(_fo.CATALOG)))
+        p.add_argument("--gym", required=True, help="Echo account key")
+        p.add_argument("--ticket", required=True, help="support_tickets.id to record on")
+        p.add_argument("--args", default="{}", help="JSON object of action args")
+        p.add_argument("--no-wait", action="store_true",
+                       help="return immediately for a background action")
+        ns = p.parse_args(argv[1:])
+        status, body = _fo.run_action(ns.action, ns.gym, ns.ticket, _json.loads(ns.args))
+        print(_json.dumps({"status": status, **body}, indent=1, default=str))
+        job_id = body.get("job_id")
+        if job_id and not ns.no_wait:
+            seen = 0
+            while True:
+                job = _fo.JOBS.get(job_id) or {}
+                for step in (job.get("steps") or [])[seen:]:
+                    print(f"[ops-action] step {_json.dumps(step, default=str)}")
+                seen = len(job.get("steps") or [])
+                if job.get("status") != "running":
+                    print(_json.dumps({"job": job}, indent=1, default=str))
+                    break
+                _time.sleep(5)
+        sys.exit(0 if 200 <= status < 300 else 1)
     elif cmd == "intake-link":
         # Mint a gym's signed intake + upload links from the shared secret (no
         # per-gym env var). Runs where the secret lives (intake-web / listener);
@@ -2237,6 +2295,20 @@ def main(argv=None):
         else:
             from .backfill import backfill_insights
             backfill_insights(acct_f, since, dry=dry)
+    elif cmd == "backfill-ig-hashtags":
+        # IG FEED HASHTAG BACKFILL (2026-09-19): fold each gym's APPROVED 3-5
+        # hashtag line (from its own VoiceDoc, never invented) into the STORED
+        # caption of FUTURE, UNPUBLISHED Instagram feed rows missing it, so the
+        # portal preview and the Zernio wire body are the same exact copy.
+        # DRY-RUN by default; --apply uses an expected-status and publish-record
+        # guard. Pending stays pending; changed approved copy resets to pending
+        # so the client approves the exact final caption.
+        # Never touches published/publishing/denied/killed/failed rows, stories,
+        # or Facebook rows; idempotent (a second --apply reports 0 changes).
+        #   python -m agent backfill-ig-hashtags --gym eng            # dry-run
+        #   python -m agent backfill-ig-hashtags --all --apply        # write
+        from . import backfill_ig_hashtags as _bih
+        sys.exit(_bih.cli(argv[1:]))
     elif cmd == "vision-backfill":
         # ECHO_VISION_SPEC §9 precondition: analyze_and_store never runs on a daily
         # schedule (there is no job wired to it), so a gym added to AGENT_VISION_GYMS
@@ -3348,6 +3420,46 @@ def main(argv=None):
         # ops-triage relay: python -m agent ops-triage-classify "<alert text>"
         from .ops_triage import main as _ops_triage_main
         sys.exit(_ops_triage_main(argv[1:]))
+    elif cmd == "post-engine":
+        # TRACEABILITY (Blake, 2026-09-13): which engine generated ONE
+        # specific published post's creative — read-only, no mutation, no
+        # network call. python -m agent post-engine --draft-id <id>
+        #                python -m agent post-engine --media-id <id>
+        from . import db as _db
+        _draft_id = None
+        _media_id = None
+        rest = argv[1:]
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--draft-id" and i + 1 < len(rest):
+                _draft_id = rest[i + 1]
+                i += 2
+            elif rest[i] == "--media-id" and i + 1 < len(rest):
+                _media_id = rest[i + 1]
+                i += 2
+            else:
+                i += 1
+        if bool(_draft_id) == bool(_media_id):
+            print("usage: python -m agent post-engine (--draft-id <id> | --media-id <id>)")
+            sys.exit(2)
+        rows = _db.post_engine_for(draft_id=_draft_id, media_id=_media_id)
+        if not rows:
+            key = f"draft_id={_draft_id}" if _draft_id else f"media_id={_media_id}"
+            print(f"post-engine: no published post found for {key}")
+            sys.exit(1)
+        for r in rows:
+            print(f"draft_id={r['draft_id']} account={r['account_key']} "
+                  f"platform={r['platform']} mode={r['mode']} "
+                  f"published_at={r['published_at']} media_id={r['media_id']} "
+                  f"image_engine={r['image_engine'] or '(unknown, predates this column)'}")
+    elif cmd == "render-card":
+        # Render ONE Astra card on demand through the REAL engine chain
+        # (gpt-6-astra reads the brief, Sunburst draws it). Publishes nothing,
+        # queues nothing, invents nothing: headline + at least one approved fact
+        # are required or it BLOCKS.
+        #   python -m agent render-card --headline "..." --fact "..." [--canvas navy]
+        from .render_card import run as _render_card_run
+        sys.exit(_render_card_run(argv[1:]))
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:

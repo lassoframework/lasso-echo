@@ -21,6 +21,7 @@ parameter does not emit -- so ON CONFLICT would fail with "no unique or exclusio
 matching" at runtime. Catching the violation is the reliable form.
 """
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 from . import testdata as _td
@@ -30,6 +31,9 @@ _TICKETS = "support_tickets"
 _MESSAGES = "support_messages"
 
 OPEN_STATUSES = ("new", "triage", "fixing", "verification", "hold", "approved")
+_UUID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+_HASH = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _a_kind_escalation():
@@ -49,6 +53,23 @@ def _is_unique_violation(status_code, text):
         return False
     t = (text or "").lower()
     return "23505" in t or "duplicate key" in t or "unique" in t
+
+
+class TicketPage(list):
+    """find_new_tickets' result: a plain list of work-ready rows, plus the two facts a
+    keyset-paginating caller needs about the RAW page they were filtered from:
+
+      * raw_count -- rows the database returned before the local strict test filter;
+      * raw_last  -- the last raw row (the cursor advances past it, so a run of rows the
+        filter removed still moves the window forward instead of being re-fetched forever).
+
+    A subclass rather than a tuple so every pre-pagination caller and test fake that
+    treats the result as a list is unaffected."""
+
+    def __init__(self, rows=(), *, raw_count=0, raw_last=None):
+        super().__init__(rows)
+        self.raw_count = raw_count
+        self.raw_last = raw_last
 
 
 class Bus:
@@ -156,22 +177,180 @@ class Bus:
     def set_ticket(self, ticket_id, **fields):
         return self._patch(_TICKETS, {"id": f"eq.{ticket_id}"}, fields)
 
-    def find_new_tickets(self, *, product, source, limit=20):
+    def resolve_current_delivery(self, ticket_id, expected_request_version,
+                                 expected_status, expected_classification,
+                                 expected_product, expected_client_id,
+                                 expected_bot_identity, expected_slack_user_id,
+                                 expected_slack_channel_id, expected_slack_thread_ts):
+        """Atomically resolve one exact, still-current FIXER client delivery.
+
+        Migration 0364 owns the authoritative eligibility envelope. Every mutable
+        tenant, requester and destination field that was validated before delivery
+        is repeated here; an empty representation is a lost CAS, never success.
+        """
+        if (not _UUID.fullmatch(str(ticket_id or ""))
+                or not isinstance(expected_request_version, int)
+                or isinstance(expected_request_version, bool)
+                or expected_request_version < 0):
+            raise BusError(400, "invalid current-delivery identity")
+        body = {
+            "p_ticket_id": ticket_id,
+            "p_expected_request_version": expected_request_version,
+            "p_expected_status": expected_status,
+            "p_expected_classification": expected_classification,
+            "p_expected_product": expected_product,
+            "p_expected_client_id": expected_client_id,
+            "p_expected_bot_identity": expected_bot_identity,
+            "p_expected_slack_user_id": expected_slack_user_id,
+            "p_expected_slack_channel_id": expected_slack_channel_id,
+            "p_expected_slack_thread_ts": expected_slack_thread_ts,
+        }
+        r = self._client().post(
+            f"{self._url}/rest/v1/rpc/fixer_resolve_current_delivery",
+            data=json.dumps(body), headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, (r.text or "")[:200])
+        data = r.json() or []
+        if isinstance(data, dict):
+            return data
+        return data[0] if isinstance(data, list) and len(data) == 1 else None
+
+    def portal_client_id(self, gym_key):
+        """The one portal UUID mapped to an exact Echo account key, or None.
+
+        This is the tenant-binding lookup used by structured automation tickets.
+        It deliberately refuses display-name and registry fallbacks: a buildable
+        FIXER row may only carry the portal's own client identity.
+        """
+        rows = self._get("echo_intake_tokens", {
+            "echo_account_key": f"eq.{gym_key}",
+            "select": "gym_id,echo_account_key", "limit": "2"})
+        ids = {str(row.get("gym_id") or "") for row in rows
+               if isinstance(row, dict) and row.get("echo_account_key") == gym_key}
+        if len(ids) != 1:
+            return None
+        client_id = next(iter(ids))
+        return client_id if _UUID.fullmatch(client_id) else None
+
+    def record_seeded_ops_fix(self, row):
+        """Insert one deterministic structured ops-fix ticket.
+
+        The caller supplies the fully materialized ticket.  This boundary checks
+        the fields that make it autonomous and tenant-safe, then confirms the
+        returned representation.  A retry may hit the deterministic primary key;
+        it succeeds only when the existing row carries the same immutable source
+        event and business-check pointer.
+        """
+        if not isinstance(row, dict):
+            raise BusError(400, "seeded ops-fix row must be an object")
+        before = row.get("verification_before")
+        fixer = before.get("fixer") if isinstance(before, dict) else None
+        check = fixer.get("business_check") if isinstance(fixer, dict) else None
+        event = fixer.get("source_event") if isinstance(fixer, dict) else None
+        valid = (
+            row.get("product") == "echo" and row.get("source") == "ops_fix"
+            and row.get("status") == "new" and row.get("classification") == "code_fix"
+            and _UUID.fullmatch(str(row.get("id") or ""))
+            and _UUID.fullmatch(str(row.get("client_id") or ""))
+            and isinstance(check, dict) and check.get("ticket_id") == row.get("id")
+            and check.get("client_id") == row.get("client_id")
+            and check.get("schema_version") == 1
+            and check.get("contract_version") == "echo-business-evidence-v1"
+            and check.get("check_id") == "forward_book_grade_at_least"
+            and isinstance(check.get("params"), dict)
+            and set(check["params"]) == {"min_total"}
+            and isinstance(check["params"]["min_total"], int)
+            and not isinstance(check["params"]["min_total"], bool)
+            and 0 <= check["params"]["min_total"] <= 100
+            and _HASH.fullmatch(str(check.get("request_key") or ""))
+            and isinstance(event, dict)
+            and event.get("schema_version") == 1
+            and event.get("source") == "echo.grade_sweep.forward_book_drop"
+            and _HASH.fullmatch(str(event.get("source_event_id") or ""))
+            and isinstance(event.get("gym_key"), str)
+            and isinstance(event.get("previous_total"), int)
+            and not isinstance(event.get("previous_total"), bool)
+            and 0 <= event["previous_total"] <= 100
+            and check["params"]["min_total"] == event.get("previous_total")
+            and isinstance(event.get("observed_total"), int)
+            and not isinstance(event.get("observed_total"), bool)
+            and 0 <= event["observed_total"] <= 100
+            and event["observed_total"] < event.get("previous_total"))
+        if not valid:
+            raise BusError(400, "invalid seeded ops-fix identity or contract")
+        if self.portal_client_id(event["gym_key"]) != row["client_id"]:
+            raise BusError(409, "seeded ops-fix tenant mapping changed")
+
+        created, duplicate = self._insert(_TICKETS, row)
+        stored = self.ticket(row["id"]) if duplicate else created
+        if not isinstance(stored, dict):
+            raise BusError(503, "seeded ops-fix write was not confirmed")
+        stored_before = stored.get("verification_before")
+        stored_fixer = stored_before.get("fixer") if isinstance(stored_before, dict) else None
+        stored_check = stored_fixer.get("business_check") if isinstance(stored_fixer, dict) else None
+        stored_event = stored_fixer.get("source_event") if isinstance(stored_fixer, dict) else None
+        if (stored.get("id") != row["id"] or stored.get("product") != "echo"
+                or stored.get("source") != "ops_fix"
+                or stored.get("client_id") != row["client_id"]
+                or stored_check != check or stored_event != event):
+            raise BusError(409, "seeded ops-fix readback identity mismatch")
+        return stored, duplicate
+
+    def find_new_tickets(self, *, product, source, limit=20, after=None):
         """D46: the portal-ticket worker's poll query. A non-Slack-sourced ticket
         (product/source given explicitly, never a wildcard) that has not been classified
         yet -- `status=eq.new` AND `classification=is.null` together are what "not yet
         picked up by anything" means for this bus; a ticket already routed to a
         classification (question/code_fix/action_request) or otherwise past 'new' is
-        never re-fetched here, so a slow worker restart can never double-process one."""
-        rows = self._get(_TICKETS, {
+        never re-fetched here, so a slow worker restart can never double-process one.
+
+        2026-09-23 starvation fix: the window is now BOUNDED AND FAIR, not "the oldest 20
+        forever".
+
+          * `is_test=eq.false` is filtered SERVER-SIDE (the column exists since migration
+            support_tickets_is_test_20260905, not-null default false), so a block of
+            flagged probe rows no longer fills the page before the local strict filter
+            ever runs. If an older database without the column answers 400, the query is
+            retried once without that filter -- the local strict predicate below still
+            applies either way, and any other error (auth, transport) raises unchanged.
+          * `after` is an optional KEYSET cursor {"created_at", "id"}: only rows strictly
+            past it are returned (created_at, id ascending -- id is the tiebreak so equal
+            timestamps cannot skip or repeat a row). Keyset, never OFFSET: an offset page
+            shifts under concurrent inserts and silently skips rows. The caller
+            (echo_ticket_worker.intake_pass) owns advancing and persisting the cursor,
+            so a page of permanently-failing rows is walked PAST instead of monopolising
+            every poll, and the cursor wraps to the top once the tail is reached.
+
+        Returns a TicketPage: a plain list of the work-ready rows (strict test filter
+        applied), carrying `.raw_count` / `.raw_last` facts about the unfiltered page so
+        the caller can advance its cursor past rows the filter removed."""
+        params = {
             "product": f"eq.{product}", "source": f"eq.{source}", "status": "eq.new",
-            "classification": "is.null", "select": "*",
-            "order": "created_at.asc", "limit": str(int(limit))})
+            "classification": "is.null", "is_test": "eq.false", "select": "*",
+            "order": "created_at.asc,id.asc", "limit": str(int(limit))}
+        if after:
+            ts = str(after.get("created_at") or "").replace('"', "")
+            tid = str(after.get("id") or "").replace('"', "")
+            if ts and tid:
+                params["or"] = (f'(created_at.gt."{ts}",'
+                                f'and(created_at.eq."{ts}",id.gt."{tid}"))')
+        try:
+            rows = self._get(_TICKETS, params)
+        except BusError as e:
+            if e.status != 400 or "is_test" not in params:
+                raise
+            # is_test may not exist yet on an older database; drop the server-side filter
+            # (never the status/classification predicates) and rely on the strict local
+            # predicate below, the same fallback count_tickets_for_user_today uses.
+            params.pop("is_test")
+            rows = self._get(_TICKETS, params)
         # 2026-09-05: our own arming probes are never work. Eight of them sat in #fixer
         # looking exactly like unhandled client tickets; a re-run of this poll must not put
         # any of them back on a card. testdata.py is the single predicate for that, shared
         # with every report and metric so they can never disagree.
-        return _td.exclude_test_strict(rows)
+        return TicketPage(_td.exclude_test_strict(rows),
+                          raw_count=len(rows),
+                          raw_last=(rows[-1] if rows else None))
 
     def find_fixing_tickets(self, *, product, limit=20):
         """The second-stage poll: code_fix tickets already dispatched to the fixer
@@ -347,3 +526,9 @@ class Bus:
             att.update(meta_update)
             fields["attachments"] = att
         return self._patch(_MESSAGES, {"id": f"eq.{message_id}"}, fields)
+
+    def set_message_body_if_posting(self, message_id, body):
+        """Store the exact Slack text only while this worker owns the claimed row."""
+        return self._patch(_MESSAGES,
+                           {"id": f"eq.{message_id}", "delivery_status": "eq.posting"},
+                           {"body": body})

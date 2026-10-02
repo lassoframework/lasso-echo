@@ -156,6 +156,11 @@ def classify(text):
     """
     t = _ALERT_PREFIX_RE.sub("", str(text or ""))
 
+    # Member text is quoted in these cards. A member saying "no action needed"
+    # must not classify the entire unanswered-work alert as operational noise.
+    if re.match(r"^REPLY NEEDED at\s+\S+:", t):
+        return NEEDS_TRIAGE
+
     if _GRADE_DROPPED_RE.search(t):
         return NEEDS_TRIAGE  # regression signal, always surfaced (see docstring above)
 

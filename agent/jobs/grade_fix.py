@@ -97,6 +97,9 @@ it is actually the honest limit:
 """
 from __future__ import annotations
 
+import re
+from datetime import date, timedelta
+
 from agent import caption_variety, config, copy_gate
 from agent.calendar_grade import _BOOKING_RE
 from agent.caption_ledger import caption_hash
@@ -415,8 +418,7 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
                        "be honestly rewritten (source material too thin)")
 
     # ---- b) day gaps ---------------------------------------------------------
-    gap_dates = [str(d[1])[:10] for d in (defects or [])
-                 if d and d[0] == "consistency" and "gap of" in str(d[2])]
+    gap_dates = _missing_gap_dates(defects)
     if gap_dates:
         filler = gap_filler if gap_filler is not None else _default_gap_filler
         outcome = "error"
@@ -425,6 +427,7 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
         except Exception as exc:  # noqa: BLE001 - remediation is best effort
             log(f"{gym_id}: gap filler raised {type(exc).__name__}")
         result["gap_fill"] = outcome
+        result["gap_dates"] = list(gap_dates)
         if outcome == "filled":
             actions.append("refilled day gaps through the existing build lane")
         else:
@@ -1825,6 +1828,36 @@ def _default_caption_regen(gym_id, profile, log):
 # b) day gaps — the EXISTING lanes only, once per gym per day
 # ---------------------------------------------------------------------------
 
+_GAP_DAYS_RE = re.compile(r"gap of (\d+) days? before", re.I)
+
+
+def _missing_gap_dates(defects):
+    """Expand each grader gap endpoint into the actual missing calendar dates.
+
+    A defect such as ``gap of 7 days before 2026-09-09`` means September 2
+    through 8 are missing; September 9 already has the row that closed the gap.
+    Recording only the endpoint loses every retryable day and makes starvation
+    look like a silent no-op.
+    """
+    missing = []
+    for defect in defects or ():
+        if not defect or defect[0] != "consistency":
+            continue
+        reason = str(defect[2])
+        match = _GAP_DAYS_RE.search(reason)
+        if not match:
+            continue
+        try:
+            endpoint = date.fromisoformat(str(defect[1])[:10])
+            count = max(0, int(match.group(1)))
+        except (TypeError, ValueError):
+            continue
+        for days_before in range(count, 0, -1):
+            day = (endpoint - timedelta(days=days_before)).isoformat()
+            if day not in missing:
+                missing.append(day)
+    return missing
+
 def _default_gap_filler(gym_id, profile, store, today_iso, log, db=None):
     """Fill forward gaps through the lane that already owns the gym's builds.
     Heavy, so it runs at most once per gym per day (kv stamp). Returns a short
@@ -1887,6 +1920,7 @@ def _record_gaps_once(gym_id, gap_dates, log, db=None):
     each gap date once (kv) and log it; the sweep's alert dedup keeps the
     channel quiet after that."""
     _db = db if db is not None else _default_db()
+    recorded = []
     for d in gap_dates:
         key = f"grade_gap_known_{gym_id}_{d}"
         try:
@@ -1895,5 +1929,7 @@ def _record_gaps_once(gym_id, gap_dates, log, db=None):
             _db.kv_set(key, "1")
         except Exception:  # noqa: BLE001
             continue
-        log(f"{gym_id}: forward gap before {d} cannot be filled honestly "
-            "(no unused media/content); recorded once")
+        recorded.append(d)
+    if recorded:
+        log(f"{gym_id}: {len(recorded)} forward gap date(s) cannot be filled honestly "
+            f"(no unused media/content): {', '.join(recorded)}; recorded once")

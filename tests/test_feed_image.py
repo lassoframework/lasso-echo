@@ -1,5 +1,5 @@
 """
-feed_image: auto-fit an OUT-OF-SPEC client feed photo into an in-spec 1080x1080 card
+feed_image: auto-fit an OUT-OF-SPEC client feed photo into an in-spec 1080x1350 card
 (Dale, 2026-08-18 "photo is not to size"). In-spec photos + videos are left untouched;
 gated by AGENT_FEED_AUTOFIT; never raises.
 """
@@ -43,19 +43,43 @@ def test_flag_off_is_noop(tmp_path, monkeypatch):
 
 def test_in_spec_photo_left_alone(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_FEED_AUTOFIT", "true")
-    p = _photo(str(tmp_path / "square.jpg"), (1080, 1080))
-    assert feed_image.get_or_make_feed_image(p, str(tmp_path)) is None   # posts raw
+    square = _photo(str(tmp_path / "square.jpg"), (1080, 1080))
+    landscape = _photo(str(tmp_path / "landscape.jpg"), (1600, 900))
+    portrait = _photo(str(tmp_path / "portrait.jpg"), (1080, 1350))
+
+    for photo in (square, landscape, portrait):
+        assert feed_image.get_or_make_feed_image(photo, str(tmp_path)) is None
 
 
-def test_out_of_spec_photo_reframed_to_square(tmp_path, monkeypatch):
+def test_out_of_spec_photo_reframed_to_4x5(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_FEED_AUTOFIT", "true")
     p = _photo(str(tmp_path / "tall.jpg"), (1080, 1920))
     out = feed_image.get_or_make_feed_image(p, str(tmp_path))
     assert out and os.path.isfile(out)
     with Image.open(out) as im:
-        assert im.size == (1080, 1080)                       # in-spec square now
+        assert im.size == (1080, 1350)                       # in-spec 4:5 now
     # cached: a second call returns the same asset, no re-render
     assert feed_image.get_or_make_feed_image(p, str(tmp_path)) == out
+
+
+def test_4x5_cache_does_not_reuse_legacy_square_derivative(tmp_path, monkeypatch):
+    """A geometry change must not return a cached 1080x1080 card for the same source."""
+    import hashlib
+
+    monkeypatch.setenv("AGENT_FEED_AUTOFIT", "true")
+    p = _photo(str(tmp_path / "tall.jpg"), (1080, 1920))
+    with open(p, "rb") as fh:
+        key = hashlib.sha256(fh.read()).hexdigest()[:12]
+    legacy = tmp_path / "feedfit" / f"{key}__feed.jpg"
+    legacy.parent.mkdir(parents=True)
+    _photo(str(legacy), (1080, 1080))
+
+    out = feed_image.get_or_make_feed_image(p, str(tmp_path))
+
+    assert out != str(legacy)
+    assert feed_image._CACHE_VERSION in out
+    with Image.open(out) as im:
+        assert im.size == (1080, 1350)
 
 
 def test_video_is_not_our_job(tmp_path, monkeypatch):
@@ -88,7 +112,7 @@ def test_make_feed_safe_from_bytes_reframes_too_tall(tmp_path):
     safe = feed_image.make_feed_safe_from_bytes(_jpeg_bytes(600, 1080), out)  # ratio 0.56
     assert safe == out and os.path.isfile(out)
     with Image.open(out) as im:
-        assert im.size == (1080, 1080)                       # now in-spec
+        assert im.size == (1080, 1350)                       # now in-spec 4:5
 
 
 def test_make_feed_safe_from_bytes_leaves_in_spec_alone(tmp_path):
@@ -137,7 +161,7 @@ def test_maybe_format_feed_localizes_a_drive_creative_and_reframes_it(monkeypatc
     cmr._maybe_format_feed(account, feed, str(tmp_path), logs.append)
 
     assert feed.creative_public_url == "https://cdn/fit.jpg", (
-        "the reframed 1080x1080 card must replace the raw Drive photo")
+        "the reframed 1080x1350 card must replace the raw Drive photo")
     assert hosted_calls, "the reframe was hosted"
     assert not any("FileNotFoundError" in m for m in logs)
 

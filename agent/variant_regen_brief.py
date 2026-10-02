@@ -99,15 +99,26 @@ def generate_variant_from_brief(row, account_key, brief, client=None,
     if not brief:
         return {"ok": False, "reason": REASON_NO_BRIEF}
 
-    facts = _brand_brain_facts(account_key) or [brief]
+    copy = None
+    if config.lasso_infographic_quality_enabled(account_key):
+        from .lasso_infographic_content import select_copy
+        try:
+            copy = select_copy(str(row.get("caption") or brief))
+        except ValueError:
+            return {"ok": False, "reason": "brain_source_unavailable"}
+        headline, facts = copy["headline"], copy["facts"]
+    else:
+        headline = brief
+        facts = _brand_brain_facts(account_key) or [brief]
     is_story = "story" in str(row.get("format") or "").lower()
     aspect = "9:16" if is_story else None
     pixels = "1080x1920" if is_story else None
     surface = "story" if is_story else "feed post"
 
     gen = generate_fn or _default_generate
-    result = gen(brief, facts, client=client, aspect=aspect, pixels=pixels,
-                surface=surface, account_key=account_key)
+    extra = {"cta": copy["cta"], "footer": copy.get("footer"), "art_direction": brief} if copy else {}
+    result = gen(headline, facts, client=client, aspect=aspect, pixels=pixels,
+                surface=surface, account_key=account_key, **extra)
     if not result or not result.get("path"):
         return {"ok": False, "reason": REASON_GENERATE_FAILED}
 
@@ -117,13 +128,21 @@ def generate_variant_from_brief(row, account_key, brief, client=None,
     if not url:
         return {"ok": False, "reason": REASON_HOSTING}
 
+    if copy:
+        from .infographic_artifacts import ArtifactStore
+        try:
+            ArtifactStore().save(account_key, url, result["path"],
+                {"source_id": copy["source_id"], "source_hash": copy["source_hash"]})
+        except Exception:
+            return {"ok": False, "reason": "review_evidence_not_saved"}
+
     return {"ok": True, "image_url": url, "prompt": result.get("prompt", ""),
            "model": result.get("model", ""), "route": result.get("route", "")}
 
 
 def _default_generate(headline, facts, client=None, aspect=None, pixels=None,
-                      surface=None, account_key=None):
+                      surface=None, account_key=None, cta="", footer=None, art_direction=""):
     from . import creative_studio
     return creative_studio.generate(
         headline, facts, client=client, aspect=aspect, pixels=pixels,
-        surface=surface, account_key=account_key)
+        surface=surface, account_key=account_key, cta=cta, footer=footer, art_direction=art_direction)
