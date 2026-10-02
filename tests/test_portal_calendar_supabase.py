@@ -47,6 +47,14 @@ class _FakeHTTP:
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.calls.append(("get", url, params or {}, headers or {}))
+        if (params or {}).get("media_not_ready_reason") == "not.is.null" and self._get_resp.status_code < 400:
+            wanted = set(params["post_date"][4:-1].split(","))
+            held = [r for r in self._get_resp.json() if r.get("media_not_ready_reason") is not None
+                    and r.get("gym_id") == params["gym_id"][3:]
+                    and r.get("post_date") in wanted and r.get("variant_status", "active") == "active"]
+            response = _Resp(200, held)
+            response.headers = {"Content-Range": f"*/{len(held)}"}
+            return response
         return self._get_resp
 
     def patch(self, url, params=None, headers=None, json=None, timeout=None):
@@ -1398,9 +1406,8 @@ def test_media_belt_fails_open_and_says_so_when_the_book_read_fails(monkeypatch)
 
 
 def test_media_belt_rides_the_existing_flag_and_costs_nothing_when_off(monkeypatch):
-    """Gated on the SAME flag media_guard already ships armed on
-    (AGENT_MEDIA_CROSS_DAY_GUARD, default ON). No new flag, no changed default. OFF
-    restores the pre-belt behavior byte-for-byte AND issues not one extra read."""
+    """The optional media belt uses its existing flag and skips book reads
+    when OFF. The separate mandatory held-slot barrier still reads holds."""
     rows = [_mrow("2026-09-03", "https://cdn/photo_07.jpg"),
             _mrow("2026-09-17", "https://cdn/photo_07.jpg")]
 
@@ -1412,8 +1419,9 @@ def test_media_belt_rides_the_existing_flag_and_costs_nothing_when_off(monkeypat
     monkeypatch.setenv("AGENT_MEDIA_CROSS_DAY_GUARD", "false")
     store_off.insert_rows("gritx", rows)
     assert len(_staged(http_off)) == 2, "flag OFF: the batch passes through untouched"
-    assert not [c for c in http_off.calls if c[0] == "get"], \
-        "flag OFF must not pay for a single book read"
+    assert all(c[2].get("media_not_ready_reason") == "not.is.null"
+               for c in http_off.calls if c[0] == "get"), \
+        "flag OFF skips media-book reads; mandatory held-slot protection remains"
 
 
 def test_insert_rows_stable_uuid_is_opt_in_and_tenant_scoped():

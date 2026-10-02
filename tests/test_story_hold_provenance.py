@@ -114,7 +114,8 @@ def test_confirmed_insert_emits_after_db_and_failed_insert_emits_nothing(monkeyp
     def post(*a, **kw):
         calls.append(('insert', None))
         return SimpleNamespace(status_code=201, json=lambda: [held_row()])
-    http = SimpleNamespace(post=post, get=lambda *a, **kw: SimpleNamespace(status_code=200, json=lambda: []))
+    http = SimpleNamespace(post=post, get=lambda *a, **kw: SimpleNamespace(
+        status_code=200, headers={'Content-Range': '*/0'}, json=lambda: []))
     store = calendar.SupabaseCalendarStore(url='https://db.test', service_key='test-key', http=http)
     assert store.insert_rows('chateau123', [held_row()]) == [held_row()]
     assert calls == [('insert', None), ('seed', ROW_ID)]
@@ -238,7 +239,11 @@ class CalendarHTTP:
         rows = [deepcopy(r) for r in self.rows
                 if all(r.get(k) == v[3:] for k, v in params.items()
                        if isinstance(v, str) and v.startswith('eq.'))]
-        return SimpleNamespace(status_code=200, json=lambda: rows)
+        if params.get('media_not_ready_reason') == 'not.is.null':
+            dates = set(params['post_date'][4:-1].split(','))
+            rows = [r for r in rows if r.get('media_not_ready_reason') is not None and r['post_date'] in dates]
+            rows = [{k: r.get(k) for k in params['select'].split(',')} for r in rows]
+        return SimpleNamespace(status_code=200, headers={'Content-Range': f'*/{len(rows)}'}, json=lambda: rows)
 
     def post(self, url, json, **kw):
         self.calls.append('insert')
