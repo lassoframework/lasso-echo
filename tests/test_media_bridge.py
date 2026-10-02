@@ -179,13 +179,14 @@ def test_active_drive_inventory_suppresses_depletion_alert(monkeypatch):
 
 def test_seed_honors_gym_timezone_and_alerts_without_facts(monkeypatch):
     from agent import no_media_astra_seed as seed, client_infographic_fill as cif
+    today = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
     monkeypatch.setenv('AGENT_NO_MEDIA_ASTRA_SEED','true')
     monkeypatch.setattr(config,'posting_timezone_for',lambda _:'Pacific/Honolulu')
     monkeypatch.setattr(seed,'_ensure_deep_brain_facts',lambda *a:[])
     seen=[]; alerts=[]
     monkeypatch.setattr(cif,'_empty_upcoming_days',lambda *a,**k: seen.append(a[2]) or ['2026-10-01'])
     monkeypatch.setattr(mb,'notify_bridge',lambda *a,**k:alerts.append(a[0]))
-    assert seed.seed_gaps('gymx',SimpleNamespace(),object())==0
+    assert seed.seed_gaps('gymx',SimpleNamespace(),object(),today=today)==0
     assert seen==['Pacific/Honolulu'] and alerts==['gymx']
 
 def test_display_preserves_cached_history_and_blocks_new_far_future(monkeypatch,tmp_path):

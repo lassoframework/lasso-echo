@@ -324,15 +324,20 @@ def test_cadence_change_forces_rebuild_flag_on(monkeypatch, tmp_path):
     """scan_and_generate: a stored cadence differing from cadence_applied bypasses
     the built-out skip so the toggle replans (2x->1x must shrink, 1x->2x must grow)."""
     from agent import client_media_sync as cms
+    from datetime import date, timedelta
     monkeypatch.setenv("AGENT_CLIENT_MEDIA_SYNC", "true")
     monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
+
+    # Keep the fully-built fixture inside the scan's current-day window. CI may
+    # run after the original October 2026 literals have become past dates.
+    today = date.today()
 
     calls = {"built": 0}
 
     class _Store(_FakeStore):
         def list_month(self, base_key, month):
             # looks fully built out at 1x: 4 feed days for a 4-photo gym
-            return [{"post_date": f"2026-10-{d:02d}", "format": "feed",
+            return [{"post_date": (today + timedelta(days=d - 1)).isoformat(), "format": "feed",
                      "account": "instagram", "status": "pending",
                      "caption": "x", "image_url": f"u{d}"} for d in range(1, 5)]
 
@@ -355,13 +360,13 @@ def test_cadence_change_forces_rebuild_flag_on(monkeypatch, tmp_path):
     monkeypatch.setattr(_cmr, "build_client_month", _fake_build)
 
     store = _Store(ppd=2)                     # portal toggled 2x; applied stamp is 1
-    out = cms.scan_and_generate(clients=["gritx"], store=store)
+    out = cms.scan_and_generate(clients=["gritx"], store=store, now=today)
     assert out["ok"]
     assert calls["built"] == 1                # rebuild forced by the cadence change
     assert db.kv_get("cadence_applied_gritx") == "2"
 
     # second pass: cadence unchanged AND built-out -> idempotent skip
-    out2 = cms.scan_and_generate(clients=["gritx"], store=store)
+    out2 = cms.scan_and_generate(clients=["gritx"], store=store, now=today)
     assert calls["built"] == 1
 
 
