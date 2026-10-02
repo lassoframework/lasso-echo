@@ -96,8 +96,44 @@ def _default_page_resolver(account_key):
     return None
 
 
+def _normal_handle(value):
+    return str(value or "").strip().lstrip("@").lower()
+
+
+def _expected_instagram_handle(account_key):
+    """Read the handle the gym supplied in its intake, not the OAuth selection.
+
+    The Chateau fallback is the verified intake value for the live incident. It
+    keeps this account fail-closed if the intake read is temporarily unavailable.
+    Other gyms without an intake handle retain their existing behavior.
+    """
+    fallback = {"crossfitchateau813e78": "crossfitchateau"}
+    base = _tenant_bases(account_key)[-1]
+    expected = fallback.get(base, "")
+    url, key = config.supabase_url(), config.supabase_service_key()
+    if not url or not key:
+        return expected
+    try:
+        import requests
+        response = requests.get(
+            f"{url.rstrip('/')}/rest/v1/echo_social_intake",
+            params={"select": "answers", "echo_account_key": f"eq.{base}",
+                    "order": "created_at.desc", "limit": "1"},
+            headers={"apikey": key, "Authorization": f"Bearer {key}"},
+            timeout=8)
+        response.raise_for_status()
+        rows = response.json() or []
+        if rows:
+            gym = (rows[0].get("answers") or {}).get("gym") or {}
+            expected = _normal_handle(gym.get("ig_handle")) or expected
+    except Exception:
+        pass
+    return expected
+
+
 def publish(draft, account, client=None, scheduled_for=None,
-            profile_resolver=None, page_resolver=None):
+            profile_resolver=None, page_resolver=None,
+            expected_handle_resolver=None):
     """Publish (or schedule) `draft` to `account`'s own connected Zernio account.
 
     All external calls go through `client` (a ZernioClient), injectable for tests.
@@ -162,6 +198,19 @@ def publish(draft, account, client=None, scheduled_for=None,
         raise ZernioPreflightError(
             f"{account.key}: no connected {platform} account under the gym's Zernio "
             "profile; reconnect required.")
+
+    if platform == "instagram":
+        expected = _normal_handle((expected_handle_resolver or
+                                   _expected_instagram_handle)(account.key))
+        if expected:
+            connected = next((a for a in (accounts_json or {}).get("accounts") or []
+                              if str(a.get("_id") or "") == account_id), {})
+            actual = _normal_handle(zernio._handle_of(connected))
+            if actual != expected:
+                raise ZernioPublishError(
+                    f"{account.key}: Instagram connection is @{actual or 'unknown'}, "
+                    f"but the gym requested @{expected}; publishing held until the "
+                    "correct gym account is connected.")
 
     page_id = None
     if platform == "facebook":
