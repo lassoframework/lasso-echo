@@ -239,12 +239,14 @@ def _check_calendar_row_status(ctx):
 
 def _check_story_calendar_media_ready(ctx):
     """Observe the exact shared row from intake-web, which has no worker volume."""
-    from .fixer_business_seed import validate_story_target, SeedError
+    from .fixer_business_seed import validate_story_target, validate_story_created_at, SeedError
     from urllib.parse import urlsplit
     p = ctx.params
     try:
         validate_story_target(p.get("row_id"), p.get("calendar_gym_key"),
                               p.get("account"), p.get("post_date"))
+        if validate_story_created_at(p.get("created_at")) != p["created_at"]:
+            raise SeedError("bad generation identity")
     except SeedError:
         raise CheckRefused("bad_params")
     echo_key = _resolve_echo_gym_key(ctx.read, ctx.gym_key)
@@ -252,7 +254,7 @@ def _check_story_calendar_media_ready(ctx):
         raise CheckRefused("scope_mismatch")
     rows = _read_rows(ctx, 'content_calendar',
                      {'id': f"eq.{p['row_id']}", 'gym_id': f"eq.{p['calendar_gym_key']}",
-                      'select': 'id,gym_id,account,post_date,format,status,image_url,media_not_ready_reason',
+                      'select': 'id,gym_id,account,post_date,format,status,image_url,media_not_ready_reason,variant_status,created_at',
                       'limit': '2'}, 2)
     if not rows:
         return Observation(True, False, f"story_calendar:{p['row_id']}:absent", 'story_not_found')
@@ -260,12 +262,13 @@ def _check_story_calendar_media_ready(ctx):
         raise CheckUnavailable('story_row_ambiguous')
     row = rows[0]
     required = {'id', 'gym_id', 'account', 'post_date', 'format', 'status',
-                'image_url', 'media_not_ready_reason'}
+                'image_url', 'media_not_ready_reason', 'variant_status', 'created_at'}
     if not required.issubset(row):
         raise CheckUnavailable('story_row_partial')
     if (row.get('id') != p['row_id'] or row.get('gym_id') != p['calendar_gym_key']
             or row.get('account') != p['account'] or row.get('post_date') != p['post_date']
-            or row.get('format') != 'story'):
+            or row.get('format') != 'story' or row.get('variant_status') != 'active'
+            or validate_story_created_at(row.get('created_at')) != p['created_at']):
         raise CheckUnavailable('story_target_mismatch')
     media = row.get('image_url')
     try:
@@ -273,9 +276,9 @@ def _check_story_calendar_media_ready(ctx):
     except ValueError:
         hosted = False
     if (row.get('status') not in {'pending', 'approved', 'published'}
-            or row.get('media_not_ready_reason') not in (None, '') or not hosted):
+            or row.get('media_not_ready_reason') is not None or not hosted):
         return Observation(True, False, f"story_calendar:{p['row_id']}:not_ready", 'story_media_not_ready')
-    return Observation(True, True, f"story_calendar:{p['row_id']}:hosted_media_ready")
+    return Observation(True, True, f"story_calendar:{p['row_id']}:calendar_media_ready")
 
 
 def _check_forward_book_grade_at_least(ctx):
@@ -555,8 +558,9 @@ CHECKS = MappingProxyType({
         'story_calendar_media_ready', _check_story_calendar_media_ready,
         params={'row_id': 'confirmed shared Story row UUID',
                 'calendar_gym_key': 'exact persisted calendar tenant',
-                'account': 'persisted account', 'post_date': 'persisted date'},
-        description='the exact shared tenant Story row has hosted media and no media hold'),
+                'account': 'persisted account', 'post_date': 'persisted date',
+                'created_at': 'immutable row generation timestamp'},
+        description='the exact active shared Story generation has a stored HTTPS media reference and null media hold'),
     'calendar_row_status': CheckSpec(
         'calendar_row_status', _check_calendar_row_status,
         params={'row_id': 'content_calendar row id',

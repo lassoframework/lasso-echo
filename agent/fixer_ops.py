@@ -217,13 +217,13 @@ def _business_params_valid(check_id, params):
     if not isinstance(params, dict):
         return False
     if check_id == "story_calendar_media_ready":
-        from .fixer_business_seed import validate_story_target, SeedError
-        if set(params) != {"row_id", "calendar_gym_key", "account", "post_date"}:
+        from .fixer_business_seed import validate_story_target, validate_story_created_at, SeedError
+        if set(params) != {"row_id", "calendar_gym_key", "account", "post_date", "created_at"}:
             return False
         try:
             validate_story_target(params.get("row_id"), params.get("calendar_gym_key"),
                                   params.get("account"), params.get("post_date"))
-            return True
+            return validate_story_created_at(params.get("created_at")) == params["created_at"]
         except SeedError:
             return False
     if check_id == "calendar_row_status":
@@ -344,7 +344,7 @@ def _run_business_evidence(raw_body, deps, now=None):
     try:
         rows = read("support_tickets", {
             "id": f"eq.{ticket_id}",
-            "select": "id,product,client_id,created_at,raw_text", "limit": "2"})
+            "select": "id,product,client_id,created_at,raw_text,verification_before", "limit": "2"})
     except Exception:  # noqa: BLE001 - source errors never become evidence
         return 503, {"error": "evidence_unavailable"}
     if not isinstance(rows, list) or len(rows) > 2 or any(not isinstance(row, dict) for row in rows):
@@ -362,6 +362,10 @@ def _run_business_evidence(raw_body, deps, now=None):
     if current_request_key != request_key:
         return 409, {"error": "request_identity_mismatch"}
 
+    if check_id == "story_calendar_media_ready":
+        from .fixer_business_seed import story_pointer_matches
+        if not story_pointer_matches(ticket, request_key, params):
+            return 409, {"error": "business_pointer_mismatch"}
     from . import fixer_business_evidence as evidence
     receipt_read = None
     if check_id == "media_swap_completed":

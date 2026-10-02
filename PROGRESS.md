@@ -1,9 +1,10 @@
 ## Story hold FIXER provenance (2026-10-02)
 
-- [~] Future retained Story holds seed support only after confirmed shared content_calendar insertion, with exact row UUID, calendar tenant/account/date, source event, submission UUID and Scout request hash. The central insertion hook covers daily mirrors and month-ahead builders. Composer holds never seed before reconciliation; studio text alerts remain.
-- [~] Recovery observes only that exact shared Supabase row, so intake-web needs no worker volume. Hosted Story media, cleared hold, unchanged target fields and current requester identity are required. Missing/replaced rows and partial reads fail closed. The retained shared hold is the actionable retry signal; the next planner pass retries persisted holds before slot dedupe.
-- [~] Independent review identified and repaired the earlier local-volume and pre-reconcile source mismatches. Focused Echo tests: 230 passed; paired Scout tests: 21 passed. Fresh review and deployment pending.
-- [ ] Historical da4b0dc4 remains merged/businessPending: no trusted original target or live historical slot exists. No production DB repair or fabricated proof is included. Exact row replacement remains unconfirmed; no broad slot substitution closes its ticket.
+- [~] Future retained Story holds seed support after confirmed shared content_calendar insertion, with exact UUID, creation timestamp, tenant/account/date, source event, submission UUID and Scout request hash. Daily mirrors and month-ahead builders use the central hook; primary text alerts remain.
+- [~] Intake-web observes the exact active shared generation with a stored HTTPS media reference and strictly null hold reason. It validates the persisted source/check pointer against caller parameters; a ready sibling or recreated UUID cannot prove recovery. This proves calendar state, not a fetched hosted object.
+- [~] Normal rebuilds retry failed seeds before deletion and retain held rows and validated incident targets. Media recovery patches the same pending UUID and timestamp with conditional ownership/readiness predicates, preserving client copy and human/publisher states. Unrelated ready Stories retain ordinary replacement/omission behavior. Ambiguous slots and missing/partial reads fail closed for Stories.
+- [~] Focused Echo source/observer/calendar tests: 358 passed; paired Scout tests: 22 passed. Independent review and deployment pending; no production mutations or migrations.
+- [ ] Historical da4b0dc4 remains merged/businessPending: no trusted original target or live historical slot exists. No fabricated proof or status override is included.
 
 ## Echo Story needs-media hold (2026-10-02, local patch, review pending)
 

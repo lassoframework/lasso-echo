@@ -139,19 +139,23 @@ def validate_story_target(row_id, calendar_gym_key, account, post_date):
     return day
 
 
-def story_hold_seed(*, row_id, calendar_gym_key, account, post_date, created_at, client_id):
-    """One persisted held row, bound to its exact UUID and immutable identity."""
+def validate_story_created_at(created_at):
     from datetime import datetime, timezone
-    validate_story_target(row_id, calendar_gym_key, account, post_date)
-    if not isinstance(client_id, str) or not _UUID.fullmatch(client_id):
-        raise SeedError("invalid portal client UUID")
     try:
         stamp = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
         if stamp.tzinfo is None:
             raise ValueError()
-        occurred_at = stamp.astimezone(timezone.utc).isoformat()
+        return stamp.astimezone(timezone.utc).isoformat()
     except (AttributeError, TypeError, ValueError) as exc:
         raise SeedError("invalid shared Story creation time") from exc
+
+
+def story_hold_seed(*, row_id, calendar_gym_key, account, post_date, created_at, client_id):
+    """One persisted held row, bound to its exact UUID and immutable identity."""
+    validate_story_target(row_id, calendar_gym_key, account, post_date)
+    if not isinstance(client_id, str) or not _UUID.fullmatch(client_id):
+        raise SeedError("invalid portal client UUID")
+    occurred_at = validate_story_created_at(created_at)
     gym_key = calendar_gym_key
     if gym_key.endswith(("_ig", "_fb")):
         gym_key = gym_key.rsplit("_", 1)[0]
@@ -163,12 +167,13 @@ def story_hold_seed(*, row_id, calendar_gym_key, account, post_date, created_at,
             "source_event_id": hashlib.sha256(_canonical(event).encode()).hexdigest(),
             "check_id": STORY_CHECK,
             "params": {"row_id": row_id, "calendar_gym_key": calendar_gym_key,
-                       "account": account, "post_date": post_date}}
+                       "account": account, "post_date": post_date, "created_at": occurred_at}}
 
 
 def prepare_story_hold_seed(row, *, bus=None):
     if (not isinstance(row, dict) or row.get("format") != "story"
-            or row.get("status") != "pending" or row.get("image_url") not in (None, "")
+            or row.get("status") != "pending" or row.get("variant_status") != "active"
+            or row.get("image_url") not in (None, "")
             or not isinstance(row.get("media_not_ready_reason"), str)
             or not row["media_not_ready_reason"].startswith("Story media not ready:")):
         raise SeedError("not a persisted Story media hold")
@@ -185,6 +190,22 @@ def story_hold_message(row):
     return (f"Story media hold for {row['gym_id']} ({row['account']}) on "
             f"{row['post_date']}: shared calendar row {row['id']} has no hosted Story media. "
             "The retained slot requires purpose-built Story media and human approval.")
+
+
+def story_pointer_matches(ticket, request_key, params):
+    """The observer cannot substitute a ready sibling for the stored source."""
+    try:
+        fx = ticket["verification_before"]["fixer"]
+        plan = fx["business_check"]
+        seed = {**fx["source_event"], "client_id": ticket["client_id"],
+                "check_id": plan["check_id"], "params": plan["params"]}
+        _validate_seed(seed)
+        expected = ticket_row(seed, ticket["raw_text"])["verification_before"]["fixer"]["business_check"]
+        return (plan == expected and plan["ticket_id"] == ticket["id"]
+                and plan["client_id"] == ticket["client_id"]
+                and plan["request_key"] == request_key and plan["params"] == params)
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def valid_story_ticket(row):
