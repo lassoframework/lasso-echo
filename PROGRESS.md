@@ -1,3 +1,9 @@
+## Story hold FIXER provenance (2026-10-02)
+
+- [~] Future retained Story render/hosting/quality holds seed a deterministic service-authenticated support ticket with exact tenant, source slot, submission UUID and Scout request hash. Studio text alerts remain; the Story caller owns support intake to avoid an unbound duplicate. Existing OPS-FIX and ops-alert flags gate this path.
+- [~] Recovery observation opens the actual configured Echo draft DB read-only and requires the exact tenant/account/day/draft to contain hosted Story media with the hold cleared. Missing/unavailable storage and changed requester identity fail closed. Focused Echo tests: 218 passed; paired Scout producer tests: 21 passed. Parent review and deployment pending.
+- [ ] Historical da4b0dc4 remains merged/businessPending: no trusted original target or live historical slot exists. No production DB repair or fabricated proof is included.
+
 ## Echo Story needs-media hold (2026-10-02, local patch, review pending)
 
 - [~] A Story slot whose reviewed 9:16 render or hosting fails under `surface_gap=True` is retained as a durable needs-media hold: BLOCKED + needs_media + force_approval, stable Draft identity (draft id/day/type), truthful reason, no cropped or reused feed card. Premade 9:16 hosting failures also retain the slot. Studio-reported quality and render-unavailable failures keep single-alert suppression; other creatives without a genuine 9:16 source keep the log-only skip.

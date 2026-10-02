@@ -276,6 +276,16 @@ class Bus:
             and not isinstance(event.get("observed_total"), bool)
             and 0 <= event["observed_total"] <= 100
             and event["observed_total"] < event.get("previous_total"))
+        if not valid and isinstance(event, dict) and event.get("source") == "echo.stories.media_hold":
+            from ..fixer_business_seed import valid_story_ticket
+            valid = valid_story_ticket(row)
+            if valid:
+                mapping = self._get("echo_intake_tokens", {
+                    "gym_id": f"eq.{row['client_id']}",
+                    "select": "gym_id,echo_account_key", "limit": "2"})
+                valid = (isinstance(mapping, list) and len(mapping) == 1
+                         and mapping[0].get("gym_id") == row["client_id"]
+                         and mapping[0].get("echo_account_key") == event["gym_key"])
         if not valid:
             raise BusError(400, "invalid seeded ops-fix identity or contract")
         if self.portal_client_id(event["gym_key"]) != row["client_id"]:

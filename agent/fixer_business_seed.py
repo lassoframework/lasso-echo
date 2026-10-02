@@ -119,7 +119,81 @@ def prepare_grade_drop_seed(*, gym_key: str, min_total: int, observed_total: int
     )
 
 
+STORY_SOURCE = "echo.stories.media_hold"
+STORY_CHECK = "story_draft_media_ready"
+_ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{2,79}_(?:ig|fb)\Z")
+_DRAFT = re.compile(r"[a-f0-9]{10}\Z")
+
+
+def validate_story_slot(account_key, draft_id, source_day):
+    """Validate the domain's stable account/day/draft identity."""
+    from .drafter import _make_id
+    if not isinstance(account_key, str) or not _ACCOUNT.fullmatch(account_key):
+        raise SeedError("invalid Story account")
+    occurred_at = _source_at(source_day)
+    day = occurred_at[:10]
+    if source_day != day:
+        raise SeedError("invalid Story slot date")
+    if (not isinstance(draft_id, str) or not _DRAFT.fullmatch(draft_id)
+            or draft_id != _make_id(account_key, "story", day)):
+        raise SeedError("invalid Story slot identity")
+    return day
+
+
+def story_hold_seed(*, account_key, draft_id, source_day, client_id):
+    """One immutable, domain-owned Story slot. No alert prose selects its target."""
+    day = validate_story_slot(account_key, draft_id, source_day)
+    occurred_at = _source_at(day)
+    if not isinstance(client_id, str) or not _UUID.fullmatch(client_id):
+        raise SeedError("invalid portal client UUID")
+    event = {"schema_version": SCHEMA_VERSION, "source": STORY_SOURCE,
+             "occurred_at": occurred_at, "gym_key": account_key.rsplit("_", 1)[0],
+             "account_key": account_key, "draft_id": draft_id, "source_day": day}
+    return {**event, "client_id": client_id,
+            "source_event_id": hashlib.sha256(_canonical(event).encode()).hexdigest(),
+            "check_id": STORY_CHECK,
+            "params": {"account_key": account_key, "draft_id": draft_id, "day_key": day}}
+
+
+def prepare_story_hold_seed(draft, *, bus=None):
+    if (getattr(draft, "draft_type", "") != "story"
+            or getattr(getattr(draft, "status", None), "value", None) != "blocked"
+            or getattr(draft, "is_story", False) is not True
+            or getattr(draft, "needs_media", False) is not True
+            or getattr(draft, "force_approval", False) is not True
+            or getattr(draft, "creative_public_url", "")
+            or getattr(draft, "creative_path", "")):
+        raise SeedError("not an authoritative Story media hold")
+    account = getattr(draft, "account_key", "")
+    if not _ACCOUNT.fullmatch(account):
+        raise SeedError("invalid Story account")
+    return story_hold_seed(account_key=account, draft_id=draft.draft_id,
+                           source_day=draft.day_key,
+                           client_id=resolve_portal_client_id(account.rsplit("_", 1)[0], bus=bus))
+
+
+def valid_story_ticket(row):
+    """Bus revalidates the complete immutable source before accepting a new route."""
+    try:
+        fx = row["verification_before"]["fixer"]
+        seed = {**fx["source_event"], "client_id": row["client_id"],
+                "check_id": fx["business_check"]["check_id"],
+                "params": fx["business_check"]["params"]}
+        expected = ticket_row(seed, row["raw_text"])
+        return all(row.get(key) == value for key, value in expected.items())
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _validate_seed(seed: dict) -> dict:
+    if isinstance(seed, dict) and seed.get("source") == STORY_SOURCE:
+        rebuilt = story_hold_seed(account_key=seed.get("account_key"),
+                                  draft_id=seed.get("draft_id"),
+                                  source_day=seed.get("source_day"),
+                                  client_id=seed.get("client_id"))
+        if seed != rebuilt:
+            raise SeedError("Story seed identity mismatch")
+        return rebuilt
     if not isinstance(seed, dict) or set(seed) != {
             "schema_version", "source", "occurred_at", "gym_key", "client_id",
             "previous_total", "observed_total", "source_event_id", "check_id", "params"}:
@@ -161,10 +235,11 @@ def ticket_row(seed: dict, alert_text: str) -> dict:
     }
     return {
         "id": ticket_id,
+        **({"submission_key": ticket_id} if seed["source"] == STORY_SOURCE else {}),
         "product": "echo",
         "source": "ops_fix",
         "client_id": seed["client_id"],
-        "reporter": "echo_grade_sweep",
+        "reporter": "echo_story_hold" if seed["source"] == STORY_SOURCE else "echo_grade_sweep",
         "raw_text": raw_text,
         "classification": "code_fix",
         "severity": "P1",
@@ -174,7 +249,9 @@ def ticket_row(seed: dict, alert_text: str) -> dict:
         "created_at": created_at,
         "verification_before": {"fixer": {
             "business_check": business_check,
-            "source_event": {
+            "source_event": ({k: v for k, v in seed.items()
+                              if k not in {"client_id", "check_id", "params"}}
+                             if seed["source"] == STORY_SOURCE else {
                 "schema_version": SCHEMA_VERSION,
                 "source": seed["source"],
                 "source_event_id": seed["source_event_id"],
@@ -182,7 +259,7 @@ def ticket_row(seed: dict, alert_text: str) -> dict:
                 "gym_key": seed["gym_key"],
                 "previous_total": seed["previous_total"],
                 "observed_total": seed["observed_total"],
-            },
+            }),
         }},
     }
 

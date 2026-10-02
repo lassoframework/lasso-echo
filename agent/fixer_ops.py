@@ -216,6 +216,16 @@ def _now_iso():
 def _business_params_valid(check_id, params):
     if not isinstance(params, dict):
         return False
+    if check_id == "story_draft_media_ready":
+        from .fixer_business_seed import validate_story_slot, SeedError
+        if set(params) != {"account_key", "draft_id", "day_key"}:
+            return False
+        try:
+            validate_story_slot(params.get("account_key"), params.get("draft_id"),
+                                params.get("day_key"))
+            return True
+        except SeedError:
+            return False
     if check_id == "calendar_row_status":
         return (set(params) == {"row_id", "expected_status"}
                 and isinstance(params.get("row_id"), str)

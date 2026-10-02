@@ -24,10 +24,10 @@ Hard rules (fail closed, all of them):
     no input field through which prose could mark anything verified; `verified` is
     True ONLY when the check's own bounded readback independently matches the
     declared expectation.
-  - No writes, no network, no env reads, no global state beyond the frozen
-    registry. Every storage read goes through the injected deps['read'] reader,
-    always with an explicit limit; a missing, failing, or out-of-bounds reader
-    yields UNKNOWN, never an exception-as-proof and never a guess.
+  - No writes or network calls. Portal reads use the injected deps['read']
+    reader with explicit limits. Story recovery additionally reads the configured
+    Echo SQLite store via a fixed parameterized query in mode=ro, without schema
+    initialization. Missing, failing, or malformed storage yields UNKNOWN.
   - Tenant scope is re-asserted on every row read back. A row stamped for another
     gym makes the observation UNKNOWN (a reader that crosses tenants cannot be
     trusted in either direction), never evidence for or against the tenant asked.
@@ -36,8 +36,8 @@ Three outcomes, distinguishable on every record: VERIFIED (readback matched),
 UNVERIFIED (readback succeeded and contradicts the expectation, or the request was
 refused before any read), UNKNOWN (evidence unavailable or untrustworthy).
 
-The module carries no feature flag by design: it performs no I/O of its own and is
-inert without an injected reader, the same posture as agent/fixer_evidence.py.
+The module carries no feature flag by design and is inert without an injected
+portal reader. The registered Story check reads only its exact local slot.
 Whatever transport mounts it owns the auth gate, as fixer_ops does for evidence.
 """
 from __future__ import annotations
@@ -236,6 +236,78 @@ def _check_calendar_row_status(ctx):
         return Observation(True, False, f'calendar_row:{row_id}:{status}',
                            'status_mismatch')
     return Observation(True, True, f'calendar_row:{row_id}:{status}')
+
+
+def _read_story_draft(draft_id, account_key, day_key):
+    """Read the actual Echo store without initializing schema or writing a DB."""
+    import json
+    import sqlite3
+    from pathlib import Path
+    from urllib.parse import quote
+    from .db import db_path
+    try:
+        uri = "file:" + quote(str(Path(db_path()).resolve())) + "?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=2) as connection:
+            rows = connection.execute(
+                "SELECT draft_id,account_key,day_key,draft_type,status,data FROM drafts "
+                "WHERE draft_id=? AND account_key=? AND day_key=? LIMIT 2",
+                (draft_id, account_key, day_key)).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise CheckUnavailable("story_store_ambiguous")
+        d_id, account, day, kind, status, raw = rows[0]
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise CheckUnavailable("story_store_unreadable")
+        for key, value in (("draft_id", d_id), ("account_key", account),
+                           ("day_key", day), ("draft_type", kind), ("status", status)):
+            if data.get(key) != value:
+                raise CheckUnavailable("story_store_identity_mismatch")
+        return data
+    except CheckUnavailable:
+        raise
+    except Exception as exc:
+        raise CheckUnavailable("story_store_unavailable") from exc
+
+
+def _check_story_draft_media_ready(ctx):
+    """Only a genuine recovered Story for this immutable source slot resolves."""
+    from datetime import date
+    from .drafter import _make_id
+    account = ctx.params.get("account_key")
+    draft_id = ctx.params.get("draft_id")
+    day = ctx.params.get("day_key")
+    if (not isinstance(account, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{2,79}_(?:ig|fb)", account)
+            or not isinstance(day, str)):
+        raise CheckRefused("bad_params")
+    try:
+        if date.fromisoformat(day).isoformat() != day:
+            raise ValueError()
+    except ValueError:
+        raise CheckRefused("bad_params")
+    if draft_id != _make_id(account, "story", day):
+        raise CheckRefused("bad_params")
+    echo_key = _resolve_echo_gym_key(ctx.read, ctx.gym_key)
+    if account.rsplit("_", 1)[0] != echo_key:
+        raise CheckRefused("scope_mismatch")
+    draft = _read_story_draft(draft_id, account, day)
+    if draft is None:
+        return Observation(True, False, f"story_draft:{draft_id}:absent", "story_not_found")
+    from urllib.parse import urlsplit
+    media_url = draft.get("creative_public_url")
+    try:
+        hosted = isinstance(media_url, str) and urlsplit(media_url).scheme == "https" and bool(urlsplit(media_url).netloc)
+    except ValueError:
+        hosted = False
+    if (draft.get("is_story") is not True or draft.get("draft_type") != "story"
+            or draft.get("needs_media") is not False
+            or draft.get("blocked_reason") not in (None, "")
+            or draft.get("status") not in {"pending", "approved", "published"}
+            or not hosted):
+        return Observation(True, False, f"story_draft:{draft_id}:not_ready", "story_media_not_ready")
+    return Observation(True, True, f"story_draft:{draft_id}:hosted_media_ready")
 
 
 def _check_forward_book_grade_at_least(ctx):
@@ -511,6 +583,11 @@ def _check_media_swap_completed(ctx):
 
 
 CHECKS = MappingProxyType({
+    'story_draft_media_ready': CheckSpec(
+        'story_draft_media_ready', _check_story_draft_media_ready,
+        params={'account_key': 'authoritative Echo Story account',
+                'draft_id': 'deterministic Story slot id', 'day_key': 'slot date YYYY-MM-DD'},
+        description='the exact tenant Story slot has recovered with hosted media and no media hold'),
     'calendar_row_status': CheckSpec(
         'calendar_row_status', _check_calendar_row_status,
         params={'row_id': 'content_calendar row id',
