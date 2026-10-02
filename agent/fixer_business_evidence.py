@@ -24,10 +24,9 @@ Hard rules (fail closed, all of them):
     no input field through which prose could mark anything verified; `verified` is
     True ONLY when the check's own bounded readback independently matches the
     declared expectation.
-  - No writes, no network, no env reads, no global state beyond the frozen
-    registry. Every storage read goes through the injected deps['read'] reader,
-    always with an explicit limit; a missing, failing, or out-of-bounds reader
-    yields UNKNOWN, never an exception-as-proof and never a guess.
+  - No writes, network calls, environment reads or local volume access. All
+    evidence comes from bounded tenant-scoped shared reads through deps['read'].
+    Missing, failing, or malformed storage yields UNKNOWN.
   - Tenant scope is re-asserted on every row read back. A row stamped for another
     gym makes the observation UNKNOWN (a reader that crosses tenants cannot be
     trusted in either direction), never evidence for or against the tenant asked.
@@ -36,8 +35,8 @@ Three outcomes, distinguishable on every record: VERIFIED (readback matched),
 UNVERIFIED (readback succeeded and contradicts the expectation, or the request was
 refused before any read), UNKNOWN (evidence unavailable or untrustworthy).
 
-The module carries no feature flag by design: it performs no I/O of its own and is
-inert without an injected reader, the same posture as agent/fixer_evidence.py.
+The module carries no feature flag by design and is inert without an injected
+shared reader. The registered Story check reads only its exact shared row UUID.
 Whatever transport mounts it owns the auth gate, as fixer_ops does for evidence.
 """
 from __future__ import annotations
@@ -236,6 +235,50 @@ def _check_calendar_row_status(ctx):
         return Observation(True, False, f'calendar_row:{row_id}:{status}',
                            'status_mismatch')
     return Observation(True, True, f'calendar_row:{row_id}:{status}')
+
+
+def _check_story_calendar_media_ready(ctx):
+    """Observe the exact shared row from intake-web, which has no worker volume."""
+    from .fixer_business_seed import validate_story_target, validate_story_created_at, SeedError
+    from urllib.parse import urlsplit
+    p = ctx.params
+    try:
+        validate_story_target(p.get("row_id"), p.get("calendar_gym_key"),
+                              p.get("account"), p.get("post_date"))
+        if validate_story_created_at(p.get("created_at")) != p["created_at"]:
+            raise SeedError("bad generation identity")
+    except SeedError:
+        raise CheckRefused("bad_params")
+    echo_key = _resolve_echo_gym_key(ctx.read, ctx.gym_key)
+    if p["calendar_gym_key"] not in {echo_key, echo_key + "_ig", echo_key + "_fb"}:
+        raise CheckRefused("scope_mismatch")
+    rows = _read_rows(ctx, 'content_calendar',
+                     {'id': f"eq.{p['row_id']}", 'gym_id': f"eq.{p['calendar_gym_key']}",
+                      'select': 'id,gym_id,account,post_date,format,status,image_url,media_not_ready_reason,variant_status,created_at',
+                      'limit': '2'}, 2)
+    if not rows:
+        return Observation(True, False, f"story_calendar:{p['row_id']}:absent", 'story_not_found')
+    if len(rows) != 1:
+        raise CheckUnavailable('story_row_ambiguous')
+    row = rows[0]
+    required = {'id', 'gym_id', 'account', 'post_date', 'format', 'status',
+                'image_url', 'media_not_ready_reason', 'variant_status', 'created_at'}
+    if not required.issubset(row):
+        raise CheckUnavailable('story_row_partial')
+    if (row.get('id') != p['row_id'] or row.get('gym_id') != p['calendar_gym_key']
+            or row.get('account') != p['account'] or row.get('post_date') != p['post_date']
+            or row.get('format') != 'story' or row.get('variant_status') != 'active'
+            or validate_story_created_at(row.get('created_at')) != p['created_at']):
+        raise CheckUnavailable('story_target_mismatch')
+    media = row.get('image_url')
+    try:
+        hosted = isinstance(media, str) and urlsplit(media).scheme == 'https' and bool(urlsplit(media).netloc)
+    except ValueError:
+        hosted = False
+    if (row.get('status') not in {'pending', 'approved', 'published'}
+            or row.get('media_not_ready_reason') is not None or not hosted):
+        return Observation(True, False, f"story_calendar:{p['row_id']}:not_ready", 'story_media_not_ready')
+    return Observation(True, True, f"story_calendar:{p['row_id']}:calendar_media_ready")
 
 
 def _check_forward_book_grade_at_least(ctx):
@@ -511,6 +554,13 @@ def _check_media_swap_completed(ctx):
 
 
 CHECKS = MappingProxyType({
+    'story_calendar_media_ready': CheckSpec(
+        'story_calendar_media_ready', _check_story_calendar_media_ready,
+        params={'row_id': 'confirmed shared Story row UUID',
+                'calendar_gym_key': 'exact persisted calendar tenant',
+                'account': 'persisted account', 'post_date': 'persisted date',
+                'created_at': 'immutable row generation timestamp'},
+        description='the exact active shared Story generation has a stored HTTPS media reference and null media hold'),
     'calendar_row_status': CheckSpec(
         'calendar_row_status', _check_calendar_row_status,
         params={'row_id': 'content_calendar row id',

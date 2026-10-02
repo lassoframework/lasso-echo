@@ -84,7 +84,8 @@ def test_delete_month_preserves_human_rows_by_default(monkeypatch):
     http = _FakeHTTP(delete_resp=_Resp(200, []))
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
     pcs.SupabaseCalendarStore().delete_month("eng", "2026-08")
-    method, url, params, headers, _ = http.calls[0]
+    method, url, params, headers, _ = next(call for call in http.calls
+                                            if call[0] == "delete")
     assert method == "delete"
     assert params["gym_id"] == "eq.eng"
     # the status guard: only NULL or a wipeable status is deleted
@@ -95,7 +96,8 @@ def test_delete_month_full_wipe_when_preserve_off(monkeypatch):
     http = _FakeHTTP(delete_resp=_Resp(200, []))
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
     pcs.SupabaseCalendarStore().delete_month("eng", "2026-08", preserve_human=False)
-    _, _, params, _, _ = http.calls[0]
+    _, _, params, _, _ = next(call for call in http.calls
+                              if call[0] == "delete")
     assert "or" not in params            # no status guard -> deletes everything
 
 
@@ -213,7 +215,8 @@ def test_delete_month_preserve_dates_excludes_locked_days(monkeypatch):
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
     pcs.SupabaseCalendarStore().delete_month(
         "eng", "2026-08", preserve_dates=("2026-08-13", "2026-08-20"))
-    _, _, params, _, _ = http.calls[0]
+    _, _, params, _, _ = next(call for call in http.calls
+                              if call[0] == "delete")
     assert params["post_date"] == [
         "gte.2026-08-01", "lte.2026-08-31",
         "not.in.(2026-08-13,2026-08-20)",

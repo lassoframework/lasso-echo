@@ -32,6 +32,10 @@ class _FakeHTTP:
     def post(self, url, headers=None, json=None, params=None, timeout=None):
         return _FakeResp(list(json or []))
 
+    def get(self, url, headers=None, params=None, timeout=None):
+        # A new Story slot has no existing calendar row to reconcile.
+        return _FakeResp([])
+
 
 def _store(http=None):
     from agent.portal_calendar_store import SupabaseCalendarStore

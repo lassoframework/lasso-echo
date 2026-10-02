@@ -2114,9 +2114,14 @@ class SupabaseCalendarStore:
         # story has three legitimate rows on one date. Keying on the date alone called
         # 441 rows duplicates when only 155 were, and superseding on it would have
         # destroyed live client content.
+        # A previously inserted hold is the durable retry signal when its
+        # support seed failed. Retry confirmed held rows before slot dedupe can
+        # drop a repeated planner proposal; READY preserved rows never emit.
+        _retry_story_hold_provenance(self, account_key, payload)
+        payload, recovered = _reconcile_story_media_holds(self, account_key, payload)
         payload = _dedupe_slots(self, account_key, payload)
         if not payload:
-            return []
+            return recovered
         all_keys = set()
         for r in payload:
             all_keys.update(r.keys())
@@ -2134,6 +2139,7 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         out = r.json() or []
         inserted = [x for x in out if str(x.get("gym_id")) == str(account_key)]
+        _record_confirmed_story_holds(account_key, inserted)
         # Wave 3 (AGENT_CAPTION_COOLDOWN): stamp each successfully staged row in
         # the caption ledger so future planner runs see the cooldown. Failure is
         # non-fatal (the rows were already inserted; the ledger is a best-effort
@@ -2148,7 +2154,53 @@ class SupabaseCalendarStore:
                         _ledger.record_staged(account_key, caption, post_date)
             except Exception:
                 pass  # ledger stamp failure is never fatal
-        return inserted
+        return recovered + inserted
+
+    def recover_story_media_hold(self, account_key, current, proposed):
+        """Atomically recover the retained row, preserving its incident UUID.
+
+        This updates a retained pending machine Story. Human/publisher states,
+        variant ownership, tenant, slot, media and generation are compared in the
+        PATCH; human-owned states never become pending again.
+        """
+        from urllib.parse import urlsplit
+        media = proposed.get("image_url")
+        try:
+            ready = (isinstance(media, str) and urlsplit(media).scheme == "https"
+                     and bool(urlsplit(media).netloc)
+                     and proposed.get("media_not_ready_reason") is None)
+        except ValueError:
+            ready = False
+        if (current.get("format") != "story" or current.get("status") != "pending" or not ready
+                or proposed.get("format") != "story" or proposed.get("status") != "pending"
+                or current.get("gym_id") != account_key
+                or current.get("variant_status") != "active"
+                or _story_slot(current) != _story_slot(proposed)):
+            return None
+        # Recovery changes media only; retain client copy and calendar decisions.
+        columns = {"image_url", "thumbnail_url", "source_media_url", "source_media_asset_id"}
+        patch = {key: value for key, value in proposed.items() if key in columns}
+        patch["media_not_ready_reason"] = None
+        params = {"id": f"eq.{current['id']}", "gym_id": f"eq.{account_key}",
+                  "account": f"eq.{current['account']}", "post_date": f"eq.{current['post_date']}",
+                  "format": "eq.story", "status": "eq.pending", "variant_status": "eq.active",
+                  "created_at": f"eq.{current['created_at']}",
+                  "media_not_ready_reason": ("is.null" if current.get("media_not_ready_reason") is None
+                                             else f"eq.{current['media_not_ready_reason']}"),
+                  "image_url": ("is.null" if current.get("image_url") is None
+                                else f"eq.{current['image_url']}")}
+        response = self._client().patch(self._rest(_TABLE), params=params, json=patch,
+                         headers=self._headers({"Prefer": "return=representation"}), timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, _scrub((response.text or "")[:200]))
+        rows = response.json() or []
+        if (len(rows) != 1 or rows[0].get("id") != current["id"]
+                or rows[0].get("gym_id") != account_key or _story_slot(rows[0]) != _story_slot(current)
+                or rows[0].get("created_at") != current["created_at"]
+                or rows[0].get("image_url") != media or rows[0].get("media_not_ready_reason") is not None
+                or rows[0].get("status") != "pending" or rows[0].get("variant_status") != "active"):
+            return None
+        return rows[0]
 
     def delete_month(self, account_key, month, *, preserve_human=True,
                      preserve_dates=()):
@@ -2192,6 +2244,28 @@ class SupabaseCalendarStore:
             "variant_status": "eq.active",
         }
         if preserve_human:
+            # Protect actual incidents, including recovered exact generations;
+            # unrelated READY Stories retain normal replace/omission behavior.
+            try:
+                month_rows = self.rows_in_range(account_key, first, last)
+                if not isinstance(month_rows, list) or len(month_rows) >= 1000:
+                    raise ValueError("partial Story read")
+                _record_confirmed_story_holds(account_key, month_rows)
+                incident_targets = _story_incident_targets(self, account_key, first, last)
+                from .fixer_business_seed import validate_story_created_at
+                protected = [r["id"] for r in month_rows
+                             if r.get("format") == "story" and
+                             (_is_story_media_hold(r) or
+                              (r.get("id"), validate_story_created_at(r.get("created_at"))) in incident_targets)]
+                # Also protect a hold inserted concurrently after this read.
+                params["and"] = "(or(format.neq.story,format.is.null,media_not_ready_reason.is.null))"
+                if protected:
+                    params["id"] = f"not.in.({','.join(protected)})"
+            except Exception:
+                # Never delete an unknown Story generation after a failed or
+                # partial shared/provenance read. Feed rebuild remains bounded.
+                params["and"] = "(or(format.neq.story,format.is.null))"
+                print("[calendar] Story protection read unavailable; Story rows retained")
             # delete only the never-touched drafts: status IS NULL OR status IN wipeable.
             in_list = ",".join(_WIPEABLE_STATUSES)
             params["or"] = f"(status.is.null,status.in.({in_list}))"
@@ -2494,6 +2568,145 @@ def _dedupe_slots(store, account_key, payload, *, existing=None):
         print(f"[slot-dedupe] {account_key}: dropped {in_batch} in-batch duplicate(s) "
               f"and {dropped_live} slot(s) already live; staged {len(deduped)}")
     return deduped
+
+
+def _story_incident_targets(store, calendar_gym_key, first, last):
+    """Read validated persisted targets; no prose or fuzzy slot substitution."""
+    from .fixer_business_seed import STORY_SOURCE, story_pointer_matches
+    response = store._client().get(store._rest("support_tickets"), params={
+        "product": "eq.echo", "source": "eq.ops_fix",
+        "verification_before->fixer->source_event->>source": f"eq.{STORY_SOURCE}",
+        "verification_before->fixer->source_event->>calendar_gym_key": f"eq.{calendar_gym_key}",
+        "verification_before->fixer->source_event->>post_date": [f"gte.{first}", f"lte.{last}"],
+        "select": "id,client_id,raw_text,verification_before", "limit": "1000"},
+        headers=store._headers(), timeout=30)
+    if response.status_code >= 400:
+        raise ValueError("Story provenance unavailable")
+    tickets = response.json()
+    if not isinstance(tickets, list) or len(tickets) >= 1000:
+        raise ValueError("partial Story provenance")
+    targets = set()
+    for ticket in tickets:
+        plan = ticket["verification_before"]["fixer"]["business_check"]
+        if not story_pointer_matches(ticket, plan["request_key"], plan["params"]):
+            raise ValueError("invalid Story provenance")
+        p = plan["params"]
+        if p["calendar_gym_key"] != calendar_gym_key or not first <= p["post_date"] <= last:
+            raise ValueError("Story provenance scope mismatch")
+        targets.add((p["row_id"], p["created_at"]))
+    return targets
+
+
+def _story_slot(row):
+    # Calendar defaults a missing time_slot to morning. Null slot_index is a
+    # genuine single-slot identity; never collapse a numbered second Story.
+    return (row.get("account"), row.get("post_date"), row.get("format"),
+            row.get("time_slot") or "morning", row.get("slot_index"))
+
+
+def _reconcile_story_media_holds(store, calendar_gym_key, proposed):
+    """Use the retained UUID for ordinary rerenders, never a READY sibling."""
+    stories = [row for row in proposed if row.get("format") == "story"]
+    if not stories:
+        return proposed, []
+    try:
+        dates = [row["post_date"] for row in stories]
+        existing = store.rows_in_range(calendar_gym_key, min(dates), max(dates))
+        if (not isinstance(existing, list) or len(existing) >= 1000
+                or any(not isinstance(r, dict) or r.get("gym_id") != calendar_gym_key
+                       or (r.get("format") == "story" and not
+                           {"id", "account", "post_date", "status", "variant_status", "created_at",
+                            "image_url", "media_not_ready_reason"}.issubset(r)) for r in existing)):
+            raise ValueError("partial Story hold read")
+    except Exception as exc:
+        print(f"[calendar] Story hold reconciliation unconfirmed: {type(exc).__name__}; existing rows retained")
+        return [row for row in proposed if row.get("format") != "story"], []
+    retained = [row for row in existing if isinstance(row, dict) and row.get("format") == "story"
+                and row.get("gym_id") == calendar_gym_key
+                and row.get("variant_status") == "active"]
+    output, recovered = [], []
+    for row in proposed:
+        if row.get("format") == "story" and sum(_story_slot(r) == _story_slot(row) for r in stories) != 1:
+            print("[calendar] ambiguous proposed Story slot; no replacement inserted")
+            continue
+        targets = [old for old in retained if _story_slot(old) == _story_slot(row)]
+        if not targets:
+            output.append(row)
+            continue
+        _record_confirmed_story_holds(calendar_gym_key, targets)
+        if len(targets) != 1:
+            print("[calendar] ambiguous retained Story target; no replacement inserted")
+            continue
+        if targets[0].get("status") != "pending":
+            # The planner never creates a sibling over a human/publisher row,
+            # even with the optional content-dedupe belt disabled.
+            continue
+        if _is_story_media_hold(row):
+            # Same failed slot: keep its source generation and retry seed, even
+            # if the latest error wording differs.
+            recovered.append(targets[0])
+            continue
+        try:
+            saved = store.recover_story_media_hold(calendar_gym_key, targets[0], row)
+        except Exception as exc:
+            print(f"[calendar] retained Story recovery unconfirmed: {type(exc).__name__}")
+            saved = None
+        if saved:
+            recovered.append(saved)
+        # A refused/raced recovery never inserts a second candidate over the
+        # retained target or changes a human's decision.
+    return output, recovered
+
+
+def _is_story_media_hold(row):
+    return (isinstance(row, dict) and row.get("format") == "story"
+            and row.get("status") == "pending" and row.get("image_url") in (None, "")
+            and isinstance(row.get("media_not_ready_reason"), str)
+            and row["media_not_ready_reason"].startswith("Story media not ready:"))
+
+
+def _record_confirmed_story_holds(calendar_gym_key, rows):
+    """Only confirmed shared rows may originate a support incident."""
+    try:
+        if not config.ops_fix_triage_enabled() or not config.ops_alerts_enabled():
+            return
+        from . import ops_alerts
+        for row in rows:
+            if _is_story_media_hold(row) and row.get("gym_id") == calendar_gym_key:
+                ops_alerts.record_story_hold(row)
+    except Exception as exc:
+        # The primary portal-visible held row is already durable. Never turn a
+        # failed support seed into a failed calendar insertion or a fake ticket.
+        print(f"[calendar] Story support provenance unconfirmed: {type(exc).__name__}; "
+              "shared media holds retained for next planner retry")
+
+
+def _retry_story_hold_provenance(store, calendar_gym_key, proposed):
+    """Retry only persisted holds for slots a planner is actually revisiting.
+
+    No new outbox table or worker-volume dependency: the shared held calendar
+    row/reason is the actionable queue. Read failure leaves it intact. This also
+    covers a restart after calendar insert but before support seed confirmation.
+    """
+    try:
+        if not config.ops_fix_triage_enabled() or not config.ops_alerts_enabled():
+            return
+        held = [row for row in proposed if _is_story_media_hold(row)]
+        if not held:
+            return
+        dates = [row["post_date"] for row in held]
+        existing = store.rows_in_range(calendar_gym_key, min(dates), max(dates))
+        if not isinstance(existing, list) or len(existing) >= 1000:
+            raise ValueError("unconfirmed hold read")
+        slot = lambda r: (r.get("account"), r.get("post_date"), r.get("format"),
+                          r.get("time_slot"), r.get("slot_index"))
+        wanted = {slot(row) for row in held}
+        actual = [row for row in existing if isinstance(row, dict)
+                  and row.get("gym_id") == calendar_gym_key and slot(row) in wanted]
+        _record_confirmed_story_holds(calendar_gym_key, actual)
+    except Exception as exc:
+        print(f"[calendar] Story support retry read unconfirmed: {type(exc).__name__}; "
+              "shared media holds retained")
 
 
 def _live_slots_for(store, account_key, dates):

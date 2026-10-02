@@ -31,6 +31,25 @@ itself only logged.
 
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+_DEFER_STORY_OPS_FIX = ContextVar("defer_story_ops_fix", default=False)
+
+
+@contextmanager
+def story_hold_scope(enabled):
+    """The Story caller owns the structured incident, including studio alerts.
+
+    Context-local state keeps concurrent feed/account renders independent. The
+    primary studio text alert is preserved; only its legacy support cross-post
+    waits for the caller to construct the actual failed Story hold.
+    """
+    token = _DEFER_STORY_OPS_FIX.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _DEFER_STORY_OPS_FIX.reset(token)
 
 from . import config
 
@@ -164,7 +183,27 @@ def _default_poster():
     return SlackPoster()
 
 
-def alert(message, poster=None, force=False, business_seed=None, seed_bus=None):
+def record_story_hold(row, *, bus=None):
+    """Persist only confirmed shared calendar provenance, without a Slack send.
+
+    An unconfirmed seed leaves the visible held row/reason as the durable retry
+    signal. The next planner pass retries that exact row before slot dedupe.
+    """
+    if not config.ops_fix_triage_enabled() or not config.ops_alerts_enabled():
+        return False
+    try:
+        from . import fixer_business_seed as seeds
+        seed = seeds.prepare_story_hold_seed(row, bus=bus)
+        seeds.persist(seed, seeds.story_hold_message(row), bus=bus)
+        return True
+    except Exception as exc:
+        print(f"[ops-alerts] Story hold provenance unconfirmed row={row.get('id', '')}: "
+              f"{type(exc).__name__}; shared media hold retained for next planner retry")
+        return False
+
+
+def alert(message, poster=None, force=False, business_seed=None, seed_bus=None,
+          story_hold=None):
     """
     Post one ops alert line to the Slack channel. Returns the Slack response, or
     None when dormant. Flag OFF -> None, no client touched (unless `force`, used
@@ -200,6 +239,8 @@ def alert(message, poster=None, force=False, business_seed=None, seed_bus=None):
     # needs to exist. A failed structured write falls back to the existing
     # echosupport cross-post below, never to a fabricated partial ticket.
     seeded_ticket = False
+    # A composing Story has no confirmed shared target yet. Its caller defers
+    # support intake until the calendar write and reconciliation finish.
     if business_seed is not None and config.ops_fix_triage_enabled():
         try:
             from . import fixer_business_seed as _business_seed
@@ -234,7 +275,9 @@ def alert(message, poster=None, force=False, business_seed=None, seed_bus=None):
         # An alert must never take the pipeline down with it.
         print(f"[ops-alerts] failed to post alert: {type(e).__name__}: {scrub(e)}")
         return None
-    if not seeded_ticket:
+    # A known structured Story target never falls back to an unbound ticket.
+    # Its primary text alert survives failure; the next run retries the same seed.
+    if not seeded_ticket and story_hold is None:
         _maybe_cross_post_ops_fix(text, poster)
     return result
 
@@ -285,7 +328,7 @@ def _maybe_cross_post_ops_fix(alert_text, poster):
     failure here is logged and swallowed, never raised into the caller -- the
     primary alert already posted and must not be affected by this side effect.
     """
-    if not config.ops_fix_triage_enabled():
+    if _DEFER_STORY_OPS_FIX.get() or not config.ops_fix_triage_enabled():
         return
     try:
         channel = config.support_channel_id()

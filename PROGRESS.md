@@ -1,3 +1,11 @@
+## Story hold FIXER provenance (2026-10-02)
+
+- [~] Future retained Story holds seed support after confirmed shared content_calendar insertion, with exact UUID, creation timestamp, tenant/account/date, source event, submission UUID and Scout request hash. Daily mirrors and month-ahead builders use the central hook; primary text alerts remain.
+- [~] Intake-web observes the exact active shared generation with a stored HTTPS media reference and strictly null hold reason. It validates the persisted source/check pointer against caller parameters; a ready sibling or recreated UUID cannot prove recovery. This proves calendar state, not a fetched hosted object.
+- [~] Normal rebuilds retry failed seeds before deletion and retain held rows and validated incident targets. Media recovery patches the same pending UUID and timestamp with conditional ownership/readiness predicates, preserving client copy and human/publisher states. Unrelated ready Stories retain ordinary replacement/omission behavior. Ambiguous slots and missing/partial reads fail closed for Stories.
+- [~] Focused Echo source/observer/calendar tests: 358 passed; paired Scout tests: 22 passed. Independent review and deployment pending; no production mutations or migrations.
+- [ ] Historical da4b0dc4 remains merged/businessPending: no trusted original target or live historical slot exists. No fabricated proof or status override is included.
+
 ## Echo Story needs-media hold (2026-10-02, local patch, review pending)
 
 - [~] A Story slot whose reviewed 9:16 render or hosting fails under `surface_gap=True` is retained as a durable needs-media hold: BLOCKED + needs_media + force_approval, stable Draft identity (draft id/day/type), truthful reason, no cropped or reused feed card. Premade 9:16 hosting failures also retain the slot. Studio-reported quality and render-unavailable failures keep single-alert suppression; other creatives without a genuine 9:16 source keep the log-only skip.

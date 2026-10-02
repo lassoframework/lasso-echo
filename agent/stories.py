@@ -71,13 +71,13 @@ def _is_studio_creative(feed_draft):
 
 
 def _needs_media_hold(account, day_key, draft_id, feed_draft, fragments, reason,
-                      image_copy=None):
+                      image_copy=None, alert_message=None):
     """The durable, recoverable Story hold for a slot whose reviewed 9:16 render or
     hosting FAILED under surface_gap=True. BLOCKED (maps to a pending calendar row
     that is never publish-ready) + needs_media + force_approval, with a stable
     story identity (draft_id/day_key/draft_type) and NO media. Never built from a
     cropped or reused feed card; never auto-approvable."""
-    return Draft(
+    draft = Draft(
         draft_id=draft_id, account_key=account.key, platform=account.platform,
         caption="", hashtags=[], creative_path="", creative_public_url="",
         scheduled_for=schedule.scheduled_for(day_key, slot="morning"),
@@ -88,6 +88,11 @@ def _needs_media_hold(account, day_key, draft_id, feed_draft, fragments, reason,
         needs_media=True, force_approval=True,
         warnings=[reason],
     )
+    if alert_message:
+        ops_alerts.alert(alert_message, story_hold=draft)
+    # Shared calendar persistence records provenance after reconciliation.
+    # A temporary composer hold cannot create a support incident.
+    return draft
 
 
 def build_story_draft(account, day_key, *, feed_draft=None,
@@ -137,13 +142,11 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                 f"or add public_url."
             )
             if surface_gap:
-                ops_alerts.alert(
-                    f"story draft held for {account.key} on {day_key}: "
-                    f"{host_reason} The slot is retained as needs-media."
-                )
                 return _needs_media_hold(
                     account, day_key, draft_id, feed_draft, fragments,
-                    f"Story media not ready: {host_reason}")
+                    f"Story media not ready: {host_reason}",
+                    alert_message=(f"story draft held for {account.key} on {day_key}: "
+                    f"{host_reason} The slot is retained as needs-media."))
             ops_alerts.alert(
                 f"story draft skipped for {account.key} on {day_key}: {host_reason}"
             )
@@ -166,14 +169,15 @@ def build_story_draft(account, day_key, *, feed_draft=None,
             # terminal failures (reason, stage, reported). draft_id rides through
             # so a failed story render is traceable in the studio's own logs.
             failure_info = {}
-            art = creative_studio.generate(
-                headline, facts, client=nano_client,
-                account_key=account.key,
-                out_path=_story_out_path(headline, unique=config.lasso_infographic_quality_enabled(account.key)),
-                aspect=config.STORY_ASPECT, pixels=config.STORY_PIXELS,
-                surface="Story", draft_id=draft_id, failure_info=failure_info,
-                **copy_opts,
-            )
+            with ops_alerts.story_hold_scope(surface_gap):
+                art = creative_studio.generate(
+                    headline, facts, client=nano_client,
+                    account_key=account.key,
+                    out_path=_story_out_path(headline, unique=config.lasso_infographic_quality_enabled(account.key)),
+                    aspect=config.STORY_ASPECT, pixels=config.STORY_PIXELS,
+                    surface="Story", draft_id=draft_id, failure_info=failure_info,
+                    **copy_opts,
+                )
             if art:
                 hosted = media_host.host_media(art["path"], account.key,
                                                client=s3_client)
@@ -189,15 +193,13 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                     f"AGENT_HOSTING_ENABLED or add public_url."
                 )
                 if surface_gap:
-                    ops_alerts.alert(
-                        f"story draft held for {account.key} on {day_key}: "
-                        f"{host_reason} The slot is retained as needs-media; a "
-                        f"Story is never a cropped feed card."
-                    )
                     return _needs_media_hold(
                         account, day_key, draft_id, feed_draft, fragments,
                         f"Story media not ready: {host_reason}",
-                        image_copy=image_copy)
+                        image_copy=image_copy,
+                        alert_message=(f"story draft held for {account.key} on {day_key}: "
+                        f"{host_reason} The slot is retained as needs-media; a "
+                        f"Story is never a cropped feed card."))
                 ops_alerts.alert(
                     f"story draft skipped for {account.key} on {day_key}: the 9:16 "
                     f"studio render succeeded but hosting returned no public URL. "
@@ -253,16 +255,13 @@ def build_story_draft(account, day_key, *, feed_draft=None,
         reason = (f"no purpose-built 9:16 asset: the studio render failed for "
                   f"{_basename} and no premade *_story sibling exists")
         if surface_gap:
-            ops_alerts.alert(
-                f"story draft blocked for {account.key} on {day_key}: the studio render "
-                f"came back dark for {_basename} (no purpose-built 9:16 studio asset and "
-                f"no premade *_story sibling). The slot is retained and the next daily "
-                f"run retries a fresh 9:16 render. A Story is never a cropped feed card."
-            )
             return _needs_media_hold(
                 account, day_key, draft_id, feed_draft, fragments,
                 f"Story media not ready: {reason}. The feed card was not cropped "
-                f"or reused.")
+                f"or reused.", alert_message=(f"story draft blocked for {account.key} on {day_key}: the studio render "
+                f"came back dark for {_basename} (no purpose-built 9:16 studio asset and "
+                f"no premade *_story sibling). The slot is retained and the next daily "
+                f"run retries a fresh 9:16 render. A Story is never a cropped feed card."))
         ops_alerts.alert(
             f"story draft skipped for {account.key} on {day_key}: the studio render "
             f"came back dark for {_basename} (no purpose-built 9:16 studio asset and "
