@@ -193,6 +193,30 @@ def _to_utc_iso(iso_ts):
 # credential it rejected.
 _ERR_BODY_CHARS = 1200
 
+
+def _idempotency_headers(idempotency_key):
+    """Preserve x-request-id and add a caller-owned, stable Idempotency-Key if given.
+
+    Zernio's 2026-09-25 posts API replays a UUID key for 24 hours. The caller
+    must persist that key for the logical post; this client does not retry.
+    """
+    headers = {"x-request-id": str(_uuid.uuid4())}
+    if idempotency_key is None:
+        return headers
+    key = str(idempotency_key)
+    try:
+        _uuid.UUID(key)
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(
+            "idempotency_key must be a UUID string (Zernio Idempotency-Key, "
+            "max 255 chars)") from None
+    if len(key) > 255:
+        raise ValueError(
+            f"idempotency_key exceeds Zernio's 255-char Idempotency-Key limit: {len(key)}")
+    headers["Idempotency-Key"] = key
+    return headers
+
+
 # Google Business photo categories (Zernio gmb-media docs). Google REQUIRES one.
 GMB_PHOTO_CATEGORIES = ("COVER", "PROFILE", "LOGO", "EXTERIOR", "INTERIOR",
                         "FOOD_AND_DRINK", "MENU", "PRODUCT", "TEAMS", "ADDITIONAL")
@@ -611,7 +635,7 @@ class ZernioClient:
                           headers=self._connect_headers(connect_token))
 
     def create_post(self, account_id, body, media_urls=None, scheduled_for=None,
-                    page_id=None, platform=None, story=False):
+                    page_id=None, platform=None, story=False, idempotency_key=None):
         """POST /v1/posts: publish (or schedule) ONE post to one connected account.
 
         Payload verified against the Zernio OpenAPI spec (docs.zernio.com/api/openapi,
@@ -625,9 +649,9 @@ class ZernioClient:
                                unless publishNow=true — so immediate sends set publishNow
           * platformSpecificData.contentType='story' publishes an IG/FB Story;
             platformSpecificData.pageId targets a specific Facebook Page.
-        Idempotency: every call carries a fresh x-request-id (UUID4) so a same-request
-        retry returns the original post instead of double-posting; Zernio additionally
-        409s exact duplicates within 24h (the caller maps that to already-posted).
+        Every call carries a fresh x-request-id. A caller may pass the same
+        stable Idempotency-Key on retries of one logical post; this method does
+        not retry or persist keys.
         Returns the created post JSON (carries the post id)."""
         entry = {"accountId": str(account_id)}
         if platform:
@@ -651,14 +675,15 @@ class ZernioClient:
             payload["timezone"] = "UTC"
         else:
             payload["publishNow"] = True
-        headers = {"x-request-id": str(_uuid.uuid4())}
-        return self._post("/v1/posts", payload, headers=headers)
+        return self._post("/v1/posts", payload,
+                          headers=_idempotency_headers(idempotency_key))
 
-    def create_post_raw(self, payload, *, draft=False, publish_now=True):
+    def create_post_raw(self, payload, *, draft=False, publish_now=True,
+                        idempotency_key=None):
         """POST /v1/posts with a FULLY-BUILT body (content + mediaItems + platforms),
         for platforms whose platformSpecificData the caller assembles itself (GBP). The
         GBP payload builder (agent/gbp.build_post_payload) produces `payload`; this only
-        adds send-mode + a fresh idempotency id, never reshapes the platforms entry.
+        adds send-mode and request headers, never reshapes the platforms entry.
 
         draft=True forces isDraft (Zernio saves it, publishes NOTHING) — used by the
         autonomous build + validation so no live post is ever created. draft=False +
@@ -669,8 +694,8 @@ class ZernioClient:
             body["isDraft"] = True
         elif publish_now:
             body["publishNow"] = True
-        headers = {"x-request-id": str(_uuid.uuid4())}
-        return self._post("/v1/posts", body, headers=headers)
+        return self._post("/v1/posts", body,
+                          headers=_idempotency_headers(idempotency_key))
 
     def get_post(self, post_id):
         """GET /v1/posts/{id} -> the post JSON (status + per-platform state). Read-only;
