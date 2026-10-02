@@ -412,16 +412,40 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def approve_ready(self, account_key, row_id):
+        """Approve only when this gym's row still has publishable media.
+
+        The RPC checks status, media URL, and needs-media reason in one database
+        UPDATE. A portal pre-read alone cannot protect against a concurrent media
+        removal between the check and the approval write. An unapplied migration
+        fails closed instead of falling back to the generic status PATCH.
+        """
+        r = self._client().post(
+            self._rest("rpc/approve_calendar_row_if_media_ready"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"p_row_id": row_id, "p_gym_id": account_key}, timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if len(rows) != 1 or str(rows[0].get("gym_id")) != str(account_key):
+            return None
+        return rows[0]
+
     def patch_image_url(self, account_key, row_id, new_image_url):
         """Task #28 (§5c): swap a story row's image_url to freshly re-burned media after a
-        caption edit. STATUS-preserving (the edit already reset it to 'pending'); this only
-        updates the media. id+gym_id isolation. Returns the updated row or None."""
+        caption edit. A real replacement also clears a prior needs-media hold, but never
+        changes status: pending / coach_review rows still need their normal approval path.
+        id+gym_id + waiting-status isolation. Returns the updated row or None."""
+        if not (new_image_url or "").strip():
+            return None
         r = self._client().patch(
             self._rest(_TABLE),
-            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"},
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
+                    "status": "in.(pending,coach_review)"},
             headers=self._headers({"Content-Type": "application/json",
                                    "Prefer": "return=representation"}),
-            json={"image_url": new_image_url}, timeout=30)
+            json={"image_url": new_image_url, "media_not_ready_reason": None}, timeout=30)
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         for row in (r.json() or []):
@@ -444,12 +468,22 @@ class SupabaseCalendarStore:
             return None
         if (current.get("image_url") or "").strip():
             return None  # already has a real image; never overwrite
-        payload = {"image_url": image_url}
+        if not (image_url or "").strip():
+            return None
+        # A real replacement resolves the explicit hold in the SAME scoped write.
+        # Do not change status: it remains pending / coach_review and must pass the
+        # ordinary approval gate before it can publish.
+        payload = {"image_url": image_url, "media_not_ready_reason": None}
         if source_media_asset_id:
             payload["source_media_asset_id"] = source_media_asset_id
+        # Keep the no-overwrite promise server-side too: another worker can attach
+        # media after the prefetch but before this write. PostgREST's OR predicate
+        # permits only a still-null or still-empty image_url to be recovered.
         r = self._client().patch(
             self._rest(_TABLE),
-            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"},
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
+                    "status": "in.(pending,coach_review)",
+                    "or": "(image_url.is.null,image_url.eq.)"},
             headers=self._headers({"Content-Type": "application/json",
                                    "Prefer": "return=representation"}),
             json=payload, timeout=30)
@@ -479,7 +513,11 @@ class SupabaseCalendarStore:
         a Drive row becomes a local-library row, so the hide / removed-from-Drive
         sweeps stop tracking an asset the row no longer carries). Any other key is
         ignored: this method never becomes a general row editor."""
-        payload = {"image_url": image_url}
+        if not (image_url or "").strip():
+            return None
+        # This is a real replacement, so release any earlier needs-media hold in
+        # the same pending / coach_review-scoped write. Status itself is unchanged.
+        payload = {"image_url": image_url, "media_not_ready_reason": None}
         if source_media_url is not None:
             payload["source_media_url"] = source_media_url
         for col in _SWAP_EXTRA_COLUMNS:
@@ -803,6 +841,10 @@ class SupabaseCalendarStore:
             "status": "not.in.(published,denied,killed)",
             "published_at": "is.null",
             "image_url": "not.is.null",
+            # Needs-media holds are never due: the reason column is set on a staged
+            # hold (and blank image_url strings slip past not.is.null, so the
+            # client-side guard below drops those too).
+            "media_not_ready_reason": "is.null",
             "account": "in.(instagram,facebook)",
             # 0318: never let a candidate variant (an unchosen Astra v2 sitting
             # beside its slot's real active row) get claimed and published --
@@ -818,7 +860,12 @@ class SupabaseCalendarStore:
         )
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        return r.json() or []
+        rows = r.json() or []
+        # Fail-closed client-side guard: never serve a row with blank/whitespace
+        # media or a media-not-ready reason, whatever the filters missed.
+        return [row for row in rows
+                if (row.get("image_url") or "").strip()
+                and not (row.get("media_not_ready_reason") or "").strip()]
 
     def mark_publishing(self, row_id):
         """
@@ -835,10 +882,34 @@ class SupabaseCalendarStore:
         already publishing / published / denied / killed (zero rows updated) so the
         caller SKIPS it. Two concurrent runs can both call this; at most one gets True.
         """
+        # MEDIA HOLD GUARD: a needs-media or blank-media row is never claimable,
+        # even when a stale status says pending/approved. The atomic PATCH carries
+        # media_not_ready_reason=is.null so the refusal is enforced server-side in
+        # the same statement; the prefetch refuses a blank image_url (PostgREST has
+        # no non-empty-string operator) before the claim is attempted.
+        try:
+            cur = self._client().get(
+                self._rest(_TABLE),
+                params={"id": f"eq.{row_id}",
+                        "select": "id,image_url,media_not_ready_reason"},
+                headers=self._headers(), timeout=30)
+            if cur.status_code >= 400:
+                return False
+            rows0 = cur.json() or []
+            if len(rows0) != 1:
+                return False
+            row0 = rows0[0]
+            if (not (row0.get("image_url") or "").strip()
+                    or (row0.get("media_not_ready_reason") or "").strip()):
+                return False
+        except Exception:
+            return False  # fail closed: an unreadable row is never claimed
         params = {
             "id": f"eq.{row_id}",
             "status": "in.(pending,approved)",
             "published_at": "is.null",
+            "image_url": "not.is.null",
+            "media_not_ready_reason": "is.null",
         }
         r = self._client().patch(
             self._rest(_TABLE),

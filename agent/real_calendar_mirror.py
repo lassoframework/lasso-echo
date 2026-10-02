@@ -27,8 +27,9 @@ HARD GUARDS:
     behind AGENT_DEMO_CALENDAR_ENABLED). A REAL gym id must never keep demo-manifest
     draft ids after a mirror: mirror_plan lists every demo row on the real gym for
     DELETE, and refuses to upsert any demo-id draft.
-  * A draft with no real hosted creative URL (creative_public_url) is skipped: the
-    portal never shows an empty card, and the demo/real split stays honest.
+  * A draft with no real hosted creative URL (creative_public_url) is skipped UNLESS
+    it is an explicit needs-media hold. Those held slots stay visible with a
+    media_not_ready_reason and can never masquerade as a publish-ready card.
   * Nothing here publishes. It writes calendar rows only.
 
 IG FEED HASHTAG FOLD (fix/instagram-hashtag-reach-20260919): when an INSTAGRAM
@@ -200,6 +201,13 @@ def _real_row(account_key, draft, caption=None):
     ev_id = getattr(draft, "event_id", "") or ""
     if ev_id:
         row["event_id"] = ev_id
+    # A needs-media hold is intentionally retained as a recoverable slot. The
+    # nullable reason column (content_calendar_media_not_ready migration) is the
+    # shared portal/publisher signal that media must be supplied before approval;
+    # the row's blank image_url + reason keep it out of every publish lane.
+    if getattr(draft, "needs_media", False):
+        row["media_not_ready_reason"] = (
+            getattr(draft, "blocked_reason", "") or "purpose_built_media_required")
     return row
 
 
@@ -212,13 +220,15 @@ def _row_source_id(draft):
 def collect_real_drafts(account_key, store):
     """The gym's REAL drafts as content_calendar row dicts.
 
-    Included: a draft for THIS account that carries a real hosted creative URL and is
-    NOT a demo-manifest draft (demof_/demos_ ids are excluded). PENDING / APPROVED /
-    PUBLISHED-equivalent states all map through _draft_status. A feed draft and its
-    paired story draft are SEPARATE rows, each with the correct format.
+    Included: a draft for THIS account that carries a real hosted creative URL or an
+    explicit needs-media hold and is NOT a demo-manifest draft (demof_/demos_ ids are
+    excluded). PENDING / APPROVED / PUBLISHED-equivalent states all map through
+    _draft_status. A feed draft and its paired story draft are SEPARATE rows, each with
+    the correct format.
 
-    Excluded: demo drafts (id namespace), drafts with no creative_public_url, and drafts
-    with no resolvable post_date (nothing to place on a calendar day).
+    Excluded: demo drafts (id namespace), drafts with neither hosted media nor a
+    needs-media hold, and drafts with no resolvable post_date (nothing to place on a
+    calendar day).
 
     PURE of writes and network: reads only store.list_for_account(account_key).
     """
@@ -232,8 +242,9 @@ def collect_real_drafts(account_key, store):
         draft_id = getattr(draft, "draft_id", "") or ""
         if _demo.is_demo_draft_id(draft_id):
             continue  # demo content never enters a real gym's calendar
-        if not (getattr(draft, "creative_public_url", "") or "").strip():
-            continue  # no hosted image: not a portal-ready card
+        if (not (getattr(draft, "creative_public_url", "") or "").strip()
+                and not getattr(draft, "needs_media", False)):
+            continue  # neither hosted media nor an explicit recoverable media hold
         row = _real_row(account_key, draft)
         if not row["post_date"]:
             continue  # cannot place on a calendar day

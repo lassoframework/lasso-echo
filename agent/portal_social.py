@@ -372,6 +372,13 @@ def _content_calendar_post(row, is_lasso=False):
         # Publish record (display only): when it actually went out + the vendor post id.
         "published_at": row.get("published_at"),
         "late_post_id": row.get("late_post_id"),
+        # Needs-media hold signal: nonempty when this row was staged WITHOUT media
+        # (e.g. a Story whose reviewed 9:16 render/hosting failed). The portal shows
+        # the truthful reason; approval + every publish lane reject the row while it
+        # is set or the image is blank.
+        "media_not_ready_reason": (row.get("media_not_ready_reason") or ""),
+        "needs_media": bool((row.get("media_not_ready_reason") or "").strip())
+                       or not (row.get("image_url") or "").strip(),
     }
     # gym_id scopes the hosted fallback card (media_host tenant isolation); the portal
     # post shape itself is unchanged (no new keys).
@@ -857,10 +864,30 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
             return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
                          "error": "this post is still in coach review and has not been "
                                   "released yet"}
-        updated = sb_store.set_status(account_key, draft_id,
-                                      _pcs.action_status("approve"))
+        if str(row.get("status") or "").lower() in ("denied", "killed", "deleted", "failed"):
+            return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                         "error": "this post is no longer awaiting approval"}
+        # MEDIA HOLD GATE: a needs-media row (reason set, or no usable media at all)
+        # can never be approved — even if a stale status already says pending. The
+        # hold stays visible until real media lands; nothing here lifts that gate.
+        _not_ready = (row.get("media_not_ready_reason") or "").strip()
+        if _not_ready:
+            return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                         "error": f"media not ready: {_not_ready[:200]}",
+                         "media_not_ready_reason": _not_ready}
+        if not (row.get("image_url") or "").strip():
+            return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                         "error": "this post has no media yet; add media before "
+                                  "approving"}
+        # The production store uses an atomic DB predicate so media removal
+        # between the pre-read and this write cannot approve a stale hold.
+        approve_ready = getattr(sb_store, "approve_ready", None)
+        updated = (approve_ready(account_key, draft_id) if callable(approve_ready)
+                   else sb_store.set_status(account_key, draft_id,
+                                            _pcs.action_status("approve")))
         if updated is None:
-            return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+            return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                         "error": "post changed before approval; refresh and review it again"}
         return 200, _action_result("approve", draft_id, updated)
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",

@@ -13,7 +13,10 @@ or a purpose-built 9:16 variant that creative_studio renders from the SAME
 approved text (its hook + body lines ride on the feed draft's source_fragments);
 aspect is per-use, so the feed target stays 4:5. If neither genuine 9:16 asset is
 available, Echo SKIPS the Story for the day (returns None) and fires one ops
-alert. It NEVER reuses or crops the day's 4:5 / 1:1 feed image into a Story frame.
+alert. When the daily runner passes surface_gap=True, a reviewed Story whose
+9:16 render or hosting FAILED is instead retained as a needs-media, BLOCKED,
+approval-required hold so the slot stays durably visible and recoverable. It
+NEVER reuses or crops the day's 4:5 / 1:1 feed image into a Story frame.
 Stories carry no caption text.
 
 Publishing is unaffected here: this module never posts. A Story publish goes
@@ -67,6 +70,26 @@ def _is_studio_creative(feed_draft):
     return base.startswith("nano_") and bool(feed_draft.source_fragments)
 
 
+def _needs_media_hold(account, day_key, draft_id, feed_draft, fragments, reason,
+                      image_copy=None):
+    """The durable, recoverable Story hold for a slot whose reviewed 9:16 render or
+    hosting FAILED under surface_gap=True. BLOCKED (maps to a pending calendar row
+    that is never publish-ready) + needs_media + force_approval, with a stable
+    story identity (draft_id/day_key/draft_type) and NO media. Never built from a
+    cropped or reused feed card; never auto-approvable."""
+    return Draft(
+        draft_id=draft_id, account_key=account.key, platform=account.platform,
+        caption="", hashtags=[], creative_path="", creative_public_url="",
+        scheduled_for=schedule.scheduled_for(day_key, slot="morning"),
+        status=DraftStatus.BLOCKED, blocked_reason=reason,
+        source_fragments=fragments,
+        infographic_copy=dict(image_copy or {}),
+        is_story=True, day_key=day_key, draft_type="story",
+        needs_media=True, force_approval=True,
+        warnings=[reason],
+    )
+
+
 def build_story_draft(account, day_key, *, feed_draft=None,
                       nano_client=None, s3_client=None, surface_gap=False):
     """
@@ -106,11 +129,23 @@ def build_story_draft(account, day_key, *, feed_draft=None,
             if hosted:
                 return _story_draft(account, day_key, draft_id, feed_draft,
                                     premade, hosted, fragments)
-            # Genuine 9:16 asset exists but could not be hosted: skip, do not reuse.
+            # A genuine 9:16 asset exists but cannot be hosted. Retain the
+            # reviewed slot when the runner asks for recoverable gaps.
+            host_reason = (
+                f"found premade 9:16 variant {os.path.basename(premade)} but "
+                f"hosting returned no public URL. Enable AGENT_HOSTING_ENABLED "
+                f"or add public_url."
+            )
+            if surface_gap:
+                ops_alerts.alert(
+                    f"story draft held for {account.key} on {day_key}: "
+                    f"{host_reason} The slot is retained as needs-media."
+                )
+                return _needs_media_hold(
+                    account, day_key, draft_id, feed_draft, fragments,
+                    f"Story media not ready: {host_reason}")
             ops_alerts.alert(
-                f"story draft skipped for {account.key} on {day_key}: found premade "
-                f"9:16 variant {os.path.basename(premade)} but hosting returned no "
-                f"public URL. Enable AGENT_HOSTING_ENABLED or add public_url."
+                f"story draft skipped for {account.key} on {day_key}: {host_reason}"
             )
             return None
 
@@ -148,6 +183,21 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                                         image_engine=art.get("route", ""))
                 # HOSTING failure, distinct from a render failure: the 9:16 render
                 # itself succeeded. Say so accurately instead of blaming the studio.
+                host_reason = (
+                    f"the 9:16 studio render succeeded but hosting returned no "
+                    f"public URL for {os.path.basename(art['path'])}. Enable "
+                    f"AGENT_HOSTING_ENABLED or add public_url."
+                )
+                if surface_gap:
+                    ops_alerts.alert(
+                        f"story draft held for {account.key} on {day_key}: "
+                        f"{host_reason} The slot is retained as needs-media; a "
+                        f"Story is never a cropped feed card."
+                    )
+                    return _needs_media_hold(
+                        account, day_key, draft_id, feed_draft, fragments,
+                        f"Story media not ready: {host_reason}",
+                        image_copy=image_copy)
                 ops_alerts.alert(
                     f"story draft skipped for {account.key} on {day_key}: the 9:16 "
                     f"studio render succeeded but hosting returned no public URL. "
@@ -157,16 +207,33 @@ def build_story_draft(account, day_key, *, feed_draft=None,
             if _quality_failure_reported(failure_info):
                 # The studio already emitted its quality alert for this call; a
                 # second "studio came back dark" story alert would be redundant
-                # and misleading. LOG the skip distinctly instead.
+                # and misleading. LOG the skip distinctly instead. Under
+                # surface_gap the slot is still RETAINED as a needs-media hold
+                # (no second alert fires).
                 print(f"[stories] skip {account.key} {day_key}: 9:16 story render "
                       f"withheld by the content quality gate ("
                       f"{str(failure_info.get('reason', ''))[:200]}). Studio alert "
                       f"already recorded for draft {draft_id}; no duplicate story alert.")
+                if surface_gap:
+                    return _needs_media_hold(
+                        account, day_key, draft_id, feed_draft, fragments,
+                        "Story media not ready: the reviewed 9:16 render was "
+                        "withheld by the content quality gate ("
+                        f"{str(failure_info.get('reason', ''))[:200]}). The feed "
+                        "card was not cropped or reused.",
+                        image_copy=image_copy)
                 return None
             if (failure_info.get("reported")
                     and failure_info.get("stage") == "render_unavailable"):
                 print(f"[stories] skip {account.key} {day_key}: rendering unavailable; "
                       f"studio already recorded draft {draft_id}; no duplicate alert.")
+                if surface_gap:
+                    return _needs_media_hold(
+                        account, day_key, draft_id, feed_draft, fragments,
+                        "Story media not ready: the 9:16 render was unavailable "
+                        "(the studio already recorded this failure). The feed "
+                        "card was not cropped or reused.",
+                        image_copy=image_copy)
                 return None
             # Unknown or unreported failure: fall through to the standard skip
             # handling below, which fires exactly one honest ops alert.
@@ -192,13 +259,10 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                 f"no premade *_story sibling). The slot is retained and the next daily "
                 f"run retries a fresh 9:16 render. A Story is never a cropped feed card."
             )
-            return Draft(
-                draft_id=draft_id, account_key=account.key, platform=account.platform,
-                caption="", hashtags=[], creative_path="", creative_public_url="",
-                scheduled_for=schedule.scheduled_for(day_key, slot="morning"),
-                status=DraftStatus.BLOCKED, blocked_reason=reason,
-                source_fragments=fragments, is_story=True,
-            )
+            return _needs_media_hold(
+                account, day_key, draft_id, feed_draft, fragments,
+                f"Story media not ready: {reason}. The feed card was not cropped "
+                f"or reused.")
         ops_alerts.alert(
             f"story draft skipped for {account.key} on {day_key}: the studio render "
             f"came back dark for {_basename} (no purpose-built 9:16 studio asset and "

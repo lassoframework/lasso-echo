@@ -1,3 +1,9 @@
+## Echo Story needs-media hold (2026-10-02, local patch, review pending)
+
+- [~] A Story slot whose reviewed 9:16 render or hosting fails under `surface_gap=True` is retained as a durable needs-media hold: BLOCKED + needs_media + force_approval, stable Draft identity (draft id/day/type), truthful reason, no cropped or reused feed card. Premade 9:16 hosting failures also retain the slot. Studio-reported quality and render-unavailable failures keep single-alert suppression; other creatives without a genuine 9:16 source keep the log-only skip.
+- [~] The hold persists through Draft storage (force_approval now round-trips) and mirrors into content_calendar with a nonempty `media_not_ready_reason` and pending status. The portal /social shape exposes the reason and a needs_media flag. Supabase approval rejects terminal, media-not-ready and blank-media rows; the new `approve_calendar_row_if_media_ready` RPC checks readiness atomically at write time. Due rows and the legacy claim fallback refuse holds, and migration `calendar_claim_media_guard_20261002.sql` adds nonblank-media guards to the production `claim_calendar_publish_slot_owned` RPC.
+- [~] Focused validation after independent review repairs: 288 story/store/portal/calendar tests passed. `test_intake_web_studio.py` failures in the Kimi sandbox were socket-bind PermissionErrors unrelated to this patch. Full CI, migration application and deploy are pending.
+
 ## Support channel repairs (2026-09-27, deployment pending)
 
 - [~] Zanshin photo reuse now observes nine calendar months at selection and again before Instagram, Facebook, Google Business posts and gallery sends. History spans platforms and archived variants, includes in-flight claims and undated published rows, and fails closed when identity or history cannot be verified. Original media files are retained; archive means ineligible for reuse during the window.
