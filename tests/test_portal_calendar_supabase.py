@@ -543,10 +543,14 @@ def test_patch_caption_cross_gym_returns_none(monkeypatch):
 
 # ---- patch_media: backfill a stale image-less arc row (Pete/Zanshin, 2026-08-31) --
 
-def test_patch_media_writes_image_and_asset_when_row_has_no_image(monkeypatch):
-    prefetch = _Resp(200, [_row("id-m", gym_id="zanshinfitness630e22", image_url="")])
-    patched = _Resp(200, [_row("id-m", gym_id="zanshinfitness630e22",
-                               image_url="https://cdn.test/a1.jpg")])
+def test_patch_media_recovers_held_row_with_image_and_asset(monkeypatch):
+    held = _row("id-m", gym_id="zanshinfitness630e22", image_url="")
+    held["media_not_ready_reason"] = "Story media not ready"
+    recovered = _row("id-m", gym_id="zanshinfitness630e22",
+                     image_url="https://cdn.test/a1.jpg")
+    recovered["media_not_ready_reason"] = None
+    prefetch = _Resp(200, [held])
+    patched = _Resp(200, [recovered])
     http = _FakeHTTP(get_resp=prefetch, patch_resp=patched)
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
 
@@ -558,8 +562,11 @@ def test_patch_media_writes_image_and_asset_when_row_has_no_image(monkeypatch):
     assert method == "patch"
     assert params["id"] == "eq.id-m"
     assert params["gym_id"] == "eq.zanshinfitness630e22"
+    assert params["status"] == "in.(pending,coach_review)"
+    assert params["or"] == "(image_url.is.null,image_url.eq.)"
     assert payload == {"image_url": "https://cdn.test/a1.jpg",
-                       "source_media_asset_id": "asset-1"}
+                       "source_media_asset_id": "asset-1",
+                       "media_not_ready_reason": None}
     # status/caption are never part of the write payload.
     assert "status" not in payload and "caption" not in payload
 
@@ -575,6 +582,22 @@ def test_patch_media_refuses_when_row_already_has_an_image(monkeypatch):
     assert result is None
     # No PATCH was ever issued — the prefetch was the only call.
     assert all(c[0] == "get" for c in http.calls)
+
+
+def test_patch_media_race_loses_when_another_worker_attaches_media(monkeypatch):
+    """The conditional PATCH must not overwrite a still-pending concurrent attach."""
+    prefetch = _Resp(200, [_row("id-m", gym_id="zanshinfitness630e22", image_url="")])
+    http = _FakeHTTP(get_resp=prefetch, patch_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().patch_media(
+        "zanshinfitness630e22", "id-m", "https://cdn.test/a1.jpg")
+    assert result is None
+    method, _url, params, _headers, payload = http.calls[1]
+    assert method == "patch"
+    assert params["or"] == "(image_url.is.null,image_url.eq.)"
+    assert params["status"] == "in.(pending,coach_review)"
+    assert payload["image_url"] == "https://cdn.test/a1.jpg"
 
 
 def test_patch_media_missing_row_returns_none_and_no_write(monkeypatch):
@@ -1191,7 +1214,8 @@ def test_swap_media_is_status_guarded_to_waiting_rows(monkeypatch):
     assert params["status"] == "in.(pending,coach_review)"
     assert params["id"] == "eq.id-m" and params["gym_id"] == "eq.gritx"
     assert payload == {"image_url": "https://cdn/new.jpg",
-                       "source_media_url": "https://cdn/raw.jpg"}
+                       "source_media_url": "https://cdn/raw.jpg",
+                       "media_not_ready_reason": None}
 
 
 def test_swap_media_zero_match_returns_none(monkeypatch):
@@ -1201,7 +1225,7 @@ def test_swap_media_zero_match_returns_none(monkeypatch):
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
     assert pcs.SupabaseCalendarStore().swap_media("gritx", "id-m", "u") is None
     _m, _u, _params, _h, payload = http.calls[0]
-    assert payload == {"image_url": "u"}   # source_media_url omitted when not given
+    assert payload == {"image_url": "u", "media_not_ready_reason": None}
 
 
 @pytest.mark.parametrize("peer_caption,preserve", [

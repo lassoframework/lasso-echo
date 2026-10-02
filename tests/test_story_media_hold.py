@@ -429,6 +429,22 @@ def test_mark_publishing_ready_row_claims_with_hold_filter():
     assert patch[1]["image_url"] == "not.is.null"
 
 
+def test_patch_media_recovers_hold_without_auto_approval():
+    held = _hold_row()
+    recovered = dict(held, image_url="https://cdn.test/recovered-story.png",
+                     media_not_ready_reason=None)
+    http = _FakeHTTP(get_payload=[held], patch_payload=[recovered])
+    row = _store(http).patch_media("lasso_ig", held["id"],
+                                   recovered["image_url"])
+    assert row == recovered
+    patch = [call for call in http.calls if call[0] == "patch"][0]
+    assert patch[1]["gym_id"] == "eq.lasso_ig"
+    assert patch[1]["status"] == "in.(pending,coach_review)"
+    assert patch[2] == {"image_url": recovered["image_url"],
+                        "media_not_ready_reason": None}
+    assert row["status"] == "pending"  # media recovery never approves the row
+
+
 def test_mark_publishing_unreadable_row_fails_closed():
     http = _FakeHTTP(get_payload=[])  # row vanished / unreadable
     assert _store(http).mark_publishing("row-gone") is False

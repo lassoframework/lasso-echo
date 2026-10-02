@@ -434,14 +434,18 @@ class SupabaseCalendarStore:
 
     def patch_image_url(self, account_key, row_id, new_image_url):
         """Task #28 (§5c): swap a story row's image_url to freshly re-burned media after a
-        caption edit. STATUS-preserving (the edit already reset it to 'pending'); this only
-        updates the media. id+gym_id isolation. Returns the updated row or None."""
+        caption edit. A real replacement also clears a prior needs-media hold, but never
+        changes status: pending / coach_review rows still need their normal approval path.
+        id+gym_id + waiting-status isolation. Returns the updated row or None."""
+        if not (new_image_url or "").strip():
+            return None
         r = self._client().patch(
             self._rest(_TABLE),
-            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"},
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
+                    "status": "in.(pending,coach_review)"},
             headers=self._headers({"Content-Type": "application/json",
                                    "Prefer": "return=representation"}),
-            json={"image_url": new_image_url}, timeout=30)
+            json={"image_url": new_image_url, "media_not_ready_reason": None}, timeout=30)
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         for row in (r.json() or []):
@@ -464,12 +468,22 @@ class SupabaseCalendarStore:
             return None
         if (current.get("image_url") or "").strip():
             return None  # already has a real image; never overwrite
-        payload = {"image_url": image_url}
+        if not (image_url or "").strip():
+            return None
+        # A real replacement resolves the explicit hold in the SAME scoped write.
+        # Do not change status: it remains pending / coach_review and must pass the
+        # ordinary approval gate before it can publish.
+        payload = {"image_url": image_url, "media_not_ready_reason": None}
         if source_media_asset_id:
             payload["source_media_asset_id"] = source_media_asset_id
+        # Keep the no-overwrite promise server-side too: another worker can attach
+        # media after the prefetch but before this write. PostgREST's OR predicate
+        # permits only a still-null or still-empty image_url to be recovered.
         r = self._client().patch(
             self._rest(_TABLE),
-            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"},
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
+                    "status": "in.(pending,coach_review)",
+                    "or": "(image_url.is.null,image_url.eq.)"},
             headers=self._headers({"Content-Type": "application/json",
                                    "Prefer": "return=representation"}),
             json=payload, timeout=30)
@@ -499,7 +513,11 @@ class SupabaseCalendarStore:
         a Drive row becomes a local-library row, so the hide / removed-from-Drive
         sweeps stop tracking an asset the row no longer carries). Any other key is
         ignored: this method never becomes a general row editor."""
-        payload = {"image_url": image_url}
+        if not (image_url or "").strip():
+            return None
+        # This is a real replacement, so release any earlier needs-media hold in
+        # the same pending / coach_review-scoped write. Status itself is unchanged.
+        payload = {"image_url": image_url, "media_not_ready_reason": None}
         if source_media_url is not None:
             payload["source_media_url"] = source_media_url
         for col in _SWAP_EXTRA_COLUMNS:
