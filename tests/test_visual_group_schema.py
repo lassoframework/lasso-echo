@@ -46,3 +46,28 @@ def test_real_tests_use_baseline_calendar_columns_and_refuse_network_dsn():
     assert "'calendar_claim_media_guard_20261002.sql'" in text
     assert 'only named disposable Unix-socket DB allowed' in text
     assert 'dbname=echo_visual_ledger_test' in text
+
+
+def test_canonical_tenant_alias_mapping_is_service_role_only_and_fail_closed():
+    schema = migration('schema').lower()
+    assert 'create table if not exists public.tenant_alias' in schema
+    assert 'tenant_alias  uuid        not null' not in schema  # sanity: column is tenant_id
+    assert 'tenant_id  uuid        not null' in schema
+    assert 'create policy tenant_alias_service_role' in schema
+    assert "revoke all on public.tenant_alias from public,anon,authenticated,service_role" in schema
+    # resolver fails closed (null) and strict paths raise for unmapped keys
+    assert 'has no canonical tenant mapping' in schema
+    assert 'unmapped calendar key cannot arm the visual guard' in schema
+    # bindings immutable: tenant_alias is in the identity-immutable loop
+    assert "'tenant_alias'" in schema
+
+
+def test_internal_tables_use_canonical_key_calendar_keeps_raw_alias():
+    trig = migration('claim_trigger')
+    back = migration('backfill')
+    for text in (trig, back):
+        assert 'visual_group_tenant_id' in text
+    # raw content_calendar.gym_id is preserved (no rewrites of the column)
+    schema = migration('schema').lower()
+    assert 'alter table public.content_calendar' in schema
+    assert 'visual_group_tenant_strict' in trig and 'visual_group_tenant_strict' in back

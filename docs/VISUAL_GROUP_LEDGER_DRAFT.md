@@ -19,6 +19,46 @@ has been applied. The application guard scaffold in PR232 remains default OFF.
 | Historical/future backfill precedes activation | Dry-run default rolls back all writes. Per-row savepoint prevents partial alias bindings on conflict. Published calendar history is unchanged; published evidence is append-only. Active rows and archived/candidate ambiguous sends reserve; unresolved history remains a gym-wide activation blocker after deletion. Row readiness considers only that row/its aliases. Only a row with its own unresolved conflict is held/demoted; verified hydration clears owned visual holds and preserves unrelated holds/approval. | Dry-run/real/idempotent backfill; alias conflicts; future reservations; unknown history; unrelated approved rows; hold recovery |
 | Planner rebuild cannot drop repeat holds | INSERT/UPSERT without the prior group or hold still resolves known URL aliases. Later-date reuse refuses the write, preserving existing calendar/ledger. | Swift River/GBP-style rebuild and UPSERT regression |
 
+## Canonical tenant alias identity (PR235 package, 2026-10-02)
+
+Source truth: `work/media-tenant-alias-preflight-20261002.md` — 124 current
+calendar keys (8,136 rows) each map to exactly one tenant UUID via
+`echo_social_intake` / `echo_intake_tokens` / `gyms`; one retired key
+(`zz-retired-20260904-f574c06c`, 42 rows) is unmapped and unresolved.
+
+- New service-role-only registry `public.tenant_alias(alias_key PK,
+  tenant_id uuid)`: one row per calendar alias key; several keys (old/current
+  aliases of one real tenant, e.g. Swift River's
+  `swiftrivercrossfitd23567` + `swiftrivercrossfite5c9db`) share one canonical
+  tenant UUID. Bindings are immutable (identity trigger) and registration is
+  advisory-locked, idempotent for the same tenant, and raises on re-bind to a
+  different tenant (ambiguity fails closed). Registration seeds the tenant
+  UUID as its own alias key for canonical pass-through.
+- `public.visual_group_tenant_id(key)` resolves a raw calendar key to its
+  canonical tenant UUID, returning NULL (never raising) for unmapped keys;
+  `public.visual_group_tenant_strict(key)` raises on unmapped keys and is used
+  by every minting/mutation path (alias registration, backfill, swaps,
+  reconciliation).
+- ALL internal visual-group tables (groups, aliases, events, usage ledger,
+  siblings, guard settings, reconciliation) are keyed by the canonical tenant
+  UUID. `content_calendar.gym_id` keeps its raw alias key and existing
+  portal/client behavior is unchanged — no production reads change because
+  enforcement remains OFF and every table is new.
+- Consequence: old and current aliases of one real tenant share one
+  date-conflict authority (a second alias cannot re-use the scene on a
+  different date), while unrelated tenants stay fully isolated even with
+  byte-identical media URLs.
+- Fail closed: unmapped keys (including the retired key) cannot arm
+  enforcement (`gym_visual_guard_settings_arm_guard` trigger rejects
+  `enforce=true` for unknown tenants), cannot register aliases or mint groups,
+  and make backfill raise before any write. With enforcement OFF their
+  calendar rows pass through untouched and nothing is ever minted.
+- Real PG coverage: cross-alias shared date authority + same-date siblings,
+  cross-alias concurrent first reservation (one winner), unrelated-tenant
+  isolation with identical media, alias registration conflict/idempotence/
+  race, tenant-alias immutability, and retired-key refusal across arming,
+  registration and backfill plus coverage-report visibility.
+
 ## Migration order and contracts
 
 1. `DRAFT_visual_group_schema_20261002.sql`: stable groups, immutable unique
@@ -88,6 +128,40 @@ After these repairs, **98 focused tests passed in 7.87s**, including 40 real
 PostgreSQL cases. A fresh server restart retained the complete ledger, sticky
 sibling flags and append-only event fingerprints unchanged; the local server
 was stopped again with review data retained.
+
+### Backfill P1 repair (2026-10-02, draft)
+
+Two further P1 findings against `DRAFT_visual_group_backfill_20261002.sql`
+were repaired in the backfill lane only:
+
+- **P1-1 (whole-gym abort).** A historical published row meeting an ambiguous
+  reserved ledger scene on a different day could make the ledger UPDATE raise
+  the immutable ambiguous identity/date (or sticky-ambiguity) trigger outside
+  any per-row savepoint, aborting the entire gym backfill and rolling back all
+  preceding rows. All ledger/sibling/calendar mutations now run inside a
+  second per-row savepoint (alongside the existing alias savepoint), and the
+  hold-path calendar demote write is itself savepoint-wrapped because the
+  guard trigger refuses identity/status changes on unreconciled ambiguous
+  rows. Any such raise becomes a held `review_hold` member event for that row
+  only; preceding rows are never lost.
+- **P1-2 (fabricated publication).** The backfill previously promoted an
+  ambiguous reservation straight to permanently `published` without provider
+  confirmation evidence. It now preserves the original ambiguous reservation
+  untouched and appends an evidence-bearing `review_hold` event
+  (`actor='backfill_ambiguous_review'`,
+  `reason='ambiguous_reservation_needs_provider_confirmation'` plus the row's
+  claim token, provider post ID, image URL and date) unless
+  `visual_group_group_reconciled` confirms evidence-based reconciliation.
+  Held rows never receive a `confirmed`/`backfill_published` evidence event.
+  Confirmed (non-ambiguous or reconciled) historical published rows still
+  finalize permanently as before; published calendar history is never edited.
+
+Behavioral invariants are unchanged: dry run remains the default and rolls
+back all writes, the function is idempotent (repeat runs add no duplicate
+events), enforcement stays OFF and is never toggled, and execute remains
+service-role only. Static PL/pgSQL block-balance checks pass; live PostgreSQL
+validation is pending on the integration lead (this lane's sandbox blocks the
+local server socket/shared memory).
 
 Per-sibling media replacement payloads that preserve feed/Story derivatives
 are now implemented in this lane by `visual_group_swap_siblings_media` (above),
