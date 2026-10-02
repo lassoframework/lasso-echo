@@ -480,6 +480,8 @@ begin
   -- Internal identity tables use the canonical tenant UUID; calendar rows
   -- keep their raw alias key. Unmapped keys raise before any write.
   v_tenant := public.visual_group_tenant_strict(p_gym_id)::text;
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',v_tenant)::text,0));
   if jsonb_typeof(p_rows) is distinct from 'array'
      or jsonb_array_length(p_rows)<>cardinality(p_row_ids)
      or exists(select 1 from jsonb_array_elements(p_rows) e
@@ -608,6 +610,8 @@ begin
     raise exception 'invalid sibling operation' using errcode='23514';
   end if;
   v_tenant := public.visual_group_tenant_strict(p_gym_id)::text;
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',v_tenant)::text,0));
   for lock_id in select id from unnest(p_row_ids) u(id) order by id loop
     perform 1 from public.content_calendar where id=lock_id
       and public.visual_group_tenant_id(gym_id)::text=v_tenant for update;
@@ -693,6 +697,8 @@ begin
     raise exception 'duplicate sibling row payload' using errcode='23514';
   end if;
   v_tenant := public.visual_group_tenant_strict(p_gym_id)::text;
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',v_tenant)::text,0));
   for lock_id in select id from unnest(ids) u(id) order by id loop
     perform 1 from public.content_calendar where id=lock_id
       and public.visual_group_tenant_id(gym_id)::text=v_tenant for update;
@@ -763,9 +769,11 @@ begin
   -- authority; alias equivalence alone can never reconcile an attempt.
   -- Unmapped or cross-tenant evidence cannot write receipts or clear ambiguity.
   v_tenant := public.visual_group_tenant_strict(p_gym_id)::text;
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',v_tenant)::text,0));
   -- Serialize terminal receipts even for deleted, identity-unknown orphans
   -- that have neither a calendar row nor a stable group to lock.
-  perform pg_advisory_xact_lock(hashtextextended(jsonb_build_array('visual_reconcile',v_tenant,p_row_id)::text,0));
+  perform public.visual_group_auxiliary_lock(hashtextextended(jsonb_build_array('visual_reconcile',v_tenant,p_row_id)::text,0));
   -- Calendar row lock precedes stable group locks, matching normal writes.
   select * into c from public.content_calendar where id=p_row_id for update;
   live:=found;

@@ -63,6 +63,27 @@ begin
 end;
 $$;
 
+-- Private advisory acquisition for auxiliary RPCs. Normal callers serialize
+-- before any calendar/group locks. If a caller already owns ANY calendar
+-- relation lock stronger than AccessShareLock (including SELECT FOR UPDATE's
+-- RowShareLock), NEVER wait for another transaction's advisory: it may be
+-- waiting for our calendar tuple or barrier. Inspect locks, never a GUC.
+create or replace function public.visual_group_auxiliary_lock(p_lock_key bigint)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if exists(select 1 from pg_locks where pid=pg_backend_pid() and granted
+      and locktype='relation' and relation='public.content_calendar'::regclass
+      and mode<>'AccessShareLock') then
+    if not pg_try_advisory_xact_lock(p_lock_key) then
+      raise exception 'auxiliary visual lock busy while holding calendar locks; retry transaction' using errcode='55P03';
+    end if;
+  else
+    perform pg_advisory_xact_lock(p_lock_key);
+  end if;
+end;
+$$;
+revoke all on function public.visual_group_auxiliary_lock(bigint) from public,anon,authenticated,service_role;
+
 -- Service-role registration. Advisory-locked, idempotent for the same tenant,
 -- raises on attempted re-bind to a different tenant (ambiguity fails closed).
 -- Seeds the tenant UUID as its own alias key so canonical pass-through works.
@@ -73,6 +94,8 @@ begin
   if nullif(btrim(p_alias_key), '') is null or p_tenant_id is null then
     raise exception 'invalid tenant alias registration' using errcode = '22023';
   end if;
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',p_tenant_id::text)::text,0));
   -- A UUID-shaped alias names its own tenant. Never allow a second tenant to
   -- claim another tenant's canonical pass-through key, even before that
   -- tenant has registered any other alias.
@@ -91,7 +114,7 @@ begin
     select distinct key from unnest(array[btrim(p_alias_key), p_tenant_id::text]) as keys(key)
       order by key
   loop
-    perform pg_advisory_xact_lock(hashtextextended(
+    perform public.visual_group_auxiliary_lock(hashtextextended(
       jsonb_build_array('tenant_alias', v_lock_key)::text, 0));
   end loop;
   select tenant_id into v_existing from public.tenant_alias where alias_key = btrim(p_alias_key);
@@ -359,13 +382,15 @@ begin
   -- Canonical tenant identity: raw calendar keys never key internal tables.
   -- Unmapped keys raise here and can never mint a group or alias.
   p_gym_id := public.visual_group_tenant_strict(p_gym_id)::text;
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',p_gym_id)::text,0));
   if nullif(btrim(p_gym_id), '') is null or nullif(btrim(p_alias_value), '') is null
      or p_alias_kind is null or p_alias_kind not in
        ('source_asset','drive_id','byte_hash','canonical_url','r2_key','manual_scene')
      or (p_group_key is not null and nullif(btrim(p_group_key), '') is null) then
     raise exception 'invalid visual alias' using errcode = '22023';
   end if;
-  perform pg_advisory_xact_lock(hashtextextended(
+  perform public.visual_group_auxiliary_lock(hashtextextended(
     jsonb_build_array('visual_alias',p_gym_id,p_alias_kind,p_alias_value)::text, 0));
   select group_key into v_group from public.visual_group_alias
     where gym_id=p_gym_id and alias_kind=p_alias_kind and alias_value=p_alias_value;
@@ -391,6 +416,8 @@ as $$
 declare v_id bigint;
 begin
   p_gym_id := public.visual_group_tenant_strict(p_gym_id)::text;
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',p_gym_id)::text,0));
   perform public.visual_group_register_alias(p_gym_id,p_alias_kind,p_alias_value,p_group_key);
   insert into public.visual_group_member_event
     (gym_id,group_key,alias_kind,alias_value,action,actor)
@@ -408,6 +435,8 @@ as $$
 declare v_id bigint;
 begin
   p_gym_id := public.visual_group_tenant_strict(p_gym_id)::text;
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',p_gym_id)::text,0));
   if nullif(btrim(p_reason),'') is null then raise exception 'reason required'; end if;
   insert into public.visual_group_member_event
     (gym_id,group_key,alias_kind,alias_value,action,actor,reason)
@@ -515,6 +544,8 @@ declare v_tenant text; v_a text; v_b text; v_members text[];
   v_connected boolean; v_dates date[]; v_pub text[]; v_amb text[]; v_unknown_date boolean;
 begin
   v_tenant := public.visual_group_tenant_strict(p_gym_id)::text;
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',v_tenant)::text,0));
   if nullif(btrim(p_actor), '') is null then
     raise exception 'a named human reviewer is required for a same-scene union' using errcode = '22023';
   end if;

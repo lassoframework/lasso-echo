@@ -28,8 +28,10 @@ begin
   -- zz-retired-20260904-f574c06c): no groups, aliases, ledger rows or events
   -- are ever minted for a key with no canonical tenant mapping.
   v_tenant := public.visual_group_tenant_strict(p_gym_id)::text;
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',v_tenant)::text,0));
   -- One backfill owner per gym. Enforcement remains OFF; never toggle it here.
-  perform pg_advisory_xact_lock(hashtextextended(jsonb_build_array('visual_backfill',p_gym_id)::text,0));
+  perform public.visual_group_auxiliary_lock(hashtextextended(jsonb_build_array('visual_backfill',p_gym_id)::text,0));
   if public.visual_group_enforcement_on(p_gym_id) then raise exception 'backfill requires enforcement OFF'; end if;
   begin
     for r in select * from public.content_calendar where gym_id=p_gym_id
@@ -38,7 +40,9 @@ begin
         published_at nulls last,post_date nulls last,id for update loop
       is_pub:=r.status='published' or r.published_at is not null;
       is_ambiguous:=public.visual_group_row_ambiguous(r);
-      day:=coalesce(r.post_date,(r.published_at at time zone 'UTC')::date);
+      -- A timestamp cannot prove the tenant's calendar date. Undated
+      -- published history is permanent NULL-date usage, blocking reuse.
+      day:=r.post_date;
       v_reason:=null; blocked:=false; g:=null; v_amb_hold:=false; l_amb:=false;
       -- Per-row savepoint: an alias conflict rolls back ALL new bindings/groups
       -- from this row before writing its review event/hold.
@@ -92,31 +96,26 @@ begin
         select * into l from public.visual_group_usage_ledger where gym_id=v_tenant and group_key=g for update;
         l_amb:=found and l.ambiguous;
         if is_pub then
-          -- A status-only historical publication still becomes permanent. If
-          -- both dates are unknown, NULL pins published usage to NO reusable
-          -- date; the guard's IS DISTINCT FROM blocks every dated claim.
+          -- A status-only historical publication still becomes permanent.
+          -- Without a verified post_date, NULL pins usage to NO reusable date;
+          -- the guard's IS DISTINCT FROM blocks every dated claim.
           if not found then
             insert into public.visual_group_usage_ledger
               (gym_id,group_key,reserved_date,calendar_row_id,channel,state,published_at)
               values(v_tenant,g,day,r.id,r.account,'published',r.published_at);
             finalized:=finalized+1;
+          elsif l.ambiguous and not public.visual_group_group_reconciled(v_tenant,g) then
+            blocked:=true; v_amb_hold:=true;
+            v_reason:='ambiguous_reservation_needs_provider_confirmation';
+          elsif l.state<>'released' and l.reserved_date is distinct from day then
+            -- A group match is insufficient: EACH historical row must agree
+            -- with its immutable/live usage date. Hold/report the later row,
+            -- never stamp it confirmed or re-date earlier permanent usage.
+            blocked:=true; v_reason:='historical_cross_date_visual_repeat';
           elsif l.state<>'published' then
-            -- P1: never promote an ambiguous reservation to permanently
-            -- published without evidence-based reconciliation, and never
-            -- re-date it (the immutable ambiguous identity/date trigger
-            -- would raise on a cross-day UPDATE). Preserve the original
-            -- ambiguous reservation and hold this row for review instead of
-            -- fabricating publication or aborting the whole gym backfill.
-            if l.ambiguous and not public.visual_group_group_reconciled(v_tenant,g) then
-              blocked:=true; v_amb_hold:=true;
-              v_reason:='ambiguous_reservation_needs_provider_confirmation';
-            else
-              update public.visual_group_usage_ledger set state='published',reserved_date=day,
-                published_at=r.published_at,released_at=null where gym_id=v_tenant and group_key=g;
-              finalized:=finalized+1;
-            end if;
-          elsif l.reserved_date is distinct from day then
-            v_reason:='historical_cross_date_visual_repeat';
+            update public.visual_group_usage_ledger set state='published',reserved_date=day,
+              published_at=r.published_at,released_at=null where gym_id=v_tenant and group_key=g;
+            finalized:=finalized+1;
           end if;
           -- Persist historical row/date evidence without editing published
           -- calendar history. Distinct history survives future row deletion.
@@ -244,7 +243,8 @@ returns jsonb language sql stable security definer set search_path = public as $
     'scene_cross_date_conflicts',coalesce((select jsonb_agg(to_jsonb(sc) order by sc.gym_id,sc.component) from (
       select gym_id,component,
         array_agg(distinct group_key order by group_key) as group_keys,
-        array_agg(distinct coalesce(reserved_date,'0001-01-01'::date) order by coalesce(reserved_date,'0001-01-01'::date)) as dates,
+        array_agg(distinct reserved_date order by reserved_date) filter(where reserved_date is not null) as dates,
+        bool_or(reserved_date is null) as has_unknown_date,
         array_agg(distinct state order by state) as states
       from (
         select l.gym_id,l.group_key,l.reserved_date,l.state,
@@ -255,7 +255,8 @@ returns jsonb language sql stable security definer set search_path = public as $
       ) comp
       where array_length(component,1)>1
       group by gym_id,component
-      having count(distinct coalesce(reserved_date,'0001-01-01'::date))>1
+      having count(distinct reserved_date)>1
+        or (bool_or(reserved_date is null) and count(distinct reserved_date)>0)
     ) sc),'[]'::jsonb),
     'unresolved_published_history',coalesce((select jsonb_agg(to_jsonb(e) - 'hold_rank' order by e.id) from (
       select e.*,row_number() over (partition by e.alias_value order by e.id desc) as hold_rank from public.visual_group_member_event e

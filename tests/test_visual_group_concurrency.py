@@ -307,13 +307,13 @@ def test_cross_date_historical_repeat_is_reported_in_backfill_and_conflict_repor
     assert 'historical_cross_date_visual_repeat' in [c['reason'] for c in report['conflict_rows']]
     l=ledger(g)
     assert len(l)==1 and l[0]['state']=='published' and l[0]['reserved_date']=='2026-09-01'
-    assert report['published_rows_finalized']==1 and report['rows_held_for_review']==0
+    assert report['published_rows_finalized']==1 and report['rows_held_for_review']==1
     coverage=json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))
     conflicts=[c for c in coverage['cross_date_conflicts'] if c['gym_id']==g and c['resolved_group']==l[0]['group_key']]
     assert len(conflicts)==1, 'expected exactly one reported cross-date conflict for the group'
     assert conflicts[0]['dates']==['2026-09-01','2026-10-06']
     assert set(conflicts[0]['row_ids'])=={first,second}
-    assert coverage['unresolved_published_history']==[]
+    assert len(coverage['unresolved_published_history'])==1
     assert coverage['activation_ready'] is False
 
 
@@ -1678,15 +1678,14 @@ def test_scene_union_race_independent_different_day_claim():
     claim = f"insert into public.content_calendar(gym_id,post_date,account,image_url,visual_group_key,status) values({q(g)},'2026-10-06','facebook','https://test/two.jpg',{q(b)},'pending')"
     union = f"select public.visual_group_link_scene({q(g)},{q(a)},{q(b)},{q(json.dumps({'basis':'human'}))}::jsonb,'blake')"
     (union_out, union_err), (claim_out, claim_err) = race(union, claim)
-    assert union_err is None, (union_err, claim_err)
-    result = json.loads(union_out.splitlines()[-1])
+    assert (union_err is None) != (claim_err is None), (union_err, claim_err)
     if claim_err is None:
-        # The independent claim committed first: the union still succeeds
-        # (identity truth) but MUST report the cross-date conflict it merged.
-        assert len(result['cross_date_conflicts']) == 2, result
-        report = json.loads(sql(f'select public.visual_group_conflict_report({q(g)})'))
-        assert len(report['scene_cross_date_conflicts']) == 1 and report['activation_ready'] is False
+        # The different-day claim won. Armed union must refuse the conflicting
+        # occupied dates rather than link them under live enforcement.
+        assert 'armed tenant scene union conflicts' in union_err
+        assert len(links(g)) == 0
     else:
+        result = json.loads(union_out.splitlines()[-1])
         # The union won the serialization: the different-day claim fails
         # atomically and the component keeps one date.
         assert result['cross_date_conflicts'] == [], result
