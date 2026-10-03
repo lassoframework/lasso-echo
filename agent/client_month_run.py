@@ -495,9 +495,12 @@ def _record_feed_served(account, feed, day_key):
         path = (getattr(feed, "creative_path", "") or "").strip()
         if not path:
             return False
-        reservation_id = rotation.reserve_served(
+        reserve = (rotation.reserve_local_media_once if os.path.splitext(path)[1].lower()
+                   in (".mp4", ".mov", ".m4v", ".webm")
+                   else rotation.reserve_local_photo_once)
+        reservation_id = reserve(
             account.key, dam.rotation_key(path),
-            getattr(feed, "category", "") or "", day_key)
+            getattr(feed, "category", "") or "", day_key, path=path)
         if reservation_id:
             setattr(feed, "_served_reservation_id", reservation_id)
         return bool(reservation_id)
@@ -667,9 +670,18 @@ def _rollback_drive_asset(draft, day_key, log):
     if not asset_id or not account_key or not day_key:
         return
     try:
-        from . import gym_media_selector
-        gym_media_selector.rollback_use(account_key, day_key, asset_id=asset_id,
-                                        restore_unstaged=True)
+        from . import db, gym_media_selector
+        restored = gym_media_selector.rollback_use(
+            account_key, day_key, asset_id=asset_id, restore_unstaged=True)
+        if restored:
+            base = gym_media_selector.base_gym_key(account_key)
+            claim_id = getattr(draft, "_drive_claim_id", None)
+            if not claim_id:
+                from . import gym_media_index
+                asset = gym_media_index.default_store().get_asset(asset_id)
+                claim_id = gym_media_selector.drive_content_claim_id(base, asset)
+            db.socialapi_claim_release(
+                claim_id, f"{base}_gbp")
     except Exception as exc:  # noqa: BLE001 - a rollback failure never sinks the build
         log(f"[gym-drive] could not return asset {asset_id} to the pool "
             f"({type(exc).__name__})")
@@ -1211,20 +1223,21 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             store=store, banned_words=banned_words, log=log, allow_reshape=allow_reshape,
             media_count=media_count, locked_feed_days=locked_feed_days,
             used_keys=used_keys, locked_keys=locked_keys, drafts=drafts,
-            drive_deferred_days=drive_deferred_days, rendition_budget=rendition_budget)
+            drive_deferred_days=drive_deferred_days, rendition_budget=rendition_budget,
+            apply_state=_applied)
         _applied["result"] = _result
         return _result
     finally:
         _res = _applied["result"] or {}
         if _applied["result"] is None:
-            # Planning can raise after one or more local reservations but before
-            # _apply owns the write. No remote calendar request started, so these
-            # exact rows are proven unlanded and safe to release.
+            # _apply catches remote write failures; an exception escaping the
+            # build before a result is returned is a prewrite planning failure.
             _release_unlanded_reservations(drafts)
+            _rollback_new_drive_drafts(drafts, log)
         wrote = bool(_res.get("inserted"))
-        if not wrote:
-            # Nothing landed (a no-op, a gate refusal, a raise, or a delete whose
-            # insert then failed): this build's own Drive picks never became rows.
+        if not wrote and _applied["result"] is not None and not _res.get("insert_outcome_unknown"):
+            # Nothing landed (a no-op, a gate refusal, or a definite pre-insert
+            # failure): this build's own Drive picks never became rows.
             _rollback_new_drive_drafts(drafts, log)
             if not _res.get("deleted_total", _res.get("deleted")):
                 # ...and the OLD rows survive, so their released assets are stamped
@@ -1241,7 +1254,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
 def _build_client_month_body(account, base_key, start, days, *, voice, library_path,
                              store, banned_words, log, allow_reshape, media_count,
                              locked_feed_days, used_keys, locked_keys, drafts,
-                             drive_deferred_days, rendition_budget):
+                             drive_deferred_days, rendition_budget, apply_state=None):
     """The picking + apply half of build_client_month, split out so the caller can
     wrap release -> apply in ONE try/finally (see build_client_month)."""
     from datetime import timedelta
@@ -1742,11 +1755,14 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         result = _apply(base_key, rows, start, days, store, log,
                         locked_days=locked_feed_days, allow_reshape=allow_reshape)
     except Exception:
-        # _apply owns and catches remote writes. An exception escaping its contract
-        # happened before it returned a retained/unknown set, so none of this build's
-        # rows is proven landed; release the exact local reservations before raising.
+        # _apply catches remote write failures and returns their unknown-outcome
+        # flag. An exception escaping its contract is a prewrite planning failure.
         _release_unlanded_reservations(drafts)
         raise
+    if apply_state is not None:
+        # Reporting below can still raise. Preserve the write outcome before that
+        # happens so the outer cleanup never mistakes a landed insert for prewrite.
+        apply_state["result"] = result
     _release_unlanded_reservations(
         drafts, retained=result.get("retained_reservation_ids", ()))
     # NOTHING WRITTEN (never-wipe-to-empty, never-shrink, a gate refusal, a store
@@ -2425,7 +2441,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                 # Once the insert request started, its outcome may be unknown. Keep
                 # those exact reservations fail closed; pre-insert failures retain none.
                 "retained_reservation_ids": sorted(planned_reservation_ids)
-                if insert_started else []}
+                if insert_started else [],
+                "insert_outcome_unknown": bool(insert_started)}
     return {"ok": True, "upserted": inserted, "inserted": inserted,
             "deleted": deleted if span_claim is None else span_claim,
             "deleted_total": deleted, "months": months,
@@ -2484,6 +2501,7 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
     except Exception:
         if not reservation_state["insert_started"]:
             _release_unlanded_reservations(reservation_state["drafts"])
+            _rollback_new_drive_drafts(reservation_state["drafts"], log)
         raise
     finally:
         _heartbeat.stop()
@@ -2731,6 +2749,7 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
                             log(f"{base_key} {day_key}: drive-first replacement "
                                 "failed the A+/banned-word gate; falling back to "
                                 "local reuse")
+                            _rollback_drive_asset(feed, day_key, log)
                             feed = None
                     if feed is not None:
                         drive_pillar_i += 1
@@ -2738,6 +2757,9 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
                             "connected Drive pool (asset "
                             f"{getattr(feed, 'source_media_asset_id', '')})")
             except Exception as exc:  # noqa: BLE001 - Drive lane never sinks the backfill
+                if feed is not None:
+                    # The returned draft has not reached a calendar row yet.
+                    _rollback_drive_asset(feed, day_key, log)
                 log(f"{base_key} {day_key}: drive-first replacement failed "
                     f"({type(exc).__name__}); falling back to local reuse")
                 feed = None
@@ -2762,11 +2784,14 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
                     log(f"{base_key} {day_key}: small library — reusing {choice} "
                         "with maximum spacing (no unused photo remained)")
         if feed is None or not _has_real_creative(feed):
+            if feed is not None:
+                _rollback_drive_asset(feed, day_key, log)
             skipped += 1
             log(f"{base_key} {day_key}: no A+ replacement could be built "
                 f"({drop or 'no usable creative'})")
             continue
         if not _record_feed_served(account, feed, day_key):
+            _rollback_drive_asset(feed, day_key, log)
             skipped += 1
             log(f"{base_key} {day_key}: served ledger write failed; backfill held")
             continue
@@ -2781,6 +2806,7 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
                 account, feed, library_path, log, day_key=day_key)
         except Exception:
             _release_feed_reservation(feed)
+            _rollback_drive_asset(feed, day_key, log)
             raise
         drafts.extend(finished)
         day_used_this_pass.add(day_key)   # so the NEXT denied row this pass rolls past it too
@@ -2828,6 +2854,9 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
         # this attempt's exact reservations; an exception above remains unknown and
         # deliberately retains them fail closed.
         _release_unlanded_reservations(drafts)
+        _rollback_new_drive_drafts(drafts, log)
+        return {"ok": True, "backfilled": 0, "rows": 0,
+                "days_needing": len(todo), "skipped": skipped}
 
     # Stamp per-row AND per-day idempotency ONLY after the insert genuinely succeeded --
     # a failed insert must leave every denied row (and its target day) eligible for retry

@@ -1,6 +1,7 @@
 """Shared offline fakes for the gym_media_drive tests (never any network)."""
 import os
 import sys
+import hashlib
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -236,9 +237,11 @@ def video(fid, title="clip.mp4", parent="root", size=50_000_000,
 def make_asset(fid="a1", gym_id="pierce", source_id="src1", kind="photo",
                title="team.jpg", size=2_000_000, eligible=True,
                excluded_by_coach=False, used_count=0, last_used_at=None,
-               content_hash="h1", reject=None, mime="image/jpeg"):
+               content_hash=None, reject=None, mime="image/jpeg"):
     # Historical selector/planner fixtures represent media ready for use. New
     # quarantine tests explicitly override these fields to pending/unknown.
+    if content_hash is None:
+        content_hash = hashlib.sha256(fid.encode("utf-8")).hexdigest()
     return {"id": fid, "source_id": source_id, "gym_id": gym_id, "kind": kind,
             "title": title, "mime_type": mime, "size_bytes": size,
             "content_hash": content_hash, "duration_sec": None, "width": 1080,

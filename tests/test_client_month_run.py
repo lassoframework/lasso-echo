@@ -68,7 +68,8 @@ def _lib(tmp_path, n=6):
     lib = tmp_path / "gritx_lib"
     lib.mkdir(exist_ok=True)
     for i in range(n):
-        (lib / f"photo_{i:02d}.jpg").write_bytes(b"\xff\xd8\xffFAKEJPEG")
+        (lib / f"photo_{i:02d}.jpg").write_bytes(
+            b"\xff\xd8\xffFAKEJPEG" + str(i).encode())
         (lib / f"photo_{i:02d}.json").write_text(
             json.dumps({"public_url": f"https://gritx.media/photo_{i:02d}.jpg"}))
     return str(lib)
@@ -900,6 +901,9 @@ def test_deny_backfill_drive_draft_still_clears_the_banned_word_gate(monkeypatch
     monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft",
                        lambda *a, **kw: bad_draft)
     monkeypatch.setattr(cmr.config, "sb7_enabled", lambda: False)
+    rollbacks = []
+    monkeypatch.setattr(cmr, "_rollback_drive_asset",
+                        lambda draft, day, log: rollbacks.append((draft, day)))
 
     out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
                                     voice=_voice(), library_path=lib, store=store,
@@ -913,6 +917,108 @@ def test_deny_backfill_drive_draft_still_clears_the_banned_word_gate(monkeypatch
     assert "drive_asset" not in ig_feed[0]["image_url"], (
         "the banned-word Drive draft must never be the one placed"
     )
+    assert rollbacks == [(bad_draft, "2026-08-19")]
+
+
+def test_deny_backfill_releases_returned_drive_draft_when_gate_raises(monkeypatch, tmp_path):
+    from agent.drafter import Draft, DraftStatus
+
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    _stock_clean("gritx_ig")
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+    drive_draft = Draft(
+        draft_id="drive-gate-error", account_key="gritx_ig", platform="instagram",
+        caption="A caption from an approved source.", hashtags=[],
+        creative_path="/tmp/drive_asset.jpg",
+        creative_public_url="https://cdn.example.com/drive_asset.jpg",
+        scheduled_for="2026-08-19T11:30:00+00:00", status=DraftStatus.PENDING,
+        source_media_asset_id="drive-asset-42")
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft",
+                        lambda *a, **kw: drive_draft)
+    monkeypatch.setattr(cmr.config, "sb7_enabled", lambda: True)
+    monkeypatch.setattr("agent.post_quality.is_a_plus",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("gate down")))
+    monkeypatch.setattr(cmr, "_clean_draft_for_day", lambda *a, **kw: (None, None))
+    rollbacks = []
+    monkeypatch.setattr(cmr, "_rollback_drive_asset",
+                        lambda draft, day, log: rollbacks.append((draft, day)))
+
+    out = cmr.backfill_denied_slots(
+        _account(), "gritx", "2026-08-19", days=30, voice=_voice(),
+        library_path=str(tmp_path), store=store, banned_words=())
+
+    assert out["ok"] is True and out["backfilled"] == 0
+    assert store.inserted == []
+    assert rollbacks == [(drive_draft, "2026-08-19")]
+
+
+@pytest.mark.parametrize("failure", ["reserve", "finish", "zero_insert", "unknown_insert"])
+def test_deny_backfill_drive_claim_follows_proven_insert_outcome(
+        monkeypatch, tmp_path, failure):
+    from agent.drafter import Draft, DraftStatus
+
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    _stock_clean("gritx_ig")
+    drive_draft = Draft(
+        draft_id="drive-backfill", account_key="gritx_ig", platform="instagram",
+        caption="A fresh caption from an approved source.", hashtags=[],
+        creative_path="/tmp/drive_asset.jpg",
+        creative_public_url="https://cdn.example.com/drive_asset.jpg",
+        scheduled_for="2026-08-19T11:30:00+00:00", status=DraftStatus.PENDING,
+        day_key="2026-08-19", source_media_asset_id="drive-asset-42")
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft",
+                        lambda *a, **kw: drive_draft)
+    monkeypatch.setattr(cmr.config, "sb7_enabled", lambda: False)
+    rollbacks = []
+    monkeypatch.setattr(cmr, "_rollback_drive_asset",
+                        lambda draft, day, log: rollbacks.append((draft, day)))
+
+    class Store(_FakeStoreLM):
+        def insert_rows(self, base_key, rows):
+            if failure == "unknown_insert":
+                raise TimeoutError("insert outcome unknown")
+            return []
+
+    denied_row = _denied_feed_row("2026-08-19")
+    denied_row["id"] = "drive-backfill-denied"
+    store = Store({("gritx", "2026-08"): [denied_row]})
+    if failure == "reserve":
+        monkeypatch.setattr(cmr, "_record_feed_served", lambda *a, **kw: False)
+    else:
+        monkeypatch.setattr(cmr, "_record_feed_served", lambda *a, **kw: True)
+        if failure == "finish":
+            monkeypatch.setattr(
+                cmr, "_finish_feed_with_story",
+                lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("story failed")))
+        else:
+            monkeypatch.setattr(cmr, "_finish_feed_with_story",
+                                lambda account, feed, *a, **kw: [feed])
+
+    def backfill():
+        return cmr.backfill_denied_slots(
+            _account(), "gritx", "2026-08-19", days=30, voice=_voice(),
+            library_path=str(tmp_path), store=store, banned_words=())
+
+    if failure == "finish":
+        with pytest.raises(RuntimeError, match="story failed"):
+            backfill()
+    else:
+        result = backfill()
+        if failure == "zero_insert":
+            from agent import db
+            assert result["rows"] == 0 and result["backfilled"] == 0
+            assert not db.kv_get("denybf_done_drive-backfill-denied")
+            assert not db.kv_get("denybf_dayused_gritx_2026-08-19")
+        else:
+            assert result["backfilled"] == 0
+
+    assert store.inserted == []
+    assert rollbacks == ([] if failure == "unknown_insert"
+                         else [(drive_draft, "2026-08-19")])
 
 
 def test_deny_backfill_falls_back_to_local_reuse_when_drive_declines(monkeypatch, tmp_path):
@@ -1113,7 +1219,7 @@ def test_month_build_records_served_only_for_accepted_feeds(tmp_path, monkeypatc
     lib = _lib(tmp_path, n=6)
     store = _FakeStore()
     served = []
-    monkeypatch.setattr(rotation, "reserve_served",
+    monkeypatch.setattr(rotation, "reserve_local_photo_once",
                         lambda *a, **k: served.append(a) or len(served))
     out = cmr.build_client_month(
         _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
@@ -1134,7 +1240,7 @@ def test_month_build_holds_local_feeds_when_served_write_fails(tmp_path, monkeyp
     _stock_clean("gritx_ig")
     lib = _lib(tmp_path, n=6)
     store = _FakeStore()
-    monkeypatch.setattr(rotation, "reserve_served", lambda *a, **k: None)
+    monkeypatch.setattr(rotation, "reserve_local_photo_once", lambda *a, **k: None)
 
     out = cmr.build_client_month(
         _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
@@ -1159,6 +1265,28 @@ def test_noop_month_releases_exact_local_reservations(tmp_path, monkeypatch):
         library_path=lib, store=store, banned_words=())
 
     assert rotation.load_served_strict().get("gritx_ig", []) == []
+
+
+def test_ambiguous_month_insert_keeps_media_reservations(tmp_path, monkeypatch):
+    from agent import rotation
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    rollbacks = []
+    monkeypatch.setattr(cmr, "_apply", lambda *a, **k: {
+        "ok": False, "inserted": 0, "deleted": 0,
+        "insert_outcome_unknown": True,
+        "retained_reservation_ids": [
+            row["_served_reservation_id"] for row in a[1]
+            if row.get("_served_reservation_id")]})
+    monkeypatch.setattr(cmr, "_rollback_new_drive_drafts",
+                        lambda *a, **k: rollbacks.append(True))
+
+    cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
+        library_path=lib, store=_FakeStore(), banned_words=())
+
+    assert rollbacks == []
+    assert rotation.load_served_strict().get("gritx_ig")
 
 
 def test_month_apply_exception_releases_exact_local_reservations(tmp_path, monkeypatch):
@@ -1408,14 +1536,32 @@ def test_lock_is_released_after_a_successful_build_so_the_next_call_can_run(tmp_
     assert build_lock.is_locked("gritx") is False
 def test_dropped_drive_draft_restores_stamp_before_calendar_insert(monkeypatch):
     from types import SimpleNamespace
-    from agent import client_month_run, gym_media_selector
+    from agent import client_month_run, db, gym_media_selector
     calls = []
+    releases = []
     monkeypatch.setattr(gym_media_selector, "rollback_use",
-                        lambda *args, **kwargs: calls.append((args, kwargs)))
-    draft = SimpleNamespace(source_media_asset_id="asset-1", account_key="pierce")
+                        lambda *args, **kwargs: calls.append((args, kwargs)) or True)
+    monkeypatch.setattr(db, "socialapi_claim_release",
+                        lambda *args: releases.append(args))
+    draft = SimpleNamespace(source_media_asset_id="asset-1", account_key="pierce",
+                            _drive_claim_id="gbp_media:pierce:hash:" + "a" * 64)
     client_month_run._rollback_drive_asset(draft, "2026-10-07", lambda _message: None)
     assert calls == [(("pierce", "2026-10-07"),
                       {"asset_id": "asset-1", "restore_unstaged": True})]
+    assert releases == [("gbp_media:pierce:hash:" + "a" * 64, "pierce_gbp")]
+
+
+def test_dropped_drive_draft_retains_claim_when_restore_fails(monkeypatch):
+    from types import SimpleNamespace
+    from agent import client_month_run, db, gym_media_selector
+    releases = []
+    monkeypatch.setattr(gym_media_selector, "rollback_use",
+                        lambda *a, **k: False)
+    monkeypatch.setattr(db, "socialapi_claim_release",
+                        lambda *a: releases.append(a))
+    draft = SimpleNamespace(source_media_asset_id="asset-1", account_key="pierce")
+    client_month_run._rollback_drive_asset(draft, "2026-10-07", lambda _m: None)
+    assert releases == []
 
 
 def test_rebuild_does_not_release_or_restamp_placed_drive_asset(monkeypatch):

@@ -234,7 +234,7 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     def _once_used(c):
         try:
             return rotation.local_photo_served(_rkey(c), account_key, day_key,
-                                               served=served_all)
+                                               served=served_all, path=c.path)
         except Exception:  # noqa: BLE001 - any doubt => treated as consumed
             return True
 
@@ -770,8 +770,11 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         # photo drifted into its reuse window and pick_image returned None -> "caption ready,
         # no image" -> nothing published (TopFuel/GritX, 2026-08-25).
         if record_serve:
-            if not rotation.record_served(
-                    account.key, dam.rotation_key(image.path), category, day_key):
+            reserve = (rotation.reserve_local_photo_once
+                       if getattr(image, "media_type", "") != "video"
+                       else rotation.reserve_local_media_once)
+            if reserve(account.key, dam.rotation_key(image.path),
+                       category, day_key, path=image.path) is None:
                 print(f"[client-content] served ledger write failed for {account.key} "
                       f"on {day_key}; refusing the local draft")
                 return None

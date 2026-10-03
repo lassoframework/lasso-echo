@@ -124,6 +124,11 @@ def _picker(clips=(1,), seen=None):
 
 
 def _sweep(store, *, apply=True, picker=None, drive_n=0, monkeypatch=None):
+    from agent import gym_media_index
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    media_store = FakeMediaStore(assets=[
+        make_asset(f"v{n:03d}", gym_id=GYM) for n in range(1, 4)])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: media_store)
     if picker is not None:
         monkeypatch.setattr("agent.media_swap.pick_replacement", picker)
     monkeypatch.setattr("agent.media_swap.after_swap",

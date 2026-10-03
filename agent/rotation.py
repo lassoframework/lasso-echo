@@ -65,13 +65,14 @@ def load_served_strict():
     apart from an UNREADABLE one."""
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT account_key, key, pillar, date, archetype, set_name "
+            "SELECT account_key, key, pillar, date, archetype, set_name, content_hash "
             "FROM served ORDER BY date, id").fetchall()
     served = {}
     for r in rows:
         served.setdefault(r["account_key"], []).append(
             {"key": r["key"], "pillar": r["pillar"], "date": r["date"],
-             "archetype": r["archetype"], "set": r["set_name"]})
+             "archetype": r["archetype"], "set": r["set_name"],
+             "content_hash": r["content_hash"]})
     return served
 
 
@@ -93,10 +94,10 @@ def save_served(served):
                 for e in entries:
                     conn.execute(
                         "INSERT INTO served (account_key, key, pillar, date, "
-                        "archetype, set_name) VALUES (?,?,?,?,?,?)",
+                        "archetype, set_name, content_hash) VALUES (?,?,?,?,?,?,?)",
                         (account_key, e.get("key", ""), e.get("pillar", ""),
                          e.get("date", ""), e.get("archetype", ""),
-                         e.get("set", "")))
+                         e.get("set", ""), e.get("content_hash", "")))
             conn.commit()
     except Exception as e:
         print(f"[rotation] could not persist served log: {type(e).__name__}: {e}")
@@ -131,6 +132,56 @@ def reserve_served(account_key, key, pillar, day_key, archetype="", set_name="")
     except Exception as e:
         print(f"[rotation] could not persist served log: {type(e).__name__}: {e}")
         return None
+
+
+def local_content_hash(path):
+    """Hash local bytes when present; missing test/legacy paths retain key-only history."""
+    if not path or not os.path.isfile(path):
+        return ""
+    digest = hashlib.sha256()
+    with open(path, "rb") as media:
+        for chunk in iter(lambda: media.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def reserve_local_media_once(account_key, key, pillar, day_key, path=None):
+    """Claim a local photo or video once across this gym's IG, FB, and GBP lanes.
+
+    The history comparison and insert share a SQLite write transaction. A
+    competing process must finish its claim before it can inspect the history.
+    Return the exact served row id, or None when used or unreadable.
+    """
+    if not account_key or not key or not day_key:
+        return None
+    from . import db as _db
+    base = _base_account_key(account_key)
+    lanes = (base, f"{base}_ig", f"{base}_fb", f"{base}_gbp")
+    try:
+        digest = local_content_hash(path)
+        with _db._lock, _conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            prior = conn.execute(
+                "SELECT 1 FROM served WHERE account_key IN (?,?,?,?) "
+                "AND (key=? OR (? != '' AND content_hash=?)) LIMIT 1",
+                (*lanes, key, digest, digest)).fetchone()
+            if prior:
+                conn.rollback()
+                return None
+            cursor = conn.execute(
+                "INSERT INTO served (account_key, key, pillar, date, archetype, "
+                "set_name, content_hash) VALUES (?,?,?,?,?,?,?)",
+                (account_key, key, pillar, day_key, "", "", digest))
+            conn.commit()
+            return int(cursor.lastrowid)
+    except Exception as e:
+        print(f"[rotation] could not claim local media: {type(e).__name__}: {e}")
+        return None
+
+
+def reserve_local_photo_once(account_key, key, pillar, day_key, path=None):
+    """Compatibility entrypoint for existing photo callers."""
+    return reserve_local_media_once(account_key, key, pillar, day_key, path=path)
 
 
 def release_served(reservation_id):
@@ -220,7 +271,7 @@ def _base_account_key(account_key):
     return base
 
 
-def local_photo_served(cluster_key, account_key, day_key, served=None):
+def local_photo_served(cluster_key, account_key, day_key, served=None, path=None):
     """DURABLE ONCE-USED GUARD (Blake, 2026-10-02) for a client's uploaded LOCAL
     photos. True when this rotation cluster (dam.rotation_key: near-dupe group,
     else basename) was EVER planned or served for this gym -- any platform lane,
@@ -243,11 +294,16 @@ def local_photo_served(cluster_key, account_key, day_key, served=None):
         except Exception:  # noqa: BLE001 - fail closed: unknown history = no pick
             return True
     base = _base_account_key(account_key)
+    try:
+        digest = local_content_hash(path)
+    except OSError:
+        return True
     for acct, entries in (served or {}).items():
         if _base_account_key(acct) != base:
             continue
         for e in entries:
-            if e.get("key") != cluster_key:
+            if e.get("key") != cluster_key and not (
+                    digest and e.get("content_hash") == digest):
                 continue
             return True
     return False

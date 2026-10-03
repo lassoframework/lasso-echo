@@ -16,6 +16,8 @@ network. Asserts:
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import config, runner, intake_ingest, ops_alerts  # noqa: E402
@@ -57,7 +59,7 @@ def _asset(tmp_path, name="photo1.jpg", note="Saturday open house was packed."):
     lib = tmp_path / "lib"
     lib.mkdir(exist_ok=True)
     p = lib / name
-    p.write_bytes(b"\x89PNG\r\n\x1a\nFAKE")
+    p.write_bytes(b"\x89PNG\r\n\x1a\nFAKE" + name.encode())
     return str(p), note
 
 
@@ -90,6 +92,7 @@ def test_flag_off_is_noop(monkeypatch, tmp_path):
 
 def test_drafts_one_card_per_asset(monkeypatch, tmp_path):
     _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
     voice_file = tmp_path / "voice.md"
     voice_file.write_text(VOICE, encoding="utf-8")
     monkeypatch.setattr(runner, "_generation_account_for",
@@ -103,6 +106,58 @@ def test_drafts_one_card_per_asset(monkeypatch, tmp_path):
     assert all(d.status == DraftStatus.PENDING for d in out)
     assert len(poster.cards) == 2                 # one approval card per asset
     assert len(store.list_pending()) == 2
+
+
+def test_upload_claim_consumes_local_media_across_lanes_and_aliases(monkeypatch, tmp_path):
+    from agent import client_content, dam, rotation
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    voice_file = tmp_path / "voice.md"
+    voice_file.write_text(VOICE, encoding="utf-8")
+    monkeypatch.setattr(runner, "_generation_account_for",
+                        lambda t: _acct(voice_doc=str(voice_file)))
+    first = _asset(tmp_path, "first.jpg", "A class at the gym.")
+    alias = _asset(tmp_path, "alias.jpg", "The same class.")
+    with open(first[0], "rb") as source, open(alias[0], "wb") as target:
+        target.write(source.read())
+    poster = FakePoster()
+    store = PendingStore(path=str(tmp_path / "s.json"))
+    out = runner.draft_for_new_upload("gymx", [first, alias], poster=poster, store=store)
+    assert len(out) == len(poster.cards) == 1
+    assert rotation.local_photo_served(
+        dam.rotation_key(alias[0]), "gymx_fb", "2026-10-04", path=alias[0])
+    assert client_content.pick_image("gymx_fb", "2026-10-04",
+                                     os.path.dirname(alias[0])) is None
+    assert runner.draft_for_new_upload("gymx", [first], poster=poster, store=store) == []
+
+
+def test_upload_releases_only_definitive_no_card_no_row(monkeypatch, tmp_path):
+    from agent import dam, rotation
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    voice_file = tmp_path / "voice.md"
+    voice_file.write_text(VOICE, encoding="utf-8")
+    monkeypatch.setattr(runner, "_generation_account_for",
+                        lambda t: _acct(voice_doc=str(voice_file)))
+    asset = _asset(tmp_path, "retry.jpg", "Coached class.")
+    store = PendingStore(path=str(tmp_path / "s.json"))
+
+    def absent(_draft, _store, _poster, _idempotent):
+        raise OSError("before card")
+
+    monkeypatch.setattr(runner, "_post_and_save", absent)
+    assert runner.draft_for_new_upload("gymx", [asset], store=store, poster=FakePoster()) == []
+    assert not rotation.local_photo_served(
+        dam.rotation_key(asset[0]), "gymx_ig", "2026-10-04", path=asset[0])
+
+    def uncertain(draft, _store, _poster, _idempotent):
+        draft._external_visibility_attempted = True
+        raise TimeoutError("card outcome unknown")
+
+    monkeypatch.setattr(runner, "_post_and_save", uncertain)
+    assert runner.draft_for_new_upload("gymx", [asset], store=store, poster=FakePoster()) == []
+    assert rotation.local_photo_served(
+        dam.rotation_key(asset[0]), "gymx_ig", "2026-10-04", path=asset[0])
 
 
 # ---- CRITICAL gate: a client upload must NEVER auto-publish -------------------
@@ -157,6 +212,237 @@ def test_noteless_asset_is_skipped_not_cta_only_card(monkeypatch, tmp_path):
                                       store=PendingStore(path=str(tmp_path / "s.json")))
     assert out == []
     assert poster.cards == []
+
+
+def test_video_upload_waits_while_an_unused_photo_is_available(monkeypatch, tmp_path):
+    """Arming the instant-card lane cannot let a clip jump an available photo."""
+    _arm(monkeypatch)
+    voice_file = tmp_path / "voice.md"
+    voice_file.write_text(VOICE, encoding="utf-8")
+    monkeypatch.setattr(runner, "_generation_account_for",
+                        lambda t: _acct(voice_doc=str(voice_file)))
+    monkeypatch.setattr(runner, "_unused_client_photo_available",
+                        lambda *a, **k: True)
+    poster = FakePoster()
+    out = runner.draft_for_new_upload(
+        "gymx", [_asset(tmp_path, "class.mp4", "A coached class in progress.")],
+        poster=poster, store=PendingStore(path=str(tmp_path / "s.json")))
+    assert out == []
+    assert poster.cards == []
+
+
+def test_daily_drive_builder_accepts_one_explicit_media_tier(monkeypatch):
+    """The daily entrypoint can constrain the builder to the photo tier."""
+    from types import SimpleNamespace
+    from agent import client_content, client_sources, gym_media_builder, rotation
+
+    monkeypatch.setattr(config, "client_sources_enabled", lambda: True)
+    monkeypatch.setattr(config, "gym_drive_stage_enabled", lambda: True)
+    monkeypatch.setattr(config, "gym_drive_connect_active_for", lambda _key: True)
+    monkeypatch.setattr(client_sources, "categories_present", lambda _key: ["service"])
+    monkeypatch.setattr(client_sources, "approved_claims", lambda _key: ["Fact"])
+    monkeypatch.setattr(client_content, "category_for_day",
+                        lambda *a: "service")
+    monkeypatch.setattr(client_content, "_pillars_for",
+                        lambda *a: ["service"])
+    source = SimpleNamespace(text="Fact")
+    monkeypatch.setattr(client_content, "_source_for_day", lambda *a: source)
+    monkeypatch.setattr(rotation, "is_gate_clean", lambda *a, **k: True)
+    seen = []
+    expected = SimpleNamespace(scheduled_for="")
+
+    def _build(*args, **kwargs):
+        seen.append(kwargs["kind_prefs"])
+        return expected
+
+    monkeypatch.setattr(gym_media_builder, "build_gym_media_draft", _build)
+    account = SimpleNamespace(key="gymx_ig")
+    assert runner._client_drive_first_draft(
+        account, "2026-10-03", object(), kind_prefs=("photo",)) is expected
+    assert seen == [("photo",)]
+    assert expected.scheduled_for
+    assert expected.force_approval is True
+
+
+def test_daily_transient_drive_photo_failure_holds_all_videos(monkeypatch):
+    """A still-pickable Drive photo may not fall through to either video tier."""
+    from types import SimpleNamespace
+    from agent import client_content
+
+    account = SimpleNamespace(key="gymx_ig")
+    kinds = []
+    monkeypatch.setattr(runner, "_client_drive_kind_available",
+                        lambda _account, kind: True)
+    monkeypatch.setattr(runner, "_client_drive_first_draft",
+                        lambda *a, **k: kinds.append(k["kind_prefs"]) or None)
+    monkeypatch.setattr(runner, "_client_local_photo_available",
+                        lambda *a, **k: False)
+    monkeypatch.setattr(client_content, "build_client_draft",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("local video must stay held")))
+    assert runner._client_photo_first_draft(
+        account, "2026-10-03", object(), "/lib") is None
+    assert kinds == [("photo",)]
+
+
+def test_daily_order_reaches_drive_video_only_after_both_photo_tiers_empty(monkeypatch):
+    from types import SimpleNamespace
+    account = SimpleNamespace(key="gymx_ig")
+    checks = []
+    expected = object()
+
+    def _available(_account, kind):
+        checks.append(kind)
+        return kind == "video"
+
+    monkeypatch.setattr(runner, "_client_drive_kind_available", _available)
+    monkeypatch.setattr(runner, "_client_local_photo_available",
+                        lambda *a, **k: False)
+    monkeypatch.setattr(runner, "_client_drive_first_draft",
+                        lambda *a, **k: expected)
+    assert runner._client_photo_first_draft(
+        account, "2026-10-03", object(), "/lib") is expected
+    assert checks == ["photo", "video"]
+
+
+def test_daily_photo_inventory_claim_failure_holds_video(monkeypatch):
+    from types import SimpleNamespace
+    from agent import config, db, gym_media_index
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+
+    monkeypatch.setattr(config, "gym_drive_stage_enabled", lambda: True)
+    monkeypatch.setattr(config, "gym_drive_connect_active_for", lambda _key: True)
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: FakeMediaStore(
+        assets=[make_asset("photo", gym_id="gymx")]))
+    monkeypatch.setattr(db, "drive_asset_claimed_ids",
+                        lambda _base: (_ for _ in ()).throw(OSError("claim read")))
+    assert runner._client_drive_kind_available(
+        SimpleNamespace(key="gymx_ig"), "photo") is None
+
+
+def test_upload_video_holds_when_local_inventory_is_uncertain(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from agent import rotation
+
+    monkeypatch.setattr(rotation, "load_served_strict",
+                        lambda: (_ for _ in ()).throw(OSError("ledger unavailable")))
+    assert runner._unused_client_photo_available(
+        SimpleNamespace(key="gymx_ig"), str(tmp_path / "clip.mp4"),
+        "2026-10-03") is True
+
+
+def test_unlanded_daily_drive_draft_restores_its_pre_stage_stamp(monkeypatch):
+    from types import SimpleNamespace
+    from agent import db, gym_media_index, gym_media_selector
+    calls = []
+    releases = []
+    media_store = object()
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: media_store)
+    monkeypatch.setattr(db, "socialapi_claim_release",
+                        lambda *args: releases.append(args))
+    monkeypatch.setattr(
+        gym_media_selector, "rollback_use",
+        lambda gym, day, **kwargs: calls.append((gym, day, kwargs)) or True)
+    draft = SimpleNamespace(account_key="gymx_ig",
+                            source_media_asset_id="drive-photo-1",
+                            _drive_claim_id="gbp_media:gymx:hash:" + "a" * 64)
+    assert runner._rollback_unlanded_drive_draft(draft, "2026-10-03") is True
+    assert calls == [("gymx_ig", "2026-10-03",
+                      {"store": media_store, "asset_id": "drive-photo-1",
+                       "restore_unstaged": True})]
+    assert releases == [("gbp_media:gymx:hash:" + "a" * 64, "gymx_gbp")]
+
+
+def test_daily_failed_restore_retains_exact_claim(monkeypatch):
+    from types import SimpleNamespace
+    from agent import db, gym_media_selector
+    releases = []
+    monkeypatch.setattr(gym_media_selector, "rollback_use",
+                        lambda *a, **k: False)
+    monkeypatch.setattr(db, "socialapi_claim_release",
+                        lambda *a: releases.append(a))
+    draft = SimpleNamespace(account_key="gymx_ig",
+                            source_media_asset_id="drive-photo-1")
+    assert runner._rollback_unlanded_drive_draft(draft, "2026-10-03") is False
+    assert releases == []
+
+
+def test_visible_card_or_partial_put_readback_never_restores_drive_media(monkeypatch):
+    from types import SimpleNamespace
+    draft = SimpleNamespace(draft_id="d1")
+
+    class EmptyStore:
+        def get(self, _draft_id):
+            return None
+
+    assert runner._drive_draft_landed_or_uncertain(draft, EmptyStore()) is False
+    draft._approval_visible = True
+    assert runner._drive_draft_landed_or_uncertain(draft, EmptyStore()) is True
+
+    persisted = SimpleNamespace(draft_id="d1")
+    class PartialPutStore:
+        def get(self, _draft_id):
+            return persisted
+
+    assert runner._drive_draft_landed_or_uncertain(
+        SimpleNamespace(draft_id="d1"), PartialPutStore()) is True
+
+    class UnknownStore:
+        def get(self, _draft_id):
+            raise OSError("readback unavailable")
+
+    assert runner._drive_draft_landed_or_uncertain(
+        SimpleNamespace(draft_id="d1"), UnknownStore()) is True
+
+    attempted = SimpleNamespace(
+        draft_id="d1", _external_visibility_attempted=True)
+    assert runner._drive_draft_landed_or_uncertain(attempted, EmptyStore()) is True
+    explicit_failure = SimpleNamespace(
+        draft_id="d1", _external_visibility_attempted=True,
+        _external_visibility_known_absent=True)
+    assert runner._drive_draft_landed_or_uncertain(
+        explicit_failure, EmptyStore()) is False
+
+
+def test_post_and_save_marks_visible_before_partial_store_failure(monkeypatch):
+    from types import SimpleNamespace
+    draft = SimpleNamespace(
+        draft_id="d1", account_key="gymx_ig", status=DraftStatus.PENDING,
+        caption="A real caption", hashtags=[], force_approval=True)
+
+    class Poster:
+        def post_approval_card(self, _draft):
+            return {"ok": True, "channel": "C1", "ts": "1.2"}
+
+    class PartialStore:
+        def put(self, _draft):
+            raise OSError("persist failed after card")
+
+    monkeypatch.setattr("agent.gym_calendar_queue.approval_surface_for",
+                        lambda _acct: "slack")
+    monkeypatch.setattr("agent.accounts.get_account", lambda _key: None)
+    with pytest.raises(OSError, match="persist failed"):
+        runner._post_and_save(draft, PartialStore(), Poster(), True)
+    assert draft._approval_visible is True
+
+
+def test_post_and_save_retains_drive_stamp_when_slack_outcome_is_uncertain(monkeypatch):
+    from types import SimpleNamespace
+    draft = SimpleNamespace(
+        draft_id="d1", account_key="gymx_ig", status=DraftStatus.PENDING,
+        caption="A real caption", hashtags=[], force_approval=True)
+
+    class Poster:
+        def post_approval_card(self, _draft):
+            raise TimeoutError("response lost")
+
+    monkeypatch.setattr("agent.gym_calendar_queue.approval_surface_for",
+                        lambda _acct: "slack")
+    monkeypatch.setattr("agent.accounts.get_account", lambda _key: None)
+    with pytest.raises(TimeoutError, match="response lost"):
+        runner._post_and_save(draft, object(), Poster(), True)
+    assert runner._drive_draft_landed_or_uncertain(
+        draft, type("Store", (), {"get": lambda self, _id: None})()) is True
 
 
 # ---- no account -> skip with one alert, media untouched -----------------------

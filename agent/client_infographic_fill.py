@@ -102,9 +102,18 @@ def real_media_depleted(base, *, now=None):
         if not callable(list_sources):
             return False
         sources = list_sources(base) or []
-        ready = [s for s in sources
-                 if str(s.get("kind") or "") == "gym_drive"
-                 and s.get("active") is not False
+        # A successful authoritative source read with no Drive rows means this
+        # gym has never connected Drive. There is no remote supply to wait for,
+        # so an empty local library may use the verified-palette Astra fallback.
+        # Exceptions still land in the outer fail-closed handler below.
+        drive_sources = [s for s in sources
+                         if str(s.get("kind") or "") == "gym_drive"]
+        if not drive_sources:
+            if config.gym_drive_connect_active_for(base):
+                return False
+            return not local
+        ready = [s for s in drive_sources
+                 if s.get("active") is not False
                  and not s.get("revoked_externally")
                  and str(s.get("sync_status") or "").lower() == "ready"
                  and s.get("sync_finished_at")]
@@ -112,8 +121,8 @@ def real_media_depleted(base, *, now=None):
         # Without that proof, an empty/stale DB must never unlock Astra fallback.
         if not ready:
             return False
-        # pickable() intentionally converts store errors to [] for planning.
-        # For a client depletion notice, distinguish a failed read from empty.
+        # The selector normally converts claim errors to [] for planning; this
+        # gate requests strict claim reads before interpreting [] as depletion.
         assets = media_store.list_assets(base)
         # An indexed client photo awaiting the normal hash-bound moderation is
         # supply waiting for Echo, not evidence that the gym has no photos.
@@ -151,7 +160,8 @@ def real_media_depleted(base, *, now=None):
             if (parsed_now is not None
                     and parsed_now.tzinfo is None):
                 parsed_now = parsed_now.replace(tzinfo=_tz.utc)
-        drive = gym_media_selector.pickable(base, store=Snapshot(), now=parsed_now)
+        drive = gym_media_selector.pickable(
+            base, store=Snapshot(), now=parsed_now, strict_claims=True)
         from .media_bridge import observe_drive_inventory
         observe_drive_inventory(base, [a.get("id") for a in drive])
         return not local and not drive

@@ -89,7 +89,8 @@ def _lib(tmp_path, n=5):
     lib = tmp_path / "gritx_lib"
     lib.mkdir(exist_ok=True)
     for i in range(n):
-        (lib / f"photo_{i:02d}.jpg").write_bytes(b"\xff\xd8\xffFAKEJPEG")
+        (lib / f"photo_{i:02d}.jpg").write_bytes(
+            b"\xff\xd8\xffFAKEJPEG" + str(i).encode())
         (lib / f"photo_{i:02d}.json").write_text(
             json.dumps({"public_url": f"https://gritx.media/photo_{i:02d}.jpg"}))
     return str(lib)
@@ -858,8 +859,28 @@ def test_a_raise_between_release_and_apply_restores_the_released_stamps(monkeypa
     assert len(cal.existing) == 3
 
 
-def test_delete_ok_but_insert_failed_rolls_back_this_builds_new_stamps(monkeypatch,
-                                                                       tmp_path):
+def test_raise_after_apply_keeps_landed_drive_stamp(monkeypatch, tmp_path):
+    """A reporting failure after insertion must not turn a staged asset fresh."""
+    _sources()
+    store = FakeMediaStore(assets=[make_asset("a_new", gym_id="gritx")])
+    _arm(monkeypatch, store, FakeDrive())
+    cal = _CalStore()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("reporting failed")
+
+    monkeypatch.setattr(client_content, "flush_needs_media_alerts", boom)
+    with pytest.raises(RuntimeError, match="reporting failed"):
+        cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1,
+                               voice=_voice(), library_path=_lib(tmp_path, n=0),
+                               store=cal, banned_words=())
+    assert _feeds(cal)
+    assert store.assets["a_new"]["used_count"] == 1
+
+
+def test_delete_ok_but_insert_outcome_unknown_keeps_new_stamps(monkeypatch, tmp_path):
+    """An insert exception may follow a committed remote write. Keep both the
+    old staged asset and the new pick consumed until calendar state is proven."""
     _sources()
     _stale_ledger(monkeypatch)
     store = FakeMediaStore(assets=[make_asset("n1", gym_id="gritx"),
@@ -874,8 +895,9 @@ def test_delete_ok_but_insert_failed_rolls_back_this_builds_new_stamps(monkeypat
     out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1, voice=_voice(),
                                  library_path=_lib(tmp_path), store=cal, banned_words=())
     assert out["ok"] is False and out.get("deleted", 0) > 0
+    assert out["insert_outcome_unknown"] is True
     picked = [a for a in ("n1", "old") if store.assets[a]["used_count"]]
-    assert picked == ["old"], "previously staged media stays consumed after a failed rebuild"
+    assert picked == ["n1", "old"], "ambiguous insert must not re-offer either asset"
 
 
 # ---- the Drive lane runs the A+ gate --------------------------------------------------
@@ -987,13 +1009,14 @@ def test_small_library_alert_ignores_drive_covered_days(monkeypatch, tmp_path):
     feeds = _feeds(cal)
     assert len([r for r in feeds if not r.get("source_media_asset_id")]) == 5   # fills
     assert fired == [], "5 stills covering 2 days is not a small library"
-    # the helper's own comparison: the SAME fill with 99 Lane A days behind it alerts
+    # The first build staged all five original stills. Add a sixth fresh photo for
+    # this separate helper check; once-staged photos cannot be used again.
     monkeypatch.setattr(client_content.rotation, "local_photo_served",
                         lambda *a, **k: False)
     logs = []
     cal2 = _CalStore()
     filled = cmr._fill_uncovered_days(
-        _account(), "gritx", _voice(), _lib(tmp_path), (), logs.append,
+        _account(), "gritx", _voice(), _lib(tmp_path, n=6), (), logs.append,
         deferred_days={"2026-08-20"}, covered_days=set(), locked_keys=set(),
         used_keys=set(), drafts=[], store=cal2, start=date(2026, 8, 20), days=1,
         max_fill=1, local_days=99)

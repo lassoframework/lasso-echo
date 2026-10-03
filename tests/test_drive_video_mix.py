@@ -165,10 +165,8 @@ def test_photo_beat_falls_back_to_video_when_photos_are_on_cooldown(monkeypatch,
 
 def test_two_x_slots_of_a_split_day_both_take_the_photo_under_photo_first(
         monkeypatch, tmp_path):
-    """2026-10-02 contract: slot_index still reaches the builder, but with a mixed
-    pool BOTH slots of a photo/video split day stage the photo -- a video beat
-    never bypasses an available client photo. (The video beat is served from a
-    video-only pool, the shape the video pre-pass now requires.)"""
+    """Both slots prefer photos, while the second must take a different photo:
+    the first slot's durable claim survives a fresh media-store snapshot."""
     _wire_builder(monkeypatch, host_url="https://cdn.fake/tt/abc/clip.mp4")
     day = None
     d = date(2026, 9, 11)
@@ -182,15 +180,19 @@ def test_two_x_slots_of_a_split_day_both_take_the_photo_under_photo_first(
     for slot in (0, 1):
         store = FakeMediaStore(assets=[
             make_asset("v1", gym_id="toughtemple52040e", kind="video", title="clip.mp4"),
-            make_asset("p1", gym_id="toughtemple52040e", kind="photo")])
+            make_asset("p1", gym_id="toughtemple52040e", kind="photo"),
+            make_asset("p2", gym_id="toughtemple52040e", kind="photo")])
         draft = builder.build_gym_media_draft(
             _Acct(), day, "faces", voice=object(), source=object(), store=store,
             drive=FakeDrive(), library_dir=str(tmp_path), now=NOW, slot_index=slot)
         picked.append(draft.source_media_asset_id)
-    assert picked == ["p1", "p1"], "photo-first on both slots of a mixed pool"
-    # and on the video beat with a video-only pool the ordinal still stages video
+    assert picked == ["p1", "p2"], "both slots prefer distinct claimed photos"
+    # A video-only eligible pool still carries claimed photo metadata so alias
+    # exclusion can be verified before the ordinal stages the video.
     store = FakeMediaStore(assets=[
-        make_asset("v1", gym_id="toughtemple52040e", kind="video", title="clip.mp4")])
+        make_asset("v1", gym_id="toughtemple52040e", kind="video", title="clip.mp4"),
+        make_asset("p1", gym_id="toughtemple52040e", kind="photo", eligible=False),
+        make_asset("p2", gym_id="toughtemple52040e", kind="photo", eligible=False)])
     draft = builder.build_gym_media_draft(
         _Acct(), day, "faces", voice=object(), source=object(), store=store,
         drive=FakeDrive(), library_dir=str(tmp_path), now=NOW, slot_index=1)
