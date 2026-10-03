@@ -1316,9 +1316,15 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # via the gap-fill lane, else the cap-respecting fallback).
     covered_slots = set()
     pre_captions = {}
+    # Photos have priority over the video-beat pre-pass.  If any approved,
+    # currently pickable Drive photo exists, let Lane A and the normal gap-fill
+    # lane consume photos first; reserve the video pre-pass for a photo-exhausted
+    # Drive pool so available stills cannot be bypassed by a video beat.
+    from . import gym_media_selector as _media_selector
+    _drive_kinds = _media_selector.pool_kinds(base_key)
     if (config.gym_drive_stage_enabled()
             and config.gym_drive_connect_active_for(base_key)
-            and client_content.drive_pool_has_video(base_key)):
+            and "video" in _drive_kinds and "photo" not in _drive_kinds):
         try:
             pre = append_gym_drive_drafts(
                 account, base_key, start, days, voice, log=log,

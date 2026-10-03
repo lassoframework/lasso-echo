@@ -89,9 +89,10 @@ def real_media_depleted(base, *, now=None):
     except Exception:
         return False
 
-    if not (config.gym_drive_stage_enabled()
-            and config.gym_drive_connect_active_for(base)):
-        return not local
+    # The indexed Drive inventory is authoritative even when the staging lane is
+    # currently disabled.  A disabled writer must not make approved client media
+    # look absent and unlock the infographic fallback.  If the index is
+    # unavailable or unreadable, return False below (fail closed).
     try:
         from . import gym_media_index, gym_media_selector
         media_store = gym_media_index.default_store()
