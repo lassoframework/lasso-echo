@@ -91,7 +91,7 @@ def _stub_pipeline(monkeypatch, palette=None):
     """Stub the Astra-only render path: verified gym palette on file, the
     shared Astra-only generator, and hosting. creative_studio is deliberately
     NOT stubbed -- the seed must never touch it."""
-    from agent import astra_prompt, media_host
+    from agent import astra_prompt, client_infographic_fill, media_host
 
     monkeypatch.setattr(astra_prompt, "load_gym_brand_palette",
                         lambda key: palette if palette is not None else {

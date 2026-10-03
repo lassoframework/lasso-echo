@@ -13,7 +13,8 @@ KEY = "gym"
 TENANT = "11111111-1111-4111-8111-111111111111"
 RAW = "https://media.example/raw.jpg?version=1"
 FINAL = "https://media.example/final.jpg?version=2"
-DATA = {RAW: b"raw photo", FINAL: b"burned photo"}
+POSTER = "https://media.example/poster.jpg?version=3"
+DATA = {RAW: b"raw photo", FINAL: b"burned photo", POSTER: b"video poster"}
 
 
 def md5(data):
@@ -27,6 +28,16 @@ def evidence(**changes):
         "source_byte_length": len(DATA[RAW]), "delivered_byte_length": len(DATA[FINAL]),
         "operation": "render", "observed_by": "test_renderer",
         "rendered_by": "test_renderer", "evidence_ref": "test_renderer:1", **changes,
+    }
+
+
+def poster_evidence(**changes):
+    return {
+        "source_exact_url": FINAL, "delivered_exact_url": POSTER,
+        "source_fingerprint": md5(DATA[FINAL]), "delivered_fingerprint": md5(DATA[POSTER]),
+        "source_byte_length": len(DATA[FINAL]), "delivered_byte_length": len(DATA[POSTER]),
+        "operation": "render", "observed_by": "test_renderer",
+        "rendered_by": "test_renderer", "evidence_ref": "test_renderer:poster-1", **changes,
     }
 
 
@@ -88,6 +99,11 @@ class HTTP:
                                  "source_fingerprint": fingerprint,
                                  "delivered_fingerprint": fingerprint,
                                  "usage_claimed": False})
+            registrations = sum(1 for call in self.calls
+                                if call[:2] == ("post", "visual_global_prepare_source_rendition"))
+            if registrations % 2 == 0:
+                return Response({"group_key": "vg_scene", "source_fingerprint": md5(DATA[FINAL]),
+                                 "delivered_fingerprint": md5(DATA[POSTER]), "usage_claimed": False})
             return Response({"group_key": "vg_scene", "source_fingerprint": md5(DATA[RAW]),
                              "delivered_fingerprint": md5(DATA[FINAL]), "usage_claimed": False})
         if name == "visual_global_prepare_bundle":
@@ -157,18 +173,24 @@ def staging(monkeypatch):
     monkeypatch.setattr(pcs, "_dedupe_slots", lambda store, key, rows: rows)
 
 
-def write(boundary, http, render=None, source=RAW):
+def write(boundary, http, render=None, source=RAW, poster=None, thumbnail=None):
     value = store(http)
     if boundary == "patch_media":
-        return value.patch_media(KEY, "row-1", FINAL, source_media_url=source, render_evidence=render)
+        return value.patch_media(KEY, "row-1", FINAL, source_media_url=source,
+                                 render_evidence=render, poster_render_evidence=poster)
     if boundary == "swap_media":
-        return value.swap_media(KEY, "row-1", FINAL, source_media_url=source, render_evidence=render)
+        return value.swap_media(KEY, "row-1", FINAL, source_media_url=source,
+                                extra_fields={"thumbnail_url": thumbnail} if thumbnail is not None else None,
+                                render_evidence=render, poster_render_evidence=poster)
     if boundary == "candidate":
         return value.create_variant_candidate(KEY, calendar_row(), FINAL,
-                                              source_media_url=source, render_evidence=render)
+                                              source_media_url=source, thumbnail_url=thumbnail,
+                                              render_evidence=render, poster_render_evidence=poster)
     return value.insert_rows(KEY, [{"image_url": FINAL, "source_media_url": source,
-                                   "gym_id": "foreign-key", "format": "story", "status": "pending"}],
-                             render_evidence_by_url={FINAL: render} if render else None)
+                                   "gym_id": "foreign-key", "format": "story", "status": "pending",
+                                   "thumbnail_url": thumbnail}],
+                             render_evidence_by_url={FINAL: render} if render else None,
+                             poster_render_evidence_by_url={(FINAL, thumbnail): poster} if poster else None)
 
 
 @pytest.mark.parametrize("boundary", ["patch_media", "swap_media", "candidate", "insert_rows"])
@@ -192,6 +214,45 @@ def test_each_boundary_prepares_both_exact_objects_before_writing(armed, staging
         payload = payload[0]
     assert "render_evidence" not in payload
     assert "render_evidence_by_url" not in payload
+
+
+@pytest.mark.parametrize("boundary", ["patch_media", "swap_media", "candidate", "insert_rows"])
+def test_distinct_poster_evidence_reaches_prepare_before_calendar_persistence(armed, staging, boundary):
+    http = HTTP(current=calendar_row(image_url="", thumbnail_url=POSTER))
+    result = write(boundary, http, evidence(), poster=poster_evidence(), thumbnail=POSTER)
+    assert result
+    assert len(armed) == 2
+    assert armed[1]["source_bytes"] == DATA[FINAL]
+    assert armed[1]["delivered_bytes"] == DATA[POSTER]
+    registrations = [i for i, call in enumerate(http.calls)
+                     if call[:2] == ("post", "visual_global_prepare_source_rendition")]
+    calendar_write = next(i for i, call in enumerate(http.calls)
+                          if call[1] == "content_calendar" and call[0] != "get")
+    assert len(registrations) == 2
+    assert registrations[1] < calendar_write
+    persisted = http.calls[calendar_write][-1]
+    if isinstance(persisted, list):
+        persisted = persisted[0]
+    assert "poster_render_evidence" not in persisted
+    assert "poster_render_evidence_by_url" not in persisted
+
+
+@pytest.mark.parametrize("thumbnail", [None, "", FINAL])
+def test_insert_blank_or_same_thumbnail_needs_no_poster_evidence(armed, staging, thumbnail):
+    http = HTTP()
+    result = write("insert_rows", http, evidence(), thumbnail=thumbnail)
+    assert result
+    assert len(armed) == 1
+
+
+@pytest.mark.parametrize("boundary", ["patch_media", "swap_media", "candidate", "insert_rows"])
+@pytest.mark.parametrize("poster", [None, poster_evidence(source_exact_url=RAW)])
+def test_distinct_poster_without_matching_evidence_refuses_before_calendar_write(
+        armed, staging, boundary, poster):
+    http = HTTP(current=calendar_row(image_url="", thumbnail_url=POSTER))
+    with pytest.raises(prep.VisualPreparationError, match="poster scene lineage"):
+        write(boundary, http, evidence(), poster=poster, thumbnail=POSTER)
+    assert not any(call[1] == "content_calendar" and call[0] != "get" for call in http.calls)
 
 
 @pytest.mark.parametrize("boundary", ["patch_media", "swap_media", "candidate", "insert_rows"])
@@ -284,18 +345,22 @@ def source_asset():
             "content_hash": hashlib.md5(DATA[RAW]).hexdigest()}
 
 
-def restage_held(store_value, current, render=None):
+def restage_held(store_value, current, render=None, poster=None, thumbnail=None):
+    extra_fields = {"source_media_asset_id": "asset-1"}
+    if thumbnail is not None:
+        extra_fields["thumbnail_url"] = thumbnail
     return store_value.restage_held_media(
         KEY, current, image_url=FINAL, source_media_url=RAW,
-        extra_fields={"source_media_asset_id": "asset-1"}, render_evidence=render)
+        extra_fields=extra_fields, render_evidence=render,
+        poster_render_evidence=poster)
 
 
-def replace_held_infographic(store_value, current, render=None):
+def replace_held_infographic(store_value, current, render=None, poster=None, thumbnail=None):
     return store_value.replace_future_infographic_media(
         KEY, current, image_url=FINAL, source_media_url=RAW,
         source_media_asset_id="asset-1",
         reason="Photo-first hold: unverified infographic placeholder; approved gym photo required",
-        render_evidence=render)
+        thumbnail_url=thumbnail, render_evidence=render, poster_render_evidence=poster)
 
 
 @pytest.mark.parametrize("writer,row_builder", [
@@ -328,6 +393,76 @@ def test_operator_replacements_refuse_missing_render_evidence_before_patch(armed
     http = HTTP(current=current, asset=source_asset())
     with pytest.raises(prep.VisualPreparationError):
         writer(store(http), current)
+    assert not any(call[0] == "patch" for call in http.calls)
+
+
+@pytest.mark.parametrize("writer,row_builder", [
+    (restage_held, held_restage_row), (replace_held_infographic, held_infographic_row),
+])
+def test_operator_replacement_wrappers_forward_distinct_poster_proof(
+        armed, writer, row_builder):
+    current = row_builder()
+    http = HTTP(current=current, asset=source_asset())
+    result = writer(store(http), current, evidence(), poster_evidence(), POSTER)
+    assert result["thumbnail_url"] == POSTER
+    assert len(armed) == 2
+    assert armed[1]["source_bytes"] == DATA[FINAL]
+    assert armed[1]["delivered_bytes"] == DATA[POSTER]
+
+
+@pytest.mark.parametrize("writer,row_builder", [
+    (restage_held, held_restage_row), (replace_held_infographic, held_infographic_row),
+])
+def test_operator_replacement_wrappers_fail_closed_without_distinct_poster_proof(
+        armed, writer, row_builder):
+    current = row_builder()
+    http = HTTP(current=current, asset=source_asset())
+    with pytest.raises(prep.VisualPreparationError, match="poster scene lineage"):
+        writer(store(http), current, evidence(), thumbnail=POSTER)
+    assert not any(call[0] == "patch" for call in http.calls)
+
+
+def test_patch_image_url_forwards_distinct_poster_proof(armed):
+    current = calendar_row(image_url="https://media.example/old-burn.jpg",
+                           source_media_url=RAW, thumbnail_url=POSTER)
+    http = HTTP(current=current)
+    result = store(http).patch_image_url(
+        KEY, "row-1", FINAL, render_evidence=evidence(),
+        poster_render_evidence=poster_evidence())
+    assert result["image_url"] == FINAL
+    assert len(armed) == 2
+
+
+def test_patch_image_url_fails_closed_without_distinct_poster_proof(armed):
+    current = calendar_row(image_url="https://media.example/old-burn.jpg",
+                           source_media_url=RAW, thumbnail_url=POSTER)
+    http = HTTP(current=current)
+    with pytest.raises(prep.VisualPreparationError, match="poster scene lineage"):
+        store(http).patch_image_url(KEY, "row-1", FINAL, render_evidence=evidence())
+    assert not any(call[0] == "patch" for call in http.calls)
+
+
+def test_story_hold_recovery_forwards_distinct_poster_proof(armed):
+    current = calendar_row(image_url="", source_media_url=None, thumbnail_url=None,
+                           media_not_ready_reason="Story media not ready: retry")
+    proposed = {**current, "image_url": FINAL, "source_media_url": FINAL,
+                "thumbnail_url": POSTER, "media_not_ready_reason": None}
+    http = HTTP(current=current)
+    result = store(http).recover_story_media_hold(
+        KEY, current, proposed, poster_render_evidence=poster_evidence())
+    assert result["image_url"] == FINAL
+    assert result["thumbnail_url"] == POSTER
+    assert len(armed) == 2
+
+
+def test_story_hold_recovery_fails_closed_without_distinct_poster_proof(armed):
+    current = calendar_row(image_url="", source_media_url=None, thumbnail_url=None,
+                           media_not_ready_reason="Story media not ready: retry")
+    proposed = {**current, "image_url": FINAL, "source_media_url": FINAL,
+                "thumbnail_url": POSTER, "media_not_ready_reason": None}
+    http = HTTP(current=current)
+    with pytest.raises(prep.VisualPreparationError, match="poster scene lineage"):
+        store(http).recover_story_media_hold(KEY, current, proposed)
     assert not any(call[0] == "patch" for call in http.calls)
 
 
@@ -471,21 +606,24 @@ def test_candidate_from_existing_candidate_checks_its_snapshot_and_stable_group(
 
 def test_swap_cannot_overwrite_thumbnail_changed_during_preparation(armed):
     concurrent_thumbnail = "https://media.example/concurrent-poster.jpg"
-    http = HTTP(current=calendar_row(thumbnail_url="https://media.example/old-poster.jpg"),
+    # The interim writer can attest only the selected image object. Use that
+    # same object for the candidate so this test reaches the thumbnail CAS
+    # race; a distinct unverified poster must be held before persistence.
+    http = HTTP(current=calendar_row(thumbnail_url=FINAL),
                 race={"thumbnail_url": concurrent_thumbnail})
     result = store(http).swap_media(
         KEY, "row-1", FINAL, source_media_url=RAW,
-        extra_fields={"thumbnail_url": "https://media.example/new-poster.jpg"},
+        extra_fields={"thumbnail_url": FINAL},
         render_evidence=evidence())
     assert result is None
     assert http.current["thumbnail_url"] == concurrent_thumbnail
     assert http.current["image_url"] != FINAL
     patch = next(call for call in http.calls if call[0] == "patch")
-    assert patch[2]["thumbnail_url"] == 'eq."https://media.example/old-poster.jpg"'
+    assert patch[2]["thumbnail_url"] == f'eq."{FINAL}"'
 
 
 def test_swap_checks_unchanged_thumbnail_in_persisted_result(armed):
-    http = HTTP(current=calendar_row(thumbnail_url="https://media.example/old-poster.jpg"),
+    http = HTTP(current=calendar_row(thumbnail_url=FINAL),
                 bad_result=lambda rows: [{**rows[0], "thumbnail_url": "https://media.example/other.jpg"}])
     assert write("swap_media", http, evidence()) is None
 
@@ -507,6 +645,50 @@ def test_insert_accepts_reordered_verified_rows_with_unique_ids(armed, staging):
     ])
     assert [r["image_url"] for r in rows] == [FINAL, RAW]
     assert len({r["id"] for r in rows}) == 2
+
+
+def test_insert_scopes_shared_poster_evidence_to_the_exact_image_edge(armed, staging, monkeypatch):
+    """A shared poster URL cannot let one video's proof attest another video."""
+    other_image = "https://media.example/another-video.mp4"
+    shared_poster = POSTER
+    first_proof = {"edge": "first"}
+    second_proof = {"edge": "second"}
+    seen = []
+
+    def prepare_row(_self, _account_key, row, render_evidence=None, poster_render_evidence=None):
+        seen.append((row["image_url"], row["thumbnail_url"], poster_render_evidence))
+        return {**row, "visual_group_key": "vg_scene", "byte_hash": "derived:edge"}
+
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_prepare_visual_row", prepare_row)
+    rows = store(HTTP()).insert_rows(
+        KEY,
+        [
+            {"image_url": FINAL, "source_media_url": FINAL, "thumbnail_url": shared_poster},
+            {"image_url": other_image, "source_media_url": other_image, "thumbnail_url": shared_poster},
+        ],
+        poster_render_evidence_by_url={
+            (FINAL, shared_poster): first_proof,
+            (other_image, shared_poster): second_proof,
+        },
+    )
+    assert len(rows) == 2
+    assert seen == [
+        (FINAL, shared_poster, first_proof),
+        (other_image, shared_poster, second_proof),
+    ]
+
+
+def test_insert_rejects_thumbnail_only_poster_evidence_lookup(armed, staging):
+    """The former thumbnail-only map shape must not be silently accepted."""
+    http = HTTP()
+    with pytest.raises(prep.VisualPreparationError, match="poster scene lineage"):
+        store(http).insert_rows(
+            KEY,
+            [{"image_url": FINAL, "source_media_url": RAW, "thumbnail_url": POSTER}],
+            render_evidence_by_url={FINAL: evidence()},
+            poster_render_evidence_by_url={POSTER: poster_evidence()},
+        )
+    assert not any(call[1] == "content_calendar" and call[0] == "post" for call in http.calls)
 
 
 def test_backfill_cannot_discard_existing_drive_asset_to_pass(armed):
@@ -552,3 +734,11 @@ def test_flag_off_retains_legacy_write_without_preparation(monkeypatch, staging,
         assert sum(call[0] == "get" for call in http.calls) == 1
     if boundary == "candidate":
         assert not any(call[0] == "get" for call in http.calls)
+
+
+def test_flag_off_retains_distinct_poster_without_preparation(monkeypatch, staging):
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    monkeypatch.setattr(prep, "prepare", lambda *args, **kwargs: pytest.fail("flag OFF must not prepare"))
+    http = HTTP()
+    assert write("insert_rows", http, thumbnail=POSTER)
+    assert not any(call[1].startswith("visual_global_") or call[1] == "tenant_alias" for call in http.calls)

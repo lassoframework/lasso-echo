@@ -97,6 +97,40 @@ def test_missing_source_media_stays_missing_after_store_round_trip(tmp_path):
     restored = store.get("source2")
     assert restored is not None
     assert restored.source_media_url == ""
+    assert not hasattr(restored, "thumbnail_url")
+    assert not hasattr(restored, "poster_render_evidence")
+
+
+def test_video_poster_evidence_survives_store_and_real_calendar_mirror(tmp_path):
+    """The real mirror reads reloaded drafts, so poster proof must be durable draft state."""
+    store = PendingStore(str(tmp_path / "poster_evidence.db"))
+    draft = _draft(draft_id="video1", day_key="2026-07-03", draft_type="feed")
+    draft.creative_path = "/clip.mp4"
+    draft.creative_public_url = "https://cdn.example/clip.mp4"
+    draft.thumbnail_url = "https://cdn.example/clip-poster.jpg"
+    draft.poster_render_evidence = {
+        "source_exact_url": draft.creative_public_url,
+        "delivered_exact_url": draft.thumbnail_url,
+        "operation": "render",
+        "evidence_ref": "poster-round-trip",
+    }
+    store.put(draft)
+
+    restored = store.get("video1")
+    assert restored is not None
+    assert restored.thumbnail_url == draft.thumbnail_url
+    assert restored.poster_render_evidence == draft.poster_render_evidence
+
+    evidence = {}
+    rows = real_mirror.collect_real_drafts(
+        "lasso_ig", store, poster_evidence_out=evidence)
+    assert len(rows) == 1
+    assert rows[0]["thumbnail_url"] == draft.thumbnail_url
+    assert "poster_render_evidence" not in rows[0]
+    assert evidence == {
+        (draft.creative_public_url, draft.thumbnail_url):
+        draft.poster_render_evidence,
+    }
 
 
 def test_log_post_mirrors_to_posts_table(tmp_path):

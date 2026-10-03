@@ -58,6 +58,46 @@ from .drafter import DraftStatus
 MONTHLY_RECREATE_BUDGET = 30
 
 
+def _poster_evidence_is_current(variant, visual_writer_prepare, cache=None):
+    """Read-only parity check for the writer's poster-edge evidence contract.
+
+    The durable writer repeats this check before its scene RPC and calendar
+    mutation. Swap callers run it first so stale or mismatched proof cannot
+    consume a local reservation or stamp a Drive asset that never reaches the
+    calendar.
+    """
+    image_url = (variant or {}).get("image_url")
+    poster_url = (variant or {}).get("thumbnail_url")
+    if not poster_url or poster_url == image_url:
+        return True
+    evidence = (variant or {}).get("poster_render_evidence")
+    if not isinstance(evidence, dict):
+        return False
+    observed = cache if cache is not None else {}
+
+    def exact(url, role):
+        if url not in observed:
+            observed[url] = visual_writer_prepare._exact_bytes(
+                url, visual_writer_prepare._bytes_for_url, role)
+        return observed[url]
+
+    try:
+        image_bytes = exact(image_url, "poster source")
+        poster_bytes = exact(poster_url, "poster")
+        expected = {
+            "source_exact_url": image_url,
+            "delivered_exact_url": poster_url,
+            "source_fingerprint": visual_writer_prepare._md5(image_bytes),
+            "delivered_fingerprint": visual_writer_prepare._md5(poster_bytes),
+            "source_byte_length": len(image_bytes),
+            "delivered_byte_length": len(poster_bytes),
+        }
+        return (all(evidence.get(key) == value for key, value in expected.items())
+                and evidence.get("operation") in ("render", "reburn", "rehost"))
+    except Exception:  # noqa: BLE001 - unreadable or changed proof must fail closed
+        return False
+
+
 # ==========================================================================
 # disabled + empty-state responses (kept identical in shape to the live ones)
 # ==========================================================================
@@ -1268,6 +1308,7 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                          "recreate_budget": _budget_state(account_key)}
         from . import visual_writer_prepare
         if visual_writer_prepare.enabled():
+            poster_byte_cache = {}
             for variant in [pick] + [variants[str(s.get("id"))] for s in siblings]:
                 if (not variant.get("source_media_url")
                         or (variant.get("source_media_url") != variant.get("image_url")
@@ -1276,6 +1317,12 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                                  "error": "verified media evidence is unavailable",
                                  "reason": "media_evidence_unavailable",
                                  "recreate_budget": _budget_state(account_key)}
+                if not _poster_evidence_is_current(
+                        variant, visual_writer_prepare, poster_byte_cache):
+                    return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                                 "error": "verified poster evidence is unavailable",
+                                 "reason": "poster_evidence_unavailable",
+                                 "recreate_budget": _budget_state(account_key)}
         # The media identity travels WITH the pixels (2026-09-10): a video's poster
         # frame (or a cleared poster when a video row becomes a photo) and the Drive
         # asset id now on the row (or None when it left the Drive pool).
@@ -1283,6 +1330,8 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                       "extra_fields": _ms.swap_fields(pick)}
         if pick.get("render_evidence") is not None:
             write_args["render_evidence"] = pick["render_evidence"]
+        if pick.get("poster_render_evidence") is not None:
+            write_args["poster_render_evidence"] = pick["poster_render_evidence"]
         # LOCAL ONCE-USED: reserve before the first calendar mutation. A failed
         # served-ledger write holds the swap, so the new pixels cannot land while
         # remaining eligible for a later pick.
@@ -1337,6 +1386,8 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                               "extra_fields": _ms.swap_fields(var)}
                 if var.get("render_evidence") is not None:
                     write_args["render_evidence"] = var["render_evidence"]
+                if var.get("poster_render_evidence") is not None:
+                    write_args["poster_render_evidence"] = var["poster_render_evidence"]
                 done = sb_store.swap_media(account_key, sid, var["image_url"],
                                            **write_args)
             except Exception as exc:  # noqa: BLE001 - one sibling never undoes the swap
@@ -1595,8 +1646,13 @@ def handle_regen_variant(account_key, draft_id, actor_id, reader=None, sb_store=
             return 409, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
                          "error": _vr.client_message(result.get("reason")),
                          "reason": result.get("reason")}
+        candidate_args = {}
+        for field in ("thumbnail_url", "source_media_url", "render_evidence",
+                      "poster_render_evidence"):
+            if result.get(field) is not None:
+                candidate_args[field] = result[field]
         candidate = sb_store.create_variant_candidate(
-            account_key, row, result["image_url"])
+            account_key, row, result["image_url"], **candidate_args)
         if candidate is None:
             return 500, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
                          "error": "the new image could not be saved as a candidate"}
@@ -1653,8 +1709,13 @@ def handle_regen_variant_from_brief(account_key, draft_id, actor_id, brief,
             return 409, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
                          "error": _vrb.client_message(result.get("reason")),
                          "reason": result.get("reason")}
+        candidate_args = {}
+        for field in ("thumbnail_url", "source_media_url", "render_evidence",
+                      "poster_render_evidence"):
+            if result.get(field) is not None:
+                candidate_args[field] = result[field]
         candidate = sb_store.create_variant_candidate(
-            account_key, row, result["image_url"])
+            account_key, row, result["image_url"], **candidate_args)
         if candidate is None:
             return 500, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
                          "error": "the new image could not be saved as a candidate"}

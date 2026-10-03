@@ -31,6 +31,12 @@ def _to_dict(d: Draft):
         # This is raw-source provenance, not a fallback for the delivered URL.
         # Keep an absent legacy value empty rather than inventing one.
         "source_media_url": d.source_media_url,
+        # A video poster and its immutable render proof must survive the store
+        # round trip before real_calendar_mirror builds the prepared-writer side
+        # channel.  The proof remains draft JSON only; it is never a calendar
+        # column.
+        "thumbnail_url": getattr(d, "thumbnail_url", ""),
+        "poster_render_evidence": getattr(d, "poster_render_evidence", {}),
         "scheduled_for": d.scheduled_for,
         "status": d.status.value,
         "blocked_reason": d.blocked_reason,
@@ -97,7 +103,7 @@ def _row_to_draft(row):
 
 
 def _from_dict(r):
-    return Draft(
+    draft = Draft(
         draft_id=r.get("draft_id", ""),
         account_key=r.get("account_key", ""),
         platform=r.get("platform", ""),
@@ -122,6 +128,18 @@ def _from_dict(r):
         force_approval=bool(r.get("force_approval", False)),
         image_engine=r.get("image_engine", ""),
     )
+    # These guarded-writer fields intentionally remain dynamic Draft attributes:
+    # flag-off and legacy drafts preserve their historical object shape, while a
+    # guarded video poster and its proof survive the persistence boundary used
+    # by real_calendar_mirror.  The proof is a writer side channel, never a
+    # content_calendar column.
+    thumbnail_url = r.get("thumbnail_url", "")
+    if isinstance(thumbnail_url, str) and thumbnail_url:
+        draft.thumbnail_url = thumbnail_url
+    poster_evidence = r.get("poster_render_evidence", {})
+    if isinstance(poster_evidence, dict) and poster_evidence:
+        draft.poster_render_evidence = poster_evidence
+    return draft
 
 
 class PendingStore:

@@ -640,12 +640,36 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
             # One poster per swap (audit D4): computed once, attached only to FEED
             # variants; a story's media is the captioned card/video itself.
             poster = ""
+            poster_render_evidence = None
             try:
                 if cand["kind"] == "video":
-                    deadline.check(f"poster frame for {cand.get('key')}")
-                    poster = poster_fn(path, work, tenant) or ""
+                    if _visual_writer_enabled():
+                        # Stories do not use a thumbnail: _finish clears it and
+                        # either reburns the story media or keeps the hosted video.
+                        # Do not reject an otherwise usable story-only swap over an
+                        # unused poster that cannot be attested.
+                        needs_feed_poster = any(
+                            str((variant or {}).get("format") or "feed").strip().lower()
+                            != "story" for variant in [row] + list(siblings or ()))
+                        if needs_feed_poster:
+                            deadline.check(f"poster frame for {cand.get('key')}")
+                            from . import gym_media_builder as _gmb
+                            poster_result = _gmb.video_poster_with_evidence(
+                                path, work, tenant, source_exact_url=hosted)
+                            if not poster_result:
+                                prep_failures += 1
+                                continue
+                            poster, poster_render_evidence = poster_result
+                            if (not poster
+                                    or not isinstance(_evidence_dict(poster_render_evidence), dict)):
+                                prep_failures += 1
+                                continue
+                    else:
+                        deadline.check(f"poster frame for {cand.get('key')}")
+                        poster = poster_fn(path, work, tenant) or ""
                 out = _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant,
-                              poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say,
+                              poster=poster, poster_render_evidence=poster_render_evidence,
+                              feed_fn=feed_fn, reburn_fn=reburn_fn, log=say,
                               deadline=deadline)
                 if not out.get("ok"):
                     return out
@@ -657,7 +681,8 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                 for sib in siblings or ():
                     sfmt = str((sib or {}).get("format") or "feed").strip().lower()
                     var = _finish(base_key, sib, sfmt, cand, path, hosted, lib, work,
-                                  tenant, poster=poster, feed_fn=feed_fn,
+                                  tenant, poster=poster,
+                                  poster_render_evidence=poster_render_evidence, feed_fn=feed_fn,
                                   reburn_fn=reburn_fn, log=say, deadline=deadline)
                     if not var.get("ok"):
                         return {"ok": False,
@@ -678,7 +703,7 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
 
 
 def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster,
-            feed_fn, reburn_fn, log, deadline=None):
+            poster_render_evidence=None, feed_fn, reburn_fn, log, deadline=None):
     """Shape the hosted replacement for the row's format: a story is re-burned with
     its caption (still card or 9:16 story video), a video feed ships the hosted video,
     a photo feed gets the autofit reframe. A failed story re-burn is a hard stop
@@ -689,6 +714,10 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
     base = {"key": cand["key"], "kind": cand["kind"], "source": cand["source"],
             "thumbnail_url": poster if (video and fmt != "story") else "", "path": path,
             "source_media_asset_id": cand["key"] if cand["source"] == "drive" else ""}
+    # A distinct video poster is another rendered scene object.  Keep its proof
+    # in the writer side channel rather than the calendar row payload.
+    if video and fmt != "story" and poster_render_evidence is not None:
+        base["poster_render_evidence"] = _evidence_dict(poster_render_evidence)
     raw_source = hosted
     if fmt == "story":
         # A story publishes empty-body, so its caption lives ON the media. Swapping

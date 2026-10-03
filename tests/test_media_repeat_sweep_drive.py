@@ -22,6 +22,7 @@ These tests pin, fully offline:
 
 import os
 import sys
+import hashlib
 
 import pytest
 
@@ -71,6 +72,7 @@ class _Store:
     def __init__(self, rows):
         self.rows = [dict(r) for r in rows]
         self.swaps = []
+        self.swap_kwargs = []
 
     def rows_in_range(self, base, start, end):
         return [dict(r) for r in self.rows
@@ -82,7 +84,7 @@ class _Store:
                      and str(r.get("gym_id")) == str(base)), None)
 
     def swap_media(self, base, row_id, image_url, source_media_url=None,
-                   extra_fields=None):
+                   extra_fields=None, **kwargs):
         for r in self.rows:
             if str(r["id"]) != str(row_id):
                 continue
@@ -95,6 +97,7 @@ class _Store:
             for k, v in (extra_fields or {}).items():
                 r[k] = v
             self.swaps.append((row_id, image_url))
+            self.swap_kwargs.append((row_id, kwargs))
             return dict(r)
         return None
 
@@ -168,6 +171,106 @@ def test_repeat_is_repointed_to_a_drive_clip_when_armed(monkeypatch):
     assert all(r.get("source_media_asset_id") == "v001" for r in store.rows
                if r["id"].startswith("r14"))
     assert any("connected Drive pool" in d for d in res["detail"])
+
+
+def test_prepared_drive_video_repeat_forwards_poster_proof(monkeypatch):
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    store = _Store(_book())
+    image_url = "https://cdn.tt/clip1.mp4"
+    poster_url = "https://cdn.tt/clip1__poster.jpg"
+    source_bytes, poster_bytes = b"selected video", b"poster frame"
+    poster = {
+        "source_exact_url": image_url,
+        "delivered_exact_url": poster_url,
+        "source_fingerprint": "md5:" + hashlib.md5(source_bytes).hexdigest(),
+        "delivered_fingerprint": "md5:" + hashlib.md5(poster_bytes).hexdigest(),
+        "source_byte_length": len(source_bytes),
+        "delivered_byte_length": len(poster_bytes),
+        "operation": "render",
+    }
+    monkeypatch.setattr(
+        "agent.visual_writer_prepare._bytes_for_url",
+        {image_url: source_bytes, poster_url: poster_bytes}.get)
+
+    def picker(*args, **kwargs):
+        got = _picker()(*args, **kwargs)
+        got["poster_render_evidence"] = poster
+        for variant in got["siblings"].values():
+            variant["poster_render_evidence"] = poster
+        return got
+
+    res = _sweep(store, picker=picker, drive_n=57, monkeypatch=monkeypatch)
+
+    assert res["rows_repointed"] == 3
+    assert all(kwargs["poster_render_evidence"] == poster
+               for _row_id, kwargs in store.swap_kwargs)
+
+
+@pytest.mark.parametrize("mismatch", [
+    "source_url", "delivered_url", "source_hash", "delivered_hash",
+    "source_bytes", "delivered_bytes",
+])
+def test_prepared_repeat_rejects_mismatched_poster_before_reservation(
+        monkeypatch, mismatch):
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    store = _Store(_book())
+    image_url = "https://cdn.tt/clip1.mp4"
+    poster_url = "https://cdn.tt/clip1__poster.jpg"
+    source_bytes, poster_bytes = b"selected video", b"poster frame"
+    objects = {image_url: source_bytes, poster_url: poster_bytes}
+    poster = {
+        "source_exact_url": image_url,
+        "delivered_exact_url": poster_url,
+        "source_fingerprint": "md5:" + hashlib.md5(source_bytes).hexdigest(),
+        "delivered_fingerprint": "md5:" + hashlib.md5(poster_bytes).hexdigest(),
+        "source_byte_length": len(source_bytes),
+        "delivered_byte_length": len(poster_bytes),
+        "operation": "render",
+    }
+    if mismatch == "source_url":
+        poster["source_exact_url"] = "https://cdn.tt/other.mp4"
+    elif mismatch == "delivered_url":
+        poster["delivered_exact_url"] = "https://cdn.tt/other-poster.jpg"
+    elif mismatch == "source_hash":
+        poster["source_fingerprint"] = "md5:" + "0" * 32
+    elif mismatch == "delivered_hash":
+        poster["delivered_fingerprint"] = "md5:" + "0" * 32
+    elif mismatch == "source_bytes":
+        objects[image_url] = b"changed selected video"
+    elif mismatch == "delivered_bytes":
+        objects[poster_url] = b"changed poster frame"
+    monkeypatch.setattr("agent.visual_writer_prepare._bytes_for_url", objects.get)
+
+    def picker(*args, **kwargs):
+        got = _picker()(*args, **kwargs)
+        got["poster_render_evidence"] = poster
+        for variant in got["siblings"].values():
+            variant["poster_render_evidence"] = poster
+        return got
+
+    reserve_calls = []
+    monkeypatch.setattr(
+        "agent.media_swap.reserve_local_pick",
+        lambda *a, **k: reserve_calls.append((a, k)) or True)
+
+    res = _sweep(store, picker=picker, drive_n=57, monkeypatch=monkeypatch)
+
+    assert res["rows_repointed"] == 0
+    assert store.swaps == []
+    assert reserve_calls == []
+
+
+def test_prepared_drive_video_repeat_holds_without_poster_proof(monkeypatch):
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    store = _Store(_book())
+
+    res = _sweep(store, picker=_picker(), drive_n=57, monkeypatch=monkeypatch)
+
+    assert res["rows_repointed"] == 0
+    assert store.swaps == []
 
 
 def test_the_owner_date_and_the_approved_row_are_never_touched(monkeypatch):

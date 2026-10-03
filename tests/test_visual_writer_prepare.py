@@ -45,7 +45,9 @@ class HTTP:
             return Response(self.bundle if self.bundle is not None else
                             {"group_key": "vg_same", "fingerprint": json["p_fingerprint"]})
         if url.endswith("visual_global_prepare_source_rendition"):
-            return Response(self.rendition if self.rendition is not None else
+            rendition = (self.rendition.pop(0) if isinstance(self.rendition, list)
+                         else self.rendition)
+            return Response(rendition if rendition is not None else
                             {"group_key": json["p_group_key"],
                              "source_fingerprint": self.fingerprint,
                              "delivered_fingerprint": self.fingerprint,
@@ -142,6 +144,140 @@ def test_guarded_same_object_entrypoint_rejects_distinct_thumbnail(monkeypatch):
             "thumbnail_url": "https://media.example/video-poster.jpg",
         })
     assert http.calls == []
+
+
+def test_guarded_video_poster_prepares_two_attested_render_edges(monkeypatch):
+    """A source -> video -> poster row registers both exact render edges."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_DSN", "test-only")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_ROLE", "receipt_owner")
+    raw_url = "https://media.example/raw-video.mp4"
+    video_url = "https://media.example/selected-video.mp4"
+    poster_url = "https://media.example/selected-video-poster.jpg"
+    objects = {
+        raw_url: b"raw video object",
+        video_url: b"selected video rendition",
+        poster_url: b"poster frame rendition",
+    }
+    fingerprints = {url: "md5:" + hashlib.md5(data).hexdigest()
+                    for url, data in objects.items()}
+
+    def evidence(source_url, delivered_url, operation):
+        return {
+            "source_exact_url": source_url,
+            "delivered_exact_url": delivered_url,
+            "source_fingerprint": fingerprints[source_url],
+            "delivered_fingerprint": fingerprints[delivered_url],
+            "source_byte_length": len(objects[source_url]),
+            "delivered_byte_length": len(objects[delivered_url]),
+            "operation": operation,
+            "evidence_ref": "test:" + operation,
+            "observed_by": "test_reader",
+            "rendered_by": "test_renderer",
+        }
+
+    receipt_calls = []
+
+    def receipt_writer(**kwargs):
+        receipt_calls.append(kwargs)
+        return {"source_read_receipt": str(uuid.uuid4()),
+                "delivered_read_receipt": str(uuid.uuid4()),
+                "render_receipt": str(uuid.uuid4())}
+
+    http = HTTP(
+        known={("canonical_url", raw_url): "vg_video"},
+        rendition=[
+            {"group_key": "vg_video",
+             "source_fingerprint": fingerprints[raw_url],
+             "delivered_fingerprint": fingerprints[video_url],
+             "usage_claimed": False},
+            {"group_key": "vg_video",
+             "source_fingerprint": fingerprints[video_url],
+             "delivered_fingerprint": fingerprints[poster_url],
+             "usage_claimed": False},
+        ],
+    )
+    prepared = prep.prepare(
+        store(http), "old-key",
+        {"image_url": video_url, "source_media_url": raw_url,
+         "thumbnail_url": poster_url},
+        read_bytes=objects.__getitem__,
+        render_evidence=evidence(raw_url, video_url, "render"),
+        poster_render_evidence=evidence(video_url, poster_url, "render"),
+        receipt_writer=receipt_writer,
+        isolated_test_callbacks=True,
+    )
+
+    assert prepared["visual_group_key"] == "vg_video"
+    assert prepared["byte_hash"] == "derived:" + fingerprints[video_url]
+    assert prepared["thumbnail_url"] == poster_url
+    assert [(call["render_evidence"]["source_exact_url"],
+             call["render_evidence"]["delivered_exact_url"])
+            for call in receipt_calls] == [
+                (raw_url, video_url), (video_url, poster_url)]
+    posts = [call for call in http.calls
+             if call[0] == "post" and call[1] == "visual_global_prepare_source_rendition"]
+    assert len(posts) == 2
+    assert posts[0][2]["p_group_key"] == posts[1][2]["p_group_key"] == "vg_video"
+
+
+def test_guarded_video_poster_rejects_mismatched_poster_evidence(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_DSN", "test-only")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_ROLE", "receipt_owner")
+    raw_url = "https://media.example/raw-mismatch.mp4"
+    video_url = "https://media.example/video-mismatch.mp4"
+    poster_url = "https://media.example/poster-mismatch.jpg"
+    objects = {raw_url: b"raw", video_url: b"video", poster_url: b"poster"}
+    fingerprints = {url: "md5:" + hashlib.md5(data).hexdigest()
+                    for url, data in objects.items()}
+    main_evidence = {
+        "source_exact_url": raw_url, "delivered_exact_url": video_url,
+        "source_fingerprint": fingerprints[raw_url],
+        "delivered_fingerprint": fingerprints[video_url],
+        "source_byte_length": len(objects[raw_url]),
+        "delivered_byte_length": len(objects[video_url]),
+        "operation": "render", "evidence_ref": "test:video",
+        "observed_by": "test_reader", "rendered_by": "test_renderer",
+    }
+    mismatched_poster_evidence = {
+        "source_exact_url": raw_url,  # must be the selected video URL
+        "delivered_exact_url": poster_url,
+        "source_fingerprint": fingerprints[raw_url],
+        "delivered_fingerprint": fingerprints[poster_url],
+        "source_byte_length": len(objects[raw_url]),
+        "delivered_byte_length": len(objects[poster_url]),
+        "operation": "render", "evidence_ref": "test:wrong-poster-source",
+        "observed_by": "test_reader", "rendered_by": "test_renderer",
+    }
+    receipt_calls = []
+
+    def receipt_writer(**kwargs):
+        receipt_calls.append(kwargs)
+        return {"source_read_receipt": str(uuid.uuid4()),
+                "delivered_read_receipt": str(uuid.uuid4()),
+                "render_receipt": str(uuid.uuid4())}
+
+    http = HTTP(
+        known={("canonical_url", raw_url): "vg_video"},
+        rendition={"group_key": "vg_video",
+                   "source_fingerprint": fingerprints[raw_url],
+                   "delivered_fingerprint": fingerprints[video_url],
+                   "usage_claimed": False},
+    )
+    with pytest.raises(prep.VisualPreparationError, match="poster scene lineage"):
+        prep.prepare(
+            store(http), "old-key",
+            {"image_url": video_url, "source_media_url": raw_url,
+             "thumbnail_url": poster_url},
+            read_bytes=objects.__getitem__, render_evidence=main_evidence,
+            poster_render_evidence=mismatched_poster_evidence,
+            receipt_writer=receipt_writer, isolated_test_callbacks=True,
+        )
+    assert len(receipt_calls) == 1
+    assert len([call for call in http.calls
+                if call[0] == "post" and
+                call[1] == "visual_global_prepare_source_rendition"]) == 1
 
 
 def test_raw_row_prepares_through_owner_receipt_source_rendition_rpc(monkeypatch):
@@ -392,7 +528,7 @@ class _CASHTTP:
 
 
 def _prepared_payload(_account_key, _row_id, payload, *, current=None,
-                      render_evidence=None):
+                      render_evidence=None, poster_render_evidence=None):
     return {**payload, "visual_group_key": "vg_prepared",
             "byte_hash": "derived:md5:" + "b" * 32}
 

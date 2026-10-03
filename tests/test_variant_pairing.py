@@ -292,6 +292,32 @@ def test_regen_variant_creates_candidate_without_touching_original(monkeypatch):
     assert store._rows["orig-1"]["status"] == "approved"
 
 
+def test_regen_variant_forwards_poster_evidence_to_candidate_writer(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    original = _row("orig-1", status="approved", image_url="https://cdn/v1.jpg")
+    store = _FakeVariantStore(rows=[original])
+    seen = {}
+
+    def create_candidate(account_key, anchor_row, image_url, **kwargs):
+        seen.update(account_key=account_key, image_url=image_url, kwargs=kwargs)
+        return {"id": "cand-new", "image_url": image_url,
+                "caption": anchor_row["caption"], "variant_status": "candidate"}
+
+    store.create_variant_candidate = create_candidate
+    poster = {"source_exact_url": "https://cdn/clip.mp4",
+              "delivered_exact_url": "https://cdn/poster.jpg", "operation": "render"}
+    status, _ = ps.handle_regen_variant(
+        "eng", "orig-1", "blake", sb_store=store,
+        regen_fn=lambda *_: {"ok": True, "image_url": "https://cdn/clip.mp4",
+                             "thumbnail_url": "https://cdn/poster.jpg",
+                             "source_media_url": "https://cdn/clip.mp4",
+                             "poster_render_evidence": poster})
+
+    assert status == 200
+    assert seen["kwargs"]["poster_render_evidence"] == poster
+    assert seen["kwargs"]["source_media_url"] == "https://cdn/clip.mp4"
+
+
 def test_regen_variant_refuses_on_a_published_row(monkeypatch):
     monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
     store = _FakeVariantStore(rows=[_row("orig-1", status="published")])

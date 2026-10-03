@@ -239,6 +239,13 @@ def test_visual_guard_keeps_raw_video_when_reel_has_no_render_receipt(monkeypatc
     from agent.drafter import Draft, DraftStatus
     monkeypatch.setattr(action_reel, "get_or_make_reel",
                         lambda *args, **kwargs: pytest.fail("guarded build must not render"))
+    # The guarded writer-prep lane REQUIRES a byte-evidenced poster for a video draft
+    # (the legacy best-effort preview is not attestable). Stub the receipt so the raw
+    # video itself still ships unchanged.
+    from agent import gym_media_builder
+    monkeypatch.setattr(gym_media_builder, "video_poster_with_evidence",
+                        lambda *args, **kwargs: ("https://cdn/poster.jpg",
+                                                 _poster_evidence()))
     clip = tmp_path / "lift.mp4"
     clip.write_bytes(b"clip")
     feed = Draft("video-source", "gritx_ig", "instagram", "caption", [], str(clip),
@@ -248,6 +255,8 @@ def test_visual_guard_keeps_raw_video_when_reel_has_no_render_receipt(monkeypatc
     assert len(drafts) == 2
     assert all(d.creative_public_url == "https://cdn/raw-lift.mp4" for d in drafts)
     assert all(d.source_media_url == "https://cdn/raw-lift.mp4" for d in drafts)
+    assert feed.thumbnail_url == "https://cdn/poster.jpg"
+    assert getattr(feed, "poster_render_evidence", None) == _poster_evidence()
 
 
 @pytest.mark.parametrize(
@@ -265,6 +274,13 @@ def test_visual_guard_keeps_same_object_story_when_story_format_has_no_render_re
                         lambda *args, **kwargs: pytest.fail("guarded build must not render"))
     monkeypatch.setattr(story_image, "get_or_make_story_video",
                         lambda *args, **kwargs: pytest.fail("guarded build must not render"))
+    if filename.endswith(".mp4"):
+        # Guard on: a video draft needs an evidenced poster to stage (the raw video
+        # itself still ships unchanged). Photos need none.
+        from agent import gym_media_builder
+        monkeypatch.setattr(gym_media_builder, "video_poster_with_evidence",
+                            lambda *args, **kwargs: ("https://cdn/poster.jpg",
+                                                     _poster_evidence()))
     media = tmp_path / filename
     media.write_bytes(b"media")
     feed = Draft("story-source", "gritx_ig", "instagram", "caption", [], str(media),
@@ -1701,3 +1717,146 @@ def test_rebuild_does_not_release_or_restamp_placed_drive_asset(monkeypatch):
     assert released == []
     assert client_month_run._restore_released_drive_assets(
         "pierce", [("2026-10-07", "asset-1")], lambda _message: None) is None
+
+
+# ---- writer-prep poster evidence propagation (guarded video poster) ---------------
+def _video_draft(tmp_path, url="https://cdn/raw-lift.mp4"):
+    from agent.drafter import Draft, DraftStatus
+    clip = tmp_path / "lift.mp4"
+    clip.write_bytes(b"clip")
+    return Draft("video-source", "gritx_ig", "instagram", "caption", [], str(clip),
+                 url, "2026-08-01T12:00:00Z", DraftStatus.PENDING)
+
+
+def _poster_evidence():
+    return {"source_exact_url": "https://cdn/raw-lift.mp4",
+            "delivered_exact_url": "https://cdn/poster.jpg",
+            "source_fingerprint": "md5:a", "delivered_fingerprint": "md5:b",
+            "operation": "render", "evidence_ref": "gym_media_builder:poster_render:x",
+            "observed_by": "gym_media_builder",
+            "rendered_by": "gym_media_builder.video_poster_with_evidence"}
+
+
+def test_guarded_video_poster_success_sets_evidence_and_feeds_side_channel(
+        monkeypatch, tmp_path):
+    """Guard on: the poster is an evidenced render of the exact hosted video bytes;
+    the proof rides the draft and maps to the strict (image, thumbnail) insert key."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    from agent import gym_media_builder
+    seen = []
+
+    def fake_evidence(_path, _work_dir, _tenant, source_url):
+        seen.append(source_url)
+        return "https://cdn/poster.jpg", _poster_evidence()
+
+    monkeypatch.setattr(gym_media_builder, "video_poster_with_evidence", fake_evidence)
+    feed = _video_draft(tmp_path)
+    drafts = cmr._finish_feed_with_story(_account(), feed, str(tmp_path),
+                                         lambda _msg: None, day_key="2026-08-01")
+    assert seen == ["https://cdn/raw-lift.mp4"]   # exact hosted url, never local bytes
+    assert len(drafts) == 2                       # feed + paired story both ship
+    assert feed.thumbnail_url == "https://cdn/poster.jpg"
+    assert getattr(feed, "poster_render_evidence", None) == _poster_evidence()
+    # the clone/story pairing preserves the proof
+    assert getattr(drafts[1], "poster_render_evidence", None) == _poster_evidence()
+    side_channel = cmr._poster_render_evidence_by_url(drafts)
+    assert side_channel == {("https://cdn/raw-lift.mp4", "https://cdn/poster.jpg"):
+                            _poster_evidence()}
+    # rows never carry evidence as a content_calendar payload field
+    rows = cmr._to_rows("gritx", drafts)
+    assert all("poster_render_evidence" not in r for r in rows)
+    video_rows = [r for r in rows if r.get("thumbnail_url")]
+    assert video_rows and all(
+        side_channel[(r["image_url"], r["thumbnail_url"])] == _poster_evidence()
+        for r in video_rows)
+
+
+def test_guarded_video_poster_failure_holds_the_slot(monkeypatch, tmp_path):
+    """Guard on, evidenced render unavailable: the day is HELD and no distinct
+    unproven thumbnail is staged (never cleared/relabeled)."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    from agent import gym_media_builder
+    monkeypatch.setattr(gym_media_builder, "video_poster_with_evidence",
+                        lambda *args, **kwargs: None)
+    feed = _video_draft(tmp_path)
+    logs = []
+    assert cmr._finish_feed_with_story(_account(), feed, str(tmp_path), logs.append,
+                                       day_key="2026-08-01") == []
+    assert not getattr(feed, "thumbnail_url", "")
+    assert not getattr(feed, "poster_render_evidence", None)
+    assert any("held" in m and "poster" in m for m in logs)
+
+
+def test_flag_off_video_poster_uses_legacy_best_effort_lane(monkeypatch, tmp_path):
+    """Flag off: the legacy get_or_make_poster path runs unchanged, never calls the
+    evidenced builder, never touches evidence, and a poster failure never blocks."""
+    from agent import action_reel, gym_media_builder
+    calls = []
+
+    def legacy_poster(path, library_path, logger=None):
+        calls.append(path)
+        return str(tmp_path / "poster.jpg")
+
+    monkeypatch.setattr(action_reel, "get_or_make_poster", legacy_poster)
+    monkeypatch.setattr(
+        gym_media_builder, "video_poster_with_evidence",
+        lambda *args, **kwargs: pytest.fail("evidenced builder must stay off flag-off"))
+    feed = _video_draft(tmp_path)
+    drafts = cmr._finish_feed_with_story(_account(), feed, str(tmp_path),
+                                         lambda _msg: None, day_key="2026-08-01")
+    assert calls == [feed.creative_path]          # legacy lane ran on the local file
+    assert len(drafts) == 2                       # best effort: a post is never held
+    assert not getattr(feed, "poster_render_evidence", None)
+    assert cmr._poster_render_evidence_by_url(drafts) == {}
+
+
+def test_insert_rows_forwards_poster_evidence_only_under_guard(monkeypatch):
+    """The composite-key side channel reaches stores that accept the kwarg, only
+    while the guard is armed; flag off and empty maps keep the plain call."""
+    calls = []
+
+    def store_fn(base_key, rows, *, poster_render_evidence_by_url=None):
+        calls.append(poster_render_evidence_by_url)
+        return rows
+
+    evidence = {("https://cdn/v.mp4", "https://cdn/p.jpg"): _poster_evidence()}
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    cmr._insert_rows_with_poster_evidence(store_fn, "gritx", [{"a": 1}], evidence)
+    assert calls[-1] == evidence
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "false")
+    cmr._insert_rows_with_poster_evidence(store_fn, "gritx", [{"a": 1}], evidence)
+    assert calls[-1] is None
+    cmr._insert_rows_with_poster_evidence(store_fn, "gritx", [{"a": 1}], {})
+    assert calls[-1] is None
+
+
+def test_insert_rows_poster_evidence_uses_plain_legacy_call_when_guard_is_off(monkeypatch):
+    """Flag-off keeps the legacy insert contract for stores without the kwarg."""
+    plain_calls = []
+
+    def legacy_store(base_key, rows):
+        plain_calls.append((base_key, rows))
+        return rows
+
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "false")
+    evidence = {("https://cdn/v.mp4", "https://cdn/p.jpg"): _poster_evidence()}
+    out = cmr._insert_rows_with_poster_evidence(legacy_store, "gritx", [{"a": 1}],
+                                                evidence)
+    assert out == [{"a": 1}]
+    assert plain_calls == [("gritx", [{"a": 1}])]
+
+
+def test_prepared_insert_does_not_retry_typeerror_without_poster_proof(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    calls = []
+
+    def ambiguous_store(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise TypeError("internal error after write")
+
+    evidence = {("https://cdn/v.mp4", "https://cdn/p.jpg"): _poster_evidence()}
+    with pytest.raises(TypeError, match="internal error after write"):
+        cmr._insert_rows_with_poster_evidence(ambiguous_store, "gritx", [{"a": 1}],
+                                              evidence)
+    assert len(calls) == 1
+    assert calls[0][1]["poster_render_evidence_by_url"] == evidence

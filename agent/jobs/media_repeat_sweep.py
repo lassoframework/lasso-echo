@@ -219,15 +219,17 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
         return False
     from agent import visual_writer_prepare
     if visual_writer_prepare.enabled():
-        if not (pick.get("source_media_url")
-                and (pick.get("source_media_url") == pick.get("image_url")
-                     or isinstance(pick.get("render_evidence"), dict))):
+        from agent.portal_social import _poster_evidence_is_current
+        prepared_variants = [pick] + [variants[str(s.get("id"))] for s in siblings]
+        if any(not (variant.get("source_media_url")
+                    and (variant.get("source_media_url") == variant.get("image_url")
+                         or isinstance(variant.get("render_evidence"), dict)))
+               for variant in prepared_variants):
             return False
-        if any(not (variants[str(s.get("id"))].get("source_media_url")
-                    and (variants[str(s.get("id"))].get("source_media_url")
-                         == variants[str(s.get("id"))].get("image_url")
-                         or isinstance(variants[str(s.get("id"))].get("render_evidence"), dict)))
-               for s in siblings):
+        poster_byte_cache = {}
+        if any(not _poster_evidence_is_current(
+                variant, visual_writer_prepare, poster_byte_cache)
+               for variant in prepared_variants):
             return False
 
     # A local replacement must enter the durable served ledger before the first
@@ -246,6 +248,8 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
                           "extra_fields": media_swap.swap_fields(var)}
             if var.get("render_evidence") is not None:
                 write_args["render_evidence"] = var["render_evidence"]
+            if var.get("poster_render_evidence") is not None:
+                write_args["poster_render_evidence"] = var["poster_render_evidence"]
             done = store.swap_media(base, rid, var["image_url"], **write_args)
         except Exception as exc:  # noqa: BLE001 - one row never undoes the others
             _log(f"{base}: swap_media failed for {rid} ({type(exc).__name__})")
