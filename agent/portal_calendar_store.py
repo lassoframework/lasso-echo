@@ -820,7 +820,8 @@ class SupabaseCalendarStore:
                 raise PortalStoreError(502, "maintenance calendar exceeds safe read bound")
 
     def restage_held_media(self, account_key, current, *, image_url=None,
-                           source_media_url=None, extra_fields=None, release=False):
+                           source_media_url=None, extra_fields=None, release=False,
+                           render_evidence=None):
         """Compare-and-swap one Swift held row; stage pixels while retaining its hold.
 
         Release is a separate CAS after the operator independently reads every staged
@@ -850,6 +851,17 @@ class SupabaseCalendarStore:
             for col in _SWAP_EXTRA_COLUMNS:
                 if col in (extra_fields or {}):
                     payload[col] = extra_fields[col]
+        from . import visual_writer_prepare
+        visual_guard = visual_writer_prepare.enabled()
+        prepared_write = not release and visual_guard
+        if prepared_write:
+            payload = self._prepare_visual_replacement(
+                account_key, current, payload, render_evidence)
+            params = self._visual_media_cas(current, params)
+        elif release and visual_guard:
+            if not current.get("visual_group_key") or not current.get("byte_hash"):
+                return None
+            params = self._visual_media_cas(current, params)
         response = self._client().patch(
             self._rest(_TABLE), params=params,
             headers=self._headers({"Content-Type": "application/json",
@@ -858,6 +870,8 @@ class SupabaseCalendarStore:
         if response.status_code >= 400:
             raise PortalStoreError(response.status_code, _scrub((response.text or "")[:200]))
         rows = response.json() or []
+        if prepared_write or (release and visual_guard):
+            return self._visual_media_result(rows, account_key, current, payload)
         if len(rows) != 1:
             return None
         row = rows[0]
@@ -960,7 +974,7 @@ class SupabaseCalendarStore:
 
     def replace_future_infographic_media(self, account_key, current, *, image_url,
                                          source_media_url, source_media_asset_id,
-                                         reason, thumbnail_url=None):
+                                         reason, thumbnail_url=None, render_evidence=None):
         """Replace one receipt-owned placeholder and clear its hold in one exact CAS.
 
         Unlike a generic portal swap, this preserves approved rows as approved.
@@ -1001,6 +1015,12 @@ class SupabaseCalendarStore:
         payload = {"image_url": image_url, "source_media_url": source_media_url,
                    "source_media_asset_id": source_media_asset_id,
                    "thumbnail_url": thumbnail_url, "media_not_ready_reason": None}
+        from . import visual_writer_prepare
+        prepared_write = visual_writer_prepare.enabled()
+        if prepared_write:
+            payload = self._prepare_visual_replacement(
+                account_key, current, payload, render_evidence)
+            params = self._visual_media_cas(current, params)
         response = self._client().patch(
             self._rest(_TABLE), params=params,
             headers=self._headers({"Content-Type": "application/json",
@@ -1009,6 +1029,8 @@ class SupabaseCalendarStore:
         if response.status_code >= 400:
             raise PortalStoreError(response.status_code, "future infographic replacement CAS failed")
         data = response.json()
+        if prepared_write:
+            return self._visual_media_result(data, account_key, current, payload)
         if not isinstance(data, list) or len(data) != 1:
             return None
         after = data[0]

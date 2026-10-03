@@ -28,6 +28,8 @@ class Calendar:
         self.fail_at = fail_at
         self.stages = 0
         self.releases = 0
+        self.evidence = {}
+        self.release_race = None
 
     def list_month(self, _gym, month):
         return [dict(r) for r in self.rows.values() if r['post_date'].startswith(month)]
@@ -36,9 +38,12 @@ class Calendar:
         return dict(self.rows[rid])
 
     def restage_held_media(self, _gym, current, *, image_url=None, source_media_url=None,
-                           extra_fields=None, release=False):
+                           extra_fields=None, release=False, render_evidence=None):
         rid = current['id']
         live = self.rows[rid]
+        if release and self.release_race is not None:
+            self.release_race(rid, live)
+            self.release_race = None
         if live != current:
             return None
         if release:
@@ -50,6 +55,7 @@ class Calendar:
                 return None
             live.update(image_url=image_url, source_media_url=source_media_url,
                         **extra_fields)
+            self.evidence[rid] = render_evidence
         return dict(live)
 
 
@@ -141,3 +147,117 @@ def test_success_uses_distinct_daily_photos_and_reserves_before_release(monkeypa
     assert out['ok'] and len(out['released_ids']) == 36
     assert len(stamps) == 9 and len({asset for asset, _, _ in stamps}) == 9
     assert all(r['media_not_ready_reason'] is None for r in ctx['calendar'].rows.values())
+
+
+def test_transformed_feed_and_story_pass_each_variant_render_evidence(monkeypatch):
+    from agent import gym_media_selector, media_swap
+    ctx = _ctx(_rows())
+    digest = _run(monkeypatch, ctx)['expected_digest']
+
+    def pick(base, row, **kwargs):
+        asset_id = kwargs['candidates_fn'](base, row)[0]['key']
+        def variant(target):
+            return {'ok': True, 'image_url': f'https://cdn/{target["id"]}.jpg',
+                    'source_media_url': f'https://cdn/raw-{asset_id}.jpg',
+                    'source_media_asset_id': asset_id, 'thumbnail_url': None,
+                    'source': 'drive', 'render_evidence': {'variant': target['format'],
+                                                            'row_id': target['id']}}
+        result = variant(row)
+        result['siblings'] = {str(s['id']): variant(s) for s in kwargs['siblings']}
+        return result
+
+    monkeypatch.setattr(media_swap, 'pick_replacement', pick)
+    monkeypatch.setattr(gym_media_selector, 'stamp_use', lambda *a, **kw: None)
+    out = _run(monkeypatch, ctx, apply=True, expected_digest=digest)
+    assert out['ok'], out
+    for day in script._TARGET_DAYS:
+        feed = f'{day}-instagram-feed'
+        story = f'{day}-instagram-story'
+        assert ctx['calendar'].evidence[feed] == {'variant': 'feed', 'row_id': feed}
+        assert ctx['calendar'].evidence[story] == {'variant': 'story', 'row_id': story}
+
+
+def test_lineage_drift_blocks_release_when_url_and_asset_are_unchanged(monkeypatch):
+    from agent import gym_media_selector, media_swap
+    monkeypatch.setenv('AGENT_VISUAL_GLOBAL_WRITER_PREP', '1')
+    rows = _rows()
+    for row in rows:
+        row.update(visual_group_key='group-verified', byte_hash='hash-verified')
+    ctx = _ctx(rows)
+    digest = _run(monkeypatch, ctx)['expected_digest']
+
+    def pick(base, row, **kwargs):
+        asset_id = kwargs['candidates_fn'](base, row)[0]['key']
+        result = {'ok': True, 'image_url': f'https://cdn/{asset_id}.jpg',
+                  'source_media_url': None, 'source_media_asset_id': asset_id,
+                  'thumbnail_url': None, 'source': 'drive'}
+        result['siblings'] = {str(s['id']): dict(result) for s in kwargs['siblings']}
+        return result
+
+    def stamp(asset, base, day, **kwargs):
+        rid = f'{script._TARGET_DAYS[0]}-instagram-feed'
+        ctx['calendar'].rows[rid]['byte_hash'] = 'drifted'
+
+    monkeypatch.setattr(media_swap, 'pick_replacement', pick)
+    monkeypatch.setattr(gym_media_selector, 'stamp_use', stamp)
+    out = _run(monkeypatch, ctx, apply=True, expected_digest=digest)
+    assert not out['ok']
+    assert out['reason'] == 'pre-release lineage readback mismatch; holds retained'
+    assert ctx['calendar'].releases == 0
+    row = ctx['calendar'].rows[f'{script._TARGET_DAYS[0]}-instagram-feed']
+    assert row['image_url'].endswith('.jpg') and row['source_media_asset_id'] == '0'
+    assert row['media_not_ready_reason'] == 'held'
+
+
+def test_flag_off_skips_pre_release_lineage_gate(monkeypatch):
+    from agent import gym_media_selector, media_swap
+    monkeypatch.delenv('AGENT_VISUAL_GLOBAL_WRITER_PREP', raising=False)
+    rows = _rows()
+    for row in rows:
+        row.update(visual_group_key='group-verified', byte_hash='hash-verified')
+    ctx = _ctx(rows)
+    digest = _run(monkeypatch, ctx)['expected_digest']
+
+    def pick(base, row, **kwargs):
+        asset_id = kwargs['candidates_fn'](base, row)[0]['key']
+        result = {'ok': True, 'image_url': f'https://cdn/{asset_id}.jpg',
+                  'source_media_url': None, 'source_media_asset_id': asset_id,
+                  'thumbnail_url': None, 'source': 'drive'}
+        result['siblings'] = {str(s['id']): dict(result) for s in kwargs['siblings']}
+        return result
+
+    def stamp(asset, base, day, **kwargs):
+        ctx['calendar'].rows[f'{script._TARGET_DAYS[0]}-instagram-feed']['byte_hash'] = 'drifted'
+
+    monkeypatch.setattr(media_swap, 'pick_replacement', pick)
+    monkeypatch.setattr(gym_media_selector, 'stamp_use', stamp)
+    out = _run(monkeypatch, ctx, apply=True, expected_digest=digest)
+    assert out['reason'] == 'partial release requires reconciliation'
+    assert ctx['calendar'].releases == len(out['released_ids']) > 0
+
+
+def test_lineage_race_after_script_check_keeps_first_hold(monkeypatch):
+    from agent import gym_media_selector, media_swap
+    monkeypatch.setenv('AGENT_VISUAL_GLOBAL_WRITER_PREP', '1')
+    rows = _rows()
+    for row in rows:
+        row.update(visual_group_key='group-verified', byte_hash='hash-verified')
+    ctx = _ctx(rows)
+    digest = _run(monkeypatch, ctx)['expected_digest']
+
+    def pick(base, row, **kwargs):
+        asset_id = kwargs['candidates_fn'](base, row)[0]['key']
+        result = {'ok': True, 'image_url': f'https://cdn/{asset_id}.jpg',
+                  'source_media_url': None, 'source_media_asset_id': asset_id,
+                  'thumbnail_url': None, 'source': 'drive'}
+        result['siblings'] = {str(s['id']): dict(result) for s in kwargs['siblings']}
+        return result
+
+    monkeypatch.setattr(media_swap, 'pick_replacement', pick)
+    monkeypatch.setattr(gym_media_selector, 'stamp_use', lambda *a, **kw: None)
+    ctx['calendar'].release_race = lambda rid, live: live.update(byte_hash='raced')
+    out = _run(monkeypatch, ctx, apply=True, expected_digest=digest)
+    assert out['reason'] == 'partial release requires reconciliation'
+    assert out['released_ids'] == []
+    assert ctx['calendar'].releases == 0
+    assert all(row['media_not_ready_reason'] == 'held' for row in ctx['calendar'].rows.values())

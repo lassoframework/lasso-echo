@@ -49,11 +49,12 @@ class Response:
 
 
 class HTTP:
-    def __init__(self, current=None, race=None, bad_result=None, asset=None):
+    def __init__(self, current=None, race=None, bad_result=None, asset=None, patch_race=None):
         self.current = current or calendar_row()
         self.race = race
         self.bad_result = bad_result
         self.asset = asset
+        self.patch_race = patch_race
         self.calls = []
 
     def get(self, url, *, params, headers, timeout):
@@ -88,6 +89,8 @@ class HTTP:
 
     def patch(self, url, *, params, json, headers, timeout):
         self.calls.append(("patch", url.rsplit("/", 1)[-1], dict(params), dict(json)))
+        if self.patch_race:
+            self.current.update(self.patch_race)
         for key in pcs._VISUAL_MEDIA_CAS_COLUMNS:
             if key not in params or not (params[key] == "is.null" or params[key].startswith('eq."')):
                 continue
@@ -237,6 +240,136 @@ def test_pending_row_with_publication_or_claim_evidence_cannot_be_swapped(armed,
     http = HTTP(current=calendar_row(image_url="", **{release_field: "existing"}))
     assert write(boundary, http, evidence()) is None
     assert not any(call[0] in ("post", "patch") for call in http.calls)
+
+
+def held_restage_row(**changes):
+    return calendar_row(media_not_ready_reason="operator hold", published_at=None,
+                        late_post_id=None, publish_claim_token=None,
+                        publish_reservation_day=None, **changes)
+
+
+def held_infographic_row(**changes):
+    return calendar_row(image_url="https://cdn.example/igfill_2026-10-03_card.png",
+                        source_media_url=None, media_not_ready_reason=(
+                            "Photo-first hold: unverified infographic placeholder; approved gym photo required"),
+                        thumbnail_url=None, published_at=None, late_post_id=None,
+                        publish_claim_token=None, publish_reservation_day=None,
+                        slot_index=0, scheduled_at="2026-10-03T14:00:00Z",
+                        source_media_asset_id=None, **changes)
+
+
+def source_asset():
+    return {"id": "asset-1", "gym_id": KEY,
+            "content_hash": hashlib.md5(DATA[RAW]).hexdigest()}
+
+
+def restage_held(store_value, current, render=None):
+    return store_value.restage_held_media(
+        KEY, current, image_url=FINAL, source_media_url=RAW,
+        extra_fields={"source_media_asset_id": "asset-1"}, render_evidence=render)
+
+
+def replace_held_infographic(store_value, current, render=None):
+    return store_value.replace_future_infographic_media(
+        KEY, current, image_url=FINAL, source_media_url=RAW,
+        source_media_asset_id="asset-1",
+        reason="Photo-first hold: unverified infographic placeholder; approved gym photo required",
+        render_evidence=render)
+
+
+@pytest.mark.parametrize("writer,row_builder", [
+    (restage_held, held_restage_row), (replace_held_infographic, held_infographic_row),
+])
+def test_operator_replacements_prepare_claims_and_use_full_visual_cas(armed, writer, row_builder):
+    current = row_builder()
+    http = HTTP(current=current, asset=source_asset())
+    result = writer(store(http), current, evidence())
+    assert result["image_url"] == FINAL
+    assert result["source_media_url"] == RAW
+    assert result["visual_group_key"] == "vg_scene"
+    assert result["byte_hash"] == "derived:" + md5(DATA[FINAL])
+    assert len(armed) == 1
+    assert armed[0]["source_bytes"] == DATA[RAW]
+    assert armed[0]["delivered_bytes"] == DATA[FINAL]
+    patch = next(call for call in http.calls if call[0] == "patch")
+    assert set(pcs._VISUAL_MEDIA_CAS_COLUMNS).issubset(patch[2])
+    assert patch[2]["caption"] == 'eq."Approved copy stays fixed"'
+    assert patch[2]["media_not_ready_reason"] == (
+        'eq."Photo-first hold: unverified infographic placeholder; approved gym photo required"'
+        if writer is replace_held_infographic else 'eq."operator hold"')
+
+
+@pytest.mark.parametrize("writer,row_builder", [
+    (restage_held, held_restage_row), (replace_held_infographic, held_infographic_row),
+])
+def test_operator_replacements_refuse_missing_render_evidence_before_patch(armed, writer, row_builder):
+    current = row_builder()
+    http = HTTP(current=current, asset=source_asset())
+    with pytest.raises(prep.VisualPreparationError):
+        writer(store(http), current)
+    assert not any(call[0] == "patch" for call in http.calls)
+
+
+@pytest.mark.parametrize("writer,row_builder", [
+    (restage_held, held_restage_row), (replace_held_infographic, held_infographic_row),
+])
+def test_operator_replacements_keep_flag_off_patch_parity(monkeypatch, writer, row_builder):
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    current = row_builder()
+    http = HTTP(current=current)
+    result = writer(store(http), current)
+    assert result["image_url"] == FINAL
+    assert result.get("visual_group_key") is None
+    assert result.get("byte_hash") is None
+    assert not any(call[0] == "post" for call in http.calls)
+
+
+@pytest.mark.parametrize("field", ["visual_group_key", "byte_hash"])
+def test_held_release_cas_refuses_lineage_race_after_script_read(armed, field):
+    staged = held_restage_row(visual_group_key="vg_scene", byte_hash="derived:md5:verified")
+    http = HTTP(current=dict(staged), patch_race={field: "concurrent"})
+    assert store(http).restage_held_media(KEY, staged, release=True) is None
+    patch = next(call for call in http.calls if call[0] == "patch")
+    assert patch[2]["visual_group_key"] == 'eq."vg_scene"'
+    assert patch[2]["byte_hash"] == 'eq."derived:md5:verified"'
+    assert patch[2]["caption"] == 'eq."Approved copy stays fixed"'
+    assert patch[2]["media_not_ready_reason"] == 'eq."operator hold"'
+    assert patch[3] == {"media_not_ready_reason": None}
+    assert http.current["media_not_ready_reason"] == "operator hold"
+
+
+def test_held_release_requires_verified_lineage_when_flag_on(armed):
+    staged = held_restage_row(visual_group_key="vg_scene")
+    http = HTTP(current=dict(staged))
+    assert store(http).restage_held_media(KEY, staged, release=True) is None
+    assert not any(call[0] == "patch" for call in http.calls)
+
+
+def test_held_release_with_verified_lineage_keeps_readback(armed):
+    staged = held_restage_row(visual_group_key="vg_scene", byte_hash="derived:md5:verified")
+    http = HTTP(current=dict(staged))
+    result = store(http).restage_held_media(KEY, staged, release=True)
+    assert result["media_not_ready_reason"] is None
+    assert result["visual_group_key"] == staged["visual_group_key"]
+    assert result["byte_hash"] == staged["byte_hash"]
+
+
+def test_held_release_flag_off_keeps_original_patch_and_readback(monkeypatch):
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    staged = held_restage_row(visual_group_key="vg_scene", byte_hash="derived:md5:verified")
+    http = HTTP(current=dict(staged))
+    result = store(http).restage_held_media(KEY, staged, release=True)
+    assert result["media_not_ready_reason"] is None
+    patch = next(call for call in http.calls if call[0] == "patch")
+    assert patch[2] == {
+        "id": "eq.row-1", "gym_id": "eq.gym", "status": "eq.pending",
+        "post_date": "eq.2026-10-03", "image_url": "eq.https://media.example/old.jpg",
+        "source_media_url": "is.null", "source_media_asset_id": "is.null",
+        "media_not_ready_reason": "eq.operator hold", "account": "eq.ig",
+        "format": "eq.story", "variant_status": "eq.active",
+        "created_at": "eq.2026-10-03T00:00:00Z",
+    }
+    assert patch[3] == {"media_not_ready_reason": None}
 
 
 def test_backfill_preserves_existing_raw_source_and_requires_its_evidence(armed):

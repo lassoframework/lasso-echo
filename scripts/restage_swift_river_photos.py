@@ -183,7 +183,8 @@ def _replace_held_groups(calendar, media_store, rows, photos, book_rows):
                 updated = calendar.restage_held_media(
                     _BASE, row, image_url=variant["image_url"],
                     source_media_url=variant.get("source_media_url"),
-                    extra_fields=media_swap.swap_fields(variant))
+                    extra_fields=media_swap.swap_fields(variant),
+                    render_evidence=variant.get("render_evidence"))
             except Exception as exc:  # a transport error may leave a partial stage
                 failures.append({"day": day_key, "row_id": str(row["id"]),
                                  "reason": f"stage_exception:{type(exc).__name__}"})
@@ -195,7 +196,9 @@ def _replace_held_groups(calendar, media_store, rows, photos, book_rows):
             staged[str(row["id"])] = {"image_url": variant["image_url"],
                                      "source_media_url": variant.get("source_media_url"),
                                      "source_media_asset_id": variant["source_media_asset_id"],
-                                     "hold": row["media_not_ready_reason"]}
+                                     "hold": row["media_not_ready_reason"],
+                                     **{key: updated[key] for key in ("visual_group_key", "byte_hash")
+                                        if updated.get(key) is not None}}
         if len(changed) != len(planned):
             # A guarded race can only leave an already-successful same-day sibling
             # replaced. Stop here; no later date gets touched and no human edit is
@@ -300,6 +303,18 @@ def run(*, apply=False, moderated_since=None, start=None, days=_DAYS, ctx=None,
         return {"ok": False, "reason": "usage reservation failed; holds retained",
                 "replaced": replaced, "ledger_failures": ledger_failures,
                 "staged_ids": sorted(staged)}
+    from agent import visual_writer_prepare
+    if visual_writer_prepare.enabled():
+        for rid in sorted(verified):
+            current = calendar.get_row(_BASE, rid)
+            lineage_keys = ("visual_group_key", "byte_hash")
+            if (current is None
+                    or any(not staged[rid].get(key)
+                           or verified[rid].get(key) != staged[rid][key]
+                           or current.get(key) != staged[rid][key]
+                           for key in lineage_keys)):
+                return {"ok": False, "reason": "pre-release lineage readback mismatch; holds retained",
+                        "row_id": rid, "released_ids": []}
     released = []
     for rid in sorted(verified):
         try:

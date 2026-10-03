@@ -317,6 +317,21 @@ def _payload(pick):
             "thumbnail_url": pick.get("thumbnail_url") or None, "media_not_ready_reason": None}
 
 
+def _writer_readback(row, *, prepared_write):
+    """The writer's verified result is the readback contract, not our input.
+
+    Prepared visual writes assign canonical lineage after rendering.  It is not
+    safe to recreate those values from the held row and operator payload.
+    """
+    result = _snapshot(row)
+    if prepared_write:
+        for key in ("visual_group_key", "byte_hash"):
+            if not row.get(key):
+                raise ValueError(f"prepared writer result missing {key}")
+            result[key] = row[key]
+    return result
+
+
 def run(*, store=None, media_store=None, hold_receipt_path=None, today=None,
         apply=False, expected_digest=None, receipt_path=None, prepare_fn=None,
         reserve_fn=None, settle_fn=None):
@@ -345,6 +360,8 @@ def run(*, store=None, media_store=None, hold_receipt_path=None, today=None,
     prepare = prepare_fn or _prepare
     reserve = reserve_fn or _reserve
     settle = settle_fn or media_swap.after_swap
+    from agent import visual_writer_prepare
+    prepared_write = visual_writer_prepare.enabled()
     try:
         for group in plan["groups"]:
             gym, rows, asset = group["gym_id"], group["rows"], group["asset"]
@@ -377,12 +394,13 @@ def run(*, store=None, media_store=None, hold_receipt_path=None, today=None,
                 payload = _payload(variant)
                 updated = store.replace_future_infographic_media(
                     gym, row, reason=REASON, **{key: value for key, value in payload.items()
-                                               if key != "media_not_ready_reason"})
+                                               if key != "media_not_ready_reason"},
+                    render_evidence=variant.get("render_evidence"))
                 if updated is None:
                     raise ValueError("exact row CAS conflict; reconcile reserved photo before retry")
                 observed = store.get_row(gym, str(row["id"]))
-                expected = {**row, **payload}
-                if _snapshot(observed) != expected:
+                expected = _writer_readback(updated, prepared_write=prepared_write)
+                if _writer_readback(observed, prepared_write=prepared_write) != expected:
                     raise ValueError("readback mismatch; reconcile before retry")
                 progress["changed_ids"].append(str(row["id"]))
                 progress["readback"].append(expected)
