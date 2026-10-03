@@ -60,7 +60,7 @@ import json
 import os
 import subprocess
 
-from . import config
+from . import config, visual_fingerprint
 
 # Media extensions we sync (mirror client_month_run._MEDIA_EXTS: the same set that
 # counts as a gym having uploaded usable creative).
@@ -470,9 +470,14 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
         except OSError as exc:
             log(f"{base_key}: write failed for one object: {type(exc).__name__}")
             continue
+        # Source identity comes from bytes, with strong SHA-256 authoritative
+        # and Drive-compatible MD5 retained only as an explicit alias.
+        aliases = visual_fingerprint.source_aliases(data)
         _write_sidecar(lib_dir, name, key, captions.get(name, ""), log,
                        client_context=contexts.get(name, ""),
-                       consent=bool(consents.get(name)))
+                       consent=bool(consents.get(name)),
+                       source_fingerprint=aliases[0],
+                       source_fingerprint_aliases=aliases[1:])
         synced += 1
         if _valid_media_file(target):
             accepted.append(key)
@@ -567,13 +572,16 @@ def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
     for key in keys:
         if not _is_media_key(key):
             continue
-        # echo/<base>/<sha1-16>/<filename> — need the hash segment + filename.
+        # echo/<base>/<sha1-16>/<filename> — need the key id segment + filename.
+        # That segment is part of the object's LOCATION. It is NOT source
+        # identity and is never recorded as one: the only source identity here
+        # is the md5 fingerprint of the downloaded bytes, computed below.
         parts = key.split("/")
         if len(parts) < 4:
             continue
-        content_hash = parts[2]
+        key_id = parts[2]
         filename = parts[-1]
-        local_name = f"{content_hash}_{filename}"
+        local_name = f"{key_id}_{filename}"
         target = os.path.join(lib_dir, local_name)
         if os.path.exists(target):
             skipped += 1
@@ -595,7 +603,12 @@ def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
         # The photo is ALREADY hosted at this exact key: the sidecar's public_url is
         # known outright (no re-hosting, no fresh upload). No client note/caption is
         # recoverable from the hosted object alone, so none is fabricated here.
-        _write_sidecar(lib_dir, local_name, key, "", log)
+        # Source identity comes from the BYTES alone (fail closed: empty bytes were
+        # skipped above, so a fingerprint here always attests real source bytes).
+        aliases = visual_fingerprint.source_aliases(data)
+        _write_sidecar(lib_dir, local_name, key, "", log,
+                       source_fingerprint=aliases[0],
+                       source_fingerprint_aliases=aliases[1:])
         recovered += 1
 
     if recovered or skipped:
@@ -639,7 +652,8 @@ def _read_context_consent(r2, prefixes, log, keys=None):
 
 
 def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
-                   consent=False):
+                   consent=False, source_fingerprint="",
+                   source_fingerprint_aliases=None):
     """Write the .json sidecar library._load_sidecar reads: public_url makes the
     downloaded photo a portal-ready real-photo card; the gym's own one line about the
     photo goes in the "note" key (the EXACT key library._load_sidecar reads into
@@ -671,6 +685,24 @@ def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
         payload["note"] = caption
     if client_context and not payload.get("client_context"):
         payload["client_context"] = client_context
+    # Stable source-byte identity. SHA-256 is authoritative; weaker/legacy
+    # digests survive only in an explicit alias list, never in the authority
+    # slot. Unknown source remains absent rather than being inferred from a key.
+    fp = visual_fingerprint.normalize(source_fingerprint)
+    existing_fp = visual_fingerprint.normalize(payload.get("source_fingerprint"))
+    if fp and not existing_fp:
+        payload["source_fingerprint"] = fp
+    aliases = []
+    for candidate in (payload.get("source_fingerprint_aliases") or []):
+        normalized = visual_fingerprint.normalize_any(candidate)
+        if normalized and normalized != payload.get("source_fingerprint"):
+            aliases.append(normalized)
+    for candidate in (source_fingerprint_aliases or []):
+        normalized = visual_fingerprint.normalize_any(candidate)
+        if normalized and normalized != payload.get("source_fingerprint"):
+            aliases.append(normalized)
+    if aliases:
+        payload["source_fingerprint_aliases"] = list(dict.fromkeys(aliases))
     # consent is the CHECKBOX only, recorded in the DAM consent log at most once (a marker on
     # the sidecar dedups across re-syncs so we never append duplicate audit rows).
     record_consent = consent and not payload.get("consent_recorded")

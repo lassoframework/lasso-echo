@@ -10,7 +10,9 @@ together into one PENDING draft:
     -> build the Roxx overlay (copy_gate + per-gym avatar rail + safe zones)
     -> select music bed (hype default, never chill-default; track_id + license_ref)
     -> plan + render the multi-clip montage (HELD on a missing renderer)
-    -> record content_hash in render_ledger (the re-ingest guard)
+    -> record the derived render's Drive-MD5 alias in render_ledger (the
+       re-ingest guard), while preserving strong derived identity and the
+       segment source-identity map in separate explicit namespaces
     -> persist story_request + story_render
     -> stage a PENDING content_calendar Draft (the human approval tap is untouched)
 
@@ -30,7 +32,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 
-from . import config
+from . import config, visual_fingerprint
 from .drafter import Draft, DraftStatus
 
 STATUS_PENDING = "pending"
@@ -179,6 +181,7 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     #     test/alternate renderer that owns its own source handling, so we never reach
     #     out to Drive for it. The default renderer needs real bytes on disk.
     src_tmp = None
+    source_identity_map = []
     rfn = render_fn or story_composer.render_compose
     need_bind = ([s for s in plan.segments if not getattr(s, "source_path", "")]
                  if render_fn is None else [])
@@ -189,6 +192,10 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
                 need_bind, assets_by_id or {}, gym_id=gym_id,
                 downloader=downloader)
 
+        # Capture source identity before the renderer can transform or remove
+        # anything, and before the live path's finally block removes src_tmp.
+        source_identity_map, _src_fps, _src_unknown = _segment_source_identities(
+            plan.segments, assets_by_id or {})
         result = rfn(plan, output_dir=out_dir, ask_frame_text=overlay.ask,
                      ask_frame_lines=overlay.ask_frame, overlay_frames=overlay.frames,
                      identity_text=overlay.identity_line, music_path=music_path)
@@ -201,10 +208,14 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
                      getattr(result, "hold_reason", "render produced no output"),
                      store, request, tmpl_name, music_sel.shelf)
 
-    # 6. content_hash + render_ledger (the re-ingest guard).
-    content_hash = _content_hash(result.output_path)
-    story_ledger.record_render(content_hash, gym_id=gym_id,
-                               story_render_id=request_id)
+    # 6. Derived render identity and source provenance are separate. The
+    # render ledger receives BOTH the historical bare SHA-256 key and Drive's
+    # bare MD5 lookup key. This preserves existing callers/rows while ensuring
+    # a later Drive walk can recognize the rendered bytes.
+    derived_fp, derived_aliases, content_hash = _derived_identity(result.output_path)
+    for ledger_key in _derived_ledger_keys(derived_fp, derived_aliases, content_hash):
+        story_ledger.record_render(ledger_key, gym_id=gym_id,
+                                   story_render_id=request_id)
 
     # 7. host + PENDING draft (the human tap is untouched).
     public_url = _host(result.output_path, gym_id)
@@ -233,8 +244,28 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
 
     # 8. persist story_request + story_render (best effort; a store failure does not
     #    un-stage the PENDING draft, which is the human-visible artifact).
-    seg_plan = [{"asset_id": s.asset_id, "start_ts": s.start_ts, "end_ts": s.end_ts,
-                 "score": s.score} for s in plan.segments]
+    identity_by_asset = {row["asset_id"]: row for row in source_identity_map}
+    seg_plan = []
+    for s in plan.segments:
+        identity = identity_by_asset.get(str(s.asset_id), {})
+        seg_plan.append({
+            "asset_id": s.asset_id,
+            "start_ts": s.start_ts,
+            "end_ts": s.end_ts,
+            "score": s.score,
+            "source_fingerprint": identity.get("source_fingerprint"),
+            "source_fingerprint_aliases":
+                identity.get("source_fingerprint_aliases") or [],
+            "source_identity_status":
+                ("verified" if identity.get("source_fingerprint") else
+                 "alias_only" if identity.get("source_fingerprint_aliases") else
+                 "unknown"),
+            # Every derived render segment maps back to its source record. The
+            # repeated render identity is intentional: segment_plan is the only
+            # current durable JSONB provenance field and needs no SQL change.
+            "derived_fingerprint": derived_fp,
+            "derived_fingerprint_aliases": derived_aliases,
+        })
     overlay_final = "\n---\n".join("\n".join(fr) for fr in overlay.frames)
     story_render = {
         "id": request_id,
@@ -489,14 +520,83 @@ def _persist(store, request, request_id, gym_id, tmpl_name, music_sel, story_ren
         print(f"[story-studio] persist failed: {type(e).__name__}: {e}")
 
 
-def _content_hash(path):
+def _derived_identity(path):
+    """Return ``(strong identity, aliases, historical content_hash)``."""
     try:
-        with open(path, "rb") as fh:
-            return hashlib.sha256(fh.read()).hexdigest()
-    except OSError:
-        # render output not on disk (an injected renderer returned a synthetic path in
-        # a test): hash the path string so the ledger still gets a stable stamp.
-        return hashlib.sha256(str(path).encode("utf-8")).hexdigest()
+        aliases = visual_fingerprint.derived_aliases_file(path)
+    except (OSError, ValueError):
+        # Test/alternate renderers may return a synthetic path. It is a locator,
+        # not byte identity; retain a clearly non-authoritative stable stamp only
+        # to satisfy the legacy non-null render-ledger contract.
+        stamp = "unmaterialized:sha256:" + hashlib.sha256(
+            str(path).encode("utf-8")).hexdigest()
+        return None, [], stamp
+    # story_render.content_hash historically stores bare SHA-256. Keep that
+    # contract; the MD5 alias is separately dual-recorded for Drive lookup.
+    return aliases[0], aliases[1:], aliases[0].rsplit(":", 1)[1]
+
+
+def _derived_ledger_keys(derived_fingerprint, aliases, content_hash):
+    """Historical SHA-256 first, then Drive MD5; stable and deduplicated."""
+    strong = visual_fingerprint.normalize(
+        derived_fingerprint, namespace=visual_fingerprint.DERIVED_SHA256)
+    keys = [strong.rsplit(":", 1)[1] if strong else
+            str(content_hash or "").strip().lower()]
+    for alias in aliases or []:
+        if str(alias).startswith("derived:md5:"):
+            keys.append(visual_fingerprint.legacy_drive_digest(alias) or "")
+    return list(dict.fromkeys(key for key in keys if key))
+
+
+def _content_hash(path):
+    """Compatibility wrapper for callers/tests of the historical helper."""
+    return _derived_identity(path)[2]
+
+
+def _segment_source_identities(segments, assets_by_id=None):
+    """Map each segment to strong source identity and explicit aliases.
+
+    Actual source bytes win. Pre-attested metadata is used only when already
+    explicitly namespaced; a Drive ``content_hash`` contributes a typed MD5
+    alias but cannot manufacture the missing SHA-256 authority.
+    """
+    fps, identities, unknown = [], [], 0
+    assets_by_id = assets_by_id or {}
+    for seg in segments or []:
+        sp = getattr(seg, "source_path", "") or ""
+        fp, aliases = None, []
+        if sp:
+            try:
+                all_ids = visual_fingerprint.source_aliases_file(sp)
+                fp, aliases = all_ids[0], all_ids[1:]
+            except (OSError, ValueError):
+                pass
+        asset = assets_by_id.get(getattr(seg, "asset_id", "")) or {}
+        if fp is None:
+            fp = visual_fingerprint.normalize(asset.get("source_fingerprint"))
+            aliases.extend(filter(None, (
+                visual_fingerprint.normalize_any(a)
+                for a in asset.get("source_fingerprint_aliases") or [])))
+        drive_alias = visual_fingerprint.from_drive_md5(asset.get("content_hash"))
+        if drive_alias:
+            aliases.append(drive_alias)
+        aliases = list(dict.fromkeys(a for a in aliases if a and a != fp))
+        if fp is None:
+            unknown += 1
+        elif fp not in fps:
+            fps.append(fp)
+        identities.append({
+            "asset_id": str(getattr(seg, "asset_id", "") or ""),
+            "source_fingerprint": fp,
+            "source_fingerprint_aliases": aliases,
+        })
+    return identities, fps, unknown
+
+
+def _segment_source_fingerprints(segments):
+    """Compatibility wrapper returning strong fingerprints and unknown count."""
+    _identities, fps, unknown = _segment_source_identities(segments)
+    return fps, unknown
 
 
 def _host(path, gym_id):

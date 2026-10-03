@@ -137,6 +137,12 @@ def test_flagged_file_goes_to_review_with_notice(monkeypatch, tmp_path):
     assert len(poster.notices) == 1
     assert "review" in poster.notices[0].lower()
     assert not (tmp_path / "library" / "gyma").exists()   # nothing filed
+    provenance = json.loads(
+        r2.objects["intake/gyma/review/20260702T100000Z_photo.json"])
+    assert provenance["status"] == "review"
+    assert provenance["original_key"].endswith("20260702T100000Z_photo.jpg")
+    assert provenance["source_fingerprint"].startswith("source:sha256:")
+    assert provenance["converted_fingerprint"].startswith("derived:sha256:")
 
 
 # ---- dead-letter + one ops alert, loop continues ----------------------------------
@@ -292,3 +298,112 @@ def test_whole_batch_deadletter_escalates(monkeypatch, tmp_path):
     assert out["gyma"]["deadlettered"] == 3 and out["gyma"]["accepted"] == 0
     # exactly one loud BATCH FAILURE escalation (distinct from the per-file alerts)
     assert len([a for a in rec.notices if "BATCH FAILURE" in a]) == 1
+
+
+# ---- source-byte fingerprint + no destructive pHash deletion (global no-reuse) ----
+def _alerts(monkeypatch):
+    fired = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda msg, **k: fired.append(msg))
+    return fired
+
+
+def test_accept_records_stable_source_fingerprint(monkeypatch, tmp_path):
+    """The manifest records strong source identity plus explicit Drive alias."""
+    _arm(monkeypatch, tmp_path)
+    r2 = FakeR2()
+    _seed(r2, data=b"IMGBYTES")
+    out = _run(r2)
+    assert out["gyma"]["accepted"] == 1
+    manifest = json.loads(r2.objects["intake/gyma/manifest.json"])
+    from agent import visual_fingerprint as vf
+    fingerprint = vf.fingerprint(b"IMGBYTES")
+    assert manifest["source_fingerprints"] == [fingerprint]
+    assert manifest["source_fingerprint_aliases"] == {
+        fingerprint: [f"source:md5:{vf.source_md5(b'IMGBYTES')}"]}
+    assert manifest["phash"] == [_fake_phash(b"IMGBYTES", "ignored.jpg")]
+    incoming_key = "intake/gyma/incoming/20260702T100000Z_photo.jpg"
+    binding = manifest["asset_provenance"][incoming_key]
+    assert binding["status"] == "accepted"
+    assert binding["filename"] == "20260702T100000Z_photo.jpg"
+    assert binding["asset_id"] is None
+    assert binding["source_fingerprint"] == fingerprint
+    assert binding["converted_fingerprint"].startswith("derived:sha256:")
+    filed_sidecar = json.loads(
+        (tmp_path / "library" / "gyma" /
+         "20260702T100000Z_photo.json").read_text())
+    assert filed_sidecar["original_key"] == incoming_key
+    assert filed_sidecar["source_fingerprint"] == fingerprint
+
+
+def test_pending_caption_persists_source_to_converted_binding(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    r2 = FakeR2()
+    name = "20260702T100000Z_uncaptioned.jpg"
+    media_key = f"intake/gyma/incoming/{name}"
+    r2.put_bytes(media_key, b"UNCAPTIONED")
+    r2.put_bytes("intake/gyma/incoming/20260702T100000Z_upload.json",
+                 json.dumps({"note": "", "client": "gyma", "filenames": [name]}).encode())
+    out = _run(r2)
+    assert out["gyma"]["needs_caption"] == 1
+    sidecar = json.loads(
+        r2.objects["intake/gyma/pending_caption/20260702T100000Z_uncaptioned.json"])
+    assert sidecar["status"] == "needs_caption"
+    assert sidecar["original_key"] == media_key
+    assert sidecar["current_key"].endswith("pending_caption/" + name)
+    assert sidecar["source_fingerprint"].startswith("source:sha256:")
+    assert sidecar["converted_fingerprint"].startswith("derived:sha256:")
+    manifest = json.loads(r2.objects["intake/gyma/manifest.json"])
+    assert manifest["asset_provenance"][media_key]["status"] == "needs_caption"
+
+
+def test_phash_collision_holds_and_preserves_source_never_deletes(monkeypatch, tmp_path):
+    """A perceptual hash is similarity, NOT identity. Two DIFFERENT photos that
+    collide on pHash: the first files, the second is QUARANTINED to hold/ with its
+    raw source bytes + an honest sidecar + one ops alert — never silently deleted."""
+    _arm(monkeypatch, tmp_path)
+    fired = _alerts(monkeypatch)
+    r2 = FakeR2()
+    _seed(r2, name="20260702T100000Z_a.jpg", data=b"PHOTO-A")
+    _seed(r2, name="20260702T100001Z_b.jpg", data=b"PHOTO-B-DIFFERENT")
+    out = intake_ingest.process_all(
+        r2=r2, converter=_fake_converter,
+        phash=lambda d, n: "collision", moderator=_pass_all)
+    assert out["gyma"]["accepted"] == 1
+    assert out["gyma"]["held"] == 1
+    assert out["gyma"]["duplicates"] == 0
+    # source preserved under hold/, incoming consumed
+    assert r2.objects["intake/gyma/hold/20260702T100001Z_b.jpg"] == b"PHOTO-B-DIFFERENT"
+    side = json.loads(r2.objects["intake/gyma/hold/20260702T100001Z_b.json"])
+    assert side["status"] == "held_near_duplicate"
+    from agent import visual_fingerprint as vf
+    assert side["source_fingerprint"] == vf.fingerprint(b"PHOTO-B-DIFFERENT")
+    assert side["source_fingerprint_aliases"] == [
+        f"source:md5:{vf.source_md5(b'PHOTO-B-DIFFERENT')}"]
+    assert side["similarity_alias"] == "perceptual:collision"
+    assert not any(k.startswith("intake/gyma/incoming/")
+                   and not k.endswith(".json") for k in r2.objects)
+    # only the FIRST photo filed; nothing destroyed
+    lib = tmp_path / "library" / "gyma"
+    assert [p.name for p in lib.glob("*.jpg")] == ["20260702T100000Z_a.jpg"]
+    assert any("HELD" in m for m in fired)
+
+
+def test_exact_converted_dup_archives_raw_source_before_drop(monkeypatch, tmp_path):
+    """Two different HEIC originals converting to the SAME JPG bytes: the second is
+    a true converted-byte duplicate, but its RAW source is archived to originals/
+    BEFORE the incoming object is deleted. No dedupe path destroys the only copy
+    of a client's source."""
+    _arm(monkeypatch, tmp_path)
+    r2 = FakeR2()
+    _seed(r2, name="20260702T100000Z_a.heic", data=b"HEIC-ONE")
+    _seed(r2, name="20260702T100001Z_b.heic", data=b"HEIC-TWO")
+    out = intake_ingest.process_all(
+        r2=r2, converter=lambda _data, name: (b"SAME-JPG", name[:-5] + ".jpg"),
+        phash=_fake_phash, moderator=_pass_all)
+    assert out["gyma"]["accepted"] == 1
+    assert out["gyma"]["duplicates"] == 1
+    # both distinct raw sources survive in originals/ before either incoming
+    # object is removed, even though their converted bytes are identical.
+    originals = [k for k in r2.objects
+                 if k.startswith("intake/gyma/originals/") and not k.endswith(".json")]
+    assert {r2.objects[orig] for orig in originals} == {b"HEIC-ONE", b"HEIC-TWO"}

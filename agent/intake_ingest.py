@@ -11,8 +11,12 @@ Per pass, for each client with objects under intake/<client>/incoming/:
      not); every conversion archives the ORIGINAL to intake/<client>/originals/
      before the incoming object is deleted, so no conversion loses a file; a
      conversion failure dead-letters the file, it never crashes the loop,
-  4. dedupe the converted bytes by SHA-256 plus perceptual hash against
-     everything already accepted,
+  4. dedupe the converted bytes by SHA-256 against everything already
+     accepted (an exact converted-byte duplicate drops the incoming copy only
+     AFTER its raw source is archived to originals/, so no source is ever
+     lost); a perceptual-hash near-duplicate is NEVER deleted — it is held
+     under intake/<client>/hold/ with its source bytes preserved for a human
+     decision (a pHash is similarity, never identity),
   5. run the moderation hook (a stub interface today: moderate(data, name) ->
      (ok, reason); anything flagged moves to intake/<client>/review/ and posts one
      Slack notice line),
@@ -31,7 +35,7 @@ import io
 import json
 import os
 
-from . import config, ops_alerts
+from . import config, ops_alerts, visual_fingerprint
 from .accounts import get_account
 
 MANIFEST = "manifest.json"
@@ -209,6 +213,14 @@ def _load_manifest(r2, client):
         manifest = {"processed": [], "sha256": [], "phash": []}
     # additive key for raw-bytes dedupe; old manifests gain it on first touch
     manifest.setdefault("sha256_raw", [])
+    # Strong source identities are authoritative. Drive-compatible MD5 values
+    # remain explicitly typed aliases; never silently promote them to identity.
+    manifest.setdefault("source_fingerprints", [])
+    manifest.setdefault("source_fingerprint_aliases", {})
+    # One durable binding per incoming object. This maps the source identity to
+    # its converted representation and current filename/key; asset_id remains
+    # nullable until a later indexer assigns one.
+    manifest.setdefault("asset_provenance", {})
     return manifest
 
 
@@ -216,6 +228,43 @@ def _save_manifest(r2, client, manifest):
     r2.put_bytes(f"intake/{client}/{MANIFEST}",
                  json.dumps(manifest).encode("utf-8"),
                  content_type="application/json")
+
+
+def _record_source_identity(manifest, fingerprint, aliases):
+    """Record one authoritative source identity and its explicit aliases."""
+    if fingerprint not in manifest["source_fingerprints"]:
+        manifest["source_fingerprints"].append(fingerprint)
+    normalized = []
+    for alias in aliases or []:
+        value = visual_fingerprint.normalize_any(alias)
+        if value and value != fingerprint:
+            normalized.append(value)
+    if normalized:
+        current = manifest["source_fingerprint_aliases"].setdefault(fingerprint, [])
+        current.extend(a for a in normalized if a not in current)
+
+
+def _record_asset_provenance(manifest, *, original_key, current_key, filename,
+                             status, source_fingerprint, source_aliases,
+                             converted_bytes, similarity_alias=None):
+    """Persist the source-to-representation binding for one intake object."""
+    _record_source_identity(manifest, source_fingerprint, source_aliases)
+    converted = visual_fingerprint.derived_aliases(converted_bytes)
+    record = {
+        "status": status,
+        "original_key": original_key,
+        "current_key": current_key,
+        "filename": filename,
+        "asset_id": None,
+        "source_fingerprint": source_fingerprint,
+        "source_fingerprint_aliases": list(source_aliases or []),
+        "converted_fingerprint": converted[0],
+        "converted_fingerprint_aliases": converted[1:],
+    }
+    if similarity_alias:
+        record["similarity_alias"] = similarity_alias
+    manifest["asset_provenance"][original_key] = record
+    return dict(record)
 
 
 def _library_dir_for(client):
@@ -490,7 +539,7 @@ def _land_intake_form(client, payload, r2, key, manifest):
 
 
 def _process_client(client, r2, poster, converter, phash, moderator):
-    stats = {"accepted": 0, "duplicates": 0, "flagged": 0, "deadlettered": 0,
+    stats = {"accepted": 0, "duplicates": 0, "held": 0, "flagged": 0, "deadlettered": 0,
              "skipped": 0, "intake_forms": 0, "needs_caption": 0, "low_res": 0}
     manifest = _load_manifest(r2, client)
     prefix = f"intake/{client}/incoming/"
@@ -564,8 +613,15 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                                  "zero-byte upload (empty file, nothing filed)")
                 continue
 
+            # Source SHA-256 is authoritative. Drive MD5 is retained only as an
+            # explicitly namespaced alias. Both are computed before conversion.
+            src_aliases = visual_fingerprint.source_aliases(raw)
+            src_fp = src_aliases[0]
+
             # RAW dedupe FIRST: the same file uploaded twice lands once, no
-            # matter what the converter does with it.
+            # matter what the converter does with it. The surviving first copy
+            # already holds these exact bytes, so deleting the re-upload loses
+            # no source.
             raw_sha = hashlib.sha256(raw).hexdigest()
             if raw_sha in manifest["sha256_raw"]:
                 stats["duplicates"] += 1
@@ -577,16 +633,79 @@ def _process_client(client, r2, poster, converter, phash, moderator):
 
             sha = hashlib.sha256(data).hexdigest()
             ph = phash(data, name)
-            if sha in manifest["sha256"] or (ph is not None and ph in manifest["phash"]):
+            if sha in manifest["sha256"]:
+                # EXACT converted-byte duplicate: the converted bytes are already
+                # filed, but the RAW source of THIS upload may differ (a HEIC
+                # original) — archive it BEFORE the incoming object is deleted.
+                # No dedupe path ever destroys the only copy of a source.
                 stats["duplicates"] += 1
                 manifest["sha256_raw"].append(raw_sha)   # remember the raw form too
+                archive_key = f"intake/{client}/originals/{os.path.basename(key)}"
+                provenance = _record_asset_provenance(
+                    manifest, original_key=key, current_key=archive_key,
+                    filename=os.path.basename(key), status="duplicate_converted",
+                    source_fingerprint=src_fp, source_aliases=src_aliases[1:],
+                    converted_bytes=data)
+                r2.put_bytes(archive_key, raw)
+                r2.put_bytes(
+                    f"{archive_key}.provenance.json",
+                    json.dumps(provenance).encode("utf-8"),
+                    content_type="application/json")
                 r2.delete(key)
                 manifest["processed"].append(key)
+                continue
+            if ph is not None and ph in manifest["phash"]:
+                # pHash COLLISION — QUARANTINE/HOLD, NEVER DELETE. A perceptual
+                # hash is similarity, not identity: two DIFFERENT photos can
+                # collide, and the old code silently destroyed the client's
+                # source on a collision. Hold the RAW source bytes under
+                # intake/<client>/hold/ with an honest sidecar and one ops
+                # alert; a human decides whether it is a true duplicate.
+                stats["held"] += 1
+                manifest["sha256_raw"].append(raw_sha)
+                hold_key = f"intake/{client}/hold/{os.path.basename(key)}"
+                provenance = _record_asset_provenance(
+                    manifest, original_key=key, current_key=hold_key,
+                    filename=os.path.basename(key), status="held_near_duplicate",
+                    source_fingerprint=src_fp, source_aliases=src_aliases[1:],
+                    converted_bytes=data, similarity_alias=f"perceptual:{ph}")
+                r2.put_bytes(hold_key, raw)
+                r2.put_bytes(
+                    f"intake/{client}/hold/{os.path.splitext(os.path.basename(key))[0]}.json",
+                    json.dumps({
+                        **provenance,
+                        "phash": ph,
+                        "note": "perceptual-hash collision with an accepted "
+                                "asset; source preserved, awaiting human "
+                                "keep/drop decision",
+                    }).encode("utf-8"),
+                    content_type="application/json")
+                r2.delete(key)   # only AFTER the hold copy + sidecar landed
+                manifest["processed"].append(key)
+                ops_alerts.alert(
+                    f"intake ingest HELD {client}/{os.path.basename(key)}: "
+                    "near-duplicate of an already-accepted asset (pHash "
+                    "collision). Source preserved under hold/ — confirm "
+                    "keep/drop; nothing was deleted.")
                 continue
 
             ok, reason = moderator(data, name)
             if not ok:
-                r2.put_bytes(f"intake/{client}/review/{name}", data)
+                review_key = f"intake/{client}/review/{name}"
+                provenance = _record_asset_provenance(
+                    manifest, original_key=key, current_key=review_key,
+                    filename=name, status="review",
+                    source_fingerprint=src_fp, source_aliases=src_aliases[1:],
+                    converted_bytes=data)
+                provenance["review_reason"] = reason
+                r2.put_bytes(review_key, data)
+                r2.put_bytes(
+                    f"intake/{client}/review/{os.path.splitext(name)[0]}.json",
+                    json.dumps(provenance).encode("utf-8"),
+                    content_type="application/json")
+                if name != os.path.basename(key):
+                    r2.put_bytes(f"intake/{client}/originals/{os.path.basename(key)}",
+                                 raw)
                 r2.delete(key)
                 manifest["processed"].append(key)
                 stats["flagged"] += 1
@@ -655,12 +774,16 @@ def _process_client(client, r2, poster, converter, phash, moderator):
             caption_text = (sidecar_data.get("note") or "").strip()
             if sidecar_found and not caption_text:
                 stats["needs_caption"] += 1
-                pending_sidecar = {
-                    "status": "needs_caption",
-                    "original_key": key,
+                pending_key = f"intake/{client}/pending_caption/{name}"
+                pending_sidecar = _record_asset_provenance(
+                    manifest, original_key=key, current_key=pending_key,
+                    filename=name, status="needs_caption",
+                    source_fingerprint=src_fp, source_aliases=src_aliases[1:],
+                    converted_bytes=data)
+                pending_sidecar.update({
                     **low_res_flag,
-                }
-                r2.put_bytes(f"intake/{client}/pending_caption/{name}", data)
+                })
+                r2.put_bytes(pending_key, data)
                 r2.put_bytes(
                     f"intake/{client}/pending_caption/{os.path.splitext(name)[0]}.json",
                     json.dumps(pending_sidecar).encode("utf-8"),
@@ -700,6 +823,26 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                         json.dump(filed_sidecar, _fh)
                 except Exception:
                     pass
+
+            library_path = os.path.join(lib_dir, name)
+            provenance = _record_asset_provenance(
+                manifest, original_key=key, current_key=library_path,
+                filename=name, status="accepted",
+                source_fingerprint=src_fp, source_aliases=src_aliases[1:],
+                converted_bytes=data)
+            provenance.update(low_res_flag)
+            provenance_path = os.path.join(
+                lib_dir, f"{os.path.splitext(name)[0]}.json")
+            try:
+                existing_provenance = {}
+                if os.path.exists(provenance_path):
+                    with open(provenance_path, encoding="utf-8") as _fh:
+                        existing_provenance = json.load(_fh) or {}
+                existing_provenance.update(provenance)
+                with open(provenance_path, "w", encoding="utf-8") as _fh:
+                    json.dump(existing_provenance, _fh)
+            except (OSError, ValueError):
+                pass
 
             manifest["processed"].append(key)
             manifest["sha256"].append(sha)
