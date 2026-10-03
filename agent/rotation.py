@@ -145,6 +145,63 @@ def local_content_hash(path):
     return digest.hexdigest()
 
 
+def local_global_fingerprint(path):
+    """Return the DRAFT global-ledger MD5 identity for exact local bytes.
+
+    The gym-scoped served table retains SHA-256 through ``local_content_hash``.
+    PR235's currently drafted global authority is keyed by MD5, however, so a
+    local selection needs this independent digest to ask the same exact-byte
+    question as the Drive picker.  A missing or unreadable file is deliberately
+    not represented by a guessed identity.
+    """
+    if not path or not os.path.isfile(path):
+        return ""
+    digest = hashlib.md5()  # noqa: S324 - PR235's database key is MD5 by schema
+    try:
+        with open(path, "rb") as media:
+            for chunk in iter(lambda: media.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return "md5:" + digest.hexdigest()
+
+
+def globally_available_local_paths(account_key, paths, *, ledger_http=None):
+    """Paths whose exact bytes are clear in PR235's global visual ledger.
+
+    Default OFF preserves the legacy local picker byte-for-byte.  When the
+    shared global-ledger flag is ON, every supplied local path must have a
+    readable MD5 identity and the canonical tenant plus every queried ledger
+    page must be proven complete.  The underlying reader raises on uncertainty;
+    callers must hold local selection and infographic depletion rather than
+    treating an unproven file as unused.
+
+    This is a read-side guard only.  It does not claim a local file globally:
+    that remains conditional on the separately gated calendar writer and its
+    database trigger actually preparing and claiming the staged row.
+    """
+    items = tuple(dict.fromkeys(str(path) for path in (paths or ()) if path))
+    # This helper is called only for photo bytes.  An all-video library has no
+    # photo identity to check, so even an ambiguous photo-ledger flag cannot
+    # manufacture a false depletion result or block the video tier.
+    if not items:
+        return set()
+    from . import gym_media_selector as selector
+    flag = selector.global_ledger_flag()
+    if flag is False:
+        return set(paths or ())
+    if flag is None:
+        raise selector.GlobalLedgerUnavailable(
+            f"{selector.GLOBAL_LEDGER_FLAG_ENV} has an ambiguous value")
+    fingerprints = {path: local_global_fingerprint(path) for path in items}
+    if any(not fingerprint for fingerprint in fingerprints.values()):
+        raise selector.GlobalLedgerUnavailable(
+            "a local photo has no global-ledger MD5 identity")
+    used = selector.cross_client_used_fingerprints(
+        selector.base_gym_key(account_key), fingerprints.values(), http=ledger_http)
+    return {path for path, fingerprint in fingerprints.items() if fingerprint not in used}
+
+
 def reserve_local_media_once(account_key, key, pillar, day_key, path=None):
     """Claim a local photo or video once across this gym's IG, FB, and GBP lanes.
 

@@ -131,6 +131,29 @@ def test_upload_claim_consumes_local_media_across_lanes_and_aliases(monkeypatch,
     assert runner.draft_for_new_upload("gymx", [first], poster=poster, store=store) == []
 
 
+def test_direct_upload_holds_when_global_ledger_already_consumed_bytes(monkeypatch, tmp_path):
+    """The immediate upload route bypasses pick_image and needs its own guard."""
+    from agent import gym_media_selector as selector, rotation
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.setenv(selector.GLOBAL_LEDGER_FLAG_ENV, "true")
+    voice_file = tmp_path / "voice.md"
+    voice_file.write_text(VOICE, encoding="utf-8")
+    monkeypatch.setattr(runner, "_generation_account_for",
+                        lambda _t: _acct(voice_doc=str(voice_file)))
+    asset = _asset(tmp_path, "used.jpg", "Packed class.")
+    used = rotation.local_global_fingerprint(asset[0])
+    monkeypatch.setattr(selector, "cross_client_used_fingerprints",
+                        lambda *args, **kwargs: {used})
+    poster = FakePoster()
+
+    out = runner.draft_for_new_upload(
+        "gymx", [asset], poster=poster, store=PendingStore(path=str(tmp_path / "s.json")))
+
+    assert out == []
+    assert poster.cards == []
+
+
 def test_upload_releases_only_definitive_no_card_no_row(monkeypatch, tmp_path):
     from agent import dam, rotation
     _arm(monkeypatch)

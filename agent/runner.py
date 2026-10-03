@@ -688,6 +688,16 @@ def draft_for_new_upload(tenant_key, filed_assets, poster=None, store=None,
                 continue
             ext = os.path.splitext(path)[1].lower()
             media_type = "video" if ext in VIDEO_EXTS else "image"
+            if media_type != "video":
+                # Direct-upload drafting does not pass through pick_image, so
+                # it must perform the same PR235 exact-byte exclusion before
+                # drafting or reserving a new local photo.  An unreadable
+                # global read reaches the per-asset exception handler and
+                # holds this asset; it never turns into a video fallback.
+                from . import rotation
+                available = rotation.globally_available_local_paths(account.key, [path])
+                if path not in available:
+                    continue
             if (media_type == "video"
                     and _unused_client_photo_available(
                         account, path, str(when)[:10])):
@@ -828,7 +838,12 @@ def _client_drive_kind_available(account, kind):
 
 
 def _client_local_photo_available(account, day_key, library_path):
-    """True/False for an unused local photo, None when its durable ledger is unreadable."""
+    """True/False for an unused local photo, None when local or global history is uncertain.
+
+    ``client_content.LocalPhotoGlobalLedgerUnavailable`` intentionally arrives
+    here as ``None`` rather than ``False``: the photo-first state machine may
+    only enter either video tier after it has proved both photo tiers empty.
+    """
     try:
         from . import client_content, rotation
         rotation.load_served_strict()
