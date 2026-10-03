@@ -77,7 +77,7 @@ def _lib(tmp_path, n=8):
     lib = tmp_path / "gritx_lib"
     lib.mkdir(exist_ok=True)
     for i in range(n):
-        (lib / f"photo_{i:02d}.jpg").write_bytes(b"\xff\xd8\xffFAKEJPEG")
+        (lib / f"photo_{i:02d}.jpg").write_bytes(b"\xff\xd8\xffFAKEJPEG" + bytes([i]))
         (lib / f"photo_{i:02d}.json").write_text(
             json.dumps({"public_url": f"https://gritx.media/photo_{i:02d}.jpg"}))
     return str(lib)
