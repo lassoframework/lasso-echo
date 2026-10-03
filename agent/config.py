@@ -14,6 +14,20 @@ import os
 # Only this Slack user can approve a post. Overridable by env, defaults to Blake.
 APPROVER_SLACK_ID = os.environ.get("AGENT_APPROVER_SLACK_ID", "U06EPUUCL13")
 
+
+def staff_slack_ids():
+    """Explicit LASSO staff identities for Slack intake, separate from approval.
+
+    ``AGENT_STAFF_SLACK_IDS`` is a comma-separated allowlist. It is read for each
+    identity resolution so an operator can add or remove a staff member without a
+    process restart. The approver is deliberately *not* folded into this setting:
+    approval remains governed only by ``APPROVER_SLACK_ID``.
+    """
+    raw = os.environ.get("AGENT_STAFF_SLACK_IDS", "")
+    return tuple(dict.fromkeys(
+        item.strip() for item in raw.split(",") if item.strip()
+    ))
+
 # ---- Paths -------------------------------------------------------------------
 # The brand voice doc is the ONLY source of voice + approved claims. If it is
 # missing, the agent drafts nothing (see voice.py + drafter.py).

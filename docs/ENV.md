@@ -20,6 +20,7 @@ before this file existed.
 | AGENT_PUBLISH_ENABLED | false | BLAKE | Publish gate. Code default stays false forever; armed only in Railway. |
 | AGENT_LASSO_3X_ENABLED | false | BLAKE | Durable third daily feed for canonical LASSO only; client gyms remain capped at 1x/2x. Requires `lasso_three_feed_capacity_20260930.sql`. |
 | AGENT_APPROVER_SLACK_ID | U06EPUUCL13 | code | The global approver. |
+| AGENT_STAFF_SLACK_IDS | (empty) | BLAKE | Comma-separated, reviewed LASSO staff Slack IDs for Slack support-ticket classification. This list does not grant approval privileges; `AGENT_APPROVER_SLACK_ID` remains the only approver gate. |
 | AGENT_OPS_ALERTS_ENABLED | false | BLAKE | One ECHO ALERT line per pipeline failure. |
 | AGENT_IDEMPOTENT_DRAFTS_ENABLED | false | BLAKE | One draft per (account, day, type); supersede/expire cards. |
 

@@ -31,6 +31,7 @@ from agent.slack_convo import adapter as A  # noqa: E402
 from agent.slack_convo import classifier as C  # noqa: E402
 from agent.slack_convo import identities as IDS  # noqa: E402
 from agent.slack_convo import identity_gate as IG  # noqa: E402
+from agent.slack_convo import listener_wiring as W  # noqa: E402
 from agent.slack_convo import outbox as OB  # noqa: E402
 from agent.slack_convo.bus import Bus, BusError  # noqa: E402
 from tests.gym_media_fakes import make_asset  # noqa: E402
@@ -291,6 +292,37 @@ def test_flags_off_touches_nothing():
     assert d.ignored and d.reason == "flag_off"
     assert bus.calls == [], "with the flag off the adapter must not even READ the bus"
     assert bus.tickets == {} and bus.msgs == []
+
+
+def test_explicit_staff_allowlist_classifies_aimee_before_ticket_persistence(monkeypatch):
+    """Aimee is staff only through the explicit runtime allowlist, never a code default."""
+    monkeypatch.setenv("AGENT_STAFF_SLACK_IDS", "U06F8BUH7CG")
+    bus = FakeBus()
+    deps = W.live_deps(IDS.get("echo"), bus=bus, log=lambda *a, **k: None)
+    deps.identity_enabled = lambda: True
+    deps.client_reply_armed = lambda: False
+    deps.staff_reply_armed = lambda: False
+    deps.daily_cap = lambda: 10
+    deps.open_window_days = lambda: 7
+
+    decision = A.handle_event(
+        _ev("the Echo calendar is broken", user="U06F8BUH7CG", channel_type="im"),
+        "G0MPIM:1.001", deps,
+    )
+
+    assert decision.identity_kind == IG.STAFF
+    assert decision.ticket_id
+    assert bus.tickets[decision.ticket_id]["identity_kind"] == IG.STAFF
+
+
+def test_approver_remains_staff_when_not_in_staff_allowlist(monkeypatch):
+    monkeypatch.setenv("AGENT_STAFF_SLACK_IDS", "U06F8BUH7CG")
+    monkeypatch.setattr(W.config, "APPROVER_SLACK_ID", "U_APPROVER")
+    deps = W.live_deps(IDS.get("echo"), bus=FakeBus(), log=lambda *a, **k: None)
+
+    assert deps.resolve_identity("U06F8BUH7CG").kind == IG.STAFF
+    assert deps.resolve_identity("U_APPROVER").kind == IG.STAFF
+    assert W.config.APPROVER_SLACK_ID == "U_APPROVER"
 
 
 def test_attach_registers_nothing_when_master_off(monkeypatch):
