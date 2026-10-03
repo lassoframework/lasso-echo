@@ -714,6 +714,95 @@ class SupabaseCalendarStore:
             return None
         return after
 
+    def replace_future_infographic_media(self, account_key, current, *, image_url,
+                                         source_media_url, source_media_asset_id,
+                                         reason, thumbnail_url=None):
+        """Replace one receipt-owned placeholder and clear its hold in one exact CAS.
+
+        Unlike a generic portal swap, this preserves approved rows as approved.
+        The old approved placeholder never becomes unheld before its replacement.
+        The operator owns byte approval, unique-photo reservation and receipt checks.
+        """
+        import re
+        from urllib.parse import urlsplit
+        hold_reason = "Photo-first hold: unverified infographic placeholder; approved gym photo required"
+        fill = re.compile(r"(?:^|/)igfill_\d{4}-\d{2}-\d{2}(?:[_-]|\.)", re.I)
+        def is_fill(row):
+            return any(fill.search(urlsplit(str(row.get(key) or "")).path)
+                       for key in ("image_url", "source_media_url"))
+        required = ("id", "gym_id", "post_date", "status", "variant_status", "account",
+                    "format", "caption", "image_url", "source_media_url",
+                    "source_media_asset_id", "media_not_ready_reason", "created_at",
+                    "published_at", "late_post_id", "thumbnail_url", "publish_claim_token",
+                    "publish_reservation_day", "slot_index", "scheduled_at")
+        if (not isinstance(current, dict) or any(key not in current for key in required)
+                or current["gym_id"] != account_key
+                or current["status"] not in ("pending", "approved")
+                or current["variant_status"] != "active"
+                or current["published_at"] is not None
+                or current["late_post_id"] is not None
+                or current["publish_claim_token"] is not None
+                or current["publish_reservation_day"] is not None
+                or reason != hold_reason or current["media_not_ready_reason"] != hold_reason
+                or not is_fill(current)
+                or not isinstance(image_url, str) or not image_url.startswith("https://")
+                or not isinstance(source_media_asset_id, str) or not source_media_asset_id.strip()
+                or (source_media_url is not None and
+                    (not isinstance(source_media_url, str)
+                     or not source_media_url.startswith("https://")))
+                or is_fill({"image_url": image_url, "source_media_url": source_media_url})):
+            return None
+        params = {key: "is.null" if current[key] is None else f"eq.{current[key]}"
+                  for key in required}
+        payload = {"image_url": image_url, "source_media_url": source_media_url,
+                   "source_media_asset_id": source_media_asset_id,
+                   "thumbnail_url": thumbnail_url, "media_not_ready_reason": None}
+        response = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=payload, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, "future infographic replacement CAS failed")
+        data = response.json()
+        if not isinstance(data, list) or len(data) != 1:
+            return None
+        after = data[0]
+        expected = {**current, **payload}
+        if any(after.get(key) != expected[key] for key in required):
+            return None
+        return after
+
+    def list_photo_restage_book(self, account_key):
+        """Read every retained gym row for a permanent no-repeat operator decision.
+
+        Include archived, denied and future rows; unknown/partial reads must abort.
+        """
+        rows, last_id = [], None
+        while True:
+            params = {"gym_id": f"eq.{account_key}", "order": "id", "limit": "500"}
+            if last_id is not None:
+                params["id"] = f"gt.{last_id}"
+            response = self._client().get(self._rest(_TABLE), params=params,
+                                          headers=self._headers(), timeout=30)
+            if response.status_code >= 400:
+                raise PortalStoreError(response.status_code, "photo restage book unavailable")
+            page = response.json()
+            if not isinstance(page, list):
+                raise PortalStoreError(502, "invalid photo restage book")
+            ids = [str(row.get("id") or "") for row in page if isinstance(row, dict)]
+            if (len(ids) != len(page) or not all(ids)
+                    or any(row.get("gym_id") != account_key for row in page)
+                    or any(a >= b for a, b in zip(ids, ids[1:]))
+                    or (ids and last_id is not None and ids[0] <= str(last_id))):
+                raise PortalStoreError(502, "photo restage book pagination stalled")
+            rows.extend(page)
+            if len(page) < 500:
+                return rows
+            last_id = page[-1]["id"]
+            if len(rows) >= 20000:
+                raise PortalStoreError(502, "photo restage book exceeds safe read bound")
+
     def release_future_infographic_media(self, account_key, current, reason):
         """Clear one receipt-owned hold by exact CAS, preserving approved state.
 
