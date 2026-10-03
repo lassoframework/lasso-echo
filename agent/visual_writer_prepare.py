@@ -24,6 +24,22 @@ def enabled() -> bool:
     return os.environ.get("AGENT_VISUAL_GLOBAL_WRITER_PREP", "").lower() in ("1", "true", "yes", "on")
 
 
+def _require_verified_thumbnail_object(row):
+    """Hold distinct poster objects until poster scene lineage is supported.
+
+    The interim writer guard can attest only the selected ``image_url`` object.
+    A blank poster adds no object; a byte-for-byte identical URL selects that
+    already verified object. Any other value must remain visible to the caller
+    and fail closed rather than being cleared or assigned invented lineage.
+    """
+    thumbnail = row.get("thumbnail_url")
+    if thumbnail is None or (isinstance(thumbnail, str) and not thumbnail.strip()):
+        return
+    if not isinstance(thumbnail, str) or thumbnail != row.get("image_url"):
+        raise VisualPreparationError(
+            "distinct thumbnail object has no verified poster scene lineage")
+
+
 def _rpc(store, name, arguments):
     response = store._client().post(
         store._rest("rpc/" + name), headers=store._headers({"Content-Type": "application/json"}),
@@ -299,6 +315,7 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
     if not enabled():
         return row
     prepared = dict(row)
+    _require_verified_thumbnail_object(prepared)
     url = prepared.get("image_url")
     source_url = prepared.get("source_media_url")
     if (not _own_media_url(url) or not isinstance(source_url, str) or
@@ -432,6 +449,7 @@ def prepare(store, account_key, row, *, read_bytes=None, render_evidence=None,
     if not enabled():
         return row
     prepared = dict(row)
+    _require_verified_thumbnail_object(prepared)
     tenant = _tenant(store, account_key)
     url = prepared.get("image_url")
     active = prepared.get("variant_status", "active") == "active"

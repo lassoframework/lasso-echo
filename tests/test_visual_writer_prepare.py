@@ -100,8 +100,47 @@ def _owner_writer(monkeypatch):
 def test_flag_off_preserves_payload_and_does_no_rpc(monkeypatch):
     monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
     http = HTTP()
-    row = {"image_url": URL, "status": "pending"}
+    row = {"image_url": URL, "thumbnail_url": "https://other.example/poster.jpg",
+           "status": "pending"}
     assert prep.prepare(store(http), "old-key", row) is row
+    assert http.calls == []
+
+
+def test_guarded_row_rejects_distinct_thumbnail_before_lookup_or_rpc(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    http = HTTP()
+    with pytest.raises(prep.VisualPreparationError, match="poster scene lineage"):
+        prep.prepare(store(http), "old-key", {
+            "image_url": URL, "source_media_url": URL,
+            "thumbnail_url": "https://media.example/another-scene-poster.jpg",
+        })
+    assert http.calls == []
+
+
+@pytest.mark.parametrize("thumbnail_url", [None, "", "   ", URL])
+def test_guarded_row_allows_blank_or_same_object_thumbnail(monkeypatch, thumbnail_url):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    data = b"same delivered and poster object"
+    digest = "md5:" + hashlib.md5(data).hexdigest()
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
+    _owner_writer(monkeypatch)
+    http = HTTP(known={("canonical_url", URL): "vg_same"}, fingerprint=digest)
+    prepared = prep.prepare(store(http), "old-key", {
+        "image_url": URL, "source_media_url": URL,
+        "thumbnail_url": thumbnail_url,
+    })
+    assert prepared["thumbnail_url"] == thumbnail_url
+    assert prepared["visual_group_key"] == "vg_same"
+
+
+def test_guarded_same_object_entrypoint_rejects_distinct_thumbnail(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    http = HTTP()
+    with pytest.raises(prep.VisualPreparationError, match="poster scene lineage"):
+        prep.prepare_same_object(store(http), "old-key", {
+            "image_url": URL, "source_media_url": URL,
+            "thumbnail_url": "https://media.example/video-poster.jpg",
+        })
     assert http.calls == []
 
 

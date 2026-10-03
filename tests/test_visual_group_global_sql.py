@@ -139,6 +139,9 @@ def test_selected_bytes_and_group_members_are_bound_before_claim():
         "create or replace function public.visual_global_row_bytes_verified(", 1
     )[1].split("end;\n$$;", 1)[0]
     assert "visual_global_row_fingerprint(p_row)" not in row_verify
+    assert "to_jsonb(p_row)->>'thumbnail_url'" in row_verify
+    assert "is distinct from\n      (to_jsonb(p_row)->>'image_url')" in row_verify
+    assert "poster so direct database writers cannot invent poster lineage" in row_verify
 
 
 def test_atomic_claim_locks_and_claims_the_complete_sorted_fingerprint_set():

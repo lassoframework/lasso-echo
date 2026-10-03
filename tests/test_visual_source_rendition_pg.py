@@ -48,7 +48,8 @@ def database():
     sql("""create table public.content_calendar(
         id uuid primary key default gen_random_uuid(), gym_id text, post_date date,
         status text default 'pending', account text, format text,
-        variant_status text default 'active', image_url text, source_media_url text,
+        variant_status text default 'active', image_url text, thumbnail_url text,
+        source_media_url text,
         source_media_asset_id text, drive_file_id text, byte_hash text, r2_key text,
         media_not_ready_reason text, published_at timestamptz, late_post_id text,
         publish_reservation_day date, publish_claim_token uuid,

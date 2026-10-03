@@ -36,15 +36,35 @@ def verified(tid, group, source_url, source_hash, delivered_url, delivered_hash)
                                                  delivered_url, delivered_hash)) + ")")
 
 
-def calendar(tid, group, source_url, delivered_url, digest, *, status="held", asset_id=None):
+def calendar(tid, group, source_url, delivered_url, digest, *, status="held", asset_id=None,
+             thumbnail_url=None):
     row_id = str(uuid.uuid4())
     sql("insert into public.content_calendar "
-        "(id,gym_id,post_date,status,account,format,image_url,source_media_url,byte_hash,visual_group_key,"
+        "(id,gym_id,post_date,status,account,format,image_url,thumbnail_url,source_media_url,byte_hash,visual_group_key,"
         "source_media_asset_id,drive_file_id) "
         f"values({q(row_id)}::uuid,{q(tid)},'2026-10-03',{q(status)},'instagram','feed',"
-        f"{q(delivered_url)},{q(source_url)},{q('derived:' + digest)},{q(group)},"
+        f"{q(delivered_url)},{q(thumbnail_url) if thumbnail_url is not None else 'null'},"
+        f"{q(source_url)},{q('derived:' + digest)},{q(group)},"
         f"{q(asset_id) if asset_id else 'null'},{q(asset_id) if asset_id else 'null'})")
     return row_id
+
+
+def test_row_verifier_holds_distinct_poster_but_allows_blank_or_same_object():
+    tid, group, urls, reads = chain(1)
+    blank = calendar(tid, group, urls[0], urls[1], reads[1][1])
+    same = calendar(tid, group, urls[0], urls[1], reads[1][1], thumbnail_url=urls[1])
+    distinct = calendar(tid, group, urls[0], urls[1], reads[1][1],
+                        thumbnail_url="https://test/another-scene-poster.jpg")
+    for row_id in (blank, same):
+        assert sql("select public.visual_global_row_bytes_verified(c) "
+                   "from public.content_calendar c "
+                   f"where c.id={q(row_id)}::uuid") == "t"
+    assert sql("select public.visual_global_row_bytes_verified(c) "
+               "from public.content_calendar c "
+               f"where c.id={q(distinct)}::uuid") == "f"
+    with pytest.raises(RuntimeError, match="not fully attested"):
+        sql("select public.visual_global_claim_scene(c,false,false) "
+            f"from public.content_calendar c where c.id={q(distinct)}::uuid")
 
 
 def test_distinct_abc_chain_verifies_and_claims_all_bytes_without_fake_ac_receipt():

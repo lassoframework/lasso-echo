@@ -871,10 +871,21 @@ create or replace function public.visual_global_row_bytes_verified(
 ) returns boolean language plpgsql stable security definer set search_path = public as $$
 declare v_tenant text; v_group text; v_source_url text; v_delivered_url text;
   v_source_hash text; v_delivered_hash text; v_selected text; v_kind text;
+  v_thumbnail_url text;
 begin
   v_tenant:=public.visual_group_tenant_id(p_row.gym_id)::text;
   v_group:=p_row.visual_group_key;
   v_delivered_url:=nullif(btrim(p_row.image_url),'');
+  v_thumbnail_url:=nullif(btrim(to_jsonb(p_row)->>'thumbnail_url'),'');
+  -- Interim poster hold: the phase-1 scene ledger attests image/source objects,
+  -- not a third poster object. Blank is safe and an exact URL match reuses the
+  -- already verified delivered object. Preserve and reject every distinct
+  -- poster so direct database writers cannot invent poster lineage.
+  if v_thumbnail_url is not null and
+      (to_jsonb(p_row)->>'thumbnail_url') is distinct from
+      (to_jsonb(p_row)->>'image_url') then
+    return false;
+  end if;
   -- An absent source is unknown, even when the delivered object has a valid
   -- receipt. Only the row can select which attested source fed its rendition.
   v_source_url:=nullif(btrim(to_jsonb(p_row)->>'source_media_url'),'');
