@@ -42,6 +42,21 @@ def _env(monkeypatch, tmp_path):
         _json.dumps({"colors": GYMX_BRAND_COLORS,
                      "source_url": "https://gymx.example/brand-guide"}))
     monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(voice_dir))
+    from agent import gym_media_index
+
+    class EmptyDriveIndex:
+        def available(self):
+            return True
+
+        def list_sources(self, _base):
+            return [{"kind": "gym_drive", "active": True,
+                     "revoked_externally": False, "sync_status": "ready",
+                     "sync_finished_at": "2026-10-02T00:00:00Z"}]
+
+        def list_assets(self, _base):
+            return []
+
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: EmptyDriveIndex())
     # hosting + nano stubbed per test
 
 
@@ -114,7 +129,7 @@ def test_fills_empty_days_with_pending_infographic_rows(monkeypatch):
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00")
-    assert out["ok"] is True and out["filled"] == cif.FILL_MAX_PER_RUN
+    assert out["ok"] is True and out["filled"] == cif.FILL_MAX_PER_RUN, out
     assert store.deleted == [], "fill must be INSERT-only"
     feeds_ig = [r for r in store.inserted
                 if r["format"] == "feed" and r["account"] == "instagram"]

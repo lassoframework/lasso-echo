@@ -81,8 +81,9 @@ def kinds_for_slot(pool_kinds, day_key, slot_index=0):
         return [_idx.KIND_VIDEO]
     if kinds == {_idx.KIND_PHOTO}:
         return [_idx.KIND_PHOTO]
-    if is_video_slot(day_key, slot_index):
-        return [_idx.KIND_VIDEO, _idx.KIND_PHOTO]
+    # Approved stills are always consumed before clips.  The video cadence is a
+    # preference only when no pickable photo remains; it must never bypass an
+    # available client photo in the same Drive pool.
     return [_idx.KIND_PHOTO, _idx.KIND_VIDEO]
 
 

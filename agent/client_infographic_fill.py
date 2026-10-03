@@ -98,6 +98,20 @@ def real_media_depleted(base, *, now=None):
         media_store = gym_media_index.default_store()
         if not media_store.available():
             return False
+        list_sources = getattr(media_store, "list_sources", None)
+        if not callable(list_sources):
+            return False
+        sources = list_sources(base) or []
+        ready = [s for s in sources
+                 if str(s.get("kind") or "") == "gym_drive"
+                 and s.get("active") is not False
+                 and not s.get("revoked_externally")
+                 and str(s.get("sync_status") or "").lower() == "ready"
+                 and s.get("sync_finished_at")]
+        # An empty asset response is meaningful only after a successful sync.
+        # Without that proof, an empty/stale DB must never unlock Astra fallback.
+        if not ready:
+            return False
         # pickable() intentionally converts store errors to [] for planning.
         # For a client depletion notice, distinguish a failed read from empty.
         assets = media_store.list_assets(base)
