@@ -486,23 +486,55 @@ def _record_feed_served(account, feed, day_key):
     """Record an ACCEPTED feed's photo as served for rotation — only once the day has cleared
     the A+ gate, the real-creative check, and the no-reuse check, i.e. it is actually KEPT.
     This replaces the old pick-time record inside build_client_draft that poisoned the ledger
-    (see build_client_draft record_serve). Best effort; never raises, never blocks a build."""
+    (see build_client_draft record_serve). Returns False when the durable write cannot
+    be proved; callers must drop that feed before the calendar write."""
     try:
         from . import rotation, dam
         path = (getattr(feed, "creative_path", "") or "").strip()
         if not path:
-            return
-        rotation.record_served(account.key, dam.rotation_key(path),
-                               getattr(feed, "category", "") or "", day_key)
+            return False
+        reservation_id = rotation.reserve_served(
+            account.key, dam.rotation_key(path),
+            getattr(feed, "category", "") or "", day_key)
+        if reservation_id:
+            setattr(feed, "_served_reservation_id", reservation_id)
+        return bool(reservation_id)
     except Exception as e:  # noqa: BLE001
-        print(f"[client-month] served-record skipped for {day_key}: {type(e).__name__}: {e}")
+        print(f"[client-month] served-record failed for {day_key}: {type(e).__name__}: {e}")
+        return False
 
 
 def _row_from_draft(base_key, draft):
     """One draft folded into a content_calendar row using the SAME mapping the real
     month/mirror use (gym_id=base_key). PAUSED status by construction (the draft is
     PENDING; _real_row maps that to 'pending')."""
-    return _mirror._real_row(base_key, draft)
+    row = _mirror._real_row(base_key, draft)
+    reservation_id = getattr(draft, "_served_reservation_id", None)
+    if reservation_id:
+        row["_served_reservation_id"] = reservation_id
+    return row
+
+
+def _release_unlanded_reservations(drafts, retained=()):
+    """Release exact served rows for drafts that never became calendar rows."""
+    from . import rotation
+    keep = {int(r) for r in (retained or ()) if r}
+    seen = set()
+    for draft in drafts or ():
+        rid = getattr(draft, "_served_reservation_id", None)
+        if not rid or int(rid) in keep or int(rid) in seen:
+            continue
+        seen.add(int(rid))
+        rotation.release_served(rid)
+
+
+def _release_feed_reservation(feed):
+    """Release one feed reserved before finishing could add it to ``drafts``."""
+    _release_unlanded_reservations([feed])
+    try:
+        delattr(feed, "_served_reservation_id")
+    except (AttributeError, TypeError):
+        pass
 
 
 def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
@@ -735,13 +767,20 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
         feed_path = (getattr(feed, "creative_path", "") or "").strip()
         key = (_url_basename(getattr(feed, "creative_public_url", "") or "")
                or os.path.basename(feed_path))
-        _record_feed_served(account, feed, day_key)
+        if not _record_feed_served(account, feed, day_key):
+            log(f"{base_key} {day_key}: served ledger write failed; local feed held")
+            continue
         raw_basename = os.path.basename(feed_path) if feed_path else ""
         media_guard.note_placed(guard_state, raw_basename or key, day_key)
         story_override = (edited_story_caps or {}).get(str(day_key)[:10])
-        drafts.extend(_finish_feed_with_story(
-            account, feed, library_path, log, day_key=day_key,
-            story_caption_override=story_override))
+        try:
+            finished = _finish_feed_with_story(
+                account, feed, library_path, log, day_key=day_key,
+                story_caption_override=story_override)
+        except Exception:
+            _release_feed_reservation(feed)
+            raise
+        drafts.extend(finished)
         covered_days.add(day_key)
         if key:
             used_keys.add(key)
@@ -1162,6 +1201,11 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         return _result
     finally:
         _res = _applied["result"] or {}
+        if _applied["result"] is None:
+            # Planning can raise after one or more local reservations but before
+            # _apply owns the write. No remote calendar request started, so these
+            # exact rows are proven unlanded and safe to release.
+            _release_unlanded_reservations(drafts)
         wrote = bool(_res.get("inserted"))
         if not wrote:
             # Nothing landed (a no-op, a gate refusal, a raise, or a delete whose
@@ -1441,10 +1485,16 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             # ACCEPTED: the feed survived every gate and is being placed. Record its
             # photo as served NOW (not at pick time) so rotation reflects only KEPT
             # days — never the picked-then-dropped attempts.
-            _record_feed_served(account, feed, day_key)
-            day_drafts = _finish_feed_with_story(
-                account, feed, library_path, log, day_key=day_key,
-                story_caption_override=story_caption_override)
+            if not _record_feed_served(account, feed, day_key):
+                log(f"{base_key} {day_key}: served ledger write failed; local feed held")
+                continue
+            try:
+                day_drafts = _finish_feed_with_story(
+                    account, feed, library_path, log, day_key=day_key,
+                    story_caption_override=story_caption_override)
+            except Exception:
+                _release_feed_reservation(feed)
+                raise
             # 2x rows carry their slot ordinal so publish-time slot times are
             # deterministic (07:30 / 18:30, config.cadence_slot_times). 1x days carry
             # NO ordinal: the row shape (and publish hashing) stays byte-for-byte.
@@ -1609,8 +1659,17 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                                      logger=log)
     if _gbp_rows:
         rows.extend(_gbp_rows)
-    result = _apply(base_key, rows, start, days, store, log,
-                    locked_days=locked_feed_days, allow_reshape=allow_reshape)
+    try:
+        result = _apply(base_key, rows, start, days, store, log,
+                        locked_days=locked_feed_days, allow_reshape=allow_reshape)
+    except Exception:
+        # _apply owns and catches remote writes. An exception escaping its contract
+        # happened before it returned a retained/unknown set, so none of this build's
+        # rows is proven landed; release the exact local reservations before raising.
+        _release_unlanded_reservations(drafts)
+        raise
+    _release_unlanded_reservations(
+        drafts, retained=result.get("retained_reservation_ids", ()))
     # NOTHING WRITTEN (never-wipe-to-empty, never-shrink, a gate refusal, a store
     # failure): build_client_month's try/finally reads `inserted` / `deleted` off this
     # result and restores the released stamps / rolls back this build's unlanded picks
@@ -2071,12 +2130,17 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     from . import lever_stamp as _levers
     _levers.apply_learning_stamps(base_key, clean_rows, logger=log)
     deleted = inserted = 0
+    insert_started = False
+    planned_reservation_ids = set()
     try:
         # PRESERVE APPROVALS: drop any incoming row that would collide with a slot the
         # gym has already approved/published, and let delete_month keep those rows in
         # place (it only wipes fresh drafts). A rebuild can no longer revert an approval.
         from .portal_calendar_store import preserve_and_prune
         clean_rows, _locked = preserve_and_prune(store, base_key, months, clean_rows)
+        planned_reservation_ids = {
+            int(r["_served_reservation_id"]) for r in clean_rows
+            if r.get("_served_reservation_id")}
         # NEVER WIPE TO EMPTY (TopFuel, 2026-08-25): a rebuild that produced NO rows must not
         # delete an existing calendar. This happens when the grow-guard re-triggers a build
         # for a gym that is effectively built out (its build_target counts photo clusters, but
@@ -2265,14 +2329,23 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                     deleted += delete_month(base_key, month) or 0
         insert_rows = getattr(store, "insert_rows", None)
         if insert_rows is not None and clean_rows:
-            inserted += len(insert_rows(base_key, clean_rows) or [])
+            store_rows = [{k: v for k, v in r.items()
+                           if k != "_served_reservation_id"} for r in clean_rows]
+            insert_started = True
+            inserted += len(insert_rows(base_key, store_rows) or [])
     except Exception as exc:  # noqa: BLE001
         log(f"store write failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
-                "upserted": inserted, "deleted": deleted, "months": months}
+                "upserted": inserted, "deleted": deleted, "months": months,
+                # Once the insert request started, its outcome may be unknown. Keep
+                # those exact reservations fail closed; pre-insert failures retain none.
+                "retained_reservation_ids": sorted(planned_reservation_ids)
+                if insert_started else []}
     return {"ok": True, "upserted": inserted, "inserted": inserted,
             "deleted": deleted if span_claim is None else span_claim,
-            "deleted_total": deleted, "months": months}
+            "deleted_total": deleted, "months": months,
+            "retained_reservation_ids": sorted(planned_reservation_ids)
+            if insert_started else []}
 
 
 def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
@@ -2317,18 +2390,24 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
     # calls the same caption/vision paths per slot, so it gets the same
     # renew-on-interval treatment instead of racing a long pass's own lock.
     _heartbeat = _build_lock.start_heartbeat(base_key, holder=_lock_holder)
+    reservation_state = {"drafts": [], "insert_started": False}
     try:
         return _backfill_denied_slots_body(
             account, base_key, start_date, days, voice=voice,
             library_path=library_path, store=store, banned_words=banned_words,
-            logger=log)
+            logger=log, _reservation_state=reservation_state)
+    except Exception:
+        if not reservation_state["insert_started"]:
+            _release_unlanded_reservations(reservation_state["drafts"])
+        raise
     finally:
         _heartbeat.stop()
         _build_lock.release(base_key, holder=_lock_holder)
 
 
 def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice,
-                                library_path=None, store, banned_words=(), logger=None):
+                                library_path=None, store, banned_words=(), logger=None,
+                                _reservation_state=None):
     """Give each DENIED feed POST a FRESH 1:1 replacement (a NEW caption on a REUSED photo)
     for a gym that is AT its creative cap — where the monthly grow-to-cap build is a no-op
     and the denied slot would otherwise stay empty forever (the portal's "recreating" state
@@ -2488,6 +2567,8 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
                       getattr(account, "key", "") or base_key))
     drive_pillar_i = 0
     drafts = []
+    if _reservation_state is not None:
+        _reservation_state["drafts"] = drafts
     skipped = 0
     done_row_ids = []
     used_days_for_marker = []    # every day a replacement was actually placed onto this
@@ -2600,15 +2681,23 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
             log(f"{base_key} {day_key}: no A+ replacement could be built "
                 f"({drop or 'no usable creative'})")
             continue
-        _record_feed_served(account, feed, day_key)   # KEPT: record only accepted backfills
+        if not _record_feed_served(account, feed, day_key):
+            skipped += 1
+            log(f"{base_key} {day_key}: served ledger write failed; backfill held")
+            continue
         # This run's placement joins the guard state so the NEXT denied day in the
         # same pass cannot pick the same photo (the store read happened before any
         # insert).
         media_guard.note_placed(
             guard_state, _url_basename(getattr(feed, "creative_public_url", ""))
             or os.path.basename(getattr(feed, "creative_path", "") or ""), day_key)
-        drafts.extend(_finish_feed_with_story(account, feed, library_path, log,
-                                              day_key=day_key))
+        try:
+            finished = _finish_feed_with_story(
+                account, feed, library_path, log, day_key=day_key)
+        except Exception:
+            _release_feed_reservation(feed)
+            raise
+        drafts.extend(finished)
         day_used_this_pass.add(day_key)   # so the NEXT denied row this pass rolls past it too
         used_days_for_marker.append(day_key)
         if denied.get("row_id"):
@@ -2618,31 +2707,43 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
         return {"ok": True, "backfilled": 0, "days_needing": len(todo),
                 "skipped": skipped}
 
-    rows = _to_rows(base_key, drafts)
-    # GATE 2 safety: withhold a first-month gym's replacement exactly as its month would be.
-    # (A gym with a denied post is established by construction, so this is a guard.)
-    if (config.coach_screen_first_month_enabled() and base_key != "lasso"
-            and _is_first_month(base_key, store, log)):
-        for r in rows:
-            r["status"] = "coach_review"
-    # GOOGLE BUSINESS MIRROR (AGENT_GBP_MIRROR, default OFF): a denied-slot replacement is
-    # a real feed post, so it mirrors to Google exactly like a month-build post. Appended
-    # after the GATE 2 loop so the GBP row stays 'pending' (never 'coach_review').
-    from . import gbp_mirror as _gbp_mirror
-    rows.extend(_gbp_mirror.rows_for(base_key, drafts, library_path=library_path,
-                                     logger=log))
-    clean_rows = [{k: v for k, v in r.items() if k != "id"}
-                  for r in rows if str(r.get("gym_id")) == str(base_key)]
-    # Same Wave 7 stamping as the month build above: a denied-slot replacement is a
-    # real post the retro should be able to learn from.
-    from . import lever_stamp as _levers
-    _levers.apply_learning_stamps(base_key, clean_rows, logger=log)
     try:
-        inserted = len(insert_rows(base_key, clean_rows) or [])
+        rows = _to_rows(base_key, drafts)
+        # GATE 2 safety: withhold a first-month replacement exactly as its month would be.
+        if (config.coach_screen_first_month_enabled() and base_key != "lasso"
+                and _is_first_month(base_key, store, log)):
+            for r in rows:
+                r["status"] = "coach_review"
+        from . import gbp_mirror as _gbp_mirror
+        rows.extend(_gbp_mirror.rows_for(base_key, drafts, library_path=library_path,
+                                         logger=log))
+        clean_rows = [{k: v for k, v in r.items() if k != "id"}
+                      for r in rows if str(r.get("gym_id")) == str(base_key)]
+        from . import lever_stamp as _levers
+        _levers.apply_learning_stamps(base_key, clean_rows, logger=log)
+    except Exception:
+        # No insert request has started, so every exact reservation is unlanded.
+        _release_unlanded_reservations(drafts)
+        raise
+    try:
+        store_rows = [{k: v for k, v in r.items()
+                       if k != "_served_reservation_id"} for r in clean_rows]
+        if _reservation_state is not None:
+            _reservation_state["insert_started"] = True
+        inserted_rows = insert_rows(base_key, store_rows) or []
+        inserted = len(inserted_rows)
     except Exception as exc:  # noqa: BLE001
+        # The insert request may have reached the remote store before the exception;
+        # keep reservations fail closed when its outcome is unknown.
         log(f"{base_key}: backfill insert failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"insert failed: {type(exc).__name__}",
                 "backfilled": 0, "days_needing": len(todo), "skipped": skipped}
+    if inserted == 0:
+        # A completed insert call returning zero rows is a proven no-op. Release only
+        # this attempt's exact reservations; an exception above remains unknown and
+        # deliberately retains them fail closed.
+        _release_unlanded_reservations(drafts)
+
     # Stamp per-row AND per-day idempotency ONLY after the insert genuinely succeeded --
     # a failed insert must leave every denied row (and its target day) eligible for retry
     # next pass, not silently marked done/used with no actual replacement ever written.

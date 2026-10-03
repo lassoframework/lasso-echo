@@ -276,18 +276,17 @@ def test_legacy_pick_returns_none_when_drive_can_fill_instead_of_a_stale_repeat(
     assert client_content.pick_image("tt_ig", "2026-09-11", lib, pillar="service") is None
 
 
-def test_legacy_pick_keeps_the_stale_repeat_when_no_drive_pool(tmp_path, monkeypatch):
+def test_legacy_pick_does_not_repeat_when_no_drive_pool(tmp_path, monkeypatch):
     lib = str(tmp_path)
     _still(lib, "only.jpg")
     _served(lib, "only.jpg", "tt_ig", "2026-09-05")
     monkeypatch.setattr(client_content, "drive_pool_can_fill", lambda *a, **k: False)
     pick = client_content.pick_image("tt_ig", "2026-09-11", lib, pillar="service")
-    assert pick is not None and getattr(pick, "stale_reuse", False) is True
+    assert pick is None
 
 
-def test_allow_reuse_last_resort_still_gets_the_stale_pick(tmp_path, monkeypatch):
-    """The denied-slot backfill already tried Drive first; its explicit allow_reuse
-    fallback must never be emptied by the gate (a denied slot stays filled)."""
+def test_allow_reuse_last_resort_does_not_repeat_a_used_photo(tmp_path, monkeypatch):
+    """A denied-slot backfill may not resurrect a photo used on another day."""
     lib = str(tmp_path)
     _still(lib, "only.jpg")
     _served(lib, "only.jpg", "tt_ig", "2026-09-05")
@@ -295,7 +294,7 @@ def test_allow_reuse_last_resort_still_gets_the_stale_pick(tmp_path, monkeypatch
                         lambda *a, **k: pytest.fail("gate must not run for allow_reuse"))
     pick = client_content.pick_image("tt_ig", "2026-09-11", lib, pillar="service",
                                      allow_reuse=True)
-    assert pick is not None
+    assert pick is None
 
 
 def test_drive_pool_can_fill_needs_both_flags_and_a_pickable_asset(monkeypatch):

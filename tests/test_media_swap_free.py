@@ -97,6 +97,7 @@ def _wire(monkeypatch, store):
     # after_swap settles the Drive/served ledgers post-write; the handler tests are
     # about the HTTP contract, so keep them off the real ledgers.
     monkeypatch.setattr(msw, "after_swap", lambda *a, **k: None)
+    monkeypatch.setattr(msw, "reserve_local_pick", lambda *a, **k: True)
 
 
 def _cand(key, kind="photo", source="local", last_used="", used_count=0, path=None):
@@ -296,6 +297,87 @@ def test_pick_replacement_reports_no_library_instead_of_borrowing_another_gyms()
         "zanshin", _row("p1"), store=_Store(), library_path="",
         media_store=type("S", (), {"available": lambda self: False})())
     assert out == {"ok": False, "reason": msw.REASON_NO_LIBRARY}
+
+
+def test_local_candidates_fail_closed_when_served_ledger_is_unreadable(
+        tmp_path, monkeypatch):
+    from PIL import Image
+    from agent import rotation
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    path = lib / "fresh.jpg"
+    Image.new("RGB", (64, 64), "red").save(path, quality=95)
+    with open(path, "ab") as fh:
+        fh.write(b"\0" * 4096)
+    monkeypatch.setattr(rotation, "load_served_strict",
+                        lambda: (_ for _ in ()).throw(RuntimeError("db down")))
+
+    assert msw.local_candidates("zanshin", str(lib), "2026-09-20", set()) == []
+
+
+def test_local_candidates_include_gbp_in_permanent_served_history(monkeypatch):
+    monkeypatch.setattr(msw, "_last_served_local", msw._last_served_local)
+    from agent import rotation
+    assert rotation.record_served("zanshin_gbp", "shot.jpg", "", "2026-09-01")
+    assert msw._last_served_local("zanshin")["shot.jpg"] == "2026-09-01"
+
+
+def test_swap_holds_before_calendar_write_when_local_reservation_fails(monkeypatch):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    store = _Store([_row("p1")])
+    monkeypatch.setattr(msw, "reserve_local_pick", lambda *a, **k: False)
+    monkeypatch.setattr(msw, "after_swap",
+                        lambda *a, **k: pytest.fail("an unreserved swap cannot settle"))
+    pick = dict(_picker("zanshin", _row("p1")), path="/lib/new.jpg")
+
+    status, body = ps.handle_swap_media(
+        "zanshin", "p1", "u1", sb_store=store,
+        picker=lambda *a, **k: pick)
+
+    assert status == 503 and body["reason"] == "served_ledger_unavailable"
+    assert store.swaps == []
+    assert store._rows["p1"]["image_url"] == "https://cdn/old.jpg"
+
+
+def test_noop_swap_releases_exact_local_reservation(monkeypatch, tmp_path):
+    from agent import rotation
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    store = _Store([_row("p1", status="approved")])
+    # The row changes to approved between the owned-row read and guarded write.
+    original_get = store.get_row
+    calls = {"n": 0}
+    def get_row(*args):
+        calls["n"] += 1
+        row = original_get(*args)
+        if row and calls["n"] == 1:
+            store._rows["p1"]["status"] = "approved"
+            row["status"] = "pending"
+        return row
+    store.get_row = get_row
+    pick = dict(_picker("zanshin", _row("p1")), path=str(tmp_path / "new.jpg"))
+
+    status, _ = ps.handle_swap_media(
+        "zanshin", "p1", "u1", sb_store=store, picker=lambda *a, **k: pick)
+
+    assert status == 409 and store.swaps
+    assert rotation.load_served_strict().get("zanshin_ig", []) == []
+
+
+def test_unknown_remote_swap_outcome_retains_local_reservation(monkeypatch, tmp_path):
+    from agent import rotation
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    store = _Store([_row("p1")])
+    def unknown(*args, **kwargs):
+        raise RuntimeError("response lost after request started")
+    store.swap_media = unknown
+    pick = dict(_picker("zanshin", _row("p1")), path=str(tmp_path / "new.jpg"))
+
+    status, _ = ps.handle_swap_media(
+        "zanshin", "p1", "u1", sb_store=store, picker=lambda *a, **k: pick)
+
+    assert status == 500
+    assert rotation.load_served_strict().get("zanshin_ig"), (
+        "unknown remote outcomes must retain the reservation fail closed")
 
 
 def test_pick_replacement_refuses_when_hosting_is_down_rather_than_half_swapping():
@@ -750,6 +832,7 @@ def test_a_failed_book_reread_leaves_the_old_asset_stamped(monkeypatch):
     store.list_month = _flaky
     seen = {}
     monkeypatch.setattr(msw, "after_swap", lambda base, row, pick, **kw: seen.update(kw))
+    monkeypatch.setattr(msw, "reserve_local_pick", lambda *a, **k: True)
     status, _ = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store, picker=_picker)
     assert status == 200
     assert seen["book_rows"] is None, "a failed re-read must reach after_swap as None"

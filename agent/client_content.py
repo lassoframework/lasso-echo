@@ -174,6 +174,13 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     recently-served photo becomes eligible. Default False = no fallback pass at all (a denied
     slot with no fresh option returns None, same as before this fallback existed).
 
+    ONCE-USED (Blake, 2026-10-02): before either branch runs, any local photo whose
+    rotation cluster was ever planned/served for this gym (any lane, any date, per
+    rotation.local_photo_served) is removed from contention -- including the
+    allow_reuse fallback pass. Same-day reuse is blocked unless a future atomic
+    calendar primitive can prove the rows are one mirrored post. The guard fails
+    closed: an unreadable served ledger returns None.
+
     FIX (Pete/CrossFit Zanshin, 2026-09-07): this used to lift the reuse window BEFORE
     scoring, so fresh and recently-denied photos were scored in the same pool together —
     recency was only a minor nudge inside content_score, not a hard preference, so a
@@ -202,14 +209,44 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
         imgs = [c for c in imgs if _image_key(c) not in skip]
     if not imgs:
         return None
+
+    def _rkey(c):
+        return dam.rotation_key(c.path)
+
+    # DURABLE ONCE-USED GUARD (Blake, 2026-10-02): a client-uploaded local photo
+    # that was EVER planned/served for this gym is out for every later date --
+    # both branches below (vision and legacy), including the allow_reuse=True
+    # last-resort pass. The served ledger is read STRICTLY here: load_served
+    # swallows read failures as {}, which would fail OPEN and resurrect consumed
+    # photos, so an unreadable ledger fails closed (no local pick) instead. The
+    # A same-day account sibling is still blocked: account/date alone cannot prove
+    # that two rows are mirrors of one post rather than separate same-day posts.
+    try:
+        served_all = rotation.load_served_strict()
+    except Exception as exc:  # noqa: BLE001 - fail closed, never reuse on a guess
+        print(f"[client-content] once-used guard: served ledger unreadable for "
+              f"{account_key} ({type(exc).__name__}); no local pick this day")
+        return None
+
+    def _once_used(c):
+        try:
+            return rotation.local_photo_served(_rkey(c), account_key, day_key,
+                                               served=served_all)
+        except Exception:  # noqa: BLE001 - any doubt => treated as consumed
+            return True
+
+    imgs = [c for c in imgs if not _once_used(c)]
+    if not imgs:
+        return None
+    # The 14-day window / least-recently-served logic below is a recency nudge,
+    # not the once-used authority, so it keeps the legacy tolerant read (a flaky
+    # ledger never changed WHICH fresh photo won, and the durable guard above
+    # already failed closed on an unreadable ledger).
     served = rotation.load_served().get(account_key, [])
     last_served = {}
     for e in served:                       # oldest..newest, so newest date wins
         last_served[e["key"]] = e["date"]
     window_start = rotation._days_ago(day_key, config.ROTATION_WINDOW_DAYS)
-
-    def _rkey(c):
-        return dam.rotation_key(c.path)
 
     if config.vision_enabled_for(account_key) and pillar:
         from . import vision
@@ -722,7 +759,11 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         # photo drifted into its reuse window and pick_image returned None -> "caption ready,
         # no image" -> nothing published (TopFuel/GritX, 2026-08-25).
         if record_serve:
-            rotation.record_served(account.key, dam.rotation_key(image.path), category, day_key)
+            if not rotation.record_served(
+                    account.key, dam.rotation_key(image.path), category, day_key):
+                print(f"[client-content] served ledger write failed for {account.key} "
+                      f"on {day_key}; refusing the local draft")
+                return None
         draft = Draft(
             draft_id=_make_id(account.key, image.path, scheduled_for),
             account_key=account.key,

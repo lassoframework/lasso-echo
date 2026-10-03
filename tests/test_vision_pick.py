@@ -158,17 +158,18 @@ def test_allow_reuse_still_prefers_a_fresh_photo(tmp_path, monkeypatch):
     )
 
 
-def test_allow_reuse_falls_back_when_library_is_exhausted(tmp_path, monkeypatch):
-    """When every photo is inside its reuse window (the gym truly has no fresh creative
-    left), allow_reuse=True is the documented last resort: a recently-served photo is
-    picked rather than leaving the slot empty."""
+def test_allow_reuse_never_resurrects_a_served_photo(tmp_path, monkeypatch):
+    """DURABLE ONCE-USED (Blake, 2026-10-02): allow_reuse=True is no longer a route
+    back to a served photo. A photo ever planned/served for the gym is ineligible
+    across dates, so an exhausted library returns None (the day is left for the
+    Drive lane / no-empty-day fallback) instead of repeating the client's photo."""
     monkeypatch.setenv("AGENT_VISION_GYMS", "zanshin")
     lib = str(tmp_path)
     _asset(lib, "only_one.png", _analysis(activity="coaching", people_bucket="pair"))
     _mark_served(lib, "only_one.png", "zanshin_ig", "2026-08-30")
     pick = client_content.pick_image("zanshin_ig", "2026-09-01", lib,
                                      pillar="testimonial", allow_reuse=True)
-    assert pick is not None and os.path.basename(pick.path) == "only_one.png"
+    assert pick is None
 
 
 def test_allow_reuse_false_still_returns_none_when_exhausted(tmp_path, monkeypatch):
@@ -185,21 +186,18 @@ def test_allow_reuse_false_still_returns_none_when_exhausted(tmp_path, monkeypat
 
 # ---- legacy branch (vision OFF): a stale repeat is still placed, but FLAGGED --------
 
-def test_legacy_still_fills_the_day_but_flags_a_stale_reuse(tmp_path, monkeypatch):
-    """A non-vision gym (Zanshin, Reverb: not in AGENT_VISION_GYMS) whose whole small
-    library was served inside the 14-day window still gets a photo — a polluted served
-    ledger must never collapse a whole month to zero content — but the pick now carries
-    `stale_reuse=True` so the caller (client_month_run.append_gym_drive_drafts only
-    fills days the uploaded-media loop left uncovered) can choose not to treat the day
-    as covered, giving the gym's connected Drive pool a chance to supply something
-    fresher instead."""
+def test_legacy_never_repeats_a_served_photo(tmp_path, monkeypatch):
+    """DURABLE ONCE-USED (Blake, 2026-10-02): a non-vision gym whose whole small
+    library was already served gets NO repeat — the stale_reuse repeat path is
+    gone for previously-served local photos. pick_image returns None and the day
+    is left uncovered for the Drive lane / no-empty-day fallback, which is where
+    a fresh fill now comes from."""
     monkeypatch.delenv("AGENT_VISION_GYMS", raising=False)
     lib = str(tmp_path)
     _asset(lib, "only.png", _analysis())
     _mark_served(lib, "only.png", "zanshin_ig", "2026-08-30")   # within the 14-day window
     pick = client_content.pick_image("zanshin_ig", "2026-09-01", lib, pillar="testimonial")
-    assert pick is not None and os.path.basename(pick.path) == "only.png"
-    assert getattr(pick, "stale_reuse", False) is True
+    assert pick is None
 
 
 def test_legacy_fresh_photo_never_flagged_stale(tmp_path, monkeypatch):

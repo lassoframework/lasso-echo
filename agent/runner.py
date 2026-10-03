@@ -682,6 +682,11 @@ def _trust_startup_warning():
               "still cards.")
 
 
+def _legacy_library_fallback_allowed(account):
+    """Whether daily drafting may bypass client_content and cycle the raw library."""
+    return str(getattr(account, "key", "") or "").startswith("lasso")
+
+
 def run_daily(poster=None, voice_path=None, library_path=None,
               scheduled_for=None, accounts=None, store=None):
     """
@@ -990,9 +995,11 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 draft = build_client_draft(account, day_key, acct_voice, acct_lib,
                                            poster=poster)
             # Library fallback: the last leg of the legacy LASSO daily draft. Skipped
-            # for LASSO accounts when autopublish is on so no redundant card is built;
-            # client/non-LASSO accounts are unaffected (_skip_legacy_lasso_daily False).
-            if draft is None and not _skip_legacy_lasso_daily:
+            # for LASSO accounts when autopublish is on so no redundant card is built.
+            # When client sources are armed, non-LASSO accounts must stay on
+            # client_content's strict once-used picker instead of cycling pick_next.
+            if (draft is None and not _skip_legacy_lasso_daily
+                    and _legacy_library_fallback_allowed(account)):
                 creative = pick_next(account, acct_lib, used_creatives_for(account.key))
                 if config.lasso_infographic_quality_enabled(account.key) and creative is not None:
                     from .infographic_evidence import reviewed_asset

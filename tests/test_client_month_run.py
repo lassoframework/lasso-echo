@@ -1113,7 +1113,8 @@ def test_month_build_records_served_only_for_accepted_feeds(tmp_path, monkeypatc
     lib = _lib(tmp_path, n=6)
     store = _FakeStore()
     served = []
-    monkeypatch.setattr(rotation, "record_served", lambda *a, **k: served.append(a))
+    monkeypatch.setattr(rotation, "reserve_served",
+                        lambda *a, **k: served.append(a) or len(served))
     out = cmr.build_client_month(
         _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
         library_path=lib, store=store, banned_words=())
@@ -1125,6 +1126,171 @@ def test_month_build_records_served_only_for_accepted_feeds(tmp_path, monkeypatc
     assert len(served) == len(feed_ig)
     # distinct photo per record (no double-count of the same cluster)
     assert len(served) == len({a[1] for a in served})
+
+
+def test_month_build_holds_local_feeds_when_served_write_fails(tmp_path, monkeypatch):
+    """A calendar row cannot land if its once-used reservation did not persist."""
+    from agent import rotation
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+    monkeypatch.setattr(rotation, "reserve_served", lambda *a, **k: None)
+
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+
+    assert out["upserted"] == 0
+    assert store.inserted == []
+
+
+def test_noop_month_releases_exact_local_reservations(tmp_path, monkeypatch):
+    """A grow-only no-op must not permanently consume the fresh build's photos."""
+    from agent import rotation
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+    monkeypatch.setattr(cmr, "_apply", lambda *a, **k: {
+        "ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
+        "noop_shrink": True, "retained_reservation_ids": []})
+
+    cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+
+    assert rotation.load_served_strict().get("gritx_ig", []) == []
+
+
+def test_month_apply_exception_releases_exact_local_reservations(tmp_path, monkeypatch):
+    from agent import rotation
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    monkeypatch.setattr(cmr, "_apply",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("gate crash")))
+
+    with pytest.raises(RuntimeError, match="gate crash"):
+        cmr.build_client_month(
+            _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
+            library_path=lib, store=_FakeStore(), banned_words=())
+
+    assert rotation.load_served_strict().get("gritx_ig", []) == []
+
+
+def test_month_pre_apply_exception_releases_exact_local_reservations(tmp_path, monkeypatch):
+    from agent import rotation
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    monkeypatch.setattr(cmr, "_to_rows",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("row crash")))
+
+    with pytest.raises(RuntimeError, match="row crash"):
+        cmr.build_client_month(
+            _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
+            library_path=lib, store=_FakeStore(), banned_words=())
+
+    assert rotation.load_served_strict().get("gritx_ig", []) == []
+
+
+def test_month_finish_exception_releases_feed_before_it_joins_drafts(tmp_path, monkeypatch):
+    from agent import rotation
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    monkeypatch.setattr(
+        cmr, "_finish_feed_with_story",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("story crash")))
+
+    with pytest.raises(RuntimeError, match="story crash"):
+        cmr.build_client_month(
+            _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
+            library_path=lib, store=_FakeStore(), banned_words=())
+
+    assert rotation.load_served_strict().get("gritx_ig", []) == []
+
+
+def test_backfill_zero_row_insert_releases_exact_reservation(monkeypatch, tmp_path):
+    from agent import rotation
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    class NoopStore(_FakeStoreLM):
+        def insert_rows(self, base_key, rows):
+            return []
+    store = NoopStore({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+
+    out = cmr.backfill_denied_slots(
+        _account(), "gritx", "2026-08-19", days=30, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+
+    assert out["rows"] == 0
+    assert rotation.load_served_strict().get("gritx_ig", []) == []
+
+
+def test_backfill_finish_exception_releases_untracked_feed_reservation(monkeypatch,
+                                                                        tmp_path):
+    from agent import rotation
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+    monkeypatch.setattr(
+        cmr, "_finish_feed_with_story",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("story crash")))
+
+    with pytest.raises(RuntimeError, match="story crash"):
+        cmr.backfill_denied_slots(
+            _account(), "gritx", "2026-08-19", days=30, voice=_voice(),
+            library_path=lib, store=store, banned_words=())
+
+    assert rotation.load_served_strict().get("gritx_ig", []) == []
+
+
+def test_backfill_preinsert_exception_releases_tracked_reservations(monkeypatch,
+                                                                     tmp_path):
+    from agent import rotation
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+    monkeypatch.setattr(
+        cmr, "_to_rows",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("preinsert crash")))
+
+    with pytest.raises(RuntimeError, match="preinsert crash"):
+        cmr.backfill_denied_slots(
+            _account(), "gritx", "2026-08-19", days=30, voice=_voice(),
+            library_path=lib, store=store, banned_words=())
+
+    assert rotation.load_served_strict().get("gritx_ig", []) == []
+
+
+def test_backfill_second_iteration_failure_releases_first_iterations_reservation(
+        monkeypatch, tmp_path):
+    from agent import rotation
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    row1 = _denied_feed_row("2026-08-19", photo="photo_00.jpg")
+    row1["id"] = "denied-row-A"
+    row2 = _denied_feed_row("2026-08-20", photo="photo_01.jpg")
+    row2["id"] = "denied-row-B"
+    store = _FakeStoreLM({("gritx", "2026-08"): [row1, row2]})
+    real_finish = cmr._finish_feed_with_story
+    calls = {"n": 0}
+    def fail_second(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("second iteration crash")
+        return real_finish(*args, **kwargs)
+    monkeypatch.setattr(cmr, "_finish_feed_with_story", fail_second)
+
+    with pytest.raises(RuntimeError, match="second iteration crash"):
+        cmr.backfill_denied_slots(
+            _account(), "gritx", "2026-08-19", days=30, voice=_voice(),
+            library_path=lib, store=store, banned_words=())
+
+    assert calls["n"] == 2
+    assert store.inserted == []
+    assert rotation.load_served_strict().get("gritx_ig", []) == []
 
 
 def test_apply_empty_build_never_wipes_existing_calendar(tmp_path):

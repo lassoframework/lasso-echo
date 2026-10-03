@@ -133,13 +133,10 @@ def library_path_for(base_key):
 # ---- candidates ---------------------------------------------------------------------
 def _last_served_local(base_key):
     """{rotation_key: newest served date} across the gym's IG/FB/base accounts."""
-    try:
-        from . import rotation
-        served = rotation.load_served()
-    except Exception:  # noqa: BLE001 - a ledger read failure just means "never served"
-        return {}
+    from . import rotation
+    served = rotation.load_served_strict()
     out = {}
-    for acct in (base_key, f"{base_key}_ig", f"{base_key}_fb"):
+    for acct in (base_key, f"{base_key}_ig", f"{base_key}_fb", f"{base_key}_gbp"):
         for e in served.get(acct, []) or []:
             k, d = e.get("key"), str(e.get("date") or "")
             if k and d > out.get(k, ""):
@@ -208,7 +205,12 @@ def local_candidates(base_key, lib, post_date, blocked_keys, *, allow_recent=Fal
         excl = set(rotation.style_exclusions(lib))
     except Exception:  # noqa: BLE001
         excl = set()
-    served = _last_served_local(base_key)
+    try:
+        served = _last_served_local(base_key)
+    except Exception as exc:  # noqa: BLE001 - unknown history cannot make local media fresh
+        _log(f"{base_key}: served ledger unreadable ({type(exc).__name__}); "
+             "local swap candidates suppressed")
+        return []
     out = []
     for key in sorted(media_guard.library_keys(lib)):
         if key in blocked_keys or key in excl:
@@ -776,13 +778,52 @@ def after_swap(base_key, row, pick, *, media_store=None, now=None, book_rows=Non
             _sel.stamp_use(asset, base_key, pd, store=store, now=now)
     except Exception as exc:  # noqa: BLE001
         _log(f"{base_key}: Drive usage ledger not settled ({type(exc).__name__})")
-    if (pick or {}).get("source") == "local" and (pick or {}).get("path"):
+    if ((pick or {}).get("source") == "local" and (pick or {}).get("path")
+            and not (pick or {}).get("_served_reserved")):
         try:
             from . import dam, rotation
             rotation.record_served(f"{base_key}_ig", dam.rotation_key(pick["path"]),
                                    "", pd)
         except Exception:  # noqa: BLE001
             pass
+
+
+def reserve_local_pick(base_key, row, pick):
+    """Durably reserve a local swap candidate before any calendar row is changed.
+
+    This is the process-local fail-closed boundary. It cannot provide a global
+    cross-service guarantee without the atomic SQL primitive, but a failed ledger
+    write can no longer be followed by a successful row swap in this process.
+    """
+    if (pick or {}).get("source") != "local":
+        return True
+    path = str((pick or {}).get("path") or "")
+    day = str((row or {}).get("post_date") or "")[:10]
+    if not path or not day:
+        return False
+    try:
+        from . import dam, rotation
+        reservation_id = rotation.reserve_served(
+            f"{base_key}_ig", dam.rotation_key(path), "", day)
+    except Exception:  # noqa: BLE001
+        reservation_id = None
+    if reservation_id:
+        pick["_served_reserved"] = True
+        pick["_served_reservation_id"] = reservation_id
+    return bool(reservation_id)
+
+
+def release_local_pick(pick):
+    """Release an exact local reservation only when no calendar row exposed it."""
+    reservation_id = (pick or {}).get("_served_reservation_id")
+    if not reservation_id:
+        return (pick or {}).get("source") != "local"
+    from . import rotation
+    released = rotation.release_served(reservation_id)
+    if released:
+        pick.pop("_served_reservation_id", None)
+        pick.pop("_served_reserved", None)
+    return released
 
 
 def client_message(reason, base_key=""):
@@ -817,6 +858,7 @@ def client_message(reason, base_key=""):
 
 __all__ = ["enabled", "pick_replacement", "candidates_for", "order_candidates",
            "local_candidates", "drive_candidates", "swap_fields", "after_swap",
+           "reserve_local_pick", "release_local_pick",
            "sibling_rows", "book_carries_asset", "has_rendition",
            "SWAP_TRANSCODE_TIMEOUT_SEC", "SWAP_REQUEST_DEADLINE_SEC",
            "SWAP_DOWNLOAD_TIMEOUT_SEC", "REASON_TIMEOUT", "SwapDeadline",
