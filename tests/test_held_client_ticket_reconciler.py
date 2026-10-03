@@ -121,6 +121,24 @@ def test_stale_eligible_hold_gets_internal_deterministic_row_and_stays_held():
     assert bus.ticket_row["resolved_at"] is None
 
 
+def test_held_reconcile_escalation_is_informational_but_regular_escalation_keeps_action():
+    current_ticket = ticket(slack_channel_id="D123", slack_thread_ts="123.456")
+    reminder = R._notice_identity(current_ticket, NOW)
+
+    blocks = O.escalation_blocks(reminder, current_ticket)
+
+    assert " ".join(block["text"]["text"] for block in blocks) == reminder["body"]
+    assert all(block["type"] != "actions" for block in blocks)
+    assert O.RESOLVE_ACTION_ID not in str(blocks)
+
+    ordinary_row = {"body": "An ordinary escalation needs operator review.",
+                    "attachments": {"kind": "escalation"}}
+    ordinary_blocks = O.escalation_blocks(ordinary_row, current_ticket)
+
+    assert any(block["type"] == "actions" for block in ordinary_blocks)
+    assert O.RESOLVE_ACTION_ID in str(ordinary_blocks)
+
+
 def test_latest_inbound_resets_wait_window():
     bus = FakeBus(messages=[inbound(NOW - timedelta(minutes=30))])
 

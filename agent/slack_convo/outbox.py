@@ -685,11 +685,17 @@ def escalation_blocks(row, ticket):
     opened group DM) and the ticket is not already closed; a button that could only no-op is
     worse than no button."""
     body = row.get("body") or ""
+    att = row.get("attachments") or {}
+    informational_only = (
+        att.get("surface") == "held_client_ticket_reconcile"
+        and att.get("contract") == "held-client-ticket-reconcile-v1"
+    )
     tid = str((ticket or {}).get("id") or "")
     chunks = [body[i:i + _BLOCK_TEXT_CHARS] for i in range(0, len(body), _BLOCK_TEXT_CHARS)] or [""]
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": c}} for c in chunks]
     reachable = portal_deliverable(ticket) or bool((ticket or {}).get("slack_channel_id"))
-    if tid and reachable and (ticket or {}).get("status") != "resolved":
+    if (not informational_only and tid and reachable
+            and (ticket or {}).get("status") != "resolved"):
         blocks.append({"type": "actions", "elements": [{
             "type": "button", "action_id": RESOLVE_ACTION_ID, "value": tid,
             "text": {"type": "plain_text", "text": "Resolved, tell them"}}]})
