@@ -926,6 +926,13 @@ def maybe_reburn_story(account_key, row, new_caption, sb_store, *, logger=None):
             if not isinstance(reburned, tuple) or len(reburned) != 2:
                 return None
             new_url, receipt_evidence = reburned
+            receipt_evidence = (receipt_evidence.as_dict()
+                                if hasattr(receipt_evidence, "as_dict")
+                                else receipt_evidence)
+            if (not receipt_evidence
+                    or receipt_evidence.get("source_exact_url") != row.get("source_media_url")
+                    or receipt_evidence.get("delivered_exact_url") != new_url):
+                return None
         else:
             new_url = story_reburn.reburn(
                 row.get("source_media_url"), new_caption, _gym_display_name(account_key),
@@ -934,7 +941,7 @@ def maybe_reburn_story(account_key, row, new_caption, sb_store, *, logger=None):
             return None
         patch_args = {}
         if receipt_evidence is not None:
-            patch_args["render_evidence"] = receipt_evidence.as_dict()
+            patch_args["render_evidence"] = receipt_evidence
         persisted = sb_store.patch_image_url(account_key, row.get("id"), new_url, **patch_args)
         if not isinstance(persisted, dict) or persisted.get("image_url") != new_url:
             return None
@@ -1252,12 +1259,25 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                          "error": _ms.client_message(_ms.REASON_STORY_REBURN),
                          "reason": _ms.REASON_STORY_REBURN, "failed_sibling": missing[0],
                          "recreate_budget": _budget_state(account_key)}
+        from . import visual_writer_prepare
+        if visual_writer_prepare.enabled():
+            for variant in [pick] + [variants[str(s.get("id"))] for s in siblings]:
+                if (not variant.get("source_media_url")
+                        or (variant.get("source_media_url") != variant.get("image_url")
+                            and not isinstance(variant.get("render_evidence"), dict))):
+                    return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                                 "error": "verified media evidence is unavailable",
+                                 "reason": "media_evidence_unavailable",
+                                 "recreate_budget": _budget_state(account_key)}
         # The media identity travels WITH the pixels (2026-09-10): a video's poster
         # frame (or a cleared poster when a video row becomes a photo) and the Drive
         # asset id now on the row (or None when it left the Drive pool).
+        write_args = {"source_media_url": pick.get("source_media_url"),
+                      "extra_fields": _ms.swap_fields(pick)}
+        if pick.get("render_evidence") is not None:
+            write_args["render_evidence"] = pick["render_evidence"]
         updated = sb_store.swap_media(account_key, draft_id, pick["image_url"],
-                                      source_media_url=pick.get("source_media_url"),
-                                      extra_fields=_ms.swap_fields(pick))
+                                      **write_args)
         if updated is None:
             # swap_media filters to pending / coach_review server-side: a row that
             # matched nothing was approved or live between the read and the write.
@@ -1274,9 +1294,12 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
             sid = str(sib.get("id") or "")
             var = variants[sid]
             try:
+                write_args = {"source_media_url": var.get("source_media_url"),
+                              "extra_fields": _ms.swap_fields(var)}
+                if var.get("render_evidence") is not None:
+                    write_args["render_evidence"] = var["render_evidence"]
                 done = sb_store.swap_media(account_key, sid, var["image_url"],
-                                           source_media_url=var.get("source_media_url"),
-                                           extra_fields=_ms.swap_fields(var))
+                                           **write_args)
             except Exception as exc:  # noqa: BLE001 - one sibling never undoes the swap
                 print(f"[portal-social] sibling swap failed for {sid}: {type(exc).__name__}")
                 done = None

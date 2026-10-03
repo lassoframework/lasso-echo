@@ -155,10 +155,7 @@ def _md5(data):
     return "md5:" + hashlib.md5(data).hexdigest()
 
 
-def _known_group(store, tenant, row, source_url):
-    group = row.get("visual_group_key")
-    if group:
-        return group
+def _known_group(store, tenant, row, source_url, *, required=True):
     response = store._client().get(
         store._rest("visual_group_alias"),
         params={"select": "group_key", "gym_id": f"eq.{tenant}",
@@ -167,9 +164,52 @@ def _known_group(store, tenant, row, source_url):
     if response.status_code >= 400:
         raise VisualPreparationError("source scene lookup failed")
     rows = response.json()
-    if not isinstance(rows, list) or len(rows) != 1:
+    if not isinstance(rows, list) or len(rows) > 1:
         raise VisualPreparationError("source scene has no unambiguous registered group")
-    return rows[0].get("group_key")
+    if not rows:
+        if required:
+            raise VisualPreparationError("source scene has no unambiguous registered group")
+        return None
+    group = rows[0].get("group_key")
+    if row.get("visual_group_key") and row["visual_group_key"] != group:
+        raise VisualPreparationError("source scene conflicts with row visual group")
+    return group
+
+
+def _register_raw_source(store, tenant, prepared, source_url, source, asset):
+    """Bind the observed raw object before any rendition receipt consumes it."""
+    if not _own_media_url(source_url):
+        raise VisualPreparationError("raw source URL is outside the configured media host")
+    source_hash = _md5(source)
+    aliases = []
+    asset_id = prepared.get("source_media_asset_id")
+    if asset:
+        aliases.extend((("source_asset", str(asset_id)),
+                        ("byte_hash", fingerprint.from_drive_md5(asset["content_hash"]))))
+    aliases.extend((("byte_hash", "derived:" + source_hash),
+                    ("canonical_url", source_url)))
+    drive_id = prepared.get("drive_file_id")
+    if drive_id:
+        if not asset or str(drive_id) != str(asset_id):
+            raise VisualPreparationError("Drive ID has no matching tenant asset")
+        aliases.append(("drive_id", str(drive_id)))
+    result = _rpc(store, "visual_global_prepare_bundle", {
+        "p_tenant": tenant,
+        "p_aliases": [{"alias_kind": kind, "alias_value": value} for kind, value in aliases],
+        "p_fingerprint": source_hash,
+        "p_evidence": {"source": "raw_object_bytes", "verified_bytes": source_hash,
+                       "delivered_url": source_url},
+        "p_actor": "visual_writer_prepare",
+        "p_asset_id": str(asset_id) if asset else None,
+    })
+    if not isinstance(result, dict) or result.get("fingerprint") != source_hash:
+        raise VisualPreparationError("raw source registration returned invalid fingerprint")
+    group = result.get("group_key")
+    if not isinstance(group, str) or not group.startswith("vg_"):
+        raise VisualPreparationError("raw source registration returned no group")
+    if prepared.get("visual_group_key") and prepared["visual_group_key"] != group:
+        raise VisualPreparationError("raw source conflicts with row visual group")
+    return group
 
 
 def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url,
@@ -209,7 +249,12 @@ def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url
         receipt_writer = visual_owner_receipts.default_writer()
     if not callable(receipt_writer):
         raise VisualPreparationError("owner receipt producer is unavailable for source/rendition")
-    group = _known_group(store, tenant, prepared, source_url)
+    group = _known_group(store, tenant, prepared, source_url, required=False)
+    if group is None:
+        registered = _register_raw_source(store, tenant, prepared, source_url, source, asset)
+        group = _known_group(store, tenant, prepared, source_url)
+        if group != registered:
+            raise VisualPreparationError("raw source registration returned conflicting group")
     if not isinstance(group, str) or not group.startswith("vg_"):
         raise VisualPreparationError("source scene has no unambiguous registered group")
     # The callback must insert owner-only byte-read and render rows using its

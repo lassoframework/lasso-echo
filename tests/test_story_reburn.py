@@ -146,6 +146,33 @@ def test_maybe_reburn_transports_verified_evidence_when_writer_prep_is_armed(mon
                           {"render_evidence": evidence})
 
 
+def test_maybe_reburn_accepts_as_dict_only_evidence(monkeypatch):
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "true")
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    evidence = {"source_exact_url": "https://r2/w/raw.jpg",
+                "delivered_exact_url": "https://r2/w/fresh.jpg",
+                "operation": "reburn", "evidence_ref": "story_reburn:as-dict"}
+
+    class Evidence:
+        def as_dict(self):
+            return evidence
+
+    class Store:
+        def __init__(self):
+            self.call = None
+        def patch_image_url(self, account_key, row_id, url, **kwargs):
+            self.call = (account_key, row_id, url, kwargs)
+            return {"id": row_id, "image_url": url}
+
+    monkeypatch.setattr(story_reburn, "reburn_with_evidence",
+                        lambda *_a, **_k: ("https://r2/w/fresh.jpg", Evidence()))
+    store = Store()
+    assert ps.maybe_reburn_story("gritx", _story_row(), "new", store) == "https://r2/w/fresh.jpg"
+    assert store.call == ("gritx", "s1", "https://r2/w/fresh.jpg",
+                          {"render_evidence": evidence})
+
+
 # ---- pre-migration safety: source_media_url only in the row when set ---------
 
 def test_real_row_includes_source_media_only_when_present():
