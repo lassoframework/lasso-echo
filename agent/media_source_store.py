@@ -19,6 +19,7 @@ from . import config
 
 _SOURCE_TABLE = "media_source"
 _ASSET_TABLE = "media_asset"
+_CLEARANCE_TABLE = "media_historical_clearance"
 
 
 class MediaStoreError(Exception):
@@ -291,6 +292,54 @@ class SupabaseMediaStore:
             raise MediaStoreError(r.status_code, self._scrubbed(r))
         if len(r.json() or []) != 1:
             raise MediaStoreError(409, "asset changed during moderation")
+        return True
+    # ---- media_historical_clearance (DRAFT) -----------------------------------
+    def list_historical_clearances(self, gym_id):
+        """Every historical-clearance receipt VERSION for ONE gym (gym_id
+        REQUIRED — tenant isolation starts here). Receipts are append-only and
+        versioned: a revoked version stays in the result as history and a
+        corrected review is a NEW version row. The table is a DRAFT additive
+        migration; until it is applied the read fails LOUD (MediaStoreError),
+        never a silent empty list that would look like 'nothing cleared'."""
+        if not gym_id:
+            raise MediaStoreError(
+                400, "list_historical_clearances requires a gym_id (tenant isolation)")
+        return self._get_all(_CLEARANCE_TABLE,
+                             {"select": "*", "gym_id": f"eq.{gym_id}",
+                              "order": "asset_id.asc,version.asc"})
+
+    def record_historical_clearance(self, gym_id, asset_id, content_hash,
+                                    decision, reviewer, evidence):
+        """Record one explicit per-asset decision VERSION via the service-role
+        RPC. The RPC is the authority on hash binding, version assignment and
+        decision legality (an active receipt must be revoked first; any
+        known_used version permanently refuses re-recording). Any refusal
+        (unapplied DRAFT migration, stale hash, bad evidence, active receipt,
+        permanent known_used) raises MediaStoreError — a refused clearance is
+        never treated as recorded."""
+        result = self._rpc("record_historical_media_clearance", {
+            "p_gym_id": gym_id, "p_asset_id": asset_id,
+            "p_content_hash": content_hash, "p_decision": decision,
+            "p_reviewer": reviewer, "p_evidence": dict(evidence or {})})
+        if not isinstance(result, dict) or \
+                result.get("asset_id") != asset_id or \
+                result.get("gym_id") != gym_id:
+            raise MediaStoreError(409, "historical clearance was not recorded")
+        return result
+
+    def revoke_historical_clearance(self, gym_id, asset_id,
+                                    expected_content_hash, reviewer, reason):
+        """Revoke the ACTIVE clearance receipt version (one-way; known_used
+        rows can never be revoked — the RPC refuses). Revocation supersedes
+        only that version; a corrected receipt for the same asset at its
+        current content_hash may then be recorded as a new version. Any
+        refusal raises MediaStoreError."""
+        result = self._rpc("revoke_historical_media_clearance", {
+            "p_gym_id": gym_id, "p_asset_id": asset_id,
+            "p_expected_content_hash": expected_content_hash,
+            "p_reviewer": reviewer, "p_reason": reason})
+        if result is not True:
+            raise MediaStoreError(409, "historical clearance was not revoked")
         return True
 
 
