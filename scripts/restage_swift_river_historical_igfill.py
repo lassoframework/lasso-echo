@@ -86,7 +86,12 @@ def _calendar_rows(store, months):
 
 
 def _consumed_asset_ids(*, ledger_rows=None):
-    """Return every asset with an active gym_media_use record; malformed reads fail."""
+    """Return every asset ever staged in the usage ledger; malformed reads fail.
+
+    A historical ``rolled_back`` stamp is not proof that the asset was never
+    displayed or sent. Once-use recovery therefore treats it as consumed even
+    when current media counters were reset by the old rollback path.
+    """
     if ledger_rows is None:
         from agent import db
         path = db.db_path()
@@ -124,8 +129,7 @@ def _consumed_asset_ids(*, ledger_rows=None):
                     or not record["asset_id"].strip()
                     or not isinstance(record.get("rolled_back"), bool)):
                 raise ValueError("usage ledger contains a malformed record")
-            if not record["rolled_back"]:
-                consumed.add(record["asset_id"])
+            consumed.add(record["asset_id"])
     return consumed
 
 

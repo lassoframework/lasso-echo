@@ -189,11 +189,11 @@ def test_candidate_filter_excludes_book_and_active_usage_ledger(monkeypatch):
     assert "photo-1" not in {item["id"] for item in available}
 
 
-def test_ledger_parser_fails_closed_and_ignores_rolled_back_use():
+def test_ledger_parser_fails_closed_and_excludes_even_rolled_back_history():
     key = f"gym_media_use:{script._BASE}:2026-09-01"
     rolled = {"gym_id": script._BASE, "asset_id": "returned", "rolled_back": True}
     consumed = {"gym_id": script._BASE, "asset_id": "used", "rolled_back": False}
-    assert script._consumed_asset_ids(ledger_rows=[(key, json.dumps([rolled, consumed]))]) == {"used"}
+    assert script._consumed_asset_ids(ledger_rows=[(key, json.dumps([rolled, consumed]))]) == {"used", "returned"}
     with __import__("pytest").raises(ValueError):
         script._consumed_asset_ids(ledger_rows=[(key, "not-json")])
 
