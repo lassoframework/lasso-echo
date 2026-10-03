@@ -25,6 +25,7 @@ that actually produced the image.
 """
 
 import os
+import re
 
 from . import config
 
@@ -317,6 +318,111 @@ def accent_law_free(placement: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# VERIFIED GYM BRAND PALETTE (Blake's global ruling, 2026-10-02): a client
+# gym's generated infographic is a LAST RESORT behind approved client photos,
+# and when it does render it must use THAT GYM'S ACTUAL verified brand colors
+# -- never colors inferred from the voice doc's tone, never LASSO's hex, never
+# an invented palette. The verified colors live in a small JSON file next to
+# the gym's durable brand bible:
+#   <DATA_DIR>/brand_voice/<base>/brand_colors.json   (durable, wins)
+#   brand_voice/<base>/brand_colors.json              (repo fallback)
+# Accepted shapes:
+#   {"colors": ["#1B2A3C", "#F2EDDE", "#D7263D"]}
+#   {"background": "#1B2A3C", "primary": "#F2EDDE", "accent": "#D7263D"}
+# Every value must be a #RGB or #RRGGBB hex string; anything else is not
+# "verified" and the loader returns None so the caller can FAIL CLOSED (hold
+# the infographic and surface the reason) instead of inventing colors.
+# ---------------------------------------------------------------------------
+
+GYM_BRAND_COLORS_FILE = "brand_colors.json"
+
+_GYM_PALETTE_ROLES = ("background", "primary", "secondary", "accent")
+_HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+
+def _gym_brand_colors_path(base) -> str:
+    """Durable-first resolution, same convention as the gym's voice bible:
+    <DATA_DIR>/brand_voice/<base>/ first, repo path as fallback. Returns the
+    first EXISTING path, else the durable path (so a 'missing' report names a
+    stable, meaningful location)."""
+    try:
+        durable = os.path.join(config.client_voice_dir(), base,
+                               GYM_BRAND_COLORS_FILE)
+    except Exception:
+        durable = ""
+    repo = os.path.join("brand_voice", base, GYM_BRAND_COLORS_FILE)
+    for cand in (durable, repo):
+        if cand and os.path.exists(cand):
+            return cand
+    return durable or repo
+
+
+def load_gym_brand_palette(account_key):
+    """The VERIFIED brand palette for a CLIENT gym, or None.
+
+    Returns {"colors": ["#...", ...], "path": <where it came from>} on a
+    verified hit; None when the account is LASSO's own (its locked V3 palette
+    governs instead), when no brand_colors.json exists, or when the file is
+    unreadable / carries no valid hex colors. Never raises: an unverifiable
+    palette must be indistinguishable from an absent one so the caller fails
+    closed either way."""
+    base = _account_base(account_key)
+    if base == "lasso":
+        return None
+    import json
+    path = _gym_brand_colors_path(base)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception:
+        return None
+    colors = []
+    if isinstance(raw, dict):
+        seq = raw.get("colors")
+        if isinstance(seq, list):
+            colors = [str(c).strip() for c in seq]
+        else:
+            colors = [str(raw.get(role) or "").strip()
+                      for role in _GYM_PALETTE_ROLES]
+    elif isinstance(raw, list):
+        colors = [str(c).strip() for c in raw]
+    colors = [c for c in colors if _HEX_RE.match(c or "")]
+    if not colors:
+        return None
+    # de-dupe, order preserved
+    seen = set()
+    uniq = []
+    for c in colors:
+        key = c.lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c.upper() if len(c) == 7 else c)
+    return {"colors": uniq, "path": path}
+
+
+def gym_brand_palette_section(palette) -> str:
+    """The palette section for a CLIENT GYM card with VERIFIED brand colors:
+    the exact hex list, a hard 'only these' rule, and the same one-accent /
+    contrast discipline the free-latitude section carries. Replaces
+    gym_brand_latitude when verified colors exist (Blake 2026-10-02: the
+    gym's ACTUAL brand colors, never colors guessed from voice tone)."""
+    colors = list((palette or {}).get("colors") or [])
+    listed = ", ".join(colors)
+    return (
+        "BRAND COLORS, VERIFIED FOR THIS GYM (use ONLY these colors, exactly "
+        f"as listed): {listed}.\n"
+        "Pick the background field from this list, supporting colors from "
+        "this list, and ONE accent color from this list used exactly once "
+        "for hierarchy (the CTA block or one key word), never scattered and "
+        "never the same color as the field. Do not introduce any color that "
+        "is not on this list (neutral tints/shades of a listed color are "
+        "allowed for type legibility only). Never LASSO's own colors, never "
+        "a generic default palette. Real contrast between type and field "
+        "still holds (see READABILITY below)."
+    )
+
+
 def _account_base(account_key) -> str:
     """Base account key (an '_ig'/'_fb' suffix stripped, lower cased). A
     missing or blank key is treated as LASSO's own, same convention as
@@ -517,7 +623,8 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
                             palette=None, footer=None, kind="infographic",
                             style_key=None, canvas=None, composition=None,
                             accent=None, freedom=None, account_key=None,
-                            corrective=None, reference_note=None, art_direction=""):
+                            corrective=None, reference_note=None, art_direction="",
+                            gym_palette=None):
     """Build the Astra creative brief from APPROVED input ONLY.
 
     `headline` is the one hook rendered on the card. `facts` are the approved
@@ -614,10 +721,17 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
         sections.append(LOCKED_BRAND_COLORS)
         sections.append(CANVAS_MODES[style["canvas"]])
     elif style:
-        # A CLIENT GYM: no LASSO hex, real palette latitude (see docstring).
-        sections.append(gym_brand_latitude(style["canvas"]))
+        # A CLIENT GYM: no LASSO hex. VERIFIED brand colors win when the
+        # caller threads them (Blake 2026-10-02); otherwise the older
+        # free-latitude section (which callers on the new ruling gate
+        # behind a fail-closed verified-palette check upstream).
+        sections.append(gym_brand_palette_section(gym_palette)
+                        if gym_palette else gym_brand_latitude(style["canvas"]))
     else:
-        sections.append(palette or _cs.BRAND_PALETTE)
+        sections.append(palette
+                        or (gym_brand_palette_section(gym_palette)
+                            if gym_palette else None)
+                        or _cs.BRAND_PALETTE)
     sections.append(BRAND_TYPE_SYSTEM)
     sections.append(
         "HOOK, the one headline rendered on the card, render it exactly and keep "

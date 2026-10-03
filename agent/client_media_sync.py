@@ -85,6 +85,18 @@ def _valid_media_file(path):
         return False
 
 
+# Derivatives Echo itself generated to FILL a gap (igfill_ infographic cards,
+# no_media_ placeholders, seed_ onboarding/demo art). They are never client
+# uploads: no planner, counter, or picker may treat them as the gym's real media,
+# regardless of the media_bridge flag or any sidecar state.
+GENERATED_DERIVATIVE_PREFIXES = ("igfill_", "no_media_", "seed_")
+
+
+def is_generated_derivative(path):
+    """True when basename is an Echo-generated fill/seed file, never client media."""
+    return os.path.basename(str(path)).startswith(GENERATED_DERIVATIVE_PREFIXES)
+
+
 def usable_local_creative(creative, account_key, *, used=None):
     """Shared publishable inventory predicate for planner and bridge."""
     from . import dam, rotation, vision
@@ -97,7 +109,7 @@ def usable_local_creative(creative, account_key, *, used=None):
         return False
     if name in rotation.style_exclusions(os.path.dirname(creative.path)):
         return False
-    if (name.startswith(("igfill_", "no_media_", "seed_"))
+    if (is_generated_derivative(name)
             or name in used or dam.rotation_key(creative.path) in used
             or not _valid_media_file(creative.path)):
         return False

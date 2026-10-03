@@ -537,6 +537,57 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def restage_held_media(self, account_key, current, *, image_url=None,
+                           source_media_url=None, extra_fields=None, release=False):
+        """Compare-and-swap one Swift held row; stage pixels while retaining its hold.
+
+        Release is a separate CAS after the operator independently reads every staged
+        row. This method is deliberately separate from the portal's general swap.
+        """
+        if (current.get("gym_id") != account_key or current.get("status") != "pending"
+                or current.get("media_not_ready_reason") is None
+                or not current.get("id") or not current.get("post_date")):
+            return None
+        def expected(value):
+            return "is.null" if value is None else f"eq.{value}"
+        params = {"id": expected(current["id"]), "gym_id": expected(account_key),
+                  "status": "eq.pending", "post_date": expected(current["post_date"]),
+                  "image_url": expected(current.get("image_url")),
+                  "source_media_url": expected(current.get("source_media_url")),
+                  "source_media_asset_id": expected(current.get("source_media_asset_id")),
+                  "media_not_ready_reason": expected(current["media_not_ready_reason"])}
+        for key in ("account", "format", "variant_status", "created_at"):
+            if key in current:
+                params[key] = expected(current[key])
+        if release:
+            payload = {"media_not_ready_reason": None}
+        else:
+            if not isinstance(image_url, str) or not image_url.startswith("https://"):
+                return None
+            payload = {"image_url": image_url, "source_media_url": source_media_url}
+            for col in _SWAP_EXTRA_COLUMNS:
+                if col in (extra_fields or {}):
+                    payload[col] = extra_fields[col]
+        response = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=payload, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, _scrub((response.text or "")[:200]))
+        rows = response.json() or []
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        if (row.get("id") != current["id"] or row.get("gym_id") != account_key
+                or row.get("status") != "pending"
+                or row.get("post_date") != current["post_date"]
+                or row.get("media_not_ready_reason") != (None if release else current["media_not_ready_reason"])):
+            return None
+        if not release and any(row.get(key) != value for key, value in payload.items()):
+            return None
+        return row
+
     # ---- variant pairing (0318): v2 creative candidates -----------------------
     # A "logical post" can have MORE THAN ONE content_calendar row once this
     # ships: exactly one 'active' row (the live/publishing creative) plus zero

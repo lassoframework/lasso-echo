@@ -22,6 +22,7 @@ Scope guards:
 """
 
 import os
+import time
 from datetime import date, timedelta
 
 from . import config
@@ -99,6 +100,18 @@ def real_media_depleted(base, *, now=None):
         # pickable() intentionally converts store errors to [] for planning.
         # For a client depletion notice, distinguish a failed read from empty.
         assets = media_store.list_assets(base)
+        # An indexed client photo awaiting the normal hash-bound moderation is
+        # supply waiting for Echo, not evidence that the gym has no photos.
+        # Hold the infographic while the moderation worker catches up. A known
+        # rejected or coach-hidden asset cannot block the last-resort lane.
+        if any(str(a.get("gym_id") or "") == base
+               and a.get("kind") == "photo"
+               and a.get("eligible") is not False
+               and not a.get("excluded_by_coach")
+               and a.get("review_status") == "pending_review"
+               and a.get("moderation_status") == "pending"
+               and a.get("content_hash") for a in assets):
+            return False
         class Snapshot:
             def available(self):
                 return True
@@ -159,6 +172,48 @@ def _empty_upcoming_days(store, base, tz_name, days_ahead, now=None):
     return [d for d in wanted if d not in have]
 
 
+def _generate_astra_only(prompt, opts, *, account_key, subject, draft_id,
+                         sleep=None):
+    """Astra, and ONLY Astra, for a client gym's last-resort infographic.
+
+    Blake's global ruling (2026-10-02): an approved client photo always wins;
+    a generated infographic is the LAST resort, and when it renders it must
+    come through the ASTRA path -- there is no silent Gemini rung and no
+    generic LASSO-branded fallback for a client gym. A total Astra failure
+    marks the slot NEEDS HUMAN (same ops alert + audit row as the shared
+    chain in image_engine.generate_image) and returns None so the caller
+    holds the day instead of filling it with off-brand art. Never raises."""
+    from . import image_engine as _ie
+    key = os.environ.get(_ie.OPENAI_API_KEY_ENV, "")
+    if not key:
+        _ie.mark_needs_human(
+            subject=subject, account_key=account_key,
+            failures=("astra route required but no Astra API key is set",),
+            draft_id=draft_id)
+        return None
+    engine = _ie.AstraImageEngine(key)
+    tries = _ie._attempts_for(engine)
+    sleep = sleep or time.sleep
+    failures = []
+    for attempt in range(1, tries + 1):
+        try:
+            result = engine.generate(prompt, opts)
+        except Exception as exc:  # noqa: BLE001 - a provider bug may not kill the run
+            from . import ops_alerts
+            detail = ops_alerts.scrub(f"{type(exc).__name__}: {exc}")
+            failures.append(f"astra attempt {attempt}/{tries}: {detail}")
+        else:
+            if result is not None and result.ok():
+                _ie.record_cost(result.cost_estimate, account_key=account_key)
+                return result
+            failures.append(f"astra attempt {attempt}/{tries}: empty result")
+        if attempt < tries:
+            sleep(_ie.ASTRA_RETRY_BACKOFF_SECS * attempt)
+    _ie.mark_needs_human(subject=subject, account_key=account_key,
+                         failures=failures, draft_id=draft_id)
+    return None
+
+
 def fill_gaps(base, account, store, *, voice, logger=None, now=None,
               days_ahead=FILL_DAYS_AHEAD, max_per_run=FILL_MAX_PER_RUN):
     """Generate + insert up to max_per_run PENDING infographic feed posts for the gym's
@@ -196,8 +251,29 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
     if not sources:
         return {"ok": False, "reason": "no sources"}
 
-    client = creative_studio._default_client()
-    if client is None:
+    # Blake's global ruling (2026-10-02): a generated infographic is a LAST
+    # RESORT behind approved client photos, it MUST render through the Astra
+    # path, and it MUST carry this gym's own VERIFIED brand colors. No
+    # verified palette on file -> fail CLOSED: hold the fill and surface the
+    # reason, never invent colors from the voice doc's tone and never reach
+    # for LASSO's or a generic palette. LASSO's own account is exempt (its
+    # locked V3 palette governs its cards).
+    from . import astra_prompt as _ap
+    gym_palette = None
+    if not _ap.is_lasso_account(account.key):
+        gym_palette = _ap.load_gym_brand_palette(account.key)
+        if not gym_palette:
+            reason = (f"no verified brand colors for {base} "
+                      f"(expected {_ap._gym_brand_colors_path(base)}); "
+                      "infographic fallback held")
+            log(reason)
+            return {"ok": False, "reason": reason}
+
+    # The Gemini client is only needed by the LASSO quality lane
+    # (creative_studio.generate). The client-gym lane below is Astra-only.
+    quality_lane = config.lasso_infographic_quality_enabled(account.key)
+    client = creative_studio._default_client() if quality_lane else None
+    if quality_lane and client is None:
         return {"ok": False, "reason": "no image client"}
 
     filled = 0
@@ -205,6 +281,19 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
     for i, day in enumerate(gaps):
         if filled >= max_per_run:
             break
+        # GENERATION-TIME RECHECK (Blake 2026-10-02, photos FIRST): the
+        # depletion and gap scans above ran before any rendering happened.
+        # Re-verify BOTH right before this card is drawn so a photo that
+        # landed (or a row another lane inserted) between the scan and now
+        # always wins over an infographic.
+        if not real_media_depleted(base, now=now):
+            log(f"{base}: usable approved photos available at generation "
+                "time; holding infographic fill (photos first)")
+            break
+        if day not in set(_empty_upcoming_days(
+                store, base, tz_name, min(days_ahead, 2), now=now)):
+            log(f"{base} {day}: day no longer empty at generation time; skipped")
+            continue
         # rotate source + archetype deterministically by date so re-runs are stable
         seed = sum(ord(c) for c in f"{base}{day}")
         source = sources[seed % len(sources)]
@@ -219,27 +308,31 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         except Exception as e:  # noqa: BLE001 - a hard-rule miss skips the day
             log(f"{base} {day}: headline failed hard rules ({type(e).__name__}); skipped")
             continue
-        # Astra first, Gemini as the fallback rung. A calendar slot may NEVER
-        # fail silently: when every engine fails, image_engine marks the slot
-        # NEEDS HUMAN (ops alert + audit row) before this returns None.
+        # ASTRA ROUTE ONLY (Blake's global ruling, 2026-10-02): this gym's
+        # last-resort infographic renders through Astra with its OWN verified
+        # brand palette threaded explicitly (gym_palette), or it does not
+        # render at all. There is NO Gemini rung and NO generic LASSO-branded
+        # fallback here; a failed Astra chain marks the slot NEEDS HUMAN (ops
+        # alert + audit row, same contract as image_engine.generate_image)
+        # and the day stays empty for a human.
         #
-        # ASTRA GETS ITS OWN BRIEF (Blake, 2026-09-13): before this, `prompt`
-        # (the Gemini-style text above, which literally says "Design a clean,
-        # minimal, premium LASSO-branded infographic") was handed to EVERY
-        # engine, Astra included, because image_engine.prompt_for() falls back
-        # to the shared prompt when opts["engine_prompts"] carries no "astra"
-        # key. A client gym's auto-infographic was therefore branded as LASSO
-        # to the primary engine on every card. Building the real Astra brief
-        # here (same helper creative_studio.generate() uses) gives this gym's
-        # card its OWN voice doc and, in freedom scope, its OWN palette
-        # latitude (astra_prompt.gym_brand_latitude) instead of LASSO's.
-        astra_brief = creative_studio._astra_brief_for(
-            headline, [getattr(source, "text", "") or ""], "feed post",
-            None, account_key=account.key)
+        # The brief is built directly (not via creative_studio._astra_brief_for,
+        # which cannot thread a verified palette): this gym's OWN voice doc
+        # (astra_prompt._voice_path_for) and its OWN verified colors
+        # (astra_prompt.gym_brand_palette_section) instead of LASSO's.
+        try:
+            astra_brief = _ap.build_infographic_brief(
+                headline, [getattr(source, "text", "") or ""],
+                surface="feed post", account_key=account.key,
+                gym_palette=gym_palette)
+        except Exception as e:  # noqa: BLE001 - a brief we cannot build is a held day
+            log(f"{base} {day}: Astra brief could not be built "
+                f"({type(e).__name__}); held (no generic fallback)")
+            continue
         draft_id = f"igfill_{base}_{day}"
         from . import image_engine as _ie
         compiled = None
-        if config.lasso_infographic_quality_enabled(account.key):
+        if quality_lane:
             from .lasso_infographic_content import select_copy
             try:
                 compiled = select_copy(headline + " " + str(getattr(source, "text", "")))
@@ -259,13 +352,12 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             img = Path(art["path"]).read_bytes()
             _res = _ie.ImageResult(image_bytes=img, model=art.get("model", ""), engine="astra")
         else:
-            _res = _ie.generate_image(
-                prompt,
+            _res = _generate_astra_only(
+                astra_brief,
                 {"kind": "infographic", "surface": "feed post",
                  "has_text_overlay": bool(str(headline or "").strip()),
-                 "gemini_model": config.NANO_MODEL,
-                 "engine_prompts": {"astra": astra_brief, "gemini": prompt}},
-                gemini_client=client, account_key=account.key,
+                 "require_astra": True},
+                account_key=account.key,
                 subject=f"{day} {headline}"[:120], draft_id=draft_id)
             img = _res.image_bytes if _res is not None else None
         if not img:

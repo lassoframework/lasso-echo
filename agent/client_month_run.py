@@ -82,7 +82,8 @@ def _client_media_count(library_path):
         return sum(usable_local_creative(c, base + "_ig")
                    for c in list_creatives(path))
     count = 0
-    from .client_media_sync import explicitly_refused_local
+    from .client_media_sync import (explicitly_refused_local,
+                                    is_generated_derivative)
     try:
         for name in os.listdir(path):
             full = os.path.join(path, name)
@@ -90,7 +91,8 @@ def _client_media_count(library_path):
                 continue
             if (not name.startswith("._")
                     and os.path.splitext(name)[1].lower() in _MEDIA_EXTS
-                    and not explicitly_refused_local(full)):
+                    and not explicitly_refused_local(full)
+                    and not is_generated_derivative(full)):
                 count += 1
     except OSError:
         return 0

@@ -186,24 +186,69 @@ def seed_gaps(base, account, store, *, log=None, today=None,
     if not facts:
         return 0
 
+    # Blake's global ruling (2026-10-02), same contract as
+    # client_infographic_fill.fill_gaps: the generated infographic is the
+    # absolute LAST resort behind approved client photos, it MUST render
+    # through the Astra path, and it MUST carry this gym's own VERIFIED brand
+    # colors in the brief. No verified palette on file -> fail CLOSED: seed
+    # nothing and surface the reason, never invent colors from the voice doc's
+    # tone and never reach for LASSO's or a generic palette (the old
+    # creative_studio.generate lane could fall back to exactly that).
+    from . import astra_prompt as _ap
+    gym_palette = _ap.load_gym_brand_palette(account.key)
+    if not gym_palette:
+        log(f"{base}: no verified brand colors for no-media Astra seed "
+            f"(expected {_ap._gym_brand_colors_path(base)}); held (no generic "
+            "palette fallback)")
+        return 0
+    from .client_infographic_fill import _generate_astra_only
+
     rows = []
     for day, source in zip(days[:max_rows], facts[:max_rows]):
         headline, fact_lines = _headline_and_facts(source)
         if not headline:
             continue
+        # Recheck depletion before EVERY render: an approved photo landing
+        # between the caller's gate and this render wins the slot (photos
+        # first, infographic last resort). A gym that is no longer media-less
+        # is completely untouched from this point on.
+        if not real_media_depleted(base, now=today):
+            log(f"{base}: usable real media appeared; no-media Astra seed held")
+            break
         try:
-            from . import creative_studio
-            result = creative_studio.generate(headline, fact_lines,
-                                              account_key=base, surface="feed post")
-        except Exception as exc:  # noqa: BLE001 - one bad card must not sink the pass
-            log(f"{base}: no-media Astra seed generate failed for {day}: "
-                f"{type(exc).__name__}: {exc}")
+            astra_brief = _ap.build_infographic_brief(
+                headline, fact_lines, surface="feed post",
+                account_key=account.key, gym_palette=gym_palette)
+        except Exception as exc:  # noqa: BLE001 - a brief we cannot build is a held day
+            log(f"{base} {day}: Astra brief could not be built "
+                f"({type(exc).__name__}); held (no generic fallback)")
             continue
-        if not result or not result.get("path"):
+        # Astra, and ONLY Astra (client_infographic_fill._generate_astra_only):
+        # no silent Gemini rung, no LASSO-branded fallback. A total Astra
+        # failure marks the slot NEEDS HUMAN and returns None so this day is
+        # held instead of filled with off-brand art.
+        _res = _generate_astra_only(
+            astra_brief,
+            {"kind": "infographic", "surface": "feed post",
+             "has_text_overlay": bool(str(headline or "").strip()),
+             "require_astra": True},
+            account_key=account.key,
+            subject=f"no-media seed {base} {day}"[:120],
+            draft_id=f"no_media_{base}_{day}")
+        if _res is None:
+            continue
+        out = os.path.join(config.LIBRARY_PATH, base, f"no_media_{day}.png")
+        try:
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, "wb") as fh:
+                fh.write(_res.image_bytes)
+        except OSError as exc:
+            log(f"{base}: no-media Astra seed could not write card for {day}: "
+                f"{type(exc).__name__}: {exc}")
             continue
         try:
             from . import media_host
-            url = media_host.host_media(result["path"], base)
+            url = media_host.host_media(out, base)
         except Exception as exc:  # noqa: BLE001
             log(f"{base}: no-media Astra seed hosting failed for {day}: "
                 f"{type(exc).__name__}: {exc}")
