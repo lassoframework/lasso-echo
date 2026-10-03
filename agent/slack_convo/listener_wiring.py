@@ -144,13 +144,15 @@ def live_deps(identity, *, bus=None, log=print):
     # Approval and staff identity are distinct capabilities. The approver retains
     # its existing staff-by-fiat classification, while AGENT_STAFF_SLACK_IDS lets
     # explicitly reviewed LASSO staff reach the staff lane without approving posts.
-    operators = tuple(dict.fromkeys(
-        x for x in (config.APPROVER_SLACK_ID, *config.staff_slack_ids()) if x
-    ))
+    def staff_identity_ids():
+        """Read the reviewed staff list for each inbound identity resolution."""
+        return tuple(dict.fromkeys(
+            x for x in (config.APPROVER_SLACK_ID, *config.staff_slack_ids()) if x
+        ))
 
     def resolve(uid):
         return _ig.resolve(uid, slack_user_info=info, portal_lookup=lookup,
-                           operator_ids=operators)
+                           operator_ids=staff_identity_ids())
 
     def answer(ticket, who, messages, question=None, answer_identity=None):
         # D50: `answer_identity` is which product's knowledge and reply voice drafts this

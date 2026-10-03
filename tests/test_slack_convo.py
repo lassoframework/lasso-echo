@@ -325,6 +325,66 @@ def test_approver_remains_staff_when_not_in_staff_allowlist(monkeypatch):
     assert W.config.APPROVER_SLACK_ID == "U_APPROVER"
 
 
+def test_staff_allowlist_is_read_for_each_identity_resolution(monkeypatch):
+    monkeypatch.delenv("AGENT_STAFF_SLACK_IDS", raising=False)
+    monkeypatch.setattr(W, "_slack_user_info_factory", lambda _token: lambda uid: {
+        "id": uid, "is_bot": False, "email": "", "real_name": "",
+    })
+    deps = W.live_deps(IDS.get("echo"), bus=FakeBus(), log=lambda *a, **k: None)
+
+    assert deps.resolve_identity("U06F8BUH7CG").kind == IG.UNKNOWN
+    monkeypatch.setenv("AGENT_STAFF_SLACK_IDS", "U06F8BUH7CG")
+    assert deps.resolve_identity("U06F8BUH7CG").kind == IG.STAFF
+
+
+def test_allowlisted_staff_cannot_release_or_resolve_approver_controls(monkeypatch):
+    """Staff identity permits the staff lane only; taps remain approver-only."""
+    monkeypatch.setenv("AGENT_STAFF_SLACK_IDS", "U06F8BUH7CG")
+    monkeypatch.setattr(W.config, "APPROVER_SLACK_ID", "U_APPROVER")
+    bus = FakeBus()
+    ticket = A.handle_event(
+        _ev("the Echo calendar is broken"), "G0MPIM:1.001", _deps(bus, client_armed=False),
+    )
+    held = _rows(bus, ticket.ticket_id, A.KIND_ACK)[0]
+    deps = W.live_deps(IDS.get("echo"), bus=bus, log=lambda *a, **k: None)
+    deps.identity_enabled = lambda: True
+
+    class _App:
+        def __init__(self):
+            self._actions = {}
+
+        def event(self, *a, **k):
+            return lambda f: f
+
+        def action(self, action_id):
+            def deco(f):
+                self._actions[action_id] = f
+                return f
+            return deco
+
+    calls = []
+    monkeypatch.setattr(W._outbox, "release_held", lambda *a, **k: calls.append("release"))
+    monkeypatch.setattr(W._outbox, "resolve_and_notify", lambda *a, **k: calls.append("resolve"))
+    app = _App()
+    wiring = W.ConvoWiring(app, IDS.get("echo"), deps, post=lambda *a, **k: "1",
+                            log=lambda *a: None).register()
+
+    assert deps.resolve_identity("U06F8BUH7CG").kind == IG.STAFF
+    app._actions[OB.RELEASE_ACTION_ID](
+        ack=lambda: calls.append("release_ack"), body={"user": {"id": "U06F8BUH7CG"}},
+        action={"value": held["id"]},
+    )
+    app._actions[OB.RESOLVE_ACTION_ID](
+        ack=lambda: calls.append("resolve_ack"), body={"user": {"id": "U06F8BUH7CG"}},
+        action={"value": ticket.ticket_id},
+    )
+
+    assert calls == ["release_ack", "resolve_ack"]
+    assert bus.message(held["id"])["delivery_status"] == "held"
+    assert wiring.counts["release:refused_non_operator"] == 1
+    assert wiring.counts["resolve:refused_non_operator"] == 1
+
+
 def test_attach_registers_nothing_when_master_off(monkeypatch):
     from agent.slack_convo import listener_wiring as W
 

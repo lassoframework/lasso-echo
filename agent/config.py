@@ -19,8 +19,7 @@ def staff_slack_ids():
     """Explicit LASSO staff identities for Slack intake, separate from approval.
 
     ``AGENT_STAFF_SLACK_IDS`` is a comma-separated allowlist. It is read for each
-    identity resolution so an operator can add or remove a staff member without a
-    process restart. The approver is deliberately *not* folded into this setting:
+    identity resolution. The approver is deliberately *not* folded into this setting:
     approval remains governed only by ``APPROVER_SLACK_ID``.
     """
     raw = os.environ.get("AGENT_STAFF_SLACK_IDS", "")
