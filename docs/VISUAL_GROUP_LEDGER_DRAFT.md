@@ -1,5 +1,60 @@
 # Persistent visual group ledger — DRAFT, unapplied
 
+## Global once-used correction (2026-10-02, still DRAFT)
+
+The tenant-local ledger described below does **not** satisfy the updated
+all-client once-used requirement. Its `(gym_id, group_key)` primary key and
+same-date sibling rule deliberately permit a different tenant to use the same
+bytes. Do not run `visual_group_activate_guard` or turn on any guard for a
+canary from this package alone.
+
+`DRAFT_visual_global_history_20261002.sql` adds an attested canonical MD5
+fingerprint for each tenant-local group, one global fingerprint owner/date row,
+an immutable first-member receipt, an atomic claim RPC, a calendar coverage
+report and an import RPC that includes per-tenant ledger history even after a
+calendar row was deleted. The import refuses any occupied local group without
+a verified fingerprint or any fingerprint already occupied by another tenant
+or date. The new tables have service-role read access; writes pass through
+SECURITY DEFINER functions. A separate settings trigger refuses `enforce=true`
+even if the old tenant-local activation RPC is called; disarming stays allowed.
+The integrated global activation migration must replace that blocker only after
+all proof checks pass. This migration is additive and remains unapplied.
+
+### Required before schema migration or canary
+
+1. Inventory every calendar key, including retired keys, and bind it to a
+   canonical tenant or explicitly reconcile it. The observed retired key with
+   42 rows remains unresolved. Recheck live counts and mappings at migration
+   time; the snapshot cited below is not live proof.
+2. Resolve exact delivered media for every published, ambiguous and active
+   row; backfill its tenant-local group. For each occupied group, verify bytes
+   and register one canonical MD5 fingerprint. Drive `media_asset.content_hash`
+   may attest a matching asset in the same tenant. Generated and externally
+   hosted assets require a real byte digest plus named reviewer/source evidence.
+   A URL, Drive ID, R2 key, or pHash cannot fill a missing byte digest.
+3. Resolve collisions and missing history from both `visual_global_coverage()`
+   and the occupied tenant-local ledger. Same-day channel siblings are allowed
+   only within one canonical tenant. Another tenant cannot use the fingerprint
+   even on the same date. An undated published group remains permanently
+   occupied; tenant-local activation currently refuses its date gap.
+4. Integrate the global claim into the calendar BEFORE trigger, all swap paths,
+   confirmed delivery and release/reconciliation paths. It must be in the same
+   transaction as the tenant-local claim, under a deterministic global lock
+   order, with exact sibling group membership. The current draft claim RPC is
+   a historical import primitive and has no release path; it is not sufficient
+   for live claims. Manual scene links across groups or tenants need one global
+   component authority and a collision check before activation.
+5. Replace tenant-local activation with one global barrier: lock all calendar
+   writes, import historical published and in-flight claims, re-read every
+   calendar row and orphaned ledger row, verify no unknown fingerprint,
+   conflicting owner/date, unreconciled ambiguity or pending scene decision,
+   and arm only in that same transaction. Keep enforcement OFF on refusal.
+   Maintain a restore receipt for schema, data and flags; preserve published
+   global history on rollback. Verify the guarded runtime revision and a
+   rollback-only local transaction before a production migration or canary.
+
+No production migration, activation, or canary is authorized by this draft.
+
 Owner: isolated `codex/echo-global-ledger-db-20261002` worktree. Base: PR230
 `0ab9f8c`. Governing acceptance: `global-media-release-plan-20261002.md`.
 All three new migrations remain `DRAFT_`; no production SQL or enforcement flag
