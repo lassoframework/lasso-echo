@@ -789,6 +789,7 @@ def test_mark_publishing_atomic_claim_params_and_true_on_one_row():
     # 'publishing', which is not in the set.
     assert params["id"] == "eq.a"
     assert params["status"] == "in.(pending,approved)"
+    assert params["variant_status"] == "eq.active"
     assert params["published_at"] == "is.null"
     assert body == {"status": "publishing"}
 
