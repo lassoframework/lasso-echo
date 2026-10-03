@@ -69,6 +69,25 @@ SINGLE_ACCENT_LAW = (
     "card, never a second red element."
 )
 
+GYM_TYPE_SYSTEM = (
+    "TYPE SYSTEM FOR THIS GYM: use a typeface named in its approved brand voice "
+    "when one is specified. Otherwise choose a clear, legible sans serif. "
+    "Keep the headline and supporting labels readable on a phone."
+)
+
+GYM_EDITORIAL_SPEC = (
+    "STYLE SPEC, GYM INFOGRAPHIC: one clear headline and a simple visual "
+    "explanation grounded in the approved context. Use the gym's verified "
+    "colors and generous margins. Include a CTA block only when exact approved "
+    "CTA words are supplied; include a site footer only when an approved gym "
+    "footer is supplied. No invented logo, URL, offer, or claim."
+)
+
+GYM_ACCENT_LAW = (
+    "COLOR LAW FOR THIS GYM: choose one accent from the verified gym palette "
+    "and use it for one focal element. Do not force red or any LASSO color."
+)
+
 READABILITY_LAW = (
     "READABILITY: the headline must be legible at thumbnail size in a phone "
     "feed. High contrast between type and field. If the composition would "
@@ -692,12 +711,11 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
         style = style_for(str(style_key or headline or ""), canvas=canvas,
                           composition=composition, accent=accent)
 
-    # The brand_line only actually changes for a GYM CARD THAT IS FREED: the
-    # locked/non-freedom path is the pre-existing universal template (LASSO's
-    # cream palette, unconditionally, for every account) and is untouched by
-    # this change -- it would be a self-contradicting brief to tell Astra
-    # "not LASSO's brand" and then still hand it LASSO's locked hex palette.
-    freed_gym_card = bool(style) and not is_lasso
+    # A verified gym palette selects gym-specific wording even when style
+    # freedom is off. Otherwise the old LASSO template would contradict the
+    # palette and force LASSO's red CTA and footer onto a client card.
+    gym_branded_card = bool(gym_palette) and not is_lasso
+    freed_gym_card = (bool(style) or gym_branded_card) and not is_lasso
     brand_line = ("for this gym's own brand, not LASSO's" if freed_gym_card
                   else "for the LASSO brand")
     sections = [
@@ -728,11 +746,9 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
         sections.append(gym_brand_palette_section(gym_palette)
                         if gym_palette else gym_brand_latitude(style["canvas"]))
     else:
-        sections.append(palette
-                        or (gym_brand_palette_section(gym_palette)
-                            if gym_palette else None)
-                        or _cs.BRAND_PALETTE)
-    sections.append(BRAND_TYPE_SYSTEM)
+        sections.append(gym_brand_palette_section(gym_palette)
+                        if gym_branded_card else (palette or _cs.BRAND_PALETTE))
+    sections.append(GYM_TYPE_SYSTEM if gym_branded_card else BRAND_TYPE_SYSTEM)
     sections.append(
         "HOOK, the one headline rendered on the card, render it exactly and keep "
         f"it short: {_cs._scrub_dashes(headline)}")
@@ -741,22 +757,28 @@ def build_infographic_brief(headline, facts, *, cta="", surface="feed post",
             "CTA, the exact words inside the button block: "
             f"{_cs._scrub_dashes(cta)}")
     if fact_lines:
-        what_shows = ("the visual element" if style
-                      else "the three element visual metaphor")
-        how_many = ("it" if style else "the three elements")
+        what_shows = ("the visual explanation" if gym_branded_card else
+                      "the visual element" if style else
+                      "the three element visual metaphor")
+        how_many = ("it" if (style or gym_branded_card) else "the three elements")
         sections.append(
             f"APPROVED CONTEXT for {what_shows} (do NOT render these sentences "
             "as body text on the image; they tell you what "
             f"{how_many} should SHOW):\n{fact_lines}")
-    if style and is_lasso:
+    if gym_branded_card:
+        accent_section = GYM_ACCENT_LAW
+    elif style and is_lasso:
         accent_section = accent_law(style["canvas"], style["accent"])
     elif style:
         accent_section = accent_law_free(style["accent"])
     else:
         accent_section = SINGLE_ACCENT_LAW
     sections.extend([
-        COMPOSITION_MODES[style["composition"]] if style else FLAT_EDITORIAL_SPEC,
-        f"URL FOOTER TEXT (render exactly): {footer or url_footer()}",
+        COMPOSITION_MODES[style["composition"]] if style else
+        (GYM_EDITORIAL_SPEC if gym_branded_card else FLAT_EDITORIAL_SPEC),
+        (f"URL FOOTER TEXT (render exactly): {footer}" if gym_branded_card and footer
+         else "" if gym_branded_card else
+         f"URL FOOTER TEXT (render exactly): {footer or url_footer()}"),
         accent_section,
         ART_DIRECTION_LATITUDE if style else READABILITY_LAW,
         READABILITY_LAW if style else "",

@@ -348,6 +348,21 @@ def test_pending_client_photo_blocks_last_resort_infographic(monkeypatch):
     assert cif.real_media_depleted("gymx") is False
 
 
+def test_gym_astra_brief_never_inherits_lasso_color_or_footer(monkeypatch):
+    from agent import astra_prompt
+
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "false")
+    brief = astra_prompt.build_infographic_brief(
+        "Train with confidence", ["Coached small group training"],
+        account_key="gymx_ig", gym_palette={"colors": GYMX_BRAND_COLORS})
+    assert "for this gym's own brand" in brief
+    assert "BRAND COLORS, VERIFIED FOR THIS GYM" in brief
+    assert all(color in brief for color in GYMX_BRAND_COLORS)
+    assert "URL FOOTER TEXT" not in brief
+    assert "LASSOFRAMEWORK.COM" not in brief
+    assert "red is used exactly one time" not in brief
+
+
 def test_existing_days_rechecked_at_generation_time(monkeypatch):
     """A day another lane filled between the scan and the render is skipped."""
     _sources()
