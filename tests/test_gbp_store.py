@@ -181,3 +181,189 @@ def test_bump_posts_published_increments_existing_and_keeps_top():
                            now_iso="2026-09-02T09:00:00Z", seed_top_post_id="zpNew")
     assert captured["json"]["posts_published"] == 6
     assert "top_post_id" not in captured["json"], "an existing top_post_id is never reseeded"
+
+
+# ---- publish_claim_token claim + CAS transitions (2026-10-02) ---------------------
+
+from agent.portal_calendar_store import PortalStoreError  # noqa: E402
+
+
+class _Resp:
+    def __init__(self, rows, status_code=200):
+        self._rows = rows
+        self.status_code = status_code
+        self.text = ""
+
+    def json(self):
+        return self._rows
+
+
+class _Http:
+    """Fake httpx client: each queued response is returned in order; calls recorded."""
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def patch(self, url, params=None, headers=None, json=None, timeout=None):
+        self.calls.append({"params": params or {}, "json": json or {}})
+        return self.responses.pop(0)
+
+
+class _Base:
+    _url, _key = "u", "k"
+
+    def __init__(self, http):
+        self._http = http
+
+    def _client(self):
+        return self._http
+
+    def _rest(self, table):
+        return f"https://x/{table}"
+
+    def _headers(self, extra=None):
+        return dict(extra or {})
+
+
+def test_claim_publishing_writes_and_returns_the_persisted_token():
+    http = _Http([_Resp([{"id": "r1", "status": "publishing",
+                          "image_url": "https://r2/x.jpg"}])])
+    # the DB echoes back whatever token we wrote
+    s = GbpStore(base=_Base(http))
+    import agent.gbp_store as gs
+    orig = gs.uuid.uuid4
+    gs.uuid.uuid4 = lambda: gs.uuid.UUID("aaaaaaaa-1111-4111-8111-111111111111")
+    try:
+        http.responses[0]._rows[0]["publish_claim_token"] = \
+            "aaaaaaaa-1111-4111-8111-111111111111"
+        tok = s.claim_publishing("r1")
+    finally:
+        gs.uuid.uuid4 = orig
+    assert tok == "aaaaaaaa-1111-4111-8111-111111111111"
+    call = http.calls[0]
+    assert call["params"]["status"] == "eq.approved"          # conditional claim
+    assert call["json"]["status"] == "publishing"
+    assert call["json"]["publish_claim_token"] == tok         # same write, same token
+
+
+def test_claim_publishing_lost_claim_returns_none():
+    s = GbpStore(base=_Base(_Http([_Resp([])])))
+    assert s.claim_publishing("r1") is None
+
+
+def test_claim_publishing_inconsistent_returned_token_raises():
+    http = _Http([_Resp([{"id": "r1", "status": "publishing",
+                          "publish_claim_token": "bbbbbbbb-2222-4222-8222-222222222222"}])])
+    s = GbpStore(base=_Base(http))
+    try:
+        s.claim_publishing("r1")
+        assert False, "an unverified token must never be used"
+    except PortalStoreError:
+        pass
+
+
+def test_mark_published_claimed_is_token_scoped_and_clears_token():
+    http = _Http([_Resp([{"id": "r1", "status": "published"}])])
+    s = GbpStore(base=_Base(http))
+    out = s.mark_published_claimed("r1", "aaaaaaaa-1111-4111-8111-111111111111",
+                                   "zpost_1", "2026-10-02T00:00:00Z")
+    assert out["status"] == "published"
+    call = http.calls[0]
+    assert call["params"]["status"] == "eq.publishing"
+    assert call["params"]["publish_claim_token"] == \
+        "eq.aaaaaaaa-1111-4111-8111-111111111111"
+    assert call["json"]["publish_claim_token"] is None        # cleared on terminal
+    assert call["json"]["late_post_id"] == "zpost_1"
+
+
+def test_claimed_transition_with_no_matching_row_raises_visibly():
+    for fn in (lambda s: s.mark_published_claimed("r1", "t", "z", "2026-10-02"),
+               lambda s: s.mark_failed_claimed("r1", "t", "nope")):
+        s = GbpStore(base=_Base(_Http([_Resp([])])))
+        try:
+            fn(s)
+            assert False, "a stale/changed claim must never be overwritten silently"
+        except PortalStoreError as e:
+            assert e.status == 409
+
+
+def test_release_publishing_claim_is_token_scoped():
+    http = _Http([_Resp([{"id": "r1", "status": "approved"}])])
+    s = GbpStore(base=_Base(http))
+    out = s.release_publishing_claim("r1", "tok-1", "approved")
+    assert out["status"] == "approved"
+    call = http.calls[0]
+    assert call["params"]["publish_claim_token"] == "eq.tok-1"
+    assert call["json"]["publish_claim_token"] is None
+    # no match -> None, no exception, nothing overwritten
+    s2 = GbpStore(base=_Base(_Http([_Resp([])])))
+    assert s2.release_publishing_claim("r1", "tok-1", "approved") is None
+
+
+# ---- media hold + variant guard (2026-10-02 Sol review release-blocker) -----------
+
+def test_approved_gbp_rows_excludes_holds_variants_claims_and_blank_images():
+    base = _FakeBase(url="u", key="k")
+    s = _CapturingStore(base, rows=[
+        {"id": "ok", "image_url": "https://r2/a.jpg"},
+        {"id": "blank", "image_url": "   "},            # slips past not.is.null
+        {"id": "hold", "image_url": "https://r2/b.jpg",
+         "media_not_ready_reason": "rendering"},        # server filter could miss
+    ])
+    out = s.approved_gbp_rows("2026-10-02")
+    _table, params = base.captured[-1]
+    # exact GET predicates: unpublished, unclaimed, no late post, active variant,
+    # non-null image, and NO media hold
+    assert params["published_at"] == "is.null"
+    assert params["late_post_id"] == "is.null"
+    assert params["publish_claim_token"] == "is.null"
+    assert params["variant_status"] == "eq.active"
+    assert params["image_url"] == "not.is.null"
+    assert params["media_not_ready_reason"] == "is.null"
+    # client-side blank/whitespace trim after the GET (PostgREST cannot trim)
+    assert [r["id"] for r in out] == ["ok"]
+
+
+def test_claim_publishing_patch_carries_all_media_hold_predicates():
+    http = _Http([_Resp([{"id": "r1", "status": "publishing",
+                          "publish_claim_token": "t",
+                          "image_url": "https://r2/x.jpg"}])])
+    s = GbpStore(base=_Base(http))
+    import agent.gbp_store as gs
+    orig = gs.uuid.uuid4
+    gs.uuid.uuid4 = lambda: gs.uuid.UUID("aaaaaaaa-1111-4111-8111-111111111111")
+    try:
+        http.responses[0]._rows[0]["publish_claim_token"] = \
+            "aaaaaaaa-1111-4111-8111-111111111111"
+        tok = s.claim_publishing("r1")
+    finally:
+        gs.uuid.uuid4 = orig
+    assert tok == "aaaaaaaa-1111-4111-8111-111111111111"
+    p = http.calls[0]["params"]
+    assert p["id"] == "eq.r1"
+    assert p["status"] == "eq.approved"
+    assert p["account"] == "eq.googlebusiness"
+    assert p["variant_status"] == "eq.active"
+    assert p["published_at"] == "is.null"
+    assert p["late_post_id"] == "is.null"
+    assert p["publish_claim_token"] == "is.null"
+    assert p["image_url"] == "not.is.null"
+    assert p["media_not_ready_reason"] == "is.null"
+
+
+def test_claim_publishing_returned_row_with_hold_or_blank_image_raises_and_retains():
+    # The PATCH won, but the returned row carries a hold/blank image the predicates
+    # could not trim: the claim must be RETAINED (no release write, nothing
+    # overwritten) and the caller told to send nothing.
+    for bad in ({"id": "r1", "status": "publishing", "image_url": "   "},
+                {"id": "r1", "status": "publishing", "image_url": "https://r2/x.jpg",
+                 "media_not_ready_reason": "rendering"}):
+        http = _Http([_Resp([dict(bad, publish_claim_token="t")])])
+        s = GbpStore(base=_Base(http))
+        try:
+            s.claim_publishing("r1")
+            assert False, "a held/blank claimed row must never yield a usable claim"
+        except PortalStoreError as e:
+            assert e.status == 409
+        # exactly one HTTP call (the claim PATCH); no release/overwrite followed
+        assert len(http.calls) == 1

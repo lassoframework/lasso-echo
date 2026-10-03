@@ -6,6 +6,7 @@ is self-contained. Everything here is content_calendar (read-side mirror) + the
 gym_gbp_connections table; NOTHING publishes.
 """
 
+import uuid
 from datetime import datetime, timezone
 
 from . import config
@@ -48,10 +49,24 @@ class GbpStore:
             "status": "eq.approved",
             "post_date": f"lte.{run_date}",
             "published_at": "is.null",
+            "late_post_id": "is.null",
+            "publish_claim_token": "is.null",
             "image_url": "not.is.null",
+            # MEDIA HOLD + VARIANT GUARD (2026-10-02, Sol review): a needs-media row,
+            # a claimed/published row, or a candidate/archived variant beside the real
+            # active slot row is never due for the publish lane.
+            "media_not_ready_reason": "is.null",
+            "variant_status": "eq.active",
             "order": "post_date",
         }
-        return self._get(_CAL, params)
+        rows = self._get(_CAL, params)
+        # PostgREST has no non-empty-string operator and cannot trim, so blank or
+        # whitespace image_url slips past not.is.null — drop those client-side, and
+        # re-drop any row that still carries a media hold (same fail-closed pattern
+        # as the IG/FB lane's due-rows prefetch).
+        return [row for row in rows
+                if (row.get("image_url") or "").strip()
+                and not (row.get("media_not_ready_reason") or "").strip()]
 
     def recent_published_gbp(self, since_iso):
         """PUBLISHED googlebusiness rows with a late_post_id whose published_at is within
@@ -199,21 +214,123 @@ class GbpStore:
         return self._patch(row_id, {"status": status})
 
     def claim_publishing(self, row_id):
-        """EXACTLY-ONCE claim for the GBP lane (audit 2026-08-25 MAJOR: the lane was
-        send-then-mark — a crash between send and mark re-sent next tick, and a deploy-
-        overlap second worker double-sent). Conditional PATCH: only a row still
-        'approved' flips to 'publishing'; zero rows updated => another worker/run owns
-        it (or its status changed) => the caller SKIPS. Mirrors the IG/FB lane's
-        mark_publishing."""
+        """EXACTLY-ONCE claim for the GBP lane, now carrying a durable logical-attempt
+        UUID (2026-10-02): one conditional PATCH flips approved -> publishing AND writes
+        a fresh publish_claim_token in the same write, so the token is the DB-persisted
+        identity of THIS attempt. The returned token (not an invented one) is what the
+        live Zernio create uses as its Idempotency-Key; an ambiguous send later keeps
+        the row in 'publishing' WITH this token for manual provider readback.
+
+        Returns the persisted token string on a won claim, None on a lost claim (zero
+        rows updated: another worker owns it or its status changed). Raises
+        PortalStoreError when the returned row does not carry the exact token we wrote
+        (schema/API drift) — never proceed on an unverified token."""
+        token = str(uuid.uuid4())
+        # MEDIA HOLD GUARD (2026-10-02, Sol review release-blocker): the claim PATCH
+        # carries every precondition server-side so a held/archived/claimed/published
+        # row can never be claimed: still approved, still googlebusiness, the ACTIVE
+        # variant for its slot, unpublished, unclaimed, carrying a non-null image and
+        # NO media_not_ready_reason. Mirrors the IG/FB lane's conditional PATCH.
         r = self._s._client().patch(
             self._s._rest(_CAL),
-            params={"id": f"eq.{row_id}", "status": "eq.approved"},
+            params={"id": f"eq.{row_id}",
+                    "status": "eq.approved",
+                    "account": f"eq.{PLATFORM}",
+                    "variant_status": "eq.active",
+                    "published_at": "is.null",
+                    "late_post_id": "is.null",
+                    "publish_claim_token": "is.null",
+                    "image_url": "not.is.null",
+                    "media_not_ready_reason": "is.null"},
             headers=self._s._headers({"Content-Type": "application/json",
                                       "Prefer": "return=representation"}),
-            json={"status": "publishing"}, timeout=30)
+            json={"status": "publishing", "publish_claim_token": token}, timeout=30)
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        return bool(r.json() or [])
+        rows = r.json() or []
+        if not rows:
+            return None                      # lost claim: another owner; send nothing
+        row = rows[0]
+        if (str(row.get("id")) != str(row_id)
+                or str(row.get("status") or "") != "publishing"
+                or str(row.get("publish_claim_token") or "") != token):
+            raise PortalStoreError(
+                409, "publish claim returned an inconsistent row/token; "
+                     "treating the claim as unverified and sending nothing")
+        # The PATCH predicates can exclude a hold but cannot trim: a blank/whitespace
+        # image_url passes not.is.null. The returned row is the last client-side gate
+        # before the worker sends. On failure the claim is RETAINED (never released:
+        # releasing would let a second attempt send an ambiguous provider post) and
+        # the caller is told loudly to send nothing.
+        if (not (row.get("image_url") or "").strip()
+                or (row.get("media_not_ready_reason") or "").strip()):
+            raise PortalStoreError(
+                409, "publish claim won but the claimed row carries a blank image "
+                     "or a media hold; claim retained in 'publishing' and nothing "
+                     "sent — manual reconciliation required")
+        return token
+
+    def _transition_claimed(self, row_id, claim_token, fields, expect_status):
+        """Conditional terminal transition for a claimed row: matches on id + still
+        'publishing' + the EXACT claim token, so a changed/lost/re-claimed row can never
+        be overwritten by a stale attempt. Clears publish_claim_token only as part of
+        this proven terminal write. Zero matched rows (or a row that comes back with an
+        unexpected status) raises PortalStoreError visibly — the caller must NOT fall
+        back to an unconditional write."""
+        if not claim_token:
+            raise PortalStoreError(422, "claimed transition requires the claim token")
+        r = self._s._client().patch(
+            self._s._rest(_CAL),
+            params={"id": f"eq.{row_id}", "status": "eq.publishing",
+                    "publish_claim_token": f"eq.{claim_token}"},
+            headers=self._s._headers({"Content-Type": "application/json",
+                                      "Prefer": "return=representation"}),
+            json=dict(fields, publish_claim_token=None), timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        row = rows[0] if rows else None
+        if row is None or str(row.get("status") or "") != expect_status:
+            raise PortalStoreError(
+                409, f"conditional {expect_status} transition matched no row for "
+                     f"{row_id}; the claim changed or was lost — NOT overwritten")
+        return row
+
+    def mark_published_claimed(self, row_id, claim_token, late_post_id, published_at,
+                               gbp_location_id=None):
+        """Confirmed-success terminal stamp for the exact claimed attempt (token CAS)."""
+        fields = {"status": "published", "late_post_id": late_post_id or "",
+                  "published_at": published_at}
+        if gbp_location_id:
+            fields["gbp_location_id"] = gbp_location_id
+        return self._transition_claimed(row_id, claim_token, fields, "published")
+
+    def mark_failed_claimed(self, row_id, claim_token, reject_reason):
+        """Definite no-post terminal stamp for the exact claimed attempt (token CAS)."""
+        return self._transition_claimed(
+            row_id, claim_token,
+            {"status": "failed", "reject_reason": (reject_reason or "")[:500]},
+            "failed")
+
+    def release_publishing_claim(self, row_id, claim_token, status="approved"):
+        """Release a claimed row back to a non-terminal status (a HOLD, not an outcome:
+        needs_reconnect, outside the publish window, a lapsed offer). Token-scoped CAS;
+        clears the token because no provider attempt was made. Returns the updated row,
+        or None when the claim no longer matches (visible to the caller, never
+        overwritten unconditionally)."""
+        if not claim_token:
+            raise PortalStoreError(422, "claim release requires the claim token")
+        r = self._s._client().patch(
+            self._s._rest(_CAL),
+            params={"id": f"eq.{row_id}", "status": "eq.publishing",
+                    "publish_claim_token": f"eq.{claim_token}"},
+            headers=self._s._headers({"Content-Type": "application/json",
+                                      "Prefer": "return=representation"}),
+            json={"status": status, "publish_claim_token": None}, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
 
     # ---- G3 metrics (posts_published at publish; top_post_id by clicks at reconcile) --
     def bump_posts_published(self, portal_gym_key, gbp_location_id, month_iso, *,

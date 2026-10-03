@@ -209,6 +209,15 @@ def reconcile(*, store=None, provider=None, kv=None, now=None, alert=None):
         if not rid or not gym or not token or not anchor:
             result["held"].append({"id": rid, "reason": "missing_claim_identity"})
             continue
+        # GBP gallery photos use /v1/accounts/{id}/gmb-media, not /v1/posts.
+        # An empty posts list cannot prove that an accepted gallery upload is
+        # absent. Retain its claim until an authoritative gallery readback or a
+        # human verifier resolves it; never release it for another upload here.
+        if (str(row.get("account") or "").lower() == "googlebusiness"
+                and str(row.get("format") or "").lower() == "photo"):
+            result["held"].append({"id": rid,
+                                   "reason": "gallery_media_requires_readback"})
+            continue
         # LASSO can use the direct Meta publisher. Zernio absence says nothing
         # about a direct send, so reconcile its rows only while the Zernio cutover
         # is the configured owner. Client gyms always use the Zernio lane.

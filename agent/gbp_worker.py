@@ -67,7 +67,7 @@ def _media_reuse_hold(row, *, now=None, history_store=None, media_store=None):
 
 
 def publish_gbp_row(row, connection, *, client, draft=True, now=None,
-                    history_store=None, media_store=None):
+                    history_store=None, media_store=None, idempotency_key=None):
     """Send one approved GBP row through Zernio. Re-validates the hard rails at send
     time (belt-and-suspenders over the planner) and refuses to ship a violation.
 
@@ -83,6 +83,15 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": "Echo access revoked or subscription canceled",
                 "held": "echo_access", "mode": ""}
+    # MEDIA HOLD GUARD (2026-10-02, Sol review release-blocker): a nonempty
+    # media_not_ready_reason means the row's media was never confirmed ready. Refuse
+    # BEFORE any provider call and return a visible HOLD (status stays 'approved'),
+    # never a 'failed' outcome — nothing was attempted and nothing was rejected.
+    _media_hold = (row.get("media_not_ready_reason") or "").strip()
+    if _media_hold:
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": f"media not ready: {_media_hold}"[:400],
+                "held": "media_hold", "mode": ""}
     caption = row.get("caption") or ""
     # INTERNAL EDIT-RATIONALE FINAL GATE (CrossFit ENG '[why]' leak, 2026-08-23): a
     # bracketed meta block after the real caption is stripped here so GBP can never
@@ -140,7 +149,14 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
                 "dedup": True}
 
     try:
-        resp = client.create_post_raw(payload, draft=draft)
+        # The persisted claim token (live lane only) is the logical-attempt
+        # Idempotency-Key; without a verified token no key is sent. Legacy fake
+        # clients that predate the kwarg keep the historical call shape.
+        if idempotency_key:
+            resp = client.create_post_raw(payload, draft=draft,
+                                          idempotency_key=idempotency_key)
+        else:
+            resp = client.create_post_raw(payload, draft=draft)
     except Exception as exc:  # noqa: BLE001
         dedup = _dedup_success(exc)
         if dedup:
@@ -269,6 +285,14 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": "Echo access revoked or subscription canceled",
                 "held": "echo_access", "mode": ""}
+    # MEDIA HOLD GUARD (2026-10-02, Sol review release-blocker): refuse a held row
+    # before the draft simulation and before any gmb-media call; a hold is not an
+    # attempt, so the result is a visible hold, never 'failed'.
+    _media_hold = (row.get("media_not_ready_reason") or "").strip()
+    if _media_hold:
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": f"media not ready: {_media_hold}"[:400],
+                "held": "media_hold", "mode": ""}
     if not (row.get("image_url") or "").strip():
         return {"ok": False, "status": "failed", "late_post_id": "",
                 "reject_reason": "photo drop has no image", "mode": ""}
@@ -283,7 +307,7 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
     try:
         resp = client.create_gmb_media(connection["zernio_account_id"],
                                        row["image_url"])
-    except Exception as e:  # noqa: BLE001 - synchronous: an error IS the outcome
+    except Exception as e:  # noqa: BLE001 - an error here is NOT always the outcome
         # CARRY THE MESSAGE, not just the class (2026-09-03). This recorded only
         # type(e).__name__, so the live failure on crossfitnine7f7dadc read "photo
         # upload: ZernioError" in the row AND in the alert -- naming the exception
@@ -298,18 +322,52 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
         # could ever help. describe_error unwraps all four, and the retry sweep
         # (agent/gbp_failed_retry.py) reads `retryable` to decide whether this row is
         # worth another attempt or is waiting on a human.
+        # AMBIGUITY (2026-10-02): the gmb-media create can time out or lose its
+        # response AFTER Zernio accepted the upload. An unstructured exception is
+        # not proof of no-post, so it must NEVER stamp terminal 'failed' and must
+        # NEVER trigger an automatic second upload: hold the row in 'publishing'
+        # (the orchestrator retains the persisted claim + token) for manual
+        # provider readback. Only a structured, authoritative definite no-post
+        # (the shared invalid_request_error validator, or an exception that
+        # explicitly attests definitive_no_post) may fail. error_summary feeds
+        # the ALERT in both cases; it never decides the status by itself.
         from .zernio import describe_error, error_summary
         desc = describe_error(e, endpoint="/v1/gmb-media",
                               account_id=connection.get("zernio_account_id"))
         summary = error_summary(desc)
+        no_post = _no_post_validation(e)
+        # A 4xx alone does not prove Google did not accept a photo. The
+        # provider may report a platform error after partial processing. Only
+        # parsed validation evidence or an explicit no-post attestation may
+        # clear this claim; an unstructured Google wrapper stays held.
+        definite = (no_post is not None
+                    or getattr(e, "definitive_no_post", False))
         if alert:
-            alert(f"GBP photo drop failed for {row.get('gym_id')} "
-                  f"row {row.get('id')}: {summary}")
-        return {"ok": False, "status": "failed", "late_post_id": "",
-                "reject_reason": f"photo upload: {summary}"[:400], "mode": "",
-                "error": desc}
+            try:
+                alert(f"GBP photo drop {'failed' if definite else 'outcome unknown'}"
+                      f" for {row.get('gym_id')} row {row.get('id')}: {summary}")
+            except Exception:  # noqa: BLE001 - an alert must never decide an outcome
+                pass
+        if definite:
+            return {"ok": False, "status": "failed", "late_post_id": "",
+                    "reject_reason": f"photo upload: {summary}"[:400], "mode": "",
+                    "error": desc}
+        return {"ok": False, "status": "publishing", "late_post_id": "",
+                "reject_reason":
+                    f"photo upload outcome unknown (provider readback required): "
+                    f"{summary}"[:400],
+                "held": "ambiguous_send", "mode": "", "error": desc}
     from .zernio import post_id_of
-    return {"ok": True, "status": "published", "late_post_id": post_id_of(resp),
+    post_id = post_id_of(resp)
+    if not post_id:
+        # A 2xx without a post id cannot be confirmed: the media may exist on the
+        # provider. Hold for manual readback — do not auto-retry (a second upload
+        # would duplicate the gallery photo) and do not stamp failed.
+        return {"ok": False, "status": "publishing", "late_post_id": "",
+                "reject_reason": "gmb-media returned no post id; manual provider "
+                                 "readback required",
+                "held": "ambiguous_send", "mode": ""}
+    return {"ok": True, "status": "published", "late_post_id": post_id,
             "reject_reason": "", "mode": "live"}
 
 
@@ -349,7 +407,7 @@ def in_publish_window(now, tz_str):
 
 
 def publish_one(row, connections, *, client, draft=True, alert=None, now=None,
-                history_store=None, media_store=None):
+                history_store=None, media_store=None, idempotency_key=None):
     """Publish one approved GBP row: connection precheck (§7.1) + routing + send. Returns
     the status transition dict {status, late_post_id, reject_reason}. A needs_reconnect
     gym HOLDS silently (status stays 'approved'); a routing failure or rail violation
@@ -385,7 +443,8 @@ def publish_one(row, connections, *, client, draft=True, alert=None, now=None,
            if is_photo
            else publish_gbp_row(row, conn, client=client, draft=draft, now=now,
                                 history_store=history_store,
-                                media_store=media_store))
+                                media_store=media_store,
+                                idempotency_key=idempotency_key))
     if not res["ok"] and not res.get("held") and alert and not is_photo:
         alert(f"GBP send failed for {row.get('gym_id')} row {row.get('id')}: "
               f"{res['reject_reason']}")
@@ -427,23 +486,55 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
             # worker/run owns the row, or its status changed) skips — a crash between
             # send and mark can no longer re-send, and two workers can never double-send.
             # Older stores/fakes without the method keep the historical behavior.
+            # A DRAFT run is a rehearsal: it must never mutate the row, so it
+            # never claims (a claim would strand the row in 'publishing' and block
+            # the real run) and never receives an idempotency key.
             claim = getattr(store, "claim_publishing", None)
-            if claim is not None:
+            claim_token = None
+            claim_won = False
+            if claim is not None and not draft:
                 try:
-                    if not claim(row.get("id")):
-                        continue                      # someone else owns it: skip
+                    claimed = claim(row.get("id"))
                 except Exception as e:  # noqa: BLE001
                     print(f"[gbp] claim failed for row {row.get('id')}: "
                           f"{type(e).__name__}; skipping this tick")
                     continue
+                if not claimed:
+                    continue                      # someone else owns it: skip
+                claim_won = True
+                # New stores return the PERSISTED publish_claim_token; it becomes
+                # the Zernio Idempotency-Key. Legacy fakes return True — proceed
+                # without a key (never invent one after the claim).
+                if isinstance(claimed, str) and claimed.strip():
+                    claim_token = claimed
             try:
                 res = publish_one(row, conns, client=client, draft=draft, alert=alert,
                                   now=(now or _utcnow()),
                                   history_store=history_store,
-                                  media_store=media_store)
+                                  media_store=media_store,
+                                  idempotency_key=claim_token)
             except Exception as e:  # noqa: BLE001
-                failed += 1
-                store.mark_failed(row.get("id"), f"worker error: {type(e).__name__}")
+                # An exception escaping publish_one is NOT proof of a definite
+                # no-post: it may come AFTER a provider call (a post-send alert
+                # callback, response parsing, the media-reuse history read). Never
+                # stamp terminal failed on an unknown outcome. A won claim keeps
+                # its durable token in 'publishing' for manual provider readback;
+                # when no claim was made (a draft rehearsal) write NO status at all.
+                if not claim_won:
+                    print(f"[gbp] publish error for row {row.get('id')}: "
+                          f"{type(e).__name__}; no claim held — row left unchanged")
+                    continue
+                held += 1
+                print(f"[gbp] WARNING: publish outcome unknown for row "
+                      f"{row.get('id')}: {type(e).__name__}; publishing claim and "
+                      "token retained for manual provider readback")
+                if alert:
+                    try:
+                        alert(f"GBP publish outcome unknown for {gym} row "
+                              f"{row.get('id')}: {type(e).__name__}; the publishing "
+                              "claim is retained — manual provider readback required.")
+                    except Exception:  # noqa: BLE001 - alerts never decide outcomes
+                        pass
                 continue
             if res.get("held"):
                 held += 1
@@ -451,23 +542,46 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                     # Keep the durable publishing claim. Only provider readback
                     # can decide whether this attempt was delivered.
                     if alert:
-                        alert(f"GBP send outcome unknown for {gym} row {row.get('id')}; "
-                              "publishing claim retained for manual provider readback. "
-                              f"{res.get('reject_reason') or ''}")
+                        try:
+                            alert(f"GBP send outcome unknown for {gym} row "
+                                  f"{row.get('id')}; publishing claim retained for "
+                                  "manual provider readback. "
+                                  f"{res.get('reject_reason') or ''}")
+                        except Exception:  # noqa: BLE001 - alerts never decide outcomes
+                            pass
                     continue
-                if claim is not None:
+                if claim_won:
                     # release the claim: a held row (needs_reconnect etc.) must go back
                     # to 'approved' so it retries once the hold clears, never strand in
-                    # 'publishing'.
+                    # 'publishing'. No provider attempt was made, so the token clears.
                     try:
-                        store.mark_status(row.get("id"), "approved")
-                    except Exception:  # noqa: BLE001
-                        pass
+                        release = getattr(store, "release_publishing_claim", None)
+                        if claim_token is not None and release is not None:
+                            if release(row.get("id"), claim_token,
+                                       "approved") is None:
+                                print(f"[gbp] WARNING: claim release matched no row "
+                                      f"for {row.get('id')}; claim changed elsewhere")
+                        else:
+                            store.mark_status(row.get("id"), "approved")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[gbp] WARNING: claim release failed for "
+                              f"{row.get('id')}: {type(e).__name__}")
                 continue
             if res.get("reverted"):
                 # G6: lapsed OFFER -> back to pending for a human; alert staff (not client)
+                # A draft rehearsal is read-only: no claim exists, write nothing.
+                if draft:
+                    print(f"[gbp] {gym} row {row.get('id')}: OFFER window lapsed; "
+                          "draft mode — row left unchanged.")
+                    continue
                 reverted += 1
-                store.mark_status(row.get("id"), "pending")
+                release = getattr(store, "release_publishing_claim", None)
+                if claim_token is not None and release is not None:
+                    if release(row.get("id"), claim_token, "pending") is None:
+                        print(f"[gbp] WARNING: claim release matched no row for "
+                              f"{row.get('id')}; claim changed elsewhere")
+                else:
+                    store.mark_status(row.get("id"), "pending")
                 if alert:
                     alert(f"GBP OFFER for {gym} row {row.get('id')} reverted to pending: "
                           "its offer window lapsed during an outage.")
@@ -491,8 +605,28 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                 _loc = res.get("gbp_location_id")
                 # G3: stamp the connection's location onto the row so the reconcile top-post
                 # ranker keys on the SAME (gym, location, month) as this bump.
-                store.mark_published(row.get("id"), res["late_post_id"], stamp,
-                                     gbp_location_id=_loc)
+                # Confirmed success is terminal: token-scoped CAS clears the token.
+                # A failed CAS (claim changed/lost) is visible and does NOT overwrite.
+                mpc = getattr(store, "mark_published_claimed", None)
+                try:
+                    if claim_token is not None and mpc is not None:
+                        mpc(row.get("id"), claim_token, res["late_post_id"], stamp,
+                            gbp_location_id=_loc)
+                    else:
+                        store.mark_published(row.get("id"), res["late_post_id"], stamp,
+                                             gbp_location_id=_loc)
+                except Exception as e:  # noqa: BLE001
+                    held += 1
+                    published -= 1
+                    print(f"[gbp] WARNING: publish stamp rejected for row "
+                          f"{row.get('id')} (post id {res['late_post_id']}): "
+                          f"{type(e).__name__}; row left in publishing for readback")
+                    if alert:
+                        alert(f"GBP publish stamp failed for {gym} row "
+                              f"{row.get('id')}: {type(e).__name__}; provider post "
+                              f"{res['late_post_id']} exists but the claim changed — "
+                              "manual reconciliation required.")
+                    continue
                 # G3: the publish rail owns posts_published (the portal cron omits it).
                 # Best-effort: a metrics write must never fail or undo a publish.
                 try:
@@ -504,8 +638,29 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                     print(f"[gbp] posts_published bump failed for {gym}: "
                           f"{type(e).__name__}")
             elif res["status"] == "failed":
+                # A draft rehearsal is read-only: report the would-be failure,
+                # never stamp the row.
+                if draft:
+                    print(f"[gbp] {gym} row {row.get('id')}: would fail "
+                          f"({res['reject_reason']}); draft mode — row left unchanged.")
+                    continue
+                mfc = getattr(store, "mark_failed_claimed", None)
+                try:
+                    if claim_token is not None and mfc is not None:
+                        mfc(row.get("id"), claim_token, res["reject_reason"])
+                    else:
+                        store.mark_failed(row.get("id"), res["reject_reason"])
+                except Exception as e:  # noqa: BLE001
+                    held += 1
+                    print(f"[gbp] WARNING: failed stamp rejected for row "
+                          f"{row.get('id')}: {type(e).__name__}; row left in "
+                          "publishing for readback")
+                    if alert:
+                        alert(f"GBP failed stamp rejected for {gym} row "
+                              f"{row.get('id')}: {type(e).__name__}; the claim "
+                              "changed — manual reconciliation required.")
+                    continue
                 failed += 1
-                store.mark_failed(row.get("id"), res["reject_reason"])
     return {"published": published, "failed": failed, "held": held,
             "reverted": reverted, "gyms": len(by_gym)}
 

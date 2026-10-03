@@ -719,3 +719,371 @@ def test_the_armed_run_still_publishes_normally():
                              alert=lambda m: None)
     assert out["published"] == 1
     assert [rid for rid, _ in store.published] == ["r1"]
+
+
+# ---- durable publish_claim_token -> Zernio Idempotency-Key (2026-10-02) ----------
+
+class _TokenStore(_Store):
+    """A store with the token-carrying atomic claim and token-CAS terminal writes.
+    The claim returns the PERSISTED token; terminal transitions must present the
+    exact token and clear it."""
+    def __init__(self, rows, conns, lose_ids=()):
+        super().__init__(rows, conns)
+        import uuid as _u
+        self._uuid = _u
+        self.tokens = {}
+        self.claims = []
+        self._lose = set(lose_ids)
+        self.released = []
+        self.issued = []
+
+    def claim_publishing(self, row_id):
+        self.claims.append(row_id)
+        if row_id in self._lose or row_id in self.tokens:
+            return None
+        tok = str(self._uuid.uuid4())
+        self.tokens[row_id] = tok
+        self.issued.append(tok)
+        return tok
+
+    def mark_published_claimed(self, row_id, token, late, at, gbp_location_id=None):
+        assert self.tokens.get(row_id) == token, "a stale token must never transition"
+        self.tokens.pop(row_id)
+        self.published.append((row_id, late))
+        return {"id": row_id, "status": "published"}
+
+    def mark_failed_claimed(self, row_id, token, reason):
+        assert self.tokens.get(row_id) == token, "a stale token must never transition"
+        self.tokens.pop(row_id)
+        self.failed.append((row_id, reason))
+        return {"id": row_id, "status": "failed"}
+
+    def release_publishing_claim(self, row_id, token, status="approved"):
+        if self.tokens.get(row_id) != token:
+            return None
+        self.tokens.pop(row_id)
+        self.released.append((row_id, status))
+        return {"id": row_id, "status": status}
+
+
+class _KeyClient:
+    """Records the idempotency_key kwarg on every create; can raise or respond."""
+    def __init__(self, resp=None, exc=None):
+        self.keys = []
+        self.calls = 0
+        self._resp = resp if resp is not None else {"_id": "zpost_key_1"}
+        self._exc = exc
+
+    def create_post_raw(self, payload, *, draft=False, publish_now=True,
+                        idempotency_key=None):
+        self.calls += 1
+        self.keys.append(idempotency_key)
+        if self._exc is not None:
+            raise self._exc
+        return self._resp
+
+
+def test_live_create_passes_the_exact_persisted_claim_token():
+    """Header stability: the Idempotency-Key on the wire IS the token the atomic
+    claim persisted — not an after-the-fact invention."""
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _TokenStore([row], {"lasso": [_c()]})
+    c = _KeyClient()
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
+                             alert=lambda m: None)
+    assert out["published"] == 1 and c.calls == 1
+    # the key on the wire IS the exact token the claim persisted
+    assert c.keys == store.issued and c.keys[0]
+    assert store.tokens == {}, "confirmed success must clear the token"
+    assert [rid for rid, _ in store.published] == ["r1"]
+
+
+def test_idempotency_header_carries_the_claim_token_verbatim():
+    from agent.zernio import _idempotency_headers
+    tok = "12345678-1234-4234-8234-123456789012"
+    h = _idempotency_headers(tok)
+    assert h["Idempotency-Key"] == tok
+    assert "x-request-id" in h
+    assert "Idempotency-Key" not in _idempotency_headers(None)
+
+
+def test_lost_token_claim_sends_nothing():
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _TokenStore([row], {"lasso": [_c()]}, lose_ids={"r1"})
+    c = _KeyClient()
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
+                             alert=lambda m: None)
+    assert c.calls == 0, "a lost claim must never reach the network"
+    assert out["published"] == 0 and store.published == [] and store.failed == []
+
+
+def test_legacy_true_claim_proceeds_without_a_key():
+    """Legacy fake stores return True: the send proceeds (historical behavior) but
+    no idempotency key is passed without a verified persisted token."""
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _ClaimStore([row], {"lasso": [_c()]})
+    c = _KeyClient()
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
+                             alert=lambda m: None)
+    assert out["published"] == 1
+    assert c.keys == [None]
+
+
+def test_ambiguous_send_retains_publishing_status_and_token():
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _TokenStore([row], {"lasso": [_c()]})
+    c = _KeyClient(exc=RuntimeError("connection reset"))
+    alerts = []
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
+                             alert=alerts.append)
+    assert out["held"] == 1 and c.calls == 1, "no second POST"
+    assert store.published == [] and store.failed == [] and store.released == []
+    assert store.tokens.get("r1"), "the token is retained for manual provider readback"
+    assert any("outcome unknown" in m for m in alerts)
+
+
+def test_definite_no_post_failure_clears_token_via_cas():
+    from agent.zernio import ZernioError
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _TokenStore([row], {"lasso": [_c()]})
+    c = _KeyClient(exc=ZernioError(400, '{"type": "invalid_request_error",'
+                                        ' "message": "bad location id"}'))
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
+                             alert=lambda m: None)
+    assert out["failed"] == 1
+    assert [rid for rid, _ in store.failed] == ["r1"]
+    assert store.tokens == {}, "a proven terminal transition clears the token"
+
+
+def test_confirmed_success_uses_the_token_scoped_terminal_write():
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _TokenStore([row], {"lasso": [_c()]})
+    c = _KeyClient(resp={"_id": "zpost_ok_9"})
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
+                             alert=lambda m: None)
+    assert out["published"] == 1
+    assert store.published == [("r1", "zpost_ok_9")]
+    assert store.tokens == {}
+
+
+def test_stale_token_cannot_overwrite_a_changed_claim():
+    """If the row's claim changed after our claim, the CAS transition must reject —
+    never an unconditional overwrite."""
+    from agent.portal_calendar_store import PortalStoreError
+    row = dict(_row(), id="r1", gym_id="lasso")
+
+    class _StaleStore(_TokenStore):
+        def mark_published_claimed(self, row_id, token, late, at,
+                                   gbp_location_id=None):
+            raise PortalStoreError(409, "conditional transition matched no row")
+    store = _StaleStore([row], {"lasso": [_c()]})
+    alerts = []
+    out = gw.publish_due_gbp(store, _KeyClient(), run_date="2026-09-01",
+                             draft=False, alert=alerts.append)
+    assert out["published"] == 0, "a rejected CAS is not a published row"
+    assert store.published == [] and store.failed == []
+    assert any("manual reconciliation" in m for m in alerts)
+
+
+def test_draft_run_never_claims_never_sends_live_never_marks():
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _TokenStore([row], {"lasso": [_c()]})
+    c = _KeyClient()
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=True,
+                             alert=lambda m: None)
+    assert store.claims == [], "a rehearsal must not claim the row"
+    assert c.calls == 1 and c.keys == [None], "no idempotency key in draft mode"
+    assert out["published"] == 0
+    assert store.published == [] and store.failed == [] and store.tokens == {}
+
+
+# ---- post-acceptance ambiguity repairs (2026-10-02) ------------------------
+
+def _photo_row(**over):
+    return dict(_row(caption="", image_url="https://r2/floor.jpg"),
+                id="p1", gym_id="lasso", format="photo", **over)
+
+
+class _MediaClient:
+    """Gallery-path client: create_gmb_media raises/responds; post API must not run."""
+    def __init__(self, resp=None, exc=None):
+        self.media_calls = 0
+        self._resp = resp
+        self._exc = exc
+
+    def create_gmb_media(self, account_id, url):
+        self.media_calls += 1
+        if self._exc is not None:
+            raise self._exc
+        return self._resp
+
+    def create_post_raw(self, *a, **k):
+        raise AssertionError("a photo row must never hit the posts API")
+
+
+def test_photo_create_timeout_holds_with_token_and_no_retry():
+    """A timeout after a possible provider accept is AMBIGUOUS: the row stays in
+    'publishing' WITH its claim token for manual provider readback — never a
+    second upload, never a terminal failed stamp."""
+    row = _photo_row()
+    store = _TokenStore([row], {"lasso": [_c()]})
+    c = _MediaClient(exc=TimeoutError("read timed out"))
+    alerts = []
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
+                             alert=alerts.append)
+    assert c.media_calls == 1, "no automatic second upload"
+    assert out["held"] == 1 and out["failed"] == 0 and out["published"] == 0
+    assert store.failed == [] and store.published == [] and store.released == []
+    assert store.tokens.get("p1"), "the claim token is retained for readback"
+    assert any("outcome unknown" in m for m in alerts)
+
+
+def test_photo_missing_post_id_holds_with_token():
+    """A 2xx gmb-media response without a post id cannot be confirmed: hold for
+    manual readback with the token retained."""
+    row = _photo_row()
+    store = _TokenStore([row], {"lasso": [_c()]})
+    c = _MediaClient(resp={"ok": True})              # no _id anywhere
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
+                             alert=lambda m: None)
+    assert out["held"] == 1 and out["published"] == 0
+    assert store.published == [] and store.failed == []
+    assert store.tokens.get("p1")
+
+
+def test_alert_throwing_after_provider_operation_never_fails_the_row():
+    """The alert callback is observability, not an outcome. If it throws after an
+    ambiguous provider operation, the row keeps its claim/token and the run
+    completes for the remaining rows."""
+    rows = [dict(_row(), id="r1", gym_id="lasso"),
+            dict(_row(), id="r2", gym_id="lasso")]
+    store = _TokenStore(rows, {"lasso": [_c()]})
+    c = _KeyClient(exc=RuntimeError("connection reset"))
+
+    def _boom(msg):
+        raise RuntimeError("alert sink down")
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
+                             alert=_boom)
+    assert out["held"] == 2 and out["failed"] == 0
+    assert store.failed == [] and store.released == []
+    assert store.tokens.get("r1") and store.tokens.get("r2")
+
+
+def test_outer_unexpected_exception_keeps_the_claim_token():
+    """An exception escaping publish_one may come AFTER a provider call (here: the
+    failure-path alert itself throws). It is never proof of no-post: the durable
+    claim and token are retained for manual provider readback."""
+    from agent.zernio import ZernioError
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _TokenStore([row], {"lasso": [_c()]})
+    c = _KeyClient(exc=ZernioError(400, '{"type": "invalid_request_error",'
+                                        ' "message": "bad location id"}'))
+
+    def _boom(msg):
+        raise RuntimeError("alert sink down")
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
+                             alert=_boom)
+    assert out["held"] == 1 and out["failed"] == 0
+    assert store.failed == []
+    assert store.tokens.get("r1"), "the token survives an outer unknown error"
+
+
+def test_draft_failure_and_lapsed_offer_leave_the_row_unchanged():
+    """Draft mode is read-only for content_calendar on EVERY outcome: a would-be
+    failure and a lapsed offer write no status, no failure, no claim."""
+    from datetime import datetime, timezone
+    failing = dict(_row(), id="r1", gym_id="lasso")
+    lapsed = dict(_row(gbp_topic_type="OFFER",
+                       gbp_event={"schedule": {"endDate": "2026-08-01"}}),
+                  id="r2", gym_id="lasso")
+    store = _TokenStore([failing, lapsed], {"lasso": [_c()]})
+    from agent.zernio import ZernioError
+    c = _KeyClient(exc=ZernioError(400, '{"type": "invalid_request_error",'
+                                        ' "message": "bad location id"}'))
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=True,
+                             alert=lambda m: None,
+                             now=datetime(2026, 9, 1, 9, 0,
+                                          tzinfo=timezone.utc))
+    assert store.claims == [], "a draft never claims"
+    assert store.failed == [] and store.published == []
+    assert store.status == [] and store.released == [] and store.tokens == {}
+    assert out["failed"] == 0 and out["reverted"] == 0 and out["published"] == 0
+
+
+# ---- media hold guard (2026-10-02 Sol review release-blocker) ---------------------
+
+def test_publish_gbp_row_with_media_hold_refuses_before_provider_call():
+    c = _FakeClient()
+    row = _row(media_not_ready_reason="render still processing")
+    out = gw.publish_gbp_row(row, _conn(), client=c, draft=True)
+    assert out["held"] == "media_hold" and out["status"] == "approved"
+    assert "media not ready" in out["reject_reason"]
+    assert c.calls == [], "a held row must never reach the provider client"
+    # and in live mode too (before the media-reuse read or any network call)
+    out2 = gw.publish_gbp_row(row, _conn(), client=c, draft=False)
+    assert out2["held"] == "media_hold"
+    assert c.calls == []
+
+
+def test_publish_gbp_row_blank_image_refuses_before_provider_call():
+    c = _FakeClient()
+    out = gw.publish_gbp_row(_row(image_url="   "), _conn(), client=c, draft=True)
+    assert out["ok"] is False and out["status"] == "failed"
+    assert "no image" in out["reject_reason"]
+    assert c.calls == [], "a blank image must refuse before any provider call"
+
+
+def test_photo_drop_with_media_hold_holds_before_draft_simulation_and_provider():
+    class _C:
+        def __init__(self):
+            self.media = 0
+        def create_gmb_media(self, a, u):
+            self.media += 1
+            return {"_id": "m1"}
+    c = _C()
+    row = _row(format="photo", media_not_ready_reason="asset pending approval")
+    out = gw.publish_photo_drop(row, _conn(), client=c, draft=True)
+    assert out["held"] == "media_hold" and out["status"] == "approved"
+    assert out["ok"] is False
+    assert c.media == 0, "held photo drop must not even take the draft-sim result"
+    out2 = gw.publish_photo_drop(row, _conn(), client=c, draft=False)
+    assert out2["held"] == "media_hold"
+    assert c.media == 0
+
+
+def test_publish_due_gbp_never_sends_a_held_approved_row():
+    """End-to-end lane: the store's claim refuses a held/archived-variant row (the
+    conditional PATCH matches zero rows), so the worker skips and nothing is sent."""
+    class _RefusingStore(_Store):
+        def __init__(self, rows, conns):
+            super().__init__(rows, conns)
+            self.claims = []
+        def claim_publishing(self, row_id):
+            self.claims.append(row_id)
+            return None                      # PATCH matched nothing: held/variant row
+
+    row = _row(id="r1", gym_id="lasso", format="post",
+               media_not_ready_reason="render still processing")
+    store = _RefusingStore([row], {"lasso": [_c()]})
+    c = _FakeClient()
+    out = gw.publish_due_gbp(store, c, run_date="2026-10-02", draft=False)
+    assert c.calls == [], "a refused claim must never send"
+    assert out["published"] == 0 and store.published == []
+
+
+def test_publish_due_gbp_claim_exception_sends_nothing():
+    """A claim that raises (e.g. the retained-claim 409 from a held returned row)
+    must skip the row entirely: no send, no status write."""
+    class _RaisingStore(_Store):
+        def __init__(self, rows, conns):
+            super().__init__(rows, conns)
+            self.claims = []
+        def claim_publishing(self, row_id):
+            self.claims.append(row_id)
+            raise RuntimeError("claim returned an inconsistent/held row")
+    row = _row(id="r1", gym_id="lasso", format="post")
+    store = _RaisingStore([row], {"lasso": [_c()]})
+    c = _FakeClient()
+    out = gw.publish_due_gbp(store, c, run_date="2026-10-02", draft=False)
+    assert c.calls == []
+    assert out["published"] == 0 and store.published == []

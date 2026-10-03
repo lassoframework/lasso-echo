@@ -94,6 +94,20 @@ def test_exact_live_match_stamps_and_exact_absence_releases(armed):
     assert out["provider_reads"] == 1
 
 
+def test_gallery_photo_is_never_released_from_posts_api_absence(armed):
+    gallery = row("gallery-1", account="googlebusiness", format="photo")
+    ordinary = row("row-2", image="https://cdn/b.png")
+    store = Store([gallery, ordinary])
+    provider = Provider({"profile-a": []})
+    out = scr.reconcile(store=store, provider=provider,
+                        kv=old_kv(gallery, ordinary), now=NOW,
+                        alert=lambda _message: None)
+    assert [entry["id"] for entry in out["held"]] == ["gallery-1"]
+    assert out["held"][0]["reason"] == "gallery_media_requires_readback"
+    assert [entry[1] for entry in store.released] == ["row-2"]
+    assert provider.calls and len(provider.calls) == 1
+
+
 def test_posted_is_a_terminal_live_status_like_normal_confirmation(armed):
     r = row()
     post = live_post()
