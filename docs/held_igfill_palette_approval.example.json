@@ -1,0 +1,20 @@
+{
+  "crossfitnewtown": {
+    "decision": "pending",
+    "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "colors": ["#1B2D5B", "#38A240", "#FFFFFF"],
+    "approved_by": "",
+    "approved_at": "",
+    "approval_reference": ""
+  },
+  "district_h": {
+    "decision": "pending",
+    "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "colors": ["#FF8900", "#FFA733", "#C33F45", "#171717"],
+    "approved_by": "",
+    "approved_at": "",
+    "approval_reference": ""
+  }
+}

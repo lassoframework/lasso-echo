@@ -3,6 +3,9 @@
 
 This operator never renders, hosts, inserts, approves, releases, or publishes.
 Briefs are previews for a human to review before any separately authorized render.
+The hash proves the captured source bytes are unchanged. A separate private human
+approval receipt attests that the source URL and listed colors match those bytes;
+the script cannot independently establish that visual judgment.
 The original private hold receipt and live photo inventory are mandatory.
 """
 from __future__ import annotations
@@ -12,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -34,8 +38,12 @@ def _voice(base, account_key):
     if path.resolve() == Path(astra_prompt.config.VOICE_DOC_PATH).resolve():
         raise ValueError(f"{base}: client voice resolved to LASSO voice")
     raw = path.read_text(encoding="utf-8")
-    if not raw.strip() or AUTO_DRAFTED_MARKER in raw:
-        raise ValueError(f"{base}: voice absent or auto drafted")
+    unresolved = re.search(
+        r"(?im)(?:\bTODO\b|\bTBD\b|\bPLACEHOLDER\b|\bFILL\s+IN\b|"
+        r"\bINSERT\s+HERE\b|\{\{[^}]+\}\}|\[[^\]\n]*(?:insert|your|gym name|example)[^\]\n]*\])",
+        raw)
+    if not raw.strip() or AUTO_DRAFTED_MARKER in raw or unresolved:
+        raise ValueError(f"{base}: voice absent, auto drafted, or has unresolved template")
     return path
 
 
@@ -72,7 +80,39 @@ def _palette_manifest(path, gym):
             "source_sha256": source_sha256}
 
 
-def build_previews(hold_receipt_path, *, palette_manifest_path, store=None,
+def _approved_palette(path, manifest_path, gym, palette):
+    """Bind a separate owned private human approval receipt to exact evidence."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.getuid()):
+            raise ValueError("palette approval receipt must be an owned private regular file")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            approvals = json.load(handle)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    item = approvals.get(gym) if isinstance(approvals, dict) else None
+    if (not isinstance(item, dict) or item.get("decision") != "approved"
+            or item.get("manifest_sha256") != _sha256(manifest_path)
+            or item.get("source_sha256") != palette["source_sha256"]
+            or item.get("colors") != palette["colors"]
+            or not str(item.get("approved_by") or "").strip()
+            or not str(item.get("approved_at") or "").strip()
+            or not str(item.get("approval_reference") or "").startswith("https://")):
+        raise ValueError(f"{gym}: exact human palette approval evidence missing")
+    approved_at = datetime.fromisoformat(item["approved_at"].replace("Z", "+00:00"))
+    if approved_at.tzinfo is None:
+        raise ValueError(f"{gym}: palette approval timestamp lacks timezone")
+    return {"approved_by": item["approved_by"], "approved_at": item["approved_at"],
+            "approval_reference": item["approval_reference"],
+            "receipt_sha256": _sha256(path)}
+
+
+def build_previews(hold_receipt_path, *, palette_manifest_path, palette_approval_path,
+                   store=None,
                    media_store=None, today=None):
     """Read exact held rows and return briefs. No writes or provider calls."""
     today = today or datetime.now(timezone.utc).date().isoformat()
@@ -101,6 +141,8 @@ def build_previews(hold_receipt_path, *, palette_manifest_path, store=None,
         if astra_prompt._account_base(account_key) != gym:
             raise ValueError(f"{row_id}: tenant mismatch")
         palette = _palette_manifest(palette_manifest_path, gym)
+        palette_approval = _approved_palette(palette_approval_path, palette_manifest_path,
+                                             gym, palette)
         voice_path = _voice(gym, account_key)
         fact = _source(gym, account_key)
         headline = " ".join(fact.text.split()[:8]).strip(".,:;!? ")
@@ -118,6 +160,7 @@ def build_previews(hold_receipt_path, *, palette_manifest_path, store=None,
                      "palette_source_url": palette["source_url"],
                      "palette_source_file": palette["source_file"],
                      "palette_source_sha256": palette["source_sha256"],
+                     "palette_approval": palette_approval,
                      "voice_path": str(voice_path), "voice_sha256": _sha256(voice_path),
                      "headline": headline, "brief": brief})
     return {"operation": "preview_held_igfill_astra", "state": "preview_only",
@@ -134,12 +177,15 @@ def main(argv=None):
     parser.add_argument("--hold-receipt", required=True)
     parser.add_argument("--palette-manifest", required=True,
                         help="private JSON with gym colors and hash-bound source evidence")
+    parser.add_argument("--palette-approval", required=True,
+                        help="separate private human approval receipt bound to manifest")
     parser.add_argument("--output", required=True, help="new private JSON preview path")
     parser.add_argument("--today", help="UTC date YYYY-MM-DD")
     args = parser.parse_args(argv)
     if Path(args.output).resolve() == Path(args.hold_receipt).resolve():
         parser.error("preview output must differ from hold receipt")
     result = build_previews(args.hold_receipt, palette_manifest_path=args.palette_manifest,
+                            palette_approval_path=args.palette_approval,
                             today=args.today)
     _receipt(args.output, result, create=True)
     print(json.dumps({k: v for k, v in result.items() if k != "previews"}, sort_keys=True))
