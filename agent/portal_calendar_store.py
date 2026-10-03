@@ -392,6 +392,8 @@ class SupabaseCalendarStore:
             "id": f"eq.{row_id}",
             "gym_id": f"eq.{account_key}",
             "status": "not.in.(publishing,published)",
+            # Archived rows are audit records, never portal-actionable cards.
+            "variant_status": "eq.active",
         }
         r = self._client().patch(
             self._rest(_TABLE),
@@ -633,6 +635,63 @@ class SupabaseCalendarStore:
             return None
         return row
 
+    def archive_pending_media(self, account_key, current):
+        """CAS one historical pending card from active to archived.
+
+        Archiving is an audit-preserving variant transition, not a status action:
+        it changes *only* ``variant_status``. The full relevant before image is
+        carried in the server-side predicate, so an approval, media/source edit,
+        sibling-variant change, or tenant mismatch makes this a no-op rather than
+        overwriting somebody else's decision.
+        """
+        if (current.get("gym_id") != account_key or current.get("status") != "pending"
+                or current.get("variant_status", "active") != "active"
+                or current.get("published_at") is not None
+                or current.get("late_post_id") is not None
+                or not current.get("id") or not current.get("post_date")):
+            return None
+
+        def expected(value):
+            return "is.null" if value is None else f"eq.{value}"
+
+        params = {
+            "id": expected(current["id"]), "gym_id": expected(account_key),
+            "status": "eq.pending", "variant_status": "eq.active",
+            "post_date": expected(current["post_date"]),
+            "caption": expected(current.get("caption")),
+            "image_url": expected(current.get("image_url")),
+            "source_media_url": expected(current.get("source_media_url")),
+            "source_media_asset_id": expected(current.get("source_media_asset_id")),
+            "media_not_ready_reason": expected(current.get("media_not_ready_reason")),
+            "variant_of": expected(current.get("variant_of")),
+            "published_at": expected(current.get("published_at")),
+            "late_post_id": expected(current.get("late_post_id")),
+            "scheduled_at": expected(current.get("scheduled_at")),
+            "slot_index": expected(current.get("slot_index")),
+        }
+        for key in ("account", "format", "created_at"):
+            if key in current:
+                params[key] = expected(current[key])
+        response = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"variant_status": "archived"}, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, _scrub((response.text or "")[:200]))
+        rows = response.json() or []
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        preserved = ("id", "gym_id", "post_date", "account", "format", "status", "caption",
+                     "image_url", "source_media_url", "source_media_asset_id",
+                     "media_not_ready_reason", "variant_of", "created_at", "published_at",
+                     "late_post_id", "scheduled_at", "slot_index")
+        if (row.get("variant_status") != "archived"
+                or any(row.get(key) != current.get(key) for key in preserved)):
+            return None
+        return row
+
     def list_pending_media_between(self, account_key, first, last):
         """Read every pending row in a bounded date window, including variants.
 
@@ -818,6 +877,7 @@ class SupabaseCalendarStore:
             "id": f"eq.{row_id}",
             "gym_id": f"eq.{account_key}",
             "status": "not.in.(publishing,published)",
+            "variant_status": "eq.active",
         }
         r = self._client().patch(
             self._rest(_TABLE),
@@ -1028,6 +1088,9 @@ class SupabaseCalendarStore:
         params = {
             "id": f"eq.{row_id}",
             "status": "in.(pending,approved)",
+            # Defence in depth: due_rows already filters active variants, but a
+            # direct/stale caller must never claim an archived audit row.
+            "variant_status": "eq.active",
             "published_at": "is.null",
             "image_url": "not.is.null",
             "media_not_ready_reason": "is.null",
