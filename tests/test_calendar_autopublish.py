@@ -70,6 +70,7 @@ def _row(row_id, account="instagram", fmt="feed", post_date=RUN_DATE,
         "account": account, "format": fmt, "status": status,
         "caption": caption, "image_url": image_url,
         "published_at": published_at, "late_post_id": late_post_id,
+        "source_media_url": None, "media_not_ready_reason": None,
     }
 
 
@@ -1064,7 +1065,11 @@ def test_feed_preflight_reframes_out_of_aspect_then_publishes(armed, monkeypatch
     row = _row("f", account="instagram", fmt="feed", status="approved",
                image_url="https://cdn/old.jpg")
     store = _FakeStore([row])
-    store.patch_image_url = lambda g, rid, url: store.rows[rid].__setitem__("image_url", url)
+    def patch_image_url(g, rid, url, *, expected_row):
+        assert expected_row == row
+        store.rows[rid]["image_url"] = url
+        return dict(store.rows[rid])
+    store.patch_image_url = patch_image_url
     pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
     cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
                     approved_only=True, catch_all=True)
@@ -1088,6 +1093,30 @@ def test_feed_preflight_noop_when_in_spec(armed, monkeypatch):
                     approved_only=True, catch_all=True)
     assert store.rows["f"]["image_url"] == "https://cdn/ok.jpg"
     assert [rid for rid, _, _ in store.published_calls] == ["f"]
+
+
+@pytest.mark.parametrize("patch_result", ["missing", None, "stale", "different_status"])
+def test_feed_preflight_holds_before_publish_claim_without_verified_patch(
+        armed, monkeypatch, patch_result):
+    from agent import feed_image, media_host
+    monkeypatch.setattr(config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(media_host, "download_bytes", lambda *a, **k: _jpeg(600, 1080))
+    monkeypatch.setattr(feed_image, "make_feed_safe_from_bytes", lambda b, out: out)
+    monkeypatch.setattr(media_host, "host_media", lambda *a: "https://cdn/new__feed.jpg")
+    monkeypatch.setattr(cap, "_alert_feed_needs_reframe", lambda *a: None)
+    row = _row("f", status="approved", image_url="https://cdn/old.jpg")
+    store = _FakeStore([row])
+    if patch_result != "missing":
+        returned = None if patch_result is None else dict(row)
+        if patch_result == "different_status":
+            returned.update(status="publishing", image_url="https://cdn/new__feed.jpg")
+        store.patch_image_url = lambda *a, **k: returned
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True, catch_all=True)
+    assert summary["waiting"] == ["f"]
+    assert pub.calls == store.publishing_calls == store.published_calls == []
+    assert store.rows["f"] == row
 
 
 def test_feed_preflight_holds_known_bad_image_when_rehost_fails(armed, monkeypatch):

@@ -385,6 +385,8 @@ create table if not exists public.visual_global_object_lineage (
   foreign key (tenant_id,group_key,delivered_exact_url,delivered_fingerprint)
     references public.visual_global_object_attestation(tenant_id,group_key,exact_url,fingerprint)
 );
+create index if not exists visual_global_object_lineage_source_idx
+  on public.visual_global_object_lineage(source_exact_url,source_fingerprint);
 
 alter table public.visual_global_object_read_receipt enable row level security;
 alter table public.visual_global_render_receipt enable row level security;
@@ -449,7 +451,7 @@ declare v_tenant text; v_source public.visual_global_object_read_receipt%rowtype
   v_render public.visual_global_render_receipt%rowtype;
   v_item public.visual_global_object_read_receipt%rowtype;
   v_object public.visual_global_object_attestation%rowtype;
-  v_role text; v_group text; v_asset_hash text; v_refreshed integer:=0;
+  v_role text; v_group text; v_asset_hash text; v_fingerprint text; v_refreshed integer:=0;
 begin
   v_tenant := public.visual_group_tenant_strict(p_tenant)::text;
   if current_setting('transaction_isolation')<>'read committed' then
@@ -562,6 +564,20 @@ begin
       v_tenant,'canonical_url',v_item.exact_url,p_group_key);
     if v_group<>p_group_key then
       raise exception 'exact URL registration returned another scene' using errcode='23514';
+    end if;
+  end loop;
+  -- Python returns the selected delivered MD5 as a derived byte_hash. The
+  -- calendar resolver requires that exact hint to be registered as well as
+  -- both URLs. Keep each attested object's alias in the same scene/transaction;
+  -- a previously bound conflicting scene aborts all new evidence registration.
+  for v_fingerprint in select distinct fingerprint
+      from public.visual_global_object_read_receipt
+      where receipt_id in (p_source_read_receipt,p_delivered_read_receipt)
+      order by fingerprint loop
+    v_group:=public.visual_group_register_alias(
+      v_tenant,'byte_hash','derived:'||v_fingerprint,p_group_key);
+    if v_group<>p_group_key then
+      raise exception 'exact byte hash registration returned another scene' using errcode='23514';
     end if;
   end loop;
   for v_role in select unnest(array['source','delivered']) loop
@@ -767,6 +783,89 @@ begin
 end;
 $$;
 
+-- Follow the actual render chain (A -> B -> C), never synthesize an A -> C
+-- receipt. Exact URL AND fingerprint continuity is required at every hop.
+-- Bound scene size, traversal rows and depth; corruption, cycles and excess
+-- traversal refuse the row rather than returning a partial proof.
+create or replace function public.visual_global_lineage_verified(
+  p_tenant text,p_group text,p_source_url text,p_source_hash text,
+  p_delivered_url text,p_delivered_hash text
+) returns boolean language plpgsql stable security definer set search_path = public as $$
+declare v_groups text[]; v_edges bigint; v_found boolean; v_invalid boolean; v_walks bigint;
+begin
+  if p_tenant is null or public.visual_group_tenant_id(p_tenant)::text is distinct from p_tenant
+      or p_group is null or p_source_url is null or p_delivered_url is null
+      or p_source_hash is null or p_delivered_hash is null then return false; end if;
+  select array_agg(sm.group_key) into v_groups
+    from (select group_key from public.visual_group_scene_members(p_tenant,p_group) members(group_key)
+      limit 1025) sm;
+  if coalesce(cardinality(v_groups),0)=0 or cardinality(v_groups)>1024 then return false; end if;
+  -- Inspect every edge originating in this scene. A foreign or inconsistent
+  -- edge cannot be silently filtered out and leave a seemingly valid proof.
+  select count(*) into v_edges from (
+    select 1 from public.visual_global_object_lineage l
+    where exists(select 1 from public.visual_global_scene_object_member m
+      where m.tenant_id=p_tenant and m.group_key=any(v_groups)
+        and m.exact_url=l.source_exact_url) limit 4097) limited;
+  if v_edges=0 or v_edges>4096 then return false; end if;
+  if exists(select 1 from public.visual_global_object_lineage l
+    left join public.visual_global_render_receipt r
+      on r.receipt_id=l.render_receipt and r.tenant_id=l.tenant_id
+        and r.source_exact_url=l.source_exact_url and r.delivered_exact_url=l.delivered_exact_url
+        and r.source_fingerprint=l.source_fingerprint and r.delivered_fingerprint=l.delivered_fingerprint
+    left join public.visual_global_object_attestation s
+      on s.tenant_id=l.tenant_id and s.group_key=l.group_key
+        and s.exact_url=l.source_exact_url and s.fingerprint=l.source_fingerprint
+    left join public.visual_global_object_attestation d
+      on d.tenant_id=l.tenant_id and d.group_key=l.group_key
+        and d.exact_url=l.delivered_exact_url and d.fingerprint=l.delivered_fingerprint
+    left join public.visual_global_object_read_receipt sr
+      on sr.receipt_id=r.source_read_receipt and sr.tenant_id=l.tenant_id
+        and sr.exact_url=l.source_exact_url and sr.fingerprint=l.source_fingerprint
+        and sr.byte_length=s.byte_length
+    left join public.visual_global_object_read_receipt dr
+      on dr.receipt_id=r.delivered_read_receipt and dr.tenant_id=l.tenant_id
+        and dr.exact_url=l.delivered_exact_url and dr.fingerprint=l.delivered_fingerprint
+        and dr.byte_length=d.byte_length
+    where exists(select 1 from public.visual_global_scene_object_member m
+      where m.tenant_id=p_tenant and m.group_key=any(v_groups)
+        and m.exact_url=l.source_exact_url)
+      and (l.tenant_id<>p_tenant or not l.group_key=any(v_groups)
+        or r.receipt_id is null or s.exact_url is null or d.exact_url is null
+        or sr.receipt_id is null or dr.receipt_id is null
+        or not exists(select 1 from public.visual_global_scene_object_member m
+          where m.tenant_id=p_tenant and m.group_key=l.group_key
+            and m.exact_url=l.source_exact_url and m.fingerprint=l.source_fingerprint
+            and m.object_role='source')
+        or not exists(select 1 from public.visual_global_scene_object_member m
+          where m.tenant_id=p_tenant and m.group_key=l.group_key
+            and m.exact_url=l.delivered_exact_url and m.fingerprint=l.delivered_fingerprint
+            and m.object_role='delivered'))) then return false; end if;
+  with recursive edges as materialized (
+    select l.* from public.visual_global_object_lineage l
+      where l.tenant_id=p_tenant and l.group_key=any(v_groups)
+        and exists(select 1 from public.visual_global_scene_object_member m
+          where m.tenant_id=p_tenant and m.group_key=l.group_key
+            and m.exact_url=l.source_exact_url and m.fingerprint=l.source_fingerprint)
+  ), walk(exact_url,fingerprint,depth,path,cycle) as (
+    select p_source_url,p_source_hash,0,array[p_source_url],false
+    union all
+    select e.delivered_exact_url,e.delivered_fingerprint,w.depth+1,
+      w.path||e.delivered_exact_url,e.delivered_exact_url=any(w.path)
+    from walk w join edges e
+      on e.source_exact_url=w.exact_url and e.source_fingerprint=w.fingerprint
+    where w.depth<32 and not w.cycle
+  )
+  select coalesce(bool_or(w.exact_url=p_delivered_url and w.fingerprint=p_delivered_hash
+      and not w.cycle),false),
+    coalesce(bool_or(w.cycle or (w.depth=32 and exists(select 1 from edges e
+      where e.source_exact_url=w.exact_url and e.source_fingerprint=w.fingerprint))),false),
+    count(*) into v_found,v_invalid,v_walks
+    from (select * from walk limit 4097) w;
+  return v_found and not v_invalid and v_walks<=4096;
+end;
+$$;
+
 create or replace function public.visual_global_row_bytes_verified(
   p_row public.content_calendar
 ) returns boolean language plpgsql stable security definer set search_path = public as $$
@@ -794,14 +893,8 @@ begin
     where m.tenant_id=v_tenant and m.exact_url=v_source_url
       and m.object_role='source';
   if v_delivered_hash is null or v_source_hash is null then return false; end if;
-  if v_source_url<>v_delivered_url and not exists(
-    select 1 from public.visual_global_object_lineage l
-    join public.visual_group_scene_members(v_tenant,v_group) sm(group_key)
-      on sm.group_key=l.group_key
-    where l.tenant_id=v_tenant and l.source_exact_url=v_source_url
-      and l.delivered_exact_url=v_delivered_url
-      and l.source_fingerprint=v_source_hash
-      and l.delivered_fingerprint=v_delivered_hash) then
+  if v_source_url<>v_delivered_url and not public.visual_global_lineage_verified(
+      v_tenant,v_group,v_source_url,v_source_hash,v_delivered_url,v_delivered_hash) then
     return false;
   end if;
   if nullif(btrim(to_jsonb(p_row)->>'byte_hash'),'') is not null then
@@ -1276,6 +1369,8 @@ revoke all on function public.visual_global_scene_fingerprints(text,text)
 revoke all on function public.visual_global_scene_complete(text,text)
   from public,anon,authenticated,service_role;
 revoke all on function public.visual_global_row_bytes_verified(public.content_calendar)
+  from public,anon,authenticated,service_role;
+revoke all on function public.visual_global_lineage_verified(text,text,text,text,text,text)
   from public,anon,authenticated,service_role;
 revoke all on function public.visual_global_claim_fingerprint_set(text,text,date,uuid,text,boolean,boolean,text[])
   from public,anon,authenticated,service_role;

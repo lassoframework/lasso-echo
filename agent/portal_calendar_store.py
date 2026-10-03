@@ -443,6 +443,37 @@ class SupabaseCalendarStore:
             raise visual_writer_prepare.VisualPreparationError("calendar row is unavailable for visual preparation")
         patch = dict(payload)
         is_story = str(current.get("format") or "").lower() == "story"
+        if render_evidence is not None and not is_story:
+            if (current.get("format") != "feed" or not isinstance(render_evidence, dict)
+                    or render_evidence.get("operation") != "rehost"
+                    or render_evidence.get("source_exact_url") != current.get("image_url")
+                    or render_evidence.get("delivered_exact_url") != patch.get("image_url")):
+                raise visual_writer_prepare.VisualPreparationError(
+                    "render evidence does not bind the scoped feed replacement")
+            # A feed may already be a rendition B of raw source A. Register
+            # the observed B -> C operation, while the calendar keeps A. The
+            # guarded PATCH verifies A/B/C belong to the attested scene; never
+            # invent an A -> C render receipt or discard A to pass preparation.
+            patch["source_media_url"] = current.get("source_media_url") or current["image_url"]
+            patch["r2_key"] = None
+            candidate = dict(current)
+            candidate.update(patch)
+            candidate["source_media_url"] = current["image_url"]
+            candidate["byte_hash"] = None
+            candidate.pop("visual_group_key", None)
+            if patch["source_media_url"] != current["image_url"]:
+                # The asset/Drive identity attests A, not input rendition B.
+                candidate["source_media_asset_id"] = None
+                candidate["drive_file_id"] = None
+            prepared = visual_writer_prepare.prepare(
+                self, account_key, candidate, render_evidence=render_evidence)
+            if (current.get("visual_group_key")
+                    and prepared["visual_group_key"] != current["visual_group_key"]):
+                raise visual_writer_prepare.VisualPreparationError(
+                    "feed replacement conflicts with the current source scene")
+            patch["visual_group_key"] = prepared["visual_group_key"]
+            patch["byte_hash"] = prepared["byte_hash"]
+            return patch
         if (is_story
                 and current.get("source_media_url")
                 and current.get("source_media_url") != patch.get("image_url", current.get("image_url"))
@@ -475,11 +506,12 @@ class SupabaseCalendarStore:
 
     def patch_image_url(self, account_key, row_id, new_image_url, *, expected_row=None,
                         render_evidence=None):
-        """Task #28 (§5c): swap a story row's image_url to freshly re-burned media after a
-        caption edit. A real replacement also clears a prior needs-media hold, but never
-        changes status. An auto-publisher reburn supplies expected_row so an approved
-        Story can be updated only while its caption, source, image and publish state
-        still match the rendered input. Returns one updated row or None."""
+        """Persist a Story reburn or feed autofit without changing status.
+
+        Publish-time replacements supply expected_row, so approved media changes
+        only while its render input, source, slot and publish state still match.
+        Returns exactly one verified updated row or None.
+        """
         if not (new_image_url or "").strip():
             return None
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"}
@@ -487,15 +519,17 @@ class SupabaseCalendarStore:
             params["status"] = "in.(pending,coach_review)"
         else:
             required = ("id", "gym_id", "status", "format", "image_url",
-                        "caption", "source_media_url", "published_at", "late_post_id")
+                        "caption", "source_media_url", "published_at", "late_post_id",
+                        "account", "post_date")
             if (not isinstance(expected_row, dict)
                     or any(key not in expected_row for key in required)
                     or str(expected_row["id"]) != str(row_id)
                     or str(expected_row["gym_id"]) != str(account_key)
                     or expected_row["status"] not in ("pending", "approved")
-                    or expected_row["format"] != "story"
+                    or expected_row["format"] not in ("story", "feed")
                     or not expected_row["image_url"]
-                    or not expected_row["source_media_url"]
+                    or (expected_row["format"] == "story"
+                        and not expected_row.get("source_media_url"))
                     or expected_row["published_at"] is not None
                     or expected_row["late_post_id"] is not None):
                 return None
@@ -505,12 +539,18 @@ class SupabaseCalendarStore:
                 escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
                 return f'eq."{escaped}"'
             for key in ("status", "format", "image_url", "caption", "source_media_url"):
-                params[key] = unchanged(expected_row[key])
+                params[key] = unchanged(expected_row.get(key))
+            for key in ("account", "post_date", "visual_group_key", "byte_hash", "r2_key",
+                        "source_media_asset_id", "drive_file_id", "variant_status",
+                        "scheduled_at", "slot_index", "publish_claim_token", "publish_reservation_day"):
+                if key in expected_row:
+                    params[key] = unchanged(expected_row[key])
             params["published_at"] = "is.null"
             params["late_post_id"] = "is.null"
             params["media_not_ready_reason"] = "is.null"
         payload = {"image_url": new_image_url, "media_not_ready_reason": None}
         payload = self._prepare_visual_media(account_key, row_id, payload,
+                                             current=expected_row,
                                              render_evidence=render_evidence)
         r = self._client().patch(
             self._rest(_TABLE),
@@ -521,19 +561,27 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
-        if len(rows) != 1:
+        if not isinstance(rows, list) or len(rows) != 1:
             return None
         row = rows[0]
-        if str(row.get("gym_id")) != str(account_key) or str(row.get("id")) != str(row_id):
+        if (not isinstance(row, dict) or str(row.get("gym_id")) != str(account_key)
+                or str(row.get("id")) != str(row_id)):
+            return None
+        if any(key not in row for key in payload):
+            return None
+        if expected_row is not None and any(key not in row for key in required):
             return None
         if expected_row is not None and any(
-                row.get(key) != expected_row[key]
-                for key in ("status", "format", "caption", "source_media_url",
+                row.get(key) != payload.get(key, expected_row.get(key))
+                for key in ("status", "format", "caption", "account", "post_date",
+                            "source_media_asset_id", "drive_file_id", "variant_status",
+                            "scheduled_at", "slot_index", "publish_claim_token", "publish_reservation_day",
                             "published_at", "late_post_id")):
             return None
-        if expected_row is not None and row.get("media_not_ready_reason") is not None:
+        if expected_row is not None and row.get("source_media_url") != payload.get(
+                "source_media_url", expected_row.get("source_media_url")):
             return None
-        if row.get("image_url") == new_image_url:
+        if all(row.get(key) == value for key, value in payload.items()):
             return row
         return None
 

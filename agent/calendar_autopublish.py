@@ -369,10 +369,14 @@ def _normalize_feed_image(row, account, store):
     # unchanged (unknown, not known-bad) — identical to the historical behavior; it will
     # self-heal on a later tick once R2/hosting recovers.
     try:
-        from . import feed_image, media_host
+        from . import feed_image, media_host, visual_writer_prepare
         if not config.hosting_enabled():
             return row
-        img = media_host.download_bytes(url)
+        evidence_enabled = visual_writer_prepare.enabled()
+        # Receipt mode reads the exact bounded object, including its query,
+        # through the same reader used by preparation.
+        img = (visual_writer_prepare._bytes_for_url(url) if evidence_enabled
+               else media_host.download_bytes(url))
         if not img:
             return row
         import io
@@ -386,34 +390,83 @@ def _normalize_feed_image(row, account, store):
               f"{row.get('id')}: {type(e).__name__}: {e}; posting as-is")
         return row
     # PHASE 2 (fail-safe): the image is CONFIRMED out-of-aspect. Re-frame + re-host, or HOLD.
+    safe = out = None
     try:
         import tempfile
-        out = os.path.join(
-            tempfile.gettempdir(),
-            f"feedfit_{account.key}_{row.get('id') or 'row'}__feed.jpg")
+        import hashlib
+        import uuid
+        fd, out = tempfile.mkstemp(prefix="feedfit_", suffix="__feed.jpg")
+        os.close(fd)
+        safe = out
         safe = feed_image.make_feed_safe_from_bytes(img, out)
+        rendered_bytes = None
+        if evidence_enabled:
+            if not safe or os.path.getsize(safe) > visual_writer_prepare.MAX_VISUAL_BYTES:
+                return None
+            with open(safe, "rb") as rendered:
+                rendered_bytes = rendered.read()
+            if (not rendered_bytes
+                    or visual_writer_prepare._bytes_for_url(url) != img):
+                return None
         hosted = media_host.host_media(safe, account.key) if safe else None
-        if safe:
-            try:
-                os.remove(safe)
-            except OSError:
-                pass
         if not hosted or hosted == url:
             print(f"[calendar-autopublish] feed preflight could NOT re-host an out-of-aspect "
                   f"image for row {row.get('id')} ({w}x{h}); HOLDING (not sending a 400).")
             return None                                   # HOLD: never ship a known-bad image
         patch = getattr(store, "patch_image_url", None)
-        if patch is not None:
-            patch(row.get("gym_id"), row.get("id"), hosted)
-        updated = dict(row)
-        updated["image_url"] = hosted
+        if patch is None:
+            return None
+        patch_args = {"expected_row": row}
+        if evidence_enabled:
+            delivered_bytes = visual_writer_prepare._bytes_for_url(hosted)
+            if delivered_bytes != rendered_bytes:
+                return None
+            patch_args["render_evidence"] = {
+                "source_exact_url": url, "delivered_exact_url": hosted,
+                "source_fingerprint": "md5:" + hashlib.md5(img).hexdigest(),
+                "delivered_fingerprint": "md5:" + hashlib.md5(delivered_bytes).hexdigest(),
+                "source_byte_length": len(img), "delivered_byte_length": len(delivered_bytes),
+                "operation": "rehost", "evidence_ref": "feed_autofit:" + str(uuid.uuid4()),
+                "observed_by": "calendar_autopublish.feed_autofit",
+                "rendered_by": "calendar_autopublish.feed_autofit",
+            }
+        persisted = patch(row.get("gym_id"), row.get("id"), hosted, **patch_args)
+        source = (row.get("source_media_url") or url) if evidence_enabled else row.get("source_media_url")
+        stable = ("id", "gym_id", "status", "format", "caption", "account", "post_date",
+                  "source_media_asset_id", "drive_file_id", "variant_status",
+                  "scheduled_at", "slot_index", "publish_claim_token", "publish_reservation_day")
+        required = ("id", "gym_id", "status", "format", "caption", "account", "post_date",
+                    "image_url", "source_media_url", "published_at", "late_post_id",
+                    "media_not_ready_reason")
+        if (not isinstance(persisted, dict)
+                or any(key not in persisted for key in required)
+                or any(persisted.get(key) != row.get(key) for key in stable)
+                or persisted.get("source_media_url") != source
+                or persisted.get("image_url") != hosted
+                or persisted.get("published_at") is not None
+                or persisted.get("late_post_id") is not None
+                or persisted.get("media_not_ready_reason") is not None):
+            return None
+        if evidence_enabled and (
+                persisted.get("byte_hash") != "derived:" + patch_args["render_evidence"]["delivered_fingerprint"]
+                or not isinstance(persisted.get("visual_group_key"), str)
+                or not persisted["visual_group_key"].startswith("vg_")
+                or (row.get("visual_group_key")
+                    and persisted["visual_group_key"] != row["visual_group_key"])):
+            return None
         print(f"[calendar-autopublish] feed preflight reframed out-of-aspect image for "
               f"row {row.get('id')} ({w}x{h}) -> in-spec 1080x1350")
-        return updated
+        return persisted
     except Exception as e:  # noqa: BLE001 - known-bad image + reframe failed -> HOLD
         print(f"[calendar-autopublish] feed preflight failed to fix out-of-aspect row "
               f"{row.get('id')}: {type(e).__name__}: {e}; HOLDING (not sending a 400).")
         return None
+    finally:
+        for path in {safe, out} - {None}:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def _alert_feed_needs_reframe(row_id, gym_id):
