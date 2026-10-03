@@ -253,12 +253,21 @@ def drive_candidates(base_key, blocked_ids, *, media_store=None, now=None,
     out = []
     for a in assets:
         kind = str(a.get("kind") or "")
-        if kind not in ("photo", "video"):
+        asset_id = a.get("id")
+        if (kind not in ("photo", "video") or not isinstance(asset_id, str)
+                or not asset_id.strip()):
             continue
-        out.append({"source": "drive", "kind": kind, "key": str(a.get("id")),
-                    "asset": a, "last_used": str(a.get("last_used_at") or "")[:10],
-                    "used_count": int(a.get("used_count") or 0),
-                    "name": str(a.get("title") or a.get("id") or "")})
+        # Cooldown fallback is for locating genuinely unused assets missed by a
+        # selector freshness read. It must never recycle a Drive asset whose
+        # persistent use counters say it has already been staged.
+        used_count = a.get("used_count")
+        last_used_at = a.get("last_used_at")
+        if (isinstance(used_count, bool) or not isinstance(used_count, int)
+                or used_count != 0 or last_used_at not in (None, "")):
+            continue
+        out.append({"source": "drive", "kind": kind, "key": asset_id,
+                    "asset": a, "last_used": "", "used_count": 0,
+                    "name": str(a.get("title") or asset_id)})
     return out
 
 
@@ -274,25 +283,32 @@ def has_rendition(cand):
 
 
 def _tier(cand):
-    """Use an unused gym photo first; video is only a fallback after photos.
+    """Drive photos first, local photos second, then usable videos.
 
-    Ready videos precede videos needing a transcode. Previously used media is
-    last, although the once-used candidate guard should normally exclude it.
+    Ready videos precede videos needing a transcode. Used media is excluded by
+    ``order_candidates`` and cannot be a last-resort candidate.
     """
-    used = bool(cand.get("last_used"))
-    if used:
-        return 3
     if cand.get("kind") == "photo":
-        return 0
+        return 0 if cand.get("source") == "drive" else 1
     if cand.get("kind") == "video":
-        return 1 if has_rendition(cand) else 2
-    return 3
+        return 2 if has_rendition(cand) else 3
+    return 4
+
+
+def _never_used_candidate(cand):
+    """Require explicit unused metadata before a swap candidate can be returned."""
+    count = (cand or {}).get("used_count")
+    last = (cand or {}).get("last_used")
+    return (isinstance(count, int) and not isinstance(count, bool) and count == 0
+            and isinstance(last, str) and not last.strip()
+            and (cand or {}).get("source") in ("drive", "local")
+            and (cand or {}).get("kind") in ("photo", "video"))
 
 
 def order_candidates(cands, *, current_is_video=False):
     """Tier first (see _tier), then least recently used, then least used, then name."""
     del current_is_video   # kept for callers; the tier order supersedes the filter
-    cands = list(cands or [])
+    cands = [cand for cand in (cands or []) if _never_used_candidate(cand)]
     cands.sort(key=lambda c: (_tier(c), c.get("last_used") or "",
                               int(c.get("used_count") or 0), str(c.get("name") or "")))
     return cands

@@ -418,15 +418,14 @@ def test_candidates_are_least_recently_used_first_not_alphabetical():
              _cand("m_never_used.jpg"),
              _cand("z_used_last_month.jpg", last_used="2026-08-10")]
     ordered = msw.order_candidates(cands, current_is_video=True)   # no video pref
-    assert [c["key"] for c in ordered] == [
-        "m_never_used.jpg", "z_used_last_month.jpg", "a_used_yesterday.jpg"]
+    assert [c["key"] for c in ordered] == ["m_never_used.jpg"]
 
 
-def test_a_still_swaps_to_unused_photo_before_ready_and_unrenditioned_video():
-    """A gym photo wins even when ready video footage is available.
+def test_drive_photo_precedes_local_photo_and_both_precede_video():
+    """Prefer connected Drive photos, then local photos, then video footage.
 
     Once photos are depleted, ready footage precedes video requiring a transcode;
-    already used media remains last.
+    used media is never returned.
     """
     ready = _cand("clipA.mp4", kind="video", source="drive")
     ready["asset"]["rendition_url"] = "https://cdn/clipA.mp4"
@@ -434,10 +433,12 @@ def test_a_still_swaps_to_unused_photo_before_ready_and_unrenditioned_video():
     used = _cand("clipB.mp4", kind="video", source="drive", last_used="2026-06-01")
     used["asset"]["rendition_url"] = "https://cdn/clipB.mp4"
     local_vid = _cand("gym.mp4", kind="video", source="local")         # served as-is
-    cands = [_cand("a_photo.jpg"), used, raw, ready, local_vid]
+    drive_photo = _cand("z_drive.jpg", source="drive")
+    local_photo = _cand("a_generic.jpg", source="local")
+    cands = [local_photo, used, raw, local_vid, drive_photo, ready]
     ordered = msw.order_candidates(cands, current_is_video=False)
     assert [c["key"] for c in ordered] == [
-        "a_photo.jpg", "clipA.mp4", "gym.mp4", "clipR.mov", "clipB.mp4"]
+        "z_drive.jpg", "a_generic.jpg", "clipA.mp4", "gym.mp4", "clipR.mov"]
     assert msw.has_rendition(ready) and msw.has_rendition(local_vid)
     assert not msw.has_rendition(raw) and not msw.has_rendition(_cand("a_photo.jpg"))
 
@@ -445,7 +446,7 @@ def test_a_still_swaps_to_unused_photo_before_ready_and_unrenditioned_video():
 def test_no_videos_means_photos_still_swap():
     cands = [_cand("b.jpg", last_used="2026-09-01"), _cand("a.jpg")]
     assert [c["key"] for c in msw.order_candidates(cands, current_is_video=False)] \
-        == ["a.jpg", "b.jpg"]
+        == ["a.jpg"]
 
 
 def test_local_candidates_skip_any_previously_served_photo(tmp_path,
@@ -477,6 +478,22 @@ def test_drive_candidates_come_from_the_pickable_pool_minus_the_book():
     cands = msw.drive_candidates("zanshin", {"v2"}, media_store=store)
     assert [c["key"] for c in cands] == ["v1"]
     assert cands[0]["kind"] == "video" and cands[0]["source"] == "drive"
+
+
+def test_drive_cooldown_fallback_never_returns_previously_used_assets():
+    from datetime import datetime, timedelta, timezone
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    now = datetime(2026, 9, 28, tzinfo=timezone.utc)
+    store = FakeMediaStore(assets=[
+        make_asset("old-count", gym_id="zanshin", kind="photo", used_count=1,
+                   last_used_at=(now - timedelta(days=150)).isoformat()),
+        make_asset("old-date", gym_id="zanshin", kind="photo", used_count=0,
+                   last_used_at=(now - timedelta(days=150)).isoformat()),
+    ])
+
+    assert msw.drive_candidates("zanshin", set(), media_store=store, now=now) == []
+    assert msw.drive_candidates("zanshin", set(), media_store=store, now=now,
+                                allow_cooling=True) == []
 
 
 def test_swift_river_swap_does_not_reuse_previously_staged_drive_media():
