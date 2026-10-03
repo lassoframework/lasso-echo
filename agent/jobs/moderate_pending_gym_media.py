@@ -8,7 +8,7 @@ import argparse
 import json
 from datetime import datetime, timezone
 
-from .. import config, gym_media_moderation as moderation
+from .. import account_key_resolve, config, gym_media_moderation as moderation
 from ..integrations.drive_client import DriveClient
 from ..media_source_store import default_store
 
@@ -38,9 +38,18 @@ def run(*, store=None, drive=None, vision=None, limit=50, now=None,
     if vision is None:
         return {"ok": False, "reason": "vision provider unarmed"}
     now = now or datetime.now(timezone.utc)
+    sources = store.list_sources()
+    verified_keys = account_key_resolve.resolve_known_source_keys(
+        source.get("gym_id") for source in sources)
     candidates = {}
-    for source in store.list_sources():
-        gym = source.get("gym_id")
+    for source in sources:
+        source_gym = source.get("gym_id")
+        gym = verified_keys.get(source_gym)
+        # list_sources() is active-only in the production store. Reassert it here
+        # so injected stores and a future store implementation cannot scan a
+        # disconnected or revoked source.
+        if source.get("active") is not True or source.get("revoked_externally") is True:
+            continue
         if gym_id is not None and gym != gym_id:
             continue
         if source.get("kind", "gym_drive") != "gym_drive" or not gym:
@@ -48,7 +57,9 @@ def run(*, store=None, drive=None, vision=None, limit=50, now=None,
         if not config.gym_drive_connect_active_for(gym):
             continue
         for asset in store.list_assets(gym, source_id=source["id"]):
-            if (asset.get("gym_id") == gym and asset.get("kind") in ("photo", "video")
+            if (asset.get("gym_id") == gym
+                    and asset.get("source_id") == source["id"]
+                    and asset.get("kind") in ("photo", "video")
                     and asset.get("review_status") == "pending_review"
                     and asset.get("moderation_status") == "pending"
                     and asset.get("content_hash")):

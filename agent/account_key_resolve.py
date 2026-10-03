@@ -346,6 +346,57 @@ def resolve(account_key, now_fn=None, get=None):
     return f"{remapped}{suffix}" if remapped else account_key
 
 
+def resolve_known_source_keys(account_keys, now_fn=None, get=None):
+    """Return only source keys proven live or uniquely mapped by a fresh plane read.
+
+    Background jobs that write reviewed media cannot treat ``resolve()`` returning
+    its input as proof: that also happens when the plane is unavailable or a
+    stale key is ambiguous. One complete fresh identity snapshot serves the
+    whole batch; an incomplete read or a live key held by multiple gym IDs
+    returns no key for that source.
+    """
+    getter = get or _get
+    token_rows = []
+
+    def capture_tokens(path, params):
+        rows, ok = getter(path, params)
+        if path == "echo_intake_tokens" and ok:
+            token_rows.extend(rows)
+        return rows, ok
+
+    try:
+        # Use the same identity builder as resolve(), but capture every token
+        # row from this exact complete read. _state intentionally exposes only
+        # the live-key set, where two gyms holding one key are indistinguishable.
+        live, mapping, _by_gym, ok = _build(get=capture_tokens, now_fn=now_fn)
+    except Exception:  # noqa: BLE001 - uncertain identity cannot authorize a write
+        return {}
+    if not ok:
+        return {}
+    holders = {}
+    keys_by_gym = {}
+    for row in token_rows:
+        gym_id, key = _norm(row.get("gym_id")), _norm(row.get("echo_account_key"))
+        if gym_id and key:
+            holders.setdefault(key, set()).add(gym_id)
+            keys_by_gym.setdefault(gym_id, set()).add(key)
+
+    def single_owner(key):
+        owners = holders.get(key, ())
+        return (len(owners) == 1
+                and len(keys_by_gym[next(iter(owners))]) == 1)
+
+    verified = {}
+    for raw in account_keys:
+        key = _norm(raw)
+        if key in live and single_owner(key):
+            verified[raw] = key
+        elif (key not in live and key in mapping and mapping[key] in live
+              and single_owner(mapping[key])):
+            verified[raw] = mapping[key]
+    return verified
+
+
 def portal_key_for_gym(gym_id, now_fn=None, get=None, fresh=False):
     """The account key the PORTAL has already issued to this gym, or "".
 
