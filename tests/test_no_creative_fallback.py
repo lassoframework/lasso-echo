@@ -432,6 +432,18 @@ def test_client_display_rejects_even_a_saved_generic_url(monkeypatch):
     assert ncf.display_image_for(post, tenant="gym_b", renderer=forbidden, host=forbidden) is None
 
 
+@pytest.mark.parametrize("tenant", ["lasso_ig", "lasso_fb", "lasso_demo"])
+def test_known_lasso_tenants_keep_house_fallback(monkeypatch, tmp_path, tenant):
+    monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")
+    post = {"id": 910, "day_key": "2026-08-10", "caption": "One platform for your gym.",
+            "pillar": "The portal", "format": "feed", "image_url": None}
+    def render(_eyebrow, _headline, _deck, out_path, **_kwargs):
+        return out_path
+    assert ncf.display_image_for(
+        post, tenant=tenant, out_dir=str(tmp_path), renderer=render,
+        host=lambda *_args: "https://cdn.example.com/house.png") == "https://cdn.example.com/house.png"
+
+
 def test_memory_and_durable_cache_do_not_cross_tenants(monkeypatch):
     """Client cache entries are never accepted by the synchronous display fallback."""
     monkeypatch.setenv("AGENT_NO_CREATIVE_FALLBACK", "true")

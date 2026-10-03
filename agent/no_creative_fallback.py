@@ -298,7 +298,7 @@ def display_image_for(post, *, out_dir=None, renderer=None, host=None, tenant=No
         if base.endswith(suffix):
             base = base[:-len(suffix)]
             break
-    if base not in {"lasso", "lasso-framework-llc"}:
+    if base not in {"lasso", "lasso-framework-llc", "lasso_demo"}:
         return None
 
     eyebrow, headline, deck = _approved_text(post.get("caption"), post.get("pillar"))
