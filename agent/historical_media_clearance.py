@@ -26,11 +26,17 @@ timestamp is at/after the cutoff is EXEMPT from this gate (it is still subject
 to normal review and the global ledger). Timestamp precedence is
 first_indexed_at (stamped once at insert, never re-stamped) over indexed_at
 (which is bumped on every re-sync PATCH, so it can NEVER prove an asset is
-new). indexed_at is consulted ONLY when the first_indexed_at column is absent
-entirely (rows predating it); a present-but-NULL or present-but-unparseable
-first_indexed_at is UNKNOWN (never a fallback to indexed_at) and fails closed. A missing cutoff, an unparseable cutoff, or an
-unknown/unparseable asset timestamp all FAIL CLOSED: the asset is treated as
-historical and requires a 'cleared' receipt.
+new). A present-but-NULL or present-but-unparseable first_indexed_at is
+UNKNOWN (never a fallback to indexed_at) and fails closed. So does an absent
+first_indexed_at KEY: the runtime reads asset rows from an API projection, and
+an API that silently drops the first_indexed_at key (instead of returning the
+column, even NULL) would otherwise let the mutable indexed_at launder an old
+asset into 'new' — a projection bypass. Only a DB row where the column truly
+does not exist (pre-migration schema) is exempt, and that exemption is the
+SQL authority's problem, not this function's: here, a missing key fails
+closed. A missing cutoff, an unparseable cutoff, or an unknown/unparseable
+asset timestamp all FAIL CLOSED: the asset is treated as historical and
+requires a 'cleared' receipt.
 """
 from __future__ import annotations
 
@@ -75,23 +81,29 @@ def clearance_cutoff(gym_id):
 def asset_first_seen(asset):
     """When Echo first saw this asset. first_indexed_at is stamped ONCE at
     insert and never re-stamped; indexed_at is bumped on every re-sync PATCH
-    and so only answers 'last touched'. indexed_at is the fallback ONLY for
-    rows where the first_indexed_at column is absent entirely (predating the
-    column, backfilled at migration). A present-but-unparseable
-    first_indexed_at is corrupt data, not a legacy row, and never falls
-    through to indexed_at. None = unknown = fail closed."""
+    and so only answers 'last touched'. An absent first_indexed_at KEY fails
+    closed: the runtime reads API projections, and a projection that drops the
+    key must not be able to route around the immutable stamp via the mutable
+    indexed_at. A present-but-unparseable first_indexed_at is corrupt data,
+    not a legacy row, and never falls through to indexed_at either.
+    None = unknown = fail closed."""
     a = asset or {}
-    if "first_indexed_at" in a:
-        # Column present on the row. A NULL first_indexed_at is UNKNOWN, never
-        # 'legacy': indexed_at is bumped on every re-sync PATCH, so falling back
-        # to it here could launder an old asset into 'new'. Fail closed.
-        value = a.get("first_indexed_at")
-        if value is None:
-            return None
-        return _parse_ts(value)
-    # Column absent entirely (rows predating it, backfilled at migration):
-    # indexed_at is the only timestamp available.
-    return _parse_ts(a.get("indexed_at"))
+    if "first_indexed_at" not in a:
+        # Key absent from the projection. An API row that silently drops the
+        # first_indexed_at key (instead of returning the column, even NULL)
+        # must NOT fall through to indexed_at — indexed_at is bumped on every
+        # re-sync PATCH and could launder an old asset into 'new'. An absent
+        # key is a projection/schema mismatch: fail closed. Only raw DB rows
+        # from a schema predating the column are exempt, and those are
+        # resolved at the SQL authority, not guessed here.
+        return None
+    # Key present. A NULL first_indexed_at is UNKNOWN, never 'legacy':
+    # indexed_at is bumped on every re-sync PATCH, so falling back to it here
+    # could launder an old asset into 'new'. Fail closed.
+    value = a.get("first_indexed_at")
+    if value is None:
+        return None
+    return _parse_ts(value)
 
 
 def asset_is_historical(asset, cutoff):
@@ -128,12 +140,28 @@ def _current_hash(asset):
     return value if re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{64})", value) else ""
 
 
-def _bound_evidence(evidence, gym_id, asset_id, content_hash):
-    """A receipt's evidence must be a dict binding the SAME identity triple."""
+def _bound_evidence(evidence, gym_id, asset_id, source_id, content_hash):
+    """A receipt's evidence must bind the SAME current identity quadruple."""
     return (isinstance(evidence, dict)
             and evidence.get("gym_id") == gym_id
             and evidence.get("asset_id") == asset_id
+            and evidence.get("source_id") == source_id
             and evidence.get("content_hash") == content_hash)
+
+
+def _evidence_has_proof(evidence):
+    """A 'cleared' decision can never rest on identity-only evidence. Mirrors
+    the SQL authority (media_historical_clearance_cleared_proof CHECK and the
+    record RPC): the reviewer must state method, observed_at and result, plus
+    a nonempty proof_ref, reviewer_assertion or assertion_ref. Fail closed:
+    any missing/blank field means the receipt cannot clear."""
+    if not isinstance(evidence, dict):
+        return False
+    def _nz(key):
+        return bool(str(evidence.get(key) or "").strip())
+    return (_nz("method") and _nz("observed_at") and _nz("result")
+            and (_nz("proof_ref") or _nz("reviewer_assertion")
+                 or _nz("assertion_ref")))
 
 
 def clearance_status(asset, clearance_rows):
@@ -145,7 +173,10 @@ def clearance_status(asset, clearance_rows):
         its hash. Permanent: cannot be revoked, never expires.
       * 'cleared' — a receipt with decision='cleared', NOT revoked, whose
         content_hash equals the asset's CURRENT content_hash, with a nonempty
-        reviewer and a dict evidence binding the same gym_id/asset_id/hash.
+        reviewer and a dict evidence binding the same gym_id/asset_id/hash
+        AND carrying observation proof (method, observed_at, result, plus a
+        nonempty proof_ref/reviewer_assertion/assertion_ref) — identity-only
+        evidence never clears, matching the SQL authority.
       * 'held' — otherwise, when an active (unrevoked) 'held' receipt matches
         the current identity.
       * 'uncleared' — no qualifying receipt at all.
@@ -181,7 +212,8 @@ def clearance_status(asset, clearance_rows):
             if (current and row_hash == current
                     and str(row.get("reviewer") or "").strip()
                     and _bound_evidence(row.get("evidence"),
-                                        gym_id, asset_id, current)):
+                                        gym_id, asset_id, source_id, current)
+                    and _evidence_has_proof(row.get("evidence"))):
                 return "cleared"
         elif decision == "held" and current and row_hash == current:
             held = True

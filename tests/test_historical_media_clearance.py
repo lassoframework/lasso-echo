@@ -2,8 +2,8 @@
 DRAFT historical media clearance — explicit per-asset review gate, offline.
 
 With AGENT_HISTORICAL_MEDIA_CLEARANCE enabled, an asset is pickable ONLY with
-an explicit 'cleared' receipt matching the exact identity triple (gym_id,
-asset_id, CURRENT content_hash) — never filename, URL, or pHash. known_used is
+an explicit 'cleared' receipt matching the exact identity quadruple (gym_id,
+asset_id, source_id, CURRENT content_hash) — never filename, URL, or pHash. known_used is
 permanent; held and uncleared are excluded; a hash change re-blocks; any read
 failure or ambiguous flag fails closed. Flag OFF = byte-for-byte legacy.
 """
@@ -36,14 +36,23 @@ def _photo(asset_id):
 
 
 def _receipt(asset, decision="cleared", reviewer="blake", revoked=False,
-             evidence=True, content_hash=None, gym_id=None, asset_id=None):
+             evidence=True, proof=True, content_hash=None, gym_id=None,
+             asset_id=None):
     gid = gym_id if gym_id is not None else asset["gym_id"]
     aid = asset_id if asset_id is not None else asset["id"]
     chash = content_hash if content_hash is not None else asset["content_hash"]
+    ev = None
+    if evidence:
+        ev = {"gym_id": gid, "asset_id": aid, "source_id": "src1",
+              "content_hash": chash}
+        if proof:
+            ev.update({"method": "drive+calendar usage audit",
+                       "observed_at": "2026-09-30T00:00:00Z",
+                       "result": "no usage found in any channel",
+                       "proof_ref": "s3://echo-clearance/gymx/%s.pdf" % aid})
     return {"gym_id": gid, "asset_id": aid, "source_id": "src1",
             "content_hash": chash, "decision": decision, "reviewer": reviewer,
-            "evidence": ({"gym_id": gid, "asset_id": aid, "content_hash": chash}
-                         if evidence else None),
+            "evidence": ev,
             "recorded_at": "2026-10-01T00:00:00Z",
             "revoked_at": "2026-10-02T00:00:00Z" if revoked else None,
             "revoked_by": "blake" if revoked else None,
@@ -112,11 +121,49 @@ def test_cleared_requires_exact_hash_unrevoked_valid_evidence():
     assert hmc.clearance_status(asset, [_receipt(asset, evidence=False)]) == "uncleared"
     bad = _receipt(asset)
     bad["evidence"] = {"gym_id": "other", "asset_id": "a1",
-                       "content_hash": asset["content_hash"]}
+                       "source_id": "src1", "content_hash": asset["content_hash"]}
     assert hmc.clearance_status(asset, [bad]) == "uncleared"
     bad2 = _receipt(asset)
-    bad2["evidence"] = {"gym_id": GYM, "asset_id": "a1", "content_hash": _hash("stale")}
+    bad2["evidence"] = {"gym_id": GYM, "asset_id": "a1", "source_id": "src1",
+                        "content_hash": _hash("stale")}
     assert hmc.clearance_status(asset, [bad2]) == "uncleared"
+
+    # A receipt row cannot launder evidence reviewed against another source.
+    source_changed = _receipt(asset)
+    source_changed["evidence"]["source_id"] = "src-before-rebind"
+    assert hmc.clearance_status(asset, [source_changed]) == "uncleared"
+
+
+def test_cleared_requires_observation_proof_not_identity_only_evidence():
+    """REGRESSION: identity-only evidence (gym/asset/source/hash only) must
+    NEVER clear — method, observed_at, result and a nonempty proof_ref,
+    reviewer_assertion or assertion_ref are required, matching the SQL
+    authority (table CHECK + record RPC)."""
+    asset = _photo("a1")
+    # identity-only evidence: bound but proofless
+    assert hmc.clearance_status(asset, [_receipt(asset, proof=False)]) == "uncleared"
+    for missing in ("method", "observed_at", "result"):
+        r = _receipt(asset)
+        del r["evidence"][missing]
+        assert hmc.clearance_status(asset, [r]) == "uncleared", missing
+    r = _receipt(asset)
+    r["evidence"]["proof_ref"] = "   "
+    assert hmc.clearance_status(asset, [r]) == "uncleared"
+    # a named reviewer assertion substitutes for proof_ref
+    r = _receipt(asset, proof=False)
+    r["evidence"].update({"method": "manual audit",
+                          "observed_at": "2026-09-30T00:00:00Z",
+                          "result": "unused",
+                          "reviewer_assertion": "I checked Drive, calendar and GHL"})
+    assert hmc.clearance_status(asset, [r]) == "cleared"
+    r2 = _receipt(asset, proof=False)
+    r2["evidence"].update({"method": "manual audit",
+                           "observed_at": "2026-09-30T00:00:00Z",
+                           "result": "unused",
+                           "assertion_ref": "assertions/blake-2026-09-30.json"})
+    assert hmc.clearance_status(asset, [r2]) == "cleared"
+    # full proof still clears
+    assert hmc.clearance_status(asset, [_receipt(asset)]) == "cleared"
 
 
 def test_hash_change_after_clearance_reblocks():
@@ -504,16 +551,28 @@ def test_present_null_first_indexed_at_is_unknown_never_indexed_at(monkeypatch):
                                           now=NOW_DT)] == ["nullstamp"]
 
 
-def test_column_absent_first_indexed_at_still_uses_indexed_at(monkeypatch):
-    """Legacy rows (column absent entirely, backfilled at migration) still use
-    indexed_at — only a PRESENT NULL is unknown."""
+def test_column_absent_first_indexed_at_fails_closed_never_indexed_at(monkeypatch):
+    """REGRESSION (2026-10-03 P1 repair): when the first_indexed_at KEY is
+    absent from the asset mapping, asset_first_seen must return None — NEVER
+    fall back to the mutable indexed_at. The runtime reads API projections:
+    a projection that silently drops the first_indexed_at key (instead of
+    returning the column, even NULL) must not be able to route around the
+    immutable stamp via indexed_at, which is bumped on every re-sync PATCH
+    and could launder an old asset into 'new'. Absent key = projection
+    bypass = fail closed (historical). Only a present-but-unparseable value
+    or present NULL was already covered; this covers the missing-key case."""
     _flag_on(monkeypatch)
     _set_cutoff(monkeypatch)
     a = _photo("legacy")
     a.pop("first_indexed_at", None)
-    a["indexed_at"] = "2026-10-02T12:00:00Z"           # after cutoff
+    a["indexed_at"] = "2026-10-02T12:00:00Z"           # post-cutoff re-sync
+    assert hmc.asset_first_seen(a) is None
     store = ClearanceFakeStore(assets=[a])
-    assert [x["id"] for x in gms.pickable(GYM, store=store,
+    assert gms.pickable(GYM, store=store, now=NOW_DT) == []
+    assert gms.cooldown_fallback(GYM, store=store) == []
+    # explicit clearance still frees it (fail closed, not fail permanently)
+    store2 = ClearanceFakeStore(assets=[a], clearances=[_receipt(a)])
+    assert [x["id"] for x in gms.pickable(GYM, store=store2,
                                           now=NOW_DT)] == ["legacy"]
 
 
@@ -533,6 +592,121 @@ def test_clearance_requires_matching_source_id():
     orphan["source_id"] = None
     assert hmc.clearance_status(
         orphan, [_receipt(orphan, decision="known_used")]) == "uncleared"
+
+
+def test_record_rpc_compares_evidence_source_to_locked_current_asset():
+    """The database is the concurrency authority: after locking media_asset,
+    it must reject evidence for the source observed before a concurrent rebind."""
+    migration = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                             "migrations",
+                             "DRAFT_historical_media_clearance_20261003.sql")
+    sql = open(migration, encoding="utf-8").read()
+    lock = "where id = p_asset_id for update;"
+    source_cas = "p_evidence->>'source_id' is distinct from v_asset.source_id"
+    assert lock in sql and source_cas in sql
+    assert sql.index(source_cas) > sql.index(lock)
+    assert "evidence->>'source_id' = source_id" in sql
+
+
+def _migration_sql():
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                        "migrations",
+                        "DRAFT_historical_media_clearance_20261003.sql")
+    return open(path, encoding="utf-8").read()
+
+
+def test_sql_authority_refuses_identity_only_cleared_evidence():
+    """REGRESSION: the SECURITY DEFINER record RPC and the table CHECK both
+    refuse decision='cleared' on identity-only evidence — method, observed_at,
+    result and a nonempty proof_ref / reviewer_assertion / assertion_ref are
+    enforced at the database, not just in the runtime."""
+    sql = _migration_sql()
+    assert "constraint media_historical_clearance_cleared_proof check (" in sql
+    for frag in ("evidence->>'method'", "evidence->>'observed_at'",
+                 "evidence->>'result'", "evidence->>'proof_ref'",
+                 "evidence->>'reviewer_assertion'", "evidence->>'assertion_ref'"):
+        assert frag in sql, frag
+        assert ("p_" + frag) in sql, "rpc-side " + frag
+    # the RPC refuses before inserting (its raise precedes the insert)
+    assert sql.index("p_evidence->>'method'") < sql.index(
+        "insert into public.media_historical_clearance")
+
+
+def test_record_rpc_proves_media_source_tenant_match():
+    """REGRESSION (2026-10-03 P1 repair): the record RPC must verify the
+    asset's media_source row exists and belongs to the SAME gym, under a
+    FOR UPDATE lock on the SOURCE row — a point-in-time EXISTS check is not
+    enough because the source's gym_id could mutate later or concurrently."""
+    sql = _migration_sql()
+    asset_lock = "where id = p_asset_id for update;"
+    tenant_lock = ("where id = v_asset.source_id and gym_id = p_gym_id\n"
+                   "    for update;")
+    assert asset_lock in sql and tenant_lock in sql
+    # tenant proof runs after the asset lock and before any insert
+    assert sql.index(tenant_lock) > sql.index(asset_lock)
+    assert sql.index(tenant_lock) < sql.index(
+        "insert into public.media_historical_clearance")
+
+
+def test_media_source_gym_id_is_immutable_tenant_binding():
+    """REGRESSION (2026-10-03 P1 repair): media_source.gym_id is an immutable
+    tenant binding. Without this, the record RPC's tenant proof is
+    point-in-time: a source re-pointed to another gym after recording rots
+    the proof of every receipt against its assets. The guard must refuse
+    ONLY gym_id changes — every other legitimate source update keeps
+    working, and an unbound (NULL) source may still be bound."""
+    sql = _migration_sql()
+    assert "create or replace function public.media_source_gym_id_guard()" in sql
+    assert ("new.gym_id is distinct from old.gym_id"
+            " and old.gym_id is not null") in sql
+    assert ("create trigger media_source_gym_id_guard before update\n"
+            "  on public.media_source") in sql
+    # immutability-only: the trigger returns new and restricts nothing else
+    trigger_body = sql.split("media_source_gym_id_guard()", 1)[1]
+    trigger_body = trigger_body.split("$$;", 1)[0]
+    assert "return new;" in trigger_body
+    assert "new.folder" not in trigger_body and "new.name" not in trigger_body
+
+
+def test_clearance_receipt_binds_durable_composite_tenant_fk():
+    """REGRESSION (2026-10-03 P1 repair): a composite tenant FOREIGN KEY
+    (source_id, gym_id) REFERENCES media_source (id, gym_id) binds every
+    receipt durably to the source AND gym it was recorded against, at the
+    database level — surviving any future code path or concurrent mutation."""
+    sql = _migration_sql()
+    assert ("constraint media_historical_clearance_source_tenant_fk\n"
+            "    foreign key (source_id, gym_id)"
+            " references public.media_source (id, gym_id)") in sql
+    assert ("create unique index if not exists media_source_id_gym_key\n"
+            "  on public.media_source (id, gym_id);") in sql
+    # APPLICABILITY/ORDER REGRESSION (2026-10-03 P0 repair): the composite FK
+    # REFERENCES media_source (id, gym_id), so the unique (id, gym_id) target
+    # index must be created BEFORE the table that declares the FK — otherwise
+    # the DRAFT fails at apply time on a fresh database.
+    unique_idx = ("create unique index if not exists media_source_id_gym_key\n"
+                  "  on public.media_source (id, gym_id);")
+    create_table = "create table if not exists public.media_historical_clearance ("
+    fk = "constraint media_historical_clearance_source_tenant_fk"
+    assert sql.index(unique_idx) < sql.index(create_table)
+    assert sql.index(create_table) < sql.index(fk)
+
+
+def test_first_indexed_at_schema_is_idempotent_immutable_and_never_backfilled():
+    """REGRESSION: the DRAFT declares media_asset.first_indexed_at (production
+    already has it, nullable, fully populated 3605/3605), protects it with an
+    immutability-only trigger, and NEVER backfills it from the mutable
+    indexed_at — so no previously held asset becomes newly eligible."""
+    sql = _migration_sql()
+    low = sql.lower()
+    assert "add column if not exists first_indexed_at timestamptz" in low
+    assert "media_asset_first_indexed_at_guard" in sql
+    assert "new.first_indexed_at is distinct from old.first_indexed_at" in sql
+    assert "create trigger media_asset_first_indexed_at_guard before update" in low
+    # no backfill: no UPDATE of media_asset anywhere in the DRAFT
+    assert "update public.media_asset" not in low
+    assert "update media_asset" not in low
+    # and no INSERT ... SELECT copying indexed_at into first_indexed_at
+    assert "first_indexed_at = indexed_at" not in low.replace(" ", "")
 
 
 def _video(asset_id):
