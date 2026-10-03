@@ -525,6 +525,16 @@ class SupabaseCalendarStore:
         """
         if not (new_image_url or "").strip():
             return None
+        from . import visual_writer_prepare
+        visual_guard = visual_writer_prepare.enabled()
+        current = expected_row
+        if visual_guard and current is None:
+            current = self.get_row(account_key, row_id)
+            if (not isinstance(current, dict)
+                    or str(current.get("id")) != str(row_id)
+                    or str(current.get("gym_id")) != str(account_key)
+                    or current.get("status") not in ("pending", "coach_review")):
+                return None
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"}
         if expected_row is None:
             params["status"] = "in.(pending,coach_review)"
@@ -561,8 +571,10 @@ class SupabaseCalendarStore:
             params["media_not_ready_reason"] = "is.null"
         payload = {"image_url": new_image_url, "media_not_ready_reason": None}
         payload = self._prepare_visual_media(account_key, row_id, payload,
-                                             current=expected_row,
+                                             current=current,
                                              render_evidence=render_evidence)
+        if visual_guard:
+            params = self._visual_media_cas(current, params)
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -572,6 +584,9 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
+        if visual_guard and self._visual_media_result(
+                rows, account_key, current, payload) is None:
+            return None
         if not isinstance(rows, list) or len(rows) != 1:
             return None
         row = rows[0]
@@ -2911,11 +2926,18 @@ class SupabaseCalendarStore:
                                              else f"eq.{current['media_not_ready_reason']}"),
                   "image_url": ("is.null" if current.get("image_url") is None
                                 else f"eq.{current['image_url']}")}
+        from . import visual_writer_prepare
+        visual_guard = visual_writer_prepare.enabled()
+        if visual_guard:
+            params = self._visual_media_cas(current, params)
         response = self._client().patch(self._rest(_TABLE), params=params, json=patch,
                          headers=self._headers({"Prefer": "return=representation"}), timeout=30)
         if response.status_code >= 400:
             raise PortalStoreError(response.status_code, _scrub((response.text or "")[:200]))
         rows = response.json() or []
+        if visual_guard and self._visual_media_result(
+                rows, account_key, current, patch) is None:
+            return None
         if (len(rows) != 1 or rows[0].get("id") != current["id"]
                 or rows[0].get("gym_id") != account_key or _story_slot(rows[0]) != _story_slot(current)
                 or rows[0].get("created_at") != current["created_at"]

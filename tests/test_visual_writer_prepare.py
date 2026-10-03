@@ -73,7 +73,7 @@ class HTTP:
         if self.patch_failure:
             self.patch_failure = False
             return Response([], status_code=409)
-        return Response([{"id": "row-1", "gym_id": "old-key", **json}])
+        return Response([{**(self.row or {}), "id": "row-1", "gym_id": "old-key", **json}])
 
 
 def store(http):
@@ -317,6 +317,121 @@ def test_story_patch_forwards_verified_rendition_evidence_and_preserves_raw_sour
     assert captured["candidate"]["source_media_url"] == raw
     patch = [call[2] for call in http.calls if call[0] == "patch"][0]
     assert patch["visual_group_key"] == "vg_scene"
+
+
+class _CASHTTP:
+    """PostgREST-shaped fake that can swap one row field just before PATCH."""
+
+    def __init__(self, row, concurrent=None):
+        self.row = dict(row)
+        self.concurrent = concurrent or {}
+        self.params = None
+
+    def get(self, url, *, params, headers, timeout):
+        return Response([dict(self.row)])
+
+    @staticmethod
+    def _matches(actual, predicate):
+        if predicate == "is.null":
+            return actual is None
+        if predicate.startswith('eq."') and predicate.endswith('"'):
+            return str(actual) == predicate[4:-1]
+        if predicate.startswith("eq."):
+            return str(actual) == predicate[3:]
+        if predicate.startswith("in.("):
+            return str(actual) in predicate[4:-1].split(",")
+        return True
+
+    def patch(self, url, *, params, headers, json, timeout):
+        self.row.update(self.concurrent)
+        self.params = dict(params)
+        if not all(self._matches(self.row.get(key), value)
+                   for key, value in params.items() if key not in ("id", "gym_id")):
+            return Response([])
+        self.row.update(json)
+        return Response([dict(self.row)])
+
+
+def _prepared_payload(_account_key, _row_id, payload, *, current=None,
+                      render_evidence=None):
+    return {**payload, "visual_group_key": "vg_prepared",
+            "byte_hash": "derived:md5:" + "b" * 32}
+
+
+def test_guarded_image_patch_refuses_concurrent_same_status_slot_swap(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    current = {"id": "row-1", "gym_id": "old-key", "status": "pending",
+               "format": "story", "image_url": "https://media.example/old.jpg",
+               "source_media_url": "https://media.example/raw.jpg", "caption": "new",
+               "slot_index": None, "thumbnail_url": "https://media.example/thumb-old.jpg",
+               "visual_group_key": "vg_old", "byte_hash": "derived:md5:" + "a" * 32}
+    http = _CASHTTP(current, {"slot_index": 2,
+                              "thumbnail_url": "https://media.example/thumb-new.jpg",
+                              "visual_group_key": "vg_concurrent"})
+    calendar = store(http)
+    monkeypatch.setattr(calendar, "_prepare_visual_media", _prepared_payload)
+
+    assert calendar.patch_image_url("old-key", "row-1",
+                                    "https://media.example/reburn.jpg") is None
+    assert http.row["image_url"] == current["image_url"]
+    assert http.row["visual_group_key"] == "vg_concurrent"
+    assert http.params["slot_index"] == "is.null"
+    assert http.params["thumbnail_url"] == 'eq."https://media.example/thumb-old.jpg"'
+    assert http.params["visual_group_key"] == 'eq."vg_old"'
+
+
+def test_guarded_image_patch_succeeds_when_observed_visual_row_is_unchanged(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    current = {"id": "row-1", "gym_id": "old-key", "status": "pending",
+               "format": "story", "image_url": "https://media.example/old.jpg",
+               "source_media_url": "https://media.example/raw.jpg", "caption": "new",
+               "slot_index": None, "visual_group_key": "vg_old",
+               "byte_hash": "derived:md5:" + "a" * 32}
+    http = _CASHTTP(current)
+    calendar = store(http)
+    monkeypatch.setattr(calendar, "_prepare_visual_media", _prepared_payload)
+
+    saved = calendar.patch_image_url("old-key", "row-1",
+                                     "https://media.example/reburn.jpg")
+    assert saved["image_url"] == "https://media.example/reburn.jpg"
+    assert saved["visual_group_key"] == "vg_prepared"
+    assert saved["caption"] == "new"
+
+
+def test_guarded_image_patch_without_expected_row_preserves_status_allowlist(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    current = {"id": "row-1", "gym_id": "old-key", "status": "approved",
+               "format": "story", "image_url": "https://media.example/old.jpg",
+               "source_media_url": "https://media.example/raw.jpg"}
+    http = _CASHTTP(current)
+    calendar = store(http)
+    monkeypatch.setattr(calendar, "_prepare_visual_media", _prepared_payload)
+
+    assert calendar.patch_image_url("old-key", "row-1",
+                                    "https://media.example/reburn.jpg") is None
+    assert http.params is None
+    assert http.row["image_url"] == current["image_url"]
+
+
+def test_guarded_story_hold_recovery_refuses_concurrent_thumbnail_swap(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    current = {"id": "row-1", "gym_id": "old-key", "status": "pending",
+               "format": "story", "account": "instagram", "post_date": "2026-10-04",
+               "time_slot": "morning", "slot_index": None, "variant_status": "active",
+               "created_at": "2026-10-03T12:00:00Z", "caption": "new",
+               "image_url": None, "thumbnail_url": None, "source_media_url": None,
+               "media_not_ready_reason": "Story media not ready: retry"}
+    proposed = {**current, "image_url": "https://media.example/recovered.jpg",
+                "source_media_url": "https://media.example/raw.jpg",
+                "media_not_ready_reason": None}
+    http = _CASHTTP(current, {"thumbnail_url": "https://media.example/concurrent-thumb.jpg"})
+    calendar = store(http)
+    monkeypatch.setattr(calendar, "_prepare_visual_media", _prepared_payload)
+
+    assert calendar.recover_story_media_hold("old-key", current, proposed) is None
+    assert http.row["image_url"] is None
+    assert http.row["thumbnail_url"] == "https://media.example/concurrent-thumb.jpg"
+    assert http.params["thumbnail_url"] == "is.null"
 
 
 def test_story_patch_rejects_evidence_for_another_source_or_delivered_url(monkeypatch):

@@ -942,6 +942,10 @@ def maybe_reburn_story(account_key, row, new_caption, sb_store, *, logger=None):
         patch_args = {}
         if receipt_evidence is not None:
             patch_args["render_evidence"] = receipt_evidence
+            # The caption save happens before this best-effort reburn. Bind the
+            # media write to that authoritative post-edit row so a concurrent
+            # visual/slot swap cannot be overwritten by a prepared stale group.
+            patch_args["expected_row"] = row
         persisted = sb_store.patch_image_url(account_key, row.get("id"), new_url, **patch_args)
         if not isinstance(persisted, dict) or persisted.get("image_url") != new_url:
             return None
@@ -1101,9 +1105,9 @@ def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
         print(f"[portal-social] learn-from-edit failed post-save for "
               f"{account_key}: {type(exc).__name__}")
     # Task #28 (§5c): a STORY caption edit re-burns onto fresh media immediately (gated,
-    # best-effort — the caption is already saved). `row` is the pre-edit row (carries
-    # format + source_media_url); `note` is the new caption.
-    reburned = maybe_reburn_story(account_key, row, note, sb_store)
+    # best-effort — the caption is already saved). Use the authoritative row returned
+    # by that save so the prepared media PATCH is bound to the new caption and status.
+    reburned = maybe_reburn_story(account_key, updated, note, sb_store)
     return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
                  "caption": updated.get("caption", ""),
                  "story_reburned": bool(reburned),
@@ -1508,7 +1512,7 @@ def handle_recreate_caption(account_key, draft_id, actor_id, reader=None,
     # pixels silently diverge. Same call `_handle_edit_supabase` already makes;
     # `maybe_reburn_story` is itself gated on `story_reburn.should_reburn(row)` and
     # is a no-op for a feed row, so this is always safe to call unconditionally.
-    reburned = maybe_reburn_story(account_key, row, result["caption"], sb_store)
+    reburned = maybe_reburn_story(account_key, updated, result["caption"], sb_store)
     # Charge the budget only after a successful, persisted recreate.
     spend_recreate(account_key)
     return 200, {"ok": True, "action": "recreate-caption", "draft_id": draft_id,
