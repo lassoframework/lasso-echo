@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -47,7 +48,32 @@ def _source(base, account_key):
     return sorted(cited, key=lambda s: (str(s.id), s.text))[0]
 
 
-def build_previews(hold_receipt_path, *, store=None, media_store=None, today=None):
+def _palette_manifest(path, gym):
+    """Require operator supplied colors bound to captured source bytes."""
+    manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    item = manifest.get(gym) if isinstance(manifest, dict) else None
+    if not isinstance(item, dict):
+        raise ValueError(f"{gym}: palette manifest entry missing")
+    colors = item.get("colors")
+    source_url = item.get("source_url")
+    source_file = item.get("source_file")
+    source_sha256 = item.get("source_sha256")
+    if (not isinstance(colors, list) or not colors or
+            any(not isinstance(c, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", c)
+                for c in colors) or
+            not isinstance(source_url, str) or not source_url.startswith("https://") or
+            not isinstance(source_file, str) or not source_file or
+            not isinstance(source_sha256, str) or
+            not re.fullmatch(r"[0-9a-f]{64}", source_sha256) or
+            _sha256(source_file) != source_sha256):
+        raise ValueError(f"{gym}: palette source citation, colors, or source hash invalid")
+    return {"colors": colors, "path": str(Path(path).resolve()),
+            "source_url": source_url, "source_file": source_file,
+            "source_sha256": source_sha256}
+
+
+def build_previews(hold_receipt_path, *, palette_manifest_path, store=None,
+                   media_store=None, today=None):
     """Read exact held rows and return briefs. No writes or provider calls."""
     today = today or datetime.now(timezone.utc).date().isoformat()
     source_receipt, held = _original_receipt(hold_receipt_path)
@@ -74,9 +100,7 @@ def build_previews(hold_receipt_path, *, store=None, media_store=None, today=Non
         account_key = f"{gym}_ig"
         if astra_prompt._account_base(account_key) != gym:
             raise ValueError(f"{row_id}: tenant mismatch")
-        palette = astra_prompt.load_gym_brand_palette(account_key)
-        if not palette:
-            raise ValueError(f"{gym}: verified palette missing")
+        palette = _palette_manifest(palette_manifest_path, gym)
         voice_path = _voice(gym, account_key)
         fact = _source(gym, account_key)
         headline = " ".join(fact.text.split()[:8]).strip(".,:;!? ")
@@ -91,6 +115,9 @@ def build_previews(hold_receipt_path, *, store=None, media_store=None, today=Non
                      "source_status": fact.status, "source_text": fact.text,
                      "palette_path": palette["path"], "palette_sha256": _sha256(palette["path"]),
                      "palette_colors": palette["colors"],
+                     "palette_source_url": palette["source_url"],
+                     "palette_source_file": palette["source_file"],
+                     "palette_source_sha256": palette["source_sha256"],
                      "voice_path": str(voice_path), "voice_sha256": _sha256(voice_path),
                      "headline": headline, "brief": brief})
     return {"operation": "preview_held_igfill_astra", "state": "preview_only",
@@ -105,12 +132,15 @@ def build_previews(hold_receipt_path, *, store=None, media_store=None, today=Non
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hold-receipt", required=True)
+    parser.add_argument("--palette-manifest", required=True,
+                        help="private JSON with gym colors and hash-bound source evidence")
     parser.add_argument("--output", required=True, help="new private JSON preview path")
     parser.add_argument("--today", help="UTC date YYYY-MM-DD")
     args = parser.parse_args(argv)
     if Path(args.output).resolve() == Path(args.hold_receipt).resolve():
         parser.error("preview output must differ from hold receipt")
-    result = build_previews(args.hold_receipt, today=args.today)
+    result = build_previews(args.hold_receipt, palette_manifest_path=args.palette_manifest,
+                            today=args.today)
     _receipt(args.output, result, create=True)
     print(json.dumps({k: v for k, v in result.items() if k != "previews"}, sort_keys=True))
     return 0
