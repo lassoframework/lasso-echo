@@ -563,8 +563,10 @@ class SupabaseCalendarStore:
             page = response.json()
             if not isinstance(page, list):
                 raise PortalStoreError(502, "invalid maintenance calendar page")
-            if page and (not page[-1].get("id") or
-                         (last_id is not None and str(page[-1]["id"]) <= str(last_id))):
+            ids = [str(row.get("id") or "") for row in page if isinstance(row, dict)]
+            if (len(ids) != len(page) or not all(ids)
+                    or any(left >= right for left, right in zip(ids, ids[1:]))
+                    or (ids and last_id is not None and ids[0] <= str(last_id))):
                 raise PortalStoreError(502, "maintenance calendar pagination stalled")
             rows.extend(page)
             if len(page) < 500:
@@ -709,6 +711,49 @@ class SupabaseCalendarStore:
                 or any(after.get(key) != current[key] for key in required
                        if key != "media_not_ready_reason")
                 or after.get("media_not_ready_reason") != reason):
+            return None
+        return after
+
+    def release_future_infographic_media(self, account_key, current, reason):
+        """Clear one receipt-owned hold by exact CAS, preserving approved state.
+
+        The caller verifies the original private hold receipt before calling.
+        This method accepts only an active unpublished row with the exact hold
+        reason and changes no field except media_not_ready_reason.
+        """
+        required = ("id", "gym_id", "post_date", "status", "variant_status",
+                    "account", "format", "caption", "image_url", "source_media_url",
+                    "source_media_asset_id", "media_not_ready_reason", "created_at",
+                    "published_at", "late_post_id")
+        if (not isinstance(current, dict) or any(key not in current for key in required)
+                or current["gym_id"] != account_key
+                or current["status"] not in ("pending", "approved")
+                or current["variant_status"] != "active"
+                or current["published_at"] is not None
+                or current["late_post_id"] is not None
+                or not isinstance(reason, str) or not reason.strip()
+                or current["media_not_ready_reason"] != reason):
+            return None
+
+        def expected(value):
+            return "is.null" if value is None else f"eq.{value}"
+
+        params = {key: expected(current[key]) for key in required}
+        response = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"media_not_ready_reason": None}, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, "future infographic release CAS failed")
+        data = response.json()
+        if not isinstance(data, list) or len(data) != 1:
+            return None
+        after = data[0]
+        if (after.get("id") != current["id"]
+                or any(after.get(key) != current[key] for key in required
+                       if key != "media_not_ready_reason")
+                or after.get("media_not_ready_reason") is not None):
             return None
         return after
 
