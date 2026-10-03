@@ -259,6 +259,12 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
     # for LASSO's or a generic palette. LASSO's own account is exempt (its
     # locked V3 palette governs its cards).
     from . import astra_prompt as _ap
+    account_base = _ap._account_base(account.key)
+    if account_base != base:
+        reason = (f"account/gym mismatch ({account_base!r} account for {base!r} gym); "
+                  "infographic fallback held")
+        log(reason)
+        return {"ok": False, "reason": reason}
     gym_palette = None
     if not _ap.is_lasso_account(account.key):
         gym_palette = _ap.load_gym_brand_palette(account.key)
@@ -268,13 +274,6 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
                       "infographic fallback held")
             log(reason)
             return {"ok": False, "reason": reason}
-
-    # The Gemini client is only needed by the LASSO quality lane
-    # (creative_studio.generate). The client-gym lane below is Astra-only.
-    quality_lane = config.lasso_infographic_quality_enabled(account.key)
-    client = creative_studio._default_client() if quality_lane else None
-    if quality_lane and client is None:
-        return {"ok": False, "reason": "no image client"}
 
     filled = 0
     drafts = []
@@ -331,43 +330,20 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             continue
         draft_id = f"igfill_{base}_{day}"
         from . import image_engine as _ie
-        compiled = None
-        if quality_lane:
-            from .lasso_infographic_content import select_copy
-            try:
-                compiled = select_copy(headline + " " + str(getattr(source, "text", "")))
-            except ValueError:
-                log(f"{base} {day}: no approved Brain material; skipped")
-                continue
-            out_dir = os.path.join(config.LIBRARY_PATH, base)
-            os.makedirs(out_dir, exist_ok=True)
-            import uuid
-            art = creative_studio.generate(
-                compiled["headline"], compiled["facts"], cta=compiled["cta"],
-                client=client, account_key=account.key, draft_id=draft_id,
-                out_path=os.path.join(out_dir, f"igfill_{day}_{archetype}_{uuid.uuid4().hex}.png"))
-            if not art:
-                continue
-            from pathlib import Path
-            img = Path(art["path"]).read_bytes()
-            _res = _ie.ImageResult(image_bytes=img, model=art.get("model", ""), engine="astra")
-        else:
-            _res = _generate_astra_only(
-                astra_brief,
-                {"kind": "infographic", "surface": "feed post",
-                 "has_text_overlay": bool(str(headline or "").strip()),
-                 "require_astra": True},
-                account_key=account.key,
-                subject=f"{day} {headline}"[:120], draft_id=draft_id)
-            img = _res.image_bytes if _res is not None else None
+        _res = _generate_astra_only(
+            astra_brief,
+            {"kind": "infographic", "surface": "feed post",
+             "has_text_overlay": bool(str(headline or "").strip()),
+             "require_astra": True},
+            account_key=account.key,
+            subject=f"{day} {headline}"[:120], draft_id=draft_id)
+        img = _res.image_bytes if _res is not None else None
         if not img:
             log(f"{base} {day}: image render failed on every engine; "
                 "marked NEEDS HUMAN and skipped")
             continue
         out = os.path.join(config.LIBRARY_PATH, base,
                            f"igfill_{day}_{archetype}.png")
-        if compiled:
-            out = art["path"]
         try:
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "wb") as fh:
@@ -381,8 +357,6 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             continue
         caption, hashtags = client_content.make_caption(
             account, source, voice, f"igfill_{day}")
-        if compiled:
-            caption = "\n\n".join([compiled["headline"], *compiled["facts"], compiled["cta"]])
         draft = Draft(
             draft_id=draft_id,
             account_key=account.key,
@@ -393,12 +367,10 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             creative_public_url=hosted,
             scheduled_for=f"{day}T12:00:00",
             status=DraftStatus.PENDING,
-            infographic_copy=dict(compiled or {}),
-            source_fragments=([compiled["headline"], *compiled["facts"],
-                               "cite:" + compiled["source_id"], "sha256:" + compiled["source_hash"]]
-                              if compiled else [getattr(source, "text", "") or "",
+            infographic_copy={},
+            source_fragments=[getattr(source, "text", "") or "",
                               f"cite:{getattr(source, 'citation', '')}",
-                              "infographic_fill"]),
+                              "infographic_fill"],
             day_key=day,
             category=_with_review_mark(getattr(source, "category", "")),
             image_engine=f"{_res.engine}:{_res.model}" if _res is not None else "",
@@ -413,6 +385,25 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
 
     if not drafts:
         return {"ok": True, "filled": 0, "gaps": len(gaps)}
+    # The render and upload can take long enough for a real client photo or a
+    # competing calendar row to arrive. Recheck immediately before the write:
+    # no generated fallback may be inserted once either condition is known.
+    # The store does not expose an atomic conditional insert, so this is the
+    # final best-effort guard; its check-to-insert interval remains necessarily
+    # subject to a concurrent writer and must stay fail-closed at the store
+    # boundary when that capability is added.
+    if not real_media_depleted(base, now=now):
+        log(f"{base}: usable approved photos available before insert; holding "
+            "all infographic drafts")
+        return {"ok": True, "filled": 0, "gaps": len(gaps),
+                "reason": "usable media available before insert"}
+    insertable_days = set(_empty_upcoming_days(
+        store, base, tz_name, min(days_ahead, 2), now=now))
+    drafts = [draft for draft in drafts if draft.day_key in insertable_days]
+    if not drafts:
+        log(f"{base}: infographic day taken before insert; holding drafts")
+        return {"ok": True, "filled": 0, "gaps": len(gaps),
+                "reason": "calendar day taken before insert"}
     rows = _to_rows(base, drafts)
     clean = [{k: v for k, v in r.items() if k != "id"} for r in rows]
     try:

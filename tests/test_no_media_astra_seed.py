@@ -219,6 +219,19 @@ def test_missing_verified_palette_fails_closed(monkeypatch):
     assert store.inserted == []
 
 
+def test_account_gym_mismatch_fails_closed_before_deep_brain(monkeypatch):
+    """A seed never borrows another tenant's account, voice, or palette."""
+    from agent import gym_deep_brain
+
+    monkeypatch.setattr(gym_deep_brain, "build_deep_brain",
+                        lambda *args, **kwargs: pytest.fail("must not scrape"))
+    account = Account(key="othergym_ig", display_name="Other Gym",
+                      platform=Platform.INSTAGRAM, token_env="T", target_id_env="G")
+    store = _Store()
+    assert nmas.seed_gaps("chateau", account, store) == 0
+    assert store.inserted == []
+
+
 def test_astra_only_with_gym_palette_in_brief(monkeypatch):
     """The render must go through the Astra-only generator and the brief must
     carry the gym's OWN verified palette -- creative_studio.generate (the
@@ -267,6 +280,43 @@ def test_media_depletion_rechecked_before_each_render(monkeypatch):
     store = _Store()
     n = nmas.seed_gaps("chateau", _acct(), store, max_rows=2, days_ahead=5)
     assert n == 0
+    assert store.inserted == []
+
+
+def test_photo_arriving_after_seed_render_holds_before_insert(monkeypatch):
+    """A card cannot enter the calendar after a new client photo is known."""
+    _stub_pipeline(monkeypatch)
+    _stub_deep_brain(monkeypatch, [_Fact("Real fact about Chateau")])
+    from agent import client_infographic_fill
+    calls = {"n": 0}
+
+    def _depleted(base, *, now=None):
+        calls["n"] += 1
+        return calls["n"] <= 2  # initial + pre-render; post-render fails
+
+    monkeypatch.setattr(client_infographic_fill, "real_media_depleted", _depleted)
+    store = _Store()
+    assert nmas.seed_gaps("chateau", _acct(), store, max_rows=1, days_ahead=1) == 0
+    assert calls["n"] >= 3
+    assert store.inserted == []
+
+
+def test_slot_taken_after_seed_render_holds_before_insert(monkeypatch):
+    """A competing calendar writer wins a seed slot after the render."""
+    _stub_pipeline(monkeypatch)
+    _stub_deep_brain(monkeypatch, [_Fact("Real fact about Chateau")])
+    from agent import client_infographic_fill
+    real = client_infographic_fill._empty_upcoming_days
+    calls = {"n": 0}
+
+    def _empty(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs) if calls["n"] == 1 else []
+
+    monkeypatch.setattr(client_infographic_fill, "_empty_upcoming_days", _empty)
+    store = _Store()
+    assert nmas.seed_gaps("chateau", _acct(), store, max_rows=1, days_ahead=1) == 0
+    assert calls["n"] >= 2
     assert store.inserted == []
 
 
