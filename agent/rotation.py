@@ -58,22 +58,31 @@ def _conn():
     return conn
 
 
-def load_served():
-    """{account: [entries oldest..newest]} from the served table (same shape the
-    json store returned, so every caller is unchanged)."""
-    try:
-        with _conn() as conn:
-            rows = conn.execute(
-                "SELECT account_key, key, pillar, date, archetype, set_name "
-                "FROM served ORDER BY date, id").fetchall()
-    except Exception:
-        return {}
+def load_served_strict():
+    """{account: [entries oldest..newest]} from the served table, WITHOUT the
+    error swallow: a read failure raises so fail-closed callers (the client
+    local-photo once-used guard, local_photo_served) can tell an EMPTY ledger
+    apart from an UNREADABLE one."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT account_key, key, pillar, date, archetype, set_name, content_hash "
+            "FROM served ORDER BY date, id").fetchall()
     served = {}
     for r in rows:
         served.setdefault(r["account_key"], []).append(
             {"key": r["key"], "pillar": r["pillar"], "date": r["date"],
-             "archetype": r["archetype"], "set": r["set_name"]})
+             "archetype": r["archetype"], "set": r["set_name"],
+             "content_hash": r["content_hash"]})
     return served
+
+
+def load_served():
+    """{account: [entries oldest..newest]} from the served table (same shape the
+    json store returned, so every caller is unchanged)."""
+    try:
+        return load_served_strict()
+    except Exception:
+        return {}
 
 
 def save_served(served):
@@ -85,35 +94,114 @@ def save_served(served):
                 for e in entries:
                     conn.execute(
                         "INSERT INTO served (account_key, key, pillar, date, "
-                        "archetype, set_name) VALUES (?,?,?,?,?,?)",
+                        "archetype, set_name, content_hash) VALUES (?,?,?,?,?,?,?)",
                         (account_key, e.get("key", ""), e.get("pillar", ""),
                          e.get("date", ""), e.get("archetype", ""),
-                         e.get("set", "")))
+                         e.get("set", ""), e.get("content_hash", "")))
             conn.commit()
     except Exception as e:
         print(f"[rotation] could not persist served log: {type(e).__name__}: {e}")
 
 
-def record_served(account_key, key, pillar, day_key, archetype="", set_name=""):
+def reserve_served(account_key, key, pillar, day_key, archetype="", set_name=""):
+    """Persist one served entry and return its exact row id, or None on failure."""
     from . import db as _db
     try:
         # in-process serialization (the listener's threads share this process);
         # WAL covers cross-process safety. No write is ever silently dropped.
         with _db._lock, _conn() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO served (account_key, key, pillar, date, archetype, "
                 "set_name) VALUES (?,?,?,?,?,?)",
                 (account_key, key, pillar, day_key, archetype, set_name))
-            # prune far beyond the window so the table never grows unbounded. Keep AT LEAST
-            # the vision per-platform reuse horizon (IG 60d) so a 60d reuse check never loses
-            # rows it needs (§3).
+            # Prune ONLY generated (nano:) rows, far beyond the window, so the table
+            # never grows unbounded. Keep AT LEAST the vision per-platform reuse
+            # horizon (IG 60d) so a 60d reuse check never loses rows it needs (§3).
+            # Local library / client-uploaded photo rows are DURABLE (Blake,
+            # 2026-10-02 once-used rule): pruning them used to erase the history
+            # local_photo_served needs, silently returning a consumed client photo
+            # to eligibility once it aged past the cutoff. nano: keys are content
+            # signatures of ephemeral generated cards -- the only unbounded family.
             cutoff = _days_ago(day_key, max(config.ROTATION_WINDOW_DAYS * 3,
                                             IG_REUSE_DAYS + 5))
-            conn.execute("DELETE FROM served WHERE account_key=? AND date < ?",
-                         (account_key, cutoff))
+            conn.execute("DELETE FROM served WHERE account_key=? AND date < ? "
+                         "AND key LIKE ?",
+                         (account_key, cutoff, _GENERATED_KEY_PREFIX + "%"))
             conn.commit()
+        return int(cursor.lastrowid)
     except Exception as e:
         print(f"[rotation] could not persist served log: {type(e).__name__}: {e}")
+        return None
+
+
+def local_content_hash(path):
+    """Hash local bytes when present; missing test/legacy paths retain key-only history."""
+    if not path or not os.path.isfile(path):
+        return ""
+    digest = hashlib.sha256()
+    with open(path, "rb") as media:
+        for chunk in iter(lambda: media.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def reserve_local_media_once(account_key, key, pillar, day_key, path=None):
+    """Claim a local photo or video once across this gym's IG, FB, and GBP lanes.
+
+    The history comparison and insert share a SQLite write transaction. A
+    competing process must finish its claim before it can inspect the history.
+    Return the exact served row id, or None when used or unreadable.
+    """
+    if not account_key or not key or not day_key:
+        return None
+    from . import db as _db
+    base = _base_account_key(account_key)
+    lanes = (base, f"{base}_ig", f"{base}_fb", f"{base}_gbp")
+    try:
+        digest = local_content_hash(path)
+        with _db._lock, _conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            prior = conn.execute(
+                "SELECT 1 FROM served WHERE account_key IN (?,?,?,?) "
+                "AND (key=? OR (? != '' AND content_hash=?)) LIMIT 1",
+                (*lanes, key, digest, digest)).fetchone()
+            if prior:
+                conn.rollback()
+                return None
+            cursor = conn.execute(
+                "INSERT INTO served (account_key, key, pillar, date, archetype, "
+                "set_name, content_hash) VALUES (?,?,?,?,?,?,?)",
+                (account_key, key, pillar, day_key, "", "", digest))
+            conn.commit()
+            return int(cursor.lastrowid)
+    except Exception as e:
+        print(f"[rotation] could not claim local media: {type(e).__name__}: {e}")
+        return None
+
+
+def reserve_local_photo_once(account_key, key, pillar, day_key, path=None):
+    """Compatibility entrypoint for existing photo callers."""
+    return reserve_local_media_once(account_key, key, pillar, day_key, path=path)
+
+
+def release_served(reservation_id):
+    """Release exactly one unlanded reservation; never delete by media/date tuple."""
+    if not reservation_id:
+        return False
+    from . import db as _db
+    try:
+        with _db._lock, _conn() as conn:
+            cur = conn.execute("DELETE FROM served WHERE id=?", (int(reservation_id),))
+            conn.commit()
+        return cur.rowcount == 1
+    except Exception as e:
+        print(f"[rotation] could not release served reservation: {type(e).__name__}: {e}")
+        return False
+
+
+def record_served(account_key, key, pillar, day_key, archetype="", set_name=""):
+    """Compatibility boolean for callers that do not need an exact reservation id."""
+    return reserve_served(account_key, key, pillar, day_key, archetype, set_name) is not None
 
 
 def _days_ago(day_key, n):
@@ -170,6 +258,55 @@ def reuse_blocked(cluster_key, target_account_key, day_key, served=None):
         return (_within(("gbp",), GBP_SAME_MONTH_DAYS)
                 or _within(("ig", "fb"), GBP_AFTER_IG_DAYS))
     return _within((target,), config.ROTATION_WINDOW_DAYS)
+
+
+def _base_account_key(account_key):
+    """The gym base a per-platform account key rolls up to (pierce_ig -> pierce),
+    matching gym_media_selector.base_gym_key so a gym's IG/FB/GBP lanes share one
+    local-photo use history."""
+    base = str(account_key or "")
+    for suf in ("_ig", "_fb", "_gbp"):
+        if base.endswith(suf):
+            return base[: -len(suf)]
+    return base
+
+
+def local_photo_served(cluster_key, account_key, day_key, served=None, path=None):
+    """DURABLE ONCE-USED GUARD (Blake, 2026-10-02) for a client's uploaded LOCAL
+    photos. True when this rotation cluster (dam.rotation_key: near-dupe group,
+    else basename) was EVER planned or served for this gym -- any platform lane,
+    any date, no expiry. The 14-day no-repeat window, the §3 per-platform reuse
+    windows and the allow_reuse fallback are recency guards; this rule outlives
+    all of them, and record_served no longer prunes the local rows it reads, so a
+    consumed photo never becomes eligible again by aging past a cutoff.
+
+    There is no same-day account-level carve-out: gym/date/platform cannot prove
+    two rows are mirrors of one post. A different gym's identical basename is a
+    different photo and never blocks.
+
+    FAIL CLOSED: an empty cluster key or an unreadable ledger answers True (no
+    pick) -- a flaky store must never resurrect a consumed photo."""
+    if not cluster_key:
+        return True
+    if served is None:
+        try:
+            served = load_served_strict()
+        except Exception:  # noqa: BLE001 - fail closed: unknown history = no pick
+            return True
+    base = _base_account_key(account_key)
+    try:
+        digest = local_content_hash(path)
+    except OSError:
+        return True
+    for acct, entries in (served or {}).items():
+        if _base_account_key(acct) != base:
+            continue
+        for e in entries:
+            if e.get("key") != cluster_key and not (
+                    digest and e.get("content_hash") == digest):
+                continue
+            return True
+    return False
 
 
 # ---- candidate metadata ---------------------------------------------------------

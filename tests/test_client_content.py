@@ -46,7 +46,8 @@ def _lib(tmp_path, n=5):
     lib = tmp_path / "alpha_lib"
     lib.mkdir(exist_ok=True)
     for i in range(n):
-        (lib / f"photo_{i:02d}.jpg").write_bytes(b"\xff\xd8\xffFAKEJPEG")
+        (lib / f"photo_{i:02d}.jpg").write_bytes(
+            b"\xff\xd8\xffFAKEJPEG" + str(i).encode())
     return str(lib)
 
 
@@ -67,7 +68,10 @@ def _july_days():
 def test_stocked_client_drafts_full_month(tmp_path):
     acct = _client(tmp_path)
     _stock_sources(acct.key)
-    lib = _lib(tmp_path, n=5)
+    # 35 photos for 30 days: the durable once-used guard (Blake, 2026-10-02) makes
+    # every served local photo ineligible on later dates, so a 5-photo library can
+    # no longer cover a month by repeating.
+    lib = _lib(tmp_path, n=35)
     voice = _voice()
 
     drafted, cats = [], []
@@ -197,6 +201,20 @@ def test_run_daily_drafts_client_from_sources(tmp_path, monkeypatch):
     assert d.caption.strip()
 
 
+def test_daily_raw_library_fallback_cannot_bypass_client_once_used_guard(monkeypatch):
+    from agent import runner
+    client = Account(key="gym_alpha_ig", display_name="Gym Alpha",
+                     platform=Platform.INSTAGRAM, token_env="T", target_id_env="TID")
+    lasso = Account(key="lasso_ig", display_name="LASSO",
+                    platform=Platform.INSTAGRAM, token_env="T", target_id_env="TID")
+    monkeypatch.setattr(runner.config, "client_sources_enabled", lambda: True)
+
+    assert runner._legacy_library_fallback_allowed(client) is False
+    assert runner._legacy_library_fallback_allowed(lasso) is True
+    monkeypatch.setattr(runner.config, "client_sources_enabled", lambda: False)
+    assert runner._legacy_library_fallback_allowed(client) is False
+
+
 # ---- make_caption: SB7 real caption vs baseline (Dale's "HYROX" fix) ------------
 
 class _Src:
@@ -270,7 +288,8 @@ def test_record_serve_flag_defers_the_served_write(tmp_path, monkeypatch):
     lib = _lib(tmp_path, n=5)
     voice = _voice()
     calls = []
-    monkeypatch.setattr(rotation, "record_served", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(rotation, "reserve_local_photo_once",
+                        lambda *a, **k: calls.append(a) or len(calls))
 
     d1 = client_content.build_client_draft(acct, "2026-07-01", voice, lib, record_serve=False)
     assert d1 is not None and d1.creative_path

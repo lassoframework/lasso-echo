@@ -1219,6 +1219,9 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
         return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
                      "error": "photo swap needs the shared calendar plane"}
     sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    pick = None
+    local_landed = False
+    primary_write_started = False
     try:
         row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
         if miss is not None:
@@ -1276,15 +1279,47 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                       "extra_fields": _ms.swap_fields(pick)}
         if pick.get("render_evidence") is not None:
             write_args["render_evidence"] = pick["render_evidence"]
+        # LOCAL ONCE-USED: reserve before the first calendar mutation. A failed
+        # served-ledger write holds the swap, so the new pixels cannot land while
+        # remaining eligible for a later pick.
+        if not _ms.reserve_local_pick(account_key, row, pick):
+            return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": "Could not reserve that photo safely. Please try again.",
+                         "reason": "served_ledger_unavailable",
+                         "recreate_budget": _budget_state(account_key)}
+        # The media identity travels WITH the pixels (2026-09-10): a video's poster
+        # frame (or a cleared poster when a video row becomes a photo) and the Drive
+        # asset id now on the row (or None when it left the Drive pool).
+        primary_write_started = True
         updated = sb_store.swap_media(account_key, draft_id, pick["image_url"],
                                       **write_args)
         if updated is None:
-            # swap_media filters to pending / coach_review server-side: a row that
-            # matched nothing was approved or live between the read and the write.
-            return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
-                         "error": ("This post is already approved or live, so its "
-                                   "photo is locked. Deny it if you want it redone."),
+            # Prepared writes can land the PATCH and still return None when the
+            # representation fails validation. Only a fresh, tenant-scoped row
+            # showing the original identity and not the target proves a no-op.
+            try:
+                fresh = sb_store.get_row(account_key, draft_id)
+            except Exception:  # noqa: BLE001 - unreadable outcome stays reserved
+                fresh = None
+            original_fields = ("image_url", "source_media_url", "thumbnail_url",
+                               "source_media_asset_id")
+            definite_noop = (isinstance(fresh, dict)
+                             and str(fresh.get("gym_id")) == str(account_key)
+                             and str(fresh.get("id")) == str(draft_id)
+                             and all(fresh.get(field) == row.get(field)
+                                     for field in original_fields)
+                             and fresh.get("image_url") != pick["image_url"])
+            if definite_noop:
+                _ms.release_local_pick(pick)
+                return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                             "error": ("This post is already approved or live, so its "
+                                       "photo is locked. Deny it if you want it redone."),
+                             "recreate_budget": _budget_state(account_key)}
+            return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": "Photo swap outcome could not be verified.",
+                         "reason": "swap_outcome_unknown",
                          "recreate_budget": _budget_state(account_key)}
+        local_landed = True
         # Same-post siblings, one operation, the SAME per-row server-side status guard
         # (a sibling approved between the read and this write matches nothing and is
         # reported as left).
@@ -1324,6 +1359,11 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                        book_rows=_month_rows_for(sb_store, account_key, row),
                        swapped_ids=swapped)
     except Exception as exc:
+        # Before the remote call starts, nothing can have landed and the exact
+        # reservation is safe to release. Once it starts, an exception is an
+        # UNKNOWN outcome: retain fail closed because the row may have changed.
+        if pick is not None and not local_landed and not primary_write_started:
+            _ms.release_local_pick(pick)
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}
     return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,

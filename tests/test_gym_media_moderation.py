@@ -531,9 +531,12 @@ def test_update_moderation_asset_zero_rows_is_409():
 @pytest.mark.parametrize('people', [False, True])
 def test_scheduled_pass_records_evidence_and_approves(monkeypatch, people):
     from agent.jobs.moderate_pending_gym_media import run
+    from agent import account_key_resolve
     from datetime import datetime
     asset, store, drive = _setup(source_id='source')
-    store.list_sources = lambda: [{'id': 'source', 'gym_id': GYM}]
+    store.list_sources = lambda: [{'id': 'source', 'gym_id': GYM, 'active': True}]
+    monkeypatch.setattr(account_key_resolve, 'resolve_known_source_keys',
+                        lambda keys: {GYM: GYM})
     monkeypatch.setattr(config, 'gym_drive_connect_active_for', lambda gym: gym == GYM)
     result = run(store=store, drive=drive, vision=_vision(_clean_json(people)),
                  now=datetime.fromisoformat(NOW))
@@ -546,9 +549,12 @@ def test_scheduled_pass_records_evidence_and_approves(monkeypatch, people):
 
 def test_scheduled_pass_includes_pending_videos(monkeypatch):
     from agent.jobs import moderate_pending_gym_media as job
+    from agent import account_key_resolve
     from datetime import datetime
     asset, store, drive = _video_setup(source_id="source")
-    store.list_sources = lambda: [{"id": "source", "gym_id": GYM}]
+    store.list_sources = lambda: [{"id": "source", "gym_id": GYM, "active": True}]
+    monkeypatch.setattr(account_key_resolve, 'resolve_known_source_keys',
+                        lambda keys: {GYM: GYM})
     monkeypatch.setattr(config, "gym_drive_connect_active_for", lambda gym: gym == GYM)
     seen = []
     monkeypatch.setattr(
@@ -562,9 +568,12 @@ def test_scheduled_pass_includes_pending_videos(monkeypatch):
 
 def test_scheduled_pass_is_bounded_and_failures_do_not_starve(monkeypatch):
     from agent.jobs import moderate_pending_gym_media as job
+    from agent import account_key_resolve
     from datetime import datetime, timedelta
     asset, store, drive = _setup(source_id='source')
-    store.list_sources = lambda: [{'id': 'source', 'gym_id': GYM}]
+    store.list_sources = lambda: [{'id': 'source', 'gym_id': GYM, 'active': True}]
+    monkeypatch.setattr(account_key_resolve, 'resolve_known_source_keys',
+                        lambda keys: {GYM: GYM})
     store.list_assets = lambda *a, **kw: [dict(asset, id=str(i)) for i in range(7)]
     monkeypatch.setattr(config, 'gym_drive_connect_active_for', lambda gym: True)
     seen = []

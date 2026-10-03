@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS posts (
   image_engine TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS served (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account_key TEXT, key TEXT,
-  pillar TEXT, date TEXT, archetype TEXT, set_name TEXT);
+  pillar TEXT, date TEXT, archetype TEXT, set_name TEXT,
+  content_hash TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account_key TEXT, date TEXT,
   metrics TEXT, UNIQUE(account_key, date));
@@ -145,6 +146,8 @@ def _connect_initialized(path=None):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    if "content_hash" not in {r["name"] for r in conn.execute("PRAGMA table_info(served)")}:
+        conn.execute("ALTER TABLE served ADD COLUMN content_hash TEXT DEFAULT ''")
     # additive column migration: per-post metrics for reporting (VIEWS, never an
     # impressions column, by design)
     have = {r["name"] for r in conn.execute("PRAGMA table_info(posts)")}
@@ -457,6 +460,20 @@ def socialapi_claim(draft_id, account_key):
             if row is not None and row["status"] == "done":
                 return ("done", row["post_id"] or "")
             return ("in_flight", (row["post_id"] if row else "") or "")
+
+
+def drive_asset_claimed_ids(base_gym_key):
+    """Read outstanding and completed Drive reservations for one gym.
+
+    A failed read raises; selectors must then hold the entire pool closed.
+    """
+    prefix = f"gbp_media:{base_gym_key}:"
+    with _lock, connect() as conn:
+        rows = conn.execute(
+            "SELECT draft_id FROM socialapi_claims WHERE account_key=? "
+            "AND substr(draft_id, 1, ?)=?",
+            (f"{base_gym_key}_gbp", len(prefix), prefix)).fetchall()
+    return {row["draft_id"][len(prefix):] for row in rows}
 
 
 def socialapi_claim_set_post(draft_id, account_key, post_id):

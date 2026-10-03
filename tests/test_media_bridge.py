@@ -7,7 +7,7 @@ import pytest
 from PIL import Image
 from agent import media_bridge as mb, config, db
 from agent.media_bridge_route import Route
-from tests.gym_media_fakes import bound_review_fields
+from tests.gym_media_fakes import SyncedEmptyDriveIndex, bound_review_fields
 
 
 def _valid_jpeg():
@@ -97,8 +97,15 @@ def test_notice_is_clear_and_no_forbidden_punctuation():
     assert 'two days' in text and 'Upload media' in text and 'review' in text
     assert ':' not in text and ';' not in text
 
+def _prove_drive_depleted(monkeypatch):
+    """733da2b: the gap lanes may run only after the Drive index proves depletion
+    (a finished successful sync with zero usable assets)."""
+    from agent import gym_media_index
+    monkeypatch.setattr(gym_media_index, 'default_store', SyncedEmptyDriveIndex)
+
 def test_fill_cannot_expand_to_month(monkeypatch):
     from agent import client_infographic_fill as cif, client_sources, creative_studio
+    _prove_drive_depleted(monkeypatch)
     monkeypatch.setenv('AGENT_CLIENT_INFOGRAPHIC_FILL','true')
     monkeypatch.setattr(config,'creative_studio_enabled',lambda:True)
     monkeypatch.setattr(client_sources,'approved_sources',lambda _: [object()])
@@ -109,6 +116,7 @@ def test_fill_cannot_expand_to_month(monkeypatch):
 
 def test_seed_cannot_expand_to_month(monkeypatch):
     from agent import no_media_astra_seed as seed, client_infographic_fill as cif
+    _prove_drive_depleted(monkeypatch)
     monkeypatch.setenv('AGENT_NO_MEDIA_ASTRA_SEED','true')
     monkeypatch.setattr(seed,'_ensure_deep_brain_facts',lambda *a:[object()])
     seen=[]
@@ -138,8 +146,10 @@ def test_depletion_alert_even_when_no_image_client(monkeypatch):
     monkeypatch.setattr(creative_studio,'_default_client',lambda:None)
     calls=[]
     monkeypatch.setattr(mb,'notify_bridge',lambda *a,**k:calls.append(a[0]))
-    result=cif.fill_gaps('gymx',SimpleNamespace(),object(),voice=object())
-    assert result['reason']=='no image client' and calls==['gymx']
+    result=cif.fill_gaps('gymx',SimpleNamespace(key='gymx_ig'),object(),voice=object())
+    # A client card now requires Astra and verified gym colors. The depletion
+    # notice still fires even when the old Gemini client is unavailable.
+    assert 'no verified brand colors' in result['reason'] and calls==['gymx']
 
 def test_calendar_gap_with_real_library_media_does_not_alert(monkeypatch, tmp_path):
     """A gap alone is not depletion: an available client photo suppresses Slack."""
@@ -179,6 +189,7 @@ def test_active_drive_inventory_suppresses_depletion_alert(monkeypatch):
 
 def test_seed_honors_gym_timezone_and_alerts_without_facts(monkeypatch):
     from agent import no_media_astra_seed as seed, client_infographic_fill as cif
+    _prove_drive_depleted(monkeypatch)
     today = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
     monkeypatch.setenv('AGENT_NO_MEDIA_ASTRA_SEED','true')
     monkeypatch.setattr(config,'posting_timezone_for',lambda _:'Pacific/Honolulu')
@@ -189,7 +200,7 @@ def test_seed_honors_gym_timezone_and_alerts_without_facts(monkeypatch):
     assert seed.seed_gaps('gymx',SimpleNamespace(),object(),today=today)==0
     assert seen==['Pacific/Honolulu'] and alerts==['gymx']
 
-def test_display_preserves_cached_history_and_blocks_new_far_future(monkeypatch,tmp_path):
+def test_client_display_rejects_cached_generic_history_and_new_fill(monkeypatch,tmp_path):
     from agent import no_creative_fallback as ncf, calendar_autopublish
     monkeypatch.setenv('AGENT_NO_CREATIVE_FALLBACK','true')
     monkeypatch.setattr(calendar_autopublish,'_local_now',lambda *a:datetime(2026,9,18,tzinfo=timezone.utc))
@@ -197,10 +208,12 @@ def test_display_preserves_cached_history_and_blocks_new_far_future(monkeypatch,
     p={'id':'bridge','day_key':'2026-09-19','caption':'Coaching for your goals.','format':'feed'}
     renders=[]
     def render(*a,**k): renders.append(1);return str(tmp_path/'art.png')
-    url=ncf.display_image_for(p,tenant='gymx',renderer=render,host=lambda *a:'https://example.com/art.png')
-    assert url
+    key=ncf._cache_key(p,False,'gymx')
+    ncf._URL_CACHE[key]='https://example.com/old-generic-art.png'
+    ncf._save_url(key,'https://example.com/old-generic-art.png')
+    assert ncf.display_image_for(p,tenant='gymx',renderer=render,host=lambda *a:'https://example.com/new.png') is None
     monkeypatch.setattr(calendar_autopublish,'_local_now',lambda *a:datetime(2026,9,20,tzinfo=timezone.utc))
-    assert ncf.display_image_for(p,tenant='gymx',renderer=render)==url
+    assert ncf.display_image_for(p,tenant='gymx',renderer=render) is None
     assert ncf.display_image_for(dict(p,id='future',day_key='2026-10-10'),tenant='gymx',renderer=render) is None
-    assert len(renders)==1
+    assert renders==[]
     ncf._URL_CACHE.clear()

@@ -67,7 +67,7 @@ HARDENING (2026-09-03 re-audit wave 2):
       set, instead of always the global default, so a second identity's holds do not land
       in Echo's channel.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
@@ -685,11 +685,17 @@ def escalation_blocks(row, ticket):
     opened group DM) and the ticket is not already closed; a button that could only no-op is
     worse than no button."""
     body = row.get("body") or ""
+    att = row.get("attachments") or {}
+    informational_only = (
+        att.get("surface") == "held_client_ticket_reconcile"
+        and att.get("contract") == "held-client-ticket-reconcile-v1"
+    )
     tid = str((ticket or {}).get("id") or "")
     chunks = [body[i:i + _BLOCK_TEXT_CHARS] for i in range(0, len(body), _BLOCK_TEXT_CHARS)] or [""]
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": c}} for c in chunks]
     reachable = portal_deliverable(ticket) or bool((ticket or {}).get("slack_channel_id"))
-    if tid and reachable and (ticket or {}).get("status") != "resolved":
+    if (not informational_only and tid and reachable
+            and (ticket or {}).get("status") != "resolved"):
         blocks.append({"type": "actions", "elements": [{
             "type": "button", "action_id": RESOLVE_ACTION_ID, "value": tid,
             "text": {"type": "plain_text", "text": "Resolved, tell them"}}]})
@@ -820,11 +826,49 @@ def _suppress(bus, row, ticket, identity, why, log, summary, *, escalate=True):
                   "recipient_kind": (row.get("attachments") or {}).get("recipient_kind")})
 
 
+def _defer_held_reconcile_row(bus, row, reason, retry_after, *, log, summary, now=None):
+    """Keep an unverified reconciler row retryable instead of permanently suppressing it."""
+    retry_after = retry_after or (now or datetime.now(timezone.utc)) + timedelta(minutes=1)
+    if retry_after.tzinfo is None:
+        retry_after = retry_after.replace(tzinfo=timezone.utc)
+    retry_meta = {
+        "held_reconcile_retry_after": retry_after.astimezone(timezone.utc).isoformat(),
+        "held_reconcile_retry_reason": reason,
+    }
+    try:
+        bus.mark_message(row["id"], "ready", meta_update=retry_meta)
+    except Exception as exc:  # noqa: BLE001 - ready/posting row remains retryable
+        log(f"[slack-convo/outbox] held reconciliation row {row['id']} "
+            f"retry scheduling failed: {type(exc).__name__}")
+    summary["skipped"] += 1
+
+
 def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                   member_check=None):
     att = row.get("attachments") or {}
     kind = att.get("kind") or ""
-    ticket = bus.ticket(row["ticket_id"])
+    held_reconcile_candidate = (
+        kind == _a.KIND_ESCALATION
+        and (att.get("surface") == "held_client_ticket_reconcile"
+             or att.get("contract") == "held-client-ticket-reconcile-v1"
+             or (row.get("body") or "").startswith("UNRESOLVED CLIENT HOLD:")))
+    if held_reconcile_candidate:
+        from ..jobs.held_client_ticket_reconciler import held_reconcile_retry_pending
+        if held_reconcile_retry_pending(row, now=now):
+            summary["skipped"] += 1
+            return
+    try:
+        ticket = bus.ticket(row["ticket_id"])
+    except Exception as exc:  # noqa: BLE001 - a transient read must not poison the claim
+        if not held_reconcile_candidate:
+            raise
+        from ..jobs.held_client_ticket_reconciler import RETRY_READ_FAILURE
+        retry_after = (now or datetime.now(timezone.utc)) + RETRY_READ_FAILURE
+        _defer_held_reconcile_row(bus, row, "dispatch_check_failed", retry_after,
+                                  log=log, summary=summary, now=now)
+        log(f"[slack-convo/outbox] held reconciliation row {row['id']} deferred after "
+            f"ticket read failure: {type(exc).__name__}")
+        return
     if not ticket:
         _suppress(bus, row, None, identity, "parent ticket missing", log, summary,
                   escalate=False)
@@ -859,6 +903,27 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
 
     # ---- internal kinds: fixer / ops-fix channels, never the person's thread ---------
     if kind in _a.INTERNAL_KINDS:
+        held_reconcile = held_reconcile_candidate
+
+        def suppress_stale_held_reconcile(reason):
+            # This marker is deliberately excluded from _suppress(): making another
+            # escalation row here would recreate the same stale reminder indefinitely.
+            log(f"[slack-convo/outbox] held reconciliation row {row['id']} suppressed: "
+                f"{reason}")
+            bus.mark_message(row["id"], "suppressed",
+                             meta_update={"suppressed_why": reason})
+            summary["suppressed"] += 1
+
+        if held_reconcile:
+            from ..jobs.held_client_ticket_reconciler import dispatch_eligibility
+            eligible, reason, retry_after = dispatch_eligibility(bus, row, now=now)
+            if eligible is None:
+                _defer_held_reconcile_row(bus, row, reason, retry_after,
+                                          log=log, summary=summary, now=now)
+                return
+            if eligible is False:
+                suppress_stale_held_reconcile(reason)
+                return
         channel = _channel_for(kind, identity)
         if not channel:
             log(f"[slack-convo/outbox] no channel configured for {kind}; row "
@@ -870,6 +935,18 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         if not _claim(bus, row, log):
             summary["skipped"] += 1
             return
+        if held_reconcile:
+            # The ready row may have waited in the outbox while a requester replied
+            # or an operator resolved/advanced the ticket. Recheck after the claim,
+            # directly before the internal Slack post.
+            eligible, reason, retry_after = dispatch_eligibility(bus, row, now=now)
+            if eligible is None:
+                _defer_held_reconcile_row(bus, row, reason, retry_after,
+                                          log=log, summary=summary, now=now)
+                return
+            if eligible is False:
+                suppress_stale_held_reconcile(reason)
+                return
         if kind == _a.KIND_HOLD_NOTICE:
             blocks = hold_notice_blocks(row)
         elif kind == _a.KIND_ESCALATION and not portal_provenance_alert:
@@ -1116,7 +1193,10 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             bus.mark_message(row["id"], "failed")
             summary["failed"] += 1
             return
-        bus.mark_message(row["id"], "posted", meta_update={"delivered_via": "portal_thread"})
+        bus.mark_message(row["id"], "posted", meta_update={
+            "delivered_via": "portal_thread",
+            "delivered_at": datetime.now(timezone.utc).isoformat(),
+        })
         summary["posted"] += 1
         _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log)
         # m4: no Slack call happens on this branch -- "posted" here means migration 0310 now

@@ -9,6 +9,10 @@ gym-media rails:
     (the store filters by gym_id) AND re-asserts a.gym_id == gym_id in the loop.
     A row for the wrong gym can never be selected.
   * eligible is TRUE (not NULL/False) and excluded_by_coach is False.
+  * GLOBAL ONCE-USED RULE (Blake, 2026-10-02): an asset with used_count > 0 is
+    NEVER automatically selected again — not after 90 days, not after the
+    calendar-month guard. Every asset is one-and-done for automatic selection.
+    The explicit cooldown_fallback lane must not bypass this either.
   * 90-day reuse cooldown: never an asset used inside 90 days.
   * never the same asset twice in a MONTH (an asset used this calendar month is
     out, even if the 90-day window has not fully elapsed — a within-month repeat
@@ -23,12 +27,17 @@ the normal pool is exhausted it can return the least-recently-used safe asset th
 is not on the live forward book. Explicit client reuse promises remain hard gates.
 
 used_count / last_used_at are stamped ONLY at stage time (stamp_use, called by the
-builder once the PENDING row is assembled) and ROLLED BACK on a coach deny
-(rollback_use / observe_denials), so a denied post returns to the pool.
+builder once the PENDING row is assembled). STAGE-USE IS PERMANENT (Blake,
+2026-10-02): once a photo is staged onto a calendar date it is never offered
+again — not after a coach deny, not after a free media swap. rollback_use only
+marks the use-records settled so a repeated deny/sweep is idempotent; it no
+longer restores the counters, so a denied or swapped-out asset stays out of the
+pool alongside the published ones.
 """
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 from . import gym_media_index as _idx
@@ -135,14 +144,79 @@ def base_gym_key(account_key):
     return base
 
 
-def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=()):
+def drive_asset_claim_id(gym_id, asset_id):
+    """Legacy asset-ID claim key, retained for outstanding reservations."""
+    return f"gbp_media:{base_gym_key(gym_id)}:{asset_id}"
+
+
+def drive_content_claim_id(gym_id, asset):
+    """Shared atomic reservation key for one gym's verified Drive bytes."""
+    digest = _byte_hash(asset)
+    if not digest or not is_usable(asset) or str(asset.get("gym_id")) != base_gym_key(gym_id):
+        raise ValueError("Drive asset has no verified content hash")
+    return f"gbp_media:{base_gym_key(gym_id)}:hash:{digest}"
+
+
+def claim_drive_content(gym_id, asset, store):
+    """Honor old ID claims, then atomically reserve the canonical byte key."""
+    from . import db
+    base = base_gym_key(gym_id)
+    claim_id = drive_content_claim_id(base, asset)
+    rows = store.list_assets(base)
+    current = next((row for row in rows if str(row.get("id")) == str(asset["id"])
+                    and str(row.get("gym_id")) == base), None)
+    if current is None or _byte_hash(current) != _byte_hash(asset) or not is_usable(current):
+        raise ValueError("Drive asset changed before claim")
+    claimed = db.drive_asset_claimed_ids(base)
+    if _byte_hash(asset) in _claimed_hashes(rows, claimed, base):
+        return None
+    state, _ = db.socialapi_claim(claim_id, f"{base}_gbp")
+    return claim_id if state == "won" else None
+
+
+def _has_prior_use(asset):
+    """Fail closed on inconsistent use counters and preserve timestamp evidence."""
+    try:
+        count = int(asset.get("used_count") or 0)
+    except (TypeError, ValueError):
+        return True
+    return count != 0 or bool(asset.get("last_used_at"))
+
+
+def _byte_hash(asset):
+    value = str(asset.get("content_hash") or "").strip().lower()
+    return value if re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{64})", value) else ""
+
+
+def _claimed_hashes(assets, claimed_ids, base):
+    """Return claimed byte hashes, or fail closed on missing claim metadata."""
+    canonical = {token[5:] for token in claimed_ids if token.startswith("hash:")}
+    if any(not re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{64})", h)
+           for h in canonical):
+        raise ValueError("canonical claim hash unreadable")
+    claimed_ids = {token for token in claimed_ids if not token.startswith("hash:")}
+    claimed = {str(asset.get("id")): asset for asset in assets
+               if str(asset.get("gym_id") or "") == base
+               and str(asset.get("id")) in claimed_ids}
+    if set(claimed) != claimed_ids:
+        raise ValueError("claimed asset row missing")
+    hashes = {_byte_hash(asset) for asset in claimed.values()}
+    if "" in hashes:
+        raise ValueError("claimed asset hash unreadable")
+    return hashes | canonical
+
+
+def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=(),
+             strict_claims=False):
     """Every asset pick_media could hand out RIGHT NOW for this gym, in pick order
     (used_count ASC, last_used_at ASC NULLS FIRST, id tiebreak). [] when the pool is
     empty, the store is down, or the read fails. NEVER alerts: this is the read the
     planner, the Lane-A repeat gate and the portal swap use to ask "could the Drive
     pool fill this slot?" -- only pick_media (the actual pick) owns the pool-empty
     alert. Same eligibility + cooldown + this-month rules as pick_media, ONE
-    implementation (pick_media is `pickable(...)[0]`)."""
+    implementation (pick_media is `pickable(...)[0]`). With strict_claims=True,
+    claim read and legacy hash mapping errors propagate to callers that must
+    distinguish uncertainty from a proven empty pool."""
     base = base_gym_key(gym_id)
     store = store or _idx.default_store()
     if not store.available():
@@ -154,6 +228,15 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
         print(f"[gym-media-selector] asset read failed for {base}: "
               f"{type(e).__name__}: {e}")
         return []
+    try:
+        from . import db
+        claimed_ids = db.drive_asset_claimed_ids(base)
+        claimed_hashes = _claimed_hashes(assets, claimed_ids, base)
+    except Exception as e:  # noqa: BLE001 - unknown claims close the pool
+        if strict_claims:
+            raise
+        print(f"[gym-media-selector] claim read failed for {base}: {type(e).__name__}")
+        return []
 
     cutoff = now - timedelta(days=REUSE_COOLDOWN_DAYS)
     from .media_reuse_policy import reuse_months, months_before
@@ -162,6 +245,11 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
     month = now.strftime("%Y-%m")
     excl = {str(i) for i in (exclude_ids or ()) if i}
 
+    # A re-upload can get a new asset ID while carrying the same bytes. A prior
+    # use of either alias consumes the hash for this gym as well.
+    used_hashes = {_byte_hash(a)
+                   for a in assets if str(a.get("gym_id") or "") == base
+                   and _has_prior_use(a) and _byte_hash(a)}
     candidates = []
     for a in assets:
         # TENANT re-assertion (defense in depth): even though the store filtered by
@@ -174,7 +262,17 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
             continue
         if str(a.get("id")) in excl:
             continue
+        if (str(a.get("id")) in claimed_ids
+                or (_byte_hash(a) and _byte_hash(a) in claimed_hashes)):
+            continue
         if kind_preference and a.get("kind") != kind_preference:
+            continue
+        # GLOBAL ONCE-USED RULE: any prior stage-use is out forever for automatic
+        # selection, independent of the cooldown clocks below. Stage-use is
+        # permanent — rollback on a deny settles the record WITHOUT restoring
+        # used_count, so published, denied, and swapped-out assets alike never
+        # return to the pool.
+        if _has_prior_use(a) or (_byte_hash(a) and _byte_hash(a) in used_hashes):
             continue
         used_at = _parse_ts(a.get("last_used_at"))
         if used_at is not None:
@@ -193,8 +291,7 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
 
 
 def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=()):
-    """Usable assets ordered for a user-requested swap after the normal pool is
-    exhausted, without applying the 90-day or same-month clocks.
+    """Unused assets for an explicit swap after the normal pool is exhausted.
 
     This is deliberately narrower than :func:`pickable`: callers must pass every
     asset already carried by the live forward book in ``exclude_ids``.  The
@@ -202,9 +299,8 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
     exclusions, and kind preference.  A gym with an explicit long-term reuse
     policy (currently Zanshin's nine calendar months) gets no fallback at all.
 
-    Month planning and automatic publishing never call this helper.  It exists so
-    a person asking Echo for a different photo is not deadlocked merely because a
-    small otherwise-safe library is inside the generic rotation cooldown.
+    Month planning and automatic publishing never call this helper. An asset
+    previously staged, or a same-byte re-upload of one, stays unavailable.
     """
     base = base_gym_key(gym_id)
     from .media_reuse_policy import reuse_months
@@ -219,12 +315,29 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
         print(f"[gym-media-selector] fallback asset read failed for {base}: "
               f"{type(e).__name__}: {e}")
         return []
+    try:
+        from . import db
+        claimed_ids = db.drive_asset_claimed_ids(base)
+        claimed_hashes = _claimed_hashes(assets, claimed_ids, base)
+    except Exception as e:  # noqa: BLE001 - unknown claims close the fallback
+        print(f"[gym-media-selector] claim read failed for {base}: {type(e).__name__}")
+        return []
     excl = {str(i) for i in (exclude_ids or ()) if i}
+    used_hashes = {_byte_hash(a)
+                   for a in assets if str(a.get("gym_id") or "") == base
+                   and _has_prior_use(a) and _byte_hash(a)}
     candidates = []
     for asset in assets:
         if str(asset.get("gym_id") or "") != base:
             continue
+        # GLOBAL ONCE-USED RULE: the explicit lane may skip the cooldown clocks
+        # but never re-offers an already-staged asset.
+        if _has_prior_use(asset) or (_byte_hash(asset) and _byte_hash(asset) in used_hashes):
+            continue
         if not is_usable(asset) or str(asset.get("id")) in excl:
+            continue
+        if (str(asset.get("id")) in claimed_ids
+                or (_byte_hash(asset) and _byte_hash(asset) in claimed_hashes)):
             continue
         if kind_preference and asset.get("kind") != kind_preference:
             continue
@@ -250,8 +363,10 @@ def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_id
     None.
 
     Order: used_count ASC, last_used_at ASC NULLS FIRST (id tiebreak for
-    determinism). Skips any asset used inside REUSE_COOLDOWN_DAYS and any asset
-    already used THIS calendar month. `kind_preference` ('photo'|'video') filters
+    determinism). Skips any asset with used_count > 0 (the global once-used
+    rule: a staged asset never auto-selects again), any asset used inside
+    REUSE_COOLDOWN_DAYS and any asset already used THIS calendar month.
+    `kind_preference` ('photo'|'video') filters
     to that kind when supplied; with no match of the preferred kind the pool is
     treated as empty for that slot (the caller falls through, or -- the media-mix
     builder -- retries with the other kind). `exclude_ids` skips assets that just
@@ -308,9 +423,9 @@ def _as_records(raw):
 
 def stamp_use(asset, gym_id, post_date, *, store=None, now=None):
     """Stamp used_count += 1 and last_used_at = now — called ONLY when the slot is
-    actually STAGED (the builder, after the PENDING row is assembled). Records prior
-    values in kv so a coach deny rolls the stamp back and the asset returns to the
-    pool.
+    actually STAGED (the builder, after the PENDING row is assembled). The stamp is
+    PERMANENT: a coach deny or a media swap settles the kv record (rollback_use) but
+    never restores the counters, so a staged asset is never offered again.
 
     APPENDS to the date's record list rather than replacing it: at 2x two assets are
     staged on one date, and the old single-record write meant the PM stamp clobbered
@@ -344,74 +459,84 @@ def stamp_use(asset, gym_id, post_date, *, store=None, now=None):
     db.kv_set(key, json.dumps(records))
 
 
-def rollback_use(gym_id, post_date, *, store=None, asset_id=None):
-    """Roll the staged assets for one gym+date back (the post was denied): each asset
-    returns to the pool exactly as it was. Idempotent. Returns True when at least one
-    rollback actually happened.
+def rollback_use(gym_id, post_date, *, store=None, asset_id=None,
+                 restore_unstaged=False):
+    """Settle the staged-use records for one gym+date on a coach deny.
 
-    Rolls back EVERY un-rolled record on that date by default: a 2x day stages two
-    gym-media posts, and callers reach that form only once the whole date is denied
-    with nothing live left on it (observe_denials' denied-and-not-live test, or a 1x
-    deny where the date holds a single post).
+    PERMANENT STAGE-USE (Blake, 2026-10-02): this function NO LONGER restores
+    prev_used_count / prev_last_used_at. Once a photo has been staged onto a
+    calendar slot it is never offered again — a denied post does not return its
+    asset to the pool, matching the rule that already covered published and
+    swapped-out assets. What remains here is bookkeeping: mark each matching
+    record rolled_back so repeated denies and the nightly observe_denials sweep
+    are idempotent. The stamped used_count / last_used_at are left untouched
+    (fail closed: a lingering stamp costs one asset; a restored counter would
+    re-offer media the coach already saw). Returns True when at least one
+    record was settled. Idempotent.
 
-    asset_id scopes the rollback to ONE asset ON THIS DATE — what a single denied
+    Settles EVERY un-settled record on that date by default: a 2x day stages two
+    gym-media posts, and callers reach that form only once the whole date is
+    denied with nothing live left on it (observe_denials' denied-and-not-live
+    test, or a 1x deny where the date holds a single post).
+
+    asset_id scopes the settle to ONE asset ON THIS DATE — what a single denied
     card needs when the day's other post still stands. Deliberately date-scoped:
-    use-records are never cleared on publish, so an asset legitimately re-staged after
-    its 90-day cooldown still carries the record of its earlier PUBLISHED post, and a
-    cross-date rollback would restore that live photo's counters and hand it straight
-    back to the pool."""
+    use-records are never cleared on publish, so a cross-date settle would also
+    touch the record of the asset's earlier PUBLISHED post. Published history is
+    never rewritten: the stamped counters stay exactly as stage time left them.
+    restore_unstaged is only for a draft abandoned before any calendar row was
+    persisted or shown. A coach deny, swap or rebuild never sets it."""
     from . import db
     base = base_gym_key(gym_id)
     key = _USE_KEY.format(base, post_date)
     records = _as_records(db.kv_get(key, ""))
     if not records or all(r.get("rolled_back") for r in records):
         return False
-    store = store or _idx.default_store()
-    if not store.available():
-        return False
-    rolled = False
+    if restore_unstaged:
+        store = store or _idx.default_store()
+        if not store.available():
+            return False
+    settled = False
     for rec in records:
         if rec.get("rolled_back"):
             continue
         if asset_id and rec.get("asset_id") != asset_id:
             continue
-        store.update_asset(rec["asset_id"], {
-            "used_count": int(rec.get("prev_used_count") or 0),
-            "last_used_at": rec.get("prev_last_used_at"),
-        })
+        if restore_unstaged:
+            store.update_asset(rec["asset_id"], {
+                "used_count": int(rec.get("prev_used_count") or 0),
+                "last_used_at": rec.get("prev_last_used_at"),
+            })
         rec["rolled_back"] = True
-        rolled = True
-    if rolled:
+        settled = True
+    if settled:
         db.kv_set(key, json.dumps(records))
-    return rolled
+    return settled
 
 
 def rollback_asset(asset_id, *, store=None):
-    """Return a specific asset to the pool by id, regardless of which slot staged it
-    — used when the coach HIDES an asset a pending row is using (the row is flipped
-    back with reject_reason='media_hidden' and the asset's usage stamp is undone).
-    Scans the gym_media_use kv records for the matching asset. Idempotent."""
+    """Settle every staged-use record for one asset, regardless of which slot
+    staged it — used when the coach HIDES an asset a pending row is using (the
+    row is flipped back with reject_reason='media_hidden'). Stage-use is
+    PERMANENT (2026-10-02): the stamp is left in place so the asset can never be
+    re-offered if it is later un-hidden; only the kv records are marked
+    rolled_back for idempotency. Scans the gym_media_use kv records for the
+    matching asset. Idempotent."""
+    del store
     from . import db
-    store = store or _idx.default_store()
-    if not store.available():
-        return False
-    rolled = False
+    settled_any = False
     for key, records in _use_records():
         touched = False
         for rec in records:
             if rec.get("asset_id") != asset_id or rec.get("rolled_back"):
                 continue
-            store.update_asset(rec["asset_id"], {
-                "used_count": int(rec.get("prev_used_count") or 0),
-                "last_used_at": rec.get("prev_last_used_at"),
-            })
             rec["rolled_back"] = True
             touched = True
         if touched:
-            # Rewrite the WHOLE list: the day's other post keeps its own stamp.
+            # Rewrite the WHOLE list: the day's other post keeps its own record.
             db.kv_set(key, json.dumps(records))
-            rolled = True
-    return rolled
+            settled_any = True
+    return settled_any
 
 
 def on_draft_denied(draft, *, store=None):

@@ -85,7 +85,10 @@ def test_mix_is_deterministic_and_lands_between_40_and_50_percent_video():
 
 def test_kinds_for_slot_only_asks_for_what_the_pool_has():
     vday, pday = _video_day(want=True), _video_day(want=False)
-    assert builder.kinds_for_slot({"photo", "video"}, vday) == ["video", "photo"]
+    # 2026-10-02 contract: an approved client photo is ALWAYS consumed before a
+    # clip, even on a video beat -- the video cadence is a preference only when
+    # no pickable photo remains in the same Drive pool.
+    assert builder.kinds_for_slot({"photo", "video"}, vday) == ["photo", "video"]
     assert builder.kinds_for_slot({"photo", "video"}, pday) == ["photo", "video"]
     assert builder.kinds_for_slot({"photo"}, vday) == ["photo"]
     assert builder.kinds_for_slot({"video"}, pday) == ["video"]
@@ -96,11 +99,12 @@ def test_kinds_for_slot_only_asks_for_what_the_pool_has():
 # ---- 2. a Drive VIDEO stages, with the video row shape -----------------------------
 def test_drive_video_stages_pending_with_poster_and_video_url(monkeypatch, tmp_path):
     _wire_builder(monkeypatch, host_url="https://cdn.fake/tt/abc/clip.mp4")
+    # Photo-first contract: a mixed pool hands the photo to this slot, so the
+    # video-staging path is exercised with a video-only pool.
     store = FakeMediaStore(assets=[
         make_asset("v1", gym_id="toughtemple52040e", kind="video", title="clip.mp4",
-                   mime="video/mp4"),
-        make_asset("p1", gym_id="toughtemple52040e", kind="photo", title="team.jpg")])
-    drive = FakeDrive(blobs={"v1": b"mp4bytes" * 512, "p1": b"jpg" * 1024})
+                   mime="video/mp4")])
+    drive = FakeDrive(blobs={"v1": b"mp4bytes" * 512})
     draft = builder.build_gym_media_draft(
         _Acct(), _video_day(want=True), "faces", voice=object(), source=object(),
         store=store, drive=drive, library_dir=str(tmp_path), now=NOW)
@@ -110,7 +114,6 @@ def test_drive_video_stages_pending_with_poster_and_video_url(monkeypatch, tmp_p
     assert draft.thumbnail_url == "https://cdn.fake/clip__poster.jpg"
     assert draft.creative_path == "clip.mp4"
     assert store.assets["v1"]["used_count"] == 1               # stamped at stage time
-    assert store.assets["p1"]["used_count"] == 0
     # probe data was written back (the index converges)
     assert store.assets["v1"]["duration_sec"] == 21.0 and store.assets["v1"]["eligible"]
 
@@ -128,10 +131,10 @@ def test_photo_beat_stages_a_photo_when_both_kinds_exist(monkeypatch, tmp_path):
     assert not getattr(draft, "thumbnail_url", "")
 
 
-def test_video_beat_falls_back_to_a_photo_when_every_video_fails_its_gate(monkeypatch,
-                                                                          tmp_path):
-    """The preferred kind is exhausted (the only video fails its probe): the slot
-    falls back to the other kind instead of leaving the day empty."""
+def test_video_beat_yields_to_an_available_photo_before_any_clip(monkeypatch,
+                                                                  tmp_path):
+    """2026-10-02 contract: on a video beat with a mixed pool the approved photo
+    wins -- the clip is never even probed (the video gate writes nothing back)."""
     _wire_builder(monkeypatch, probe={"duration_sec": 240.0, "width": 1080,
                                       "height": 1920, "codec": "h264"})   # > 90s
     store = FakeMediaStore(assets=[
@@ -141,7 +144,8 @@ def test_video_beat_falls_back_to_a_photo_when_every_video_fails_its_gate(monkey
         _Acct(), _video_day(want=True), "faces", voice=object(), source=object(),
         store=store, drive=FakeDrive(), library_dir=str(tmp_path), now=NOW)
     assert draft is not None and draft.source_media_asset_id == "p1"
-    assert store.assets["v_long"]["eligible"] is False        # gate wrote back
+    assert "eligible" not in store.assets["v_long"] or \
+        store.assets["v_long"]["eligible"] is not False, "video must not be probed"
 
 
 def test_photo_beat_falls_back_to_video_when_photos_are_on_cooldown(monkeypatch,
@@ -159,9 +163,10 @@ def test_photo_beat_falls_back_to_video_when_photos_are_on_cooldown(monkeypatch,
     assert draft is not None and draft.source_media_asset_id == "v1"
 
 
-def test_two_x_slots_pass_their_ordinal_into_the_mix(monkeypatch, tmp_path):
-    """slot_index reaches the builder from append_gym_drive_drafts: pick a day whose
-    slot 0 is a photo beat and slot 1 a video beat and check the kinds differ."""
+def test_two_x_slots_of_a_split_day_both_take_the_photo_under_photo_first(
+        monkeypatch, tmp_path):
+    """Both slots prefer photos, while the second must take a different photo:
+    the first slot's durable claim survives a fresh media-store snapshot."""
     _wire_builder(monkeypatch, host_url="https://cdn.fake/tt/abc/clip.mp4")
     day = None
     d = date(2026, 9, 11)
@@ -175,12 +180,23 @@ def test_two_x_slots_pass_their_ordinal_into_the_mix(monkeypatch, tmp_path):
     for slot in (0, 1):
         store = FakeMediaStore(assets=[
             make_asset("v1", gym_id="toughtemple52040e", kind="video", title="clip.mp4"),
-            make_asset("p1", gym_id="toughtemple52040e", kind="photo")])
+            make_asset("p1", gym_id="toughtemple52040e", kind="photo"),
+            make_asset("p2", gym_id="toughtemple52040e", kind="photo")])
         draft = builder.build_gym_media_draft(
             _Acct(), day, "faces", voice=object(), source=object(), store=store,
             drive=FakeDrive(), library_dir=str(tmp_path), now=NOW, slot_index=slot)
         picked.append(draft.source_media_asset_id)
-    assert picked == ["p1", "v1"]
+    assert picked == ["p1", "p2"], "both slots prefer distinct claimed photos"
+    # A video-only eligible pool still carries claimed photo metadata so alias
+    # exclusion can be verified before the ordinal stages the video.
+    store = FakeMediaStore(assets=[
+        make_asset("v1", gym_id="toughtemple52040e", kind="video", title="clip.mp4"),
+        make_asset("p1", gym_id="toughtemple52040e", kind="photo", eligible=False),
+        make_asset("p2", gym_id="toughtemple52040e", kind="photo", eligible=False)])
+    draft = builder.build_gym_media_draft(
+        _Acct(), day, "faces", voice=object(), source=object(), store=store,
+        drive=FakeDrive(), library_dir=str(tmp_path), now=NOW, slot_index=1)
+    assert draft.source_media_asset_id == "v1"
 
 
 # ---- 3. the WHOLE row path: a Drive video row publishes as a VIDEO ------------------
@@ -276,18 +292,17 @@ def test_legacy_pick_returns_none_when_drive_can_fill_instead_of_a_stale_repeat(
     assert client_content.pick_image("tt_ig", "2026-09-11", lib, pillar="service") is None
 
 
-def test_legacy_pick_keeps_the_stale_repeat_when_no_drive_pool(tmp_path, monkeypatch):
+def test_legacy_pick_does_not_repeat_when_no_drive_pool(tmp_path, monkeypatch):
     lib = str(tmp_path)
     _still(lib, "only.jpg")
     _served(lib, "only.jpg", "tt_ig", "2026-09-05")
     monkeypatch.setattr(client_content, "drive_pool_can_fill", lambda *a, **k: False)
     pick = client_content.pick_image("tt_ig", "2026-09-11", lib, pillar="service")
-    assert pick is not None and getattr(pick, "stale_reuse", False) is True
+    assert pick is None
 
 
-def test_allow_reuse_last_resort_still_gets_the_stale_pick(tmp_path, monkeypatch):
-    """The denied-slot backfill already tried Drive first; its explicit allow_reuse
-    fallback must never be emptied by the gate (a denied slot stays filled)."""
+def test_allow_reuse_last_resort_does_not_repeat_a_used_photo(tmp_path, monkeypatch):
+    """A denied-slot backfill may not resurrect a photo used on another day."""
     lib = str(tmp_path)
     _still(lib, "only.jpg")
     _served(lib, "only.jpg", "tt_ig", "2026-09-05")
@@ -295,7 +310,7 @@ def test_allow_reuse_last_resort_still_gets_the_stale_pick(tmp_path, monkeypatch
                         lambda *a, **k: pytest.fail("gate must not run for allow_reuse"))
     pick = client_content.pick_image("tt_ig", "2026-09-11", lib, pillar="service",
                                      allow_reuse=True)
-    assert pick is not None
+    assert pick is None
 
 
 def test_drive_pool_can_fill_needs_both_flags_and_a_pickable_asset(monkeypatch):
@@ -373,9 +388,9 @@ def test_deny_sweep_fetch_selects_source_media_asset_id(monkeypatch):
     assert rows[0]["source_media_asset_id"] == "a1"
 
 
-def test_deny_sweep_end_to_end_with_the_fixed_select_rolls_the_asset_back(monkeypatch):
-    """The two halves together: a portal-denied Drive row (out-of-band, no Slack
-    hook) returns its asset to the pool on the nightly sweep."""
+def test_deny_sweep_end_to_end_keeps_once_used_asset_out_of_pool(monkeypatch):
+    """A portal-denied Drive row settles its record on the nightly sweep while
+    keeping the already-staged photo unavailable for another day."""
     store = FakeMediaStore(assets=[make_asset("a1", gym_id="tt")])
     sel.stamp_use(store.get_asset("a1"), "tt", "2026-09-12", store=store, now=NOW)
     assert store.assets["a1"]["used_count"] == 1
@@ -397,7 +412,7 @@ def test_deny_sweep_end_to_end_with_the_fixed_select_rolls_the_asset_back(monkey
     summary = sel.observe_denials(
         store=store, fetch_rows=lambda g, d: sel._default_fetch_rows(g, d, http=_Http()))
     assert summary["rolled_back"] == 1
-    assert store.assets["a1"]["used_count"] == 0
+    assert store.assets["a1"]["used_count"] == 1
 
 
 # ---- 7. the store carries the media identity with a swap ----------------------------

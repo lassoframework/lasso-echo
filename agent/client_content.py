@@ -150,7 +150,7 @@ def drive_pool_can_fill(account_key, *, store=None, now=None):
 
 
 def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
-               allow_reuse=False):
+               allow_reuse=False, prefer_photos=False):
     """A creative from the account's uploaded library.
 
     LEGACY (vision off): least-recently-served within the no-repeat window, cluster-keyed
@@ -167,12 +167,22 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     exclude_keys: creative basenames that must NOT be picked (photos already on the gym's
     approved/published rows + this build's placements).
 
+    prefer_photos: for the legacy daily client lane, exhaust unused photos before
+    offering a video. The ordinary month builder keeps its own video mix.
+
     allow_reuse (denied-slot backfill only): a LAST RESORT, not a blend. The vision branch
     always tries the pool with the §3 reuse window ENFORCED first; a fresh photo always wins
     when one exists. Only when that pool is empty (the gym genuinely has no fresh creative
     left) does allow_reuse=True fall back to a second pass with the window lifted, so a
     recently-served photo becomes eligible. Default False = no fallback pass at all (a denied
     slot with no fresh option returns None, same as before this fallback existed).
+
+    ONCE-USED (Blake, 2026-10-02): before either branch runs, any local photo whose
+    rotation cluster was ever planned/served for this gym (any lane, any date, per
+    rotation.local_photo_served) is removed from contention -- including the
+    allow_reuse fallback pass. Same-day reuse is blocked unless a future atomic
+    calendar primitive can prove the rows are one mirrored post. The guard fails
+    closed: an unreadable served ledger returns None.
 
     FIX (Pete/CrossFit Zanshin, 2026-09-07): this used to lift the reuse window BEFORE
     scoring, so fresh and recently-denied photos were scored in the same pool together —
@@ -183,9 +193,16 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     the gym actually being at that cap."""
     from . import dam
     from .media_bridge import enabled as bridge_enabled
-    from .client_media_sync import explicitly_refused_local, usable_local_creative
+    from .client_media_sync import (explicitly_refused_local, is_generated_derivative,
+                                    usable_local_creative)
     if not bridge_enabled():
-        usable_local_creative = lambda creative, account: not explicitly_refused_local(creative.path)
+        # Bridge-off keeps the legacy permissive filter, but Echo-generated gap
+        # fillers (igfill_/no_media_/seed_) are still never client media: without
+        # this, a month built after an infographic fill pass picks the filler
+        # cards themselves as "photos" (Swift River, 2026-10-02 regression).
+        usable_local_creative = lambda creative, account: (
+            not explicitly_refused_local(creative.path)
+            and not is_generated_derivative(creative.path))
     imgs = [c for c in list_creatives(library_path)
             if usable_local_creative(c, account_key)]
     excl = rotation.style_exclusions(library_path)
@@ -195,14 +212,48 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
         imgs = [c for c in imgs if _image_key(c) not in skip]
     if not imgs:
         return None
+
+    def _rkey(c):
+        return dam.rotation_key(c.path)
+
+    # DURABLE ONCE-USED GUARD (Blake, 2026-10-02): a client-uploaded local photo
+    # that was EVER planned/served for this gym is out for every later date --
+    # both branches below (vision and legacy), including the allow_reuse=True
+    # last-resort pass. The served ledger is read STRICTLY here: load_served
+    # swallows read failures as {}, which would fail OPEN and resurrect consumed
+    # photos, so an unreadable ledger fails closed (no local pick) instead. The
+    # A same-day account sibling is still blocked: account/date alone cannot prove
+    # that two rows are mirrors of one post rather than separate same-day posts.
+    try:
+        served_all = rotation.load_served_strict()
+    except Exception as exc:  # noqa: BLE001 - fail closed, never reuse on a guess
+        print(f"[client-content] once-used guard: served ledger unreadable for "
+              f"{account_key} ({type(exc).__name__}); no local pick this day")
+        return None
+
+    def _once_used(c):
+        try:
+            return rotation.local_photo_served(_rkey(c), account_key, day_key,
+                                               served=served_all, path=c.path)
+        except Exception:  # noqa: BLE001 - any doubt => treated as consumed
+            return True
+
+    imgs = [c for c in imgs if not _once_used(c)]
+    if not imgs:
+        return None
+    if prefer_photos:
+        photos = [c for c in imgs if c.media_type == "image"]
+        if photos:
+            imgs = photos
+    # The 14-day window / least-recently-served logic below is a recency nudge,
+    # not the once-used authority, so it keeps the legacy tolerant read (a flaky
+    # ledger never changed WHICH fresh photo won, and the durable guard above
+    # already failed closed on an unreadable ledger).
     served = rotation.load_served().get(account_key, [])
     last_served = {}
     for e in served:                       # oldest..newest, so newest date wins
         last_served[e["key"]] = e["date"]
     window_start = rotation._days_ago(day_key, config.ROTATION_WINDOW_DAYS)
-
-    def _rkey(c):
-        return dam.rotation_key(c.path)
 
     if config.vision_enabled_for(account_key) and pillar:
         from . import vision
@@ -593,7 +644,7 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
                        s3_client=None, template_fn=None, exclude_keys=(),
                        avoid_openings=(), allow_reuse=False,
                        angle="", avoid_angles=(), record_serve=True,
-                       alerts_enabled=True):
+                       alerts_enabled=True, prefer_photos=False):
     """
     The day's client draft, sourced from the account's approved sources + library.
     Returns None only when the client-sources flag is off, the voice doc is
@@ -623,6 +674,10 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     the needs-media ops alert is suppressed (logged only) and no dedup stamp is
     written, so the real worker's later build still alerts once. Default True keeps
     every existing caller byte-for-byte.
+
+    prefer_photos: when true, pass the planner's photo-first preference to the
+    local media selector. This lets the month planner exhaust eligible local
+    photos before it considers a local video.
 
     EDUCATIONAL pillar (Bryan, AGENT_EDUCATIONAL_PILLAR): when the day's rotated pillar is
     'educational', the source is resolved from the gym's APPROVED educational material
@@ -669,7 +724,7 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     # for non-vision gyms, which keep least-recently-served rotation).
     image = pick_image(account.key, day_key, library_path,
                        exclude_keys=exclude_keys, pillar=category,
-                       allow_reuse=allow_reuse)
+                       allow_reuse=allow_reuse, prefer_photos=prefer_photos)
     if image is not None:
         # §3.5 CROP-VERIFY (vision gyms): re-check the SHIPPED pixels (IG/FB = the original,
         # ruling 4) before drafting, so the caption may lean only on details that survived.
@@ -715,7 +770,14 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         # photo drifted into its reuse window and pick_image returned None -> "caption ready,
         # no image" -> nothing published (TopFuel/GritX, 2026-08-25).
         if record_serve:
-            rotation.record_served(account.key, dam.rotation_key(image.path), category, day_key)
+            reserve = (rotation.reserve_local_photo_once
+                       if getattr(image, "media_type", "") != "video"
+                       else rotation.reserve_local_media_once)
+            if reserve(account.key, dam.rotation_key(image.path),
+                       category, day_key, path=image.path) is None:
+                print(f"[client-content] served ledger write failed for {account.key} "
+                      f"on {day_key}; refusing the local draft")
+                return None
         draft = Draft(
             draft_id=_make_id(account.key, image.path, scheduled_for),
             account_key=account.key,

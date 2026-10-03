@@ -99,10 +99,13 @@ def _cluster_key(lib, key):
     return os.path.splitext(key)[0].lower()
 
 
-def _fresh_photo(lib, state, exclude):
+def _fresh_photo(base_key, lib, state, exclude, served):
     """A genuinely unused, VALIDATED library image (never on any book/window
     date, never in exclude, never a NEAR-DUPE of one), deterministic.
-    (None, None) when nothing unused."""
+    (None, None) when nothing unused. ``served`` must be a successful strict
+    ledger read; None suppresses local picks fail closed."""
+    if served is None:
+        return None, None
     used = set(state.keys()) | set(exclude)
     lib_names = media_guard.library_keys(lib)
     used_clusters = {_cluster_key(lib, k) for k in used if k in lib_names}
@@ -114,6 +117,13 @@ def _fresh_photo(lib, state, exclude):
         if _cluster_key(lib, key) in used_clusters:
             continue                       # a near-dupe of a used photo repeats visually
         path = os.path.join(lib, key)
+        try:
+            from agent import dam, rotation
+            if rotation.local_photo_served(
+                    dam.rotation_key(path), f"{base_key}_ig", "", served=served):
+                continue
+        except Exception:  # noqa: BLE001 - uncertain history is already-used
+            continue
         if os.path.isfile(path) and _is_real_image(path):
             return key, path
     return None, None
@@ -150,6 +160,21 @@ def _feed_first(fixable):
     the story siblings are re-burned onto the same materialized file. Deterministic."""
     return sorted(fixable, key=lambda r: (str(r.get("format") or "").lower() != "feed",
                                           str(r.get("id") or "")))
+
+
+def _swap_definitely_did_not_land(store, base, original, target_url):
+    """Release a reservation only after a fresh, tenant-scoped identity read."""
+    try:
+        fresh = store.get_row(base, original.get("id"))
+    except Exception:  # noqa: BLE001 - unknown remote state retains the reservation
+        return False
+    fields = ("image_url", "source_media_url", "thumbnail_url",
+              "source_media_asset_id")
+    return (isinstance(fresh, dict)
+            and str(fresh.get("gym_id")) == str(base)
+            and str(fresh.get("id")) == str(original.get("id"))
+            and all(fresh.get(field) == original.get(field) for field in fields)
+            and fresh.get("image_url") != target_url)
 
 
 def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, result,
@@ -205,7 +230,15 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
                for s in siblings):
             return False
 
+    # A local replacement must enter the durable served ledger before the first
+    # calendar mutation. Drive picks return True without touching that ledger.
+    if not media_swap.reserve_local_pick(base, row, pick):
+        _log(f"{base}: {key} {pd}: local replacement could not be reserved; "
+             "nothing changed")
+        return False
+
     swapped = []
+    write_outcome_unknown = False
     for target, var in [(row, pick)] + [(s, variants[str(s.get("id"))]) for s in siblings]:
         rid = target.get("id")
         try:
@@ -216,7 +249,11 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
             done = store.swap_media(base, rid, var["image_url"], **write_args)
         except Exception as exc:  # noqa: BLE001 - one row never undoes the others
             _log(f"{base}: swap_media failed for {rid} ({type(exc).__name__})")
+            write_outcome_unknown = True
             done = None
+        if done is None and not _swap_definitely_did_not_land(
+                store, base, target, var["image_url"]):
+            write_outcome_unknown = True
         if done is not None:
             swapped.append(str(rid))
             result["rows_repointed"] += 1
@@ -226,6 +263,11 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
                     and config.story_format_enabled()):
                 result["stories_reburned"] += 1
     if not swapped:
+        if not write_outcome_unknown:
+            media_swap.release_local_pick(pick)
+        else:
+            _log(f"{base}: {key} {pd}: remote swap outcome unknown; "
+                 "local reservation retained fail closed")
         return False
 
     new_asset = str(pick.get("source_media_asset_id") or "")
@@ -530,6 +572,13 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     # an asset already sitting on another day (and never the same clip twice in a run).
     asset_state = _asset_state(rows)
     pool_dry = None                  # dry-run only: the pool size, read once per gym
+    try:
+        from agent import rotation
+        served_history = rotation.load_served_strict()
+    except Exception as exc:  # noqa: BLE001 - local history uncertainty fails closed
+        served_history = None
+        _log(f"{base}: served ledger unreadable ({type(exc).__name__}); "
+             "local repeat replacements suppressed")
 
     today_iso = today.isoformat()
     for key, by_date in sorted(dupes.items()):
@@ -556,7 +605,8 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                        if str(r.get("status") or "").lower() in FIXABLE]
             if not fixable:
                 continue
-            new_key, new_path = _fresh_photo(lib, state, exclude={key})
+            new_key, new_path = _fresh_photo(
+                base, lib, state, exclude={key}, served=served_history)
             if not new_key:
                 # THE LOCAL LIBRARY IS EXHAUSTED -- but the gym's CONNECTED DRIVE POOL
                 # may not be (Tough Temple: every still on the book, 57 unused clips in
@@ -634,7 +684,14 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                                                     delivered_bytes, "render")
                 except Exception:
                     feed_evidence = None
+            from agent import media_swap
+            local_pick = {"source": "local", "path": new_path}
+            if not media_swap.reserve_local_pick(base, fixable[0], local_pick):
+                result["detail"].append(
+                    f"{key} {pd}: served ledger unavailable; left")
+                continue
             fixed_any = False
+            write_outcome_unknown = False
             for r in fixable:
                 rid = r.get("id")
                 fmt = str(r.get("format") or "").lower()
@@ -672,18 +729,26 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                 write_args = {"source_media_url": src_url}
                 if evidence is not None:
                     write_args["render_evidence"] = evidence
-                if store.swap_media(base, rid, target_url, **write_args) is not None:
+                try:
+                    done = store.swap_media(base, rid, target_url, **write_args)
+                except Exception as exc:  # noqa: BLE001 - remote outcome may be unknown
+                    _log(f"{base}: local swap failed for {rid} ({type(exc).__name__})")
+                    write_outcome_unknown = True
+                    done = None
+                if done is None and not _swap_definitely_did_not_land(
+                        store, base, r, target_url):
+                    write_outcome_unknown = True
+                if done is not None:
                     result["rows_repointed"] += 1
                     fixed_any = True
             if fixed_any:
                 result["dates_fixed"] += 1
                 state.setdefault(new_key, set()).add((pd, "x"))
-                try:
-                    from agent import dam, rotation
-                    rotation.record_served(f"{base}_ig", dam.rotation_key(new_path),
-                                           "", pd)
-                except Exception:  # noqa: BLE001
-                    pass
+            elif not write_outcome_unknown:
+                media_swap.release_local_pick(local_pick)
+            else:
+                _log(f"{base}: {key} {pd}: local swap outcome unknown; "
+                     "reservation retained fail closed")
     if result["small_library"]:
         # MEASURE what the sweep could not reach, so the report tells the truth about
         # WHY (a genuinely thin library, or a full Drive folder behind an unarmed lane)

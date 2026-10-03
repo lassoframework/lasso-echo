@@ -38,6 +38,7 @@ REPEATED = "IMG_6771.jpg"
 def _env(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", raising=False)
     monkeypatch.setenv("AGENT_MEDIA_REPEAT_WINDOW_DAYS", "30")
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
     lib = tmp_path / "lib"
     lib.mkdir()
     # ONE local still, and it is already the repeated photo: the local pool is
@@ -74,6 +75,11 @@ class _Store:
     def rows_in_range(self, base, start, end):
         return [dict(r) for r in self.rows
                 if start <= str(r.get("post_date") or "") <= end]
+
+    def get_row(self, base, row_id):
+        return next((dict(r) for r in self.rows
+                     if str(r.get("id")) == str(row_id)
+                     and str(r.get("gym_id")) == str(base)), None)
 
     def swap_media(self, base, row_id, image_url, source_media_url=None,
                    extra_fields=None):
@@ -123,6 +129,11 @@ def _picker(clips=(1,), seen=None):
 
 
 def _sweep(store, *, apply=True, picker=None, drive_n=0, monkeypatch=None):
+    from agent import gym_media_index
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    media_store = FakeMediaStore(assets=[
+        make_asset(f"v{n:03d}", gym_id=GYM) for n in range(1, 4)])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: media_store)
     if picker is not None:
         monkeypatch.setattr("agent.media_swap.pick_replacement", picker)
     monkeypatch.setattr("agent.media_swap.after_swap",
@@ -246,6 +257,101 @@ def test_a_picker_that_raises_never_breaks_the_sweep(monkeypatch):
     res = _sweep(store, picker=boom, drive_n=57, monkeypatch=monkeypatch)
     assert res["small_library"] is True
     assert store.swaps == []
+
+
+def test_local_fresh_photo_respects_durable_served_history(monkeypatch):
+    from agent import dam, rotation
+    lib = mrs._lib_dir(GYM)
+    fresh = os.path.join(lib, "fresh.jpg")
+    with open(fresh, "wb") as fh:
+        fh.write(b"\xff\xd8\xff" + b"y" * 4096)
+    assert rotation.record_served(
+        f"{GYM}_gbp", dam.rotation_key(fresh), "", "2026-08-01")
+    store = _Store(_book())
+
+    res = mrs.sweep_gym(
+        GYM, store, apply=True, today=__import__("datetime").date(2026, 9, 11))
+
+    assert store.swaps == []
+    assert res["small_library"] is True
+
+
+def test_local_fresh_photo_reserves_before_first_write(monkeypatch):
+    lib = mrs._lib_dir(GYM)
+    with open(os.path.join(lib, "fresh.jpg"), "wb") as fh:
+        fh.write(b"\xff\xd8\xff" + b"y" * 4096)
+    monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda path, tenant: f"https://cdn.tt/{os.path.basename(path)}")
+    monkeypatch.setattr("agent.media_swap.reserve_local_pick", lambda *a, **k: False)
+    store = _Store(_book())
+
+    res = mrs.sweep_gym(
+        GYM, store, apply=True, today=__import__("datetime").date(2026, 9, 11))
+
+    assert res["dates_fixed"] == 0
+    assert store.swaps == []
+
+
+def test_local_fresh_photo_unknown_write_retains_reservation(monkeypatch):
+    from agent import rotation
+    lib = mrs._lib_dir(GYM)
+    with open(os.path.join(lib, "fresh.jpg"), "wb") as fh:
+        fh.write(b"\xff\xd8\xff" + b"y" * 4096)
+    monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda path, tenant: f"https://cdn.tt/{os.path.basename(path)}")
+    store = _Store(_book())
+    store.swap_media = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("remote outcome unknown"))
+
+    res = mrs.sweep_gym(
+        GYM, store, apply=True, today=__import__("datetime").date(2026, 9, 11))
+
+    assert res["dates_fixed"] == 0
+    assert rotation.load_served_strict().get(f"{GYM}_ig")
+
+
+def test_local_fresh_photo_landed_with_none_retains_reservation(monkeypatch):
+    from agent import rotation
+    lib = mrs._lib_dir(GYM)
+    with open(os.path.join(lib, "fresh.jpg"), "wb") as fh:
+        fh.write(b"\xff\xd8\xff" + b"y" * 4096)
+    monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda path, tenant: f"https://cdn.tt/{os.path.basename(path)}")
+    store = _Store(_book())
+    real_swap = store.swap_media
+
+    def landed_without_representation(*args, **kwargs):
+        real_swap(*args, **kwargs)
+        return None
+
+    store.swap_media = landed_without_representation
+    res = mrs.sweep_gym(
+        GYM, store, apply=True, today=__import__("datetime").date(2026, 9, 11))
+
+    assert res["dates_fixed"] == 0
+    assert store.get_row(GYM, "r14ig")["image_url"] == "https://cdn.tt/fresh.jpg"
+    assert rotation.load_served_strict().get(f"{GYM}_ig")
+
+
+def test_local_fresh_photo_definite_noop_releases_reservation(monkeypatch):
+    from agent import rotation
+    lib = mrs._lib_dir(GYM)
+    with open(os.path.join(lib, "fresh.jpg"), "wb") as fh:
+        fh.write(b"\xff\xd8\xff" + b"y" * 4096)
+    monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda path, tenant: f"https://cdn.tt/{os.path.basename(path)}")
+    store = _Store(_book())
+    store.swap_media = lambda *a, **k: None
+
+    res = mrs.sweep_gym(
+        GYM, store, apply=True, today=__import__("datetime").date(2026, 9, 11))
+
+    assert res["dates_fixed"] == 0
+    assert rotation.load_served_strict().get(f"{GYM}_ig", []) == []
 
 
 def test_a_dry_run_never_downloads_hosts_or_writes(monkeypatch):
@@ -384,6 +490,74 @@ def test_a_local_video_pick_is_not_reported_as_the_drive_pool(monkeypatch):
     assert res["dates_fixed"] == 1
     assert any("from the local library" in d for d in res["detail"])
     assert not any("connected Drive pool" in d for d in res["detail"])
+
+
+def test_local_sweep_pick_is_held_when_served_reservation_fails(monkeypatch):
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    store = _Store(_book())
+
+    def local_pick(base, row, *, store, siblings=(), **kw):
+        got = {"ok": True, "source": "local", "kind": "video", "key": "reel_02.mp4",
+               "image_url": "https://cdn.tt/reel_02.mp4", "source_media_url": None,
+               "thumbnail_url": "https://cdn.tt/p.jpg", "source_media_asset_id": "",
+               "path": "/tmp/reel_02.mp4"}
+        got["siblings"] = {str(s.get("id")): dict(got) for s in siblings}
+        return got
+
+    monkeypatch.setattr("agent.media_swap.reserve_local_pick", lambda *a, **k: False)
+    res = _sweep(store, picker=local_pick, drive_n=0, monkeypatch=monkeypatch)
+
+    assert res["dates_fixed"] == 0
+    assert store.swaps == []
+
+
+def test_local_sweep_unknown_write_retains_reservation(monkeypatch):
+    from agent import rotation
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    store = _Store(_book())
+    store.swap_media = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("remote outcome unknown"))
+
+    def local_pick(base, row, *, store, siblings=(), **kw):
+        got = {"ok": True, "source": "local", "kind": "video", "key": "reel_02.mp4",
+               "image_url": "https://cdn.tt/reel_02.mp4", "source_media_url": None,
+               "thumbnail_url": "https://cdn.tt/p.jpg", "source_media_asset_id": "",
+               "path": "/tmp/reel_02.mp4"}
+        got["siblings"] = {str(s.get("id")): dict(got) for s in siblings}
+        return got
+
+    res = _sweep(store, picker=local_pick, drive_n=0, monkeypatch=monkeypatch)
+
+    assert res["dates_fixed"] == 0
+    assert rotation.load_served_strict().get(f"{GYM}_ig"), (
+        "unknown remote outcomes must retain the reservation fail closed")
+
+
+def test_local_sweep_landed_with_none_retains_reservation(monkeypatch):
+    from agent import rotation
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    store = _Store(_book())
+    real_swap = store.swap_media
+
+    def landed_without_representation(*args, **kwargs):
+        real_swap(*args, **kwargs)
+        return None
+
+    store.swap_media = landed_without_representation
+
+    def local_pick(base, row, *, store, siblings=(), **kw):
+        got = {"ok": True, "source": "local", "kind": "video", "key": "reel_02.mp4",
+               "image_url": "https://cdn.tt/reel_02.mp4", "source_media_url": None,
+               "thumbnail_url": "https://cdn.tt/p.jpg", "source_media_asset_id": "",
+               "path": "/tmp/reel_02.mp4"}
+        got["siblings"] = {str(s.get("id")): dict(got) for s in siblings}
+        return got
+
+    res = _sweep(store, picker=local_pick, drive_n=0, monkeypatch=monkeypatch)
+
+    assert res["dates_fixed"] == 0
+    assert store.get_row(GYM, "r14ig")["image_url"] == "https://cdn.tt/reel_02.mp4"
+    assert rotation.load_served_strict().get(f"{GYM}_ig")
 
 
 def test_a_reburned_story_is_counted_like_the_local_path_counts_it(monkeypatch):

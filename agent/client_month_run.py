@@ -82,7 +82,8 @@ def _client_media_count(library_path):
         return sum(usable_local_creative(c, base + "_ig")
                    for c in list_creatives(path))
     count = 0
-    from .client_media_sync import explicitly_refused_local
+    from .client_media_sync import (explicitly_refused_local,
+                                    is_generated_derivative)
     try:
         for name in os.listdir(path):
             full = os.path.join(path, name)
@@ -90,7 +91,8 @@ def _client_media_count(library_path):
                 continue
             if (not name.startswith("._")
                     and os.path.splitext(name)[1].lower() in _MEDIA_EXTS
-                    and not explicitly_refused_local(full)):
+                    and not explicitly_refused_local(full)
+                    and not is_generated_derivative(full)):
                 count += 1
     except OSError:
         return 0
@@ -302,7 +304,7 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
                          exclude_keys=(), avoid_openings=(), allow_reuse=False,
                          angle="", avoid_angles=(), avoid_captions=(),
                          recent_formulas=(), require_media=True,
-                         avoid_categories=()):
+                         avoid_categories=(), prefer_photos=False):
     """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
     whose caption carries NO banned word, preferring a different approved source/category
     over dropping the day.
@@ -415,6 +417,7 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
                                               avoid_openings=avoid_openings,
                                               allow_reuse=allow_reuse,
                                               angle=angle, avoid_angles=avoid_angles,
+                                              prefer_photos=prefer_photos,
                                               record_serve=False)
     if draft is None:
         return None, None
@@ -435,6 +438,7 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
                                                 avoid_openings=avoid_openings,
                                                 allow_reuse=allow_reuse,
                                                 angle=angle, avoid_angles=avoid_angles,
+                                                prefer_photos=prefer_photos,
                                                 record_serve=False)
         if _accept(alt):
             # Re-home the alternative draft onto the real day so the calendar row sits
@@ -484,23 +488,58 @@ def _record_feed_served(account, feed, day_key):
     """Record an ACCEPTED feed's photo as served for rotation — only once the day has cleared
     the A+ gate, the real-creative check, and the no-reuse check, i.e. it is actually KEPT.
     This replaces the old pick-time record inside build_client_draft that poisoned the ledger
-    (see build_client_draft record_serve). Best effort; never raises, never blocks a build."""
+    (see build_client_draft record_serve). Returns False when the durable write cannot
+    be proved; callers must drop that feed before the calendar write."""
     try:
         from . import rotation, dam
         path = (getattr(feed, "creative_path", "") or "").strip()
         if not path:
-            return
-        rotation.record_served(account.key, dam.rotation_key(path),
-                               getattr(feed, "category", "") or "", day_key)
+            return False
+        reserve = (rotation.reserve_local_media_once if os.path.splitext(path)[1].lower()
+                   in (".mp4", ".mov", ".m4v", ".webm")
+                   else rotation.reserve_local_photo_once)
+        reservation_id = reserve(
+            account.key, dam.rotation_key(path),
+            getattr(feed, "category", "") or "", day_key, path=path)
+        if reservation_id:
+            setattr(feed, "_served_reservation_id", reservation_id)
+        return bool(reservation_id)
     except Exception as e:  # noqa: BLE001
-        print(f"[client-month] served-record skipped for {day_key}: {type(e).__name__}: {e}")
+        print(f"[client-month] served-record failed for {day_key}: {type(e).__name__}: {e}")
+        return False
 
 
 def _row_from_draft(base_key, draft):
     """One draft folded into a content_calendar row using the SAME mapping the real
     month/mirror use (gym_id=base_key). PAUSED status by construction (the draft is
     PENDING; _real_row maps that to 'pending')."""
-    return _mirror._real_row(base_key, draft)
+    row = _mirror._real_row(base_key, draft)
+    reservation_id = getattr(draft, "_served_reservation_id", None)
+    if reservation_id:
+        row["_served_reservation_id"] = reservation_id
+    return row
+
+
+def _release_unlanded_reservations(drafts, retained=()):
+    """Release exact served rows for drafts that never became calendar rows."""
+    from . import rotation
+    keep = {int(r) for r in (retained or ()) if r}
+    seen = set()
+    for draft in drafts or ():
+        rid = getattr(draft, "_served_reservation_id", None)
+        if not rid or int(rid) in keep or int(rid) in seen:
+            continue
+        seen.add(int(rid))
+        rotation.release_served(rid)
+
+
+def _release_feed_reservation(feed):
+    """Release one feed reserved before finishing could add it to ``drafts``."""
+    _release_unlanded_reservations([feed])
+    try:
+        delattr(feed, "_served_reservation_id")
+    except (AttributeError, TypeError):
+        pass
 
 
 def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
@@ -571,6 +610,7 @@ def _is_first_month(base_key, store, log):
 # The gym-drive lane fills these people-forward slots (spec §7). Kept in the order
 # a month rotates through them so consecutive Drive days do not repeat one pillar.
 _GYM_DRIVE_PILLARS = ("faces", "community", "results")
+_PHOTO_KIND = "photo"        # gym_media_index.KIND_PHOTO, without the import cycle
 _VIDEO_KIND = "video"        # gym_media_index.KIND_VIDEO, without the import cycle
 
 
@@ -630,83 +670,36 @@ def _rollback_drive_asset(draft, day_key, log):
     if not asset_id or not account_key or not day_key:
         return
     try:
-        from . import gym_media_selector
-        gym_media_selector.rollback_use(account_key, day_key, asset_id=asset_id)
+        from . import db, gym_media_selector
+        restored = gym_media_selector.rollback_use(
+            account_key, day_key, asset_id=asset_id, restore_unstaged=True)
+        if restored:
+            base = gym_media_selector.base_gym_key(account_key)
+            claim_id = getattr(draft, "_drive_claim_id", None)
+            if not claim_id:
+                from . import gym_media_index
+                asset = gym_media_index.default_store().get_asset(asset_id)
+                claim_id = gym_media_selector.drive_content_claim_id(base, asset)
+            db.socialapi_claim_release(
+                claim_id, f"{base}_gbp")
     except Exception as exc:  # noqa: BLE001 - a rollback failure never sinks the build
         log(f"[gym-drive] could not return asset {asset_id} to the pool "
             f"({type(exc).__name__})")
 
 
 def _release_wipeable_drive_assets(base_key, start, days, store, log, locked_days=()):
-    """REBUILD MUST NOT BURN THE POOL (audit D3, 2026-09-10). _apply deletes every
-    WIPEABLE row (pending/draft/queued) inside the span months, but the Drive assets
-    those rows carried stayed stamped used_count+1 / last_used_at=now, so a second
-    build in the same month found every one of them "used this month", read the pool
-    as empty, and fell back to repeats while the assets sat on a 90-day cooldown for
-    rows that no longer existed.
+    """Prior calendar placements permanently consume their Drive assets.
 
-    Roll those stamps back BEFORE this build picks, so the pool it draws from is the
-    pool it will actually have once the old rows are gone. Rows on a locked day are
-    kept by _apply (preserve_dates) and are left stamped. Returns the list of
-    (post_date, asset_id) actually rolled back so the caller can RE-STAMP them if the
-    build then writes nothing (never-wipe-to-empty / never-shrink / a gate refusal):
-    the old rows survive in that case and must keep owning their assets."""
-    from datetime import timedelta
-    from .portal_calendar_store import _WIPEABLE_STATUSES
-    list_month = getattr(store, "list_month", None)
-    if list_month is None:
-        return []
-    months = sorted({(start + timedelta(days=i)).isoformat()[:7]
-                     for i in range(max(1, days))})
-    locked = {str(d)[:10] for d in (locked_days or ())}
-    released = []
-    try:
-        from . import gym_media_selector as _sel
-    except Exception:  # noqa: BLE001
-        return []
-    for month in months:
-        try:
-            rows = list_month(base_key, month) or []
-        except Exception as exc:  # noqa: BLE001 - never block the build on a read
-            log(f"{base_key}: drive-asset release read failed for {month} "
-                f"({type(exc).__name__})")
-            continue
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            status = str(row.get("status") or "").lower()
-            if status and status not in _WIPEABLE_STATUSES:
-                continue
-            pd = str(row.get("post_date") or "")[:10]
-            aid = str(row.get("source_media_asset_id") or "").strip()
-            if not pd or not aid or pd in locked or pd[:7] not in months:
-                continue
-            try:
-                if _sel.rollback_use(base_key, pd, asset_id=aid):
-                    released.append((pd, aid))
-            except Exception as exc:  # noqa: BLE001
-                log(f"{base_key}: could not release Drive asset {aid} ({type(exc).__name__})")
-    if released:
-        log(f"{base_key}: released {len(released)} Drive asset(s) held by rows this "
-            "rebuild replaces")
-    return released
+    Keep this compatibility hook so callers do not restore or double-stamp rows
+    that survive a no-op rebuild. Only a new draft that never reached the calendar
+    may restore its stamp via _rollback_drive_asset.
+    """
+    return []
 
 
 def _restore_released_drive_assets(base_key, released, log):
-    """The build wrote nothing, so the rows whose assets _release_wipeable_drive_assets
-    rolled back are still on the calendar: stamp their assets again. Best effort."""
-    if not released:
-        return
-    try:
-        from . import gym_media_index as _idx, gym_media_selector as _sel
-        store = _idx.default_store()
-        for pd, aid in released:
-            asset = store.get_asset(aid) or {"id": aid}
-            _sel.stamp_use(asset, base_key, pd, store=store)
-        log(f"{base_key}: nothing written; re-stamped {len(released)} Drive asset(s) "
-            "still held by the surviving rows")
-    except Exception as exc:  # noqa: BLE001
-        log(f"{base_key}: could not re-stamp released Drive assets ({type(exc).__name__})")
+    """Compatibility no-op: a rebuild never releases calendar-used assets."""
+    return None
 
 
 def _rollback_new_drive_drafts(drafts, log):
@@ -789,13 +782,20 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
         feed_path = (getattr(feed, "creative_path", "") or "").strip()
         key = (_url_basename(getattr(feed, "creative_public_url", "") or "")
                or os.path.basename(feed_path))
-        _record_feed_served(account, feed, day_key)
+        if not _record_feed_served(account, feed, day_key):
+            log(f"{base_key} {day_key}: served ledger write failed; local feed held")
+            continue
         raw_basename = os.path.basename(feed_path) if feed_path else ""
         media_guard.note_placed(guard_state, raw_basename or key, day_key)
         story_override = (edited_story_caps or {}).get(str(day_key)[:10])
-        drafts.extend(_finish_feed_with_story(
-            account, feed, library_path, log, day_key=day_key,
-            story_caption_override=story_override))
+        try:
+            finished = _finish_feed_with_story(
+                account, feed, library_path, log, day_key=day_key,
+                story_caption_override=story_override)
+        except Exception:
+            _release_feed_reservation(feed)
+            raise
+        drafts.extend(finished)
         covered_days.add(day_key)
         if key:
             used_keys.add(key)
@@ -863,7 +863,8 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                             library_path="", slots_per_day=1, banned_words=(),
                             rendition_budget=None, covered_slots=None,
                             video_beats_only=False, kind_prefs=None,
-                            day_captions_seed=None, failed_assets=None):
+                            day_captions_seed=None, failed_assets=None,
+                            max_feed_count=None):
     """Widen the month with PENDING posts built FROM THE GYM'S CONNECTED DRIVE POOL
     (gym_media_drive spec §7). This is the production caller of
     gym_media_builder.build_gym_media_draft: for each day in the span that the
@@ -907,6 +908,9 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
     is rolled back) cannot be re-picked on every later beat and starve the month
     (final verification g).
 
+    max_feed_count: optional cap across this call's feed drafts (stories excluded).
+    The month pre-passes use it to preserve the existing whole-build media ceiling.
+
     NEVER LOSES WORK (final verification h): an exception escaping any step after the
     builder returns rolls the in-flight draft's asset back and RETURNS the drafts
     already finished, so covered_slots, the returned drafts and the usage stamps stay
@@ -920,7 +924,11 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
     pillar_i = 0
     slots = 2 if int(slots_per_day or 1) == 2 else 1
     failed = failed_assets if failed_assets is not None else set()
+    staged_feeds = 0
     for i in range(days):
+        if (max_feed_count is not None
+                and staged_feeds >= max(0, int(max_feed_count))):
+            break
         day_key = (start + timedelta(days=i)).isoformat()
         if day_key in covered:
             continue
@@ -928,6 +936,9 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
         # lanes' placements on the same day
         day_captions = list((day_captions_seed or {}).get(day_key, []))
         for slot_i in range(slots):
+            if (max_feed_count is not None
+                    and staged_feeds >= max(0, int(max_feed_count))):
+                break
             if covered_slots is not None and (day_key, slot_i) in covered_slots:
                 continue                   # another lane already owns this slot
             if video_beats_only and not gym_media_builder.is_video_slot(day_key, slot_i):
@@ -968,6 +979,7 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                 return extra
             if not placed:
                 break
+            staged_feeds += 1
             pillar_i += 1
         if not video_beats_only:
             covered.add(day_key)
@@ -1211,15 +1223,21 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             store=store, banned_words=banned_words, log=log, allow_reshape=allow_reshape,
             media_count=media_count, locked_feed_days=locked_feed_days,
             used_keys=used_keys, locked_keys=locked_keys, drafts=drafts,
-            drive_deferred_days=drive_deferred_days, rendition_budget=rendition_budget)
+            drive_deferred_days=drive_deferred_days, rendition_budget=rendition_budget,
+            apply_state=_applied)
         _applied["result"] = _result
         return _result
     finally:
         _res = _applied["result"] or {}
+        if _applied["result"] is None:
+            # _apply catches remote write failures; an exception escaping the
+            # build before a result is returned is a prewrite planning failure.
+            _release_unlanded_reservations(drafts)
+            _rollback_new_drive_drafts(drafts, log)
         wrote = bool(_res.get("inserted"))
-        if not wrote:
-            # Nothing landed (a no-op, a gate refusal, a raise, or a delete whose
-            # insert then failed): this build's own Drive picks never became rows.
+        if not wrote and _applied["result"] is not None and not _res.get("insert_outcome_unknown"):
+            # Nothing landed (a no-op, a gate refusal, or a definite pre-insert
+            # failure): this build's own Drive picks never became rows.
             _rollback_new_drive_drafts(drafts, log)
             if not _res.get("deleted_total", _res.get("deleted")):
                 # ...and the OLD rows survive, so their released assets are stamped
@@ -1236,7 +1254,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
 def _build_client_month_body(account, base_key, start, days, *, voice, library_path,
                              store, banned_words, log, allow_reshape, media_count,
                              locked_feed_days, used_keys, locked_keys, drafts,
-                             drive_deferred_days, rendition_budget):
+                             drive_deferred_days, rendition_budget, apply_state=None):
     """The picking + apply half of build_client_month, split out so the caller can
     wrap release -> apply in ONE try/finally (see build_client_month)."""
     from datetime import timedelta
@@ -1264,7 +1282,18 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         _used_in_lib = len(used_keys & _lib_names) if _lib_names else len(used_keys)
     except Exception:  # noqa: BLE001 - fall back to the raw count, never block
         _used_in_lib = len(used_keys)
-    max_feed_days = min(days * slots_per_day, max(0, media_count - _used_in_lib))
+    # The ceiling covers every distinct creative this build can actually select.  A
+    # Drive-only gym has no local files, but its eligible Drive assets are still real
+    # media and must not collapse the entire build to a zero-feed budget.  pickable()
+    # already applies the selector's reviewed, moderation, once-used and cooldown
+    # gates, so this is a bounded snapshot of the usable Drive budget rather than a
+    # broad asset-table count.
+    from . import gym_media_selector as _media_selector
+    _drive_budget = (len(_media_selector.pickable(base_key))
+                     if (config.gym_drive_stage_enabled()
+                         and config.gym_drive_connect_active_for(base_key)) else 0)
+    max_feed_days = min(days * slots_per_day,
+                        max(0, media_count - _used_in_lib) + _drive_budget)
 
     # `drafts` is the caller's list (build_client_month's try/finally reads it back to
     # roll unlanded Drive picks out of the pool); never rebound here.
@@ -1314,50 +1343,61 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # Days the uploaded-media path placed a feed on. The gym-drive lane (below) fills
     # only the GAPS, so a Drive post never doubles up a day that already has a photo.
     covered_days = set(locked_feed_days)
-    # VIDEO PRE-PASS (audit round 5 MAJOR 1): when the gym's Drive pool holds pickable
-    # VIDEOS, the video beats of the mix (gym_media_builder.is_video_slot) are claimed
-    # by the Drive lane BEFORE Lane A runs. Lane A used to take every day it had a
-    # fresh local still for and the Drive lane only ever saw the leftovers, so a gym
-    # with a big fresh still library (Tough Temple: 95 stills, 57 videos) rebuilt to
-    # 20 photo days and zero videos. Per SLOT, so a 2x day can be one Lane A still
-    # plus one Drive video. Every guard still applies inside the lane (A+ gate,
-    # same-concept guard, budget, tenant, cooldown); Lane A then skips the slots
-    # the pre-pass owns and keeps every photo beat (fresh still, else Drive photo
-    # via the gap-fill lane, else the cap-respecting fallback).
+    # The Drive-photo pre-pass, Lane A and video pre-pass claim exact slots. Drive
+    # photos lead, local photos use the remaining slots, and video is considered only
+    # after Lane A has exhausted its eligible local-photo supply.
     covered_slots = set()
     pre_captions = {}
-    if (config.gym_drive_stage_enabled()
-            and config.gym_drive_connect_active_for(base_key)
-            and client_content.drive_pool_has_video(base_key)):
+    # SOURCE ORDER: approved Drive photos, then local real photos, then Drive videos.
+    # Pin this first pass to photos so a mixed pool cannot spill into video when its
+    # approved photos run out. Lane A and the later video pass share slot ownership.
+    _drive_armed = (config.gym_drive_stage_enabled()
+                    and config.gym_drive_connect_active_for(base_key))
+
+    def _record_drive_prepass(pre, label):
+        if not pre:
+            return 0
+        drafts.extend(pre)
+        feed_count = 0
+        for d in pre:
+            if getattr(d, "is_story", False):
+                continue
+            feed_count += 1
+            day = str(getattr(d, "day_key", "") or "")[:10]
+            pre_captions.setdefault(day, []).append(
+                (getattr(d, "caption", "") or "").strip())
+            category = str(getattr(d, "category", "") or "").strip().lower()
+            if category:
+                pillar_counts[category] += 1
+        # A day is covered only when every cadence slot has an owner. This still lets
+        # Lane A and the later video pass fill a partial 2x day.
+        for dk, _slot in covered_slots:
+            if all((dk, s) in covered_slots for s in range(slots_per_day)):
+                covered_days.add(dk)
+        log(f"{base_key}: {label} pre-pass claimed {feed_count} feed(s) from the "
+            "connected Drive pool")
+        return feed_count
+
+    _drive_kinds = _media_selector.pool_kinds(base_key) if _drive_armed else set()
+    if "photo" in _drive_kinds:
         try:
-            pre = append_gym_drive_drafts(
+            photo_pre = append_gym_drive_drafts(
                 account, base_key, start, days, voice, log=log,
                 covered_days=locked_feed_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
                 rendition_budget=rendition_budget, covered_slots=covered_slots,
-                video_beats_only=True, kind_prefs=(_VIDEO_KIND,))
-            if pre:
-                drafts.extend(pre)
-                for d in pre:
-                    if not getattr(d, "is_story", False):
-                        pre_captions.setdefault(str(getattr(d, "day_key", ""))[:10], []).append(
-                            (getattr(d, "caption", "") or "").strip())
-                        _pre_cat = str(getattr(d, "category", "") or "").strip().lower()
-                        if _pre_cat:
-                            pillar_counts[_pre_cat] += 1
-                # a day whose EVERY slot the pre-pass owns is a covered day
-                for dk in {d for d, _s in covered_slots}:
-                    if all((dk, s) in covered_slots for s in range(slots_per_day)):
-                        covered_days.add(dk)
-                log(f"{base_key}: video pre-pass claimed {len(covered_slots)} video "
-                    f"beat(s) from the connected Drive pool before the uploaded-media loop")
+                kind_prefs=(_PHOTO_KIND,), max_feed_count=max_feed_days)
+            drive_photo_feeds = _record_drive_prepass(photo_pre, "Drive photo")
         except Exception as e:  # noqa: BLE001 - the pre-pass never sinks the month
-            log(f"{base_key}: video pre-pass skipped ({type(e).__name__}: {e})")
+            drive_photo_feeds = 0
+            log(f"{base_key}: Drive photo pre-pass skipped ({type(e).__name__}: {e})")
+    else:
+        drive_photo_feeds = 0
     # Walk day keys as an UPPER bound (days), but STOP emitting feeds once we have
     # placed one per unique photo (max_feed_days). Stories reuse the feed's photo (a
     # feed + its paired story are the same asset), so stories do not consume the cap.
     i = 0
-    while i < days and built_feeds < max_feed_days:
+    while i < days and built_feeds + drive_photo_feeds < max_feed_days:
         day_key = (start + timedelta(days=i)).isoformat()
         i += 1
 
@@ -1367,15 +1407,15 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             log(f"locked {day_key}: day already has approved/published content")
             continue
 
-        # captions placed on THIS day (2x uniqueness, D5), seeded with the video
-        # pre-pass's placements so a Lane A slot never repeats a Drive concept
+        # captions placed on THIS day (2x uniqueness, D5), seeded with Drive-photo
+        # placements so a Lane A slot never repeats a Drive concept
         day_captions = list(pre_captions.get(day_key, []))
         day_built = 0
         for slot_i in range(slots_per_day):
-            if built_feeds >= max_feed_days:
+            if built_feeds + drive_photo_feeds >= max_feed_days:
                 break
             if (day_key, slot_i) in covered_slots:
-                continue                   # the video pre-pass owns this slot
+                continue                   # the Drive-photo pass owns this slot
             # Choose this slot's angle (round-robin by the accepted-feed index) + the
             # recent angles to avoid, and widen the opening window, only when angle
             # rotation is armed.
@@ -1413,7 +1453,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 angle=day_angle, avoid_angles=day_avoid_angles,
                 avoid_captions=tuple(day_captions),
                 recent_formulas=tuple(recent_formulas[-_FORMULA_WINDOW:]),
-                avoid_categories=_heavy_pillars)
+                avoid_categories=_heavy_pillars,
+                prefer_photos=True)
             if feed is None:
                 if feed_drop:
                     skipped_banned += 1
@@ -1443,6 +1484,18 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             # NO REUSE: a photo already placed on an earlier feed is never reused.
             # Skip the slot; a later pick fills a still-unused photo.
             feed_path = (getattr(feed, "creative_path", "") or "").strip()
+            # A Drive-photo pre-pass can fail transiently before it claims an asset.
+            # `prefer_photos` only filters the LOCAL library, so without this final
+            # eligibility check Lane A could stage a local video while an approved,
+            # unused Drive photo remained pickable. Keep that slot open for the final
+            # Drive retry (or hold it if the retry also fails); a clip never outranks
+            # a still merely because the first Drive attempt blinked.
+            if (is_video_url(feed_path or getattr(feed, "creative_public_url", ""))
+                    and _drive_armed
+                    and "photo" in _media_selector.pool_kinds(base_key)):
+                log(f"held: local video for {day_key} feed while an approved Drive "
+                    "photo remains pickable")
+                continue
             if feed_path and feed_path in used_paths:
                 log(f"skip {day_key} feed: photo already used by an earlier feed "
                     "(no reuse)")
@@ -1495,10 +1548,16 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             # ACCEPTED: the feed survived every gate and is being placed. Record its
             # photo as served NOW (not at pick time) so rotation reflects only KEPT
             # days — never the picked-then-dropped attempts.
-            _record_feed_served(account, feed, day_key)
-            day_drafts = _finish_feed_with_story(
-                account, feed, library_path, log, day_key=day_key,
-                story_caption_override=story_caption_override)
+            if not _record_feed_served(account, feed, day_key):
+                log(f"{base_key} {day_key}: served ledger write failed; local feed held")
+                continue
+            try:
+                day_drafts = _finish_feed_with_story(
+                    account, feed, library_path, log, day_key=day_key,
+                    story_caption_override=story_caption_override)
+            except Exception:
+                _release_feed_reservation(feed)
+                raise
             # 2x rows carry their slot ordinal so publish-time slot times are
             # deterministic (07:30 / 18:30, config.cadence_slot_times). 1x days carry
             # NO ordinal: the row shape (and publish hashing) stays byte-for-byte.
@@ -1515,7 +1574,12 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             built_feeds += 1
             day_built += 1
             covered_days.add(day_key)   # the gym-drive lane skips days already filled
+            covered_slots.add((day_key, slot_i))
             day_captions.append(getattr(feed, "caption", "") or "")
+            # The video pass runs after Lane A. Keep its same-day uniqueness map
+            # current so it cannot stage a Drive caption that Lane A already used.
+            pre_captions.setdefault(day_key, []).append(
+                getattr(feed, "caption", "") or "")
             # Record this accepted feed's opening so the NEXT slot/day avoids leading
             # the same way (the cross-day repetition Ryan flagged).
             sig = opening_signature(getattr(feed, "caption", "") or "")
@@ -1533,6 +1597,26 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 angle_idx += 1
         if day_built:
             built_days += 1
+
+    # VIDEO PRE-PASS: only after the Drive-photo pass and Lane A have consumed every
+    # photo slot they can. Restrict this pass to video beats and a video-only currently
+    # pickable pool, so a clip cannot outrank any approved Drive or local photo.
+    _drive_kinds = _media_selector.pool_kinds(base_key) if _drive_armed else set()
+    if "video" in _drive_kinds and "photo" not in _drive_kinds:
+        try:
+            video_pre = append_gym_drive_drafts(
+                account, base_key, start, days, voice, log=log,
+                # Slot ownership, rather than day coverage, allows a video to fill a
+                # genuinely open PM slot after a local or Drive-photo AM post.
+                covered_days=locked_feed_days, library_path=library_path,
+                slots_per_day=slots_per_day, banned_words=banned_words,
+                rendition_budget=rendition_budget, covered_slots=covered_slots,
+                video_beats_only=True, kind_prefs=(_VIDEO_KIND,),
+                day_captions_seed=pre_captions,
+                max_feed_count=max(0, max_feed_days - drive_photo_feeds - built_feeds))
+            _record_drive_prepass(video_pre, "video")
+        except Exception as e:  # noqa: BLE001 - the pre-pass never sinks the month
+            log(f"{base_key}: video pre-pass skipped ({type(e).__name__}: {e})")
 
     # §4 weak_match: no image cleared the content-score floor for these slots — the best
     # available was planned and must reach the coach (never silent). One summary staff alert
@@ -1566,10 +1650,14 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         try:
             drive_extra = append_gym_drive_drafts(
                 account, base_key, start, days, voice, log=log,
-                covered_days=covered_days, library_path=library_path,
+                # Exact slot ownership decides whether a 2x slot is open.  Passing
+                # a day with one Lane-A feed here used to skip its open second slot.
+                covered_days=locked_feed_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
                 rendition_budget=rendition_budget, covered_slots=covered_slots,
-                day_captions_seed=pre_captions)
+                day_captions_seed=pre_captions,
+                max_feed_count=max(0, max_feed_days - sum(
+                    1 for d in drafts if not getattr(d, "is_story", False))))
             if drive_extra:
                 drafts.extend(drive_extra)
                 # append_gym_drive_drafts tracks coverage on its own copy; the
@@ -1663,15 +1751,33 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                                      logger=log)
     if _gbp_rows:
         rows.extend(_gbp_rows)
-    result = _apply(base_key, rows, start, days, store, log,
-                    locked_days=locked_feed_days, allow_reshape=allow_reshape)
+    try:
+        result = _apply(base_key, rows, start, days, store, log,
+                        locked_days=locked_feed_days, allow_reshape=allow_reshape)
+    except Exception:
+        # _apply catches remote write failures and returns their unknown-outcome
+        # flag. An exception escaping its contract is a prewrite planning failure.
+        _release_unlanded_reservations(drafts)
+        raise
+    if apply_state is not None:
+        # Reporting below can still raise. Preserve the write outcome before that
+        # happens so the outer cleanup never mistakes a landed insert for prewrite.
+        apply_state["result"] = result
+    _release_unlanded_reservations(
+        drafts, retained=result.get("retained_reservation_ids", ()))
     # NOTHING WRITTEN (never-wipe-to-empty, never-shrink, a gate refusal, a store
     # failure): build_client_month's try/finally reads `inserted` / `deleted` off this
     # result and restores the released stamps / rolls back this build's unlanded picks
     # (audit D3 + residual). Nothing to do here.
+    # Report the plan we actually assembled, rather than the Lane-A counters.  Drive
+    # pre-passes stage feeds before Lane A, and a 2x day can hold two feed slots, so
+    # `built_feeds` / `built_days` alone undercount a valid Drive-first plan.
+    _planned_feeds = [d for d in drafts if not getattr(d, "is_story", False)]
     result["gbp_mirrored"] = len(_gbp_rows)
-    result["days"] = built_days
-    result["feeds"] = built_feeds
+    result["days"] = len({str(getattr(d, "day_key", "") or "")[:10]
+                          for d in _planned_feeds
+                          if str(getattr(d, "day_key", "") or "")[:10]})
+    result["feeds"] = len(_planned_feeds)
     result["posts_per_day"] = slots_per_day
     result["skipped_banned"] = skipped_banned
     result["media_count"] = media_count
@@ -2125,12 +2231,17 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     from . import lever_stamp as _levers
     _levers.apply_learning_stamps(base_key, clean_rows, logger=log)
     deleted = inserted = 0
+    insert_started = False
+    planned_reservation_ids = set()
     try:
         # PRESERVE APPROVALS: drop any incoming row that would collide with a slot the
         # gym has already approved/published, and let delete_month keep those rows in
         # place (it only wipes fresh drafts). A rebuild can no longer revert an approval.
         from .portal_calendar_store import preserve_and_prune
         clean_rows, _locked = preserve_and_prune(store, base_key, months, clean_rows)
+        planned_reservation_ids = {
+            int(r["_served_reservation_id"]) for r in clean_rows
+            if r.get("_served_reservation_id")}
         # NEVER WIPE TO EMPTY (TopFuel, 2026-08-25): a rebuild that produced NO rows must not
         # delete an existing calendar. This happens when the grow-guard re-triggers a build
         # for a gym that is effectively built out (its build_target counts photo clusters, but
@@ -2319,14 +2430,24 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                     deleted += delete_month(base_key, month) or 0
         insert_rows = getattr(store, "insert_rows", None)
         if insert_rows is not None and clean_rows:
-            inserted += len(insert_rows(base_key, clean_rows) or [])
+            store_rows = [{k: v for k, v in r.items()
+                           if k != "_served_reservation_id"} for r in clean_rows]
+            insert_started = True
+            inserted += len(insert_rows(base_key, store_rows) or [])
     except Exception as exc:  # noqa: BLE001
         log(f"store write failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
-                "upserted": inserted, "deleted": deleted, "months": months}
+                "upserted": inserted, "deleted": deleted, "months": months,
+                # Once the insert request started, its outcome may be unknown. Keep
+                # those exact reservations fail closed; pre-insert failures retain none.
+                "retained_reservation_ids": sorted(planned_reservation_ids)
+                if insert_started else [],
+                "insert_outcome_unknown": bool(insert_started)}
     return {"ok": True, "upserted": inserted, "inserted": inserted,
             "deleted": deleted if span_claim is None else span_claim,
-            "deleted_total": deleted, "months": months}
+            "deleted_total": deleted, "months": months,
+            "retained_reservation_ids": sorted(planned_reservation_ids)
+            if insert_started else []}
 
 
 def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
@@ -2371,18 +2492,25 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
     # calls the same caption/vision paths per slot, so it gets the same
     # renew-on-interval treatment instead of racing a long pass's own lock.
     _heartbeat = _build_lock.start_heartbeat(base_key, holder=_lock_holder)
+    reservation_state = {"drafts": [], "insert_started": False}
     try:
         return _backfill_denied_slots_body(
             account, base_key, start_date, days, voice=voice,
             library_path=library_path, store=store, banned_words=banned_words,
-            logger=log)
+            logger=log, _reservation_state=reservation_state)
+    except Exception:
+        if not reservation_state["insert_started"]:
+            _release_unlanded_reservations(reservation_state["drafts"])
+            _rollback_new_drive_drafts(reservation_state["drafts"], log)
+        raise
     finally:
         _heartbeat.stop()
         _build_lock.release(base_key, holder=_lock_holder)
 
 
 def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice,
-                                library_path=None, store, banned_words=(), logger=None):
+                                library_path=None, store, banned_words=(), logger=None,
+                                _reservation_state=None):
     """Give each DENIED feed POST a FRESH 1:1 replacement (a NEW caption on a REUSED photo)
     for a gym that is AT its creative cap — where the monthly grow-to-cap build is a no-op
     and the denied slot would otherwise stay empty forever (the portal's "recreating" state
@@ -2542,6 +2670,8 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
                       getattr(account, "key", "") or base_key))
     drive_pillar_i = 0
     drafts = []
+    if _reservation_state is not None:
+        _reservation_state["drafts"] = drafts
     skipped = 0
     done_row_ids = []
     used_days_for_marker = []    # every day a replacement was actually placed onto this
@@ -2619,6 +2749,7 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
                             log(f"{base_key} {day_key}: drive-first replacement "
                                 "failed the A+/banned-word gate; falling back to "
                                 "local reuse")
+                            _rollback_drive_asset(feed, day_key, log)
                             feed = None
                     if feed is not None:
                         drive_pillar_i += 1
@@ -2626,6 +2757,9 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
                             "connected Drive pool (asset "
                             f"{getattr(feed, 'source_media_asset_id', '')})")
             except Exception as exc:  # noqa: BLE001 - Drive lane never sinks the backfill
+                if feed is not None:
+                    # The returned draft has not reached a calendar row yet.
+                    _rollback_drive_asset(feed, day_key, log)
                 log(f"{base_key} {day_key}: drive-first replacement failed "
                     f"({type(exc).__name__}); falling back to local reuse")
                 feed = None
@@ -2650,19 +2784,31 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
                     log(f"{base_key} {day_key}: small library — reusing {choice} "
                         "with maximum spacing (no unused photo remained)")
         if feed is None or not _has_real_creative(feed):
+            if feed is not None:
+                _rollback_drive_asset(feed, day_key, log)
             skipped += 1
             log(f"{base_key} {day_key}: no A+ replacement could be built "
                 f"({drop or 'no usable creative'})")
             continue
-        _record_feed_served(account, feed, day_key)   # KEPT: record only accepted backfills
+        if not _record_feed_served(account, feed, day_key):
+            _rollback_drive_asset(feed, day_key, log)
+            skipped += 1
+            log(f"{base_key} {day_key}: served ledger write failed; backfill held")
+            continue
         # This run's placement joins the guard state so the NEXT denied day in the
         # same pass cannot pick the same photo (the store read happened before any
         # insert).
         media_guard.note_placed(
             guard_state, _url_basename(getattr(feed, "creative_public_url", ""))
             or os.path.basename(getattr(feed, "creative_path", "") or ""), day_key)
-        drafts.extend(_finish_feed_with_story(account, feed, library_path, log,
-                                              day_key=day_key))
+        try:
+            finished = _finish_feed_with_story(
+                account, feed, library_path, log, day_key=day_key)
+        except Exception:
+            _release_feed_reservation(feed)
+            _rollback_drive_asset(feed, day_key, log)
+            raise
+        drafts.extend(finished)
         day_used_this_pass.add(day_key)   # so the NEXT denied row this pass rolls past it too
         used_days_for_marker.append(day_key)
         if denied.get("row_id"):
@@ -2672,31 +2818,46 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
         return {"ok": True, "backfilled": 0, "days_needing": len(todo),
                 "skipped": skipped}
 
-    rows = _to_rows(base_key, drafts)
-    # GATE 2 safety: withhold a first-month gym's replacement exactly as its month would be.
-    # (A gym with a denied post is established by construction, so this is a guard.)
-    if (config.coach_screen_first_month_enabled() and base_key != "lasso"
-            and _is_first_month(base_key, store, log)):
-        for r in rows:
-            r["status"] = "coach_review"
-    # GOOGLE BUSINESS MIRROR (AGENT_GBP_MIRROR, default OFF): a denied-slot replacement is
-    # a real feed post, so it mirrors to Google exactly like a month-build post. Appended
-    # after the GATE 2 loop so the GBP row stays 'pending' (never 'coach_review').
-    from . import gbp_mirror as _gbp_mirror
-    rows.extend(_gbp_mirror.rows_for(base_key, drafts, library_path=library_path,
-                                     logger=log))
-    clean_rows = [{k: v for k, v in r.items() if k != "id"}
-                  for r in rows if str(r.get("gym_id")) == str(base_key)]
-    # Same Wave 7 stamping as the month build above: a denied-slot replacement is a
-    # real post the retro should be able to learn from.
-    from . import lever_stamp as _levers
-    _levers.apply_learning_stamps(base_key, clean_rows, logger=log)
     try:
-        inserted = len(insert_rows(base_key, clean_rows) or [])
+        rows = _to_rows(base_key, drafts)
+        # GATE 2 safety: withhold a first-month replacement exactly as its month would be.
+        if (config.coach_screen_first_month_enabled() and base_key != "lasso"
+                and _is_first_month(base_key, store, log)):
+            for r in rows:
+                r["status"] = "coach_review"
+        from . import gbp_mirror as _gbp_mirror
+        rows.extend(_gbp_mirror.rows_for(base_key, drafts, library_path=library_path,
+                                         logger=log))
+        clean_rows = [{k: v for k, v in r.items() if k != "id"}
+                      for r in rows if str(r.get("gym_id")) == str(base_key)]
+        from . import lever_stamp as _levers
+        _levers.apply_learning_stamps(base_key, clean_rows, logger=log)
+    except Exception:
+        # No insert request has started, so every exact reservation is unlanded.
+        _release_unlanded_reservations(drafts)
+        raise
+    try:
+        store_rows = [{k: v for k, v in r.items()
+                       if k != "_served_reservation_id"} for r in clean_rows]
+        if _reservation_state is not None:
+            _reservation_state["insert_started"] = True
+        inserted_rows = insert_rows(base_key, store_rows) or []
+        inserted = len(inserted_rows)
     except Exception as exc:  # noqa: BLE001
+        # The insert request may have reached the remote store before the exception;
+        # keep reservations fail closed when its outcome is unknown.
         log(f"{base_key}: backfill insert failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"insert failed: {type(exc).__name__}",
                 "backfilled": 0, "days_needing": len(todo), "skipped": skipped}
+    if inserted == 0:
+        # A completed insert call returning zero rows is a proven no-op. Release only
+        # this attempt's exact reservations; an exception above remains unknown and
+        # deliberately retains them fail closed.
+        _release_unlanded_reservations(drafts)
+        _rollback_new_drive_drafts(drafts, log)
+        return {"ok": True, "backfilled": 0, "rows": 0,
+                "days_needing": len(todo), "skipped": skipped}
+
     # Stamp per-row AND per-day idempotency ONLY after the insert genuinely succeeded --
     # a failed insert must leave every denied row (and its target day) eligible for retry
     # next pass, not silently marked done/used with no actual replacement ever written.

@@ -49,15 +49,34 @@ def test_the_old_cap_was_shorter_than_the_boilerplate():
     assert "PHOTO_URL_INACCESSIBLE" in _GOOGLE_BODY[:_ERR_BODY_CHARS]
 
 
-def test_reject_reason_carries_googles_actual_reason():
+def test_ambiguous_hold_carries_googles_actual_reason():
     seen = []
     res = gbp_worker.publish_photo_drop(
         _row(), {"zernio_account_id": "a1"},
         client=_Boom(_GOOGLE_BODY[:_ERR_BODY_CHARS]), draft=False, alert=seen.append)
-    assert res["status"] == "failed"
+    assert res["status"] == "publishing"
+    assert res["held"] == "ambiguous_send"
     assert res["ok"] is False
     assert "PHOTO_URL_INACCESSIBLE" in res["reject_reason"], \
         "the row must say WHY, not just name the exception class"
+
+
+def test_photo_platform_error_400_keeps_the_claim_for_readback():
+    res = gbp_worker.publish_photo_drop(
+        _row(), {"zernio_account_id": "a1"},
+        client=_Boom('{"type":"platform_error","code":"google_error"}'),
+        draft=False)
+    assert res["status"] == "publishing"
+    assert res["held"] == "ambiguous_send"
+
+
+def test_photo_invalid_request_400_is_definite_no_post():
+    res = gbp_worker.publish_photo_drop(
+        _row(), {"zernio_account_id": "a1"},
+        client=_Boom('{"type":"invalid_request_error","code":"invalid_image"}'),
+        draft=False)
+    assert res["status"] == "failed"
+    assert not res.get("held")
 
 
 def test_the_alert_carries_googles_actual_reason():

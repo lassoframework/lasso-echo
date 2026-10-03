@@ -22,6 +22,7 @@ Scope guards:
 """
 
 import os
+import time
 from datetime import date, timedelta
 
 from . import config
@@ -88,23 +89,79 @@ def real_media_depleted(base, *, now=None):
     except Exception:
         return False
 
-    if not (config.gym_drive_stage_enabled()
-            and config.gym_drive_connect_active_for(base)):
-        return not local
+    # The indexed Drive inventory is authoritative even when the staging lane is
+    # currently disabled.  A disabled writer must not make approved client media
+    # look absent and unlock the infographic fallback.  If the index is
+    # unavailable or unreadable, return False below (fail closed).
     try:
         from . import gym_media_index, gym_media_selector
         media_store = gym_media_index.default_store()
         if not media_store.available():
             return False
-        # pickable() intentionally converts store errors to [] for planning.
-        # For a client depletion notice, distinguish a failed read from empty.
+        list_sources = getattr(media_store, "list_sources", None)
+        if not callable(list_sources):
+            return False
+        sources = list_sources(base) or []
+        # A successful authoritative source read with no Drive rows means this
+        # gym has never connected Drive. There is no remote supply to wait for,
+        # so an empty local library may use the verified-palette Astra fallback.
+        # Exceptions still land in the outer fail-closed handler below.
+        drive_sources = [s for s in sources
+                         if str(s.get("kind") or "") == "gym_drive"]
+        if not drive_sources:
+            if config.gym_drive_connect_active_for(base):
+                return False
+            return not local
+        ready = [s for s in drive_sources
+                 if s.get("active") is not False
+                 and not s.get("revoked_externally")
+                 and str(s.get("sync_status") or "").lower() == "ready"
+                 and s.get("sync_finished_at")]
+        # An empty asset response is meaningful only after a successful sync.
+        # Without that proof, an empty/stale DB must never unlock Astra fallback.
+        if not ready:
+            return False
+        # The selector normally converts claim errors to [] for planning; this
+        # gate requests strict claim reads before interpreting [] as depletion.
         assets = media_store.list_assets(base)
+        # An indexed client photo awaiting the normal hash-bound moderation is
+        # supply waiting for Echo, not evidence that the gym has no photos.
+        # Hold the infographic while the moderation worker catches up. A known
+        # rejected or coach-hidden asset cannot block the last-resort lane.
+        if any(str(a.get("gym_id") or "") == base
+               and a.get("kind") == "photo"
+               and a.get("eligible") is not False
+               and not a.get("excluded_by_coach")
+               and a.get("review_status") == "pending_review"
+               and a.get("moderation_status") == "pending"
+               and a.get("content_hash") for a in assets):
+            return False
         class Snapshot:
             def available(self):
                 return True
             def list_assets(self, gym):
                 return assets
-        drive = gym_media_selector.pickable(base, store=Snapshot(), now=now)
+        # pickable() expects a timezone-aware datetime (its `_now_utc` passes a
+        # truthy `now` through untouched). Callers hand us ISO strings, so parse
+        # first -- a TypeError here would be swallowed below as "inventory
+        # uncertain" and the lane would hold forever.
+        parsed_now = now
+        from datetime import date as _date, datetime as _dt, timezone as _tz
+        if isinstance(parsed_now, _date) and not isinstance(parsed_now, _dt):
+            # no_media_astra_seed hands a plain date; pickable's cooldown math
+            # compares against tz-aware datetimes.
+            parsed_now = _dt(parsed_now.year, parsed_now.month, parsed_now.day,
+                             tzinfo=_tz.utc)
+        elif isinstance(parsed_now, str):
+            try:
+                parsed_now = _dt.fromisoformat(parsed_now.replace("Z", "+00:00"))
+            except ValueError:
+                parsed_now = None
+            if (parsed_now is not None
+                    and parsed_now.tzinfo is None):
+                parsed_now = parsed_now.replace(tzinfo=_tz.utc)
+        drive = gym_media_selector.pickable(
+            base, store=Snapshot(), now=parsed_now, strict_claims=True)
         from .media_bridge import observe_drive_inventory
         observe_drive_inventory(base, [a.get("id") for a in drive])
         return not local and not drive
@@ -159,6 +216,48 @@ def _empty_upcoming_days(store, base, tz_name, days_ahead, now=None):
     return [d for d in wanted if d not in have]
 
 
+def _generate_astra_only(prompt, opts, *, account_key, subject, draft_id,
+                         sleep=None):
+    """Astra, and ONLY Astra, for a client gym's last-resort infographic.
+
+    Blake's global ruling (2026-10-02): an approved client photo always wins;
+    a generated infographic is the LAST resort, and when it renders it must
+    come through the ASTRA path -- there is no silent Gemini rung and no
+    generic LASSO-branded fallback for a client gym. A total Astra failure
+    marks the slot NEEDS HUMAN (same ops alert + audit row as the shared
+    chain in image_engine.generate_image) and returns None so the caller
+    holds the day instead of filling it with off-brand art. Never raises."""
+    from . import image_engine as _ie
+    key = os.environ.get(_ie.OPENAI_API_KEY_ENV, "")
+    if not key:
+        _ie.mark_needs_human(
+            subject=subject, account_key=account_key,
+            failures=("astra route required but no Astra API key is set",),
+            draft_id=draft_id)
+        return None
+    engine = _ie.AstraImageEngine(key)
+    tries = _ie._attempts_for(engine)
+    sleep = sleep or time.sleep
+    failures = []
+    for attempt in range(1, tries + 1):
+        try:
+            result = engine.generate(prompt, opts)
+        except Exception as exc:  # noqa: BLE001 - a provider bug may not kill the run
+            from . import ops_alerts
+            detail = ops_alerts.scrub(f"{type(exc).__name__}: {exc}")
+            failures.append(f"astra attempt {attempt}/{tries}: {detail}")
+        else:
+            if result is not None and result.ok():
+                _ie.record_cost(result.cost_estimate, account_key=account_key)
+                return result
+            failures.append(f"astra attempt {attempt}/{tries}: empty result")
+        if attempt < tries:
+            sleep(_ie.ASTRA_RETRY_BACKOFF_SECS * attempt)
+    _ie.mark_needs_human(subject=subject, account_key=account_key,
+                         failures=failures, draft_id=draft_id)
+    return None
+
+
 def fill_gaps(base, account, store, *, voice, logger=None, now=None,
               days_ahead=FILL_DAYS_AHEAD, max_per_run=FILL_MAX_PER_RUN):
     """Generate + insert up to max_per_run PENDING infographic feed posts for the gym's
@@ -196,15 +295,48 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
     if not sources:
         return {"ok": False, "reason": "no sources"}
 
-    client = creative_studio._default_client()
-    if client is None:
-        return {"ok": False, "reason": "no image client"}
+    # Blake's global ruling (2026-10-02): a generated infographic is a LAST
+    # RESORT behind approved client photos, it MUST render through the Astra
+    # path, and it MUST carry this gym's own VERIFIED brand colors. No
+    # verified palette on file -> fail CLOSED: hold the fill and surface the
+    # reason, never invent colors from the voice doc's tone and never reach
+    # for LASSO's or a generic palette. LASSO's own account is exempt (its
+    # locked V3 palette governs its cards).
+    from . import astra_prompt as _ap
+    account_base = _ap._account_base(account.key)
+    if account_base != base:
+        reason = (f"account/gym mismatch ({account_base!r} account for {base!r} gym); "
+                  "infographic fallback held")
+        log(reason)
+        return {"ok": False, "reason": reason}
+    gym_palette = None
+    if not _ap.is_lasso_account(account.key):
+        gym_palette = _ap.load_gym_brand_palette(account.key)
+        if not gym_palette:
+            reason = (f"no verified brand colors for {base} "
+                      f"(expected {_ap._gym_brand_colors_path(base)}); "
+                      "infographic fallback held")
+            log(reason)
+            return {"ok": False, "reason": reason}
 
     filled = 0
     drafts = []
     for i, day in enumerate(gaps):
         if filled >= max_per_run:
             break
+        # GENERATION-TIME RECHECK (Blake 2026-10-02, photos FIRST): the
+        # depletion and gap scans above ran before any rendering happened.
+        # Re-verify BOTH right before this card is drawn so a photo that
+        # landed (or a row another lane inserted) between the scan and now
+        # always wins over an infographic.
+        if not real_media_depleted(base, now=now):
+            log(f"{base}: usable approved photos available at generation "
+                "time; holding infographic fill (photos first)")
+            break
+        if day not in set(_empty_upcoming_days(
+                store, base, tz_name, min(days_ahead, 2), now=now)):
+            log(f"{base} {day}: day no longer empty at generation time; skipped")
+            continue
         # rotate source + archetype deterministically by date so re-runs are stable
         seed = sum(ord(c) for c in f"{base}{day}")
         source = sources[seed % len(sources)]
@@ -219,63 +351,43 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         except Exception as e:  # noqa: BLE001 - a hard-rule miss skips the day
             log(f"{base} {day}: headline failed hard rules ({type(e).__name__}); skipped")
             continue
-        # Astra first, Gemini as the fallback rung. A calendar slot may NEVER
-        # fail silently: when every engine fails, image_engine marks the slot
-        # NEEDS HUMAN (ops alert + audit row) before this returns None.
+        # ASTRA ROUTE ONLY (Blake's global ruling, 2026-10-02): this gym's
+        # last-resort infographic renders through Astra with its OWN verified
+        # brand palette threaded explicitly (gym_palette), or it does not
+        # render at all. There is NO Gemini rung and NO generic LASSO-branded
+        # fallback here; a failed Astra chain marks the slot NEEDS HUMAN (ops
+        # alert + audit row, same contract as image_engine.generate_image)
+        # and the day stays empty for a human.
         #
-        # ASTRA GETS ITS OWN BRIEF (Blake, 2026-09-13): before this, `prompt`
-        # (the Gemini-style text above, which literally says "Design a clean,
-        # minimal, premium LASSO-branded infographic") was handed to EVERY
-        # engine, Astra included, because image_engine.prompt_for() falls back
-        # to the shared prompt when opts["engine_prompts"] carries no "astra"
-        # key. A client gym's auto-infographic was therefore branded as LASSO
-        # to the primary engine on every card. Building the real Astra brief
-        # here (same helper creative_studio.generate() uses) gives this gym's
-        # card its OWN voice doc and, in freedom scope, its OWN palette
-        # latitude (astra_prompt.gym_brand_latitude) instead of LASSO's.
-        astra_brief = creative_studio._astra_brief_for(
-            headline, [getattr(source, "text", "") or ""], "feed post",
-            None, account_key=account.key)
+        # The brief is built directly (not via creative_studio._astra_brief_for,
+        # which cannot thread a verified palette): this gym's OWN voice doc
+        # (astra_prompt._voice_path_for) and its OWN verified colors
+        # (astra_prompt.gym_brand_palette_section) instead of LASSO's.
+        try:
+            astra_brief = _ap.build_infographic_brief(
+                headline, [getattr(source, "text", "") or ""],
+                surface="feed post", account_key=account.key,
+                gym_palette=gym_palette)
+        except Exception as e:  # noqa: BLE001 - a brief we cannot build is a held day
+            log(f"{base} {day}: Astra brief could not be built "
+                f"({type(e).__name__}); held (no generic fallback)")
+            continue
         draft_id = f"igfill_{base}_{day}"
         from . import image_engine as _ie
-        compiled = None
-        if config.lasso_infographic_quality_enabled(account.key):
-            from .lasso_infographic_content import select_copy
-            try:
-                compiled = select_copy(headline + " " + str(getattr(source, "text", "")))
-            except ValueError:
-                log(f"{base} {day}: no approved Brain material; skipped")
-                continue
-            out_dir = os.path.join(config.LIBRARY_PATH, base)
-            os.makedirs(out_dir, exist_ok=True)
-            import uuid
-            art = creative_studio.generate(
-                compiled["headline"], compiled["facts"], cta=compiled["cta"],
-                client=client, account_key=account.key, draft_id=draft_id,
-                out_path=os.path.join(out_dir, f"igfill_{day}_{archetype}_{uuid.uuid4().hex}.png"))
-            if not art:
-                continue
-            from pathlib import Path
-            img = Path(art["path"]).read_bytes()
-            _res = _ie.ImageResult(image_bytes=img, model=art.get("model", ""), engine="astra")
-        else:
-            _res = _ie.generate_image(
-                prompt,
-                {"kind": "infographic", "surface": "feed post",
-                 "has_text_overlay": bool(str(headline or "").strip()),
-                 "gemini_model": config.NANO_MODEL,
-                 "engine_prompts": {"astra": astra_brief, "gemini": prompt}},
-                gemini_client=client, account_key=account.key,
-                subject=f"{day} {headline}"[:120], draft_id=draft_id)
-            img = _res.image_bytes if _res is not None else None
+        _res = _generate_astra_only(
+            astra_brief,
+            {"kind": "infographic", "surface": "feed post",
+             "has_text_overlay": bool(str(headline or "").strip()),
+             "require_astra": True},
+            account_key=account.key,
+            subject=f"{day} {headline}"[:120], draft_id=draft_id)
+        img = _res.image_bytes if _res is not None else None
         if not img:
             log(f"{base} {day}: image render failed on every engine; "
                 "marked NEEDS HUMAN and skipped")
             continue
         out = os.path.join(config.LIBRARY_PATH, base,
                            f"igfill_{day}_{archetype}.png")
-        if compiled:
-            out = art["path"]
         try:
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "wb") as fh:
@@ -289,8 +401,6 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             continue
         caption, hashtags = client_content.make_caption(
             account, source, voice, f"igfill_{day}")
-        if compiled:
-            caption = "\n\n".join([compiled["headline"], *compiled["facts"], compiled["cta"]])
         draft = Draft(
             draft_id=draft_id,
             account_key=account.key,
@@ -301,12 +411,10 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             creative_public_url=hosted,
             scheduled_for=f"{day}T12:00:00",
             status=DraftStatus.PENDING,
-            infographic_copy=dict(compiled or {}),
-            source_fragments=([compiled["headline"], *compiled["facts"],
-                               "cite:" + compiled["source_id"], "sha256:" + compiled["source_hash"]]
-                              if compiled else [getattr(source, "text", "") or "",
+            infographic_copy={},
+            source_fragments=[getattr(source, "text", "") or "",
                               f"cite:{getattr(source, 'citation', '')}",
-                              "infographic_fill"]),
+                              "infographic_fill"],
             day_key=day,
             category=_with_review_mark(getattr(source, "category", "")),
             image_engine=f"{_res.engine}:{_res.model}" if _res is not None else "",
@@ -321,6 +429,25 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
 
     if not drafts:
         return {"ok": True, "filled": 0, "gaps": len(gaps)}
+    # The render and upload can take long enough for a real client photo or a
+    # competing calendar row to arrive. Recheck immediately before the write:
+    # no generated fallback may be inserted once either condition is known.
+    # The store does not expose an atomic conditional insert, so this is the
+    # final best-effort guard; its check-to-insert interval remains necessarily
+    # subject to a concurrent writer and must stay fail-closed at the store
+    # boundary when that capability is added.
+    if not real_media_depleted(base, now=now):
+        log(f"{base}: usable approved photos available before insert; holding "
+            "all infographic drafts")
+        return {"ok": True, "filled": 0, "gaps": len(gaps),
+                "reason": "usable media available before insert"}
+    insertable_days = set(_empty_upcoming_days(
+        store, base, tz_name, min(days_ahead, 2), now=now))
+    drafts = [draft for draft in drafts if draft.day_key in insertable_days]
+    if not drafts:
+        log(f"{base}: infographic day taken before insert; holding drafts")
+        return {"ok": True, "filled": 0, "gaps": len(gaps),
+                "reason": "calendar day taken before insert"}
     rows = _to_rows(base, drafts)
     clean = [{k: v for k, v in r.items() if k != "id"} for r in rows]
     try:

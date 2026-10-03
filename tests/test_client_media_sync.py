@@ -132,7 +132,7 @@ def _r2_with_uploads(base, n=4, extra=None):
     caps = {}
     for i in range(n):
         name = f"20260810T120000Z_photo_{i:02d}.jpg"
-        objs[f"intake/{base}/incoming/{name}"] = b"\xff\xd8\xffFAKEJPEG"
+        objs[f"intake/{base}/incoming/{name}"] = b"\xff\xd8\xffFAKEJPEG" + bytes([i])
         caps[name] = f"day {i} at the gym"
     objs[f"intake/{base}/incoming/20260810T120000Z_upload.json"] = json.dumps(
         {"note": "batch", "captions": caps}).encode("utf-8")

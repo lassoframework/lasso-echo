@@ -38,6 +38,9 @@ def _enable(monkeypatch):
 
 def test_portal_propagates_raw_source_and_render_evidence(monkeypatch):
     _enable(monkeypatch)
+    # This case checks evidence forwarding. The local served-ledger reservation
+    # is covered separately and requires a real on-disk source path.
+    monkeypatch.setattr(media_swap, "reserve_local_pick", lambda *a: True)
     store = SwapStore()
     evidence = {"source_exact_url": "https://cdn/raw.jpg",
                 "delivered_exact_url": "https://cdn/crop.jpg",

@@ -431,8 +431,10 @@ def _row(row_id="r1", account_key="eng", post_date="2026-08-27",
 
 
 def test_deny_gym_media_rolls_back_asset_scoped_to_date(monkeypatch):
-    """A portal deny of a gym-media row (draft_type == 'gym_media') returns its
-    photo to the pool SYNCHRONOUSLY, scoped to this row's own post_date + asset."""
+    """A portal deny of a gym-media row (draft_type == 'gym_media') settles its
+    use-record SYNCHRONOUSLY, scoped to this row's own post_date + asset. Stage-use
+    is PERMANENT (2026-10-02): the stamp stays, so a denied photo is never offered
+    again — the settle is bookkeeping/idempotency only."""
     _deny_env(monkeypatch)
     kv = {}
     monkeypatch.setattr("agent.db.kv_get", lambda k, d="": kv.get(k, d))
@@ -452,8 +454,10 @@ def test_deny_gym_media_rolls_back_asset_scoped_to_date(monkeypatch):
 
     assert status == 200
     assert body["status"] == "denied"
-    assert media_store.assets["a1"]["used_count"] == 0
-    assert media_store.assets["a1"]["last_used_at"] is None
+    assert media_store.assets["a1"]["used_count"] == 1
+    assert media_store.assets["a1"]["last_used_at"] is not None
+    assert _gms.pickable("eng", store=media_store,
+                         now=datetime(2026, 8, 27, tzinfo=timezone.utc)) == []
 
 
 def test_deny_rolls_back_a_LIVE_SHAPED_row_that_has_no_draft_type(monkeypatch):
@@ -483,7 +487,8 @@ def test_deny_rolls_back_a_LIVE_SHAPED_row_that_has_no_draft_type(monkeypatch):
     status, body = portal_routes.handle_portal_action("deny", "eng", "r1", "actor")
 
     assert status == 200 and body["status"] == "denied"
-    assert media_store.assets["a1"]["used_count"] == 0, "live-shaped row did not roll back"
+    assert media_store.assets["a1"]["used_count"] == 1, \
+        "live-shaped row did not settle; the stamp must stay (permanent stage-use)"
 
 
 def test_deny_podcast_rolls_back_clip(monkeypatch):
@@ -575,11 +580,11 @@ def test_deny_twice_does_not_double_rollback(monkeypatch):
 
     status1, _ = portal_routes.handle_portal_action("deny", "eng", "r1", "actor")
     assert status1 == 200
-    assert media_store.assets["a1"]["used_count"] == 0
+    assert media_store.assets["a1"]["used_count"] == 1
 
     status2, _ = portal_routes.handle_portal_action("deny", "eng", "r1", "actor")
     assert status2 == 200
-    # A second rollback of an already-rolled-back record must be a no-op: the
-    # counter must NOT go negative (the real bug a double-rollback would cause).
-    assert media_store.assets["a1"]["used_count"] == 0
-    assert media_store.assets["a1"]["last_used_at"] is None
+    # A second settle of an already-settled record must be a no-op: the permanent
+    # stamp must be untouched (never double-restored, never cleared).
+    assert media_store.assets["a1"]["used_count"] == 1
+    assert media_store.assets["a1"]["last_used_at"] is not None

@@ -2,10 +2,21 @@
 
 import importlib
 
+import pytest
 from PIL import Image
 
 from agent import client_infographic_fill, config, dam, media_bridge, upload_media_approvals
 from agent.accounts import Account, Platform
+
+
+@pytest.fixture(autouse=True)
+def _synced_empty_drive_index(monkeypatch):
+    """These gyms have no usable real media; under the 733da2b contract depletion
+    is provable only from an indexed Drive source that finished a successful sync
+    and indexed zero assets. Stub that proof in unless a test overrides it."""
+    from agent import gym_media_index
+    from tests.gym_media_fakes import SyncedEmptyDriveIndex
+    monkeypatch.setattr(gym_media_index, "default_store", SyncedEmptyDriveIndex)
 
 
 def _photo(path):
@@ -99,6 +110,10 @@ def test_drive_pickable_new_id_rearms_once(monkeypatch, tmp_path):
     class Store:
         def available(self):
             return True
+        def list_sources(self, gym):
+            return [{"kind": "gym_drive", "active": True,
+                     "revoked_externally": False, "sync_status": "ready",
+                     "sync_finished_at": "2026-10-02T00:00:00Z"}]
         def list_assets(self, gym):
             return rows
     monkeypatch.setattr(gym_media_index, "default_store", Store)

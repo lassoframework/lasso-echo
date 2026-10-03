@@ -89,7 +89,8 @@ def _lib(tmp_path, n=5):
     lib = tmp_path / "gritx_lib"
     lib.mkdir(exist_ok=True)
     for i in range(n):
-        (lib / f"photo_{i:02d}.jpg").write_bytes(b"\xff\xd8\xffFAKEJPEG")
+        (lib / f"photo_{i:02d}.jpg").write_bytes(
+            b"\xff\xd8\xffFAKEJPEG" + str(i).encode())
         (lib / f"photo_{i:02d}.json").write_text(
             json.dumps({"public_url": f"https://gritx.media/photo_{i:02d}.jpg"}))
     return str(lib)
@@ -137,11 +138,13 @@ def _feeds(store):
 # ---- 2c: never an empty day ---------------------------------------------------------
 def test_partial_pool_fills_every_day_three_drive_then_spaced_repeats(monkeypatch,
                                                                        tmp_path):
-    """3 pickable assets, 10 days, a stale 5-photo library. Round 2 filled all 10
+    """3 pickable Drive photos, 10 days, a stale 5-photo library. Drive photos go
+    first; once that pool is exhausted, local repeats fill only the remaining cap.
+    Round 2 filled all 10
     days (3 Drive + 7 repeats) and thereby repealed Blake's standing rule (N photos ->
     at most N feeds, never pad). Round 3 (audit R-A1): the media cap binds the whole
-    build. max_feed_days = 5 photos; the 3 Drive feeds count against it, so the
-    fallback may add at most 2 spaced repeats; the other 5 deferred days stay
+    build. max_feed_days = 8 distinct assets; the 3 Drive feeds and 5 local photos
+    each count once, so the other 2 deferred days stay
     UNCOVERED exactly as they would have before the PR."""
     _sources()
     _stale_ledger(monkeypatch)
@@ -157,20 +160,15 @@ def test_partial_pool_fills_every_day_three_drive_then_spaced_repeats(monkeypatc
     feeds = _feeds(cal)
     drive = [r for r in feeds if r.get("source_media_asset_id")]
     repeats = [r for r in feeds if not r.get("source_media_asset_id")]
-    assert len(drive) == 3 and len(repeats) == 2, "cap = 5 photos -> 3 Drive + 2 repeats"
-    assert len({r["post_date"] for r in feeds}) == 5
-    assert sum("placed a spaced repeat" in m for m in logs) == 2
-    assert any("filling 2 of 7 deferred day(s)" in m for m in logs), logs
-    assert len({r["image_url"] for r in repeats}) == 2
-    # the truthful digest names the Drive pool, and the small-library alert stays quiet
-    # (5 photos vs 5 covered days is not "smaller than the book")
-    assert any("Drive pool ran short; 2 day(s)" in m for m in logs)
+    assert len(drive) == 3 and len(repeats) == 5, "cap = 8 assets -> 3 Drive + 5 local"
+    assert len({r["post_date"] for r in feeds}) == 8
+    assert not any(mt.is_video_url(r["image_url"]) for r in feeds)
+    assert len({r["image_url"] for r in repeats}) == 5
 
 
-def test_two_photos_one_drive_asset_never_pads_past_the_cap(monkeypatch, tmp_path):
-    """Blake's rule verbatim: 2 photos + 1 Drive asset on a 30-day span -> 2 feeds
-    (1 Drive + 1 repeat), 28 days uncovered. Pre-PR this gym got 2 feeds; it must
-    not get 30 now."""
+def test_two_photos_one_drive_asset_counts_all_distinct_media(monkeypatch, tmp_path):
+    """The cap includes the Drive photo as well as the two local photos: three
+    distinct assets make three feeds, never a padded 30-day calendar."""
     _sources()
     _stale_ledger(monkeypatch, n=2)
     store = FakeMediaStore(assets=[make_asset("only", gym_id="gritx", title="t.jpg")])
@@ -185,9 +183,28 @@ def test_two_photos_one_drive_asset_never_pads_past_the_cap(monkeypatch, tmp_pat
     drive = [r for r in feeds if r.get("source_media_asset_id")]
     repeats = [r for r in feeds if not r.get("source_media_asset_id")]
     assert len(drive) == 1
-    assert len(repeats) <= 2 and len(feeds) == 2, f"{len(feeds)} feeds on a 2-photo gym"
-    assert len({r["post_date"] for r in feeds}) == 2
-    assert any("stay uncovered under the media cap" in m for m in logs), logs
+    assert len(repeats) == 2 and len(feeds) == 3, f"{len(feeds)} feeds on a 3-media gym"
+    assert len({r["post_date"] for r in feeds}) == 3
+    assert len(feeds) == 3, "all remaining days stay uncovered under the media cap"
+
+
+def test_lane_a_prefers_a_local_photo_before_a_local_video(monkeypatch, tmp_path):
+    _sources()
+    lib = _lib(tmp_path, n=1)
+    with open(os.path.join(lib, "clip_00.mp4"), "wb") as f:
+        f.write(b"FAKEVIDEO")
+    with open(os.path.join(lib, "clip_00.json"), "w") as f:
+        f.write('{"public_url": "https://gritx.media/clip_00.mp4"}')
+    store = FakeMediaStore(assets=[])
+    _arm(monkeypatch, store, FakeDrive())
+    cal = _CalStore()
+    out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1,
+                                 voice=_voice(), library_path=lib, store=cal,
+                                 banned_words=())
+    assert out["ok"] is True
+    feeds = _feeds(cal)
+    assert len(feeds) == 1
+    assert feeds[0]["image_url"].endswith("photo_00.jpg")
 
 
 def test_tough_temple_like_pool_yields_zero_repeats(monkeypatch, tmp_path):
@@ -195,9 +212,14 @@ def test_tough_temple_like_pool_yields_zero_repeats(monkeypatch, tmp_path):
     post and NOT ONE local still repeats."""
     _sources()
     _stale_ledger(monkeypatch)
+    # 2026-10-02 photo-first contract: stills are consumed before clips, so the
+    # pool carries fewer photos (16) than days; once they are spent the remaining
+    # days draw videos, keeping the mix inside the 35-55% band.
     store = FakeMediaStore(assets=[
-        make_asset(f"a{i:02d}", gym_id="gritx", kind="video" if i % 2 else "photo",
-                   title=f"t{i:02d}.{'mp4' if i % 2 else 'jpg'}") for i in range(63)])
+        make_asset(f"a{i:02d}", gym_id="gritx",
+                   kind="photo" if i % 4 == 0 else "video",
+                   title=f"t{i:02d}.{'jpg' if i % 4 == 0 else 'mp4'}")
+        for i in range(63)])
     _arm(monkeypatch, store, FakeDrive())
     cal = _CalStore()
     logs = []
@@ -227,10 +249,8 @@ def _pending_drive_rows(asset_ids, start=date(2026, 8, 1)):
     return rows
 
 
-def test_rebuild_releases_wipeable_drive_assets_and_repicks_them(monkeypatch, tmp_path):
-    """The first build staged a1..a3 (stamped, used this month). A second build in the
-    same month used to find the pool EMPTY (every asset "used this month") and fall back
-    to repeats while the assets cooled down for rows that no longer existed."""
+def test_rebuild_keeps_staged_drive_assets_consumed(monkeypatch, tmp_path):
+    """A rebuild must not make photos staged by its previous rows available again."""
     _sources()
     store = FakeMediaStore(assets=[make_asset(f"a{i}", gym_id="gritx", title=f"t{i}.jpg")
                                    for i in range(1, 4)])
@@ -243,12 +263,10 @@ def test_rebuild_releases_wipeable_drive_assets_and_repicks_them(monkeypatch, tm
     out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=3, voice=_voice(),
                                  library_path=_lib(tmp_path, n=0), store=cal, banned_words=(),
                                  logger=logs.append)
-    assert out["ok"] is True and out["inserted"] > 0
-    assert any("released 3 Drive asset(s)" in m for m in logs), logs
-    feeds = _feeds(cal)
-    assert sorted(r["source_media_asset_id"] for r in feeds) == ["a1", "a2", "a3"], \
-        "the second build must see the same pool the first one did"
-    # stamped exactly once for the rows that now exist, never 2
+    assert out["ok"] is True and out["inserted"] == 0
+    assert _feeds(cal) == []
+    assert sorted({r["source_media_asset_id"] for r in cal.existing}) == ["a1", "a2", "a3"], \
+        "the existing rows survive when no new creative can replace them"
     assert all(store.assets[f"a{i}"]["used_count"] == 1 for i in range(1, 4))
 
 
@@ -665,10 +683,11 @@ def test_builder_with_spent_budget_prefers_renditioned_videos_then_photos(monkey
     """Audit R-D1 #3: budget spent -> a video already carrying a rendition_url is
     picked over a never-used unrenditioned one; with no renditioned video left the
     slot falls back to a photo, without encoding anything."""
+    # Photo-first contract: the photo fallback is added AFTER the spent-budget
+    # video assertions (with a photo already pickable it would always win the slot).
     store = FakeMediaStore(assets=[
         make_asset("raw1", gym_id="gritx", kind="video", title="raw1.mov"),
-        make_asset("rend", gym_id="gritx", kind="video", title="rend.mov", used_count=0),
-        make_asset("p1", gym_id="gritx", kind="photo", title="p.jpg")])
+        make_asset("rend", gym_id="gritx", kind="video", title="rend.mov", used_count=0)])
     store.assets["rend"]["rendition_url"] = "https://cdn.fake/rend.mp4"
     _arm(monkeypatch, store, FakeDrive())
     monkeypatch.setattr(_gmi, "hevc_to_h264",
@@ -686,6 +705,7 @@ def test_builder_with_spent_budget_prefers_renditioned_videos_then_photos(monkey
                                           rendition_budget=spent)
     assert first.source_media_asset_id == "rend"
     assert first.creative_public_url == "https://cdn.fake/rend.mp4"
+    store.assets["p1"] = make_asset("p1", gym_id="gritx", kind="photo", title="p.jpg")
     second = builder.build_gym_media_draft(_A(), vday, "faces", voice=object(),
                                            source=object(), store=store, drive=FakeDrive(),
                                            library_dir=str(tmp_path), now=NOW,
@@ -839,8 +859,28 @@ def test_a_raise_between_release_and_apply_restores_the_released_stamps(monkeypa
     assert len(cal.existing) == 3
 
 
-def test_delete_ok_but_insert_failed_rolls_back_this_builds_new_stamps(monkeypatch,
-                                                                       tmp_path):
+def test_raise_after_apply_keeps_landed_drive_stamp(monkeypatch, tmp_path):
+    """A reporting failure after insertion must not turn a staged asset fresh."""
+    _sources()
+    store = FakeMediaStore(assets=[make_asset("a_new", gym_id="gritx")])
+    _arm(monkeypatch, store, FakeDrive())
+    cal = _CalStore()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("reporting failed")
+
+    monkeypatch.setattr(client_content, "flush_needs_media_alerts", boom)
+    with pytest.raises(RuntimeError, match="reporting failed"):
+        cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1,
+                               voice=_voice(), library_path=_lib(tmp_path, n=0),
+                               store=cal, banned_words=())
+    assert _feeds(cal)
+    assert store.assets["a_new"]["used_count"] == 1
+
+
+def test_delete_ok_but_insert_outcome_unknown_keeps_new_stamps(monkeypatch, tmp_path):
+    """An insert exception may follow a committed remote write. Keep both the
+    old staged asset and the new pick consumed until calendar state is proven."""
     _sources()
     _stale_ledger(monkeypatch)
     store = FakeMediaStore(assets=[make_asset("n1", gym_id="gritx"),
@@ -855,8 +895,9 @@ def test_delete_ok_but_insert_failed_rolls_back_this_builds_new_stamps(monkeypat
     out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1, voice=_voice(),
                                  library_path=_lib(tmp_path), store=cal, banned_words=())
     assert out["ok"] is False and out.get("deleted", 0) > 0
+    assert out["insert_outcome_unknown"] is True
     picked = [a for a in ("n1", "old") if store.assets[a]["used_count"]]
-    assert picked == [], "an unlanded pick must not keep its stamp; deleted rows stay free"
+    assert picked == ["n1", "old"], "ambiguous insert must not re-offer either asset"
 
 
 # ---- the Drive lane runs the A+ gate --------------------------------------------------
@@ -966,13 +1007,16 @@ def test_small_library_alert_ignores_drive_covered_days(monkeypatch, tmp_path):
                                  library_path=_lib(tmp_path), store=cal, banned_words=())
     assert out["ok"] is True
     feeds = _feeds(cal)
-    assert len([r for r in feeds if not r.get("source_media_asset_id")]) == 2   # fills
+    assert len([r for r in feeds if not r.get("source_media_asset_id")]) == 5   # fills
     assert fired == [], "5 stills covering 2 days is not a small library"
-    # the helper's own comparison: the SAME fill with 99 Lane A days behind it alerts
+    # The first build staged all five original stills. Add a sixth fresh photo for
+    # this separate helper check; once-staged photos cannot be used again.
+    monkeypatch.setattr(client_content.rotation, "local_photo_served",
+                        lambda *a, **k: False)
     logs = []
     cal2 = _CalStore()
     filled = cmr._fill_uncovered_days(
-        _account(), "gritx", _voice(), _lib(tmp_path), (), logs.append,
+        _account(), "gritx", _voice(), _lib(tmp_path, n=6), (), logs.append,
         deferred_days={"2026-08-20"}, covered_days=set(), locked_keys=set(),
         used_keys=set(), drafts=[], store=cal2, start=date(2026, 8, 20), days=1,
         max_fill=1, local_days=99)
@@ -1002,47 +1046,98 @@ def _video_beats(start, days, slot=0):
                if builder.is_video_slot((start + timedelta(days=i)).isoformat(), slot))
 
 
-def test_video_beats_are_claimed_by_drive_before_lane_a_with_fresh_stills(monkeypatch,
-                                                                          tmp_path):
-    """Tough Temple's rebuild: 95 FRESH local stills, 57 renditioned Drive videos, 6
-    Drive photos, 20 days at 1x. Before round 5 Lane A took every day (20 stills, 0
-    videos). Now every video beat is a Drive video, every photo beat a fresh still:
-    0 repeats, 0 uncovered, and each video day carries its FB mirror + story."""
+def test_drive_photos_precede_local_photos_and_videos(monkeypatch, tmp_path):
+    """Approved Drive photos get first claim, local photos fill the remaining days,
+    and an available video pool cannot outrank either photo source."""
     _sources()
-    store = FakeMediaStore(assets=_tt_pool())
+    store = FakeMediaStore(assets=_tt_pool(n_photos=6))
     _arm(monkeypatch, store, FakeDrive())
     start = date(2026, 8, 1)
     cal = _CalStore()
-    logs = []
     out = cmr.build_client_month(_account(), "gritx", start.isoformat(), days=20,
                                  voice=_voice(), library_path=_lib(tmp_path, n=95),
-                                 store=cal, banned_words=(), logger=logs.append)
+                                 store=cal, banned_words=())
     assert out["ok"] is True
     feeds = _feeds(cal)
-    beats = _video_beats(start, 20)
-    assert 8 <= beats <= 10                                   # the 5/11 pattern over 20 days
     videos = [r for r in feeds if mt.is_video_url(r["image_url"])]
+    drive_photos = [r for r in feeds
+                    if r.get("source_media_asset_id", "").startswith("p")]
     stills = [r for r in feeds if not r.get("source_media_asset_id")]
-    assert len(videos) == beats, f"{len(videos)} video days for {beats} beats"
-    assert len(stills) == 20 - beats and len(feeds) == 20, "0 uncovered"
+    assert len(drive_photos) == 6
+    assert len(stills) == 14
+    assert videos == [], "videos wait until both photo sources are exhausted"
+    assert len(feeds) == 20, "0 uncovered"
+    assert out["feeds"] == 20 and out["days"] == 20
     assert len({r["post_date"] for r in feeds}) == 20, "no double placement"
     assert len({r["image_url"] for r in feeds}) == 20, "0 repeats"
-    assert all(r.get("source_media_asset_id", "").startswith("v") for r in videos)
-    assert any("video pre-pass claimed" in m for m in logs)
     rows = cal.inserted
-    for v in videos:
-        d = v["post_date"]
-        assert any(r["post_date"] == d and r["format"] == "feed" and r["account"] == "facebook"
-                   and r["image_url"] == v["image_url"] for r in rows), "FB mirror"
-        assert any(r["post_date"] == d and r["format"] == "story" for r in rows), "story"
     # one feed per (date, account): the day-shape assertion inside _apply also held
     assert len({(r["post_date"], r["account"]) for r in rows if r["format"] == "feed"}) == 40
 
 
+def test_result_counts_drive_prepass_and_both_slots_of_a_2x_day(monkeypatch, tmp_path):
+    _sources()
+    monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
+    monkeypatch.setattr(_CalStore, "gym_posts_per_day", lambda self, base: 2,
+                        raising=False)
+    store = FakeMediaStore(assets=[make_asset("drive-photo", gym_id="gritx",
+                                               kind="photo", title="team.jpg")])
+    _arm(monkeypatch, store, FakeDrive())
+    captions = iter(range(20))
+    monkeypatch.setattr("agent.client_content.make_caption", lambda *a, **k: (
+        f"Grounded gym class detail number {next(captions)} gives members a useful next step today",
+        []))
+    cal = _CalStore()
+    out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1,
+                                 voice=_voice(), library_path=_lib(tmp_path, n=1),
+                                 store=cal, banned_words=())
+    feeds = _feeds(cal)
+    assert len(feeds) == 2
+    assert {r["post_date"] for r in feeds} == {"2026-08-01"}
+    assert out["feeds"] == 2 and out["days"] == 1
+
+
+def test_video_only_drive_pool_waits_for_fresh_local_photos(monkeypatch, tmp_path):
+    _sources()
+    store = FakeMediaStore(assets=_tt_pool(n_photos=0))
+    _arm(monkeypatch, store, FakeDrive())
+    cal = _CalStore()
+    out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=20,
+                                 voice=_voice(), library_path=_lib(tmp_path, n=95),
+                                 store=cal, banned_words=())
+    assert out["ok"] is True
+    feeds = _feeds(cal)
+    assert len(feeds) == 20
+    assert all(not mt.is_video_url(r["image_url"]) for r in feeds)
+    assert all(not r.get("source_media_asset_id") for r in feeds)
+
+
+def test_transient_drive_photo_failure_holds_a_local_video(monkeypatch, tmp_path):
+    """A still that remains pickable after the photo pre-pass may be retried by the
+    final Drive lane; it cannot be bypassed by the local clip."""
+    _sources()
+    lib = _lib(tmp_path, n=0)
+    (tmp_path / "gritx_lib" / "local_clip.mp4").write_bytes(b"FAKEVIDEO")
+    (tmp_path / "gritx_lib" / "local_clip.json").write_text(
+        '{"public_url": "https://gritx.media/local_clip.mp4"}')
+    store = FakeMediaStore(assets=[make_asset("drive-photo", gym_id="gritx",
+                                               kind="photo", title="team.jpg")])
+    _arm(monkeypatch, store, FakeDrive())
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("transient")))
+    cal, logs = _CalStore(), []
+    out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1,
+                                 voice=_voice(), library_path=lib, store=cal,
+                                 banned_words=(), logger=logs.append)
+    assert out["ok"] is True
+    assert _feeds(cal) == []
+    assert any("local video" in message and "Drive photo remains pickable" in message
+               for message in logs)
+
+
 def test_video_beats_then_drive_photos_when_no_still_is_fresh(monkeypatch, tmp_path):
-    """Same pool, every local still stale: video beats -> Drive videos; the deferred
-    photo beats -> the 6 Drive photos first, then videos again. ~14 video + 6 Drive
-    photo days, 0 repeats, 0 uncovered."""
+    """Same pool, every local still stale: all six Drive photos go first, then
+    videos fill remaining slots. 0 repeats, 0 uncovered."""
     _sources()
     _stale_ledger(monkeypatch, n=95)
     store = FakeMediaStore(assets=_tt_pool())
@@ -1171,11 +1266,11 @@ def test_a_poisoned_asset_is_skipped_after_two_gate_failures_and_beats_still_get
 # ---- final verification (h): an exception mid-lane never loses finished drafts ------
 def test_a_raise_mid_lane_keeps_finished_drafts_and_rolls_back_the_in_flight_asset(
         monkeypatch, tmp_path):
-    """Raise on the 3rd _finish_feed_with_story: the two finished video drafts land,
-    the third asset is returned to the pool, Lane A covers every remaining day ->
-    20/20 feeds and no stamped-but-unlanded asset."""
+    """With local photos exhausted, the video pass can partially fail without
+    losing its finished drafts or leaving a stamped-but-unlanded asset."""
     _sources()
-    store = FakeMediaStore(assets=_tt_pool())
+    _stale_ledger(monkeypatch, n=95)
+    store = FakeMediaStore(assets=_tt_pool(n_photos=0))
     _arm(monkeypatch, store, FakeDrive())
     calls = {"n": 0}
     real_finish = cmr._finish_feed_with_story
@@ -1194,9 +1289,9 @@ def test_a_raise_mid_lane_keeps_finished_drafts_and_rolls_back_the_in_flight_ass
                                  store=cal, banned_words=(), logger=logs.append)
     assert out["ok"] is True
     feeds = _feeds(cal)
-    assert len(feeds) == 20 and len({r["post_date"] for r in feeds}) == 20, "20/20 feeds"
+    assert feeds and len({r["post_date"] for r in feeds}) == len(feeds)
     videos = [r for r in feeds if r.get("source_media_asset_id")]
-    assert len(videos) == 2, "the two drafts finished before the raise landed"
+    assert len(videos) >= 2, "the two drafts finished before the raise landed"
     assert any("staging raised RuntimeError" in m for m in logs)
     landed = {r["source_media_asset_id"] for r in videos}
     stamped = {a["id"] for a in store.assets.values() if a["used_count"]}

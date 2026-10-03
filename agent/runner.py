@@ -548,12 +548,36 @@ def _post_and_save(draft, store, poster, idempotent):
         # has NOT flipped autonomy is unchanged: the draft is stored PENDING and waits
         # on the portal. Any failure falls back to storing PENDING (the post is never
         # lost, only held for a manual approve).
+        if draft.status == DraftStatus.PENDING:
+            try:
+                from . import db as _db
+                if _db.is_autonomous(draft.account_key):
+                    # Once the autonomous path starts, an exception or false
+                    # result cannot prove the publisher had no external effect.
+                    draft._external_visibility_attempted = True
+            except Exception:
+                # An unreadable autonomy setting is itself uncertainty; retain
+                # a Drive stamp if the subsequent pending-row write also fails.
+                draft._external_visibility_attempted = True
         if (draft.status == DraftStatus.PENDING
                 and _autonomous_publish(draft, store, poster)):
+            draft._durable_or_visible = True
             return
         store.put(draft)
+        draft._durable_or_visible = True
         return
+    # Set this before the network call. An exception, malformed success response,
+    # or timeout may still have created a visible card; only Slack's explicit
+    # ok=false response proves the card did not land.
+    draft._external_visibility_attempted = True
     resp = poster.post_approval_card(draft) or {}
+    if resp.get("ok") is False:
+        draft._external_visibility_known_absent = True
+    if (resp.get("ok") is not False
+            and (resp.get("channel") or resp.get("ts") or resp.get("ok"))):
+        # Set before store.put: a partial put failure must not restore/reoffer
+        # media after an approval card is already visible to a human.
+        draft._approval_visible = True
     # A hard send failure (transport down, rate limit past every retry) must be
     # LOUD for this one account and invisible to the rest of the fan-out: one
     # ops alert, the draft still saved (PENDING, actionable once Slack is back),
@@ -569,6 +593,7 @@ def _post_and_save(draft, store, poster, idempotent):
     # Blocked drafts are stored too (terminal records): that is what lets the
     # blocked dedupe stop a retry storm from re-carding the same failure.
     store.put(draft)
+    draft._durable_or_visible = True
 
 
 def _generation_account_for(tenant_key):
@@ -663,10 +688,32 @@ def draft_for_new_upload(tenant_key, filed_assets, poster=None, store=None,
                 continue
             ext = os.path.splitext(path)[1].lower()
             media_type = "video" if ext in VIDEO_EXTS else "image"
+            if (media_type == "video"
+                    and _unused_client_photo_available(
+                        account, path, str(when)[:10])):
+                # The upload remains safely filed for a later daily draw. An
+                # immediate video card must not jump ahead of an unused real
+                # client photo merely because draft-on-upload is armed.
+                continue
             creative = Creative(path=path, media_type=media_type, client_note=note)
             draft = draft_post(account, creative, when, voice=voice)
             draft.force_approval = force_card
-            _post_and_save(draft, store, poster, idempotent)
+            reservation = None
+            if draft.status != DraftStatus.BLOCKED:
+                from . import dam, rotation
+                reservation = rotation.reserve_local_media_once(
+                    account.key, dam.rotation_key(path),
+                    getattr(draft, "category", "") or "upload", str(when)[:10],
+                    path=path)
+                if reservation is None:
+                    continue
+            try:
+                _post_and_save(draft, store, poster, idempotent)
+            finally:
+                # A visible card, durable row, or ambiguous external outcome
+                # consumes the bytes. Only proven absence can undo the claim.
+                if reservation and not _drive_draft_landed_or_uncertain(draft, store):
+                    rotation.release_served(reservation)
             produced.append(draft)
         except Exception as e:
             # One bad asset never blocks the rest, and never crashes ingest.
@@ -680,6 +727,221 @@ def _trust_startup_warning():
         print("[trust] WARNING: AGENT_TRUST_AUTOPUBLISH is ARMED. Calendar routine "
               "posts on level 1+ accounts publish without a tap. Everything else "
               "still cards.")
+
+
+def _legacy_library_fallback_allowed(account):
+    """Whether daily drafting may bypass client_content and cycle the raw library."""
+    return str(getattr(account, "key", "") or "").startswith("lasso")
+
+
+def _client_library_fallback(account, day_key, voice, library_path):
+    """Draft from an unused client creative when approved sources are disabled.
+
+    The old raw-library fallback is unsafe for client photos because it cycles
+    through previously served media. Reserve the pick before exposing its card.
+    """
+    from . import client_content, dam, rotation
+    creative = client_content.pick_image(account.key, day_key, library_path,
+                                         prefer_photos=True)
+    if creative is None:
+        return draft_post(account, None, schedule.scheduled_for(day_key), voice=voice)
+    reserve = (rotation.reserve_local_media_once
+               if getattr(creative, "media_type", "") == "video"
+               else rotation.reserve_local_photo_once)
+    reservation = reserve(
+        account.key, dam.rotation_key(creative.path), "legacy", day_key,
+        path=creative.path)
+    if reservation is None:
+        return None
+    try:
+        draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=voice)
+    except Exception:
+        rotation.release_served(reservation)
+        raise
+    if draft is None or draft.status == DraftStatus.BLOCKED:
+        rotation.release_served(reservation)
+    return draft
+
+
+def _client_drive_first_draft(account, day_key, voice, kind_prefs=("photo",)):
+    """Build today's client draft from one explicitly ordered Drive media tier."""
+    if not (config.client_sources_enabled()
+            and config.gym_drive_stage_enabled()
+            and config.gym_drive_connect_active_for(account.key)):
+        return None
+    draft = None
+    try:
+        from . import client_content, client_sources, gym_media_builder, rotation
+        present = client_sources.categories_present(account.key)
+        if not present:
+            return None
+        pillars = client_content._pillars_for(account.key, present)
+        category = client_content.category_for_day(account.key, day_key, present)
+        if category == "educational":
+            source = client_sources.educational_source_for(account.key, day_key)
+        else:
+            source = client_content._source_for_day(
+                account.key, day_key, category, pillars)
+        if source is None:
+            return None
+        if not rotation.is_gate_clean(
+                source.text, approved_claims=client_sources.approved_claims(account.key)):
+            return None
+        draft = gym_media_builder.build_gym_media_draft(
+            account, day_key, category, voice, source,
+            kind_prefs=kind_prefs)
+        if draft is not None:
+            draft.scheduled_for = schedule.scheduled_for(day_key)
+            draft.force_approval = True
+        return draft
+    except Exception as exc:  # noqa: BLE001 - Drive may never sink daily drafting
+        if draft is not None and getattr(draft, "source_media_asset_id", ""):
+            _rollback_unlanded_drive_draft(draft, day_key)
+        print(f"[daily] Drive-first draft failed for {account.key} on {day_key} "
+              f"({type(exc).__name__}); falling through to local media")
+        return None
+
+
+def _client_drive_kind_available(account, kind):
+    """True/False for a readable Drive inventory, None when inventory is uncertain."""
+    if not (config.gym_drive_stage_enabled()
+            and config.gym_drive_connect_active_for(account.key)):
+        return False
+    try:
+        from . import gym_media_index, gym_media_selector
+        media_store = gym_media_index.default_store()
+        if not media_store.available():
+            return None
+        base = gym_media_selector.base_gym_key(account.key)
+        # pickable intentionally hides read failures as []; probe the authoritative
+        # read once so a transient outage cannot be mistaken for an empty photo tier.
+        assets = media_store.list_assets(base)
+        class Snapshot:
+            def available(self):
+                return True
+            def list_assets(self, _base):
+                return assets
+        return bool(gym_media_selector.pickable(
+            base, kind, store=Snapshot(), strict_claims=True))
+    except Exception:  # noqa: BLE001 - uncertainty holds lower-priority video
+        return None
+
+
+def _client_local_photo_available(account, day_key, library_path):
+    """True/False for an unused local photo, None when its durable ledger is unreadable."""
+    try:
+        from . import client_content, rotation
+        rotation.load_served_strict()
+        picked = client_content.pick_image(
+            account.key, day_key, library_path, prefer_photos=True)
+        if picked is None:
+            return False
+        return getattr(picked, "media_type", "") != "video"
+    except Exception:  # noqa: BLE001 - uncertainty holds lower-priority video
+        return None
+
+
+def _client_photo_first_draft(account, day_key, voice, library_path, poster=None):
+    """Daily client order: Drive photo, local photo, Drive video, local video."""
+    from .client_content import build_client_draft
+    drive_photo = _client_drive_kind_available(account, "photo")
+    draft = None
+    if drive_photo is True:
+        draft = _client_drive_first_draft(
+            account, day_key, voice, kind_prefs=("photo",))
+    local_photo = (_client_local_photo_available(account, day_key, library_path)
+                   if draft is None else False)
+    if draft is None and local_photo is True:
+        draft = build_client_draft(
+            account, day_key, voice, library_path, poster=poster,
+            prefer_photos=True)
+    # A photo tier that is present, unreadable, or failed materialization holds
+    # all videos. Enter video tiers only after both photo inventories are known empty.
+    if draft is None and drive_photo is False and local_photo is False:
+        drive_video = _client_drive_kind_available(account, "video")
+        if drive_video is True:
+            draft = _client_drive_first_draft(
+                account, day_key, voice, kind_prefs=("video",))
+        elif drive_video is False:
+            draft = build_client_draft(
+                account, day_key, voice, library_path, poster=poster,
+                prefer_photos=True)
+    return draft
+
+
+def _rollback_unlanded_drive_draft(draft, day_key):
+    """Restore a Drive stamp only when its draft never reached the pending store."""
+    asset_id = str(getattr(draft, "source_media_asset_id", "") or "")
+    if not asset_id:
+        return True
+    try:
+        from . import db, gym_media_index, gym_media_selector
+        restored = gym_media_selector.rollback_use(
+            draft.account_key, day_key, store=gym_media_index.default_store(),
+            asset_id=asset_id, restore_unstaged=True)
+        if not restored:
+            return False
+        base = gym_media_selector.base_gym_key(draft.account_key)
+        claim_id = getattr(draft, "_drive_claim_id", None)
+        if not claim_id:
+            asset = gym_media_index.default_store().get_asset(asset_id)
+            claim_id = gym_media_selector.drive_content_claim_id(base, asset)
+        db.socialapi_claim_release(
+            claim_id, f"{base}_gbp")
+        return True
+    except Exception as exc:  # noqa: BLE001 - surface a once-used integrity failure
+        print(f"[daily] failed to restore unlanded Drive asset {asset_id} for "
+              f"{draft.account_key} on {day_key}: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _drive_draft_landed_or_uncertain(draft, store):
+    """True when a card/publish/save landed, or durable readback is uncertain."""
+    if (getattr(draft, "_approval_visible", False)
+            or getattr(draft, "_durable_or_visible", False)):
+        return True
+    if (getattr(draft, "_external_visibility_attempted", False)
+            and not getattr(draft, "_external_visibility_known_absent", False)):
+        return True
+    getter = getattr(store, "get", None)
+    if not callable(getter):
+        return True  # no readback proof: fail closed, never make media reofferable
+    try:
+        return getter(draft.draft_id) is not None
+    except Exception:
+        return True  # a partial put cannot be disproved when readback also fails
+
+
+def _unused_client_photo_available(account, path, day_key):
+    """True when an unused local or armed Drive photo should precede a video card."""
+    try:
+        from . import client_content, rotation
+        rotation.load_served_strict()
+        local = client_content.pick_image(
+            account.key, day_key, os.path.dirname(path), prefer_photos=True)
+        if local is not None and getattr(local, "media_type", "") != "video":
+            return True
+    except Exception:  # noqa: BLE001 - unknown local history holds the video
+        return True
+    try:
+        if not (config.gym_drive_stage_enabled()
+                and config.gym_drive_connect_active_for(account.key)):
+            return False
+        from . import gym_media_index, gym_media_selector
+        media_store = gym_media_index.default_store()
+        if not media_store.available():
+            return True
+        base = gym_media_selector.base_gym_key(account.key)
+        assets = media_store.list_assets(base)
+        class Snapshot:
+            def available(self):
+                return True
+            def list_assets(self, _base):
+                return assets
+        return bool(gym_media_selector.pickable(
+            base, "photo", store=Snapshot(), strict_claims=True))
+    except Exception:  # noqa: BLE001 - unknown Drive inventory holds the video
+        return True
 
 
 def run_daily(poster=None, voice_path=None, library_path=None,
@@ -821,6 +1083,7 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         # FLEET ISOLATION (flagless hardening): one account's API error,
         # missing token, or empty library never blocks another account's
         # cycle. An exception logs, alerts once, audits, and moves on.
+        _unlanded_drive = None
         try:
             # Cadence gate FIRST: a configured skip day produces no draft and no
             # card for this account (default 7 days/week, no skip days).
@@ -986,13 +1249,21 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # as today. Book/summit stay LASSO-only (never reached here).
             if (draft is None and config.client_sources_enabled()
                     and not account.key.startswith("lasso")):
-                from .client_content import build_client_draft
-                draft = build_client_draft(account, day_key, acct_voice, acct_lib,
-                                           poster=poster)
+                draft = _client_photo_first_draft(
+                    account, day_key, acct_voice, acct_lib, poster=poster)
+                if (draft is not None
+                        and getattr(draft, "source_media_asset_id", "")):
+                    _unlanded_drive = draft
+            if (draft is None and not account.key.startswith("lasso")
+                    and not config.client_sources_enabled()):
+                draft = _client_library_fallback(account, day_key, acct_voice,
+                                                 acct_lib)
             # Library fallback: the last leg of the legacy LASSO daily draft. Skipped
-            # for LASSO accounts when autopublish is on so no redundant card is built;
-            # client/non-LASSO accounts are unaffected (_skip_legacy_lasso_daily False).
-            if draft is None and not _skip_legacy_lasso_daily:
+            # for LASSO accounts when autopublish is on so no redundant card is built.
+            # When client sources are armed, non-LASSO accounts must stay on
+            # client_content's strict once-used picker instead of cycling pick_next.
+            if (draft is None and not _skip_legacy_lasso_daily
+                    and _legacy_library_fallback_allowed(account)):
                 creative = pick_next(account, acct_lib, used_creatives_for(account.key))
                 if config.lasso_infographic_quality_enabled(account.key) and creative is not None:
                     from .infographic_evidence import reviewed_asset
@@ -1045,11 +1316,17 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             if idempotent and draft is not None:
                 draft, existing = _reconcile(draft, day_key, "feed", store, poster)
                 if draft is None:
+                    if (_unlanded_drive is not None
+                            and not _drive_draft_landed_or_uncertain(
+                                _unlanded_drive, store)):
+                        _rollback_unlanded_drive_draft(_unlanded_drive, day_key)
+                    _unlanded_drive = None
                     # Re-run, nothing new: the existing PENDING draft IS the result.
                     # No new draft, no new card.
                     results.append(existing)
             if draft is not None:
                 _post_and_save(draft, store, poster, idempotent)
+                _unlanded_drive = None
                 results.append(draft)
             feed_draft = draft if draft is not None else existing
 
@@ -1122,6 +1399,10 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                         results.append(story)
 
         except Exception as e:
+            if (_unlanded_drive is not None
+                    and not _drive_draft_landed_or_uncertain(
+                        _unlanded_drive, store)):
+                _rollback_unlanded_drive_draft(_unlanded_drive, day_key)
             print(f"[runner] {account.key} failed this cycle: "
                   f"{type(e).__name__}: {e}")
             ops_alerts.alert(f"account {account.key} failed its draft cycle: "
