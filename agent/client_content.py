@@ -183,9 +183,16 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     the gym actually being at that cap."""
     from . import dam
     from .media_bridge import enabled as bridge_enabled
-    from .client_media_sync import explicitly_refused_local, usable_local_creative
+    from .client_media_sync import (explicitly_refused_local, is_generated_derivative,
+                                    usable_local_creative)
     if not bridge_enabled():
-        usable_local_creative = lambda creative, account: not explicitly_refused_local(creative.path)
+        # Bridge-off keeps the legacy permissive filter, but Echo-generated gap
+        # fillers (igfill_/no_media_/seed_) are still never client media: without
+        # this, a month built after an infographic fill pass picks the filler
+        # cards themselves as "photos" (Swift River, 2026-10-02 regression).
+        usable_local_creative = lambda creative, account: (
+            not explicitly_refused_local(creative.path)
+            and not is_generated_derivative(creative.path))
     imgs = [c for c in list_creatives(library_path)
             if usable_local_creative(c, account_key)]
     excl = rotation.style_exclusions(library_path)

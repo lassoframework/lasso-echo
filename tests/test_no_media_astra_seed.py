@@ -58,14 +58,26 @@ class _Store:
         return rows
 
 
-def _stub_pipeline(monkeypatch):
-    from agent import creative_studio, media_host
+class _AstraResult:
+    engine = "astra"
+    model = "gpt-image-test"
 
-    class _Client:
-        def generate_image(self, prompt, model):
-            return b"\x89PNG_fake_card_bytes"
-    monkeypatch.setattr(creative_studio, "_default_client", lambda: _Client())
-    monkeypatch.setattr(creative_studio, "_render_with_timeout", lambda fn: fn())
+    def __init__(self):
+        self.image_bytes = b"\x89PNG_fake_card_bytes"
+
+
+def _stub_pipeline(monkeypatch, palette=None):
+    """Stub the Astra-only render path: verified gym palette on file, the
+    shared Astra-only generator, and hosting. creative_studio is deliberately
+    NOT stubbed -- the seed must never touch it."""
+    from agent import astra_prompt, client_infographic_fill, media_host
+
+    monkeypatch.setattr(astra_prompt, "load_gym_brand_palette",
+                        lambda key: palette if palette is not None else {
+                            "canvas": "#111111", "ink": "#FFFFFF",
+                            "accent": "#C8102E"})
+    monkeypatch.setattr(client_infographic_fill, "_generate_astra_only",
+                        lambda prompt, opts, **kw: _AstraResult())
     monkeypatch.setattr(media_host, "host_media",
                         lambda path, key: f"https://r2/{os.path.basename(path)}")
 
@@ -181,14 +193,79 @@ def test_scrapes_once_per_gym(monkeypatch):
 
 
 def test_generate_failure_never_raises(monkeypatch):
+    _stub_pipeline(monkeypatch)
     _stub_deep_brain(monkeypatch, [_Fact("Real fact about Chateau")])
-    from agent import creative_studio
+    from agent import client_infographic_fill
 
-    def _boom(*a, **k):
-        raise RuntimeError("astra timeout")
-    monkeypatch.setattr(creative_studio, "generate", _boom)
+    def _none(*a, **k):
+        return None  # Astra failed on every attempt -> NEEDS HUMAN, day held
+    monkeypatch.setattr(client_infographic_fill, "_generate_astra_only", _none)
     store = _Store()
     n = nmas.seed_gaps("chateau", _acct(), store, max_rows=1, days_ahead=1)
+    assert n == 0
+    assert store.inserted == []
+
+
+def test_missing_verified_palette_fails_closed(monkeypatch):
+    """No verified gym brand colors on file -> seed nothing, never a generic
+    or LASSO palette (2026-10-02 ruling)."""
+    _stub_pipeline(monkeypatch, palette=None)
+    _stub_deep_brain(monkeypatch, [_Fact("Real fact about Chateau")])
+    from agent import astra_prompt
+    monkeypatch.setattr(astra_prompt, "load_gym_brand_palette", lambda key: None)
+    store = _Store()
+    n = nmas.seed_gaps("chateau", _acct(), store, max_rows=1, days_ahead=1)
+    assert n == 0
+    assert store.inserted == []
+
+
+def test_astra_only_with_gym_palette_in_brief(monkeypatch):
+    """The render must go through the Astra-only generator and the brief must
+    carry the gym's OWN verified palette -- creative_studio.generate (the
+    Gemini/generic lane) must never be reached."""
+    from agent import astra_prompt, client_infographic_fill, creative_studio
+    seen = {}
+
+    def _fake_brief(headline, facts, **kw):
+        seen["gym_palette"] = kw.get("gym_palette")
+        return "BRIEF:" + headline
+    monkeypatch.setattr(astra_prompt, "build_infographic_brief", _fake_brief)
+    monkeypatch.setattr(astra_prompt, "load_gym_brand_palette",
+                        lambda key: {"canvas": "#0A1B2C", "accent": "#C8102E"})
+
+    def _no_gemini(*a, **k):
+        raise AssertionError("creative_studio.generate must not be called")
+    monkeypatch.setattr(creative_studio, "generate", _no_gemini)
+
+    monkeypatch.setattr(client_infographic_fill, "_generate_astra_only",
+                        lambda prompt, opts, **kw: _AstraResult())
+    _stub_deep_brain(monkeypatch, [_Fact("Real fact about Chateau")])
+    from agent import media_host
+    monkeypatch.setattr(media_host, "host_media",
+                        lambda path, key: f"https://r2/{os.path.basename(path)}")
+    store = _Store()
+    n = nmas.seed_gaps("chateau", _acct(), store, max_rows=1, days_ahead=1)
+    assert n == 1
+    assert seen["gym_palette"] == {"canvas": "#0A1B2C", "accent": "#C8102E"}
+
+
+def test_media_depletion_rechecked_before_each_render(monkeypatch):
+    """An approved photo landing mid-run wins: the second render is held."""
+    _stub_pipeline(monkeypatch)
+    _stub_deep_brain(monkeypatch, [
+        _Fact("Real fact about Chateau"),
+        _Fact("Another real fact about Chateau"),
+    ])
+    from agent import client_infographic_fill
+    calls = {"n": 0}
+
+    def _depleted(base, *, now=None):
+        calls["n"] += 1
+        return calls["n"] <= 1  # True at the gate, False at the first render
+    monkeypatch.setattr(client_infographic_fill, "real_media_depleted",
+                        _depleted)
+    store = _Store()
+    n = nmas.seed_gaps("chateau", _acct(), store, max_rows=2, days_ahead=5)
     assert n == 0
     assert store.inserted == []
 

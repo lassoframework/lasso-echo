@@ -21,6 +21,9 @@ from agent.accounts import Account, Platform  # noqa: E402
 from agent.voice import VoiceDoc  # noqa: E402
 
 
+GYMX_BRAND_COLORS = ["#1B2A3C", "#F2EDDE", "#D7263D"]
+
+
 @pytest.fixture(autouse=True)
 def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
@@ -28,6 +31,16 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_NANO_ENABLED", "true")
     monkeypatch.setenv("AGENT_CLIENT_SOURCES", "true")
     monkeypatch.setattr(config, "LIBRARY_PATH", str(tmp_path / "lib"), raising=False)
+    # Verified brand colors for the test gym (Blake 2026-10-02: the fill lane
+    # fails CLOSED without them). Tests that exercise the missing-palette hold
+    # point AGENT_CLIENT_VOICE_DIR at an empty dir.
+    voice_dir = tmp_path / "voice"
+    gym_dir = voice_dir / "gymx"
+    gym_dir.mkdir(parents=True)
+    import json as _json
+    (gym_dir / "brand_colors.json").write_text(
+        _json.dumps({"colors": GYMX_BRAND_COLORS}))
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(voice_dir))
     # hosting + nano stubbed per test
 
 
@@ -96,6 +109,7 @@ def test_flag_off_is_noop(monkeypatch):
 def test_fills_empty_days_with_pending_infographic_rows(monkeypatch):
     _sources()
     _stub_pipeline(monkeypatch)
+    _arm_astra(monkeypatch, 200, _astra_body())
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00")
@@ -128,6 +142,7 @@ def test_every_inserted_row_carries_the_client_safe_review_mark(monkeypatch):
     fails."""
     _sources()
     _stub_pipeline(monkeypatch)
+    _arm_astra(monkeypatch, 200, _astra_body())
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00")
@@ -161,6 +176,7 @@ def test_days_with_existing_feeds_are_never_touched(monkeypatch):
 def test_denied_days_count_as_empty(monkeypatch):
     _sources()
     _stub_pipeline(monkeypatch)
+    _arm_astra(monkeypatch, 200, _astra_body())
     rows = [{"post_date": "2026-08-26", "format": "feed", "account": "instagram",
              "status": "denied"}]
     store = _Store(rows)
@@ -215,30 +231,28 @@ def test_fill_cards_are_drawn_by_astra(monkeypatch):
     assert seen[0]["tools"][0]["model"] == "gpt-image-2.5-sunburst"
 
 
-def test_fill_falls_back_to_gemini_when_astra_is_down(monkeypatch):
+def test_astra_down_holds_the_day_no_gemini_fallback(monkeypatch):
+    """Blake 2026-10-02: NO silent Gemini rung and no generic LASSO fallback for
+    a client gym's infographic. Astra down = the day stays empty and the slot
+    is marked NEEDS HUMAN, never filled by a second engine."""
     _sources()
     _stub_pipeline(monkeypatch)
     seen = _arm_astra(monkeypatch, 503, "astra unavailable")
+    alerts = []
+    monkeypatch.setattr("agent.ops_alerts.alert", lambda msg: alerts.append(msg))
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
-    assert len(seen) == 2, "Astra is retried once before the fallback"
-    assert out["filled"] == 1, "the Gemini rung still fills the slot"
+    assert len(seen) == 2, "Astra is retried once, then the day is held"
+    assert out["filled"] == 0 and store.inserted == []
+    assert any("NEEDS HUMAN" in a for a in alerts), alerts
 
 
 def test_a_dead_chain_marks_the_calendar_slot_needs_human(monkeypatch):
     """A calendar slot may NEVER fail silently."""
-    from agent import creative_studio, media_host
     _sources()
     _stub_pipeline(monkeypatch)
     _arm_astra(monkeypatch, 503, "astra unavailable")
-
-    class _DeadGemini:
-        def generate_image(self, prompt, model):
-            raise RuntimeError("gemini down too")
-
-    monkeypatch.setattr(creative_studio, "_default_client", lambda: _DeadGemini())
-    monkeypatch.setattr(media_host, "host_media", lambda path, key: "https://r2/x")
     alerts = []
     monkeypatch.setattr("agent.ops_alerts.alert", lambda msg: alerts.append(msg))
 
@@ -251,3 +265,121 @@ def test_a_dead_chain_marks_the_calendar_slot_needs_human(monkeypatch):
     from agent import db
     rows = [r for r in db.audit_rows() if r["kind"] == "image_needs_human"]
     assert rows and rows[0]["account_key"] == "gymx_ig"
+
+
+# ---- Blake 2026-10-02: photos first, Astra route, verified gym palette ----
+
+def test_missing_brand_colors_fails_closed(monkeypatch, tmp_path):
+    """No verified palette on file -> the infographic fallback HELDS and says
+    why. Colors are never invented from the voice doc's tone."""
+    _sources()
+    _stub_pipeline(monkeypatch)
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "empty_voice"))
+    logs = []
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00",
+                        logger=logs.append)
+    assert out["ok"] is False
+    assert "no verified brand colors" in out["reason"]
+    assert store.inserted == []
+    assert any("brand colors" in m for m in logs)
+
+
+def test_astra_brief_carries_the_verified_gym_palette(monkeypatch):
+    """The brief Astra actually receives names THIS gym's verified hex colors
+    and forbids inventing others."""
+    _sources()
+    _stub_pipeline(monkeypatch)
+    seen = _arm_astra(monkeypatch, 200, _astra_body())
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert out["filled"] == 1
+    brief = seen[0]["input"]
+    if not isinstance(brief, str):
+        brief = " ".join(str(c.get("text", "")) for c in brief
+                         if isinstance(c, dict))
+    for hex_color in GYMX_BRAND_COLORS:
+        assert hex_color in brief, brief
+    assert "VERIFIED FOR THIS GYM" in brief
+
+
+def test_photos_rechecked_at_generation_time(monkeypatch):
+    """A photo landing between the scan and the render always wins: the fill
+    stops instead of drawing an infographic."""
+    _sources()
+    _stub_pipeline(monkeypatch)
+    _arm_astra(monkeypatch, 200, _astra_body())
+    calls = {"n": 0}
+    real = cif.real_media_depleted
+
+    def _flip(base, *, now=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real(base, now=now)   # the top-of-scan check: still depleted
+        return False                     # generation-time recheck: photos arrived
+
+    monkeypatch.setattr(cif, "real_media_depleted", _flip)
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert calls["n"] >= 2, "the generation-time recheck must actually run"
+    assert out["filled"] == 0 and store.inserted == []
+
+
+def test_pending_client_photo_blocks_last_resort_infographic(monkeypatch):
+    """An indexed Drive photo awaiting moderation is not an empty photo pool."""
+    from agent import gym_media_index
+
+    class MediaStore:
+        def available(self):
+            return True
+
+        def list_assets(self, gym):
+            return [{"id": "photo-1", "gym_id": gym, "kind": "photo",
+                     "eligible": True, "excluded_by_coach": False,
+                     "review_status": "pending_review",
+                     "moderation_status": "pending", "content_hash": "hash"}]
+
+    monkeypatch.setattr(config, "gym_drive_stage_enabled", lambda: True)
+    monkeypatch.setattr(config, "gym_drive_connect_active_for", lambda base: True)
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: MediaStore())
+    assert cif.real_media_depleted("gymx") is False
+
+
+def test_gym_astra_brief_never_inherits_lasso_color_or_footer(monkeypatch):
+    from agent import astra_prompt
+
+    monkeypatch.setenv("AGENT_ASTRA_STYLE_FREEDOM", "false")
+    brief = astra_prompt.build_infographic_brief(
+        "Train with confidence", ["Coached small group training"],
+        account_key="gymx_ig", gym_palette={"colors": GYMX_BRAND_COLORS})
+    assert "for this gym's own brand" in brief
+    assert "BRAND COLORS, VERIFIED FOR THIS GYM" in brief
+    assert all(color in brief for color in GYMX_BRAND_COLORS)
+    assert "URL FOOTER TEXT" not in brief
+    assert "LASSOFRAMEWORK.COM" not in brief
+    assert "red is used exactly one time" not in brief
+
+
+def test_existing_days_rechecked_at_generation_time(monkeypatch):
+    """A day another lane filled between the scan and the render is skipped."""
+    _sources()
+    _stub_pipeline(monkeypatch)
+    _arm_astra(monkeypatch, 200, _astra_body())
+    calls = {"n": 0}
+    real = cif._empty_upcoming_days
+
+    def _flip(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real(*a, **k)         # the scan: day is empty
+        return []                        # generation-time recheck: now filled
+
+    monkeypatch.setattr(cif, "_empty_upcoming_days", _flip)
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert calls["n"] >= 2
+    assert out["filled"] == 0 and store.inserted == []

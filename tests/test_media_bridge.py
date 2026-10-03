@@ -138,8 +138,10 @@ def test_depletion_alert_even_when_no_image_client(monkeypatch):
     monkeypatch.setattr(creative_studio,'_default_client',lambda:None)
     calls=[]
     monkeypatch.setattr(mb,'notify_bridge',lambda *a,**k:calls.append(a[0]))
-    result=cif.fill_gaps('gymx',SimpleNamespace(),object(),voice=object())
-    assert result['reason']=='no image client' and calls==['gymx']
+    result=cif.fill_gaps('gymx',SimpleNamespace(key='gymx_ig'),object(),voice=object())
+    # A client card now requires Astra and verified gym colors. The depletion
+    # notice still fires even when the old Gemini client is unavailable.
+    assert 'no verified brand colors' in result['reason'] and calls==['gymx']
 
 def test_calendar_gap_with_real_library_media_does_not_alert(monkeypatch, tmp_path):
     """A gap alone is not depletion: an available client photo suppresses Slack."""
