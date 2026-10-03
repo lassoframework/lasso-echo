@@ -651,3 +651,237 @@ def test_slot_taken_after_render_holds_before_insert(monkeypatch):
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
     assert calls["n"] >= 3
     assert out["filled"] == 0 and store.inserted == []
+
+
+TENANT = "11111111-1111-4111-8111-111111111111"
+
+
+def _astra_bytes():
+    """The EXACT bytes Astra returns for _astra_body() -- the bytes fill_gaps
+    writes to disk and media_host uploads. The hosted object IS this byte
+    string; anything else served at the row URL is a failed attestation."""
+    import base64 as _b64
+    import json as _json
+    return _b64.b64decode(_json.loads(_astra_body())["output"][0]["result"])
+
+
+class _CalendarHTTP:
+    """Production-shaped PostgREST double for the REAL SupabaseCalendarStore.
+
+    fill_gaps drives store.list_month / store.insert_rows over HTTP exactly as
+    production does: the insert goes through every insert_rows stage belt and,
+    with the guard armed, through visual_writer_prepare's owner-receipt RPCs
+    BEFORE the content_calendar POST. Calls are recorded in order so the tests
+    can assert preparation-RPC-before-insert ordering. Never touches the
+    network."""
+
+    def __init__(self, tenant):
+        self.tenant = tenant
+        self.calls = []                    # ordered ("get"|"post", endpoint)
+        self.registered = False            # raw source registered via bundle RPC
+        self.digest = None                 # fingerprint the bundle RPC attested
+        self.insert_payloads = []          # content_calendar POST bodies
+        self.rendition_args = []
+        self.bundle_args = []
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, value):
+            self.value = value
+            self.headers = {"Content-Range": f"0-{max(0, len(value) - 1)}/{len(value)}"
+                            if isinstance(value, list) else ""}
+
+        def json(self):
+            return self.value
+
+        @property
+        def text(self):
+            return ""
+
+    def get(self, url, *, params, headers, timeout):
+        endpoint = url.rsplit("/", 1)[-1]
+        self.calls.append(("get", endpoint))
+        if endpoint == "tenant_alias":
+            alias = params["alias_key"]
+            assert alias.startswith("eq."), alias
+            return self._Resp([{"alias_key": alias[3:],
+                                "tenant_id": self.tenant}])
+        if endpoint == "visual_group_alias":
+            if not self.registered:
+                return self._Resp([])
+            return self._Resp([{"group_key": "vg_same"}])
+        # content_calendar / support_tickets reads: this gym's calendar is empty
+        return self._Resp([])
+
+    def post(self, url, *, headers, json, timeout):
+        endpoint = url.rsplit("/", 1)[-1]
+        self.calls.append(("post", endpoint))
+        if endpoint == "visual_global_prepare_bundle":
+            self.bundle_args.append(json)
+            self.digest = json["p_fingerprint"]
+            self.registered = True
+            return self._Resp({"group_key": "vg_same",
+                               "fingerprint": self.digest})
+        if endpoint == "visual_global_prepare_source_rendition":
+            self.rendition_args.append(json)
+            return self._Resp({"group_key": "vg_same",
+                               "source_fingerprint": self.digest,
+                               "delivered_fingerprint": self.digest,
+                               "usage_claimed": False})
+        if endpoint == "content_calendar":
+            self.insert_payloads.append(json)
+            import uuid as _uuid
+            return self._Resp([dict(row, id=str(_uuid.uuid4()))
+                               for row in json])
+        raise AssertionError(f"unexpected POST: {url}")
+
+
+def _production_store(tenant=TENANT):
+    """The real SupabaseCalendarStore over the scripted HTTP double."""
+    from agent import portal_calendar_store as pcs
+
+    http = _CalendarHTTP(tenant)
+    return pcs.SupabaseCalendarStore(url="https://db.example",
+                                     service_key="test", http=http), http
+
+
+def _stub_pipeline_hosting(monkeypatch):
+    """Offline Astra + hosting where host_media serves the EXACT bytes written
+    to disk (the real lane uploads the rendered file untransformed), so the
+    served-byte reader can be bound to the actual hosted object."""
+    from agent import creative_studio, media_host
+
+    class _Client:
+        def generate_image(self, prompt, model):
+            return b"\x89PNG_fake_card_bytes"
+    monkeypatch.setattr(creative_studio, "_default_client", lambda: _Client())
+    monkeypatch.setattr(creative_studio, "_render_with_timeout", lambda fn: fn())
+    served = {}
+
+    def _host(path, key):
+        with open(path, "rb") as fh:
+            data = fh.read()
+        url = f"https://r2/{os.path.basename(path)}"
+        served[url] = data
+        return url
+    monkeypatch.setattr(media_host, "host_media", _host)
+    return served
+
+
+def test_guard_on_routes_through_production_store_with_exact_hosted_astra_bytes(
+        monkeypatch):
+    """AGENT_VISUAL_GLOBAL_WRITER_PREP, production shape: fill_gaps writes the
+    real content_calendar POST through SupabaseCalendarStore.insert_rows; the
+    preparation RPCs run BEFORE that POST; and the bytes the byte-proof reads
+    are the exact Astra-generated bytes fill_gaps wrote and hosted (the hosted
+    card IS the generated object, uploaded untransformed). The prior version of
+    this test used an in-memory _Store and then called prepare() separately
+    with fake bytes that never matched Astra's output -- it proved neither the
+    production insert path nor the hosted-byte identity."""
+    import hashlib
+    import uuid
+
+    from agent import visual_owner_receipts as owner
+    from agent import visual_writer_prepare as prep
+
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://r2", raising=False)
+    _sources()
+    served = _stub_pipeline_hosting(monkeypatch)
+    _arm_astra(monkeypatch, 200, _astra_body())
+
+    # Served-byte reader bound to the ACTUAL hosted objects: only URLs fill_gaps
+    # itself hosted may be read, and the bytes returned are the bytes uploaded.
+    def _read_hosted(url):
+        assert url in served, f"byte proof read an unknown URL: {url}"
+        return served[url]
+    monkeypatch.setattr(prep, "_bytes_for_url", _read_hosted)
+
+    receipt_observations = []
+
+    def _same_object_writer(**kw):
+        receipt_observations.append(kw)
+        return {"read_receipt": str(uuid.uuid4()), "render_receipt": None}
+    monkeypatch.setattr(owner, "default_same_object_writer",
+                        lambda: _same_object_writer)
+
+    store, http = _production_store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert out["ok"] is True and out["filled"] == 1, out
+
+    astra_bytes = _astra_bytes()
+    assert served, "fill_gaps must have hosted its card"
+    assert all(data == astra_bytes for data in served.values()), (
+        "the hosted object must be the exact Astra-generated bytes, not a "
+        "stand-in; the byte proof below is only meaningful if served == written")
+
+    # insert_rows really POSTed the batch to content_calendar ...
+    assert len(http.insert_payloads) == 1, http.calls
+    batch = http.insert_payloads[0]
+    assert batch and all(isinstance(r, dict) for r in batch)
+    digest = "md5:" + hashlib.md5(astra_bytes).hexdigest()
+    for r in batch:
+        assert r.get("image_url") in served, r
+        assert r.get("source_media_url") == r["image_url"], (
+            f"guarded row must carry the explicit same-object source: {r!r}")
+        assert r["visual_group_key"] == "vg_same", r
+        assert r["byte_hash"] == "derived:" + digest, (
+            f"row byte_hash must be derived from the exact hosted Astra bytes: {r!r}")
+        assert r["status"] == "pending"
+
+    # ... the raw source was registered through the owner bundle RPC ...
+    assert http.bundle_args, http.calls
+    for args in http.bundle_args:
+        assert args["p_fingerprint"] == digest, (
+            f"raw source registration must attest the exact hosted bytes: {args}")
+    # ... and the owner-receipt writer observed the exact hosted Astra bytes.
+    assert receipt_observations, "owner receipt writer was never invoked"
+    for obs in receipt_observations:
+        assert obs["exact_bytes"] == astra_bytes, (
+            "owner receipt must attest the exact Astra bytes served at the row URL")
+        assert obs["evidence"]["exact_url"] in served
+
+    # Preparation RPCs ran BEFORE the content_calendar insert POST, and the
+    # rendition RPC repeated the attested digest back unchanged.
+    posts = [ep for method, ep in http.calls if method == "post"]
+    insert_at = posts.index("content_calendar")
+    rendition_at = posts.index("visual_global_prepare_source_rendition")
+    bundle_at = posts.index("visual_global_prepare_bundle")
+    assert bundle_at < rendition_at < insert_at, posts
+    for args in http.rendition_args:
+        assert args["p_group_key"] == "vg_same"
+        assert args["p_source_read_receipt"] == args["p_delivered_read_receipt"]
+        assert args["p_render_receipt"] is None
+
+
+def test_guard_off_through_production_store_no_prep_calls_legacy_row_shape(
+        monkeypatch):
+    """Guard OFF through the SAME production-shaped store: zero preparation RPC
+    calls, and the content_calendar POST carries the pre-migration legacy row
+    shape (no source_media_url / visual_group_key / byte_hash columns)."""
+    from agent import visual_writer_prepare as prep
+
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    _sources()
+    _stub_pipeline_hosting(monkeypatch)
+    _arm_astra(monkeypatch, 200, _astra_body())
+    store, http = _production_store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert out["ok"] is True and out["filled"] == 1, out
+
+    assert len(http.insert_payloads) == 1, http.calls
+    batch = http.insert_payloads[0]
+    assert batch, "guard OFF must still insert through the production store"
+    for r in batch:
+        for column in ("source_media_url", "visual_group_key", "byte_hash"):
+            assert column not in r, (
+                f"guard OFF must never write the provenance columns: {r!r}")
+    # prepare stays an exact pass-through for legacy rows ...
+    legacy = dict(batch[0])
+    assert prep.prepare(store, "gymx", legacy) is legacy
+    # ... and the whole run made no preparation RPC calls at all.
+    assert not http.rendition_args and not http.bundle_args, http.calls
+    assert not any("visual_global" in ep for _m, ep in http.calls), http.calls
