@@ -270,7 +270,7 @@ def _business_request_key(read, ticket):
     try:
         rows = read("support_messages", {
             "ticket_id": f"eq.{ticket['id']}", "direction": "eq.inbound",
-            "select": "id,ticket_id,created_at,body,author_type,direction,attachments",
+            "select": "id,ticket_id,created_at,body,author_id,author_type,direction,attachments",
             "order": "created_at.asc,id.asc", "limit": "1000"})
     except Exception:  # noqa: BLE001
         return None
@@ -286,10 +286,12 @@ def _business_request_key(read, ticket):
             return None
         author = message.get("author_type")
         client = author == "client" or not author
+        staff_case_coach = (ticket.get("id") == "ae8c7e39-7509-4948-b06a-a24954c3b0a3"
+                            and author == "coach" and message.get("author_id") == "U06F8BUH7CG")
         operator_mention = (author in ("staff", "blake")
                             and attachments.get("surface") == "mention"
                             and attachments.get("identity_reason") == "operator list")
-        if client or operator_mention:
+        if client or staff_case_coach or operator_mention:
             requester.append([message.get("id"), message.get("created_at"),
                               message.get("body")])
     encode = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -1757,7 +1759,8 @@ def _audit(action, gym_key, ticket_id, status, summary, log=print):
         f"status={status} at={_now_iso()} summary={summary!r}")
 
 
-def _ticket_tenant(gym_key, ticket_id, deps):
+def _ticket_tenant(gym_key, ticket_id, deps, *, action=None, args=None,
+                   reservation_key=None):
     """Bind an ops request to the persisted ticket before any side effect.
 
     A portal ticket's client_id is a gym UUID; the portal's exact token mapping
@@ -1773,7 +1776,7 @@ def _ticket_tenant(gym_key, ticket_id, deps):
     try:
         tickets = bus._get("support_tickets", {
             "id": f"eq.{ticket_id}",
-            "select": "id,product,source,client_id,raw_text,verification_before",
+            "select": "id,product,source,client_id,raw_text,verification_before,status,identity_kind,slack_user_id,slack_channel_id,slack_thread_ts",
             "limit": "2"})
         if (not isinstance(tickets, list) or len(tickets) != 1
                 or not isinstance(tickets[0], dict)
@@ -1785,6 +1788,7 @@ def _ticket_tenant(gym_key, ticket_id, deps):
             before = ticket.get("verification_before") or {}
             fixer = before.get("fixer") if isinstance(before, dict) else {}
             triage = fixer.get("triage") if isinstance(fixer, dict) else {}
+            staff_swap = fixer.get("staff_swap") if isinstance(fixer, dict) else {}
             bound_key = triage.get("gym_key") if isinstance(triage, dict) else None
             raw_text = str(ticket.get("raw_text") or "")
             raw_has_key = bool(re.search(
@@ -1794,6 +1798,47 @@ def _ticket_tenant(gym_key, ticket_id, deps):
             if (ticket.get("product") == "echo" and ticket.get("source") == "ops_fix"
                     and bound_key == gym_key and raw_has_key):
                 return None
+            # One legacy internal Slack case may run a keyed media swap only when
+            # its immutable pointer names this exact tenant and the live token
+            # mapping proves that tenant resolves once.  Do not generalize the
+            # null-client exception to other Slack tickets.
+            # The legacy staff exception is a capability for exactly one
+            # pointer-bound operation.  It cannot authorize a catalog action
+            # merely because the ticket contains a Swift pointer.
+            expected_pointer_keys = {"gym_key", "row_id", "reservation_key",
+                                     "before_image_sha256", "caption_sha256"}
+            if (action == "swap_media"
+                    and isinstance(args, dict)
+                    and set(args) == {"row_id"}
+                    and ticket_id == "ae8c7e39-7509-4948-b06a-a24954c3b0a3"
+                    and ticket.get("product") == "echo"
+                    and ticket.get("source") == "slack_conversation"
+                    and ticket.get("status") == "hold"
+                    and ticket.get("identity_kind") == "coach"
+                    and ticket.get("slack_user_id") == "U06F8BUH7CG"
+                    and ticket.get("slack_channel_id") == "C0C2MHAAUMU"
+                    and ticket.get("slack_thread_ts") == "1790946130.867599"
+                    and isinstance(staff_swap, dict)
+                    and set(staff_swap) == expected_pointer_keys
+                    and staff_swap.get("gym_key") == gym_key
+                    and isinstance(staff_swap.get("row_id"), str)
+                    and _BUSINESS_ROW_ID.fullmatch(staff_swap["row_id"]) is not None
+                    and args.get("row_id") == staff_swap["row_id"]
+                    and isinstance(staff_swap.get("reservation_key"), str)
+                    and re.fullmatch(r"[A-Za-z0-9_-]{8,128}", staff_swap["reservation_key"])
+                    and reservation_key == staff_swap["reservation_key"]
+                    and all(isinstance(staff_swap.get(key), str)
+                            and _BUSINESS_REQUEST_KEY.fullmatch(staff_swap[key])
+                            for key in ("before_image_sha256", "caption_sha256"))):
+                tokens = bus._get("echo_intake_tokens", {
+                    "echo_account_key": f"eq.{gym_key}",
+                    "select": "gym_id,echo_account_key", "limit": "2"})
+                if (isinstance(tokens, list) and len(tokens) == 1
+                        and isinstance(tokens[0], dict)
+                        and tokens[0].get("echo_account_key") == gym_key
+                        and isinstance(tokens[0].get("gym_id"), str)
+                        and _UUID.fullmatch(tokens[0]["gym_id"])):
+                    return None
             return 409, {"error": "ticket_tenant_unconfirmed"}
         if not isinstance(client_id, str) or not client_id.strip():
             return 409, {"error": "ticket_tenant_unconfirmed"}
@@ -1859,7 +1904,9 @@ def run_action(action, gym_key, ticket_id, args, *, reservation_key=None,
         args = {}
     if not isinstance(args, dict):
         return 400, {"error": "bad_request", "detail": "args must be an object"}
-    tenant_refusal = _ticket_tenant(gym_key, ticket_id, deps)
+    tenant_refusal = _ticket_tenant(
+        gym_key, ticket_id, deps, action=action, args=args,
+        reservation_key=reservation_key)
     if tenant_refusal:
         _audit(action, gym_key, ticket_id, tenant_refusal[0],
                tenant_refusal[1]["error"], log)
@@ -1920,7 +1967,9 @@ def run_action(action, gym_key, ticket_id, args, *, reservation_key=None,
             return receipt.get("http_status", 200), body
         if action == "swap_media":
             latest_key = _current_swap_request_key(deps, ticket_id)
-            latest_tenant_refusal = _ticket_tenant(gym_key, ticket_id, deps)
+            latest_tenant_refusal = _ticket_tenant(
+                gym_key, ticket_id, deps, action=action, args=args,
+                reservation_key=reservation_key)
             if latest_key != bound_request_key or latest_tenant_refusal:
                 # The reservation is durable and no side effect has run. Mark it
                 # failed so the stale queued action cannot be replayed later.
@@ -2003,6 +2052,23 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         return refused
     deps = dict(deps or {})
     method = (method or "").upper()
+    if path == ROUTE_PREFIX + "/staff-adoption/business-proof":
+        if method != "POST":
+            return 405, {"error": "method_not_allowed"}
+        from . import fixer_staff_adoption_proof
+        receipt_read = deps.get("staff_adoption_receipt_read")
+        if receipt_read is None:
+            from . import fixer_ops_receipts as receipts
+            try:
+                receipt_store = deps.get("receipt_store") or receipts.default_store()
+            except receipts.ReceiptError:
+                receipt_store = None
+            if receipt_store is not None:
+                receipt_read = lambda key, gym: receipts.get_receipt(receipt_store, key, gym)
+        return fixer_staff_adoption_proof.handle(
+            raw_body, read=deps.get("staff_adoption_read"),
+            http_get=deps.get("staff_adoption_http_get"),
+            receipt_read=receipt_read)
     m = re.match(rf"^{re.escape(ROUTE_PREFIX)}/reply-reconciliation/"
                  r"([0-9a-f]{32})$", path)
     if m:
