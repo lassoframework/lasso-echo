@@ -85,6 +85,54 @@ def test_daily_drafts_one_per_account(monkeypatch, tmp_path):
     assert len(poster.cards) == 3  # exactly one per account
 
 
+def test_client_daily_fallback_never_reuses_a_staged_photo(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.delenv("AGENT_CLIENT_SOURCES", raising=False)
+    voice = tmp_path / "voice.md"
+    voice.write_text("We help gyms grow.\n#LASSO", encoding="utf-8")
+    library = tmp_path / "lib"
+    library.mkdir()
+    (library / "a.jpg").write_bytes(b"img")
+    (library / "a.txt").write_text("Founders class, Saturday 9am.")
+    (library / "0-video.mp4").write_bytes(b"video")
+    (library / "0-video.txt").write_text("Coached strength class.")
+    from agent.store import PendingStore
+    store = PendingStore(path=str(tmp_path / "pending.db"))
+    poster = FakePoster()
+
+    first = runner.run_daily(poster=poster, voice_path=str(voice),
+                             library_path=str(library), accounts=[_acct(key="gym_ig")],
+                             scheduled_for="2026-07-01T12:00:00Z", store=store)
+    second = runner.run_daily(poster=poster, voice_path=str(voice),
+                              library_path=str(library), accounts=[_acct(key="gym_ig")],
+                              scheduled_for="2026-07-02T12:00:00Z", store=store)
+    assert len(poster.cards) == 2
+    assert first["drafts"][0].creative_path.endswith("a.jpg")
+    assert second["drafts"][0].creative_path.endswith("0-video.mp4")
+    third = runner.run_daily(poster=poster, voice_path=str(voice),
+                             library_path=str(library), accounts=[_acct(key="gym_ig")],
+                             scheduled_for="2026-07-03T12:00:00Z", store=store)
+    assert third["drafts"][0].status == DraftStatus.BLOCKED
+    assert third["drafts"][0].creative_path == ""
+
+
+def test_client_daily_fallback_releases_unbuilt_draft(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    library = tmp_path / "lib"
+    library.mkdir()
+    (library / "a.jpg").write_bytes(b"img")
+    from agent import rotation
+    from agent import runner as runmod
+    def fail(*args, **kwargs):
+        raise RuntimeError("draft failed")
+    monkeypatch.setattr(runmod, "draft_post", fail)
+    with pytest.raises(RuntimeError, match="draft failed"):
+        runmod._client_library_fallback(_acct(key="gym_ig"), "2026-07-01",
+                                        _voice(), str(library))
+    assert rotation.load_served_strict().get("gym_ig", []) == []
+
+
 # ---- GATE: missing voice doc blocks drafting --------------------------------
 def test_missing_voice_blocks_drafting(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_ENABLED", "true")

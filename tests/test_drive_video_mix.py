@@ -276,18 +276,17 @@ def test_legacy_pick_returns_none_when_drive_can_fill_instead_of_a_stale_repeat(
     assert client_content.pick_image("tt_ig", "2026-09-11", lib, pillar="service") is None
 
 
-def test_legacy_pick_keeps_the_stale_repeat_when_no_drive_pool(tmp_path, monkeypatch):
+def test_legacy_pick_does_not_repeat_when_no_drive_pool(tmp_path, monkeypatch):
     lib = str(tmp_path)
     _still(lib, "only.jpg")
     _served(lib, "only.jpg", "tt_ig", "2026-09-05")
     monkeypatch.setattr(client_content, "drive_pool_can_fill", lambda *a, **k: False)
     pick = client_content.pick_image("tt_ig", "2026-09-11", lib, pillar="service")
-    assert pick is not None and getattr(pick, "stale_reuse", False) is True
+    assert pick is None
 
 
-def test_allow_reuse_last_resort_still_gets_the_stale_pick(tmp_path, monkeypatch):
-    """The denied-slot backfill already tried Drive first; its explicit allow_reuse
-    fallback must never be emptied by the gate (a denied slot stays filled)."""
+def test_allow_reuse_last_resort_does_not_repeat_a_used_photo(tmp_path, monkeypatch):
+    """A denied-slot backfill may not resurrect a photo used on another day."""
     lib = str(tmp_path)
     _still(lib, "only.jpg")
     _served(lib, "only.jpg", "tt_ig", "2026-09-05")
@@ -295,7 +294,7 @@ def test_allow_reuse_last_resort_still_gets_the_stale_pick(tmp_path, monkeypatch
                         lambda *a, **k: pytest.fail("gate must not run for allow_reuse"))
     pick = client_content.pick_image("tt_ig", "2026-09-11", lib, pillar="service",
                                      allow_reuse=True)
-    assert pick is not None
+    assert pick is None
 
 
 def test_drive_pool_can_fill_needs_both_flags_and_a_pickable_asset(monkeypatch):
@@ -373,9 +372,9 @@ def test_deny_sweep_fetch_selects_source_media_asset_id(monkeypatch):
     assert rows[0]["source_media_asset_id"] == "a1"
 
 
-def test_deny_sweep_end_to_end_with_the_fixed_select_rolls_the_asset_back(monkeypatch):
-    """The two halves together: a portal-denied Drive row (out-of-band, no Slack
-    hook) returns its asset to the pool on the nightly sweep."""
+def test_deny_sweep_end_to_end_keeps_once_used_asset_out_of_pool(monkeypatch):
+    """A portal-denied Drive row settles its record on the nightly sweep while
+    keeping the already-staged photo unavailable for another day."""
     store = FakeMediaStore(assets=[make_asset("a1", gym_id="tt")])
     sel.stamp_use(store.get_asset("a1"), "tt", "2026-09-12", store=store, now=NOW)
     assert store.assets["a1"]["used_count"] == 1
@@ -397,7 +396,7 @@ def test_deny_sweep_end_to_end_with_the_fixed_select_rolls_the_asset_back(monkey
     summary = sel.observe_denials(
         store=store, fetch_rows=lambda g, d: sel._default_fetch_rows(g, d, http=_Http()))
     assert summary["rolled_back"] == 1
-    assert store.assets["a1"]["used_count"] == 0
+    assert store.assets["a1"]["used_count"] == 1
 
 
 # ---- 7. the store carries the media identity with a swap ----------------------------

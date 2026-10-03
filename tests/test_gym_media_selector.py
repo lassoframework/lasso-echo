@@ -43,10 +43,24 @@ def test_used_this_month_excluded():
     assert sel.pick_media("pierce", store=store, now=NOW) is None
 
 
-def test_user_requested_fallback_uses_oldest_safe_cooling_asset_only():
-    """Automatic picks keep the 90-day rule, while an explicit swap can recover
-    from exhaustion. Assets on the live book remain excluded and the oldest prior
-    use wins so recovery maximizes spacing."""
+def test_once_used_asset_never_auto_selected_even_after_cooldown():
+    """GLOBAL ONCE-USED RULE (2026-10-02): used_count > 0 is out forever, even
+    years after the 90-day cooldown and the calendar-month guard have passed."""
+    store = FakeMediaStore(assets=[
+        reviewed_asset("used-long-ago", used_count=1,
+                       last_used_at=(NOW - timedelta(days=900)).isoformat()),
+        reviewed_asset("fresh", used_count=0, last_used_at=None),
+    ])
+    assert sel.pick_media("pierce", store=store, now=NOW)["id"] == "fresh"
+    # Only the used asset remains: the pool is empty, it is NOT re-selected.
+    store2 = FakeMediaStore(assets=[store.assets["used-long-ago"]])
+    assert sel.pickable("pierce", store=store2, now=NOW) == []
+    assert sel.pick_media("pierce", store=store2, now=NOW) is None
+
+
+def test_cooldown_fallback_cannot_bypass_once_used_rule():
+    """The explicit swap lane skips the cooldown clocks but must never re-offer
+    an asset that has already been staged (used_count > 0)."""
     store = FakeMediaStore(assets=[
         reviewed_asset("oldest", gym_id="swiftrivercrossfit", used_count=4,
                        last_used_at=(NOW - timedelta(days=70)).isoformat()),
@@ -55,10 +69,37 @@ def test_user_requested_fallback_uses_oldest_safe_cooling_asset_only():
         reviewed_asset("on-book", gym_id="swiftrivercrossfit", used_count=2,
                        last_used_at=(NOW - timedelta(days=80)).isoformat()),
     ])
-    assert sel.pickable("swiftrivercrossfit", store=store, now=NOW) == []
+    assert sel.cooldown_fallback(
+        "swiftrivercrossfit", store=store, exclude_ids=("on-book",)) == []
+    # An unused (never-staged) asset is still eligible for the explicit lane.
+    store.assets["virgin"] = reviewed_asset(
+        "virgin", gym_id="swiftrivercrossfit", used_count=0, last_used_at=None)
     got = sel.cooldown_fallback(
         "swiftrivercrossfit", store=store, exclude_ids=("on-book",))
-    assert [a["id"] for a in got] == ["oldest", "newer"]
+    assert [a["id"] for a in got] == ["virgin"]
+
+
+def test_reuploaded_same_bytes_remain_used_and_other_tenant_does_not_leak():
+    digest = "a" * 32
+    store = FakeMediaStore(assets=[
+        reviewed_asset("original", used_count=1, content_hash=digest),
+        reviewed_asset("reupload", used_count=0, content_hash=digest),
+        reviewed_asset("other-gym", gym_id="elsewhere", used_count=1,
+                       content_hash="b" * 32),
+        reviewed_asset("fresh", used_count=0, content_hash="b" * 32),
+    ])
+    assert [a["id"] for a in sel.pickable("pierce", store=store, now=NOW)] == ["fresh"]
+    assert [a["id"] for a in sel.cooldown_fallback("pierce", store=store)] == ["fresh"]
+
+
+def test_timestamp_or_invalid_counter_blocks_reuse():
+    store = FakeMediaStore(assets=[
+        reviewed_asset("timestamp", used_count=0,
+                       last_used_at="2020-01-01T00:00:00+00:00"),
+        reviewed_asset("bad-count", used_count="invalid"),
+    ])
+    assert sel.pickable("pierce", store=store, now=NOW) == []
+    assert sel.cooldown_fallback("pierce", store=store) == []
 
 
 def test_explicit_nine_month_client_never_gets_cooldown_fallback():
@@ -111,7 +152,9 @@ def test_tenant_isolation_never_selects_other_gym(monkeypatch):
     assert sel.pick_media("pierce", store=store, now=NOW) is None
 
 
-def test_stamp_and_rollback(monkeypatch):
+def test_stamp_and_deny_settle(monkeypatch):
+    """PERMANENT STAGE-USE (2026-10-02): a coach deny settles the use-record but
+    NEVER restores the counters — once staged, a photo is never offered again."""
     kv = {}
     monkeypatch.setattr("agent.db.kv_get", lambda k, d="": kv.get(k, d))
     monkeypatch.setattr("agent.db.kv_set", lambda k, v: kv.__setitem__(k, v))
@@ -120,12 +163,27 @@ def test_stamp_and_rollback(monkeypatch):
     sel.stamp_use(asset, "pierce", "2026-08-27", store=store, now=NOW)
     assert store.assets["a"]["used_count"] == 1
     assert store.assets["a"]["last_used_at"] == NOW.isoformat()
-    # Deny rollback returns the asset exactly as it was.
+    # Deny settles the record; the stamp stays so the asset stays out of the pool.
     assert sel.rollback_use("pierce", "2026-08-27", store=store) is True
+    assert store.assets["a"]["used_count"] == 1
+    assert store.assets["a"]["last_used_at"] == NOW.isoformat()
+    assert sel.pickable("pierce", store=store, now=NOW) == []
+    # Idempotent second settle.
+    assert sel.rollback_use("pierce", "2026-08-27", store=store) is False
+
+
+def test_abandoned_before_calendar_insert_restores_unused_photo(monkeypatch):
+    kv = {}
+    monkeypatch.setattr("agent.db.kv_get", lambda k, d="": kv.get(k, d))
+    monkeypatch.setattr("agent.db.kv_set", lambda k, v: kv.__setitem__(k, v))
+    store = FakeMediaStore(assets=[make_asset("a", used_count=0, last_used_at=None)])
+    sel.stamp_use(store.get_asset("a"), "pierce", "2026-08-27", store=store, now=NOW)
+    assert sel.rollback_use("pierce", "2026-08-27", store=store,
+                            asset_id="a", restore_unstaged=True) is True
     assert store.assets["a"]["used_count"] == 0
     assert store.assets["a"]["last_used_at"] is None
-    # Idempotent second rollback.
-    assert sel.rollback_use("pierce", "2026-08-27", store=store) is False
+    assert sel.rollback_use("pierce", "2026-08-27", store=store,
+                            asset_id="a", restore_unstaged=True) is False
 
 
 def test_two_assets_on_one_date_both_roll_back(monkeypatch):
@@ -145,8 +203,9 @@ def test_two_assets_on_one_date_both_roll_back(monkeypatch):
     assert store.assets["pm"]["used_count"] == 1
 
     assert sel.rollback_use("pierce", "2026-08-27", store=store) is True
-    assert store.assets["am"]["used_count"] == 0, "the AM asset was stranded"
-    assert store.assets["pm"]["used_count"] == 0
+    # Both records settled; both stamps stay (stage-use is permanent).
+    assert store.assets["am"]["used_count"] == 1
+    assert store.assets["pm"]["used_count"] == 1
     assert sel.rollback_use("pierce", "2026-08-27", store=store) is False
 
 
@@ -162,15 +221,17 @@ def test_rollback_asset_returns_one_and_leaves_the_days_other_post_stamped(monke
     sel.stamp_use(store.get_asset("pm"), "pierce", "2026-08-27", store=store, now=NOW)
 
     assert sel.rollback_asset("pm", store=store) is True
-    assert store.assets["pm"]["used_count"] == 0
+    # The hidden asset's record is settled but its stamp is permanent: it can
+    # never be re-offered even if the coach later un-hides it.
+    assert store.assets["pm"]["used_count"] == 1
     assert store.assets["am"]["used_count"] == 1, "the standing post lost its stamp"
-    # And the day's remaining record still rolls back on a full deny.
+    # And the day's remaining record still settles on a full deny.
     assert sel.rollback_use("pierce", "2026-08-27", store=store) is True
-    assert store.assets["am"]["used_count"] == 0
+    assert store.assets["am"]["used_count"] == 1
 
 
-def test_legacy_single_dict_record_still_rolls_back(monkeypatch):
-    """Records written before the list format (a bare dict) must still roll back."""
+def test_legacy_single_dict_record_still_settles(monkeypatch):
+    """Records written before the list format (a bare dict) must still settle."""
     import json as _json
     kv = {"gym_media_use:pierce:2026-08-27": _json.dumps({
         "asset_id": "old", "gym_id": "pierce", "prev_used_count": 0,
@@ -179,7 +240,7 @@ def test_legacy_single_dict_record_still_rolls_back(monkeypatch):
     monkeypatch.setattr("agent.db.kv_set", lambda k, v: kv.__setitem__(k, v))
     store = FakeMediaStore(assets=[make_asset("old", used_count=1)])
     assert sel.rollback_use("pierce", "2026-08-27", store=store) is True
-    assert store.assets["old"]["used_count"] == 0
+    assert store.assets["old"]["used_count"] == 1
 
 
 def test_deny_never_rolls_back_the_same_photos_earlier_published_use(monkeypatch, tmp_path):
@@ -218,12 +279,14 @@ def test_deny_never_rolls_back_the_same_photos_earlier_published_use(monkeypatch
     day1 = _json.loads(_db.kv_get("gym_media_use:pierce:2026-01-01", "[]"))
     assert day1 and day1[0]["rolled_back"] is False, \
         "the live published use was rolled back — a posted photo returned to the pool"
-    # The denied day's own record IS rolled back, and the asset keeps the published use.
+    # The denied day's own record IS settled, and the stamp is permanent: the
+    # counters stay exactly as the day-95 staging left them. Published history is
+    # never rewritten and the denied asset never returns to the pool.
     day95 = _json.loads(_db.kv_get("gym_media_use:pierce:2026-04-05", "[]"))
     assert day95 and day95[0]["rolled_back"] is True
-    assert store.assets["a"]["used_count"] == 1
-    assert store.assets["a"]["last_used_at"] == NOW.isoformat(), \
-        "the asset must fall back to its PUBLISHED day-1 timestamp, not to never-used"
+    assert store.assets["a"]["used_count"] == 2
+    assert store.assets["a"]["last_used_at"] == later.isoformat()
+    assert sel.pickable("pierce", store=store, now=later) == []
 
 
 def test_observe_denials_works_on_LIVE_SHAPED_rows(monkeypatch, tmp_path):
@@ -248,7 +311,9 @@ def test_observe_denials_works_on_LIVE_SHAPED_rows(monkeypatch, tmp_path):
 
     summary = sel.observe_denials(store=store, fetch_rows=fetch_rows)
     assert summary["rolled_back"] == 1, "the nightly backstop is still a no-op"
-    assert store.assets["a1"]["used_count"] == 0
+    # The record is settled; the stamp stays — a denied photo is never re-offered.
+    assert store.assets["a1"]["used_count"] == 1
+    assert sel.pickable("pierce", store=store, now=NOW) == []
     # idempotent: a second sweep rolls nothing twice
     assert sel.observe_denials(store=store, fetch_rows=fetch_rows)["rolled_back"] == 0
 

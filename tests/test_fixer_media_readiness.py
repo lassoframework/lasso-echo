@@ -127,7 +127,7 @@ def test_media_readiness_includes_new_local_swap_candidate(monkeypatch):
                                      "source": "local", "selectable": True}]
 
 
-def test_media_readiness_reports_safe_cooldown_fallback_when_fresh_pool_is_empty():
+def test_media_readiness_holds_when_only_previously_used_asset_remains():
     calendar = _Calendar(_row(), [_row(id="row002", source_media_asset_id="asset-book")])
     assets = _Assets([
         _asset("asset-book"),
@@ -137,9 +137,7 @@ def test_media_readiness_reports_safe_cooldown_fallback_when_fresh_pool_is_empty
     ])
     status, body = _get(_path(), calendar, assets)
     assert status == 200
-    assert body == {"ok": True, "gym_key": GYM, "candidates": [
-        {"id": "asset-used", "row_id": ROW, "source": "drive",
-         "review_state": "reviewed", "selectable": True}]}
+    assert body == {"ok": True, "gym_key": GYM, "candidates": []}
 
 
 def test_media_readiness_zero_is_definitive_when_no_safe_fallback_exists():
