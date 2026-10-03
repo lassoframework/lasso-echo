@@ -1,5 +1,6 @@
 -- DRAFT / UNAPPLIED. Transactional service-role activation for the visual
--- guard. Apply schema, claim trigger and backfill drafts first. This file
+-- guard. Apply schema, claim trigger and backfill drafts, then the global
+-- history draft, and apply this activation draft LAST. This file
 -- grants NO production application or activation approval; the global ledger
 -- stays DRAFT/OFF until an owner ruling.
 -- Rollback: set enforce=false for any armed tenant (disarming is always
@@ -7,6 +8,8 @@
 -- migration's visual_group_settings_arm_guard definition, drop
 -- visual_group_activate_guard and visual_group_activation. Preserve permanent
 -- published usage/history; DROP is not a data rollback after live activation.
+-- Never remove calendar claim/release integration or global history while any
+-- tenant is armed; preserve all global published rows during rollback.
 --
 -- Barrier contract (all in ONE fresh READ COMMITTED transaction):
 --   1. LOCK TABLE content_calendar IN SHARE ROW EXCLUSIVE MODE first, before
@@ -37,6 +40,21 @@ create table if not exists public.visual_group_activation (
   transaction_id bigint      not null default txid_current(),
   created_at     timestamptz not null default now()
 );
+
+-- The global draft installs a temporary arming blocker. Replace it only when
+-- every global object used by the integrated calendar transaction exists.
+do $$ begin
+  if to_regclass('public.visual_global_identity') is null
+     or to_regclass('public.visual_global_usage') is null
+     or to_regprocedure('public.visual_global_claim(text,text,date,uuid,text,boolean,boolean,text)') is null
+     or to_regprocedure('public.visual_global_import_history()') is null
+     or to_regprocedure('public.visual_global_row_fingerprint(public.content_calendar)') is null
+     or to_regprocedure('public.visual_global_release(text,text)') is null then
+    raise exception 'apply global visual history before integrated activation' using errcode='55000';
+  end if;
+end $$;
+drop trigger if exists visual_global_block_local_activation
+  on public.gym_visual_guard_settings;
 
 comment on table public.visual_group_activation is
   'Arming receipts. The activation RPC writes one row per canonical tenant in the same transaction as the enforce=true write; the settings arm guard requires a receipt with the CURRENT txid, so direct/manual arming is impossible.';
@@ -123,6 +141,7 @@ declare
   v_calendar_rows integer;
   v_ledger_rows integer;
   v_sibling_rows integer;
+  v_global_rows integer;
   v_proof jsonb;
 begin
   if nullif(btrim(p_gym_id), '') is null then
@@ -159,6 +178,14 @@ begin
   -- 1. WRITE BARRIER FIRST: drains and blocks all calendar writers (ROW
   -- EXCLUSIVE conflicts) before any advisory lock, row lock or calendar read.
   lock table public.content_calendar in share row exclusive mode;
+  -- Freeze cross-tenant history/identity inputs as well. NOWAIT avoids a
+  -- deadlock if an auxiliary writer owns one while waiting for our calendar
+  -- barrier; a retry must start a new transaction.
+  lock table public.visual_group_usage_ledger, public.visual_group_alias,
+    public.visual_global_identity, public.visual_group_scene_link,
+    public.visual_group_usage_sibling, public.visual_group_member_event,
+    public.visual_group_reconciliation, public.tenant_alias
+    in share row exclusive mode nowait;
 
   -- 2. The SAME canonical mutex every auxiliary mutation RPC takes before
   -- its other locks. Never wait after the barrier: an auxiliary writer may
@@ -219,6 +246,19 @@ begin
           and public.visual_group_row_review_pending(r)))) then
     raise exception 'activation refused: unknown, ambiguous or review-pending media identity before backfill'
       using errcode = '23514';
+  end if;
+
+  -- Legacy generic hashes can collapse source and derived byte identities.
+  -- They remain visible for repair but cannot enter an armed authority.
+  if exists(select 1 from public.visual_group_alias a
+      where a.gym_id=v_tenant_text and a.alias_kind='byte_hash'
+        and a.alias_value !~ '^(source|derived):(sha256:[0-9a-f]{64}|md5:[0-9a-f]{32})$')
+     or exists(select 1 from public.content_calendar r
+      where r.gym_id=any(v_keys) and nullif(btrim(r.byte_hash),'') is not null
+        and lower(btrim(r.byte_hash)) !~
+          '^(source|derived):(sha256:[0-9a-f]{64}|md5:[0-9a-f]{32})$') then
+    raise exception 'activation refused: legacy byte_hash lacks source/derived algorithm namespace'
+      using errcode='23514';
   end if;
 
   -- 3b. ACTUAL backfill for every covered alias key (not just one). Held rows
@@ -311,11 +351,27 @@ begin
            count(distinct l.reserved_date) as date_count,
            bool_or(l.reserved_date is null) as has_unknown_date
     from public.visual_group_usage_ledger l
-    where l.gym_id = v_tenant_text and l.state <> 'released'
+    where l.gym_id = v_tenant_text
     group by 1) c
     where c.date_count > 1 or (c.has_unknown_date and c.date_count>0)) then
     raise exception 'activation refused: cross-date occupied visual scene; reconcile history first'
       using errcode = '23514';
+  end if;
+
+  -- Import EVERY tenant's calendar and orphan-ledger history under the same
+  -- table-wide barrier. The owner-only importer refuses incomplete coverage
+  -- anywhere and imports published history before reservations.
+  perform public.visual_global_import_history();
+
+  -- Re-read both calendar and orphan-ledger coverage after import. Any
+  -- missing fingerprint, owner/date conflict or member mismatch aborts the
+  -- transaction before its activation receipt is written.
+  if exists(select 1 from public.visual_global_coverage() c
+      where c.issue<>'ready')
+     or exists(select 1 from public.visual_global_history_coverage() h
+      where h.issue<>'ready') then
+    raise exception 'activation refused: global visual history coverage incomplete after import'
+      using errcode='23514';
   end if;
 
   -- 4. Proof + arming in the SAME transaction. The receipt (current txid)
@@ -324,6 +380,7 @@ begin
   select count(*) into v_calendar_rows from public.content_calendar r where r.gym_id = any(v_keys);
   select count(*) into v_ledger_rows from public.visual_group_usage_ledger l where l.gym_id = v_tenant_text;
   select count(*) into v_sibling_rows from public.visual_group_usage_sibling s where s.gym_id = v_tenant_text;
+  select count(*) into v_global_rows from public.visual_global_usage_member m where m.tenant_id = v_tenant_text;
 
   v_proof := jsonb_build_object(
     'tenant', v_tenant_text,
@@ -334,6 +391,8 @@ begin
     'calendar_rows', v_calendar_rows,
     'ledger_rows', v_ledger_rows,
     'sibling_rows', v_sibling_rows,
+    'global_member_rows', v_global_rows,
+    'global_history_imported', true,
     'backfills', v_backfills,
     'barrier', 'lock table content_calendar share row exclusive; try advisory visual_tenant + sorted visual_backfill keys',
     'armed_at', now());

@@ -1,7 +1,6 @@
 -- DRAFT / UNAPPLIED. Global exact-byte visual authority and historical import.
--- Apply only after the four DRAFT_visual_group_* migrations. This does not arm
--- any guard. The calendar trigger and activation RPC must be integrated with
--- visual_global_claim before production activation; see the release document.
+-- Apply after schema, claim trigger and backfill drafts, BEFORE the activation
+-- draft (which must be last). This does not arm any guard.
 -- All writes below are additive. Rollback before activation: DROP these RPCs
 -- and tables in reverse dependency order. After a confirmed publish, preserve
 -- visual_global_usage and visual_global_usage_member as permanent history.
@@ -59,8 +58,8 @@ create table if not exists public.visual_global_usage_member (
 );
 create index if not exists visual_global_usage_member_fingerprint_idx
   on public.visual_global_usage_member(fingerprint);
--- Append-only record of each released reservation before its live claim row is
--- reused. Published observations never enter this table or become reusable.
+-- Legacy release receipts remain inspectable. A staged reservation is never
+-- reusable; new releases do not write this table.
 create table if not exists public.visual_global_release_history (
   id bigint generated always as identity primary key,
   fingerprint text not null,
@@ -122,12 +121,11 @@ begin
     raise exception 'published global usage is permanent' using errcode='23514';
   end if;
   if new.fingerprint<>old.fingerprint
-      or (old.state<>'released' and
-          (new.tenant_id<>old.tenant_id or new.used_date is distinct from old.used_date))
-      or (old.state='released' and new.state not in ('reserved','published'))
+      or new.tenant_id<>old.tenant_id or new.used_date is distinct from old.used_date
+      or old.state='released' or new.state='released'
       or new.first_seen_at is distinct from old.first_seen_at
       or (old.ambiguous and not new.ambiguous)
-      or (old.state='reserved' and new.state not in ('reserved','published','released')) then
+      or (old.state='reserved' and new.state not in ('reserved','published')) then
     raise exception 'global claim owner, date and uncertainty are immutable' using errcode='23514';
   end if;
   return new;
@@ -160,6 +158,11 @@ begin
     raise exception 'group does not belong to canonical tenant' using errcode='23503';
   end if;
   if nullif(btrim(p_asset_id),'') is not null then
+    if not exists(select 1 from public.visual_group_alias a
+        where a.gym_id=v_tenant::text and a.group_key=p_group_key
+          and a.alias_kind='source_asset' and a.alias_value=btrim(p_asset_id)) then
+      raise exception 'asset is not a member of the visual group' using errcode='23514';
+    end if;
     select lower(btrim(a.content_hash)) into v_asset_hash
       from public.media_asset a where a.id=p_asset_id
         and public.visual_group_tenant_id(a.gym_id)=v_tenant;
@@ -189,13 +192,79 @@ begin
 end;
 $$;
 
+-- A group key is scene identity, not byte identity. A calendar claim needs a
+-- digest for its selected media, and every known byte-bearing member of the
+-- group must agree with the attested global fingerprint. Unknown or SHA-only
+-- members cannot be proven equal to the canonical MD5 and fail closed.
+create or replace function public.visual_global_row_fingerprint(p_row public.content_calendar)
+returns text language plpgsql stable security definer set search_path = public as $$
+declare v_tenant uuid; v_asset_hash text; v_row_hash text;
+begin
+  v_tenant := public.visual_group_tenant_id(p_row.gym_id);
+  if v_tenant is null then return null; end if;
+  if nullif(btrim(to_jsonb(p_row)->>'source_media_asset_id'),'') is not null then
+    select 'md5:'||lower(btrim(a.content_hash)) into v_asset_hash
+      from public.media_asset a where a.id=to_jsonb(p_row)->>'source_media_asset_id'
+        and public.visual_group_tenant_id(a.gym_id)=v_tenant
+        and lower(btrim(a.content_hash)) ~ '^[0-9a-f]{32}$';
+    if v_asset_hash is null then return null; end if;
+  end if;
+  if nullif(btrim(to_jsonb(p_row)->>'byte_hash'),'') is not null then
+    if lower(btrim(to_jsonb(p_row)->>'byte_hash')) !~ '^(source|derived):md5:[0-9a-f]{32}$' then
+      return null;
+    end if;
+    if split_part(lower(btrim(to_jsonb(p_row)->>'byte_hash')),':',1)='source'
+       and nullif(btrim(to_jsonb(p_row)->>'source_media_url'),'') is distinct from
+           nullif(btrim(p_row.image_url),'') then
+      return null;
+    end if;
+    v_row_hash := split_part(lower(btrim(to_jsonb(p_row)->>'byte_hash')),':',2)||':'||
+      split_part(lower(btrim(to_jsonb(p_row)->>'byte_hash')),':',3);
+  end if;
+  if v_asset_hash is not null and v_row_hash is not null and v_asset_hash<>v_row_hash then
+    return null;
+  end if;
+  -- A source asset digest is the delivered digest only when the calendar
+  -- explicitly names the same source URL. Renders/renditions need their own
+  -- derived byte digest; a lineage link alone cannot attest delivered bytes.
+  if v_row_hash is null and (v_asset_hash is null or
+      nullif(btrim(to_jsonb(p_row)->>'source_media_url'),'') is distinct from
+      nullif(btrim(p_row.image_url),'')) then
+    return null;
+  end if;
+  return coalesce(v_row_hash,v_asset_hash);
+end;
+$$;
+
+create or replace function public.visual_global_group_bytes_verified(
+  p_tenant text,p_group text,p_fingerprint text
+) returns boolean language sql stable security definer set search_path = public as $$
+  select p_fingerprint ~ '^md5:[0-9a-f]{32}$'
+    -- Multiple delivered URLs can be byte-distinct even when the group is
+    -- visually equivalent. Until each URL has a separate byte attestation,
+    -- reject the whole group instead of letting one MD5 bless every alias.
+    and (select count(*) from public.visual_group_alias a
+      where a.gym_id=p_tenant and a.group_key=p_group
+        and a.alias_kind='canonical_url') <= 1
+    and not exists(select 1 from public.visual_group_alias a
+      where a.gym_id=p_tenant and a.group_key=p_group and a.alias_kind='byte_hash'
+        and a.alias_value not in ('source:'||p_fingerprint,'derived:'||p_fingerprint))
+    and not exists(select 1 from public.visual_group_alias a
+      left join public.media_asset m on m.id=a.alias_value
+        and public.visual_group_tenant_id(m.gym_id)::text=p_tenant
+      where a.gym_id=p_tenant and a.group_key=p_group and a.alias_kind='source_asset'
+        and (m.id is null or lower(btrim(m.content_hash)) is distinct from
+          split_part(p_fingerprint,':',2)));
+$$;
+
 -- Atomic cross-client claim. The fingerprint PK serializes first use, even
 -- if two tenant-local groups are created concurrently. Same-day siblings are
 -- permitted only for the SAME canonical tenant; another tenant always fails.
 -- Unknown historical dates (NULL published date) block every future claim.
 create or replace function public.visual_global_claim(
   p_gym_key text, p_group_key text, p_date date, p_row_id uuid,
-  p_channel text, p_published boolean, p_ambiguous boolean default false
+  p_channel text, p_published boolean, p_ambiguous boolean default false,
+  p_selected_fingerprint text default null
 ) returns text language plpgsql security definer set search_path = public as $$
 declare v_tenant uuid; v_hash text; v_usage public.visual_global_usage%rowtype;
   v_member public.visual_global_usage_member%rowtype;
@@ -209,6 +278,12 @@ begin
   if v_hash is null then
     raise exception 'global fingerprint missing for visual group' using errcode='23514';
   end if;
+  if not public.visual_global_group_bytes_verified(v_tenant::text,p_group_key,v_hash) then
+    raise exception 'visual group has byte-distinct or unverifiable members' using errcode='23514';
+  end if;
+  if p_selected_fingerprint is not null and p_selected_fingerprint<>v_hash then
+    raise exception 'selected calendar asset is not bound to claimed bytes' using errcode='23514';
+  end if;
   -- The INSERT creates and locks the absent key; ON CONFLICT waits for the
   -- winner, then the row lock reads its committed owner/date.
   insert into public.visual_global_usage
@@ -219,10 +294,7 @@ begin
   select * into v_usage from public.visual_global_usage
     where fingerprint=v_hash for update;
   if v_usage.state='released' then
-    update public.visual_global_usage set tenant_id=v_tenant::text,
-      used_date=p_date,state=case when p_published then 'published' else 'reserved' end,
-      ambiguous=p_ambiguous,published_at=case when p_published then now() end
-      where fingerprint=v_hash;
+    raise exception 'legacy released global fingerprint requires historical repair' using errcode='23514';
   elsif v_usage.tenant_id <> v_tenant::text or v_usage.used_date is distinct from p_date then
     raise exception 'visual byte fingerprint already used by another client or date' using errcode='23514';
   end if;
@@ -235,12 +307,8 @@ begin
   end if;
   select * into v_member from public.visual_global_usage_member
     where tenant_id=v_tenant::text and group_key=p_group_key;
-  if found and v_member.state='released' and v_member.fingerprint=v_hash then
-    update public.visual_global_usage_member set used_date=p_date,
-      calendar_row_id=p_row_id,channel=p_channel,
-      state=case when p_published then 'published' else 'reserved' end,
-      ambiguous=p_ambiguous,recorded_at=now()
-      where tenant_id=v_tenant::text and group_key=p_group_key;
+  if found and v_member.state='released' then
+    raise exception 'legacy released global member requires historical repair' using errcode='23514';
   elsif found and (v_member.fingerprint <> v_hash or
       v_member.used_date is distinct from p_date) then
     raise exception 'visual group has conflicting historical membership' using errcode='23514';
@@ -260,10 +328,8 @@ begin
 end;
 $$;
 
--- Called by the calendar integration only after the local ledger has actually
--- released its last active sibling. A tentative or ambiguous provider attempt
--- cannot be released. The global fingerprint remains occupied while any other
--- same-day member is active; the final release makes it reusable atomically.
+-- Calendar row release changes active membership only. Once staged, the byte
+-- claim remains occupied on its original tenant/date forever.
 create or replace function public.visual_global_release(
   p_gym_key text,p_group_key text
 ) returns boolean language plpgsql security definer set search_path = public as $$
@@ -277,9 +343,12 @@ begin
   select * into v_usage from public.visual_global_usage where fingerprint=v_hash for update;
   select * into v_member from public.visual_global_usage_member
     where tenant_id=v_tenant::text and group_key=p_group_key for update;
-  if not found or v_member.state='released' then return false; end if;
-  if v_member.state='published' or v_member.ambiguous or v_usage.state='published'
-      or v_usage.ambiguous or not exists(
+  if not found or v_usage.fingerprint is null or v_member.state='released' or v_usage.state='released' then
+    raise exception 'global staged history is missing or legacy released' using errcode='23514';
+  end if;
+  if v_member.state='published' or v_member.ambiguous or v_usage.ambiguous
+      or v_usage.tenant_id<>v_tenant::text
+      or v_usage.used_date is distinct from v_member.used_date or not exists(
         select 1 from public.visual_group_usage_ledger l
         where l.gym_id=v_tenant::text and l.group_key=p_group_key
           and l.state='released' and not l.ambiguous)
@@ -288,15 +357,8 @@ begin
           and s.state='active') then
     raise exception 'global reservation still occupied or uncertain' using errcode='23514';
   end if;
-  insert into public.visual_global_release_history
-    (fingerprint,tenant_id,group_key,used_date,calendar_row_id)
-    values(v_hash,v_tenant::text,p_group_key,v_member.used_date,v_member.calendar_row_id);
-  update public.visual_global_usage_member set state='released'
-    where tenant_id=v_tenant::text and group_key=p_group_key;
-  if not exists(select 1 from public.visual_global_usage_member m
-      where m.fingerprint=v_hash and m.state<>'released') then
-    update public.visual_global_usage set state='released' where fingerprint=v_hash;
-  end if;
+  -- Keep both owner and member occupied. This also preserves same-date reuse
+  -- for a legitimate sibling while rejecting every cross-date/client claim.
   return true;
 end;
 $$;
@@ -309,6 +371,26 @@ create or replace function public.visual_global_import_history()
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare r record; v_count integer:=0; v_missing integer;
 begin
+  if current_setting('transaction_isolation') <> 'read committed' then
+    raise exception 'global history import requires READ COMMITTED' using errcode='25006';
+  end if;
+  -- Direct owner invocation takes the same table-wide barrier as activation.
+  -- Refuse a prior advisory/calendar writer lock that could invert lock order.
+  if exists(select 1 from pg_locks where pid=pg_backend_pid() and granted and
+      (locktype='advisory' or (locktype='relation'
+        and relation='public.content_calendar'::regclass and mode<>'AccessShareLock')))
+      and not exists(select 1 from pg_locks where pid=pg_backend_pid() and granted
+        and locktype='relation' and relation='public.content_calendar'::regclass
+        and mode='ShareRowExclusiveLock') then
+    raise exception 'global history import requires calendar barrier before writer locks'
+      using errcode='55P03';
+  end if;
+  lock table public.content_calendar in share row exclusive mode;
+  lock table public.visual_group_usage_ledger, public.visual_group_alias,
+    public.visual_global_identity, public.visual_group_scene_link,
+    public.visual_group_usage_sibling, public.visual_group_member_event,
+    public.visual_group_reconciliation, public.tenant_alias
+    in share row exclusive mode nowait;
   if exists(select 1 from public.visual_global_coverage() c where c.issue<>'ready') then
     raise exception 'global history import refused: calendar coverage incomplete' using errcode='23514';
   end if;
@@ -325,13 +407,13 @@ begin
   select count(*) into v_missing from public.visual_group_usage_ledger l
     left join public.visual_global_identity i
       on i.tenant_id=l.gym_id and i.group_key=l.group_key
-    where l.state<>'released' and i.fingerprint is null;
+    where i.fingerprint is null;
   if v_missing>0 then
     raise exception 'global history import refused: % occupied groups lack verified byte fingerprints',v_missing
       using errcode='23514';
   end if;
   if exists(select 1 from public.visual_group_usage_ledger l
-      where l.state<>'released' and (
+      where (
         select count(distinct i.fingerprint)
         from public.visual_group_scene_members(l.gym_id,l.group_key) sm(group_key)
         join public.visual_global_identity i
@@ -342,7 +424,6 @@ begin
   -- Published first means an existing permanent owner wins over a competing
   -- reservation; either order still refuses a cross-client/date collision.
   for r in select l.* from public.visual_group_usage_ledger l
-      where l.state<>'released'
       order by (l.state='published') desc,l.gym_id,l.group_key loop
     perform public.visual_global_claim(r.gym_id,r.group_key,r.reserved_date,
       r.calendar_row_id,r.channel,r.state='published',r.ambiguous);
@@ -367,6 +448,11 @@ language sql stable security definer set search_path = public as $$
       when public.visual_group_tenant_id(c.gym_id) is null then 'unmapped_tenant'
       when c.visual_group_key is null then 'unresolved_group'
       when i.fingerprint is null then 'missing_verified_fingerprint'
+      when not public.visual_global_group_bytes_verified(
+          public.visual_group_tenant_id(c.gym_id)::text,c.visual_group_key,i.fingerprint)
+        then 'byte_distinct_or_unverified_group_members'
+      when public.visual_global_row_fingerprint(c) is distinct from i.fingerprint
+        then 'selected_media_bytes_unverified'
       when (c.status='published' or c.published_at is not null) and c.post_date is null
         then 'published_date_unverified'
       when not exists(select 1 from public.visual_group_usage_ledger l
@@ -396,6 +482,8 @@ returns table(tenant_id text, group_key text, fingerprint text,
 language sql stable security definer set search_path = public as $$
   select l.gym_id,l.group_key,i.fingerprint,l.reserved_date,l.state,
     case when i.fingerprint is null then 'missing_verified_fingerprint'
+      when not public.visual_global_group_bytes_verified(l.gym_id,l.group_key,i.fingerprint)
+        then 'byte_distinct_or_unverified_group_members'
       when g.fingerprint is not null and
         (g.tenant_id<>l.gym_id or g.used_date is distinct from l.reserved_date)
         then 'global_owner_or_date_conflict'
@@ -405,7 +493,9 @@ language sql stable security definer set search_path = public as $$
           on ci.tenant_id=l.gym_id and ci.group_key=sm.group_key)>1
         then 'scene_component_has_distinct_bytes_without_global_authority'
       when g.fingerprint is null then 'not_imported'
-      when m.state is distinct from l.state
+      when m.fingerprint is distinct from i.fingerprint
+        or m.used_date is distinct from l.reserved_date
+        or m.state is distinct from case when l.state='published' then 'published' else 'reserved' end
         then 'global_member_state_mismatch'
       else 'ready' end
   from public.visual_group_usage_ledger l
@@ -414,13 +504,12 @@ language sql stable security definer set search_path = public as $$
   left join public.visual_global_usage g on g.fingerprint=i.fingerprint
   left join public.visual_global_usage_member m
     on m.tenant_id=l.gym_id and m.group_key=l.group_key
-  where l.state<>'released';
+  ;
 $$;
 
--- No global activation RPC is intentionally defined: integration must add a
--- calendar-write barrier, import all history under it, re-read coverage and
--- conflicts, then arm atomically. Calling tenant-local activation alone is
--- insufficient for the global once-used requirement.
+-- The separate DRAFT activation migration adds the all-tenant calendar-write
+-- barrier, historical import, coverage re-read, and atomic arm. This file
+-- keeps tenant-local activation blocked until that migration is applied.
 create or replace function public.visual_global_block_local_activation()
 returns trigger language plpgsql set search_path = public as $$
 begin
@@ -439,10 +528,16 @@ create trigger visual_global_block_local_activation
 
 revoke all on function public.visual_global_register_identity(text,text,text,jsonb,text,text)
   from public,anon,authenticated;
-revoke all on function public.visual_global_claim(text,text,date,uuid,text,boolean,boolean)
+revoke all on function public.visual_global_row_fingerprint(public.content_calendar)
+  from public,anon,authenticated,service_role;
+revoke all on function public.visual_global_group_bytes_verified(text,text,text)
+  from public,anon,authenticated,service_role;
+revoke all on function public.visual_global_claim(text,text,date,uuid,text,boolean,boolean,text)
+  from public,anon,authenticated,service_role;
+revoke all on function public.visual_global_release(text,text)
   from public,anon,authenticated,service_role;
 revoke all on function public.visual_global_import_history()
-  from public,anon,authenticated;
+  from public,anon,authenticated,service_role;
 revoke all on function public.visual_global_coverage()
   from public,anon,authenticated;
 revoke all on function public.visual_global_history_coverage()
@@ -451,5 +546,4 @@ grant execute on function public.visual_global_register_identity(text,text,text,
   to service_role;
 grant execute on function public.visual_global_coverage() to service_role;
 grant execute on function public.visual_global_history_coverage() to service_role;
-grant execute on function public.visual_global_import_history() to service_role;
 commit;

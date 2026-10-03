@@ -88,7 +88,7 @@ begin
         -- for review; existing history is reported, never rewritten. The
         -- per-row savepoint turns this raise into one held review event.
         if exists(select 1 from public.visual_group_usage_ledger sl
-          where sl.gym_id=v_tenant and sl.group_key<>g and sl.state<>'released'
+          where sl.gym_id=v_tenant and sl.group_key<>g
             and sl.reserved_date is distinct from day
             and sl.group_key in (select public.visual_group_scene_members(v_tenant,g))) then
           raise exception 'linked_scene_cross_date_hold' using errcode='23514';
@@ -107,13 +107,13 @@ begin
           elsif l.ambiguous and not public.visual_group_group_reconciled(v_tenant,g) then
             blocked:=true; v_amb_hold:=true;
             v_reason:='ambiguous_reservation_needs_provider_confirmation';
-          elsif l.state<>'released' and l.reserved_date is distinct from day then
+          elsif l.reserved_date is distinct from day then
             -- A group match is insufficient: EACH historical row must agree
             -- with its immutable/live usage date. Hold/report the later row,
             -- never stamp it confirmed or re-date earlier permanent usage.
             blocked:=true; v_reason:='historical_cross_date_visual_repeat';
           elsif l.state<>'published' then
-            update public.visual_group_usage_ledger set state='published',reserved_date=day,
+            update public.visual_group_usage_ledger set state='published',
               published_at=r.published_at,released_at=null where gym_id=v_tenant and group_key=g;
             finalized:=finalized+1;
           end if;
@@ -128,7 +128,7 @@ begin
           end if;
         elsif day is null then
           blocked:=true; v_reason:='visual_group_date_unresolved';
-        elsif found and l.state<>'released' and l.reserved_date is distinct from day then
+        elsif found and l.reserved_date is distinct from day then
           blocked:=true; v_reason:='cross_date_media_repeat_needs_new_visual';
         else
           if not found then
@@ -136,8 +136,8 @@ begin
               (gym_id,group_key,reserved_date,calendar_row_id,channel,state,ambiguous)
               values(v_tenant,g,day,r.id,r.account,'reserved',is_ambiguous); reserved:=reserved+1;
           elsif l.state='released' then
-            update public.visual_group_usage_ledger set state='reserved',reserved_date=day,
-              released_at=null,reserved_at=now(),ambiguous=ambiguous or is_ambiguous where gym_id=v_tenant and group_key=g;
+            update public.visual_group_usage_ledger set state='reserved',
+              released_at=null,ambiguous=ambiguous or is_ambiguous where gym_id=v_tenant and group_key=g;
             reserved:=reserved+1;
           end if;
           insert into public.visual_group_usage_sibling(gym_id,group_key,calendar_row_id,channel,ambiguous,original_claim_token,original_provider_post_id,original_image_url)
@@ -250,8 +250,7 @@ returns jsonb language sql stable security definer set search_path = public as $
         select l.gym_id,l.group_key,l.reserved_date,l.state,
           (select array_agg(m order by m) from public.visual_group_scene_members(l.gym_id,l.group_key) members(m)) as component
         from public.visual_group_usage_ledger l
-        where l.state<>'released'
-          and (p_gym_id is null or l.gym_id=public.visual_group_tenant_id(p_gym_id)::text)
+        where p_gym_id is null or l.gym_id=public.visual_group_tenant_id(p_gym_id)::text
       ) comp
       where array_length(component,1)>1
       group by gym_id,component

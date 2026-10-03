@@ -17,8 +17,8 @@ a verified fingerprint or any fingerprint already occupied by another tenant
 or date. The new tables have service-role read access; writes pass through
 SECURITY DEFINER functions. A separate settings trigger refuses `enforce=true`
 even if the old tenant-local activation RPC is called; disarming stays allowed.
-The integrated global activation migration must replace that blocker only after
-all proof checks pass. This migration is additive and remains unapplied.
+The draft integrated activation migration replaces that blocker only after
+all proof checks pass. All global migrations remain unapplied.
 
 ### Required before schema migration or canary
 
@@ -37,19 +37,16 @@ all proof checks pass. This migration is additive and remains unapplied.
    only within one canonical tenant. Another tenant cannot use the fingerprint
    even on the same date. An undated published group remains permanently
    occupied; tenant-local activation currently refuses its date gap.
-4. Integrate the global claim into the calendar BEFORE trigger, all swap paths,
-   confirmed delivery and release/reconciliation paths. It must be in the same
-   transaction as the tenant-local claim, under a deterministic global lock
-   order, with exact sibling group membership. The current draft claim RPC is
-   a historical import primitive. A draft release RPC now checks the local
-   released state and records a permanent receipt, but no calendar trigger calls
-   either global RPC. Manual scene links across groups or tenants need one global
-   component authority and a collision check before activation.
-5. Replace tenant-local activation with one global barrier: lock all calendar
-   writes, import historical published and in-flight claims, re-read every
-   calendar row and orphaned ledger row, verify no unknown fingerprint,
-   conflicting owner/date, unreconciled ambiguity or pending scene decision,
-   and arm only in that same transaction. Keep enforcement OFF on refusal.
+4. The draft calendar BEFORE trigger and global claim now enforce the same
+   transaction and exact selected-byte identity. Before activation, wire every
+   Python calendar writer, swap, render, and delivery path to register its
+   byte-verified MD5 and exact group; a URL, source-only SHA, or asset ID alone
+   cannot satisfy the global claim. Exercise these paths with real PostgreSQL.
+5. The draft activation uses one all-tenant calendar barrier, imports published
+   and in-flight history including orphaned ledger rows, rereads global
+   coverage, and arms only in that transaction. Resolve unknown fingerprints,
+   conflicting owner/date, ambiguity, and pending scene decisions first. Keep
+   enforcement OFF on refusal.
    Maintain a restore receipt for schema, data and flags; preserve published
    global history on rollback. Verify the guarded runtime revision and a
    rollback-only local transaction before a production migration or canary.

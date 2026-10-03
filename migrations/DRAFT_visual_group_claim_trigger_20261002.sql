@@ -217,6 +217,41 @@ create or replace function public.visual_group_finalization_evidenced(
   );
 $$;
 
+-- The global exact-byte authority is installed after this draft, so calls are
+-- dynamic. Once a tenant is armed, absence of that authority is a hard error.
+create or replace function public.visual_group_global_claim(
+  p_gym_id text,p_group_key text,p_date date,p_row_id uuid,p_channel text,
+  p_published boolean,p_ambiguous boolean,p_selected_fingerprint text
+) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if p_selected_fingerprint is null then
+    raise exception 'selected calendar asset has no verified byte fingerprint' using errcode='23514';
+  end if;
+  if to_regprocedure('public.visual_global_claim(text,text,date,uuid,text,boolean,boolean,text)') is null then
+    raise exception 'global visual claim authority is missing for armed tenant' using errcode='55000';
+  end if;
+  execute 'select public.visual_global_claim($1,$2,$3,$4,$5,$6,$7,$8)'
+    using p_gym_id,p_group_key,p_date,p_row_id,p_channel,p_published,p_ambiguous,p_selected_fingerprint;
+end;
+$$;
+
+create or replace function public.visual_group_global_release(
+  p_gym_id text,p_group_key text
+) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if to_regprocedure('public.visual_global_release(text,text)') is null then
+    raise exception 'global visual release authority is missing for armed tenant' using errcode='55000';
+  end if;
+  execute 'select public.visual_global_release($1,$2)' using p_gym_id,p_group_key;
+end;
+$$;
+-- These are trigger-internal wrappers. PUBLIC/service callers must use the
+-- validated owner RPCs, never forge a calendar claim or release directly.
+revoke all on function public.visual_group_global_claim(text,text,date,uuid,text,boolean,boolean,text)
+  from public,anon,authenticated,service_role;
+revoke all on function public.visual_group_global_release(text,text)
+  from public,anon,authenticated,service_role;
+
 create or replace function public.visual_group_sync_row(
   p_old public.content_calendar,p_new public.content_calendar,p_op text
 ) returns void language plpgsql security definer set search_path = public as $$
@@ -260,6 +295,11 @@ begin
       where gym_id=p_old.gym_id and group_key=p_old.visual_group_key and state='reserved' and not ambiguous
         and not exists(select 1 from public.visual_group_usage_sibling s
           where s.gym_id=p_old.gym_id and s.group_key=p_old.visual_group_key and s.state='active');
+    if exists(select 1 from public.visual_group_usage_ledger
+        where gym_id=p_old.gym_id and group_key=p_old.visual_group_key
+          and state='released' and not ambiguous) then
+      perform public.visual_group_global_release(p_old.gym_id,p_old.visual_group_key);
+    end if;
   end if;
   if p_op='delete' or not public.visual_group_enforcement_on(p_new.gym_id) then return; end if;
   finalized := p_new.status='published' or p_new.published_at is not null;
@@ -274,19 +314,17 @@ begin
   -- across every component member. Lock member groups in deterministic key
   -- order (the same order unions use) so this claim serializes with
   -- concurrent unions and member reservations; then refuse any date that
-  -- disagrees with a non-released member claim. An ambiguous member retains
-  -- the component claim (its ledger row is non-released until evidence-based
-  -- reconciliation); pending members may share the date across channels.
+  -- disagrees with any staged member claim, including released history.
   -- Complete component locks were acquired before endpoint mutations above.
   if exists(select 1 from public.visual_group_usage_ledger cl
-    where cl.gym_id=p_new.gym_id and cl.state<>'released'
+    where cl.gym_id=p_new.gym_id
       and cl.reserved_date is distinct from p_new.post_date
       and cl.group_key in (select public.visual_group_scene_members(p_new.gym_id,p_new.visual_group_key))) then
     raise exception 'linked visual scene is used on another date' using errcode='23514';
   end if;
   select * into l from public.visual_group_usage_ledger
     where gym_id=p_new.gym_id and group_key=p_new.visual_group_key for update;
-  if found and l.state <> 'released' and l.reserved_date is distinct from p_new.post_date then
+  if found and l.reserved_date is distinct from p_new.post_date then
     raise exception 'visual group reserved on another date' using errcode='23514';
   end if;
   if not found then
@@ -298,8 +336,8 @@ begin
         public.visual_group_row_ambiguous(p_new));
   elsif l.state <> 'published' then
     update public.visual_group_usage_ledger set
-      reserved_date=p_new.post_date, state=case when finalized then 'published' else 'reserved' end,
-      released_at=null, reserved_at=case when l.state='released' then now() else reserved_at end,
+      state=case when finalized then 'published' else 'reserved' end,
+      released_at=null,
       published_at=case when finalized then coalesce(p_new.published_at,now()) end,
       ambiguous=ambiguous or public.visual_group_row_ambiguous(p_new)
       where gym_id=p_new.gym_id and group_key=p_new.visual_group_key;
@@ -319,6 +357,10 @@ begin
         then excluded.original_provider_post_id else coalesce(public.visual_group_usage_sibling.original_provider_post_id,excluded.original_provider_post_id) end,
       original_image_url=case when not public.visual_group_usage_sibling.ambiguous and excluded.ambiguous
         then excluded.original_image_url else coalesce(public.visual_group_usage_sibling.original_image_url,excluded.original_image_url) end;
+  -- A collision rolls back the local ledger, sibling and calendar mutation.
+  perform public.visual_group_global_claim(p_new.gym_id,p_new.visual_group_key,
+    p_new.post_date,p_new.id,p_new.account,finalized,
+    public.visual_group_row_ambiguous(p_new),public.visual_global_row_fingerprint(p_new));
 end;
 $$;
 
@@ -333,7 +375,18 @@ begin
     return old;
   end if;
   if not public.visual_group_enforcement_on(new.gym_id)
-     and (tg_op='INSERT' or not public.visual_group_enforcement_on(old.gym_id)) then return new; end if;
+     and (tg_op='INSERT' or not public.visual_group_enforcement_on(old.gym_id)) then
+    -- Once any tenant is armed, an unarmed writer cannot create history that
+    -- was absent from the global import. Existing untouched rows may remain.
+    if exists(select 1 from public.gym_visual_guard_settings where enforce)
+       and (new.status='published' or new.published_at is not null
+         or public.visual_group_row_active(new) or public.visual_group_row_ambiguous(new))
+       and (tg_op='INSERT' or new is distinct from old) then
+      raise exception 'unarmed calendar authority requires global history activation first'
+        using errcode='23514';
+    end if;
+    return new;
+  end if;
   -- Keep trigger OLD/NEW calendar keys raw. Only internal predicates use
   -- canonical UUIDs; returning NEW must never rewrite a client-facing key.
   new_tenant := public.visual_group_tenant_id(new.gym_id)::text;
@@ -459,6 +512,23 @@ drop trigger if exists content_calendar_visual_group_guard on public.content_cal
 create trigger content_calendar_visual_group_guard before insert or update or delete
   on public.content_calendar for each row execute function public.visual_group_guard_trigger();
 
+-- TRUNCATE has no rows and bypasses row triggers. Controlled cleanup must
+-- disarm first and preserve the immutable usage histories.
+create or replace function public.visual_group_guard_truncate()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if exists(select 1 from public.gym_visual_guard_settings where enforce) then
+    raise exception 'content_calendar truncate refused while visual guard is armed' using errcode='23514';
+  end if;
+  return null;
+end;
+$$;
+drop trigger if exists content_calendar_visual_group_truncate_guard on public.content_calendar;
+create trigger content_calendar_visual_group_truncate_guard before truncate
+  on public.content_calendar for each statement execute function public.visual_group_guard_truncate();
+revoke all on function public.visual_group_guard_truncate()
+  from public,anon,authenticated,service_role;
+
 -- Per-row replacement media application shared by both swap RPCs. The caller
 -- has already validated and locked the expected active unsent same-date
 -- calendar rows. Full membership is checked under sorted old+target group
@@ -531,7 +601,7 @@ begin
   select * into l from public.visual_group_usage_ledger
     where gym_id=v_tenant and group_key=p_old_group for update;
   if exists(select 1 from public.visual_group_usage_ledger sl
-      where sl.gym_id=v_tenant and sl.group_key<>p_old_group and sl.state<>'released'
+      where sl.gym_id=v_tenant and sl.group_key<>p_old_group
         and sl.reserved_date is distinct from p_new_date
         and sl.group_key in (select public.visual_group_scene_members(v_tenant,p_old_group))) then
     raise exception 'linked scene component holds a different date' using errcode='23514';
@@ -551,11 +621,11 @@ begin
   end loop;
   foreach t in array targets loop
     select * into l from public.visual_group_usage_ledger where gym_id=v_tenant and group_key=t for update;
-    if found and (l.state<>'released' or l.ambiguous) then
+    if found and (l.state<>'released' or l.ambiguous or l.reserved_date is distinct from p_new_date) then
       raise exception 'replacement group is reserved, published or ambiguous; cross-date reuse refused' using errcode='23514';
     end if;
     if exists(select 1 from public.visual_group_usage_ledger sl
-        where sl.gym_id=v_tenant and sl.group_key<>t and (sl.state<>'released' or sl.ambiguous)
+        where sl.gym_id=v_tenant and sl.group_key<>t
           and sl.group_key in (select public.visual_group_scene_members(v_tenant,t))) then
       raise exception 'replacement group is linked to an occupied scene component' using errcode='23514';
     end if;
@@ -566,10 +636,9 @@ begin
       raise exception 'replacement group has active siblings outside this set' using errcode='23514';
     end if;
   end loop;
-  -- Pre-move the old reservation date so the per-row trigger never reads its
-  -- own group as reserved on the old date mid-update.
-  update public.visual_group_usage_ledger set reserved_date=p_new_date
-    where gym_id=v_tenant and group_key=p_old_group and state='reserved';
+  if new_scene=p_old_group and p_new_date is distinct from old_date then
+    raise exception 'staged visual group cannot be redated' using errcode='23514';
+  end if;
   foreach v_col in array array['source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key'] loop
     if exists(select 1 from information_schema.columns
       where table_schema='public' and table_name='content_calendar' and column_name=v_col) then
@@ -656,7 +725,9 @@ begin
       and public.visual_group_row_active(content_calendar) and not(id=any(p_row_ids))) then
     raise exception 'partial, stale, published or ambiguous sibling set' using errcode='23514';
   end if;
-  update public.visual_group_usage_ledger set reserved_date=p_new_date where gym_id=v_tenant and group_key=g;
+  if p_new_date is distinct from old_date then
+    raise exception 'staged visual group cannot be redated' using errcode='23514';
+  end if;
   update public.content_calendar set post_date=p_new_date where public.visual_group_tenant_id(gym_id)::text=v_tenant and id=any(p_row_ids);
   get diagnostics n=row_count;
   if n<>cardinality(p_row_ids) then raise exception 'stale sibling row set' using errcode='23514'; end if;
@@ -885,18 +956,18 @@ begin
   if p_outcome='confirmed_published' then
     -- All original/delivered components were locked before endpoint ledgers.
     if exists(select 1 from public.visual_group_usage_ledger cl
-      where cl.gym_id=v_tenant and cl.state<>'released' and cl.group_key<>p_group_key
+      where cl.gym_id=v_tenant and cl.group_key<>p_group_key
         and cl.reserved_date is distinct from p_date
         and cl.group_key in (select public.visual_group_scene_members(v_tenant,p_group_key))) then
       raise exception 'confirmed scene date conflicts with linked scene component';
     end if;
     select * into v_ledger from public.visual_group_usage_ledger where gym_id=v_tenant and group_key=p_group_key for update;
-    if found and v_ledger.state<>'released' and v_ledger.reserved_date is distinct from p_date then raise exception 'confirmed scene date conflict'; end if;
+    if found and v_ledger.reserved_date is distinct from p_date then raise exception 'confirmed scene date conflict'; end if;
     if not found then
       insert into public.visual_group_usage_ledger(gym_id,group_key,reserved_date,calendar_row_id,state,published_at)
         values(v_tenant,p_group_key,p_date,p_row_id,'published',pub_at);
     elsif v_ledger.state<>'published' then
-      update public.visual_group_usage_ledger set state='published',reserved_date=p_date,published_at=pub_at,released_at=null
+      update public.visual_group_usage_ledger set state='published',published_at=pub_at,released_at=null
         where gym_id=v_tenant and group_key=p_group_key;
     end if;
   end if;

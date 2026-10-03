@@ -167,13 +167,28 @@ create table if not exists public.visual_group_alias (
   gym_id      text        not null,
   alias_kind  text        not null check (alias_kind in
     ('source_asset','drive_id','byte_hash','canonical_url','r2_key','manual_scene')),
-  alias_value text        not null,
+  alias_value text        not null check (
+    alias_kind <> 'byte_hash' or alias_value ~
+      '^(source|derived):(sha256:[0-9a-f]{64}|md5:[0-9a-f]{32})$'),
   group_key   text        not null,
   created_at  timestamptz not null default now(),
   primary key (gym_id, alias_kind, alias_value),
   foreign key (gym_id, group_key)
     references public.visual_group (gym_id, group_key)
 );
+
+-- Existing draft databases may predate the inline constraint. Keep legacy
+-- rows visible for activation audit, while rejecting every new unnamespaced
+-- byte hash immediately; activation below refuses until legacy rows are fixed.
+do $$ begin
+  if not exists(select 1 from pg_constraint
+      where conrelid='public.visual_group_alias'::regclass
+        and conname='visual_group_alias_byte_hash_namespace') then
+    alter table public.visual_group_alias add constraint visual_group_alias_byte_hash_namespace
+      check (alias_kind <> 'byte_hash' or alias_value ~
+        '^(source|derived):(sha256:[0-9a-f]{64}|md5:[0-9a-f]{32})$') not valid;
+  end if;
+end $$;
 
 comment on table public.visual_group_alias is
   'One alias maps to exactly one visual group per gym; duplicate registration to a different group fails.';
@@ -229,7 +244,7 @@ create table if not exists public.visual_group_usage_ledger (
 alter table public.visual_group_usage_ledger add column if not exists ambiguous boolean not null default false;
 
 comment on table public.visual_group_usage_ledger is
-  'One row per (gym, group). Same-date IG/FB/Story/GBP siblings share it; a different date while state<>''released'' is rejected; state=''published'' usage fields are immutable forever; uncertainty metadata clears only with terminal evidence.';
+  'One row per (gym, group). Every staged date remains occupied after release; same-date siblings share it. Published usage fields are immutable forever; uncertainty metadata clears only with terminal evidence.';
 
 -- backfill/coverage scans: which rows of the ledger sit on a given date/state
 create index if not exists visual_group_usage_ledger_date_idx
@@ -290,8 +305,8 @@ create index if not exists content_calendar_visual_group_key_idx
 -- A confirmed provider publish makes the group permanently used, including
 -- after the calendar row is deleted or edited. Block UPDATE and DELETE of any
 -- ledger row whose state is 'published' -- no exceptions at the SQL layer.
--- Releases only ever apply to 'reserved' rows (state transition to 'released'),
--- which remains permitted.
+-- A released reservation retains its original date and still blocks reuse on
+-- any other date. Releases only change active membership state.
 
 create or replace function public.visual_group_ledger_block_published_mutation()
 returns trigger
@@ -299,9 +314,10 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  if old.ambiguous and tg_op='UPDATE' and
-      (new.gym_id<>old.gym_id or new.group_key<>old.group_key or new.reserved_date is distinct from old.reserved_date) then
-    raise exception 'ambiguous reservation identity/date is immutable' using errcode='23514';
+  if tg_op='DELETE' or
+      new.gym_id<>old.gym_id or new.group_key<>old.group_key or
+      new.reserved_date is distinct from old.reserved_date then
+    raise exception 'staged visual identity and date are permanent' using errcode='23514';
   end if;
   if old.ambiguous and (tg_op='DELETE' or
       ((not new.ambiguous or new.state='released') and
@@ -389,6 +405,14 @@ begin
        ('source_asset','drive_id','byte_hash','canonical_url','r2_key','manual_scene')
      or (p_group_key is not null and nullif(btrim(p_group_key), '') is null) then
     raise exception 'invalid visual alias' using errcode = '22023';
+  end if;
+  if p_alias_kind = 'byte_hash' and lower(btrim(p_alias_value)) !~
+      '^(source|derived):(sha256:[0-9a-f]{64}|md5:[0-9a-f]{32})$' then
+    raise exception 'byte_hash requires an explicit source/derived and sha256/md5 namespace'
+      using errcode = '22023';
+  end if;
+  if p_alias_kind = 'byte_hash' then
+    p_alias_value := lower(btrim(p_alias_value));
   end if;
   perform public.visual_group_auxiliary_lock(hashtextextended(
     jsonb_build_array('visual_alias',p_gym_id,p_alias_kind,p_alias_value)::text, 0));
@@ -574,7 +598,7 @@ begin
   -- OFF tenants may link conflicting historical scenes for review/reporting.
   select count(distinct reserved_date)>1, bool_or(reserved_date is null)
     into v_connected,v_unknown_date from public.visual_group_usage_ledger
-    where gym_id=v_tenant and group_key=any(v_members) and state<>'released';
+    where gym_id=v_tenant and group_key=any(v_members);
   if exists(select 1 from public.gym_visual_guard_settings where gym_id=v_tenant and enforce)
      and (v_connected or coalesce(v_unknown_date,false)) then
     raise exception 'armed tenant scene union conflicts with occupied dates; disable and reconcile history first'
@@ -596,7 +620,7 @@ begin
          array_agg(distinct l.group_key order by l.group_key) filter (where l.ambiguous)
     into v_dates, v_pub, v_amb
     from public.visual_group_usage_ledger l
-   where l.gym_id = v_tenant and l.state <> 'released'
+   where l.gym_id = v_tenant
      and l.group_key in (select m from public.visual_group_scene_members(v_tenant, v_a) m(m));
   return jsonb_build_object(
     'tenant', v_tenant,
