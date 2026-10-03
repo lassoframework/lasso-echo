@@ -29,7 +29,9 @@ def _row():
             'status': 'pending', 'variant_status': 'active', 'account': 'instagram',
             'format': 'story', 'image_url': 'https://cdn/igfill_old.jpg',
             'source_media_url': 'https://cdn/igfill_old.jpg',
-            'source_media_asset_id': None, 'media_not_ready_reason': 'hold'}
+            'source_media_asset_id': None, 'media_not_ready_reason': 'hold',
+            'published_at': None, 'late_post_id': None, 'scheduled_at': None,
+            'slot_index': None}
 
 
 def test_stage_retains_hold_and_clears_stale_source():
@@ -72,6 +74,51 @@ def test_historical_hold_is_complete_row_cas_and_changes_only_reason():
     assert params['media_not_ready_reason'] == 'is.null'
 
 
+def test_historical_archive_is_complete_row_cas_and_changes_only_variant_status():
+    row = _row()
+    http = HTTP(row)
+    store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=http)
+    result = store.archive_pending_media('swift', row)
+    assert result['variant_status'] == 'archived'
+    assert result['status'] == 'pending'
+    assert result['image_url'] == row['image_url']
+    assert result['source_media_url'] == row['source_media_url']
+    params, payload = http.calls[0]
+    assert payload == {'variant_status': 'archived'}
+    assert params['gym_id'] == 'eq.swift'
+    assert params['status'] == 'eq.pending'
+    assert params['variant_status'] == 'eq.active'
+    assert params['media_not_ready_reason'] == 'eq.hold'
+    assert params['published_at'] == 'is.null'
+    assert params['late_post_id'] == 'is.null'
+    assert params['scheduled_at'] == 'is.null'
+    assert params['slot_index'] == 'is.null'
+
+
+def test_historical_archive_refuses_an_already_archived_or_raced_row():
+    row = _row()
+    row['variant_status'] = 'archived'
+    http = HTTP(row)
+    store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=http)
+    assert store.archive_pending_media('swift', row) is None
+    assert not http.calls
+    row = _row()
+    http = HTTP(row, race=True)
+    store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=http)
+    assert store.archive_pending_media('swift', row) is None
+    assert http.row == row
+
+
+def test_historical_archive_refuses_published_pending_row():
+    for field in ('published_at', 'late_post_id'):
+        row = _row()
+        row[field] = 'marker'
+        http = HTTP(row)
+        store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=http)
+        assert store.archive_pending_media('swift', row) is None
+        assert not http.calls
+
+
 def test_pending_media_read_includes_variants_and_requires_exact_count():
     class ReadHTTP:
         def __init__(self, count):
@@ -87,3 +134,12 @@ def test_pending_media_read_includes_variants_and_requires_exact_count():
     store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=ReadHTTP(2))
     with pytest.raises(ValueError, match='incomplete'):
         store.list_pending_media_between('swift', '2026-10-01', '2026-10-03')
+
+
+def test_portal_status_action_refuses_archived_variant():
+    row = _row()
+    http = HTTP(row)
+    store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=http)
+    store.set_status('swift', 'r1', 'approved')
+    params, _payload = http.calls[0]
+    assert params['variant_status'] == 'eq.active'
