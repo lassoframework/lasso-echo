@@ -132,7 +132,26 @@ def real_media_depleted(base, *, now=None):
                 return True
             def list_assets(self, gym):
                 return assets
-        drive = gym_media_selector.pickable(base, store=Snapshot(), now=now)
+        # pickable() expects a timezone-aware datetime (its `_now_utc` passes a
+        # truthy `now` through untouched). Callers hand us ISO strings, so parse
+        # first -- a TypeError here would be swallowed below as "inventory
+        # uncertain" and the lane would hold forever.
+        parsed_now = now
+        from datetime import date as _date, datetime as _dt, timezone as _tz
+        if isinstance(parsed_now, _date) and not isinstance(parsed_now, _dt):
+            # no_media_astra_seed hands a plain date; pickable's cooldown math
+            # compares against tz-aware datetimes.
+            parsed_now = _dt(parsed_now.year, parsed_now.month, parsed_now.day,
+                             tzinfo=_tz.utc)
+        elif isinstance(parsed_now, str):
+            try:
+                parsed_now = _dt.fromisoformat(parsed_now.replace("Z", "+00:00"))
+            except ValueError:
+                parsed_now = None
+            if (parsed_now is not None
+                    and parsed_now.tzinfo is None):
+                parsed_now = parsed_now.replace(tzinfo=_tz.utc)
+        drive = gym_media_selector.pickable(base, store=Snapshot(), now=parsed_now)
         from .media_bridge import observe_drive_inventory
         observe_drive_inventory(base, [a.get("id") for a in drive])
         return not local and not drive

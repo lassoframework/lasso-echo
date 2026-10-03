@@ -266,3 +266,20 @@ def make_source(sid="src1", gym_id="pierce", folder_id="fold1", active=True,
             "owner_email": "owner@piercewellness.com", "sync_mode": "all",
             "active": active, "revoked_externally": revoked, "connected_by": "u1",
             "connected_at": "2026-08-20T00:00:00Z"}
+
+
+class SyncedEmptyDriveIndex:
+    """A Drive index that PROVES depletion under the 733da2b contract: one active
+    gym_drive source whose sync finished successfully, and zero indexed assets.
+    Fixtures for a gym with no usable real media stub default_store with this."""
+
+    def available(self):
+        return True
+
+    def list_sources(self, _base):
+        return [{"kind": "gym_drive", "active": True,
+                 "revoked_externally": False, "sync_status": "ready",
+                 "sync_finished_at": "2026-10-02T00:00:00Z"}]
+
+    def list_assets(self, _base):
+        return []

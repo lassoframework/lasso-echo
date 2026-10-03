@@ -274,21 +274,23 @@ def has_rendition(cand):
 
 
 def _tier(cand):
-    """Audit R-D1 #4 ordering for the portal swap, which runs INSIDE an HTTP request:
-    0 never-used video WITH a rendition, 1 never-used photo, 2 never-used video
-    without a rendition (may need a transcode), 3 anything already used (LRU below)."""
+    """Use an unused gym photo first; video is only a fallback after photos.
+
+    Ready videos precede videos needing a transcode. Previously used media is
+    last, although the once-used candidate guard should normally exclude it.
+    """
     used = bool(cand.get("last_used"))
     if used:
         return 3
+    if cand.get("kind") == "photo":
+        return 0
     if cand.get("kind") == "video":
-        return 0 if has_rendition(cand) else 2
-    return 1
+        return 1 if has_rendition(cand) else 2
+    return 3
 
 
 def order_candidates(cands, *, current_is_video=False):
-    """Tier first (see _tier), then least recently used, then least used, then name.
-    A still therefore swaps to fresh footage whenever a ready-to-serve video exists,
-    but never waits on a transcode when a fresh photo is available."""
+    """Tier first (see _tier), then least recently used, then least used, then name."""
     del current_is_video   # kept for callers; the tier order supersedes the filter
     cands = list(cands or [])
     cands.sort(key=lambda c: (_tier(c), c.get("last_used") or "",

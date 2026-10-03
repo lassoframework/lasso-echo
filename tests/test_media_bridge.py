@@ -7,7 +7,7 @@ import pytest
 from PIL import Image
 from agent import media_bridge as mb, config, db
 from agent.media_bridge_route import Route
-from tests.gym_media_fakes import bound_review_fields
+from tests.gym_media_fakes import SyncedEmptyDriveIndex, bound_review_fields
 
 
 def _valid_jpeg():
@@ -97,8 +97,15 @@ def test_notice_is_clear_and_no_forbidden_punctuation():
     assert 'two days' in text and 'Upload media' in text and 'review' in text
     assert ':' not in text and ';' not in text
 
+def _prove_drive_depleted(monkeypatch):
+    """733da2b: the gap lanes may run only after the Drive index proves depletion
+    (a finished successful sync with zero usable assets)."""
+    from agent import gym_media_index
+    monkeypatch.setattr(gym_media_index, 'default_store', SyncedEmptyDriveIndex)
+
 def test_fill_cannot_expand_to_month(monkeypatch):
     from agent import client_infographic_fill as cif, client_sources, creative_studio
+    _prove_drive_depleted(monkeypatch)
     monkeypatch.setenv('AGENT_CLIENT_INFOGRAPHIC_FILL','true')
     monkeypatch.setattr(config,'creative_studio_enabled',lambda:True)
     monkeypatch.setattr(client_sources,'approved_sources',lambda _: [object()])
@@ -109,6 +116,7 @@ def test_fill_cannot_expand_to_month(monkeypatch):
 
 def test_seed_cannot_expand_to_month(monkeypatch):
     from agent import no_media_astra_seed as seed, client_infographic_fill as cif
+    _prove_drive_depleted(monkeypatch)
     monkeypatch.setenv('AGENT_NO_MEDIA_ASTRA_SEED','true')
     monkeypatch.setattr(seed,'_ensure_deep_brain_facts',lambda *a:[object()])
     seen=[]
@@ -181,6 +189,7 @@ def test_active_drive_inventory_suppresses_depletion_alert(monkeypatch):
 
 def test_seed_honors_gym_timezone_and_alerts_without_facts(monkeypatch):
     from agent import no_media_astra_seed as seed, client_infographic_fill as cif
+    _prove_drive_depleted(monkeypatch)
     today = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
     monkeypatch.setenv('AGENT_NO_MEDIA_ASTRA_SEED','true')
     monkeypatch.setattr(config,'posting_timezone_for',lambda _:'Pacific/Honolulu')

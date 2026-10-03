@@ -372,6 +372,68 @@ def test_client_gym_never_initializes_the_gemini_lane(monkeypatch):
     assert out["filled"] == 1
 
 
+def test_indexed_drive_photo_holds_infographic_even_with_drive_flags_off(
+        monkeypatch):
+    """2026-10-02 regression (8e06dbf): the indexed Drive inventory is authoritative
+    even when the staging lane is disabled. A pickable approved client photo must
+    hold the Astra fallback with BOTH Drive flags off."""
+    from agent import gym_media_index
+    from tests.gym_media_fakes import make_asset, bound_review_fields
+
+    photo = make_asset("ph1", gym_id="gymx", kind="photo", title="team.jpg")
+    photo.update(bound_review_fields("ph1", "gymx"))
+
+    class DriveIndexWithPhoto:
+        def available(self):
+            return True
+
+        def list_sources(self, _base):
+            return [{"kind": "gym_drive", "active": True,
+                     "revoked_externally": False, "sync_status": "ready",
+                     "sync_finished_at": "2026-10-02T00:00:00Z"}]
+
+        def list_assets(self, _base):
+            return [photo]
+
+    monkeypatch.setattr(gym_media_index, "default_store",
+                        lambda: DriveIndexWithPhoto())
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "false")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT", "false")
+    _sources()
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00")
+    assert out["filled"] == 0 and store.inserted == [], out
+    assert not cif.real_media_depleted("gymx", now="2026-08-25T12:00:00-04:00")
+
+
+def test_unsynced_drive_source_holds_the_infographic_fallback(monkeypatch):
+    """2026-10-02 regression (733da2b): an empty asset list is depletion proof only
+    after a successful source sync. A source still syncing (or never finished) must
+    fail CLOSED and hold the Astra fallback."""
+    from agent import gym_media_index
+
+    class UnsyncedDriveIndex:
+        def available(self):
+            return True
+
+        def list_sources(self, _base):
+            return [{"kind": "gym_drive", "active": True,
+                     "revoked_externally": False, "sync_status": "syncing"}]
+
+        def list_assets(self, _base):
+            return []
+
+    monkeypatch.setattr(gym_media_index, "default_store",
+                        lambda: UnsyncedDriveIndex())
+    _sources()
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00")
+    assert out["filled"] == 0 and store.inserted == [], out
+    assert not cif.real_media_depleted("gymx", now="2026-08-25T12:00:00-04:00")
+
+
 def test_photos_rechecked_at_generation_time(monkeypatch):
     """A photo landing between the scan and the render always wins: the fill
     stops instead of drawing an infographic."""

@@ -72,4 +72,9 @@ def test_corrupt_photo_is_not_usable_inventory(monkeypatch, tmp_path):
     gym_dir.mkdir()
     (gym_dir / "photo.jpg").write_bytes(b"not a photograph")
     monkeypatch.setattr(config, "gym_drive_stage_enabled", lambda: False)
+    # 733da2b: depletion must be PROVEN by the indexed Drive inventory (a finished
+    # successful source sync with zero usable assets), even with the stage flag off.
+    from agent import gym_media_index
+    from tests.gym_media_fakes import SyncedEmptyDriveIndex
+    monkeypatch.setattr(gym_media_index, "default_store", SyncedEmptyDriveIndex)
     assert client_infographic_fill.real_media_depleted("gymx") is True

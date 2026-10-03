@@ -195,9 +195,14 @@ def test_tough_temple_like_pool_yields_zero_repeats(monkeypatch, tmp_path):
     post and NOT ONE local still repeats."""
     _sources()
     _stale_ledger(monkeypatch)
+    # 2026-10-02 photo-first contract: stills are consumed before clips, so the
+    # pool carries fewer photos (16) than days; once they are spent the remaining
+    # days draw videos, keeping the mix inside the 35-55% band.
     store = FakeMediaStore(assets=[
-        make_asset(f"a{i:02d}", gym_id="gritx", kind="video" if i % 2 else "photo",
-                   title=f"t{i:02d}.{'mp4' if i % 2 else 'jpg'}") for i in range(63)])
+        make_asset(f"a{i:02d}", gym_id="gritx",
+                   kind="photo" if i % 4 == 0 else "video",
+                   title=f"t{i:02d}.{'jpg' if i % 4 == 0 else 'mp4'}")
+        for i in range(63)])
     _arm(monkeypatch, store, FakeDrive())
     cal = _CalStore()
     logs = []
@@ -661,10 +666,11 @@ def test_builder_with_spent_budget_prefers_renditioned_videos_then_photos(monkey
     """Audit R-D1 #3: budget spent -> a video already carrying a rendition_url is
     picked over a never-used unrenditioned one; with no renditioned video left the
     slot falls back to a photo, without encoding anything."""
+    # Photo-first contract: the photo fallback is added AFTER the spent-budget
+    # video assertions (with a photo already pickable it would always win the slot).
     store = FakeMediaStore(assets=[
         make_asset("raw1", gym_id="gritx", kind="video", title="raw1.mov"),
-        make_asset("rend", gym_id="gritx", kind="video", title="rend.mov", used_count=0),
-        make_asset("p1", gym_id="gritx", kind="photo", title="p.jpg")])
+        make_asset("rend", gym_id="gritx", kind="video", title="rend.mov", used_count=0)])
     store.assets["rend"]["rendition_url"] = "https://cdn.fake/rend.mp4"
     _arm(monkeypatch, store, FakeDrive())
     monkeypatch.setattr(_gmi, "hevc_to_h264",
@@ -682,6 +688,7 @@ def test_builder_with_spent_budget_prefers_renditioned_videos_then_photos(monkey
                                           rendition_budget=spent)
     assert first.source_media_asset_id == "rend"
     assert first.creative_public_url == "https://cdn.fake/rend.mp4"
+    store.assets["p1"] = make_asset("p1", gym_id="gritx", kind="photo", title="p.jpg")
     second = builder.build_gym_media_draft(_A(), vday, "faces", voice=object(),
                                            source=object(), store=store, drive=FakeDrive(),
                                            library_dir=str(tmp_path), now=NOW,
@@ -1001,11 +1008,12 @@ def _video_beats(start, days, slot=0):
 def test_video_beats_are_claimed_by_drive_before_lane_a_with_fresh_stills(monkeypatch,
                                                                           tmp_path):
     """Tough Temple's rebuild: 95 FRESH local stills, 57 renditioned Drive videos, 6
-    Drive photos, 20 days at 1x. Before round 5 Lane A took every day (20 stills, 0
-    videos). Now every video beat is a Drive video, every photo beat a fresh still:
-    0 repeats, 0 uncovered, and each video day carries its FB mirror + story."""
+    Drive videos, 20 days at 1x. Photo-first contract: the video pre-pass runs only
+    for a photo-exhausted (video-only) Drive pool, so this pool carries videos only
+    and Lane A's stills are the photo supply. Every video beat is a Drive video,
+    every photo beat a fresh still: 0 repeats, 0 uncovered."""
     _sources()
-    store = FakeMediaStore(assets=_tt_pool())
+    store = FakeMediaStore(assets=_tt_pool(n_photos=0))
     _arm(monkeypatch, store, FakeDrive())
     start = date(2026, 8, 1)
     cal = _CalStore()
@@ -1169,9 +1177,10 @@ def test_a_raise_mid_lane_keeps_finished_drafts_and_rolls_back_the_in_flight_ass
         monkeypatch, tmp_path):
     """Raise on the 3rd _finish_feed_with_story: the two finished video drafts land,
     the third asset is returned to the pool, Lane A covers every remaining day ->
-    20/20 feeds and no stamped-but-unlanded asset."""
+    20/20 feeds and no stamped-but-unlanded asset. Photo-first contract: the
+    pre-pass only runs for a photo-exhausted (video-only) Drive pool."""
     _sources()
-    store = FakeMediaStore(assets=_tt_pool())
+    store = FakeMediaStore(assets=_tt_pool(n_photos=0))
     _arm(monkeypatch, store, FakeDrive())
     calls = {"n": 0}
     real_finish = cmr._finish_feed_with_story

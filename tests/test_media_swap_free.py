@@ -422,12 +422,12 @@ def test_candidates_are_least_recently_used_first_not_alphabetical():
         "m_never_used.jpg", "z_used_last_month.jpg", "a_used_yesterday.jpg"]
 
 
-def test_a_still_swaps_to_ready_footage_first_then_photos_then_unrenditioned_video():
-    """Audit R-D1 #4: the swap runs inside a portal request, so the order is
-    never-used video WITH a rendition (ready to serve) > never-used photo >
-    never-used video WITHOUT a rendition (would need a transcode) > anything used
-    (LRU). A gym with ready footage is handed footage, never a tenth still; a gym
-    whose footage is all unrenditioned gets a fresh photo before it waits on ffmpeg."""
+def test_a_still_swaps_to_unused_photo_before_ready_and_unrenditioned_video():
+    """A gym photo wins even when ready video footage is available.
+
+    Once photos are depleted, ready footage precedes video requiring a transcode;
+    already used media remains last.
+    """
     ready = _cand("clipA.mp4", kind="video", source="drive")
     ready["asset"]["rendition_url"] = "https://cdn/clipA.mp4"
     raw = _cand("clipR.mov", kind="video", source="drive")            # no rendition yet
@@ -437,7 +437,7 @@ def test_a_still_swaps_to_ready_footage_first_then_photos_then_unrenditioned_vid
     cands = [_cand("a_photo.jpg"), used, raw, ready, local_vid]
     ordered = msw.order_candidates(cands, current_is_video=False)
     assert [c["key"] for c in ordered] == [
-        "clipA.mp4", "gym.mp4", "a_photo.jpg", "clipR.mov", "clipB.mp4"]
+        "a_photo.jpg", "clipA.mp4", "gym.mp4", "clipR.mov", "clipB.mp4"]
     assert msw.has_rendition(ready) and msw.has_rendition(local_vid)
     assert not msw.has_rendition(raw) and not msw.has_rendition(_cand("a_photo.jpg"))
 
