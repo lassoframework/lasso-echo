@@ -917,12 +917,27 @@ def maybe_reburn_story(account_key, row, new_caption, sb_store, *, logger=None):
         from . import story_reburn
         if not story_reburn.should_reburn(row):
             return None
-        new_url = story_reburn.reburn(
-            row.get("source_media_url"), new_caption, _gym_display_name(account_key),
-            account_key, logger=log)
+        from . import visual_writer_prepare
+        receipt_evidence = None
+        if visual_writer_prepare.enabled():
+            reburned = story_reburn.reburn_with_evidence(
+                row.get("source_media_url"), new_caption, _gym_display_name(account_key),
+                account_key, logger=log)
+            if not isinstance(reburned, tuple) or len(reburned) != 2:
+                return None
+            new_url, receipt_evidence = reburned
+        else:
+            new_url = story_reburn.reburn(
+                row.get("source_media_url"), new_caption, _gym_display_name(account_key),
+                account_key, logger=log)
         if not new_url:
             return None
-        sb_store.patch_image_url(account_key, row.get("id"), new_url)
+        patch_args = {}
+        if receipt_evidence is not None:
+            patch_args["render_evidence"] = receipt_evidence.as_dict()
+        persisted = sb_store.patch_image_url(account_key, row.get("id"), new_url, **patch_args)
+        if not isinstance(persisted, dict) or persisted.get("image_url") != new_url:
+            return None
         return new_url
     except Exception as exc:  # noqa: BLE001 - a re-burn must NEVER fail the saved edit
         log(f"story re-burn skipped ({type(exc).__name__})")

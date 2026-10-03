@@ -849,7 +849,11 @@ def test_stale_story_self_heals_and_publishes_same_tick(armed, monkeypatch):
                image_url="https://cdn/old__story.jpg", caption="edited caption")
     row["source_media_url"] = "https://cdn/raw.jpg"
     store = _FakeStore([row])
-    store.patch_image_url = lambda gym, rid, url: store.rows[rid].__setitem__("image_url", url)
+    def patch_image_url(gym, rid, url, *, expected_row):
+        assert expected_row == row
+        store.rows[rid]["image_url"] = url
+        return dict(store.rows[rid])
+    store.patch_image_url = patch_image_url
     # OLD media is stale; the re-burned NEW media carries the caption.
     monkeypatch.setattr(story_image, "story_media_carries_caption", lambda url, cap: url == NEW)
     monkeypatch.setattr(story_reburn, "should_reburn", lambda r: True)
@@ -860,6 +864,127 @@ def test_stale_story_self_heals_and_publishes_same_tick(armed, monkeypatch):
     # it healed the media and published this tick, rather than holding
     assert store.rows["s"]["image_url"] == NEW
     assert [c[0] for c in store.published_calls] == ["s"]
+
+
+def test_stale_story_transports_verified_reburn_evidence_when_writer_prep_is_armed(monkeypatch):
+    from agent import story_reburn
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    row = _row("s", account="instagram", fmt="story", status="approved",
+               image_url="https://cdn/old__story.jpg", caption="edited caption")
+    row["source_media_url"] = "https://cdn/raw.jpg"
+    evidence = {"source_exact_url": row["source_media_url"],
+                "delivered_exact_url": "https://cdn/healed__story.jpg",
+                "source_fingerprint": "md5:" + "a" * 32,
+                "delivered_fingerprint": "md5:" + "b" * 32,
+                "source_byte_length": 10, "delivered_byte_length": 11,
+                "operation": "reburn", "evidence_ref": "story_reburn:test",
+                "observed_by": "story_reburn", "rendered_by": "story_reburn"}
+    captured = {}
+
+    class Store:
+        def patch_image_url(self, gym, row_id, url, **kwargs):
+            captured.update(gym=gym, row_id=row_id, url=url, **kwargs)
+            return {**row, "image_url": url}
+
+    monkeypatch.setattr(story_reburn, "should_reburn", lambda _: True)
+    monkeypatch.setattr(story_reburn, "reburn_with_evidence",
+                        lambda *_a, **_k: ("https://cdn/healed__story.jpg",
+                                           type("Evidence", (), {"as_dict": lambda _: evidence})()))
+    healed = cap._reburn_stale_story(row, SimpleNamespace(display_name="LASSO IG", key="lasso_ig"), Store())
+    assert healed["image_url"] == "https://cdn/healed__story.jpg"
+    assert captured == {"gym": "lasso", "row_id": "s", "url": "https://cdn/healed__story.jpg",
+                        "expected_row": row, "render_evidence": evidence}
+
+
+@pytest.mark.parametrize("changed_field", [None, "status", "caption", "image_url",
+                                                  "source_media_url", "published_at"])
+def test_approved_story_reburn_real_store_conditional_patch(monkeypatch, changed_field):
+    """Exercise the real store method against a fake that applies PostgREST filters."""
+    from agent import story_reburn
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    old = "https://cdn/old__story.jpg"
+    new = "https://cdn/new__story.jpg"
+    saved = _row("s", fmt="story", status="approved", image_url=old,
+                 caption='edited, "quoted" caption')
+    saved["source_media_url"] = "https://cdn/raw.jpg"
+    observed = dict(saved)
+
+    class ConditionalHTTP:
+        def __init__(self):
+            self.row = dict(saved)
+            self.calls = []
+
+        def patch(self, url, *, params, headers, json, timeout):
+            self.calls.append((params, json))
+            for key, condition in params.items():
+                if condition == "is.null":
+                    matches = self.row.get(key) is None
+                elif condition.startswith('eq."') and condition.endswith('"'):
+                    value = condition[4:-1].replace('\\"', '"').replace('\\\\', '\\')
+                    matches = str(self.row.get(key)) == value
+                else:
+                    matches = condition == f"eq.{self.row.get(key)}"
+                if not matches:
+                    return _Resp(200, [])
+            self.row.update(json)
+            return _Resp(200, [dict(self.row)])
+
+    http = ConditionalHTTP()
+    changes = {"status": "publishing", "caption": "newer caption",
+               "image_url": "https://cdn/other.jpg",
+               "source_media_url": "https://cdn/other-source.jpg",
+               "published_at": "2026-08-10T20:00:00Z"}
+    if changed_field:
+        http.row[changed_field] = changes[changed_field]
+    store = _store(http)
+    monkeypatch.setattr(story_reburn, "should_reburn", lambda row: True)
+    monkeypatch.setattr(story_reburn, "reburn", lambda *args: new)
+
+    healed = cap._reburn_stale_story(
+        observed, SimpleNamespace(display_name="LASSO IG", key="lasso_ig"), store)
+
+    params, body = http.calls[0]
+    assert params["status"] == 'eq."approved"'
+    assert params["caption"] == 'eq."edited, \\"quoted\\" caption"'
+    assert params["image_url"] == f'eq."{old}"'
+    assert params["source_media_url"] == 'eq."https://cdn/raw.jpg"'
+    assert params["published_at"] == params["late_post_id"] == "is.null"
+    assert params["media_not_ready_reason"] == "is.null"
+    assert body == {"image_url": new, "media_not_ready_reason": None}
+    if changed_field:
+        assert healed is None
+        assert http.row["image_url"] != new
+    else:
+        assert healed["image_url"] == http.row["image_url"] == new
+        assert http.row["status"] == "approved"
+
+
+@pytest.mark.parametrize("patch_result", ["missing", None, {"image_url": "https://cdn/old__story.jpg"}])
+def test_stale_approved_story_holds_when_reburn_url_is_not_persisted(
+        armed, monkeypatch, patch_result):
+    from agent import story_image, story_reburn
+    old = "https://cdn/old__story.jpg"
+    new = "https://cdn/healed__story.jpg"
+    row = _row("s", account="instagram", fmt="story", status="approved",
+               image_url=old, caption="edited caption")
+    row["source_media_url"] = "https://cdn/raw.jpg"
+    store = _FakeStore([row])
+    if patch_result != "missing":
+        store.patch_image_url = lambda gym, rid, url, *, expected_row: patch_result
+    monkeypatch.setattr(story_image, "story_media_carries_caption", lambda url, cap: url == new)
+    monkeypatch.setattr(story_reburn, "should_reburn", lambda r: True)
+    monkeypatch.setattr(story_reburn, "reburn", lambda *a, **k: new)
+    monkeypatch.setattr(cap, "_alert_story_needs_render", lambda *a: None)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True, catch_all=True)
+
+    assert summary["waiting"] == ["s"]
+    assert pub.calls == []
+    assert store.publishing_calls == []
+    assert store.rows["s"]["status"] == "approved"
+    assert store.rows["s"]["image_url"] == old
 
 
 def test_stale_story_without_source_media_holds_not_publishes(armed, monkeypatch):

@@ -46,11 +46,23 @@ create table if not exists public.visual_group_activation (
 do $$ begin
   if to_regclass('public.visual_global_identity') is null
      or to_regclass('public.visual_global_usage') is null
-     or to_regprocedure('public.visual_global_claim(text,text,date,uuid,text,boolean,boolean,text)') is null
+     or to_regclass('public.visual_global_object_attestation') is null
+     or to_regclass('public.visual_global_scene_object_member') is null
+     or to_regclass('public.visual_global_object_lineage') is null
+     or to_regprocedure('public.visual_global_claim_scene(public.content_calendar,boolean,boolean)') is null
+     or to_regprocedure('public.visual_global_claim_fingerprint_set(text,text,date,uuid,text,boolean,boolean,text[])') is null
+     or to_regprocedure('public.visual_global_refresh_scene_history(text,text)') is null
      or to_regprocedure('public.visual_global_import_history()') is null
-     or to_regprocedure('public.visual_global_row_fingerprint(public.content_calendar)') is null
+     or to_regprocedure('public.visual_global_row_bytes_verified(public.content_calendar)') is null
      or to_regprocedure('public.visual_global_release(text,text)') is null then
     raise exception 'apply global visual history before integrated activation' using errcode='55000';
+  end if;
+  if not exists(select 1 from pg_trigger
+      where tgrelid='public.visual_group_scene_link'::regclass
+        and tgname='visual_global_scene_link_claim_guard'
+        and not tgisinternal and tgenabled<>'D') then
+    raise exception 'global scene-link claim guard is missing before integrated activation'
+      using errcode='55000';
   end if;
 end $$;
 drop trigger if exists visual_global_block_local_activation
@@ -184,7 +196,10 @@ begin
   lock table public.visual_group_usage_ledger, public.visual_group_alias,
     public.visual_global_identity, public.visual_group_scene_link,
     public.visual_group_usage_sibling, public.visual_group_member_event,
-    public.visual_group_reconciliation, public.tenant_alias
+    public.visual_group_reconciliation, public.tenant_alias,
+    public.visual_global_object_attestation,
+    public.visual_global_scene_object_member, public.visual_global_object_lineage,
+    public.visual_global_usage, public.visual_global_usage_member
     in share row exclusive mode nowait;
 
   -- 2. The SAME canonical mutex every auxiliary mutation RPC takes before

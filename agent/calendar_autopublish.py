@@ -300,13 +300,39 @@ def _reburn_stale_story(row, account, store):
         for suf in (" IG", " FB", " Instagram", " Facebook", " Facebook Page"):
             if name.endswith(suf):
                 name = name[: -len(suf)].strip()
-        new_url = story_reburn.reburn(row.get("source_media_url"), row.get("caption") or "",
-                                      name, account.key)
+        from . import visual_writer_prepare
+        receipt_evidence = None
+        if visual_writer_prepare.enabled():
+            reburned = story_reburn.reburn_with_evidence(
+                row.get("source_media_url"), row.get("caption") or "", name, account.key)
+            if not isinstance(reburned, tuple) or len(reburned) != 2:
+                return None
+            new_url, receipt_evidence = reburned
+        else:
+            new_url = story_reburn.reburn(row.get("source_media_url"), row.get("caption") or "",
+                                          name, account.key)
         if not new_url:
             return None
         patch = getattr(store, "patch_image_url", None)
-        if patch is not None:
-            patch(row.get("gym_id"), row.get("id"), new_url)
+        if patch is None:
+            return None
+        patch_args = {"expected_row": row}
+        if receipt_evidence is not None:
+            patch_args["render_evidence"] = receipt_evidence.as_dict()
+        persisted = patch(row.get("gym_id"), row.get("id"), new_url, **patch_args)
+        # The store may reject this update (for example, its status filter may
+        # exclude an approved row). Do not publish media that only changed in
+        # this in-memory copy; the next tick would still see the stale URL.
+        if (not isinstance(persisted, dict)
+                or persisted.get("id") != row.get("id")
+                or persisted.get("gym_id") != row.get("gym_id")
+                or persisted.get("status") != row.get("status")
+                or persisted.get("caption") != row.get("caption")
+                or persisted.get("source_media_url") != row.get("source_media_url")
+                or persisted.get("image_url") != new_url
+                or persisted.get("published_at") is not None
+                or persisted.get("late_post_id") is not None):
+            return None
         updated = dict(row)
         updated["image_url"] = new_url
         return updated

@@ -432,25 +432,109 @@ class SupabaseCalendarStore:
             return None
         return rows[0]
 
-    def patch_image_url(self, account_key, row_id, new_image_url):
+    def _prepare_visual_media(self, account_key, row_id, payload, *, current=None,
+                              render_evidence=None):
+        """Prepare a replacement against the actual scoped row before its PATCH."""
+        from . import visual_writer_prepare
+        if not visual_writer_prepare.enabled():
+            return payload
+        current = current if current is not None else self.get_row(account_key, row_id)
+        if current is None:
+            raise visual_writer_prepare.VisualPreparationError("calendar row is unavailable for visual preparation")
+        patch = dict(payload)
+        is_story = str(current.get("format") or "").lower() == "story"
+        if (is_story
+                and current.get("source_media_url")
+                and current.get("source_media_url") != patch.get("image_url", current.get("image_url"))
+                and "source_media_url" not in patch and render_evidence is None):
+            raise visual_writer_prepare.VisualPreparationError(
+                "story raw source requires verified rendition lineage")
+        if render_evidence is not None:
+            if (not is_story or not isinstance(render_evidence, dict)
+                    or render_evidence.get("source_exact_url") != current.get("source_media_url")
+                    or render_evidence.get("delivered_exact_url") != patch.get("image_url")):
+                raise visual_writer_prepare.VisualPreparationError(
+                    "render evidence does not bind the scoped story replacement")
+        # A replacement must not carry a stale source identity from the old
+        # image. Callers that know the replacement asset supply it explicitly.
+        for field in ("source_media_url", "source_media_asset_id", "drive_file_id", "byte_hash", "r2_key"):
+            if (field == "source_media_url" and is_story
+                    and (current.get(field) == patch.get("image_url")
+                         or render_evidence is not None)):
+                continue
+            if field not in patch and current.get(field):
+                patch[field] = None
+        candidate = dict(current)
+        candidate.update(patch)
+        candidate.pop("visual_group_key", None)
+        prepared = visual_writer_prepare.prepare(
+            self, account_key, candidate, render_evidence=render_evidence)
+        patch["visual_group_key"] = prepared["visual_group_key"]
+        patch["byte_hash"] = prepared["byte_hash"]
+        return patch
+
+    def patch_image_url(self, account_key, row_id, new_image_url, *, expected_row=None,
+                        render_evidence=None):
         """Task #28 (§5c): swap a story row's image_url to freshly re-burned media after a
         caption edit. A real replacement also clears a prior needs-media hold, but never
-        changes status: pending / coach_review rows still need their normal approval path.
-        id+gym_id + waiting-status isolation. Returns the updated row or None."""
+        changes status. An auto-publisher reburn supplies expected_row so an approved
+        Story can be updated only while its caption, source, image and publish state
+        still match the rendered input. Returns one updated row or None."""
         if not (new_image_url or "").strip():
             return None
+        params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"}
+        if expected_row is None:
+            params["status"] = "in.(pending,coach_review)"
+        else:
+            required = ("id", "gym_id", "status", "format", "image_url",
+                        "caption", "source_media_url", "published_at", "late_post_id")
+            if (not isinstance(expected_row, dict)
+                    or any(key not in expected_row for key in required)
+                    or str(expected_row["id"]) != str(row_id)
+                    or str(expected_row["gym_id"]) != str(account_key)
+                    or expected_row["status"] not in ("pending", "approved")
+                    or expected_row["format"] != "story"
+                    or not expected_row["image_url"]
+                    or not expected_row["source_media_url"]
+                    or expected_row["published_at"] is not None
+                    or expected_row["late_post_id"] is not None):
+                return None
+            def unchanged(value):
+                if value is None:
+                    return "is.null"
+                escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+                return f'eq."{escaped}"'
+            for key in ("status", "format", "image_url", "caption", "source_media_url"):
+                params[key] = unchanged(expected_row[key])
+            params["published_at"] = "is.null"
+            params["late_post_id"] = "is.null"
+            params["media_not_ready_reason"] = "is.null"
+        payload = {"image_url": new_image_url, "media_not_ready_reason": None}
+        payload = self._prepare_visual_media(account_key, row_id, payload,
+                                             render_evidence=render_evidence)
         r = self._client().patch(
             self._rest(_TABLE),
-            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
-                    "status": "in.(pending,coach_review)"},
+            params=params,
             headers=self._headers({"Content-Type": "application/json",
                                    "Prefer": "return=representation"}),
-            json={"image_url": new_image_url, "media_not_ready_reason": None}, timeout=30)
+            json=payload, timeout=30)
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        for row in (r.json() or []):
-            if str(row.get("gym_id")) == str(account_key):
-                return row
+        rows = r.json() or []
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        if str(row.get("gym_id")) != str(account_key) or str(row.get("id")) != str(row_id):
+            return None
+        if expected_row is not None and any(
+                row.get(key) != expected_row[key]
+                for key in ("status", "format", "caption", "source_media_url",
+                            "published_at", "late_post_id")):
+            return None
+        if expected_row is not None and row.get("media_not_ready_reason") is not None:
+            return None
+        if row.get("image_url") == new_image_url:
+            return row
         return None
 
     def patch_media(self, account_key, row_id, image_url, source_media_asset_id=""):
@@ -476,6 +560,7 @@ class SupabaseCalendarStore:
         payload = {"image_url": image_url, "media_not_ready_reason": None}
         if source_media_asset_id:
             payload["source_media_asset_id"] = source_media_asset_id
+        payload = self._prepare_visual_media(account_key, row_id, payload)
         # Keep the no-overwrite promise server-side too: another worker can attach
         # media after the prefetch but before this write. PostgREST's OR predicate
         # permits only a still-null or still-empty image_url to be recovered.
@@ -523,6 +608,7 @@ class SupabaseCalendarStore:
         for col in _SWAP_EXTRA_COLUMNS:
             if col in (extra_fields or {}):
                 payload[col] = extra_fields[col]
+        payload = self._prepare_visual_media(account_key, row_id, payload)
         r = self._client().patch(
             self._rest(_TABLE),
             params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
@@ -604,6 +690,9 @@ class SupabaseCalendarStore:
             payload["thumbnail_url"] = thumbnail_url
         if source_media_asset_id is not None:
             payload["source_media_asset_id"] = source_media_asset_id
+        from . import visual_writer_prepare
+        if visual_writer_prepare.enabled():
+            payload = visual_writer_prepare.prepare(self, account_key, payload)
         r = self._client().post(
             self._rest(_TABLE),
             headers=self._headers({"Content-Type": "application/json",
@@ -2127,6 +2216,9 @@ class SupabaseCalendarStore:
         payload = _dedupe_slots(self, account_key, payload)
         if not payload:
             return recovered
+        from . import visual_writer_prepare
+        if visual_writer_prepare.enabled():
+            payload = [visual_writer_prepare.prepare(self, account_key, row) for row in payload]
         all_keys = set()
         for r in payload:
             all_keys.update(r.keys())
@@ -2186,6 +2278,7 @@ class SupabaseCalendarStore:
         columns = {"image_url", "thumbnail_url", "source_media_url", "source_media_asset_id"}
         patch = {key: value for key, value in proposed.items() if key in columns}
         patch["media_not_ready_reason"] = None
+        patch = self._prepare_visual_media(account_key, current["id"], patch, current=current)
         params = {"id": f"eq.{current['id']}", "gym_id": f"eq.{account_key}",
                   "account": f"eq.{current['account']}", "post_date": f"eq.{current['post_date']}",
                   "format": "eq.story", "status": "eq.pending", "variant_status": "eq.active",

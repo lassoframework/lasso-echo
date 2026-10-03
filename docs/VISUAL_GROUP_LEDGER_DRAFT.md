@@ -1,5 +1,35 @@
 # Persistent visual group ledger — DRAFT, unapplied
 
+## PR235 writer preparation repair (2026-10-03, still OFF)
+
+When `AGENT_VISUAL_GLOBAL_WRITER_PREP` is explicitly enabled, the Python
+calendar writer reads the selected delivered bytes and calls
+`visual_global_prepare_bundle` once to bind their derived MD5 alias, exact
+delivered URL, verified source aliases and global group identity in one SQL
+transaction. The calendar payload carries `byte_hash=derived:md5:<digest>`
+and the returned `visual_group_key`. The SQL function takes canonical tenant
+and fingerprint locks before binding aliases, rejects an alias bundle spanning
+different groups, and checks the returned group and fingerprint. If the later
+calendar INSERT or PATCH fails, the immutable registration can remain. Retrying
+the same bytes and aliases reuses it; registration alone creates no global
+usage. Only the calendar claim trigger may mark those bytes used.
+
+This repair does not authorize activation. The flag remains OFF by default.
+Direct paths still requiring separate writer/response review include the
+feed-aspect rehost in `calendar_autopublish.py` (it ignores an unsuccessful
+`patch_image_url` result and does not yet submit transformation evidence) and
+callers outside `SupabaseCalendarStore` that write
+`content_calendar.image_url` directly. Portal caption-edit reburn now passes
+render evidence through store preparation and checks the persisted PATCH row.
+The store's `patch_image_url` status filter accepts only pending or coach-review
+rows; approved-story reburn now holds instead of publishing a URL that was not
+persisted. The legacy one-hash preparation/claim path still cannot represent a
+distinct raw `source_media_url` and delivered rendition. The new DRAFT
+source/rendition path registers both only with byte-read/render receipts and
+uses the set-based global claim; its writer, SQL, and PostgreSQL acceptance
+remain release gates. A second delivered URL cannot be added through the
+legacy one-hash bundle without per-URL byte evidence.
+
 ## Global once-used correction (2026-10-02, still DRAFT)
 
 The tenant-local ledger described below does **not** satisfy the updated
@@ -53,11 +83,20 @@ all proof checks pass. All global migrations remain unapplied.
 
 No production migration, activation, or canary is authorized by this draft.
 
-The global activation blocker remains deliberate. Multi-hash manual scene
-components are reported by `visual_global_history_coverage()` as
-`scene_component_has_distinct_bytes_without_global_authority`. No global
-activation transaction, calendar write barrier, component claim, or calendar
-trigger integration exists yet. These are release blockers.
+The DRAFT global-history migration now derives a component's complete set of
+attested MD5 fingerprints, claims that set atomically, and imports/reports
+multi-fingerprint retained history. The DRAFT calendar trigger is integrated
+through `visual_group_global_claim` and `visual_global_claim_scene`; it requires
+verified selected row bytes and rolls local/global claims back with the calendar
+write. Object attestations and receipt-backed source/rendition lineage are also
+present in the DRAFT schema. The dirty writer lane now produces receipts for
+the Story reburn path, but this is unaccepted local implementation, not
+production evidence; other transformations and direct writers remain
+unreconciled. Activation remains blocked by incomplete historical source and
+rendition evidence, missing production rollout, and incomplete integrated
+acceptance. `visual_global_import_history()` and both coverage reports are
+draft mechanisms, not evidence that historical records are complete. Keep all
+flags OFF.
 
 Owner: isolated `codex/echo-global-ledger-db-20261002` worktree. Base: PR230
 `0ab9f8c`. Governing acceptance: `global-media-release-plan-20261002.md`.

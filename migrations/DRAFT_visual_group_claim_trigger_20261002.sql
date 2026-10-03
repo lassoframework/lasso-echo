@@ -220,18 +220,14 @@ $$;
 -- The global exact-byte authority is installed after this draft, so calls are
 -- dynamic. Once a tenant is armed, absence of that authority is a hard error.
 create or replace function public.visual_group_global_claim(
-  p_gym_id text,p_group_key text,p_date date,p_row_id uuid,p_channel text,
-  p_published boolean,p_ambiguous boolean,p_selected_fingerprint text
+  p_row public.content_calendar,p_published boolean,p_ambiguous boolean
 ) returns void language plpgsql security definer set search_path = public as $$
 begin
-  if p_selected_fingerprint is null then
-    raise exception 'selected calendar asset has no verified byte fingerprint' using errcode='23514';
-  end if;
-  if to_regprocedure('public.visual_global_claim(text,text,date,uuid,text,boolean,boolean,text)') is null then
+  if to_regprocedure('public.visual_global_claim_scene(public.content_calendar,boolean,boolean)') is null then
     raise exception 'global visual claim authority is missing for armed tenant' using errcode='55000';
   end if;
-  execute 'select public.visual_global_claim($1,$2,$3,$4,$5,$6,$7,$8)'
-    using p_gym_id,p_group_key,p_date,p_row_id,p_channel,p_published,p_ambiguous,p_selected_fingerprint;
+  execute 'select public.visual_global_claim_scene($1,$2,$3)'
+    using p_row,p_published,p_ambiguous;
 end;
 $$;
 
@@ -247,7 +243,7 @@ end;
 $$;
 -- These are trigger-internal wrappers. PUBLIC/service callers must use the
 -- validated owner RPCs, never forge a calendar claim or release directly.
-revoke all on function public.visual_group_global_claim(text,text,date,uuid,text,boolean,boolean,text)
+revoke all on function public.visual_group_global_claim(public.content_calendar,boolean,boolean)
   from public,anon,authenticated,service_role;
 revoke all on function public.visual_group_global_release(text,text)
   from public,anon,authenticated,service_role;
@@ -358,9 +354,8 @@ begin
       original_image_url=case when not public.visual_group_usage_sibling.ambiguous and excluded.ambiguous
         then excluded.original_image_url else coalesce(public.visual_group_usage_sibling.original_image_url,excluded.original_image_url) end;
   -- A collision rolls back the local ledger, sibling and calendar mutation.
-  perform public.visual_group_global_claim(p_new.gym_id,p_new.visual_group_key,
-    p_new.post_date,p_new.id,p_new.account,finalized,
-    public.visual_group_row_ambiguous(p_new),public.visual_global_row_fingerprint(p_new));
+  perform public.visual_group_global_claim(
+    p_new,finalized,public.visual_group_row_ambiguous(p_new));
 end;
 $$;
 
