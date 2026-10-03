@@ -603,6 +603,12 @@ def _daily_scheduler(store):
     inbox_every = config.episode_inbox_poll_minutes() * 60
     cms_every = config.client_media_sync_minutes() * 60
     portal_echo_every = config.portal_echo_tickets_poll_minutes() * 60
+    try:
+        held_ticket_reconcile_minutes = max(5, min(60, int(
+            os.environ.get("AGENT_HELD_CLIENT_TICKET_RECONCILE_POLL_MINUTES", "15"))))
+    except ValueError:
+        held_ticket_reconcile_minutes = 15
+    held_ticket_reconcile_every = held_ticket_reconcile_minutes * 60
     last_run_date = _read_last_run_date()  # survives a redeploy inside the window
     last_pcast_auto = _read_podcast_auto_date()  # weekly Monday auto-ingest guard
     last_ingest = 0.0
@@ -612,6 +618,7 @@ def _daily_scheduler(store):
     last_inbox = 0.0
     last_cms = 0.0
     last_portal_echo = 0.0
+    last_held_ticket_reconcile = 0.0
     auto_reels_worker = None
     while True:
         now = datetime.now(timezone.utc)
@@ -844,6 +851,18 @@ def _daily_scheduler(store):
                           f"are NOT being processed this cycle: {e}")
                 else:
                     print(f"[echo-ticket-worker/scout] pass failed: {type(e).__name__}: {e}")
+        # Held-client reconciliation is a separate, default-off lane. Keep its
+        # cadence bounded independently from intake; it writes only deterministic
+        # internal escalation rows and the existing outbox delivers them.
+        if time.monotonic() - last_held_ticket_reconcile >= held_ticket_reconcile_every:
+            last_held_ticket_reconcile = time.monotonic()
+            try:
+                from .jobs.held_client_ticket_reconciler import run as _held_reconcile_run
+                _held_result = _held_reconcile_run()
+                if not _held_result.get("ok"):
+                    print(f"[held-ticket-reconcile] skipped: {_held_result.get('reason', '')}")
+            except Exception as e:
+                print(f"[held-ticket-reconcile] pass failed: {type(e).__name__}")
         # CLIENT MEDIA SYNC frequent lane: dormant unless AGENT_CLIENT_MEDIA_SYNC.
         # Picks up a client gym's fresh R2 upload PROMPTLY (throttled to
         # AGENT_CLIENT_MEDIA_SYNC_MINUTES, default 5) and auto-builds its DRAFT
