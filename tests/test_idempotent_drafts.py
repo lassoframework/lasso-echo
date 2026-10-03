@@ -82,9 +82,15 @@ def _run(tmp_path, poster, store, day=DAY, voice_text=VOICE_V1):
     lib.mkdir(exist_ok=True)
     (lib / "asset.png").write_bytes(b"\x89PNG\r\n\x1a\nFAKE")
     (lib / "asset.txt").write_text("A plain approved note.", encoding="utf-8")
+    # This suite exercises the general card idempotency contract. LASSO's owned
+    # library remains the stable creative for that contract; client-uploaded
+    # photos are permanently retired after their first staging.
+    owned = Account(key="lasso_test", display_name="LASSO Test",
+                    platform=Platform.INSTAGRAM,
+                    token_env="IDEM_TEST_TOKEN", target_id_env="IDEM_TEST_TARGET")
     return run_daily(poster=poster, voice_path=str(voice), library_path=str(lib),
                      scheduled_for=f"{day}T18:30:00+00:00",
-                     accounts=[_acct()], store=store)
+                     accounts=[owned], store=store)
 
 
 def _store(tmp_path):

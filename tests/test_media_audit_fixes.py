@@ -227,10 +227,8 @@ def _pending_drive_rows(asset_ids, start=date(2026, 8, 1)):
     return rows
 
 
-def test_rebuild_releases_wipeable_drive_assets_and_repicks_them(monkeypatch, tmp_path):
-    """The first build staged a1..a3 (stamped, used this month). A second build in the
-    same month used to find the pool EMPTY (every asset "used this month") and fall back
-    to repeats while the assets cooled down for rows that no longer existed."""
+def test_rebuild_keeps_staged_drive_assets_consumed(monkeypatch, tmp_path):
+    """A rebuild must not make photos staged by its previous rows available again."""
     _sources()
     store = FakeMediaStore(assets=[make_asset(f"a{i}", gym_id="gritx", title=f"t{i}.jpg")
                                    for i in range(1, 4)])
@@ -243,12 +241,10 @@ def test_rebuild_releases_wipeable_drive_assets_and_repicks_them(monkeypatch, tm
     out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=3, voice=_voice(),
                                  library_path=_lib(tmp_path, n=0), store=cal, banned_words=(),
                                  logger=logs.append)
-    assert out["ok"] is True and out["inserted"] > 0
-    assert any("released 3 Drive asset(s)" in m for m in logs), logs
-    feeds = _feeds(cal)
-    assert sorted(r["source_media_asset_id"] for r in feeds) == ["a1", "a2", "a3"], \
-        "the second build must see the same pool the first one did"
-    # stamped exactly once for the rows that now exist, never 2
+    assert out["ok"] is True and out["inserted"] == 0
+    assert _feeds(cal) == []
+    assert sorted({r["source_media_asset_id"] for r in cal.existing}) == ["a1", "a2", "a3"], \
+        "the existing rows survive when no new creative can replace them"
     assert all(store.assets[f"a{i}"]["used_count"] == 1 for i in range(1, 4))
 
 
@@ -856,7 +852,7 @@ def test_delete_ok_but_insert_failed_rolls_back_this_builds_new_stamps(monkeypat
                                  library_path=_lib(tmp_path), store=cal, banned_words=())
     assert out["ok"] is False and out.get("deleted", 0) > 0
     picked = [a for a in ("n1", "old") if store.assets[a]["used_count"]]
-    assert picked == [], "an unlanded pick must not keep its stamp; deleted rows stay free"
+    assert picked == ["old"], "previously staged media stays consumed after a failed rebuild"
 
 
 # ---- the Drive lane runs the A+ gate --------------------------------------------------

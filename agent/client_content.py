@@ -150,7 +150,7 @@ def drive_pool_can_fill(account_key, *, store=None, now=None):
 
 
 def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
-               allow_reuse=False):
+               allow_reuse=False, prefer_photos=False):
     """A creative from the account's uploaded library.
 
     LEGACY (vision off): least-recently-served within the no-repeat window, cluster-keyed
@@ -166,6 +166,9 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
 
     exclude_keys: creative basenames that must NOT be picked (photos already on the gym's
     approved/published rows + this build's placements).
+
+    prefer_photos: for the legacy daily client lane, exhaust unused photos before
+    offering a video. The ordinary month builder keeps its own video mix.
 
     allow_reuse (denied-slot backfill only): a LAST RESORT, not a blend. The vision branch
     always tries the pool with the §3 reuse window ENFORCED first; a fresh photo always wins
@@ -238,6 +241,10 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     imgs = [c for c in imgs if not _once_used(c)]
     if not imgs:
         return None
+    if prefer_photos:
+        photos = [c for c in imgs if c.media_type == "image"]
+        if photos:
+            imgs = photos
     # The 14-day window / least-recently-served logic below is a recency nudge,
     # not the once-used authority, so it keeps the legacy tolerant read (a flaky
     # ledger never changed WHICH fresh photo won, and the durable guard above
