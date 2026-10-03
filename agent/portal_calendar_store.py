@@ -539,6 +539,40 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def list_future_media_maintenance_rows(self, start_iso, end_iso):
+        """Complete cross-gym active future book for a maintenance dry run.
+
+        Page by id rather than relying on PostgREST's default 1000-row cap. A
+        failed page aborts the whole scan, so no partial book is considered safe.
+        """
+        rows = []
+        last_id = None
+        while True:
+            params = {"post_date": [f"gte.{start_iso}", f"lte.{end_iso}"],
+                      "variant_status": "eq.active",
+                      "status": "in.(pending,coach_review,approved,publishing,published)",
+                      "order": "id", "limit": "500"}
+            if last_id is not None:
+                params["id"] = f"gt.{last_id}"
+            response = self._client().get(
+                self._rest(_TABLE),
+                params=params,
+                headers=self._headers(), timeout=30)
+            if response.status_code >= 400:
+                raise PortalStoreError(response.status_code, "maintenance calendar read failed")
+            page = response.json()
+            if not isinstance(page, list):
+                raise PortalStoreError(502, "invalid maintenance calendar page")
+            if page and (not page[-1].get("id") or
+                         (last_id is not None and str(page[-1]["id"]) <= str(last_id))):
+                raise PortalStoreError(502, "maintenance calendar pagination stalled")
+            rows.extend(page)
+            if len(page) < 500:
+                return rows
+            last_id = page[-1]["id"]
+            if len(rows) >= 20000:
+                raise PortalStoreError(502, "maintenance calendar exceeds safe read bound")
+
     def restage_held_media(self, account_key, current, *, image_url=None,
                            source_media_url=None, extra_fields=None, release=False):
         """Compare-and-swap one Swift held row; stage pixels while retaining its hold.
@@ -634,6 +668,49 @@ class SupabaseCalendarStore:
                 or row.get("media_not_ready_reason") != reason):
             return None
         return row
+
+    def hold_future_infographic_media(self, account_key, current, reason):
+        """Exact row CAS for an active pending or approved infographic placeholder.
+
+        Only media_not_ready_reason changes. Approved stays approved; a concurrent
+        client edit, approval, publish claim, media swap, or variant transition
+        makes the PATCH match zero rows. No image or caption is rewritten.
+        """
+        required = ("id", "gym_id", "post_date", "status", "variant_status",
+                    "account", "format", "caption", "image_url", "source_media_url",
+                    "source_media_asset_id", "media_not_ready_reason", "created_at",
+                    "published_at", "late_post_id")
+        if (not isinstance(current, dict) or any(key not in current for key in required)
+                or current["gym_id"] != account_key
+                or current["status"] not in ("pending", "approved")
+                or current["variant_status"] != "active"
+                or current["published_at"] is not None
+                or current["late_post_id"] is not None
+                or current["media_not_ready_reason"] is not None
+                or not isinstance(reason, str) or not reason.strip()):
+            return None
+
+        def expected(value):
+            return "is.null" if value is None else f"eq.{value}"
+
+        params = {key: expected(current[key]) for key in required}
+        response = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"media_not_ready_reason": reason}, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, "future infographic hold CAS failed")
+        data = response.json()
+        if not isinstance(data, list) or len(data) != 1:
+            return None
+        after = data[0]
+        if (after.get("id") != current["id"]
+                or any(after.get(key) != current[key] for key in required
+                       if key != "media_not_ready_reason")
+                or after.get("media_not_ready_reason") != reason):
+            return None
+        return after
 
     def archive_pending_media(self, account_key, current):
         """CAS one historical pending card from active to archived.
