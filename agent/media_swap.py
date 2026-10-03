@@ -197,20 +197,13 @@ def _local_video_servable(path):
 def local_candidates(base_key, lib, post_date, blocked_keys, *, allow_recent=False):
     """The gym's local-library creatives a swap may use for a row on post_date.
 
-    ``allow_recent`` is the user-requested exhaustion lane. It relaxes only the
-    generic served-ledger cooldown; media already carried by the live book remains
-    blocked by ``blocked_keys``. Explicit client reuse policies are checked by the
-    caller before this lane is reachable.
+    The served ledger is permanent for swaps: a locally served photo is never
+    offered again. ``allow_recent`` remains for caller compatibility and cannot
+    override this rule. Live-book media remains blocked by ``blocked_keys``.
     """
     if not lib or not os.path.isdir(lib):
         return []
     from . import dam, rotation
-    from datetime import date as _date, timedelta
-    window = config.media_repeat_window_days()
-    try:
-        floor = (_date.fromisoformat(post_date) - timedelta(days=window)).isoformat()
-    except (TypeError, ValueError):
-        floor = ""
     try:
         excl = set(rotation.style_exclusions(lib))
     except Exception:  # noqa: BLE001
@@ -234,8 +227,8 @@ def local_candidates(base_key, lib, post_date, blocked_keys, *, allow_recent=Fal
         except Exception:  # noqa: BLE001
             rk = key
         last = served.get(rk, "")
-        if not allow_recent and last and floor and last >= floor:
-            continue                      # served inside the repeat window
+        if last:
+            continue                      # once served, never offer again
         out.append({"source": "local", "kind": kind, "key": key, "path": path,
                     "last_used": last, "used_count": 1 if last else 0, "name": key})
     return out
@@ -742,17 +735,19 @@ def swap_fields(pick):
 def after_swap(base_key, row, pick, *, media_store=None, now=None, book_rows=None,
                swapped_ids=()):
     """Settle the usage ledgers once the row write actually happened: stamp the Drive
-    asset now on the row (so the 90-day cooldown and the deny rollback see it), roll
-    back the asset the row USED to carry on this date ONLY when no live row on the
-    book still carries it (audit 3c: the FB mirror / paired story keep the old asset
-    when they were approved or the sibling swap failed; a rollback then would let
-    pick_media re-stage the very asset the client just rejected), and record a local
-    pick as served. Best effort, never raises.
+    asset now on the row (so the once-used rule and the deny bookkeeping see it), and
+    settle the use-record of the asset the row USED to carry on this date ONLY when no
+    live row on the book still carries it (audit 3c: the FB mirror / paired story keep
+    the old asset when they were approved or the sibling swap failed). Stage-use is
+    PERMANENT (2026-10-02): settling no longer restores the old asset's counters —
+    a swapped-out asset is never offered again, exactly like a published one — the
+    record is only marked rolled_back so repeated settles are idempotent. Record a
+    local pick as served. Best effort, never raises.
 
     book_rows: the gym's rows after the swaps (the caller re-reads). None means the
-    read FAILED = unknown: the old asset is left stamped (a stamp that lingers costs
-    one asset a cooldown; a rollback of an asset a sibling still carries re-pools the
-    very media the client rejected). An empty list is a real "nothing else carries it".
+    read FAILED = unknown: the old asset's record is left unsettled (harmless; its
+    permanent stamp already keeps it out of the pool). An empty list is a real
+    "nothing else carries it".
     swapped_ids: the rows this swap just repointed (they now carry the NEW asset even
     if the caller's read predates the write)."""
     pd = str((row or {}).get("post_date") or "")[:10]
@@ -795,9 +790,10 @@ def client_message(reason, base_key=""):
     and never blaming them for a system gap."""
     del base_key
     if reason == REASON_NO_FRESH_PHOTO:
-        return ("Every other photo and video Echo can reach is already on another day "
-                "of this month or ran recently. Add media (connect your Drive folder or "
-                "upload in the portal) and try again. Your post is unchanged and your "
+        return ("No unused approved photo or video is available for this swap. "
+                "Echo does not reuse media once it has been placed on your calendar. "
+                "Add fresh photos or videos (connect your Drive folder or upload "
+                "in the portal) and try again. Your post is unchanged and your "
                 "recreates were not touched.")
     if reason == REASON_NO_LIBRARY:
         return ("Your media library is not connected yet, so there is nothing to "

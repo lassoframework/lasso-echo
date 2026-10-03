@@ -633,82 +633,26 @@ def _rollback_drive_asset(draft, day_key, log):
         return
     try:
         from . import gym_media_selector
-        gym_media_selector.rollback_use(account_key, day_key, asset_id=asset_id)
+        gym_media_selector.rollback_use(account_key, day_key, asset_id=asset_id,
+                                        restore_unstaged=True)
     except Exception as exc:  # noqa: BLE001 - a rollback failure never sinks the build
         log(f"[gym-drive] could not return asset {asset_id} to the pool "
             f"({type(exc).__name__})")
 
 
 def _release_wipeable_drive_assets(base_key, start, days, store, log, locked_days=()):
-    """REBUILD MUST NOT BURN THE POOL (audit D3, 2026-09-10). _apply deletes every
-    WIPEABLE row (pending/draft/queued) inside the span months, but the Drive assets
-    those rows carried stayed stamped used_count+1 / last_used_at=now, so a second
-    build in the same month found every one of them "used this month", read the pool
-    as empty, and fell back to repeats while the assets sat on a 90-day cooldown for
-    rows that no longer existed.
+    """Prior calendar placements permanently consume their Drive assets.
 
-    Roll those stamps back BEFORE this build picks, so the pool it draws from is the
-    pool it will actually have once the old rows are gone. Rows on a locked day are
-    kept by _apply (preserve_dates) and are left stamped. Returns the list of
-    (post_date, asset_id) actually rolled back so the caller can RE-STAMP them if the
-    build then writes nothing (never-wipe-to-empty / never-shrink / a gate refusal):
-    the old rows survive in that case and must keep owning their assets."""
-    from datetime import timedelta
-    from .portal_calendar_store import _WIPEABLE_STATUSES
-    list_month = getattr(store, "list_month", None)
-    if list_month is None:
-        return []
-    months = sorted({(start + timedelta(days=i)).isoformat()[:7]
-                     for i in range(max(1, days))})
-    locked = {str(d)[:10] for d in (locked_days or ())}
-    released = []
-    try:
-        from . import gym_media_selector as _sel
-    except Exception:  # noqa: BLE001
-        return []
-    for month in months:
-        try:
-            rows = list_month(base_key, month) or []
-        except Exception as exc:  # noqa: BLE001 - never block the build on a read
-            log(f"{base_key}: drive-asset release read failed for {month} "
-                f"({type(exc).__name__})")
-            continue
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            status = str(row.get("status") or "").lower()
-            if status and status not in _WIPEABLE_STATUSES:
-                continue
-            pd = str(row.get("post_date") or "")[:10]
-            aid = str(row.get("source_media_asset_id") or "").strip()
-            if not pd or not aid or pd in locked or pd[:7] not in months:
-                continue
-            try:
-                if _sel.rollback_use(base_key, pd, asset_id=aid):
-                    released.append((pd, aid))
-            except Exception as exc:  # noqa: BLE001
-                log(f"{base_key}: could not release Drive asset {aid} ({type(exc).__name__})")
-    if released:
-        log(f"{base_key}: released {len(released)} Drive asset(s) held by rows this "
-            "rebuild replaces")
-    return released
+    Keep this compatibility hook so callers do not restore or double-stamp rows
+    that survive a no-op rebuild. Only a new draft that never reached the calendar
+    may restore its stamp via _rollback_drive_asset.
+    """
+    return []
 
 
 def _restore_released_drive_assets(base_key, released, log):
-    """The build wrote nothing, so the rows whose assets _release_wipeable_drive_assets
-    rolled back are still on the calendar: stamp their assets again. Best effort."""
-    if not released:
-        return
-    try:
-        from . import gym_media_index as _idx, gym_media_selector as _sel
-        store = _idx.default_store()
-        for pd, aid in released:
-            asset = store.get_asset(aid) or {"id": aid}
-            _sel.stamp_use(asset, base_key, pd, store=store)
-        log(f"{base_key}: nothing written; re-stamped {len(released)} Drive asset(s) "
-            "still held by the surviving rows")
-    except Exception as exc:  # noqa: BLE001
-        log(f"{base_key}: could not re-stamp released Drive assets ({type(exc).__name__})")
+    """Compatibility no-op: a rebuild never releases calendar-used assets."""
+    return None
 
 
 def _rollback_new_drive_drafts(drafts, log):

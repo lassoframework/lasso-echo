@@ -373,9 +373,9 @@ def test_deny_sweep_fetch_selects_source_media_asset_id(monkeypatch):
     assert rows[0]["source_media_asset_id"] == "a1"
 
 
-def test_deny_sweep_end_to_end_with_the_fixed_select_rolls_the_asset_back(monkeypatch):
-    """The two halves together: a portal-denied Drive row (out-of-band, no Slack
-    hook) returns its asset to the pool on the nightly sweep."""
+def test_deny_sweep_end_to_end_keeps_once_used_asset_out_of_pool(monkeypatch):
+    """A portal-denied Drive row settles its record on the nightly sweep while
+    keeping the already-staged photo unavailable for another day."""
     store = FakeMediaStore(assets=[make_asset("a1", gym_id="tt")])
     sel.stamp_use(store.get_asset("a1"), "tt", "2026-09-12", store=store, now=NOW)
     assert store.assets["a1"]["used_count"] == 1
@@ -397,7 +397,7 @@ def test_deny_sweep_end_to_end_with_the_fixed_select_rolls_the_asset_back(monkey
     summary = sel.observe_denials(
         store=store, fetch_rows=lambda g, d: sel._default_fetch_rows(g, d, http=_Http()))
     assert summary["rolled_back"] == 1
-    assert store.assets["a1"]["used_count"] == 0
+    assert store.assets["a1"]["used_count"] == 1
 
 
 # ---- 7. the store carries the media identity with a swap ----------------------------

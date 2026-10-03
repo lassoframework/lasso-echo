@@ -366,7 +366,7 @@ def test_no_videos_means_photos_still_swap():
         == ["a.jpg", "b.jpg"]
 
 
-def test_local_candidates_skip_a_photo_served_inside_the_repeat_window(tmp_path,
+def test_local_candidates_skip_any_previously_served_photo(tmp_path,
                                                                         monkeypatch):
     """The served ledger is honored: a still served 10 days ago (inside the 30-day
     repeat window) is not a swap candidate even though it is not on the book."""
@@ -380,8 +380,9 @@ def test_local_candidates_skip_a_photo_served_inside_the_repeat_window(tmp_path,
     monkeypatch.setattr(msw, "_last_served_local",
                         lambda base: {"recent.jpg": "2026-09-10", "old.jpg": "2026-07-01"})
     cands = msw.local_candidates("zanshin", str(lib), "2026-09-20", set())
-    assert [c["key"] for c in cands] == ["old.jpg"]
-    assert cands[0]["last_used"] == "2026-07-01"
+    assert cands == []
+    assert msw.local_candidates("zanshin", str(lib), "2026-09-20", set(),
+                                allow_recent=True) == []
 
 
 def test_drive_candidates_come_from_the_pickable_pool_minus_the_book():
@@ -396,10 +397,9 @@ def test_drive_candidates_come_from_the_pickable_pool_minus_the_book():
     assert cands[0]["kind"] == "video" and cands[0]["source"] == "drive"
 
 
-def test_swift_river_swap_recovers_from_cooldown_without_reusing_live_book_media():
-    """A small library with every safe asset inside the generic 90-day cooldown
-    must still answer a user-requested swap. The current asset and another active
-    row's asset stay hard-blocked; the oldest remaining asset is the fallback."""
+def test_swift_river_swap_does_not_reuse_previously_staged_drive_media():
+    """An explicit swap cannot reuse a previously staged Drive image, even
+    when it is outside the live book or the old cooldown would allow it."""
     from datetime import datetime, timedelta, timezone
     from tests.gym_media_fakes import FakeMediaStore, make_asset
     now = datetime(2026, 9, 28, tzinfo=timezone.utc)
@@ -420,8 +420,7 @@ def test_swift_river_swap_recovers_from_cooldown_without_reusing_live_book_media
         "swiftrivercrossfit", row, store=_Store(), lib="", book_state={},
         asset_state={"booked": {("2026-09-22", "pending")}},
         media_store=media_store, now=now)
-    assert [c["key"] for c in cands] == ["oldest-safe", "newer-safe"]
-    assert all(c["reuse_fallback"] is True for c in cands)
+    assert cands == []
 
 
 def test_zanshin_nine_month_policy_refuses_the_same_exhaustion_fallback():
@@ -482,7 +481,7 @@ def test_swapping_back_to_a_still_clears_the_stale_poster_and_asset_id():
     assert msw.swap_fields(pick) == {"thumbnail_url": None, "source_media_asset_id": None}
 
 
-def test_after_swap_stamps_the_new_drive_asset_and_returns_the_old_one(monkeypatch,
+def test_after_swap_stamps_the_new_drive_asset_and_settles_the_old_one(monkeypatch,
                                                                        tmp_path):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
     from datetime import datetime, timezone
@@ -500,10 +499,15 @@ def test_after_swap_stamps_the_new_drive_asset_and_returns_the_old_one(monkeypat
     msw.after_swap("zanshin", row, pick, media_store=store, now=now, book_rows=None)
     assert store.assets["old_a"]["used_count"] == 1, "unknown book must never roll back"
     assert store.assets["new_v"]["used_count"] == 1, "the swapped-in asset cools down"
-    # book KNOWN and empty: nothing else carries it -> back to the pool
+    # book KNOWN and empty: nothing else carries it -> its record settles, but
+    # stage-use is PERMANENT (2026-10-02): the swapped-out asset keeps its stamp
+    # and is never offered again, exactly like a published one.
     local_pick = {"ok": True, "source": "local", "source_media_asset_id": "", "path": ""}
     msw.after_swap("zanshin", row, local_pick, media_store=store, now=now, book_rows=[])
-    assert store.assets["old_a"]["used_count"] == 0, "the replaced asset returns to the pool"
+    assert store.assets["old_a"]["used_count"] == 1, \
+        "a swapped-out asset must never return to the pool"
+    from agent import gym_media_selector as _sel
+    assert _sel.pickable("zanshin", store=store, now=now) == []
 
 
 # ---- audit 3c: the FB mirror + paired story move WITH the clicked row -------------
@@ -775,10 +779,11 @@ def test_book_carries_asset_and_after_swap_keeps_the_old_asset_stamped(monkeypat
                    book_rows=book, swapped_ids=["p1", "p2", "p3"])
     assert store.assets["a1"]["used_count"] == 1
     assert store.assets["v1"]["used_count"] == 1
-    # nothing left carries a1: it returns to the pool
+    # nothing left carries a1: its record settles, but the stamp is permanent —
+    # a swapped-out photo is never re-offered.
     msw.after_swap("zanshin", rows[0], pick, media_store=store, now=now,
                    book_rows=rows, swapped_ids=["p1", "p2", "p3"])
-    assert store.assets["a1"]["used_count"] == 0
+    assert store.assets["a1"]["used_count"] == 1
 
 
 def test_the_handler_writes_the_media_identity_columns_with_the_pixels(monkeypatch):

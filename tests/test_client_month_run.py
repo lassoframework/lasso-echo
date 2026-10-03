@@ -1240,3 +1240,28 @@ def test_lock_is_released_after_a_successful_build_so_the_next_call_can_run(tmp_
         library_path=lib, store=store, banned_words=())
     assert out["ok"] is True
     assert build_lock.is_locked("gritx") is False
+def test_dropped_drive_draft_restores_stamp_before_calendar_insert(monkeypatch):
+    from types import SimpleNamespace
+    from agent import client_month_run, gym_media_selector
+    calls = []
+    monkeypatch.setattr(gym_media_selector, "rollback_use",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    draft = SimpleNamespace(source_media_asset_id="asset-1", account_key="pierce")
+    client_month_run._rollback_drive_asset(draft, "2026-10-07", lambda _message: None)
+    assert calls == [(("pierce", "2026-10-07"),
+                      {"asset_id": "asset-1", "restore_unstaged": True})]
+
+
+def test_rebuild_does_not_release_or_restamp_placed_drive_asset(monkeypatch):
+    from datetime import date
+    from agent import client_month_run, gym_media_selector
+
+    monkeypatch.setattr(gym_media_selector, "rollback_use",
+                        lambda *args, **kwargs: pytest.fail("must not release"))
+    monkeypatch.setattr(gym_media_selector, "stamp_use",
+                        lambda *args, **kwargs: pytest.fail("must not restamp"))
+    released = client_month_run._release_wipeable_drive_assets(
+        "pierce", date(2026, 10, 7), 1, object(), lambda _message: None)
+    assert released == []
+    assert client_month_run._restore_released_drive_assets(
+        "pierce", [("2026-10-07", "asset-1")], lambda _message: None) is None
