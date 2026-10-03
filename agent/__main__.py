@@ -937,7 +937,7 @@ _COMMANDS = {
         ("draft-bible", "draft a brand bible from an intake doc"),
         ("intake-doc", "turn a client PDF into held draft posts"),
         ("intake-web", "the upload web surface (own service)"),
-        ("ops-action", "run one FIXER ops action (D72): <action> --gym K --ticket T [--args JSON]"),
+        ("ops-action", "run one FIXER ops action (D72): <action> --gym K --ticket T [--args JSON]; swap_media also needs --reservation-key and --request-key"),
         ("intake-link", "mint a gym's signed intake + upload links (--account <key>)"),
         ("intake-revoke", "kill one gym's signed link via the R2 denylist (--account <key>)"),
         ("intake-unrevoke", "restore one gym's revoked link (--account <key>)"),
@@ -1708,21 +1708,44 @@ def main(argv=None):
         p.add_argument("--gym", required=True, help="Echo account key")
         p.add_argument("--ticket", required=True, help="support_tickets.id to record on")
         p.add_argument("--args", default="{}", help="JSON object of action args")
+        p.add_argument("--reservation-key", help="durable swap_media reservation key")
+        p.add_argument("--request-key", help="current swap_media requester SHA")
         p.add_argument("--no-wait", action="store_true",
                        help="return immediately for a background action")
         ns = p.parse_args(argv[1:])
-        status, body = _fo.run_action(ns.action, ns.gym, ns.ticket, _json.loads(ns.args))
-        print(_json.dumps({"status": status, **body}, indent=1, default=str))
+        if ns.action != "swap_media" and (ns.reservation_key is not None or ns.request_key is not None):
+            p.error("--reservation-key and --request-key are only valid for swap_media")
+        request_key = ns.request_key
+        if ns.action == "swap_media" and request_key == "current":
+            request_key = _fo._current_swap_request_key({}, ns.ticket)
+            if request_key is None:
+                print(_json.dumps({"status": 503, "error": "request_identity_unavailable"},
+                                  indent=1))
+                sys.exit(1)
+        status, body = _fo.run_action(
+            ns.action, ns.gym, ns.ticket, _json.loads(ns.args),
+            reservation_key=ns.reservation_key, expected_request_key=request_key)
+        def _redact_ops_keys(value):
+            if isinstance(value, dict):
+                return {key: ("[redacted]" if key in {"reservation_key", "request_key"}
+                              else _redact_ops_keys(item))
+                        for key, item in value.items()}
+            if isinstance(value, list):
+                return [_redact_ops_keys(item) for item in value]
+            return value
+        print(_json.dumps(_redact_ops_keys({"status": status, **body}), indent=1,
+                          default=str))
         job_id = body.get("job_id")
         if job_id and not ns.no_wait:
             seen = 0
             while True:
                 job = _fo.JOBS.get(job_id) or {}
                 for step in (job.get("steps") or [])[seen:]:
-                    print(f"[ops-action] step {_json.dumps(step, default=str)}")
+                    print(f"[ops-action] step {_json.dumps(_redact_ops_keys(step), default=str)}")
                 seen = len(job.get("steps") or [])
                 if job.get("status") != "running":
-                    print(_json.dumps({"job": job}, indent=1, default=str))
+                    print(_json.dumps(_redact_ops_keys({"job": job}), indent=1,
+                                      default=str))
                     break
                 _time.sleep(5)
         sys.exit(0 if 200 <= status < 300 else 1)
