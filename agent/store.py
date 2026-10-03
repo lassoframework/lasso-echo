@@ -28,6 +28,9 @@ def _to_dict(d: Draft):
         "hashtags": d.hashtags,
         "creative_path": d.creative_path,
         "creative_public_url": d.creative_public_url,
+        # This is raw-source provenance, not a fallback for the delivered URL.
+        # Keep an absent legacy value empty rather than inventing one.
+        "source_media_url": d.source_media_url,
         "scheduled_for": d.scheduled_for,
         "status": d.status.value,
         "blocked_reason": d.blocked_reason,
@@ -102,6 +105,7 @@ def _from_dict(r):
         hashtags=r.get("hashtags", []),
         creative_path=r.get("creative_path", ""),
         creative_public_url=r.get("creative_public_url", ""),
+        source_media_url=r.get("source_media_url", ""),
         scheduled_for=r.get("scheduled_for", ""),
         status=DraftStatus(r.get("status", "pending")),
         blocked_reason=r.get("blocked_reason", ""),

@@ -300,7 +300,9 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
         return row
     prepared = dict(row)
     url = prepared.get("image_url")
-    if not _own_media_url(url) or prepared.get("source_media_url", url) != url:
+    source_url = prepared.get("source_media_url")
+    if (not _own_media_url(url) or not isinstance(source_url, str) or
+            not source_url.strip() or source_url != url):
         raise VisualPreparationError("same-object source and delivered URL must match the media host")
     if read_bytes is not None or receipt_writer is not None:
         # Test injection must never be a production route to attest stale bytes
@@ -412,11 +414,20 @@ def prepare_same_object(store, account_key, row_or_url, *, flag_on=None,
 
 
 def prepare(store, account_key, row, *, read_bytes=None, render_evidence=None,
-            receipt_writer=None):
+            receipt_writer=None, isolated_test_callbacks=False):
     """Return a prepared row; never trust identity hints or mutate the input.
 
     ``read_bytes`` is injectable for tests and callers with an exact delivered
     object reader. It must return the bytes currently served at ``image_url``.
+    Injected callbacks are isolated-test-only: both the same-object path and
+    the distinct source/rendition path bind owner-created receipts, so a
+    production caller must never supply the byte reader or receipt writer.
+
+    A raw same-object row requires an explicit nonblank ``source_media_url``
+    equal to ``image_url`` and is prepared through the one-read owner receipt
+    path (``prepare_same_object``). Distinct source/delivered objects require
+    verified render evidence. A guarded row never infers its source identity
+    from a delivered rendition.
     """
     if not enabled():
         return row
@@ -428,60 +439,30 @@ def prepare(store, account_key, row, *, read_bytes=None, render_evidence=None,
         if active:
             raise VisualPreparationError("active visual row has no delivered media")
         return prepared
+    source_url = prepared.get("source_media_url")
+    if not isinstance(source_url, str) or not source_url.strip():
+        raise VisualPreparationError("active visual row has no explicit source media URL")
     reader = read_bytes or _bytes_for_url
     asset_id = prepared.get("source_media_asset_id")
     asset = _asset(store, tenant, asset_id) if asset_id else None
-    source_url = prepared.get("source_media_url")
-    if source_url and source_url != url:
+    if source_url != url:
+        if read_bytes is not None or receipt_writer is not None:
+            # Test injection must never be a production route to attest stale
+            # source/delivered bytes or replay receipt UUIDs for a transformed
+            # write. The sentinel is deliberately not a usable database DSN;
+            # real owner connections always use the built-in paths.
+            if (not isolated_test_callbacks
+                    or os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_DSN") != "test-only"
+                    or os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_ROLE") != "receipt_owner"):
+                raise VisualPreparationError(
+                    "source/rendition callbacks require isolated test configuration")
         return _prepare_source_rendition(store, tenant, prepared, source_url, url,
                                          reader, render_evidence, receipt_writer, asset)
-    data = _exact_bytes(url, reader, "delivered")
-    if asset and not fingerprint.attest_drive(asset.get("content_hash"), data):
-        raise VisualPreparationError("Drive asset MD5 does not attest delivered bytes")
-    aliases = []
-    if asset:
-        aliases.append(("source_asset", str(asset_id)))
-    # The draft global claim accepts one canonical MD5 per group. A SHA-only
-    # alias cannot be checked against that MD5 by the database at claim time.
-    aliases.append(("byte_hash", fingerprint.derived_aliases(data)[1]))
-    # Drive's bare content_hash attests this exact selected asset and delivered
-    # bytes. A transformed rendition needs a separate proven lineage path.
-    if asset:
-        aliases.append(("byte_hash", fingerprint.from_drive_md5(asset["content_hash"])))
-    aliases.append(("canonical_url", url))
-    drive_id = prepared.get("drive_file_id")
-    if drive_id:
-        if not asset or str(drive_id) != str(asset_id):
-            raise VisualPreparationError("Drive ID has no matching tenant asset")
-        aliases.append(("drive_id", str(drive_id)))
-    r2_key = prepared.get("r2_key")
-    if r2_key:
-        from . import media_host
-        if media_host._key_from_public_url(url) != r2_key:
-            raise VisualPreparationError("R2 key does not match delivered object")
-        aliases.append(("r2_key", str(r2_key)))
-    supplied_hash = prepared.get("byte_hash")
-    if supplied_hash and supplied_hash not in [value for kind, value in aliases if kind == "byte_hash"]:
-        raise VisualPreparationError("row byte_hash does not match delivered bytes")
-    digest = hashlib.md5(data).hexdigest()
-    expected_fingerprint = "md5:" + digest
-    result = _rpc(store, "visual_global_prepare_bundle", {
-        "p_tenant": tenant,
-        "p_aliases": [{"alias_kind": kind, "alias_value": value} for kind, value in aliases],
-        "p_fingerprint": expected_fingerprint,
-        "p_evidence": {"source": "delivered_object_bytes", "verified_bytes": expected_fingerprint,
-                       "delivered_url": url},
-        "p_actor": "visual_writer_prepare",
-        "p_asset_id": str(asset_id) if asset else None,
-    })
-    if not isinstance(result, dict) or result.get("fingerprint") != expected_fingerprint:
-        raise VisualPreparationError("visual bundle registration returned invalid fingerprint")
-    group = result.get("group_key")
-    if not isinstance(group, str) or not group.startswith("vg_"):
-        raise VisualPreparationError("visual bundle registration returned no group")
-    supplied_group = prepared.get("visual_group_key")
-    if supplied_group and supplied_group != group:
-        raise VisualPreparationError("row visual group conflicts with registered identity")
-    prepared["visual_group_key"] = group
-    prepared["byte_hash"] = "derived:md5:" + digest
-    return prepared
+    # Raw same-object row: the delivered object IS the source object. Route
+    # through the owner one-read receipt boundary so the guarded row carries
+    # owner source+delivered scene object members; never the legacy bundle
+    # RPC, which cannot establish byte authority for the global claim.
+    return _prepare_same_object_row(
+        store, account_key, prepared, read_bytes=read_bytes,
+        receipt_writer=receipt_writer,
+        isolated_test_callbacks=isolated_test_callbacks)

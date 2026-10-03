@@ -875,8 +875,11 @@ begin
   v_tenant:=public.visual_group_tenant_id(p_row.gym_id)::text;
   v_group:=p_row.visual_group_key;
   v_delivered_url:=nullif(btrim(p_row.image_url),'');
-  v_source_url:=coalesce(nullif(btrim(to_jsonb(p_row)->>'source_media_url'),''),v_delivered_url);
-  if v_tenant is null or v_group is null or v_delivered_url is null
+  -- An absent source is unknown, even when the delivered object has a valid
+  -- receipt. Only the row can select which attested source fed its rendition.
+  v_source_url:=nullif(btrim(to_jsonb(p_row)->>'source_media_url'),'');
+  if v_tenant is null or v_group is null or v_source_url is null
+      or v_delivered_url is null
       or not public.visual_global_scene_complete(v_tenant,v_group) then
     return false;
   end if;
@@ -893,7 +896,10 @@ begin
     where m.tenant_id=v_tenant and m.exact_url=v_source_url
       and m.object_role='source';
   if v_delivered_hash is null or v_source_hash is null then return false; end if;
-  if v_source_url<>v_delivered_url and not public.visual_global_lineage_verified(
+  if v_source_url=v_delivered_url then
+    -- A same-object selection must resolve to identical bytes in both roles.
+    if v_source_hash<>v_delivered_hash then return false; end if;
+  elsif not public.visual_global_lineage_verified(
       v_tenant,v_group,v_source_url,v_source_hash,v_delivered_url,v_delivered_hash) then
     return false;
   end if;

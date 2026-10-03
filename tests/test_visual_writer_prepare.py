@@ -1,9 +1,11 @@
 """Offline contract tests for the draft, default-off Python writer boundary."""
 import hashlib
+import uuid
 
 import pytest
 
 from agent import portal_calendar_store as pcs
+from agent import visual_owner_receipts as owner
 from agent import visual_writer_prepare as prep
 
 
@@ -24,19 +26,30 @@ class Response:
 
 
 class HTTP:
-    def __init__(self, asset=None, known=None, bundle=None, patch_failure=False, row=None):
+    def __init__(self, asset=None, known=None, bundle=None, patch_failure=False, row=None,
+                 fingerprint=None, rendition=None):
         self.calls = []
         self.asset = asset
         self.known = known or {}
         self.bundle = bundle
         self.patch_failure = patch_failure
         self.row = row
+        self.fingerprint = fingerprint
+        self.rendition = rendition
+        self.registered = False
 
     def post(self, url, *, headers, json, timeout):
         self.calls.append(("post", url.rsplit("/", 1)[-1], json))
         if url.endswith("visual_global_prepare_bundle"):
+            self.registered = True
             return Response(self.bundle if self.bundle is not None else
                             {"group_key": "vg_same", "fingerprint": json["p_fingerprint"]})
+        if url.endswith("visual_global_prepare_source_rendition"):
+            return Response(self.rendition if self.rendition is not None else
+                            {"group_key": json["p_group_key"],
+                             "source_fingerprint": self.fingerprint,
+                             "delivered_fingerprint": self.fingerprint,
+                             "usage_claimed": False})
         return Response([json[0]] if isinstance(json, list) else [])
 
     def get(self, url, *, params, headers, timeout):
@@ -49,7 +62,9 @@ class HTTP:
             return Response([self.asset] if self.asset else [])
         if url.endswith("visual_group_alias"):
             group = self.known.get((params["alias_kind"][3:], params["alias_value"][3:]))
-            return Response([{"group_key": group}] if group else [])
+            if group:
+                return Response([{"group_key": group}])
+            return Response([{"group_key": "vg_same"}] if self.registered else [])
         return Response([self.row or {"id": "row-1", "gym_id": "old-key", "status": "pending",
                                       "variant_status": "active", "image_url": "https://old.example/a.jpg"}])
 
@@ -65,6 +80,23 @@ def store(http):
     return pcs.SupabaseCalendarStore(url="https://db.example", service_key="test", http=http)
 
 
+@pytest.fixture(autouse=True)
+def own_host(monkeypatch):
+    monkeypatch.setattr("agent.config.S3_PUBLIC_BASE_URL", "https://media.example")
+
+
+def _owner_writer(monkeypatch):
+    """Production-shaped configured owner writer: exact bytes in, one receipt out."""
+    calls = []
+
+    def writer(**kwargs):
+        calls.append(kwargs)
+        return {"read_receipt": str(uuid.uuid4()), "render_receipt": None}
+
+    monkeypatch.setattr(owner, "default_same_object_writer", lambda: writer)
+    return calls
+
+
 def test_flag_off_preserves_payload_and_does_no_rpc(monkeypatch):
     monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
     http = HTTP()
@@ -73,32 +105,43 @@ def test_flag_off_preserves_payload_and_does_no_rpc(monkeypatch):
     assert http.calls == []
 
 
-def test_registers_final_byte_hashes_and_delivered_url_before_write(monkeypatch):
+def test_raw_row_prepares_through_owner_receipt_source_rendition_rpc(monkeypatch):
+    """Production-shaped: default byte reader plus the configured owner writer.
+
+    A guarded raw row must carry owner source+delivered scene object members,
+    so the same-object path never uses the legacy bundle RPC for the row.
+    """
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
-    http = HTTP()
     data = b"exact delivered image"
-    row = prep.prepare(store(http), "old-key", {"image_url": URL, "status": "pending"},
-                       read_bytes=lambda url: data)
+    digest = "md5:" + hashlib.md5(data).hexdigest()
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
+    writer_calls = _owner_writer(monkeypatch)
+    http = HTTP(known={("canonical_url", URL): "vg_same"}, fingerprint=digest)
+    row = prep.prepare(store(http), "old-key", {"image_url": URL, "source_media_url": URL,
+                                                  "status": "pending"})
     assert row["visual_group_key"] == "vg_same"
-    bundles = [call[2] for call in http.calls if call[1] == "visual_global_prepare_bundle"]
-    assert len(bundles) == 1
-    assert [(item["alias_kind"], item["alias_value"]) for item in bundles[0]["p_aliases"]] == [
-        ("byte_hash", "derived:md5:" + hashlib.md5(data).hexdigest()),
-        ("canonical_url", URL),
-    ]
-    assert bundles[0]["p_tenant"] == TENANT
-    assert bundles[0]["p_fingerprint"] == "md5:" + hashlib.md5(data).hexdigest()
-    assert row["byte_hash"] == "derived:md5:" + hashlib.md5(data).hexdigest()
-    assert [call[1] for call in http.calls if call[0] == "post"] == ["visual_global_prepare_bundle"]
+    assert row["byte_hash"] == "derived:" + digest
+    posts = [call for call in http.calls if call[0] == "post"]
+    assert [call[1] for call in posts] == ["visual_global_prepare_source_rendition"]
+    rendition = posts[0][2]
+    assert rendition["p_tenant"] == TENANT
+    assert rendition["p_group_key"] == "vg_same"
+    assert rendition["p_source_read_receipt"] == rendition["p_delivered_read_receipt"]
+    assert rendition["p_render_receipt"] is None
+    assert writer_calls[0]["tenant"] == TENANT
+    assert writer_calls[0]["group_key"] == "vg_same"
+    assert writer_calls[0]["exact_bytes"] == data
 
 
 def test_unverifiable_active_media_refuses_without_registration(monkeypatch):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: None)
+    _owner_writer(monkeypatch)
     http = HTTP()
     with pytest.raises(prep.VisualPreparationError, match="bytes"):
-        prep.prepare(store(http), "old-key", {"image_url": URL, "status": "pending"},
-                     read_bytes=lambda url: None)
-    assert not any(call[1] == "visual_global_prepare_bundle" for call in http.calls)
+        prep.prepare(store(http), "old-key", {"image_url": URL,
+                                               "source_media_url": URL, "status": "pending"})
+    assert not any(call[0] == "post" for call in http.calls)
     with pytest.raises(prep.VisualPreparationError, match="no delivered media"):
         prep.prepare(store(HTTP()), "old-key", {"image_url": "", "status": "pending",
                      "media_not_ready_reason": "awaiting_media"})
@@ -107,56 +150,115 @@ def test_unverifiable_active_media_refuses_without_registration(monkeypatch):
 def test_drive_md5_requires_same_tenant_asset_and_matching_final_bytes(monkeypatch):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
     data = b"Drive original"
+    digest = "md5:" + hashlib.md5(data).hexdigest()
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
+    writer_calls = _owner_writer(monkeypatch)
     http = HTTP({"id": "drive-1", "gym_id": "old-key",
-                 "content_hash": hashlib.md5(data).hexdigest()})
-    prep.prepare(store(http), "old-key", {"image_url": URL, "source_media_asset_id": "drive-1"},
-                 read_bytes=lambda url: data)
-    aliases = [item["alias_value"] for call in http.calls if call[1] == "visual_global_prepare_bundle"
-               for item in call[2]["p_aliases"]]
-    assert "source:md5:" + hashlib.md5(data).hexdigest() in aliases
-    assert "drive-1" in aliases
-    assert not any(value.startswith("source:sha256:") for value in aliases)
+                 "content_hash": hashlib.md5(data).hexdigest()},
+                known={("canonical_url", URL): "vg_same"}, fingerprint=digest)
+    prep.prepare(store(http), "old-key", {"image_url": URL, "source_media_url": URL,
+                                           "source_media_asset_id": "drive-1"})
+    assert writer_calls[0]["asset_id"] == "drive-1"
+    assert writer_calls[0]["exact_bytes"] == data
+    assert [call[1] for call in http.calls if call[0] == "post"] == [
+        "visual_global_prepare_source_rendition"]
 
-    bad = HTTP({"id": "drive-1", "gym_id": "another-key", "content_hash": hashlib.md5(data).hexdigest()})
+    bad = HTTP({"id": "drive-1", "gym_id": "another-key",
+                "content_hash": hashlib.md5(data).hexdigest()})
     with pytest.raises(prep.VisualPreparationError, match="tenant"):
-        prep.prepare(store(bad), "old-key", {"image_url": URL, "source_media_asset_id": "drive-1"},
-                     read_bytes=lambda url: data)
-    assert not any(call[1] == "visual_global_prepare_bundle" for call in bad.calls)
+        prep.prepare(store(bad), "old-key", {"image_url": URL, "source_media_url": URL,
+                                               "source_media_asset_id": "drive-1"})
+    assert not any(call[0] == "post" for call in bad.calls)
 
     mismatch = HTTP({"id": "drive-1", "gym_id": "old-key", "content_hash": "0" * 32})
     with pytest.raises(prep.VisualPreparationError, match="MD5"):
-        prep.prepare(store(mismatch), "old-key", {"image_url": URL, "source_media_asset_id": "drive-1"},
-                     read_bytes=lambda url: data)
-    assert not any(call[1] == "visual_global_prepare_bundle" for call in mismatch.calls)
+        prep.prepare(store(mismatch), "old-key",
+                     {"image_url": URL, "source_media_url": URL,
+                      "source_media_asset_id": "drive-1"})
+    assert not any(call[0] == "post" for call in mismatch.calls)
+
+
+def test_raw_same_object_write_needs_no_render_lineage(monkeypatch):
+    # An unchanged raw photo (source object IS the delivered object) is not a
+    # transformation: it prepares through the owner one-read receipt path with
+    # no render evidence and a null render receipt -- never the bundle RPC.
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    data = b"unchanged raw photo"
+    digest = "md5:" + hashlib.md5(data).hexdigest()
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
+    _owner_writer(monkeypatch)
+    http = HTTP(known={("canonical_url", URL): "vg_same"}, fingerprint=digest)
+    prepared = prep.prepare(store(http), "old-key", {"image_url": URL, "source_media_url": URL})
+    assert prepared["visual_group_key"] == "vg_same"
+    assert prepared["byte_hash"] == "derived:" + digest
+    posts = [call for call in http.calls if call[0] == "post"]
+    assert [call[1] for call in posts] == ["visual_global_prepare_source_rendition"]
+    assert posts[0][2]["p_render_receipt"] is None
+
+
+@pytest.mark.parametrize("source_media_url", [None, "", "   "])
+def test_guarded_row_missing_explicit_source_url_refuses_even_with_asset(monkeypatch, source_media_url):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    http = HTTP()
+    with pytest.raises(prep.VisualPreparationError, match="explicit source media URL"):
+        prep.prepare(store(http), "old-key", {
+            "image_url": URL,
+            "source_media_url": source_media_url,
+            "source_media_asset_id": "drive-1",
+        })
+    assert [call[1] for call in http.calls] == ["tenant_alias"]
+
+
+def test_same_object_row_refuses_without_owner_receipt_producer(monkeypatch):
+    # Fail closed: no configured owner receipt boundary means no preparation
+    # and no registration RPC at all.
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    for env in ("AGENT_VISUAL_GLOBAL_OWNER_RECEIPTS", "AGENT_VISUAL_RECEIPT_OWNER_DSN",
+                "AGENT_VISUAL_RECEIPT_OWNER_ROLE"):
+        monkeypatch.delenv(env, raising=False)
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: b"exact")
+    http = HTTP()
+    with pytest.raises(prep.VisualPreparationError, match="owner receipt producer"):
+        prep.prepare(store(http), "old-key", {"image_url": URL, "source_media_url": URL})
+    assert not any(call[0] == "post" for call in http.calls)
 
 
 def test_reuses_registered_delivered_url_group(monkeypatch):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
-    http = HTTP(known={("canonical_url", URL): "vg_same"})
-    prep.prepare(store(http), "old-key", {"image_url": URL}, read_bytes=lambda url: b"exact")
-    assert len([call for call in http.calls if call[1] == "visual_global_prepare_bundle"]) == 1
+    data = b"exact"
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
+    _owner_writer(monkeypatch)
+    http = HTTP(known={("canonical_url", URL): "vg_same"},
+                fingerprint="md5:" + hashlib.md5(data).hexdigest())
+    prep.prepare(store(http), "old-key", {"image_url": URL, "source_media_url": URL})
+    # The already-registered group is reused: no raw-source bundle bootstrap,
+    # exactly one owner-receipt source/rendition registration.
+    assert [call[1] for call in http.calls if call[0] == "post"] == [
+        "visual_global_prepare_source_rendition"]
 
 
-def test_media_patch_registers_before_patch_and_clears_old_source(monkeypatch):
+def test_media_patch_missing_source_fails_closed_before_patch(monkeypatch):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
-    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: b"new pixels")
-    http = HTTP()
-    result = store(http).patch_image_url("old-key", "row-1", URL)
-    assert result["visual_group_key"] == "vg_same"
-    assert http.calls[-1][0] == "patch"
-    assert http.calls[-1][2]["image_url"] == URL
-    assert http.calls[-1][2]["byte_hash"] == "derived:md5:" + hashlib.md5(b"new pixels").hexdigest()
-
-
-def test_failed_calendar_patch_leaves_reusable_registration_without_usage(monkeypatch):
-    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
-    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: b"same pixels")
-    http = HTTP(patch_failure=True)
-    with pytest.raises(pcs.PortalStoreError):
+    data = b"new pixels"
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
+    _owner_writer(monkeypatch)
+    http = HTTP(known={("canonical_url", URL): "vg_same"},
+                fingerprint="md5:" + hashlib.md5(data).hexdigest())
+    with pytest.raises(prep.VisualPreparationError, match="explicit source media URL"):
         store(http).patch_image_url("old-key", "row-1", URL)
-    assert store(http).patch_image_url("old-key", "row-1", URL)["image_url"] == URL
-    bundles = [call[2] for call in http.calls if call[1] == "visual_global_prepare_bundle"]
-    assert len(bundles) == 2 and bundles[0] == bundles[1]
+    assert not any(call[0] == "patch" for call in http.calls)
+
+
+def test_media_patch_without_source_never_reaches_calendar_write(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    data = b"same pixels"
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
+    _owner_writer(monkeypatch)
+    http = HTTP(patch_failure=True, known={("canonical_url", URL): "vg_same"},
+                fingerprint="md5:" + hashlib.md5(data).hexdigest())
+    with pytest.raises(prep.VisualPreparationError, match="explicit source media URL"):
+        store(http).patch_image_url("old-key", "row-1", URL)
+    assert not any(call[0] == "patch" for call in http.calls)
     assert not any("visual_global_usage" in call[1] for call in http.calls)
 
 
@@ -174,10 +276,14 @@ def test_story_reburn_does_not_clear_unverified_raw_source(monkeypatch):
 
 def test_story_replacement_preserves_source_when_it_equals_delivered_url(monkeypatch):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
-    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: b"story pixels")
+    data = b"story pixels"
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
+    _owner_writer(monkeypatch)
     http = HTTP(row={"id": "row-1", "gym_id": "old-key", "status": "pending",
                      "format": "story", "variant_status": "active",
-                     "image_url": "https://media.example/old.jpg", "source_media_url": URL})
+                     "image_url": "https://media.example/old.jpg", "source_media_url": URL},
+                known={("canonical_url", URL): "vg_same"},
+                fingerprint="md5:" + hashlib.md5(data).hexdigest())
     result = store(http).patch_image_url("old-key", "row-1", URL)
     assert result["image_url"] == URL
     assert "source_media_url" not in [call[2] for call in http.calls if call[0] == "patch"][0]
@@ -238,28 +344,51 @@ def test_insert_rows_refuses_unverifiable_media_before_calendar_post(monkeypatch
     monkeypatch.setattr(pcs, "_preserve_held_slots", lambda store, key, rows: rows)
     monkeypatch.setattr(pcs, "_dedupe_slots", lambda store, key, rows: rows)
     monkeypatch.setattr(prep, "_bytes_for_url", lambda url: None)
+    _owner_writer(monkeypatch)
     http = HTTP()
     with pytest.raises(prep.VisualPreparationError, match="bytes"):
-        store(http).insert_rows("old-key", [{"image_url": URL, "status": "pending"}])
+        store(http).insert_rows("old-key", [{"image_url": URL, "source_media_url": URL,
+                                               "status": "pending"}])
     assert not any(call[1] == "content_calendar" and call[0] == "post" for call in http.calls)
 
 
 def test_rejects_unverified_source_locator_and_hash_hint(monkeypatch):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_DSN", "test-only")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_ROLE", "receipt_owner")
     http = HTTP()
+    digest = "md5:" + hashlib.md5(b"final").hexdigest()
+    evidence = {"source_exact_url": "https://source.example/file",
+                "delivered_exact_url": URL,
+                "source_fingerprint": digest, "delivered_fingerprint": digest,
+                "source_byte_length": 5, "delivered_byte_length": 5,
+                "operation": "rehost"}
     with pytest.raises(prep.VisualPreparationError, match="source URL"):
         prep.prepare(store(http), "old-key", {"image_url": URL,
-                     "source_media_url": "https://source.example/file"}, read_bytes=lambda url: b"final")
+                     "source_media_url": "https://source.example/file"},
+                     read_bytes=lambda url: b"final", render_evidence=evidence,
+                     receipt_writer=lambda **kwargs: pytest.fail("no receipts for external source"),
+                     isolated_test_callbacks=True)
+    _owner_writer(monkeypatch)
     with pytest.raises(prep.VisualPreparationError, match="byte_hash"):
-        prep.prepare(store(HTTP()), "old-key", {"image_url": URL,
-                     "byte_hash": "source:sha256:" + "0" * 64}, read_bytes=lambda url: b"final")
+        prep.prepare(store(HTTP(known={("canonical_url", URL): "vg_same"},
+                              fingerprint="md5:" + hashlib.md5(b"final").hexdigest())),
+                     "old-key", {"image_url": URL, "source_media_url": URL,
+                                 "byte_hash": "source:sha256:" + "0" * 64},
+                     read_bytes=lambda url: b"final", isolated_test_callbacks=True)
 
 
 def test_bundle_response_conflict_or_failure_aborts_preparation(monkeypatch):
+    # The bundle RPC is now only the raw-source group bootstrap for an
+    # unregistered scene; a conflicting bundle identity still aborts before
+    # any owner receipt or source/rendition registration.
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: b"final")
+    _owner_writer(monkeypatch)
     for response, message in [({"group_key": "vg_same", "fingerprint": "md5:" + "0" * 32}, "fingerprint"),
                               ({"group_key": "wrong", "fingerprint": "md5:" + hashlib.md5(b"final").hexdigest()}, "group")]:
         http = HTTP(bundle=response)
         with pytest.raises(prep.VisualPreparationError, match=message):
-            prep.prepare(store(http), "old-key", {"image_url": URL}, read_bytes=lambda url: b"final")
+            prep.prepare(store(http), "old-key", {"image_url": URL, "source_media_url": URL})
         assert len([c for c in http.calls if c[1] == "visual_global_prepare_bundle"]) == 1
+        assert not any(c[1] == "visual_global_prepare_source_rendition" for c in http.calls)

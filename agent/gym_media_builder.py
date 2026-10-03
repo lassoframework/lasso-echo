@@ -362,6 +362,10 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             # sweep can flip this PENDING post back to needs_media (§4, §8).
             source_media_asset_id=str(asset["id"]),
         )
+        # Keep the hosted original as provenance when it is also the served media.
+        # A rendition URL is a transformed delivery asset, not the raw source.
+        if not public_override:
+            draft.source_media_url = public_url
         if poster_url:
             draft.thumbnail_url = poster_url          # -> content_calendar.thumbnail_url
         # The grounding this caption was written against, so a caption RETRY

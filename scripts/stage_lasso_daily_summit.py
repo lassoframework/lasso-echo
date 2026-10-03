@@ -307,10 +307,14 @@ def _prepare_insert_evidence(store, action, *, prepare_fn=None):
         raise RuntimeError(
             "staging readiness failed: owner-attested same-object preparation "
             "contract is unavailable; staging RPC refused")
-    prepared = prepare(store, TARGET_GYM, url, flag_on=True)
+    # This is a generated final artifact, so the exact delivered object is also
+    # its source. State that relationship explicitly; the guarded preparation
+    # API must not infer source identity from a bare rendition URL.
+    prepared = prepare(store, TARGET_GYM,
+                       {"image_url": url, "source_media_url": url}, flag_on=True)
     digest = str(prepared.get("byte_hash") or "") if isinstance(prepared, dict) else ""
-    if (not isinstance(prepared, dict) or prepared.get("url") != url
-            or prepared.get("usage_claimed") is not False
+    if (not isinstance(prepared, dict) or prepared.get("image_url") != url
+            or prepared.get("source_media_url") != url
             or not str(prepared.get("visual_group_key") or "").startswith("vg_")
             or not (digest.startswith("derived:md5:") and len(digest) == 44
                     and all(c in "0123456789abcdef" for c in digest[12:]))):

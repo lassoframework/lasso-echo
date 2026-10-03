@@ -155,6 +155,15 @@ def test_collect_uses_scheduled_for_when_no_day_key():
     assert rows[0]["post_date"] == "2026-08-09"
 
 
+def test_collect_carries_explicit_raw_media_provenance():
+    draft = _draft("realf_source")
+    draft.source_media_url = "https://cdn/raw-upload.jpg"
+    rows = rcm.collect_real_drafts("northside_ig", _FakeStore([draft]))
+    assert len(rows) == 1
+    assert rows[0]["image_url"] == "https://cdn/x.jpg"
+    assert rows[0]["source_media_url"] == "https://cdn/raw-upload.jpg"
+
+
 # ---- mirror_plan ----------------------------------------------------------
 
 def test_plan_upserts_real_deletes_demo_gym_scoped():

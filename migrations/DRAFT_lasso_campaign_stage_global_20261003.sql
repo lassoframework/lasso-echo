@@ -17,10 +17,11 @@
 -- Rollback: drop the 7-argument function and recreate the 5-argument one from
 -- migrations/lasso_campaign_stage_20260923.sql.
 
--- The two identity columns the armed visual guard reads.  visual_group_key is
--- already added by DRAFT_visual_group_schema_20261002.sql; both are idempotent.
+-- The identity columns the armed visual guard reads.  visual_group_key is
+-- already added by DRAFT_visual_group_schema_20261002.sql; all are idempotent.
 alter table public.content_calendar add column if not exists visual_group_key text;
 alter table public.content_calendar add column if not exists byte_hash text;
+alter table public.content_calendar add column if not exists source_media_url text;
 
 -- Replacing the signature would leave the unguarded 5-argument overload alive;
 -- drop it.  Calls with five arguments still bind to the evolved function via
@@ -46,6 +47,7 @@ declare
   v_account text;
   v_slot integer;
   v_image_url text;
+  v_source_media_url text;
   v_caption text;
   v_scheduled_at timestamptz;
   v_existing public.content_calendar%rowtype;
@@ -137,8 +139,31 @@ begin
             where gym_id = v_tenant and group_key = p_visual_group_key) then
       return jsonb_build_object('result', 'conflict', 'reason', 'unknown_visual_scene');
     end if;
+    -- This narrow RPC accepts only an owner-attested same-object Summit image.
+    -- A delivered URL alone never proves its source. Require independently
+    -- recorded source and delivered roles for that exact URL and digest; a
+    -- rendition with a distinct source needs a separate explicit-source path.
+    if not exists (
+      select 1 from public.visual_global_scene_object_member src
+      join public.visual_global_scene_object_member delivered
+        on delivered.tenant_id = src.tenant_id
+       and delivered.group_key = src.group_key
+       and delivered.exact_url = src.exact_url
+       and delivered.fingerprint = src.fingerprint
+       and delivered.object_role = 'delivered'
+      where src.tenant_id = v_tenant
+        and src.group_key in (
+          select public.visual_group_scene_members(v_tenant, p_visual_group_key))
+        and src.exact_url = v_image_url
+        and src.object_role = 'source'
+        and 'derived:' || src.fingerprint = lower(btrim(p_byte_hash))
+    ) then
+      return jsonb_build_object('result', 'conflict', 'reason', 'visual_source_not_attested');
+    end if;
+    v_source_media_url := v_image_url;
     v_candidate.gym_id := 'lasso';
     v_candidate.image_url := v_image_url;
+    v_candidate.source_media_url := v_source_media_url;
     v_candidate.visual_group_key := p_visual_group_key;
     v_candidate.byte_hash := lower(btrim(p_byte_hash));
     if not public.visual_global_row_bytes_verified(v_candidate) then
@@ -216,6 +241,8 @@ begin
        and v_existing.pillar = p_row->>'pillar'
        and v_existing.caption = v_caption
        and v_existing.image_url = v_image_url
+       and (p_visual_group_key is null
+         or v_existing.source_media_url is not distinct from v_source_media_url)
        and v_existing.scheduled_at is not distinct from v_scheduled_at
        and v_existing.visual_group_key is not distinct from p_visual_group_key
        and v_existing.byte_hash is not distinct from p_byte_hash then
@@ -264,10 +291,11 @@ begin
 
   insert into public.content_calendar (
     id, gym_id, account, post_date, pillar, format, caption, image_url,
-    status, scheduled_at, slot_index, variant_status, visual_group_key, byte_hash
+    source_media_url, status, scheduled_at, slot_index, variant_status,
+    visual_group_key, byte_hash
   ) values (
     v_id, 'lasso', v_account, v_day, p_row->>'pillar', 'feed', v_caption,
-    v_image_url, 'pending', v_scheduled_at,
+    v_image_url, v_source_media_url, 'pending', v_scheduled_at,
     v_slot, 'active', p_visual_group_key, p_byte_hash
   );
 

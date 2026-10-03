@@ -44,6 +44,7 @@ def test_photo_stages_pending(monkeypatch, tmp_path):
     assert draft.status == DraftStatus.PENDING           # human tap untouched
     assert draft.draft_type == "gym_media"
     assert draft.creative_public_url == "https://cdn.fake/served.jpg"
+    assert draft.source_media_url == "https://cdn.fake/served.jpg"
     # usage was stamped at stage time.
     assert store.assets["p1"]["used_count"] == 1
 
@@ -99,6 +100,7 @@ def test_heic_photo_stages_via_rendition(monkeypatch, tmp_path):
         store=store, drive=drive, library_dir=str(tmp_path))
     assert draft is not None and draft.status == DraftStatus.PENDING
     assert draft.creative_public_url == "https://cdn.fake/rend.jpg"
+    assert not getattr(draft, "source_media_url", "")
 
 
 def test_unprobed_video_never_stages(monkeypatch, tmp_path):

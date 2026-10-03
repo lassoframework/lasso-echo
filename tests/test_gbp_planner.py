@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import gbp_planner as gp, client_sources as cs  # noqa: E402
+from agent import gbp_planner as gp, client_sources as cs, visual_owner_receipts as owner  # noqa: E402
 from agent.voice import VoiceDoc  # noqa: E402
 from tests.gym_media_fakes import FakeMediaStore, make_asset  # noqa: E402
 
@@ -800,3 +800,143 @@ def test_a_month_that_planned_rows_still_reports_what_it_lost():
                             image_fn=_some_media)
     assert out["ok"] is True and out["planned"] > 0
     assert out["skips"]["no_media"] > 0
+
+
+# ---- global media guard: exact source/delivered lineage (2026-10-03) ------
+
+class _PrepStore:
+    """Insert store with the prepared-writer render_evidence_by_url kwarg."""
+
+    def __init__(self):
+        self.rows = []
+        self.evidence_by_url = None
+
+    def insert_rows(self, key, rows, render_evidence_by_url=None):
+        self.rows.extend(rows)
+        self.evidence_by_url = render_evidence_by_url
+        return rows
+
+
+_FACTS = [("update", "Small group strength coaching for busy parents in Carmel")]
+
+
+def test_same_object_row_names_delivered_url_as_raw_source(monkeypatch):
+    """Guard ON + untransformed (injected) image: the staged row's source_media_url IS
+    the delivered URL (raw same-object), and no render evidence is invented."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    store = _PrepStore()
+    out = gp.plan_gbp_month("gymx", "gymx_gbp", voice=_voice(),
+                            library_path="/tmp/none", city="Carmel", store=store,
+                            start=date(2026, 10, 5), facts=_FACTS,
+                            caption_fn=_cap, image_fn=_img)
+    assert out["planned"] > 0
+    assert store.rows
+    for row in store.rows:
+        assert row["source_media_url"] == row["image_url"]
+        assert "render_evidence" not in row
+    assert store.evidence_by_url == {}
+
+
+def test_guard_off_keeps_rows_without_lineage_keys(monkeypatch):
+    """Default OFF: no source_media_url key, no evidence kwarg — legacy behavior."""
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    store = _Store()
+    out = gp.plan_gbp_month("gymx", "gymx_gbp", voice=_voice(),
+                            library_path="/tmp/none", city="Carmel", store=store,
+                            start=date(2026, 10, 5), facts=_FACTS,
+                            caption_fn=_cap, image_fn=_img)
+    assert out["planned"] > 0
+    assert all("source_media_url" not in row for row in store.rows)
+
+
+class _Img:
+    def __init__(self, path):
+        self.path = str(path)
+        self.media_type = "image"
+
+
+def _stub_local_pick(monkeypatch, tmp_path, raw_bytes=b"raw-source-bytes",
+                     crop_bytes=b"cropped-delivered-bytes"):
+    raw = tmp_path / "photo.jpg"
+    raw.write_bytes(raw_bytes)
+    crop = tmp_path / "photo_gbp.jpg"
+    crop.write_bytes(crop_bytes)
+    monkeypatch.setattr(gp.client_content, "pick_image",
+                        lambda *a, **k: _Img(raw))
+    monkeypatch.setattr(gp, "_cropped_image",
+                        lambda *a, **k: ("https://r2/gbp/crop.jpg", str(crop)))
+    monkeypatch.setattr(gp.config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(gp.media_host, "host_media",
+                        lambda path, acct: "https://r2/gbp/raw.jpg")
+    monkeypatch.setattr(gp.rotation, "reserve_local_photo_once",
+                        lambda *a, **k: "rid-1")
+    monkeypatch.setattr(gp.rotation, "release_served", lambda *a, **k: None)
+    return raw, crop
+
+
+def test_cropped_transform_carries_raw_source_and_byte_bound_evidence(monkeypatch,
+                                                                      tmp_path):
+    """Guard ON + cropped local photo: row names the hosted RAW source (never the
+    cropped URL) and insert receives render evidence bound to the exact bytes."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    import hashlib
+    raw, crop = _stub_local_pick(monkeypatch, tmp_path)
+    store = _PrepStore()
+    out = gp.plan_gbp_month("gymx", "gymx_gbp", voice=_voice(),
+                            library_path="/tmp/lib", city="Carmel", store=store,
+                            start=date(2026, 10, 5), facts=_FACTS,
+                            caption_fn=_cap)
+    assert out["planned"] > 0
+    assert store.rows
+    for row in store.rows:
+        assert row["image_url"] == "https://r2/gbp/crop.jpg"
+        assert row["source_media_url"] == "https://r2/gbp/raw.jpg"
+        assert "render_evidence" not in row
+    ev = store.evidence_by_url["https://r2/gbp/crop.jpg"]
+    assert ev["operation"] == "render"
+    assert ev["source_exact_url"] == "https://r2/gbp/raw.jpg"
+    assert ev["delivered_exact_url"] == "https://r2/gbp/crop.jpg"
+    assert ev["source_fingerprint"] == "md5:" + hashlib.md5(b"raw-source-bytes").hexdigest()
+    assert ev["delivered_fingerprint"] == "md5:" + hashlib.md5(b"cropped-delivered-bytes").hexdigest()
+    assert ev["source_byte_length"] == len(b"raw-source-bytes")
+    assert ev["delivered_byte_length"] == len(b"cropped-delivered-bytes")
+    # Exercise the production owner-receipt contract, which validates provenance
+    # fields as well as the byte-bound lineage values above.
+    monkeypatch.setattr(gp.config, "S3_PUBLIC_BASE_URL", "https://r2")
+    receipt_identity = owner._validate(
+        "11111111-1111-4111-8111-111111111111", "vg_gbp_crop",
+        b"raw-source-bytes", b"cropped-delivered-bytes", ev, None)
+    assert receipt_identity[6:10] == (
+        "render", ev["evidence_ref"], "gbp_planner", "gbp_planner")
+    assert ev["evidence_ref"].startswith(
+        "gbp_planner:render:"
+        + hashlib.md5(b"raw-source-bytes").hexdigest()
+        + ":" + hashlib.md5(b"cropped-delivered-bytes").hexdigest() + ":")
+
+
+def test_cropped_transform_holds_when_raw_source_cannot_be_hosted(monkeypatch,
+                                                                  tmp_path):
+    """Guard ON, raw source hosting fails -> the transformed write is HELD (slot
+    skipped, nothing staged), never staged with the cropped URL as its own source."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    raw, _crop = _stub_local_pick(monkeypatch, tmp_path)
+    monkeypatch.setattr(gp.media_host, "host_media", lambda path, acct: None)
+    store = _PrepStore()
+    out = gp.plan_gbp_month("gymx", "gymx_gbp", voice=_voice(),
+                            library_path="/tmp/lib", city="Carmel", store=store,
+                            start=date(2026, 10, 5), facts=_FACTS,
+                            caption_fn=_cap)
+    assert out["planned"] == 0
+    assert store.rows == []
+    assert out["skips"]["no_media"] > 0
+
+
+def test_transformed_evidence_uses_real_bytes_not_invented(monkeypatch, tmp_path):
+    """Evidence helper returns None (hold upstream) when byte objects are unreadable."""
+    assert gp._render_evidence_dict("https://r2/a", "https://r2/b",
+                                    tmp_path / "missing-a",
+                                    tmp_path / "missing-b") is None
+    src = tmp_path / "s"
+    src.write_bytes(b"s")
+    assert gp._render_evidence_dict("https://r2/a", "https://r2/b",
+                                    src, tmp_path / "missing") is None

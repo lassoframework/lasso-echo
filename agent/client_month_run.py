@@ -552,6 +552,22 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
     produces IDENTICAL feed+story cards (same lanes, same captionless-story guard). Mutates
     feed.creative_public_url in place via the lanes. The caller owns loop state (built_days,
     opening variety); this helper is stateless beyond the drafts it returns."""
+    # The global visual writer needs the exact hosted object that existed before any
+    # local rendition lane runs.  Keep that identity on both paired drafts while its
+    # guard is armed; the writer, not this planner, performs the later byte proof.
+    # No URL is inferred from a rendered output.
+    raw_source = _capture_raw_hosted_source(feed, log, day_key)
+    if _visual_writer_guard_enabled() and not raw_source:
+        log(f"held {day_key} feed: visual provenance requires a raw hosted source URL")
+        return []
+    if (_visual_writer_guard_enabled()
+            and raw_source != (getattr(feed, "creative_public_url", "") or "").strip()):
+        # A pre-rendered Drive/legacy draft is already a distinct rendition.  This
+        # producer has no route to attach its owner receipt to insert_rows, so retain
+        # its explicit raw source but hold the slot rather than stage unproven lineage.
+        log(f"held {day_key} feed: transformed media lacks owner-attested render evidence")
+        return []
+
     # ACTION-CUT REEL (AGENT_CLIENT_VIDEO_EDIT, OFF by default): a VIDEO draft is edited
     # into a fast-cut 9:16 reel and the draft's creative swaps to the hosted edit. Any
     # failure keeps the raw video; approval gate unchanged.
@@ -576,6 +592,15 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
             story.creative_public_url = _pre_autofit_url
         except Exception:  # noqa: BLE001 - a frozen/edge draft never blocks the build
             pass
+    if _visual_writer_guard_enabled() and raw_source:
+        # dataclasses.replace deliberately drops dynamic draft fields, so copy the
+        # exact raw source explicitly.  The story's existing source-media path below
+        # still owns caption re-burn provenance when that separate flag is armed.
+        try:
+            story.source_media_url = raw_source
+        except Exception:  # noqa: BLE001 - a frozen draft is held below
+            log(f"held {day_key} story: visual provenance could not retain raw source")
+            return [feed]
     _mark_story(story)
     # Honor a client-edited story caption when one was passed in.
     if story_caption_override:
@@ -795,6 +820,10 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
         except Exception:
             _release_feed_reservation(feed)
             raise
+        if not finished:
+            _release_feed_reservation(feed)
+            log(f"{base_key} {day_key}: held; visual provenance could not stage the feed")
+            continue
         drafts.extend(finished)
         covered_days.add(day_key)
         if key:
@@ -1056,6 +1085,17 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
     # guard). A story that cannot carry its caption is still dropped in there.
     day_drafts = _finish_feed_with_story(
         account, draft, library_path, log, day_key=day_key)
+    if not day_drafts:
+        _rollback_drive_asset(draft, day_key, log)
+        # The rollback makes this unattestable rendition least-used again. Exclude it
+        # for the remainder of this build so the next day can reach a different,
+        # provable Drive asset instead of repeatedly starving the pool.
+        aid = (getattr(draft, "source_media_asset_id", "") or "").strip()
+        if aid:
+            failed.add(aid)
+        log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: held; visual provenance "
+            "could not stage the feed")
+        return False
     if slots == 2:
         for d in day_drafts:
             try:
@@ -1558,6 +1598,10 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             except Exception:
                 _release_feed_reservation(feed)
                 raise
+            if not day_drafts:
+                _release_feed_reservation(feed)
+                log(f"{base_key} {day_key}: held; visual provenance could not stage the feed")
+                continue
             # 2x rows carry their slot ordinal so publish-time slot times are
             # deterministic (07:30 / 18:30, config.cadence_slot_times). 1x days carry
             # NO ordinal: the row shape (and publish hashing) stays byte-for-byte.
@@ -1790,6 +1834,44 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
 from .media_types import VIDEO_EXTS as _VIDEO_EXTS, is_video_url   # ONE definition (D1)
 
 
+def _visual_writer_guard_enabled():
+    """Whether calendar writes require owner-attested visual provenance."""
+    try:
+        from . import visual_writer_prepare
+        return bool(visual_writer_prepare.enabled())
+    except Exception:  # noqa: BLE001 - an armed guard must never silently open
+        return os.environ.get("AGENT_VISUAL_GLOBAL_WRITER_PREP", "").lower() in (
+            "1", "true", "yes", "on")
+
+
+def _capture_raw_hosted_source(draft, log, day_key):
+    """Attach the pre-transform hosted URL without guessing a source identity.
+
+    The visual writer verifies same-object bytes at its privileged boundary.  This
+    producer preserves an explicit source when one already exists, and otherwise
+    carries the exact URL it received before its own rendition lanes can swap
+    ``creative_public_url``.  A Drive asset without explicit source provenance may
+    already be a HEIC/HEVC rendition, so it is held instead of being relabeled raw.
+    """
+    if not _visual_writer_guard_enabled():
+        return ""
+    existing = (getattr(draft, "source_media_url", "") or "").strip()
+    if existing:
+        return existing
+    if (getattr(draft, "source_media_asset_id", "") or "").strip():
+        log(f"held {day_key} feed: Drive rendition has no explicit raw source URL")
+        return ""
+    raw = (getattr(draft, "creative_public_url", "") or "").strip()
+    if not raw:
+        return ""
+    try:
+        draft.source_media_url = raw
+    except Exception:  # noqa: BLE001 - never silently lose provenance on an immutable draft
+        log(f"held {day_key} feed: visual provenance could not retain raw source")
+        return ""
+    return raw
+
+
 def _maybe_edit_video(account, feed, library_path, log):
     """Swap a VIDEO feed draft's creative for its action-cut reel (edited + HOSTED).
     No-op unless AGENT_CLIENT_VIDEO_EDIT is armed, the creative is a video, and both
@@ -1797,6 +1879,12 @@ def _maybe_edit_video(account, feed, library_path, log):
     may never block a post). Mutates feed.creative_public_url in place; the paired
     story is cloned FROM the feed afterwards, so it inherits the same reel."""
     if not config.client_video_edit_enabled():
+        return
+    if _visual_writer_guard_enabled():
+        # This producer has no owner receipt for the rendered reel.  Keep the exact
+        # raw hosted video; writing a distinct rendition without that evidence is
+        # forbidden by the calendar writer.
+        log("reel edit held: visual provenance lacks owner-attested render evidence")
         return
     path = (getattr(feed, "creative_path", "") or "").strip()
     if not path or not path.lower().endswith(_VIDEO_EXTS):
@@ -1924,6 +2012,20 @@ def _maybe_format_story(account, story, feed, library_path, log):
     (return True) — this guard does not change flag-off behavior."""
     if not config.story_format_enabled():
         return True                              # baseline: unchanged, always keep
+    if _visual_writer_guard_enabled():
+        # A caption burn is a distinct rendition, and this planner cannot attest to
+        # one.  Keep the story only when it still points at the exact raw object the
+        # guarded writer will verify later.  Do not silently lose the paired Story
+        # merely because a transformed rendition is unavailable, and never relabel a
+        # different object as its source.
+        raw_source = (getattr(story, "source_media_url", "") or "").strip()
+        story_media = (getattr(story, "creative_public_url", "") or "").strip()
+        if raw_source and raw_source == story_media:
+            log("story format deferred: keeping raw same-object story pending "
+                "visual-writer verification")
+            return True
+        log("story format held: visual provenance lacks a same-object raw source")
+        return False
     # INFOGRAPHIC vs PHOTO (Blake, 2026-08-20): only a real uploaded PHOTO/VIDEO gets a
     # caption burned in. A house-rendered INFOGRAPHIC is already a finished, story-sized
     # card carrying its own text, so a burned caption would sit ON TOP of it ("takes over
@@ -2011,6 +2113,11 @@ def _maybe_format_feed(account, feed, library_path, log):
     hosting-off, or any failure keeps the raw media (this never DROPS a post, unlike the story
     caption guard). Mutates feed.creative_public_url in place on success."""
     if not config.feed_autofit_enabled():
+        return
+    if _visual_writer_guard_enabled():
+        # Do not swap to a reframe unless this producer can supply the distinct
+        # source/rendition evidence the guarded calendar writer requires.
+        log("feed autofit held: visual provenance lacks owner-attested render evidence")
         return
     path = (getattr(feed, "creative_path", "") or "").strip()
     hosted_src = (getattr(feed, "creative_public_url", "") or "").strip()
@@ -2808,6 +2915,12 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
             _release_feed_reservation(feed)
             _rollback_drive_asset(feed, day_key, log)
             raise
+        if not finished:
+            _release_feed_reservation(feed)
+            _rollback_drive_asset(feed, day_key, log)
+            skipped += 1
+            log(f"{base_key} {day_key}: held; visual provenance could not stage the feed")
+            continue
         drafts.extend(finished)
         day_used_this_pass.add(day_key)   # so the NEXT denied row this pass rolls past it too
         used_days_for_marker.append(day_key)

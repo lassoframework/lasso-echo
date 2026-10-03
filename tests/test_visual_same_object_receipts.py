@@ -203,11 +203,12 @@ def test_prepare_same_object_happy_path_verifies_rpc_result(monkeypatch):
         seen.update(kwargs)
         return {"read_receipt": receipt_id, "render_receipt": None}
 
-    out = prep.prepare_same_object(Store(), "gymx", URL, flag_on=True,
+    out = prep.prepare_same_object(Store(), "gymx", {"image_url": URL, "source_media_url": URL}, flag_on=True,
                                    read_bytes=lambda url: DATA,
                                    receipt_writer=writer, isolated_test_callbacks=True)
-    assert out == {"visual_group_key": GROUP, "byte_hash": "derived:" + FINGERPRINT,
-                   "usage_claimed": False, "url": URL}
+    assert out["image_url"] == URL and out["source_media_url"] == URL
+    assert out["visual_group_key"] == GROUP
+    assert out["byte_hash"] == "derived:" + FINGERPRINT
     # The owner producer received the EXACT observed bytes and the exact URL.
     assert seen["tenant"] == TENANT and seen["group_key"] == GROUP
     assert seen["exact_bytes"] == DATA
@@ -219,7 +220,7 @@ def test_prepare_same_object_reuses_one_receipt_uuid_for_both_roles(monkeypatch)
     _armed(monkeypatch)
     receipt_id = str(uuid.uuid4())
     store = Store()
-    prep.prepare_same_object(store, "gymx", URL, flag_on=True,
+    prep.prepare_same_object(store, "gymx", {"image_url": URL, "source_media_url": URL}, flag_on=True,
                              read_bytes=lambda url: DATA,
                              receipt_writer=lambda **k: {"read_receipt": receipt_id,
                                                          "render_receipt": None},
@@ -237,7 +238,7 @@ def test_prepare_same_object_reuses_one_receipt_uuid_for_both_roles(monkeypatch)
 def test_prepare_same_object_bundle_bootstraps_group_first(monkeypatch):
     _armed(monkeypatch)
     store = Store()
-    prep.prepare_same_object(store, "gymx", URL, flag_on=True,
+    prep.prepare_same_object(store, "gymx", {"image_url": URL, "source_media_url": URL}, flag_on=True,
                              read_bytes=lambda url: DATA,
                              receipt_writer=lambda **k: {"read_receipt": str(uuid.uuid4()),
                                                          "render_receipt": None},
@@ -263,7 +264,7 @@ def test_prepare_same_object_rejects_conflicting_rpc_result(monkeypatch):
                       {"group_key": GROUP, "source_fingerprint": FINGERPRINT,
                        "delivered_fingerprint": FINGERPRINT, "usage_claimed": True}):
         with pytest.raises(prep.VisualPreparationError, match="conflicting identity"):
-            prep.prepare_same_object(Store(rendition=rendition), "gymx", URL,
+            prep.prepare_same_object(Store(rendition=rendition), "gymx", {"image_url": URL, "source_media_url": URL},
                                      flag_on=True, read_bytes=lambda url: DATA,
                                      receipt_writer=writer, isolated_test_callbacks=True)
 
@@ -273,7 +274,7 @@ def test_prepare_same_object_rejects_render_receipt_from_producer(monkeypatch):
     bad = lambda **k: {"read_receipt": str(uuid.uuid4()),
                        "render_receipt": str(uuid.uuid4())}
     with pytest.raises(prep.VisualPreparationError, match="invalid receipt"):
-        prep.prepare_same_object(Store(), "gymx", URL, flag_on=True,
+        prep.prepare_same_object(Store(), "gymx", {"image_url": URL, "source_media_url": URL}, flag_on=True,
                                  read_bytes=lambda url: DATA, receipt_writer=bad, isolated_test_callbacks=True)
 
 
@@ -285,7 +286,7 @@ def test_prepare_same_object_owner_writer_absent_fails_closed(monkeypatch):
         monkeypatch.delenv(env, raising=False)
     store = Store()
     with pytest.raises(prep.VisualPreparationError, match="owner receipt producer"):
-        prep.prepare_same_object(store, "gymx", URL, flag_on=True)
+        prep.prepare_same_object(store, "gymx", {"image_url": URL, "source_media_url": URL}, flag_on=True)
     # No scene or receipt RPC is reached without a configured owner writer.
     assert not any(call[1] == "visual_global_prepare_source_rendition"
                    for call in store.calls)
@@ -305,7 +306,7 @@ def test_prepare_same_object_flag_off_raises_and_does_nothing(monkeypatch):
                                  read_bytes=lambda url: DATA,
                                  isolated_test_callbacks=True)
     with pytest.raises(prep.VisualPreparationError, match="ambiguous"):
-        prep.prepare_same_object(Store(), "gymx", URL, flag_on=True,
+        prep.prepare_same_object(Store(), "gymx", {"image_url": URL, "source_media_url": URL}, flag_on=True,
                                  read_bytes=lambda url: DATA,
                                  isolated_test_callbacks=True)
 
@@ -313,7 +314,7 @@ def test_prepare_same_object_flag_off_raises_and_does_nothing(monkeypatch):
 def test_prepare_same_object_flag_state_mismatch_is_ambiguous(monkeypatch):
     _armed(monkeypatch)
     with pytest.raises(prep.VisualPreparationError, match="ambiguous"):
-        prep.prepare_same_object(Store(), "gymx", URL, flag_on=False,
+        prep.prepare_same_object(Store(), "gymx", {"image_url": URL, "source_media_url": URL}, flag_on=False,
                                  read_bytes=lambda url: DATA,
                                  isolated_test_callbacks=True)
 
@@ -321,12 +322,20 @@ def test_prepare_same_object_flag_state_mismatch_is_ambiguous(monkeypatch):
 def test_prepare_same_object_rejects_foreign_url_and_unreadable_bytes(monkeypatch):
     _armed(monkeypatch)
     with pytest.raises(prep.VisualPreparationError, match="media host"):
-        prep.prepare_same_object(Store(), "gymx", "https://evil.example/x.png",
+        prep.prepare_same_object(Store(), "gymx", {"image_url": "https://evil.example/x.png", "source_media_url": "https://evil.example/x.png"},
                                  flag_on=True, read_bytes=lambda url: DATA,
                                  isolated_test_callbacks=True)
     with pytest.raises(prep.VisualPreparationError, match="could not be (read|verified)"):
-        prep.prepare_same_object(Store(), "gymx", URL, flag_on=True,
+        prep.prepare_same_object(Store(), "gymx", {"image_url": URL, "source_media_url": URL}, flag_on=True,
                                  read_bytes=lambda url: None,
+                                 isolated_test_callbacks=True)
+
+
+def test_prepare_same_object_bare_url_cannot_imply_source_identity(monkeypatch):
+    _armed(monkeypatch)
+    with pytest.raises(prep.VisualPreparationError, match="source and delivered URL must match"):
+        prep.prepare_same_object(Store(), "gymx", URL, flag_on=True,
+                                 read_bytes=lambda url: DATA,
                                  isolated_test_callbacks=True)
 
 
@@ -336,7 +345,7 @@ def test_production_config_rejects_injected_callbacks_for_url_and_row(monkeypatc
     calls = []
     reader = lambda url: calls.append("reader") or DATA
     writer = lambda **kw: calls.append("writer") or {"read_receipt": str(uuid.uuid4())}
-    for item in (URL, {"image_url": URL}):
+    for item in ({"image_url": URL, "source_media_url": URL},):
         for kwargs in ({"read_bytes": reader}, {"receipt_writer": writer},
                        {"read_bytes": reader, "receipt_writer": writer,
                         "isolated_test_callbacks": True}):

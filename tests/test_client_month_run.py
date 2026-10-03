@@ -211,6 +211,130 @@ def test_feed_autofit_reframes_feed_but_never_the_story(monkeypatch, tmp_path):
     assert all("__feed.jpg" not in r["image_url"] for r in stories)
 
 
+def test_visual_guard_keeps_raw_feed_and_story_when_autofit_has_no_render_receipt(
+        monkeypatch, tmp_path):
+    """A guarded planner never relabels a reframe as its own raw source."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "false")
+    monkeypatch.setenv("AGENT_FEED_AUTOFIT", "true")
+    monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
+    from agent import feed_image
+    monkeypatch.setattr(feed_image, "get_or_make_feed_image",
+                        lambda *args, **kwargs: pytest.fail("guarded build must not render"))
+    _stock_clean("gritx_ig")
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=2, voice=_voice(),
+        library_path=_lib(tmp_path, n=4), store=store, banned_words=())
+    assert out["ok"] is True
+    rows = [r for r in store.inserted if r["format"] in ("feed", "story")]
+    assert rows
+    assert all(r["source_media_url"] == r["image_url"] for r in rows)
+
+
+def test_visual_guard_keeps_raw_video_when_reel_has_no_render_receipt(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    monkeypatch.setenv("AGENT_CLIENT_VIDEO_EDIT", "true")
+    from agent import action_reel
+    from agent.drafter import Draft, DraftStatus
+    monkeypatch.setattr(action_reel, "get_or_make_reel",
+                        lambda *args, **kwargs: pytest.fail("guarded build must not render"))
+    clip = tmp_path / "lift.mp4"
+    clip.write_bytes(b"clip")
+    feed = Draft("video-source", "gritx_ig", "instagram", "caption", [], str(clip),
+                 "https://cdn/raw-lift.mp4", "2026-08-01T12:00:00Z", DraftStatus.PENDING)
+    drafts = cmr._finish_feed_with_story(_account(), feed, str(tmp_path), lambda _msg: None,
+                                         day_key="2026-08-01")
+    assert len(drafts) == 2
+    assert all(d.creative_public_url == "https://cdn/raw-lift.mp4" for d in drafts)
+    assert all(d.source_media_url == "https://cdn/raw-lift.mp4" for d in drafts)
+
+
+@pytest.mark.parametrize(
+    ("filename", "url"),
+    (("raw.jpg", "https://cdn/raw.jpg"), ("raw.mp4", "https://cdn/raw.mp4")),
+)
+def test_visual_guard_keeps_same_object_story_when_story_format_has_no_render_receipt(
+        monkeypatch, tmp_path, filename, url):
+    """Story formatting may not turn an unattested render into a cadence hole."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    from agent import story_image
+    from agent.drafter import Draft, DraftStatus
+    monkeypatch.setattr(story_image, "get_or_make_story_image",
+                        lambda *args, **kwargs: pytest.fail("guarded build must not render"))
+    monkeypatch.setattr(story_image, "get_or_make_story_video",
+                        lambda *args, **kwargs: pytest.fail("guarded build must not render"))
+    media = tmp_path / filename
+    media.write_bytes(b"media")
+    feed = Draft("story-source", "gritx_ig", "instagram", "caption", [], str(media),
+                 url, "2026-08-01T12:00:00Z", DraftStatus.PENDING)
+    drafts = cmr._finish_feed_with_story(_account(), feed, str(tmp_path), lambda _msg: None,
+                                         day_key="2026-08-01")
+    assert len(drafts) == 2
+    assert drafts[1].draft_type == "story"
+    assert all(d.creative_public_url == url for d in drafts)
+    assert all(d.source_media_url == url for d in drafts)
+
+
+def test_visual_guard_holds_transformed_drive_draft_without_source_or_render_receipt(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    from agent.drafter import Draft, DraftStatus
+    feed = Draft("drive-rendition", "gritx_ig", "instagram", "caption", [], "asset.heic",
+                 "https://cdn/rendition.jpg", "2026-08-01T12:00:00Z", DraftStatus.PENDING,
+                 source_media_asset_id="drive-asset")
+    logs = []
+    assert cmr._finish_feed_with_story(_account(), feed, str(tmp_path), logs.append,
+                                       day_key="2026-08-01") == []
+    assert not getattr(feed, "source_media_url", "")
+    assert any("Drive rendition" in message for message in logs)
+
+
+def test_visual_guard_preserves_existing_raw_source_but_holds_unattested_rendition(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    from agent.drafter import Draft, DraftStatus
+    feed = Draft("drive-rendition", "gritx_ig", "instagram", "caption", [], "asset.heic",
+                 "https://cdn/rendition.jpg", "2026-08-01T12:00:00Z", DraftStatus.PENDING,
+                 source_media_asset_id="drive-asset")
+    feed.source_media_url = "https://cdn/raw-upload.heic"
+    assert cmr._finish_feed_with_story(_account(), feed, str(tmp_path), lambda _msg: None,
+                                       day_key="2026-08-01") == []
+    assert feed.source_media_url == "https://cdn/raw-upload.heic"
+
+
+def test_drive_provenance_hold_excludes_rendition_for_next_day(monkeypatch, tmp_path):
+    """A rolled-back HEIC rendition cannot starve the next eligible Drive photo."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    from agent import gym_media_builder
+    from agent.drafter import Draft, DraftStatus
+    calls = []
+
+    def build(_account, day_key, _pillar, _voice, _source, **kwargs):
+        excluded = set(kwargs.get("exclude_ids") or ())
+        calls.append((day_key, excluded))
+        if not excluded:
+            return Draft("bad", "gritx_ig", "instagram", "caption", [], "asset.heic",
+                         "https://cdn/rendition.jpg", "", DraftStatus.PENDING,
+                         source_media_asset_id="heic")
+        good = Draft("good", "gritx_ig", "instagram", "caption", [], "asset.jpg",
+                     "https://cdn/raw.jpg", "", DraftStatus.PENDING,
+                     source_media_asset_id="photo")
+        good.source_media_url = "https://cdn/raw.jpg"
+        return good
+
+    monkeypatch.setattr(gym_media_builder, "build_gym_media_draft", build)
+    monkeypatch.setattr(cmr, "_gym_drive_source_for", lambda *args: object())
+    monkeypatch.setattr(cmr, "_rollback_drive_asset", lambda *args, **kwargs: None)
+    drafts = cmr.append_gym_drive_drafts(
+        _account(), "gritx", __import__("datetime").date(2026, 8, 1), 2, _voice(),
+        log=lambda _msg: None, covered_days=set(), library_path=str(tmp_path))
+    assert calls[0][1] == set()
+    assert calls[1][1] == {"heic"}
+    assert any(d.draft_id == "good" for d in drafts)
+
+
 # ---- 3b. GATE 2 coach-screens-first-month (FB/IG client month) -------------------
 
 class _StoreWithHistory(_FakeStore):

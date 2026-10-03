@@ -1,5 +1,6 @@
 """Offline acceptance for the opt-in shared calendar media boundaries."""
 import hashlib
+import uuid
 
 import pytest
 
@@ -27,6 +28,11 @@ def evidence(**changes):
         "operation": "render", "observed_by": "test_renderer",
         "rendered_by": "test_renderer", "evidence_ref": "test_renderer:1", **changes,
     }
+
+
+# Same-object owner receipts are keyed by receipt UUID so the PostgREST fake
+# can answer the source/rendition RPC with the exact observed fingerprint.
+_SAME_OBJECT_HASHES = {}
 
 
 def calendar_row(**changes):
@@ -76,6 +82,12 @@ class HTTP:
         if name == "visual_global_prepare_source_rendition":
             if self.race:
                 self.current.update(self.race)
+            if json.get("p_render_receipt") is None:
+                fingerprint = _SAME_OBJECT_HASHES[json["p_source_read_receipt"]]
+                return Response({"group_key": json["p_group_key"],
+                                 "source_fingerprint": fingerprint,
+                                 "delivered_fingerprint": fingerprint,
+                                 "usage_claimed": False})
             return Response({"group_key": "vg_scene", "source_fingerprint": md5(DATA[RAW]),
                              "delivered_fingerprint": md5(DATA[FINAL]), "usage_claimed": False})
         if name == "visual_global_prepare_bundle":
@@ -112,7 +124,9 @@ def store(http):
 @pytest.fixture
 def armed(monkeypatch):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setattr("agent.config.S3_PUBLIC_BASE_URL", "https://media.example")
     monkeypatch.setattr(prep, "_bytes_for_url", DATA.get)
+    _SAME_OBJECT_HASHES.clear()
     receipt_calls = []
 
     def receipts(**kwargs):
@@ -120,7 +134,14 @@ def armed(monkeypatch):
         return {name: "33333333-3333-4333-8333-333333333333" for name in (
             "source_read_receipt", "delivered_read_receipt", "render_receipt")}
 
+    def same_object_receipts(**kwargs):
+        receipt_id = str(uuid.uuid4())
+        _SAME_OBJECT_HASHES[receipt_id] = md5(kwargs["exact_bytes"])
+        receipt_calls.append(kwargs)
+        return {"read_receipt": receipt_id, "render_receipt": None}
+
     monkeypatch.setattr(owner, "default_writer", lambda: receipts)
+    monkeypatch.setattr(owner, "default_same_object_writer", lambda: same_object_receipts)
     return receipt_calls
 
 
@@ -480,13 +501,17 @@ def test_insert_rejects_an_unverified_persistence_receipt(armed, staging, alter)
 
 def test_insert_accepts_reordered_verified_rows_with_unique_ids(armed, staging):
     http = HTTP(bad_result=lambda rows: list(reversed(rows)))
-    rows = store(http).insert_rows(KEY, [{"image_url": RAW}, {"image_url": FINAL}])
+    rows = store(http).insert_rows(KEY, [
+        {"image_url": RAW, "source_media_url": RAW},
+        {"image_url": FINAL, "source_media_url": FINAL},
+    ])
     assert [r["image_url"] for r in rows] == [FINAL, RAW]
     assert len({r["id"] for r in rows}) == 2
 
 
 def test_backfill_cannot_discard_existing_drive_asset_to_pass(armed):
-    http = HTTP(current=calendar_row(image_url="", source_media_asset_id="asset-1",
+    http = HTTP(current=calendar_row(image_url="", source_media_url=FINAL,
+                                    source_media_asset_id="asset-1",
                                     drive_file_id="asset-1"),
                 asset={"id": "asset-1", "gym_id": KEY, "content_hash": "0" * 32})
     with pytest.raises(prep.VisualPreparationError, match="MD5"):
@@ -495,7 +520,8 @@ def test_backfill_cannot_discard_existing_drive_asset_to_pass(armed):
 
 
 def test_backfill_retains_attested_existing_drive_identity(armed):
-    http = HTTP(current=calendar_row(image_url="", source_media_asset_id="asset-1",
+    http = HTTP(current=calendar_row(image_url="", source_media_url=FINAL,
+                                    source_media_asset_id="asset-1",
                                     drive_file_id="asset-1"),
                 asset={"id": "asset-1", "gym_id": KEY,
                        "content_hash": hashlib.md5(DATA[FINAL]).hexdigest()})
@@ -508,7 +534,7 @@ def test_swap_rejects_foreign_tenant_source_asset(armed):
     http = HTTP(asset={"id": "asset-1", "gym_id": "foreign-key",
                        "content_hash": hashlib.md5(DATA[FINAL]).hexdigest()})
     with pytest.raises(prep.VisualPreparationError, match="another tenant"):
-        store(http).swap_media(KEY, "row-1", FINAL,
+        store(http).swap_media(KEY, "row-1", FINAL, source_media_url=FINAL,
                               extra_fields={"source_media_asset_id": "asset-1"})
     assert not any(call[0] == "patch" for call in http.calls)
 

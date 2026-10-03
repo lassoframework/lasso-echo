@@ -216,26 +216,28 @@ def test_writer_flag_off_never_prepares_before_staging_rpc(tmp_path, monkeypatch
 
 
 def _same_object_result(url, **overrides):
-    result = {"visual_group_key": "vg_scene1",
-              "byte_hash": "derived:md5:" + "c" * 32,
-              "usage_claimed": False, "url": url}
+    result = {"image_url": url, "source_media_url": url,
+              "visual_group_key": "vg_scene1",
+              "byte_hash": "derived:md5:" + "c" * 32}
     result.update(overrides)
     return result
 
 
 def _same_object_prepare(calls, result=None, error=None):
-    def prepare(store, account_key, url, *, flag_on=None):
-        calls.append(("prepare", account_key, url, flag_on))
+    def prepare(store, account_key, row, *, flag_on=None):
+        calls.append(("prepare", account_key, row, flag_on))
         if error is not None:
             raise error
-        return result or _same_object_result(url)
+        return result or _same_object_result(row["image_url"])
     return prepare
 
 
 def test_writer_flag_on_same_object_preparation_feeds_staging_rpc(tmp_path, monkeypatch):
     """Flag ON: the owner-attested same-exact-URL preparation contract is
     invoked for the reviewed artifact URL, and its verified identity is passed
-    to the narrowed staging RPC — exact payload, nothing unexpected."""
+    to the narrowed staging RPC — exact payload, nothing unexpected. The real
+    row-returning helper does not expose usage_claimed in this prepared row;
+    its internal RPC check remains the authority for that state."""
     import agent.visual_writer_prepare as vwp
     monkeypatch.setattr(vwp, "enabled", lambda: True)
     calls = []
@@ -247,7 +249,9 @@ def test_writer_flag_on_same_object_preparation_feeds_staging_rpc(tmp_path, monk
                            current_day_fn=lambda *_: [{"account": "instagram", "caption": "Summit", "slot_index": 2, "status": "pending"}],
                            prepare_fn=_same_object_prepare(calls), insert_fn=insert)
     assert receipts[0]["status"] == "applied"
-    assert calls[0] == ("prepare", "lasso", url, True)
+    assert calls[0] == ("prepare", "lasso",
+                        {"image_url": url, "source_media_url": url}, True)
+    assert "usage_claimed" not in _same_object_result(url)
     rpc_action = calls[1][1]
     assert rpc_action["visual_group_key"] == "vg_scene1"
     assert rpc_action["byte_hash"] == "derived:md5:" + "c" * 32
@@ -300,13 +304,6 @@ def test_writer_flag_on_preparation_raise_fails_closed(tmp_path, monkeypatch):
     assert receipt["error"] == "VisualPreparationError"
 
 
-def test_writer_flag_on_claimed_usage_fails_closed(tmp_path, monkeypatch):
-    receipt = _flag_on_failure(tmp_path, monkeypatch, _same_object_prepare(
-        [], result=_same_object_result(_insert_action()["row"]["image_url"],
-                                       usage_claimed=True)))
-    assert receipt["error"] == "RuntimeError"
-
-
 def test_writer_flag_on_non_scene_group_key_fails_closed(tmp_path, monkeypatch):
     receipt = _flag_on_failure(tmp_path, monkeypatch, _same_object_prepare(
         [], result=_same_object_result(_insert_action()["row"]["image_url"],
@@ -317,6 +314,10 @@ def test_writer_flag_on_non_scene_group_key_fails_closed(tmp_path, monkeypatch):
 def test_writer_flag_on_wrong_url_or_hash_fails_closed(tmp_path, monkeypatch):
     receipt = _flag_on_failure(tmp_path, monkeypatch, _same_object_prepare(
         [], result=_same_object_result("https://other.example/swapped.png")))
+    assert receipt["error"] == "RuntimeError"
+    receipt = _flag_on_failure(tmp_path / "c", monkeypatch, _same_object_prepare(
+        [], result={**_same_object_result(_insert_action()["row"]["image_url"]),
+                    "source_media_url": "https://other.example/source.png"}))
     assert receipt["error"] == "RuntimeError"
     receipt = _flag_on_failure(tmp_path / "b", monkeypatch, _same_object_prepare(
         [], result=_same_object_result(_insert_action()["row"]["image_url"],
