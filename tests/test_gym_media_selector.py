@@ -20,6 +20,69 @@ def reviewed_asset(*args, **kwargs):
     return row
 
 
+def test_drive_claim_hides_asset_from_every_selection_path(monkeypatch, tmp_path):
+    from agent import db
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    store = FakeMediaStore(assets=[
+        reviewed_asset("claimed", content_hash="a" * 64),
+        reviewed_asset("free", content_hash="b" * 64)])
+    claim_id = sel.drive_asset_claim_id("pierce", "claimed")
+    assert db.socialapi_claim(claim_id, "pierce_gbp")[0] == "won"
+    assert [a["id"] for a in sel.pickable("pierce", store=store)] == ["free"]
+    assert [a["id"] for a in sel.cooldown_fallback("pierce", store=store)] == ["free"]
+    db.socialapi_claim_done(claim_id, "pierce_gbp", "claimed")
+    assert [a["id"] for a in sel.pickable("pierce", store=store)] == ["free"]
+
+
+def test_claim_hides_same_byte_alias_and_unreadable_claim_closes_pool(monkeypatch,
+                                                                    tmp_path):
+    from agent import db
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    store = FakeMediaStore(assets=[
+        reviewed_asset("claimed", content_hash="a" * 64),
+        reviewed_asset("alias", content_hash="a" * 64),
+        reviewed_asset("free", content_hash="b" * 64)])
+    claim_id = sel.drive_asset_claim_id("pierce", "claimed")
+    assert db.socialapi_claim(claim_id, "pierce_gbp")[0] == "won"
+    for select in (sel.pickable, sel.cooldown_fallback):
+        assert [a["id"] for a in select("pierce", store=store)] == ["free"]
+    store.assets["claimed"].pop("content_hash")
+    for select in (sel.pickable, sel.cooldown_fallback):
+        assert select("pierce", store=store) == []
+    store.assets.pop("claimed")
+    for select in (sel.pickable, sel.cooldown_fallback):
+        assert select("pierce", store=store) == []
+
+
+def test_legacy_id_claim_blocks_new_canonical_alias_claim(monkeypatch, tmp_path):
+    from agent import db
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    original = reviewed_asset("old-id", content_hash="a" * 64)
+    alias = reviewed_asset("new-id", content_hash="a" * 64)
+    store = FakeMediaStore(assets=[original, alias])
+    assert db.socialapi_claim(
+        sel.drive_asset_claim_id("pierce", "old-id"), "pierce_gbp")[0] == "won"
+    assert sel.claim_drive_content("pierce", alias, store) is None
+
+
+def test_claim_requires_verified_hash(monkeypatch, tmp_path):
+    import pytest
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    asset = reviewed_asset("no-hash", content_hash="unverified")
+    store = FakeMediaStore(assets=[asset])
+    with pytest.raises(ValueError, match="verified content hash"):
+        sel.claim_drive_content("pierce", asset, store)
+
+
+def test_claim_read_failure_closes_drive_pool(monkeypatch):
+    from agent import db
+    store = FakeMediaStore(assets=[reviewed_asset("free")])
+    monkeypatch.setattr(db, "drive_asset_claimed_ids",
+                        lambda *_: (_ for _ in ()).throw(OSError("db down")))
+    assert sel.pickable("pierce", store=store) == []
+    assert sel.cooldown_fallback("pierce", store=store) == []
+
+
 def test_picks_least_used_longest_unused():
     store = FakeMediaStore(assets=[
         reviewed_asset("a", used_count=3, last_used_at="2026-01-01T00:00:00+00:00"),

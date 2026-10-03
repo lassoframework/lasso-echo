@@ -81,8 +81,9 @@ def kinds_for_slot(pool_kinds, day_key, slot_index=0):
         return [_idx.KIND_VIDEO]
     if kinds == {_idx.KIND_PHOTO}:
         return [_idx.KIND_PHOTO]
-    if is_video_slot(day_key, slot_index):
-        return [_idx.KIND_VIDEO, _idx.KIND_PHOTO]
+    # Approved stills are always consumed before clips.  The video cadence is a
+    # preference only when no pickable photo remains; it must never bypass an
+    # available client photo in the same Drive pool.
     return [_idx.KIND_PHOTO, _idx.KIND_VIDEO]
 
 
@@ -369,10 +370,38 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
         draft.caption_grounding = {
             "creative_name": os.path.basename(str(local_for_vision)),
             "verified": verified}
+        # The claim is shared with GBP and swaps. A selector snapshot alone is
+        # insufficient: another lane can claim this asset during materialization.
+        from . import db
         try:
-            _sel.stamp_use(asset, gym_base, day_key, store=store, now=now)
+            claim_id = _sel.claim_drive_content(gym_base, asset, store)
+        except Exception as e:  # noqa: BLE001 - unknown claim state holds the slot
+            _vision_alert(f"{gym_base} {day_key}: Drive claim failed ({type(e).__name__})")
+            return None
+        if claim_id is None:
+            return None
+        draft._drive_claim_id = claim_id
+        claim_account = f"{gym_base}_gbp"
+        try:
+            # A legacy or independent stamp could predate the claim. Do not
+            # release this claim after an uncertain authoritative read.
+            fresh = store.get_asset(asset["id"])
+            if fresh is None or _sel._has_prior_use(fresh):
+                return None
+            _sel.stamp_use(fresh, gym_base, day_key, store=store, now=now)
         except Exception as e:  # noqa: BLE001
-            print(f"[gym-media-builder] usage stamp failed: {type(e).__name__}: {e}")
+            # The card must never become durable while its media is still
+            # reofferable. A partial stamp fails closed too: returning no draft
+            # holds the slot, while any counter that did land keeps the asset out.
+            _vision_alert(
+                f"{gym_base} {day_key}: Drive usage stamp failed "
+                f"({type(e).__name__}); draft held before approval/card persistence")
+            return None
+        try:
+            db.socialapi_claim_done(claim_id, claim_account, str(asset["id"]))
+        except Exception as e:  # noqa: BLE001 - in-flight claim still protects asset
+            _vision_alert(f"{gym_base} {day_key}: Drive claim receipt failed "
+                          f"({type(e).__name__}); claim retained")
         return draft
     return None
 

@@ -46,7 +46,8 @@ def _lib(tmp_path, n=5):
     lib = tmp_path / "alpha_lib"
     lib.mkdir(exist_ok=True)
     for i in range(n):
-        (lib / f"photo_{i:02d}.jpg").write_bytes(b"\xff\xd8\xffFAKEJPEG")
+        (lib / f"photo_{i:02d}.jpg").write_bytes(
+            b"\xff\xd8\xffFAKEJPEG" + str(i).encode())
     return str(lib)
 
 
@@ -287,8 +288,8 @@ def test_record_serve_flag_defers_the_served_write(tmp_path, monkeypatch):
     lib = _lib(tmp_path, n=5)
     voice = _voice()
     calls = []
-    monkeypatch.setattr(rotation, "record_served",
-                        lambda *a, **k: calls.append(a) or True)
+    monkeypatch.setattr(rotation, "reserve_local_photo_once",
+                        lambda *a, **k: calls.append(a) or len(calls))
 
     d1 = client_content.build_client_draft(acct, "2026-07-01", voice, lib, record_serve=False)
     assert d1 is not None and d1.creative_path

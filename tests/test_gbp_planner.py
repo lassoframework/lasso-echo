@@ -6,7 +6,9 @@ seeded in the sqlite client_sources, a fake store captures inserted rows.
 
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from threading import Barrier
 
 import pytest
 
@@ -14,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import gbp_planner as gp, client_sources as cs  # noqa: E402
 from agent.voice import VoiceDoc  # noqa: E402
+from tests.gym_media_fakes import FakeMediaStore, make_asset  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -144,6 +147,537 @@ def test_injected_facts_drive_standard_without_client_sources():
     pillars = {r["pillar"] for r in store.rows if r["gbp_topic_type"] == "STANDARD"
                and r["format"] == "update"}
     assert pillars <= {"All in one offer", "Sales are now", "Proof"}
+
+
+def test_client_gbp_uses_drive_photo_before_local_library(monkeypatch):
+    _seed("gymx_ig")
+    store = _Store()
+    calls = []
+    monkeypatch.setattr(gp, "_drive_photo_candidate",
+                        lambda account, day, used: calls.append((account, day))
+                        or {"url": f"https://r2/drive/{day}.jpg",
+                            "kind": "injected", "day_key": day})
+    monkeypatch.setattr(gp.client_content, "pick_image",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("local picker must not outrank Drive")))
+    out = gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=store, start=date(2026, 9, 1), offer=None, events=[],
+        caption_fn=_cap)
+    assert out["ok"] and calls
+    assert all("/drive/" in row["image_url"] for row in store.rows)
+
+
+def test_client_gbp_local_fallback_explicitly_prefers_photos(monkeypatch):
+    from types import SimpleNamespace
+    _seed("gymx_ig")
+    store = _Store()
+    seen = []
+    monkeypatch.setattr(gp, "_drive_photo_candidate", lambda *a, **k: None)
+
+    def _pick(*args, **kwargs):
+        seen.append(kwargs.get("prefer_photos"))
+        return SimpleNamespace(path=f"/tmp/photo-{len(seen)}.jpg", media_type="image")
+
+    monkeypatch.setattr(gp.client_content, "pick_image", _pick)
+    monkeypatch.setattr(gp, "_cropped_image_url",
+                        lambda account, image, day: f"https://r2/local/{day}.jpg")
+    out = gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=store, start=date(2026, 9, 1), offer=None, events=[],
+        caption_fn=_cap)
+    assert out["ok"] and seen
+    assert all(value is True for value in seen)
+
+
+def test_drive_photo_is_cropped_then_stamped_once(monkeypatch):
+    from agent import config, gym_media_index, gym_media_selector
+    from agent.integrations import drive_client
+
+    asset = {"id": "drive-photo-1", "gym_id": "gymx", "kind": "photo",
+             "title": "class.jpg"}
+    stamps = []
+
+    class Store:
+        def available(self):
+            return True
+
+        def list_sources(self, _base):
+            return [{"kind": "gym_drive", "active": True,
+                     "revoked_externally": False, "sync_status": "ready",
+                     "sync_finished_at": "2026-10-03T00:00:00Z"}]
+
+        def list_assets(self, _base):
+            return [asset]
+
+    class Drive:
+        def available(self):
+            return True
+
+        def download(self, _asset_id, path):
+            path.write_bytes(b"photo bytes")
+
+    monkeypatch.setattr(config, "gym_drive_stage_enabled", lambda: True)
+    monkeypatch.setattr(config, "gym_drive_connect_active_for", lambda _key: True)
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: Store())
+    monkeypatch.setattr(gym_media_index, "needs_rendition", lambda _asset: False)
+    monkeypatch.setattr(drive_client, "DriveClient", lambda: Drive())
+    monkeypatch.setattr(gym_media_selector, "pick_media",
+                        lambda gym, kind_preference, **kwargs: asset
+                        if kind_preference == "photo" else None)
+    monkeypatch.setattr(gym_media_selector, "stamp_use",
+                        lambda selected, gym, day, **kwargs:
+                        stamps.append((selected["id"], gym, day)))
+
+    def _crop(account, image, day):
+        assert os.path.isfile(image.path)
+        return f"https://r2/{account}/{day}.jpg"
+
+    monkeypatch.setattr(gp, "_cropped_image_url", _crop)
+    used = set()
+    pick = gp._drive_photo_candidate("gymx_ig", "2026-10-03", used)
+    assert pick["url"] == "https://r2/gymx_ig/2026-10-03.jpg"
+    assert used == {"drive-photo-1"}
+    assert stamps == [], "candidate materialization must not burn the asset"
+
+
+def test_active_drive_uncertainty_holds_local_gbp_fallback(monkeypatch):
+    from agent import config, gym_media_index
+    from agent.integrations import drive_client
+
+    class Store:
+        def available(self):
+            return False
+
+    class Drive:
+        def available(self):
+            return True
+
+    monkeypatch.setattr(config, "gym_drive_stage_enabled", lambda: True)
+    monkeypatch.setattr(config, "gym_drive_connect_active_for", lambda _key: True)
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: Store())
+    monkeypatch.setattr(drive_client, "DriveClient", lambda: Drive())
+    assert gp._drive_photo_candidate("gymx_ig", "2026-10-03", set()) == {"hold": True}
+
+
+def test_drive_claim_is_single_winner_and_releasable():
+    asset = make_asset("drive-1", gym_id="gymx")
+    media_store = FakeMediaStore(assets=[asset])
+    first = {"base": "gymx", "asset": asset, "store": media_store}
+    second = {"base": "gymx", "asset": asset, "store": media_store}
+    assert gp._claim_drive_pick(first, "gymx_gbp") is True
+    assert gp._claim_drive_pick(second, "gymx_gbp") is False
+    assert gp._release_drive_claim(first) is True
+    assert gp._claim_drive_pick(second, "gymx_gbp") is True
+
+
+def test_concurrent_same_byte_aliases_share_one_atomic_claim():
+    first_asset = make_asset("alias-a", gym_id="gymx", content_hash="a" * 64)
+    second_asset = make_asset("alias-b", gym_id="gymx", content_hash="a" * 64)
+    media_store = FakeMediaStore(assets=[first_asset, second_asset])
+    barrier = Barrier(2)
+
+    def claim(asset):
+        pick = {"base": "gymx", "asset": asset, "store": media_store}
+        barrier.wait()
+        return gp._claim_drive_pick(pick, "gymx_gbp"), pick
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(claim, (first_asset, second_asset)))
+    assert sum(won for won, _ in results) == 1
+    assert {pick["claim_id"] for won, pick in results if won} == {
+        "gbp_media:gymx:hash:" + "a" * 64}
+
+
+def test_gbp_batch_skips_same_byte_alias_before_claims(monkeypatch):
+    _seed("gymx_ig")
+    first = make_asset("alias-a", gym_id="gymx", content_hash="a" * 64)
+    alias = make_asset("alias-b", gym_id="gymx", content_hash="a" * 64)
+    other = make_asset("other", gym_id="gymx", content_hash="b" * 64)
+    media_store = FakeMediaStore(assets=[first, alias, other])
+
+    def candidate(_account, day, used):
+        asset = next((a for a in (first, alias, other)
+                      if a["id"] not in used), None)
+        if asset is None:
+            return None
+        return {"url": f"https://r2/{asset['id']}.jpg", "kind": "drive",
+                "day_key": day, "asset": asset, "base": "gymx",
+                "store": media_store}
+
+    monkeypatch.setattr(gp, "_drive_photo_candidate", candidate)
+    monkeypatch.setattr(gp.gym_media_selector, "stamp_use", lambda *a, **k: None)
+    store = _Store()
+    out = gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=store, start=date(2026, 9, 1), days=12,
+        offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is True
+    urls = {row["image_url"] for row in store.rows}
+    assert "https://r2/alias-a.jpg" in urls
+    assert "https://r2/other.jpg" in urls
+    assert "https://r2/alias-b.jpg" not in urls
+
+
+def test_insert_readback_requires_exact_count_for_absence():
+    row = {"post_date": "2026-09-01", "format": "update",
+           "image_url": "https://r2/photo.jpg", "account": "googlebusiness"}
+
+    class Response:
+        status_code = 200
+        def __init__(self, content_range):
+            self.headers = {"content-range": content_range}
+        def json(self):
+            return []
+
+    class Client:
+        response = Response("*/0")
+        def get(self, *args, **kwargs):
+            assert kwargs["headers"]["Prefer"] == "count=exact"
+            return self.response
+
+    client = Client()
+    class Base:
+        def _client(self):
+            return client
+        def _rest(self, table):
+            assert table == "content_calendar"
+            return "/content_calendar"
+        def _headers(self, extra=None):
+            return dict(extra or {})
+
+    store = type("Store", (), {"_s": Base()})()
+    assert gp._readback_inserted_rows(store, "gymx", [row]) == []
+    client.response = Response("")
+    assert gp._readback_inserted_rows(store, "gymx", [row]) is None
+
+
+def test_drive_stamp_happens_only_after_caption_and_durable_insert(monkeypatch):
+    from agent import gym_media_selector
+    _seed("gymx_ig")
+    events = []
+    asset = make_asset("drive-1", gym_id="gymx")
+
+    class MediaStore:
+        def list_assets(self, _base):
+            return [asset]
+
+    class Store(_Store):
+        def insert_rows(self, key, rows):
+            events.append("insert")
+            return super().insert_rows(key, rows)
+
+    monkeypatch.setattr(
+        gp, "_drive_photo_candidate",
+        lambda account, day, used: {"url": f"https://r2/{day}.jpg",
+                                    "kind": "drive", "day_key": day,
+                                    "asset": asset, "base": "gymx",
+                                    "store": MediaStore()})
+    monkeypatch.setattr(gym_media_selector, "stamp_use",
+                        lambda *a, **k: events.append("stamp"))
+    out = gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=Store(), start=date(2026, 9, 1), days=1,
+        offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is True
+    assert events == ["insert", "stamp"]
+
+
+def test_caption_rejection_and_failed_insert_do_not_burn_drive_asset(monkeypatch):
+    from agent import gym_media_selector
+    _seed("gymx_ig")
+    stamps = []
+    asset = make_asset("drive-1", gym_id="gymx")
+    candidate = {"url": "https://r2/drive.jpg", "kind": "drive",
+                 "day_key": "2026-09-01", "asset": asset,
+                 "base": "gymx", "store": FakeMediaStore(assets=[asset])}
+    monkeypatch.setattr(gp, "_drive_photo_candidate",
+                        lambda *a, **k: dict(candidate))
+    monkeypatch.setattr(gym_media_selector, "stamp_use",
+                        lambda *a, **k: stamps.append(True))
+    rejected = gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=_Store(), start=date(2026, 9, 1), days=1,
+        offer=None, events=[], caption_fn=lambda _fact: None)
+    assert rejected["ok"] is False and stamps == []
+
+    class FailedStore:
+        def insert_rows(self, _key, _rows):
+            raise OSError("write failed")
+
+    with pytest.raises(OSError, match="write failed"):
+        gp.plan_gbp_month(
+            "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+            store=FailedStore(), start=date(2026, 9, 1), days=1,
+            offer=None, events=[], caption_fn=_cap)
+    assert stamps == []
+
+
+def test_drive_stamp_retries_once_after_a_prewrite_failure(monkeypatch):
+    from agent import gym_media_selector
+    _seed("gymx_ig")
+    asset = make_asset("drive-1", gym_id="gymx")
+
+    class MediaStore:
+        def list_assets(self, _base):
+            return [asset]
+
+    monkeypatch.setattr(
+        gp, "_drive_photo_candidate",
+        lambda account, day, used: {"url": f"https://r2/{day}.jpg",
+                                    "kind": "drive", "day_key": day,
+                                    "asset": asset, "base": "gymx",
+                                    "store": MediaStore()})
+    attempts = []
+
+    def _stamp(*args, **kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise OSError("transient before write")
+
+    monkeypatch.setattr(gym_media_selector, "stamp_use", _stamp)
+    out = gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=_Store(), start=date(2026, 9, 1), days=1,
+        offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is True
+    assert len(attempts) == 2
+
+
+def test_after_insert_stamp_failure_keeps_atomic_claim_in_flight(monkeypatch):
+    from agent import db, gym_media_selector
+    _seed("gymx_ig")
+    asset = make_asset("drive-1", gym_id="gymx")
+
+    class MediaStore:
+        def list_assets(self, _base):
+            return [asset]
+
+    monkeypatch.setattr(
+        gp, "_drive_photo_candidate",
+        lambda account, day, used: {"url": f"https://r2/{day}.jpg",
+                                    "kind": "drive", "day_key": day,
+                                    "asset": asset, "base": "gymx",
+                                    "store": MediaStore()})
+    monkeypatch.setattr(gym_media_selector, "stamp_use",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("stamp down")))
+    out = gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=_Store(), start=date(2026, 9, 1), days=1,
+        offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is False and out["planned"] == 1
+    assert out["operational_hold"] is True and out["claim_ids"]
+    state, _ = db.socialapi_claim(
+        gp._drive_claim_id("gymx", asset), "gymx_gbp")
+    assert state == "in_flight", "durable row must leave a non-reofferable claim"
+
+
+def test_ambiguous_insert_exception_retains_drive_claim(monkeypatch):
+    from agent import db, gym_media_selector
+    _seed("gymx_ig")
+    asset = make_asset("drive-1", gym_id="gymx")
+    monkeypatch.setattr(
+        gp, "_drive_photo_candidate",
+        lambda account, day, used: {"url": f"https://r2/{day}.jpg",
+                                    "kind": "drive", "day_key": day,
+                                    "asset": asset, "base": "gymx",
+                                    "store": FakeMediaStore(assets=[asset])})
+    monkeypatch.setattr(gym_media_selector, "stamp_use",
+                        lambda *a, **k: pytest.fail("ambiguous insert must not stamp"))
+
+    class AmbiguousStore:
+        def insert_rows(self, _key, _rows):
+            raise TimeoutError("response lost after request")
+        def list_month(self, _key, _month):
+            return []  # filtered/non-counted reads are never absence proof
+
+    with pytest.raises(TimeoutError, match="response lost"):
+        gp.plan_gbp_month(
+            "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+            store=AmbiguousStore(), start=date(2026, 9, 1), days=1,
+            offer=None, events=[], caption_fn=_cap)
+    state, _ = db.socialapi_claim(
+        gp._drive_claim_id("gymx", asset), "gymx_gbp")
+    assert state == "in_flight"
+
+
+def test_insert_exception_readback_stamps_visible_row_and_completes_claim(monkeypatch):
+    from agent import db, gym_media_selector
+    _seed("gymx_ig")
+    asset = make_asset("drive-1", gym_id="gymx")
+    stamps = []
+    monkeypatch.setattr(
+        gp, "_drive_photo_candidate",
+        lambda account, day, used: {"url": f"https://r2/{day}.jpg",
+                                    "kind": "drive", "day_key": day,
+                                    "asset": asset, "base": "gymx",
+                                    "store": FakeMediaStore(assets=[asset])})
+    monkeypatch.setattr(gym_media_selector, "stamp_use",
+                        lambda *a, **k: stamps.append(True))
+
+    class LostResponseStore:
+        proposed = []
+        def insert_rows(self, _key, rows):
+            self.proposed = list(rows)
+            raise TimeoutError("response lost after commit")
+        def authoritative_rows_for_keys(self, _key, _proposed):
+            return self.proposed
+
+    out = gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=LostResponseStore(), start=date(2026, 9, 1), days=1,
+        offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is True and out["planned"] == 1
+    assert stamps == [True]
+    state, _ = db.socialapi_claim(
+        gp._drive_claim_id("gymx", asset), "gymx_gbp")
+    assert state == "done"
+
+
+def test_local_gbp_photo_is_once_used_across_planner_runs(monkeypatch, tmp_path):
+    from agent import dam, rotation
+    _seed("gymx_ig")
+    photo = tmp_path / "class.jpg"
+    photo.write_bytes(b"photo")
+    monkeypatch.setattr(gp, "_drive_photo_candidate", lambda *a, **k: None)
+    monkeypatch.setattr(gp, "_cropped_image_url",
+                        lambda account, image, day: f"https://r2/{day}.jpg")
+    first = gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path=str(tmp_path), city="Carmel",
+        store=_Store(), start=date(2026, 9, 1), days=1,
+        offer=None, events=[], caption_fn=_cap)
+    assert first["ok"] is True
+    assert rotation.local_photo_served(
+        dam.rotation_key(str(photo)), "gymx_ig", "2026-09-01") is True
+    second_store = _Store()
+    second = gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path=str(tmp_path), city="Carmel",
+        store=second_store, start=date(2026, 10, 1), days=1,
+        offer=None, events=[], caption_fn=_cap)
+    assert second["ok"] is False and second_store.rows == []
+
+
+def test_failed_local_insert_keeps_reservation_even_when_readback_is_zero(monkeypatch, tmp_path):
+    from agent import dam, rotation
+    _seed("gymx_ig")
+    photo = tmp_path / "class.jpg"
+    photo.write_bytes(b"photo")
+    monkeypatch.setattr(gp, "_drive_photo_candidate", lambda *a, **k: None)
+    monkeypatch.setattr(gp, "_cropped_image_url",
+                        lambda account, image, day: f"https://r2/{day}.jpg")
+
+    class FailedStore:
+        def insert_rows(self, _key, _rows):
+            raise OSError("write failed")
+        def authoritative_rows_for_keys(self, _key, _proposed):
+            return []
+
+    with pytest.raises(OSError, match="write failed"):
+        gp.plan_gbp_month(
+            "gymx", "gymx_ig", voice=_voice(), library_path=str(tmp_path), city="Carmel",
+            store=FailedStore(), start=date(2026, 9, 1), days=1,
+            offer=None, events=[], caption_fn=_cap)
+    assert rotation.local_photo_served(
+        dam.rotation_key(str(photo)), "gymx_ig", "2026-09-01") is True
+
+
+def test_drive_insert_exception_zero_readback_keeps_claim(monkeypatch):
+    from agent import db
+    _seed("gymx_ig")
+    asset = make_asset("drive-1", gym_id="gymx")
+    monkeypatch.setattr(
+        gp, "_drive_photo_candidate",
+        lambda account, day, used: {"url": "https://r2/drive.jpg",
+                                    "kind": "drive", "day_key": day,
+                                    "asset": asset, "base": "gymx",
+                                    "store": FakeMediaStore(assets=[asset])})
+
+    class ZeroReadbackStore:
+        def insert_rows(self, _key, _rows):
+            raise TimeoutError("POST may finish later")
+        def authoritative_rows_for_keys(self, _key, _rows):
+            return []
+
+    with pytest.raises(TimeoutError, match="finish later"):
+        gp.plan_gbp_month(
+            "gymx", "gymx_ig", voice=_voice(), library_path="/x", city="Carmel",
+            store=ZeroReadbackStore(), start=date(2026, 9, 1), days=1,
+            offer=None, events=[], caption_fn=_cap)
+    assert db.socialapi_claim(
+        gp._drive_claim_id("gymx", asset), "gymx_gbp")[0] == "in_flight"
+
+
+def test_local_photo_reservation_has_one_concurrent_winner():
+    from agent import rotation
+    gate = Barrier(2)
+
+    def reserve(lane):
+        gate.wait()
+        return rotation.reserve_local_photo_once(
+            f"gymx_{lane}", "class.jpg", "photo", "2026-09-01")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ids = list(pool.map(reserve, ("gbp", "ig")))
+    assert sum(rid is not None for rid in ids) == 1
+
+
+def test_gbp_and_ig_concurrent_same_byte_local_aliases_have_one_winner(
+        monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from agent import dam, rotation
+
+    _seed("gymx_ig")
+    gbp_photo = tmp_path / "gbp-class.jpg"
+    ig_photo = tmp_path / "ig-class.jpg"
+    gbp_photo.write_bytes(b"same local photo bytes")
+    ig_photo.write_bytes(gbp_photo.read_bytes())
+    assert dam.rotation_key(str(gbp_photo)) != dam.rotation_key(str(ig_photo))
+
+    monkeypatch.setattr(gp, "_drive_photo_candidate", lambda *a, **k: None)
+    monkeypatch.setattr(gp.client_content, "pick_image",
+                        lambda *a, **k: SimpleNamespace(
+                            path=str(gbp_photo), media_type="image"))
+    monkeypatch.setattr(gp, "_cropped_image_url",
+                        lambda *a, **k: "https://r2/gbp-class.jpg")
+    gate = Barrier(2)
+    original_reserve = rotation.reserve_local_photo_once
+
+    def concurrent_reserve(*args, **kwargs):
+        gate.wait(timeout=5)
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(rotation, "reserve_local_photo_once", concurrent_reserve)
+    store = _Store()
+
+    def plan_gbp():
+        return gp.plan_gbp_month(
+            "gymx", "gymx_ig", voice=_voice(), library_path=str(tmp_path),
+            city="Carmel", store=store, start=date(2026, 9, 1), days=1,
+            offer=None, events=[], caption_fn=_cap)
+
+    def reserve_ig():
+        return rotation.reserve_local_photo_once(
+            "gymx_ig", dam.rotation_key(str(ig_photo)), "photo", "2026-09-01",
+            path=str(ig_photo))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        gbp_future = pool.submit(plan_gbp)
+        ig_future = pool.submit(reserve_ig)
+        gbp_result = gbp_future.result()
+        ig_id = ig_future.result()
+
+    assert int(gbp_result["ok"]) + int(ig_id is not None) == 1
+    assert len(store.rows) == int(gbp_result["ok"])
+
+
+@pytest.mark.parametrize("lane", ["ig", "fb", "gbp"])
+def test_local_photo_reservation_respects_prior_gym_lane(lane):
+    from agent import rotation
+    assert rotation.record_served(f"gymx_{lane}", "class.jpg", "photo", "2026-08-01")
+    assert rotation.reserve_local_photo_once(
+        "gymx_gbp", "class.jpg", "photo", "2026-09-01") is None
+    assert rotation.reserve_local_photo_once(
+        "other_gbp", "class.jpg", "photo", "2026-09-01") is not None
 
 
 def test_gate1_offer_skipped_when_not_confirmed():

@@ -11,6 +11,8 @@ and tmp library).
 
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -112,6 +114,26 @@ def test_release_served_deletes_only_its_exact_reservation():
     assert rotation.release_served(second) is True
     entries = rotation.load_served_strict()["gymx_ig"]
     assert len(entries) == 1 and entries[0]["key"] == "shot.jpg"
+
+
+def test_concurrent_video_aliases_have_one_winner(tmp_path):
+    a = tmp_path / "first.mp4"
+    b = tmp_path / "alias.mp4"
+    a.write_bytes(b"same video bytes")
+    b.write_bytes(a.read_bytes())
+    gate = Barrier(2)
+
+    def claim(item):
+        lane, path = item
+        gate.wait()
+        return rotation.reserve_local_media_once(
+            f"gymx_{lane}", path.name, "video", "2026-10-03", path=str(path))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ids = list(pool.map(claim, (("ig", a), ("gbp", b))))
+    assert sum(value is not None for value in ids) == 1
+    assert rotation.reserve_local_media_once(
+        "other_ig", b.name, "video", "2026-10-03", path=str(b))
 
 
 def test_same_day_same_lane_blocked(tmp_path):

@@ -234,7 +234,7 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     def _once_used(c):
         try:
             return rotation.local_photo_served(_rkey(c), account_key, day_key,
-                                               served=served_all)
+                                               served=served_all, path=c.path)
         except Exception:  # noqa: BLE001 - any doubt => treated as consumed
             return True
 
@@ -644,7 +644,7 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
                        s3_client=None, template_fn=None, exclude_keys=(),
                        avoid_openings=(), allow_reuse=False,
                        angle="", avoid_angles=(), record_serve=True,
-                       alerts_enabled=True):
+                       alerts_enabled=True, prefer_photos=False):
     """
     The day's client draft, sourced from the account's approved sources + library.
     Returns None only when the client-sources flag is off, the voice doc is
@@ -674,6 +674,10 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     the needs-media ops alert is suppressed (logged only) and no dedup stamp is
     written, so the real worker's later build still alerts once. Default True keeps
     every existing caller byte-for-byte.
+
+    prefer_photos: when true, pass the planner's photo-first preference to the
+    local media selector. This lets the month planner exhaust eligible local
+    photos before it considers a local video.
 
     EDUCATIONAL pillar (Bryan, AGENT_EDUCATIONAL_PILLAR): when the day's rotated pillar is
     'educational', the source is resolved from the gym's APPROVED educational material
@@ -720,7 +724,7 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     # for non-vision gyms, which keep least-recently-served rotation).
     image = pick_image(account.key, day_key, library_path,
                        exclude_keys=exclude_keys, pillar=category,
-                       allow_reuse=allow_reuse)
+                       allow_reuse=allow_reuse, prefer_photos=prefer_photos)
     if image is not None:
         # §3.5 CROP-VERIFY (vision gyms): re-check the SHIPPED pixels (IG/FB = the original,
         # ruling 4) before drafting, so the caption may lean only on details that survived.
@@ -766,8 +770,11 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         # photo drifted into its reuse window and pick_image returned None -> "caption ready,
         # no image" -> nothing published (TopFuel/GritX, 2026-08-25).
         if record_serve:
-            if not rotation.record_served(
-                    account.key, dam.rotation_key(image.path), category, day_key):
+            reserve = (rotation.reserve_local_photo_once
+                       if getattr(image, "media_type", "") != "video"
+                       else rotation.reserve_local_media_once)
+            if reserve(account.key, dam.rotation_key(image.path),
+                       category, day_key, path=image.path) is None:
                 print(f"[client-content] served ledger write failed for {account.key} "
                       f"on {day_key}; refusing the local draft")
                 return None

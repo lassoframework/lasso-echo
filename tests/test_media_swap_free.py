@@ -14,6 +14,8 @@ injected, no hosting, no network, no library on disk.
 
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -418,26 +420,27 @@ def test_candidates_are_least_recently_used_first_not_alphabetical():
              _cand("m_never_used.jpg"),
              _cand("z_used_last_month.jpg", last_used="2026-08-10")]
     ordered = msw.order_candidates(cands, current_is_video=True)   # no video pref
-    assert [c["key"] for c in ordered] == [
-        "m_never_used.jpg", "z_used_last_month.jpg", "a_used_yesterday.jpg"]
+    assert [c["key"] for c in ordered] == ["m_never_used.jpg"]
 
 
-def test_a_still_swaps_to_ready_footage_first_then_photos_then_unrenditioned_video():
-    """Audit R-D1 #4: the swap runs inside a portal request, so the order is
-    never-used video WITH a rendition (ready to serve) > never-used photo >
-    never-used video WITHOUT a rendition (would need a transcode) > anything used
-    (LRU). A gym with ready footage is handed footage, never a tenth still; a gym
-    whose footage is all unrenditioned gets a fresh photo before it waits on ffmpeg."""
+def test_drive_photo_precedes_local_photo_and_both_precede_video():
+    """Prefer connected Drive photos, then local photos, then video footage.
+
+    Once photos are depleted, ready footage precedes video requiring a transcode;
+    used media is never returned.
+    """
     ready = _cand("clipA.mp4", kind="video", source="drive")
     ready["asset"]["rendition_url"] = "https://cdn/clipA.mp4"
     raw = _cand("clipR.mov", kind="video", source="drive")            # no rendition yet
     used = _cand("clipB.mp4", kind="video", source="drive", last_used="2026-06-01")
     used["asset"]["rendition_url"] = "https://cdn/clipB.mp4"
     local_vid = _cand("gym.mp4", kind="video", source="local")         # served as-is
-    cands = [_cand("a_photo.jpg"), used, raw, ready, local_vid]
+    drive_photo = _cand("z_drive.jpg", source="drive")
+    local_photo = _cand("a_generic.jpg", source="local")
+    cands = [local_photo, used, raw, local_vid, drive_photo, ready]
     ordered = msw.order_candidates(cands, current_is_video=False)
     assert [c["key"] for c in ordered] == [
-        "clipA.mp4", "gym.mp4", "a_photo.jpg", "clipR.mov", "clipB.mp4"]
+        "z_drive.jpg", "a_generic.jpg", "clipA.mp4", "gym.mp4", "clipR.mov"]
     assert msw.has_rendition(ready) and msw.has_rendition(local_vid)
     assert not msw.has_rendition(raw) and not msw.has_rendition(_cand("a_photo.jpg"))
 
@@ -445,7 +448,7 @@ def test_a_still_swaps_to_ready_footage_first_then_photos_then_unrenditioned_vid
 def test_no_videos_means_photos_still_swap():
     cands = [_cand("b.jpg", last_used="2026-09-01"), _cand("a.jpg")]
     assert [c["key"] for c in msw.order_candidates(cands, current_is_video=False)] \
-        == ["a.jpg", "b.jpg"]
+        == ["a.jpg"]
 
 
 def test_local_candidates_skip_any_previously_served_photo(tmp_path,
@@ -477,6 +480,22 @@ def test_drive_candidates_come_from_the_pickable_pool_minus_the_book():
     cands = msw.drive_candidates("zanshin", {"v2"}, media_store=store)
     assert [c["key"] for c in cands] == ["v1"]
     assert cands[0]["kind"] == "video" and cands[0]["source"] == "drive"
+
+
+def test_drive_cooldown_fallback_never_returns_previously_used_assets():
+    from datetime import datetime, timedelta, timezone
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    now = datetime(2026, 9, 28, tzinfo=timezone.utc)
+    store = FakeMediaStore(assets=[
+        make_asset("old-count", gym_id="zanshin", kind="photo", used_count=1,
+                   last_used_at=(now - timedelta(days=150)).isoformat()),
+        make_asset("old-date", gym_id="zanshin", kind="photo", used_count=0,
+                   last_used_at=(now - timedelta(days=150)).isoformat()),
+    ])
+
+    assert msw.drive_candidates("zanshin", set(), media_store=store, now=now) == []
+    assert msw.drive_candidates("zanshin", set(), media_store=store, now=now,
+                                allow_cooling=True) == []
 
 
 def test_swift_river_swap_does_not_reuse_previously_staged_drive_media():
@@ -592,6 +611,108 @@ def test_after_swap_stamps_the_new_drive_asset_and_settles_the_old_one(monkeypat
     assert _sel.pickable("zanshin", store=store, now=now) == []
 
 
+def test_drive_swap_stamp_failure_holds_before_calendar_write(monkeypatch):
+    from agent import gym_media_index, gym_media_selector
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    store = FakeMediaStore(assets=[make_asset("new_v", gym_id="zanshin")])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    monkeypatch.setattr(gym_media_selector, "stamp_use",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("stamp down")))
+    pick = {"source": "drive", "source_media_asset_id": "new_v"}
+    assert msw.reserve_local_pick(
+        "zanshin", {"post_date": "2026-09-20"}, pick) is False
+    assert not pick.get("_drive_stamped")
+
+
+def test_prewrite_drive_swap_stamp_restores_on_definite_write_failure(monkeypatch,
+                                                                      tmp_path):
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    from agent import gym_media_index
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    store = FakeMediaStore(assets=[make_asset("new_v", gym_id="zanshin")])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    pick = {"source": "drive", "source_media_asset_id": "new_v"}
+    assert msw.reserve_local_pick(
+        "zanshin", {"post_date": "2026-09-20"}, pick) is True
+    assert store.assets["new_v"]["used_count"] == 1
+    assert msw.release_local_pick(pick) is True
+    assert store.assets["new_v"]["used_count"] == 0
+    from agent import db, gym_media_selector
+    claim_id = gym_media_selector.drive_content_claim_id("zanshin", store.get_asset("new_v"))
+    assert db.socialapi_claim(claim_id, "zanshin_gbp")[0] == "won"
+
+
+def test_prewrite_drive_swap_stamp_is_not_repeated_after_row_lands(monkeypatch,
+                                                                   tmp_path):
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    from agent import gym_media_index
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    store = FakeMediaStore(assets=[make_asset("new_v", gym_id="zanshin")])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    row = {"post_date": "2026-09-20", "source_media_asset_id": ""}
+    pick = {"source": "drive", "source_media_asset_id": "new_v"}
+    assert msw.reserve_local_pick("zanshin", row, pick) is True
+    assert store.assets["new_v"]["used_count"] == 1
+    msw.after_swap("zanshin", row, pick, media_store=store, book_rows=[])
+    assert store.assets["new_v"]["used_count"] == 1
+
+    from agent import db, gym_media_selector
+    claim_id = gym_media_selector.drive_content_claim_id("zanshin", store.get_asset("new_v"))
+    assert db.socialapi_claim(claim_id, "zanshin_gbp")[0] == "done"
+
+
+def test_drive_swap_has_one_concurrent_claim_winner(monkeypatch):
+    from agent import gym_media_index
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    store = FakeMediaStore(assets=[make_asset("new_v", gym_id="zanshin")])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    gate = Barrier(2)
+
+    def reserve(_):
+        pick = {"source": "drive", "source_media_asset_id": "new_v"}
+        gate.wait()
+        return msw.reserve_local_pick(
+            "zanshin", {"post_date": "2026-09-20"}, pick), pick
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, range(2)))
+    assert sum(won for won, _ in results) == 1
+    assert store.assets["new_v"]["used_count"] == 1
+
+
+def test_drive_swap_respects_existing_gbp_claim(monkeypatch):
+    from agent import db, gym_media_index, gym_media_selector
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    store = FakeMediaStore(assets=[make_asset("new_v", gym_id="zanshin")])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    claim_id = gym_media_selector.drive_asset_claim_id("zanshin", "new_v")
+    assert db.socialapi_claim(claim_id, "zanshin_gbp")[0] == "won"
+    pick = {"source": "drive", "source_media_asset_id": "new_v"}
+    assert msw.reserve_local_pick(
+        "zanshin", {"post_date": "2026-09-20"}, pick) is False
+    assert store.assets["new_v"]["used_count"] == 0
+
+
+def test_drive_swap_unknown_write_retains_claim(monkeypatch):
+    from agent import db, gym_media_index, gym_media_selector
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    media_store = FakeMediaStore(assets=[make_asset("new_v", gym_id="zanshin")])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: media_store)
+    calendar = _Store([_row("p1")])
+    calendar.swap_media = lambda *a, **k: (_ for _ in ()).throw(
+        TimeoutError("response lost"))
+    pick = {"ok": True, "source": "drive", "source_media_asset_id": "new_v",
+            "image_url": "https://cdn/new.jpg", "siblings": {}}
+    status, _ = ps.handle_swap_media(
+        "zanshin", "p1", "u1", sb_store=calendar,
+        picker=lambda *a, **k: pick)
+    assert status == 500
+    claim_id = gym_media_selector.drive_content_claim_id(
+        "zanshin", media_store.get_asset("new_v"))
+    assert db.socialapi_claim(claim_id, "zanshin_gbp")[0] == "in_flight"
+
+
 # ---- audit 3c: the FB mirror + paired story move WITH the clicked row -------------
 
 def _sib_rows():
@@ -660,6 +781,7 @@ def test_the_handler_swaps_pending_siblings_and_leaves_approved_ones(monkeypatch
     settled = {}
     monkeypatch.setattr(msw, "after_swap",
                         lambda base, row, pick, **kw: settled.update(kw))
+    monkeypatch.setattr(msw, "reserve_local_pick", lambda *a, **k: True)
 
     def _picker(_gym, _row, siblings=(), **_kw):
         var = {"ok": True, "image_url": "https://cdn/squat.mp4", "source_media_url": None,

@@ -48,6 +48,43 @@ def test_photo_stages_pending(monkeypatch, tmp_path):
     assert store.assets["p1"]["used_count"] == 1
 
 
+def test_builder_loses_claim_race_after_select(monkeypatch, tmp_path):
+    from agent import db, gym_media_selector
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    _wire(monkeypatch)
+    store = FakeMediaStore(assets=[make_asset("p1", gym_id="pierce", kind="photo")])
+    drive = FakeDrive(blobs={"p1": b"jpgbytes"})
+    original = db.socialapi_claim
+
+    def concurrent_gbp_claim(claim_id, account_key):
+        original(claim_id, account_key)
+        return original(claim_id, account_key)
+
+    monkeypatch.setattr(db, "socialapi_claim", concurrent_gbp_claim)
+    draft = builder.build_gym_media_draft(
+        _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
+        store=store, drive=drive, library_dir=str(tmp_path))
+    assert draft is None
+    assert store.assets["p1"]["used_count"] == 0
+    assert gym_media_selector.pickable("pierce", store=store) == []
+
+
+def test_usage_stamp_failure_holds_before_returning_a_durable_draft(monkeypatch,
+                                                                    tmp_path):
+    _wire(monkeypatch)
+    store = FakeMediaStore(assets=[make_asset("p1", gym_id="pierce", kind="photo")])
+    drive = FakeDrive(blobs={"p1": b"jpgbytes"})
+    alerts = []
+    monkeypatch.setattr("agent.gym_media_selector.stamp_use",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("stamp down")))
+    monkeypatch.setattr(builder, "_vision_alert", lambda msg: alerts.append(msg))
+    draft = builder.build_gym_media_draft(
+        _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
+        store=store, drive=drive, library_dir=str(tmp_path))
+    assert draft is None
+    assert alerts and "held" in alerts[0]
+
+
 def test_heic_photo_stages_via_rendition(monkeypatch, tmp_path):
     _wire(monkeypatch)
     monkeypatch.setattr("agent.gym_media_index.heic_to_jpeg",

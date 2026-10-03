@@ -144,6 +144,36 @@ def base_gym_key(account_key):
     return base
 
 
+def drive_asset_claim_id(gym_id, asset_id):
+    """Legacy asset-ID claim key, retained for outstanding reservations."""
+    return f"gbp_media:{base_gym_key(gym_id)}:{asset_id}"
+
+
+def drive_content_claim_id(gym_id, asset):
+    """Shared atomic reservation key for one gym's verified Drive bytes."""
+    digest = _byte_hash(asset)
+    if not digest or not is_usable(asset) or str(asset.get("gym_id")) != base_gym_key(gym_id):
+        raise ValueError("Drive asset has no verified content hash")
+    return f"gbp_media:{base_gym_key(gym_id)}:hash:{digest}"
+
+
+def claim_drive_content(gym_id, asset, store):
+    """Honor old ID claims, then atomically reserve the canonical byte key."""
+    from . import db
+    base = base_gym_key(gym_id)
+    claim_id = drive_content_claim_id(base, asset)
+    rows = store.list_assets(base)
+    current = next((row for row in rows if str(row.get("id")) == str(asset["id"])
+                    and str(row.get("gym_id")) == base), None)
+    if current is None or _byte_hash(current) != _byte_hash(asset) or not is_usable(current):
+        raise ValueError("Drive asset changed before claim")
+    claimed = db.drive_asset_claimed_ids(base)
+    if _byte_hash(asset) in _claimed_hashes(rows, claimed, base):
+        return None
+    state, _ = db.socialapi_claim(claim_id, f"{base}_gbp")
+    return claim_id if state == "won" else None
+
+
 def _has_prior_use(asset):
     """Fail closed on inconsistent use counters and preserve timestamp evidence."""
     try:
@@ -158,14 +188,35 @@ def _byte_hash(asset):
     return value if re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{64})", value) else ""
 
 
-def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=()):
+def _claimed_hashes(assets, claimed_ids, base):
+    """Return claimed byte hashes, or fail closed on missing claim metadata."""
+    canonical = {token[5:] for token in claimed_ids if token.startswith("hash:")}
+    if any(not re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{64})", h)
+           for h in canonical):
+        raise ValueError("canonical claim hash unreadable")
+    claimed_ids = {token for token in claimed_ids if not token.startswith("hash:")}
+    claimed = {str(asset.get("id")): asset for asset in assets
+               if str(asset.get("gym_id") or "") == base
+               and str(asset.get("id")) in claimed_ids}
+    if set(claimed) != claimed_ids:
+        raise ValueError("claimed asset row missing")
+    hashes = {_byte_hash(asset) for asset in claimed.values()}
+    if "" in hashes:
+        raise ValueError("claimed asset hash unreadable")
+    return hashes | canonical
+
+
+def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=(),
+             strict_claims=False):
     """Every asset pick_media could hand out RIGHT NOW for this gym, in pick order
     (used_count ASC, last_used_at ASC NULLS FIRST, id tiebreak). [] when the pool is
     empty, the store is down, or the read fails. NEVER alerts: this is the read the
     planner, the Lane-A repeat gate and the portal swap use to ask "could the Drive
     pool fill this slot?" -- only pick_media (the actual pick) owns the pool-empty
     alert. Same eligibility + cooldown + this-month rules as pick_media, ONE
-    implementation (pick_media is `pickable(...)[0]`)."""
+    implementation (pick_media is `pickable(...)[0]`). With strict_claims=True,
+    claim read and legacy hash mapping errors propagate to callers that must
+    distinguish uncertainty from a proven empty pool."""
     base = base_gym_key(gym_id)
     store = store or _idx.default_store()
     if not store.available():
@@ -176,6 +227,15 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
     except Exception as e:  # noqa: BLE001 - a read failure is an empty pick, not a crash
         print(f"[gym-media-selector] asset read failed for {base}: "
               f"{type(e).__name__}: {e}")
+        return []
+    try:
+        from . import db
+        claimed_ids = db.drive_asset_claimed_ids(base)
+        claimed_hashes = _claimed_hashes(assets, claimed_ids, base)
+    except Exception as e:  # noqa: BLE001 - unknown claims close the pool
+        if strict_claims:
+            raise
+        print(f"[gym-media-selector] claim read failed for {base}: {type(e).__name__}")
         return []
 
     cutoff = now - timedelta(days=REUSE_COOLDOWN_DAYS)
@@ -201,6 +261,9 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
         if not is_usable(a):
             continue
         if str(a.get("id")) in excl:
+            continue
+        if (str(a.get("id")) in claimed_ids
+                or (_byte_hash(a) and _byte_hash(a) in claimed_hashes)):
             continue
         if kind_preference and a.get("kind") != kind_preference:
             continue
@@ -252,6 +315,13 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
         print(f"[gym-media-selector] fallback asset read failed for {base}: "
               f"{type(e).__name__}: {e}")
         return []
+    try:
+        from . import db
+        claimed_ids = db.drive_asset_claimed_ids(base)
+        claimed_hashes = _claimed_hashes(assets, claimed_ids, base)
+    except Exception as e:  # noqa: BLE001 - unknown claims close the fallback
+        print(f"[gym-media-selector] claim read failed for {base}: {type(e).__name__}")
+        return []
     excl = {str(i) for i in (exclude_ids or ()) if i}
     used_hashes = {_byte_hash(a)
                    for a in assets if str(a.get("gym_id") or "") == base
@@ -265,6 +335,9 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
         if _has_prior_use(asset) or (_byte_hash(asset) and _byte_hash(asset) in used_hashes):
             continue
         if not is_usable(asset) or str(asset.get("id")) in excl:
+            continue
+        if (str(asset.get("id")) in claimed_ids
+                or (_byte_hash(asset) and _byte_hash(asset) in claimed_hashes)):
             continue
         if kind_preference and asset.get("kind") != kind_preference:
             continue

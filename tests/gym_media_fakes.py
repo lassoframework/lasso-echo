@@ -1,6 +1,7 @@
 """Shared offline fakes for the gym_media_drive tests (never any network)."""
 import os
 import sys
+import hashlib
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -236,9 +237,11 @@ def video(fid, title="clip.mp4", parent="root", size=50_000_000,
 def make_asset(fid="a1", gym_id="pierce", source_id="src1", kind="photo",
                title="team.jpg", size=2_000_000, eligible=True,
                excluded_by_coach=False, used_count=0, last_used_at=None,
-               content_hash="h1", reject=None, mime="image/jpeg"):
+               content_hash=None, reject=None, mime="image/jpeg"):
     # Historical selector/planner fixtures represent media ready for use. New
     # quarantine tests explicitly override these fields to pending/unknown.
+    if content_hash is None:
+        content_hash = hashlib.sha256(fid.encode("utf-8")).hexdigest()
     return {"id": fid, "source_id": source_id, "gym_id": gym_id, "kind": kind,
             "title": title, "mime_type": mime, "size_bytes": size,
             "content_hash": content_hash, "duration_sec": None, "width": 1080,
@@ -266,3 +269,20 @@ def make_source(sid="src1", gym_id="pierce", folder_id="fold1", active=True,
             "owner_email": "owner@piercewellness.com", "sync_mode": "all",
             "active": active, "revoked_externally": revoked, "connected_by": "u1",
             "connected_at": "2026-08-20T00:00:00Z"}
+
+
+class SyncedEmptyDriveIndex:
+    """A Drive index that PROVES depletion under the 733da2b contract: one active
+    gym_drive source whose sync finished successfully, and zero indexed assets.
+    Fixtures for a gym with no usable real media stub default_store with this."""
+
+    def available(self):
+        return True
+
+    def list_sources(self, _base):
+        return [{"kind": "gym_drive", "active": True,
+                 "revoked_externally": False, "sync_status": "ready",
+                 "sync_finished_at": "2026-10-02T00:00:00Z"}]
+
+    def list_assets(self, _base):
+        return []

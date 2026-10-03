@@ -30,6 +30,24 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_NO_MEDIA_ASTRA_SEED", "true")
     monkeypatch.setenv("AGENT_GYM_DEEP_BRAIN", "true")
     monkeypatch.setenv("AGENT_NANO_ENABLED", "true")
+    # 733da2b: depletion may only be inferred from an indexed Drive source that
+    # finished a successful sync and indexed zero assets. These gyms have no
+    # Drive media at all, so the fixture proves exactly that.
+    from agent import gym_media_index
+
+    class EmptyDriveIndex:
+        def available(self):
+            return True
+
+        def list_sources(self, _base):
+            return [{"kind": "gym_drive", "active": True,
+                     "revoked_externally": False, "sync_status": "ready",
+                     "sync_finished_at": "2026-10-02T00:00:00Z"}]
+
+        def list_assets(self, _base):
+            return []
+
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: EmptyDriveIndex())
 
 
 def _acct():

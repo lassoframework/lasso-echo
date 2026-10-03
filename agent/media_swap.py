@@ -141,6 +141,9 @@ def _last_served_local(base_key):
             k, d = e.get("key"), str(e.get("date") or "")
             if k and d > out.get(k, ""):
                 out[k] = d
+            digest = e.get("content_hash") or ""
+            if digest and d > out.get(f"sha256:{digest}", ""):
+                out[f"sha256:{digest}"] = d
     return out
 
 
@@ -228,7 +231,11 @@ def local_candidates(base_key, lib, post_date, blocked_keys, *, allow_recent=Fal
             rk = dam.rotation_key(path)
         except Exception:  # noqa: BLE001
             rk = key
-        last = served.get(rk, "")
+        try:
+            digest = rotation.local_content_hash(path)
+        except OSError:
+            continue
+        last = served.get(rk, "") or served.get(f"sha256:{digest}", "")
         if last:
             continue                      # once served, never offer again
         out.append({"source": "local", "kind": kind, "key": key, "path": path,
@@ -253,12 +260,21 @@ def drive_candidates(base_key, blocked_ids, *, media_store=None, now=None,
     out = []
     for a in assets:
         kind = str(a.get("kind") or "")
-        if kind not in ("photo", "video"):
+        asset_id = a.get("id")
+        if (kind not in ("photo", "video") or not isinstance(asset_id, str)
+                or not asset_id.strip()):
             continue
-        out.append({"source": "drive", "kind": kind, "key": str(a.get("id")),
-                    "asset": a, "last_used": str(a.get("last_used_at") or "")[:10],
-                    "used_count": int(a.get("used_count") or 0),
-                    "name": str(a.get("title") or a.get("id") or "")})
+        # Cooldown fallback is for locating genuinely unused assets missed by a
+        # selector freshness read. It must never recycle a Drive asset whose
+        # persistent use counters say it has already been staged.
+        used_count = a.get("used_count")
+        last_used_at = a.get("last_used_at")
+        if (isinstance(used_count, bool) or not isinstance(used_count, int)
+                or used_count != 0 or last_used_at not in (None, "")):
+            continue
+        out.append({"source": "drive", "kind": kind, "key": asset_id,
+                    "asset": a, "last_used": "", "used_count": 0,
+                    "name": str(a.get("title") or asset_id)})
     return out
 
 
@@ -274,23 +290,32 @@ def has_rendition(cand):
 
 
 def _tier(cand):
-    """Audit R-D1 #4 ordering for the portal swap, which runs INSIDE an HTTP request:
-    0 never-used video WITH a rendition, 1 never-used photo, 2 never-used video
-    without a rendition (may need a transcode), 3 anything already used (LRU below)."""
-    used = bool(cand.get("last_used"))
-    if used:
-        return 3
+    """Drive photos first, local photos second, then usable videos.
+
+    Ready videos precede videos needing a transcode. Used media is excluded by
+    ``order_candidates`` and cannot be a last-resort candidate.
+    """
+    if cand.get("kind") == "photo":
+        return 0 if cand.get("source") == "drive" else 1
     if cand.get("kind") == "video":
-        return 0 if has_rendition(cand) else 2
-    return 1
+        return 2 if has_rendition(cand) else 3
+    return 4
+
+
+def _never_used_candidate(cand):
+    """Require explicit unused metadata before a swap candidate can be returned."""
+    count = (cand or {}).get("used_count")
+    last = (cand or {}).get("last_used")
+    return (isinstance(count, int) and not isinstance(count, bool) and count == 0
+            and isinstance(last, str) and not last.strip()
+            and (cand or {}).get("source") in ("drive", "local")
+            and (cand or {}).get("kind") in ("photo", "video"))
 
 
 def order_candidates(cands, *, current_is_video=False):
-    """Tier first (see _tier), then least recently used, then least used, then name.
-    A still therefore swaps to fresh footage whenever a ready-to-serve video exists,
-    but never waits on a transcode when a fresh photo is available."""
+    """Tier first (see _tier), then least recently used, then least used, then name."""
     del current_is_video   # kept for callers; the tier order supersedes the filter
-    cands = list(cands or [])
+    cands = [cand for cand in (cands or []) if _never_used_candidate(cand)]
     cands.sort(key=lambda c: (_tier(c), c.get("last_used") or "",
                               int(c.get("used_count") or 0), str(c.get("name") or "")))
     return cands
@@ -769,7 +794,8 @@ def after_swap(base_key, row, pick, *, media_store=None, now=None, book_rows=Non
             _log(f"{base_key}: asset {old} "
                  + ("book unreadable" if book_rows is None
                     else f"still carried by a sibling row on {pd}") + "; left stamped")
-        if new and (pick or {}).get("source") == "drive":
+        if (new and (pick or {}).get("source") == "drive"
+                and not (pick or {}).get("_drive_stamped")):
             store = media_store
             if store is None:
                 from . import gym_media_index as _idx
@@ -778,33 +804,78 @@ def after_swap(base_key, row, pick, *, media_store=None, now=None, book_rows=Non
             _sel.stamp_use(asset, base_key, pd, store=store, now=now)
     except Exception as exc:  # noqa: BLE001
         _log(f"{base_key}: Drive usage ledger not settled ({type(exc).__name__})")
+    # The row write is confirmed by the caller. The prewrite claim remains
+    # protective if this receipt fails; no retry can re-offer the same asset.
+    if (pick or {}).get("_drive_stamped") and (pick or {}).get("_drive_claim_id"):
+        try:
+            from . import db
+            db.socialapi_claim_done(
+                pick["_drive_claim_id"], pick["_drive_claim_account"],
+                str(pick["source_media_asset_id"]))
+        except Exception as exc:  # noqa: BLE001
+            _log(f"{base_key}: Drive swap claim receipt failed ({type(exc).__name__})")
     if ((pick or {}).get("source") == "local" and (pick or {}).get("path")
             and not (pick or {}).get("_served_reserved")):
         try:
             from . import dam, rotation
-            rotation.record_served(f"{base_key}_ig", dam.rotation_key(pick["path"]),
-                                   "", pd)
+            # Compatibility callers reaching post-write settlement without the
+            # prewrite reservation cannot create a duplicate served entry.
+            reserve = (rotation.reserve_local_media_once if pick.get("kind") == "video"
+                       else rotation.reserve_local_photo_once)
+            if reserve(f"{base_key}_ig", dam.rotation_key(pick["path"]),
+                       "", pd, path=pick["path"]) is None:
+                _log(f"{base_key}: local swap had no prewrite reservation; "
+                     "served ledger held or already consumed")
         except Exception:  # noqa: BLE001
             pass
 
 
 def reserve_local_pick(base_key, row, pick):
-    """Durably reserve a local swap candidate before any calendar row is changed.
+    """Durably reserve a swap candidate before any calendar row is changed.
 
-    This is the process-local fail-closed boundary. It cannot provide a global
-    cross-service guarantee without the atomic SQL primitive, but a failed ledger
-    write can no longer be followed by a successful row swap in this process.
+    Drive claims use a SQLite unique key across planners and swaps. A failed
+    claim or usage stamp holds the write; the claim survives ambiguous outcomes.
     """
-    if (pick or {}).get("source") != "local":
+    source = (pick or {}).get("source")
+    day = str((row or {}).get("post_date") or "")[:10]
+    if source == "drive":
+        asset_id = str((pick or {}).get("source_media_asset_id") or "")
+        if not asset_id or not day:
+            return False
+        try:
+            from . import db, gym_media_index as _idx, gym_media_selector as _sel
+            base = _sel.base_gym_key(base_key)
+            store = _idx.default_store()
+            asset = store.get_asset(asset_id)
+            if asset is None:
+                return False
+            claim_id = _sel.claim_drive_content(base, asset, store)
+            if claim_id is None:
+                return False
+            claim_account = f"{base}_gbp"
+            pick["_drive_claim_id"] = claim_id
+            pick["_drive_claim_account"] = claim_account
+            _sel.stamp_use(asset, base_key, day, store=store)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"{base_key}: Drive swap usage stamp failed before row write "
+                 f"({type(exc).__name__}); swap held")
+            return False
+        pick["_drive_stamped"] = True
+        pick["_drive_stamp_store"] = store
+        pick["_drive_stamp_day"] = day
+        pick["_drive_stamp_base"] = base_key
+        return True
+    if source != "local":
         return True
     path = str((pick or {}).get("path") or "")
-    day = str((row or {}).get("post_date") or "")[:10]
     if not path or not day:
         return False
     try:
         from . import dam, rotation
-        reservation_id = rotation.reserve_served(
-            f"{base_key}_ig", dam.rotation_key(path), "", day)
+        reserve = (rotation.reserve_local_media_once if pick.get("kind") == "video"
+                   else rotation.reserve_local_photo_once)
+        reservation_id = reserve(
+            f"{base_key}_ig", dam.rotation_key(path), "", day, path=path)
     except Exception:  # noqa: BLE001
         reservation_id = None
     if reservation_id:
@@ -814,7 +885,29 @@ def reserve_local_pick(base_key, row, pick):
 
 
 def release_local_pick(pick):
-    """Release an exact local reservation only when no calendar row exposed it."""
+    """Release an exact reservation only when no calendar row exposed it."""
+    if (pick or {}).get("_drive_stamped"):
+        try:
+            from . import gym_media_selector as _sel
+            released = _sel.rollback_use(
+                pick.get("_drive_stamp_base"), pick.get("_drive_stamp_day"),
+                store=pick.get("_drive_stamp_store"),
+                asset_id=pick.get("source_media_asset_id"),
+                restore_unstaged=True)
+        except Exception:  # noqa: BLE001
+            return False
+        if released:
+            from . import db
+            claim_id = pick.get("_drive_claim_id")
+            if claim_id:
+                db.socialapi_claim_release(claim_id, pick["_drive_claim_account"])
+                pick.pop("_drive_claim_id", None)
+                pick.pop("_drive_claim_account", None)
+            pick.pop("_drive_stamped", None)
+            pick.pop("_drive_stamp_store", None)
+            pick.pop("_drive_stamp_day", None)
+            pick.pop("_drive_stamp_base", None)
+        return released
     reservation_id = (pick or {}).get("_served_reservation_id")
     if not reservation_id:
         return (pick or {}).get("source") != "local"

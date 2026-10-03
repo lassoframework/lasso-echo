@@ -89,16 +89,40 @@ def real_media_depleted(base, *, now=None):
     except Exception:
         return False
 
-    if not (config.gym_drive_stage_enabled()
-            and config.gym_drive_connect_active_for(base)):
-        return not local
+    # The indexed Drive inventory is authoritative even when the staging lane is
+    # currently disabled.  A disabled writer must not make approved client media
+    # look absent and unlock the infographic fallback.  If the index is
+    # unavailable or unreadable, return False below (fail closed).
     try:
         from . import gym_media_index, gym_media_selector
         media_store = gym_media_index.default_store()
         if not media_store.available():
             return False
-        # pickable() intentionally converts store errors to [] for planning.
-        # For a client depletion notice, distinguish a failed read from empty.
+        list_sources = getattr(media_store, "list_sources", None)
+        if not callable(list_sources):
+            return False
+        sources = list_sources(base) or []
+        # A successful authoritative source read with no Drive rows means this
+        # gym has never connected Drive. There is no remote supply to wait for,
+        # so an empty local library may use the verified-palette Astra fallback.
+        # Exceptions still land in the outer fail-closed handler below.
+        drive_sources = [s for s in sources
+                         if str(s.get("kind") or "") == "gym_drive"]
+        if not drive_sources:
+            if config.gym_drive_connect_active_for(base):
+                return False
+            return not local
+        ready = [s for s in drive_sources
+                 if s.get("active") is not False
+                 and not s.get("revoked_externally")
+                 and str(s.get("sync_status") or "").lower() == "ready"
+                 and s.get("sync_finished_at")]
+        # An empty asset response is meaningful only after a successful sync.
+        # Without that proof, an empty/stale DB must never unlock Astra fallback.
+        if not ready:
+            return False
+        # The selector normally converts claim errors to [] for planning; this
+        # gate requests strict claim reads before interpreting [] as depletion.
         assets = media_store.list_assets(base)
         # An indexed client photo awaiting the normal hash-bound moderation is
         # supply waiting for Echo, not evidence that the gym has no photos.
@@ -117,7 +141,27 @@ def real_media_depleted(base, *, now=None):
                 return True
             def list_assets(self, gym):
                 return assets
-        drive = gym_media_selector.pickable(base, store=Snapshot(), now=now)
+        # pickable() expects a timezone-aware datetime (its `_now_utc` passes a
+        # truthy `now` through untouched). Callers hand us ISO strings, so parse
+        # first -- a TypeError here would be swallowed below as "inventory
+        # uncertain" and the lane would hold forever.
+        parsed_now = now
+        from datetime import date as _date, datetime as _dt, timezone as _tz
+        if isinstance(parsed_now, _date) and not isinstance(parsed_now, _dt):
+            # no_media_astra_seed hands a plain date; pickable's cooldown math
+            # compares against tz-aware datetimes.
+            parsed_now = _dt(parsed_now.year, parsed_now.month, parsed_now.day,
+                             tzinfo=_tz.utc)
+        elif isinstance(parsed_now, str):
+            try:
+                parsed_now = _dt.fromisoformat(parsed_now.replace("Z", "+00:00"))
+            except ValueError:
+                parsed_now = None
+            if (parsed_now is not None
+                    and parsed_now.tzinfo is None):
+                parsed_now = parsed_now.replace(tzinfo=_tz.utc)
+        drive = gym_media_selector.pickable(
+            base, store=Snapshot(), now=parsed_now, strict_claims=True)
         from .media_bridge import observe_drive_inventory
         observe_drive_inventory(base, [a.get("id") for a in drive])
         return not local and not drive
