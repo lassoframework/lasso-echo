@@ -32,9 +32,21 @@ def default_writer():
     if not enabled():
         return None
     if not (os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_DSN")
-            and os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_ROLE")):
+            and os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_ROLE")
+            and os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_ROLE") != "service_role"):
         return None
     return produce
+
+
+def default_same_object_writer():
+    """The same-object producer, armed by exactly the same owner boundary."""
+    if not enabled():
+        return None
+    if not (os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_DSN")
+            and os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_ROLE")
+            and os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_ROLE") != "service_role"):
+        return None
+    return produce_same_object
 
 
 def _md5(data):
@@ -160,3 +172,80 @@ def produce(*, tenant, group_key, source_bytes, delivered_bytes, render_evidence
     return {"source_read_receipt": str(source_receipt),
             "delivered_read_receipt": str(delivered_receipt),
             "render_receipt": str(render_receipt)}
+
+
+def _validate_same_object(tenant, group_key, exact_bytes, evidence, asset_id):
+    """One exact object serving as BOTH source and delivered evidence.
+
+    The draft SQL (visual_global_prepare_source_rendition) accepts the same exact
+    URL for both roles with a NULL render receipt -- there is no render operation
+    for an object that was never transformed, and this producer must never invent
+    one. Evidence carrying a render operation is rejected outright."""
+    try:
+        tenant = str(uuid.UUID(str(tenant)))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise OwnerReceiptError("canonical tenant is invalid") from exc
+    if not isinstance(group_key, str) or not _GROUP.fullmatch(group_key):
+        raise OwnerReceiptError("visual group is invalid")
+    if not isinstance(exact_bytes, bytes) or not exact_bytes:
+        raise OwnerReceiptError("an exact byte observation is required")
+    from . import visual_writer_prepare as prepare
+    if len(exact_bytes) > prepare.MAX_VISUAL_BYTES:
+        raise OwnerReceiptError("exact byte observation exceeds the limit")
+    if not isinstance(evidence, dict):
+        raise OwnerReceiptError("same-object evidence is required")
+    if any(evidence.get(key) is not None for key in
+           ("operation", "rendered_by", "render_receipt")):
+        raise OwnerReceiptError("a same-object receipt never carries a render operation")
+    exact_url = _text(evidence.get("exact_url"), "exact URL")
+    if not prepare._own_media_url(exact_url):
+        raise OwnerReceiptError("receipt URL must use the configured media host")
+    fingerprint = _md5(exact_bytes)
+    if (evidence.get("fingerprint") != fingerprint
+            or evidence.get("byte_length") != len(exact_bytes)):
+        raise OwnerReceiptError("same-object evidence differs from observed bytes")
+    evidence_ref = _text(evidence.get("evidence_ref"), "byte evidence reference")
+    observed_by = _text(evidence.get("observed_by"), "byte observer")
+    if asset_id is not None and (not isinstance(asset_id, str) or not asset_id.strip()):
+        raise OwnerReceiptError("source asset is invalid")
+    return tenant, group_key, exact_url, fingerprint, evidence_ref, observed_by, asset_id
+
+
+def produce_same_object(*, tenant, group_key, exact_bytes, evidence, asset_id=None,
+                        connection_factory=None):
+    """Insert ONE immutable object-read receipt for bytes that are simultaneously
+    the source and the delivered object (e.g. a generated artifact published at
+    the exact URL it was rendered to). The returned receipt UUID is evidence for
+    BOTH roles; there is deliberately NO render receipt -- no lineage is
+    fabricated for an object that was never transformed.
+
+    Same owner-only boundary as produce(): no service-role fallback, and the
+    owner DSN/role configuration must be complete. ``connection_factory`` exists
+    only for isolated tests or a separately provisioned owner runtime."""
+    (tenant, group_key, exact_url, fingerprint, evidence_ref, observed_by,
+     asset_id) = _validate_same_object(
+         tenant, group_key, exact_bytes, evidence, asset_id)
+    connection = connection_factory() if connection_factory else _connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "insert into public.visual_global_object_read_receipt "
+                "(tenant_id,exact_url,fingerprint,byte_length,acquisition_method,asset_id,"
+                "evidence_ref,observed_by) values (%s,%s,%s,%s,%s,%s,%s,%s) returning receipt_id",
+                (tenant, exact_url, fingerprint, len(exact_bytes),
+                 "drive_asset" if asset_id else "verified_object_read", asset_id,
+                 evidence_ref, observed_by))
+            read_receipt = cursor.fetchone()[0]
+        connection.commit()
+    except Exception as exc:  # noqa: BLE001 - rollback the immutable row as a unit
+        try:
+            connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise OwnerReceiptError("owner receipt transaction failed") from exc
+    finally:
+        try:
+            connection.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return {"read_receipt": str(read_receipt), "render_receipt": None}
