@@ -460,6 +460,7 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     used = set()
     used_drive_ids = set()
     used_drive_hashes = set()
+    global_local_hold = [False]
     rows = []
     media_claims = []
     counts = {"standard": 0, "offer": 0, "event": 0, "photo": 0, "skipped": 0}
@@ -500,9 +501,14 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
                 used_drive_hashes.add(digest)
             return drive_pick
         # §4: pass the slot pillar so vision content-scores the pick (no-op for non-vision).
-        img = client_content.pick_image(_gbp_rotation_key, day_key, library_path,
-                                        exclude_keys=used, pillar=pillar,
-                                        prefer_photos=True)
+        try:
+            img = client_content.pick_image(_gbp_rotation_key, day_key, library_path,
+                                            exclude_keys=used, pillar=pillar,
+                                            prefer_photos=True)
+        except client_content.LocalPhotoGlobalLedgerUnavailable:
+            global_local_hold[0] = True
+            log(f"{day_key}: held GBP local-photo pick; global byte history is unreadable")
+            return None
         if img is None:
             return None
         if getattr(img, "media_type", "") == "video":
@@ -615,6 +621,13 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
                          status=initial_status), pick)
             counts["photo"] += 1
         pday += timedelta(days=7)
+
+    if global_local_hold[0]:
+        # Do not partially write a GBP plan after a local photo tier became
+        # unprovable. A later rerun with a readable global ledger is the only
+        # safe way to decide those slots.
+        return {"ok": False, "reason": "global local-photo history unreadable",
+                "planned": 0, "skips": dict(skips), **counts}
 
     if not rows:
         return {"ok": False, "reason": empty_month_reason(skips, counts),
