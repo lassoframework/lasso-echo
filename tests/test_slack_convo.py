@@ -224,6 +224,25 @@ class FakeBus:
                 return dict(m)
         return None
 
+    def hold_uncertain_outreach(self, mid):
+        row = self.message(mid)
+        if not row or row["delivery_status"] == "posted":
+            return row
+        if row["delivery_status"] != "posting":
+            return row
+        return self.mark_message(mid, "held", meta_update={
+            "outreach_delivery_uncertain": True})
+
+    def uncertain_outreach_alert_exists(self, ticket_id, mid):
+        return any(m.get("ticket_id") == ticket_id
+                   and (m.get("attachments") or {}).get("outreach_uncertain_row_id") == mid
+                   for m in self.msgs)
+
+    def mark_uncertain_outreach_alerted(self, mid):
+        if (self.message(mid) or {}).get("delivery_status") != "held":
+            return None
+        return self.mark_message(mid, "held", meta_update={"outreach_staff_alerted": True})
+
     def set_message_body_if_posting(self, mid, body):
         for m in self.msgs:
             if m["id"] == mid and m["delivery_status"] == "posting":
@@ -2968,6 +2987,34 @@ def test_stale_posting_row_is_reclaimed_to_ready_on_the_next_run(monkeypatch):
     s = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
     assert s["reclaimed"] == 1
     assert bus.message(row["id"])["delivery_status"] == "posted", "reclaimed, then delivered"
+
+
+def test_stale_direct_outreach_is_held_and_staff_alerted_when_slack_may_have_succeeded(monkeypatch):
+    """An uncertain first DM must not be reposted by the ordinary outbox sweep."""
+    bus = FakeBus()
+    ticket, _ = bus.get_or_create_ticket(channel_id="C123", thread_ts="1.1", product="echo",
+                                         reporter="client@example.com", raw_text="question",
+                                         client_id="gym-1", slack_user_id="U_CLIENT",
+                                         identity_kind="client", bot_identity="echo")
+    row = bus.record_outbound(ticket_id=ticket["id"], author_type="echo", body="answer",
+                              delivery_status="ready", kind="status",
+                              meta={"identity": "echo", "outreach": True})
+    bus.claim_message(row["id"])
+    stale = datetime.now(timezone.utc) - timedelta(seconds=OB.CLAIM_TIMEOUT_SECONDS + 30)
+    bus.mark_message(row["id"], "posting", meta_update={"claimed_at": stale.isoformat()})
+    assert OB._recover_stale_claims(bus, IDS.get("echo"), log=lambda *a: None) == 1
+    held = bus.message(row["id"])
+    assert held["delivery_status"] == "held"
+    assert held["attachments"]["outreach_delivery_uncertain"] is True
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    assert not any(c["text"] == "answer" for c in calls)
+    alerts = [m for m in bus.msgs
+              if (m.get("attachments") or {}).get("outreach_uncertain_row_id") == row["id"]]
+    assert len(alerts) == 1
+    assert "Slack may have delivered" in alerts[0]["body"]
 
 
 def test_a_row_just_claimed_is_not_reclaimed_out_from_under_a_live_post(monkeypatch):

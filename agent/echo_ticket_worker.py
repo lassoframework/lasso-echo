@@ -38,6 +38,7 @@ client or the live bus at module scope, so they are fully unit-testable offline.
 """
 import json
 import os
+import re
 import time
 
 from . import config
@@ -205,6 +206,94 @@ def _verified_ticket_dict(ticket):
     return d
 
 
+_DELIVERY_IDENTITY = ("product", "client_id", "bot_identity", "slack_user_id")
+_DIRECT_FOLLOW_UP_PROMISE = re.compile(
+    r"\b(?:i|we)\s+(?:will|'ll)\s+(?:follow up|get back(?: to you)?|reach out)\b",
+    re.IGNORECASE)
+
+
+def _promises_follow_up(body):
+    return (_a.promises_human_follow_up(body)
+            or bool(_DIRECT_FOLLOW_UP_PROMISE.search(body or "")))
+
+
+def _patch_current_ticket(bus, ticket, *, log=print, **fields):
+    """Leave a newer requester cycle untouched when this poll has gone stale."""
+    patch = getattr(bus, "patch_ticket_if_current", None)
+    if not callable(patch):
+        log(f"[echo-ticket-worker] current-ticket CAS unavailable ticket={ticket.get('id')}")
+        return None
+    updated = patch(ticket, **fields)
+    if not isinstance(updated, dict) or updated.get("id") != ticket.get("id"):
+        log(f"[echo-ticket-worker] stale ticket transition refused ticket={ticket.get('id')}")
+        return None
+    return updated
+
+
+def _delivery_snapshot(bus, original, *, status, classification, identity_name, who):
+    """Keep the request version and requester identity from before the Slack post."""
+    version = original.get("request_version")
+    if type(version) is not int or version < 0:
+        return None
+    try:
+        fresh = bus.ticket(original["id"])
+    except Exception:  # noqa: BLE001 - unreadable current request fails closed
+        return None
+    if (not isinstance(fresh, dict) or fresh.get("request_version") != version
+            or fresh.get("status") != status
+            or fresh.get("classification") != classification
+            or fresh.get("source") != original.get("source")
+            or fresh.get("raw_text") != original.get("raw_text")
+            or any(fresh.get(field) != original.get(field)
+                   for field in ("product", "client_id"))
+            or fresh.get("bot_identity") != identity_name
+            or fresh.get("slack_user_id") != who.slack_user_id
+            or who.gym_id != fresh.get("client_id")
+            or fresh.get("escalated") is True or fresh.get("hold_tier") is not None):
+        return None
+    return fresh
+
+
+def _resolve_delivered(bus, snapshot, result, *, log):
+    """Close only a confirmed posted completion for the original request cycle."""
+    resolver = getattr(bus, "resolve_current_delivery", None)
+    if (not snapshot or not result.completion_posted or not result.ticket_stamped
+            or not callable(resolver)
+            or not result.channel_id or not result.posted_ts):
+        return False
+    try:
+        fresh = bus.ticket(snapshot["id"])
+        if (not isinstance(fresh, dict)
+                or fresh.get("request_version") != snapshot["request_version"]
+                or fresh.get("status") != snapshot["status"]
+                or fresh.get("classification") != snapshot["classification"]
+                or any(fresh.get(field) != snapshot.get(field)
+                       for field in _DELIVERY_IDENTITY)
+                or fresh.get("slack_channel_id") != result.channel_id
+                or fresh.get("slack_thread_ts") != result.posted_ts):
+            return False
+        expected = {field: fresh.get(field) for field in _DELIVERY_IDENTITY}
+        resolved = resolver(
+            snapshot["id"], snapshot["request_version"], snapshot["status"],
+            snapshot["classification"], expected["product"], expected["client_id"],
+            expected["bot_identity"], expected["slack_user_id"],
+            result.channel_id, result.posted_ts)
+    except Exception as e:  # noqa: BLE001 - a failed CAS leaves the request open
+        log(f"[echo-ticket-worker] delivery resolution refused ticket={snapshot['id']}: "
+            f"{type(e).__name__}")
+        return False
+    return (isinstance(resolved, dict) and resolved.get("id") == snapshot["id"]
+            and resolved.get("request_version") == snapshot["request_version"]
+            and resolved.get("status") == "resolved"
+            and resolved.get("classification") == snapshot["classification"]
+            and resolved.get("escalated") is False
+            and resolved.get("hold_tier") is None
+            and all(resolved.get(field) == expected[field]
+                    for field in _DELIVERY_IDENTITY)
+            and resolved.get("slack_channel_id") == result.channel_id
+            and resolved.get("slack_thread_ts") == result.posted_ts)
+
+
 def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print,
                          who=None, outreach=None):
     """LIVE BUG FIX (2026-09-04, found running the real Echo regression test): the
@@ -224,7 +313,9 @@ def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print
     # Round 3 (audit of PR #107): classification is cleared explicitly. The QUESTION branch
     # stamps answerable_question before an undelivered answer lands here, and the FIXER's
     # poll (hold + escalated + classification NULL) would skip that ticket forever.
-    bus.set_ticket(tid, status="hold", escalated=True, classification=None)
+    if not _patch_current_ticket(bus, ticket, log=log, status="hold", escalated=True,
+                                 classification=None):
+        return
     bus.record_outbound(
         ticket_id=tid, author_type="system",
         body=f"Portal ticket {tid} ({identity_name}) could not be routed "
@@ -330,18 +421,9 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 claim_message,
                 stamp_ticket, log):
     tid = ticket["id"]
-    # Row-first: the client's original words are recorded as an inbound message
-    # before anything else touches this ticket -- the portal insert only wrote the
-    # TICKET, not a support_messages row, unlike a Slack-sourced ticket. Guarded by
-    # inbound_count so a ticket that fails a LATER step (and so stays 'new' for the
-    # next poll to pick up again) does not duplicate this row every retry -- found
-    # live: the same real client message was recorded 5 times over 5 failed polls
-    # before the _escalate_unresolved status bug (fixed alongside this) was found.
-    if bus.inbound_count(tid) < 1:
-        bus.record_inbound(ticket_id=tid, slack_event_id=None, slack_ts=None,
-                           author_type="client", author_id=ticket.get("reporter") or "",
-                           body=ticket.get("raw_text") or "",
-                           meta={"surface": "portal_ticket_bridge"})
+    # The portal ticket already stores the client's original words in raw_text.
+    # Mirroring them as an inbound client message increments request_version under
+    # migration 0364/0378 and silently invalidates this very poll's identity.
 
     # D46/D47 audit fix (Frame 1, CRITICAL): outbox.py's dispatch gate refuses to post
     # ANY row whose parent ticket's bot_identity does not match the identity currently
@@ -353,7 +435,9 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
     # unconditionally, before any dispatch decision, so both of those branches (and any
     # future one) are covered, not just the one path (QUESTION) that happens to bypass
     # outbox.py entirely.
-    bus.set_ticket(tid, bot_identity=identity_name)
+    ticket = _patch_current_ticket(bus, ticket, log=log, bot_identity=identity_name)
+    if ticket is None:
+        return
 
     outreach = {"ident": ident, "open_group_dm": open_group_dm,
                 "post_first_message": post_first_message, "stamp_ticket": stamp_ticket,
@@ -371,7 +455,9 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
 
     # Persisted so fixed_pass (a later poll, possibly after a redeploy) can
     # reconstruct who to notify without re-resolving.
-    bus.set_ticket(tid, slack_user_id=who.slack_user_id)
+    ticket = _patch_current_ticket(bus, ticket, log=log, slack_user_id=who.slack_user_id)
+    if ticket is None:
+        return
 
     # RTF-2 (2026-09-05, found live): this used to pass `llm` -- the ANSWER LANE's model
     # callable, whose signature is (system, user, model=None) -- as the CLASSIFIER's llm,
@@ -396,9 +482,12 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
             log(f"[echo-ticket-worker] answer lane failed ticket={tid}: "
                 f"{type(e).__name__}")
         if answer and answer.get("body") and answer.get("grounding"):
-            bus.set_ticket(tid, classification=_cls.QUESTION, status="verification",
-                           verification_before=answer["grounding"],
-                           verification_after=answer["grounding"])
+            ticket = _patch_current_ticket(
+                bus, ticket, log=log, classification=_cls.QUESTION, status="verification",
+                verification_before=answer["grounding"],
+                verification_after=answer["grounding"])
+            if ticket is None:
+                return
             # C2 (2026-09-05 audit, CRITICAL): this branch posts a model-written answer
             # straight to the client through outreach.initiate, bypassing outbox._dispatch_one
             # and therefore EVERY gate D54 added -- the trust ladder, the AUTO_ANSWER flag and
@@ -444,23 +533,38 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                     unarmed_flag=f"SLACK_CONVO_{identity_name.upper()}_AUTO_ANSWER",
                     client_notice=False, log=log)
                 return
+            # Round 2 (MAJOR 6): an answer that promised a PERSON will follow up must
+            # not close the ticket -- it goes to the FIXER with the follow-up marker
+            # instead (same disposition the Slack adapter and the outbox use). The
+            # decision is made BEFORE the send so the completion stamp below is only
+            # requested when this delivery genuinely resolves the ticket -- a follow-up
+            # promise keeps the ticket open and must never read as a completion.
+            resolves_on_delivery = not _promises_follow_up(answer["body"])
+            snapshot = _delivery_snapshot(bus, ticket, status="verification",
+                                          classification=_cls.QUESTION,
+                                          identity_name=identity_name, who=who)
+            if not snapshot or not callable(stamp_ticket) or not callable(mark_message):
+                log(f"[echo-ticket-worker] current delivery identity unavailable "
+                    f"ticket={tid}; answer not sent")
+                return
             result = _out.initiate(
-                _verified_ticket_dict(ticket), who, ident,
+                _verified_ticket_dict(snapshot), who, ident,
                 open_group_dm=open_group_dm, post_first_message=post_first_message,
                 record_outbound=bus.record_outbound, stamp_ticket=stamp_ticket,
                 message_text=answer["body"], mark_message=mark_message,
-                claim_message=claim_message, log=log)
+                claim_message=claim_message, completion=resolves_on_delivery,
+                ticket_lookup=bus.ticket,
+                reconcile_uncertain=bus.hold_uncertain_outreach, log=log)
             if getattr(result, "delivered", False):
-                # Round 2 (MAJOR 6): an answer that promised a PERSON will follow up must
-                # not close the ticket -- it goes to the FIXER with the follow-up marker
-                # instead (same disposition the Slack adapter and the outbox use).
-                if _a.promises_human_follow_up(answer["body"]):
+                if not resolves_on_delivery:
                     _a.route_follow_up_promise(bus, bus.ticket(tid) or {"id": tid},
                                                ident_name=identity_name, body=answer["body"],
                                                recipient_kind=who.kind,
                                                surface="portal_ticket_bridge", log=log)
                 else:
-                    bus.set_ticket(tid, status="resolved")
+                    if not _resolve_delivered(bus, snapshot, result, log=log):
+                        log(f"[echo-ticket-worker] posted answer did not resolve "
+                            f"current request ticket={tid}")
                 # M1: the one path that sends a model answer with NO tap at all produced no
                 # receipt, so the very thing Blake asked to see was the one thing invisible.
                 try:
@@ -490,7 +594,10 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
         # Preserve the HELD fixer_request as durable internal evidence. Scout's
         # narrow authenticated portal bridge may independently verify it and
         # queue the original ticket without releasing this internal row.
-        bus.set_ticket(tid, classification=_cls.CODE_FIX, status="fixing")
+        ticket = _patch_current_ticket(bus, ticket, log=log,
+                                       classification=_cls.CODE_FIX, status="fixing")
+        if ticket is None:
+            return
         # Customer contact for a code fix waits for merge, verified deployment,
         # and a conversation that includes Blake. The held internal request is
         # the durable intake signal; an early acknowledgement would violate that
@@ -968,15 +1075,31 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
             _escalate_unresolved(bus, ticket, reason="verification_not_a_success",
                                 identity_name=identity_name, log=log, who=who)
             continue
+        snapshot = _delivery_snapshot(bus, ticket, status="fixing",
+                                      classification=ticket.get("classification"),
+                                      identity_name=identity_name, who=who)
+        # Migration 0381's resolver does not accept 'fixing'. The legacy lane is
+        # currently unwired; if a producer is registered later, it must move its
+        # verified ticket to an eligible state before client notification.
+        if (not snapshot or not callable(stamp_ticket) or not callable(mark_message)
+                or snapshot.get("status") not in ("verification", "merged")):
+            log(f"[ticket-worker/{identity_name}] verified delivery cannot resolve "
+                f"current request ticket={tid}; client not notified")
+            continue
         result = _out.initiate(
-            _verified_ticket_dict(ticket), who, ident,
+            _verified_ticket_dict(snapshot), who, ident,
             open_group_dm=open_group_dm, post_first_message=post_first_message,
             record_outbound=bus.record_outbound, stamp_ticket=stamp_ticket,
             message_text=summary, mark_message=mark_message,
-            claim_message=claim_message, log=log)
+            claim_message=claim_message, completion=True,
+            ticket_lookup=bus.ticket,
+            reconcile_uncertain=bus.hold_uncertain_outreach, log=log)
         if getattr(result, "delivered", False):
-            bus.set_ticket(tid, status="resolved")
-            notified += 1
+            if _resolve_delivered(bus, snapshot, result, log=log):
+                notified += 1
+            else:
+                log(f"[ticket-worker/{identity_name}] posted fix notice did not "
+                    f"resolve current request ticket={tid}")
             try:
                 _ob.write_receipt(bus, bus.ticket(tid) or {"id": tid}, identity=ident,
                                   body=summary, kind=_a.KIND_STATUS,

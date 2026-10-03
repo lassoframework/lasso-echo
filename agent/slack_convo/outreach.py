@@ -78,6 +78,10 @@ class OutreachResult:
     # (no tap)" over a row whose own delivery_status was 'failed'. `delivered` is the fact
     # callers actually need, and it is True only after the post came back ok.
     delivered: bool = False
+    # True only when the posted completion row was confirmed by the bus response.
+    completion_posted: bool = False
+    posted_ts: str = ""
+    ticket_stamped: bool = False
 
 
 def _base_eligible(ticket, who):
@@ -204,7 +208,7 @@ def first_message_text(ticket, ident):
 
 def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_outbound,
             stamp_ticket=None, message_text=None, mark_message=None, claim_message=None,
-            log=print):
+            completion=False, ticket_lookup=None, reconcile_uncertain=None, log=print):
     """The one outbound-first call this whole adapter makes.
 
     `open_group_dm(user_ids: list[str]) -> {"ok": bool, "channel_id": str}` and
@@ -239,6 +243,16 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
     left in 'ready' for another consumer to find. Optional only so a caller doing a pure
     dry run (no real bus) can omit it; live wiring always passes it.
 
+    `completion` (portal migration 0381 compatibility): True only when the caller will
+    RESOLVE the ticket on a successful delivery -- today Echo's direct grounded-answer
+    lane and the verified-fix notify lane in echo_ticket_worker. The completion stamp
+    (attachments.resolve_notice=True, plus request_version when the ticket carries a
+    trustworthy one) is written ONLY after the post comes back ok, merged into the row
+    by the same mark_message('posted') call that closes the row's lifecycle, so a held,
+    failed, claimed-away or never-posted row can never read as a completion to the
+    portal's guard. Default False keeps every existing caller and the held/approval
+    lanes untouched.
+
     Refuses (returns OutreachResult(opened=False, ...)) rather than raising for every
     business reason; only a bus write failure propagates (the caller decides how to log
     a genuine bus outage, same convention as adapter.handle_event)."""
@@ -249,12 +263,15 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
     return _send(ticket, who, ident, open_group_dm=open_group_dm,
                 post_first_message=post_first_message, record_outbound=record_outbound,
                 stamp_ticket=stamp_ticket, message_text=message_text,
-                mark_message=mark_message, claim_message=claim_message, log=log)
+                mark_message=mark_message, claim_message=claim_message,
+                completion=completion, ticket_lookup=ticket_lookup,
+                reconcile_uncertain=reconcile_uncertain, log=log)
 
 
 def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbound,
          stamp_ticket=None, message_text=None, message_text_already_escaped=False,
-         mark_message=None, claim_message=None, log=print):
+         mark_message=None, claim_message=None, completion=False,
+         ticket_lookup=None, reconcile_uncertain=None, log=print):
     """The actual Slack side of outreach, with NO eligibility check of its own -- every
     caller (`initiate()` after the autonomous `eligible()` gate, `release_approved_outreach()`
     after a human tap) has already decided this send is authorized, by a different route.
@@ -285,16 +302,30 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
         return OutreachResult(opened=False, reason="open_failed")
     channel_id = opened["channel_id"]
 
-    # Row-first even on this exceptional outbound-first path: the first message is
-    # recorded before it is posted. `kind` matches KIND_ACK's shape (adapter.py) so the
-    # outbox's per-kind verification gate treats it exactly like any other
-    # non-substantive acknowledgement -- an outreach first message never claims a fact,
-    # so it needs no grounding snapshot, same as every ack elsewhere in this system.
-    row = record_outbound(
-        ticket_id=(ticket or {}).get("id"), author_type=getattr(ident, "name", "system"),
-        body=text, delivery_status="ready", kind="ack",
-        meta={"identity": getattr(ident, "name", ""), "outreach": True,
-              "recipient_kind": who.kind})
+    # Row-first even on this exceptional outbound-first path. A completion uses
+    # kind='status' because migration 0381 recognises only posted status notices;
+    # all other first-contact messages retain the existing ack kind.
+    outbound_args = {
+        "ticket_id": (ticket or {}).get("id"),
+        "author_type": getattr(ident, "name", "system"),
+        "body": text, "delivery_status": "ready",
+        "kind": "status" if completion else "ack",
+        "meta": {"identity": getattr(ident, "name", ""), "outreach": True,
+                 "recipient_kind": who.kind},
+    }
+    version = (ticket or {}).get("request_version")
+    if type(version) is int and version >= 0:
+        outbound_args["expected_request_version"] = version
+        outbound_args["meta"].update({
+            "delivery_identity_fence": True,
+            "delivery_expected_product": ticket.get("product"),
+            "delivery_expected_client_id": ticket.get("client_id"),
+            "delivery_expected_status": ticket.get("status"),
+            "delivery_expected_classification": ticket.get("classification"),
+            "delivery_expected_bot_identity": getattr(ident, "name", ""),
+            "delivery_expected_slack_user_id": who.slack_user_id,
+        })
+    row = record_outbound(**outbound_args)
     row_id = (row or {}).get("id")
 
     # D44 (MINOR, Frame 2 closing-audit finding): the row sat in 'ready' for the whole
@@ -316,6 +347,27 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
             log(f"[outreach] row={row_id} already claimed by another consumer, backing off")
             return OutreachResult(opened=True, channel_id=channel_id, reason="lost_claim")
 
+    if ticket_lookup is not None:
+        try:
+            fresh = ticket_lookup(ticket["id"])
+        except Exception:  # noqa: BLE001 - no readable current identity, no post
+            fresh = None
+        fields = ("request_version", "product", "client_id", "status", "classification",
+                  "bot_identity", "slack_user_id")
+        if (not isinstance(fresh, dict)
+                or any(fresh.get(field) != ticket.get(field) for field in fields)
+                or fresh.get("bot_identity") != getattr(ident, "name", "")
+                or fresh.get("slack_user_id") != who.slack_user_id
+                or fresh.get("escalated") is True or fresh.get("hold_tier") is not None):
+            if mark_message is not None and row_id is not None:
+                try:
+                    mark_message(row_id, "suppressed",
+                                 meta_update={"suppressed_why": "delivery identity changed"})
+                except Exception:  # noqa: BLE001 - no Slack post occurred
+                    pass
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="delivery_identity_changed")
+
     posted = post_first_message(channel_id, text)
     if not posted or not posted.get("ok"):
         log(f"[outreach] first-message post failed ticket={(ticket or {}).get('id')} "
@@ -329,15 +381,60 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
         return OutreachResult(opened=True, channel_id=channel_id, reason="post_failed",
                               delivered=False)
 
+    completion_posted = False
     if mark_message is not None and row_id is not None:
+        # Portal migration 0381 (not yet applied at time of writing) recognises a ticket
+        # as complete only on a CURRENT-REQUEST posted answer or a status row with
+        # resolve_notice. Echo's direct support deliveries used to land as a bare
+        # kind='ack' followed by a status flip, which that guard cannot see. When the
+        # caller asserts completion (it resolves the ticket on delivery), stamp the row
+        # HERE -- after the post succeeded, in the same mark that closes the lifecycle --
+        # never at row-write time, so a row that failed, lost its claim or was never
+        # posted cannot claim completion. resolve_notice is explicit; request_version is
+        # added only from a real non-negative int on the ticket (never fabricated), so
+        # the portal's current-request check can bind the completion to this exact
+        # request instead of a stale one.
+        meta_update = None
+        if completion:
+            meta_update = {"resolve_notice": True}
+            version = (ticket or {}).get("request_version")
+            if isinstance(version, int) and not isinstance(version, bool) and version >= 0:
+                meta_update["request_version"] = version
+            else:
+                log(f"[outreach] completion stamp row={row_id} "
+                    f"ticket={(ticket or {}).get('id')}: no trustworthy request_version "
+                    f"on the ticket (got {version!r}); resolve_notice only")
         try:
-            mark_message(row_id, "posted", slack_ts=posted.get("ts") or None)
+            if meta_update:
+                marked = mark_message(row_id, "posted", slack_ts=posted.get("ts") or None,
+                                      meta_update=meta_update)
+            else:
+                marked = mark_message(row_id, "posted", slack_ts=posted.get("ts") or None)
+            attachments = (marked or {}).get("attachments") if isinstance(marked, dict) else None
+            completion_posted = bool(
+                completion and isinstance(marked, dict)
+                and marked.get("id") == row_id
+                and marked.get("delivery_status") == "posted"
+                and isinstance(attachments, dict)
+                and attachments.get("kind") == "status"
+                and attachments.get("resolve_notice") is True
+                and marked.get("delivery_request_version") == ticket.get("request_version"))
         except Exception as e:  # noqa: BLE001 - the message already sent; never undo it,
-                                # but a stuck 'ready' row is exactly D41's finding, so this
-                                # is logged loudly rather than swallowed quietly.
+                                # so quarantine uncertain delivery for manual reconciliation.
             log(f"[outreach] CRITICAL: mark_message(posted) failed row={row_id} "
-                f"ticket={(ticket or {}).get('id')} -- row will still show 'ready' and "
-                f"may be re-posted by the armed outbox: {type(e).__name__}")
+                f"ticket={(ticket or {}).get('id')}: {type(e).__name__}")
+            if callable(reconcile_uncertain):
+                try:
+                    observed = reconcile_uncertain(row_id)
+                    att = (observed or {}).get("attachments") or {}
+                    completion_posted = bool(
+                        completion and observed and observed.get("id") == row_id
+                        and observed.get("delivery_status") == "posted"
+                        and observed.get("delivery_request_version") == ticket.get("request_version")
+                        and att.get("kind") == "status"
+                        and att.get("resolve_notice") is True)
+                except Exception:  # noqa: BLE001 - stale-claim recovery retries quarantine
+                    pass
 
     # "The group DM thread becomes the ticket thread": stamp the ticket with this
     # channel (and the client's own slack_user_id / this ticket's owning bot_identity)
@@ -346,16 +443,31 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
     # matches on slack_channel_id alone (D11), not thread_ts, so a DM never threads.
     # Best-effort: a stamp failure must not un-send an already-posted first message, so
     # it is logged, never raised.
+    ticket_stamped = False
     if stamp_ticket is not None:
         try:
-            stamp_ticket((ticket or {}).get("id"), channel_id=channel_id,
-                        thread_ts=posted.get("ts") or "", slack_user_id=who.slack_user_id,
-                        bot_identity=getattr(ident, "name", ""), identity_kind=who.kind)
+            stamp_args = {
+                "channel_id": channel_id, "thread_ts": posted.get("ts") or "",
+                "slack_user_id": who.slack_user_id,
+                "bot_identity": getattr(ident, "name", ""), "identity_kind": who.kind,
+            }
+            if ticket_lookup is not None:
+                stamp_args["expected_ticket"] = ticket
+            stamped = stamp_ticket((ticket or {}).get("id"), **stamp_args)
+            ticket_stamped = (isinstance(stamped, dict)
+                              and stamped.get("id") == ticket.get("id")
+                              and stamped.get("request_version") == ticket.get("request_version")
+                              and stamped.get("slack_channel_id") == channel_id
+                              and stamped.get("slack_user_id") == who.slack_user_id
+                              and stamped.get("bot_identity") == getattr(ident, "name", ""))
         except Exception as e:  # noqa: BLE001 - the DM already sent; never undo it
             log(f"[outreach] stamp_ticket failed ticket={(ticket or {}).get('id')}: "
                 f"{type(e).__name__}")
 
-    return OutreachResult(opened=True, channel_id=channel_id, reason="ok", delivered=True)
+    return OutreachResult(opened=True, channel_id=channel_id, reason="ok", delivered=True,
+                          completion_posted=completion_posted,
+                          posted_ts=posted.get("ts") or "",
+                          ticket_stamped=ticket_stamped)
 
 
 # ---- D45: the human-tap path (Blake's ruling, 2026-09-04, resolving D42) -----------------
@@ -422,7 +534,7 @@ def request_approval(ticket, who, ident, *, record_outbound, write_hold_notice,
 def release_approved_outreach(message_id, ticket, who, ident, *, get_held_message,
                               open_group_dm, post_first_message, record_outbound,
                               stamp_ticket=None, mark_message=None, claim_message=None,
-                              log=print):
+                              completion=False, log=print):
     """The tap handler: validates a held KIND_OUTREACH_REQUEST row belongs to THIS ticket
     and THIS identity before doing anything Blake's tap did not actually authorize, then
     calls `_send()` -- the tap itself is the provenance _base_eligible's stricter sibling,
@@ -460,7 +572,8 @@ def release_approved_outreach(message_id, ticket, who, ident, *, get_held_messag
                   post_first_message=post_first_message, record_outbound=record_outbound,
                   stamp_ticket=stamp_ticket, message_text=row.get("body"),
                   message_text_already_escaped=True,
-                  mark_message=mark_message, claim_message=claim_message, log=log)
+                  mark_message=mark_message, claim_message=claim_message,
+                  completion=completion, log=log)
 
     # D45 closing-audit finding: _send() always writes a NEW row for the actual DM (the
     # held row is never itself postable, see request_approval's docstring), so without
