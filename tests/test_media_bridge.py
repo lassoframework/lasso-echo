@@ -191,7 +191,7 @@ def test_seed_honors_gym_timezone_and_alerts_without_facts(monkeypatch):
     assert seed.seed_gaps('gymx',SimpleNamespace(),object(),today=today)==0
     assert seen==['Pacific/Honolulu'] and alerts==['gymx']
 
-def test_display_preserves_cached_history_and_blocks_new_far_future(monkeypatch,tmp_path):
+def test_client_display_rejects_cached_generic_history_and_new_fill(monkeypatch,tmp_path):
     from agent import no_creative_fallback as ncf, calendar_autopublish
     monkeypatch.setenv('AGENT_NO_CREATIVE_FALLBACK','true')
     monkeypatch.setattr(calendar_autopublish,'_local_now',lambda *a:datetime(2026,9,18,tzinfo=timezone.utc))
@@ -199,10 +199,12 @@ def test_display_preserves_cached_history_and_blocks_new_far_future(monkeypatch,
     p={'id':'bridge','day_key':'2026-09-19','caption':'Coaching for your goals.','format':'feed'}
     renders=[]
     def render(*a,**k): renders.append(1);return str(tmp_path/'art.png')
-    url=ncf.display_image_for(p,tenant='gymx',renderer=render,host=lambda *a:'https://example.com/art.png')
-    assert url
+    key=ncf._cache_key(p,False,'gymx')
+    ncf._URL_CACHE[key]='https://example.com/old-generic-art.png'
+    ncf._save_url(key,'https://example.com/old-generic-art.png')
+    assert ncf.display_image_for(p,tenant='gymx',renderer=render,host=lambda *a:'https://example.com/new.png') is None
     monkeypatch.setattr(calendar_autopublish,'_local_now',lambda *a:datetime(2026,9,20,tzinfo=timezone.utc))
-    assert ncf.display_image_for(p,tenant='gymx',renderer=render)==url
+    assert ncf.display_image_for(p,tenant='gymx',renderer=render) is None
     assert ncf.display_image_for(dict(p,id='future',day_key='2026-10-10'),tenant='gymx',renderer=render) is None
-    assert len(renders)==1
+    assert renders==[]
     ncf._URL_CACHE.clear()

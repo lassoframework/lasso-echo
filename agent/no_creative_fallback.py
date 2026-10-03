@@ -1,19 +1,18 @@
 """
-no_creative_fallback.py — the client Organic Social calendar's no-creative fallback.
+no_creative_fallback.py — LASSO's no-creative calendar display fallback.
 
-When a scheduled calendar post has NO usable creative image (image_url missing / None,
+When LASSO's own calendar post has NO usable creative image (image_url missing / None,
 the Gemini or Nano render failed or was skipped, or the DAM had nothing), the calendar
-must NOT show a blank / broken card and must NOT fabricate a photo. Instead it degrades
-to a clean, on-brand WEBSITE STYLE INFOGRAPHIC built from the post's OWN approved text
-(caption + pillar) using the HOUSE PIL renderer — the same clean, professional data-viz
-look already locked in (no AI-looking illustrated scenes; the creative_studio banned
-list stands). Pure typographic / graphic infographic on the brand palette.
+may degrade to a clean, on-brand WEBSITE STYLE INFOGRAPHIC built from that post's OWN
+approved text (caption + pillar) using the HOUSE PIL renderer. A client gym's missing
+image remains empty here: client infographics are served only as pre-generated,
+source-grounded Astra drafts after the media bridge and verified-palette gates pass.
 
 Two hard guarantees, mirrored from the rest of Echo:
 
   - OFF BY DEFAULT (`config.no_creative_fallback_enabled()`). Flag OFF -> behavior is
-    unchanged: an image_url present is returned as-is, an absent one stays absent (the
-    caller keeps its current empty-state behavior). No fallback card is ever drawn.
+    unchanged: an image_url present is returned as-is, an absent one stays absent. The
+    PIL fallback is LASSO-only.
   - NO FABRICATION. The infographic renders ONLY the post's approved caption / pillar
     text. It invents no facts, offers, prices, or stats. If there is NO caption and no
     pillar to render, it returns None and lets the upstream BLOCK / show its empty
@@ -259,18 +258,15 @@ def display_image_for(post, *, out_dir=None, renderer=None, host=None, tenant=No
     'story'), image_url (or image_public_url), account_key. Returns:
 
       - the existing image_url when it is present and usable  (no render, unchanged)
-      - a PUBLIC hosted url for an infographic rendered from caption / pillar, when the
-        flag is ON, the image is absent, AND there is approved text to render
-      - None when: the flag is OFF (fallback disabled, current behavior); there is no
-        caption / pillar text to render; hosting is off or returns nothing; or the
-        render / font step fails. In every None case the caller keeps its existing
-        empty-state (a clean blank beats a blank card, a fabricated photo, or an
-        unshowable local path).
+      - a PUBLIC hosted url for LASSO's house infographic when the flag is ON, the image
+        is absent, AND there is approved text to render
+      - None for client gyms with a missing image, or when the flag is OFF, there is no
+        approved text, hosting is unavailable, or rendering fails.
 
     NO FABRICATION: the infographic text comes only from the post's approved caption /
     pillar. Nothing here publishes and no gate is weakened.
 
-    Injection seams for tests: `renderer` (defaults to the house PIL renderer above),
+    Injection seams for LASSO tests: `renderer` (defaults to the house PIL renderer above),
     `host` (defaults to agent.media_host.host_media, the same content-addressed hosting
     primitive summit_rebuild uses), `tenant` (hosting scope), `out_dir` (temp render dir).
     """
@@ -292,6 +288,19 @@ def display_image_for(post, *, out_dir=None, renderer=None, host=None, tenant=No
         from . import lasso_display_infographic
         return lasso_display_infographic.display_image_for(post, resolved_tenant)
 
+    # The synchronous portal read is not a safe place to make a client infographic:
+    # it has no verified gym palette or Astra result, and must never serve an old
+    # generic PIL URL from its local cache. Client cards are created only by the
+    # background client_infographic_fill path, which confirms depletion + bridge day,
+    # requires brand_colors.json, and calls Astra without the Gemini fallback.
+    base = resolved_tenant.strip().lower()
+    for suffix in ("_ig", "_fb"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    if base not in {"lasso", "lasso-framework-llc"}:
+        return None
+
     eyebrow, headline, deck = _approved_text(post.get("caption"), post.get("pillar"))
     # No approved text -> block, never a blank card and never invented copy.
     if not headline:
@@ -306,12 +315,6 @@ def display_image_for(post, *, out_dir=None, renderer=None, host=None, tenant=No
     if cached:
         return cached
 
-    if not resolved_tenant.lower().startswith("lasso"):
-        from .client_infographic_fill import real_media_depleted
-        from .media_bridge import bridge_days
-        if (not real_media_depleted(resolved_tenant)
-                or str(post.get("day_key") or "")[:10] not in bridge_days(resolved_tenant)):
-            return None
     render = renderer or _render_infographic
     host_media = host or _default_host
 
