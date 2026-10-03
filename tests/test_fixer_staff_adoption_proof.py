@@ -2,8 +2,11 @@
 import json
 from copy import deepcopy
 
+import pytest
+
 from agent import fixer_ops
 from agent import fixer_staff_adoption_proof as proof
+import agent.__main__ as agent_main
 
 
 def message(number):
@@ -249,3 +252,77 @@ def test_staff_ticket_tenant_capability_is_swap_and_pointer_row_only():
                                     action="swap_media", args={"row_id": row_id},
                                     reservation_key=pointer["reservation_key"]) == (
         409, {"error": "ticket_tenant_unconfirmed"})
+
+
+def test_ops_action_cli_passes_and_redacts_keyed_swap_receipt(monkeypatch, capsys):
+    calls = {}
+
+    def run_action(action, gym, ticket, args, **kwargs):
+        calls.update(action=action, gym=gym, ticket=ticket, args=args, **kwargs)
+        return 200, {"ok": True, "reservation_key": kwargs["reservation_key"],
+                     "receipt": {"reservation_key": kwargs["reservation_key"],
+                                 "request_key": kwargs["expected_request_key"],
+                                 "result": {"postcondition_verified": True,
+                                            "swap_proof": {"row_id": args["row_id"]}}},
+                     "result": {"postcondition_verified": True,
+                                "swap_proof": {"row_id": args["row_id"]}}}
+
+    monkeypatch.setattr(fixer_ops, "run_action", run_action)
+    reservation, request = "staff-swap-001", "a" * 64
+    with pytest.raises(SystemExit) as exited:
+        agent_main.main(["ops-action", "swap_media", "--gym", proof._SWIFT,
+                         "--ticket", proof.TICKET_ID, "--args", '{"row_id":"swift-row-01"}',
+                         "--reservation-key", reservation, "--request-key", request])
+    assert exited.value.code == 0
+    assert calls == {"action": "swap_media", "gym": proof._SWIFT,
+                     "ticket": proof.TICKET_ID, "args": {"row_id": "swift-row-01"},
+                     "reservation_key": reservation, "expected_request_key": request}
+    output = capsys.readouterr().out
+    assert reservation not in output and request not in output
+    rendered = json.loads(output)
+    assert rendered["reservation_key"] == "[redacted]"
+    assert rendered["receipt"]["reservation_key"] == "[redacted]"
+    assert rendered["receipt"]["request_key"] == "[redacted]"
+    assert rendered["result"]["postcondition_verified"] is True
+    assert rendered["receipt"]["result"]["swap_proof"]["row_id"] == "swift-row-01"
+
+
+def test_ops_action_cli_rejects_swap_keys_for_other_actions(capsys):
+    with pytest.raises(SystemExit) as exited:
+        agent_main.main(["ops-action", "restage_month", "--gym", proof._SWIFT,
+                         "--ticket", proof.TICKET_ID, "--reservation-key", "staff-swap-001"])
+    assert exited.value.code == 2
+    assert "only valid for swap_media" in capsys.readouterr().err
+
+
+def test_ops_action_cli_resolves_current_request_key_on_the_worker(monkeypatch, capsys):
+    resolved = "c" * 64
+    calls = {}
+    monkeypatch.setattr(fixer_ops, "_current_swap_request_key",
+                        lambda deps, ticket_id: resolved)
+
+    def run_action(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return 200, {"ok": True, "result": {"postcondition_verified": True}}
+
+    monkeypatch.setattr(fixer_ops, "run_action", run_action)
+    with pytest.raises(SystemExit) as exited:
+        agent_main.main(["ops-action", "swap_media", "--gym", proof._SWIFT,
+                         "--ticket", proof.TICKET_ID, "--args", '{"row_id":"swift-row-01"}',
+                         "--reservation-key", "staff-swap-001", "--request-key", "current"])
+    assert exited.value.code == 0
+    assert calls["kwargs"]["expected_request_key"] == resolved
+    assert resolved not in capsys.readouterr().out
+
+
+def test_ops_action_cli_current_request_key_fails_closed_when_unavailable(monkeypatch, capsys):
+    monkeypatch.setattr(fixer_ops, "_current_swap_request_key", lambda *_: None)
+    monkeypatch.setattr(fixer_ops, "run_action", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError()))
+    with pytest.raises(SystemExit) as exited:
+        agent_main.main(["ops-action", "swap_media", "--gym", proof._SWIFT,
+                         "--ticket", proof.TICKET_ID, "--args", '{"row_id":"swift-row-01"}',
+                         "--reservation-key", "staff-swap-001", "--request-key", "current"])
+    assert exited.value.code == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": 503, "error": "request_identity_unavailable"}
