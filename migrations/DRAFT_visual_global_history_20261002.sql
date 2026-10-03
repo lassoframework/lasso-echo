@@ -37,7 +37,7 @@ create table if not exists public.visual_global_usage (
   fingerprint text primary key,
   tenant_id text not null,
   used_date date,
-  state text not null check (state in ('reserved','published')),
+  state text not null check (state in ('reserved','published','released')),
   ambiguous boolean not null default false,
   first_seen_at timestamptz not null default now(),
   published_at timestamptz,
@@ -51,7 +51,7 @@ create table if not exists public.visual_global_usage_member (
   calendar_row_id uuid,
   channel text,
   used_date date,
-  state text not null check (state in ('reserved','published')),
+  state text not null check (state in ('reserved','published','released')),
   ambiguous boolean not null default false,
   recorded_at timestamptz not null default now(),
   primary key (tenant_id, group_key),
@@ -59,16 +59,28 @@ create table if not exists public.visual_global_usage_member (
 );
 create index if not exists visual_global_usage_member_fingerprint_idx
   on public.visual_global_usage_member(fingerprint);
+-- Append-only record of each released reservation before its live claim row is
+-- reused. Published observations never enter this table or become reusable.
+create table if not exists public.visual_global_release_history (
+  id bigint generated always as identity primary key,
+  fingerprint text not null,
+  tenant_id text not null,
+  group_key text not null,
+  used_date date not null,
+  calendar_row_id uuid,
+  released_at timestamptz not null default now()
+);
 
 -- These are owner-only writes. The service role can inspect receipts but must
 -- use the validated SECURITY DEFINER functions to bind and import history.
 alter table public.visual_global_identity enable row level security;
 alter table public.visual_global_usage enable row level security;
 alter table public.visual_global_usage_member enable row level security;
+alter table public.visual_global_release_history enable row level security;
 revoke all on public.visual_global_identity, public.visual_global_usage,
-  public.visual_global_usage_member from public, anon, authenticated, service_role;
+  public.visual_global_usage_member, public.visual_global_release_history from public, anon, authenticated, service_role;
 grant select on public.visual_global_identity, public.visual_global_usage,
-  public.visual_global_usage_member to service_role;
+  public.visual_global_usage_member, public.visual_global_release_history to service_role;
 
 create or replace function public.visual_global_immutable()
 returns trigger language plpgsql set search_path = public as $$
@@ -82,20 +94,40 @@ $$;
 drop trigger if exists visual_global_identity_immutable on public.visual_global_identity;
 create trigger visual_global_identity_immutable before update or delete
   on public.visual_global_identity for each row execute function public.visual_global_immutable();
-drop trigger if exists visual_global_member_immutable on public.visual_global_usage_member;
-create trigger visual_global_member_immutable before update or delete
-  on public.visual_global_usage_member for each row execute function public.visual_global_immutable();
+drop trigger if exists visual_global_release_immutable on public.visual_global_release_history;
+create trigger visual_global_release_immutable before update or delete
+  on public.visual_global_release_history for each row execute function public.visual_global_immutable();
+create or replace function public.visual_global_member_guard()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  if tg_op='DELETE' or old.state='published' then
+    raise exception 'published global member is permanent' using errcode='23514';
+  end if;
+  if new.tenant_id<>old.tenant_id or new.group_key<>old.group_key
+      or new.fingerprint<>old.fingerprint or
+      (old.ambiguous and not new.ambiguous) or
+      (old.state='reserved' and new.state not in ('reserved','published','released')) then
+    raise exception 'global member identity or uncertainty cannot change' using errcode='23514';
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists visual_global_member_guard on public.visual_global_usage_member;
+create trigger visual_global_member_guard before update or delete
+  on public.visual_global_usage_member for each row execute function public.visual_global_member_guard();
 create or replace function public.visual_global_usage_guard()
 returns trigger language plpgsql set search_path = public as $$
 begin
   if tg_op='DELETE' or old.state='published' then
     raise exception 'published global usage is permanent' using errcode='23514';
   end if;
-  if new.fingerprint<>old.fingerprint or new.tenant_id<>old.tenant_id
-      or new.used_date is distinct from old.used_date
+  if new.fingerprint<>old.fingerprint
+      or (old.state<>'released' and
+          (new.tenant_id<>old.tenant_id or new.used_date is distinct from old.used_date))
+      or (old.state='released' and new.state not in ('reserved','published'))
       or new.first_seen_at is distinct from old.first_seen_at
       or (old.ambiguous and not new.ambiguous)
-      or (old.state='reserved' and new.state not in ('reserved','published')) then
+      or (old.state='reserved' and new.state not in ('reserved','published','released')) then
     raise exception 'global claim owner, date and uncertainty are immutable' using errcode='23514';
   end if;
   return new;
@@ -186,7 +218,12 @@ begin
     on conflict (fingerprint) do nothing;
   select * into v_usage from public.visual_global_usage
     where fingerprint=v_hash for update;
-  if v_usage.tenant_id <> v_tenant::text or v_usage.used_date is distinct from p_date then
+  if v_usage.state='released' then
+    update public.visual_global_usage set tenant_id=v_tenant::text,
+      used_date=p_date,state=case when p_published then 'published' else 'reserved' end,
+      ambiguous=p_ambiguous,published_at=case when p_published then now() end
+      where fingerprint=v_hash;
+  elsif v_usage.tenant_id <> v_tenant::text or v_usage.used_date is distinct from p_date then
     raise exception 'visual byte fingerprint already used by another client or date' using errcode='23514';
   end if;
   if p_published and v_usage.state='reserved' then
@@ -198,18 +235,69 @@ begin
   end if;
   select * into v_member from public.visual_global_usage_member
     where tenant_id=v_tenant::text and group_key=p_group_key;
-  if found and (v_member.fingerprint <> v_hash or
+  if found and v_member.state='released' and v_member.fingerprint=v_hash then
+    update public.visual_global_usage_member set used_date=p_date,
+      calendar_row_id=p_row_id,channel=p_channel,
+      state=case when p_published then 'published' else 'reserved' end,
+      ambiguous=p_ambiguous,recorded_at=now()
+      where tenant_id=v_tenant::text and group_key=p_group_key;
+  elsif found and (v_member.fingerprint <> v_hash or
       v_member.used_date is distinct from p_date) then
     raise exception 'visual group has conflicting historical membership' using errcode='23514';
+  elsif found and p_published and v_member.state='reserved' then
+    update public.visual_global_usage_member set state='published',
+      ambiguous=ambiguous or p_ambiguous where tenant_id=v_tenant::text and group_key=p_group_key;
+  elsif found and p_ambiguous and not v_member.ambiguous and v_member.state='reserved' then
+    update public.visual_global_usage_member set ambiguous=true
+      where tenant_id=v_tenant::text and group_key=p_group_key;
   end if;
   insert into public.visual_global_usage_member
     (tenant_id,group_key,fingerprint,calendar_row_id,channel,used_date,state,ambiguous)
     values(v_tenant::text,p_group_key,v_hash,p_row_id,p_channel,p_date,
       case when p_published then 'published' else 'reserved' end,p_ambiguous)
     on conflict (tenant_id,group_key) do nothing;
-  -- No release path is exposed yet. The first member observation is immutable;
-  -- the usage row carries permanent publication state.
   return v_hash;
+end;
+$$;
+
+-- Called by the calendar integration only after the local ledger has actually
+-- released its last active sibling. A tentative or ambiguous provider attempt
+-- cannot be released. The global fingerprint remains occupied while any other
+-- same-day member is active; the final release makes it reusable atomically.
+create or replace function public.visual_global_release(
+  p_gym_key text,p_group_key text
+) returns boolean language plpgsql security definer set search_path = public as $$
+declare v_tenant uuid; v_hash text; v_usage public.visual_global_usage%rowtype;
+  v_member public.visual_global_usage_member%rowtype;
+begin
+  v_tenant:=public.visual_group_tenant_strict(p_gym_key);
+  select fingerprint into v_hash from public.visual_global_identity
+    where tenant_id=v_tenant::text and group_key=p_group_key;
+  if v_hash is null then raise exception 'global identity missing' using errcode='23514'; end if;
+  select * into v_usage from public.visual_global_usage where fingerprint=v_hash for update;
+  select * into v_member from public.visual_global_usage_member
+    where tenant_id=v_tenant::text and group_key=p_group_key for update;
+  if not found or v_member.state='released' then return false; end if;
+  if v_member.state='published' or v_member.ambiguous or v_usage.state='published'
+      or v_usage.ambiguous or not exists(
+        select 1 from public.visual_group_usage_ledger l
+        where l.gym_id=v_tenant::text and l.group_key=p_group_key
+          and l.state='released' and not l.ambiguous)
+      or exists(select 1 from public.visual_group_usage_sibling s
+        where s.gym_id=v_tenant::text and s.group_key=p_group_key
+          and s.state='active') then
+    raise exception 'global reservation still occupied or uncertain' using errcode='23514';
+  end if;
+  insert into public.visual_global_release_history
+    (fingerprint,tenant_id,group_key,used_date,calendar_row_id)
+    values(v_hash,v_tenant::text,p_group_key,v_member.used_date,v_member.calendar_row_id);
+  update public.visual_global_usage_member set state='released'
+    where tenant_id=v_tenant::text and group_key=p_group_key;
+  if not exists(select 1 from public.visual_global_usage_member m
+      where m.fingerprint=v_hash and m.state<>'released') then
+    update public.visual_global_usage set state='released' where fingerprint=v_hash;
+  end if;
+  return true;
 end;
 $$;
 
@@ -221,12 +309,34 @@ create or replace function public.visual_global_import_history()
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare r record; v_count integer:=0; v_missing integer;
 begin
+  if exists(select 1 from public.visual_global_coverage() c where c.issue<>'ready') then
+    raise exception 'global history import refused: calendar coverage incomplete' using errcode='23514';
+  end if;
+  -- Every recorded publication must still have a permanent local ledger row.
+  -- A deleted calendar row is not grounds for silently discarding this event.
+  if exists(select 1 from public.visual_group_reconciliation e
+      where e.outcome='confirmed_published'
+        and not exists(select 1 from public.visual_group_usage_ledger l
+          where l.gym_id=e.gym_id and l.group_key=e.delivered_group_key
+            and l.state='published')) then
+    raise exception 'global history import refused: published event lacks ledger owner'
+      using errcode='23514';
+  end if;
   select count(*) into v_missing from public.visual_group_usage_ledger l
     left join public.visual_global_identity i
       on i.tenant_id=l.gym_id and i.group_key=l.group_key
     where l.state<>'released' and i.fingerprint is null;
   if v_missing>0 then
     raise exception 'global history import refused: % occupied groups lack verified byte fingerprints',v_missing
+      using errcode='23514';
+  end if;
+  if exists(select 1 from public.visual_group_usage_ledger l
+      where l.state<>'released' and (
+        select count(distinct i.fingerprint)
+        from public.visual_group_scene_members(l.gym_id,l.group_key) sm(group_key)
+        join public.visual_global_identity i
+          on i.tenant_id=l.gym_id and i.group_key=sm.group_key)>1) then
+    raise exception 'global history import refused: linked scene has distinct byte fingerprints without component authority'
       using errcode='23514';
   end if;
   -- Published first means an existing permanent owner wins over a competing
@@ -259,6 +369,16 @@ language sql stable security definer set search_path = public as $$
       when i.fingerprint is null then 'missing_verified_fingerprint'
       when (c.status='published' or c.published_at is not null) and c.post_date is null
         then 'published_date_unverified'
+      when not exists(select 1 from public.visual_group_usage_ledger l
+          where l.gym_id=public.visual_group_tenant_id(c.gym_id)::text
+            and l.group_key=c.visual_group_key and l.state<>'released'
+            and l.reserved_date is not distinct from c.post_date)
+        then 'missing_matching_local_ledger'
+      when (c.status='published' or c.published_at is not null) and
+          not exists(select 1 from public.visual_group_usage_ledger l
+          where l.gym_id=public.visual_group_tenant_id(c.gym_id)::text
+            and l.group_key=c.visual_group_key and l.state='published')
+        then 'published_row_without_permanent_local_ledger'
       else 'ready' end
   from public.content_calendar c
   left join public.visual_global_identity i
@@ -279,12 +399,21 @@ language sql stable security definer set search_path = public as $$
       when g.fingerprint is not null and
         (g.tenant_id<>l.gym_id or g.used_date is distinct from l.reserved_date)
         then 'global_owner_or_date_conflict'
+      when (select count(distinct ci.fingerprint)
+        from public.visual_group_scene_members(l.gym_id,l.group_key) sm(group_key)
+        left join public.visual_global_identity ci
+          on ci.tenant_id=l.gym_id and ci.group_key=sm.group_key)>1
+        then 'scene_component_has_distinct_bytes_without_global_authority'
       when g.fingerprint is null then 'not_imported'
+      when m.state is distinct from l.state
+        then 'global_member_state_mismatch'
       else 'ready' end
   from public.visual_group_usage_ledger l
   left join public.visual_global_identity i
     on i.tenant_id=l.gym_id and i.group_key=l.group_key
   left join public.visual_global_usage g on g.fingerprint=i.fingerprint
+  left join public.visual_global_usage_member m
+    on m.tenant_id=l.gym_id and m.group_key=l.group_key
   where l.state<>'released';
 $$;
 

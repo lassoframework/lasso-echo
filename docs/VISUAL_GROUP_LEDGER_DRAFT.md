@@ -10,7 +10,7 @@ canary from this package alone.
 
 `DRAFT_visual_global_history_20261002.sql` adds an attested canonical MD5
 fingerprint for each tenant-local group, one global fingerprint owner/date row,
-an immutable first-member receipt, an atomic claim RPC, a calendar coverage
+stateful member receipts and an append-only release history, an atomic claim RPC, a calendar coverage
 report and an import RPC that includes per-tenant ledger history even after a
 calendar row was deleted. The import refuses any occupied local group without
 a verified fingerprint or any fingerprint already occupied by another tenant
@@ -41,8 +41,9 @@ all proof checks pass. This migration is additive and remains unapplied.
    confirmed delivery and release/reconciliation paths. It must be in the same
    transaction as the tenant-local claim, under a deterministic global lock
    order, with exact sibling group membership. The current draft claim RPC is
-   a historical import primitive and has no release path; it is not sufficient
-   for live claims. Manual scene links across groups or tenants need one global
+   a historical import primitive. A draft release RPC now checks the local
+   released state and records a permanent receipt, but no calendar trigger calls
+   either global RPC. Manual scene links across groups or tenants need one global
    component authority and a collision check before activation.
 5. Replace tenant-local activation with one global barrier: lock all calendar
    writes, import historical published and in-flight claims, re-read every
@@ -54,6 +55,12 @@ all proof checks pass. This migration is additive and remains unapplied.
    rollback-only local transaction before a production migration or canary.
 
 No production migration, activation, or canary is authorized by this draft.
+
+The global activation blocker remains deliberate. Multi-hash manual scene
+components are reported by `visual_global_history_coverage()` as
+`scene_component_has_distinct_bytes_without_global_authority`. No global
+activation transaction, calendar write barrier, component claim, or calendar
+trigger integration exists yet. These are release blockers.
 
 Owner: isolated `codex/echo-global-ledger-db-20261002` worktree. Base: PR230
 `0ab9f8c`. Governing acceptance: `global-media-release-plan-20261002.md`.
