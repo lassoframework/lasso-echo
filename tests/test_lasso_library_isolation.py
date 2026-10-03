@@ -103,6 +103,23 @@ def test_generated_reels_cache_is_not_a_carousel_but_real_bundle_still_is(
     assert len(carousels[0].slides) == 2
 
 
+def test_legacy_feedfit_cache_is_not_a_carousel_but_real_bundle_still_is(
+        tmp_path, registered_gyms):
+    """Pre 4:5 feed cards sit directly in feedfit and must not become posts."""
+    parent = tmp_path / "content_library"
+    feedfit = parent / "feedfit"
+    bundle = parent / "class_photos"
+    feedfit.mkdir(parents=True)
+    bundle.mkdir()
+    for index in range(2):
+        (feedfit / f"old_{index}__feed.jpg").write_bytes(b"generated")
+        (bundle / f"slide_{index}.jpg").write_bytes(b"client")
+
+    creatives = list_creatives(str(parent))
+    assert [os.path.basename(c.path) for c in creatives] == ["class_photos"]
+    assert len(creatives[0].slides) == 2
+
+
 def test_is_client_gym_asset(registered_gyms):
     assert is_client_gym_asset("/data/content_library/eng/Robin_trio.jpg")
     assert is_client_gym_asset("content_library/gritx/photo.jpg")
