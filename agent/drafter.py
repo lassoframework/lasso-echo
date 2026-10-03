@@ -1228,9 +1228,12 @@ def draft_post(account, creative, scheduled_for, voice=None,
     # the hosted URLs (tenant-scoped by account). OFF, or any failure, leaves the
     # existing sidecar URLs untouched -> current behavior is unchanged.
     if config.hosting_enabled():
-        hosted = media_host.host_media(creative.path, account.key)
-        if hosted:
-            creative_public_url = hosted
+        # A carousel's path names its containing folder, not uploadable media.
+        # Only its regular slide files belong in the hosting call.
+        if creative.media_type != "carousel":
+            hosted = media_host.host_media(creative.path, account.key)
+            if hosted:
+                creative_public_url = hosted
         if slides:
             hosted_slides = media_host.host_many(slides, account.key)
             if hosted_slides:

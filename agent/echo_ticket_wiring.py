@@ -68,10 +68,13 @@ def _write_hold_notice_factory(bus):
 
 def _stamp_ticket_factory(bus):
     def stamp_ticket(ticket_id, *, channel_id, thread_ts, slack_user_id, bot_identity,
-                     identity_kind):
-        return bus.set_ticket(ticket_id, slack_channel_id=channel_id,
-                              slack_thread_ts=thread_ts, slack_user_id=slack_user_id,
-                              bot_identity=bot_identity, identity_kind=identity_kind)
+                     identity_kind, expected_ticket=None):
+        if expected_ticket is None:
+            return None
+        return bus.stamp_outreach_ticket_if_current(
+            ticket_id, expected_ticket=expected_ticket, channel_id=channel_id,
+            thread_ts=thread_ts, slack_user_id=slack_user_id,
+            bot_identity=bot_identity, identity_kind=identity_kind)
     return stamp_ticket
 
 

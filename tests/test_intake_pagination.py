@@ -65,9 +65,6 @@ class KeysetBus:
 
     def record_inbound(self, **kwargs):
         tid = kwargs.get("ticket_id")
-        self.attempts[tid] = self.attempts.get(tid, 0) + 1
-        if tid in self.fail_ids:
-            raise RuntimeError("permanent failure for this row")
         self.inbound.append(kwargs)
         return ({"id": f"in-{len(self.inbound)}"}, False)
 
@@ -82,6 +79,27 @@ class KeysetBus:
     def set_ticket(self, ticket_id, **fields):
         self.patches.append((ticket_id, fields))
         self.tickets[ticket_id].update(fields)
+
+    def patch_ticket_if_current(self, expected_ticket, **fields):
+        """Match the production CAS rather than letting stale transitions through."""
+        version = expected_ticket.get("request_version")
+        if type(version) is not int or version < 0:
+            return None
+        current = self.tickets.get(expected_ticket.get("id"))
+        identity = ("request_version", "status", "classification", "product", "source",
+                    "client_id", "reporter", "bot_identity", "slack_user_id",
+                    "slack_channel_id", "slack_thread_ts", "hold_tier", "escalated")
+        if current is None or any(current.get(field) != expected_ticket.get(field)
+                                  for field in identity):
+            return None
+        # `_intake_one` no longer mirrors portal raw_text into a synthetic inbound row.
+        # Its first CAS (the bot stamp) is therefore the faithful per-ticket fault point.
+        if "bot_identity" in fields:
+            self.attempts[expected_ticket["id"]] = self.attempts.get(expected_ticket["id"], 0) + 1
+        if "bot_identity" in fields and expected_ticket["id"] in self.fail_ids:
+            raise RuntimeError("permanent CAS failure for this row")
+        self.set_ticket(expected_ticket["id"], **fields)
+        return self.ticket(expected_ticket["id"])
 
     def ticket(self, ticket_id):
         return dict(self.tickets[ticket_id])
@@ -124,7 +142,7 @@ def test_twenty_plus_poison_rows_no_longer_starve_a_fresh_ticket(tmp_path):
     assert second["processed"] == 1
     worked = bus.tickets["fresh-1"]
     assert worked["classification"] is not None and worked["status"] != "new"
-    assert bus.inbound_count("fresh-1") == 1
+    assert bus.inbound_count("fresh-1") == 0  # portal raw_text is the durable inbound record
     # The poison rows failed, stayed 'new', and were never classified by accident.
     assert all(bus.tickets[f"poison-{i:02d}"]["classification"] is None
                for i in range(25))
@@ -196,11 +214,11 @@ def test_successful_rows_are_never_processed_twice_across_polls_and_restarts(tmp
     cursor = tmp_path / "cursor.json"
     bus = KeysetBus([_fresh()])
     assert _run(bus, cursor)["processed"] == 1
-    assert bus.inbound_count("fresh-1") == 1
+    assert bus.inbound_count("fresh-1") == 0
 
     # Same process, next poll: nothing left to do.
     assert _run(bus, cursor)["processed"] == 0
-    assert bus.inbound_count("fresh-1") == 1
+    assert bus.inbound_count("fresh-1") == 0
 
     # Restart shape: a brand-new bus over the same persisted cursor and the same row.
     bus2 = KeysetBus([_fresh()])
@@ -233,7 +251,7 @@ def test_replace_failure_keeps_process_cursor_and_logs_without_starving_fresh_ti
     # cursor so the remaining poison rows no longer pin the oldest page.
     assert _run(bus, cursor, log=logs.append)["processed"] == 1
     assert bus.tickets["fresh-1"]["classification"] is not None
-    assert bus.inbound_count("fresh-1") == 1
+    assert bus.inbound_count("fresh-1") == 0
 
 
 def test_malformed_leg_is_dropped_without_resetting_other_leg(tmp_path):

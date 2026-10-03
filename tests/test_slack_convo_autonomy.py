@@ -810,8 +810,10 @@ def test_the_answer_lane_llm_is_never_the_one_handed_to_classify():
         return "NO_ANSWER"
 
     os.environ["AGENT_PORTAL_ECHO_TICKETS_ENABLED"] = "true"
+    from tests.test_echo_ticket_worker import FakeBus as PortalBus, _ticket as portal_ticket
     ETW.intake_pass(
-        _Bus(), slack_lookup_email=lambda e: "U1",
+        PortalBus([portal_ticket(raw_text="wholly ambiguous sentence")]),
+        slack_lookup_email=lambda e: "U1",
         slack_user_info=lambda u: {"id": u, "is_bot": False, "email": "owner@gym.com"},
         portal_lookup=lambda e: {"role": "client",
                                  "gyms": [{"gym_id": "g-1", "relationship": "client_owner",
@@ -929,7 +931,8 @@ def test_the_portal_hold_path_actually_writes_a_card_through_the_real_callable()
         def messages(self, tid, limit=200):
             return []
 
-    bus = _Bus()
+    from tests.test_echo_ticket_worker import FakeBus as PortalBus, _ticket as portal_ticket
+    bus = PortalBus([portal_ticket(raw_text="is my instagram connected?")])
     _os.environ["AGENT_PORTAL_ECHO_TICKETS_ENABLED"] = "true"
     for var in ("SLACK_CONVO_ECHO_AUTO_ANSWER",):
         _os.environ.pop(var, None)
@@ -946,7 +949,7 @@ def test_the_portal_hold_path_actually_writes_a_card_through_the_real_callable()
         fetch_state=lambda t, w: {"social_status": {"instagram": "connected"}},
         llm=lambda system, user, model=None: "Yes, it is connected.",
         classify_llm=None, log=lambda *a, **k: None)
-    cards = [r for r in bus.rows if r.get("kind") == A.KIND_HOLD_NOTICE]
+    cards = [r for r in bus.outbound if r.get("kind") == A.KIND_HOLD_NOTICE]
     assert cards, "a held portal answer must produce a real hold card through the real factory"
 
 
@@ -1033,7 +1036,8 @@ def test_the_portal_bridge_enforces_the_allowlist_not_just_the_denylist(text, mo
         def messages(self, tid, limit=200):
             return []
 
-    bus = _Bus()
+    from tests.test_echo_ticket_worker import FakeBus as PortalBus, _ticket as portal_ticket
+    bus = PortalBus([portal_ticket(raw_text=text)])
     ETW.intake_pass(
         bus, slack_lookup_email=lambda e: "U1",
         slack_user_info=lambda u: {"id": u, "is_bot": False, "email": "owner@gym.com"},
@@ -1053,7 +1057,7 @@ def test_the_portal_bridge_enforces_the_allowlist_not_just_the_denylist(text, mo
         f"{text!r} reached a client with a model-written answer and no tap"
     assert all("could not answer this one myself" in p for p in posted), \
         f"only the honest acknowledgement may reach the client, got: {posted!r}"
-    assert bus.status == "hold"
+    assert bus.tickets["t-1"]["status"] == "hold"
 
 
 @pytest.mark.parametrize("text", [

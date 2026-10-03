@@ -1,0 +1,8 @@
+{
+  "colors": [
+    "#66FF03",
+    "#111111"
+  ],
+  "source_url": "https://engcrossfit.com/",
+  "source_note": "Official homepage uses #66FF03 on CTAs and #111111 on section backgrounds; linked custom stylesheet confirms both."
+}
