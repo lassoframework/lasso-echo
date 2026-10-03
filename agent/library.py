@@ -21,7 +21,7 @@ VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
 # to media_host, which cannot publish it and can collapse an otherwise healthy
 # month build to zero rows.  Keep this narrow so named client carousel folders
 # continue to work.
-_RESERVED_DERIVATIVE_DIRS = frozenset({"reels"})
+_RESERVED_DERIVATIVE_DIRS = frozenset({"reels", "feedfit"})
 
 
 def _is_appledouble(name):

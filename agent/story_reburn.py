@@ -9,8 +9,9 @@ waiting for the monthly rebuild.
 
 Best-effort by contract: the caption edit is ALREADY persisted before this runs, so a
 re-burn failure NEVER fails the edit (the monthly rebuild remains the backstop). Fully
-gated: no-op unless BOTH AGENT_STORY_SOURCE_MEDIA and AGENT_STORY_FORMAT are on and the row
-is a story carrying a source_media_url.
+gated: no-op unless AGENT_STORY_FORMAT is on and the row is a story carrying a
+source_media_url. Normally AGENT_STORY_SOURCE_MEDIA must also be on; the global visual
+writer guard is the exception because it owns same-object source evidence.
 """
 
 import os
@@ -25,10 +26,20 @@ from .media_types import VIDEO_EXTS as _VIDEO_EXTS   # ONE definition (audit D1)
 
 
 def should_reburn(row):
-    """True when a story row is eligible for an immediate caption re-burn: both flags on,
-    format 'story', and a stored raw source_media_url to burn from."""
-    if not (config.story_source_media_enabled() and config.story_format_enabled()):
+    """True when a story row is eligible for an immediate caption re-burn.
+
+    The visual writer guard supplies verified same-object source evidence, so it may
+    enable a publish-time repair even when the legacy source-media flag is off.
+    """
+    if not config.story_format_enabled():
         return False
+    if not config.story_source_media_enabled():
+        try:
+            from . import visual_writer_prepare
+            if not visual_writer_prepare.enabled():
+                return False
+        except Exception:
+            return False
     if str((row or {}).get("format") or "").lower() != "story":
         return False
     return bool((row or {}).get("source_media_url"))

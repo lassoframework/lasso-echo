@@ -898,6 +898,114 @@ def test_stale_story_transports_verified_reburn_evidence_when_writer_prep_is_arm
                         "expected_row": row, "render_evidence": evidence}
 
 
+@pytest.mark.parametrize(("raw_url", "reburned_url"), [
+    ("https://cdn/raw-photo.jpg", "https://cdn/healed__story.jpg"),
+    ("https://cdn/raw-video.mp4", "https://cdn/healed__storyvid.mp4"),
+])
+def test_visual_writer_same_object_story_reburns_before_publish(
+        armed, monkeypatch, raw_url, reburned_url):
+    """A writer-attested raw Story is source provenance, never caption-burn proof."""
+    from agent import story_image, story_reburn
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "false")
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    row = _row("s", account="instagram", fmt="story", status="approved",
+               image_url=raw_url, caption="current caption")
+    row["source_media_url"] = raw_url
+    store = _FakeStore([row])
+    evidence = {"source_exact_url": raw_url, "delivered_exact_url": reburned_url}
+    reburn_calls = []
+
+    def patch_image_url(gym, row_id, url, *, expected_row, render_evidence):
+        assert expected_row == row
+        assert render_evidence == evidence
+        store.rows[row_id]["image_url"] = url
+        return dict(store.rows[row_id])
+
+    store.patch_image_url = patch_image_url
+    monkeypatch.setattr(story_image, "story_media_carries_caption",
+                        lambda url, caption: url == reburned_url)
+    monkeypatch.setattr(story_reburn, "reburn_with_evidence", lambda *args: (
+        reburn_calls.append(args) or reburned_url,
+        SimpleNamespace(as_dict=lambda: evidence),
+    ))
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True, catch_all=True)
+
+    assert summary["published"] == ["s"]
+    assert reburn_calls == [(raw_url, "current caption", "LASSO", "lasso_ig")]
+    assert [draft.creative_public_url for draft, _ in pub.calls] == [reburned_url]
+
+
+def test_visual_writer_same_object_story_holds_when_reburn_fails(armed, monkeypatch):
+    from agent import story_reburn
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "false")
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    raw_url = "https://cdn/raw-photo.jpg"
+    row = _row("s", account="instagram", fmt="story", status="approved",
+               image_url=raw_url, caption="current caption")
+    row["source_media_url"] = raw_url
+    store = _FakeStore([row])
+    monkeypatch.setattr(story_reburn, "reburn_with_evidence", lambda *args: None)
+    monkeypatch.setattr(cap, "_alert_story_needs_render", lambda *args: None)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True, catch_all=True)
+
+    assert summary["waiting"] == ["s"]
+    assert pub.calls == []
+    assert store.publishing_calls == []
+
+
+def test_visual_writer_same_object_story_holds_when_guard_evaluation_fails(
+        armed, monkeypatch):
+    from agent import visual_writer_prepare
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "false")
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    raw_url = "https://cdn/raw-photo.jpg"
+    row = _row("s", account="instagram", fmt="story", status="approved",
+               image_url=raw_url, caption="current caption")
+    row["source_media_url"] = raw_url
+    store = _FakeStore([row])
+
+    def broken_guard_evaluator():
+        raise RuntimeError("writer guard unavailable")
+
+    monkeypatch.setattr(visual_writer_prepare, "enabled", broken_guard_evaluator)
+    monkeypatch.setattr(cap, "_alert_story_needs_render", lambda *args: None)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True, catch_all=True)
+
+    assert summary["waiting"] == ["s"]
+    assert pub.calls == []
+    assert store.publishing_calls == []
+
+
+def test_same_object_story_preserves_behavior_when_writer_guard_off(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "false")
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    raw_url = "https://cdn/raw-photo.jpg"
+    row = _row("s", account="instagram", fmt="story", status="approved",
+               image_url=raw_url, caption="current caption")
+    row["source_media_url"] = raw_url
+    store = _FakeStore([row])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True, catch_all=True)
+
+    assert summary["published"] == ["s"]
+    assert [draft.creative_public_url for draft, _ in pub.calls] == [raw_url]
+
+
 @pytest.mark.parametrize("changed_field", [None, "status", "caption", "image_url",
                                                   "source_media_url", "published_at"])
 def test_approved_story_reburn_real_store_conditional_patch(monkeypatch, changed_field):

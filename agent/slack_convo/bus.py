@@ -177,6 +177,48 @@ class Bus:
     def set_ticket(self, ticket_id, **fields):
         return self._patch(_TICKETS, {"id": f"eq.{ticket_id}"}, fields)
 
+    def patch_ticket_if_current(self, expected_ticket, **fields):
+        """CAS a worker transition against the exact request cycle and owner."""
+        version = expected_ticket.get("request_version")
+        if type(version) is not int or version < 0:
+            raise BusError(400, "invalid ticket transition version")
+
+        def match_value(value):
+            return "is.null" if value is None else f"eq.{value}"
+
+        identity_fields = ("status", "classification", "product", "source", "client_id",
+                           "reporter", "bot_identity", "slack_user_id",
+                           "slack_channel_id", "slack_thread_ts", "hold_tier")
+        match = {"id": f"eq.{expected_ticket['id']}",
+                 "request_version": f"eq.{version}",
+                 "escalated": match_value(expected_ticket.get("escalated"))}
+        match.update({field: match_value(expected_ticket.get(field))
+                      for field in identity_fields})
+        return self._patch(_TICKETS, match, fields)
+
+    def stamp_outreach_ticket_if_current(self, ticket_id, *, expected_ticket,
+                                         channel_id, thread_ts, slack_user_id,
+                                         bot_identity, identity_kind):
+        """Stamp the DM only while the complete pre-send request still owns it."""
+        version = expected_ticket.get("request_version")
+        if type(version) is not int or version < 0:
+            raise BusError(400, "invalid outreach request version")
+
+        def match_value(value):
+            return "is.null" if value is None else f"eq.{value}"
+
+        fields = ("status", "classification", "product", "client_id",
+                  "bot_identity", "slack_user_id", "slack_channel_id",
+                  "slack_thread_ts")
+        match = {"id": f"eq.{ticket_id}", "request_version": f"eq.{version}",
+                 "escalated": "eq.false", "hold_tier": "is.null"}
+        match.update({field: match_value(expected_ticket.get(field)) for field in fields})
+        return self._patch(_TICKETS, match, {
+            "slack_channel_id": channel_id, "slack_thread_ts": thread_ts,
+            "slack_user_id": slack_user_id, "bot_identity": bot_identity,
+            "identity_kind": identity_kind,
+        })
+
     def resolve_current_delivery(self, ticket_id, expected_request_version,
                                  expected_status, expected_classification,
                                  expected_product, expected_client_id,
@@ -434,7 +476,7 @@ class Bus:
         return self._insert(_MESSAGES, row)
 
     def record_outbound(self, *, ticket_id, author_type, body, delivery_status, kind,
-                        meta=None):
+                        meta=None, expected_request_version=None):
         """The bot's reply AS A ROW. Nothing posts until the outbox reads it back in 'ready'.
         `kind` (ack | answer | template | escalation | fixer_request | hold_notice | status)
         rides in attachments so the outbox can apply the verification gate per kind without a
@@ -445,6 +487,13 @@ class Bus:
         row = {"ticket_id": ticket_id, "author_type": author_type, "author_id": None,
                "body": (body or "")[:8000], "attachments": att, "direction": "outbound",
                "delivery_status": delivery_status}
+        if expected_request_version is not None:
+            if type(expected_request_version) is not int or expected_request_version < 0:
+                raise BusError(400, "invalid outbound expected request version")
+            # Migration 0381 compares this expected value with the ticket under its
+            # insert lock. A new requester cycle between Python read and INSERT
+            # refuses the row before any Slack post can use it as completion proof.
+            row["delivery_request_version"] = expected_request_version
         created, dup = self._insert(_MESSAGES, row)
         if dup:  # cannot happen (no unique key on outbound), but never mask it
             raise BusError(409, "unexpected duplicate on outbound insert")
@@ -536,6 +585,44 @@ class Bus:
             att.update(meta_update)
             fields["attachments"] = att
         return self._patch(_MESSAGES, {"id": f"eq.{message_id}"}, fields)
+
+    def hold_uncertain_outreach(self, message_id):
+        """Preserve a committed posted receipt; quarantine only an unposted outreach row."""
+        row = self.message(message_id)
+        if not row or (row.get("attachments") or {}).get("outreach") is not True:
+            return None
+        state = row.get("delivery_status")
+        if state == "posted" or state == "held":
+            return row
+        if state not in ("posting", "ready"):
+            return row
+        att = dict(row.get("attachments") or {})
+        att.update({"outreach_delivery_uncertain": True,
+                    "held_why": "Slack may have delivered; staff must reconcile before resend"})
+        updated = self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": f"eq.{state}",
+            "attachments->>outreach": "eq.true",
+        }, {"delivery_status": "held", "attachments": att})
+        return updated or self.message(message_id)
+
+    def uncertain_outreach_alert_exists(self, ticket_id, message_id):
+        rows = self._get(_MESSAGES, {
+            "ticket_id": f"eq.{ticket_id}", "direction": "eq.outbound",
+            "attachments->>outreach_uncertain_row_id": f"eq.{message_id}",
+            "select": "id", "limit": "1",
+        })
+        return bool(rows)
+
+    def mark_uncertain_outreach_alerted(self, message_id):
+        row = self.message(message_id)
+        if not row or row.get("delivery_status") != "held":
+            return None
+        att = dict(row.get("attachments") or {})
+        att["outreach_staff_alerted"] = True
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.held",
+            "attachments->>outreach_delivery_uncertain": "eq.true",
+        }, {"attachments": att})
 
     def set_message_body_if_posting(self, message_id, body):
         """Store the exact Slack text only while this worker owns the claimed row."""

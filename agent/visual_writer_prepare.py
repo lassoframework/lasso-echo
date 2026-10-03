@@ -5,8 +5,8 @@ trigger. An RPC failure or an unverified delivered object aborts the write.
 """
 from __future__ import annotations
 
-import os
 import hashlib
+import os
 import uuid
 from urllib.parse import unquote, urlsplit, urlunsplit
 
@@ -22,6 +22,79 @@ class VisualPreparationError(ValueError):
 
 def enabled() -> bool:
     return os.environ.get("AGENT_VISUAL_GLOBAL_WRITER_PREP", "").lower() in ("1", "true", "yes", "on")
+
+
+def _distinct_poster_url(row, poster_render_evidence):
+    """Return the distinct poster object URL requiring a second render edge.
+
+    A blank poster adds no object; a byte-for-byte identical URL selects the
+    already verified delivered object. Any other value is a third scene object
+    and must carry explicit poster render evidence: without it the row fails
+    closed before any lookup or RPC rather than being cleared or assigned
+    invented lineage.
+    """
+    thumbnail = row.get("thumbnail_url")
+    if thumbnail is None or (isinstance(thumbnail, str) and not thumbnail.strip()):
+        return None
+    if isinstance(thumbnail, str) and thumbnail == row.get("image_url"):
+        return None
+    if not isinstance(thumbnail, str) or poster_render_evidence is None:
+        raise VisualPreparationError(
+            "distinct thumbnail object has no verified poster scene lineage")
+    return thumbnail
+
+
+def _prepare_poster_edge(store, tenant, group, image_url, image_bytes, image_hash,
+                         poster_url, poster_render_evidence, reader, receipt_writer):
+    """Attest the poster as a second owner render edge image -> thumbnail.
+
+    The selected image is this edge's source and the poster its delivered
+    object, reusing the existing owner receipt boundary and source/rendition
+    RPC in the same linked scene. The row's byte identity stays about the
+    selected image only; this adds the poster object and its lineage so the
+    database verifier can prove the full 3-object scene.
+    """
+    poster = _exact_bytes(poster_url, reader, "poster")
+    poster_hash = _md5(poster)
+    evidence = (poster_render_evidence.as_dict()
+                if hasattr(poster_render_evidence, "as_dict") else poster_render_evidence)
+    if not isinstance(evidence, dict) or any(evidence.get(k) != v for k, v in {
+        "source_exact_url": image_url, "delivered_exact_url": poster_url,
+        "source_fingerprint": image_hash, "delivered_fingerprint": poster_hash,
+        "source_byte_length": len(image_bytes), "delivered_byte_length": len(poster),
+    }.items()) or evidence.get("operation") not in ("render", "reburn", "rehost"):
+        raise VisualPreparationError(
+            "distinct thumbnail object has no verified poster scene lineage")
+    if receipt_writer is None:
+        from . import visual_owner_receipts
+        receipt_writer = visual_owner_receipts.default_writer()
+    if not callable(receipt_writer):
+        raise VisualPreparationError("owner receipt producer is unavailable for poster rendition")
+    try:
+        receipts = receipt_writer(tenant=tenant, group_key=group,
+                                  source_bytes=image_bytes, delivered_bytes=poster,
+                                  render_evidence=evidence, asset_id=None)
+    except Exception as exc:
+        raise VisualPreparationError("owner poster receipt production failed") from exc
+    if not isinstance(receipts, dict):
+        raise VisualPreparationError("owner receipt producer returned no receipts")
+    try:
+        ids = {key: str(uuid.UUID(str(receipts[key]))) for key in (
+            "source_read_receipt", "delivered_read_receipt", "render_receipt")}
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise VisualPreparationError("owner receipt producer returned invalid receipts") from exc
+    result = _rpc(store, "visual_global_prepare_source_rendition", {
+        "p_tenant": tenant, "p_group_key": group,
+        "p_source_read_receipt": ids["source_read_receipt"],
+        "p_delivered_read_receipt": ids["delivered_read_receipt"],
+        "p_render_receipt": ids["render_receipt"], "p_actor": "visual_writer_prepare",
+    })
+    if not isinstance(result, dict) or result.get("group_key") != group or (
+        result.get("source_fingerprint") != image_hash or
+        result.get("delivered_fingerprint") != poster_hash or
+        result.get("usage_claimed") is not False
+    ):
+        raise VisualPreparationError("poster registration returned conflicting identity")
 
 
 def _rpc(store, name, arguments):
@@ -213,7 +286,8 @@ def _register_raw_source(store, tenant, prepared, source_url, source, asset):
 
 
 def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url,
-                              reader, render_evidence, receipt_writer, asset):
+                              reader, render_evidence, receipt_writer, asset,
+                              poster_render_evidence=None):
     """Register two exact objects only through owner-created receipt IDs.
 
     The service-role RPC validates the owner-only rows. This process cannot
@@ -284,21 +358,177 @@ def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url
         result.get("usage_claimed") is not False
     ):
         raise VisualPreparationError("source/rendition registration returned conflicting identity")
+    poster_url = _distinct_poster_url(prepared, poster_render_evidence)
+    if poster_url is not None:
+        # Second owner-attested render edge: selected image -> poster object.
+        _prepare_poster_edge(store, tenant, group, delivered_url, delivered,
+                             delivered_hash, poster_url, poster_render_evidence,
+                             reader, receipt_writer)
     prepared["visual_group_key"] = group
     prepared["byte_hash"] = "derived:" + delivered_hash
     return prepared
 
 
-def prepare(store, account_key, row, *, read_bytes=None, render_evidence=None,
-            receipt_writer=None):
-    """Return a prepared row; never trust identity hints or mutate the input.
+def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receipt_writer=None,
+                             isolated_test_callbacks=False, poster_render_evidence=None):
+    """Attest one exact source/delivered URL through the owner receipt boundary.
 
-    ``read_bytes`` is injectable for tests and callers with an exact delivered
-    object reader. It must return the bytes currently served at ``image_url``.
+    The legacy bundle RPC may create an absent scene, but cannot establish byte
+    authority. The owner read receipt and source/rendition RPC do that work.
     """
     if not enabled():
         return row
     prepared = dict(row)
+    _distinct_poster_url(prepared, poster_render_evidence)
+    url = prepared.get("image_url")
+    source_url = prepared.get("source_media_url")
+    if (not _own_media_url(url) or not isinstance(source_url, str) or
+            not source_url.strip() or source_url != url):
+        raise VisualPreparationError("same-object source and delivered URL must match the media host")
+    if read_bytes is not None or receipt_writer is not None:
+        # Test injection must never be a production route to attest stale bytes
+        # or replay a receipt UUID. The sentinel is deliberately not a usable
+        # database DSN; real owner connections always use the built-in paths.
+        if (not isolated_test_callbacks
+                or os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_DSN") != "test-only"
+                or os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_ROLE") != "receipt_owner"):
+            raise VisualPreparationError("same-object callbacks require isolated test configuration")
+    from . import visual_owner_receipts
+    configured_writer = visual_owner_receipts.default_same_object_writer()
+    if configured_writer is None:
+        raise VisualPreparationError("owner receipt producer is unavailable for same-object visual")
+    if receipt_writer is None:
+        receipt_writer = configured_writer
+    if not callable(receipt_writer):
+        raise VisualPreparationError("owner receipt producer is unavailable for same-object visual")
+
+    tenant = _tenant(store, account_key)
+    data = _exact_bytes(url, read_bytes or _bytes_for_url, "same-object")
+    digest = _md5(data)
+    asset_id = prepared.get("source_media_asset_id")
+    asset = _asset(store, tenant, asset_id) if asset_id else None
+    if asset and not fingerprint.attest_drive(asset.get("content_hash"), data):
+        raise VisualPreparationError("Drive asset MD5 does not attest exact bytes")
+    drive_id = prepared.get("drive_file_id")
+    if drive_id and (not asset or str(drive_id) != str(asset_id)):
+        raise VisualPreparationError("Drive ID has no matching tenant asset")
+    r2_key = prepared.get("r2_key")
+    if r2_key:
+        from . import media_host
+        parsed = urlsplit(url)
+        object_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        if media_host._key_from_public_url(object_url) != r2_key:
+            raise VisualPreparationError("R2 key does not match exact object")
+    supplied_hash = prepared.get("byte_hash")
+    if supplied_hash and supplied_hash != "derived:" + digest:
+        raise VisualPreparationError("row byte_hash does not match exact bytes")
+
+    group = _known_group(store, tenant, prepared, url, required=False)
+    if group is None:
+        registered = _register_raw_source(store, tenant, prepared, url, data, asset)
+        group = _known_group(store, tenant, prepared, url)
+        if group != registered:
+            raise VisualPreparationError("raw source registration returned conflicting group")
+    if not isinstance(group, str) or not group.startswith("vg_"):
+        raise VisualPreparationError("same-object source has no unambiguous registered group")
+
+    evidence = {"exact_url": url, "fingerprint": digest, "byte_length": len(data),
+                "evidence_ref": "visual_writer_prepare:same_object_exact_read",
+                "observed_by": "visual_writer_prepare"}
+    try:
+        receipts = receipt_writer(tenant=tenant, group_key=group, exact_bytes=data,
+                                  evidence=evidence, asset_id=str(asset_id) if asset else None)
+    except Exception as exc:
+        raise VisualPreparationError("owner same-object receipt production failed") from exc
+    try:
+        receipt_id = str(uuid.UUID(str(receipts["read_receipt"])))
+        if receipts.get("render_receipt") is not None:
+            raise ValueError("same-object producer returned render lineage")
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise VisualPreparationError("owner same-object producer returned invalid receipt") from exc
+    result = _rpc(store, "visual_global_prepare_source_rendition", {
+        "p_tenant": tenant, "p_group_key": group,
+        "p_source_read_receipt": receipt_id, "p_delivered_read_receipt": receipt_id,
+        "p_render_receipt": None, "p_actor": "visual_writer_prepare",
+    })
+    if not isinstance(result, dict) or any((
+        result.get("group_key") != group,
+        result.get("source_fingerprint") != digest,
+        result.get("delivered_fingerprint") != digest,
+        result.get("usage_claimed") is not False,
+    )):
+        raise VisualPreparationError("same-object registration returned conflicting identity")
+    poster_url = _distinct_poster_url(prepared, poster_render_evidence)
+    if poster_url is not None:
+        # The same-object writer is one-read form; the poster edge reuses the
+        # configured source/rendition owner writer for image -> thumbnail.
+        _prepare_poster_edge(store, tenant, group, url, data, digest,
+                             poster_url, poster_render_evidence,
+                             read_bytes or _bytes_for_url, None)
+    prepared["visual_group_key"] = group
+    prepared["byte_hash"] = "derived:" + digest
+    return prepared
+
+
+def prepare_same_object(store, account_key, row_or_url, *, flag_on=None,
+                        read_bytes=None, receipt_writer=None,
+                        isolated_test_callbacks=False, poster_render_evidence=None):
+    """Prepare one exact object through the owner receipt boundary.
+
+    Calendar rows retain their row shape; generated-artifact URL callers receive
+    a compact identity for staging. Both forms share byte, tenant, group, and
+    owner receipt checks. Injected callbacks are isolated-test-only.
+    """
+    actual = enabled()
+    if flag_on is not None and bool(flag_on) is not actual:
+        raise VisualPreparationError("writer preparation flag state is ambiguous")
+    if isinstance(row_or_url, dict):
+        return _prepare_same_object_row(
+            store, account_key, row_or_url, read_bytes=read_bytes,
+            receipt_writer=receipt_writer,
+            isolated_test_callbacks=isolated_test_callbacks,
+            poster_render_evidence=poster_render_evidence)
+    if not actual:
+        raise VisualPreparationError("writer preparation flag is off")
+    if not isinstance(row_or_url, str):
+        raise VisualPreparationError("same-object URL is invalid")
+    url = row_or_url
+    prepared = _prepare_same_object_row(
+        store, account_key, {"image_url": url}, read_bytes=read_bytes,
+        receipt_writer=receipt_writer,
+        isolated_test_callbacks=isolated_test_callbacks)
+    return {"visual_group_key": prepared["visual_group_key"],
+            "byte_hash": prepared["byte_hash"], "usage_claimed": False,
+            "url": url}
+
+
+def prepare(store, account_key, row, *, read_bytes=None, render_evidence=None,
+            receipt_writer=None, isolated_test_callbacks=False,
+            poster_render_evidence=None):
+    """Return a prepared row; never trust identity hints or mutate the input.
+
+    ``read_bytes`` is injectable for tests and callers with an exact delivered
+    object reader. It must return the bytes currently served at ``image_url``.
+    Injected callbacks are isolated-test-only: both the same-object path and
+    the distinct source/rendition path bind owner-created receipts, so a
+    production caller must never supply the byte reader or receipt writer.
+
+    A raw same-object row requires an explicit nonblank ``source_media_url``
+    equal to ``image_url`` and is prepared through the one-read owner receipt
+    path (``prepare_same_object``). Distinct source/delivered objects require
+    verified render evidence. A guarded row never infers its source identity
+    from a delivered rendition.
+
+    A distinct ``thumbnail_url`` poster is a third scene object: it prepares
+    as a second owner-attested render edge from the selected image bytes to
+    the poster bytes and requires ``poster_render_evidence``. Without that
+    evidence the row fails closed before any lookup, RPC or calendar write.
+    Blank posters and posters exactly equal to ``image_url`` need no edge.
+    """
+    if not enabled():
+        return row
+    prepared = dict(row)
+    _distinct_poster_url(prepared, poster_render_evidence)
     tenant = _tenant(store, account_key)
     url = prepared.get("image_url")
     active = prepared.get("variant_status", "active") == "active"
@@ -306,60 +536,32 @@ def prepare(store, account_key, row, *, read_bytes=None, render_evidence=None,
         if active:
             raise VisualPreparationError("active visual row has no delivered media")
         return prepared
+    source_url = prepared.get("source_media_url")
+    if not isinstance(source_url, str) or not source_url.strip():
+        raise VisualPreparationError("active visual row has no explicit source media URL")
     reader = read_bytes or _bytes_for_url
     asset_id = prepared.get("source_media_asset_id")
     asset = _asset(store, tenant, asset_id) if asset_id else None
-    source_url = prepared.get("source_media_url")
-    if source_url and source_url != url:
+    if source_url != url:
+        if read_bytes is not None or receipt_writer is not None:
+            # Test injection must never be a production route to attest stale
+            # source/delivered bytes or replay receipt UUIDs for a transformed
+            # write. The sentinel is deliberately not a usable database DSN;
+            # real owner connections always use the built-in paths.
+            if (not isolated_test_callbacks
+                    or os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_DSN") != "test-only"
+                    or os.environ.get("AGENT_VISUAL_RECEIPT_OWNER_ROLE") != "receipt_owner"):
+                raise VisualPreparationError(
+                    "source/rendition callbacks require isolated test configuration")
         return _prepare_source_rendition(store, tenant, prepared, source_url, url,
-                                         reader, render_evidence, receipt_writer, asset)
-    data = _exact_bytes(url, reader, "delivered")
-    if asset and not fingerprint.attest_drive(asset.get("content_hash"), data):
-        raise VisualPreparationError("Drive asset MD5 does not attest delivered bytes")
-    aliases = []
-    if asset:
-        aliases.append(("source_asset", str(asset_id)))
-    # The draft global claim accepts one canonical MD5 per group. A SHA-only
-    # alias cannot be checked against that MD5 by the database at claim time.
-    aliases.append(("byte_hash", fingerprint.derived_aliases(data)[1]))
-    # Drive's bare content_hash attests this exact selected asset and delivered
-    # bytes. A transformed rendition needs a separate proven lineage path.
-    if asset:
-        aliases.append(("byte_hash", fingerprint.from_drive_md5(asset["content_hash"])))
-    aliases.append(("canonical_url", url))
-    drive_id = prepared.get("drive_file_id")
-    if drive_id:
-        if not asset or str(drive_id) != str(asset_id):
-            raise VisualPreparationError("Drive ID has no matching tenant asset")
-        aliases.append(("drive_id", str(drive_id)))
-    r2_key = prepared.get("r2_key")
-    if r2_key:
-        from . import media_host
-        if media_host._key_from_public_url(url) != r2_key:
-            raise VisualPreparationError("R2 key does not match delivered object")
-        aliases.append(("r2_key", str(r2_key)))
-    supplied_hash = prepared.get("byte_hash")
-    if supplied_hash and supplied_hash not in [value for kind, value in aliases if kind == "byte_hash"]:
-        raise VisualPreparationError("row byte_hash does not match delivered bytes")
-    digest = hashlib.md5(data).hexdigest()
-    expected_fingerprint = "md5:" + digest
-    result = _rpc(store, "visual_global_prepare_bundle", {
-        "p_tenant": tenant,
-        "p_aliases": [{"alias_kind": kind, "alias_value": value} for kind, value in aliases],
-        "p_fingerprint": expected_fingerprint,
-        "p_evidence": {"source": "delivered_object_bytes", "verified_bytes": expected_fingerprint,
-                       "delivered_url": url},
-        "p_actor": "visual_writer_prepare",
-        "p_asset_id": str(asset_id) if asset else None,
-    })
-    if not isinstance(result, dict) or result.get("fingerprint") != expected_fingerprint:
-        raise VisualPreparationError("visual bundle registration returned invalid fingerprint")
-    group = result.get("group_key")
-    if not isinstance(group, str) or not group.startswith("vg_"):
-        raise VisualPreparationError("visual bundle registration returned no group")
-    supplied_group = prepared.get("visual_group_key")
-    if supplied_group and supplied_group != group:
-        raise VisualPreparationError("row visual group conflicts with registered identity")
-    prepared["visual_group_key"] = group
-    prepared["byte_hash"] = "derived:md5:" + digest
-    return prepared
+                                         reader, render_evidence, receipt_writer, asset,
+                                         poster_render_evidence)
+    # Raw same-object row: the delivered object IS the source object. Route
+    # through the owner one-read receipt boundary so the guarded row carries
+    # owner source+delivered scene object members; never the legacy bundle
+    # RPC, which cannot establish byte authority for the global claim.
+    return _prepare_same_object_row(
+        store, account_key, prepared, read_bytes=read_bytes,
+        receipt_writer=receipt_writer,
+        isolated_test_callbacks=isolated_test_callbacks,
+        poster_render_evidence=poster_render_evidence)

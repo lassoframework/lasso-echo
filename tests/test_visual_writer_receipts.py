@@ -91,13 +91,17 @@ def receipts(**kwargs):
 @pytest.fixture(autouse=True)
 def armed(monkeypatch):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    # Isolated-test sentinel for injected byte readers/receipt writers; never a
+    # usable database DSN and deliberately absent from production configuration.
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_DSN", "test-only")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_ROLE", "receipt_owner")
 
 
 def test_distinct_pair_requires_owner_receipt_producer():
     http = HTTP()
     with pytest.raises(prep.VisualPreparationError, match="owner receipt producer"):
         prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW},
-                     read_bytes=reader, render_evidence=evidence())
+                     read_bytes=reader, render_evidence=evidence(), isolated_test_callbacks=True)
     assert http.posts == []
 
 
@@ -108,7 +112,8 @@ def test_unknown_object_bytes_never_reach_receipt_producer(missing):
         prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW},
                      read_bytes=lambda url: None if url == missing else reader(url),
                      render_evidence=evidence(),
-                     receipt_writer=lambda **kwargs: pytest.fail("should not issue receipts"))
+                     receipt_writer=lambda **kwargs: pytest.fail("should not issue receipts"),
+                     isolated_test_callbacks=True)
     assert http.posts == []
 
 
@@ -116,7 +121,7 @@ def test_distinct_pair_uses_verified_source_and_delivered_receipts():
     http = HTTP()
     row = prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW,
                                             "source_media_asset_id": "asset-1"},
-                       read_bytes=reader, render_evidence=evidence(), receipt_writer=receipts)
+                       read_bytes=reader, render_evidence=evidence(), receipt_writer=receipts, isolated_test_callbacks=True)
     assert row["source_media_url"] == RAW
     assert row["byte_hash"] == "derived:" + md5(DELIVERED)
     assert row["visual_group_key"] == "vg_scene"
@@ -128,6 +133,7 @@ def test_distinct_pair_uses_verified_source_and_delivered_receipts():
 
 @pytest.mark.parametrize("change", [
     {"source_fingerprint": md5(b"wrong")},
+    {"delivered_fingerprint": md5(b"stale")},
     {"delivered_byte_length": 1},
     {"source_exact_url": RAW.split("?")[0]},
 ])
@@ -136,7 +142,7 @@ def test_render_evidence_must_match_exact_reads(change):
     with pytest.raises(prep.VisualPreparationError, match="rendition lineage"):
         prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW},
                      read_bytes=reader, render_evidence=evidence(**change),
-                     receipt_writer=receipts)
+                     receipt_writer=receipts, isolated_test_callbacks=True)
     assert http.posts == []
 
 
@@ -145,7 +151,7 @@ def test_owner_rpc_rejection_leaves_calendar_write_unprepared():
     with pytest.raises(prep.VisualPreparationError, match="RPC"):
         prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW},
                      read_bytes=reader, render_evidence=evidence(),
-                     receipt_writer=receipts)
+                     receipt_writer=receipts, isolated_test_callbacks=True)
     assert len(http.posts) == 1
 
 
@@ -155,7 +161,7 @@ def test_drive_asset_hash_checks_raw_bytes_not_burned_bytes():
         prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW,
                                             "source_media_asset_id": "asset-1"},
                      read_bytes=lambda url: b"changed" if url == RAW else DELIVERED,
-                     render_evidence=evidence(), receipt_writer=receipts)
+                     render_evidence=evidence(), receipt_writer=receipts, isolated_test_callbacks=True)
     assert http.posts == []
 
 
@@ -251,7 +257,7 @@ def test_injected_reader_cannot_bypass_byte_cap(monkeypatch):
     with pytest.raises(prep.VisualPreparationError, match="bytes could not be verified"):
         prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW},
                      read_bytes=lambda url: b"123456", render_evidence=evidence(),
-                     receipt_writer=receipts)
+                     receipt_writer=receipts, isolated_test_callbacks=True)
     assert http.posts == []
 
 
@@ -286,3 +292,50 @@ def test_bucket_object_read_streams_with_cap_and_closes_body(monkeypatch):
     monkeypatch.setattr(media_host, "_default_client", lambda: Client())
     assert prep._bytes_for_url("https://media.example/raw.jpg") is None
     assert body.closed
+
+
+def test_transformed_write_without_render_evidence_fails_closed():
+    # Distinct source and delivered bytes are a transformation; without
+    # verified render lineage no receipts are issued and no RPC is attempted.
+    http = HTTP()
+    with pytest.raises(prep.VisualPreparationError, match="rendition lineage"):
+        prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW},
+                     read_bytes=reader, render_evidence=None,
+                     receipt_writer=lambda **kwargs: pytest.fail("no receipts without lineage"),
+                     isolated_test_callbacks=True)
+    assert http.posts == []
+
+
+def test_injected_rendition_callbacks_require_isolated_configuration(monkeypatch):
+    # Production configuration has no test sentinel: injected byte readers or
+    # receipt writers on the transformed path fail closed before any byte read.
+    monkeypatch.delenv("AGENT_VISUAL_RECEIPT_OWNER_DSN", raising=False)
+    monkeypatch.delenv("AGENT_VISUAL_RECEIPT_OWNER_ROLE", raising=False)
+    http = HTTP()
+    with pytest.raises(prep.VisualPreparationError, match="isolated test configuration"):
+        prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW},
+                     read_bytes=lambda url: pytest.fail("no production injected reads"),
+                     render_evidence=evidence(),
+                     receipt_writer=receipts, isolated_test_callbacks=True)
+    assert http.posts == []
+
+
+def test_isolated_sentinel_still_requires_explicit_callback_flag():
+    # The sentinel environment alone never authorizes injected callbacks.
+    http = HTTP()
+    with pytest.raises(prep.VisualPreparationError, match="isolated test configuration"):
+        prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW},
+                     read_bytes=reader, render_evidence=evidence(),
+                     receipt_writer=receipts)
+    assert http.posts == []
+
+
+def test_wrong_sentinel_values_never_authorize_injection(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_DSN", "test-only")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_ROLE", "service_role")
+    http = HTTP()
+    with pytest.raises(prep.VisualPreparationError, match="isolated test configuration"):
+        prep.prepare(Store(http), "gym", {"image_url": BURN, "source_media_url": RAW},
+                     read_bytes=reader, render_evidence=evidence(),
+                     receipt_writer=receipts, isolated_test_callbacks=True)
+    assert http.posts == []

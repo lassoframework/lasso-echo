@@ -25,9 +25,12 @@ from __future__ import annotations
 
 import tempfile
 import re
+import os
 from pathlib import Path
 
-from . import config, podcast_caption as _cap, podcast_index as _idx
+from . import config
+from . import podcast_caption as _cap, podcast_index as _idx
+from .gym_media_builder import writer_prep_enabled
 from . import podcast_selector as _sel
 from .drafter import Draft, DraftStatus
 
@@ -221,17 +224,62 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
                       f"({reject}); trying the next clip")
                 continue
 
+            provider_public_url = ""
             if config.lasso_editorial_calendar_enabled() and gym_base == 'lasso':
                 # Calendar videos need the same durable media storage as graphics.
                 from .media_host import host_media
                 public_url = host_media(tmp_path, gym_base)
             else:
-                public_url = _upload_clip(zernio_client, tmp_path, asset.get("title") or
-                                          f"gmms_{episode}_clip.mp4")
+                provider_public_url = _upload_clip(
+                    zernio_client, tmp_path,
+                    asset.get("title") or f"gmms_{episode}_clip.mp4")
+                public_url = provider_public_url
             if not public_url:
                 return None  # vendor-side failure: not a clip problem, stop the slot
-            from .gym_media_builder import video_poster_url
-            thumbnail_url = video_poster_url(tmp_path, tmp_dir, gym_base)
+            poster_evidence = None
+            if writer_prep_enabled():
+                # Zernio's provider publicUrl is outside the writer's strict own-host
+                # boundary. Host these exact local clip bytes in our configured bucket,
+                # use that durable URL as the draft media, and attest the same URL.
+                # The provider URL remains separate below for any publish integration
+                # that needs it; it must never establish source-byte lineage.
+                from .media_host import host_media
+                public_url = host_media(tmp_path, gym_base)
+                if not public_url:
+                    print(f"[podcast-builder] own-host video failed for episode "
+                          f"{episode}; holding the slot (writer prep)")
+                    return None
+                # The provider download is the clip we selected. Verify that the
+                # exact own-host object still serves those bytes before treating
+                # that URL as the selected media or the poster's source.
+                try:
+                    from . import visual_writer_prepare as _visual_prep
+                    local_size = os.path.getsize(tmp_path)
+                    if local_size <= 0 or local_size > _visual_prep.MAX_VISUAL_BYTES:
+                        return None
+                    with open(tmp_path, "rb") as clip_file:
+                        local_bytes = clip_file.read(_visual_prep.MAX_VISUAL_BYTES + 1)
+                    hosted_bytes = _visual_prep._exact_bytes(
+                        public_url, _visual_prep._bytes_for_url, "source")
+                    if local_bytes != hosted_bytes:
+                        print(f"[podcast-builder] own-host bytes differ for episode "
+                              f"{episode}; holding the slot (writer prep)")
+                        return None
+                except Exception:  # noqa: BLE001 - unknown bytes must not stage
+                    print(f"[podcast-builder] own-host byte check failed for episode "
+                          f"{episode}; holding the slot (writer prep)")
+                    return None
+                from .gym_media_builder import video_poster_with_evidence
+                _poster = video_poster_with_evidence(tmp_path, tmp_dir, gym_base,
+                                                     public_url)
+                if _poster is None:
+                    print(f"[podcast-builder] evidenced poster failed for episode "
+                          f"{episode}; holding the slot (writer prep)")
+                    return None
+                thumbnail_url, poster_evidence = _poster
+            else:
+                from .gym_media_builder import video_poster_url
+                thumbnail_url = video_poster_url(tmp_path, tmp_dir, gym_base)
         finally:
             try:
                 import shutil
@@ -261,6 +309,14 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
                              + [f"claim:{c}" for c in (meta or {}).get("claims", [])],
         )
         draft.thumbnail_url = thumbnail_url
+        if poster_evidence:
+            # NON-DB side channel: byte-bound poster receipt for the writer-prep
+            # lane (read by the persistence/calendar integration; no column yet).
+            draft.poster_render_evidence = poster_evidence
+            if provider_public_url and provider_public_url != public_url:
+                # Provider state is intentionally separate from the durable, byte-
+                # attested creative URL used by the writer-prep persistence path.
+                draft.zernio_public_url = provider_public_url
         draft.source_media_asset_id = asset["id"]
         draft.podcast_asset = dict(asset, width=info['width'], height=info['height'],
                                    duration_sec=info['duration_sec'], aspect=aspect)

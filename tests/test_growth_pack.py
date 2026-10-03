@@ -162,6 +162,29 @@ def test_draft_carries_slides(tmp_path):
     assert d.slide_urls == ["https://x/1.png", "https://x/2.png"]
 
 
+def test_carousel_hosting_uploads_slides_without_uploading_folder(tmp_path, monkeypatch):
+    from agent import config, media_host
+
+    folder = _make_carousel(tmp_path, n=2)
+    car = list_creatives(str(tmp_path))[0]
+    calls = []
+    monkeypatch.setattr(config, "hosting_enabled", lambda: True)
+    def host_one(path, tenant):
+        calls.append(path)
+        assert os.path.isfile(path)
+        return f"https://example.test/{os.path.basename(path)}"
+    monkeypatch.setattr(media_host, "host_media", host_one)
+    monkeypatch.setattr(media_host, "host_many",
+                        lambda paths, tenant: [host_one(p, tenant) for p in paths])
+
+    draft = draft_post(_acct(), car, "2026-07-01T10:00:00Z",
+                       voice=_voice_with_ctas())
+
+    assert folder.as_posix() not in calls
+    assert calls == car.slides
+    assert len(draft.slide_urls) == 2
+
+
 def test_store_roundtrips_slides(tmp_path):
     s = PendingStore(path=str(tmp_path / "p.json"))
     d = Draft(draft_id="d1", account_key="k", platform="instagram", caption="c",

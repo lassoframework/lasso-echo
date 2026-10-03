@@ -1,0 +1,8 @@
+{
+  "colors": [
+    "#FF5A00",
+    "#000000"
+  ],
+  "source_url": "https://traingritx.com/",
+  "source_note": "Official homepage links the gym's Astra child-theme custom-styles.css, which uses #FF5A00 for CTAs; owner-authored contrast rules use #000000."
+}

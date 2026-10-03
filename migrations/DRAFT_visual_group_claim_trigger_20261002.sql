@@ -105,6 +105,7 @@ returns table(alias_kind text,alias_value text)
 language sql immutable set search_path = public as $$
   select distinct k, btrim(v) from (values
     ('canonical_url',p_row.image_url),
+    ('canonical_url',to_jsonb(p_row)->>'thumbnail_url'),
     ('canonical_url',to_jsonb(p_row)->>'source_media_url'),
     ('source_asset',to_jsonb(p_row)->>'source_media_asset_id'),
     ('drive_id',to_jsonb(p_row)->>'drive_file_id'),
@@ -396,12 +397,12 @@ begin
   end if;
   if tg_op='UPDATE' then
     media_changed := new.image_url is distinct from old.image_url or
-      exists(select 1 from (values('source_media_url'),('source_media_asset_id'),('drive_file_id'),('byte_hash'),('r2_key')) x(k)
+      exists(select 1 from (values('source_media_url'),('thumbnail_url'),('source_media_asset_id'),('drive_file_id'),('byte_hash'),('r2_key')) x(k)
         where to_jsonb(new)->>k is distinct from to_jsonb(old)->>k);
     identity_changed := new_tenant is distinct from old_tenant or
       new.post_date is distinct from old.post_date or new.visual_group_key is distinct from old.visual_group_key or
       new.image_url is distinct from old.image_url or
-      exists(select 1 from (values('source_media_url'),('source_media_asset_id'),('drive_file_id'),('byte_hash'),('r2_key')) x(k)
+      exists(select 1 from (values('source_media_url'),('thumbnail_url'),('source_media_asset_id'),('drive_file_id'),('byte_hash'),('r2_key')) x(k)
         where to_jsonb(new)->>k is distinct from to_jsonb(old)->>k);
     if identity_changed and (new.status='published' or new.published_at is not null or old.status='published' or old.published_at is not null
        or (public.visual_group_row_ambiguous(old) and not public.visual_group_row_reconciled_here(old))) then
@@ -555,7 +556,7 @@ begin
            or jsonb_typeof(e.value->'media') is distinct from 'object'
            or exists(select 1 from jsonb_object_keys(e.value) k where k not in ('calendar_row_id','media'))
            or exists(select 1 from jsonb_object_keys(e.value->'media') k
-             where k not in ('image_url','source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key','visual_group_key')))
+             where k not in ('image_url','thumbnail_url','source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key','visual_group_key')))
      or (select count(*) from (select distinct (e.value->>'calendar_row_id')::uuid id
          from jsonb_array_elements(p_rows) e) d)<>cardinality(p_row_ids)
      or exists(select 1 from jsonb_array_elements(p_rows) e
@@ -574,8 +575,9 @@ begin
       where public.visual_group_tenant_id(gym_id)::text=v_tenant and id=(item->>'calendar_row_id')::uuid;
     old_date:=r.post_date;
     replacement:=jsonb_populate_record(r,
-      jsonb_build_object('image_url',null,'source_media_url',null,'source_media_asset_id',null,
-        'drive_file_id',null,'byte_hash',null,'r2_key',null,'visual_group_key',null)||media);
+      jsonb_build_object('image_url',null,'thumbnail_url',null,'source_media_url',null,
+        'source_media_asset_id',null,'drive_file_id',null,'byte_hash',null,'r2_key',null,
+        'visual_group_key',null)||media);
     resolved:=public.visual_group_resolve_row(replacement);
     if resolved is null or nullif(btrim(replacement.image_url),'') is null
        or (media->>'visual_group_key' is not null and media->>'visual_group_key'<>resolved) then
@@ -634,7 +636,7 @@ begin
   if new_scene=p_old_group and p_new_date is distinct from old_date then
     raise exception 'staged visual group cannot be redated' using errcode='23514';
   end if;
-  foreach v_col in array array['source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key'] loop
+  foreach v_col in array array['thumbnail_url','source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key'] loop
     if exists(select 1 from information_schema.columns
       where table_schema='public' and table_name='content_calendar' and column_name=v_col) then
       cols:=cols||v_col;
@@ -698,7 +700,7 @@ begin
   end if;
   if p_media is not null and (
     jsonb_typeof(p_media)<>'object' or exists(select 1 from jsonb_object_keys(p_media) k
-      where k not in ('image_url','source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key','visual_group_key'))) then
+      where k not in ('image_url','thumbnail_url','source_media_url','source_media_asset_id','drive_file_id','byte_hash','r2_key','visual_group_key'))) then
     raise exception 'invalid media fields' using errcode='22023';
   end if;
   -- Internal group/ledger/sibling tables are keyed by the canonical tenant

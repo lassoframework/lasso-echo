@@ -275,6 +275,67 @@ def test_stage_arc_stages_pending_and_holds_blocked_recap():
     assert all("recap_blocked" not in r and "arc_kind" not in r for r in store.inserted)
 
 
+def test_stage_arc_does_not_stamp_media_when_durable_insert_fails(monkeypatch):
+    ev = _event(media_ids=())
+    store = _StageStore()
+    store.insert_rows = lambda gym_id, rows: (_ for _ in ()).throw(RuntimeError("db down"))
+    stamped = []
+    monkeypatch.setattr(ec, "_stamp_media_usage", lambda gym, rows: stamped.extend(rows))
+    arc = [{"event_id": ev.id, "post_date": "2026-10-03", "account": "instagram",
+            "format": "feed", "status": "pending", "image_url": "https://cdn.test/x",
+            "source_media_asset_id": "asset-x"}]
+    result = ec.stage_arc(store, ev, arc)
+    assert result["ok"] is False
+    assert stamped == []
+
+
+def test_stage_arc_stamps_only_exact_rows_returned_by_partial_insert(monkeypatch):
+    ev = _event(media_ids=())
+    store = _StageStore()
+    original_insert = store.insert_rows
+
+    def insert_first_only(gym_id, rows):
+        original_insert(gym_id, rows)
+        return store.inserted[-len(rows):][:1]
+
+    store.insert_rows = insert_first_only
+    stamped = []
+    monkeypatch.setattr(ec, "_stamp_media_usage", lambda gym, rows: stamped.extend(rows))
+    arc = [
+        {"event_id": ev.id, "post_date": f"2026-10-0{day}", "account": "instagram",
+         "format": "feed", "status": "pending", "image_url": f"https://cdn.test/{day}",
+         "source_media_asset_id": f"asset-{day}"}
+        for day in (3, 4)
+    ]
+    result = ec.stage_arc(store, ev, arc)
+    assert result["ok"] is True and result["staged"] == 1
+    assert [r["source_media_asset_id"] for r in stamped] == ["asset-3"]
+
+
+def test_stage_arc_does_not_stamp_mismatched_or_count_only_insert_receipt(monkeypatch):
+    ev = _event(media_ids=())
+    arc = [{"event_id": ev.id, "post_date": "2026-10-03", "account": "instagram",
+            "format": "feed", "status": "pending", "image_url": "https://cdn.test/x",
+            "source_media_asset_id": "asset-x"}]
+    stamped = []
+    monkeypatch.setattr(ec, "_stamp_media_usage", lambda gym, rows: stamped.extend(rows))
+
+    for receipt in ("mismatched", 1):
+        store = _StageStore()
+
+        def insert_with_receipt(gym_id, rows, result=receipt):
+            store.inserted.extend({**r, "gym_id": gym_id} for r in rows)
+            if result == "mismatched":
+                return [{**store.inserted[-1], "image_url": "https://cdn.test/other"}]
+            return result
+
+        store.insert_rows = insert_with_receipt
+        stamped.clear()
+        result = ec.stage_arc(store, ev, arc)
+        assert result["ok"] is True
+        assert stamped == []
+
+
 # ---- an image-less arc row must never be staged ----------------------------------
 def test_attach_media_gives_rows_a_photo_and_stamps_the_asset():
     """Event rows used to be staged with NO image_url at all — media_ids existed on
@@ -283,7 +344,8 @@ def test_attach_media_gives_rows_a_photo_and_stamps_the_asset():
     from agent import event_calendar as ec
     rows = [{"post_date": "2026-10-03", "account": "instagram", "format": "feed"},
             {"post_date": "2026-10-04", "account": "instagram", "format": "feed"}]
-    picked = [{"id": "a1", "title": "one.jpg"}, {"id": "a2", "title": "two.jpg"}]
+    picked = [{"id": "a1", "title": "one.jpg", "source_media_url": "https://drive.test/raw/a1"},
+              {"id": "a2", "title": "two.jpg", "source_media_url": "https://drive.test/raw/a2"}]
     kept, held = ec._attach_media(
         "zanshinfitness630e22", rows, lambda m: None,
         picker=lambda exclude: next((a for a in picked if a["id"] not in exclude), None),
@@ -292,6 +354,20 @@ def test_attach_media_gives_rows_a_photo_and_stamps_the_asset():
     assert [r["image_url"] for r in kept] == ["https://cdn.test/a1.jpg",
                                               "https://cdn.test/a2.jpg"]
     assert [r["source_media_asset_id"] for r in kept] == ["a1", "a2"]
+    assert [r["source_media_url"] for r in kept] == [
+        "https://drive.test/raw/a1", "https://drive.test/raw/a2"]
+
+
+def test_attach_media_does_not_claim_hosted_rendition_as_raw_source():
+    from agent import event_calendar as ec
+    rows = [{"post_date": "2026-10-03", "account": "instagram", "format": "feed"}]
+    kept, held = ec._attach_media(
+        "g", rows, lambda m: None,
+        picker=lambda exclude: {"id": "a1", "title": "x.jpg"},
+        host=lambda *a: "https://cdn.test/transformed.jpg")
+    assert not held
+    assert kept[0]["image_url"] == "https://cdn.test/transformed.jpg"
+    assert "source_media_url" not in kept[0]
 
 
 def test_attach_media_holds_a_row_it_cannot_give_a_photo():
@@ -340,7 +416,8 @@ class _BackfillStore:
             return dict(r)
         return None
 
-    def patch_media(self, gym_id, row_id, image_url, source_media_asset_id=""):
+    def patch_media(self, gym_id, row_id, image_url, source_media_asset_id="", *,
+                    source_media_url=None):
         current = self.get_row(gym_id, row_id)
         if current is None or (current.get("image_url") or "").strip():
             return None
@@ -348,6 +425,8 @@ class _BackfillStore:
         r["image_url"] = image_url
         if source_media_asset_id:
             r["source_media_asset_id"] = source_media_asset_id
+        if source_media_url:
+            r["source_media_url"] = source_media_url
         self.patched.append(row_id)
         return dict(r)
 
@@ -358,10 +437,8 @@ def _stale_row(rid, post_date, status, event_id="evt_x", image_url=""):
             "caption": "unchanged"}
 
 
-def test_backfill_missing_media_patches_pending_and_approved_rows():
-    """The exact live shape (Pete/Zanshin, 2026-08-31): pending + approved rows
-    staged with no image before the media-attach guard existed. Each gets a real
-    photo, caption/status/date untouched."""
+def test_backfill_missing_media_holds_approved_and_patches_pending_rows():
+    """Pending rows can be backfilled; approved content awaits owner reapproval."""
     from agent import event_calendar as ec
     rows = [
         _stale_row("r1", "2026-10-02", "pending"),
@@ -369,21 +446,48 @@ def test_backfill_missing_media_patches_pending_and_approved_rows():
         _stale_row("r3", "2026-09-26", "denied"),   # denied: never touched
     ]
     store = _BackfillStore(rows)
-    picked = [{"id": "a1", "title": "one.jpg"}, {"id": "a2", "title": "two.jpg"}]
+    picked = [{"id": "a1", "title": "one.jpg", "source_media_url": "https://drive.test/a1"}]
     res = ec.backfill_missing_media(
         store, "zanshinfitness630e22", "evt_x",
         picker=lambda exclude: next((a for a in picked if a["id"] not in exclude), None),
         host=lambda asset, gym, drive: f"https://cdn.test/{asset['id']}.jpg")
-    assert sorted(res["backfilled"]) == ["r1", "r2"]
-    assert res["held"] == 0
+    assert res["backfilled"] == ["r1"]
+    assert res["held"] == 1
     assert store.rows["r1"]["image_url"] == "https://cdn.test/a1.jpg"
     assert store.rows["r1"]["status"] == "pending"        # status untouched
     assert store.rows["r1"]["caption"] == "unchanged"      # caption untouched
-    assert store.rows["r2"]["image_url"] == "https://cdn.test/a2.jpg"
+    assert store.rows["r2"]["image_url"] == ""
     assert store.rows["r2"]["status"] == "approved"
+    # Explicit source lineage is forwarded separately from the hosted rendition.
+    assert store.rows["r1"]["source_media_url"] == "https://drive.test/a1"
+    assert "r2" not in store.patched
     # denied row never entered the candidate set at all.
     assert store.rows["r3"]["image_url"] == ""
     assert "r3" not in store.patched
+
+
+def test_backfill_missing_media_holds_when_guard_requires_missing_source_lineage(monkeypatch):
+    from agent import event_calendar as ec
+
+    class GuardedBackfillStore(_BackfillStore):
+        def patch_media(self, gym_id, row_id, image_url, source_media_asset_id="", *,
+                        source_media_url=None):
+            if not source_media_url:
+                raise ValueError("source lineage required")
+            return super().patch_media(
+                gym_id, row_id, image_url, source_media_asset_id,
+                source_media_url=source_media_url)
+
+    store = GuardedBackfillStore([_stale_row("r1", "2026-10-02", "pending")])
+    stamped = []
+    monkeypatch.setattr(ec, "_stamp_media_usage", lambda gym, rows: stamped.extend(rows))
+    res = ec.backfill_missing_media(
+        store, "zanshinfitness630e22", "evt_x",
+        picker=lambda exclude: {"id": "asset-x", "title": "transformed.jpg"},
+        host=lambda *args: "https://cdn.test/transformed.jpg")
+    assert res == {"backfilled": [], "held": 1}
+    assert store.rows["r1"]["image_url"] == ""
+    assert stamped == []
 
 
 def test_backfill_missing_media_never_touches_a_row_that_already_has_an_image():

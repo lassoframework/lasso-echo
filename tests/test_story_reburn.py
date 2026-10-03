@@ -1,8 +1,9 @@
 """
 Task #28 §5c — story caption re-burn (agent/story_reburn.py + the edit wiring). Fully
-gated: no-op unless BOTH AGENT_STORY_SOURCE_MEDIA and AGENT_STORY_FORMAT are on and the row
-is a story with a source_media_url. Best-effort: a re-burn failure NEVER fails the saved
-edit. Offline — the burn + host + download are stubbed.
+gated: a story needs AGENT_STORY_FORMAT and a source_media_url; normally it also needs
+AGENT_STORY_SOURCE_MEDIA, with an exception for a visual-writer-guarded same-object row.
+Best-effort: a re-burn failure NEVER fails the saved edit. Offline — the burn + host +
+download are stubbed.
 """
 
 import os
@@ -45,6 +46,13 @@ def test_should_reburn_off_when_flag_off(monkeypatch):
     monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "false")
     monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
     assert story_reburn.should_reburn(_story_row()) is False
+
+
+def test_should_reburn_allows_visual_writer_guard_when_source_flag_off(monkeypatch):
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "false")
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    assert story_reburn.should_reburn(_story_row()) is True
 
 
 # ---- reburn() best-effort ---------------------------------------------------
@@ -143,7 +151,7 @@ def test_maybe_reburn_transports_verified_evidence_when_writer_prep_is_armed(mon
     store = Store()
     assert ps.maybe_reburn_story("gritx", _story_row(), "brand new caption", store) == "https://r2/w/fresh.jpg"
     assert store.call == ("gritx", "s1", "https://r2/w/fresh.jpg",
-                          {"render_evidence": evidence})
+                          {"render_evidence": evidence, "expected_row": _story_row()})
 
 
 def test_maybe_reburn_accepts_as_dict_only_evidence(monkeypatch):
@@ -170,7 +178,34 @@ def test_maybe_reburn_accepts_as_dict_only_evidence(monkeypatch):
     store = Store()
     assert ps.maybe_reburn_story("gritx", _story_row(), "new", store) == "https://r2/w/fresh.jpg"
     assert store.call == ("gritx", "s1", "https://r2/w/fresh.jpg",
-                          {"render_evidence": evidence})
+                          {"render_evidence": evidence, "expected_row": _story_row()})
+
+
+def test_caption_edit_reburn_uses_authoritative_post_edit_row(monkeypatch):
+    old = _story_row(caption="old", status="approved")
+    updated = {**old, "caption": "new", "status": "pending"}
+
+    class Store:
+        def get_row(self, account_key, row_id):
+            return dict(old)
+
+        def patch_caption(self, account_key, row_id, caption):
+            assert caption == "new"
+            return dict(updated)
+
+    observed = {}
+    monkeypatch.setattr(ps, "_action_gates", lambda *_a, **_k: None)
+    monkeypatch.setattr(ps._rotation, "is_gate_clean", lambda *_a, **_k: True)
+    monkeypatch.setattr(ps, "_learn_from_edit", lambda *_a, **_k: None)
+    monkeypatch.setattr(ps, "maybe_reburn_story",
+                        lambda account_key, row, caption, store: observed.update(
+                            account_key=account_key, row=dict(row), caption=caption) or "fresh")
+
+    status, body = ps._handle_edit_supabase(
+        "gritx", "s1", "owner", "new", None, Store())
+    assert status == 200 and body["story_reburned"] is True
+    assert observed["row"] == updated
+    assert observed["caption"] == "new"
 
 
 # ---- pre-migration safety: source_media_url only in the row when set ---------

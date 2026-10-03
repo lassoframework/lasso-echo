@@ -99,6 +99,8 @@ def test_owner_producer_refuses_external_urls_and_mismatched_evidence():
 
 def test_prepare_uses_configured_owner_writer_only_when_available(monkeypatch):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_DSN", "test-only")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_ROLE", "receipt_owner")
     seen = {}
 
     def writer(**kwargs):
@@ -131,6 +133,6 @@ def test_prepare_uses_configured_owner_writer_only_when_available(monkeypatch):
     prepared = prep.prepare(Store(), "gym", {"image_url": DELIVERED_URL,
                                                "source_media_url": SOURCE_URL},
                             read_bytes=lambda url: {SOURCE_URL: SOURCE, DELIVERED_URL: DELIVERED}[url],
-                            render_evidence=evidence())
+                            render_evidence=evidence(), isolated_test_callbacks=True)
     assert prepared["visual_group_key"] == "vg_scene"
     assert seen["source_bytes"] == SOURCE and seen["delivered_bytes"] == DELIVERED

@@ -10,6 +10,7 @@ lookup. resolve_client_identity then reported "no Slack account for this authent
 email" for a client who actually had one, escalating instead of answering.
 """
 from agent import echo_ticket_wiring as W
+from agent.slack_convo.bus import Bus
 
 
 class _FakePoster:
@@ -39,3 +40,27 @@ def test_slack_lookup_email_factory_returns_none_on_not_ok():
     poster = _FakePoster({"ok": False, "error": "users_not_found"})
     lookup = W._slack_lookup_email_factory(poster)
     assert lookup("nobody@lassoframework.com") is None
+
+
+def test_live_echo_stamp_uses_request_and_identity_cas():
+    calls = []
+    bus = Bus.__new__(Bus)
+    bus._patch = lambda table, match, fields: calls.append((table, match, fields)) or None
+    stamp = W._stamp_ticket_factory(bus)
+    original = {
+        "request_version": 4, "status": "verification",
+        "classification": "answerable_question", "product": "echo",
+        "client_id": "gym-1", "bot_identity": "echo", "slack_user_id": "U_CLIENT",
+        "slack_channel_id": None, "slack_thread_ts": None,
+    }
+    stamp("ticket-1", expected_ticket=original, channel_id="G123",
+          thread_ts="9999.1", slack_user_id="U_CLIENT",
+          bot_identity="echo", identity_kind="client")
+    table, match, fields = calls[0]
+    assert table == "support_tickets"
+    assert match["request_version"] == "eq.4"
+    assert match["bot_identity"] == "eq.echo"
+    assert match["slack_user_id"] == "eq.U_CLIENT"
+    assert match["slack_channel_id"] == "is.null"
+    assert match["slack_thread_ts"] == "is.null"
+    assert fields["slack_channel_id"] == "G123"

@@ -9,8 +9,10 @@ gap detection reuse, per-run cap, PENDING insert-only rows, and that a scrape
 or generate failure never raises.
 """
 
+import hashlib
 import os
 import sys
+import uuid
 
 import pytest
 
@@ -30,6 +32,7 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_NO_MEDIA_ASTRA_SEED", "true")
     monkeypatch.setenv("AGENT_GYM_DEEP_BRAIN", "true")
     monkeypatch.setenv("AGENT_NANO_ENABLED", "true")
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
     # 733da2b: depletion may only be inferred from an indexed Drive source that
     # finished a successful sync and indexed zero assets. These gyms have no
     # Drive media at all, so the fixture proves exactly that.
@@ -148,6 +151,121 @@ def test_generates_grounded_pending_rows(monkeypatch):
         # machine-scraped, not human-authored/approved.
         assert row["pillar"] == nmas.NEEDS_CLIENT_SAFE_REVIEW_PILLAR
         assert row["pillar"] != "pending"
+
+
+def test_global_visual_writer_guard_stamps_truthful_same_object_source(monkeypatch):
+    """Hosted seed PNG is the exact rendered object, so guard-on rows identify
+    the hosted URL as both delivered image and raw source."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    _stub_pipeline(monkeypatch)
+    _stub_deep_brain(monkeypatch, [_Fact("Real fact about Chateau")])
+    store = _Store()
+
+    assert nmas.seed_gaps("chateau", _acct(), store, max_rows=1,
+                          days_ahead=1) == 1
+    row = store.inserted[0]
+    assert row["source_media_url"] == row["image_url"]
+
+
+def test_global_visual_writer_guard_off_preserves_legacy_seed_payload(monkeypatch):
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    _stub_pipeline(monkeypatch)
+    _stub_deep_brain(monkeypatch, [_Fact("Real fact about Chateau")])
+    store = _Store()
+
+    assert nmas.seed_gaps("chateau", _acct(), store, max_rows=1,
+                          days_ahead=1) == 1
+    assert "source_media_url" not in store.inserted[0]
+
+
+def test_seed_output_passes_prepared_writer_as_same_object(monkeypatch):
+    """Exercise the real prepared-row boundary on a guard-on Astra seed, with
+    exact hosted bytes and owner receipt stubs. The configured gym palette still
+    passes through the brief builder before that row is prepared."""
+    from agent import astra_prompt, client_infographic_fill, media_host
+    from agent import visual_owner_receipts, visual_writer_prepare as prep
+
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://r2")
+    palette = {"canvas": "#112233", "ink": "#FFFFFF", "accent": "#C8102E"}
+    _stub_pipeline(monkeypatch, palette=palette)
+    brief_seen = {}
+    monkeypatch.setattr(astra_prompt, "build_infographic_brief",
+                        lambda headline, facts, **kw: brief_seen.update(
+                            palette=kw["gym_palette"]) or "verified brief")
+    _stub_deep_brain(monkeypatch, [_Fact("Real fact about Chateau")])
+    monkeypatch.setattr(media_host, "host_media",
+                        lambda path, key: "https://r2/no_media_test.png")
+
+    store = _Store()
+    assert nmas.seed_gaps("chateau", _acct(), store, max_rows=1,
+                          days_ahead=1) == 1
+    candidate = store.inserted[0]
+    assert brief_seen["palette"] == palette
+    assert candidate["source_media_url"] == candidate["image_url"]
+
+    exact_bytes = _AstraResult().image_bytes
+    digest = "md5:" + hashlib.md5(exact_bytes).hexdigest()
+    receipt_id = str(uuid.uuid4())
+    receipt_calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, value):
+            self.value = value
+
+        def json(self):
+            return self.value
+
+    class HTTP:
+        def get(self, url, *, params, headers, timeout):
+            if url.endswith("tenant_alias"):
+                key = params["alias_key"][3:]
+                return Response([{"alias_key": key,
+                                  "tenant_id": "11111111-1111-4111-8111-111111111111"}])
+            if url.endswith("visual_group_alias"):
+                return Response([{"group_key": "vg_seed_card"}])
+            raise AssertionError(f"unexpected lookup: {url}")
+
+        def post(self, url, *, headers, json, timeout):
+            assert url.endswith("visual_global_prepare_source_rendition")
+            assert json["p_source_read_receipt"] == receipt_id
+            assert json["p_delivered_read_receipt"] == receipt_id
+            assert json["p_render_receipt"] is None
+            return Response({"group_key": "vg_seed_card",
+                             "source_fingerprint": digest,
+                             "delivered_fingerprint": digest,
+                             "usage_claimed": False})
+
+    class PreparedStore:
+        def _client(self):
+            return http
+
+        @staticmethod
+        def _rest(path):
+            return "https://db.example/rest/v1/" + path
+
+        @staticmethod
+        def _headers(extra=None):
+            return extra or {}
+
+    http = HTTP()
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: exact_bytes)
+
+    def owner_writer(**kwargs):
+        receipt_calls.append(kwargs)
+        return {"read_receipt": receipt_id, "render_receipt": None}
+
+    monkeypatch.setattr(visual_owner_receipts, "default_same_object_writer",
+                        lambda: owner_writer)
+    prepared = prep.prepare(PreparedStore(), "chateau_ig", candidate)
+    assert prepared["source_media_url"] == prepared["image_url"]
+    assert prepared["visual_group_key"] == "vg_seed_card"
+    assert prepared["byte_hash"] == "derived:" + digest
+    assert len(receipt_calls) == 1
+    assert receipt_calls[0]["exact_bytes"] == exact_bytes
+    assert receipt_calls[0]["evidence"]["exact_url"] == candidate["image_url"]
 
 
 def test_needs_client_safe_review_pillar_is_never_a_known_taxonomy_pillar():

@@ -98,16 +98,40 @@ def _conditional_replace(store, row, pick):
     if pick.get("source_media_url") is not None:
         payload["source_media_url"] = pick.get("source_media_url")
 
-    old_asset_id = str(row.get("source_media_asset_id") or "").strip()
-    params = {
-        "id": f"eq.{_ROW_ID}",
-        "gym_id": f"eq.{_GYM}",
-        "status": "eq.approved",
-        "reject_reason": f"eq.{_REASON}",
-        "source_media_asset_id": (
-            f"eq.{old_asset_id}" if old_asset_id else "is.null"
-        ),
-    }
+    from agent import visual_writer_prepare
+    from agent.portal_calendar_store import PortalStoreError, _scrub
+
+    prepared = visual_writer_prepare.enabled()
+    if prepared:
+        # Route through the store's prepared visual writer so the replacement
+        # earns durable lineage (visual_group_key / byte_hash) instead of
+        # bypassing it. Preparation fails closed: if the replacement cannot
+        # attest its source (e.g. the row carries a raw source the pick does
+        # not re-supply), nothing is written.
+        try:
+            payload = store._prepare_visual_replacement(_GYM, row, payload)
+        except visual_writer_prepare.VisualPreparationError as exc:
+            raise SystemExit(
+                f"REFUSED: prepared visual writer rejected the replacement "
+                f"({exc}); no media was written."
+            )
+        params = store._visual_media_cas(row, {
+            "id": f"eq.{_ROW_ID}",
+            "gym_id": f"eq.{_GYM}",
+            "status": "eq.approved",
+            "reject_reason": f"eq.{_REASON}",
+        })
+    else:
+        old_asset_id = str(row.get("source_media_asset_id") or "").strip()
+        params = {
+            "id": f"eq.{_ROW_ID}",
+            "gym_id": f"eq.{_GYM}",
+            "status": "eq.approved",
+            "reject_reason": f"eq.{_REASON}",
+            "source_media_asset_id": (
+                f"eq.{old_asset_id}" if old_asset_id else "is.null"
+            ),
+        }
     response = store._client().patch(
         store._rest("content_calendar"),
         params=params,
@@ -119,9 +143,12 @@ def _conditional_replace(store, row, pick):
         timeout=30,
     )
     if response.status_code >= 400:
-        from agent.portal_calendar_store import PortalStoreError, _scrub
         raise PortalStoreError(
             response.status_code, _scrub((response.text or "")[:200])
+        )
+    if prepared:
+        return store._visual_media_result(
+            response.json() or [], _GYM, row, payload
         )
     rows = [
         candidate for candidate in (response.json() or [])

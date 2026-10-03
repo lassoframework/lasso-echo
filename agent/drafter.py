@@ -102,6 +102,11 @@ class Draft:
     # SPECIFIC published post can be traced back to the engine that made it,
     # not just "Astra was in use during some window."
     image_engine: str = ""
+    # Raw, explicit media provenance for a delivered rendition. This remains
+    # empty unless a producer supplies it; consumers must never infer it from
+    # creative_public_url because the delivered asset may be a crop or burn.
+    # Kept last so existing positional Draft construction stays compatible.
+    source_media_url: str = ""
 
 
 def _make_id(account_key, creative_path, scheduled_for):
@@ -1223,9 +1228,12 @@ def draft_post(account, creative, scheduled_for, voice=None,
     # the hosted URLs (tenant-scoped by account). OFF, or any failure, leaves the
     # existing sidecar URLs untouched -> current behavior is unchanged.
     if config.hosting_enabled():
-        hosted = media_host.host_media(creative.path, account.key)
-        if hosted:
-            creative_public_url = hosted
+        # A carousel's path names its containing folder, not uploadable media.
+        # Only its regular slide files belong in the hosting call.
+        if creative.media_type != "carousel":
+            hosted = media_host.host_media(creative.path, account.key)
+            if hosted:
+                creative_public_url = hosted
         if slides:
             hosted_slides = media_host.host_many(slides, account.key)
             if hosted_slides:

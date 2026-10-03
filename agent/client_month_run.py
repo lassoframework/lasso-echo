@@ -552,13 +552,33 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
     produces IDENTICAL feed+story cards (same lanes, same captionless-story guard). Mutates
     feed.creative_public_url in place via the lanes. The caller owns loop state (built_days,
     opening variety); this helper is stateless beyond the drafts it returns."""
+    # The global visual writer needs the exact hosted object that existed before any
+    # local rendition lane runs.  Keep that identity on both paired drafts while its
+    # guard is armed; the writer, not this planner, performs the later byte proof.
+    # No URL is inferred from a rendered output.
+    raw_source = _capture_raw_hosted_source(feed, log, day_key)
+    if _visual_writer_guard_enabled() and not raw_source:
+        log(f"held {day_key} feed: visual provenance requires a raw hosted source URL")
+        return []
+    if (_visual_writer_guard_enabled()
+            and raw_source != (getattr(feed, "creative_public_url", "") or "").strip()):
+        # A pre-rendered Drive/legacy draft is already a distinct rendition.  This
+        # producer has no route to attach its owner receipt to insert_rows, so retain
+        # its explicit raw source but hold the slot rather than stage unproven lineage.
+        log(f"held {day_key} feed: transformed media lacks owner-attested render evidence")
+        return []
+
     # ACTION-CUT REEL (AGENT_CLIENT_VIDEO_EDIT, OFF by default): a VIDEO draft is edited
     # into a fast-cut 9:16 reel and the draft's creative swaps to the hosted edit. Any
     # failure keeps the raw video; approval gate unchanged.
     _maybe_edit_video(account, feed, library_path, log)
     # VIDEO PREVIEW: a video shows BLANK in the calendar slot; host a poster frame so the
-    # client sees a real frame. Display-only; best effort.
-    _attach_video_poster(account, feed, library_path, log)
+    # client sees a real frame. Display-only; best effort. Under the armed writer-prep
+    # guard a video preview must carry byte-bound render evidence: a failure HOLDS the
+    # whole slot (return []) rather than stage a distinct unproven thumbnail.
+    if not _attach_video_poster(account, feed, library_path, log):
+        log(f"held {day_key} feed: video poster lacks owner-attested render evidence")
+        return []
     # FEED AUTOFIT (AGENT_FEED_AUTOFIT, OFF by default): an out-of-spec feed PHOTO is
     # re-framed to 1080x1350. Snapshot the pre-autofit media FIRST so the paired story
     # never inherits the formatted feed card.
@@ -576,6 +596,15 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
             story.creative_public_url = _pre_autofit_url
         except Exception:  # noqa: BLE001 - a frozen/edge draft never blocks the build
             pass
+    if _visual_writer_guard_enabled() and raw_source:
+        # dataclasses.replace deliberately drops dynamic draft fields, so copy the
+        # exact raw source explicitly.  The story's existing source-media path below
+        # still owns caption re-burn provenance when that separate flag is armed.
+        try:
+            story.source_media_url = raw_source
+        except Exception:  # noqa: BLE001 - a frozen draft is held below
+            log(f"held {day_key} story: visual provenance could not retain raw source")
+            return [feed]
     _mark_story(story)
     # Honor a client-edited story caption when one was passed in.
     if story_caption_override:
@@ -795,6 +824,10 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
         except Exception:
             _release_feed_reservation(feed)
             raise
+        if not finished:
+            _release_feed_reservation(feed)
+            log(f"{base_key} {day_key}: held; visual provenance could not stage the feed")
+            continue
         drafts.extend(finished)
         covered_days.add(day_key)
         if key:
@@ -1056,6 +1089,17 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
     # guard). A story that cannot carry its caption is still dropped in there.
     day_drafts = _finish_feed_with_story(
         account, draft, library_path, log, day_key=day_key)
+    if not day_drafts:
+        _rollback_drive_asset(draft, day_key, log)
+        # The rollback makes this unattestable rendition least-used again. Exclude it
+        # for the remainder of this build so the next day can reach a different,
+        # provable Drive asset instead of repeatedly starving the pool.
+        aid = (getattr(draft, "source_media_asset_id", "") or "").strip()
+        if aid:
+            failed.add(aid)
+        log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: held; visual provenance "
+            "could not stage the feed")
+        return False
     if slots == 2:
         for d in day_drafts:
             try:
@@ -1558,6 +1602,10 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             except Exception:
                 _release_feed_reservation(feed)
                 raise
+            if not day_drafts:
+                _release_feed_reservation(feed)
+                log(f"{base_key} {day_key}: held; visual provenance could not stage the feed")
+                continue
             # 2x rows carry their slot ordinal so publish-time slot times are
             # deterministic (07:30 / 18:30, config.cadence_slot_times). 1x days carry
             # NO ordinal: the row shape (and publish hashing) stays byte-for-byte.
@@ -1753,7 +1801,9 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         rows.extend(_gbp_rows)
     try:
         result = _apply(base_key, rows, start, days, store, log,
-                        locked_days=locked_feed_days, allow_reshape=allow_reshape)
+                        locked_days=locked_feed_days, allow_reshape=allow_reshape,
+                        poster_render_evidence_by_url=_poster_render_evidence_by_url(
+                            drafts))
     except Exception:
         # _apply catches remote write failures and returns their unknown-outcome
         # flag. An exception escaping its contract is a prewrite planning failure.
@@ -1790,6 +1840,44 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
 from .media_types import VIDEO_EXTS as _VIDEO_EXTS, is_video_url   # ONE definition (D1)
 
 
+def _visual_writer_guard_enabled():
+    """Whether calendar writes require owner-attested visual provenance."""
+    try:
+        from . import visual_writer_prepare
+        return bool(visual_writer_prepare.enabled())
+    except Exception:  # noqa: BLE001 - an armed guard must never silently open
+        return os.environ.get("AGENT_VISUAL_GLOBAL_WRITER_PREP", "").lower() in (
+            "1", "true", "yes", "on")
+
+
+def _capture_raw_hosted_source(draft, log, day_key):
+    """Attach the pre-transform hosted URL without guessing a source identity.
+
+    The visual writer verifies same-object bytes at its privileged boundary.  This
+    producer preserves an explicit source when one already exists, and otherwise
+    carries the exact URL it received before its own rendition lanes can swap
+    ``creative_public_url``.  A Drive asset without explicit source provenance may
+    already be a HEIC/HEVC rendition, so it is held instead of being relabeled raw.
+    """
+    if not _visual_writer_guard_enabled():
+        return ""
+    existing = (getattr(draft, "source_media_url", "") or "").strip()
+    if existing:
+        return existing
+    if (getattr(draft, "source_media_asset_id", "") or "").strip():
+        log(f"held {day_key} feed: Drive rendition has no explicit raw source URL")
+        return ""
+    raw = (getattr(draft, "creative_public_url", "") or "").strip()
+    if not raw:
+        return ""
+    try:
+        draft.source_media_url = raw
+    except Exception:  # noqa: BLE001 - never silently lose provenance on an immutable draft
+        log(f"held {day_key} feed: visual provenance could not retain raw source")
+        return ""
+    return raw
+
+
 def _maybe_edit_video(account, feed, library_path, log):
     """Swap a VIDEO feed draft's creative for its action-cut reel (edited + HOSTED).
     No-op unless AGENT_CLIENT_VIDEO_EDIT is armed, the creative is a video, and both
@@ -1797,6 +1885,12 @@ def _maybe_edit_video(account, feed, library_path, log):
     may never block a post). Mutates feed.creative_public_url in place; the paired
     story is cloned FROM the feed afterwards, so it inherits the same reel."""
     if not config.client_video_edit_enabled():
+        return
+    if _visual_writer_guard_enabled():
+        # This producer has no owner receipt for the rendered reel.  Keep the exact
+        # raw hosted video; writing a distinct rendition without that evidence is
+        # forbidden by the calendar writer.
+        log("reel edit held: visual provenance lacks owner-attested render evidence")
         return
     path = (getattr(feed, "creative_path", "") or "").strip()
     if not path or not path.lower().endswith(_VIDEO_EXTS):
@@ -1824,14 +1918,23 @@ def _maybe_edit_video(account, feed, library_path, log):
 def _attach_video_poster(account, draft, library_path, log):
     """For a VIDEO draft, generate + host a poster frame and stash its url on the draft
     (-> content_calendar.thumbnail_url) so the portal shows a real frame, not a blank
-    card. Best effort: no poster just means the existing blank, never a blocked post."""
+    card. Returns True when the draft may ship (poster attached, already present, or
+    no poster needed). Returns False ONLY under the armed AGENT_VISUAL_GLOBAL_WRITER_PREP
+    guard, when a distinct thumbnail could not be produced WITH byte-bound render
+    evidence: the caller then HOLDS the slot instead of staging an unproven rendition.
+    Flag off: legacy best effort, never a blocked post."""
     path = (getattr(draft, "creative_path", "") or "").strip()
     if not path or not path.lower().endswith(_VIDEO_EXTS):
-        return
+        return True
     # A Drive-lane video already carries the poster its builder made while the
-    # download was on disk; its creative_path is the asset TITLE, not a file.
+    # download was on disk; its creative_path is the asset TITLE, not a file. Under
+    # the guard that builder also stashes draft.poster_render_evidence; if a distinct
+    # thumbnail reaches the guarded writer without proof the WRITER fails closed and
+    # holds the row -- this lane never clears or relabels it.
     if getattr(draft, "thumbnail_url", "") or not os.path.isfile(path):
-        return
+        return True
+    if _visual_writer_guard_enabled():
+        return _attach_video_poster_guarded(account, draft, path, library_path, log)
     try:
         from . import action_reel, media_host
         poster = action_reel.get_or_make_poster(path, library_path, logger=log)
@@ -1841,6 +1944,81 @@ def _attach_video_poster(account, draft, library_path, log):
                 draft.thumbnail_url = hosted
     except Exception as exc:  # noqa: BLE001 - a preview must never block a post
         log(f"poster lane failed for {os.path.basename(path)}: {type(exc).__name__}")
+    return True
+
+
+def _attach_video_poster_guarded(account, draft, path, library_path, log):
+    """Guarded poster lane: the preview frame must be an EVIDENCED render of the EXACT
+    hosted video object (gym_media_builder.video_poster_with_evidence reads the hosted
+    bytes, renders, re-reads the hosted JPEG, and returns a byte-bound receipt). On any
+    failure the slot is HELD (False) -- an unattested distinct thumbnail is never
+    staged. The evidence rides the draft as the dynamic attribute
+    poster_render_evidence (NOT a content_calendar column); the insert side channel
+    forwards it to the calendar writer keyed by (image_url, thumbnail_url)."""
+    source_url = (getattr(draft, "creative_public_url", "") or "").strip()
+    if not source_url:
+        log(f"poster held for {os.path.basename(path)}: video draft carries no exact "
+            "hosted url to evidence a poster render against")
+        return False
+    try:
+        import tempfile
+        from . import gym_media_builder
+        work_dir = library_path or tempfile.mkdtemp(prefix="echo-poster-")
+        result = gym_media_builder.video_poster_with_evidence(
+            path, work_dir, account.key, source_url)
+    except Exception as exc:  # noqa: BLE001 - an unverifiable preview must hold, not crash
+        log(f"poster held for {os.path.basename(path)}: evidenced render lane failed "
+            f"({type(exc).__name__})")
+        return False
+    if not result:
+        log(f"poster held for {os.path.basename(path)}: no byte-evidenced poster render "
+            f"for {source_url}")
+        return False
+    poster_url, evidence = result
+    draft.thumbnail_url = poster_url
+    try:
+        draft.poster_render_evidence = evidence
+    except Exception:  # noqa: BLE001 - a frozen/edge draft: evidence lost is a hold
+        log(f"poster held for {os.path.basename(path)}: evidence could not be retained "
+            "on the draft")
+        try:
+            draft.thumbnail_url = ""
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+    log(f"evidenced poster attached for {os.path.basename(path)}")
+    return True
+
+
+def _poster_render_evidence_by_url(drafts):
+    """Composite-key side channel for insert_rows: (image_url, thumbnail_url) ->
+    poster render evidence, built from the ACTUAL draft objects (the row mapping never
+    carries evidence as a content_calendar payload field). Strict composite key, never
+    a thumbnail-only fallback: two videos can share one poster URL while each needs its
+    own image -> poster rendition proof."""
+    out = {}
+    for draft in drafts or ():
+        evidence = getattr(draft, "poster_render_evidence", None)
+        if not evidence:
+            continue
+        image = (getattr(draft, "creative_public_url", "") or "").strip()
+        thumb = (getattr(draft, "thumbnail_url", "") or "").strip()
+        if image and thumb:
+            out[(image, thumb)] = evidence
+    return out
+
+
+def _insert_rows_with_poster_evidence(insert_rows, base_key, rows, evidence_by_url):
+    """Forward poster proof through the prepared writer boundary.
+
+    A TypeError from a prepared call is ambiguous: the store may have written before
+    failing internally.  Never retry that write without the proof.  Flag-off retains
+    the plain legacy call for older stores and test fakes.
+    """
+    if evidence_by_url and _visual_writer_guard_enabled():
+        return insert_rows(base_key, rows,
+                           poster_render_evidence_by_url=evidence_by_url)
+    return insert_rows(base_key, rows)
 
 
 _INFOGRAPHIC_MARKERS = ("no_creative_",)   # house-rendered fallback card filename prefix
@@ -1924,6 +2102,20 @@ def _maybe_format_story(account, story, feed, library_path, log):
     (return True) — this guard does not change flag-off behavior."""
     if not config.story_format_enabled():
         return True                              # baseline: unchanged, always keep
+    if _visual_writer_guard_enabled():
+        # A caption burn is a distinct rendition, and this planner cannot attest to
+        # one.  Keep the story only when it still points at the exact raw object the
+        # guarded writer will verify later.  Do not silently lose the paired Story
+        # merely because a transformed rendition is unavailable, and never relabel a
+        # different object as its source.
+        raw_source = (getattr(story, "source_media_url", "") or "").strip()
+        story_media = (getattr(story, "creative_public_url", "") or "").strip()
+        if raw_source and raw_source == story_media:
+            log("story format deferred: keeping raw same-object story pending "
+                "visual-writer verification")
+            return True
+        log("story format held: visual provenance lacks a same-object raw source")
+        return False
     # INFOGRAPHIC vs PHOTO (Blake, 2026-08-20): only a real uploaded PHOTO/VIDEO gets a
     # caption burned in. A house-rendered INFOGRAPHIC is already a finished, story-sized
     # card carrying its own text, so a burned caption would sit ON TOP of it ("takes over
@@ -2012,6 +2204,11 @@ def _maybe_format_feed(account, feed, library_path, log):
     caption guard). Mutates feed.creative_public_url in place on success."""
     if not config.feed_autofit_enabled():
         return
+    if _visual_writer_guard_enabled():
+        # Do not swap to a reframe unless this producer can supply the distinct
+        # source/rendition evidence the guarded calendar writer requires.
+        log("feed autofit held: visual provenance lacks owner-attested render evidence")
+        return
     path = (getattr(feed, "creative_path", "") or "").strip()
     hosted_src = (getattr(feed, "creative_public_url", "") or "").strip()
     if not path and not hosted_src:
@@ -2082,11 +2279,18 @@ def _story_from_feed(feed):
     import dataclasses
     story = dataclasses.replace(feed)
     story.draft_id = f"{feed.draft_id}_story"
-    # carry the dynamic poster attr (not a dataclass field, so replace() drops it) so
-    # a video story card shows the same frame preview as its feed.
+    # carry the dynamic poster attrs (not dataclass fields, so replace() drops them)
+    # so a video story card shows the same frame preview as its feed AND the paired
+    # story row forwards the same composite-key poster proof at insert.
     thumb = getattr(feed, "thumbnail_url", "") or ""
     if thumb:
         story.thumbnail_url = thumb
+    poster_evidence = getattr(feed, "poster_render_evidence", None)
+    if poster_evidence:
+        try:
+            story.poster_render_evidence = poster_evidence
+        except Exception:  # noqa: BLE001 - a frozen/edge draft never blocks the build
+            pass
     return story
 
 
@@ -2191,7 +2395,7 @@ def _out_of_span_preserve_dates(months, span_first, span_last,
 
 
 def _apply(base_key, rows, start, days, store, log, locked_days=(),
-           allow_reshape=False):
+           allow_reshape=False, poster_render_evidence_by_url=None):
     """Delete-then-insert, gym-scoped, across every month the rows land in PLUS the full
     planned span. Rows are inserted WITHOUT an id (DB mints the uuid). Mirrors
     apply_month_plan. Refuses the demo gym id. Never raises out.
@@ -2433,7 +2637,9 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             store_rows = [{k: v for k, v in r.items()
                            if k != "_served_reservation_id"} for r in clean_rows]
             insert_started = True
-            inserted += len(insert_rows(base_key, store_rows) or [])
+            inserted += len(_insert_rows_with_poster_evidence(
+                insert_rows, base_key, store_rows,
+                poster_render_evidence_by_url) or [])
     except Exception as exc:  # noqa: BLE001
         log(f"store write failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
@@ -2808,6 +3014,12 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
             _release_feed_reservation(feed)
             _rollback_drive_asset(feed, day_key, log)
             raise
+        if not finished:
+            _release_feed_reservation(feed)
+            _rollback_drive_asset(feed, day_key, log)
+            skipped += 1
+            log(f"{base_key} {day_key}: held; visual provenance could not stage the feed")
+            continue
         drafts.extend(finished)
         day_used_this_pass.add(day_key)   # so the NEXT denied row this pass rolls past it too
         used_days_for_marker.append(day_key)
@@ -2841,7 +3053,9 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
                        if k != "_served_reservation_id"} for r in clean_rows]
         if _reservation_state is not None:
             _reservation_state["insert_started"] = True
-        inserted_rows = insert_rows(base_key, store_rows) or []
+        inserted_rows = _insert_rows_with_poster_evidence(
+            insert_rows, base_key, store_rows,
+            _poster_render_evidence_by_url(drafts)) or []
         inserted = len(inserted_rows)
     except Exception as exc:  # noqa: BLE001
         # The insert request may have reached the remote store before the exception;

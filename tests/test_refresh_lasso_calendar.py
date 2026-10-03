@@ -101,6 +101,44 @@ def test_apply_uses_guarded_rows_and_readback(tmp_path):
     assert (tmp_path / "apply-receipts.json").exists()
 
 
+def test_apply_prepared_swap_keeps_each_anchor_snapshot(tmp_path, monkeypatch):
+    from agent import visual_writer_prepare
+
+    monkeypatch.setattr(visual_writer_prepare, "enabled", lambda: True)
+    image = tmp_path / "reviewed.png"
+    image.write_bytes(b"reviewed pixels")
+    evidence = {"card.png": {"infographic_copy": {"headline": "Approved", "facts": ["Fact"]}}}
+    original = [row("a", "2026-09-24"), row("b", "2026-09-24")]
+    manifest = refresh.plan(original, start="2026-09-24", end="2026-09-24",
+                            root=tmp_path, copy_evidence=evidence)
+    group = manifest["regeneration_groups"][0]
+    digest = __import__("hashlib").sha256(image.read_bytes()).hexdigest()
+    review = {"reviewed_groups": [{"id": group["id"], "review_status": "PASS",
+              "image_sha256": digest, "path": str(image)}]}
+    state = {item["id"]: dict(item) for item in original}
+
+    class Store:
+        def get_row(self, _gym, row_id):
+            return dict(state[row_id])
+
+        def patch_image_url(self, _gym, row_id, image_url, *, expected_row):
+            assert expected_row["id"] == row_id
+            assert expected_row["image_url"] == state[row_id]["image_url"]
+            state[row_id]["image_url"] = image_url
+            return dict(state[row_id])
+
+    class ArtifactStore:
+        def save(self, *_args):
+            pass
+
+    receipts = refresh.apply_reviewed_swaps(
+        manifest, review, Store(), tmp_path,
+        host_fn=lambda *_: "https://cdn/reviewed.png", artifact_store=ArtifactStore(),
+        review_fn=lambda *_: {"grade_status": "PASS", "image_sha256": digest,
+                              "infographic_copy": group["generation"]["approved_copy"]})
+    assert [item["status"] for item in receipts] == ["applied", "applied"]
+
+
 def test_local_generation_uses_recorded_copy_and_resumes(tmp_path):
     rows = [row("a", "2026-09-24", image="https://cdn/old.png")]
     evidence = {"old.png": {"infographic_copy": {"headline": "Approved", "facts": ["Fact"],

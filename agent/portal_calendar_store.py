@@ -444,7 +444,7 @@ class SupabaseCalendarStore:
         return rows[0]
 
     def _prepare_visual_media(self, account_key, row_id, payload, *, current=None,
-                              render_evidence=None):
+                              render_evidence=None, poster_render_evidence=None):
         """Prepare a replacement against the actual scoped row before its PATCH."""
         from . import visual_writer_prepare
         if not visual_writer_prepare.enabled():
@@ -477,7 +477,8 @@ class SupabaseCalendarStore:
                 candidate["source_media_asset_id"] = None
                 candidate["drive_file_id"] = None
             prepared = visual_writer_prepare.prepare(
-                self, account_key, candidate, render_evidence=render_evidence)
+                self, account_key, candidate, render_evidence=render_evidence,
+                poster_render_evidence=poster_render_evidence)
             if (current.get("visual_group_key")
                     and prepared["visual_group_key"] != current["visual_group_key"]):
                 raise visual_writer_prepare.VisualPreparationError(
@@ -510,13 +511,14 @@ class SupabaseCalendarStore:
         candidate.update(patch)
         candidate.pop("visual_group_key", None)
         prepared = visual_writer_prepare.prepare(
-            self, account_key, candidate, render_evidence=render_evidence)
+            self, account_key, candidate, render_evidence=render_evidence,
+            poster_render_evidence=poster_render_evidence)
         patch["visual_group_key"] = prepared["visual_group_key"]
         patch["byte_hash"] = prepared["byte_hash"]
         return patch
 
     def patch_image_url(self, account_key, row_id, new_image_url, *, expected_row=None,
-                        render_evidence=None):
+                        render_evidence=None, poster_render_evidence=None):
         """Persist a Story reburn or feed autofit without changing status.
 
         Publish-time replacements supply expected_row, so approved media changes
@@ -525,6 +527,16 @@ class SupabaseCalendarStore:
         """
         if not (new_image_url or "").strip():
             return None
+        from . import visual_writer_prepare
+        visual_guard = visual_writer_prepare.enabled()
+        current = expected_row
+        if visual_guard and current is None:
+            current = self.get_row(account_key, row_id)
+            if (not isinstance(current, dict)
+                    or str(current.get("id")) != str(row_id)
+                    or str(current.get("gym_id")) != str(account_key)
+                    or current.get("status") not in ("pending", "coach_review")):
+                return None
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"}
         if expected_row is None:
             params["status"] = "in.(pending,coach_review)"
@@ -561,8 +573,11 @@ class SupabaseCalendarStore:
             params["media_not_ready_reason"] = "is.null"
         payload = {"image_url": new_image_url, "media_not_ready_reason": None}
         payload = self._prepare_visual_media(account_key, row_id, payload,
-                                             current=expected_row,
-                                             render_evidence=render_evidence)
+                                             current=current,
+                                             render_evidence=render_evidence,
+                                             poster_render_evidence=poster_render_evidence)
+        if visual_guard:
+            params = self._visual_media_cas(current, params)
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -572,6 +587,9 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
+        if visual_guard and self._visual_media_result(
+                rows, account_key, current, payload) is None:
+            return None
         if not isinstance(rows, list) or len(rows) != 1:
             return None
         row = rows[0]
@@ -622,7 +640,8 @@ class SupabaseCalendarStore:
             return None
         return row
 
-    def _prepare_visual_row(self, account_key, row, render_evidence=None):
+    def _prepare_visual_row(self, account_key, row, render_evidence=None,
+                            poster_render_evidence=None):
         """Render evidence must describe the exact source retained on the row."""
         from . import visual_writer_prepare
         if render_evidence is not None:
@@ -634,10 +653,11 @@ class SupabaseCalendarStore:
                 raise visual_writer_prepare.VisualPreparationError(
                     "render evidence does not bind the scoped media replacement")
         return visual_writer_prepare.prepare(
-            self, account_key, row, render_evidence=render_evidence)
+            self, account_key, row, render_evidence=render_evidence,
+            poster_render_evidence=poster_render_evidence)
 
     def _prepare_visual_replacement(self, account_key, current, payload,
-                                    render_evidence=None):
+                                    render_evidence=None, poster_render_evidence=None):
         """A swap's new source is explicit; never erase an old rendition source."""
         from . import visual_writer_prepare
         patch = dict(payload)
@@ -651,13 +671,15 @@ class SupabaseCalendarStore:
                 patch[field] = None
         candidate = {**current, **patch}
         candidate.pop("visual_group_key", None)
-        prepared = self._prepare_visual_row(account_key, candidate, render_evidence)
+        prepared = self._prepare_visual_row(
+            account_key, candidate, render_evidence, poster_render_evidence)
         patch["visual_group_key"] = prepared["visual_group_key"]
         patch["byte_hash"] = prepared["byte_hash"]
         return patch
 
     def patch_media(self, account_key, row_id, image_url, source_media_asset_id="", *,
-                    source_media_url=None, render_evidence=None):
+                    source_media_url=None, render_evidence=None,
+                    poster_render_evidence=None):
         """Backfill a row's image_url (+ source_media_asset_id) that was staged with NO
         image, WITHOUT touching status or caption (Pete/CrossFit Zanshin, 2026-08-31: an
         event arc row inserted before event_calendar's media-attach guard existed sat
@@ -699,7 +721,7 @@ class SupabaseCalendarStore:
                     and current.get("source_media_asset_id") == payload.get("source_media_asset_id")):
                 payload["drive_file_id"] = current["drive_file_id"]
             payload = self._prepare_visual_replacement(
-                account_key, current, payload, render_evidence)
+                account_key, current, payload, render_evidence, poster_render_evidence)
         # Keep the no-overwrite promise server-side too: another worker can attach
         # media after the prefetch but before this write. PostgREST's OR predicate
         # permits only a still-null or still-empty image_url to be recovered.
@@ -724,7 +746,8 @@ class SupabaseCalendarStore:
         return None
 
     def swap_media(self, account_key, row_id, image_url, source_media_url=None,
-                   extra_fields=None, *, render_evidence=None):
+                   extra_fields=None, *, render_evidence=None,
+                   poster_render_evidence=None):
         """CROSS-DAY MEDIA GUARD sweep (Blake, 2026-08-31): re-point a WAITING row's
         media to a fresh photo because its current photo already sits on another day
         of the gym's book. STATUS-GUARDED SERVER-SIDE: the PATCH itself is filtered to
@@ -766,7 +789,7 @@ class SupabaseCalendarStore:
                            ("published_at", "late_post_id", "publish_claim_token"))):
                 return None
             payload = self._prepare_visual_replacement(
-                account_key, current, payload, render_evidence)
+                account_key, current, payload, render_evidence, poster_render_evidence)
             params = self._visual_media_cas(current, params)
         r = self._client().patch(
             self._rest(_TABLE), params=params,
@@ -821,7 +844,7 @@ class SupabaseCalendarStore:
 
     def restage_held_media(self, account_key, current, *, image_url=None,
                            source_media_url=None, extra_fields=None, release=False,
-                           render_evidence=None):
+                           render_evidence=None, poster_render_evidence=None):
         """Compare-and-swap one Swift held row; stage pixels while retaining its hold.
 
         Release is a separate CAS after the operator independently reads every staged
@@ -856,7 +879,7 @@ class SupabaseCalendarStore:
         prepared_write = not release and visual_guard
         if prepared_write:
             payload = self._prepare_visual_replacement(
-                account_key, current, payload, render_evidence)
+                account_key, current, payload, render_evidence, poster_render_evidence)
             params = self._visual_media_cas(current, params)
         elif release and visual_guard:
             if not current.get("visual_group_key") or not current.get("byte_hash"):
@@ -974,7 +997,8 @@ class SupabaseCalendarStore:
 
     def replace_future_infographic_media(self, account_key, current, *, image_url,
                                          source_media_url, source_media_asset_id,
-                                         reason, thumbnail_url=None, render_evidence=None):
+                                         reason, thumbnail_url=None, render_evidence=None,
+                                         poster_render_evidence=None):
         """Replace one receipt-owned placeholder and clear its hold in one exact CAS.
 
         Unlike a generic portal swap, this preserves approved rows as approved.
@@ -1019,7 +1043,7 @@ class SupabaseCalendarStore:
         prepared_write = visual_writer_prepare.enabled()
         if prepared_write:
             payload = self._prepare_visual_replacement(
-                account_key, current, payload, render_evidence)
+                account_key, current, payload, render_evidence, poster_render_evidence)
             params = self._visual_media_cas(current, params)
         response = self._client().patch(
             self._rest(_TABLE), params=params,
@@ -1232,7 +1256,8 @@ class SupabaseCalendarStore:
     def create_variant_candidate(self, account_key, anchor_row, image_url,
                                  caption=None, thumbnail_url=None,
                                  source_media_asset_id=None, prompt_used=None, *,
-                                 source_media_url=None, render_evidence=None):
+                                 source_media_url=None, render_evidence=None,
+                                 poster_render_evidence=None):
         """INSERT a new 'candidate' row linked to `anchor_row` (a dict, the row the
         candidate is an alternate FOR). Copies the slot identity (post_date,
         account, format, pillar, gbp_* fields) so the candidate is a genuine
@@ -1287,7 +1312,8 @@ class SupabaseCalendarStore:
                         "variant anchor is not registered to the calendar tenant")
             if source_media_url is not None:
                 payload["source_media_url"] = source_media_url
-            payload = self._prepare_visual_row(account_key, payload, render_evidence)
+            payload = self._prepare_visual_row(
+                account_key, payload, render_evidence, poster_render_evidence)
         r = self._client().post(
             self._rest(_TABLE),
             headers=self._headers({"Content-Type": "application/json",
@@ -2721,7 +2747,7 @@ class SupabaseCalendarStore:
     # ---- mirror writes (real-drafts calendar mirror) ------------------------
     # These write calendar rows only. NOTHING here publishes to any social account.
     def insert_rows(self, account_key, rows, *, preserve_ids=False,
-                    render_evidence_by_url=None):
+                    render_evidence_by_url=None, poster_render_evidence_by_url=None):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -2825,9 +2851,17 @@ class SupabaseCalendarStore:
         from . import visual_writer_prepare
         prepared_write = visual_writer_prepare.enabled()
         if prepared_write:
+            # Poster evidence is scoped to the whole media edge, not only to
+            # the poster URL. Two videos can intentionally share a poster URL
+            # while each requires a different image -> poster rendition proof.
+            # Accepting a thumbnail-only key would attach one video's proof to
+            # another video's image, so use the strict composite key and never
+            # fall back to a thumbnail-only lookup.
             payload = [self._prepare_visual_row(
                 account_key, row,
-                render_evidence=(render_evidence_by_url or {}).get(row.get("image_url")))
+                render_evidence=(render_evidence_by_url or {}).get(row.get("image_url")),
+                poster_render_evidence=(poster_render_evidence_by_url or {}).get(
+                    (row.get("image_url"), row.get("thumbnail_url"))))
                 for row in payload]
         all_keys = set()
         for r in payload:
@@ -2877,7 +2911,8 @@ class SupabaseCalendarStore:
                 pass  # ledger stamp failure is never fatal
         return recovered + inserted
 
-    def recover_story_media_hold(self, account_key, current, proposed):
+    def recover_story_media_hold(self, account_key, current, proposed, *,
+                                 poster_render_evidence=None):
         """Atomically recover the retained row, preserving its incident UUID.
 
         This updates a retained pending machine Story. Human/publisher states,
@@ -2902,7 +2937,9 @@ class SupabaseCalendarStore:
         columns = {"image_url", "thumbnail_url", "source_media_url", "source_media_asset_id"}
         patch = {key: value for key, value in proposed.items() if key in columns}
         patch["media_not_ready_reason"] = None
-        patch = self._prepare_visual_media(account_key, current["id"], patch, current=current)
+        patch = self._prepare_visual_media(
+            account_key, current["id"], patch, current=current,
+            poster_render_evidence=poster_render_evidence)
         params = {"id": f"eq.{current['id']}", "gym_id": f"eq.{account_key}",
                   "account": f"eq.{current['account']}", "post_date": f"eq.{current['post_date']}",
                   "format": "eq.story", "status": "eq.pending", "variant_status": "eq.active",
@@ -2911,11 +2948,18 @@ class SupabaseCalendarStore:
                                              else f"eq.{current['media_not_ready_reason']}"),
                   "image_url": ("is.null" if current.get("image_url") is None
                                 else f"eq.{current['image_url']}")}
+        from . import visual_writer_prepare
+        visual_guard = visual_writer_prepare.enabled()
+        if visual_guard:
+            params = self._visual_media_cas(current, params)
         response = self._client().patch(self._rest(_TABLE), params=params, json=patch,
                          headers=self._headers({"Prefer": "return=representation"}), timeout=30)
         if response.status_code >= 400:
             raise PortalStoreError(response.status_code, _scrub((response.text or "")[:200]))
         rows = response.json() or []
+        if visual_guard and self._visual_media_result(
+                rows, account_key, current, patch) is None:
+            return None
         if (len(rows) != 1 or rows[0].get("id") != current["id"]
                 or rows[0].get("gym_id") != account_key or _story_slot(rows[0]) != _story_slot(current)
                 or rows[0].get("created_at") != current["created_at"]

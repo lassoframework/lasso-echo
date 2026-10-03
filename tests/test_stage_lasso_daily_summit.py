@@ -143,7 +143,11 @@ def test_atomic_insert_posts_only_to_rpc_with_provenance():
     result = stage._atomic_insert(store, _insert_action())
     assert result["result"] == "inserted"
     assert store.client.args[0].endswith("/rpc/stage_lasso_campaign_row")
-    assert store.client.kwargs["json"]["p_source_hash"] == "a" * 64
+    # Legacy flag-OFF payload: exactly the original five reviewed parameters.
+    assert store.client.kwargs["json"] == {
+        "p_row": _insert_action()["row"], "p_artifact_tenant": "lasso",
+        "p_source_hash": "a" * 64, "p_policy_version": "p1",
+        "p_image_sha256": "b" * 64}
     assert "/content_calendar" not in store.client.args[0]
 
 
@@ -197,6 +201,196 @@ def test_campaign_shape_audit_requires_two_regular_and_one_summit_on_each_platfo
     assert gap["status"] == "partial"
     assert gap["regular_slots"] == [0]
     assert gap["summit_slots"] == [2]
+
+
+def test_writer_flag_off_never_prepares_before_staging_rpc(tmp_path, monkeypatch):
+    import agent.visual_writer_prepare as vwp
+    monkeypatch.setattr(vwp, "enabled", lambda: False)
+    calls = []
+    receipts = stage.apply({"actions": [_insert_action()]}, object(), tmp_path,
+                           current_day_fn=lambda *_: [{"account": "instagram", "caption": "Summit", "slot_index": 2, "status": "pending"}],
+                           prepare_fn=lambda *_: calls.append("prepare"),
+                           insert_fn=lambda *_: calls.append("rpc") or {"result": "inserted"})
+    assert calls == ["rpc"]
+    assert receipts[0]["status"] == "applied"
+
+
+def _same_object_result(url, **overrides):
+    result = {"image_url": url, "source_media_url": url,
+              "visual_group_key": "vg_scene1",
+              "byte_hash": "derived:md5:" + "c" * 32}
+    result.update(overrides)
+    return result
+
+
+def _same_object_prepare(calls, result=None, error=None):
+    def prepare(store, account_key, row, *, flag_on=None):
+        calls.append(("prepare", account_key, row, flag_on))
+        if error is not None:
+            raise error
+        return result or _same_object_result(row["image_url"])
+    return prepare
+
+
+def test_writer_flag_on_same_object_preparation_feeds_staging_rpc(tmp_path, monkeypatch):
+    """Flag ON: the owner-attested same-exact-URL preparation contract is
+    invoked for the reviewed artifact URL, and its verified identity is passed
+    to the narrowed staging RPC — exact payload, nothing unexpected. The real
+    row-returning helper does not expose usage_claimed in this prepared row;
+    its internal RPC check remains the authority for that state."""
+    import agent.visual_writer_prepare as vwp
+    monkeypatch.setattr(vwp, "enabled", lambda: True)
+    calls = []
+    url = _insert_action()["row"]["image_url"]
+    def insert(store, action):
+        calls.append(("rpc", action))
+        return {"result": "inserted"}
+    receipts = stage.apply({"actions": [_insert_action()]}, object(), tmp_path,
+                           current_day_fn=lambda *_: [{"account": "instagram", "caption": "Summit", "slot_index": 2, "status": "pending"}],
+                           prepare_fn=_same_object_prepare(calls), insert_fn=insert)
+    assert receipts[0]["status"] == "applied"
+    assert calls[0] == ("prepare", "lasso",
+                        {"image_url": url, "source_media_url": url}, True)
+    assert "usage_claimed" not in _same_object_result(url)
+    rpc_action = calls[1][1]
+    assert rpc_action["visual_group_key"] == "vg_scene1"
+    assert rpc_action["byte_hash"] == "derived:md5:" + "c" * 32
+    # The staged row itself keeps only the reviewed contract keys.
+    assert sorted(rpc_action["row"]) == sorted(_insert_action()["row"])
+
+
+def test_atomic_insert_includes_visual_identity_only_when_prepared():
+    class Response:
+        status_code = 200
+        def json(self): return {"result": "inserted", "id": "new"}
+    class Client:
+        def post(self, *args, **kwargs): self.args = args; self.kwargs = kwargs; return Response()
+    class Store:
+        def __init__(self): self.client = Client()
+        def _client(self): return self.client
+        def _rest(self, name): return "https://supabase.test/rest/v1/" + name
+        def _headers(self, extra): return extra
+    store = Store()
+    action = {**_insert_action(), "visual_group_key": "vg_scene1",
+              "byte_hash": "derived:md5:" + "c" * 32}
+    result = stage._atomic_insert(store, action)
+    assert result["result"] == "inserted"
+    payload = store.client.kwargs["json"]
+    assert sorted(payload) == ["p_artifact_tenant", "p_byte_hash", "p_image_sha256",
+                               "p_policy_version", "p_row", "p_source_hash",
+                               "p_visual_group_key"]
+    assert payload["p_visual_group_key"] == "vg_scene1"
+    assert payload["p_byte_hash"] == "derived:md5:" + "c" * 32
+    assert payload["p_source_hash"] == "a" * 64
+
+
+def _flag_on_failure(tmp_path, monkeypatch, prepare_fn):
+    import agent.visual_writer_prepare as vwp
+    monkeypatch.setattr(vwp, "enabled", lambda: True)
+    calls = []
+    receipts = stage.apply({"actions": [_insert_action()]}, object(), tmp_path,
+                           current_day_fn=lambda *_: [],
+                           prepare_fn=prepare_fn,
+                           insert_fn=lambda *_: calls.append("rpc"))
+    assert receipts[0]["status"] == "writer_preparation_failed"
+    assert calls == []
+    return receipts[0]
+
+
+def test_writer_flag_on_preparation_raise_fails_closed(tmp_path, monkeypatch):
+    import agent.visual_writer_prepare as vwp
+    receipt = _flag_on_failure(tmp_path, monkeypatch, _same_object_prepare(
+        [], error=vwp.VisualPreparationError("delivered media bytes could not be verified")))
+    assert receipt["error"] == "VisualPreparationError"
+
+
+def test_writer_flag_on_non_scene_group_key_fails_closed(tmp_path, monkeypatch):
+    receipt = _flag_on_failure(tmp_path, monkeypatch, _same_object_prepare(
+        [], result=_same_object_result(_insert_action()["row"]["image_url"],
+                                       visual_group_key="legacy-group")))
+    assert receipt["error"] == "RuntimeError"
+
+
+def test_writer_flag_on_wrong_url_or_hash_fails_closed(tmp_path, monkeypatch):
+    receipt = _flag_on_failure(tmp_path, monkeypatch, _same_object_prepare(
+        [], result=_same_object_result("https://other.example/swapped.png")))
+    assert receipt["error"] == "RuntimeError"
+    receipt = _flag_on_failure(tmp_path / "c", monkeypatch, _same_object_prepare(
+        [], result={**_same_object_result(_insert_action()["row"]["image_url"]),
+                    "source_media_url": "https://other.example/source.png"}))
+    assert receipt["error"] == "RuntimeError"
+    receipt = _flag_on_failure(tmp_path / "b", monkeypatch, _same_object_prepare(
+        [], result=_same_object_result(_insert_action()["row"]["image_url"],
+                                       byte_hash="md5:" + "c" * 32)))
+    assert receipt["error"] == "RuntimeError"
+
+
+def test_writer_flag_on_absent_same_object_contract_fails_closed(tmp_path, monkeypatch):
+    """If Child A's prepare_same_object is not importable, fail closed."""
+    import agent.visual_writer_prepare as vwp
+    monkeypatch.setattr(vwp, "enabled", lambda: True)
+    monkeypatch.delattr(vwp, "prepare_same_object", raising=False)
+    calls = []
+    receipts = stage.apply({"actions": [_insert_action()]}, object(), tmp_path,
+                           current_day_fn=lambda *_: [],
+                           insert_fn=lambda *_: calls.append("rpc"))
+    assert receipts[0]["status"] == "writer_preparation_failed"
+    assert receipts[0]["error"] == "RuntimeError"
+    assert calls == []
+
+
+def test_writer_flag_on_rpc_conflict_is_surfaced(tmp_path, monkeypatch):
+    import agent.visual_writer_prepare as vwp
+    monkeypatch.setattr(vwp, "enabled", lambda: True)
+    receipts = stage.apply({"actions": [_insert_action()]}, object(), tmp_path,
+                           current_day_fn=lambda *_: [],
+                           prepare_fn=_same_object_prepare([]),
+                           insert_fn=lambda *_: {"result": "conflict", "reason": "visual_bytes_not_attested"})
+    assert receipts[0]["status"] == "conflict"
+    assert receipts[0]["reason"] == "visual_bytes_not_attested"
+
+
+def _run_main_apply(monkeypatch, tmp_path, receipts, report, enabled):
+    import agent.visual_writer_prepare as vwp
+    import agent.portal_calendar_store as pcs
+    monkeypatch.setattr(vwp, "enabled", lambda: enabled)
+    monkeypatch.setattr(pcs, "SupabaseCalendarStore", lambda: object())
+    monkeypatch.setattr(stage, "build_plan", lambda *a, **k: {"mode": "m", "actions": [1], "blocked": []})
+    monkeypatch.setattr(stage, "apply", lambda *a, **k: receipts)
+    monkeypatch.setattr(stage, "campaign_shape_report", lambda *a, **k: report)
+    argv = ["--snapshot", str(tmp_path / "s.json"), "--three-slot-plan", str(tmp_path / "p.json"),
+            "--catalog", str(tmp_path / "c.json"), "--output", str(tmp_path / "out.json"),
+            "--apply", "--receipt-dir", str(tmp_path / "receipts")]
+    (tmp_path / "s.json").write_text("{}"); (tmp_path / "p.json").write_text("{}")
+    (tmp_path / "c.json").write_text("{}")
+    (tmp_path / "receipts").mkdir()
+    return stage.main(argv)
+
+
+def test_apply_main_flag_on_failed_receipt_exits_nonzero(tmp_path, monkeypatch):
+    report = {"complete": 94, "total": 94}
+    receipts = [{"status": "writer_preparation_failed", "error": "RuntimeError"}]
+    assert _run_main_apply(monkeypatch, tmp_path, receipts, report, True) == 1
+
+
+def test_apply_main_flag_on_incomplete_shape_exits_nonzero(tmp_path, monkeypatch):
+    report = {"complete": 90, "total": 94}
+    receipts = [{"status": "applied"}, {"status": "already_present"}]
+    assert _run_main_apply(monkeypatch, tmp_path, receipts, report, True) == 1
+
+
+def test_apply_main_flag_on_success_keeps_zero_exit(tmp_path, monkeypatch):
+    report = {"complete": 94, "total": 94}
+    receipts = [{"status": "applied"}, {"status": "already_present"}]
+    assert _run_main_apply(monkeypatch, tmp_path, receipts, report, True) in (None, 0)
+
+
+def test_apply_main_flag_off_exit_behavior_unchanged(tmp_path, monkeypatch):
+    # Flag OFF: even conflict receipts and an incomplete shape keep the legacy
+    # zero exit; only --audit-only ever returned nonzero before.
+    report = {"complete": 0, "total": 94}
+    receipts = [{"status": "conflict"}, {"status": "readback_conflict"}]
+    assert _run_main_apply(monkeypatch, tmp_path, receipts, report, False) in (None, 0)
 
 
 def test_campaign_shape_audit_rejects_third_regular_and_misplaced_summit():

@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import db, postlog, rotation  # noqa: E402
 from agent.drafter import Draft, DraftStatus  # noqa: E402
+from agent import real_calendar_mirror as real_mirror  # noqa: E402
 from agent.store import PendingStore  # noqa: E402
 
 
@@ -68,6 +69,68 @@ def test_draft_flow_put_get_remove_find(tmp_path):
     assert store.list_pending() == []
     assert store.remove("d1") is True
     assert store.get("d1") is None
+
+
+def test_explicit_source_media_survives_store_and_real_calendar_mirror(tmp_path):
+    """Persist raw provenance exactly; a delivered rendition is never a fallback."""
+    store = PendingStore(str(tmp_path / "source_media.db"))
+    draft = _draft(draft_id="source1", day_key="2026-07-03", draft_type="feed")
+    draft.creative_public_url = "https://cdn.example/delivered-crop.jpg"
+    draft.source_media_url = "https://cdn.example/raw-upload.jpg"
+    store.put(draft)
+
+    restored = store.get("source1")
+    assert restored is not None
+    assert restored.source_media_url == "https://cdn.example/raw-upload.jpg"
+    rows = real_mirror.collect_real_drafts("lasso_ig", store)
+    assert len(rows) == 1
+    assert rows[0]["image_url"] == "https://cdn.example/delivered-crop.jpg"
+    assert rows[0]["source_media_url"] == "https://cdn.example/raw-upload.jpg"
+
+
+def test_missing_source_media_stays_missing_after_store_round_trip(tmp_path):
+    store = PendingStore(str(tmp_path / "no_source_media.db"))
+    draft = _draft(draft_id="source2")
+    draft.creative_public_url = "https://cdn.example/delivered-crop.jpg"
+    store.put(draft)
+
+    restored = store.get("source2")
+    assert restored is not None
+    assert restored.source_media_url == ""
+    assert not hasattr(restored, "thumbnail_url")
+    assert not hasattr(restored, "poster_render_evidence")
+
+
+def test_video_poster_evidence_survives_store_and_real_calendar_mirror(tmp_path):
+    """The real mirror reads reloaded drafts, so poster proof must be durable draft state."""
+    store = PendingStore(str(tmp_path / "poster_evidence.db"))
+    draft = _draft(draft_id="video1", day_key="2026-07-03", draft_type="feed")
+    draft.creative_path = "/clip.mp4"
+    draft.creative_public_url = "https://cdn.example/clip.mp4"
+    draft.thumbnail_url = "https://cdn.example/clip-poster.jpg"
+    draft.poster_render_evidence = {
+        "source_exact_url": draft.creative_public_url,
+        "delivered_exact_url": draft.thumbnail_url,
+        "operation": "render",
+        "evidence_ref": "poster-round-trip",
+    }
+    store.put(draft)
+
+    restored = store.get("video1")
+    assert restored is not None
+    assert restored.thumbnail_url == draft.thumbnail_url
+    assert restored.poster_render_evidence == draft.poster_render_evidence
+
+    evidence = {}
+    rows = real_mirror.collect_real_drafts(
+        "lasso_ig", store, poster_evidence_out=evidence)
+    assert len(rows) == 1
+    assert rows[0]["thumbnail_url"] == draft.thumbnail_url
+    assert "poster_render_evidence" not in rows[0]
+    assert evidence == {
+        (draft.creative_public_url, draft.thumbnail_url):
+        draft.poster_render_evidence,
+    }
 
 
 def test_log_post_mirrors_to_posts_table(tmp_path):

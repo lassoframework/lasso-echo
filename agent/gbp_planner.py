@@ -18,8 +18,10 @@ default (7-14 days, validator cap 30). See PROGRESS.md for the flagged gaps. Nev
 fabricate an offer: no offer name or no redeem URL -> the OFFER slot is skipped.
 """
 
+import hashlib
 import os
 import tempfile
+import uuid
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -119,9 +121,10 @@ def _offer_window(start):
     return {"schedule": {"startDate": start.isoformat(), "endDate": end.isoformat()}}
 
 
-def _cropped_image_url(account_key, image, day_key):
-    """Crop the picked library photo to 1200x900 at PLANNING time, host it, return the
-    hosted url (the exact pixels the owner approves + that publish). None on failure."""
+def _cropped_image(account_key, image, day_key):
+    """Crop the picked library photo to 1200x900 at PLANNING time, host it, return
+    (hosted url, local crop path) — the exact pixels the owner approves + that publish.
+    (None, None) on failure."""
     try:
         cache = os.path.join(rotation._cache_dir(None) if hasattr(rotation, "_cache_dir")
                              else "/tmp", "gbp_crops")
@@ -144,12 +147,123 @@ def _cropped_image_url(account_key, image, day_key):
             gbp.crop_4x3(image.path, out)
         except Exception as exc:  # noqa: BLE001
             print(f"[gbp-planner] crop failed for {image.path}: {type(exc).__name__}")
-            return None
+            return None, None
     if config.hosting_enabled():
         hosted = media_host.host_media(out, account_key)
         if hosted:
-            return hosted
-    return None
+            return hosted, out
+    return None, None
+
+
+def _cropped_image_url(account_key, image, day_key):
+    """Hosted 1200x900 crop URL only (legacy callers). See _cropped_image."""
+    return _cropped_image(account_key, image, day_key)[0]
+
+
+# ---- global visual lineage (2026-10-03, GBP provenance package) ------------------
+# Blake's global media guard: no reused photos, Drive photos first, and EXACT
+# source/delivered lineage on every staged visual row. The GBP planner crops and
+# re-hosts every photo, so the hosted crop URL alone is NOT lineage: the staged row
+# must name the trusted exact RAW source URL, and a transformed write must carry
+# render evidence bound to the actual source/delivered bytes. When the global
+# prepared writer is enabled (AGENT_VISUAL_GLOBAL_WRITER_PREP), a GBP image that
+# cannot establish BOTH is HELD (slot skipped, never staged) rather than written
+# with a cropped URL masquerading as its own source. Default-off behavior is
+# byte-for-byte unchanged: no extra hosting, no new row keys.
+def _global_writer_enabled():
+    """True when the global prepared writer guards calendar writes. Unknown state
+    (import/flag read failure) fails CLOSED for transformed GBP writes."""
+    try:
+        from . import visual_writer_prepare
+        return bool(visual_writer_prepare.enabled())
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _render_evidence_dict(source_url, delivered_url, source_path, delivered_path):
+    """Render evidence bound to the ACTUAL local source/delivered byte objects, in the
+    exact contract visual_writer_prepare._prepare_source_rendition verifies (it re-reads
+    both URLs and rejects any fingerprint/length mismatch). None when bytes unreadable —
+    never an invented attestation."""
+    try:
+        source = Path(source_path).read_bytes()
+        delivered = Path(delivered_path).read_bytes()
+    except (OSError, TypeError, ValueError):
+        return None
+    if not source or not delivered:
+        return None
+    source_hash = hashlib.md5(source).hexdigest()
+    delivered_hash = hashlib.md5(delivered).hexdigest()
+    return {
+        "operation": "render",
+        "source_exact_url": source_url,
+        "delivered_exact_url": delivered_url,
+        "source_fingerprint": "md5:" + source_hash,
+        "delivered_fingerprint": "md5:" + delivered_hash,
+        "source_byte_length": len(source),
+        "delivered_byte_length": len(delivered),
+        # The identifier is persisted with the owner receipts. It includes the
+        # exact local transform's two observed hashes and a per-render UUID, so
+        # it is both bound to those bytes and unique when a crop is repeated.
+        "evidence_ref": f"gbp_planner:render:{source_hash}:{delivered_hash}:{uuid.uuid4()}",
+        "observed_by": "gbp_planner",
+        "rendered_by": "gbp_planner",
+    }
+
+
+def _url_bytes_match(url, path):
+    """True only when the exact bytes served at url equal the local file's bytes.
+    False/None on any read failure — a hosted URL we cannot byte-verify never
+    attests a source."""
+    try:
+        local = Path(path).read_bytes()
+    except (OSError, TypeError, ValueError):
+        return False
+    try:
+        import requests
+        with requests.get(url, timeout=(5, 30), allow_redirects=False,
+                          stream=True) as response:
+            if response.status_code != 200:
+                return False
+            chunks, total = [], 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > 128 * 1024 * 1024:
+                    return False
+            return b"".join(chunks) == local
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _transformed_gbp_image(account_key, image, day_key, *, source_url=None):
+    """Crop+host one GBP photo WITH exact source lineage.
+
+    Returns {"url", ...} plus, when the global prepared writer is enabled,
+    "source_media_url" (trusted exact RAW source URL, never the cropped URL) and
+    "render_evidence" (byte-bound, verified below and re-verified by the writer).
+    Returns None — HOLD, the slot is skipped — when the guard is on and either
+    cannot be established. With the guard off this is exactly the historical
+    crop+host (no extra hosting, no new keys)."""
+    url, out_path = _cropped_image(account_key, image, day_key)
+    if not url:
+        return None
+    if source_url:
+        # An externally produced source object (e.g. a cached Drive rendition) is
+        # only trusted when its served bytes equal the exact local source bytes we
+        # cropped from. Mismatch/unreadable -> hold, never attest stale bytes.
+        if not _url_bytes_match(source_url, image.path):
+            return None
+    else:
+        if not config.hosting_enabled():
+            return None
+        source_url = media_host.host_media(str(image.path), account_key)
+        if not source_url:
+            return None
+    evidence = _render_evidence_dict(source_url, url, image.path, out_path)
+    if evidence is None:
+        return None
+    return {"url": url, "source_media_url": source_url, "render_evidence": evidence}
 
 
 def _drive_photo_candidate(account_key, day_key, used_ids):
@@ -199,6 +313,7 @@ def _drive_photo_candidate(account_key, day_key, used_ids):
                 asset.get("title") or f"{asset['id']}.jpg")
             drive.download(asset["id"], raw)
             source = raw
+            source_url = None
             if gym_media_index.needs_rendition(asset):
                 rendition_url, _ = gym_media_index.ensure_rendition(
                     asset, raw, store=media_store)
@@ -206,17 +321,31 @@ def _drive_photo_candidate(account_key, day_key, used_ids):
                     return None
                 source = Path(work) / f"{raw.stem}.jpg"
                 gym_media_index.heic_to_jpeg(raw, source)
+                # The exact RAW source of the GBP crop is the hosted rendition
+                # object (the Drive original is never touched); it must still
+                # byte-verify against the local converted bytes before it may
+                # be named as the row's source.
+                source_url = rendition_url
 
             class DrivePhoto:
                 path = str(source)
                 media_type = "image"
 
-            url = _cropped_image_url(account_key, DrivePhoto(), day_key)
-        if not url:
+            if _global_writer_enabled():
+                prov = _transformed_gbp_image(account_key, DrivePhoto(), day_key,
+                                              source_url=source_url)
+            else:
+                url = _cropped_image_url(account_key, DrivePhoto(), day_key)
+                prov = {"url": url} if url else None
+        if not prov:
             return None
         used_ids.add(str(asset["id"]))
-        return {"url": url, "kind": "drive", "asset": asset,
+        pick = {"url": prov["url"], "kind": "drive", "asset": asset,
                 "base": base, "store": media_store, "day_key": day_key}
+        if prov.get("source_media_url"):
+            pick["source_media_url"] = prov["source_media_url"]
+            pick["render_evidence"] = prov["render_evidence"]
+        return pick
     except Exception as exc:  # noqa: BLE001 - GBP falls through to local media
         print(f"[gbp-planner] Drive photo failed for {account_key} on {day_key}: "
               f"{type(exc).__name__}")
@@ -347,7 +476,7 @@ def _alert_drive_claim_hold(portal_gym_key, picks, reason):
 def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
          topic_type, pillar, cta_type=gbp.DEFAULT_CTA, cta_url="",
          event=None, offer=None, gbp_location_id=None, fmt="update",
-         status="pending"):
+         status="pending", source_media_url=None):
     """One content_calendar GBP row dict (no id; DB mints it). account is the literal
     'googlebusiness'; gym_id is the portal_gym_key canonical join. status is 'pending'
     (owner-visible) normally, or 'coach_review' (withheld from the owner) for a gym's
@@ -372,6 +501,11 @@ def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
         row["gbp_offer"] = offer
     if gbp_location_id:
         row["gbp_location_id"] = gbp_location_id
+    if source_media_url:
+        # Exact raw source lineage for the global prepared writer. Never the
+        # cropped/delivered URL: a transform names its true raw source, a
+        # same-object row names the delivered object itself.
+        row["source_media_url"] = source_media_url
     return row
 
 
@@ -479,7 +613,14 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     def _image_pick(day_key, pillar=None):
         if image_fn is not None:
             url = image_fn(day_key, used)
-            return {"url": url, "kind": "injected", "day_key": day_key} if url else None
+            if not url:
+                return None
+            pick = {"url": url, "kind": "injected", "day_key": day_key}
+            if _global_writer_enabled():
+                # An injected URL is delivered exactly as given — no transform —
+                # so the raw source IS the delivered object (same-object row).
+                pick["source_media_url"] = url
+            return pick
         drive_pick = _drive_photo_candidate(
             account_gen_key, day_key, used_drive_ids)
         if drive_pick and drive_pick.get("hold"):
@@ -514,13 +655,21 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
         if getattr(img, "media_type", "") == "video":
             return None
         key = os.path.basename(img.path)
-        url = _cropped_image_url(account_gen_key, img, day_key)
-        if url:
+        if _global_writer_enabled():
+            prov = _transformed_gbp_image(account_gen_key, img, day_key)
+        else:
+            url = _cropped_image_url(account_gen_key, img, day_key)
+            prov = {"url": url} if url else None
+        if prov:
             used.add(key)
             from . import dam
-            return {"url": url, "kind": "local", "day_key": day_key,
+            pick = {"url": prov["url"], "kind": "local", "day_key": day_key,
                     "rotation_key": dam.rotation_key(img.path), "pillar": pillar,
                     "path": img.path}
+            if prov.get("source_media_url"):
+                pick["source_media_url"] = prov["source_media_url"]
+                pick["render_evidence"] = prov["render_evidence"]
+            return pick
         return None
 
     def _accept(row, pick):
@@ -549,7 +698,8 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
                          img_url, topic_type="STANDARD", pillar=pillar,
                          cta_type=gbp.DEFAULT_CTA, cta_url=cta_url,
                          gbp_location_id=gbp_location_id, fmt="update",
-                         status=initial_status), pick)
+                         status=initial_status,
+                         source_media_url=pick.get("source_media_url")), pick)
             counts["standard"] += 1
         else:
             counts["skipped"] += 1
@@ -572,7 +722,8 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
             _accept(_row(portal_gym_key, account_gen_key, od, cap, img_url,
                          topic_type="OFFER", pillar="offer", offer=odict,
                          event=_offer_window(day), gbp_location_id=gbp_location_id,
-                         fmt="offer", status=initial_status), pick)
+                         fmt="offer", status=initial_status,
+                         source_media_url=pick.get("source_media_url")), pick)
             counts["offer"] += 1
         else:
             counts["skipped"] += 1
@@ -597,7 +748,8 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
                          cta_url=cta_url,
                          event={"title": ev.get("title") or "", "schedule": ev["schedule"]},
                          gbp_location_id=gbp_location_id, fmt="event",
-                         status=initial_status), pick)
+                         status=initial_status,
+                         source_media_url=pick.get("source_media_url")), pick)
             counts["event"] += 1
         else:
             counts["skipped"] += 1
@@ -618,7 +770,8 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
             _accept(_row(portal_gym_key, account_gen_key, pday.isoformat(),
                          "", img_url, topic_type="STANDARD", pillar="photo",
                          gbp_location_id=gbp_location_id, fmt="photo",
-                         status=initial_status), pick)
+                         status=initial_status,
+                         source_media_url=pick.get("source_media_url")), pick)
             counts["photo"] += 1
         pday += timedelta(days=7)
 
@@ -673,7 +826,19 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
                     "planned": 0, "skips": dict(skips), **counts}
         local_reservations[id(row)] = rid
     try:
-        inserted = store.insert_rows(portal_gym_key, rows) or []
+        if _global_writer_enabled():
+            # Render evidence is NOT a row column; it binds source/delivered bytes at
+            # the prepared-writer boundary via insert_rows(render_evidence_by_url=...).
+            # gbp_store.insert_rows is a pure passthrough without the kwarg, so call
+            # the underlying calendar store directly (same object _readback uses).
+            evidence_by_url = {
+                p["url"]: p["render_evidence"]
+                for _row_obj, p in media_claims if p.get("render_evidence")}
+            target = getattr(store, "_s", store)
+            inserted = target.insert_rows(
+                portal_gym_key, rows, render_evidence_by_url=evidence_by_url) or []
+        else:
+            inserted = store.insert_rows(portal_gym_key, rows) or []
     except Exception as exc:
         readback = _readback_inserted_rows(store, portal_gym_key, rows)
         if readback is None:

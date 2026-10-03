@@ -871,12 +871,17 @@ create or replace function public.visual_global_row_bytes_verified(
 ) returns boolean language plpgsql stable security definer set search_path = public as $$
 declare v_tenant text; v_group text; v_source_url text; v_delivered_url text;
   v_source_hash text; v_delivered_hash text; v_selected text; v_kind text;
+  v_thumbnail_url text; v_poster_hash text;
 begin
   v_tenant:=public.visual_group_tenant_id(p_row.gym_id)::text;
   v_group:=p_row.visual_group_key;
   v_delivered_url:=nullif(btrim(p_row.image_url),'');
-  v_source_url:=coalesce(nullif(btrim(to_jsonb(p_row)->>'source_media_url'),''),v_delivered_url);
-  if v_tenant is null or v_group is null or v_delivered_url is null
+  v_thumbnail_url:=nullif(btrim(to_jsonb(p_row)->>'thumbnail_url'),'');
+  -- An absent source is unknown, even when the delivered object has a valid
+  -- receipt. Only the row can select which attested source fed its rendition.
+  v_source_url:=nullif(btrim(to_jsonb(p_row)->>'source_media_url'),'');
+  if v_tenant is null or v_group is null or v_source_url is null
+      or v_delivered_url is null
       or not public.visual_global_scene_complete(v_tenant,v_group) then
     return false;
   end if;
@@ -893,9 +898,33 @@ begin
     where m.tenant_id=v_tenant and m.exact_url=v_source_url
       and m.object_role='source';
   if v_delivered_hash is null or v_source_hash is null then return false; end if;
-  if v_source_url<>v_delivered_url and not public.visual_global_lineage_verified(
+  if v_source_url=v_delivered_url then
+    -- A same-object selection must resolve to identical bytes in both roles.
+    if v_source_hash<>v_delivered_hash then return false; end if;
+  elsif not public.visual_global_lineage_verified(
       v_tenant,v_group,v_source_url,v_source_hash,v_delivered_url,v_delivered_hash) then
     return false;
+  end if;
+  -- Poster object: a blank thumbnail adds no object and an exact URL match
+  -- reuses the already verified delivered object. A distinct poster is
+  -- permitted only as an attested delivered member of this same linked scene
+  -- with immutable owner render lineage from the selected image bytes to the
+  -- poster so direct database writers cannot invent poster lineage. Anything
+  -- else fails closed.
+  if v_thumbnail_url is not null and
+      (to_jsonb(p_row)->>'thumbnail_url') is distinct from
+      (to_jsonb(p_row)->>'image_url') then
+    select m.fingerprint into v_poster_hash
+      from public.visual_global_scene_object_member m
+      join public.visual_group_scene_members(v_tenant,v_group) sm(group_key)
+        on sm.group_key=m.group_key
+      where m.tenant_id=v_tenant and m.exact_url=v_thumbnail_url
+        and m.object_role='delivered';
+    if v_poster_hash is null or not public.visual_global_lineage_verified(
+        v_tenant,v_group,v_delivered_url,v_delivered_hash,
+        v_thumbnail_url,v_poster_hash) then
+      return false;
+    end if;
   end if;
   if nullif(btrim(to_jsonb(p_row)->>'byte_hash'),'') is not null then
     if lower(btrim(to_jsonb(p_row)->>'byte_hash')) !~

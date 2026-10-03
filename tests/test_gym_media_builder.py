@@ -2,6 +2,10 @@
 unprobed video never stages, tenant assertion blocks a cross-gym asset."""
 import os
 import sys
+import hashlib
+from io import BytesIO
+
+from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -33,6 +37,127 @@ def _wire(monkeypatch, analysis=None):
                         lambda path, gym: "https://cdn.fake/served.jpg")
 
 
+def _jpeg_bytes():
+    output = BytesIO()
+    Image.new("RGB", (2, 2), "white").save(output, format="JPEG")
+    return output.getvalue()
+
+
+def test_video_poster_with_evidence_renders_from_exact_hosted_video_bytes(monkeypatch, tmp_path):
+    source_url = "https://media.example/echo/pierce/source/clip.mp4"
+    delivered_url = "https://media.example/echo/pierce/poster/poster.jpg"
+    source_bytes = b"exact-hosted-video-bytes"
+    poster_bytes = _jpeg_bytes()
+    reads = {source_url: source_bytes, delivered_url: poster_bytes}
+    seen = {}
+
+    monkeypatch.setattr(builder.config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr("agent.visual_writer_prepare._bytes_for_url", lambda url: reads.get(url))
+
+    def frame(path, out):
+        seen["source_bytes"] = open(path, "rb").read()
+        with open(out, "wb") as fh:
+            fh.write(poster_bytes)
+
+    monkeypatch.setattr("agent.action_reel.poster_frame", frame)
+    monkeypatch.setattr("agent.media_host.host_media", lambda path, tenant: delivered_url)
+
+    result = builder.video_poster_with_evidence(
+        tmp_path / "untrusted-local.mp4", tmp_path, "pierce", source_url)
+
+    assert result is not None
+    url, evidence = result
+    assert url == delivered_url
+    assert seen["source_bytes"] == source_bytes
+    assert evidence["source_exact_url"] == source_url
+    assert evidence["delivered_exact_url"] == delivered_url
+    assert evidence["source_fingerprint"] == "md5:" + hashlib.md5(source_bytes).hexdigest()
+    assert evidence["delivered_fingerprint"] == "md5:" + hashlib.md5(poster_bytes).hexdigest()
+    assert evidence["source_byte_length"] == len(source_bytes)
+    assert evidence["delivered_byte_length"] == len(poster_bytes)
+    assert evidence["operation"] == "render"
+    assert evidence["rendered_by"] == "gym_media_builder.video_poster_with_evidence"
+    assert evidence["evidence_ref"].startswith("gym_media_builder:poster_render:")
+
+
+def test_video_poster_with_evidence_fails_closed_when_hosted_poster_differs(monkeypatch, tmp_path):
+    source_url = "https://media.example/echo/pierce/source/clip.mp4"
+    delivered_url = "https://media.example/echo/pierce/poster/poster.jpg"
+    local_poster = _jpeg_bytes()
+    changed_poster = _jpeg_bytes() + b"changed"
+    monkeypatch.setattr(builder.config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr("agent.visual_writer_prepare._bytes_for_url",
+                        lambda url: {source_url: b"source", delivered_url: changed_poster}.get(url))
+    monkeypatch.setattr("agent.action_reel.poster_frame",
+                        lambda _path, out: open(out, "wb").write(local_poster))
+    monkeypatch.setattr("agent.media_host.host_media", lambda path, tenant: delivered_url)
+
+    assert builder.video_poster_with_evidence(tmp_path / "clip.mp4", tmp_path,
+                                              "pierce", source_url) is None
+
+
+def test_video_poster_with_evidence_rejects_magic_prefixed_junk(monkeypatch, tmp_path):
+    source_url = "https://media.example/echo/pierce/source/clip.mp4"
+    monkeypatch.setattr(builder.config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr("agent.visual_writer_prepare._bytes_for_url", lambda url: b"source")
+    monkeypatch.setattr("agent.action_reel.poster_frame",
+                        lambda _path, out: open(out, "wb").write(b"\xff\xd8\xffjunk"))
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda *_args: (_ for _ in ()).throw(AssertionError("must not host")))
+
+    assert builder.video_poster_with_evidence(tmp_path / "clip.mp4", tmp_path,
+                                              "pierce", source_url) is None
+
+
+def test_video_poster_with_evidence_rejects_oversized_local_poster(monkeypatch, tmp_path):
+    source_url = "https://media.example/echo/pierce/source/clip.mp4"
+    monkeypatch.setattr(builder.config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr("agent.visual_writer_prepare._bytes_for_url", lambda url: b"source")
+    monkeypatch.setattr("agent.visual_writer_prepare.MAX_VISUAL_BYTES", 1)
+    monkeypatch.setattr("agent.action_reel.poster_frame",
+                        lambda _path, out: open(out, "wb").write(_jpeg_bytes()))
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda *_args: (_ for _ in ()).throw(AssertionError("must not host")))
+
+    assert builder.video_poster_with_evidence(tmp_path / "clip.mp4", tmp_path,
+                                              "pierce", source_url) is None
+
+
+def test_video_poster_with_evidence_removes_source_temp_after_write_failure(monkeypatch, tmp_path):
+    source_url = "https://media.example/echo/pierce/source/clip.mp4"
+    allocated = tmp_path / "poster-source-write-fail.mp4"
+    allocated.write_bytes(b"partial")
+
+    class FailingSourceFile:
+        name = str(allocated)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def write(self, _data):
+            raise OSError("write failed")
+
+    monkeypatch.setattr(builder.config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr("agent.visual_writer_prepare._bytes_for_url", lambda url: b"source")
+    monkeypatch.setattr(builder.tempfile, "NamedTemporaryFile", lambda **_kwargs: FailingSourceFile())
+
+    assert builder.video_poster_with_evidence(tmp_path / "clip.mp4", tmp_path,
+                                              "pierce", source_url) is None
+    assert not allocated.exists()
+
+
+def test_video_poster_with_evidence_is_off_when_hosting_is_off(monkeypatch, tmp_path):
+    monkeypatch.setattr(builder.config, "hosting_enabled", lambda: False)
+    monkeypatch.setattr("agent.visual_writer_prepare._bytes_for_url",
+                        lambda _url: (_ for _ in ()).throw(AssertionError("must not read")))
+
+    assert builder.video_poster_with_evidence(tmp_path / "clip.mp4", tmp_path, "pierce",
+                                              "https://media.example/source.mp4") is None
+
+
 def test_photo_stages_pending(monkeypatch, tmp_path):
     _wire(monkeypatch)
     store = FakeMediaStore(assets=[make_asset("p1", gym_id="pierce", kind="photo")])
@@ -44,6 +169,7 @@ def test_photo_stages_pending(monkeypatch, tmp_path):
     assert draft.status == DraftStatus.PENDING           # human tap untouched
     assert draft.draft_type == "gym_media"
     assert draft.creative_public_url == "https://cdn.fake/served.jpg"
+    assert draft.source_media_url == "https://cdn.fake/served.jpg"
     # usage was stamped at stage time.
     assert store.assets["p1"]["used_count"] == 1
 
@@ -99,6 +225,7 @@ def test_heic_photo_stages_via_rendition(monkeypatch, tmp_path):
         store=store, drive=drive, library_dir=str(tmp_path))
     assert draft is not None and draft.status == DraftStatus.PENDING
     assert draft.creative_public_url == "https://cdn.fake/rend.jpg"
+    assert not getattr(draft, "source_media_url", "")
 
 
 def test_unprobed_video_never_stages(monkeypatch, tmp_path):

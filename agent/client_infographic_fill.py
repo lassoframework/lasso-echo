@@ -271,6 +271,37 @@ def _generate_astra_only(prompt, opts, *, account_key, subject, draft_id,
     return None
 
 
+def _stamp_same_object_source(draft, hosted, log, day):
+    """Global visual writer guard (AGENT_VISUAL_GLOBAL_WRITER_PREP) provenance.
+
+    This lane renders the Astra card to ``out`` and ``media_host.host_media``
+    uploads those exact bytes with no transformation, so the hosted URL IS the
+    generated source object.  When the guard is armed the row must carry an
+    explicit ``source_media_url`` equal to ``image_url`` (the same-object row
+    contract in visual_writer_prepare.prepare); the writer's privileged
+    boundary performs the byte proof.  Guard OFF: no stamp, so pre-migration
+    inserts never carry the column and scheduling behavior is unchanged.
+
+    Never infer a transformed source from a delivered URL: if this lane ever
+    gains a rendition lane between render and host, that lane must instead
+    hold or attach genuine owner-attested render evidence.  A stamp that
+    cannot be retained holds the day rather than inserting an unproven row.
+    Returns True when the draft is insertable under the current guard state.
+    """
+    from .client_month_run import _visual_writer_guard_enabled
+    if not _visual_writer_guard_enabled():
+        return True
+    if not isinstance(hosted, str) or not hosted.strip():
+        log(f"{day}: visual provenance requires the exact hosted source URL; held")
+        return False
+    try:
+        draft.source_media_url = hosted
+    except Exception:  # noqa: BLE001 - never silently lose provenance on an immutable draft
+        log(f"{day}: visual provenance could not retain the hosted source; held")
+        return False
+    return True
+
+
 def fill_gaps(base, account, store, *, voice, logger=None, now=None,
               days_ahead=FILL_DAYS_AHEAD, max_per_run=FILL_MAX_PER_RUN):
     """Generate + insert up to max_per_run PENDING infographic feed posts for the gym's
@@ -433,6 +464,8 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             image_engine=f"{_res.engine}:{_res.model}" if _res is not None else "",
         )
         draft.is_story = False
+        if not _stamp_same_object_source(draft, hosted, log, f"{base} {day}"):
+            continue
         issues = post_quality.post_issues(draft)
         if issues:
             log(f"{base} {day}: infographic caption not A+ ({'; '.join(issues)}); skipped")

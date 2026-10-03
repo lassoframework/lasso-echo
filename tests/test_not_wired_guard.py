@@ -110,8 +110,12 @@ def test_the_portal_bridge_actually_forwards_the_classifier_callable():
 
     import os as _os
     _os.environ["AGENT_PORTAL_ECHO_TICKETS_ENABLED"] = "true"
+    # The older inline fake predated current-ticket CAS and therefore caused the worker
+    # to return before it reached classify(). Use the schema-faithful bridge fixture.
+    from tests.test_echo_ticket_worker import FakeBus as PortalBus, _ticket as portal_ticket
     ETW.intake_pass(
-        _Bus(), slack_lookup_email=lambda e: "U1",
+        PortalBus([portal_ticket(raw_text="something ambiguous entirely")]),
+        slack_lookup_email=lambda e: "U1",
         slack_user_info=lambda u: {"id": u, "is_bot": False, "email": "owner@gym.com"},
         portal_lookup=lambda e: {"role": "client",
                                  "gyms": [{"gym_id": "g-1", "relationship": "client_owner",

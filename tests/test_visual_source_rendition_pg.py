@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -48,7 +49,8 @@ def database():
     sql("""create table public.content_calendar(
         id uuid primary key default gen_random_uuid(), gym_id text, post_date date,
         status text default 'pending', account text, format text,
-        variant_status text default 'active', image_url text, source_media_url text,
+        variant_status text default 'active', image_url text, thumbnail_url text,
+        source_media_url text,
         source_media_asset_id text, drive_file_id text, byte_hash text, r2_key text,
         media_not_ready_reason text, published_at timestamptz, late_post_id text,
         publish_reservation_day date, publish_claim_token uuid,
@@ -131,6 +133,129 @@ def test_distinct_source_and_delivered_bytes_are_attested_without_usage():
             "select public.visual_global_prepare_source_rendition("
             f"{q(tid)},{q(group)},{q(source)}::uuid,{q(delivered)}::uuid,"
             f"{q(render)}::uuid,'test_actor'); rollback")
+
+
+def test_three_object_video_poster_chain_claims_every_exact_byte():
+    source_url = "https://test/video-source-" + uuid.uuid4().hex
+    video_url = "https://test/video-rendition-" + uuid.uuid4().hex
+    poster_url = "https://test/video-poster-" + uuid.uuid4().hex
+    tid, group = tenant_and_group(source_url)
+
+    source, source_md5 = read_receipt(tid, source_url, b"raw video bytes")
+    video, video_md5 = read_receipt(tid, video_url, b"selected video bytes")
+    video_render = render_receipt(
+        tid, source, video, source_url, video_url, source_md5, video_md5)
+    prepare(tid, group, source, video, video_render)
+
+    video_source, repeated_video_md5 = read_receipt(
+        tid, video_url, b"selected video bytes")
+    poster, poster_md5 = read_receipt(tid, poster_url, b"poster frame bytes")
+    poster_render = render_receipt(
+        tid, video_source, poster, video_url, poster_url,
+        repeated_video_md5, poster_md5)
+    prepare(tid, group, video_source, poster, poster_render)
+
+    assert repeated_video_md5 == video_md5
+    assert sql(f"select count(*) from public.visual_global_object_attestation "
+               f"where tenant_id={q(tid)} and group_key={q(group)}") == "3"
+    assert sql(f"select count(*) from public.visual_global_object_lineage "
+               f"where tenant_id={q(tid)} and group_key={q(group)}") == "2"
+    assert sql(f"select count(*) from public.visual_global_scene_object_member "
+               f"where tenant_id={q(tid)} and group_key={q(group)}") == "4"
+
+    sql("drop trigger visual_global_block_local_activation "
+        "on public.gym_visual_guard_settings; "
+        f"insert into public.gym_visual_guard_settings(gym_id,enforce) "
+        f"values({q(tid)},true)")
+    row_id = str(uuid.uuid4())
+    sql("set role service_role; insert into public.content_calendar "
+        "(id,gym_id,post_date,status,account,image_url,thumbnail_url,"
+        "source_media_url,byte_hash,visual_group_key) "
+        f"values({q(row_id)}::uuid,{q(tid)},'2026-10-14','pending','instagram',"
+        f"{q(video_url)},{q(poster_url)},{q(source_url)},"
+        f"{q('derived:' + video_md5)},{q(group)})")
+
+    claimed = set(sql("select fingerprint from public.visual_global_usage "
+                      f"where tenant_id={q(tid)} order by fingerprint").splitlines())
+    assert claimed == {source_md5, video_md5, poster_md5}
+    assert sql(f"select public.visual_global_row_bytes_verified(c) "
+               f"from public.content_calendar c where id={q(row_id)}::uuid") == "t"
+
+
+def test_concurrent_identical_poster_edge_converges_to_one_lineage():
+    source_url = "https://test/concurrent-poster-source-" + uuid.uuid4().hex
+    video_url = "https://test/concurrent-poster-video-" + uuid.uuid4().hex
+    poster_url = "https://test/concurrent-poster-frame-" + uuid.uuid4().hex
+    tid, group = tenant_and_group(source_url)
+    source, source_md5 = read_receipt(tid, source_url, b"concurrent raw video")
+    video, video_md5 = read_receipt(tid, video_url, b"concurrent video")
+    video_render = render_receipt(
+        tid, source, video, source_url, video_url, source_md5, video_md5)
+    prepare(tid, group, source, video, video_render)
+
+    video_source, repeated_video_md5 = read_receipt(
+        tid, video_url, b"concurrent video")
+    poster, poster_md5 = read_receipt(tid, poster_url, b"concurrent poster")
+    poster_render = render_receipt(
+        tid, video_source, poster, video_url, poster_url,
+        repeated_video_md5, poster_md5)
+    barrier = threading.Barrier(2)
+
+    def prepare_same_edge(_):
+        barrier.wait(timeout=5)
+        return prepare(tid, group, video_source, poster, poster_render)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(prepare_same_edge, range(2)))
+    assert results[0] == results[1]
+    assert sql(f"select count(*) from public.visual_global_object_attestation "
+               f"where tenant_id={q(tid)} and group_key={q(group)}") == "3"
+    assert sql(f"select count(*) from public.visual_global_object_lineage "
+               f"where tenant_id={q(tid)} and group_key={q(group)}") == "2"
+    assert sql(f"select count(*) from public.visual_global_object_lineage "
+               f"where tenant_id={q(tid)} and group_key={q(group)} "
+               f"and source_exact_url={q(video_url)} "
+               f"and delivered_exact_url={q(poster_url)}") == "1"
+
+
+def test_poster_must_descend_from_selected_video_object():
+    source_url = "https://test/poster-source-" + uuid.uuid4().hex
+    video_url = "https://test/poster-video-" + uuid.uuid4().hex
+    poster_url = "https://test/poster-wrong-edge-" + uuid.uuid4().hex
+    tid, group = tenant_and_group(source_url)
+    source_data = b"poster test raw source"
+    source, source_md5 = read_receipt(tid, source_url, source_data)
+    video, video_md5 = read_receipt(tid, video_url, b"poster test video")
+    video_render = render_receipt(
+        tid, source, video, source_url, video_url, source_md5, video_md5)
+    prepare(tid, group, source, video, video_render)
+
+    # The poster is attested in the same scene, but the immutable render edge
+    # starts at the raw source instead of the selected video. Alias agreement
+    # alone must not authorize this row.
+    repeated_source, repeated_source_md5 = read_receipt(
+        tid, source_url, source_data)
+    poster, poster_md5 = read_receipt(tid, poster_url, b"wrong edge poster")
+    wrong_render = render_receipt(
+        tid, repeated_source, poster, source_url, poster_url,
+        repeated_source_md5, poster_md5)
+    prepare(tid, group, repeated_source, poster, wrong_render)
+
+    sql("drop trigger visual_global_block_local_activation "
+        "on public.gym_visual_guard_settings; "
+        f"insert into public.gym_visual_guard_settings(gym_id,enforce) "
+        f"values({q(tid)},true)")
+    row_id = str(uuid.uuid4())
+    with pytest.raises(RuntimeError, match="source and rendition bytes are not fully attested"):
+        sql("set role service_role; insert into public.content_calendar "
+            "(id,gym_id,post_date,status,account,image_url,thumbnail_url,"
+            "source_media_url,byte_hash,visual_group_key) "
+            f"values({q(row_id)}::uuid,{q(tid)},'2026-10-15','pending','instagram',"
+            f"{q(video_url)},{q(poster_url)},{q(source_url)},"
+            f"{q('derived:' + video_md5)},{q(group)})")
+    assert sql(f"select count(*) from public.content_calendar "
+               f"where id={q(row_id)}::uuid") == "0"
+    assert sql("select count(*) from public.visual_global_usage") == "0"
 
 
 def test_foreign_tenant_missing_lineage_and_rebound_url_fail_atomically():
