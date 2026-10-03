@@ -263,12 +263,15 @@ def _cas_move(store, expected, values):
 
 
 def _atomic_insert(store, action):
+    payload = {"p_row": action["row"], "p_artifact_tenant": action["artifact_tenant"],
+               "p_source_hash": action["source_identity"]["source_hash"],
+               "p_policy_version": action["policy_version"],
+               "p_image_sha256": action["image_sha256"]}
+    if action.get("visual_group_key") or action.get("byte_hash"):
+        payload["p_visual_group_key"] = action.get("visual_group_key")
+        payload["p_byte_hash"] = action.get("byte_hash")
     response = store._client().post(store._rest("rpc/stage_lasso_campaign_row"),
-        headers=store._headers({"Content-Type": "application/json"}), json={
-            "p_row": action["row"], "p_artifact_tenant": action["artifact_tenant"],
-            "p_source_hash": action["source_identity"]["source_hash"],
-            "p_policy_version": action["policy_version"],
-            "p_image_sha256": action["image_sha256"]}, timeout=30)
+        headers=store._headers({"Content-Type": "application/json"}), json=payload, timeout=30)
     if response.status_code >= 400:
         raise RuntimeError("atomic Summit insert failed")
     result = response.json()
@@ -277,7 +280,46 @@ def _atomic_insert(store, action):
     return result
 
 
-def apply(plan, store, receipt_dir, *, current_day_fn=None, move_fn=None, insert_fn=None):
+def _prepare_insert_evidence(store, action, *, prepare_fn=None):
+    """With the visual writer flag ON, require claim-scene-grade evidence first.
+
+    The armed calendar trigger claims through public.visual_global_claim_scene,
+    which refuses a row unless visual_global_row_bytes_verified holds: the scene
+    must be complete (owner-attested source AND delivered object members for the
+    exact URLs on the row).  For a generated Summit creative the source IS the
+    delivered object, so the owner-attested same-exact-URL preparation path is
+    the contract that creates that evidence (Child A,
+    agent.visual_writer_prepare.prepare_same_object).  The legacy group/hash
+    bundle alone is NOT sufficient and is never accepted here.
+
+    The contract is imported defensively: if it is absent, unusable, or returns
+    an identity that is not an unclaimed vg_ scene with a derived byte hash for
+    this exact URL, fail closed BEFORE the staging RPC.
+    """
+    from agent import visual_writer_prepare
+    if not visual_writer_prepare.enabled():
+        return None
+    url = str((action.get("row") or {}).get("image_url") or "").strip()
+    if not url:
+        raise RuntimeError("staging readiness failed: Summit insert has no reviewed artifact URL")
+    prepare = prepare_fn or getattr(visual_writer_prepare, "prepare_same_object", None)
+    if not callable(prepare):
+        raise RuntimeError(
+            "staging readiness failed: owner-attested same-object preparation "
+            "contract is unavailable; staging RPC refused")
+    prepared = prepare(store, TARGET_GYM, url, flag_on=True)
+    digest = str(prepared.get("byte_hash") or "") if isinstance(prepared, dict) else ""
+    if (not isinstance(prepared, dict) or prepared.get("url") != url
+            or prepared.get("usage_claimed") is not False
+            or not str(prepared.get("visual_group_key") or "").startswith("vg_")
+            or not (digest.startswith("derived:md5:") and len(digest) == 44
+                    and all(c in "0123456789abcdef" for c in digest[12:]))):
+        raise RuntimeError("same-object preparation returned an unverified identity")
+    return {"visual_group_key": prepared["visual_group_key"],
+            "byte_hash": digest}
+
+
+def apply(plan, store, receipt_dir, *, current_day_fn=None, move_fn=None, insert_fn=None, prepare_fn=None):
     """Apply the reviewed manifest once.  A zero-row CAS is a conflict and is never retried."""
     folder = Path(receipt_dir); folder.mkdir(parents=True, exist_ok=True)
     before_path, receipt_path = folder / "calendar-before-apply.json", folder / "summit-stage-receipts.json"
@@ -316,6 +358,13 @@ def apply(plan, store, receipt_dir, *, current_day_fn=None, move_fn=None, insert
                 receipts.append({"date": day, "account": account, "operation": "insert", "status": "out_of_scope_input"}); persist(); continue
             if not all(action.get(key) for key in ("artifact_tenant", "source_identity", "policy_version", "image_sha256")):
                 receipts.append({"date": day, "account": account, "operation": "insert", "status": "reviewed_artifact_missing"}); persist(); continue
+            try:
+                evidence = _prepare_insert_evidence(store, action, prepare_fn=prepare_fn)
+            except Exception as exc:
+                receipts.append({"date": day, "account": account, "operation": "insert",
+                                 "status": "writer_preparation_failed", "error": type(exc).__name__}); persist(); continue
+            if evidence:
+                action = {**action, **evidence}
             result = (insert_fn or _atomic_insert)(store, action)
             if result["result"] == "conflict":
                 receipts.append({"date": day, "account": account, "operation": "insert", "status": "conflict",
@@ -367,6 +416,14 @@ def main(argv=None):
         print(json.dumps({"applied": sum(r["status"] == "applied" for r in receipts),
                           "receipts": len(receipts), "complete_days": report["complete"],
                           "total_days": report["total"]}))
+        from agent import visual_writer_prepare
+        if visual_writer_prepare.enabled():
+            # Flag ON: any failed preparation/write receipt or an incomplete
+            # campaign shape is a nonzero exit.  Flag OFF keeps legacy exits.
+            failed = [r for r in receipts
+                      if r.get("status") not in ("applied", "already_present")]
+            if failed or report["complete"] != report["total"]:
+                return 1
     print(json.dumps({"mode": plan["mode"], "actions": len(plan["actions"]), "blocked": len(plan["blocked"])}))
 
 

@@ -289,8 +289,8 @@ def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url
     return prepared
 
 
-def prepare_same_object(store, account_key, row, *, read_bytes=None, receipt_writer=None,
-                        isolated_test_callbacks=False):
+def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receipt_writer=None,
+                             isolated_test_callbacks=False):
     """Attest one exact source/delivered URL through the owner receipt boundary.
 
     The legacy bundle RPC may create an absent scene, but cannot establish byte
@@ -378,6 +378,37 @@ def prepare_same_object(store, account_key, row, *, read_bytes=None, receipt_wri
     prepared["visual_group_key"] = group
     prepared["byte_hash"] = "derived:" + digest
     return prepared
+
+
+def prepare_same_object(store, account_key, row_or_url, *, flag_on=None,
+                        read_bytes=None, receipt_writer=None,
+                        isolated_test_callbacks=False):
+    """Prepare one exact object through the owner receipt boundary.
+
+    Calendar rows retain their row shape; generated-artifact URL callers receive
+    a compact identity for staging. Both forms share byte, tenant, group, and
+    owner receipt checks. Injected callbacks are isolated-test-only.
+    """
+    actual = enabled()
+    if flag_on is not None and bool(flag_on) is not actual:
+        raise VisualPreparationError("writer preparation flag state is ambiguous")
+    if isinstance(row_or_url, dict):
+        return _prepare_same_object_row(
+            store, account_key, row_or_url, read_bytes=read_bytes,
+            receipt_writer=receipt_writer,
+            isolated_test_callbacks=isolated_test_callbacks)
+    if not actual:
+        raise VisualPreparationError("writer preparation flag is off")
+    if not isinstance(row_or_url, str):
+        raise VisualPreparationError("same-object URL is invalid")
+    url = row_or_url
+    prepared = _prepare_same_object_row(
+        store, account_key, {"image_url": url}, read_bytes=read_bytes,
+        receipt_writer=receipt_writer,
+        isolated_test_callbacks=isolated_test_callbacks)
+    return {"visual_group_key": prepared["visual_group_key"],
+            "byte_hash": prepared["byte_hash"], "usage_claimed": False,
+            "url": url}
 
 
 def prepare(store, account_key, row, *, read_bytes=None, render_evidence=None,

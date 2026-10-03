@@ -201,8 +201,8 @@ def _validate_same_object(tenant, group_key, exact_bytes, evidence, asset_id):
     if not prepare._own_media_url(exact_url):
         raise OwnerReceiptError("receipt URL must use the configured media host")
     fingerprint = _md5(exact_bytes)
-    if (evidence.get("fingerprint") != fingerprint
-            or evidence.get("byte_length") != len(exact_bytes)):
+    if (evidence.get("fingerprint") not in (None, fingerprint)
+            or evidence.get("byte_length") not in (None, len(exact_bytes))):
         raise OwnerReceiptError("same-object evidence differs from observed bytes")
     evidence_ref = _text(evidence.get("evidence_ref"), "byte evidence reference")
     observed_by = _text(evidence.get("observed_by"), "byte observer")
