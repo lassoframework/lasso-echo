@@ -154,6 +154,40 @@ def test_direct_upload_holds_when_global_ledger_already_consumed_bytes(monkeypat
     assert poster.cards == []
 
 
+@pytest.mark.parametrize("mode", ("ambiguous_flag", "unreadable_ledger"))
+def test_direct_upload_holds_photo_when_global_history_uncertain(
+        monkeypatch, tmp_path, mode):
+    """Unknown global photo history must hold the photo upload (fail closed),
+    alert once, and never draft or card it."""
+    from agent import gym_media_selector as selector
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    if mode == "ambiguous_flag":
+        monkeypatch.setenv(selector.GLOBAL_LEDGER_FLAG_ENV, "maybe")
+    else:
+        monkeypatch.setenv(selector.GLOBAL_LEDGER_FLAG_ENV, "true")
+        monkeypatch.setattr(selector, "cross_client_used_fingerprints",
+                            lambda *args, **kwargs: (_ for _ in ()).throw(
+                                selector.GlobalLedgerUnavailable("unreadable")))
+    voice_file = tmp_path / "voice.md"
+    voice_file.write_text(VOICE, encoding="utf-8")
+    monkeypatch.setattr(runner, "_generation_account_for",
+                        lambda _t: _acct(voice_doc=str(voice_file)))
+    alerts = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda msg, **k: alerts.append(msg))
+    poster = FakePoster()
+    store = PendingStore(path=str(tmp_path / "s.json"))
+    held = _asset(tmp_path, "held.jpg", "Packed class.")
+
+    out = runner.draft_for_new_upload("gymx", [held], poster=poster, store=store)
+
+    # Uncertain global state is never proof the bytes are free: hold the asset.
+    assert out == []
+    assert poster.cards == []
+    assert store.list_pending() == []
+    assert len(alerts) == 1 and "held.jpg" in alerts[0]
+
+
 def test_upload_releases_only_definitive_no_card_no_row(monkeypatch, tmp_path):
     from agent import dam, rotation
     _arm(monkeypatch)
