@@ -18,6 +18,11 @@ def _rows():
                      "source_media_url": "https://cdn/igfill_raw.jpg",
                      "source_media_asset_id": None, "media_not_ready_reason": None})
     rows.extend([
+        {"id": "2026-09-03-ig-story-source-only", "gym_id": script._BASE,
+         "post_date": "2026-09-03", "account": "instagram", "format": "story",
+         "status": "pending", "image_url": "https://cdn/rendered_story.jpg",
+         "source_media_url": "https://cdn/igfill_sep03_story_source.jpg",
+         "source_media_asset_id": None, "media_not_ready_reason": None},
         {"id": "2026-09-03-fb", "gym_id": script._BASE,
          "post_date": "2026-09-03", "account": "facebook", "format": "feed",
          "status": "pending", "image_url": "https://cdn/igfill_sep03_fb.jpg",
@@ -159,9 +164,9 @@ def test_exact_scope_digest_and_dry_run_has_no_writes(monkeypatch):
     _wire_selector(monkeypatch, ctx)
     out = script.run(ctx=ctx, ledger_rows=[])
     assert out["ok"] and out["dry_run"] and out["apply_available"] is False
-    assert out["target_rows"] == 24 and out["target_days"] == 17
+    assert out["target_rows"] == 25 and out["target_days"] == 17
     assert len(out["target_digest"]) == 64
-    assert sum(len(item["row_ids"]) for item in out["plan"]) == 24
+    assert sum(len(item["row_ids"]) for item in out["plan"]) == 25
     assert len({item["asset_id"] for item in out["plan"]}) == 17
     assert ctx["calendar"].writes == 0
 

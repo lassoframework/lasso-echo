@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan or restage Swift River's Sep 2-Oct 2 2026 pending igfill cards.
+"""Audit Swift River's Sep 2-Oct 2 2026 pending igfill cards.
 
 This is an evidence-only dry run. Apply is disabled until a server-side operation
 can atomically reserve a photo and compare-and-swap its complete day of rows.
@@ -23,7 +23,7 @@ _BASE = "swiftrivercrossfite5c9db"
 _IG_KEY = f"{_BASE}_ig"
 _START = date(2026, 9, 2)
 _END = date(2026, 10, 2)
-_TARGET_ROWS = 24
+_TARGET_ROWS = 25
 _TARGET_DAYS = 17
 _TARGET_HELD_ROWS = 1
 _BOOK_PADDING_DAYS = 90
@@ -230,7 +230,7 @@ def run(*, apply=False, expected_digest=None, ctx=None, ledger_rows=None):
         initial_rows = _calendar_rows(calendar, initial_months)
         target = _target_rows(initial_rows)
         if target is None:
-            return {"ok": False, "reason": "exact 24-row, 17-day historical target absent"}
+            return {"ok": False, "reason": "exact 25-row, 17-day historical target absent"}
         digest = _row_digest(target)
         book = _calendar_rows(calendar, _months_for_book(target))
         consumed = _consumed_asset_ids(ledger_rows=ledger_rows)
