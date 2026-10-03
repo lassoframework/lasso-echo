@@ -24,7 +24,7 @@ from agent.media_source_store import SupabaseMediaStore
 REASON = "cross_date_media_repeat_needs_new_visual"
 _URL_FIELD_HASHES = ("image_url", "source_media_url")
 _ROW_FIELDS = (
-    "id", "gym_id", "post_date", "status", "variant_status", "account",
+    "id", "gym_id", "post_date", "slot_index", "status", "variant_status", "account",
     "format", "caption", "image_url", "source_media_url",
     "source_media_asset_id", "media_not_ready_reason", "created_at",
     "published_at", "late_post_id", "publish_claim_token",

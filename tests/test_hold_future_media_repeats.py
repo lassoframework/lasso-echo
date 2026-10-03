@@ -8,6 +8,7 @@ from scripts import hold_future_media_repeats as hold
 def _row(row_id, gym, day, *, account="instagram", status="pending"):
     return {
         "id": row_id, "gym_id": gym, "post_date": day, "status": status,
+        "slot_index": 2,
         "variant_status": "active", "account": account, "format": "feed",
         "caption": f"Caption for {row_id}, keep as written.",
         "image_url": f"https://cdn.test/{row_id}.jpg", "source_media_url": None,
@@ -186,6 +187,22 @@ def test_apply_digest_stales_on_any_row_edit_before_write(tmp_path, monkeypatch)
     assert not receipt.exists()
 
 
+def test_apply_digest_and_cas_guard_concurrent_slot_move(tmp_path, monkeypatch):
+    store, media, _ = configured(monkeypatch)
+    dry = hold.run(store=store, media_store=media, today="2026-10-03")
+    target_id = hold.TARGETS[0]["id"]
+    store.rows[target_id]["slot_index"] = 3
+    monkeypatch.setenv("ECHO_CROSS_DATE_MEDIA_REPEAT_HOLD_ENABLED", "true")
+    receipt = tmp_path / "slot-move.json"
+    result = hold.run(store=store, media_store=media, today="2026-10-03", apply=True,
+                      expected_digest=dry["preflight"]["target_digest"],
+                      receipt_path=receipt)
+    assert result["ok"] is False
+    assert result["reason"] == "exact dry-run digest and new private receipt required"
+    assert store.http.calls == []
+    assert not receipt.exists()
+
+
 def test_preflight_fails_closed_on_changed_repeat_source_or_claim(tmp_path, monkeypatch):
     store, media, _ = configured(monkeypatch)
     cross_url = hold.TARGETS[0]
@@ -213,6 +230,7 @@ def test_cas_filters_exact_claim_and_snapshot_fields_and_changes_one_column(monk
     assert result["post_date"] == before["post_date"]
     assert store.http.calls[0][1]["publish_claim_token"] == "is.null"
     assert store.http.calls[0][1]["publish_reservation_day"] == "is.null"
+    assert store.http.calls[0][1]["slot_index"] == f"eq.{before['slot_index']}"
     assert store.http.calls[0][1]["caption"] == f"eq.{before['caption']}"
     assert store.http.calls[0][2] == {"media_not_ready_reason": hold.REASON}
 
