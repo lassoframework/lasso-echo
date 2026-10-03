@@ -752,11 +752,52 @@ def _recover_stale_claims(bus, identity, log, now=None):
         if _age_seconds(row, now) < CLAIM_TIMEOUT_SECONDS:
             continue  # plausibly still in flight; do not steal it
         try:
+            if (row.get("attachments") or {}).get("outreach") is True:
+                # The direct outreach path posts to Slack before its final DB mark.
+                # A crashed/failed mark may mean the person already got the DM.
+                # Never return that uncertain row to the automatic send queue.
+                quarantine = getattr(bus, "hold_uncertain_outreach", None)
+                if not callable(quarantine):
+                    log(f"[slack-convo/outbox] CRITICAL uncertain outreach row "
+                        f"{row['id']} has no safe quarantine capability")
+                    continue
+                observed = quarantine(row["id"])
+                if observed and observed.get("delivery_status") == "held":
+                    n += 1
+                continue
             bus.mark_message(row["id"], "ready", meta_update={"reclaimed_stale_posting": True})
             n += 1
         except Exception:  # noqa: BLE001
             pass
     return n
+
+
+def _report_uncertain_outreach(bus, identity, log):
+    """Persist a staff card for each held outreach whose Slack outcome is uncertain."""
+    try:
+        rows = bus.outbox("held", limit=200, identity=identity.name)
+    except Exception:  # noqa: BLE001 - retained held rows are retried next run
+        return
+    for row in rows:
+        att = row.get("attachments") or {}
+        if not att.get("outreach_delivery_uncertain") or att.get("outreach_staff_alerted"):
+            continue
+        ticket_id = row.get("ticket_id")
+        try:
+            if not bus.uncertain_outreach_alert_exists(ticket_id, row["id"]):
+                fresh = bus.ticket(ticket_id) or {}
+                owner = fresh.get("bot_identity") or identity.name
+                bus.record_outbound(
+                    ticket_id=ticket_id, author_type="system",
+                    body=(f"Outreach delivery needs staff reconciliation for ticket "
+                          f"{ticket_id}, message {row['id']}. Slack may have delivered it. "
+                          f"Check Slack and the ticket before any resend."),
+                    delivery_status="ready", kind=_a.KIND_ESCALATION,
+                    meta={"identity": owner, "outreach_uncertain_row_id": row["id"]})
+            bus.mark_uncertain_outreach_alerted(row["id"])
+        except Exception as e:  # noqa: BLE001 - keep held and retry staff alert
+            log(f"[slack-convo/outbox] uncertain outreach staff alert failed "
+                f"row={row['id']}: {type(e).__name__}")
 
 
 def _blake_is_member(identity, channel, user):
@@ -789,6 +830,7 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
     summary = {"posted": 0, "held": 0, "suppressed": 0, "failed": 0, "skipped": 0,
                "resolved": 0, "reclaimed": 0}
     summary["reclaimed"] = _recover_stale_claims(bus, identity, log, now=now)
+    _report_uncertain_outreach(bus, identity, log)
     try:
         rows = bus.outbox("ready", limit=limit, identity=identity.name)
     except TypeError:  # a bus without the identity filter (older fakes)

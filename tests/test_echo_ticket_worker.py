@@ -49,9 +49,10 @@ class FakeBus:
         self.outbound = []
         self.patches = []
         self.raise_on_inbound = set()
+        self.raise_on_patch = set()
 
     def find_new_tickets(self, *, product, source, limit=20):
-        return [t for t in self.tickets.values()
+        return [dict(t) for t in self.tickets.values()
                if t.get("product") == product and t.get("source") == source
                and t.get("status") == "new" and t.get("classification") is None]
 
@@ -64,13 +65,35 @@ class FakeBus:
         if tid in self.raise_on_inbound:
             raise RuntimeError("bus down for this row")
         self.inbound.append(kwargs)
+        if kwargs.get("author_type") == "client":
+            self.tickets[tid]["request_version"] += 1
         return ({"id": f"in-{len(self.inbound)}"}, False)
 
     def inbound_count(self, ticket_id):
         return len([m for m in self.inbound if m.get("ticket_id") == ticket_id])
 
     def record_outbound(self, **kwargs):
-        row = {"id": f"out-{len(self.outbound)}", **kwargs}
+        current_version = self.tickets[kwargs["ticket_id"]].get("request_version")
+        expected_version = kwargs.get("expected_request_version")
+        if expected_version is not None and expected_version != current_version:
+            raise RuntimeError("outbound request version changed before insert")
+        meta = kwargs.get("meta") or {}
+        if meta.get("delivery_identity_fence") is True:
+            ticket = self.tickets[kwargs["ticket_id"]]
+            expected = (meta.get("delivery_expected_product"),
+                        meta.get("delivery_expected_client_id"),
+                        meta.get("delivery_expected_status"),
+                        meta.get("delivery_expected_classification"),
+                        meta.get("delivery_expected_bot_identity"),
+                        meta.get("delivery_expected_slack_user_id"))
+            actual = tuple(ticket.get(field) for field in (
+                "product", "client_id", "status", "classification",
+                "bot_identity", "slack_user_id"))
+            if expected != actual:
+                raise RuntimeError("outbound delivery identity changed before insert")
+        row = {"id": f"out-{len(self.outbound)}", **kwargs,
+               "delivery_request_version": current_version}
+        row["attachments"] = {"kind": kwargs.get("kind"), **(kwargs.get("meta") or {})}
         self.outbound.append(row)
         return row
 
@@ -78,8 +101,90 @@ class FakeBus:
         self.patches.append((ticket_id, fields))
         self.tickets[ticket_id].update(fields)
 
+    def patch_ticket_if_current(self, expected_ticket, **fields):
+        if type(expected_ticket.get("request_version")) is not int:
+            return None
+        if expected_ticket["id"] in self.raise_on_patch:
+            raise RuntimeError("bus down for this row")
+        current = self.tickets[expected_ticket["id"]]
+        identity = ("request_version", "status", "classification", "product",
+                    "source", "client_id", "reporter", "bot_identity",
+                    "slack_user_id", "slack_channel_id", "slack_thread_ts",
+                    "hold_tier", "escalated")
+        if any(current.get(field) != expected_ticket.get(field) for field in identity):
+            return None
+        self.set_ticket(expected_ticket["id"], **fields)
+        return self.ticket(expected_ticket["id"])
+
     def ticket(self, ticket_id):
         return dict(self.tickets[ticket_id])
+
+    def mark_message(self, message_id, delivery_status, slack_ts=None, meta_update=None):
+        row = next(m for m in self.outbound if m["id"] == message_id)
+        if delivery_status == "posted" and row["attachments"].get("delivery_identity_fence"):
+            ticket = self.tickets[row["ticket_id"]]
+            expected = (row["delivery_request_version"], *(
+                row["attachments"].get(f"delivery_expected_{field}") for field in (
+                    "product", "client_id", "status", "classification",
+                    "bot_identity", "slack_user_id")))
+            actual = tuple(ticket.get(field) for field in (
+                "request_version", "product", "client_id", "status", "classification",
+                "bot_identity", "slack_user_id"))
+            if expected != actual:
+                raise RuntimeError("outbound delivery identity changed before posted receipt")
+        row["delivery_status"] = delivery_status
+        row["slack_ts"] = slack_ts
+        row["attachments"].update(meta_update or {})
+        return dict(row)
+
+    def claim_message(self, message_id):
+        row = next(m for m in self.outbound if m["id"] == message_id)
+        if row["delivery_status"] != "ready":
+            return False
+        row["delivery_status"] = "posting"
+        return True
+
+    def hold_uncertain_outreach(self, message_id):
+        row = next(m for m in self.outbound if m["id"] == message_id)
+        if row["delivery_status"] == "posted":
+            return dict(row)
+        if row["delivery_status"] in ("posting", "ready"):
+            row["delivery_status"] = "held"
+            row["attachments"].update({"outreach_delivery_uncertain": True,
+                                       "held_why": "Slack may have delivered"})
+        return dict(row)
+
+    def stamp_ticket(self, ticket_id, *, channel_id, thread_ts, slack_user_id,
+                     bot_identity, identity_kind, expected_ticket=None):
+        current = self.ticket(ticket_id)
+        if expected_ticket is None or any(
+                current.get(field) != expected_ticket.get(field) for field in (
+                    "request_version", "status", "classification", "product", "client_id",
+                    "bot_identity", "slack_user_id", "slack_channel_id", "slack_thread_ts")):
+            return None
+        self.set_ticket(ticket_id, slack_channel_id=channel_id,
+                        slack_thread_ts=thread_ts, slack_user_id=slack_user_id,
+                        bot_identity=bot_identity, identity_kind=identity_kind)
+        return self.ticket(ticket_id)
+
+    def resolve_current_delivery(self, tid, version, status, classification, product,
+                                 client_id, bot_identity, slack_user_id, channel, thread):
+        t = self.tickets[tid]
+        expected = (version, status, classification, product, client_id, bot_identity,
+                    slack_user_id, channel, thread)
+        actual = tuple(t.get(k) for k in ("request_version", "status", "classification",
+                                         "product", "client_id", "bot_identity",
+                                         "slack_user_id", "slack_channel_id", "slack_thread_ts"))
+        if actual != expected or t.get("escalated") is True or t.get("hold_tier") is not None:
+            return None
+        if not any(m.get("ticket_id") == tid and m.get("delivery_status") == "posted"
+                   and m.get("delivery_request_version") == version
+                   and m["attachments"].get("kind") == "status"
+                   and m["attachments"].get("resolve_notice") is True
+                   for m in self.outbound):
+            return None
+        self.set_ticket(tid, status="resolved")
+        return self.ticket(tid)
 
 
 def _ticket(**over):
@@ -88,6 +193,8 @@ def _ticket(**over):
         "client_id": "g-1", "reporter": "owner@gym.com",
         "raw_text": "my Instagram posts stopped going out",
         "status": "new", "classification": None,
+        "request_version": 0,
+        "escalated": False, "hold_tier": None,
     }
     row.update(over)
     return row
@@ -347,7 +454,7 @@ def test_intake_pass_isolates_a_bus_failure_to_the_one_ticket_that_hit_it():
         _ticket(id="t-good", reporter="owner@gym.com",
                raw_text="is my instagram connected?"),
     ])
-    bus.raise_on_inbound = {"t-bad"}
+    bus.raise_on_patch = {"t-bad"}
     log, open_dm, post = _calls()
     _, notice = _notices()
 
@@ -356,7 +463,9 @@ def test_intake_pass_isolates_a_bus_failure_to_the_one_ticket_that_hit_it():
 
     result = W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
                            write_hold_notice=notice, fetch_state=fetch_state,
-                           llm=lambda s, u: "Yes, connected.", **_client_deps())
+                           llm=lambda s, u: "Yes, connected.",
+                           mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                           **_client_deps())
     assert result == {"processed": 1}  # only t-good counted
     assert bus.tickets["t-bad"]["status"] == "new"  # never touched past the crash
     assert bus.tickets["t-good"]["status"] == "resolved"
@@ -377,9 +486,11 @@ def test_intake_pass_answers_a_grounded_question_and_sends_outreach():
 
     result = W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
                            write_hold_notice=notice, fetch_state=fetch_state, llm=llm,
+                           mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
                            **_client_deps())
     assert result == {"processed": 1}
     assert bus.tickets["t-1"]["status"] == "resolved"
+    assert bus.inbound == [], "portal raw_text is already the original requester record"
     assert len(log["opened"]) == 1
     assert "connected" in log["posted"][0][1]
     # Never a generic "I'm on it" placeholder -- the VERIFIED answer is the first
@@ -525,15 +636,14 @@ def test_the_answer_lanes_grounding_snapshot_is_never_read_as_a_fix_verdict(_wir
 
 
 def test_fixed_pass_notifies_once_a_registered_producer_has_verified(_wired):
-    """The delivery path still works -- the refusal is the ONLY thing holding it."""
+    """The legacy fixing state cannot satisfy migration 0381's resolution CAS."""
     bus = FakeBus([_ticket(status="fixing", slack_user_id="U_CLIENT",
                           verification_after=_verdict(fix_pr_url="https://github.com/x/y/pull/1"))])
     log, open_dm, post = _calls()
     result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
-    assert result == {"notified": 1}
-    assert bus.tickets["t-1"]["status"] == "resolved"
-    assert "Fixed it" in log["posted"][0][1]
-    assert "https://github.com/x/y/pull/1" in log["posted"][0][1]
+    assert result == {"notified": 0}
+    assert bus.tickets["t-1"]["status"] == "fixing"
+    assert log["posted"] == []
 
 
 def test_fixed_pass_leaves_an_unverified_ticket_alone(_wired):
@@ -578,6 +688,7 @@ def test_intake_pass_routes_product_portal_to_scout_identity():
     result = W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
                            write_hold_notice=notice, product="portal",
                            identity_name="scout", fetch_state=fetch_state, llm=llm,
+                           mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
                            **_client_deps())
     assert result == {"processed": 1}
     assert bus.tickets["t-1"]["status"] == "resolved"
@@ -615,6 +726,321 @@ def test_fixed_pass_routes_product_portal_to_scout_identity(_wired):
     log, open_dm, post = _calls()
     result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post,
                          product="portal", identity_name="scout")
-    assert result == {"notified": 1}
+    assert result == {"notified": 0}
+    assert bus.tickets["t-1"]["status"] == "fixing"
+    assert log["posted"] == []
+
+
+# ---- completion receipt stamp (portal migration 0381 compatibility) -------------------
+
+def _marks_capture(bus):
+    marks = []
+
+    def mark_message(message_id, delivery_status, slack_ts=None, meta_update=None):
+        marks.append({"id": message_id, "status": delivery_status,
+                      "meta_update": meta_update})
+        return bus.mark_message(message_id, delivery_status, slack_ts, meta_update)
+
+    return marks, mark_message
+
+
+def test_delivered_answer_stamps_resolve_notice_with_the_current_request_version():
+    """The direct grounded-answer lane resolves the ticket on delivery, so its posted
+    row must carry an explicit resolve_notice bound to the ticket's current
+    request_version -- what portal migration 0381's completion guard reads."""
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=5)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    marks, mark_message = _marks_capture(bus)
+
+    def fetch_state(ticket, who):
+        return {"social_status": "connected"}
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice, fetch_state=fetch_state,
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
     assert bus.tickets["t-1"]["status"] == "resolved"
-    assert "Fixed it" in log["posted"][0][1]
+    assert len(marks) == 1 and marks[0]["status"] == "posted"
+    assert marks[0]["meta_update"] == {"resolve_notice": True, "request_version": 5}
+
+
+def test_delivered_answer_without_a_request_version_refuses_to_send():
+    """A request without a trustworthy version cannot be closed safely."""
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=None)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    marks, mark_message = _marks_capture(bus)
+
+    def fetch_state(ticket, who):
+        return {"social_status": "connected"}
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice, fetch_state=fetch_state,
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert bus.tickets["t-1"]["status"] == "new"
+    assert marks == []
+    assert log["posted"] == []
+
+
+def test_answer_promising_human_follow_up_is_never_stamped_as_a_completion():
+    """A follow-up promise keeps the ticket OPEN (routed to the FIXER), so the posted
+    answer must not read as a completion to the portal guard."""
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    marks, mark_message = _marks_capture(bus)
+
+    def fetch_state(ticket, who):
+        return {"social_status": "connected"}
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice, fetch_state=fetch_state,
+                  llm=lambda s, u: ("It looks connected. I will flag this for a "
+                                    "teammate to double-check the queue."),
+                  mark_message=mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert bus.tickets["t-1"]["escalated"] is True
+    # The DM row was posted (mark captured) but carries NO completion stamp.
+    assert len(marks) == 1 and marks[0]["status"] == "posted"
+    assert marks[0]["meta_update"] is None
+
+
+def test_direct_first_person_follow_up_keeps_ticket_open():
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda s, u: "It looks connected. I will follow up tomorrow.",
+                  mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert bus.tickets["t-1"]["escalated"] is True
+    assert bus.outbound[0]["attachments"].get("resolve_notice") is None
+
+
+def test_requester_reply_during_post_cannot_resolve_old_cycle():
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, _post = _calls()
+    _, notice = _notices()
+
+    def post(channel, body):
+        bus.tickets["t-1"]["request_version"] = 3
+        bus.tickets["t-1"]["raw_text"] = "Actually, a different question"
+        return {"ok": True, "ts": "9999.1"}
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert bus.tickets["t-1"]["request_version"] == 3
+    assert bus.tickets["t-1"]["status"] == "verification"
+    assert bus.outbound[0]["delivery_request_version"] == 2
+
+
+def test_new_request_during_answer_generation_stays_in_new_queue():
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+
+    def fetch_state(ticket, who):
+        bus.tickets["t-1"]["request_version"] = 3
+        bus.tickets["t-1"]["raw_text"] = "Please answer my newer request"
+        return {"social_status": "connected"}
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice, fetch_state=fetch_state,
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert bus.tickets["t-1"]["request_version"] == 3
+    assert bus.tickets["t-1"]["status"] == "new"
+    assert bus.tickets["t-1"]["classification"] is None
+    assert bus.outbound == []
+    assert log["posted"] == []
+
+
+def test_new_request_before_initial_owner_stamp_is_not_claimed():
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    original_patch = bus.patch_ticket_if_current
+
+    def racing_patch(expected, **fields):
+        if "bot_identity" in fields:
+            bus.tickets["t-1"]["request_version"] = 3
+            bus.tickets["t-1"]["raw_text"] = "Newer request"
+        return original_patch(expected, **fields)
+
+    bus.patch_ticket_if_current = racing_patch
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda s, u: "Yes, connected.", **_client_deps())
+    assert bus.tickets["t-1"]["request_version"] == 3
+    assert bus.tickets["t-1"]["status"] == "new"
+    assert bus.tickets["t-1"].get("bot_identity") is None
+    assert bus.outbound == []
+
+
+def test_mark_failure_after_slack_post_never_resolves():
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+
+    def failing_mark(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=failing_mark, claim_message=bus.claim_message,
+                  stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert log["posted"]
+    assert bus.tickets["t-1"]["status"] == "verification"
+    assert bus.outbound[0]["delivery_status"] == "held"
+    assert bus.outbound[0]["attachments"]["outreach_delivery_uncertain"] is True
+
+
+def test_mark_response_lost_after_committed_post_preserves_receipt_and_resolution():
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+
+    def committed_then_response_lost(*args, **kwargs):
+        bus.mark_message(*args, **kwargs)
+        raise RuntimeError("response lost")
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=committed_then_response_lost,
+                  claim_message=bus.claim_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert bus.outbound[0]["delivery_status"] == "posted"
+    assert bus.outbound[0]["attachments"]["resolve_notice"] is True
+    assert bus.tickets["t-1"]["status"] == "resolved"
+
+
+@pytest.mark.parametrize("changed_field,new_value", [
+    ("slack_user_id", "U_DIFFERENT"),
+    ("bot_identity", "scout"),
+])
+def test_identity_change_before_send_refuses_client_message(changed_field, new_value):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+
+    def fetch_state(ticket, who):
+        bus.tickets["t-1"][changed_field] = new_value
+        return {"social_status": "connected"}
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice, fetch_state=fetch_state,
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert log["posted"] == []
+    assert bus.outbound == []
+    assert bus.tickets["t-1"]["status"] == "new"
+
+
+def test_new_request_before_outbound_insert_cannot_inherit_its_version():
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    original_insert = bus.record_outbound
+
+    def racing_insert(**kwargs):
+        bus.tickets["t-1"]["request_version"] = 3
+        bus.tickets["t-1"]["raw_text"] = "Actually, I have a new question"
+        return original_insert(**kwargs)
+
+    bus.record_outbound = racing_insert
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert bus.tickets["t-1"]["request_version"] == 3
+    assert bus.outbound == []
+    assert log["posted"] == []
+    assert bus.tickets["t-1"]["status"] == "verification"
+
+
+def test_recipient_change_before_outbound_insert_is_rejected():
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    original_insert = bus.record_outbound
+
+    def racing_insert(**kwargs):
+        bus.tickets["t-1"]["slack_user_id"] = "U_DIFFERENT"
+        return original_insert(**kwargs)
+
+    bus.record_outbound = racing_insert
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert bus.outbound == []
+    assert log["posted"] == []
+
+
+def test_recipient_change_after_insert_is_suppressed_before_post():
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    original_insert = bus.record_outbound
+
+    def racing_insert(**kwargs):
+        row = original_insert(**kwargs)
+        bus.tickets["t-1"]["slack_user_id"] = "U_DIFFERENT"
+        return row
+
+    bus.record_outbound = racing_insert
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert bus.outbound[0]["delivery_status"] == "suppressed"
+    assert log["posted"] == []
+
+
+def test_recipient_change_during_slack_post_is_not_restored_or_resolved():
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, open_dm, _post = _calls()
+    _, notice = _notices()
+
+    def post(channel, body):
+        bus.tickets["t-1"]["slack_user_id"] = "U_DIFFERENT"
+        return {"ok": True, "ts": "9999.1"}
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda s, u: "Yes, your Instagram is connected right now.",
+                  mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    assert bus.tickets["t-1"]["slack_user_id"] == "U_DIFFERENT"
+    assert bus.tickets["t-1"].get("slack_channel_id") is None
+    assert bus.tickets["t-1"]["status"] == "verification"
+    assert bus.outbound[0]["delivery_status"] == "held"
+    assert bus.outbound[0]["attachments"].get("resolve_notice") is None

@@ -660,3 +660,120 @@ def test_release_approved_outreach_re_checks_base_eligibility_at_tap_time():
         open_group_dm=open_dm, post_first_message=post, record_outbound=record)
     assert result.opened is False and result.reason == "already_outreached"
     assert log["opened"] == []
+
+
+# ---- completion receipt stamp (portal migration 0381 compatibility) -------------------
+
+def _marks_capture():
+    marks = []
+
+    def mark_message(message_id, delivery_status, slack_ts=None, meta_update=None):
+        marks.append({"id": message_id, "status": delivery_status,
+                      "ts": slack_ts, "meta_update": meta_update})
+
+    return marks, mark_message
+
+
+def test_completion_stamps_resolve_notice_and_request_version_after_a_successful_post():
+    """Portal migration 0381 recognises a current-request posted completion answer or an
+    explicit resolve_notice. A completion delivery must stamp BOTH, merged into the row
+    by the same mark_message('posted') that closes its lifecycle -- never at row-write
+    time, so a row that never posted cannot claim completion."""
+    log, open_dm, post, record = _calls()
+    marks, mark_message = _marks_capture()
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.initiate(_ticket(request_version=7), _client(), ident,
+                               open_group_dm=open_dm, post_first_message=post,
+                               record_outbound=record, mark_message=mark_message,
+                               completion=True)
+    assert result.delivered is True
+    assert marks == [{"id": "m-1", "status": "posted", "ts": "9999.1",
+                      "meta_update": {"resolve_notice": True, "request_version": 7}}]
+    # The row itself is written kind='status' with NO completion fields at write
+    # time -- the stamp exists only on the posted mark, after delivery succeeded.
+    assert log["recorded"][0]["kind"] == "status"
+    assert log["recorded"][0]["expected_request_version"] == 7
+    assert "resolve_notice" not in (log["recorded"][0].get("meta") or {})
+
+
+def test_completion_without_a_trustworthy_request_version_stamps_notice_only():
+    """The version is never fabricated: missing, bool, negative or non-int values all
+    degrade to an explicit resolve_notice alone, logged plainly."""
+    for bad in (None, True, -1, "3"):
+        log, open_dm, post, record = _calls()
+        marks, mark_message = _marks_capture()
+        logs = []
+        ident = ids.IDENTITIES["wrangler"]
+        ticket = _ticket()
+        if bad is not None:
+            ticket["request_version"] = bad
+        result = outreach.initiate(ticket, _client(), ident, open_group_dm=open_dm,
+                                   post_first_message=post, record_outbound=record,
+                                   mark_message=mark_message, completion=True,
+                                   log=logs.append)
+        assert result.delivered is True
+        assert marks[0]["meta_update"] == {"resolve_notice": True}
+        assert any("no trustworthy request_version" in line for line in logs), bad
+
+
+def test_completion_is_never_stamped_when_the_post_fails():
+    """Truthful completion: a failed delivery resolves nothing, so the failed mark must
+    carry no completion metadata and the ticket's caller must not resolve."""
+    log, open_dm, _post, record = _calls()
+    marks, mark_message = _marks_capture()
+
+    def failing_post(channel_id, text):
+        return {"ok": False}
+
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.initiate(_ticket(request_version=3), _client(), ident,
+                               open_group_dm=open_dm, post_first_message=failing_post,
+                               record_outbound=record, mark_message=mark_message,
+                               completion=True)
+    assert result.delivered is False and result.reason == "post_failed"
+    assert marks == [{"id": "m-1", "status": "failed", "ts": None, "meta_update": None}]
+
+
+def test_default_callers_get_no_completion_stamp_backward_compatible():
+    """completion defaults False: every pre-existing caller's rows are untouched."""
+    log, open_dm, post, record = _calls()
+    marks, mark_message = _marks_capture()
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.initiate(_ticket(request_version=9), _client(), ident,
+                               open_group_dm=open_dm, post_first_message=post,
+                               record_outbound=record, mark_message=mark_message)
+    assert result.delivered is True
+    assert marks == [{"id": "m-1", "status": "posted", "ts": "9999.1",
+                      "meta_update": None}]
+
+
+def test_completion_never_stamps_when_the_claim_is_lost():
+    """lost_claim means another consumer owns and will post this row; this call must not
+    mark anything, so no completion stamp can appear from the losing side."""
+    log, open_dm, post, record = _calls()
+    marks, mark_message = _marks_capture()
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.initiate(_ticket(request_version=4), _client(), ident,
+                               open_group_dm=open_dm, post_first_message=post,
+                               record_outbound=record, mark_message=mark_message,
+                               claim_message=lambda mid: False, completion=True)
+    assert result.reason == "lost_claim"
+    assert marks == []
+
+
+def test_release_approved_outreach_passes_completion_through_to_the_send():
+    """The human-tap lane opts in identically: with completion=True the DM row gets the
+    stamp, and the held request row itself is closed out WITHOUT one (it never carried
+    the client message)."""
+    log, open_dm, post, record = _calls()
+    marks, mark_message = _marks_capture()
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.release_approved_outreach(
+        "hold-1", _ticket(reporter_verified=False, request_version=2), _client(), ident,
+        get_held_message=lambda mid: _held_row(),
+        open_group_dm=open_dm, post_first_message=post, record_outbound=record,
+        mark_message=mark_message, completion=True)
+    assert result.delivered is True
+    by_id = {m["id"]: m for m in marks}
+    assert by_id["m-1"]["meta_update"] == {"resolve_notice": True, "request_version": 2}
+    assert by_id["hold-1"]["meta_update"] is None
