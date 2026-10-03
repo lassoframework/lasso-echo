@@ -349,9 +349,11 @@ def accent_law_free(placement: str) -> str:
 # Accepted shapes:
 #   {"colors": ["#1B2A3C", "#F2EDDE", "#D7263D"]}
 #   {"background": "#1B2A3C", "primary": "#F2EDDE", "accent": "#D7263D"}
-# Every value must be a #RGB or #RRGGBB hex string; anything else is not
-# "verified" and the loader returns None so the caller can FAIL CLOSED (hold
-# the infographic and surface the reason) instead of inventing colors.
+# Every value must be a #RGB or #RRGGBB hex string AND the file must say where
+# the colors came from (an official source URL) or record owner approval. A
+# bare JSON list is unproven input, not a verified palette. Anything else is
+# rejected so the caller can FAIL CLOSED (hold the infographic and surface the
+# reason) instead of inventing colors.
 # ---------------------------------------------------------------------------
 
 GYM_BRAND_COLORS_FILE = "brand_colors.json"
@@ -397,7 +399,10 @@ def load_gym_brand_palette(account_key):
     except Exception:
         return None
     colors = []
+    evidence_ok = False
     if isinstance(raw, dict):
+        evidence_ok = bool(str(raw.get("source_url") or "").strip()) or \
+            raw.get("owner_approved") is True
         seq = raw.get("colors")
         if isinstance(seq, list):
             colors = [str(c).strip() for c in seq]
@@ -407,7 +412,7 @@ def load_gym_brand_palette(account_key):
     elif isinstance(raw, list):
         colors = [str(c).strip() for c in raw]
     colors = [c for c in colors if _HEX_RE.match(c or "")]
-    if not colors:
+    if not evidence_ok or not colors:
         return None
     # de-dupe, order preserved
     seen = set()

@@ -36,10 +36,11 @@ def _env(monkeypatch, tmp_path):
     # point AGENT_CLIENT_VOICE_DIR at an empty dir.
     voice_dir = tmp_path / "voice"
     gym_dir = voice_dir / "gymx"
-    gym_dir.mkdir(parents=True)
+    gym_dir.mkdir(parents=True, exist_ok=True)
     import json as _json
     (gym_dir / "brand_colors.json").write_text(
-        _json.dumps({"colors": GYMX_BRAND_COLORS}))
+        _json.dumps({"colors": GYMX_BRAND_COLORS,
+                     "source_url": "https://gymx.example/brand-guide"}))
     monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(voice_dir))
     # hosting + nano stubbed per test
 
@@ -286,6 +287,38 @@ def test_missing_brand_colors_fails_closed(monkeypatch, tmp_path):
     assert any("brand colors" in m for m in logs)
 
 
+def test_unproven_brand_colors_fail_closed(monkeypatch, tmp_path):
+    """Hex values alone are not evidence of this gym's actual palette."""
+    _sources()
+    _stub_pipeline(monkeypatch)
+    voice_dir = tmp_path / "voice"
+    gym_dir = voice_dir / "gymx"
+    gym_dir.mkdir(parents=True, exist_ok=True)
+    (gym_dir / "brand_colors.json").write_text(
+        '{"colors": ["#1B2A3C", "#F2EDDE"]}')
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(voice_dir))
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00")
+    assert out["ok"] is False
+    assert "no verified brand colors" in out["reason"]
+    assert store.inserted == []
+
+
+def test_account_gym_mismatch_fails_closed(monkeypatch):
+    """A client fill never inherits a palette exception from another account."""
+    _sources()
+    _stub_pipeline(monkeypatch)
+    account = Account(key="lasso_ig", display_name="LASSO",
+                      platform=Platform.INSTAGRAM, token_env="T", target_id_env="G")
+    store = _Store()
+    out = cif.fill_gaps("gymx", account, store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00")
+    assert out["ok"] is False
+    assert "account/gym mismatch" in out["reason"]
+    assert store.inserted == []
+
+
 def test_astra_brief_carries_the_verified_gym_palette(monkeypatch):
     """The brief Astra actually receives names THIS gym's verified hex colors
     and forbids inventing others."""
@@ -303,6 +336,25 @@ def test_astra_brief_carries_the_verified_gym_palette(monkeypatch):
     for hex_color in GYMX_BRAND_COLORS:
         assert hex_color in brief, brief
     assert "VERIFIED FOR THIS GYM" in brief
+
+
+def test_client_gym_never_initializes_the_gemini_lane(monkeypatch):
+    """The client fallback stays Astra-only even if a quality flag is misrouted."""
+    from agent import creative_studio
+
+    _sources()
+    monkeypatch.setattr(config, "lasso_infographic_quality_enabled", lambda _key: True)
+    monkeypatch.setattr(
+        creative_studio, "_default_client",
+        lambda: (_ for _ in ()).throw(AssertionError("Gemini lane must stay unused")))
+    _arm_astra(monkeypatch, 200, _astra_body())
+    from agent import media_host
+    monkeypatch.setattr(media_host, "host_media",
+                        lambda path, key: f"https://r2/{os.path.basename(path)}")
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert out["filled"] == 1
 
 
 def test_photos_rechecked_at_generation_time(monkeypatch):
@@ -382,4 +434,43 @@ def test_existing_days_rechecked_at_generation_time(monkeypatch):
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
     assert calls["n"] >= 2
+    assert out["filled"] == 0 and store.inserted == []
+
+
+def test_photo_arriving_after_render_holds_before_insert(monkeypatch):
+    """The final pre-insert guard wins over a card rendered moments earlier."""
+    _sources()
+    _stub_pipeline(monkeypatch)
+    _arm_astra(monkeypatch, 200, _astra_body())
+    calls = {"n": 0}
+
+    def _flip(base, *, now=None):
+        calls["n"] += 1
+        return calls["n"] <= 2  # scan + pre-render pass; pre-insert fails
+
+    monkeypatch.setattr(cif, "real_media_depleted", _flip)
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert calls["n"] >= 3
+    assert out["filled"] == 0 and store.inserted == []
+
+
+def test_slot_taken_after_render_holds_before_insert(monkeypatch):
+    """A competing feed row wins even after Astra has already rendered."""
+    _sources()
+    _stub_pipeline(monkeypatch)
+    _arm_astra(monkeypatch, 200, _astra_body())
+    real = cif._empty_upcoming_days
+    calls = {"n": 0}
+
+    def _flip(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs) if calls["n"] <= 2 else []
+
+    monkeypatch.setattr(cif, "_empty_upcoming_days", _flip)
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert calls["n"] >= 3
     assert out["filled"] == 0 and store.inserted == []

@@ -160,6 +160,17 @@ def seed_gaps(base, account, store, *, log=None, today=None,
     log = log or (lambda *_: None)
     if not enabled() or store is None or account is None:
         return 0
+    # A named account must resolve to this exact tenant before any scrape or
+    # render. Test-only callers without an account key may still exercise the
+    # earlier read-only gap gate below, but cannot pass the render gate.
+    account_key = getattr(account, "key", None)
+    if account_key:
+        from . import astra_prompt as _ap
+        account_base = _ap._account_base(account_key)
+        if account_base != base:
+            log(f"{base}: account/gym mismatch ({account_base!r} account); "
+                "no-media Astra seed held")
+            return 0
     from .client_infographic_fill import real_media_depleted
     depleted = real_media_depleted(base, now=today)
     if not depleted:
@@ -195,7 +206,12 @@ def seed_gaps(base, account, store, *, log=None, today=None,
     # tone and never reach for LASSO's or a generic palette (the old
     # creative_studio.generate lane could fall back to exactly that).
     from . import astra_prompt as _ap
-    gym_palette = _ap.load_gym_brand_palette(account.key)
+    account_base = _ap._account_base(account_key)
+    if account_base != base:
+        log(f"{base}: account/gym mismatch ({account_base!r} account); "
+            "no-media Astra seed held")
+        return 0
+    gym_palette = _ap.load_gym_brand_palette(account_key)
     if not gym_palette:
         log(f"{base}: no verified brand colors for no-media Astra seed "
             f"(expected {_ap._gym_brand_colors_path(base)}); held (no generic "
@@ -255,6 +271,16 @@ def seed_gaps(base, account, store, *, log=None, today=None,
             continue
         if not url:
             continue
+        # Rendering and hosting are deliberately outside the calendar store;
+        # a photo or a competing feed row may have arrived while they ran.
+        # Recheck before this candidate can join the pending insert batch.
+        if not real_media_depleted(base, now=today):
+            log(f"{base}: usable real media appeared before seed insert; held")
+            break
+        if day not in set(_empty_upcoming_days(
+                store, base, tz_name, min(days_ahead, 2), now=today)):
+            log(f"{base} {day}: feed slot taken before seed insert; held")
+            continue
         rows.append({
             "gym_id": base, "account": "instagram", "post_date": day,
             "format": "feed", "pillar": NEEDS_CLIENT_SAFE_REVIEW_PILLAR,
@@ -262,6 +288,18 @@ def seed_gaps(base, account, store, *, log=None, today=None,
         })
 
     if not rows:
+        return 0
+    # Final batch guard. store.insert_rows has no conditional compare-and-
+    # insert API, so a writer can still win after these reads; this module
+    # cannot truthfully promise atomicity and holds on every observable race.
+    if not real_media_depleted(base, now=today):
+        log(f"{base}: usable real media available before seed batch insert; held")
+        return 0
+    insertable_days = set(_empty_upcoming_days(
+        store, base, tz_name, min(days_ahead, 2), now=today))
+    rows = [row for row in rows if row["post_date"] in insertable_days]
+    if not rows:
+        log(f"{base}: seed feed slot taken before batch insert; held")
         return 0
     try:
         inserted = store.insert_rows(base, rows) or []
