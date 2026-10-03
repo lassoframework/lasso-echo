@@ -59,6 +59,36 @@ class Bus:
         self.tickets[tid].update(fields)
         return dict(self.tickets[tid])
 
+    def patch_ticket_if_current(self, expected_ticket, **fields):
+        """Faithful in-memory form of bus.py's transition CAS."""
+        version = expected_ticket.get("request_version")
+        if type(version) is not int or version < 0:
+            return None
+        ticket = self.tickets.get(expected_ticket.get("id"))
+        identity = ("request_version", "status", "classification", "product", "source",
+                    "client_id", "reporter", "bot_identity", "slack_user_id",
+                    "slack_channel_id", "slack_thread_ts", "hold_tier", "escalated")
+        if ticket is None or any(ticket.get(field) != expected_ticket.get(field)
+                                 for field in identity):
+            return None
+        return self.set_ticket(expected_ticket["id"], **fields)
+
+    def stamp_outreach_ticket_if_current(self, ticket_id, *, expected_ticket,
+                                         channel_id, thread_ts, slack_user_id,
+                                         bot_identity, identity_kind):
+        ticket = self.tickets.get(ticket_id)
+        identity = ("request_version", "status", "classification", "product",
+                    "client_id", "bot_identity", "slack_user_id",
+                    "slack_channel_id", "slack_thread_ts")
+        if (ticket is None or ticket.get("escalated", False) is not False
+                or ticket.get("hold_tier") is not None
+                or any(ticket.get(field) != expected_ticket.get(field)
+                       for field in identity)):
+            return None
+        return self.set_ticket(ticket_id, slack_channel_id=channel_id,
+                               slack_thread_ts=thread_ts, slack_user_id=slack_user_id,
+                               bot_identity=bot_identity, identity_kind=identity_kind)
+
     def resolve_current_delivery(self, tid, expected_request_version,
                                  expected_status, expected_classification,
                                  expected_product, expected_client_id,
@@ -146,12 +176,13 @@ class Bus:
                     if m.get("ticket_id") == tid and m.get("direction") == "inbound"])
 
     def record_outbound(self, *, ticket_id, author_type, body, delivery_status, kind,
-                        meta=None):
+                        meta=None, expected_request_version=None):
         att = dict(meta or {})
         att["kind"] = kind
         m = {"id": f"out-{len(self.msgs)}", "ticket_id": ticket_id, "direction": "outbound",
              "author_type": author_type, "body": body, "delivery_status": delivery_status,
-             "attachments": att, "created_at": datetime.now(timezone.utc).isoformat()}
+             "attachments": att, "delivery_request_version": expected_request_version,
+             "created_at": datetime.now(timezone.utc).isoformat()}
         self.msgs.append(m)
         return m
 
@@ -171,7 +202,20 @@ class Bus:
                 if m.get("direction") == "outbound" and m.get("delivery_status") == status]
 
     def claim_message(self, mid):
-        return True
+        for m in self.msgs:
+            if m["id"] == mid and m.get("delivery_status") == "ready":
+                m["delivery_status"] = "posting"
+                return True
+        return False
+
+    def hold_uncertain_outreach(self, mid):
+        row = self.message(mid)
+        if not row or row.get("delivery_status") == "posted":
+            return row
+        if row.get("delivery_status") in {"ready", "posting"}:
+            return self.mark_message(mid, "held", meta_update={
+                "outreach_delivery_uncertain": True})
+        return row
 
     def mark_message(self, mid, delivery_status, slack_ts=None, meta_update=None):
         for m in self.msgs:
@@ -699,7 +743,11 @@ def _answering_worker(bus, seen_deps, *, answer_body="Yes, both are connected.")
         fetch_state=lambda t, w: {"social_status": {"instagram": "connected"}},
         llm=lambda system, user, model=None: answer_body,
         classify_llm=None, mark_message=bus.mark_message, claim_message=bus.claim_message,
-        stamp_ticket=lambda *a, **k: None, log=lambda *a, **k: None,
+        stamp_ticket=lambda tid, **kw: bus.stamp_outreach_ticket_if_current(
+            tid, expected_ticket=kw["expected_ticket"], channel_id=kw["channel_id"],
+            thread_ts=kw["thread_ts"], slack_user_id=kw["slack_user_id"],
+            bot_identity=kw["bot_identity"], identity_kind=kw["identity_kind"]),
+        log=lambda *a, **k: None,
         **_client_deps())
     return cards
 

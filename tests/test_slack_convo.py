@@ -93,6 +93,20 @@ class FakeBus:
         self.tickets[tid].update(fields)
         return dict(self.tickets[tid])
 
+    def patch_ticket_if_current(self, expected_ticket, **fields):
+        """Model bus.py's full request-cycle and ownership CAS."""
+        version = expected_ticket.get("request_version")
+        if type(version) is not int or version < 0:
+            return None
+        ticket = self.tickets.get(expected_ticket.get("id"))
+        identity = ("request_version", "status", "classification", "product", "source",
+                    "client_id", "reporter", "bot_identity", "slack_user_id",
+                    "slack_channel_id", "slack_thread_ts", "hold_tier", "escalated")
+        if ticket is None or any(ticket.get(field) != expected_ticket.get(field)
+                                 for field in identity):
+            return None
+        return self.set_ticket(expected_ticket["id"], **fields)
+
     def resolve_current_delivery(self, tid, expected_request_version,
                                  expected_status, expected_classification,
                                  expected_product, expected_client_id,
