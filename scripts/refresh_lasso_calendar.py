@@ -313,8 +313,24 @@ def _readback_matches(row, expected, new_url):
     return _row_matches(row, expected_after)
 
 
-def _conditional_swap(store, expected, new_url):
-    """One PostgREST compare-and-swap; a zero-row result is a conflict, never retried."""
+def _conditional_swap(store, expected, new_url, current=None):
+    """One PostgREST compare-and-swap; a zero-row result is a conflict, never retried.
+
+    When the global prepared visual writer is enabled this delegates to the
+    store's guarded ``patch_image_url`` (durable lineage + full CAS); the
+    direct PATCH below is only the flag-off fallback and is never used when
+    preparation is active.
+    """
+    from agent import visual_writer_prepare
+    if visual_writer_prepare.enabled():
+        from agent.portal_calendar_store import PortalStoreError
+        if current is None:
+            raise RuntimeError("conditional calendar swap failed: missing fetched row")
+        try:
+            return store.patch_image_url(TARGET_GYM, expected["id"], new_url,
+                                         expected_row=current)
+        except PortalStoreError as exc:
+            raise RuntimeError("conditional calendar swap failed") from exc
     r = store._client().patch(store._rest("content_calendar"), params={
         "id": "eq." + str(expected["id"]), "gym_id": "eq.lasso",
         "status": "eq." + str(expected["status"]), "variant_status": "eq.active",
@@ -383,7 +399,7 @@ def apply_reviewed_swaps(manifest, review_manifest, store, receipt_dir, *, swap_
                 receipts.append({"id": expected["id"], "group_id": group["id"], "status": "conflict"})
                 persist()
                 continue
-            ready.append(expected)
+            ready.append((expected, current))
         if not ready:
             continue
         try:
@@ -403,9 +419,10 @@ def apply_reviewed_swaps(manifest, review_manifest, store, receipt_dir, *, swap_
                              "error": type(exc).__name__})
             persist()
             continue
-        for expected in ready:
+        for expected, current in ready:
             try:
-                changed = (swap_fn or _conditional_swap)(store, expected, new_url)
+                changed = (swap_fn(store, expected, new_url) if swap_fn is not None
+                           else _conditional_swap(store, expected, new_url, current=current))
             except Exception as exc:
                 receipts.append({"id": expected["id"], "group_id": group["id"],
                                  "status": "swap_failed", "error": type(exc).__name__})

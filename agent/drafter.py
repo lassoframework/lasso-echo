@@ -102,6 +102,11 @@ class Draft:
     # SPECIFIC published post can be traced back to the engine that made it,
     # not just "Astra was in use during some window."
     image_engine: str = ""
+    # Raw, explicit media provenance for a delivered rendition. This remains
+    # empty unless a producer supplies it; consumers must never infer it from
+    # creative_public_url because the delivered asset may be a crop or burn.
+    # Kept last so existing positional Draft construction stays compatible.
+    source_media_url: str = ""
 
 
 def _make_id(account_key, creative_path, scheduled_for):

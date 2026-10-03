@@ -272,13 +272,39 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                 _mark_not_eligible(store, asset, _idx.REJECT_CONVERT_UNAVAILABLE)
                 continue
 
+            poster_evidence = None
+            video_source_url = ""
             if asset.get("kind") == _idx.KIND_VIDEO:
-                # POSTER FRAME while the download still exists on disk. The month
-                # run's _attach_video_poster reads creative_path, which for a Drive
-                # draft is the asset TITLE (nothing on disk by then), so without this
-                # a Drive video shows as a BLANK card in the portal. Display only:
-                # the row publishes the video itself. Best effort, never blocks.
-                poster_url = video_poster_url(tmp_path, lib, gym_base)
+                if writer_prep_enabled():
+                    # GLOBAL WRITER PREP: the poster must carry a byte-bound render
+                    # receipt. The source of truth is the EXACT hosted video URL --
+                    # the rendition URL when one was made, else the hosted original
+                    # (hosted HERE, before the poster, so the URL attests real
+                    # served bytes; never guessed from the local path/title).
+                    video_source_url = public_override or media_host.host_media(
+                        str(tmp_path), gym_base)
+                    if not video_source_url:
+                        print(f"[gym-media-builder] no hosted video url for "
+                              f"{title!r}; holding the slot (writer prep)")
+                        return None
+                    _poster = video_poster_with_evidence(
+                        tmp_path, lib, gym_base, video_source_url)
+                    if _poster is None:
+                        # Evidence failed: HOLD the slot. The legacy path would skip
+                        # the preview; writer prep refuses to stage an unattested
+                        # video card.
+                        print(f"[gym-media-builder] evidenced poster failed for "
+                              f"{title!r}; holding the slot (writer prep)")
+                        return None
+                    poster_url, poster_evidence = _poster
+                else:
+                    # POSTER FRAME while the download still exists on disk. The month
+                    # run's _attach_video_poster reads creative_path, which for a Drive
+                    # draft is the asset TITLE (nothing on disk by then), so without
+                    # this a Drive video shows as a BLANK card in the portal. Display
+                    # only: the row publishes the video itself. Best effort, never
+                    # blocks.
+                    poster_url = video_poster_url(tmp_path, lib, gym_base)
 
             # ECHO_VISION on the frame (photos). vision writes the analysis to the
             # DAM sidecar; we mirror it into media_asset.vision_json.
@@ -333,8 +359,8 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                 continue
 
             # Host the served media (rendition if we made one, else the original).
-            public_url = public_override or media_host.host_media(
-                str(tmp_path), gym_base)
+            public_url = (public_override or video_source_url
+                          or media_host.host_media(str(tmp_path), gym_base))
             if not public_url:
                 print(f"[gym-media-builder] hosting returned no url for {title!r}; "
                       "stopping the slot")
@@ -362,8 +388,18 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             # sweep can flip this PENDING post back to needs_media (§4, §8).
             source_media_asset_id=str(asset["id"]),
         )
+        # Keep the hosted original as provenance when it is also the served media.
+        # A rendition URL is a transformed delivery asset, not the raw source.
+        if not public_override:
+            draft.source_media_url = public_url
         if poster_url:
             draft.thumbnail_url = poster_url          # -> content_calendar.thumbnail_url
+        if poster_evidence:
+            # NON-DB side channel (Draft has no poster_render_evidence column):
+            # the byte-bound receipt rides the draft object for the writer-prep
+            # lane (portal_calendar_store / client_month_run integration reads it
+            # before persistence; persistence itself is a separate migration).
+            draft.poster_render_evidence = poster_evidence
         # The grounding this caption was written against, so a caption RETRY
         # (client_month_run._recaption_drive_draft) grounds the same way instead of
         # from nothing (audit round 5 minor).
@@ -406,6 +442,17 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
     return None
 
 
+
+def writer_prep_enabled():
+    """AGENT_VISUAL_GLOBAL_WRITER_PREP (default OFF): the global visual writer
+    prep lane. When ON, Drive/podcast video poster frames must be rendered from
+    the EXACT hosted video bytes with a byte-bound rendition receipt; a poster
+    without evidence holds the slot. When OFF, the legacy best-effort
+    video_poster_url path and behavior are unchanged."""
+    return os.environ.get("AGENT_VISUAL_GLOBAL_WRITER_PREP", "").lower() in (
+        "1", "true", "yes", "on")
+
+
 def video_poster_url(video_path, work_dir, tenant):
     """A hosted poster JPG for a local video file, or '' on any failure. Pure ffmpeg
     frame grab (action_reel.poster_frame) into work_dir, hosted under the gym's
@@ -425,6 +472,100 @@ def video_poster_url(video_path, work_dir, tenant):
         print(f"[gym-media-builder] poster skipped for "
               f"{os.path.basename(str(video_path))}: {type(exc).__name__}")
         return ""
+
+
+def video_poster_with_evidence(video_path, work_dir, tenant, source_exact_url):
+    """Return ``(poster_url, render_evidence)`` for an explicitly attested video.
+
+    Unlike :func:`video_poster_url`, this is an opt-in receipt-producing path.  It
+    never treats ``video_path`` as the source of truth: it reads the exact hosted
+    video URL, materializes those observed bytes for ffmpeg, then reads the hosted
+    JPEG back before returning a byte-bound rendition receipt.  Any unavailable,
+    changed, or non-JPEG object fails closed with ``None``.
+
+    ``video_path`` supplies only a file extension for ffmpeg's temporary input; its
+    local bytes must not establish source lineage.
+    """
+    source_path = poster_path = None
+    try:
+        from urllib.parse import urlsplit
+        import hashlib
+        import uuid
+
+        from . import action_reel, media_host, visual_writer_prepare
+
+        if not config.hosting_enabled():
+            return None
+
+        # _bytes_for_url accepts only our configured host and _exact_bytes enforces
+        # a valid exact URL, bounded non-empty read, and no redirects/query guessing.
+        source_bytes = visual_writer_prepare._exact_bytes(
+            source_exact_url, visual_writer_prepare._bytes_for_url, "source")
+        work = Path(work_dir)
+        work.mkdir(parents=True, exist_ok=True)
+        suffix = Path(urlsplit(source_exact_url).path).suffix.lower()
+        if not suffix or len(suffix) > 12:
+            suffix = Path(str(video_path)).suffix.lower() or ".mp4"
+        with tempfile.NamedTemporaryFile(dir=work, prefix="poster-source-",
+                                         suffix=suffix, delete=False) as source_file:
+            # Record the allocated file before a write or close can fail, so the
+            # fail-closed path can still remove the byte-bearing temporary object.
+            source_path = Path(source_file.name)
+            source_file.write(source_bytes)
+        with tempfile.NamedTemporaryFile(dir=work, prefix="poster-render-",
+                                         suffix=".jpg", delete=False) as poster_file:
+            poster_path = Path(poster_file.name)
+
+        action_reel.poster_frame(str(source_path), str(poster_path))
+        size = poster_path.stat().st_size
+        if size <= 0 or size > visual_writer_prepare.MAX_VISUAL_BYTES:
+            return None
+        rendered_bytes = poster_path.read_bytes()
+        # A .jpg suffix or magic prefix is not an attestation that this is a
+        # decodable JPEG.  Pillow's verify() reads the actual image structure.
+        from io import BytesIO
+        from PIL import Image
+        with Image.open(BytesIO(rendered_bytes)) as image:
+            if image.format != "JPEG":
+                return None
+            image.verify()
+        if not rendered_bytes.startswith(b"\xff\xd8\xff"):
+            return None
+        delivered_url = media_host.host_media(str(poster_path), tenant)
+        if not delivered_url or delivered_url == source_exact_url:
+            return None
+        delivered_bytes = visual_writer_prepare._exact_bytes(
+            delivered_url, visual_writer_prepare._bytes_for_url, "delivered")
+        if delivered_bytes != rendered_bytes:
+            return None
+
+        source_hash = hashlib.md5(source_bytes).hexdigest()
+        delivered_hash = hashlib.md5(delivered_bytes).hexdigest()
+        evidence = {
+            "source_exact_url": source_exact_url,
+            "delivered_exact_url": delivered_url,
+            "source_fingerprint": "md5:" + source_hash,
+            "delivered_fingerprint": "md5:" + delivered_hash,
+            "source_byte_length": len(source_bytes),
+            "delivered_byte_length": len(delivered_bytes),
+            "operation": "render",
+            "evidence_ref": ("gym_media_builder:poster_render:" + source_hash + ":"
+                             + delivered_hash + ":" + str(uuid.uuid4())),
+            "observed_by": "gym_media_builder",
+            "rendered_by": "gym_media_builder.video_poster_with_evidence",
+        }
+        return delivered_url, evidence
+    except Exception as exc:  # noqa: BLE001 - an unverifiable preview must not stage
+        print(f"[gym-media-builder] evidenced poster skipped for "
+              f"{os.path.basename(str(video_path))}: {type(exc).__name__}")
+        return None
+    finally:
+        for path in (source_path, poster_path):
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def assert_tenant(asset, gym_base):

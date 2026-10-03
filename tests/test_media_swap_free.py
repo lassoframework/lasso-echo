@@ -365,6 +365,28 @@ def test_noop_swap_releases_exact_local_reservation(monkeypatch, tmp_path):
     assert rotation.load_served_strict().get("zanshin_ig", []) == []
 
 
+def test_swap_landed_but_representation_none_keeps_local_reservation(monkeypatch, tmp_path):
+    from agent import rotation
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    store = _Store([_row("p1")])
+    real_swap = store.swap_media
+
+    def landed_without_representation(*args, **kwargs):
+        real_swap(*args, **kwargs)
+        return None
+
+    store.swap_media = landed_without_representation
+    pick = dict(_picker("zanshin", _row("p1")), path=str(tmp_path / "new.jpg"))
+
+    status, body = ps.handle_swap_media(
+        "zanshin", "p1", "u1", sb_store=store, picker=lambda *a, **k: pick)
+
+    assert status == 503 and body["reason"] == "swap_outcome_unknown"
+    assert store.get_row("zanshin", "p1")["image_url"] == pick["image_url"]
+    assert rotation.load_served_strict().get("zanshin_ig"), (
+        "a landed PATCH must keep its once-use reservation")
+
+
 def test_unknown_remote_swap_outcome_retains_local_reservation(monkeypatch, tmp_path):
     from agent import rotation
     monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")

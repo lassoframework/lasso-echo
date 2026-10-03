@@ -49,6 +49,8 @@ class Calendar:
         self.calls = []
         self.conflict_id = None
         self.readback_bad = False
+        self.writer_result = None
+        self.evidence = {}
     def get_row(self, gym, id_):
         r = copy.deepcopy(self.rows.get(id_))
         if r and r["gym_id"] != gym:
@@ -58,12 +60,15 @@ class Calendar:
         return r
     def list_photo_restage_book(self, gym):
         return [copy.deepcopy(r) for r in self.rows.values() if r["gym_id"] == gym]
-    def replace_future_infographic_media(self, gym, before, *, reason, **payload):
+    def replace_future_infographic_media(self, gym, before, *, reason, render_evidence=None, **payload):
         self.calls.append(before["id"])
         assert reason == hold.REASON
         if before["id"] == self.conflict_id or self.rows[before["id"]] != before:
             return None
         self.rows[before["id"]].update(payload, media_not_ready_reason=None)
+        self.evidence[before["id"]] = render_evidence
+        if self.writer_result:
+            self.rows[before["id"]].update(self.writer_result)
         return copy.deepcopy(self.rows[before["id"]])
 
 
@@ -167,6 +172,36 @@ def test_apply_preserves_pending_approved_caption_and_has_private_writeahead(tmp
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     saved = json.loads(output.read_text())
     assert saved["state"] == "readback_verified" and len(saved["readback"]) == 2
+
+
+def test_prepared_feed_story_readback_uses_writer_lineage_and_receipt(tmp_path, monkeypatch):
+    from agent import visual_writer_prepare
+    rows = [row("feed"), {**row("story"), "format": "story"}]
+    calendar, _, args = invoke(tmp_path, monkeypatch, rows, [asset("photo")])
+    calendar.writer_result = {"visual_group_key": "vg_verified", "byte_hash": "derived:md5:abc"}
+    digest = op.run(**args)["preflight"]["target_digest"]
+
+    def prepared(gym, root, *, siblings, candidates_fn, **kwargs):
+        candidate = candidates_fn(gym, root)[0]
+        def variant(target):
+            return {"ok": True, "kind": "photo", "source": "drive",
+                    "image_url": f"https://cdn/{target['id']}.jpg",
+                    "source_media_url": "https://cdn/source.jpg", "thumbnail_url": "",
+                    "source_media_asset_id": candidate["key"],
+                    "render_evidence": {"variant": target["format"]}}
+        return {**variant(root), "siblings": {target["id"]: variant(target) for target in siblings}}
+
+    monkeypatch.setattr(visual_writer_prepare, "enabled", lambda: True)
+    monkeypatch.setenv("ECHO_FUTURE_IGFILL_RESTAGE_ENABLED", "true")
+    output = tmp_path / "restage.json"
+    result = op.run(**args, apply=True, expected_digest=digest, receipt_path=output,
+                    prepare_fn=prepared, reserve_fn=lambda *a: True,
+                    settle_fn=lambda *a, **kw: None)
+    assert result["ok"]
+    assert calendar.evidence == {"feed": {"variant": "feed"}, "story": {"variant": "story"}}
+    readback = json.loads(output.read_text())["readback"]
+    assert all(entry["visual_group_key"] == "vg_verified" and
+               entry["byte_hash"] == "derived:md5:abc" for entry in readback)
 
 
 def test_apply_stops_on_conflict_retaining_remaining_hold_and_claim(tmp_path, monkeypatch):

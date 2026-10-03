@@ -425,7 +425,27 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
         # Strip the transient planner-only keys the DB does not carry.
         payload = [_db_row(r) for r in to_stage]
         try:
-            inserted = len(inserter(gym_id, payload) or [])
+            written = inserter(gym_id, payload) or []
+            inserted = len(written) if not isinstance(written, int) else written
+            # A Drive asset is globally burned only after the store returns the exact
+            # inserted row. _attach_media reserves IDs within this call, but stamping
+            # before durable confirmation could consume a photo with no calendar row.
+            if isinstance(written, (list, tuple)):
+                waiting = {}
+                for row in to_stage:
+                    ident = _media_write_identity(row, gym_id)
+                    waiting.setdefault(ident, []).append(row)
+                durable_rows = []
+                for persisted in written:
+                    ident = _media_write_identity(persisted, None)
+                    matches = waiting.get(ident) or []
+                    if matches:
+                        durable_rows.append(matches.pop(0))
+            else:
+                # A count does not prove which row(s) were committed, so it cannot
+                # safely identify which selected assets to burn.
+                durable_rows = []
+            _stamp_media_usage(gym_id, durable_rows)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "reason": f"insert failed {type(exc).__name__}",
                     "staged": 0}
@@ -451,40 +471,60 @@ def backfill_missing_media(store, gym_id, event_id, *, statuses=("pending", "app
 
     Only rows whose status is in `statuses` (default pending/approved — never denied or
     killed rows, which a human or the system already decided against) AND whose
-    image_url is currently empty are touched. Each is given the SAME real-photo pool
-    pick + host that _attach_media uses (tenant-isolated, reuse-cooldown respected,
-    usage stamped), then PATCHed through store.patch_media — id+gym_id scoped, and
+    image_url is currently empty are considered. Approved rows are explicitly held:
+    adding media changes approved content, so the owner must reapprove it. Eligible
+    pending rows are given the SAME real-photo pool pick + host that _attach_media uses
+    (tenant-isolated, reuse-cooldown respected, usage stamped), then PATCHed through
+    store.patch_media — id+gym_id scoped, and
     itself re-confirms the row still has no image before writing (never clobbers a row
     a human or a later pass already gave a photo, never crosses to a different row).
     Only image_url + source_media_asset_id are written; caption/status/date are never
     touched.
 
-    Returns {"backfilled": [row_id, ...], "held": n} — `held` is how many candidate
-    rows still could not get an image (pool exhausted / hosting failed), left exactly
-    as they were for the next pass."""
+    Returns {"backfilled": [row_id, ...], "held": n} — `held` includes approved rows
+    awaiting owner reapproval and eligible rows that could not be safely patched
+    (missing source lineage, pool exhausted, or hosting failed)."""
     log = logger or (lambda m: print(f"[event-calendar] {m}"))
     lister = getattr(store, "list_event_rows", None)
     if lister is None:
         log(f"backfill_missing_media: store has no list_event_rows; nothing to do")
         return {"backfilled": [], "held": 0}
     rows = lister(gym_id, event_id) or []
-    candidates = [r for r in rows
-                  if str(r.get("status") or "").lower() in statuses
-                  and not (r.get("image_url") or "").strip()]
+    eligible = [r for r in rows
+                if str(r.get("status") or "").lower() in statuses
+                and not (r.get("image_url") or "").strip()]
+    approved_held = [r for r in eligible
+                     if str(r.get("status") or "").lower() == "approved"]
+    candidates = [r for r in eligible
+                  if str(r.get("status") or "").lower() != "approved"]
+    for row in approved_held:
+        log(f"backfill_missing_media: holding approved row {row.get('id')}; media changes "
+            "require owner reapproval")
     if not candidates:
-        return {"backfilled": [], "held": 0}
+        return {"backfilled": [], "held": len(approved_held)}
     kept, held = _attach_media(gym_id, candidates, log, picker=picker, host=host)
     backfilled = []
+    patch_held = len(approved_held)
     patcher = getattr(store, "patch_media", None)
     for row in kept:
         rid = row.get("id")
         if not rid or patcher is None:
+            patch_held += 1
             continue
-        updated = patcher(gym_id, rid, row.get("image_url") or "",
-                          row.get("source_media_asset_id") or "")
+        try:
+            updated = patcher(
+                gym_id, rid, row.get("image_url") or "",
+                row.get("source_media_asset_id") or "",
+                source_media_url=row.get("source_media_url"))
+        except Exception as exc:  # noqa: BLE001 - leave the stale row eligible to retry
+            log(f"backfill_missing_media: patch failed for {rid} ({type(exc).__name__})")
+            updated = None
         if updated is not None:
             backfilled.append(rid)
-    return {"backfilled": backfilled, "held": len(held)}
+            _stamp_media_usage(gym_id, [row])
+        else:
+            patch_held += 1
+    return {"backfilled": backfilled, "held": len(held) + patch_held}
 
 
 def top_up_arc(store, event, *, today=None, avatar=None, logger=None,
@@ -560,17 +600,51 @@ def _attach_media(gym_id, rows, log, *, picker=None, host=None):
             continue
         row = dict(row)
         row["image_url"] = url
+        # image_url is a hosted delivery rendition. It is not necessarily the raw
+        # source, so persist lineage only when the selected asset supplies an explicit
+        # source URL. The visual writer guard must reject missing lineage safely.
+        source_url = str(asset.get("source_media_url") or asset.get("source_url") or "").strip()
+        if source_url:
+            row["source_media_url"] = source_url
+        else:
+            row.pop("source_media_url", None)
         row["source_media_asset_id"] = str(asset.get("id") or "")
+        row["_media_asset"] = dict(asset)  # usage counters needed by rollback bookkeeping
         used.append(asset.get("id"))
-        try:
-            _sel.stamp_use(asset, gym_id, str(row.get("post_date") or ""))
-        except Exception:  # noqa: BLE001 - the stamp is best effort
-            pass
         kept.append(row)
     if held:
         log(f"event media: HELD {len(held)} row(s) with no available photo "
             f"(an image-less feed post cannot publish); the gym needs more media")
     return kept, held
+
+
+def _stamp_media_usage(gym_id, rows):
+    """Best-effort stamp for assets whose calendar write has succeeded."""
+    if not rows:
+        return
+    try:
+        from . import gym_media_selector as _sel
+    except Exception:  # noqa: BLE001
+        return
+    for row in rows:
+        asset = (row or {}).get("_media_asset") or {}
+        asset_id = str(asset.get("id") or (row or {}).get("source_media_asset_id") or "").strip()
+        if not asset_id:
+            continue
+        try:
+            _sel.stamp_use({**asset, "id": asset_id}, gym_id,
+                           str((row or {}).get("post_date") or ""))
+        except Exception:  # noqa: BLE001 - usage stamping is best effort
+            pass
+
+
+def _media_write_identity(row, default_gym_id):
+    """Stable content identity required to match a store's insert receipt."""
+    row = row or {}
+    return tuple(str(row.get(key) or fallback or "") for key, fallback in (
+        ("gym_id", default_gym_id), ("post_date", ""), ("account", ""),
+        ("format", ""), ("event_id", ""), ("image_url", ""),
+        ("source_media_asset_id", "")))
 
 
 def _host_asset(asset, gym_id, drive_mod):
@@ -596,7 +670,7 @@ def _host_asset(asset, gym_id, drive_mod):
 
 # Transient, planner-only keys that are NOT content_calendar columns and must be
 # stripped before an insert (arc_kind/recap_blocked/arc_note are engine state).
-_TRANSIENT_KEYS = ("arc_kind", "recap_blocked", "arc_note")
+_TRANSIENT_KEYS = ("arc_kind", "recap_blocked", "arc_note", "_media_asset")
 
 
 def _db_row(row):

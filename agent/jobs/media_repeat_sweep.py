@@ -162,6 +162,21 @@ def _feed_first(fixable):
                                           str(r.get("id") or "")))
 
 
+def _swap_definitely_did_not_land(store, base, original, target_url):
+    """Release a reservation only after a fresh, tenant-scoped identity read."""
+    try:
+        fresh = store.get_row(base, original.get("id"))
+    except Exception:  # noqa: BLE001 - unknown remote state retains the reservation
+        return False
+    fields = ("image_url", "source_media_url", "thumbnail_url",
+              "source_media_asset_id")
+    return (isinstance(fresh, dict)
+            and str(fresh.get("gym_id")) == str(base)
+            and str(fresh.get("id")) == str(original.get("id"))
+            and all(fresh.get(field) == original.get(field) for field in fields)
+            and fresh.get("image_url") != target_url)
+
+
 def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, result,
                           key, pd, picker=None):
     """REPLACE A REPEAT FROM THE GYM'S CONNECTED DRIVE POOL when no unused LOCAL image
@@ -202,6 +217,20 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
         _log(f"{base}: {key} {pd}: Drive swap skipped, a sibling row could not be "
              "shaped from the same clip")
         return False
+    from agent import visual_writer_prepare
+    if visual_writer_prepare.enabled():
+        from agent.portal_social import _poster_evidence_is_current
+        prepared_variants = [pick] + [variants[str(s.get("id"))] for s in siblings]
+        if any(not (variant.get("source_media_url")
+                    and (variant.get("source_media_url") == variant.get("image_url")
+                         or isinstance(variant.get("render_evidence"), dict)))
+               for variant in prepared_variants):
+            return False
+        poster_byte_cache = {}
+        if any(not _poster_evidence_is_current(
+                variant, visual_writer_prepare, poster_byte_cache)
+               for variant in prepared_variants):
+            return False
 
     # A local replacement must enter the durable served ledger before the first
     # calendar mutation. Drive picks return True without touching that ledger.
@@ -215,13 +244,20 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
     for target, var in [(row, pick)] + [(s, variants[str(s.get("id"))]) for s in siblings]:
         rid = target.get("id")
         try:
-            done = store.swap_media(base, rid, var["image_url"],
-                                    source_media_url=var.get("source_media_url"),
-                                    extra_fields=media_swap.swap_fields(var))
+            write_args = {"source_media_url": var.get("source_media_url"),
+                          "extra_fields": media_swap.swap_fields(var)}
+            if var.get("render_evidence") is not None:
+                write_args["render_evidence"] = var["render_evidence"]
+            if var.get("poster_render_evidence") is not None:
+                write_args["poster_render_evidence"] = var["poster_render_evidence"]
+            done = store.swap_media(base, rid, var["image_url"], **write_args)
         except Exception as exc:  # noqa: BLE001 - one row never undoes the others
             _log(f"{base}: swap_media failed for {rid} ({type(exc).__name__})")
             write_outcome_unknown = True
             done = None
+        if done is None and not _swap_definitely_did_not_land(
+                store, base, target, var["image_url"]):
+            write_outcome_unknown = True
         if done is not None:
             swapped.append(str(rid))
             result["rows_repointed"] += 1
@@ -287,6 +323,53 @@ def _reburn_story(base, row, new_path, lib):
     except Exception as exc:  # noqa: BLE001
         _log(f"{base}: story re-burn error ({type(exc).__name__})")
         return None
+
+
+def _visual_writer_enabled():
+    from agent import visual_writer_prepare
+    return visual_writer_prepare.enabled()
+
+
+def _render_receipt(source_url, delivered_url, source_bytes, delivered_bytes, operation):
+    """Return evidence only when the current exact URL bytes match both inputs."""
+    import hashlib
+    import uuid
+    from agent import visual_writer_prepare
+    if (not source_url or not delivered_url or source_url == delivered_url
+            or not source_bytes or not delivered_bytes
+            or visual_writer_prepare._bytes_for_url(source_url) != source_bytes
+            or visual_writer_prepare._bytes_for_url(delivered_url) != delivered_bytes):
+        return None
+    return {"source_exact_url": source_url, "delivered_exact_url": delivered_url,
+            "source_fingerprint": "md5:" + hashlib.md5(source_bytes).hexdigest(),
+            "delivered_fingerprint": "md5:" + hashlib.md5(delivered_bytes).hexdigest(),
+            "source_byte_length": len(source_bytes), "delivered_byte_length": len(delivered_bytes),
+            "operation": operation, "evidence_ref": "media_repeat_sweep:" + str(uuid.uuid4()),
+            "observed_by": "media_repeat_sweep", "rendered_by": "media_repeat_sweep"}
+
+
+def _reburn_story_prepared(base, row, new_path, lib, raw_url):
+    """Reburn a Story and attest the exact raw and delivered objects."""
+    try:
+        from agent import media_host, story_image
+        caption = (row.get("caption") or "").strip()
+        asset = story_image.get_or_make_story_image(new_path, caption, _gym_name(base),
+                                                    lib, logger=_log)
+        if not asset or not config.hosting_enabled():
+            return None, None
+        delivered_url = media_host.host_media(asset, f"{base}_ig")
+        if not delivered_url:
+            return None, None
+        with open(new_path, "rb") as fh:
+            source_bytes = fh.read()
+        with open(asset, "rb") as fh:
+            delivered_bytes = fh.read()
+        evidence = _render_receipt(raw_url, delivered_url, source_bytes,
+                                   delivered_bytes, "reburn")
+        return (delivered_url, evidence) if evidence else (None, None)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"{base}: story evidence unavailable ({type(exc).__name__})")
+        return None, None
 
 
 def _grouped(rows, lib):
@@ -577,6 +660,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
             # FEED AUTOFIT PARITY: the original feeds shipped through the autofit
             # reframe; give the replacement the same treatment (raw on any failure).
             feed_url = hosted
+            feed_rendered_bytes = None
             if config.feed_autofit_enabled():
                 try:
                     from agent import feed_image, media_host
@@ -586,8 +670,24 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                         reframed = media_host.host_media(asset, f"{base}_ig")
                         if reframed:
                             feed_url = reframed
+                            if _visual_writer_enabled():
+                                with open(asset, "rb") as rendered:
+                                    feed_rendered_bytes = rendered.read()
                 except Exception:  # noqa: BLE001 - keep the raw hosted photo
                     pass
+            feed_evidence = None
+            if _visual_writer_enabled() and feed_url != hosted:
+                try:
+                    with open(new_path, "rb") as fh:
+                        source_bytes = fh.read()
+                    from agent import visual_writer_prepare
+                    delivered_bytes = visual_writer_prepare._bytes_for_url(feed_url)
+                    if feed_rendered_bytes is None or delivered_bytes != feed_rendered_bytes:
+                        raise ValueError("hosted feed bytes differ from local render")
+                    feed_evidence = _render_receipt(hosted, feed_url, source_bytes,
+                                                    delivered_bytes, "render")
+                except Exception:
+                    feed_evidence = None
             from agent import media_swap
             local_pick = {"source": "local", "path": new_path}
             if not media_swap.reserve_local_pick(base, fixable[0], local_pick):
@@ -600,10 +700,22 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                 rid = r.get("id")
                 fmt = str(r.get("format") or "").lower()
                 target_url = feed_url
-                src_url = None
+                src_url = hosted if _visual_writer_enabled() else None
+                evidence = None
+                if (_visual_writer_enabled() and fmt != "story"
+                        and feed_url != hosted):
+                    evidence = feed_evidence
+                    if evidence is None:
+                        result["detail"].append(
+                            f"{key} {pd}: feed rendition evidence unavailable; left")
+                        continue
                 if fmt == "story":
                     if config.story_format_enabled():
-                        burned = _reburn_story(base, r, new_path, lib)
+                        if _visual_writer_enabled():
+                            burned, evidence = _reburn_story_prepared(
+                                base, r, new_path, lib, hosted)
+                        else:
+                            burned = _reburn_story(base, r, new_path, lib)
                         if not burned:
                             result["detail"].append(
                                 f"{key} {pd}: story re-burn failed; left")
@@ -614,15 +726,22 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                         target_url = hosted            # raw photo, never the square
                     if config.story_source_media_enabled():
                         src_url = hosted
+                    elif _visual_writer_enabled():
+                        src_url = hosted
                 # swap_media is status-guarded server-side (pending/coach_review
                 # only), so an approval or publish landing mid-sweep wins the race.
+                write_args = {"source_media_url": src_url}
+                if evidence is not None:
+                    write_args["render_evidence"] = evidence
                 try:
-                    done = store.swap_media(base, rid, target_url,
-                                            source_media_url=src_url)
+                    done = store.swap_media(base, rid, target_url, **write_args)
                 except Exception as exc:  # noqa: BLE001 - remote outcome may be unknown
                     _log(f"{base}: local swap failed for {rid} ({type(exc).__name__})")
                     write_outcome_unknown = True
                     done = None
+                if done is None and not _swap_definitely_did_not_land(
+                        store, base, r, target_url):
+                    write_outcome_unknown = True
                 if done is not None:
                     result["rows_repointed"] += 1
                     fixed_any = True

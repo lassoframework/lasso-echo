@@ -217,7 +217,7 @@ def _row_source_id(draft):
     return getattr(draft, "draft_id", "") or ""
 
 
-def collect_real_drafts(account_key, store):
+def collect_real_drafts(account_key, store, poster_evidence_out=None):
     """The gym's REAL drafts as content_calendar row dicts.
 
     Included: a draft for THIS account that carries a real hosted creative URL or an
@@ -231,6 +231,13 @@ def collect_real_drafts(account_key, store):
     calendar day).
 
     PURE of writes and network: reads only store.list_for_account(account_key).
+
+    poster_evidence_out: optional dict this call populates with the writer-prep poster
+    proof side channel, keyed STRICTLY by (row image_url, row thumbnail_url) and built
+    from the actual draft objects. Evidence is never a content_calendar payload field;
+    mirror_to_supabase forwards the dict to insert_rows(poster_render_evidence_by_url=...)
+    so the guarded calendar writer can bind each video row's distinct thumbnail to a
+    byte-bound rendition receipt.
     """
     if not account_key or store is None:
         return []
@@ -249,6 +256,12 @@ def collect_real_drafts(account_key, store):
         if not row["post_date"]:
             continue  # cannot place on a calendar day
         rows.append(row)
+        poster_evidence = getattr(draft, "poster_render_evidence", None)
+        if poster_evidence and poster_evidence_out is not None:
+            image = row.get("image_url") or ""
+            thumb = row.get("thumbnail_url") or ""
+            if image and thumb:
+                poster_evidence_out[(image, thumb)] = poster_evidence
     return rows
 
 
@@ -310,8 +323,11 @@ def mirror_to_supabase(account_key, store, sb_store):
 
     # Real rows, gym-forced, with any stray id stripped (belt and braces; _real_row no
     # longer emits one). A real gym never carries a demo id, so a demo-id row is dropped.
+    poster_evidence_by_url = {}
     real_rows = [{k: v for k, v in row.items() if k != "id"}
-                 for row in collect_real_drafts(account_key, store)
+                 for row in collect_real_drafts(
+                     account_key, store,
+                     poster_evidence_out=poster_evidence_by_url)
                  if not _demo.is_demo_draft_id(row.get("id"))
                  and str(row.get("gym_id")) == str(account_key)]
     # Months to reconcile: every month a real draft lands in.
@@ -329,7 +345,17 @@ def mirror_to_supabase(account_key, store, sb_store):
                 deleted += delete_month(account_key, month) or 0
         insert_rows = getattr(sb_store, "insert_rows", None)
         if insert_rows is not None and real_rows:
-            inserted += len(insert_rows(account_key, real_rows) or [])
+            from . import visual_writer_prepare
+            if poster_evidence_by_url and visual_writer_prepare.enabled():
+                # Poster proof is a side channel, never a row column: the store binds
+                # each (image_url, thumbnail_url) pair to its rendition receipt at the
+                # prepared-writer boundary. A TypeError can happen after an internal
+                # write, so it must fail the mirror rather than retrying without proof.
+                inserted += len(insert_rows(
+                    account_key, real_rows,
+                    poster_render_evidence_by_url=poster_evidence_by_url) or [])
+            else:
+                inserted += len(insert_rows(account_key, real_rows) or [])
     except Exception as exc:
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
                 "upserted": inserted, "deleted": deleted}

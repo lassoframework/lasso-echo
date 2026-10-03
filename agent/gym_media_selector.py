@@ -37,12 +37,173 @@ pool alongside the published ones.
 from __future__ import annotations
 
 import json
+import os
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from . import gym_media_index as _idx
 
 REUSE_COOLDOWN_DAYS = 90
+
+# DRAFT GLOBAL VISUAL LEDGER (PR235, 2026-10-03): when AGENT_VISUAL_GLOBAL_LEDGER
+# is explicitly enabled, the DRAFT global exact-byte usage ledger
+# (public.visual_global_usage, migrations/DRAFT_visual_global_history_20261002.sql)
+# is authoritative for global byte reuse: a photo whose exact bytes the ledger
+# shows previously used (reserved/published/released) by any canonical tenant is
+# excluded from the pickable photo set BEFORE any caller decides whether the
+# infographic fallback is allowed. The flag is tri-state: an unrecognized
+# non-empty value is AMBIGUOUS and fails closed. Default OFF = byte-for-byte
+# legacy behavior. This is a read-side belt only; the calendar claim trigger
+# remains the authority and this read never mutates ledger state.
+GLOBAL_LEDGER_FLAG_ENV = "AGENT_VISUAL_GLOBAL_LEDGER"
+
+
+class GlobalLedgerUnavailable(RuntimeError):
+    """The global visual ledger could not prove a photo's global usage status."""
+
+
+def global_ledger_flag():
+    """Tri-state read of AGENT_VISUAL_GLOBAL_LEDGER: True (on), False (off or
+    unset), None (ambiguous value — fail closed). Matches the truthy set used by
+    visual_writer_prepare.enabled(); anything else is not a silent default."""
+    raw = (os.environ.get(GLOBAL_LEDGER_FLAG_ENV, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _md5_fingerprint(asset):
+    """The global ledger's canonical key for an asset's exact bytes, or "".
+
+    visual_global_usage is keyed by 'md5:<32 hex>' only (the schema deliberately
+    uses MD5 for ALL media because Drive supplies MD5 natively). A SHA-256-only
+    content hash has no global representation, so it can never be PROVEN unused
+    cross-client — callers must treat it as unverifiable, not as clean."""
+    digest = _byte_hash(asset)
+    if re.fullmatch(r"[0-9a-f]{32}", digest):
+        return f"md5:{digest}"
+    return ""
+
+
+def _complete_ledger_read(http, url, params, headers, *, maximum=100):
+    """Make one exact, bounded ledger read and prove it was complete.
+
+    Each visual_global_usage query is for at most 100 primary-key fingerprints,
+    so it can match at most 100 rows.  One Range 0-99 request avoids offset
+    pagination, whose moving window could incorrectly miss a concurrent row.
+    """
+    page_headers = dict(headers)
+    page_headers.update({"Prefer": "count=exact", "Range-Unit": "items",
+                         "Range": "0-99"})
+    try:
+        response = http.get(url, params=params, headers=page_headers, timeout=30)
+    except Exception as exc:  # noqa: BLE001 - an incomplete ledger is unsafe
+        raise GlobalLedgerUnavailable("global visual ledger read failed") from exc
+    if not 200 <= response.status_code < 300:
+        raise GlobalLedgerUnavailable(
+            f"global visual ledger read failed ({response.status_code})")
+    try:
+        rows = response.json()
+    except Exception as exc:  # noqa: BLE001
+        raise GlobalLedgerUnavailable("global visual ledger read was malformed") from exc
+    if not isinstance(rows, list):
+        raise GlobalLedgerUnavailable("global visual ledger page was malformed")
+    response_headers = getattr(response, "headers", {}) or {}
+    content_range = (response_headers.get("Content-Range")
+                     or response_headers.get("content-range") or "")
+    match = re.fullmatch(r"(\*|\d+-\d+)/(\d+)", str(content_range))
+    if not match:
+        raise GlobalLedgerUnavailable("global visual ledger did not prove page completeness")
+    span, total_text = match.groups()
+    total = int(total_text)
+    if total > maximum or len(rows) != total:
+        raise GlobalLedgerUnavailable("global visual ledger page was incomplete")
+    if total == 0:
+        if span != "*":
+            raise GlobalLedgerUnavailable("global visual ledger page was incomplete")
+    elif span != f"0-{total - 1}":
+        raise GlobalLedgerUnavailable("global visual ledger page was incomplete")
+    return rows
+
+
+def cross_client_used_fingerprints(base, fingerprints, *, http=None):
+    """The subset of `fingerprints` ('md5:<hex>') the DRAFT global visual ledger
+    shows used by any canonical tenant, including this gym's current tenant.
+
+    Read-only PostgREST against the DRAFT schema (tenant_alias +
+    visual_global_usage), the same tables visual_writer_prepare's writer side
+    registers into — never a client-side guess. Any state counts: staged
+    (reserved), confirmed (published) and released staged bytes all remain
+    globally consumed per the ledger contract. FAILS CLOSED: missing creds, a
+    failed/malformed read, an unmapped tenant, an ambiguous ledger row, or an
+    unknown state raises GlobalLedgerUnavailable; the caller must not treat
+    uncertainty as 'unused'."""
+    from . import config
+    base = str(base or "").strip()
+    fingerprints = sorted({str(f) for f in (fingerprints or ()) if f})
+    if not base or not fingerprints:
+        return set()
+    url = (config.supabase_url() or "").rstrip("/")
+    key = config.supabase_service_key()
+    if not url or not key:
+        raise GlobalLedgerUnavailable("global visual ledger credentials are not configured")
+    if http is None:
+        import requests  # lazy, matches the repo pattern
+        http = requests
+    headers = {"apikey": key, "Authorization": f"Bearer {key}",
+               "Accept": "application/json"}
+    # Require the gym's immutable canonical mapping even though every ledger
+    # usage excludes: an unmapped raw key can never be proven to have complete
+    # history across aliases or imports.
+    rows = _complete_ledger_read(
+        http, f"{url}/rest/v1/tenant_alias",
+        {"select": "alias_key,tenant_id", "alias_key": f"eq.{base}"}, headers)
+    if len(rows) != 1 or not isinstance(rows[0], dict) \
+            or rows[0].get("alias_key") != base:
+        raise GlobalLedgerUnavailable(
+            f"{base} has no canonical visual tenant mapping")
+    try:
+        uuid.UUID(str(rows[0].get("tenant_id")))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise GlobalLedgerUnavailable(
+            f"{base} has no canonical visual tenant mapping") from exc
+    wanted = set(fingerprints)
+    used = set()
+    ordered = sorted(wanted)
+    for start in range(0, len(ordered), 100):
+        batch = ordered[start:start + 100]
+        rows = _complete_ledger_read(
+            http, f"{url}/rest/v1/visual_global_usage",
+            {"select": "fingerprint,tenant_id,state,ambiguous",
+             "fingerprint": "in.(" + ",".join(batch) + ")"}, headers)
+        seen = set()
+        for row in rows:
+            if not isinstance(row, dict) \
+                    or row.get("fingerprint") not in batch \
+                    or row.get("fingerprint") in seen \
+                    or row.get("state") not in ("reserved", "published", "released") \
+                    or type(row.get("ambiguous")) is not bool:
+                raise GlobalLedgerUnavailable(
+                    "global visual usage returned an unreadable row")
+            try:
+                uuid.UUID(str(row.get("tenant_id")))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise GlobalLedgerUnavailable(
+                    "global visual usage returned an unreadable row") from exc
+            seen.add(row["fingerprint"])
+            if row["ambiguous"]:
+                # Sticky uncertainty is never cleared by ordinary writes; an
+                # ambiguous usage row can never prove bytes are free.
+                raise GlobalLedgerUnavailable(
+                    "global visual usage row is ambiguous (unreconciled)")
+            # A prior usage is permanent even when a gym's alias now resolves to the
+            # same canonical tenant: imports, deletions, alias moves, and local asset
+            # counters cannot establish that the exact bytes are safe to reuse.
+            used.add(row["fingerprint"])
+    return used
 _POOL_EMPTY_STAMP = "pool_empty:{}"          # per gym
 _USE_KEY = "gym_media_use:{}:{}"             # gym base key, post_date
 
@@ -207,7 +368,7 @@ def _claimed_hashes(assets, claimed_ids, base):
 
 
 def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=(),
-             strict_claims=False):
+             strict_claims=False, ledger_http=None):
     """Every asset pick_media could hand out RIGHT NOW for this gym, in pick order
     (used_count ASC, last_used_at ASC NULLS FIRST, id tiebreak). [] when the pool is
     empty, the store is down, or the read fails. NEVER alerts: this is the read the
@@ -216,7 +377,10 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
     alert. Same eligibility + cooldown + this-month rules as pick_media, ONE
     implementation (pick_media is `pickable(...)[0]`). With strict_claims=True,
     claim read and legacy hash mapping errors propagate to callers that must
-    distinguish uncertainty from a proven empty pool."""
+    distinguish uncertainty from a proven empty pool. With the DRAFT global
+    visual ledger flag ON (see global_ledger_flag), globally previously-used
+    photos are excluded and any ledger uncertainty fails closed the same way;
+    ledger_http injects the ledger's HTTP client for tests."""
     base = base_gym_key(gym_id)
     store = store or _idx.default_store()
     if not store.available():
@@ -250,6 +414,39 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
     used_hashes = {_byte_hash(a)
                    for a in assets if str(a.get("gym_id") or "") == base
                    and _has_prior_use(a) and _byte_hash(a)}
+
+    # DRAFT GLOBAL VISUAL LEDGER (PR235): with the flag ON, photos whose exact
+    # bytes the global ledger shows used by ANY client leave the pickable
+    # set here — BEFORE the planner picks and before client_infographic_fill's
+    # depletion gate may decide the infographic fallback is allowed. OFF keeps
+    # byte-for-byte legacy behavior. An ambiguous flag value or ANY ledger
+    # uncertainty fails closed exactly like an unreadable claim set: strict
+    # callers get the exception, the planning read gets an empty pool.
+    ledger_flag = global_ledger_flag()
+    ledger_used = set()
+    if ledger_flag is not False:
+        try:
+            if ledger_flag is None:
+                raise GlobalLedgerUnavailable(
+                    f"{GLOBAL_LEDGER_FLAG_ENV} has an ambiguous value")
+            ledger_photos = [a for a in assets
+                             if str(a.get("gym_id") or "") == base
+                             and str(a.get("kind") or "") == "photo"
+                             and is_usable(a)]
+            if any(not _md5_fingerprint(a) for a in ledger_photos):
+                raise GlobalLedgerUnavailable(
+                    "a usable photo has no global-ledger MD5 identity")
+            ledger_used = cross_client_used_fingerprints(
+                base,
+                [_md5_fingerprint(a) for a in ledger_photos],
+                http=ledger_http)
+        except Exception as e:  # noqa: BLE001 - unproven bytes close the pool
+            if strict_claims:
+                raise
+            print(f"[gym-media-selector] global ledger read failed for {base}: "
+                  f"{type(e).__name__}")
+            return []
+
     candidates = []
     for a in assets:
         # TENANT re-assertion (defense in depth): even though the store filtered by
@@ -267,6 +464,12 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
             continue
         if kind_preference and a.get("kind") != kind_preference:
             continue
+        if ledger_flag and str(a.get("kind") or "") == "photo":
+            fp = _md5_fingerprint(a)
+            # A photo whose bytes cannot be keyed in the global ledger (no MD5)
+            # can never be proven globally unused: fail closed, exclude it.
+            if not fp or fp in ledger_used:
+                continue
         # GLOBAL ONCE-USED RULE: any prior stage-use is out forever for automatic
         # selection, independent of the cooldown clocks below. Stage-use is
         # permanent — rollback on a deny settles the record WITHOUT restoring

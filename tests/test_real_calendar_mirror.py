@@ -22,6 +22,7 @@ from agent import real_calendar_mirror as rcm
 from agent import demo_calendar_queue as demo
 from agent import portal_social as ps
 from agent.drafter import Draft, DraftStatus
+from agent.store import PendingStore
 
 
 def _reject_non_uuid_id(row):
@@ -153,6 +154,15 @@ def test_collect_uses_scheduled_for_when_no_day_key():
     d = _draft("realf_s", day_key="", scheduled_for="2026-08-09T18:30:00+00:00")
     rows = rcm.collect_real_drafts("northside_ig", _FakeStore([d]))
     assert rows[0]["post_date"] == "2026-08-09"
+
+
+def test_collect_carries_explicit_raw_media_provenance():
+    draft = _draft("realf_source")
+    draft.source_media_url = "https://cdn/raw-upload.jpg"
+    rows = rcm.collect_real_drafts("northside_ig", _FakeStore([draft]))
+    assert len(rows) == 1
+    assert rows[0]["image_url"] == "https://cdn/x.jpg"
+    assert rows[0]["source_media_url"] == "https://cdn/raw-upload.jpg"
 
 
 # ---- mirror_plan ----------------------------------------------------------
@@ -296,3 +306,106 @@ def test_mirrored_draft_action_roundtrips_with_isolation(monkeypatch):
     # Token isolation: another gym's token can never act on this row.
     s2, b2 = ps.handle_approve("othergym", row_uuid, "actor-2", sb_store=sb)
     assert s2 == 404 and b2["ok"] is False
+
+
+# ---- writer-prep poster evidence side channel (mirror -> guarded insert) ----------
+class _EvidenceStore:
+    """PendingStore fake whose drafts carry writer-prep poster proof."""
+
+    def __init__(self, drafts):
+        self._drafts = list(drafts)
+
+    def list_for_account(self, account_key):
+        return [d for d in self._drafts if d.account_key == account_key]
+
+
+class _EvidenceSB:
+    """SupabaseCalendarStore fake accepting the poster evidence side-channel kwarg."""
+
+    def __init__(self):
+        self.poster_evidence_by_url = None
+        self.inserted = []
+
+    def list_month(self, account_key, month):
+        return []
+
+    def insert_rows(self, account_key, rows, *, poster_render_evidence_by_url=None):
+        self.poster_evidence_by_url = poster_render_evidence_by_url
+        self.inserted.extend(rows or [])
+        return rows
+
+    def delete_month(self, account_key, month):
+        return 0
+
+
+def _video_draft_with_poster_evidence():
+    draft = _draft("vid-1", url="https://cdn/vid.mp4")
+    draft.thumbnail_url = "https://cdn/poster.jpg"
+    draft.poster_render_evidence = {
+        "source_exact_url": "https://cdn/vid.mp4",
+        "delivered_exact_url": "https://cdn/poster.jpg",
+        "operation": "render",
+        "rendered_by": "gym_media_builder.video_poster_with_evidence"}
+    return draft
+
+
+def test_prepared_mirror_forwards_composite_key_poster_proof_to_insert_rows(monkeypatch):
+    """A real draft's poster_render_evidence reaches insert_rows keyed STRICTLY by
+    (image_url, thumbnail_url) and never as a content_calendar payload field."""
+    from agent import portal_calendar_store
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    draft = _video_draft_with_poster_evidence()
+    sb = _EvidenceSB()
+    out = rcm.mirror_to_supabase("northside_ig", _EvidenceStore([draft]), sb)
+    assert out["ok"] is True and out["inserted"] >= 1
+    assert sb.poster_evidence_by_url == {
+        ("https://cdn/vid.mp4", "https://cdn/poster.jpg"):
+        draft.poster_render_evidence}
+    assert all("poster_render_evidence" not in row for row in sb.inserted)
+
+
+def test_prepared_mirror_forwards_poster_proof_after_real_store_round_trip(
+        monkeypatch, tmp_path):
+    """Exercise the production boundary: mirror reads a freshly deserialized draft."""
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    pending = PendingStore(str(tmp_path / "poster-mirror.db"))
+    draft = _video_draft_with_poster_evidence()
+    pending.put(draft)
+
+    sb = _EvidenceSB()
+    out = rcm.mirror_to_supabase("northside_ig", pending, sb)
+
+    assert out["ok"] is True and out["inserted"] == 1
+    assert sb.poster_evidence_by_url == {
+        (draft.creative_public_url, draft.thumbnail_url):
+        draft.poster_render_evidence}
+    assert sb.inserted[0]["thumbnail_url"] == draft.thumbnail_url
+    assert "poster_render_evidence" not in sb.inserted[0]
+
+
+def test_flag_off_mirror_keeps_plain_insert(monkeypatch):
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    sb = _EvidenceSB()
+    out = rcm.mirror_to_supabase("northside_ig", _EvidenceStore([_draft("p-1")]), sb)
+    assert out["ok"] is True
+    assert sb.poster_evidence_by_url is None
+
+
+def test_prepared_mirror_does_not_retry_typeerror_without_poster_proof(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    calls = []
+
+    class AmbiguousStore(_EvidenceSB):
+        def insert_rows(self, account_key, rows, *, poster_render_evidence_by_url=None):
+            calls.append(poster_render_evidence_by_url)
+            raise TypeError("internal error after write")
+
+    out = rcm.mirror_to_supabase(
+        "northside_ig", _EvidenceStore([_video_draft_with_poster_evidence()]),
+        AmbiguousStore())
+
+    assert out["ok"] is False
+    assert "TypeError" in out["reason"]
+    assert len(calls) == 1
+    assert calls[0][("https://cdn/vid.mp4", "https://cdn/poster.jpg")][
+        "operation"] == "render"

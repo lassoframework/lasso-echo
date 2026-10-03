@@ -605,6 +605,16 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                 prep_failures += 1
                 continue
             path = mat["path"]
+            if (_visual_writer_enabled() and cand["source"] == "drive"
+                    and mat.get("hosted")):
+                # ensure_rendition only returns (URL, newly_converted). A cached
+                # HEIC/HEVC rendition has no source URL or render receipt here.
+                # Its bytes cannot satisfy the Drive original's content_hash as
+                # a raw same-byte asset. Activation needs real conversion lineage.
+                say(f"{base_key}: Drive rendition has no verified render provenance; "
+                    "writer preparation blocked")
+                prep_failures += 1
+                continue
             # Drive assets host under the gym base (builder parity, so the same bytes
             # dedupe to one object); local library photos keep the _ig tenant the
             # sweep and the month build have always used.
@@ -630,12 +640,36 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
             # One poster per swap (audit D4): computed once, attached only to FEED
             # variants; a story's media is the captioned card/video itself.
             poster = ""
+            poster_render_evidence = None
             try:
                 if cand["kind"] == "video":
-                    deadline.check(f"poster frame for {cand.get('key')}")
-                    poster = poster_fn(path, work, tenant) or ""
+                    if _visual_writer_enabled():
+                        # Stories do not use a thumbnail: _finish clears it and
+                        # either reburns the story media or keeps the hosted video.
+                        # Do not reject an otherwise usable story-only swap over an
+                        # unused poster that cannot be attested.
+                        needs_feed_poster = any(
+                            str((variant or {}).get("format") or "feed").strip().lower()
+                            != "story" for variant in [row] + list(siblings or ()))
+                        if needs_feed_poster:
+                            deadline.check(f"poster frame for {cand.get('key')}")
+                            from . import gym_media_builder as _gmb
+                            poster_result = _gmb.video_poster_with_evidence(
+                                path, work, tenant, source_exact_url=hosted)
+                            if not poster_result:
+                                prep_failures += 1
+                                continue
+                            poster, poster_render_evidence = poster_result
+                            if (not poster
+                                    or not isinstance(_evidence_dict(poster_render_evidence), dict)):
+                                prep_failures += 1
+                                continue
+                    else:
+                        deadline.check(f"poster frame for {cand.get('key')}")
+                        poster = poster_fn(path, work, tenant) or ""
                 out = _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant,
-                              poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say,
+                              poster=poster, poster_render_evidence=poster_render_evidence,
+                              feed_fn=feed_fn, reburn_fn=reburn_fn, log=say,
                               deadline=deadline)
                 if not out.get("ok"):
                     return out
@@ -647,7 +681,8 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                 for sib in siblings or ():
                     sfmt = str((sib or {}).get("format") or "feed").strip().lower()
                     var = _finish(base_key, sib, sfmt, cand, path, hosted, lib, work,
-                                  tenant, poster=poster, feed_fn=feed_fn,
+                                  tenant, poster=poster,
+                                  poster_render_evidence=poster_render_evidence, feed_fn=feed_fn,
                                   reburn_fn=reburn_fn, log=say, deadline=deadline)
                     if not var.get("ok"):
                         return {"ok": False,
@@ -668,7 +703,7 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
 
 
 def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster,
-            feed_fn, reburn_fn, log, deadline=None):
+            poster_render_evidence=None, feed_fn, reburn_fn, log, deadline=None):
     """Shape the hosted replacement for the row's format: a story is re-burned with
     its caption (still card or 9:16 story video), a video feed ships the hosted video,
     a photo feed gets the autofit reframe. A failed story re-burn is a hard stop
@@ -679,33 +714,58 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
     base = {"key": cand["key"], "kind": cand["kind"], "source": cand["source"],
             "thumbnail_url": poster if (video and fmt != "story") else "", "path": path,
             "source_media_asset_id": cand["key"] if cand["source"] == "drive" else ""}
+    # A distinct video poster is another rendered scene object.  Keep its proof
+    # in the writer side channel rather than the calendar row payload.
+    if video and fmt != "story" and poster_render_evidence is not None:
+        base["poster_render_evidence"] = _evidence_dict(poster_render_evidence)
+    raw_source = hosted
     if fmt == "story":
         # A story publishes empty-body, so its caption lives ON the media. Swapping
         # the pixels without re-burning would ship a captionless story.
+        evidence = None
         if config.story_format_enabled():
             if deadline is not None:
                 deadline.check(f"story burn for row {row.get('id')}")
-            burned = (_reburn_story_video(base_key, row, path, lib) if video
-                      else reburn_fn(base_key, row, path, lib))
+            if _visual_writer_enabled():
+                if video:
+                    burned, evidence = _reburn_story_video_with_evidence(
+                        base_key, row, path, lib, hosted, deadline=deadline)
+                else:
+                    burned, evidence = _reburn_story_with_evidence(
+                        base_key, row, path, lib, hosted, deadline=deadline)
+            else:
+                burned = (_reburn_story_video(base_key, row, path, lib) if video
+                          else reburn_fn(base_key, row, path, lib))
             if not burned:
                 return {"ok": False, "reason": REASON_STORY_REBURN}
             target = burned
         else:
             target = hosted
         src = hosted if config.story_source_media_enabled() else None
-        return {"ok": True, "image_url": target, "source_media_url": src, **base}
+        out = {"ok": True, "image_url": target, "source_media_url": src, **base}
+        if evidence is not None:
+            out["render_evidence"] = _evidence_dict(evidence)
+            out["source_media_url"] = raw_source
+        elif _visual_writer_enabled():
+            # Even an unburned Story points at its exact raw object.
+            out["source_media_url"] = raw_source
+        return out
 
     if video:
         # A video feed ships the hosted video itself (autofit is a still-photo lane).
-        return {"ok": True, "image_url": hosted, "source_media_url": None, **base}
+        return {"ok": True, "image_url": hosted,
+                "source_media_url": hosted if _visual_writer_enabled() else None, **base}
 
     # FEED AUTOFIT PARITY: the original shipped through the square reframe, so the
     # replacement gets it too. Any failure keeps the raw hosted photo (never a drop).
     target = hosted
+    feed_rendered_bytes = None
     if deadline is not None and (feed_fn is not None or config.feed_autofit_enabled()):
         deadline.check(f"autofit for row {row.get('id')}")
     if feed_fn is not None:
-        target = feed_fn(path) or hosted
+        feed_result = feed_fn(path)
+        # Injected URL-only renderers cannot attest their local output bytes.
+        target = feed_result if isinstance(feed_result, str) and feed_result else hosted
     elif config.feed_autofit_enabled():
         try:
             from . import feed_image, media_host
@@ -714,9 +774,160 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
                 reframed = media_host.host_media(asset, tenant)
                 if reframed:
                     target = reframed
+                    if _visual_writer_enabled():
+                        with open(asset, "rb") as rendered:
+                            feed_rendered_bytes = rendered.read()
         except Exception:  # noqa: BLE001 - the raw hosted photo is a correct answer
             pass
-    return {"ok": True, "image_url": target, "source_media_url": None, **base}
+    out = {"ok": True, "image_url": target,
+           "source_media_url": hosted if _visual_writer_enabled() else None, **base}
+    if target != hosted and _visual_writer_enabled():
+        evidence = _feed_render_evidence(path, hosted, target,
+                                         rendered_bytes=feed_rendered_bytes,
+                                         deadline=deadline)
+        if evidence is None:
+            return {"ok": False, "reason": REASON_ASSET_PREP}
+        out["render_evidence"] = evidence
+        out["source_media_url"] = hosted
+    elif _visual_writer_enabled():
+        out["source_media_url"] = hosted
+    return out
+
+
+def _visual_writer_enabled():
+    from . import visual_writer_prepare
+    return visual_writer_prepare.enabled()
+
+
+def _evidence_dict(evidence):
+    return evidence.as_dict() if hasattr(evidence, "as_dict") else evidence
+
+
+def _read_evidence_url(url, deadline):
+    """Bound a remote read by the request clock without executor shutdown waits."""
+    from . import visual_writer_prepare
+    if deadline is None:
+        return visual_writer_prepare._bytes_for_url(url)
+    import threading
+    deadline.check(f"evidence read of {url!r}")
+    result = {}
+
+    def _read():
+        try:
+            result["bytes"] = visual_writer_prepare._bytes_for_url(url)
+        except Exception as exc:  # noqa: BLE001 - caller treats an unreadable URL as no evidence
+            result["error"] = exc
+
+    worker = threading.Thread(target=_read, name="media-swap-evidence", daemon=True)
+    worker.start()
+    worker.join(deadline.remaining())
+    deadline.check(f"evidence read of {url!r}")
+    if worker.is_alive():
+        raise SwapDeadline(f"request deadline passed during evidence read of {url!r}")
+    if "error" in result:
+        raise result["error"]
+    return result.get("bytes")
+
+
+def _render_evidence(source_url, delivered_url, source_bytes, delivered_bytes, operation,
+                     deadline=None):
+    import hashlib
+    import uuid
+    if not source_bytes or not delivered_bytes or source_url == delivered_url:
+        return None
+    if _read_evidence_url(source_url, deadline) != source_bytes:
+        return None
+    if _read_evidence_url(delivered_url, deadline) != delivered_bytes:
+        return None
+    return {"source_exact_url": source_url, "delivered_exact_url": delivered_url,
+            "source_fingerprint": "md5:" + hashlib.md5(source_bytes).hexdigest(),
+            "delivered_fingerprint": "md5:" + hashlib.md5(delivered_bytes).hexdigest(),
+            "source_byte_length": len(source_bytes), "delivered_byte_length": len(delivered_bytes),
+            "operation": operation, "evidence_ref": "media_swap:" + str(uuid.uuid4()),
+            "observed_by": "media_swap", "rendered_by": "media_swap"}
+
+
+def _reburn_story_with_evidence(base_key, row, path, lib, raw_url, *, deadline=None):
+    """Reburn with exact bytes observed at raw and hosted URLs."""
+    try:
+        from . import media_host, story_image
+        from .jobs.media_repeat_sweep import _gym_name
+        caption = (row.get("caption") or "").strip()
+        asset = story_image.get_or_make_story_image(path, caption, _gym_name(base_key),
+                                                     lib, logger=_log)
+        if not asset or not config.hosting_enabled():
+            return None, None
+        delivered_url = media_host.host_media(asset, f"{base_key}_ig")
+        if not raw_url or not delivered_url:
+            return None, None
+        with open(path, "rb") as fh:
+            source_bytes = fh.read()
+        with open(asset, "rb") as fh:
+            rendered = fh.read()
+        evidence = _render_evidence(raw_url, delivered_url, source_bytes, rendered,
+                                    "reburn", deadline=deadline)
+        return (delivered_url, evidence) if evidence else (None, None)
+    except SwapDeadline:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _log(f"{base_key}: story evidence unavailable ({type(exc).__name__})")
+        return None, None
+
+
+def _reburn_story_video_with_evidence(base_key, row, path, lib, raw_url, *, deadline=None):
+    """Video counterpart of _reburn_story_with_evidence."""
+    try:
+        from . import media_host, story_image
+        from .jobs.media_repeat_sweep import _gym_name
+        caption = (row.get("caption") or "").strip()
+        asset = story_image.get_or_make_story_video(path, caption, _gym_name(base_key),
+                                                     lib, logger=_log)
+        if not asset or not config.hosting_enabled():
+            return None, None
+        delivered_url = media_host.host_media(asset, f"{base_key}_ig")
+        if not raw_url or not delivered_url:
+            return None, None
+        with open(path, "rb") as fh:
+            source_bytes = fh.read()
+        with open(asset, "rb") as fh:
+            rendered = fh.read()
+        evidence = _render_evidence(raw_url, delivered_url, source_bytes, rendered,
+                                    "reburn", deadline=deadline)
+        return (delivered_url, evidence) if evidence else (None, None)
+    except SwapDeadline:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _log(f"{base_key}: story video evidence unavailable ({type(exc).__name__})")
+        return None, None
+
+
+def _feed_render_evidence(path, source_url, delivered_url, *, rendered_bytes=None,
+                          deadline=None):
+    """Verify exact source and locally rendered bytes against the hosted delivery."""
+    try:
+        with open(path, "rb") as fh:
+            source_bytes = fh.read()
+        if rendered_bytes is None:
+            return None
+        delivered_bytes = _read_evidence_url(delivered_url, deadline)
+        import hashlib, uuid
+        if not source_bytes or not rendered_bytes or not delivered_bytes or not delivered_url:
+            return None
+        if _read_evidence_url(source_url, deadline) != source_bytes:
+            return None
+        if delivered_bytes != rendered_bytes:
+            return None
+        return {"source_exact_url": source_url, "delivered_exact_url": delivered_url,
+                "source_fingerprint": "md5:" + hashlib.md5(source_bytes).hexdigest(),
+                "delivered_fingerprint": "md5:" + hashlib.md5(delivered_bytes).hexdigest(),
+                "source_byte_length": len(source_bytes),
+                "delivered_byte_length": len(delivered_bytes), "operation": "render",
+                "evidence_ref": "media_swap:" + str(uuid.uuid4()),
+                "observed_by": "media_swap", "rendered_by": "media_swap"}
+    except SwapDeadline:
+        raise
+    except Exception:
+        return None
 
 
 def _reburn_story_video(base_key, row, video_path, lib):

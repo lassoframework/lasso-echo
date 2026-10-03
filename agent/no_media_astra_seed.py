@@ -281,11 +281,23 @@ def seed_gaps(base, account, store, *, log=None, today=None,
                 store, base, tz_name, min(days_ahead, 2), now=today)):
             log(f"{base} {day}: feed slot taken before seed insert; held")
             continue
-        rows.append({
+        row = {
             "gym_id": base, "account": "instagram", "post_date": day,
             "format": "feed", "pillar": NEEDS_CLIENT_SAFE_REVIEW_PILLAR,
             "caption": headline, "image_url": url, "status": "pending",
-        })
+        }
+        # The generated PNG is hosted byte-for-byte as rendered; it is not
+        # cropped or otherwise transformed after hosting. When the global
+        # prepared writer is armed, explicitly identify that same hosted object
+        # as its own source so the writer can verify same-object lineage.
+        # Keep the legacy payload unchanged while the guard is off.
+        try:
+            from . import visual_writer_prepare
+            if visual_writer_prepare.enabled():
+                row["source_media_url"] = url
+        except Exception:  # noqa: BLE001 - unknown guard state fails closed
+            row["source_media_url"] = url
+        rows.append(row)
 
     if not rows:
         return 0
