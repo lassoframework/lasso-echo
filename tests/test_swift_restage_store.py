@@ -1,4 +1,5 @@
 from agent.portal_calendar_store import SupabaseCalendarStore
+import pytest
 
 
 class Response:
@@ -53,3 +54,36 @@ def test_server_race_returns_no_match():
     store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=http)
     assert store.restage_held_media('swift', row, image_url='https://cdn/new.jpg') is None
     assert http.row == row
+
+
+def test_historical_hold_is_complete_row_cas_and_changes_only_reason():
+    row = _row()
+    row['media_not_ready_reason'] = None
+    http = HTTP(row)
+    store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=http)
+    reason = 'Historical igfill card held: archive versus real-photo restage decision pending'
+    result = store.hold_pending_media('swift', row, reason)
+    assert result['media_not_ready_reason'] == reason
+    params, payload = http.calls[0]
+    assert payload == {'media_not_ready_reason': reason}
+    assert params['status'] == 'eq.pending'
+    assert params['image_url'] == 'eq.https://cdn/igfill_old.jpg'
+    assert params['source_media_url'] == 'eq.https://cdn/igfill_old.jpg'
+    assert params['media_not_ready_reason'] == 'is.null'
+
+
+def test_pending_media_read_includes_variants_and_requires_exact_count():
+    class ReadHTTP:
+        def __init__(self, count):
+            self.count = count
+        def get(self, _url, *, params, headers, timeout):
+            assert params['status'] == 'eq.pending'
+            assert 'variant_status' not in params
+            response = Response([_row()])
+            response.headers = {'Content-Range': f'0-0/{self.count}'}
+            return response
+    store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=ReadHTTP(1))
+    assert len(store.list_pending_media_between('swift', '2026-10-01', '2026-10-03')) == 1
+    store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=ReadHTTP(2))
+    with pytest.raises(ValueError, match='incomplete'):
+        store.list_pending_media_between('swift', '2026-10-01', '2026-10-03')
