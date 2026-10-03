@@ -591,6 +591,71 @@ def _fresh_fixer_request(bus, ticket, att, *, body="", require_direct_answer=Fal
     return fresh
 
 
+def _fresh_portal_progress(bus, ticket, row, identity):
+    """A progress row may only become visible in its original portal thread.
+
+    Recheck the durable request even after a human releases a held row. The
+    marker grants no exception to the normal recipient arming/release gate.
+    """
+    att = row.get("attachments") or {}
+    if (row.get("direction") != "outbound"
+            or row.get("author_type") != identity.name
+            or row.get("ticket_id") != (ticket or {}).get("id")
+            or att.get("kind") != _a.KIND_STATUS
+            or att.get("identity") != identity.name
+            or att.get("recipient_kind") != "client"
+            or att.get("surface") != "portal_ticket_bridge"
+            or att.get("fixer") is not True
+            or "resolve_notice" in att):
+        return None
+    if (not isinstance(ticket, dict)
+            or ticket.get("source") != "website_tab"
+            or ticket.get("classification") != "code_fix"
+            or ticket.get("status") not in ("hold", "merged")
+            or ticket.get("bot_identity") != identity.name
+            or not isinstance(ticket.get("client_id"), str)
+            or not ticket["client_id"].strip()
+            or ticket.get("slack_channel_id")
+            or ticket.get("slack_thread_ts")):
+        return None
+    fresh = _fresh_fixer_request(bus, ticket, att)
+    if (not fresh or fresh.get("source") != "website_tab"
+            or fresh.get("classification") != "code_fix"
+            or fresh.get("status") not in ("hold", "merged")
+            or fresh.get("bot_identity") != identity.name
+            or not portal_deliverable(fresh)
+            or fresh.get("slack_channel_id")
+            or fresh.get("slack_thread_ts")
+            or not _portal_progress_original_inbound(bus, fresh)):
+        return None
+    return fresh
+
+
+def _portal_progress_original_inbound(bus, ticket):
+    """Require one durable portal-origin client row for the ticket's original text."""
+    reporter = ticket.get("reporter")
+    original_text = ticket.get("raw_text")
+    if (not isinstance(reporter, str) or not reporter.strip()
+            or not isinstance(original_text, str) or not original_text.strip()):
+        return False
+    try:
+        rows = bus.messages(ticket["id"], limit=1000)
+        if not isinstance(rows, list) or len(rows) >= 1000:
+            return False
+        inbound = [m for m in rows if m.get("direction") == "inbound"]
+        if len(inbound) != bus.inbound_count(ticket["id"]):
+            return False
+    except Exception:  # noqa: BLE001 - missing or partial provenance is not proof
+        return False
+    matches = [m for m in inbound
+               if m.get("ticket_id") == ticket["id"]
+               and m.get("author_type") == "client"
+               and m.get("author_id") == reporter
+               and m.get("body") == original_text
+               and (m.get("attachments") or {}).get("surface") == "portal_ticket_bridge"]
+    return len(matches) == 1
+
+
 def _channel_for(kind, identity):
     if kind == _a.KIND_FIXER_REQUEST:
         return config.ops_fix_channel_id()
@@ -933,6 +998,11 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         and (ticket.get("product"), identity.name) in {
             ("echo", "echo"), ("portal", "scout")})
     if (ticket.get("bot_identity") or "") != identity.name and not portal_provenance_alert:
+        if att.get("portal_progress_status") is True and row_ident == identity.name:
+            _suppress(bus, row, ticket, identity,
+                      "portal progress status bot identity changed before delivery",
+                      log, summary, escalate=False)
+            return
         summary["skipped"] += 1
         return
     # 0. fail closed on anything we do not recognise
@@ -942,6 +1012,15 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     if not row_ident:
         _suppress(bus, row, ticket, identity, "row carries no identity stamp", log, summary)
         return
+    portal_progress = att.get("portal_progress_status") is True
+    if portal_progress:
+        fresh_progress = _fresh_portal_progress(bus, ticket, row, identity)
+        if not fresh_progress:
+            _suppress(bus, row, ticket, identity,
+                      "portal progress status no longer matches its open portal request",
+                      log, summary)
+            return
+        ticket = fresh_progress
 
     # ---- internal kinds: fixer / ops-fix channels, never the person's thread ---------
     if kind in _a.INTERNAL_KINDS:
@@ -1012,7 +1091,8 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     # ---- conversational kinds: the gates ---------------------------------------------
     # Re-read deployment proof at dispatch time. A queued FIXER acknowledgement,
     # held-answer replacement, or stale notice must never reach a client.
-    customer_fix = _customer_fix_reply(ticket, att, row.get("body") or "")
+    customer_fix = (not portal_progress
+                    and _customer_fix_reply(ticket, att, row.get("body") or ""))
     fixer_grounded_answer = _fixer_grounded_question_answer(
         ticket, att, kind, row.get("body") or "")
     if customer_fix:
@@ -1196,6 +1276,14 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     if not _claim(bus, row, log):
         summary["skipped"] += 1
         return
+    if portal_progress:
+        fresh_progress = _fresh_portal_progress(bus, ticket, row, identity)
+        if not fresh_progress:
+            _suppress(bus, row, ticket, identity,
+                      "portal progress status changed before portal delivery",
+                      log, summary)
+            return
+        ticket = fresh_progress
     # Membership reads and the claim itself are externally visible boundaries. A
     # correction arriving during either one invalidates a grounded FIXER answer
     # even though that answer legitimately has no deployment record.
