@@ -1,8 +1,9 @@
 """
 Task #28 §5c — story caption re-burn (agent/story_reburn.py + the edit wiring). Fully
-gated: no-op unless BOTH AGENT_STORY_SOURCE_MEDIA and AGENT_STORY_FORMAT are on and the row
-is a story with a source_media_url. Best-effort: a re-burn failure NEVER fails the saved
-edit. Offline — the burn + host + download are stubbed.
+gated: a story needs AGENT_STORY_FORMAT and a source_media_url; normally it also needs
+AGENT_STORY_SOURCE_MEDIA, with an exception for a visual-writer-guarded same-object row.
+Best-effort: a re-burn failure NEVER fails the saved edit. Offline — the burn + host +
+download are stubbed.
 """
 
 import os
@@ -45,6 +46,13 @@ def test_should_reburn_off_when_flag_off(monkeypatch):
     monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "false")
     monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
     assert story_reburn.should_reburn(_story_row()) is False
+
+
+def test_should_reburn_allows_visual_writer_guard_when_source_flag_off(monkeypatch):
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "false")
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    assert story_reburn.should_reburn(_story_row()) is True
 
 
 # ---- reburn() best-effort ---------------------------------------------------

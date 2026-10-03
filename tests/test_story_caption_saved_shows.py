@@ -9,8 +9,9 @@ still carries the OLD/absent caption, and the publisher shipped image_url verbat
 Fixes pinned here:
   (a) story_image.story_media_carries_caption detects a stale story (the burned media's
       filename embeds the caption key), schema-free and cross-service.
-  (b) the publisher HOLDS a story whose media does not carry the current caption (never
-      ships stale/blank) — calendar_autopublish._story_media_is_stale.
+  (b) the publisher HOLDS a story whose media does not carry the current caption, including
+      a writer-attested raw same-object Story while formatting is armed (never ships
+      stale/blank) — calendar_autopublish._story_media_is_stale.
   (c) the calendar rebuild RE-RENDERS a story with the CLIENT'S edited caption instead of
       overwriting it with the freshly generated feed caption — client_month_run.
 

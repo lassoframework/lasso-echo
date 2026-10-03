@@ -578,15 +578,38 @@ def _story_media_is_stale(row):
     CURRENT caption (the caption was edited after the media was burned), so publishing
     it would ship a stale/blank story. False for a feed row, a story with a matching
     caption, or a story whose media was not caption-burned by story_image (raw baseline).
-    Never raises (a guard must never crash the lane)."""
+    A raw same-object Story under the armed visual writer and Story-format guards is
+    stale by definition; an error evaluating those armed guards fails closed. Never
+    raises (a guard must never crash the lane)."""
     if (row.get("format") or "feed").strip().lower() != "story":
         return False
+    source_url = str(row.get("source_media_url") or "").strip()
+    image_url = str(row.get("image_url") or "").strip()
+    same_object = bool(source_url and source_url == image_url)
+    if same_object:
+        # A visual-writer receipt may attest a raw same-object story, but that
+        # provenance cannot prove the current caption was burned into the media.
+        # With Story formatting enabled, re-burn it before the publisher boundary.
+        try:
+            from . import visual_writer_prepare
+            if config.story_format_enabled() and visual_writer_prepare.enabled():
+                return True
+        except Exception:
+            # A guard evaluator/import/config error must not turn an explicitly
+            # armed raw Story into a publishable one. Read the direct flags only as
+            # a conservative fallback for this exceptional path; ordinary flag-off
+            # rows retain the legacy filename evaluator below.
+            story_format = os.environ.get("AGENT_STORY_FORMAT", "").lower()
+            writer_guard = os.environ.get("AGENT_VISUAL_GLOBAL_WRITER_PREP", "").lower()
+            if (story_format in ("1", "true", "yes", "on")
+                    and writer_guard in ("1", "true", "yes", "on")):
+                return True
     try:
         from . import story_image
         return not story_image.story_media_carries_caption(
             row.get("image_url") or "", row.get("caption") or "")
     except Exception:
-        return False  # fail OPEN to the existing behavior; never block on the guard
+        return False  # legacy filename guard remains fail-open when unarmed
 
 
 def _alert_story_needs_render(row_id, gym_id):
