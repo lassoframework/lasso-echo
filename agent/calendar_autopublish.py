@@ -1548,7 +1548,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 _bump_pub_count(gym_id, run_date)
         elif mode == "would_publish" or _result_proves_no_post(result):
             _receipt.record(lane="calendar", row=row, decision="provider_result",
-                            attempted=True, outcome=mode or "no_post")
+                            attempted=False if mode == "would_publish" else True,
+                            outcome=mode or "no_post")
             # `would_publish` is the publisher's pre-network kill-switch contract.
             # A provider rejection may also opt into definitive_no_post only when its
             # API guarantees that no post exists. Both are safe to retry.
@@ -1567,6 +1568,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         else:
             # A normal return is still ambiguous unless the adapter explicitly proves
             # no post exists. Keep the claim so a later tick cannot resend it.
+            _receipt.record(lane="calendar", row=row, decision="provider_result",
+                            attempted=True, outcome="ambiguous")
             failed.append(row_id)
             recovery_required.append(row_id)
             detail = f"publisher returned ok={ok!r} mode={mode!r}"

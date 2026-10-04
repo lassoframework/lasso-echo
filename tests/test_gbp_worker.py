@@ -610,6 +610,49 @@ def test_photo_drop_live_calls_gmb_media():
     assert c.media == [("acc1", "https://r2/floor.jpg")]
 
 
+def test_photo_drop_receipts_bracket_live_provider_call(monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    events = []
+    monkeypatch.setattr(receipts, "record", lambda **kw: events.append(kw) or kw)
+
+    class _C:
+        def create_gmb_media(self, *_):
+            assert events[-1]["decision"] == "preflight_passed"
+            return {"_id": "m1"}
+
+    out = gw.publish_photo_drop(_photo_row(), _conn(), client=_C(), draft=False)
+    assert out["status"] == "published"
+    assert [event["decision"] for event in events] == ["preflight_passed", "provider_result"]
+    assert events[-1]["outcome"] == "published"
+
+
+def test_armed_receipt_failure_prevents_photo_upload(monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    monkeypatch.setattr(receipts, "record",
+                        lambda **_: (_ for _ in ()).throw(receipts.ReceiptWriteError("safe")))
+
+    class _C:
+        def create_gmb_media(self, *_):
+            raise AssertionError("receipt failure must prevent provider upload")
+
+    with pytest.raises(receipts.ReceiptWriteError, match="safe"):
+        gw.publish_photo_drop(_photo_row(), _conn(), client=_C(), draft=False)
+
+
+def test_photo_drop_ambiguous_response_gets_provider_receipt(monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    events = []
+    monkeypatch.setattr(receipts, "record", lambda **kw: events.append(kw) or kw)
+
+    class _C:
+        def create_gmb_media(self, *_):
+            return {}
+
+    out = gw.publish_photo_drop(_photo_row(), _conn(), client=_C(), draft=False)
+    assert out["held"] == "ambiguous_send"
+    assert events[-1]["outcome"] == "ambiguous"
+
+
 def test_photo_drop_empty_caption_is_fine_not_a_rail_fail():
     # a photo row with empty caption must NOT be rejected as 'empty caption' (that was
     # the audit MAJOR: photo rows are gallery uploads, no caption gate)

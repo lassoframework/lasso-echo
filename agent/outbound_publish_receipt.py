@@ -16,6 +16,10 @@ _FLAG = "AGENT_OUTBOUND_PUBLISH_RECEIPT"
 _PATH = "AGENT_OUTBOUND_PUBLISH_RECEIPT_PATH"
 
 
+class ReceiptWriteError(RuntimeError):
+    """Raised only when the explicitly armed receipt rail cannot be made durable."""
+
+
 def enabled():
     return os.environ.get(_FLAG, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -27,9 +31,12 @@ def record(*, lane, row, decision, reason="", attempted=False, outcome=""):
     ``source_media_asset_id`` is only represented as a boolean because older live
     photo and video rows legitimately do not carry that id.
     """
+    armed = enabled()
     path = os.environ.get(_PATH, "").strip()
-    if not enabled() or not path:
+    if not armed:
         return None
+    if not path:
+        raise ReceiptWriteError("outbound publish receipt path is not configured")
     row = row or {}
     record = {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -51,11 +58,15 @@ def record(*, lane, row, decision, reason="", attempted=False, outcome=""):
     try:
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            os.write(fd, payload)
+            offset = 0
+            while offset < len(payload):
+                written = os.write(fd, payload[offset:])
+                if not written:
+                    raise OSError("receipt write made no progress")
+                offset += written
+            os.fsync(fd)
         finally:
             os.close(fd)
     except OSError as exc:
-        # Audit storage failure must never turn into an unrecorded authorization path.
-        print(f"[outbound-publish-receipt] append failed: {type(exc).__name__}")
-        return None
+        raise ReceiptWriteError("outbound publish receipt could not be persisted") from exc
     return record

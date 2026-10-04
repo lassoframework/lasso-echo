@@ -39,3 +39,15 @@ def test_missing_asset_id_is_observed_not_held(monkeypatch, tmp_path):
                               decision="preflight_passed")
     assert receipt["source_media_asset_id_present"] is False
     assert receipt["decision"] == "preflight_passed"
+
+
+def test_armed_write_failure_raises_safe_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_OUTBOUND_PUBLISH_RECEIPT", "true")
+    monkeypatch.setenv("AGENT_OUTBOUND_PUBLISH_RECEIPT_PATH", str(tmp_path / "receipt.jsonl"))
+    monkeypatch.setattr(receipts.os, "write", lambda *_: (_ for _ in ()).throw(OSError("disk")))
+    try:
+        receipts.record(lane="calendar", row=_row(), decision="preflight_passed")
+    except receipts.ReceiptWriteError as exc:
+        assert str(exc) == "outbound publish receipt could not be persisted"
+    else:
+        raise AssertionError("armed persistence failure must fail closed")

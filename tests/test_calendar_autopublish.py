@@ -379,6 +379,33 @@ def test_would_publish_reverts_claim_and_is_retryable(armed):
     assert store.rows["a"]["status"] == "pending"  # retryable next run
 
 
+def test_receipt_precedes_calendar_send_and_marks_would_publish_unattempted(
+        armed, monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    events = []
+    monkeypatch.setattr(receipts, "record", lambda **kw: events.append(kw) or kw)
+    store = _FakeStore([_row("a")])
+
+    def publisher(*_):
+        assert events[-1]["decision"] == "preflight_passed"
+        return PublishResult(ok=True, mode="would_publish")
+
+    cap.publish_due(RUN_DATE, store=store, publisher=publisher, now=LATE_NOW)
+    assert events[-1]["outcome"] == "would_publish"
+    assert events[-1]["attempted"] is False
+
+
+def test_armed_receipt_failure_prevents_calendar_provider_send(armed, monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    store = _FakeStore([_row("a")])
+    pub = _FakePublisher()
+    monkeypatch.setattr(receipts, "record",
+                        lambda **_: (_ for _ in ()).throw(receipts.ReceiptWriteError("safe")))
+    with pytest.raises(receipts.ReceiptWriteError, match="safe"):
+        cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert pub.calls == []
+
+
 # ---- IG/FB + feed/story mapping --------------------------------------------
 
 def test_account_and_story_mapping(armed):
@@ -1781,6 +1808,20 @@ def test_ambiguous_failed_result_holds_and_alerts_without_retry(armed, monkeypat
     assert "AMBIGUOUS" in sent[0] and "ok=False" in sent[0]
     cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert len(pub.calls) == 1
+
+
+def test_ambiguous_normal_return_gets_provider_receipt(armed, monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    events = []
+    monkeypatch.setattr(receipts, "record", lambda **kw: events.append(kw) or kw)
+    monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *a, **kw: None)
+    store = _FakeStore([_row("soft")])
+    cap.publish_due(RUN_DATE, store=store,
+                    publisher=_FakePublisher(PublishResult(ok=False, mode="failed")),
+                    now=LATE_NOW)
+    assert events[-1]["decision"] == "provider_result"
+    assert events[-1]["outcome"] == "ambiguous"
+    assert events[-1]["attempted"] is True
 
 
 def test_explicit_provider_rejection_proving_no_post_reverts_for_retry(
