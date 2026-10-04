@@ -137,7 +137,7 @@ DOLLAR_TAG = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
 # kind, ACLs and column lists; function signature, security flag, ACLs and
 # body hash; trigger definition. Rollback must restore this byte-for-byte.
 SNAPSHOT_SQL = (
-    "select 'r:'||c.relname||':'||c.relkind||':'"
+    "select 'r:'||c.relname||':'||c.relkind::text||':'"
     "||coalesce(c.relacl::text,'')||':'||coalesce(("
     "select string_agg(a.attname||':'||format_type(a.atttypid,a.atttypmod)"
     "||':'||a.attnotnull, ',' order by a.attnum)"
