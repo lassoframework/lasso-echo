@@ -28,6 +28,7 @@ Nothing here logs a token or secret. The manual approval path is untouched.
 """
 
 import os
+import re
 from datetime import datetime, time, timedelta, timezone
 from uuid import NAMESPACE_URL, uuid5
 
@@ -37,6 +38,93 @@ from .accounts import get_account
 from .drafter import Draft, DraftStatus
 from .media_types import is_video_url          # ONE video definition (audit D1)
 from .summit_queue import SPRINT_SLOT_TIMES
+
+
+# LEGACY IGFILL MEDIA (2026-10-04 hard block): legacy client_infographic_fill
+# cards are hosted under paths like .../igfill_2026-09-10_<archetype>.png. Same
+# pattern as client_media_sync.GENERATED_DERIVATIVE_PREFIXES and
+# infographic_photo_maintenance._IGFILL. Separately branded Astra fallback media
+# (no_media_/seed_) deliberately does NOT match this pattern and stays publishable.
+_LEGACY_IGFILL_MEDIA = re.compile(r"(?:^|/)igfill_\d{4}-\d{2}-\d{2}(?:[_-]|\.)", re.I)
+
+
+def _row_has_legacy_igfill_media(row):
+    """True when the media the row would ACTUALLY ship points at legacy
+    client_infographic_fill media (igfill_YYYY-MM-DD_...), regardless of pillar.
+    Row-type-aware: a FEED row is judged by its FEED image_url ONLY -- a stale
+    igfill provenance on source_media_url must NOT block a feed whose live
+    image_url was already swapped to a client-real photo. A STORY row is judged
+    by its source_media_url PLUS the actually-delivered story image_url."""
+    from urllib.parse import urlparse
+
+    def _legacy(url):
+        url = str(url or "").strip()
+        return bool(url) and bool(_LEGACY_IGFILL_MEDIA.search(urlparse(url).path))
+
+    if _is_story_row(row):
+        return _legacy(row.get("source_media_url")) or _legacy(row.get("image_url"))
+    return _legacy(row.get("image_url"))
+
+
+def _alert_confirmed(result):
+    """True ONLY when ops_alerts.alert CONFIRMED delivery. alert() returns None
+    when the flag is off, a gate suppressed the line, or the Slack post failed
+    or raised -- none of those may KV-stamp a dedupe key, or one transient
+    delivery failure would permanently suppress the notice (retry un-stamped).
+    A Slack-style response dict with ok=False is also not a confirmed delivery."""
+    if not result:
+        return False
+    if isinstance(result, dict) and result.get("ok") is False:
+        return False
+    return True
+
+
+def _stamp_after_confirmed_alert(db, key, result):
+    """KV-stamp a dedupe key only AFTER a confirmed delivered alert. Best
+    effort; a stamp failure never blocks the lane (the alert itself already
+    fired, and the repeat gate keeps any re-fire from storming)."""
+    try:
+        if _alert_confirmed(result):
+            db.kv_set(key, "1")
+    except Exception:
+        pass
+
+
+def _rail_fail_closed_alert(kind, row_id, gym_id, detail=""):
+    """One deduped internal ops alert when a safety rail cannot evaluate for a row:
+    the row is SKIPPED (fail-closed), and the rail failure must be visible to ops
+    instead of silent. An alert failure never blocks the lane."""
+    try:
+        from . import db, ops_alerts
+        key = f"rail_failclosed_{kind}_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
+            f"{gym_id}: row {row_id} SKIPPED (fail-closed) — the {kind} safety "
+            f"rail could not be evaluated ({detail or 'import/config error'}). "
+            "A row is NEVER published past an unevaluable safety rail; fix the rail."))
+    except Exception:
+        pass  # an alert failure must never block the publish lane
+
+
+def _legacy_igfill_blocked_alert(row_id, gym_id):
+    """One deduped internal ops alert per row blocked by the legacy-igfill media
+    hard block, so the media can be swapped for client-real media instead of
+    silently stranding the slot. Fires for a legacy-media row EVEN when the
+    pillar also carries a review suffix -- both hold reasons are true and the
+    media swap alert must not be swallowed by the pillar block."""
+    try:
+        from . import db, ops_alerts
+        key = f"legacy_igfill_blocked_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
+            f"{gym_id}: row {row_id} BLOCKED at the publish boundary — it points "
+            "at legacy client_infographic_fill media (igfill_YYYY-MM-DD_...), which "
+            "must never auto-publish even when the pillar has no review suffix and "
+            "even in approved/autonomous lanes. Swap in client-real media."))
+    except Exception:
+        pass  # an alert failure must never block the publish lane
 
 
 def _now_iso(now=None):
@@ -1049,8 +1137,11 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             if _demo.is_sample_row(row):
                 skipped.append(row_id)
                 continue
-        except Exception:  # noqa: BLE001 - a rail that cannot load must not publish
-            pass
+        except Exception as _e:  # noqa: BLE001 - a rail that cannot load must not publish
+            skipped.append(row_id)
+            _rail_fail_closed_alert("sample-rail", row_id, gym_id,
+                                    type(_e).__name__)
+            continue
 
         # CLIENT-SAFE REVIEW HARD BLOCK (2026-09-11): a row Echo generated
         # without a client's own real photo/voice behind it must NEVER auto-
@@ -1069,16 +1160,35 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         #     (_NEEDS_CLIENT_SAFE_REVIEW_SUFFIX), since that category is
         #     otherwise meaningful and must not be replaced outright — so this
         #     checks endswith(), not equality.
+        # LEGACY IGFILL MEDIA HARD BLOCK (2026-10-04): a row pointing at legacy
+        # client_infographic_fill media (feed image_url or story source_media_url
+        # matching igfill_YYYY-MM-DD_...) must NEVER auto-publish on ANY account,
+        # regardless of trust level, approved_only, catch_all, or a status of
+        # 'approved' reached by ANY path (manual tap or an autonomous lane). The
+        # 2026-09-11 pillar check above misses rows whose pillar carries no review
+        # suffix — Swift River rows e11f7bec-.../8de2ef1e-... (dated Sep 25,
+        # published Oct 1) shipped exactly that way. Checked BEFORE the approval
+        # gate, the slot gate and the claim, like the pillar block. Separately
+        # branded Astra fallback media (no_media_/seed_) is NOT legacy igfill and
+        # stays publishable. A rail that cannot evaluate is FAIL-CLOSED: skip +
+        # internal ops alert, never publish.
         try:
             pillar = str(row.get("pillar") or "")
             from . import no_media_astra_seed as _nmas
             from . import client_infographic_fill as _cif
-            if pillar == _nmas.NEEDS_CLIENT_SAFE_REVIEW_PILLAR or \
-                    pillar.endswith(_cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX):
-                skipped.append(row_id)
-                continue
-        except Exception:  # noqa: BLE001 - a rail that cannot load must not publish
-            pass
+            needs_review = (pillar == _nmas.NEEDS_CLIENT_SAFE_REVIEW_PILLAR or
+                            pillar.endswith(_cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX))
+            legacy_media = _row_has_legacy_igfill_media(row)
+        except Exception as _e:  # noqa: BLE001 - a rail that cannot load must not publish
+            skipped.append(row_id)
+            _rail_fail_closed_alert("client-safe-review", row_id, gym_id,
+                                    type(_e).__name__)
+            continue
+        if needs_review or legacy_media:
+            skipped.append(row_id)
+            if legacy_media:
+                _legacy_igfill_blocked_alert(row_id, gym_id)
+            continue
 
         # CLIENT approval gate: when approved_only (client gyms), a row that the client
         # has not approved yet is left UNTOUCHED (never claimed, never published). LASSO

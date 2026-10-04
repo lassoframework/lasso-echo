@@ -296,6 +296,199 @@ def test_client_infographic_fill_suffixed_pillar_never_autopublishes(armed):
     assert "ordinary2" in summary["published"]
 
 
+# ---- legacy igfill media hard block (2026-10-04) -----------------------------
+# Swift River rows e11f7bec-7ec4-47da-b4b7-b53da85ff0eb / 8de2ef1e-167e-42bb-9954-
+# db0800c1348e (dated Sep 25) published Oct 1 on legacy igfill_2026-09-10 media
+# because the 2026-09-11 client-safe-review block only checks the PILLAR and the
+# row's pillar carried no suffix. The block now also keys on the MEDIA URL (feed
+# image_url and story source_media_url) and is fail-closed when it cannot run.
+
+def test_legacy_igfill_media_blocked_with_plain_pillar(armed):
+    """A feed row whose image_url is legacy client_infographic_fill media must
+    never auto-publish even when the pillar has NO review suffix, even with
+    status 'approved' and catch_all -- approved/autonomous lanes included."""
+    row = _row("legacy-igfill", status="approved",
+               image_url="https://cdn.example.com/lib/x/igfill_2026-09-10_path.png")
+    ordinary = _row("ordinary3", status="approved")
+    store = _FakeStore([row, ordinary])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True)
+
+    assert "legacy-igfill" not in summary["published"]
+    assert "legacy-igfill" in summary["skipped"]
+    assert "legacy-igfill" not in store.publishing_calls   # never even claimed
+    assert "ordinary3" in summary["published"]
+
+
+def test_legacy_igfill_story_source_media_blocked(armed):
+    """STORY variant: the legacy igfill media may sit on source_media_url while
+    image_url is the (separately named) burned story card -- the block must key
+    on source_media_url for stories, not only the feed image_url."""
+    row = _row("legacy-story", fmt="story", status="approved",
+               image_url="https://cdn.example.com/story_burned_x.png",
+               )
+    row["source_media_url"] = \
+        "https://cdn.example.com/lib/x/igfill_2026-09-10_path.png"
+    ordinary = _row("ordinary4", fmt="story", status="approved",
+                    image_url="https://cdn.example.com/story_burned_y.png")
+    ordinary["source_media_url"] = "https://cdn.example.com/raw/client_y.jpg"
+    store = _FakeStore([row, ordinary])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True)
+
+    assert "legacy-story" not in summary["published"]
+    assert "legacy-story" in summary["skipped"]
+    assert "legacy-story" not in store.publishing_calls
+    assert "ordinary4" in summary["published"]
+
+
+def test_legacy_igfill_feed_with_swapped_real_image_publishes(armed):
+    """P1 repair: the legacy-igfill check must examine the FEED image_url ONLY.
+    A feed whose live image_url was already swapped to a client-real photo must
+    NOT stay blocked by a stale igfill provenance on source_media_url."""
+    row = _row("swapped-feed", status="approved",
+               image_url="https://cdn.example.com/client/real_photo_oct.jpg")
+    row["source_media_url"] = \
+        "https://cdn.example.com/lib/x/igfill_2026-09-10_path.png"
+    blocked = _row("still-legacy", status="approved",
+                   image_url="https://cdn.example.com/lib/x/igfill_2026-09-10_b.png")
+    store = _FakeStore([row, blocked])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True)
+
+    assert "swapped-feed" in summary["published"]       # stale provenance ignored
+    assert "still-legacy" in summary["skipped"]         # real igfill still blocked
+    assert "still-legacy" not in store.publishing_calls
+
+
+def test_legacy_igfill_with_review_pillar_still_alerts(armed, monkeypatch):
+    """P2 repair: a legacy-media row whose pillar ALSO carries a review suffix is
+    held by both rails, but the legacy-media alert must still fire (so the media
+    gets swapped) -- the pillar hold must not swallow it."""
+    sent = _capture_alerts(monkeypatch)
+    from agent import no_media_astra_seed as nmas
+    row = _row("legacy-and-review", status="approved",
+               image_url="https://cdn.example.com/lib/x/igfill_2026-09-10_c.png")
+    row["pillar"] = nmas.NEEDS_CLIENT_SAFE_REVIEW_PILLAR
+    store = _FakeStore([row])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True)
+
+    assert "legacy-and-review" not in summary["published"]
+    assert "legacy-and-review" in summary["skipped"]
+    assert "legacy-and-review" not in store.publishing_calls
+    assert any("legacy-and-review" in m and "legacy client_infographic_fill" in m
+               for m in sent)
+
+
+def test_failed_alert_then_retry_is_not_suppressed(armed, monkeypatch):
+    """P1 repair: the KV dedupe stamp happens ONLY after a CONFIRMED delivered
+    alert. A transient delivery failure (alert returns None, as ops_alerts does
+    when the Slack post fails) must leave the key un-stamped so the next tick
+    retries the notice; after a confirmed delivery the key stamps and the alert
+    dedupes. Fully isolated from persistent KV via a fresh in-memory ledger."""
+    from agent import db as real_db
+    ledger = {}
+
+    monkeypatch.setattr(real_db, "kv_get",
+                        lambda k, default="": ledger.get(k, default))
+    monkeypatch.setattr(real_db, "kv_set", lambda k, v: ledger.__setitem__(k, v))
+
+    calls = []
+
+    def flaky_alert(message, **kwargs):
+        calls.append(message)
+        # attempts 1 and 2 fail transiently; attempt 3 confirms delivery
+        return None if len(calls) < 3 else {"ok": True}
+
+    monkeypatch.setattr("agent.ops_alerts.alert", flaky_alert)
+
+    for _ in range(3):
+        cap._legacy_igfill_blocked_alert("row-1", "gymx")
+    assert len(calls) == 3                     # no permanent suppression on failure
+    assert ledger.get("legacy_igfill_blocked_gymx_row-1") == "1"  # stamped on success
+
+    cap._legacy_igfill_blocked_alert("row-1", "gymx")
+    assert len(calls) == 3                     # confirmed alert dedupes afterwards
+
+    # A failure-shaped dict (Slack ok=False) is ALSO not a confirmed delivery.
+    monkeypatch.setattr("agent.ops_alerts.alert",
+                        lambda m, **k: {"ok": False, "error": "channel_not_found"})
+    cap._legacy_igfill_blocked_alert("row-2", "gymx")
+    assert "legacy_igfill_blocked_gymx_row-2" not in ledger
+
+
+def test_separately_branded_astra_fallback_media_still_allowed(armed):
+    """Ruling preservation: future separately branded Astra fallback media
+    (no_media_/seed_ naming) is NOT legacy igfill and must stay publishable."""
+    row = _row("astra-fallback", status="approved",
+               image_url="https://cdn.example.com/lib/x/no_media_2026-10-04_card.png")
+    seed = _row("seed-fallback", status="approved",
+                image_url="https://cdn.example.com/lib/x/seed_2026-10-04_card.png")
+    store = _FakeStore([row, seed])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True)
+
+    assert "astra-fallback" in summary["published"]
+    assert "seed-fallback" in summary["published"]
+
+
+def test_client_safe_review_rail_exception_fails_closed(armed, monkeypatch):
+    """If the rail's own imports cannot load, the row is SKIPPED and an internal
+    ops alert fires -- never a silent pass into the approval/claim path (the
+    Oct 1 defect class: the import-exception branch used to `pass`)."""
+    sent = _capture_alerts(monkeypatch)
+    # A rail dependency that blows up mid-evaluation (TypeError from a
+    # non-str suffix here; the production case is an import/config error) must
+    # hit the same fail-closed branch.
+    from agent import client_infographic_fill as _cif
+    monkeypatch.setattr(_cif, "_NEEDS_CLIENT_SAFE_REVIEW_SUFFIX", 123)
+    row = _row("rail-down", status="approved")
+    ordinary = _row("ordinary5", status="approved")
+    store = _FakeStore([row, ordinary])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True)
+
+    # EVERY row fails closed while the rail cannot evaluate (ordinary5 too) --
+    # publishing past an unevaluable rail is exactly what this repair forbids.
+    assert summary["published"] == []
+    assert "rail-down" in summary["skipped"]
+    assert "ordinary5" in summary["skipped"]
+    assert store.publishing_calls == []          # nothing was ever claimed
+    assert any("rail-down" in m and "fail-closed" in m for m in sent)
+
+
+def test_sample_rail_exception_fails_closed(armed, monkeypatch):
+    """A failed sample check cannot let a demo row reach the claim path."""
+    from agent import onboarding_demo
+    sent = _capture_alerts(monkeypatch)
+
+    def broken_sample_check(_row):
+        raise RuntimeError("sample rail unavailable")
+
+    monkeypatch.setattr(onboarding_demo, "is_sample_row", broken_sample_check)
+    store = _FakeStore([_row("sample-rail-down", status="approved")])
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=_FakePublisher(),
+                              now=LATE_NOW, catch_all=True)
+
+    assert summary["published"] == []
+    assert "sample-rail-down" in summary["skipped"]
+    assert store.publishing_calls == []
+    assert any("sample-rail-down" in m and "fail-closed" in m for m in sent)
+
+
 def test_lost_claim_is_not_published(armed):
     # mark_publishing returns False (another worker won the claim) -> SKIP, no publish.
     store = _FakeStore([_row("x"), _row("y")], claim_returns={"x": False, "y": True})
