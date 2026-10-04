@@ -280,14 +280,12 @@ one P2, both repaired in this revision:
   Historical fingerprint-free obligations remain
   `historical_fingerprint_unproven`; nothing here clears them.
 - **Local database verification (2026-10-04, round 4).** Static
-  contracts pass **15/15** after the round-4 edits. The 28 PostgreSQL
-  scenarios (23 prior + 5 new round-4 adversarial/positive cases) were
-  SKIPPED in the worker sandbox (no scratch cluster; SysV shared-memory
-  calls fail) and **must be re-run by the integration owner on the
-  disposable host PostgreSQL 17 cluster after these edits** — the earlier
-  37/37 host pass covered the round-3 code, not this revision. This is
-  local database evidence, not a production migration or provider
-  delivery proof.
+  contracts passed **15/15**. The integration owner then ran the full
+  **44/44** suite on a disposable host PostgreSQL 17 cluster, including
+  29 database scenarios covering historical ambiguity, account binding,
+  armed finalization, and denial of direct calls to the internal
+  SECURITY DEFINER helper. This is local database evidence, not a
+  production migration or provider delivery proof.
 - `calendar_row_id` on attempts/attestations/receipts is an evidence
   pointer without FK (deletion retention); referential cleanup policy is
   an open decision.
