@@ -995,6 +995,70 @@ class SupabaseCalendarStore:
             return None
         return after
 
+    def hold_repeat_media(self, account_key, current, reason):
+        """Repeat-specific exact-row CAS for the nightly cross-date repeat hold.
+
+        Pins id + gym_id + EVERY _VISUAL_MEDIA_CAS_COLUMNS field of the
+        before image (status, thumbnail_url, byte_hash, r2_key, drive_file_id,
+        slot_index, time_slot, source identity, ...); a before image missing
+        any of those keys is refused (None), never a partial predicate. Also
+        requires the publish-safety fields
+        (claim / reservation / schedule / publish / late post / existing hold)
+        to be NULL, and writes ONLY media_not_ready_reason. A concurrent
+        thumbnail/slot/claim mutation makes the predicate match zero rows and
+        this returns None -- the row is reported, never corrupted. Returns the
+        updated row, or None when the CAS matched no row or the returned row
+        disagrees. Never raises on a lost race; a transport/4xx+ failure
+        raises PortalStoreError so the caller reports instead of claiming
+        success.
+        """
+        required_null = ("published_at", "late_post_id", "publish_claim_token",
+                         "publish_reservation_day", "scheduled_at",
+                         "media_not_ready_reason")
+        # The predicate must pin the COMPLETE before image: a row missing any
+        # _VISUAL_MEDIA_CAS_COLUMNS key would silently drop that predicate and
+        # could hold a row whose unseen field changed concurrently.
+        if (not isinstance(current, dict)
+                or str(current.get("gym_id")) != str(account_key)
+                or current.get("id") is None
+                or current.get("status") not in ("pending", "approved")
+                or current.get("variant_status") != "active"
+                or any(key not in current for key in _VISUAL_MEDIA_CAS_COLUMNS)
+                or any(current[key] is not None for key in required_null)
+                or not isinstance(reason, str) or not reason.strip()):
+            return None
+
+        params = {"id": f'eq.{current["id"]}',
+                  "gym_id": f"eq.{account_key}"}
+        for key in _VISUAL_MEDIA_CAS_COLUMNS:
+            if key not in current:
+                continue
+            value = current[key]
+            if value is None:
+                params[key] = "is.null"
+            else:
+                escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+                params[key] = f'eq."{escaped}"'
+        response = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"media_not_ready_reason": reason}, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, "repeat media hold CAS failed")
+        data = response.json()
+        if not isinstance(data, list) or len(data) != 1:
+            return None
+        after = data[0]
+        if (not isinstance(after, dict)
+                or after.get("id") != current["id"]
+                or any(after.get(key) != current[key]
+                       for key in _VISUAL_MEDIA_CAS_COLUMNS
+                       if key in current and key != "media_not_ready_reason")
+                or after.get("media_not_ready_reason") != reason):
+            return None
+        return after
+
     def replace_future_infographic_media(self, account_key, current, *, image_url,
                                          source_media_url, source_media_asset_id,
                                          reason, thumbnail_url=None, render_evidence=None,
@@ -3174,6 +3238,64 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
+
+    # Repeat-hold lane pagination bounds: 500-row id-cursor pages, hard page cap.
+    _REPEAT_HOLD_PAGE_SIZE = 500
+    _REPEAT_HOLD_MAX_PAGES = 100        # 50k rows: a hard tripwire, far past any real book
+
+    def rows_in_range_repeat_hold(self, account_key, start_iso, end_iso):
+        """COMPLETE tenant-scoped read for the cross-date repeat HOLD lane ONLY
+        (Blake: rows_in_range caps at 1000; a hold must never rest on a partial
+        book). Id-cursor pagination, active statuses, date range. Every page is
+        validated; ANY error, malformed row, out-of-scope row, duplicate or
+        non-ascending id, or a runaway page count fails the ENTIRE read --
+        never a partial result."""
+        rows = []
+        seen_ids = set()
+        last_id = None
+        for _ in range(self._REPEAT_HOLD_MAX_PAGES):
+            params = {
+                "gym_id": f"eq.{account_key}",
+                "status": "in.(pending,approved,publishing,published,coach_review)",
+                "variant_status": "eq.active",
+                "post_date": f"gte.{start_iso}",
+                "and": f"(post_date.lte.{end_iso})",
+                "order": "id",
+                "limit": str(self._REPEAT_HOLD_PAGE_SIZE),
+            }
+            if last_id is not None:
+                params["id"] = f"gt.{last_id}"
+            r = self._client().get(
+                self._rest(_TABLE), params=params, headers=self._headers(),
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            page = r.json()
+            if not isinstance(page, list):
+                raise PortalStoreError(0, "repeat hold page malformed")
+            if not page:
+                return rows
+            prev_in_page = last_id
+            for row in page:
+                rid = row.get("id") if isinstance(row, dict) else None
+                pd = str(row.get("post_date") or "")[:10] if isinstance(row, dict) else ""
+                # Monotonic strictly-ascending ids WITHIN every page as well
+                # as across pages: a re-ordered or repeated page is malformed.
+                if (rid is None or not isinstance(row, dict)
+                        or str(row.get("gym_id")) != str(account_key)
+                        or not start_iso <= pd <= end_iso
+                        or str(rid) in seen_ids
+                        or (prev_in_page is not None and not str(rid) > prev_in_page)):
+                    raise PortalStoreError(
+                        0, "repeat hold page malformed/out-of-scope/duplicate-id")
+                seen_ids.add(str(rid))
+                prev_in_page = str(rid)
+            rows.extend(page)
+            last_id = str(page[-1]["id"])
+            if len(page) < self._REPEAT_HOLD_PAGE_SIZE:
+                return rows
+        raise PortalStoreError(0, "repeat hold read exceeded maximum page count")
 
     def rows_in_range(self, account_key, start_iso, end_iso):
         """Return all non-denied content_calendar rows for account_key with

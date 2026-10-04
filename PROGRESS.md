@@ -1,3 +1,9 @@
+## Exact delivered-media repeat hold (2026-10-04)
+
+- [~] The nightly repeat sweep has a default-OFF `AGENT_MEDIA_REPEAT_SWEEP_HOLD` lane. After its existing replacement attempt, a complete tenant-scoped reread finds identical delivered image URLs on different dates across Instagram, Facebook and Google Business. A strict before-image CAS adds only `media_not_ready_reason` to future non-owner pending or approved rows. Same-day siblings and published, claimed, scheduled or changed rows stay untouched.
+- [~] Kimi K3 and K2.8 low-effort builders completed the bounded code and repair waves. Luna and Terra independently reviewed the final exact-URL scope with no P0/P1 findings. The full local suite passed in Echo's existing virtual environment: 9703 passed, 234 skipped. Merge, deployment, flag activation and live dry-run/readback remain pending.
+- [ ] Different rendered URLs of the same source photo still need immutable source-to-delivered provenance and the separate draft pHash guard in PR #268. This exact-URL lane does not establish global no-repeat or a 95/100 Echo grade.
+
 ## Story hold FIXER provenance (2026-10-02)
 
 - [~] Future retained Story holds seed support after confirmed shared content_calendar insertion, with exact UUID, creation timestamp, tenant/account/date, source event, submission UUID and Scout request hash. Daily mirrors and month-ahead builders use the central hook; primary text alerts remain.

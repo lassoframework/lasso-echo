@@ -74,8 +74,12 @@ def _is_real_image(path):
 
 
 def _owner_date(by_date):
-    """The date that KEEPS the photo: the earliest date carrying a published/
-    publishing/approved row wins; else the earliest date."""
+    """The NON-OWNER-EXEMPT date that KEEPS the photo: the earliest date
+    carrying a published/publishing/approved row wins; else the earliest
+    date. Every OTHER future date in the group is a hold target, even a
+    calendar-EARLIER pending date whose owner is a later approved row --
+    the approved client card is preserved while the non-owner future
+    duplicate is held so it cannot publish as a visible repeat."""
     anchored = sorted(d for d, rows in by_date.items()
                       if any(str(r.get("status") or "").lower()
                              in ("published", "publishing", "approved")
@@ -411,6 +415,203 @@ def cross_day_repeats(rows, lib):
 
 
 # ---------------------------------------------------------------------------
+# Cross-date repeat HOLD lane (AGENT_MEDIA_REPEAT_SWEEP_HOLD, default OFF).
+#
+# The swap above can never fix an APPROVED repeat (the gym approved that exact
+# card) and gives up when no fresh media exists. This lane does not swap
+# anything: it marks a non-owner FUTURE-date exact duplicate with ONLY
+# media_not_ready_reason='cross_date_media_repeat_needs_new_visual', preserving
+# status, caption, image, approval and variant, so the row cannot publish as a
+# visible repeat and surfaces for a new visual.
+#
+# Identity is EXACT and PROVABLE (2026-10-04 safety repair): ONLY the
+# canonical full URL of the current DELIVERED image_url groups rows --
+# lowercased scheme/host with the trailing slash stripped. source_media_url
+# and source_media_asset_id are NEVER used for grouping: the row schema has
+# no immutable source-to-delivered receipt, so stale Story/feed source or
+# asset metadata could manufacture FALSE HOLDS on fresh media. Basename-only
+# matching is NEVER used (two different photos can share a filename).
+# RELEASE GAP (PR268, not a global guarantee): transformed same-photo repeats
+# delivered under DIFFERENT derivative URLs are out of scope -- they are not
+# grouped and not held. Perceptual near-dupe detection is a separate,
+# still-OFF lane (PR268 pHash); nothing here asserts a blanket perceptual
+# guarantee.
+_HOLD_REASON = "cross_date_media_repeat_needs_new_visual"
+_HOLD_ACCOUNTS = ("instagram", "ig", "facebook", "fb", "googlebusiness", "gbp")
+
+
+def _canonical_media_url(raw):
+    """Conservative URL canonicalization for grouping: lowercase scheme and
+    host, drop default ports and fragments, strip a trailing path slash.
+    Path case and query are PRESERVED (CDN paths are case-sensitive; lowering
+    them manufactured repeats that were not)."""
+    from urllib.parse import urlsplit
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if not scheme or not host:
+        return None
+    if port is not None and ((scheme == "http" and port == 80)
+                             or (scheme == "https" and port == 443)):
+        port = None
+    netloc = host if port is None else f"{host}:{port}"
+    path = parts.path or ""
+    if path != "/":
+        path = path.rstrip("/")
+    return f"{scheme}://{netloc}{path}" + (f"?{parts.query}" if parts.query else "")
+
+
+def _fp(value):
+    """Short privacy-safe fingerprint: raw media URLs / signed-URL fragments
+    never reach logs or detail lines."""
+    import hashlib
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _hold_identities(row):
+    """Exact-media grouping identity for one row in the automatic hold lane.
+
+    PROVABLE-ONLY RULE (Blake, 2026-10-04, after an independent Luna rereview
+    found P1 false holds from stale Story source/asset metadata): the ONLY
+    identity ever used for cross-date grouping is the current DELIVERED
+    image_url, canonicalized to the full URL (all IG/FB/GBP formats).
+
+    WHY source/asset identities are gone: the current row schema carries no
+    immutable source-to-delivered receipt. A story's delivered card is a
+    burned derivative whose source_media_url / source_media_asset_id can be
+    STALE relative to the creative actually on the row, and a feed/GBP
+    re-point can leave a stale asset id behind while the delivered image_url
+    is a brand-new visual. Any grouping on source_media_url or
+    source_media_asset_id -- with or without corroboration rules -- can
+    manufacture a false hold on fresh media, so they are removed entirely.
+    The old asset/source corroboration heuristics (asset id indexed for
+    stories or raw-creative equality) never constituted proof, only a
+    documented residual-risk bet, and are deleted with them.
+
+    RELEASE GAP (tracked as PR268, do NOT claim a global guarantee): this
+    lane cannot detect a TRANSFORMED same-photo repeat -- the same raw photo
+    delivered on different dates under DIFFERENT derivative URLs (different
+    burns, crops, overlays, or re-renders). Only identical delivered URLs
+    group. Transformed-same-photo detection requires an immutable render
+    receipt that the current schema does not provide.
+
+    The delivered image_url is always the URL the gym's audience actually
+    sees on this row today, so two ACTIVE rows in the window with the same
+    canonical delivered URL are the same delivered media; everything else
+    is not grouped.
+    """
+    delivered = _canonical_media_url(row.get("image_url"))
+    return {("url", delivered)} if delivered else set()
+
+
+
+def _hold_cross_date_repeats(base, store, *, apply, start, end, today_iso, result):
+    """Fresh-reread the window and hold non-owner future-date exact cross-date
+    duplicates (the owner date keeps the photo; every other FUTURE date in
+    the group is held, including a calendar-earlier pending date whose owner
+    is a later approved/published/publishing row).
+
+    Runs only when config.media_repeat_sweep_hold_enabled(). Fail closed: a
+    read error writes nothing. A CAS that matches no row (a concurrent claim,
+    approval, publish, media swap or hold) is reported, never counted as held.
+    """
+    result.setdefault("rows_held", 0)
+    result.setdefault("rows_skipped", 0)
+    result.setdefault("hold_errors", 0)
+    if not config.media_repeat_sweep_hold_enabled():
+        return
+    try:
+        # Repeat-specific COMPLETE tenant-scoped read (500-row id-cursor
+        # pagination, strict page validation). The old sweep read is capped
+        # at 1000 rows; hold decisions must never rest on a partial book.
+        rows = store.rows_in_range_repeat_hold(base, start, end) or []
+    except Exception as exc:  # noqa: BLE001 - fail closed with no write
+        _log(f"{base}: repeat-hold reread failed ({type(exc).__name__}); "
+             "no holds written")
+        result["detail"].append("repeat hold: window reread failed "
+                                f"({type(exc).__name__}); fail closed, no holds")
+        return
+    groups = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("account") or "").strip().lower() not in _HOLD_ACCOUNTS:
+            continue
+        if str(row.get("variant_status") or "active").strip().lower() != "active":
+            continue
+        pd = str(row.get("post_date") or "")[:10]
+        if not pd:
+            continue
+        for ident in _hold_identities(row):
+            groups.setdefault(ident, {}).setdefault(pd, []).append(row)
+    # Collect DISTINCT target rows before any CAS so a row is held at most
+    # once even if future proved identity channels are added.
+    targets = {}
+    skipped = set()
+    for ident, by_date in sorted(groups.items()):
+        if len(by_date) < 2:
+            continue                       # same-date siblings are one post
+        owner = _owner_date(by_date)
+        for pd in sorted(by_date):
+            if pd == owner or pd < today_iso:
+                continue                   # owner keeps it; past-dated left alone
+            for row in by_date[pd]:
+                rid = row.get("id")
+                if rid in targets:
+                    continue
+                status = str(row.get("status") or "").strip().lower()
+                if status not in ("pending", "approved"):
+                    skipped.add(rid)       # published/publishing never held
+                    continue
+                if row.get("media_not_ready_reason") is not None:
+                    skipped.add(rid)       # already held by another lane
+                    continue
+                targets[rid] = row
+    result["rows_skipped"] += len(skipped)
+    # APPROVED non-owner future rows are held too (Blake: a repeat must
+    # not publish even when approved) -- only the reason is written, the
+    # approval itself is preserved, and they are reported as needing a new
+    # visual -- never silently skipped.
+    for rid in sorted(targets, key=str):
+        row = targets[rid]
+        pd = str(row.get("post_date") or "")[:10]
+        status = str(row.get("status") or "").strip().lower()
+        label = (f"repeat-hold {pd} row {rid} "
+                 f"media fp:{_fp(row.get('image_url'))}")
+        if status == "approved":
+            label += " (approved; approval preserved, needs new visual)"
+        if not apply:
+            result["rows_held"] += 1
+            result["detail"].append(
+                f"{label}: -> {_HOLD_REASON} [dry-run]")
+            continue
+        try:
+            held = store.hold_repeat_media(base, row, _HOLD_REASON)
+        except Exception as exc:  # noqa: BLE001 - never claim success
+            _log(f"{base}: repeat hold CAS raised for {rid} "
+                 f"({type(exc).__name__})")
+            result["hold_errors"] += 1
+            result["detail"].append(
+                f"{label}: hold CAS error ({type(exc).__name__}); left")
+            continue
+        if held is None:
+            result["hold_errors"] += 1
+            result["detail"].append(
+                f"{label}: hold CAS matched no row (changed "
+                "concurrently); left")
+            continue
+        result["rows_held"] += 1
+        result["detail"].append(f"{label}: held ({_HOLD_REASON})")
+
+
+# ---------------------------------------------------------------------------
 # B5 — the repeats the sweep is RIGHT to refuse, and WRONG to swallow
 #
 # Measured live on 2026-09-05 with the guard armed and this sweep running nightly:
@@ -563,8 +764,12 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     dupes = cross_day_repeats(rows, lib)
     result = {"gym": base, "photos_repeated": len(dupes), "dates_fixed": 0,
               "rows_repointed": 0, "stories_reburned": 0, "approved_left": 0,
-              "small_library": False, "drive_pool": 0, "detail": []}
+              "rows_held": 0, "rows_skipped": 0, "hold_errors": 0,
+              "small_library": False, "drive_pool": 0,
+              "detail": []}
     if not dupes:
+        _hold_cross_date_repeats(base, store, apply=apply, start=start, end=end,
+                                 today_iso=today.isoformat(), result=result)
         return result
 
     # Full occupancy state for the fresh pick (every raw key on the book/window).
@@ -753,6 +958,8 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
             else:
                 _log(f"{base}: {key} {pd}: local swap outcome unknown; "
                      "reservation retained fail closed")
+    _hold_cross_date_repeats(base, store, apply=apply, start=start, end=end,
+                             today_iso=today.isoformat(), result=result)
     if result["small_library"]:
         # MEASURE what the sweep could not reach, so the report tells the truth about
         # WHY (a genuinely thin library, or a full Drive folder behind an unarmed lane)
@@ -784,14 +991,16 @@ def run(gyms, *, apply=False, horizon=62):
     mode = "APPLY" if apply else "DRY-RUN"
     print(f"\n=== media_repeat_sweep [{mode}] ===")
     print(f"{'gym':<14}{'photos':>7}{'dates_fixed':>12}{'rows':>6}"
-          f"{'reburned':>9}{'approved_left':>14}{'small_lib':>10}")
+          f"{'reburned':>9}{'approved_left':>14}{'rows_held':>10}"
+          f"{'small_lib':>10}")
     for r in results:
         if r.get("error"):
             print(f"{r['gym']:<14} ERROR {r['error']}")
             continue
         print(f"{r['gym']:<14}{r['photos_repeated']:>7}{r['dates_fixed']:>12}"
               f"{r['rows_repointed']:>6}{r['stories_reburned']:>9}"
-              f"{r['approved_left']:>14}{str(r['small_library']):>10}")
+              f"{r['approved_left']:>14}{r.get('rows_held', 0):>10}"
+              f"{str(r['small_library']):>10}")
     for r in results:
         for line in r.get("detail") or []:
             print(f"  {r['gym']}: {line}")

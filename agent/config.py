@@ -4439,6 +4439,43 @@ def media_repeat_sweep_drive_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "false"))
 
 
+def media_repeat_sweep_hold_enabled() -> bool:
+    """Cross-date media repeat HOLD lane for the nightly repeat sweep
+    (AGENT_MEDIA_REPEAT_SWEEP_HOLD, default OFF).
+
+    The ordinary sweep swap leaves an APPROVED repeat in place (the gym approved
+    that exact card) and leaves a repeat it has no fresh media for. ON: after the
+    ordinary swap attempt, agent/jobs/media_repeat_sweep.py FRESH-REREADS the
+    active calendar rows in the configured window and detects EXACT repeats of
+    the same media across different dates for the same gym across Instagram,
+    Facebook and Google Business rows -- matched ONLY by the canonical full URL
+    of the current DELIVERED image_url. Basename-only matching is deliberately
+    never used, and -- after the 2026-10-04 safety repair -- source_media_url
+    and source_media_asset_id are NEVER used for grouping: the current row
+    schema carries no immutable source-to-delivered receipt, so source/asset
+    matching could place FALSE HOLDS on fresh media from stale metadata.
+    RELEASE GAP (PR268, not a global guarantee): transformed same-photo repeats
+    delivered under different derivative URLs are out of scope; only identical
+    delivered URLs group.
+
+    The earliest date carrying a published/publishing/approved row owns the
+    media (otherwise the earliest date). Any non-owner future active pending or
+    approved row that remains an exact duplicate is given ONLY
+    media_not_ready_reason='cross_date_media_repeat_needs_new_visual' through a
+    strict complete-row compare-and-swap
+    (SupabaseCalendarStore.hold_repeat_media): status, caption, image, approval
+    and variant are all preserved, and published, publishing, past-dated,
+    already held, claimed, reserved, scheduled or otherwise concurrently
+    changed rows match zero rows and are left alone. A failed CAS is reported,
+    never counted as held. A read error fails closed with no write. Same-date
+    siblings (the FB mirror of a feed, a paired story) are one post and are
+    never held against each other.
+
+    Default OFF because a new write path is a new capability. The ordinary swap
+    sweep is byte-for-byte unchanged while this flag is off."""
+    return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_SWEEP_HOLD", "false"))
+
+
 def plan_horizon_sweep_enabled() -> bool:
     """The RETIREMENT counterpart of the planning-horizon cap
     (AGENT_PLAN_HORIZON_SWEEP, default ON).
