@@ -2072,8 +2072,12 @@ def _auto_redate_expired(gym, gym_rows, store, kv, now_dt):
 
     MEDIA-AWARE: when the group's photo ALREADY sits on another active future day
     (a rebuild or backfill re-picked it after these rows expired), moving the group
-    would plant a duplicate — UNAPPROVED members are retired as redundant instead;
-    APPROVED members still move (the gym's word is never dropped silently, logged)."""
+    would plant a cross-day duplicate — the exact repeat a client spotted. Blake
+    2026-10-04: NO cross-day repeat, globally, no exceptions. The whole group stays
+    put: UNAPPROVED members are retired as redundant under existing rules, while
+    APPROVED members are left at their expired date (NOT patched, NOT killed) so the
+    human digest names them; the gym's approval is preserved and its word is never
+    silently dropped."""
     list_month = getattr(store, "list_month", None)
     patch = getattr(store, "patch_post_date", None)
     if list_month is None or patch is None:
@@ -2135,21 +2139,23 @@ def _auto_redate_expired(gym, gym_rows, store, kv, now_dt):
             continue
         photo_key = gmk if not str(gmk).startswith("row:") else ""
         if photo_key and media_guard.enabled() and media_days.get(photo_key):
-            # The photo already lives on an active future day: moving this group
-            # would plant a cross-day duplicate. Retire the unapproved members as
-            # redundant; approved members keep moving (approval is sacred), logged.
-            still = []
+            # FAIL CLOSED (Blake 2026-10-04): the photo already lives on an active
+            # future day, so moving ANY member of this group would plant a cross-day
+            # duplicate — globally forbidden, approvals included. Retire the
+            # unapproved members as redundant; leave approved members at their
+            # expired date (no date patch, no kill) so the human digest names them.
+            left = []
             for row in movers:
                 if str(row.get("status") or "").lower() == "approved":
-                    still.append(row)
+                    left.append(row)
                 else:
                     _retire(row.get("id"))
-            movers = still
-            if not movers:
-                continue
-            print(f"[calendar-autopublish] {gym}: re-dating APPROVED row(s) whose "
-                  f"photo already sits on {sorted(media_days[photo_key])} "
-                  "(approval preserved; photo will repeat)")
+            if left:
+                print(f"[calendar-autopublish] {gym}: leaving {len(left)} APPROVED "
+                      f"expired row(s) at their date (photo already booked on "
+                      f"{sorted(media_days[photo_key])}); no re-date, human digest "
+                      "will surface them")
+            continue
         slots = [(str(r.get("account") or "").lower(),
                   str(r.get("format") or "feed").lower()) for r in movers]
         slot_day = next((d for d in horizon

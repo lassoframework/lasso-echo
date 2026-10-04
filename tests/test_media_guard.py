@@ -328,7 +328,10 @@ def test_redate_retires_unapproved_row_whose_photo_moved_on():
         "an unapproved expired row whose photo already sits ahead is redundant"
 
 
-def test_redate_still_moves_approved_row_even_when_photo_repeats():
+def test_redate_leaves_approved_row_at_expired_date_when_photo_repeats():
+    # FAIL CLOSED (Blake 2026-10-04): no cross-day repeat globally. The photo is
+    # already booked on a future day, so the approved expired row is NOT re-dated
+    # and NOT killed — it stays at its expired date for the human digest.
     from datetime import datetime
     from agent import calendar_autopublish as cap
     rows = [{"id": "ap", "gym_id": "eng", "account": "instagram", "format": "feed",
@@ -340,9 +343,37 @@ def test_redate_still_moves_approved_row_even_when_photo_repeats():
     store, kv = _RedateStore(occupied), _MemKV()
     moved, retired = cap._auto_redate_expired(
         "eng", rows, store, kv, datetime.fromisoformat("2026-08-30T12:00:00"))
-    assert [m["id"] for m in moved] == ["ap"], \
-        "the gym's approved word is never dropped silently"
+    assert moved == []
     assert retired == []
+    assert store.redates == [], "no duplicate date patch may occur"
+    assert store.status_sets == [], "the approved row must not be killed"
+    assert kv.get("redated_ap", "") == "", "no re-date marker either"
+
+
+def test_redate_mixed_sibling_group_photo_conflict_retires_pending_keeps_approved():
+    # One group, one photo, mixed statuses, photo already booked ahead: the pending
+    # sibling is retired as redundant; the approved sibling stays at its expired
+    # date — never patched to a day where the photo already sits.
+    from datetime import datetime
+    from agent import calendar_autopublish as cap
+    rows = [
+        {"id": "mix_ap", "gym_id": "eng", "account": "instagram", "format": "feed",
+         "post_date": "2026-08-07", "status": "approved",
+         "image_url": "https://eng.media/p9.jpg"},
+        {"id": "mix_pd", "gym_id": "eng", "account": "facebook", "format": "feed",
+         "post_date": "2026-08-07", "status": "pending",
+         "image_url": "https://eng.media/p9.jpg"},
+    ]
+    occupied = [{"account": "instagram", "format": "feed",
+                 "post_date": "2026-09-05", "status": "pending",
+                 "image_url": "https://eng.media/p9.jpg"}]
+    store, kv = _RedateStore(occupied), _MemKV()
+    moved, retired = cap._auto_redate_expired(
+        "eng", rows, store, kv, datetime.fromisoformat("2026-08-30T12:00:00"))
+    assert moved == []
+    assert [(rid, st) for rid, st in store.status_sets] == [("mix_pd", "killed")]
+    assert store.redates == [], "no date patch on a conflicting photo, ever"
+    assert kv.get("redated_mix_ap", "") == "", "approved row untouched"
 
 
 # ---- sweep grouping (pure) ----------------------------------------------------------
