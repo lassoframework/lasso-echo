@@ -80,10 +80,23 @@ def real_media_depleted(base, *, now=None):
     try:
         served = rotation.load_served().get(f"{base}_ig", [])
         used = {str(row.get("key")) for row in served}
-        local = []
+        local_creatives = []
         for creative in list_creatives(library_path):
             if usable_local_creative(creative, f"{base}_ig", used=used):
-                local.append(creative.path)
+                local_creatives.append(creative)
+        # Selection and depletion must use the same global exact-byte view.
+        # With PR235's flag on, an unavailable / ambiguous ledger is not proof
+        # that local supply is exhausted, so the outer fail-closed handler keeps
+        # the Astra fallback held.  Flag OFF returns this same list unchanged.
+        from .client_content import _global_photo_paths
+        photo_paths = tuple(path for creative in local_creatives
+                            if creative.media_type != "video"
+                            for path in _global_photo_paths(creative))
+        available = rotation.globally_available_local_paths(f"{base}_ig", photo_paths)
+        local = [creative.path for creative in local_creatives
+                 if creative.media_type == "video" or (
+                     (paths := _global_photo_paths(creative))
+                     and all(path in available for path in paths))]
         from .media_bridge import observe_local_inventory
         observe_local_inventory(base, local)
     except Exception:

@@ -30,6 +30,15 @@ from .drafter import (Draft, DraftStatus, _make_id, _pick_cta, _select_hashtags,
 from .library import list_creatives
 
 
+class LocalPhotoGlobalLedgerUnavailable(RuntimeError):
+    """The armed PR235 read cannot prove whether local bytes are globally used.
+
+    This is deliberately distinct from ``None`` (a proven empty local pool).
+    Callers that choose a lower-priority video or infographic tier must hold
+    when this exception is raised.
+    """
+
+
 def _day_ordinal(day_key):
     """A stable integer per calendar day, for deterministic category/source/image
     rotation that never drifts across re-runs."""
@@ -90,6 +99,18 @@ def _form_plan_for_day(day_key):
 
 def _image_key(creative):
     return os.path.basename(creative.path)
+
+
+def _global_photo_paths(creative):
+    """Exact local photo files that make up one selectable creative.
+
+    A carousel is one choice only when every slide is globally clear.  Its
+    directory is metadata, not media bytes, and must never be hashed as though
+    it were an image.
+    """
+    if getattr(creative, "media_type", "") == "carousel":
+        return tuple(str(path) for path in (getattr(creative, "slides", ()) or ()) if path)
+    return (str(getattr(creative, "path", "") or ""),)
 
 
 # drive_pool_can_fill's per-gym answer cache: {base: (monotonic_expiry, bool)}. A month
@@ -239,6 +260,25 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
             return True
 
     imgs = [c for c in imgs if not _once_used(c)]
+    if not imgs:
+        return None
+    # PR235 global exact-byte read guard.  The flag is OFF by default, which
+    # leaves this picker unchanged.  When it is ON, any unreadable identity or
+    # ledger state holds the local lane: Drive remains the next supply rung and
+    # the infographic lane must not interpret uncertain local supply as empty.
+    try:
+        photo_candidates = [c for c in imgs if c.media_type != "video"]
+        photo_paths = tuple(path for c in photo_candidates for path in _global_photo_paths(c))
+        globally_available = rotation.globally_available_local_paths(account_key, photo_paths)
+    except Exception as exc:  # noqa: BLE001 - callers must distinguish uncertainty
+        print(f"[client-content] global local-photo guard unreadable for "
+              f"{account_key} ({type(exc).__name__}); no local pick this day")
+        raise LocalPhotoGlobalLedgerUnavailable(
+            "global local-photo history is unreadable") from exc
+    # The global authority is photo-only. Videos keep their existing local
+    # once-used guard and can remain real supply when no photo is usable.
+    imgs = [c for c in imgs if c.media_type == "video" or (
+        (paths := _global_photo_paths(c)) and all(path in globally_available for path in paths))]
     if not imgs:
         return None
     if prefer_photos:
