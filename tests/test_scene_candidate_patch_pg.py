@@ -215,19 +215,15 @@ def _seed_object(tid, group, phash=None):
         " evidence_ref, observed_by) values "
         f"('{tid}', '{url}', '{fp}', 1024, 'verified_object_read',"
         f" 'scratch-evidence', 'scene-patch-test') returning receipt_id")
-    _sql("insert into public.visual_global_object_attestation"
-         "(exact_url, tenant_id, group_key, fingerprint, byte_length,"
-         " acquisition_method, evidence_ref, read_receipt, attested_by) values "
-         f"('{url}', '{tid}', '{group}', '{fp}', 1024,"
-         f" 'verified_object_read', 'scratch-evidence', '{receipt}',"
+    # Bind through the real preparation RPC (same URL as both source and
+    # delivered bytes, no render receipt) instead of hand-inserting
+    # attestation/member/alias rows: direct inserts leave the scene's
+    # exact-byte global staged history stale, which breaks the frozen
+    # release/guard SQL's history lookups for held rows prepared after an
+    # earlier object already claimed the group.
+    _one("select public.visual_global_prepare_source_rendition("
+         f"'{tid}', '{group}', '{receipt}', '{receipt}', NULL,"
          " 'scene-patch-test')")
-    for role in ("source", "delivered"):
-        _sql("insert into public.visual_global_scene_object_member"
-             "(tenant_id, group_key, exact_url, fingerprint, object_role) "
-             f"values ('{tid}', '{group}', '{url}', '{fp}', '{role}')")
-    _sql("insert into public.visual_group_alias"
-         "(gym_id, alias_kind, alias_value, group_key) values "
-         f"('{tid}', 'canonical_url', '{url}', '{group}')")
     if phash is not None:
         _one("select public.visual_scene_register_candidate("
              f"'{tid}', '{group}', '{phash}', '{url}', '{fp}',"
@@ -895,7 +891,8 @@ def test_incomplete_expected_image_rejected_explicit_nulls_allowed():
     url_a, _fpa = _seed_object(tid, group, _PHASH_A)
     row_id = _insert_row(tid, group, url_a)
     url_b, fp_b = _seed_object(tid, group)
-    patch = json.dumps({"image_url": url_b, "media_not_ready_reason": None})
+    patch = json.dumps({"image_url": url_b, "source_media_url": url_b,
+                        "media_not_ready_reason": None})
     candidate = _candidate_arg(tid, group, _PHASH_B, url_b, fp_b)
     for missing in ("thumbnail_url", "publish_claim_token", "created_at",
                     "media_not_ready_reason", "slot_index"):
