@@ -32,11 +32,13 @@ exact band control (<=6 near_frame, 7..30 uncertain). Allocation is a
 bounded iterator — an assert fires if exhausted; there is no loop-search.
 """
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -46,6 +48,7 @@ DSN = os.environ.get("VISUAL_SCENE_WAVE_TEST_DSN")
 PSQL = shutil.which("psql")
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
 WAVE = MIGRATIONS / "DRAFT_visual_scene_claim_wave_20261003.sql"
+HISTORY_BACKFILL = MIGRATIONS / "DRAFT_visual_scene_history_backfill_20261004.sql"
 STACK = [
     "DRAFT_visual_group_schema_20261002.sql",
     "DRAFT_visual_global_history_20261002.sql",
@@ -53,6 +56,7 @@ STACK = [
     "DRAFT_visual_group_backfill_20261002.sql",
     "DRAFT_visual_group_activation_20261002.sql",
     "DRAFT_visual_scene_claim_wave_20261003.sql",
+    "DRAFT_visual_scene_history_backfill_20261004.sql",
 ]
 
 pytestmark = pytest.mark.skipif(
@@ -1233,7 +1237,8 @@ def test_reactivation_converted_back_to_held_is_reported_not_faked():
 # ---- frozen-hash P0: upgrade/replay idempotency + review re-resolution --------
 
 UPG_DB = "echo_scene_wave_test_upg"
-WAVE2_HEAD = Path("/tmp/scene_wave3_kimi_wave2_head.sql")
+WAVE2_REV = "7c3539dfff9228afc66d60fac17325a22adf0e5d"
+WAVE2_SHA256 = "23f49f843a8b0be30e32534b0b85543b25b93e32d13a886aad86bee393ba1024"
 
 
 def _upg_dsn(db=UPG_DB):
@@ -1290,21 +1295,28 @@ def upgrade_db():
     _db_sql(dsn, "create or replace function public.visual_group_row_ambiguous(public.content_calendar)"
                  " returns boolean language sql stable as $$ select false $$")
     prereqs = "".join((MIGRATIONS / name).read_text() + "\n"
-                      for name in STACK[:-1])
+                      for name in STACK[:-2])
     _apply_sql(dsn, prereqs)
     yield dsn
     _db_sql(admin, f"drop database if exists {UPG_DB}")
 
 
 def _wave2_text():
-    """The COMMITTED wave-2 revision of the scene draft, regenerated from
-    git HEAD into a temp file — the working tree is never touched."""
+    """Load the immutable predecessor that actually installed the separate
+    scene trigger and legacy hold shape. HEAD is wave 3 and cannot model the
+    upgrade source these tests exercise."""
     done = subprocess.run(
-        ["git", "show", "HEAD:migrations/DRAFT_visual_scene_claim_wave_20261003.sql"],
+        ["git", "show",
+         f"{WAVE2_REV}:migrations/DRAFT_visual_scene_claim_wave_20261003.sql"],
         text=True, capture_output=True, timeout=30,
         cwd=MIGRATIONS.parent)
-    assert done.returncode == 0
-    WAVE2_HEAD.write_text(done.stdout)
+    assert done.returncode == 0, done.stderr
+    assert hashlib.sha256(done.stdout.encode()).hexdigest() == WAVE2_SHA256
+    assert "create trigger content_calendar_scene_wave_claim_guard" in done.stdout
+    legacy_hold = done.stdout.split(
+        "create table if not exists public.visual_scene_review_hold", 1
+    )[1].split(");", 1)[0]
+    assert "candidate_id" not in legacy_hold
     return done.stdout
 
 
@@ -1314,7 +1326,7 @@ def test_scene_file_replay_is_idempotent():
     # creates are IF NOT EXISTS / OR REPLACE / idempotent do-blocks).
     assert _one("select count(*) from pg_trigger where tgname = "
                 "'content_calendar_scene_wave_claim_guard'") == "0"
-    done = _apply_sql(DSN, WAVE.read_text())
+    done = _apply_sql(DSN, WAVE.read_text() + "\n" + HISTORY_BACKFILL.read_text())
     assert done.returncode == 0
     # still exactly ONE authoritative calendar row trigger afterwards
     assert _one("select count(*) from pg_trigger t join pg_class c "
@@ -1325,7 +1337,7 @@ def test_scene_file_replay_is_idempotent():
 
 
 def test_upgrade_from_committed_wave2_retires_leftovers_and_converges(upgrade_db):
-    # (b) UPGRADE SIM: committed wave-2 revision (git HEAD, temp file) then
+    # (b) UPGRADE SIM: immutable committed predecessor revision then
     # the working wave-3 file. Exit 0; the wave-2 separate early trigger and
     # its zero-arg function are retired by the after-begin drops; the hold
     # table converges onto the named checks and the candidate-scoped open_uq.
@@ -1739,3 +1751,333 @@ def test_reactivation_postcondition_raise_rolls_back_row_and_occupancy():
                 "'zz_emulated_tamper'") == "0"
     assert _one("select count(*) from pg_proc where proname = "
                 "'scratch_wave3_tamper'") == "0"
+
+
+# ---- additive historical scene backfill + activation receipt (2026-10-04) ----
+
+def _insert_published_history(tid, group, url, source_marker=True,
+                              date="2026-09-01"):
+    """Scratch-only historical row inserted without the runtime claim trigger."""
+    source_col = ", source_media_url" if source_marker else ""
+    source_val = f", '{url}'" if source_marker else ""
+    return _one(
+        "set session_replication_role=replica; "
+        "insert into public.content_calendar"
+        "(gym_id,account,post_date,status,variant_status,published_at,image_url,"
+        f" visual_group_key{source_col}) values "
+        f"('{tid}','ig','{date}','published','active',now(),'{url}',"
+        f" '{group}'{source_val}) returning id")
+
+
+def _history_audit(row_id):
+    return json.loads(_one(
+        "select to_jsonb(a)::text from public.visual_scene_history_audit(null) a "
+        f"where a.calendar_row_id='{row_id}'"))
+
+
+def test_history_backfill_clean_activation_persists_full_receipt():
+    tid, group = _seed_tenant()
+    phash = _phash()
+    url, fingerprint, candidate = _seed_object(tid, group, phash)
+    row_id = _insert_published_history(tid, group, url)
+    _sql("update public.gym_visual_guard_settings set enforce=false "
+         f"where gym_id='{tid}'")
+
+    returned = json.loads(_one(
+        f"select public.visual_group_activate_guard('{tid}',"
+        " 'scene-history-test')::text"))
+    assert returned["enforced"] is True
+    persisted = json.loads(_one(
+        "select proof::text from public.visual_group_activation "
+        f"where gym_id='{tid}'"))
+    scene = persisted["scene_history"]
+    assert "scene_history" not in returned  # trigger receipt requires readback
+    assert scene["scope"] == "fleet"
+    assert scene["tenant_id"] is None
+    assert scene["covered_published_rows"] == 1
+    assert int(scene["transaction_id"]) > 0
+    assert scene["inserted"] == 1
+    assert scene["unresolved"] == 0
+    assert scene["barrier"] == "content_calendar share row exclusive"
+    recorded = scene["rows"][0]
+    assert recorded["calendar_row_id"] == row_id
+    assert recorded["tenant_id"] == tid
+    assert recorded["group_key"] == group
+    assert recorded["candidate_id"] == candidate
+    assert recorded["phash"] == phash
+    assert recorded["fingerprint"] == fingerprint
+    assert recorded["exact_url"] == url
+    assert recorded["object_role"] == "display"
+    assert recorded["source_url"] == url
+    assert recorded["source_fingerprint"] == fingerprint
+    assert _occupied(tid) == [phash]
+
+
+def test_history_backfill_source_null_in_other_tenant_blocks_activation_fleetwide():
+    tid_a, _group_a = _seed_tenant()
+    tid_b, group_b = _seed_tenant()
+    url, _fingerprint, _candidate = _seed_object(tid_b, group_b, _phash())
+    row_id = _insert_published_history(tid_b, group_b, url,
+                                       source_marker=False)
+    prior_receipt = _one(
+        "select proof::text from public.visual_group_activation "
+        f"where gym_id='{tid_a}'")
+    _sql("update public.gym_visual_guard_settings set enforce=false "
+         f"where gym_id='{tid_a}'")
+
+    # Exercise the additive receipt hook directly under the same table barrier
+    # the activation RPC holds. This isolates the scene gate from the older
+    # global importer, which may independently reject source-null history first.
+    hook = _run(
+        "begin; lock table public.content_calendar in share row exclusive mode; "
+        "update public.visual_group_activation set proof='{}'::jsonb "
+        f"where gym_id='{tid_a}'; commit", check=False)
+    assert hook.returncode != 0
+    assert "unresolved scene history requires review" in hook.stderr
+
+    done = _run(
+        f"select public.visual_group_activate_guard('{tid_a}',"
+        " 'scene-history-test')", check=False)
+    assert done.returncode != 0
+    assert ("unresolved scene history requires review" in done.stderr
+            or "global history import refused" in done.stderr)
+    audit = _history_audit(row_id)
+    assert audit["backfill_status"] == "unresolved"
+    assert audit["reason"] == "source_null"
+    assert _occupied(tid_b) == []
+    assert _one("select enforce::text from public.gym_visual_guard_settings "
+                f"where gym_id='{tid_a}'") == "false"
+    # Failed activation rolls back the attempted replacement receipt.
+    assert _one("select proof::text from public.visual_group_activation "
+                f"where gym_id='{tid_a}'") == prior_receipt
+
+
+def test_activation_backfills_other_tenant_before_first_near_claim():
+    base = _phash()
+    tid_a, group_a = _seed_tenant()
+    url_a, _fp_a, _candidate_a = _seed_object(
+        tid_a, group_a, _near(base, 2))
+    tid_b, group_b = _seed_tenant()
+    url_b, _fp_b, _candidate_b = _seed_object(tid_b, group_b, base)
+    historical_b = _insert_published_history(tid_b, group_b, url_b)
+    # Model the real predecessor state: the visual-group history ledger was
+    # already backfilled, while the later pHash scene-history ledger was not.
+    _sql("update public.gym_visual_guard_settings set enforce=false "
+         f"where gym_id='{tid_b}'")
+    _one(f"select public.visual_group_backfill_gym('{tid_b}', false)::text")
+    assert _occupied(tid_b) == []
+
+    _sql("update public.gym_visual_guard_settings set enforce=false "
+         f"where gym_id='{tid_a}'")
+    _one(f"select public.visual_group_activate_guard('{tid_a}',"
+         " 'scene-history-fleet-test')::text")
+
+    # Tenant A's activation receipt must have occupied B before A's first
+    # runtime claim. A's near match therefore commits held, never unused.
+    assert _occupied(tid_b) == [base]
+    receipt = json.loads(_one(
+        "select proof->'scene_history' from public.visual_group_activation "
+        f"where gym_id='{tid_a}'"))
+    assert receipt["scope"] == "fleet"
+    assert any(r["calendar_row_id"] == historical_b
+               and r["tenant_id"] == tid_b
+               and r["status"] in ("recorded", "already_recorded")
+               for r in receipt["rows"])
+
+    row_a = _insert_row(tid_a, group_a, url_a)
+    assert _row(row_a)["media_not_ready_reason"] == "scene_review_hold"
+    assert len(_holds(tid_a)) == 1
+    assert _occupied(tid_a) == []
+
+
+def test_history_backfill_ambiguous_candidate_blocks_even_same_phash():
+    tid, group = _seed_tenant()
+    phash = _phash()
+    url, fingerprint, _candidate = _seed_object(tid, group, phash)
+    _one("select public.visual_scene_register_candidate("
+         f"'{tid}','{group}','{phash}','{url}','{fingerprint}',"
+         f"jsonb_build_object('verified_bytes','{fingerprint}'),"
+         "'scene-history-test','display')")
+    row_id = _insert_published_history(tid, group, url)
+    _sql("update public.gym_visual_guard_settings set enforce=false "
+         f"where gym_id='{tid}'")
+
+    done = _run(
+        f"select public.visual_group_activate_guard('{tid}',"
+        " 'scene-history-test')", check=False)
+    assert done.returncode != 0
+    assert "unresolved scene history requires review" in done.stderr
+    audit = _history_audit(row_id)
+    assert audit["backfill_status"] == "unresolved"
+    assert audit["reason"] == "ambiguous_candidate"
+    assert _occupied(tid) == []
+
+
+def test_history_backfill_uses_current_live_row_not_prior_audit_snapshot():
+    tid, group = _seed_tenant()
+    url, _fingerprint, _candidate = _seed_object(tid, group, _phash())
+    row_id = _insert_published_history(tid, group, url)
+    assert _history_audit(row_id)["backfill_status"] == "ready"
+    # Drift after the read-only audit. The owner backfill must reload the live
+    # calendar row and refuse the now-source-null proof, never use old facts.
+    _sql("set session_replication_role=replica; update public.content_calendar "
+         f"set source_media_url=null where id='{row_id}'")
+    assert _one("select public.visual_scene_backfill_occupied()") == "0"
+    audit = _history_audit(row_id)
+    assert audit["backfill_status"] == "unresolved"
+    assert audit["reason"] == "source_null"
+    assert _occupied(tid) == []
+
+
+def test_history_backfill_fleet_lock_contention_fails_closed():
+    tid, group = _seed_tenant()
+    url, _fingerprint, _candidate = _seed_object(tid, group, _phash())
+    _insert_published_history(tid, group, url)
+    locker = subprocess.Popen(
+        [PSQL, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", DSN, "-c",
+         "select pg_advisory_lock(hashtextextended("
+         "jsonb_build_array('visual_scene_global')::text,0)); "
+         "select pg_sleep(20);"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for _ in range(100):
+            held = _one("select count(*) from pg_locks where locktype='advisory' "
+                        "and pid<>pg_backend_pid()")
+            if held == "1":
+                break
+            assert locker.poll() is None
+            time.sleep(.05)
+        assert held == "1"
+        done = _run("select public.visual_scene_backfill_occupied()", check=False)
+        assert done.returncode != 0
+        assert "global scene claim busy; retry transaction" in done.stderr
+        assert _occupied(tid) == []
+    finally:
+        locker.kill()
+        locker.wait(timeout=30)
+        _sql("select pg_terminate_backend(pid) from pg_stat_activity "
+             "where pid<>pg_backend_pid() and datname=current_database()")
+
+
+def test_same_component_exact_prepare_makes_backfill_retry_without_deadlock():
+    tid, group = _seed_tenant()
+    url, _fingerprint, _candidate = _seed_object(tid, group, _phash())
+    _insert_published_history(tid, group, url)
+    _sql("update public.gym_visual_guard_settings set enforce=false "
+         f"where gym_id='{tid}'")
+
+    prepare_url = f"https://scratch.example/{uuid.uuid4().hex}.jpg"
+    prepare_fp = "md5:" + uuid.uuid4().hex
+    prepare_receipt = _one(
+        "insert into public.visual_global_object_read_receipt"
+        "(tenant_id,exact_url,fingerprint,byte_length,acquisition_method,"
+        " evidence_ref,observed_by) values "
+        f"('{tid}','{prepare_url}','{prepare_fp}',2048,"
+        " 'verified_object_read','prepare-race','scene-history-test') "
+        "returning receipt_id")
+    prepare_sql = (
+        "begin; "
+        "select public.visual_group_lock_scene_components("
+        "jsonb_build_array(jsonb_build_object("
+        f"'gym_id','{tid}','group_key','{group}'))); "
+        "select pg_sleep(1.5); "
+        "select public.visual_global_prepare_source_rendition("
+        f"'{tid}','{group}','{prepare_receipt}','{prepare_receipt}',"
+        "null,'scene-history-test'); commit")
+    env = os.environ.copy()
+    env["PGAPPNAME"] = "scene_history_prepare_order"
+    prepare = subprocess.Popen(
+        [PSQL, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", DSN,
+         "-c", prepare_sql], text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=env)
+    try:
+        sleeping = "0"
+        for _ in range(100):
+            sleeping = _one(
+                "select count(*) from pg_stat_activity where "
+                "application_name='scene_history_prepare_order' "
+                "and wait_event='PgSleep'")
+            if sleeping == "1":
+                break
+            assert prepare.poll() is None
+            time.sleep(.02)
+        assert sleeping == "1"
+
+        first = _run("select public.visual_scene_backfill_occupied()",
+                     check=False)
+        assert first.returncode != 0
+        assert "scene component busy; retry transaction" in first.stderr
+        assert _occupied(tid) == []
+
+        stdout, stderr = prepare.communicate(timeout=30)
+        assert prepare.returncode == 0, stderr or stdout
+        assert _one("select public.visual_scene_backfill_occupied()") == "1"
+        assert _occupied(tid) != []
+        assert _one("select count(*) from "
+                    "public.visual_global_object_attestation where "
+                    f"exact_url='{prepare_url}'") == "1"
+    finally:
+        if prepare.poll() is None:
+            prepare.kill()
+            prepare.wait(timeout=30)
+        _sql("select pg_terminate_backend(pid) from pg_stat_activity "
+             "where pid<>pg_backend_pid() and datname=current_database()")
+
+
+def test_unrelated_exact_prepare_makes_backfill_retry_then_succeed():
+    tid_a, group_a = _seed_tenant()
+    tid_b, group_b = _seed_tenant()
+    url_a, _fingerprint_a, _candidate_a = _seed_object(
+        tid_a, group_a, _phash())
+    _insert_published_history(tid_a, group_a, url_a)
+    _sql("update public.gym_visual_guard_settings set enforce=false "
+         f"where gym_id in ('{tid_a}','{tid_b}')")
+
+    prepare_url = f"https://scratch.example/{uuid.uuid4().hex}.jpg"
+    prepare_fp = "md5:" + uuid.uuid4().hex
+    prepare_receipt = _one(
+        "insert into public.visual_global_object_read_receipt"
+        "(tenant_id,exact_url,fingerprint,byte_length,acquisition_method,"
+        " evidence_ref,observed_by) values "
+        f"('{tid_b}','{prepare_url}','{prepare_fp}',2048,"
+        " 'verified_object_read','prepare-retry','scene-history-test') "
+        "returning receipt_id")
+    prepare_sql = (
+        "begin; select public.visual_global_prepare_source_rendition("
+        f"'{tid_b}','{group_b}','{prepare_receipt}','{prepare_receipt}',"
+        "null,'scene-history-test'); select pg_sleep(1.5); commit")
+    env = os.environ.copy()
+    env["PGAPPNAME"] = "scene_history_prepare_retry"
+    prepare = subprocess.Popen(
+        [PSQL, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", DSN,
+         "-c", prepare_sql], text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=env)
+    try:
+        sleeping = "0"
+        for _ in range(100):
+            sleeping = _one(
+                "select count(*) from pg_stat_activity where "
+                "application_name='scene_history_prepare_retry' "
+                "and wait_event='PgSleep'")
+            if sleeping == "1":
+                break
+            assert prepare.poll() is None
+            time.sleep(.02)
+        assert sleeping == "1"
+
+        first = _run("select public.visual_scene_backfill_occupied()",
+                     check=False)
+        assert first.returncode != 0
+        assert "scene proof writer busy; retry transaction" in first.stderr
+        assert _occupied(tid_a) == []
+
+        stdout, stderr = prepare.communicate(timeout=30)
+        assert prepare.returncode == 0, stderr or stdout
+        assert _one("select public.visual_scene_backfill_occupied()") == "1"
+        assert _occupied(tid_a) != []
+    finally:
+        if prepare.poll() is None:
+            prepare.kill()
+            prepare.wait(timeout=30)
+        _sql("select pg_terminate_backend(pid) from pg_stat_activity "
+             "where pid<>pg_backend_pid() and datname=current_database()")
