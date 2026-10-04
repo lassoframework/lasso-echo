@@ -282,7 +282,8 @@ def _handler_class():
 
 def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure core
     from http.server import ThreadingHTTPServer
-    port = int(port or os.environ.get("AGENT_CONNECT_PORT", "8090"))
+    port = int(port or os.environ.get("PORT") or
+               os.environ.get("AGENT_CONNECT_PORT", "8090"))
     print(f"[connect] serving on :{port}")
     ThreadingHTTPServer(("0.0.0.0", port), _handler_class()).serve_forever()
 
