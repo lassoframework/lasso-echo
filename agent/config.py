@@ -4701,3 +4701,24 @@ def auto_reels_debounce_seconds():
         return max(60, min(3600, int(os.environ.get("AGENT_AUTO_REELS_DEBOUNCE_SECONDS", "300"))))
     except ValueError:
         return 300
+
+
+def visual_scene_guard_enabled() -> bool:
+    """AGENT_VISUAL_SCENE_GUARD, default OFF. New capability (the global
+    cross-tenant pHash scene-similarity guard in agent/visual_scene.py) ships
+    off by default, same house rule as every other new capability in this
+    file: with the flag unset, behavior is byte-for-byte unchanged."""
+    return _truthy(os.environ.get("AGENT_VISUAL_SCENE_GUARD", "false"))
+
+
+def visual_scene_guard_flag():
+    """Tri-state read of AGENT_VISUAL_SCENE_GUARD: True (on), False (off or
+    unset), None (ambiguous value — fail closed). Mirrors the stricter
+    global_ledger_flag pattern in agent/gym_media_selector.py: anything
+    outside the explicit truthy/off sets is not a silent default."""
+    raw = (os.environ.get("AGENT_VISUAL_SCENE_GUARD", "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    return None

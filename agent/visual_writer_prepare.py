@@ -228,6 +228,22 @@ def _md5(data):
     return "md5:" + hashlib.md5(data).hexdigest()
 
 
+def _scene_fingerprint(data):
+    """Additive, advisory pHash scene evidence ('scene:phash64:<16 hex>') for
+    bytes whose exact md5 identity is already verified, or None.
+
+    ADVISORY METADATA ONLY (Astra rejection, see
+    docs/VISUAL_SCENE_GUARD_DRAFT.md): prep-time scene records were rejected as
+    an architecture — prep must not act as an enforcement writer. This helper
+    therefore never gates and never raises: undecodable bytes simply record
+    null evidence alongside the md5 identity, which stays the only authority."""
+    try:
+        from . import visual_scene
+        return visual_scene.scene_fingerprint(data)
+    except Exception:  # noqa: BLE001 - no scene evidence is not byte evidence
+        return None
+
+
 def _known_group(store, tenant, row, source_url, *, required=True):
     response = store._client().get(
         store._rest("visual_group_alias"),
@@ -266,11 +282,13 @@ def _register_raw_source(store, tenant, prepared, source_url, source, asset):
         if not asset or str(drive_id) != str(asset_id):
             raise VisualPreparationError("Drive ID has no matching tenant asset")
         aliases.append(("drive_id", str(drive_id)))
+    scene_fp = _scene_fingerprint(source)
     result = _rpc(store, "visual_global_prepare_bundle", {
         "p_tenant": tenant,
         "p_aliases": [{"alias_kind": kind, "alias_value": value} for kind, value in aliases],
         "p_fingerprint": source_hash,
         "p_evidence": {"source": "raw_object_bytes", "verified_bytes": source_hash,
+                       "scene_fingerprint": scene_fp,
                        "delivered_url": source_url},
         "p_actor": "visual_writer_prepare",
         "p_asset_id": str(asset_id) if asset else None,
@@ -432,7 +450,9 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
     if not isinstance(group, str) or not group.startswith("vg_"):
         raise VisualPreparationError("same-object source has no unambiguous registered group")
 
+    scene_fp = _scene_fingerprint(data)
     evidence = {"exact_url": url, "fingerprint": digest, "byte_length": len(data),
+                "scene_fingerprint": scene_fp,
                 "evidence_ref": "visual_writer_prepare:same_object_exact_read",
                 "observed_by": "visual_writer_prepare"}
     try:
