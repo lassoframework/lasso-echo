@@ -4,6 +4,15 @@
 Release restores only media_not_ready_reason to NULL. It requires the private
 receipt from the original hold, exact current row images, a matching digest,
 an OFF-by-default release flag, and a new private write-ahead receipt.
+
+The hold that produced the receipt now atomically demotes approved rows to
+pending (the armed PR268 trigger rejects approved+hold_reason), so a held
+approved-origin row is persisted as pending. This script accepts either the
+demoted readback (new receipts) or the legacy approved readback (receipts
+written before the demotion patch), derives the demoted release image, and
+verifies after release that the row is pending with the reason cleared --
+never reapproved. Rows protected by scene_review_hold or archived variants
+are refused by the store CAS and treated as conflicts here, never released.
 """
 from __future__ import annotations
 
@@ -59,10 +68,25 @@ def _original_receipt(path):
     for row_id in changed:
         original, held = before_by_id[row_id], held_by_id[row_id]
         if (any(field not in original or field not in held for field in _FIELDS)
-                or original["media_not_ready_reason"] is not None
-                or held != {**original, "media_not_ready_reason": REASON}):
+                or original["media_not_ready_reason"] is not None):
+            raise ValueError("original hold receipt readback mismatch")
+        # New receipts carry the atomic demotion (approved-origin rows held as
+        # pending); legacy receipts may still show the row approved with the
+        # reason set. Both are structurally valid hold outcomes; the actual
+        # persisted state is re-verified against the store before any write.
+        expected_held = {**original, "media_not_ready_reason": REASON}
+        if original.get("status") == "approved":
+            expected_held["status"] = "pending"
+        if held != expected_held and held != {**original, "media_not_ready_reason": REASON}:
             raise ValueError("original hold receipt readback mismatch")
     return source, [held_by_id[row_id] for row_id in changed]
+
+
+def current_image_status_is_demoted(held, current):
+    """True when the persisted row matched the receipt only in demoted form."""
+    by_id = {str(row["id"]): row for row in current}
+    observed = by_id.get(str(held["id"]))
+    return observed is not None and observed == {**held, "status": "pending"}
 
 
 def run(*, store=None, hold_receipt_path=None, apply=False, expected_digest=None,
@@ -73,7 +97,21 @@ def run(*, store=None, hold_receipt_path=None, apply=False, expected_digest=None
     conflicts = []
     for held in held_rows:
         row = store.get_row(held["gym_id"], str(held["id"]))
-        if row is None or _image(row) != held:
+        # The only legitimate persisted state for a held row is the receipt
+        # image itself, or -- for approved-origin rows from legacy receipts --
+        # the same image demoted to pending with the hold reason. A persisted
+        # row that is STILL approved is refused at preflight (fail closed
+        # before any mutation): a legacy approved-with-hold row must not be
+        # released into a publishable state. Anything else (drift, republish,
+        # cleared reason, scene_review_hold takeover, archived variant) is a
+        # conflict and is never released.
+        demoted = {**held, "status": "pending"}
+        allowed = (demoted,) if held.get("status") == "approved" else (held, demoted)
+        if (row is None
+                or row.get("status") == "approved"
+                or held.get("media_not_ready_reason") != REASON
+                or held.get("variant_status") != "active"
+                or _image(row) not in allowed):
             conflicts.append(str(held["id"]))
         else:
             current.append(_image(row))
@@ -84,8 +122,10 @@ def run(*, store=None, hold_receipt_path=None, apply=False, expected_digest=None
                  "target_digest": digest, "target_count": len(current),
                  "conflict_ids": conflicts, "before_image": current,
                  "reason": REASON,
-                 "preserved": ["status", "caption", "image_url", "source_media_url",
-                               "source_media_asset_id", "approval", "publication"]}
+                 "status_transition": "held rows stay or return to pending; "
+                                      "release never reapproves",
+                 "preserved": ["caption", "image_url", "source_media_url",
+                               "source_media_asset_id", "publication"]}
     if not apply:
         return {"ok": not conflicts, "dry_run": True, "preflight": preflight}
     if os.environ.get("ECHO_FUTURE_IGFILL_RELEASE_ENABLED", "").lower() != "true":
@@ -111,8 +151,18 @@ def run(*, store=None, hold_receipt_path=None, apply=False, expected_digest=None
         except Exception as exc:
             return {"ok": False, "reason": f"write-intent receipt failed:{type(exc).__name__}",
                     "receipt": receipt_path}
+        # The store CAS matches the persisted row exactly and refuses any
+        # non-pending row before a PATCH. Preflight already rejected persisted
+        # approved rows; defensively still release only the demoted image for
+        # approved-origin receipt rows. The payload clears only
+        # media_not_ready_reason, so a demoted row returns to pending and can
+        # never be reapproved by this path.
+        release_image = dict(held)
+        if release_image.get("status") == "approved":
+            release_image["status"] = "pending"
         try:
-            updated = store.release_future_infographic_media(held["gym_id"], held, REASON)
+            updated = store.release_future_infographic_media(
+                held["gym_id"], release_image, REASON)
         except Exception as exc:
             return {"ok": False, "reason": f"release CAS uncertain:{type(exc).__name__}",
                     "receipt": receipt_path, "inflight_id": held["id"]}
@@ -127,7 +177,10 @@ def run(*, store=None, hold_receipt_path=None, apply=False, expected_digest=None
         except Exception as exc:
             return {"ok": False, "reason": f"readback failed:{type(exc).__name__}",
                     "receipt": receipt_path, "inflight_id": held["id"]}
-        if observed is None or _image(observed) != {**held, "media_not_ready_reason": None}:
+        expected_released = {**release_image, "media_not_ready_reason": None}
+        if (observed is None or _image(observed) != expected_released
+                or (held["status"] == "approved"
+                    and observed.get("status") == "approved")):
             return {"ok": False, "reason": "readback mismatch; reconcile before retry",
                     "receipt": receipt_path, "inflight_id": held["id"]}
         progress["changed_ids"].append(str(held["id"]))

@@ -3,7 +3,12 @@
 
 Dry run by default. Apply is OFF unless ECHO_FUTURE_IGFILL_HOLD_ENABLED=true,
 the observed target digest is supplied, and a new private receipt path exists.
-The only database mutation is media_not_ready_reason on pending/approved rows.
+
+The armed PR268 visual-group trigger rejects an approved/publishing row with a
+non-null media_not_ready_reason, so the hold cannot leave an approved row
+approved: the atomic PATCH sets the hold reason and demotes approved rows to
+pending in the same write. Pending rows change only media_not_ready_reason.
+A held (demoted) row requires later reapproval; release never restores one.
 """
 from __future__ import annotations
 
@@ -116,8 +121,10 @@ def run(*, store=None, today=None, horizon_days=365, apply=False,
                "pending_count": sum(row["status"] == "pending" for row in before),
                "approved_count": sum(row["status"] == "approved" for row in before),
                "before_image": before, "reason": REASON,
-               "preserved": ["status", "caption", "image_url", "source_media_url",
-                             "source_media_asset_id", "approval", "publication"],
+               "status_transition": "approved rows atomically demote to pending; "
+                                    "pending rows stay pending",
+               "preserved": ["caption", "image_url", "source_media_url",
+                             "source_media_asset_id", "publication"],
                "rollback": "Re-read each ID and use an exact row CAS matching this receipt and hold reason before clearing any hold."}
     if not apply:
         return {"ok": True, "dry_run": True, "preflight": summary}
@@ -158,6 +165,11 @@ def run(*, store=None, today=None, horizon_days=365, apply=False,
             return {"ok": False, "reason": f"readback failed:{type(exc).__name__}",
                     "receipt": receipt_path, "inflight_id": row["id"]}
         expected = {**row, "media_not_ready_reason": REASON}
+        if row["status"] == "approved":
+            # The hold persists only as an atomic hold+demote; an approved row
+            # still approved after the write is the trigger-rejected state and
+            # must surface here as a readback mismatch, never as success.
+            expected["status"] = "pending"
         if current is None or _image(current) != expected:
             return {"ok": False, "reason": "readback mismatch; reconcile before retry",
                     "receipt": receipt_path, "inflight_id": row["id"]}
