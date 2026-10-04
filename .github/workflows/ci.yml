@@ -58,10 +58,10 @@ jobs:
     timeout-minutes: 15
 
     env:
-      # Owned exclusively by this job: disposable cluster under the runner temp
-      # dir, stopped in the always() cleanup step below.
-      PGDATA: ${{ runner.temp }}/echo-scene-pg/data
-      PGSOCK: ${{ runner.temp }}/echo-scene-pg/sock
+      # Owned exclusively by this disposable runner, stopped in always() below.
+      # The runner context is unavailable in job-level env expressions.
+      PGDATA: /tmp/echo-scene-rollback-pg/data
+      PGSOCK: /tmp/echo-scene-rollback-pg/sock
 
     steps:
       - uses: actions/checkout@v4
