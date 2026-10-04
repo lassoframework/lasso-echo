@@ -26,11 +26,15 @@ resolve.
 
 Fail-closed integrity checks abort the run (exit 2, no output written) on:
 
-* duplicate, blank, or missing calendar/provider/postlog row refs,
-  including an explicitly present blank primary persisted reference
-  (``id``/``row_ref``) even when an alias is nonblank; byte-observation
-  rows must each be an object with a nonblank ``row_ref`` (duplicates
-  rejected),
+* duplicate, blank, missing, or ambiguously disagreeing
+  calendar/provider/postlog row refs (two nonblank persisted reference
+  fields on one row with different values), including collisions of any
+  provided primary/alias ref across manifest rows, and including an
+  explicitly present blank primary persisted reference (``id``/``row_ref``)
+  even when an alias is nonblank; byte-observation rows must each be an
+  object with a nonblank ``row_ref`` (duplicates rejected) whose nested
+  ``delivered``/``source_observation`` values, when present, are objects
+  or null (absent/null allowed; any other nested non-object rejected),
 * duplicate asset IDs or duplicate source URLs (ambiguous URL matching),
 * malformed digest values (sha256/md5 that are not full lowercase/uppercase
   hex of the correct length),
@@ -263,60 +267,105 @@ def _index_byte_rows(byte_rows):
             raise InputError(
                 f"byte_observation_manifest: duplicate row_ref {ref!r}")
         by_row_ref[ref] = row
-        _hashes_of(row.get("delivered") or {},
+        _hashes_of(_nested_object(row, "delivered",
+                                  f"byte_observation_manifest row {index}"),
                    f"byte_observation_manifest row {index} delivered")
-        _hashes_of(row.get("source_observation") or {},
+        _hashes_of(_nested_object(row, "source_observation",
+                                  f"byte_observation_manifest row {index}"),
                    f"byte_observation_manifest row {index} source_observation")
     return by_row_ref
 
 
-def _persisted_ref(row, fields, where):
-    """Return a persisted nonblank ref, failing closed on ambiguity.
+def _persisted_refs(row, fields, where):
+    """Return every distinct nonblank persisted ref on the row.
 
-    The primary persisted field (first in ``fields``) fails closed when it
-    is explicitly present but blank/None, even if a supported alias carries
-    a nonblank value: a persisted blank is a real observation, not an
-    absence, and must never be silently substituted. Aliases are consulted
-    only when the primary field is absent from the row.
+    Fails closed on ambiguity: the primary persisted field (first in
+    ``fields``) fails closed when it is explicitly present but blank/None,
+    even if a supported alias carries a nonblank value (a persisted blank
+    is a real observation, not an absence, and must never be silently
+    substituted). When two or more fields carry nonblank values that
+    disagree, the row's persisted identity is ambiguous and the run aborts:
+    silently preferring one field can misassociate evidence across
+    calendar/provider/postlog manifests.
     """
+    if not isinstance(row, dict):
+        raise InputError(
+            f"{where}: expected an object with a persisted "
+            f"{'/'.join(fields)} reference")
     primary = fields[0]
     if primary in row and not _is_text(row[primary]):
         raise InputError(
             f"{where}: missing or blank {primary} (explicitly present blank "
             f"primary persisted reference; aliases are not consulted)")
-    ref = _first_text(row, fields)
-    if ref is None:
+    refs = []
+    for field in fields:
+        value = row.get(field)
+        if _is_text(value):
+            text = value.strip()
+            if text not in refs:
+                refs.append(text)
+    if not refs:
         raise InputError(f"{where}: missing or blank {fields[0]}")
-    return ref
+    if len(refs) > 1:
+        raise InputError(
+            f"{where}: ambiguous persisted reference "
+            f"({', '.join(f'{field}={row.get(field)!r}' for field in fields if _is_text(row.get(field)))} "
+            f"disagree); refusing to guess which persisted ref is authoritative")
+    return refs
 
 
-def _required_manifest_ref(row, index, label, fields):
-    """Return a persisted nonblank manifest ref or abort without ambiguity."""
-    if not isinstance(row, dict):
-        raise InputError(f"{label} row {index}: expected an object with row_ref")
-    return _persisted_ref(row, fields, f"{label} row {index}")
+def _persisted_ref(row, fields, where):
+    """Return the single nonblank persisted ref, failing closed on ambiguity."""
+    return _persisted_refs(row, fields, where)[0]
+
+
+def _nested_object(row, key, where):
+    """Return a nested manifest object, failing closed on malformed nesting.
+
+    Absent or null is allowed by the documented input shape and yields an
+    empty object; any other non-object value (string, number, array, bool)
+    is malformed and aborts the run instead of being silently coerced to
+    an empty dict or crashing on ``.get``.
+    """
+    if key not in row or row[key] is None:
+        return {}
+    value = row[key]
+    if not isinstance(value, dict):
+        raise InputError(
+            f"{where}: {key} must be an object or null, got "
+            f"{type(value).__name__}")
+    return value
+
+
+def _index_manifest_refs(rows, label, fields):
+    """Index a manifest by persisted ref, failing closed on collisions.
+
+    Any provided persisted ref value (primary or alias) must be unique
+    across the whole manifest: two rows whose refs collide after alias
+    resolution (for example ``row_ref=a, id=b`` and ``row_ref=b, id=a``)
+    make evidence association ambiguous, so the run aborts.
+    """
+    by_row_ref = {}
+    for index, row in enumerate(rows, 1):
+        refs = _persisted_refs(row, fields, f"{label} row {index}")
+        ref = refs[0]
+        for value in refs:
+            if value in by_row_ref:
+                raise InputError(
+                    f"{label}: duplicate row_ref {value!r} "
+                    f"(rows {by_row_ref[value]} and {index})")
+        by_row_ref[ref] = index
+    return {ref: rows[index - 1] for ref, index in by_row_ref.items()}
 
 
 def _index_provider(provider_rows):
-    by_row_ref = {}
-    for index, row in enumerate(provider_rows, 1):
-        ref = _required_manifest_ref(row, index, "provider_manifest",
-                                     ("row_ref", "id"))
-        if ref in by_row_ref:
-            raise InputError(f"provider_manifest: duplicate row_ref {ref!r}")
-        by_row_ref[ref] = row
-    return by_row_ref
+    return _index_manifest_refs(provider_rows, "provider_manifest",
+                                ("row_ref", "id"))
 
 
 def _index_postlog(postlog_rows):
-    by_row_ref = {}
-    for index, row in enumerate(postlog_rows, 1):
-        ref = _required_manifest_ref(row, index, "postlog_manifest",
-                                     ("row_ref", "calendar_row_id", "id"))
-        if ref in by_row_ref:
-            raise InputError(f"postlog_manifest: duplicate row_ref {ref!r}")
-        by_row_ref[ref] = row
-    return by_row_ref
+    return _index_manifest_refs(postlog_rows, "postlog_manifest",
+                                ("row_ref", "calendar_row_id", "id"))
 
 
 def _row_ref(row, index):
@@ -329,15 +378,17 @@ def _row_ref(row, index):
 
 
 def _check_unique_row_refs(calendar_rows):
-    """Fail closed on missing, blank, duplicate, or ambiguous calendar refs."""
+    """Fail closed on missing, blank, duplicate, colliding, or ambiguous
+    calendar refs (any provided primary/alias ref must be unique across rows)."""
     seen = {}
     for index, row in enumerate(calendar_rows, 1):
-        ref = _row_ref(row, index)
-        if ref in seen:
-            raise InputError(
-                f"calendar_snapshot: duplicate row ref {ref!r} "
-                f"(rows {seen[ref]} and {index})")
-        seen[ref] = index
+        for ref in _persisted_refs(row, ("id", "row_ref"),
+                                   f"calendar_snapshot row {index}"):
+            if ref in seen:
+                raise InputError(
+                    f"calendar_snapshot: duplicate row ref {ref!r} "
+                    f"(rows {seen[ref]} and {index})")
+            seen[ref] = index
 
 
 def _match_asset(row, by_id, by_source_url, by_rendition_key):
@@ -358,8 +409,9 @@ def _match_asset(row, by_id, by_source_url, by_rendition_key):
 def _check_byte_urls(byte_row, row, ref):
     """Fail closed on exact-URL mismatch between a byte observation and the
     calendar row's source/delivered URLs."""
-    delivered = byte_row.get("delivered") or {}
-    source = byte_row.get("source_observation") or {}
+    where = f"byte_observation_manifest row_ref {ref!r}"
+    delivered = _nested_object(byte_row, "delivered", where)
+    source = _nested_object(byte_row, "source_observation", where)
     row_delivered = _first_text(row, DELIVERED_URL_FIELDS) if isinstance(row, dict) else None
     row_source = _first_text(row, SOURCE_URL_FIELDS) if isinstance(row, dict) else None
     obs_delivered = delivered.get("exact_url")
@@ -439,8 +491,9 @@ def _reconcile_row(row, index, by_id, by_source_url, by_rendition_key,
     byte_row = byte_rows.get(ref)
     if byte_row is not None:
         _check_byte_urls(byte_row, row, ref)
-        delivered_obs = byte_row.get("delivered") or {}
-        source_obs = byte_row.get("source_observation") or {}
+        byte_where = f"byte_observation_manifest row_ref {ref!r}"
+        delivered_obs = _nested_object(byte_row, "delivered", byte_where)
+        source_obs = _nested_object(byte_row, "source_observation", byte_where)
         evidence["byte_observation_status"] = delivered_obs.get("status")
         if delivered_obs.get("status") == "error" or \
                 (isinstance(source_obs, dict) and source_obs.get("status") == "error"):
@@ -460,7 +513,8 @@ def _reconcile_row(row, index, by_id, by_source_url, by_rendition_key,
             _hashes_of(asset, "matched asset") or
             _first_text(asset, RENDITION_IDENTITY_FIELDS) or
             (byte_row and _hashes_of(
-                byte_row.get("source_observation") or {},
+                _nested_object(byte_row, "source_observation",
+                               f"byte_observation_manifest row_ref {ref!r}"),
                 f"byte_observation_manifest row_ref {ref!r}")))
         if match_kind in ("asset_id", "source_url_hint", "rendition_key_hint") \
                 and not has_rendition_identity:

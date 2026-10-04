@@ -115,10 +115,13 @@ def _iso_utc(timestamp):
 def fetch_snapshot(store, *, page_size=DEFAULT_PAGE_SIZE,
                    max_pages=DEFAULT_MAX_PAGES, now=None):
     """Read and reconcile two bounded passes; this is not a point-in-time read."""
-    if not isinstance(page_size, int) or page_size < 1 or page_size > 1000:
-        raise ValueError("page_size must be between 1 and 1000")
-    if not isinstance(max_pages, int) or max_pages < 1:
-        raise ValueError("max_pages must be positive")
+    # bool is a subclass of int; True/False are not valid page bounds.
+    if (not isinstance(page_size, int) or isinstance(page_size, bool)
+            or page_size < 1 or page_size > 1000):
+        raise ValueError("page_size must be an integer between 1 and 1000")
+    if (not isinstance(max_pages, int) or isinstance(max_pages, bool)
+            or max_pages < 1):
+        raise ValueError("max_pages must be a positive integer")
     clock = (lambda: now) if now is not None else lambda: datetime.now(timezone.utc)
     scan_started = clock()
     if scan_started.tzinfo is None:

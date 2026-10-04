@@ -544,3 +544,94 @@ def test_real_schema_snapshot_object_accepted_by_main(tmp_path):
     report = json.loads(out.read_text())
     assert report["summary"]["resolved"] == 0
     assert report["asset_obligations"][0]["evidence"]["rendition_identity"] == "rend-1"
+
+
+# --- Adversarial: ambiguous / colliding persisted references ---------------
+
+@pytest.mark.parametrize("row", [
+    {"id": "row-1", "row_ref": "row-2"},
+    {"id": "row-1", "row_ref": "row-1-extra"},
+])
+def test_disagreeing_primary_and_alias_calendar_refs_abort(row):
+    with pytest.raises(InputError, match="ambiguous persisted reference"):
+        reconcile([row], [])
+
+
+@pytest.mark.parametrize("indexer", ["provider", "postlog"])
+def test_disagreeing_manifest_refs_abort(indexer):
+    row = {"row_ref": "row-1", "id": "row-2"}
+    kwargs = {f"{indexer}_rows": [row]}
+    with pytest.raises(InputError, match="ambiguous persisted reference"):
+        reconcile([_calendar_row("row-1")], [_asset()], **kwargs)
+
+
+def test_postlog_disagreeing_alias_refs_abort():
+    row = {"row_ref": "row-1", "calendar_row_id": "row-2"}
+    with pytest.raises(InputError, match="ambiguous persisted reference"):
+        reconcile([_calendar_row("row-1")], [_asset()], postlog_rows=[row])
+
+
+@pytest.mark.parametrize("indexer", ["provider", "postlog"])
+def test_colliding_manifest_refs_across_rows_abort(indexer):
+    # The alias of one row collides with the primary of another even though
+    # each row individually resolves a distinct ref; silently preferring one
+    # field would misassociate evidence across rows.
+    rows = [{"id": "a"}, {"row_ref": "a", "id": "a"}]
+    kwargs = {f"{indexer}_rows": rows}
+    with pytest.raises(InputError, match="duplicate row_ref"):
+        reconcile([_calendar_row("a")], [_asset()], **kwargs)
+
+
+def test_colliding_calendar_refs_across_rows_abort():
+    rows = [{"id": "a"}, {"row_ref": "a"}]
+    with pytest.raises(InputError, match="duplicate row ref"):
+        reconcile(rows, [])
+
+
+def test_agreeing_duplicate_alias_values_are_not_ambiguous():
+    # Same nonblank value in primary and alias is redundant, not ambiguous.
+    row = dict(_calendar_row("row-1"))
+    row["row_ref"] = "row-1"
+    cal_obs, _ = reconcile([row], [_asset()])
+    assert cal_obs[0]["row_ref"] == "row-1"
+
+
+# --- Adversarial: malformed nested byte-observation objects ----------------
+
+@pytest.mark.parametrize("nested", [
+    {"delivered": "not-an-object"},
+    {"delivered": ["not", "an", "object"]},
+    {"delivered": 7},
+    {"delivered": True},
+    {"source_observation": "not-an-object"},
+    {"source_observation": ["not", "an", "object"]},
+    {"source_observation": 3.5},
+    {"delivered": {"exact_url": "https://x/delivered1"},
+     "source_observation": False},
+])
+def test_malformed_nested_byte_objects_abort(nested):
+    row = {"row_ref": "row-1"}
+    row.update(nested)
+    with pytest.raises(InputError,
+                       match="must be an object or null"):
+        reconcile([_calendar_row("row-1")], [_asset()], byte_rows=[row])
+
+
+def test_absent_or_null_nested_byte_objects_are_allowed():
+    # Documented input allows absent/null nested objects.
+    base = {"row_ref": "row-1"}
+    for variant in ({"delivered": None, "source_observation": None},
+                    {}):
+        row = dict(base, **variant)
+        cal_obs, _ = reconcile([_calendar_row("row-1")], [_asset()],
+                               byte_rows=[row])
+        assert cal_obs[0]["evidence"]["byte_identity_observed"] is False
+
+
+def test_nested_byte_object_is_used_not_silently_coerced():
+    # A string nested value must abort even though ``or {}`` would have
+    # coerced it silently before hardening.
+    row = {"row_ref": "row-1", "delivered": "https://x/delivered1"}
+    with pytest.raises(InputError, match="delivered must be an object or null"):
+        reconcile([_calendar_row("row-1")], [_asset()],
+                  byte_rows=[row], provider_rows=None)

@@ -201,3 +201,60 @@ def test_pagination_exhausts_all_pages_of_both_passes():
     assert result["row_count"] == 5
     # 3 pages per pass x 2 passes.
     assert len(store.http.calls) == 6
+
+
+# --- Adversarial: pagination bound types -----------------------------------
+
+@pytest.mark.parametrize("page_size", [True, False, 2.5, "500", None])
+def test_page_size_rejects_bool_and_non_int(page_size):
+    rows = [asset_row("a")]
+    store = FakeStore(FakeHTTP([rows]))
+    with pytest.raises(ValueError, match="page_size"):
+        snapshot.fetch_snapshot(store, page_size=page_size,
+                                now=datetime(2026, 10, 4, tzinfo=timezone.utc))
+
+
+@pytest.mark.parametrize("max_pages", [True, False, 3.0, "10", None])
+def test_max_pages_rejects_bool_and_non_int(max_pages):
+    rows = [asset_row("a")]
+    store = FakeStore(FakeHTTP([rows]))
+    with pytest.raises(ValueError, match="max_pages"):
+        snapshot.fetch_snapshot(store, max_pages=max_pages,
+                                now=datetime(2026, 10, 4, tzinfo=timezone.utc))
+
+
+# --- Content-Range with a star total is not an exact count -----------------
+
+class _StarResponse:
+    def __init__(self, content_range, rows):
+        self.status_code = 200
+        self.headers = {"Content-Range": content_range}
+        self._rows = rows
+
+    def json(self):
+        return self._rows
+
+
+class _StarHTTP:
+    def __init__(self, content_range, rows):
+        self._content_range = content_range
+        self._rows = rows
+
+    def get(self, url, *, params, headers, timeout):
+        offset = int(params["offset"])
+        limit = int(params["limit"])
+        return _StarResponse(self._content_range,
+                             self._rows[offset:offset + limit])
+
+
+@pytest.mark.parametrize("content_range", [
+    "0-0/*",   # Luna-claimed acceptable form: unknown total must fail closed
+    "*/0",
+    "0-1/*",
+])
+def test_star_content_range_is_rejected_not_accepted(content_range):
+    rows = [asset_row("a"), asset_row("b")]
+    store = FakeStore(_StarHTTP(content_range, rows))
+    with pytest.raises(ValueError, match="Content-Range"):
+        snapshot.fetch_snapshot(
+            store, page_size=2, now=datetime(2026, 10, 4, tzinfo=timezone.utc))
