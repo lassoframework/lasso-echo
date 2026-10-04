@@ -207,12 +207,68 @@ remain legal and idempotent.
 ## Sol audit P1 dispositions
 
 - P1-1 writer emits `scene_candidate` in prepared payloads but nothing
-  registers it / no column stores the candidate UUID — STILL OPEN (writer
-  subagent scope). In the repaired SQL the candidate is no longer carried on
-  the calendar row at all: the trigger RESOLVES it from the row's delivered
-  object via `visual_scene_row_candidate`, so no column is needed on the SQL
-  side — but no Python writer calls `visual_scene_register_candidate` yet,
-  so staging remains unwired.
+  registers it / no column stores the candidate UUID — the INSERT writer lane
+  now has an ATOMIC DRAFT route (2026-10-04, echo-scene-writes):
+  `visual_scene_insert_calendar_batch` resolves raw tenant aliases, verifies
+  the exact displayed URL/role/md5/`verified_bytes`, stages candidate N before
+  row N's BEFORE INSERT trigger, and inserts the full batch in one PostgreSQL
+  statement transaction. Any candidate or row error rolls back every earlier
+  candidate and row; the rejected post-write registration + compensation
+  DELETE path is not used. `agent/visual_scene_register.py` builds and verifies
+  this contract behind the exact conjunction
+  `AGENT_VISUAL_SCENE_REGISTER=true` AND
+  `AGENT_VISUAL_GLOBAL_WRITER_PREP=true` AND
+  `AGENT_VISUAL_SCENE_CANDIDATE=true` (all default OFF). Once REGISTER is
+  explicitly ON, a missing/off/ambiguous prerequisite raises before either
+  new-row REST or RPC insertion; it cannot silently degrade that insertion to
+  REST. Existing Story hold reconciliation runs before the new-row insertion
+  branch and remains an explicit recovery-path activation blocker below. With
+  REGISTER OFF, the normal REST insert remains and makes zero scene RPC calls.
+  Candidate staging
+  never marks use or occupancy; only the
+  calendar claim trigger can do that. No candidate column is needed because
+  the trigger binds by canonical tenant + group + exact delivered role/URL and
+  the attested fingerprint. The additive draft makes that binding canonical:
+  identical siblings/retries reuse one stable candidate UUID under a unique
+  tenant/group/role/exact-URL key, while a different pHash or fingerprint on
+  the same binding fails closed. It also revokes direct `service_role` EXECUTE
+  on the frozen insert-only `visual_scene_register_candidate`; otherwise a
+  random-UUID side registration could destabilize row binding. The atomic RPC
+  also checks this ACL at runtime and fails closed if a later
+  migration or privilege change reopens the direct route. ACTIVATION
+  BLOCKER 6 remains OPEN: the SQL is
+  UNAPPLIED/OFF, recovered story-hold rows are pre-existing and outside this
+  insert path, and media PATCH candidate staging is not yet composed with the
+  existing patch CAS in one database transaction.
+
+### Atomic INSERT draft install/upgrade prerequisite
+
+`DRAFT_visual_scene_calendar_atomic_write_20261004.sql` takes SHARE locks on
+the frozen candidate and review-hold inventories before changing any ACL,
+function, or index. Every pre-existing duplicate tenant/group/role/exact-URL
+binding aborts the transaction with candidate IDs, complete identity/evidence,
+classification (`identical_evidence`, `conflicting_evidence`, or
+`conflicting_identity`), and all referencing `visual_scene_review_hold`
+IDs/candidate FKs. The refusal leaves the old function definition, direct
+registration ACL, candidates, holds, and indexes unchanged.
+
+No contradiction is auto-merged. The separate owner-only
+`DRAFT_visual_scene_calendar_candidate_dedupe_20261004.sql` path accepts only
+an explicitly reviewed pair whose tenant, group, role, exact URL, pHash, md5,
+evidence JSON, and actor are identical. It requires the frozen resolver's
+lowest UUID as canonical, archives the complete duplicate candidate and every
+referencing hold row in a remediation receipt, rebinds those hold FKs, and
+deletes the duplicate in one transaction. Conflicting evidence/identity stays
+blocked for source-level adjudication. After remediation, the installer writes
+a zero-duplicate count plus full candidate-snapshot digest receipt, builds and
+catalog-validates the exact unique btree index shape, rechecks the receipt, and
+only then changes ACLs/functions. Replay repeats those proofs.
+
+The first canonical registration retains immutable provenance in candidate
+evidence (`registration_provenance=first_atomic_calendar_registration` and
+`first_calendar_row_id`). Sibling/retry responses report
+`registration_reused=true`; they never rewrite the first observation. Their
+own persisted row-to-candidate binding is still reverified after triggers.
 - P1-2 rollback-only pg test wrapper vs migrations that COMMIT internally —
   addressed BY DESIGN: the real-PostgreSQL scenarios run COMMITTED
   transactions on a disposable, dedicated scratch database (never
@@ -248,6 +304,37 @@ hold from inside a raising path) remain REJECTED: fragile under
 transaction-mode connection poolers (session state and advisory-lock
 assumptions break) and they demand stored connect credentials inside the
 database, which this security-definer surface must not require.
+
+## Calendar media-writer inventory (2026-10-04)
+
+Scene guard activation remains blocked until every row that can introduce new
+displayed bytes stages its bound candidate in the same database transaction:
+
+- `insert_rows` — covered by the new draft atomic batch RPC only when
+  `AGENT_VISUAL_SCENE_REGISTER=true` AND
+  `AGENT_VISUAL_GLOBAL_WRITER_PREP=true` AND
+  `AGENT_VISUAL_SCENE_CANDIDATE=true`; REGISTER ON with either prerequisite
+  absent/off/ambiguous fails before new-row persistence. Story hold recovery
+  occurs earlier and is separately uncovered. Normal REST behavior remains in
+  place while REGISTER is OFF.
+- `create_variant_candidate` — covered by that same atomic RPC for its prepared
+  alternate-row INSERT. Variant promotion (`swap_variant`) changes row state in
+  an existing transaction but introduces no new bytes.
+- `patch_image_url`, `patch_media`, `swap_media`, and the staging branch of
+  `restage_held_media` — each has a server-side full-row/media CAS today, but
+  preparation currently returns only `visual_group_key`/`byte_hash`; candidate
+  staging is not composed with the PATCH in one PostgreSQL transaction.
+- `replace_future_infographic_media` — exact receipt-owned CAS exists, but its
+  replacement candidate is not transactionally staged with the PATCH.
+- hold/release-only methods (`hold_future_infographic_media`,
+  `release_future_infographic_media`, the release branch of
+  `restage_held_media`) do not introduce new displayed bytes and need no new
+  candidate, though their persisted held/readiness contracts still apply.
+- recovered Story hold rows are pre-existing rows and do not pass through the
+  new-row RPC; their own recovery path must be reconciled before activation.
+
+The uncovered PATCH/recovery surfaces are explicit activation gaps. Existing
+CAS reduces stale-write risk but is not atomic scene-candidate registration.
 
 ## ACTIVATION BLOCKERS
 
@@ -286,11 +373,21 @@ database, which this security-definer surface must not require.
    hold resolution, and unknown-history backfill. `visual_global_coverage` and
    `visual_global_history_coverage` must show reviewed coverage before
    activation.
-6. RUNTIME CANDIDATE REGISTRATION. No Python writer transactionally calls
-   `visual_scene_register_candidate`; staging a candidate and writing the
-   corresponding calendar row must be integrated before arming the guard.
-   Partial registration changes claim behavior because an engaged scene row
-   without a bound candidate fails closed.
+6. RUNTIME CANDIDATE REGISTRATION — INSERT LANE DRAFT EXISTS, STILL OPEN for
+   activation. `agent/visual_scene_register.py` routes prepared inserts through
+   the single-transaction `visual_scene_insert_calendar_batch` RPC behind the
+   exact explicit-on conjunction of `AGENT_VISUAL_SCENE_REGISTER`,
+   `AGENT_VISUAL_GLOBAL_WRITER_PREP`, and `AGENT_VISUAL_SCENE_CANDIDATE`
+   (all default OFF). REGISTER ON with either prerequisite not explicitly ON
+   fails before new-row insertion; pre-insert Story hold recovery remains
+   outside this route. Candidate N
+   is registered before row N's BEFORE trigger; candidate/row failures abort
+   the full RPC, with no post-write compensation. The blocker remains OPEN
+   because the RPC is an UNAPPLIED DRAFT, recovered story-hold rows are outside
+   this new-row path, and existing media PATCHes have server-side CAS but do
+   not yet stage their replacement candidate inside that same transaction.
+   Do not arm the scene guard until every engaged write path is atomic and the
+   exact applied diff passes disposable-PG and independent review.
 
 Only after blockers 2, 4, 5 and 6 are closed: flip `SCENE_GUARD_OPERATIONAL`
 and arm `AGENT_VISUAL_SCENE_GUARD`. Nothing in this document certifies

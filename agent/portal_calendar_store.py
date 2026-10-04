@@ -1289,6 +1289,13 @@ class SupabaseCalendarStore:
             payload["source_media_asset_id"] = source_media_asset_id
         from . import visual_writer_prepare
         prepared_write = visual_writer_prepare.enabled()
+        from . import visual_scene_register
+        try:
+            atomic_scene_write = visual_scene_register.enabled()
+            if atomic_scene_write:
+                visual_scene_register.require_prerequisites()
+        except visual_scene_register.SceneRegistrationError as exc:
+            raise PortalStoreError(502, str(exc)) from exc
         if prepared_write:
             if str(anchor_row.get("gym_id")) != str(account_key) or not anchor_id:
                 raise visual_writer_prepare.VisualPreparationError(
@@ -1314,16 +1321,24 @@ class SupabaseCalendarStore:
                 payload["source_media_url"] = source_media_url
             payload = self._prepare_visual_row(
                 account_key, payload, render_evidence, poster_render_evidence)
-        r = self._client().post(
-            self._rest(_TABLE),
-            headers=self._headers({"Content-Type": "application/json",
-                                   "Prefer": "return=representation"}),
-            json=[payload], timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        rows = r.json() or []
-        if prepared_write:
+        scene_candidate = payload.pop("scene_candidate", None)
+        if atomic_scene_write:
+            try:
+                rows = visual_scene_register.insert_batch(
+                    self, account_key, [payload], [scene_candidate])
+            except visual_scene_register.SceneRegistrationError as exc:
+                raise PortalStoreError(502, str(exc)) from exc
+        else:
+            r = self._client().post(
+                self._rest(_TABLE),
+                headers=self._headers({"Content-Type": "application/json",
+                                       "Prefer": "return=representation"}),
+                json=[payload], timeout=30,
+            )
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            rows = r.json() or []
+        if prepared_write and not atomic_scene_write:
             if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
                     or not rows[0].get("id")
                     or any(key not in rows[0] or rows[0][key] != value
@@ -2850,6 +2865,13 @@ class SupabaseCalendarStore:
             return recovered
         from . import visual_writer_prepare
         prepared_write = visual_writer_prepare.enabled()
+        from . import visual_scene_register
+        try:
+            atomic_scene_write = visual_scene_register.enabled()
+            if atomic_scene_write:
+                visual_scene_register.require_prerequisites()
+        except visual_scene_register.SceneRegistrationError as exc:
+            raise PortalStoreError(502, str(exc)) from exc
         if prepared_write:
             # Poster evidence is scoped to the whole media edge, not only to
             # the poster URL. Two videos can intentionally share a poster URL
@@ -2864,30 +2886,39 @@ class SupabaseCalendarStore:
                     (row.get("image_url"), row.get("thumbnail_url"))))
                 for row in payload]
         # ``scene_candidate`` is owner-attested, advisory preparation evidence.
-        # content_calendar has no column for it, and this write boundary has no
-        # candidate-registration transaction. Keep preparation/receipt evidence
-        # local to its producer until that separate registration contract exists;
-        # never turn arming the candidate flag into an unknown calendar payload,
-        # a registered candidate, or an operational scene guard.
-        for row in payload:
-            row.pop("scene_candidate", None)
+        # content_calendar has no column for it, so it is ALWAYS popped before
+        # key normalization/persistence. When AGENT_VISUAL_SCENE_REGISTER is
+        # explicitly armed (default OFF), the writer first requires GLOBAL
+        # WRITER PREP and SCENE CANDIDATE to be explicitly armed as well, then
+        # agent/visual_scene_register routes the WHOLE batch through one DRAFT
+        # RPC: candidate N is staged before
+        # row N's BEFORE INSERT trigger, and any candidate/row failure rolls the
+        # complete batch back. Flag OFF retains the normal REST insert below.
+        scene_candidates = [row.pop("scene_candidate", None) for row in payload]
         all_keys = set()
         for r in payload:
             all_keys.update(r.keys())
         payload = [{k: r.get(k) for k in all_keys} for r in payload]
-        r = self._client().post(
-            self._rest(_TABLE),
-            headers=self._headers({
-                "Content-Type": "application/json",
-                "Prefer": "return=representation",
-            }),
-            json=payload,
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        out = r.json() or []
-        if prepared_write:
+        if atomic_scene_write:
+            try:
+                out = visual_scene_register.insert_batch(
+                    self, account_key, payload, scene_candidates)
+            except visual_scene_register.SceneRegistrationError as exc:
+                raise PortalStoreError(502, str(exc)) from exc
+        else:
+            r = self._client().post(
+                self._rest(_TABLE),
+                headers=self._headers({
+                    "Content-Type": "application/json",
+                    "Prefer": "return=representation",
+                }),
+                json=payload,
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            out = r.json() or []
+        if prepared_write and not atomic_scene_write:
             if not isinstance(out, list) or len(out) != len(payload):
                 raise PortalStoreError(502, "calendar insert returned unverified visual rows")
             unmatched = list(payload)
