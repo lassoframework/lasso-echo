@@ -2863,6 +2863,14 @@ class SupabaseCalendarStore:
                 poster_render_evidence=(poster_render_evidence_by_url or {}).get(
                     (row.get("image_url"), row.get("thumbnail_url"))))
                 for row in payload]
+        # ``scene_candidate`` is owner-attested, advisory preparation evidence.
+        # content_calendar has no column for it, and this write boundary has no
+        # candidate-registration transaction. Keep preparation/receipt evidence
+        # local to its producer until that separate registration contract exists;
+        # never turn arming the candidate flag into an unknown calendar payload,
+        # a registered candidate, or an operational scene guard.
+        for row in payload:
+            row.pop("scene_candidate", None)
         all_keys = set()
         for r in payload:
             all_keys.update(r.keys())

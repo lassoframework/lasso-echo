@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -20,6 +22,18 @@ if str(_REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT))
 
 MAX_BYTES = 128 * 1024 * 1024
+
+
+class ReaderSetupError(RuntimeError):
+    """A safe, non-secret setup classification for the default reader."""
+
+
+class ReaderObservationError(RuntimeError):
+    """A safe, non-secret classification for an exact URL read."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _valid_url(value):
@@ -37,12 +51,18 @@ def _valid_url(value):
 
 def _load_default_reader():
     """Load the repository's guarded reader once, failing on setup errors."""
-    from agent.visual_writer_prepare import _bytes_for_url
+    try:
+        from agent.visual_writer_prepare import _bytes_for_url
+    except Exception as exc:
+        raise ReaderSetupError("reader_unconfigured") from exc
 
     def read_exact_url(url):
-        data = _bytes_for_url(url)
+        try:
+            data = _bytes_for_url(url)
+        except Exception as exc:
+            raise ReaderObservationError("object_read_failed") from exc
         if data is None:
-            raise ValueError("exact URL could not be read without redirect or size violation")
+            raise ReaderObservationError("exact_url_read_failed")
         return data
 
     return read_exact_url
@@ -58,6 +78,10 @@ def _observe(url, reader):
         return {"status": "error", "error": "invalid_or_missing_exact_url"}
     try:
         data = reader(url)
+    except ReaderObservationError as exc:
+        return {"status": "error", "error": exc.reason}
+    except ReaderSetupError:
+        return {"status": "error", "error": "reader_unconfigured"}
     except Exception:
         return {"status": "error", "error": "exact_url_read_failed"}
     if not isinstance(data, bytes):
@@ -152,6 +176,33 @@ def build_manifest(snapshot, reader=None):
     }
 
 
+def write_manifest(path, manifest):
+    """Atomically write a manifest with owner-only permissions."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp",
+                                     dir=str(target.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, target)
+        os.chmod(target, 0o600)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", type=Path, help="local JSON snapshot of historical rows")
@@ -160,10 +211,10 @@ def main(argv=None):
     try:
         snapshot = json.loads(args.snapshot.read_text(encoding="utf-8"))
         result = build_manifest(snapshot)
-        args.manifest.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n",
-                                 encoding="utf-8")
-    except ImportError as exc:
-        print(f"visual byte inventory reader setup failed: {exc}", file=sys.stderr)
+        write_manifest(args.manifest, result)
+    except (ImportError, ReaderSetupError):
+        print("visual byte inventory reader setup failed: reader_unconfigured",
+              file=sys.stderr)
         return 2
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         print(f"visual byte inventory failed: {exc}", file=sys.stderr)
