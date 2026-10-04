@@ -1419,6 +1419,18 @@ class SupabaseCalendarStore:
             "variant_of": anchor_id,
             "variant_status": "candidate",
         }
+        # The candidate is an alternate creative for the SAME logical post, so it
+        # inherits the anchor's logical_post_id (never re-minted) when the anchor
+        # carries one. Absent/NULL anchor IDs leave the candidate NULL.
+        if anchor_row.get("logical_post_id") is not None:
+            import uuid as _uuid
+            try:
+                payload["logical_post_id"] = str(
+                    _uuid.UUID(str(anchor_row["logical_post_id"])))
+            except (ValueError, AttributeError, TypeError):
+                raise ValueError(
+                    "anchor logical_post_id must be a UUID; got "
+                    f"{anchor_row['logical_post_id']!r}")
         if thumbnail_url is not None:
             payload["thumbnail_url"] = thumbnail_url
         if source_media_asset_id is not None:
@@ -2917,6 +2929,21 @@ class SupabaseCalendarStore:
                 # Explicit stable UUIDs support crash-safe automatic render retries.
                 clean["id"] = str(uuid.UUID(str((row or {}).get("id") or "")))
             clean["gym_id"] = account_key  # gym scope: never trust a foreign gym_id
+            # LOGICAL POST IDENTITY (2026-10-04): a caller may stamp each row with
+            # the ONE logical_post_id minted upstream for the sibling group (IG
+            # feed + FB mirror + paired Story share one UUID). We pass it through
+            # verbatim after strict UUID validation; we NEVER mint one here,
+            # because per-row minting would give siblings different IDs. Existing
+            # callers that send no logical_post_id leave the column NULL.
+            if clean.get("logical_post_id") is not None:
+                import uuid as _uuid
+                try:
+                    clean["logical_post_id"] = str(
+                        _uuid.UUID(str(clean["logical_post_id"])))
+                except (ValueError, AttributeError, TypeError):
+                    raise ValueError(
+                        "logical_post_id must be a UUID shared by the sibling "
+                        f"post group; got {clean['logical_post_id']!r}")
             payload.append(clean)
         # STAGE-TIME BELTS (report-card build, 2026-08-28; both flags default OFF,
         # account-agnostic — LASSO and gyms share the bug class):

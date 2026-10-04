@@ -47,6 +47,7 @@ path is offline-testable.
 
 import os
 import re
+import uuid
 
 from . import client_content, config, day_shape
 from . import cta_self_question_gate
@@ -517,6 +518,12 @@ def _row_from_draft(base_key, draft):
     reservation_id = getattr(draft, "_served_reservation_id", None)
     if reservation_id:
         row["_served_reservation_id"] = reservation_id
+    # New client pairs receive their identity at _finish_feed_with_story, before the
+    # Story is cloned.  Existing drafts have no attribute and stay untouched: this
+    # forward-only writer never invents an identity while rebuilding old calendar rows.
+    logical_post_id = getattr(draft, "logical_post_id", "") or ""
+    if logical_post_id:
+        row["logical_post_id"] = logical_post_id
     return row
 
 
@@ -585,10 +592,20 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
     _pre_autofit_url = getattr(feed, "creative_public_url", "")
     _maybe_format_feed(account, feed, library_path, log)
     _mark_feed(feed)
+    # A feed and its paired Story are one logical post even though they become three
+    # calendar rows after the Facebook mirror.  Mint before cloning so both drafts
+    # carry the same opaque identity without relying on image, date, or caption.
+    # A retry can pass the same draft through this helper again, so preserve its
+    # existing identity and mint only for a new pair.
+    if not (getattr(feed, "logical_post_id", "") or "").strip():
+        feed.logical_post_id = str(uuid.uuid4())
     out = [feed]
 
     # PAIRED STORY on the SAME photo (cloned from the feed; no second media consumed).
     story = _story_from_feed(feed)
+    # dataclasses.replace intentionally drops dynamic fields, so retain the pair
+    # identity explicitly on the Story clone.
+    story.logical_post_id = feed.logical_post_id
     # The story must NOT carry the feed's 4:5 autofit reframe: restore the pre-autofit
     # media (story-format ON rebuilds a fresh 1080x1920; this keeps it correct when OFF).
     if getattr(story, "creative_public_url", "") != _pre_autofit_url:
