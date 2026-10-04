@@ -1,7 +1,13 @@
-# Scene claim wave — DRAFT / UNAPPLIED / OFF (2026-10-03; P0 repair pass 2026-10-04)
+# Scene claim wave — DRAFT / UNAPPLIED / OFF / INCOMPLETE (2026-10-03; P0 repair pass 2026-10-04; wave-2 repair pass 2026-10-04 per `SCENE_REPAIR_WAVE2_SCOPE.md`; wave-3 architecture repair 2026-10-04 per `SCENE_WAVE3_SOL_DESIGN.md`)
 
-STATUS: DRAFT / UNAPPLIED / OFF / INCOMPLETE. Nothing in this wave is applied
-anywhere, no guard is armed, no flag is flipped, no provider is contacted.
+STATUS: DRAFT / UNAPPLIED / OFF / INCOMPLETE. The current source package was
+independently audited against frozen SQL hashes (group
+`199b33279a442cf78816457e588f886d2478b9b2063f0f0c8b599617a1f7d791`, scene
+`8fae2bdc788ed874e34a13d9f46ae77262bd93ef928cc2f5a4d8d4de9a5ee570`), and a
+fresh independent PostgreSQL 17 run reports 145 passed, exit 0. This is
+draft-level source and scratch-database evidence only. Nothing in this wave is
+applied anywhere, no guard is armed, no flag is flipped, and no provider is
+contacted.
 `SCENE_GUARD_OPERATIONAL` stays `False`; an armed `AGENT_VISUAL_SCENE_GUARD`
 still means fail-closed, not enforcement. The frozen exact-byte md5 ledger
 (`migrations/DRAFT_visual_global_history_20261002.sql`) is unchanged and
@@ -26,9 +32,12 @@ the repair pass implements is `SCENE_ACTIVATION_REPAIR_SPEC.md`.
 4. `migrations/DRAFT_visual_scene_claim_wave_20261003.sql` (this wave:
    candidate staging bound to the row's delivered object, permanent occupied
    scenes, idempotent review holds, the shared scan core + internal
-   decide/guard functions, the DRAFT calendar BEFORE trigger realizing the
-   committed held-row contract, guarded publish-claim/approval wrappers,
+   decide/guard functions, guarded publish-claim/approval wrappers,
    hold resolve/reactivate review RPCs, hamming function, backfill stub).
+   WAVE-3: the committed held-row contract is realized by the merged
+   exact-byte guard `visual_group_guard_trigger` (in the
+   `DRAFT_visual_group_claim_trigger_20261002.sql` draft, step 1), not by a
+   separate scene trigger — the scene file installs no calendar trigger.
 5. Any activation draft — must remain LAST. None exists yet.
 
 The wave file may only be applied after step 2 (it FK-references
@@ -51,13 +60,18 @@ any activation draft.
   never freed on local release, denial, or swap — mirroring the exact-byte
   ledger's "released stays consumed" semantics.
 - (c) `visual_scene_review_hold` — durable holds written ONLY by the
-  non-raising claim paths. A partial unique index on
-  (tenant_id, group_key, claim_date, calendar_row_id, candidate_phash,
-  matched_phash) WHERE state='open' is the stable open-hold uniqueness key:
-  a retry of the same conflict for the same row inserts no duplicate
-  (`visual_scene_write_holds` conflicts-do-nothing). Holds carry the full
-  conflict scope; an APPROVED hold exempts ONLY that exact reviewed conflict
-  pair for that exact claim date.
+  non-raising claim paths. Post wave-2 the hold row also carries
+  `candidate_id` (FK), `exact_url`, `fingerprint`, and
+  `resolution_evidence`, and the partial unique open-hold index
+  `visual_scene_review_hold_open_uq` spans
+  (tenant_id, group_key, claim_date, calendar_row_id, candidate_id,
+  candidate_phash, matched_phash, matched_tenant_id, matched_group_key,
+  matched_used_date) WHERE state='open': a retry of the same conflict for
+  the same row inserts no duplicate (`visual_scene_write_holds`
+  conflicts-do-nothing), and a later DISTINCT conflict can never reuse an
+  earlier approval. Holds carry the full conflict scope; an APPROVED hold
+  exempts ONLY the exact reviewed candidate + delivered object + matched
+  occupied conflict for that exact claim date.
 - (d) `visual_scene_hamming` (immutable plpgsql) + full-table occupied scan
   inside the shared, write-nothing, INTERNAL scan core
   `visual_scene_claim_scan(content_calendar, uuid)` — server-side, no
@@ -66,20 +80,53 @@ any activation draft.
   enforced inside the trigger path).
 - (e) `visual_scene_backfill_occupied` — STUB raising 0A000; backfill is an
   activation-draft deliverable, never ad hoc.
-- DRAFT calendar BEFORE trigger `content_calendar_scene_wave_claim_guard`
-  (function `visual_scene_calendar_claim_guard`) — fires before
-  `content_calendar_visual_group_guard` (alphabetical), realizes the
-  committed held-row contract (below).
+- WAVE-3 ARCHITECTURE (per `SCENE_WAVE3_SOL_DESIGN.md`, superseding the
+  wave-2 layout): the separate early scene BEFORE trigger
+  `content_calendar_scene_wave_claim_guard` and function
+  `visual_scene_calendar_claim_guard` are REMOVED. PostgreSQL runs same-kind
+  triggers alphabetically, so a later raising trigger could roll back holds
+  written by an earlier scene trigger — that design failed the durable-hold
+  contract. The scene decision now lives INSIDE the exact-byte guard
+  `visual_group_guard_trigger`
+  (`migrations/DRAFT_visual_group_claim_trigger_20261002.sql`), the ONE
+  authoritative content_calendar BEFORE path, gated on
+  `to_regprocedure('public.visual_scene_claim_scan(public.content_calendar,uuid)')`
+  so the guard behaves byte-identically to the pre-scene guard when the
+  scene draft is absent. Ordering invariant in the merged guard: AFTER
+  unconditional `visual_group_resolve_row` + changed-media refinement +
+  component locks + re-check, and BEFORE `visual_group_sync_row`: byte
+  attestation (23514 fail-closed) → bound candidate (23514 fail-closed) →
+  fleet-locked scan → in-memory held mutation
+  (`variant_status='archived'`, `status='pending'`,
+  `media_not_ready_reason='scene_review_hold'`, clears BOTH
+  `publish_claim_token` AND `publish_reservation_day`). Then
+  `visual_group_sync_row` (which may still raise — no hold exists yet), and
+  the scene writes are the LAST writes: conflict → idempotent
+  `visual_scene_write_holds`, clean → occupancy insert, then immediate
+  `RETURN NEW`. Nothing can raise after hold insertion; a failure rolls back
+  both calendar row and hold. A caller-prefilled `NEW.visual_group_key` is a
+  hint only: unconditional `visual_group_resolve_row` overwrites a mismatched
+  caller-prefilled key with the resolved group. A genuinely unresolved identity
+  remains not-ready; a stale hint does not itself force that unresolved state.
 - `visual_scene_publish_claim_guarded` (returns NULL for held rows; raises
   0A000 for the actual token mint pending calendar integration) and
   `visual_scene_approval_guarded` (held rows never approvable) — both read
   PERSISTED row state, never attempted-update success.
-- `visual_scene_hold_resolve` (validated one-shot open→approved|rejected
-  with named actor + non-empty evidence + current-scene re-scan under the
-  fleet lock; refuses on conflict-scope drift) and
-  `visual_scene_hold_reactivate` (approved-only; fresh bound-candidate
-  re-scan must be clean; reactivation UPDATE passes back through the trigger
-  chain).
+- `visual_scene_hold_resolve` / `visual_scene_hold_reactivate` — wave-3:
+  lock order matches actual DML per Sol design — calendar row FOR UPDATE
+  FIRST, then component locks, then fleet lock (a normal UPDATE already
+  holds the row before its trigger seeks component locks, so
+  component/fleet-before-row can deadlock). Both reload the current calendar
+  row, rebind exact candidate/tenant/group/role/URL/fingerprint/pHash,
+  reload the hold under lock, rescan the live conflict, and reject stale
+  binding and cross-tenant review. Approval exempts only the exact reviewed
+  conflict and does NOT activate the row. Reactivation rescans, refuses a
+  row with no calendar row (`23514`), guards against mid-reactivation
+  mutation (ROW_COUNT, `23514`), and verifies persisted identity after the
+  update. A persisted tenant/group/date/candidate mismatch raises `23514` and
+  rolls back the activation and occupancy changes. A fresh conflict that
+  persists as not-ready is reported as `converted_back_to_held`, never as a
+  false success.
 
 Policy bands (mirror `agent/visual_scene.py`): hamming ≤ 6 near_frame blocks
 (cross-tenant any date, or same-tenant different date); 7..30 uncertain holds
@@ -105,17 +152,24 @@ remain legal and idempotent.
   held state — FIXED: partial unique open-hold index + idempotent
   `visual_scene_write_holds` + the committed held calendar row (P0-4).
 - P0-4 calendar BEFORE trigger does not call the scene decision or
-  atomically hold the row — DRAFTED: `visual_scene_calendar_claim_guard`
-  never raises on a scene conflict; it writes idempotent holds, mutates NEW
-  to the held state (`variant_status='archived'`, `status='pending'`,
-  `media_not_ready_reason='scene_review_hold'`, `publish_claim_token`
-  cleared), still passes NEW through `visual_group_sync_row` (old active
-  local membership released; no exact claim and no pHash occupancy for the
-  held row), and RETURNs NEW so the transaction commits the held row with
-  its holds. Clean path: `visual_group_sync_row` FIRST (hard-rejects on
-  missing/invalid byte attestation), THEN pHash occupancy under the
-  still-held fleet lock. Calendar wiring into `visual_group_guard_trigger`
-  (resolved-key order) remains ACTIVATION BLOCKER 1.
+  atomically hold the row — DRAFTED, wave-3 architecture: the scene decision
+  is INSIDE the exact-byte guard `visual_group_guard_trigger` (the separate
+  `visual_scene_calendar_claim_guard` trigger is removed — Sol wave-3
+  design). The merged guard never raises on a scene conflict: it mutates NEW
+  to the held state in memory (`variant_status='archived'`,
+  `status='pending'`, `media_not_ready_reason='scene_review_hold'`, BOTH
+  `publish_claim_token` AND `publish_reservation_day` cleared), runs
+  `visual_group_sync_row` (old active local membership released; may still
+  raise — no hold exists yet, so a failure rolls back BOTH row and hold),
+  and only THEN inserts the idempotent hold as the LAST write before
+  `RETURN NEW`, so no later trigger/function can raise after hold insertion.
+  Clean path: byte attestation and bound-candidate checks (23514
+  fail-closed) → fleet-locked scan → `visual_group_sync_row` → occupancy
+  insert as last write. Former ACTIVATION BLOCKER 1 is resolved by
+  construction: the scene decision runs after the exact-byte guard's
+  unconditional group resolution. A caller-prefilled key is only a hint; a
+  mismatched value is overwritten with the resolved group. Truly unresolved
+  identities remain not-ready.
 - P0-5 publish-claim/approval RPCs can report false success — DRAFTED:
   guarded wrappers enforce the persisted-state contract (NULL token for held
   rows; held rows never approvable). Routing the REAL publish-claim RPC
@@ -128,16 +182,27 @@ remain legal and idempotent.
   reactivation — DRAFTED: `visual_scene_hold_resolve` (actor + evidence
   validated, current-scene re-evaluation: candidate and matched occupied row
   must still exist at the recorded hamming distance, drift refuses
-  resolution) and `visual_scene_hold_reactivate` (approved-only, fresh
-  re-scan, refuses while still blocked). Exemption scope is enforced in
+  resolution; wave-2: candidate validated by phash + exact_url +
+  fingerprint, evidence stored one-shot in `resolution_evidence`) and
+  `visual_scene_hold_reactivate` (approved-only, fresh re-scan, refuses
+  while still blocked). Persisted tenant/group/date/candidate mismatch raises
+  `23514`, rolling back activation and occupancy changes; a fresh conflict
+  that persists as not-ready is reported as `converted_back_to_held`.
+  Exemption scope is enforced in
   `visual_scene_claim_scan`: an approved hold exempts ONLY the exact
-  reviewed pair for its exact claim date.
-- P0-8 fleet lock order unenforced — DRAFTED: every occupancy writer, hold
-  writer, hold resolution and the future backfill uses the same order —
-  existing scene-component locks (`visual_group_lock_scene_components`)
-  FIRST, THEN the single fleet-wide scene advisory lock inside the scan.
-  The trigger takes component locks before the scan; resolution touches only
-  scene tables so it takes the advisory lock alone.
+  reviewed candidate + delivered object + matched occupied conflict for its
+  exact claim date.
+- P0-8 fleet lock order unenforced — DRAFTED, wave-3 lock order per Sol
+  design: normal claim path (inside the merged guard): unconditional
+  resolution → component locks → fleet advisory lock inside the scan.
+  Review functions (`visual_scene_hold_resolve`,
+  `visual_scene_hold_reactivate`): calendar row FOR UPDATE FIRST → component
+  locks → fleet advisory lock — matching actual DML order, since a normal
+  UPDATE already holds the row before its trigger seeks component locks
+  (component/fleet-before-row would deadlock). Deadlock-freedom is covered
+  by a disposable-PG opposing-session scenario (lock_timeout on the row,
+  never 40P01). The future backfill's order (component first, then fleet) is
+  documented in the wave file for the activation draft.
 
 ## Sol audit P1 dispositions
 
@@ -149,10 +214,11 @@ remain legal and idempotent.
   side — but no Python writer calls `visual_scene_register_candidate` yet,
   so staging remains unwired.
 - P1-2 rollback-only pg test wrapper vs migrations that COMMIT internally —
-  addressed BY DESIGN: the real-PostgreSQL scenarios now run COMMITTED
+  addressed BY DESIGN: the real-PostgreSQL scenarios run COMMITTED
   transactions on a disposable, dedicated scratch database (never
   production); committed state is exactly what the held-row contract needs
-  to prove. The suite is being rerun against the repaired SQL (below).
+  to prove. See current final-source and fresh PostgreSQL 17 evidence at the
+  top and below; earlier counts are retained as historical run records.
 - P1-3 denial/swap occupancy permanence naming — fixed in SQL comments and
   here: occupancy is PERMANENT; local release/denial/swap never frees a
   scene, mirroring the exact-byte ledger.
@@ -160,18 +226,22 @@ remain legal and idempotent.
 ## Durable-hold vs rollback (HOLD-ROLLBACK) — RESOLVED, realized by the committed held row
 
 Enforced semantics: **a hold exists IF AND ONLY IF the claim transaction
-commits in a blocked/held state.** Post-repair this is REALIZED, not just
-enforceable-by-contract: the conflict path in the draft BEFORE trigger never
-raises — it writes the hold evidence, mutates NEW to the held state, runs
-`visual_group_sync_row`, and RETURNs NEW, so the holds commit with the held
-calendar row in the same transaction. No caller replay, no errdetail
-contract. The non-raising `visual_scene_claim_decide` is the internal
-function form of the same contract for claim contexts that compose their own
-row write. The RAISING `visual_scene_claim_guard` (kept for hard-fail
-contexts) still writes NO holds by construction — its own raise would roll
-them back (even through a plpgsql EXCEPTION handler's savepoint — verified
-on scratch PG); its errors carry full match detail in errdetail for
-forensics.
+commits in a blocked/held state.** Post wave-3 this is REALIZED inside the
+merged exact-byte guard `visual_group_guard_trigger` (the separate scene
+trigger is removed): the conflict branch completes every potentially-raising
+step — resolution, attestation, component locks, fleet lock, scan, in-memory
+held mutation, `visual_group_sync_row` — BEFORE the final idempotent hold
+insertion, then RETURNs NEW immediately, so no later trigger/function can
+raise after the hold write and the holds commit with the held calendar row
+in the same transaction. A forced raise in the sync/release path leaves
+NEITHER row nor hold (verified on scratch PG). No caller replay, no
+errdetail contract. The non-raising `visual_scene_claim_decide` is the
+internal function form of the same contract for claim contexts that compose
+their own row write. The RAISING `visual_scene_claim_guard` (kept for
+hard-fail contexts) still writes NO holds by construction — its own raise
+would roll them back (even through a plpgsql EXCEPTION handler's savepoint
+— verified on scratch PG); its errors carry full match detail in errdetail
+for forensics.
 
 Autonomous-transaction alternatives (a dblink self-connection writing the
 hold from inside a raising path) remain REJECTED: fragile under
@@ -179,62 +249,66 @@ transaction-mode connection poolers (session state and advisory-lock
 assumptions break) and they demand stored connect credentials inside the
 database, which this security-definer surface must not require.
 
-## ACTIVATION BLOCKERS (verbatim from the migration header; ALL open)
+## ACTIVATION BLOCKERS
 
-1. CALENDAR WIRING / RESOLVED-KEY ORDER. The draft trigger
-   `content_calendar_scene_wave_claim_guard` fires BEFORE
-   `content_calendar_visual_group_guard` (alphabetical) so a held row never
-   reaches the exact-byte claim. It therefore sees `new.visual_group_key`
-   BEFORE `visual_group_guard_trigger` resolves aliases, and engages only
-   when the row already carries a resolved visual_group_key + post_date
-   (armed tenant, active unsent row). The ACTIVATION draft MUST move the
-   scene decision inside `visual_group_guard_trigger` after
-   visual_group_key resolution (or add the post-resolution hook there),
-   without ever creating an exact claim or occupancy for a row that ends
-   held.
+1. CALENDAR WIRING / RESOLVED-KEY ORDER — RESOLVED by the wave-3
+   architecture (Sol design): the separate early scene trigger is removed;
+   the scene decision runs inside `visual_group_guard_trigger` AFTER its
+   unconditional object/group resolution and component locking. A
+   caller-prefilled `visual_group_key` is only a hint; unconditional
+   resolution overwrites a mismatched value with the resolved group. Truly
+   unresolved identities remain not-ready. No row is skipped for lacking a
+   pre-populated key or pre-staged candidate, and no claim, hold, or occupancy
+   is based on a forged hint.
 2. PUBLISH-CLAIM RPC WIRING. The real publish-claim RPC (PR230 path) is not
    part of this draft stack; `visual_scene_publish_claim_guarded` enforces
    the persisted-state contract (NULL for held rows) and raises 0A000 for
    the actual token mint. The activation draft must route the real RPC
    through this persisted-state check. The approval RPC must likewise
    consult persisted state (`visual_scene_approval_guarded`).
-3. PUBLISH RESERVATION COLUMNS. In this draft stack the only publish
-   reservation marker on content_calendar is publish_claim_token (plus
-   late_post_id as provider id); no separate publish reservation column
-   exists. The held mutation clears publish_claim_token. If production
-   content_calendar has additional reservation columns, the activation draft
-   must name and clear them explicitly — they are integration prerequisites,
-   not invented here.
+3. PUBLISH RESERVATION COLUMNS — RESOLVED by the wave-2 pass:
+   `publish_reservation_day` (real column from
+   `calendar_publish_day_capacity_20260917.sql`) is cleared alongside
+   `publish_claim_token` in the held mutation.
 4. BACKFILL (still 0A000). Occupied history must be derived from the
    exact-byte ledger and attested candidates before activation. Unknown or
    source-null published history must STAY HELD for review, and the backfill
-   may never mark a staged candidate as used.
-5. COVERAGE REPORT + LIVE ACCEPTANCE RUNS. visual_global_coverage /
-   visual_global_history_coverage must show reviewed coverage, and the
-   repair-spec acceptance suite (clean claim, legal sibling, cross-date /
-   cross-tenant near conflict, uncertain band, concurrent conflicting
-   claims, preparation without use, denial/swap, invalid attestation,
-   persisted hold, approval/claim false-success prevention, hold resolution,
-   backfill with unknown history) must be run live against a disposable
-   database by the independent reviewer on the exact diff.
+   may never mark a staged candidate as used. Its lock order (component
+   locks first, then the fleet advisory lock) is documented in the wave file
+   for the activation draft.
+5. EXACT-DIFF ACCEPTANCE. The independent 145-pass PostgreSQL 17 run
+   verifies the current source package, not a future activation diff. The
+   activation reviewer must verify the coverage report and repair-spec suite
+   against the exact integrated diff, including clean claim, legal sibling,
+   cross-date / cross-tenant near conflict, uncertain band, concurrent
+   conflicting claims, preparation without use, denial/swap, invalid
+   attestation, persisted hold, approval/claim false-success prevention,
+   hold resolution, and unknown-history backfill. `visual_global_coverage` and
+   `visual_global_history_coverage` must show reviewed coverage before
+   activation.
+6. RUNTIME CANDIDATE REGISTRATION. No Python writer transactionally calls
+   `visual_scene_register_candidate`; staging a candidate and writing the
+   corresponding calendar row must be integrated before arming the guard.
+   Partial registration changes claim behavior because an engaged scene row
+   without a bound candidate fails closed.
 
-Only after all five: flip `SCENE_GUARD_OPERATIONAL` and arm
-`AGENT_VISUAL_SCENE_GUARD`. Nothing in this document certifies activation
-readiness.
+Only after blockers 2, 4, 5 and 6 are closed: flip `SCENE_GUARD_OPERATIONAL`
+and arm `AGENT_VISUAL_SCENE_GUARD`. Nothing in this document certifies
+activation readiness.
 
 ## Scratch-PG verification evidence (2026-10-03 / 2026-10-04)
 
 Draft-level verification against disposable local PostgreSQL instances (never
 production; the migration remains UNAPPLIED everywhere):
 
-- 2026-10-03 (pre-repair decide/guard contract): blocked-then-committed
+- Historical 2026-10-03 (pre-repair decide/guard contract): blocked-then-committed
   claim via `visual_scene_claim_decide` leaves durable hold rows with
   `visual_scene_phash_occupied` EMPTY and candidates untouched; the raising
   path leaves ZERO holds (including through an EXCEPTION-handler savepoint);
   band behaviors confirmed (≤ 6 blocks, 7..30 blocks with holds, > 30
   distinct, same-tenant same-date same-group legal, unknown candidate
   fail-closed with no holds).
-- 2026-10-04 (agent-3 scratch PostgreSQL 16 run against the repaired SQL):
+- Historical 2026-10-04 (agent-3 scratch PostgreSQL 16 run against the repaired SQL):
   - held-commit row state — a conflicting claim COMMITS the calendar row in
     the held state (`variant_status='archived'`, `status='pending'`,
     `media_not_ready_reason='scene_review_hold'`, publish_claim_token NULL)
@@ -251,12 +325,74 @@ production; the migration remains UNAPPLIED everywhere):
   - occupancy persistence — occupancy survives local release/denial/swap
     (append-only, mirrors the exact-byte ledger).
 
+- Historical 2026-10-04 (wave-2 pass, disposable PostgreSQL 17, port 54399, dropped
+  after; all transactions COMMITTED, nothing rollback-only):
+  - clean claim on an UNKEYED row: trigger auto-resolves the exact-byte
+    group, commits active, pHash occupancy + local ledger + global usage
+    written; same-day sibling stays single-occupancy idempotent;
+  - held conflict: row commits `pending/archived/scene_review_hold` with
+    BOTH `publish_claim_token` AND `publish_reservation_day` NULL, open hold
+    durable in the same transaction, old local membership released, zero
+    occupancy for the held row; retry inserts no duplicate hold; a DISTINCT
+    row hitting the same conflict gets its own open hold;
+  - missing/invalid byte attestation: 23514 fail-closed BEFORE any hold
+    write — zero rows, zero holds, zero occupancy;
+  - raw-alias gym key: evaluated (canonical tenant resolution) and held
+    against the occupied conflict, not skipped;
+  - uncertain band: two DISTINCT holds for two matched occupied identities
+    (approval-reuse prevention);
+  - resolution/reactivation: approval stores actor + `resolution_evidence`
+    with exact `exemption_scope`; reactivation refuses a still-blocked
+    different conflict with no mutation, succeeds after its own approval,
+    records occupancy only for the exempted conflict;
+  - busy fleet lock: `visual_scene_hold_resolve` under a held advisory lock
+    raises 'global scene claim busy; retry transaction' (55P03), hold stays
+    open;
+  - media-kind binding: a `display` candidate on a video file URL fails
+    closed (23514) for a video row; a `poster` candidate on the exact
+    thumbnail URL claims clean;
+  - Historical run: `tests/test_scene_claim_wave_*.py`: 127 passed / 0 failed with the
+    disposable DSN (25 committed-transaction PG scenarios + 102
+    static/classify/flags/prepare), 3 consecutive random-order passes;
+    without DSN: 102 passed, 25 skipped (convention preserved).
+- Historical 2026-10-04 (wave-3 architecture pass, disposable PostgreSQL 17 clusters,
+  dropped after; all transactions COMMITTED):
+  - merged guard ordering: conflict commits held row + hold atomically;
+    a forced raise in exact-byte release/sync on the conflict path leaves
+    NEITHER row nor hold (scratch-only override, restored after);
+  - forged `visual_group_key` hint: overwritten by unconditional group
+    resolution; a truly unresolved identity remains not-ready;
+  - review lock order: concurrent writer holding the calendar row blocks
+    `visual_scene_hold_resolve` on the ROW (lock_timeout, never 40P01
+    deadlock); resolve succeeds after the writer commits;
+  - stale binding and cross-tenant resolutions reject (23514);
+  - reactivation identity mismatch raises `23514`, rolling back activation
+    and occupancy changes; a fresh conflict that persists as not-ready
+    reports `converted_back_to_held`; real reactivation records occupancy
+    for the exempted conflict only;
+  - scene-absent gate: without the scene draft the guard applies and claims
+    exactly as pre-scene (`visual_group_identity_unresolved` for unkeyed
+    rows, no scene tables);
+  - Historical run: `tests/test_scene_claim_wave_*.py`: 133 passed / 0 failed, EXIT=0 with
+    the disposable DSN (31 committed-transaction PG scenarios + 102
+    static/classify/flags/prepare); without DSN: 102 passed, 31 skipped,
+    EXIT=0. Two scenarios use clearly-marked scratch-only instrumentation
+    (forced release raise; emulated re-hold), each restored/dropped in
+    `finally` with a positive-path sanity assertion.
+
+- Current independent Astra run (2026-10-04, fresh disposable PostgreSQL 17):
+  `tests/test_scene_claim_wave_*.py`: 145 passed, EXIT=0. This supersedes the
+  earlier 127/133 run counts as the current verification result. The final
+  source audit is recorded in `SCENE_WAVE3_FINAL_SOURCE_AUDIT_20261004.md`;
+  it found no P0/P1 in the frozen source. This does not close production
+  blockers.
+
 The pg test suite (`tests/test_scene_claim_wave_pg.py`, committed-transaction
-scenarios on a disposable DSN by design — Sol P1-2) is being RERUN against
-the repaired SQL; treat the static SQL-text contract tests as draft pins
-until that rerun lands. These runs are draft-level verification, NOT
-activation acceptance — the repair-spec acceptance suite (BLOCKER 5) must
-still be run live by the independent reviewer on the exact diff.
+scenarios on a disposable DSN by design — Sol P1-2) has been rerun against
+the wave-3 merged-guard SQL as recorded above. The latest 145-pass run is
+draft-level verification, NOT activation acceptance — the repair-spec
+acceptance suite (BLOCKER 5) must still be run by the independent reviewer on
+the exact activation diff.
 
 ## Test-fixture pattern: Walsh–Hadamard codebook (Astra directive)
 
@@ -283,15 +419,16 @@ removes this wave's test surface.
 
 ## Unresolved limitations
 
-- The 5 ACTIVATION BLOCKERS above are all open. In particular: the trigger
-  still sees pre-alias-resolution keys (BLOCKER 1), the real publish-claim /
-  approval RPCs are not routed through the guarded wrappers (BLOCKER 2), and
-  any production reservation columns beyond publish_claim_token are unnamed
-  (BLOCKER 3).
-- Sol P1-1 remains open: no Python writer calls
-  `visual_scene_register_candidate`; a scene with no staged candidates is
-  inert (feature OFF for that scene), and once any candidate IS staged the
-  scene is fail-closed for rows lacking a bound candidate — so partial
+- Production readiness remains blocked by real publish-claim / approval RPC
+  wiring, historical occupied-scene backfill, and transactional runtime
+  candidate registration. Blocker 5 also requires acceptance on the exact
+  activation diff; the current 145-pass source-package run is not that gate.
+  `publish_reservation_day` clearing and resolved-key ordering are implemented
+  in the draft. Exact-diff acceptance (BLOCKER 5) remains outstanding even
+  though the current source package has a fresh independent 145-pass run.
+- Runtime candidate registration remains open: no Python writer calls
+  `visual_scene_register_candidate`. Post wave-2 an engaged row WITHOUT a
+  bound candidate is a fail-closed 23514 rejection (not inert), so partial
   writer wiring changes claim behavior and must land deliberately.
 - Backfill is a stub; occupied history is empty until the activation draft
   derives it from the exact-byte ledger (BLOCKER 4).

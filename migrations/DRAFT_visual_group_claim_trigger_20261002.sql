@@ -3,6 +3,46 @@
 -- exist before a first claim and serialize absent-ledger races as well as swaps.
 -- Rollback: disable gyms, drop content_calendar_visual_group_guard, RPCs and
 -- helper functions, then sibling table; preserve permanent ledger history.
+-- ---------------------------------------------------------------------------
+-- WAVE-3 REPAIR (Astra SCENE_REPAIR_WAVE3_SCOPE.md items 1-2; Sol
+-- SCENE_WAVE3_SOL_DESIGN.md, whose lock-order wording SUPERSEDES the scope
+-- file, 2026-10-04): content_calendar_visual_group_guard is now the ONE
+-- authoritative content_calendar BEFORE trigger. The separate early scene
+-- trigger (content_calendar_scene_wave_claim_guard in
+-- DRAFT_visual_scene_claim_wave_20261003.sql) is REMOVED: PostgreSQL runs
+-- same-kind triggers alphabetically, so any later raising trigger could roll
+-- back scene holds written by an earlier trigger, breaking the durable-hold
+-- contract (audit "Durable committed hold", MISSING/P0). The scene claim
+-- decision now runs INSIDE this exact-byte guard, AFTER its unconditional
+-- object/group resolution and component locking, with this ORDERING
+-- INVARIANT on the conflict path:
+--   1. ALL potentially-raising work completes FIRST: published/terminal and
+--      ambiguous-flow checks, unconditional exact resolution and re-read,
+--      candidate byte attestation, component locks, the fleet-wide scene
+--      advisory lock and the occupied-table scan;
+--   2. NEW is then mutated to the held state IN MEMORY
+--      (variant_status='archived', status='pending',
+--      media_not_ready_reason='scene_review_hold', publish_claim_token AND
+--      publish_reservation_day cleared);
+--   3. visual_group_sync_row(OLD, held NEW, op) runs — it may still raise,
+--      but NO hold exists yet, so a raise leaves neither row nor hold;
+--   4. the idempotent scene hold insertion is the LAST write of this
+--      trigger, immediately followed by RETURN NEW: no later trigger or
+--      function in this statement can raise after a hold insert.
+-- A failed transaction therefore rolls back both the calendar row and the
+-- hold (PostgreSQL has no autonomous-transaction escape hatch).
+-- A caller-prefilled NEW.visual_group_key remains a HINT ONLY: the group
+-- resolved UNCONDITIONALLY from the final delivered object is written over
+-- it before any scene claim/hold/occupancy decision, so a forged hint can
+-- never steer the outcome — and (Sol independent audit P0, 2026-10-04) when
+-- the hint disagrees with a NON-NULL resolution the row proceeds under the
+-- RESOLVED group with full scene evaluation, never NULLed into a silent
+-- skip; only a genuinely unresolved (NULL) resolution keeps the fail-closed
+-- visual_group_identity_unresolved path. The scene block is gated on the
+-- presence of the scene claim authority (the scene draft is applied after
+-- the exact-byte ledger); when the scene draft is absent this trigger
+-- behaves exactly as the pre-wave-3 exact-byte guard.
+-- ---------------------------------------------------------------------------
 
 create table if not exists public.visual_group_usage_sibling (
   gym_id text not null, group_key text not null, calendar_row_id uuid not null,
@@ -363,6 +403,7 @@ $$;
 create or replace function public.visual_group_guard_trigger()
 returns trigger language plpgsql security definer set search_path = public as $$
 declare resolved text; need_claim boolean; finalized boolean; identity_changed boolean; media_changed boolean; old_tenant text; new_tenant text;
+  scene_hint text; scene_candidate uuid; scene_engaged boolean:=false; scene_conflict boolean:=false; scene_scan record;
 begin
   if tg_op='DELETE' then
     if public.visual_group_enforcement_on(old.gym_id) then
@@ -458,7 +499,20 @@ begin
       end if;
       -- Caller-provided keys are hints, never authority. An unchanged old key
       -- cannot survive a new media URL unless exact aliases still resolve it.
-      if new.visual_group_key is not null and new.visual_group_key is distinct from resolved then
+      -- Wave-3 P0 (Sol independent audit, 2026-10-04): the authoritative
+      -- delivered-object resolution DRIVES the claim. When a forged or stale
+      -- hint disagrees with a NON-NULL resolution, the row proceeds under
+      -- the RESOLVED group — claim, hold and occupancy are evaluated
+      -- normally below — it is NEVER silently nulled into skipping the scene
+      -- decision. Only a genuinely unresolved (NULL) resolution nulls the
+      -- key, which keeps the fail-closed visual_group_identity_unresolved
+      -- path (and, for armed engaged rows, the not-ready rejection before
+      -- any approval/claim/finalize below plus the scene hint-attestation
+      -- hard fail for keyed rows).
+      scene_hint := new.visual_group_key;
+      if resolved is not null then
+        new.visual_group_key := resolved;
+      elsif new.visual_group_key is not null then
         new.visual_group_key := null;
       else new.visual_group_key := resolved; end if;
       if public.visual_group_row_review_pending(new) then
@@ -498,9 +552,109 @@ begin
          nullif(btrim(new.image_url),'') is null or new.media_not_ready_reason is not null) then
         raise exception 'visual media not ready for approval, claim or finalize' using errcode='23514';
       end if;
+      -- ---------------------------------------------------------------------
+      -- WAVE-3 SCENE DECISION (moved out of the removed early scene trigger
+      -- content_calendar_scene_wave_claim_guard; see this file's header).
+      -- Engages for armed, active, unsent, unambiguous rows with a post_date,
+      -- and ONLY when the scene claim authority exists (the scene draft is
+      -- applied after this one; without it this guard behaves exactly as the
+      -- pre-wave-3 exact-byte guard). Everything here is potentially-raising
+      -- work and therefore completes BEFORE any held-state mutation, sync or
+      -- hold write. A caller-prefilled visual_group_key is a hint only: the
+      -- group resolved unconditionally above drives every scene decision.
+      -- ---------------------------------------------------------------------
+      if not finalized
+         and public.visual_group_row_active(new)
+         and not public.visual_group_row_ambiguous(new)
+         and new.post_date is not null
+         and to_regprocedure('public.visual_scene_claim_scan(public.content_calendar,uuid)') is not null then
+        if new.visual_group_key is not null then
+          -- Resolution survived the hint check above, so new.visual_group_key
+          -- IS the group resolved unconditionally from the delivered object.
+          -- Exact DELIVERED-row byte attestation BEFORE any hold write.
+          if not public.visual_global_row_bytes_verified(new) then
+            raise exception 'delivered-row byte attestation missing or invalid; scene guard fails closed'
+              using errcode='23514';
+          end if;
+          -- A scene with no candidate bound to its exact delivered object is
+          -- a HARD fail-closed rejection, never a silent pass.
+          scene_candidate := public.visual_scene_row_candidate(new);
+          if scene_candidate is null then
+            raise exception 'no scene candidate bound to this row''s delivered object; scene guard fails closed'
+              using errcode='23514';
+          end if;
+          -- The scan takes the single fleet-wide scene advisory lock AFTER
+          -- the component locks taken above (component-before-fleet).
+          select * into scene_scan from public.visual_scene_claim_scan(new, scene_candidate);
+          if scene_scan.o_worst_band = 'fail_closed' then
+            -- Candidate evidence vanished between binding and scan.
+            raise exception 'no scene candidate bound to this row''s delivered object; scene guard fails closed'
+              using errcode='23514';
+          end if;
+          scene_engaged := true;
+          if scene_scan.o_worst_band is not null then
+            -- CONFLICT: held-state mutation of NEW, IN MEMORY ONLY. The
+            -- release/sync below still runs for the held NEW (which is not
+            -- claimable, so sync creates NO exact claim and NO occupancy for
+            -- it) and may raise — no hold exists yet. The hold insertion
+            -- after sync_row is the LAST write of this statement.
+            scene_conflict := true;
+            new.variant_status := 'archived';
+            new.status := 'pending';
+            new.media_not_ready_reason := 'scene_review_hold';
+            new.publish_claim_token := null;
+            new.publish_reservation_day := null;
+          end if;
+        end if;
+        if new.visual_group_key is null and resolved is null
+            and scene_hint is not null then
+          -- TRUE identity-unresolved keyed row (resolution itself is NULL):
+          -- the wave-2 keyed-path parity check. A row that arrived KEYED
+          -- still fails closed on its byte attestation (checked under the
+          -- hint): the hint can only make an unattested row raise earlier —
+          -- it never produces a claim, hold, or occupancy. The not-ready
+          -- mark above owns the unresolved identity. (A key that DISAGREED
+          -- with a non-NULL resolution no longer reaches this branch: the
+          -- row was re-keyed to the resolved group above and is evaluated
+          -- normally — the hint can never null its way past the scene
+          -- decision, Sol independent-audit P0.)
+          new.visual_group_key := scene_hint;
+          if not public.visual_global_row_bytes_verified(new) then
+            raise exception 'delivered-row byte attestation missing or invalid; scene guard fails closed'
+              using errcode='23514';
+          end if;
+          new.visual_group_key := null;
+        end if;
+      end if;
     end if;
   end if;
   perform public.visual_group_sync_row(case when tg_op='UPDATE' then old end,new,lower(tg_op));
+  -- ---------------------------------------------------------------------------
+  -- WAVE-3 ORDERING INVARIANT: scene writes are the LAST writes of this
+  -- statement, AFTER visual_group_sync_row (which may raise). A raise above
+  -- leaves neither calendar row nor hold/occupancy; after the hold insertion
+  -- below nothing in this statement raises, so the held row and its hold
+  -- commit or roll back TOGETHER. RETURN NEW follows immediately.
+  -- ---------------------------------------------------------------------------
+  if scene_conflict then
+    -- Idempotent, non-raising hold insertion (stable open-hold uniqueness
+    -- key; a retry inserts no duplicate).
+    perform public.visual_scene_write_holds(scene_scan.o_tenant,
+      new.visual_group_key, new.post_date, new.id, new.account,
+      scene_scan.o_candidate_id, scene_scan.o_phash, scene_scan.o_fingerprint,
+      scene_scan.o_exact_url, scene_scan.o_detail);
+  elsif scene_engaged then
+    -- CLEAN: the exact-byte sync already committed above; record pHash
+    -- occupancy as the last write (idempotent no-op for legal siblings).
+    insert into public.visual_scene_phash_occupied
+      (phash, tenant_id, group_key, used_date, fingerprint,
+       calendar_row_id, channel, evidence)
+      values (scene_scan.o_phash, scene_scan.o_tenant, new.visual_group_key,
+        new.post_date, scene_scan.o_fingerprint, new.id, new.account,
+        jsonb_build_object('candidate_id', scene_scan.o_candidate_id,
+          'exact_url', scene_scan.o_exact_url))
+      on conflict (phash, tenant_id, group_key, used_date) do nothing;
+  end if;
   return new;
 end;
 $$;
