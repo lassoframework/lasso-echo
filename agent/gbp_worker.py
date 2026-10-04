@@ -79,7 +79,10 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
     draft=True (autonomous build + validation) sends isDraft — Zernio stores it and
     publishes NOTHING. The armed worker passes draft=False, human-tap gated upstream."""
     from .publish_billing_gate import publishing_blocked
+    from . import outbound_publish_receipt as _receipt
     if not draft and publishing_blocked(row.get("gym_id")):
+        _receipt.record(lane="gbp", row=row, decision="held_billing",
+                        reason="access_revoked")
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": "Echo access revoked or subscription canceled",
                 "held": "echo_access", "mode": ""}
@@ -89,6 +92,8 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
     # never a 'failed' outcome — nothing was attempted and nothing was rejected.
     _media_hold = (row.get("media_not_ready_reason") or "").strip()
     if _media_hold:
+        _receipt.record(lane="gbp", row=row, decision="held_media_review",
+                        reason="media_not_ready")
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": f"media not ready: {_media_hold}"[:400],
                 "held": "media_hold", "mode": ""}
@@ -109,11 +114,15 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
     if not (row.get("image_url") or "").strip():
         issues.append("no image on the row")
     if issues:
+        _receipt.record(lane="gbp", row=row, decision="held_preflight",
+                        reason="caption_or_media_rail")
         return {"ok": False, "status": "failed", "late_post_id": "",
                 "reject_reason": "rail check: " + "; ".join(issues), "mode": ""}
     try:
         payload = build_gbp_payload_for_row(row, connection)
     except gbp.GbpPayloadError as e:
+        _receipt.record(lane="gbp", row=row, decision="held_preflight",
+                        reason="payload_invalid")
         return {"ok": False, "status": "failed", "late_post_id": "",
                 "reject_reason": f"payload: {e}", "mode": ""}
     if not draft:
@@ -148,6 +157,7 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
                 "reject_reason": "", "mode": "draft" if draft else "live",
                 "dedup": True}
 
+    _receipt.record(lane="gbp", row=row, decision="preflight_passed")
     try:
         # The persisted claim token (live lane only) is the logical-attempt
         # Idempotency-Key; without a verified token no key is sent. Legacy fake
@@ -158,8 +168,12 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
         else:
             resp = client.create_post_raw(payload, draft=draft)
     except Exception as exc:  # noqa: BLE001
+        _receipt.record(lane="gbp", row=row, decision="provider_result",
+                        attempted=True, outcome="exception", reason=type(exc).__name__)
         dedup = _dedup_success(exc)
         if dedup:
+            _receipt.record(lane="gbp", row=row, decision="provider_result",
+                            attempted=True, outcome="deduplicated")
             return dedup
         no_post = _no_post_validation(exc)
         if no_post is not None:
@@ -171,7 +185,11 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
         return _ambiguous(f"Zernio create outcome unknown: {type(exc).__name__}")
     post_id = post_id_of(resp)
     if not post_id:
+        _receipt.record(lane="gbp", row=row, decision="provider_result",
+                        attempted=True, outcome="ambiguous")
         return _ambiguous("Zernio create returned no post id")
+    _receipt.record(lane="gbp", row=row, decision="provider_result",
+                    attempted=True, outcome="draft" if draft else "published")
     return {"ok": True, "status": "published", "late_post_id": post_id,
             "reject_reason": "", "mode": "draft" if draft else "live"}
 
@@ -281,7 +299,10 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
     the DRAFT build we do NOT call gmb-media (it would upload live); we simulate a
     published result so the dogfood shows the photo card without touching Google."""
     from .publish_billing_gate import publishing_blocked
+    from . import outbound_publish_receipt as _receipt
     if not draft and publishing_blocked(row.get("gym_id")):
+        _receipt.record(lane="gbp_photo", row=row, decision="held_billing",
+                        reason="access_revoked")
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": "Echo access revoked or subscription canceled",
                 "held": "echo_access", "mode": ""}
@@ -290,24 +311,36 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
     # attempt, so the result is a visible hold, never 'failed'.
     _media_hold = (row.get("media_not_ready_reason") or "").strip()
     if _media_hold:
+        _receipt.record(lane="gbp_photo", row=row, decision="held_media_review",
+                        reason="media_not_ready")
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": f"media not ready: {_media_hold}"[:400],
                 "held": "media_hold", "mode": ""}
     if not (row.get("image_url") or "").strip():
+        _receipt.record(lane="gbp_photo", row=row, decision="held_preflight",
+                        reason="missing_image")
         return {"ok": False, "status": "failed", "late_post_id": "",
                 "reject_reason": "photo drop has no image", "mode": ""}
     if draft:
+        _receipt.record(lane="gbp_photo", row=row, decision="preflight_passed")
+        _receipt.record(lane="gbp_photo", row=row, decision="provider_result",
+                        attempted=False, outcome="draft")
         return {"ok": True, "status": "published", "late_post_id": "",
                 "reject_reason": "", "mode": "draft"}
     hold = _media_reuse_hold(row, now=now, history_store=history_store,
                              media_store=media_store)
     if hold:
+        _receipt.record(lane="gbp_photo", row=row, decision="held_media_review",
+                        reason="media_reuse")
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": hold, "held": "media_reuse", "mode": ""}
+    _receipt.record(lane="gbp_photo", row=row, decision="preflight_passed")
     try:
         resp = client.create_gmb_media(connection["zernio_account_id"],
                                        row["image_url"])
     except Exception as e:  # noqa: BLE001 - an error here is NOT always the outcome
+        _receipt.record(lane="gbp_photo", row=row, decision="provider_result",
+                        attempted=True, outcome="exception", reason=type(e).__name__)
         # CARRY THE MESSAGE, not just the class (2026-09-03). This recorded only
         # type(e).__name__, so the live failure on crossfitnine7f7dadc read "photo
         # upload: ZernioError" in the row AND in the alert -- naming the exception
@@ -360,6 +393,8 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
     from .zernio import post_id_of
     post_id = post_id_of(resp)
     if not post_id:
+        _receipt.record(lane="gbp_photo", row=row, decision="provider_result",
+                        attempted=True, outcome="ambiguous")
         # A 2xx without a post id cannot be confirmed: the media may exist on the
         # provider. Hold for manual readback — do not auto-retry (a second upload
         # would duplicate the gallery photo) and do not stamp failed.
@@ -367,6 +402,8 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
                 "reject_reason": "gmb-media returned no post id; manual provider "
                                  "readback required",
                 "held": "ambiguous_send", "mode": ""}
+    _receipt.record(lane="gbp_photo", row=row, decision="provider_result",
+                    attempted=True, outcome="published")
     return {"ok": True, "status": "published", "late_post_id": post_id,
             "reject_reason": "", "mode": "live"}
 

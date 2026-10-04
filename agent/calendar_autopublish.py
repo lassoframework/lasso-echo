@@ -1047,6 +1047,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         try:
             from . import onboarding_demo as _demo
             if _demo.is_sample_row(row):
+                from . import outbound_publish_receipt as _receipt
+                _receipt.record(lane="calendar", row=row, decision="held_generic_media",
+                                reason="onboarding_sample")
                 skipped.append(row_id)
                 continue
         except Exception:  # noqa: BLE001 - a rail that cannot load must not publish
@@ -1075,6 +1078,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             from . import client_infographic_fill as _cif
             if pillar == _nmas.NEEDS_CLIENT_SAFE_REVIEW_PILLAR or \
                     pillar.endswith(_cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX):
+                from . import outbound_publish_receipt as _receipt
+                _receipt.record(lane="calendar", row=row, decision="held_generic_media",
+                                reason="client_safe_review_required")
                 skipped.append(row_id)
                 continue
         except Exception:  # noqa: BLE001 - a rail that cannot load must not publish
@@ -1084,6 +1090,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # has not approved yet is left UNTOUCHED (never claimed, never published). LASSO
         # (approved_only=False) is unchanged: it auto-publishes pending rows at slot time.
         if approved_only and (row.get("status") or "").strip().lower() != "approved":
+            from . import outbound_publish_receipt as _receipt
+            _receipt.record(lane="calendar", row=row, decision="held_unapproved",
+                            reason="client_approval_required")
             waiting.append(row_id)
             continue
 
@@ -1369,6 +1378,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # claimed. Read it freshly at the last pre-network boundary for BOTH
         # external publishers. Calendar approval cannot substitute for asset review.
         if not _drive_asset_usable_at_send(row, gym_id):
+            from . import outbound_publish_receipt as _receipt
+            _receipt.record(lane="calendar", row=row, decision="held_media_review",
+                            reason="media_asset_review_required")
             _reason = "media_asset_review_required"
             _reverted = _revert_to_pending(
                 store, row_id, reject_reason=_reason, gym_id=gym_id,
@@ -1406,6 +1418,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # (the API body is empty by design), so its traced value is the burned
         # caption — never a false LOST.
         from .caption_trace import trace_publish as _trace_publish
+        from . import outbound_publish_receipt as _receipt
+        _receipt.record(lane="calendar", row=row, decision="preflight_passed")
         with _trace_publish(row_id, getattr(account, "platform", "")) as _tr:
             _tr.t("row_loaded", row.get("caption") or "")
             _tr.t("caption_resolved", draft.caption or "")
@@ -1449,6 +1463,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 # post-create exceptions held: a timeout or malformed 2xx may have
                 # created a real post and an automatic retry could duplicate it.
                 if getattr(e, "definitive_no_post", False):
+                    _receipt.record(lane="calendar", row=row,
+                                    decision="preflight_refused", attempted=False,
+                                    outcome="preflight_refused", reason=type(e).__name__)
                     _reason = f"provider preflight proved no post: {type(e).__name__}: {e}"
                     _reverted = _revert_to_pending(
                         store, row_id, reject_reason=_reason, gym_id=gym_id,
@@ -1462,6 +1479,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                     failed.append(row_id)
                     _note_repeat_failure(row_id, gym_id, e)
                     continue
+                _receipt.record(lane="calendar", row=row, decision="provider_result",
+                                attempted=True, outcome="exception",
+                                reason=type(e).__name__)
                 # Once a publisher is called, an exception is ambiguous: a timeout may
                 # arrive after the provider accepted the post. Retrying can create a
                 # duplicate, so retain the owned claim for reconciliation.
@@ -1479,6 +1499,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # ONLY a real 'published' counts. 'would_publish' means a gate was off inside
         # publish() before the network call, so it can safely revert the claim.
         if ok and mode == "published":
+            _receipt.record(lane="calendar", row=row, decision="provider_result",
+                            attempted=True, outcome="published")
             try:
                 # Only a Zernio 409 content-hash dedup may be stamped published with no
                 # post id — Zernio told us the content is already live but named no id.
@@ -1528,6 +1550,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             if daily_cap:
                 _bump_pub_count(gym_id, run_date)
         elif mode == "would_publish" or _result_proves_no_post(result):
+            _receipt.record(lane="calendar", row=row, decision="provider_result",
+                            attempted=False if mode == "would_publish" else True,
+                            outcome=mode or "no_post")
             # `would_publish` is the publisher's pre-network kill-switch contract.
             # A provider rejection may also opt into definitive_no_post only when its
             # API guarantees that no post exists. Both are safe to retry.
@@ -1546,6 +1571,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         else:
             # A normal return is still ambiguous unless the adapter explicitly proves
             # no post exists. Keep the claim so a later tick cannot resend it.
+            _receipt.record(lane="calendar", row=row, decision="provider_result",
+                            attempted=True, outcome="ambiguous")
             failed.append(row_id)
             recovery_required.append(row_id)
             detail = f"publisher returned ok={ok!r} mode={mode!r}"

@@ -53,6 +53,26 @@ def test_standard_row_builds_payload_and_sends_draft():
     assert "utm_campaign=echo_local_update" in psd["callToAction"]["url"]
 
 
+def test_standard_gbp_receipt_precedes_create_and_failure_prevents_send(monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    events = []
+
+    class _OrderedClient:
+        def create_post_raw(self, *_args, **_kwargs):
+            assert events[-1]["decision"] == "preflight_passed"
+            return {"_id": "p1"}
+
+    monkeypatch.setattr(receipts, "record", lambda **kw: events.append(kw) or kw)
+    out = gw.publish_gbp_row(_row(), _conn(), client=_OrderedClient(), draft=False)
+    assert out["status"] == "published"
+    assert events[-1]["outcome"] == "published"
+
+    monkeypatch.setattr(receipts, "record",
+                        lambda **_: (_ for _ in ()).throw(receipts.ReceiptWriteError("safe")))
+    with pytest.raises(receipts.ReceiptWriteError, match="safe"):
+        gw.publish_gbp_row(_row(), _conn(), client=_OrderedClient(), draft=False)
+
+
 def test_offer_row_omits_call_to_action():
     c = _FakeClient()
     row = _row(gbp_topic_type="OFFER", gbp_cta_type=None, gbp_cta_url="",
@@ -608,6 +628,49 @@ def test_photo_drop_live_calls_gmb_media():
     out = gw.publish_one(row, [_c()], client=c, draft=False)
     assert out["status"] == "published" and out["late_post_id"] == "m1"
     assert c.media == [("acc1", "https://r2/floor.jpg")]
+
+
+def test_photo_drop_receipts_bracket_live_provider_call(monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    events = []
+    monkeypatch.setattr(receipts, "record", lambda **kw: events.append(kw) or kw)
+
+    class _C:
+        def create_gmb_media(self, *_):
+            assert events[-1]["decision"] == "preflight_passed"
+            return {"_id": "m1"}
+
+    out = gw.publish_photo_drop(_photo_row(), _conn(), client=_C(), draft=False)
+    assert out["status"] == "published"
+    assert [event["decision"] for event in events] == ["preflight_passed", "provider_result"]
+    assert events[-1]["outcome"] == "published"
+
+
+def test_armed_receipt_failure_prevents_photo_upload(monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    monkeypatch.setattr(receipts, "record",
+                        lambda **_: (_ for _ in ()).throw(receipts.ReceiptWriteError("safe")))
+
+    class _C:
+        def create_gmb_media(self, *_):
+            raise AssertionError("receipt failure must prevent provider upload")
+
+    with pytest.raises(receipts.ReceiptWriteError, match="safe"):
+        gw.publish_photo_drop(_photo_row(), _conn(), client=_C(), draft=False)
+
+
+def test_photo_drop_ambiguous_response_gets_provider_receipt(monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    events = []
+    monkeypatch.setattr(receipts, "record", lambda **kw: events.append(kw) or kw)
+
+    class _C:
+        def create_gmb_media(self, *_):
+            return {}
+
+    out = gw.publish_photo_drop(_photo_row(), _conn(), client=_C(), draft=False)
+    assert out["held"] == "ambiguous_send"
+    assert events[-1]["outcome"] == "ambiguous"
 
 
 def test_photo_drop_empty_caption_is_fine_not_a_rail_fail():
