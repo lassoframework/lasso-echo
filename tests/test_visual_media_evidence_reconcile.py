@@ -455,9 +455,11 @@ def test_write_report_atomic_permissions(tmp_path):
 # --- Real public.media_asset schema acceptance --------------------------------
 # Live rows carry id/source_id/gym_id/kind/title/mime_type/content_hash/
 # rendition_key/rendition_url/eligible/excluded_by_coach/used_count/
-# last_used_at/indexed_at/review_status. There is NO source_media_url,
-# sha256, or md5. content_hash is a Drive MD5 hint, never original-byte
-# proof; rendition_url is never a source URL.
+# last_used_at/indexed_at/review_status/moderation_status/consent_status/
+# review_content_hash. There is NO source_media_url, sha256, or md5.
+# content_hash is a Drive MD5 hint, never original-byte proof; rendition_url
+# is never a source URL. review_content_hash equality may support review
+# binding, but is not original-use proof and never clears an asset.
 
 def _media_asset_row(rid="asset-1", gym="gym-a", *, rendition_key="rend-1",
                      content_hash="a" * 32):
@@ -469,6 +471,8 @@ def _media_asset_row(rid="asset-1", gym="gym-a", *, rendition_key="rend-1",
         "excluded_by_coach": False, "used_count": 1,
         "last_used_at": "2026-09-30T12:00:00Z",
         "indexed_at": "2026-10-01T00:00:00Z", "review_status": "approved",
+        "moderation_status": "clean", "consent_status": "not_required",
+        "review_content_hash": content_hash,
     }
 
 

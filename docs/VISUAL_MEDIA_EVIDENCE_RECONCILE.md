@@ -32,18 +32,23 @@ python3 scripts/visual_media_evidence_reconcile.py \
   Real-schema `public.media_asset` rows carry `id`, `source_id`, `gym_id`,
   `kind`, `title`, `mime_type`, `content_hash`, `rendition_key`,
   `rendition_url`, `eligible`, `excluded_by_coach`, `used_count`,
-  `last_used_at`, `indexed_at`, `review_status` — with NO `source_media_url`,
+  `last_used_at`, `indexed_at`, `review_status`, `moderation_status`,
+  `consent_status`, `review_content_hash` — with NO `source_media_url`,
   `sha256`, or `md5`. `content_hash` is a Drive MD5 hint only, never
   original-byte proof, and is never validated as a digest or used as byte
   identity; `rendition_url` is a processed-rendition URL and is never treated
-  as a source URL. Legacy rows may instead carry `source_media_url`,
+  as a source URL. `review_content_hash` equality may support review binding,
+  but is not original-use proof and does not clear an asset. Legacy rows may
+  instead carry `source_media_url`,
   `sha256`/`md5`, and lifecycle `state`. `rendition_key` is an identity hint
   only — a match never proves original use.
   The asset snapshot rejects null or blank values for the live schema's NOT
   NULL columns: `id`, `source_id`, `gym_id`, `kind`, `title`,
-  `excluded_by_coach`, `used_count`, `indexed_at`, and `review_status`.
+  `excluded_by_coach`, `used_count`, `indexed_at`, `review_status`,
+  `moderation_status`, and `consent_status`.
   Nullable selected fields, including MIME/hash/rendition fields, `eligible`,
-  and `last_used_at`, are preserved as null when observed.
+  `last_used_at`, and `review_content_hash`, are preserved as null when
+  observed.
 - Optional manifests: `visual-delivered-byte-inventory-v1` byte observations
   (from `scripts/visual_byte_inventory.py`), provider obligation rows, and a
   publish postlog. Rows join on the calendar row id (`row_ref`). The provider

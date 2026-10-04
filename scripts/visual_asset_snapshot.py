@@ -3,7 +3,8 @@
 This captures rows observed in two matching reads of ``media_asset`` (the
 live table has: id, source_id, gym_id, kind, title, mime_type, content_hash,
 rendition_key, rendition_url, eligible, excluded_by_coach, used_count,
-last_used_at, indexed_at, review_status). The reads are not transactional.
+last_used_at, indexed_at, review_status, moderation_status, consent_status,
+review_content_hash). The reads are not transactional.
 
 ``content_hash`` is a Drive MD5 hint only: it is NOT an authenticated digest
 of original upload bytes and is never byte-identity proof. ``rendition_url``
@@ -28,12 +29,14 @@ if str(_ROOT) not in sys.path:
 FIELDS = ("id", "source_id", "gym_id", "kind", "title", "mime_type",
           "content_hash", "rendition_key", "rendition_url", "eligible",
           "excluded_by_coach", "used_count", "last_used_at", "indexed_at",
-          "review_status")
+          "review_status", "moderation_status", "consent_status",
+          "review_content_hash")
 # These are the actual NOT NULL columns in public.media_asset. The remaining
 # selected fields are preserved verbatim because they are genuinely nullable.
 REQUIRED_NON_NULL_FIELDS = ("id", "source_id", "gym_id", "kind", "title",
                             "excluded_by_coach", "used_count", "indexed_at",
-                            "review_status")
+                            "review_status", "moderation_status",
+                            "consent_status")
 TABLE = "media_asset"
 FORMAT = "visual-asset-snapshot-v1"
 DEFAULT_PAGE_SIZE = 500

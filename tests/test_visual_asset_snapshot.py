@@ -11,7 +11,7 @@ from scripts import visual_asset_snapshot as snapshot
 
 
 def asset_row(rid, **overrides):
-    """A row using the 15 selected live public.media_asset columns."""
+    """A row using the 18 selected live public.media_asset columns."""
     row = {
         "id": rid,
         "source_id": "source-1",
@@ -28,6 +28,9 @@ def asset_row(rid, **overrides):
         "last_used_at": "2026-09-30T12:00:00Z",
         "indexed_at": "2026-10-01T00:00:00Z",
         "review_status": "approved",
+        "moderation_status": "clean",
+        "consent_status": "not_required",
+        "review_content_hash": "a" * 32,
     }
     row.update(overrides)
     return row
@@ -109,12 +112,13 @@ def test_fetch_snapshot_selects_only_real_schema_fields_in_stable_id_order():
     assert result["snapshot_at"] == "2026-10-04T00:00:00Z"
     assert result["consistency"] == "non_atomic_observed_scan_reconciled"
     assert result["reconciliation_passes"] == 2
-    # Only these 15 live columns are selected — never sha256/md5/source_media_url.
+    # Only these 18 live columns are selected — never sha256/md5/source_media_url.
     assert tuple(snapshot.FIELDS) == (
         "id", "source_id", "gym_id", "kind", "title", "mime_type",
         "content_hash", "rendition_key", "rendition_url", "eligible",
         "excluded_by_coach", "used_count", "last_used_at", "indexed_at",
-        "review_status")
+        "review_status", "moderation_status", "consent_status",
+        "review_content_hash")
     for field in ("sha256", "md5", "source_media_url"):
         assert field not in snapshot.FIELDS
     for _, params, headers, _ in store.http.calls:
@@ -131,17 +135,19 @@ def test_fetch_snapshot_selects_only_real_schema_fields_in_stable_id_order():
 def test_nullable_fields_are_preserved_but_schema_not_null_fields_must_be_present():
     rows = [asset_row("a", mime_type=None, content_hash=None,
                       rendition_key=None, rendition_url=None,
-                      last_used_at=None)]
+                      last_used_at=None, review_content_hash=None)]
     store = FakeStore(FakeHTTP([rows]))
     result = snapshot.fetch_snapshot(store)
     assert result["rows"][0]["rendition_key"] is None
     assert result["rows"][0]["content_hash"] is None
+    assert result["rows"][0]["review_content_hash"] is None
 
     for field, value in (("id", None), ("source_id", "  "),
                          ("gym_id", None), ("kind", ""),
                          ("title", None), ("excluded_by_coach", None),
                          ("used_count", None), ("indexed_at", None),
-                         ("review_status", "")):
+                         ("review_status", ""), ("moderation_status", None),
+                         ("consent_status", "  ")):
         with pytest.raises(ValueError, match="required NOT NULL"):
             snapshot.fetch_snapshot(
                 FakeStore(FakeHTTP([[asset_row("a", **{field: value})]])))
