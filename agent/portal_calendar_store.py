@@ -485,6 +485,8 @@ class SupabaseCalendarStore:
                     "feed replacement conflicts with the current source scene")
             patch["visual_group_key"] = prepared["visual_group_key"]
             patch["byte_hash"] = prepared["byte_hash"]
+            if prepared.get("scene_candidate") is not None:
+                patch["scene_candidate"] = prepared["scene_candidate"]
             return patch
         if (is_story
                 and current.get("source_media_url")
@@ -515,6 +517,8 @@ class SupabaseCalendarStore:
             poster_render_evidence=poster_render_evidence)
         patch["visual_group_key"] = prepared["visual_group_key"]
         patch["byte_hash"] = prepared["byte_hash"]
+        if prepared.get("scene_candidate") is not None:
+            patch["scene_candidate"] = prepared["scene_candidate"]
         return patch
 
     def patch_image_url(self, account_key, row_id, new_image_url, *, expected_row=None,
@@ -529,6 +533,13 @@ class SupabaseCalendarStore:
             return None
         from . import visual_writer_prepare
         visual_guard = visual_writer_prepare.enabled()
+        from . import visual_scene_register
+        try:
+            atomic_scene_patch = visual_scene_register.enabled()
+            if atomic_scene_patch:
+                visual_scene_register.require_prerequisites()
+        except visual_scene_register.SceneRegistrationError as exc:
+            raise PortalStoreError(502, str(exc)) from exc
         current = expected_row
         if visual_guard and current is None:
             current = self.get_row(account_key, row_id)
@@ -578,6 +589,13 @@ class SupabaseCalendarStore:
                                              poster_render_evidence=poster_render_evidence)
         if visual_guard:
             params = self._visual_media_cas(current, params)
+        scene_candidate = payload.pop("scene_candidate", None)
+        if atomic_scene_patch:
+            try:
+                return visual_scene_register.media_patch(
+                    self, account_key, row_id, current, payload, scene_candidate)
+            except visual_scene_register.SceneRegistrationError as exc:
+                raise PortalStoreError(502, str(exc)) from exc
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -675,6 +693,8 @@ class SupabaseCalendarStore:
             account_key, candidate, render_evidence, poster_render_evidence)
         patch["visual_group_key"] = prepared["visual_group_key"]
         patch["byte_hash"] = prepared["byte_hash"]
+        if prepared.get("scene_candidate") is not None:
+            patch["scene_candidate"] = prepared["scene_candidate"]
         return patch
 
     def patch_media(self, account_key, row_id, image_url, source_media_asset_id="", *,
@@ -704,6 +724,13 @@ class SupabaseCalendarStore:
             payload["source_media_asset_id"] = source_media_asset_id
         from . import visual_writer_prepare
         prepared_write = visual_writer_prepare.enabled()
+        from . import visual_scene_register
+        try:
+            atomic_scene_patch = visual_scene_register.enabled()
+            if atomic_scene_patch:
+                visual_scene_register.require_prerequisites()
+        except visual_scene_register.SceneRegistrationError as exc:
+            raise PortalStoreError(502, str(exc)) from exc
         if prepared_write:
             if (str(current.get("gym_id")) != str(account_key)
                     or str(current.get("id")) != str(row_id)
@@ -730,6 +757,13 @@ class SupabaseCalendarStore:
                   "or": "(image_url.is.null,image_url.eq.)"}
         if prepared_write:
             params = self._visual_media_cas(current, params)
+        scene_candidate = payload.pop("scene_candidate", None)
+        if atomic_scene_patch:
+            try:
+                return visual_scene_register.media_patch(
+                    self, account_key, row_id, current, payload, scene_candidate)
+            except visual_scene_register.SceneRegistrationError as exc:
+                raise PortalStoreError(502, str(exc)) from exc
         r = self._client().patch(
             self._rest(_TABLE), params=params,
             headers=self._headers({"Content-Type": "application/json",
@@ -777,6 +811,13 @@ class SupabaseCalendarStore:
                 payload[col] = extra_fields[col]
         from . import visual_writer_prepare
         prepared_write = visual_writer_prepare.enabled()
+        from . import visual_scene_register
+        try:
+            atomic_scene_patch = visual_scene_register.enabled()
+            if atomic_scene_patch:
+                visual_scene_register.require_prerequisites()
+        except visual_scene_register.SceneRegistrationError as exc:
+            raise PortalStoreError(502, str(exc)) from exc
         current = None
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
                   "status": "in.(pending,coach_review)"}
@@ -791,6 +832,13 @@ class SupabaseCalendarStore:
             payload = self._prepare_visual_replacement(
                 account_key, current, payload, render_evidence, poster_render_evidence)
             params = self._visual_media_cas(current, params)
+        scene_candidate = payload.pop("scene_candidate", None)
+        if atomic_scene_patch:
+            try:
+                return visual_scene_register.media_patch(
+                    self, account_key, row_id, current, payload, scene_candidate)
+            except visual_scene_register.SceneRegistrationError as exc:
+                raise PortalStoreError(502, str(exc)) from exc
         r = self._client().patch(
             self._rest(_TABLE), params=params,
             headers=self._headers({"Content-Type": "application/json",
@@ -877,9 +925,24 @@ class SupabaseCalendarStore:
         from . import visual_writer_prepare
         visual_guard = visual_writer_prepare.enabled()
         prepared_write = not release and visual_guard
+        from . import visual_scene_register
+        try:
+            atomic_scene_patch = visual_scene_register.enabled()
+            if atomic_scene_patch:
+                visual_scene_register.require_prerequisites()
+        except visual_scene_register.SceneRegistrationError as exc:
+            raise PortalStoreError(502, str(exc)) from exc
+        if atomic_scene_patch:
+            # This archived held-media restage retains its hold evidence and is
+            # SQL-ineligible for visual_scene_atomic_media_patch by design.
+            # Fail closed before any write; an armed scene register must never
+            # be bypassed with the REST PATCH below.
+            return None
         if prepared_write:
             payload = self._prepare_visual_replacement(
                 account_key, current, payload, render_evidence, poster_render_evidence)
+            # Sidecar preparation evidence; content_calendar has no such column.
+            payload.pop("scene_candidate", None)
             params = self._visual_media_cas(current, params)
         elif release and visual_guard:
             if not current.get("visual_group_key") or not current.get("byte_hash"):
@@ -1041,10 +1104,24 @@ class SupabaseCalendarStore:
                    "thumbnail_url": thumbnail_url, "media_not_ready_reason": None}
         from . import visual_writer_prepare
         prepared_write = visual_writer_prepare.enabled()
+        from . import visual_scene_register
+        try:
+            atomic_scene_patch = visual_scene_register.enabled()
+            if atomic_scene_patch:
+                visual_scene_register.require_prerequisites()
+        except visual_scene_register.SceneRegistrationError as exc:
+            raise PortalStoreError(502, str(exc)) from exc
         if prepared_write:
             payload = self._prepare_visual_replacement(
                 account_key, current, payload, render_evidence, poster_render_evidence)
             params = self._visual_media_cas(current, params)
+        scene_candidate = payload.pop("scene_candidate", None)
+        if atomic_scene_patch:
+            try:
+                return visual_scene_register.media_patch(
+                    self, account_key, current["id"], current, payload, scene_candidate)
+            except visual_scene_register.SceneRegistrationError as exc:
+                raise PortalStoreError(502, str(exc)) from exc
         response = self._client().patch(
             self._rest(_TABLE), params=params,
             headers=self._headers({"Content-Type": "application/json",
@@ -2989,8 +3066,27 @@ class SupabaseCalendarStore:
                                 else f"eq.{current['image_url']}")}
         from . import visual_writer_prepare
         visual_guard = visual_writer_prepare.enabled()
+        from . import visual_scene_register
+        try:
+            atomic_scene_patch = visual_scene_register.enabled()
+            if atomic_scene_patch:
+                visual_scene_register.require_prerequisites()
+        except visual_scene_register.SceneRegistrationError as exc:
+            raise PortalStoreError(502, str(exc)) from exc
         if visual_guard:
             params = self._visual_media_cas(current, params)
+        # Sidecar preparation evidence; content_calendar has no such column.
+        scene_candidate = patch.pop("scene_candidate", None)
+        if atomic_scene_patch:
+            # The active Story recovery writer routes through the DRAFT atomic
+            # RPC with the full 23-key CAS image and its scene candidate. A
+            # held/stale RPC outcome returns None, never a false success; any
+            # contract drift fails closed. There is no REST fallback once armed.
+            try:
+                return visual_scene_register.media_patch(
+                    self, account_key, current["id"], current, patch, scene_candidate)
+            except visual_scene_register.SceneRegistrationError as exc:
+                raise PortalStoreError(502, str(exc)) from exc
         response = self._client().patch(self._rest(_TABLE), params=params, json=patch,
                          headers=self._headers({"Prefer": "return=representation"}), timeout=30)
         if response.status_code >= 400:

@@ -205,9 +205,9 @@ def build_items(rows, scene_candidates):
     return items
 
 
-def _rpc(store, arguments):
+def _post_rpc(store, name, arguments):
     response = store._client().post(
-        store._rest("rpc/" + _RPC),
+        store._rest("rpc/" + name),
         headers=store._headers({"Content-Type": "application/json"}),
         json=arguments,
         timeout=30,
@@ -220,6 +220,132 @@ def _rpc(store, arguments):
     except (TypeError, ValueError) as exc:
         raise SceneRegistrationError(
             "atomic scene calendar RPC returned invalid JSON") from exc
+
+
+def _rpc(store, arguments):
+    return _post_rpc(store, _RPC, arguments)
+
+
+_PATCH_RPC = "visual_scene_atomic_media_patch"
+
+
+def media_patch(store, account_key, row_id, current, patch, candidate):
+    """Route one prepared calendar media PATCH through the atomic scene RPC.
+
+    ``current`` is the observed before-image (it must carry EVERY
+    ``_VISUAL_MEDIA_CAS_COLUMNS`` key, explicit None included, exactly like
+    the SQL contract refuses absent keys), ``patch`` the prepared
+    allowlisted media payload, and ``candidate`` the exact
+    ``visual_writer_prepare`` scene_candidate evidence for the post-patch
+    displayed object. Candidate normalization follows the same
+    ``_registration`` contract as the atomic insert writer, applied to the
+    merged post-patch row.
+
+    Returns the verified persisted post-patch row, or None when the RPC
+    reported a committed scene hold (a held row is never reported as
+    patched), a stale CAS, or a missing/cross-tenant row. Any contract
+    drift raises SceneRegistrationError; once this route is armed there is
+    no REST fallback.
+    """
+    if (not _nonblank(account_key) or not isinstance(current, dict)
+            or not isinstance(patch, dict) or not patch):
+        raise SceneRegistrationError(
+            "atomic media patch needs a tenant, an observed row and a patch")
+    if (str(current.get("id")) != str(row_id)
+            or str(current.get("gym_id")) != str(account_key)):
+        raise SceneRegistrationError(
+            "atomic media patch observed row does not match its scope")
+    try:
+        normalized_row_id = str(uuid.UUID(str(row_id)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise SceneRegistrationError(
+            "atomic media patch needs a UUID row id") from exc
+    from .portal_calendar_store import _VISUAL_MEDIA_CAS_COLUMNS
+    missing = [key for key in _VISUAL_MEDIA_CAS_COLUMNS if key not in current]
+    if missing:
+        raise SceneRegistrationError(
+            "atomic media patch observed row is missing CAS keys: "
+            + ", ".join(missing))
+    expected = {key: current.get(key) for key in _VISUAL_MEDIA_CAS_COLUMNS}
+    merged = dict(current)
+    merged.update(patch)
+    # The merged post-patch row carries media, so _registration fails closed
+    # when its exact scene candidate evidence is missing or invalid.
+    registration = _registration(merged, candidate, 0)
+    result = _post_rpc(store, _PATCH_RPC, {
+        "p_row_id": normalized_row_id,
+        "p_gym_id": account_key,
+        "p_expected": expected,
+        "p_patch": patch,
+        "p_candidate": registration,
+    })
+    if not isinstance(result, dict):
+        raise SceneRegistrationError(
+            "atomic media patch RPC returned an invalid result")
+    outcome = result.get("outcome")
+    if outcome in ("stale", "not_found"):
+        if (str(result.get("row_id")) != normalized_row_id
+                or str(result.get("gym_id")) != str(account_key)
+                or set(result) - {"outcome", "row_id", "gym_id"}):
+            raise SceneRegistrationError(
+                "atomic media patch RPC returned an unverified miss")
+        return None
+    if outcome not in ("patched", "held"):
+        raise SceneRegistrationError(
+            "atomic media patch RPC returned an unknown outcome")
+    row = result.get("row")
+    if (not isinstance(row, dict)
+            or str(row.get("gym_id")) != str(account_key)
+            or str(row.get("id")) != normalized_row_id):
+        raise SceneRegistrationError(
+            "atomic media patch RPC returned an unverified row")
+    held = (row.get("status") == "pending"
+            and row.get("variant_status") == "archived"
+            and row.get("media_not_ready_reason") == "scene_review_hold"
+            and row.get("publish_claim_token") is None
+            and row.get("publish_reservation_day") is None)
+    if outcome == "held":
+        if not held:
+            raise SceneRegistrationError(
+                "atomic media patch RPC mislabeled a persisted row as held")
+        # The hold is committed; the patch is NOT a success for the caller.
+        return None
+    if held:
+        raise SceneRegistrationError(
+            "atomic media patch RPC reported a held row as patched")
+    for key, value in patch.items():
+        if key not in row or row[key] != value:
+            raise SceneRegistrationError(
+                f"atomic media patch value did not persist for {key}")
+    for key, value in expected.items():
+        if key in patch:
+            continue
+        if key not in row or row[key] != value:
+            raise SceneRegistrationError(
+                f"atomic media patch changed immutable field {key}")
+    candidate_id = result.get("candidate_id")
+    reused = result.get("candidate_reused")
+    if registration is None:
+        if candidate_id is not None:
+            raise SceneRegistrationError(
+                "atomic media patch unexpectedly staged a scene candidate")
+    else:
+        try:
+            str(uuid.UUID(str(candidate_id)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise SceneRegistrationError(
+                "atomic media patch RPC did not return a candidate UUID") from exc
+        if not isinstance(reused, bool):
+            raise SceneRegistrationError(
+                "atomic media patch RPC returned an invalid reuse marker")
+        delivered = row_delivered_object(row)
+        if (row.get("visual_group_key") != registration["group_key"]
+                or delivered != (registration["object_role"],
+                                 registration["exact_url"])):
+            raise SceneRegistrationError(
+                "atomic media patch did not rebind the persisted row to its "
+                "registered candidate")
+    return row
 
 
 def insert_batch(store, account_key, rows, scene_candidates):
