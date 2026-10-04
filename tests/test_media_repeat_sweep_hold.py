@@ -52,7 +52,7 @@ def _row(rid, pd, account="instagram", status="pending", fmt="feed", **over):
     row = {
         "id": rid, "gym_id": GYM, "post_date": pd, "status": status,
         "variant_status": "active", "account": account, "format": fmt,
-        "caption": f"Caption for {rid}, keep as written.",
+        "caption": f"Caption for {rid} keep as written.",
         "image_url": URL_A, "source_media_url": None,
         "source_media_asset_id": None, "media_not_ready_reason": None,
         "created_at": "2026-09-30T12:00:00Z", "published_at": None,
@@ -89,9 +89,10 @@ class _Http:
         def _match(row, field, pred):
             if pred == "is.null":
                 return row.get(field) is None
-            if pred.startswith('eq."') and pred.endswith('"'):
-                raw = pred[4:-1].replace('\\"', '"').replace("\\\\", "\\")
-                return str(row.get(field)) == raw
+            # Mirrors production PostgREST bare-eq semantics per the
+            # 2026-10-04 probes: EVERYTHING after eq. is the literal value,
+            # even when the value itself starts with a double quote.
+            assert pred.startswith("eq."), pred
             return str(row.get(field)) == pred[3:]
 
         matches = [row for row in self.store.rows.values()
@@ -719,7 +720,11 @@ def test_hold_cas_pins_visual_media_columns(monkeypatch):
     params, _payload = store.http.patches[0]
     for field in ("thumbnail_url", "byte_hash", "r2_key", "drive_file_id",
                   "slot_index", "time_slot"):
-        assert params[field].startswith('eq."'), field
+        # Bare eq.<value> is the ONLY form with live-match evidence: the
+        # 2026-10-04 production probe showed eq."pending" matched ZERO rows
+        # against real PostgREST while every bare eq.<value> matched the row.
+        assert params[field].startswith("eq."), field
+        assert not params[field].startswith('eq."'), field
 
 
 # --- reporting (P5) ----------------------------------------------------------
@@ -897,15 +902,188 @@ def test_real_paginated_read_max_page_tripwire(monkeypatch):
 
 
 def test_real_hold_cas_refuses_incomplete_before_image():
-    """A before image missing ANY _VISUAL_MEDIA_CAS_COLUMNS key is refused
-    locally -- never a silent partial predicate."""
-    full = _row("t", "2026-10-06")
-    store = _PagedStore([full])
-    from agent.portal_calendar_store import _VISUAL_MEDIA_CAS_COLUMNS
-    for key in _VISUAL_MEDIA_CAS_COLUMNS:
-        incomplete = dict(full)
+    """A before image missing any APPLIED core _VISUAL_MEDIA_CAS_COLUMNS key
+    is refused locally -- never a silent partial predicate. The four draft
+    scene columns (not yet migrated to live content_calendar, 2026-10-04
+    Zanshin probe) are optional: missing ones are skipped, present ones are
+    pinned."""
+    from agent.portal_calendar_store import (_CORE_VISUAL_MEDIA_CAS_COLUMNS,
+                                             _DRAFT_SCENE_CAS_COLUMNS)
+    core = _row("core", "2026-10-06")
+    store = _PagedStore([core])
+    for key in _CORE_VISUAL_MEDIA_CAS_COLUMNS:
+        incomplete = dict(core)
         del incomplete[key]
         assert store.hold_repeat_media(GYM, incomplete, "some reason") is None
     assert store.http.patches == []
-    assert store.hold_repeat_media(GYM, full, "some reason") is not None
+
+    # The live Zanshin failure, reproduced: a row whose select=* lacks the
+    # four draft columns still holds, and the predicate excludes them.
+    bare = {k: v for k, v in _row("bare", "2026-10-07").items()
+            if k not in _DRAFT_SCENE_CAS_COLUMNS}
+    store = _PagedStore([_row("bare", "2026-10-07")])
+    assert store.hold_repeat_media(GYM, bare, "some reason") is not None
     assert len(store.http.patches) == 1
+    params, _ = store.http.patches[0]
+    for key in _DRAFT_SCENE_CAS_COLUMNS:
+        assert key not in params
+
+    # Draft columns present on the row ARE pinned in the predicate, bare form.
+    rich = _row("rich", "2026-10-08", byte_hash="bh-9", r2_key="r2/9.jpg",
+                drive_file_id="drv-9", visual_group_key="vg-9")
+    store = _PagedStore([rich])
+    assert store.hold_repeat_media(GYM, rich, "some reason") is not None
+    assert len(store.http.patches) == 1
+    params, _ = store.http.patches[0]
+    assert params["byte_hash"] == "eq.bh-9"
+    assert params["r2_key"] == "eq.r2/9.jpg"
+    assert params["drive_file_id"] == "eq.drv-9"
+    assert params["visual_group_key"] == "eq.vg-9"
+
+
+def test_hold_cas_bare_eq_reproduces_live_quoted_filter_failure(monkeypatch):
+    """Live probe 2026-10-04: status=eq.\"pending\" matched ZERO rows against
+    real PostgREST while status=eq.pending matched the row (HTTP 200). The
+    hold predicate must use the bare form -- no eq."..." anywhere -- or the
+    hold can never match and every repeat slips through."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_HOLD", "true")
+    store = MemoryStore([
+        _row("own", "2026-10-02", status="approved"),
+        _row("t", "2026-10-06"),
+    ])
+    _sweep(store, apply=True, monkeypatch=monkeypatch)
+    assert len(store.http.patches) == 1
+    params, _payload = store.http.patches[0]
+    assert params["status"] == "eq.pending"
+    for field, pred in params.items():
+        assert not pred.startswith('eq."'), (field, pred)
+        assert "\\" not in pred, (field, pred)
+
+
+def test_comma_quote_paren_captions_hold_with_exact_bare_predicates(monkeypatch):
+    """2026-10-04 follow-up production probes (read-only): live pending/approved
+    rows whose captions contain a comma, a double quote, or parentheses matched
+    HTTP 200 with exactly ONE row for the bare caption=eq.<exact caption> form
+    and ZERO rows for the quoted form. Captions with these characters are
+    common; they must hold with exact bare predicates -- the full CAS intact,
+    status/approval preserved -- never fail closed."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_HOLD", "true")
+    store = MemoryStore([
+        _row("own", "2026-10-02", status="approved"),
+        _row("comma", "2026-10-06",
+             caption="Sale this weekend, don't miss it"),
+        _row("quote", "2026-10-07", caption='She said "PRs over pounds" today'),
+        _row("leadquote", "2026-10-08", caption='"PRs over pounds", she said'),
+        _row("paren", "2026-10-09", caption="Bring a friend (spots limited!)"),
+        _row("combo", "2026-10-10",
+             caption='Coach tip: "breathe, brace, lift" (see highlights), ok?'),
+    ])
+    result = _sweep(store, apply=True, monkeypatch=monkeypatch)
+    assert result["rows_held"] == 5
+    assert result["hold_errors"] == 0
+    assert len(store.http.patches) == 5
+    for params, payload in store.http.patches:
+        # Exact bare predicates: no quoting, no escaping, full CAS field set.
+        for field, pred in params.items():
+            if pred == "is.null":
+                continue
+            # Bare eq with the EXACT stored value, never a re-encoded form:
+            # a leading-quote caption's predicate legitimately begins
+            # eq." -- that quote is part of the value, not wrapping.
+            row = next(r for r in store.rows.values()
+                       if r["id"] == params["id"][len("eq."):])
+            expected = "eq." + str(row[field]) if row[field] is not None \
+                else "is.null"
+            assert pred == expected, (field, pred, expected)
+        assert payload == {"media_not_ready_reason":
+                           "cross_date_media_repeat_needs_new_visual"}
+    held = {rid: r for rid, r in store.rows.items()
+            if r["media_not_ready_reason"]
+            == "cross_date_media_repeat_needs_new_visual"}
+    assert set(held) == {"comma", "quote", "leadquote", "paren", "combo"}
+    for rid, row in held.items():
+        assert row["status"] == "pending"           # approval never invented
+        assert row["image_url"] == URL_A            # media preserved
+
+
+def test_reserved_char_caption_mismatch_noops_without_write():
+    """Exactness is two-sided: a before image whose reserved-character caption
+    no longer matches the stored row must match ZERO rows server-side and
+    leave the row untouched (the stale no-op), never PATCH."""
+    row = _row("t", "2026-10-06",
+               caption="Sale this weekend, don't miss it (bring a friend)")
+    store = _PagedStore([row])
+    stale = dict(row, caption="Sale this weekend, don't miss it "
+                              "(bring two friends)")
+    assert store.hold_repeat_media(GYM, stale, "some reason") is None
+    assert store.rows["t"]["media_not_ready_reason"] is None   # untouched
+
+
+def test_backslash_caption_fails_closed_with_precise_blocker(monkeypatch):
+    """Backslash is the one character still without live-match evidence: it
+    can flip the PostgREST parser into escape/quoted-literal mode, so a
+    caption containing it fails closed with a precise blocker -- never
+    PATCH, never a weakened predicate. The row is reported for a manual
+    hold instead."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_HOLD", "true")
+    store = MemoryStore([
+        _row("own", "2026-10-02", status="approved"),
+        _row("t", "2026-10-06", caption="Line one\\nline two"),
+    ])
+    result = _sweep(store, apply=True, monkeypatch=monkeypatch)
+    assert result["rows_held"] == 0
+    assert result["hold_errors"] == 1
+    assert store.http.patches == []          # no weakened predicate was sent
+    assert store.rows["t"]["media_not_ready_reason"] is None
+    assert any("hold CAS error" in d for d in result["detail"])
+
+
+def test_malformed_cas_value_fails_closed(monkeypatch):
+    """Non-scalar CAS values are malformed before-images: refused before any
+    write."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_HOLD", "true")
+    store = MemoryStore([
+        _row("own", "2026-10-02", status="approved"),
+        _row("bad", "2026-10-06", caption={"ops": "not a string"}),
+    ])
+    result = _sweep(store, apply=True, monkeypatch=monkeypatch)
+    assert result["rows_held"] == 0
+    assert result["hold_errors"] == 1
+    assert store.http.patches == []
+    assert all(r["media_not_ready_reason"] is None for r in store.rows.values())
+
+
+def test_empty_caption_matches_exactly_and_holds(monkeypatch):
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_HOLD", "true")
+    store = MemoryStore([
+        _row("own", "2026-10-02", status="approved", caption=""),
+        _row("empty", "2026-10-06", caption=""),
+    ])
+    result = _sweep(store, apply=True, monkeypatch=monkeypatch)
+    assert result["rows_held"] == 1
+    assert result["hold_errors"] == 0
+    params, _payload = store.http.patches[0]
+    assert params["caption"] == "eq."
+    assert store.rows["empty"]["media_not_ready_reason"] == (
+        "cross_date_media_repeat_needs_new_visual")
+
+
+def test_stale_empty_vs_nonempty_caption_noops_without_write():
+    row = _row("t", "2026-10-06", caption="Caption restored after the read")
+    store = _PagedStore([row])
+    stale = dict(row, caption="")
+    assert store.hold_repeat_media(GYM, stale, "some reason") is None
+    assert len(store.http.patches) == 1
+    assert store.http.patches[0][0]["caption"] == "eq."
+    assert store.rows["t"]["media_not_ready_reason"] is None
+
+
+def test_stale_before_image_noops_without_write():
+    """A before image whose fields no longer match the stored row matches
+    zero rows server-side: hold_repeat_media returns None and the row is
+    untouched (the stale-field no-op)."""
+    row = _row("t", "2026-10-06")
+    store = _PagedStore([row])
+    stale = dict(row, caption="An older caption that was since edited")
+    assert store.hold_repeat_media(GYM, stale, "some reason") is None
+    assert store.rows["t"]["media_not_ready_reason"] is None   # untouched

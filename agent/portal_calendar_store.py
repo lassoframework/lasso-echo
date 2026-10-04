@@ -71,6 +71,61 @@ _VISUAL_MEDIA_CAS_COLUMNS = (
     "publish_reservation_day", "created_at",
 )
 
+# Draft scene-migration columns. The 2026-10-04 read-only production probe of
+# Zanshin row 2d188069-db62-45f6-a80f-6fedc1483dc5 (logs
+# /tmp/fixer_zanshin_readonly_cas_probe_20261004.log) showed select=* on live
+# content_calendar LACKS exactly these four _VISUAL_MEDIA_CAS_COLUMNS fields
+# (the other 19 are applied). They are REQUIRED once the migration
+# lands, but until then a row legitimately lacks them: the repeat hold CAS
+# must pin them when the before image carries them and must not refuse the
+# hold when it does not.
+_DRAFT_SCENE_CAS_COLUMNS = frozenset(
+    ("drive_file_id", "visual_group_key", "byte_hash", "r2_key"))
+_CORE_VISUAL_MEDIA_CAS_COLUMNS = tuple(
+    key for key in _VISUAL_MEDIA_CAS_COLUMNS
+    if key not in _DRAFT_SCENE_CAS_COLUMNS)
+
+# Characters for which a safe bare PostgREST eq encoding is NOT established.
+# Live probes 2026-10-04: the quoted form eq."pending" matched ZERO rows against
+# the real API (/tmp/fixer_zanshin_readonly_cas_probe_unquoted_20261004.log),
+# while bare eq.<value> matched exactly the live row for all 19 applied fields
+# -- including '.' and ':' inside image_url/created_at values. Follow-up probes
+# of live pending/approved rows whose captions contain a comma, a double quote,
+# and parentheses (/tmp/fixer_postgrest_comma_probe_20261004.log,
+# /tmp/fixer_postgrest_quote_probe_20261004.log,
+# /tmp/fixer_postgrest_paren_probe_20261004.log) returned HTTP 200 with the ONE
+# exact row for the bare caption=eq.<exact caption> form and ZERO rows for the
+# quoted form. Top-level eq filters here are independently URL-encoded by the
+# HTTP client, so comma/quote/paren pass through bare. Backslash still carries
+# no live-match evidence and can flip the parser into escape/quoted-literal
+# mode, so it (plus non-scalars) fails closed with a precise
+# blocker instead of a weakened CAS.
+_EQ_FILTER_RESERVED = frozenset("\\")
+
+
+def _eq_filter(value):
+    """Encode one scalar as a PostgREST equality filter, or None if safe
+    equality encoding is not established for it.
+
+    The bare eq.<value> form is the ONLY form with live-match evidence (probe
+    logs above); quoting is disproven by that probe for all scalar text,
+    including values containing ',', '"', '(' and ')' (2026-10-04 comma /
+    quote / paren probes). None is returned only for values containing a
+    backslash and non-scalars: the caller must fail closed
+    rather than issue a partial or weakened predicate that could hold a row
+    whose real value differs."""
+    if value is None:
+        return "is.null"
+    if isinstance(value, bool):
+        return f"eq.{str(value).lower()}"
+    if isinstance(value, (int, float)):
+        return f"eq.{value}"
+    if not isinstance(value, str):
+        return None
+    if any(ch in _EQ_FILTER_RESERVED for ch in value):
+        return None
+    return f"eq.{value}"
+
 
 def _slot_key(row):
     """The (post_date, account, format) a row occupies, normalized. Two rows with the
@@ -998,10 +1053,16 @@ class SupabaseCalendarStore:
     def hold_repeat_media(self, account_key, current, reason):
         """Repeat-specific exact-row CAS for the nightly cross-date repeat hold.
 
-        Pins id + gym_id + EVERY _VISUAL_MEDIA_CAS_COLUMNS field of the
-        before image (status, thumbnail_url, byte_hash, r2_key, drive_file_id,
-        slot_index, time_slot, source identity, ...); a before image missing
-        any of those keys is refused (None), never a partial predicate. Also
+        Pins id + gym_id + EVERY observed _VISUAL_MEDIA_CAS_COLUMNS field of
+        the before image (status, thumbnail_url, byte_hash, r2_key,
+        drive_file_id, slot_index, time_slot, source identity, ...). All
+        APPLIED core fields must be present; the four draft scene columns are
+        pinned only when the row carries them (2026-10-04 live probe: not yet
+        migrated). A before image missing any core key is refused (None),
+        never a partial predicate. Equality filters use the bare eq.<value>
+        form -- the only encoding with live-match evidence; a value whose
+        safe encoding is not established raises a precise PortalStoreError
+        blocker and the row is left untouched. Also
         requires the publish-safety fields
         (claim / reservation / schedule / publish / late post / existing hold)
         to be NULL, and writes ONLY media_not_ready_reason. A concurrent
@@ -1015,15 +1076,19 @@ class SupabaseCalendarStore:
         required_null = ("published_at", "late_post_id", "publish_claim_token",
                          "publish_reservation_day", "scheduled_at",
                          "media_not_ready_reason")
-        # The predicate must pin the COMPLETE before image: a row missing any
-        # _VISUAL_MEDIA_CAS_COLUMNS key would silently drop that predicate and
-        # could hold a row whose unseen field changed concurrently.
+        # The predicate must pin the COMPLETE observed before image. Every
+        # APPLIED core CAS field must be present; the four draft scene columns
+        # (_DRAFT_SCENE_CAS_COLUMNS, not yet migrated to live
+        # content_calendar per the 2026-10-04 Zanshin probe) are pinned when
+        # the row actually carries them and never required. A core key
+        # missing from the before image would silently drop that predicate
+        # and could hold a row whose unseen field changed concurrently.
         if (not isinstance(current, dict)
                 or str(current.get("gym_id")) != str(account_key)
                 or current.get("id") is None
                 or current.get("status") not in ("pending", "approved")
                 or current.get("variant_status") != "active"
-                or any(key not in current for key in _VISUAL_MEDIA_CAS_COLUMNS)
+                or any(key not in current for key in _CORE_VISUAL_MEDIA_CAS_COLUMNS)
                 or any(current[key] is not None for key in required_null)
                 or not isinstance(reason, str) or not reason.strip()):
             return None
@@ -1033,12 +1098,19 @@ class SupabaseCalendarStore:
         for key in _VISUAL_MEDIA_CAS_COLUMNS:
             if key not in current:
                 continue
-            value = current[key]
-            if value is None:
-                params[key] = "is.null"
-            else:
-                escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-                params[key] = f'eq."{escaped}"'
+            # Fail closed BEFORE any write: a value with no evidenced-safe
+            # equality encoding (reserved characters or non-
+            # scalar) raises a precise blocker; it is never dropped from the
+            # predicate and never sent in a weakened form.
+            encoded = _eq_filter(current[key])
+            if encoded is None:
+                raise PortalStoreError(
+                    422,
+                    "repeat media hold CAS blocked: field "
+                    f"{key!r} value has no evidenced-safe PostgREST "
+                    "equality encoding (reserved characters or malformed "
+                    "value); row left untouched, hold by hand")
+            params[key] = encoded
         response = self._client().patch(
             self._rest(_TABLE), params=params,
             headers=self._headers({"Content-Type": "application/json",

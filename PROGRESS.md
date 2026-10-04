@@ -4825,3 +4825,48 @@ settled.
 - [~] Content-led LASSO briefs now explicitly favor dark, colored, split, photographic and tactile fields over repeated white backgrounds. Layout follows the content; references do not prescribe a pale field. Uses the existing default-OFF quality flag and preserves explicit visual requests, copy, Story safe regions and corrective edits.
 - [ ] Deploy and inspect newly generated pixels. Prompt guidance does not guarantee a rotation; existing rendered/calendar assets are unchanged.
 - [x] Validation: 59 focused checks passed; full suite 8279 passed, 1 skipped. No dependency installation; existing environment reused. Worktree retained at `/Users/blakeruff/Documents/Codex/echo-infographic-variety-20260922` pending integration; 108 GiB free measured before the run.
+
+## 2026-10-04 — repeat hold CAS repair (branch codex/echo-repeat-hold-cas-repair-20261004)
+
+- `agent/portal_calendar_store.py`: `hold_repeat_media` precheck now requires the
+  19 applied core `_VISUAL_MEDIA_CAS_COLUMNS` fields; the four draft scene columns
+  (`drive_file_id`, `visual_group_key`, `byte_hash`, `r2_key`, per the 2026-10-04
+  Zanshin read-only probe showing they are not yet migrated to live
+  `content_calendar`) are pinned in the predicate only when the row carries them.
+- New `_eq_filter` encoder: bare `eq.<value>` (the only form with live-match
+  evidence; the probe showed `eq."pending"` matched zero rows while all 19 bare
+  `eq.<value>` filters matched exactly the live row). **K2.8 follow-up (same
+  day):** Astra's extended read-only production probes of live pending/approved
+  rows with comma / double-quote / parentheses captions
+  (`/tmp/fixer_postgrest_comma_probe_20261004.log`,
+  `/tmp/fixer_postgrest_quote_probe_20261004.log`,
+  `/tmp/fixer_postgrest_paren_probe_20261004.log`) established the BARE
+  `caption=eq.<exact caption>` form matches HTTP 200 with exactly ONE row for
+  those characters (quoted form: zero rows), so comma, quote and parentheses
+  now pass through bare eq exactly. Values containing a backslash (still no
+  live-match evidence; can flip the parser into escape/quoted-literal mode),
+  non-scalars fail closed with a precise `PortalStoreError(422, ...)` blocker
+  before any PATCH — the sweep counts it as a hold error and leaves the row
+  for a manual hold; the CAS is never weakened. **Empty-string proof (same
+  day):** Astra's read-only probe selected a current active row with
+  `caption=''`; top-level `caption=eq.` returned HTTP 200 with exactly one row.
+  Empty captions therefore pass through the exact bare equality filter, while
+  stale empty-vs-nonempty captions still match zero rows. Full CAS field set unchanged (19 core required, 4 draft scene
+  columns pinned only when present).
+- Scope note for Astra: `swap_media` / `_visual_media_cas` still use the quoted
+  `eq."..."` encoding (same live-bug family) — out of this bounded task's write
+  scope; needs a separate ruling/task.
+- Tests: `tests/test_media_repeat_sweep_hold.py` (+4 new: bare-eq reproduction of
+  the live quoted-filter failure, malformed/empty blocker, stale before-image
+  no-op; updated incomplete-before-image and pins-visual-columns tests for
+  core/draft split). **Follow-up:** comma/quote/paren captions (including a
+  leading-quote caption and a combined case) now hold with exact reconstructed
+  bare predicates and approval preserved; stale reserved-char caption mismatch
+  no-ops without a write; backslash caption fails closed with the precise
+  blocker; the `_Http` fake now always parses predicates bare, mirroring
+  production. 47/47 pass; related suites (test_calendar_autopublish,
+  test_visual_writer_prepare) still green; total 205.
+- Remaining unsupported CAS values (fail closed until live evidence or a
+  ruling): backslash in any pinned field; non-scalar (dict/list) values. The
+  `swap_media` / `_visual_media_cas` quoted-encoding
+  scope note above is unchanged and still needs its own task.
