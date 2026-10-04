@@ -1018,9 +1018,16 @@ class SupabaseCalendarStore:
     def hold_future_infographic_media(self, account_key, current, reason):
         """Exact row CAS for an active pending or approved infographic placeholder.
 
-        Only media_not_ready_reason changes. Approved stays approved; a concurrent
-        client edit, approval, publish claim, media swap, or variant transition
-        makes the PATCH match zero rows. No image or caption is rewritten.
+        The armed PR268 visual-group trigger rejects any approved/publishing row
+        carrying a non-null media_not_ready_reason, so an approved placeholder
+        cannot be held while staying approved. The hold therefore sets the hold
+        reason and, in the same atomic PATCH, demotes approved rows to pending:
+        the protective hold persists and the row can never silently remain
+        approved/publishable. Pending rows change only media_not_ready_reason.
+        A concurrent client edit, approval, publish claim, media swap, or
+        variant transition makes the PATCH match zero rows. No image or caption
+        is rewritten. A held approved row requires later reapproval; the
+        release path below never restores an approval.
         """
         required = ("id", "gym_id", "post_date", "status", "variant_status",
                     "account", "format", "caption", "image_url", "source_media_url",
@@ -1039,22 +1046,30 @@ class SupabaseCalendarStore:
         def expected(value):
             return "is.null" if value is None else f"eq.{value}"
 
+        demote = current["status"] == "approved"
+        payload = {"media_not_ready_reason": reason}
+        if demote:
+            payload["status"] = "pending"
         params = {key: expected(current[key]) for key in required}
         response = self._client().patch(
             self._rest(_TABLE), params=params,
             headers=self._headers({"Content-Type": "application/json",
                                    "Prefer": "return=representation"}),
-            json={"media_not_ready_reason": reason}, timeout=30)
+            json=payload, timeout=30)
         if response.status_code >= 400:
             raise PortalStoreError(response.status_code, "future infographic hold CAS failed")
         data = response.json()
         if not isinstance(data, list) or len(data) != 1:
             return None
         after = data[0]
+        expected_after = dict(current)
+        expected_after["media_not_ready_reason"] = reason
+        if demote:
+            expected_after["status"] = "pending"
+        # Full before-image verification: any field outside the intended
+        # transition (including a status that stayed approved) is no success.
         if (after.get("id") != current["id"]
-                or any(after.get(key) != current[key] for key in required
-                       if key != "media_not_ready_reason")
-                or after.get("media_not_ready_reason") != reason):
+                or any(after.get(key) != expected_after[key] for key in required)):
             return None
         return after
 
@@ -1171,11 +1186,17 @@ class SupabaseCalendarStore:
                 raise PortalStoreError(502, "photo restage book exceeds safe read bound")
 
     def release_future_infographic_media(self, account_key, current, reason):
-        """Clear one receipt-owned hold by exact CAS, preserving approved state.
+        """Clear one receipt-owned hold by exact CAS, without reactivating.
 
         The caller verifies the original private hold receipt before calling.
-        This method accepts only an active unpublished row with the exact hold
-        reason and changes no field except media_not_ready_reason.
+        This method accepts only a PENDING active unpublished row with the exact
+        hold reason and changes no field except media_not_ready_reason. An
+        approved row is refused BEFORE any PATCH: a legacy approved-with-hold
+        row must never be made publishable by clearing only the hold reason
+        (the publisher only checks status). Rows demoted to pending by the
+        hold stay pending and require later reapproval. Scene review holds and
+        archived variants are refused outright, so an ordinary release can
+        never clear a scene_review_hold protection or touch an archived row.
         """
         required = ("id", "gym_id", "post_date", "status", "variant_status",
                     "account", "format", "caption", "image_url", "source_media_url",
@@ -1183,11 +1204,12 @@ class SupabaseCalendarStore:
                     "published_at", "late_post_id")
         if (not isinstance(current, dict) or any(key not in current for key in required)
                 or current["gym_id"] != account_key
-                or current["status"] not in ("pending", "approved")
+                or current["status"] != "pending"
                 or current["variant_status"] != "active"
                 or current["published_at"] is not None
                 or current["late_post_id"] is not None
                 or not isinstance(reason, str) or not reason.strip()
+                or reason.strip() == "scene_review_hold"
                 or current["media_not_ready_reason"] != reason):
             return None
 
