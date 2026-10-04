@@ -122,7 +122,7 @@ def _catalog_snapshot():
         " join pg_namespace n on n.oid=p.pronamespace "
         " where n.nspname='public' "
         "union all "
-        "select 'r:'||c.relname||':'||c.relkind from pg_class c "
+        "select 'r:'||c.relname||':'||c.relkind::text from pg_class c "
         " join pg_namespace n on n.oid=c.relnamespace "
         " where n.nspname='public' and c.relkind in ('r','v','m','S','i') "
         "union all "
