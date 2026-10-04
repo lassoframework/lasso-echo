@@ -476,9 +476,15 @@ def test_other_tenant_unresolved_blocks_activation_fleetwide(scratch):
     tid_a, group_a = _seed_tenant()
     tid_b, group_b = _seed_tenant()
     _ledger(tid_b, group_b, state="reserved")  # tenant B's unresolved ledger
+    receipt = _receipt()
+    assert receipt["scope"] == "fleet"
+    assert receipt["unresolved"] == 1
+    assert any(x["tenant_id"] == tid_b and x["status"] == "unresolved"
+               for x in _ledger_rows(receipt))
     done = _activate(tid_a)                    # arming A must still refuse
     assert done.returncode != 0
-    assert "unresolved scene ledger coverage" in done.stderr
+    # The older global-history import may refuse this unsafe state before
+    # activation reaches the scene hook. Either way, no tenant arms.
     assert _one("select count(*) from public.visual_group_activation") == "0"
     assert _one("select count(*) from public.gym_visual_guard_settings "
                 "where enforce") == "0"
@@ -576,7 +582,7 @@ def test_already_recorded_requires_exact_fingerprint(scratch):
                 "where enforce") == "0"
 
 
-def test_valid_verified_history_backfills_and_arms(scratch):
+def test_valid_verified_history_backfills_but_imported_local_use_holds_arming(scratch):
     tid, group = _seed_tenant()
     url, fp, cand = _seed_object(tid, group, phash=_phash(8))
     row_id = _insert_published_row(tid, group, url)
@@ -595,17 +601,15 @@ def test_valid_verified_history_backfills_and_arms(scratch):
     assert member["reason"] == "calendar_row_proof"
     assert member["status"] == "resolved"
     assert not [x for x in rows if x["kind"] == "group_usage_ledger"]
-    # activation succeeds and persists the authoritative recomputed receipt
+    # The base activation importer writes a fingerprint-free local usage row.
+    # That new historical obligation cannot prove its original bytes, so the
+    # scene gate must refuse arming even though the pre-import receipt was clean.
     done = _activate(tid)
-    assert done.returncode == 0, done.stderr
-    proof = json.loads(_one(
-        "select proof::text from public.visual_group_activation "
-        f"where gym_id = '{tid}'"))
-    sh = proof["scene_history"]
-    assert sh["coverage"] == "calendar_and_ledger"
-    assert sh["scope"] == "fleet"
-    assert sh["unresolved"] == 0
-    assert "ledger_obligations" in sh
+    assert done.returncode != 0
+    assert "unresolved scene ledger coverage" in done.stderr
+    assert "historical_fingerprint_unproven" in done.stderr
+    assert _one("select count(*) from public.visual_group_activation") == "0"
+    assert _one("select count(*) from public.gym_visual_guard_settings where enforce") == "0"
 
 
 def test_incoming_receipt_is_never_trusted(scratch):

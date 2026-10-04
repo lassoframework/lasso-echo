@@ -74,6 +74,12 @@ Any unresolved calendar row or ledger obligation refuses activation
 **fleet-wide** (SQLSTATE 23514) and the whole arming transaction rolls back:
 no activation row, no armed setting, no occupied writes survive.
 
+The current base activation importer creates a local usage-ledger row without
+an immutable byte fingerprint. Even when a pre-import fleet receipt is clean,
+that new row is unresolved and activation stays held. A separate reviewed
+byte-bound provenance design is required before this gate can be armed; do not
+weaken the unresolved rule to make activation pass.
+
 ## Lock order (preserved)
 
 1. `content_calendar` SHARE ROW EXCLUSIVE write barrier.
@@ -116,8 +122,9 @@ fingerprint, the SAME-`calendar_row_id` regression (old local ledger use +
 new replacement occupancy + surviving published row with new bytes — the
 fingerprint-free obligation stays unresolved
 `historical_fingerprint_unproven`), `already_recorded` exact-fingerprint
-enforcement with activation refusal, valid verified history + arming
-(fingerprint-bearing obligations only),
+enforcement with activation refusal, verified pre-import history followed by
+fail-closed activation when the base importer adds a fingerprint-free local
+use,
 incoming-receipt bypass, rollback/no-writes on failure, and the read-only
 audit surface. Before any committed scenario setup, two install probes run on
 the scratch DB: (a) a rollback-only installation probe (the draft's outer
