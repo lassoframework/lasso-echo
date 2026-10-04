@@ -79,7 +79,10 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
     draft=True (autonomous build + validation) sends isDraft — Zernio stores it and
     publishes NOTHING. The armed worker passes draft=False, human-tap gated upstream."""
     from .publish_billing_gate import publishing_blocked
+    from . import outbound_publish_receipt as _receipt
     if not draft and publishing_blocked(row.get("gym_id")):
+        _receipt.record(lane="gbp", row=row, decision="held_billing",
+                        reason="access_revoked")
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": "Echo access revoked or subscription canceled",
                 "held": "echo_access", "mode": ""}
@@ -89,6 +92,8 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
     # never a 'failed' outcome — nothing was attempted and nothing was rejected.
     _media_hold = (row.get("media_not_ready_reason") or "").strip()
     if _media_hold:
+        _receipt.record(lane="gbp", row=row, decision="held_media_review",
+                        reason="media_not_ready")
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": f"media not ready: {_media_hold}"[:400],
                 "held": "media_hold", "mode": ""}
@@ -109,11 +114,15 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
     if not (row.get("image_url") or "").strip():
         issues.append("no image on the row")
     if issues:
+        _receipt.record(lane="gbp", row=row, decision="held_preflight",
+                        reason="caption_or_media_rail")
         return {"ok": False, "status": "failed", "late_post_id": "",
                 "reject_reason": "rail check: " + "; ".join(issues), "mode": ""}
     try:
         payload = build_gbp_payload_for_row(row, connection)
     except gbp.GbpPayloadError as e:
+        _receipt.record(lane="gbp", row=row, decision="held_preflight",
+                        reason="payload_invalid")
         return {"ok": False, "status": "failed", "late_post_id": "",
                 "reject_reason": f"payload: {e}", "mode": ""}
     if not draft:
@@ -149,6 +158,7 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
                 "dedup": True}
 
     try:
+        _receipt.record(lane="gbp", row=row, decision="preflight_passed")
         # The persisted claim token (live lane only) is the logical-attempt
         # Idempotency-Key; without a verified token no key is sent. Legacy fake
         # clients that predate the kwarg keep the historical call shape.
@@ -158,8 +168,12 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
         else:
             resp = client.create_post_raw(payload, draft=draft)
     except Exception as exc:  # noqa: BLE001
+        _receipt.record(lane="gbp", row=row, decision="provider_result",
+                        attempted=True, outcome="exception", reason=type(exc).__name__)
         dedup = _dedup_success(exc)
         if dedup:
+            _receipt.record(lane="gbp", row=row, decision="provider_result",
+                            attempted=True, outcome="deduplicated")
             return dedup
         no_post = _no_post_validation(exc)
         if no_post is not None:
@@ -171,7 +185,11 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
         return _ambiguous(f"Zernio create outcome unknown: {type(exc).__name__}")
     post_id = post_id_of(resp)
     if not post_id:
+        _receipt.record(lane="gbp", row=row, decision="provider_result",
+                        attempted=True, outcome="ambiguous")
         return _ambiguous("Zernio create returned no post id")
+    _receipt.record(lane="gbp", row=row, decision="provider_result",
+                    attempted=True, outcome="draft" if draft else "published")
     return {"ok": True, "status": "published", "late_post_id": post_id,
             "reject_reason": "", "mode": "draft" if draft else "live"}
 
