@@ -142,3 +142,113 @@ jobs:
           if [ -d "$PGDATA" ]; then
             "$PGBIN/pg_ctl" -D "$PGDATA" -m fast stop || true
           fi
+
+  scene-candidate-patch-pg:
+    name: scene candidate patch proof (disposable PostgreSQL)
+    runs-on: ubuntu-latest
+    # Same disposable-runner pattern as scene-rollback-pg: this patch proof
+    # needs a real local PostgreSQL server, which the dev host cannot start.
+    timeout-minutes: 15
+
+    env:
+      # Owned exclusively by this disposable runner, stopped in always() below.
+      # The runner context is unavailable in job-level env expressions.
+      PGDATA: /tmp/echo-scene-patch-pg/data
+      PGSOCK: /tmp/echo-scene-patch-pg/sock
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install local PostgreSQL package and resolve server bindir
+        # Identical version-resolution contract to scene-rollback-pg: prefer
+        # PostgreSQL 17 from the runner's archive, otherwise the distro's
+        # PostgreSQL 16; pin one stable $PGBIN from the installed SERVER
+        # package and assert it. No extra or untrusted apt sources.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          if apt-cache show postgresql-17 >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends postgresql-17
+            PKG=postgresql-17
+          else
+            sudo apt-get install -y --no-install-recommends postgresql
+            # postgresql is a metapackage whose own version looks like
+            # "16+ubuntu..."; resolve the actual Depends: postgresql-<major>
+            # SERVER package it pulled in and use that version/bindir.
+            PKG="$(apt-cache depends postgresql               | awk '$1=="Depends:" && $2 ~ /^postgresql-[0-9]+$/ {print $2; exit}')"
+            test -n "$PKG" || { echo "No postgresql-<major> dependency found" >&2; exit 1; }
+            dpkg-query -W -f='${db:Status-Status}' "$PKG" | grep -q '^installed$' || {
+              echo "Server package $PKG is not installed" >&2
+              exit 1
+            }
+          fi
+          VER="$(dpkg-query -W -f='${Version}' "$PKG")"
+          MAJOR="${PKG#postgresql-}"
+          if ! [[ "$MAJOR" =~ ^[0-9]+$ ]]; then
+            echo "Could not resolve server major version from $PKG ($VER)" >&2
+            exit 1
+          fi
+          PGBIN="/usr/lib/postgresql/$MAJOR/bin"
+          for bin in initdb pg_ctl psql createdb; do
+            test -x "$PGBIN/$bin" || { echo "Missing $PGBIN/$bin" >&2; exit 1; }
+          done
+          echo "Installed PostgreSQL server version: $VER (major $MAJOR)"
+          echo "PGBIN=$PGBIN" >> "$GITHUB_ENV"
+
+      - name: Initialize and start disposable cluster (runner-owned, Unix socket only)
+        run: |
+          set -euo pipefail
+          mkdir -p "$PGDATA" "$PGSOCK"
+          "$PGBIN/initdb" -D "$PGDATA" -A trust --no-sync
+          "$PGBIN/pg_ctl" -D "$PGDATA" -l "${PGDATA}.log" -w \
+            -o "-k $PGSOCK -c listen_addresses='' -p 55433" start
+          echo "Server version: $("$PGBIN/psql" -h "$PGSOCK" -p 55433 \
+            -d postgres -Atc 'show server_version')"
+
+      - name: Create disposable test database
+        run: |
+          set -euo pipefail
+          "$PGBIN/createdb" -h "$PGSOCK" -p 55433 echo_scene_patch_test
+
+      - name: Install test-only Python dependency
+        run: pip install pytest
+
+      - name: Run scene candidate patch proof
+        env:
+          # Guarded DSN accepted by the test: Unix socket, no host=localhost /
+          # no network host, database literally echo_scene_patch_test. The
+          # test itself applies the canonical WRITE/PATCH migration stack
+          # (DRAFT_visual_scene_calendar_atomic_write_20261004.sql and
+          # DRAFT_visual_scene_calendar_atomic_patch_20261004.sql on top
+          # of the shared scene stack) from this checkout.
+          VISUAL_SCENE_PATCH_TEST_DSN: host=${{ env.PGSOCK }} port=55433 dbname=echo_scene_patch_test
+        run: |
+          set -o pipefail
+          python -m pytest -q -v -rs tests/test_scene_candidate_patch_pg.py | tee patch-pytest.log
+
+      - name: Assert the patch test ran (no collection, no all-skipped)
+        run: |
+          set -euo pipefail
+          # pytest exits non-zero on collection errors / no tests, which the
+          # step above already surfaced. Here we fail the job if the run only
+          # produced skips: with the DSN set, the patch proof must exercise
+          # the disposable database instead of skipping.
+          if ! grep -qE '^tests/.*(PASSED|FAILED|ERROR)' patch-pytest.log; then
+            echo "No test items ran in tests/test_scene_candidate_patch_pg.py" >&2
+            exit 1
+          fi
+          if grep -q 'SKIPPED' patch-pytest.log && ! grep -qE '^tests/.*(PASSED|FAILED)' patch-pytest.log; then
+            echo "tests/test_scene_candidate_patch_pg.py skipped entirely; DSN guard not exercised" >&2
+            exit 1
+          fi
+
+      - name: Stop disposable PostgreSQL cluster
+        if: always()
+        run: |
+          if [ -d "$PGDATA" ]; then
+            "$PGBIN/pg_ctl" -D "$PGDATA" -m fast stop || true
+          fi

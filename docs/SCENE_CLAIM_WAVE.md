@@ -27,9 +27,7 @@ the repair pass implements is `SCENE_ACTIVATION_REPAIR_SPEC.md`.
 1. Base schema + claim trigger drafts (existing `DRAFT_visual_group_*` files).
 2. `migrations/DRAFT_visual_global_history_20261002.sql` (exact-byte ledger;
    frozen contract, md5-keyed — do not edit).
-3. `migrations/DRAFT_visual_scene_phash_20261003.sql` (superseded design
-   sketch; its record functions raise 0A000).
-4. `migrations/DRAFT_visual_scene_claim_wave_20261003.sql` (this wave:
+3. `migrations/DRAFT_visual_scene_claim_wave_20261003.sql` (this wave:
    candidate staging bound to the row's delivered object, permanent occupied
    scenes, idempotent review holds, the shared scan core + internal
    decide/guard functions, guarded publish-claim/approval wrappers,
@@ -38,7 +36,21 @@ the repair pass implements is `SCENE_ACTIVATION_REPAIR_SPEC.md`.
    exact-byte guard `visual_group_guard_trigger` (in the
    `DRAFT_visual_group_claim_trigger_20261002.sql` draft, step 1), not by a
    separate scene trigger — the scene file installs no calendar trigger.
-5. Any activation draft — must remain LAST. None exists yet.
+4. `migrations/DRAFT_visual_scene_calendar_atomic_write_20261004.sql`
+   (canonical candidate binding + atomic insert writer, integrated in this
+   draft branch: unique index
+   `visual_scene_candidate_canonical_binding_uq` on
+   (tenant_id, group_key, object_role, exact_url), stable same-evidence
+   reuse, and revocation of the direct service_role registration route).
+5. `migrations/DRAFT_visual_scene_calendar_atomic_patch_20261004.sql` (atomic
+   media PATCH scene binding draft, 2026-10-04 wave — see "Atomic media PATCH
+   RPC" below; DRAFT/UNAPPLIED/OFF, no calendar trigger, no occupancy writes;
+   REQUIRES step 4's canonical binding).
+6. Any activation draft — must remain LAST. None exists yet.
+
+`migrations/DRAFT_visual_scene_phash_20261003.sql` is a SUPERSEDED design
+sketch (its record functions raise 0A000) and is NOT applied anywhere in this
+order.
 
 The wave file may only be applied after step 2 (it FK-references
 `visual_group` and `visual_global_object_attestation`) and strictly before
@@ -533,3 +545,189 @@ removes this wave's test surface.
   lock; throughput under concurrent calendar writes is unmeasured.
 - The 7..30 band remains calibrated on exactly one measured incident pair
   (Swift River JCK_6328/JCK_6331, hamming 28) and is hold-only.
+
+## Atomic media PATCH RPC — candidate staging + CAS in one transaction (2026-10-04 wave)
+
+STATUS: DRAFT / UNAPPLIED / OFF. Executed per
+`KIMI_SCENE_PATCH_SWARM_20261004.md` (two-child AgentSwarm; parent
+integration only in this file). Nothing is wired into Python; the Astra lead
+owns integration and independent acceptance. This does NOT close any
+activation blocker and does NOT certify activation readiness.
+
+New files (this wave only, both uncommitted in the isolated worktree):
+
+- `migrations/DRAFT_visual_scene_calendar_atomic_patch_20261004.sql`
+- `tests/test_scene_candidate_patch_pg.py`
+
+### SQL contract
+
+`public.visual_scene_atomic_media_patch(p_row_id uuid, p_gym_id text,
+p_expected jsonb, p_patch jsonb, p_candidate jsonb default null) returns
+jsonb` — SECURITY DEFINER, `search_path=public, pg_temp`, EXECUTE granted to
+`service_role` only (revoked from public/anon/authenticated).
+
+REPAIRED after independent-review rejection (2026-10-04): the draft now
+depends on the canonical insert-writer migration (order step 4) and shares
+its stable candidate identity instead of calling the frozen random-UUID
+registration route on every call.
+
+0. Dependency guards: `visual_scene_candidate_canonical_binding_uq` must
+   exist and `service_role` must NOT hold EXECUTE on the frozen
+   `visual_scene_register_candidate` route (both installed by the write
+   draft); otherwise the RPC raises (42P01 / 42501) before any write.
+0a. Eligible before-image (independent-review P1 repair, 2026-10-04;
+   second pass after the P1 REJECT on the negative-check form), checked
+   BEFORE any candidate staging or update: NULL-safe POSITIVE eligibility —
+   status must PROVE one of `pending`/`coach_review`/`approved` and
+   `variant_status` must PROVE exactly `active`. The frozen scene guard's
+   active predicate (`visual_group_row_active`) requires
+   `variant_status='active'` and includes `approved`, so an approved unsent
+   row IS re-decided on a media update and must not be refused (this
+   matches `patch_image_url`'s publish-time approved form and the
+   approval-preserving `replace_future_infographic_media` shape), while a
+   NULL status (`NOT IN` evaluates to NULL, not TRUE) or a non-active
+   variant (`'candidate'`/NULL slip an archived-only check) would return
+   `patched` without any scene re-decision and is now refused. Published/
+   claimed/reserved rows (published_at, publish_claim_token,
+   publish_reservation_day or late_post_id set), non-active variants
+   (archived/candidate/NULL), currently scene-held rows
+   (`media_not_ready_reason='scene_review_hold'`) and rows with an OPEN
+   `visual_scene_review_hold` are refused with 23514 before anything is
+   staged. Only OPEN holds block: hold resolution is one-shot
+   (`open`→`approved`/`rejected`), so resolved hold HISTORY (e.g. on a
+   reactivated row) never refuses the patch. Behavioral regressions:
+   `test_candidate_variant_refused_before_staging_and_mutation`,
+   `test_null_variant_refused_before_staging_and_mutation` and
+   `test_null_status_refused_before_staging_and_mutation` in
+   tests/test_scene_candidate_patch_pg.py — the ineligible states are
+   staged scratch-only via session_replication_role=replica on the
+   disposable DB (the scratch content_calendar stub has nullable
+   status/variant_status); the production guard is NOT weakened.
+1. `p_patch` keys restricted to a fixed media allowlist (`image_url`,
+   `thumbnail_url`, `source_media_url`, `source_media_asset_id`,
+   `drive_file_id`, `byte_hash`, `r2_key`, `visual_group_key`,
+   `media_not_ready_reason`); any other key (status, caption, post_date, …)
+   raises 22023 — approval state and tenant scope can never be rewritten.
+   `p_expected` must carry EVERY one of the 23 `_VISUAL_MEDIA_CAS_COLUMNS`
+   keys (`agent/portal_calendar_store.py:66-72`) — explicit JSON null values
+   required where observed; an ABSENT key raises 22023 rather than silently
+   comparing as NULL.
+2. The candidate must be staging-only evidence in the same shape the insert
+   writer accepts (kind/stage/usage_claimed=false/counts_as_use=false), name
+   the row's own canonical tenant (`visual_group_tenant_strict` on both
+   sides), and bind the POST-PATCH visual group and exact delivered object
+   (display=image_url, poster=thumbnail_url when distinct) — a bare tenant
+   match is never sufficient (changed group/URL/role raise 23514).
+3. Canonical staging BEFORE the UPDATE: look up the ONE canonical binding
+   (tenant_id, group_key, object_role, exact_url); reuse the stable UUID
+   only when pHash AND fingerprint match exactly (contradictory evidence
+   raises 23514); on first registration insert via the frozen
+   `visual_scene_register_candidate` as the SECURITY DEFINER owner (never
+   the direct service_role route) and catch unique_violation so concurrent
+   identical registrations converge on the committed winner. Preparation
+   only — never writes `visual_scene_phash_occupied`.
+4. One CAS UPDATE whose WHERE mirrors `_visual_media_cas` exactly: `id` +
+   `gym_id` plus NULL-safe `is not distinct from` over all 23 expected
+   columns. `returning to_jsonb(content_calendar)` yields the persisted
+   POST-TRIGGER row (the UPDATE re-enters the merged
+   `visual_group_guard_trigger`).
+5. Post-trigger disposition: a persisted scene hold (status='pending',
+   variant_status='archived', media_not_ready_reason='scene_review_hold',
+   no claim token/reservation) returns a DISTINCT
+   `{"outcome":"held","candidate_id","candidate_reused","row"}` with the
+   actual committed row — never `patched` — and does NOT raise (the
+   committed hold is preserved). `patched` additionally requires every
+   intended patch value persisted AND the rebound row candidate
+   (`visual_scene_row_candidate` + `visual_scene_row_delivered_object`)
+   equal to the stable candidate (group/role/exact URL included); any drift
+   raises 23514 and rolls the whole transaction back.
+6. Stale CAS: zero rows → private marker SQLSTATE `PZ001` rolls the
+   candidate insert back inside the plpgsql subtransaction (NO compensating
+   DELETE), then classifies `{"outcome":"stale"}` (row exists in scope) vs
+   `{"outcome":"not_found"}` (missing or cross-tenant — indistinguishable,
+   matching portal 404 discipline). Only PZ001 is caught; all other errors
+   propagate.
+
+### Test evidence (draft-level, disposable PG only)
+
+`tests/test_scene_candidate_patch_pg.py` applies the canonical insert
+writer resolved from THIS repository's own `migrations/` directory
+(integrated stack, never a sibling worktree) BEFORE the patch migration;
+the superseded phash sketch is NOT applied. 27 scenarios: stack
+applies + service_role-only EXECUTE + canonical binding installed; direct
+service_role registration stays revoked; happy path (staging + CAS +
+post-trigger row + occupancy only via trigger); same-object retry reuses the
+stable candidate UUID; concurrent identical registration converges on ONE
+canonical candidate (one `patched`, one distinguishable `stale`);
+contradictory pHash on the same binding fails closed; changed
+group/URL/role rejected; persisted scene hold returns `held` with the actual
+committed archived row (hold preserved, no occupancy fabricated); incomplete
+expected image rejected per missing CAS key while explicit JSON nulls pass;
+stale CAS rolls back staging (no residue on the canonical binding); missing
+and cross-tenant rows both `not_found`; candidate tenant mismatch 23514;
+unattested candidate fails closed; non-staging-only candidate evidence
+rejected; patch allowlist refuses status/caption/post_date; stale-then-fresh
+retry patches cleanly as a fresh insert; approved UNSENT row patches under
+the full CAS with approval state preserved; an approved row carrying an
+OPEN scene hold is refused before any write; a row reactivated after an
+approved (closed) hold patches cleanly — resolved hold history never
+blocks; inactive and NULL status/variant rows are refused before staging;
+each of published_at, publish_claim_token, publish_reservation_day and
+late_post_id independently refuses a media patch before staging.
+
+REPAIR-PASS STATUS: the disposable PG run is BLOCKED in this session —
+macOS SysV shared memory is exhausted (`shmget ... No space left on
+device`), so the task-owned cluster at `.scratch-scene-patch/` (preserved,
+not recreated) cannot start and no other task's socket may be touched. The
+earlier 8/8 pass predates the repair and is superseded. Without
+`VISUAL_SCENE_PATCH_TEST_DSN` the module skips cleanly (27 skipped),
+preserving suite convention. Fresh PG evidence is owed before activation
+acceptance.
+
+### Read-only mapping findings (which Python paths fit this RPC)
+
+Shared shape today: Python computes byte attestation → group/prepare RPCs →
+separate PATCH with full-row CAS → response re-verification. The window
+between registration RPC and PATCH is only DETECTED by the CAS, not
+prevented; the new RPC closes it for single-row media writes.
+`insert_rows` currently DROPS `scene_candidate`
+(`portal_calendar_store.py:2866-2873`) — candidate registration has no
+transaction home today; that remains the gap this RPC family addresses.
+
+RPC-suitable single-row paths (candidate + media CAS in one tx):
+
+- `patch_image_url` (`portal_calendar_store.py:520-615`) — status-preserving
+  story reburn / feed autofit; publish-time form allows `approved`.
+- `patch_media` (`:680-746`) — blank-image backfill, clears
+  `media_not_ready_reason`, never overwrites existing media.
+- `swap_media` (`:748-807`) — pending/coach_review only, never published or
+  claim-token rows.
+- `restage_held_media` STAGE arm only (`:845-908`) — best fit: hold-preserving
+  stage is a pure candidate+media write.
+- `replace_future_infographic_media` (`:998-1064`) — high value:
+  approval-PRESERVING igfill placeholder swap + exact hold clear on an
+  approved row is exactly the atomic shape.
+- `recover_story_media_hold` row CAS (`:2922-2977`) — the PATCH itself fits.
+
+Must remain DISTINCT transactions:
+
+- `restage_held_media` RELEASE arm — operator re-read between stage and
+  release is a required interleaving; a separate hold-resolve-style RPC.
+- Story support-provenance side effects (`_record_confirmed_story_holds`,
+  `_retry_story_hold_provenance`) — fail-open alerting must never roll back
+  calendar writes.
+- `insert_rows` (`:2860-2920`) — batch multi-row insert + best-effort caption
+  ledger; needs its own batch design, not the single-row RPC.
+- `swap_variant` (`:1334-1355`) — already an atomic multi-row RPC
+  (`content_calendar_swap_variant`); precedent, not consumer.
+- `claim_publish_slot` / `approve_ready` — trigger-side contract work per
+  ACTIVATION BLOCKER 2, not candidate staging.
+
+### Status vs activation blockers
+
+Unchanged: blockers 2 (publish-claim RPC wiring), 4 (backfill 0A000), 5
+(exact-diff independent acceptance), and 6 (runtime candidate registration —
+this wave drafts the SQL contract for it but deliberately does NOT wire any
+Python; the Astra lead integrates it against the insert-only writer package
+before assigning that separate owner). `SCENE_GUARD_OPERATIONAL` stays
+`False`; no flag flipped; frozen scene migrations and their tests untouched.
