@@ -78,6 +78,15 @@ def sha256_hex(data):
     return hashlib.sha256(bytes(data)).hexdigest()
 
 
+def md5_hex(data):
+    """MD5 of the supplied bytes as a lowercase hex string. REPORTING /
+    SECONDARY SIGNAL ONLY: MD5 is collision-broken and is never a proof input
+    here — the proof digest is SHA256. A declared MD5 the bytes do not
+    reproduce still fails closed (caller metadata is a claim, not proof)."""
+    sha256_hex(data)  # shared byte-shape rejection (type/empty)
+    return hashlib.md5(bytes(data)).hexdigest()
+
+
 def phash_hex(data):
     """The repo-convention 64-bit DCT pHash (16-char hex) of the supplied image
     bytes, via agent.vision.dct_phash. Raises ByteEvidenceError when the bytes
@@ -100,6 +109,7 @@ class ByteEvidence:
     sha256: str
     phash: str
     byte_len: int
+    md5: str = ""
 
 
 @dataclass(frozen=True)
@@ -124,12 +134,16 @@ class RenderEvidence:
 
 
 # ---- validation ------------------------------------------------------------
-def build_byte_evidence(data, *, declared_sha256=None):
-    """Compute the ByteEvidence for `data`. When declared_sha256 is given it is
-    a CLAIM, never proof: the bytes must reproduce it exactly (case-insensitive
-    hex compare) or this fails closed with ByteEvidenceError. Also rejects
-    bytes that do not decode as a readable image (no pHash possible)."""
+def build_byte_evidence(data, *, declared_sha256=None, declared_md5=None,
+                        declared_byte_len=None):
+    """Compute the ByteEvidence for `data` from the ACTUAL BYTES: SHA256,
+    MD5, byte count and the repo-convention DCT pHash. Every declared_* value
+    is a CLAIM, never proof: the bytes must reproduce each given declared
+    value exactly (case-insensitive hex compare for digests) or this fails
+    closed with ByteEvidenceError. Also rejects bytes that do not decode as
+    a readable image (no pHash possible)."""
     digest = sha256_hex(data)
+    md5 = md5_hex(data)
     phash = phash_hex(data)
     if declared_sha256 is not None:
         declared = str(declared_sha256).strip().lower()
@@ -137,7 +151,27 @@ def build_byte_evidence(data, *, declared_sha256=None):
             raise ByteEvidenceError(
                 "declared sha256 does not match the supplied bytes "
                 "(fail-closed: caller metadata is not proof)")
-    return ByteEvidence(sha256=digest, phash=phash, byte_len=len(data))
+    if declared_md5 is not None:
+        declared = str(declared_md5).strip().lower()
+        if not declared or declared != md5:
+            raise ByteEvidenceError(
+                "declared md5 does not match the supplied bytes "
+                "(fail-closed: caller metadata is not proof)")
+    if declared_byte_len is not None:
+        # Exact-int ONLY: a bool is not a byte count (True != 1 byte), a
+        # float would silently truncate, and a string would silently coerce —
+        # all three are caller-metadata defects and fail closed.
+        if type(declared_byte_len) is not int:
+            raise ByteEvidenceError(
+                "declared byte count must be an exact int "
+                f"(got {type(declared_byte_len).__name__}; bool, float and "
+                "string coercion are rejected)")
+        if declared_byte_len != len(data):
+            raise ByteEvidenceError(
+                "declared byte count does not match the supplied bytes "
+                "(fail-closed: caller metadata is not proof)")
+    return ByteEvidence(sha256=digest, phash=phash, byte_len=len(data),
+                        md5=md5)
 
 
 def validate_render_evidence(render_evidence, *, original, delivered):
@@ -168,7 +202,11 @@ def validate_render_evidence(render_evidence, *, original, delivered):
 def prove_original_use(original_bytes, delivered_bytes, *,
                        render_evidence=None,
                        declared_original_sha256=None,
-                       declared_delivered_sha256=None):
+                       declared_delivered_sha256=None,
+                       declared_original_md5=None,
+                       declared_delivered_md5=None,
+                       declared_original_byte_len=None,
+                       declared_delivered_byte_len=None):
     """Determine whether `delivered_bytes` provably used `original_bytes`.
 
     Returns a dict:
@@ -190,10 +228,14 @@ def prove_original_use(original_bytes, delivered_bytes, *,
     Raises ByteEvidenceError on malformed input: missing/empty/unreadable
     bytes, or a declared digest the bytes do not reproduce.
     Pure: no I/O, no network, no flags."""
-    original = build_byte_evidence(original_bytes,
-                                   declared_sha256=declared_original_sha256)
-    delivered = build_byte_evidence(delivered_bytes,
-                                    declared_sha256=declared_delivered_sha256)
+    original = build_byte_evidence(
+        original_bytes, declared_sha256=declared_original_sha256,
+        declared_md5=declared_original_md5,
+        declared_byte_len=declared_original_byte_len)
+    delivered = build_byte_evidence(
+        delivered_bytes, declared_sha256=declared_delivered_sha256,
+        declared_md5=declared_delivered_md5,
+        declared_byte_len=declared_delivered_byte_len)
     identical = original.sha256 == delivered.sha256
     if identical:
         return {"status": PROVEN_IDENTICAL, "proven": True, "identical": True,

@@ -239,3 +239,84 @@ def test_no_network_or_io_imports():
     src = inspect.getsource(sob)
     for forbidden in ("requests", "urllib", "http", "socket", "open(", "urlopen"):
         assert forbidden not in src
+
+
+# ---- md5 / byte-count declared-value binding ---------------------------------
+def test_md5_computed_from_actual_bytes():
+    data = _original()
+    assert sob.md5_hex(data) == hashlib.md5(data).hexdigest()
+    ev = sob.build_byte_evidence(data)
+    assert ev.md5 == hashlib.md5(data).hexdigest()
+    assert ev.byte_len == len(data)
+
+
+def test_declared_md5_match_ok_mismatch_rejected():
+    data = _original()
+    ev = sob.build_byte_evidence(data, declared_md5=hashlib.md5(data).hexdigest())
+    assert ev.md5 == hashlib.md5(data).hexdigest()
+    wrong = hashlib.md5(b"other").hexdigest()
+    with pytest.raises(sob.ByteEvidenceError, match="md5"):
+        sob.build_byte_evidence(data, declared_md5=wrong)
+    with pytest.raises(sob.ByteEvidenceError):
+        sob.prove_original_use(data, data, declared_original_md5=wrong)
+    with pytest.raises(sob.ByteEvidenceError):
+        sob.prove_original_use(data, data, declared_delivered_md5=wrong)
+
+
+def test_declared_byte_len_match_ok_mismatch_rejected():
+    data = _original()
+    ev = sob.build_byte_evidence(data, declared_byte_len=len(data))
+    assert ev.byte_len == len(data)
+    with pytest.raises(sob.ByteEvidenceError, match="byte count"):
+        sob.build_byte_evidence(data, declared_byte_len=len(data) + 1)
+    with pytest.raises(sob.ByteEvidenceError):
+        sob.prove_original_use(data, data, declared_delivered_byte_len=1)
+    with pytest.raises(sob.ByteEvidenceError):
+        sob.build_byte_evidence(data, declared_byte_len="not-an-int")
+
+
+def test_all_declared_values_together_differing_bytes_still_held():
+    """Even with EVERY declared value correct and a perfect RenderEvidence,
+    differing bytes remain HELD_UNPROVEN."""
+    orig, rend = _original(), _render_of_original()
+    res = sob.prove_original_use(
+        orig, rend,
+        render_evidence=_good_render_evidence(orig, rend),
+        declared_original_sha256=hashlib.sha256(orig).hexdigest(),
+        declared_delivered_sha256=hashlib.sha256(rend).hexdigest(),
+        declared_original_md5=hashlib.md5(orig).hexdigest(),
+        declared_delivered_md5=hashlib.md5(rend).hexdigest(),
+        declared_original_byte_len=len(orig),
+        declared_delivered_byte_len=len(rend))
+    assert res["status"] == sob.HELD_UNPROVEN and res["proven"] is False
+
+
+# ---- adversarial: declared byte count type coercion --------------------------
+@pytest.mark.parametrize("bad", [
+    True, False,                 # bool must not pass as 1/0
+    1.0, 3.7,                    # float truncation
+    "1234", "", "12px",          # string coercion
+    None is None and b"5" or b"5",  # bytes, not int
+])
+def test_declared_byte_len_rejects_non_exact_int_types(bad):
+    data = _original()
+    with pytest.raises(sob.ByteEvidenceError):
+        sob.build_byte_evidence(data, declared_byte_len=bad)
+
+
+def test_declared_byte_len_rejects_coercible_correct_value():
+    """Even when the coerced VALUE would equal len(data), a float or string
+    form is rejected — type must be exact int."""
+    data = _original()
+    n = len(data)
+    for bad in (float(n), str(n)):
+        with pytest.raises(sob.ByteEvidenceError):
+            sob.build_byte_evidence(data, declared_byte_len=bad)
+    if n == 1:  # pragma: no cover - fixture is never 1 byte
+        pass
+    with pytest.raises(sob.ByteEvidenceError):
+        sob.prove_original_use(data, data,
+                               declared_original_byte_len=float(n))
+    # exact int of the correct value still passes
+    ev = sob.build_byte_evidence(data, declared_byte_len=n)
+    assert ev.byte_len == n

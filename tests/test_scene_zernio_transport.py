@@ -31,12 +31,20 @@ from agent import zernio  # noqa: E402
 ATTEMPT_ID = "3f6f8f8a-2a1b-4c5d-9e0f-1234567890ab"
 MEDIA_URL = "https://r2.example.test/scene/card1.jpg"
 
-TARGET = szt.SceneChannelTarget(
-    account_id="acct_1",
-    channel="instagram",
-    media_url=MEDIA_URL,
-    expected_profile_id="prof_1",
-)
+
+def _mk_target(content="hello scene", **kw):
+    """A SceneChannelTarget with a VALID payload digest binding `content`.
+    The digest is computed over the exact canonical payload, mirroring how a
+    real caller freezes an attempt."""
+    base = dict(account_id="acct_1", channel="instagram", media_url=MEDIA_URL,
+                expected_profile_id="prof_1")
+    base.update(kw)
+    probe = szt.SceneChannelTarget(payload_sha256="0" * 64, **base)
+    digest = szt.canonical_payload_digest(szt.canonical_payload(probe, content))
+    return szt.SceneChannelTarget(payload_sha256=digest, **base)
+
+
+TARGET = _mk_target()
 
 
 class FakeClient:
@@ -52,7 +60,8 @@ class FakeClient:
 
     def create_post_raw(self, payload, *, draft=False, publish_now=True,
                         idempotency_key=None):
-        self.create_calls.append({"payload": payload,
+        self.create_calls.append({"payload": payload, "draft": draft,
+                                  "publish_now": publish_now,
                                   "idempotency_key": idempotency_key})
         if self.create_error is not None:
             raise self.create_error
@@ -67,11 +76,23 @@ class FakeClient:
 
 def _readback(post_id="zpost_1", account_id="acct_1", channel="instagram",
               media_url=MEDIA_URL, profile_id="prof_1",
-              status="published", platform_status="published"):
-    return {"_id": post_id, "profileId": profile_id, "status": status,
-            "platforms": [{"accountId": account_id, "platform": channel,
-                           "status": platform_status}],
-            "mediaItems": [{"type": "image", "url": media_url}]}
+              status="published", platform_status="published",
+              content_type="feed", page_id=None, content="hello scene",
+              media_type="image"):
+    psd = {"contentType": content_type} if content_type is not None else None
+    if page_id is not None:
+        psd = psd or {}
+        psd["pageId"] = page_id
+    entry = {"accountId": account_id, "platform": channel,
+             "status": platform_status}
+    if psd is not None:
+        entry["platformSpecificData"] = psd
+    body = {"_id": post_id, "profileId": profile_id, "status": status,
+            "platforms": [entry],
+            "mediaItems": [{"type": media_type, "url": media_url}]}
+    if content is not None:
+        body["content"] = content
+    return body
 
 
 @pytest.fixture
@@ -378,14 +399,20 @@ def test_wrapped_post_shape_verifies(attempt, client):
 def test_readback_status_matrix_pure():
     """The pure gate directly: success requires BOTH levels conclusive."""
     ok = _readback()
-    assert szt.readback_matches(ok, TARGET, post_id="zpost_1") is True
-    assert szt.readback_matches(ok, TARGET, post_id="zpost_2") is False
+    assert szt.readback_matches(ok, TARGET, post_id="zpost_1",
+                                expected_content="hello scene") is True
+    assert szt.readback_matches(ok, TARGET, post_id="zpost_2",
+                                expected_content="hello scene") is False
+    # Content binding is mandatory: no expected_content never matches.
+    assert szt.readback_matches(ok, TARGET, post_id="zpost_1") is False
     for bad_top in ("failed", "pending", "draft", None):
         assert szt.readback_matches(_readback(status=bad_top), TARGET,
-                                    post_id="zpost_1") is False
+                                    post_id="zpost_1",
+                                    expected_content="hello scene") is False
     for bad_plat in ("failed", "pending", "", None):
         assert szt.readback_matches(_readback(platform_status=bad_plat), TARGET,
-                                    post_id="zpost_1") is False
+                                    post_id="zpost_1",
+                                    expected_content="hello scene") is False
 
 
 # ---- P2 adversarial: existingPostId extraction must never throw or guess ------
@@ -440,3 +467,233 @@ def test_409_nested_dict_value_held_without_throw(attempt, client):
         409, '{"existingPostId": {"id": "zp_1"}}')
     out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
     assert not out.ok and client.get_calls == []
+
+
+# ---- surface / destination / payload-digest binding ---------------------------
+
+STORY_TARGET = _mk_target("hi", channel="facebook", content_type="story",
+                          page_id="page_9")
+
+
+def test_surface_must_be_explicit_validated():
+    with pytest.raises(ValueError):
+        szt.SceneChannelTarget(account_id="a", channel="instagram",
+                               media_url=MEDIA_URL, expected_profile_id="p",
+                               content_type="reel")  # not a declared surface
+
+
+def test_story_payload_mirrors_zernio_builder():
+    """platformSpecificData.contentType='story' + pageId, exactly as
+    agent/zernio.py create_post assembles it."""
+    payload = szt.canonical_payload(STORY_TARGET, "hi")
+    entry = payload["platforms"][0]
+    assert entry["platformSpecificData"] == {"contentType": "story",
+                                             "pageId": "page_9"}
+
+
+def test_feed_payload_omits_platform_specific_data():
+    payload = szt.canonical_payload(TARGET, "hi")
+    assert "platformSpecificData" not in payload["platforms"][0]
+
+
+def test_story_readback_proven_when_surface_and_page_match():
+    client = FakeClient()
+    client.posts["zpost_1"] = _readback(channel="facebook", content_type="story",
+                                        page_id="page_9", content="hi")
+    attempt = szt.ScenePublishAttempt(attempt_id=ATTEMPT_ID,
+                                      target=STORY_TARGET, content="hi")
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert out.ok and out.readback_verified
+
+
+def test_readback_missing_content_type_held_even_for_feed(attempt, client):
+    """Surface is never inferred: a readback without contentType proves
+    nothing — not even a feed."""
+    client.posts["zpost_1"] = _readback(content_type=None)
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert not out.ok and out.status == szt.STATUS_HELD
+
+
+def test_surface_drift_story_vs_feed_held(attempt, client):
+    client.posts["zpost_1"] = _readback(content_type="story")
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert not out.ok
+
+
+def test_page_drift_held():
+    client = FakeClient()
+    attempt = szt.ScenePublishAttempt(attempt_id=ATTEMPT_ID,
+                                      target=STORY_TARGET, content="hi")
+    for bad in (None, "page_OTHER", ""):
+        client.posts["zpost_1"] = _readback(channel="facebook",
+                                            content_type="story", page_id=bad,
+                                            content="hi")
+        out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+        assert not out.ok, bad
+
+
+def test_undeclared_readback_page_held_when_target_has_none(attempt, client):
+    """Target declared no page; a readback pageId is destination drift."""
+    client.posts["zpost_1"] = _readback(page_id="page_9")
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert not out.ok
+
+
+def test_same_account_on_another_profile_held(attempt, client):
+    client.posts["zpost_1"] = _readback(profile_id="prof_OTHER")
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert not out.ok
+
+
+def _digest_bound_attempt(content="bind me"):
+    target = _mk_target(content)
+    return szt.ScenePublishAttempt(attempt_id=ATTEMPT_ID, target=target,
+                                   content=content)
+
+
+def test_payload_digest_match_publishes_with_content_proof(client):
+    attempt = _digest_bound_attempt()
+    client.posts["zpost_1"] = _readback(content="bind me")
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert out.ok and out.readback_verified
+
+
+def test_payload_digest_mismatch_refuses_pre_network(client):
+    target = szt.SceneChannelTarget(
+        account_id="acct_1", channel="instagram", media_url=MEDIA_URL,
+        expected_profile_id="prof_1", payload_sha256="0" * 64)
+    attempt = szt.ScenePublishAttempt(attempt_id=ATTEMPT_ID, target=target)
+    with pytest.raises(ValueError):
+        szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert client.create_calls == [] and client.get_calls == []
+
+
+def test_payload_digest_bound_readback_without_content_held(client):
+    """Digest binding requires the readback to prove the content verbatim."""
+    attempt = _digest_bound_attempt()
+    client.posts["zpost_1"] = _readback(content=None)  # no content field
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert not out.ok
+    client.posts["zpost_1"] = _readback(content="different words")
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert not out.ok
+
+
+# ---- adversarial: stale idempotency / digest / media-type rails ---------------
+
+def test_stale_409_existing_post_with_different_caption_held(attempt, client):
+    """A 409 existingPostId whose readback is a delivered post with a
+    DIFFERENT caption is a stale idempotency hit, never PUBLISHED."""
+    client.create_error = _conflict("zpost_stale")
+    client.posts["zpost_stale"] = _readback(post_id="zpost_stale",
+                                            content="a completely different caption")
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert not out.ok and out.status == szt.STATUS_HELD
+    assert out.post_id == "zpost_stale"
+
+
+def test_stale_409_readback_without_content_field_held(attempt, client):
+    """If the provider readback does not expose the content field, the
+    transport cannot prove content binding and must hold."""
+    client.create_error = _conflict("zpost_stale")
+    client.posts["zpost_stale"] = _readback(post_id="zpost_stale", content=None)
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert not out.ok
+
+
+def test_missing_payload_digest_refused_at_construction():
+    """payload_sha256 is MANDATORY: no default, no empty-string fallback."""
+    with pytest.raises(ValueError):  # omitted -> empty -> refused
+        szt.SceneChannelTarget(account_id="a", channel="instagram",
+                               media_url=MEDIA_URL, expected_profile_id="p")
+    with pytest.raises(ValueError):  # explicit empty string
+        szt.SceneChannelTarget(account_id="a", channel="instagram",
+                               media_url=MEDIA_URL, expected_profile_id="p",
+                               payload_sha256="")
+
+
+@pytest.mark.parametrize("bad", [
+    "0" * 63, "0" * 65, "g" * 64, "0x" + "0" * 62, 42, None,
+    " " + "0" * 63 + " Z",
+])
+def test_invalid_payload_digest_refused_before_network(bad, client):
+    with pytest.raises((ValueError, TypeError)):
+        szt.SceneChannelTarget(account_id="a", channel="instagram",
+                               media_url=MEDIA_URL, expected_profile_id="p",
+                               payload_sha256=bad)
+    assert client.create_calls == [] and client.get_calls == []
+
+
+def test_uppercase_hex_digest_normalized_and_accepted():
+    digest = szt.canonical_payload_digest(
+        szt.canonical_payload(TARGET, "hello scene"))
+    target = _mk_target("hello scene",
+                        )  # same digest, lowercase
+    assert target.payload_sha256 == digest
+    upper = szt.SceneChannelTarget(
+        account_id="acct_1", channel="instagram", media_url=MEDIA_URL,
+        expected_profile_id="prof_1", payload_sha256=digest.upper())
+    assert upper.payload_sha256 == digest
+
+
+def test_readback_media_type_drift_held(attempt, client):
+    """Same singleton media URL but type 'video' where the canonical payload
+    expects 'image' is drift — held, never published."""
+    client.posts["zpost_1"] = _readback(media_type="video")
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert not out.ok and out.status == szt.STATUS_HELD
+
+
+def test_readback_media_type_missing_held(attempt, client):
+    body = _readback()
+    del body["mediaItems"][0]["type"]
+    client.posts["zpost_1"] = body
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert not out.ok
+
+
+def test_publish_sends_explicit_immediate_send_args(attempt, client):
+    """publish() must call create_post_raw with draft=False, publish_now=True
+    so the sent body's send mode is explicit and cannot silently default."""
+    client.posts["zpost_1"] = _readback()
+    out = szt.SceneZernioTransport(client=client, enabled=True).publish(attempt)
+    assert out.ok
+    call = client.create_calls[0]
+    assert call["draft"] is False
+    assert call["publish_now"] is True
+    # The digested canonical payload IS the final provider body: publishNow
+    # is already present, so create_post_raw's body copy is byte-identical.
+    assert call["payload"]["publishNow"] is True
+    assert (szt.canonical_payload_digest(call["payload"])
+            == attempt.target.payload_sha256)
+
+
+@pytest.mark.parametrize("tamper", [
+    lambda p: p.pop("publishNow"),                      # send mode removed
+    lambda p: p.__setitem__("publishNow", False),       # immediate -> not now
+    lambda p: p.__setitem__("isDraft", True),           # draft smuggled in
+])
+def test_send_mode_tamper_changes_digest_or_refuses_pre_network(tamper, client):
+    """Adversarial: any change to the final send-mode field of the provider
+    body must change the digest (so a caller freezing a tampered attempt is
+    refused BEFORE any network call) — there is no way to digest one mode
+    and send another."""
+    payload = szt.canonical_payload(TARGET, "hello scene")
+    tampered = dict(payload)
+    tamper(tampered)
+    assert szt.canonical_payload_digest(tampered) != TARGET.payload_sha256
+    # Prove the refusal rail end-to-end: a caller whose frozen digest was
+    # computed over a body with the send mode REMOVED cannot publish — the
+    # mismatch raises before any network call.
+    removed = dict(payload)
+    removed.pop("publishNow")
+    stale_digest = szt.canonical_payload_digest(removed)
+    stale_target = szt.SceneChannelTarget(
+        account_id="acct_1", channel="instagram", media_url=MEDIA_URL,
+        expected_profile_id="prof_1", payload_sha256=stale_digest)
+    stale_attempt = szt.ScenePublishAttempt(attempt_id=ATTEMPT_ID,
+                                            target=stale_target,
+                                            content="hello scene")
+    with pytest.raises(ValueError):
+        szt.SceneZernioTransport(client=client, enabled=True).publish(stale_attempt)
+    assert client.create_calls == [] and client.get_calls == []

@@ -24,9 +24,17 @@ Hard rules baked in here:
    SAME post id that was requested, (b) carries a conclusive successful
    top-level status AND a conclusive per-platform delivered/published state
    for the target platform, and (c) matches the frozen account id, channel,
-   media URL and expected profile id EXACTLY. Failed, pending, draft,
+   media URL AND media type, expected profile id, and the attempt content
+   verbatim EXACTLY. Failed, pending, draft,
    scheduled, unknown or missing states — and multiple ambiguous platform
    entries — are all held. Never invent success from unknown state.
+6. Every send is bound to a MANDATORY 64-hex payload_sha256 digest of the
+   canonical payload (account/channel/page/surface/media/content AND the
+   explicit publishNow=True send mode of the final provider body).
+   A missing or invalid digest refuses BEFORE any network call or hold; a
+   stale 409 existingPostId readback with a different caption can NEVER mark
+   PUBLISHED because the readback content must match verbatim. There is no
+   compatibility success fallback.
 
 The transport does nothing unless explicitly enabled: SceneZernioTransport
 defaults enabled=False, and the environment flag
@@ -61,16 +69,67 @@ def transport_enabled(env=None):
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+#: Explicit publish surfaces. "feed" is a normal post; "story" maps to
+#: platformSpecificData.contentType='story' in the Zernio payload builder
+#: (agent/zernio.py create_post). The surface is ALWAYS caller-declared and
+#: must be reproduced EXPLICITLY by the provider readback — a readback that
+#: omits contentType never proves a feed; nothing is inferred from absence.
+SURFACE_FEED = "feed"
+SURFACE_STORY = "story"
+_SURFACES = frozenset({SURFACE_FEED, SURFACE_STORY})
+
+
 @dataclass(frozen=True)
 class SceneChannelTarget:
     """The frozen destination identity for one scene publish attempt.
 
     Every field is a caller-supplied binding; the provider readback must
-    reproduce ALL of them exactly or the outcome is held."""
+    reproduce ALL of them exactly or the outcome is held.
+
+    content_type:   the explicit surface — SURFACE_FEED or SURFACE_STORY.
+                    Never inferred: the readback's per-platform
+                    platformSpecificData.contentType must name it exactly.
+    page_id:        the exact Facebook Page destination ("" when the attempt
+                    declares none). Strict equality both ways: a readback
+                    pageId the target did not declare — or a declared pageId
+                    the readback lacks — is destination drift, held.
+    payload_sha256: REQUIRED caller-declared 64-hex SHA256 digest of the
+                    canonical payload (canonical_payload /
+                    canonical_payload_digest) for the EXACT attempt content.
+                    It binds account, channel, page, surface, media (URL and
+                    type), content and send mode into every send. A missing
+                    or malformed digest refuses at construction; a digest the
+                    built payload does not reproduce refuses BEFORE any
+                    network call; and the provider readback must prove the
+                    content verbatim. No compatibility success fallback."""
     account_id: str            # Zernio connected-account _id
     channel: str               # Zernio platform spelling, e.g. "instagram"
     media_url: str             # the exact delivered media URL
     expected_profile_id: str   # the gym's expected Zernio profile id
+    content_type: str = SURFACE_FEED
+    page_id: str = ""
+    # No usable default: "" is rejected by __post_init__ (mandatory digest),
+    # the default exists only to keep dataclass field ordering legal.
+    payload_sha256: str = ""
+
+    def __post_init__(self):
+        if str(self.content_type) not in _SURFACES:
+            raise ValueError(
+                "content_type must be an explicit surface "
+                f"({sorted(_SURFACES)}); got {self.content_type!r}")
+        # The payload digest is MANDATORY and must be a well-formed 64-hex
+        # SHA256. This is the anti-stale-idempotency rail: without it a 409
+        # existingPostId (or any 2xx) could mark PUBLISHED after readback of
+        # a DIFFERENT caption. Refuse construction, before any network or
+        # hold path, when it is missing or malformed.
+        digest = (self.payload_sha256.strip().lower()
+                  if isinstance(self.payload_sha256, str) else "")
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError(
+                "payload_sha256 must be a 64-character hex SHA256 digest of "
+                "the canonical payload for this exact attempt; a missing or "
+                "malformed digest refuses pre-network by construction")
+        object.__setattr__(self, "payload_sha256", digest)
 
 
 @dataclass(frozen=True)
@@ -216,16 +275,86 @@ def _platform_entries(post_json, channel):
             if isinstance(e, dict) and str(e.get("platform") or "") == str(channel)]
 
 
-def readback_matches(post_json, target: SceneChannelTarget, post_id="") -> bool:
+def canonical_payload(target: SceneChannelTarget, content=""):
+    """The FINAL provider body publish() sends for this target — the exact
+    dict create_post_raw(draft=False, publish_now=True) POSTs: the real
+    Zernio builder (agent/zernio.py create_post_raw) copies the payload and
+    sets body["publishNow"] = True for this fixed immediate-send path, so the
+    canonical payload reproduces that send-mode field EXPLICITLY. Digesting
+    this body therefore binds the send mode: there is no way to digest one
+    mode (draft/scheduled) and send another — any send-mode tamper changes
+    the digest and refuses pre-network. platformSpecificData carries
+    contentType only for a story, and pageId only when a page destination is
+    declared. Pure; no network, no defaults beyond the frozen target."""
+    entry = {"accountId": str(target.account_id), "platform": str(target.channel)}
+    psd = {}
+    if str(target.content_type) == SURFACE_STORY:
+        psd["contentType"] = SURFACE_STORY
+    if str(target.page_id or ""):
+        psd["pageId"] = str(target.page_id)
+    if psd:
+        entry["platformSpecificData"] = psd
+    return {
+        "content": content or "",
+        "platforms": [entry],
+        "mediaItems": [{"type": zernio._media_type(str(target.media_url)),
+                        "url": str(target.media_url)}],
+        # The FINAL send-mode field of the provider body. publish() always
+        # sends immediately on this lane (draft=False, publish_now=True) and
+        # create_post_raw would set exactly this on its body copy — the
+        # canonical payload must hash it so the digest binds send mode.
+        "publishNow": True,
+    }
+
+
+def canonical_payload_digest(payload):
+    """SHA256 of the canonical JSON serialization (sorted keys, compact
+    separators) of a payload built by canonical_payload. This is the digest
+    SceneChannelTarget.payload_sha256 binds. Pure."""
+    import hashlib
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _readback_surface(entry):
+    """(content_type, page_id) EXPLICITLY present in a platforms[] entry's
+    platformSpecificData, or (None, None) when the shape cannot prove them.
+    Missing contentType is None — never inferred as feed."""
+    if not isinstance(entry, dict):
+        return None, None
+    psd = entry.get("platformSpecificData")
+    if not isinstance(psd, dict):
+        return None, None
+    ct = psd.get("contentType")
+    ct = str(ct) if ct and not isinstance(ct, bool) else None
+    pid = psd.get("pageId")
+    pid = str(pid) if pid and not isinstance(pid, bool) else ""
+    return ct, pid
+
+
+def readback_matches(post_json, target: SceneChannelTarget, post_id="",
+                     expected_content=None) -> bool:
     """True iff a get_post readback PROVES this exact attempt landed:
       1. the readback post id equals the requested post id (when given);
       2. the top-level status is a conclusive delivered state;
       3. the target platform has exactly one unambiguous per-platform entry
          and it is in a conclusive delivered state for the frozen account;
       4. the frozen identity (account, channel, media URL, profile) matches
-         EXACTLY.
+         EXACTLY;
+      5. the surface is EXPLICIT: the entry's platformSpecificData names the
+         frozen content_type exactly (a missing contentType proves nothing,
+         not even a feed) and its pageId equals the frozen page_id exactly
+         (both empty only when neither side declares a page);
+      6. expected_content is MANDATORY (the payload-digest content binding):
+         the readback's content field must be present and equal it verbatim.
+         A None/non-str expected_content never matches — when the provider
+         does not expose sufficient fields to prove content, hold.
+      7. the singleton readback media item's TYPE equals the canonical
+         payload's expected media type (video vs image drift rejects).
     Any missing, drifted, failed, pending, draft or ambiguous element is a
     non-match — success is never invented from unknown state."""
+    if not isinstance(expected_content, str):
+        return False
     if post_id and _readback_post_id(post_json) != str(post_id):
         return False
     post = _unwrap_post(post_json)
@@ -245,14 +374,24 @@ def readback_matches(post_json, target: SceneChannelTarget, post_id="") -> bool:
     entry_account = entry.get("accountId") or entry.get("account_id")
     if not entry_account or str(entry_account) != str(target.account_id):
         return False
+    surface, page_id = _readback_surface(entry)
+    if surface != str(target.content_type):
+        return False
+    if str(page_id or "") != str(target.page_id or ""):
+        return False
+    content = post.get("content")
+    if not isinstance(content, str) or content != str(expected_content):
+        return False
     media = post.get("mediaItems")
     if media is None:
         media = post.get("media")
     # We sent exactly one image. Membership alone would accept a readback that
     # also published an unapproved second image.
+    expected_media_type = zernio._media_type(str(target.media_url))
     if (not isinstance(media, list) or len(media) != 1
             or not isinstance(media[0], dict)
-            or str(media[0].get("url") or "") != str(target.media_url)):
+            or str(media[0].get("url") or "") != str(target.media_url)
+            or str(media[0].get("type") or "") != expected_media_type):
         return False
     account_id, channel, urls, profile_id = _readback_identity(post_json)
     if not account_id or not channel or not profile_id:
@@ -294,7 +433,13 @@ class SceneZernioTransport:
                          f"{via}: readback of post {post_id} failed "
                          f"({type(exc).__name__}); outcome ambiguous, held",
                          post_id=post_id)
-        if readback_matches(post, attempt.target, post_id=str(post_id)):
+        # Content binding is MANDATORY on every PUBLISHED path: the readback
+        # must reproduce the frozen attempt content verbatim (stale-409
+        # rail). If Zernio does not expose the content field, the readback
+        # cannot match and the attempt holds.
+        expected_content = attempt.content
+        if readback_matches(post, attempt.target, post_id=str(post_id),
+                            expected_content=expected_content):
             return SceneTransportOutcome(
                 status=STATUS_PUBLISHED, attempt_id=str(attempt.attempt_id),
                 post_id=str(post_id), reason=f"{via}: readback identity match",
@@ -318,16 +463,25 @@ class SceneZernioTransport:
                          f"transport disabled ({ENABLED_ENV} OFF); no send attempted")
 
         target = attempt.target
-        payload = {
-            "content": attempt.content or "",
-            "platforms": [{"accountId": str(target.account_id),
-                           "platform": str(target.channel)}],
-            "mediaItems": [{"type": zernio._media_type(str(target.media_url)),
-                            "url": str(target.media_url)}],
-        }
+        payload = canonical_payload(target, attempt.content)
+        # The declared payload digest (validated 64-hex at construction) is a
+        # CLAIM the built payload must reproduce exactly — account, channel,
+        # page, surface, media, content and send mode. A mismatch is a caller
+        # defect and refuses BEFORE any network call (same rail as an invalid
+        # attempt id). No compatibility success fallback.
+        if canonical_payload_digest(payload) != target.payload_sha256:
+            raise ValueError(
+                "declared payload_sha256 does not match the canonical "
+                "payload this target builds; refusing pre-network")
         try:
+            # Explicit send mode, matching the canonical payload's
+            # publishNow=True exactly: draft=False + publish_now=True sends
+            # immediately. The digest already bound this mode; these args
+            # make the sent body identical to the digested body by
+            # construction (create_post_raw sets body["publishNow"]=True).
             resp = self._zernio().create_post_raw(
-                payload, idempotency_key=str(attempt.attempt_id))
+                payload, draft=False, publish_now=True,
+                idempotency_key=str(attempt.attempt_id))
         except zernio.ZernioError as exc:
             if getattr(exc, "status", None) == 409:
                 existing = _existing_post_id(getattr(exc, "detail", ""))
