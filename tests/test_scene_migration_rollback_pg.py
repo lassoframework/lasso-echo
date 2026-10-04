@@ -75,14 +75,15 @@ STACK = [
 # rollback.
 BASELINE = "calendar_claim_media_guard_20261002.sql"
 
-# Frozen source hashes (base a20dd1b973cc5e6b4c00255e3bb88175138c776b).
+# Frozen source hashes for the reviewed draft stack, including the
+# claim-time guard at 8ab1885.
 FROZEN_SHA256 = {
     "DRAFT_visual_group_schema_20261002.sql":
         "36418af9933bba651b16bb214e21c5f72f4a51a7c3cc2c5b6566927c4ebe7c26",
     "DRAFT_visual_global_history_20261002.sql":
         "f062b3b7d346f3e2e22e203608c9cbba25eda1a3bc8a4eebb28ef5b6c836566d",
     "DRAFT_visual_group_claim_trigger_20261002.sql":
-        "199b33279a442cf78816457e588f886d2478b9b2063f0f0c8b599617a1f7d791",
+        "f96b53341cc2dcf6dbb90be30da40a3b4af27a51c3359776f3c663e104ef3bf8",
     "DRAFT_visual_group_backfill_20261002.sql":
         "aa13d21d18e8375ff32d708757a89d11fdfb86fa37112d7f14b650b952bff95e",
     "DRAFT_visual_group_activation_20261002.sql":
