@@ -53,6 +53,26 @@ def test_standard_row_builds_payload_and_sends_draft():
     assert "utm_campaign=echo_local_update" in psd["callToAction"]["url"]
 
 
+def test_standard_gbp_receipt_precedes_create_and_failure_prevents_send(monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    events = []
+
+    class _OrderedClient:
+        def create_post_raw(self, *_args, **_kwargs):
+            assert events[-1]["decision"] == "preflight_passed"
+            return {"_id": "p1"}
+
+    monkeypatch.setattr(receipts, "record", lambda **kw: events.append(kw) or kw)
+    out = gw.publish_gbp_row(_row(), _conn(), client=_OrderedClient(), draft=False)
+    assert out["status"] == "published"
+    assert events[-1]["outcome"] == "published"
+
+    monkeypatch.setattr(receipts, "record",
+                        lambda **_: (_ for _ in ()).throw(receipts.ReceiptWriteError("safe")))
+    with pytest.raises(receipts.ReceiptWriteError, match="safe"):
+        gw.publish_gbp_row(_row(), _conn(), client=_OrderedClient(), draft=False)
+
+
 def test_offer_row_omits_call_to_action():
     c = _FakeClient()
     row = _row(gbp_topic_type="OFFER", gbp_cta_type=None, gbp_cta_url="",

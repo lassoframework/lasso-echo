@@ -1824,6 +1824,26 @@ def test_ambiguous_normal_return_gets_provider_receipt(armed, monkeypatch):
     assert events[-1]["attempted"] is True
 
 
+def test_zernio_preflight_refusal_is_unattempted_receipt(armed, monkeypatch):
+    from agent import outbound_publish_receipt as receipts
+    from agent.zernio_publisher import ZernioPreflightError
+    events = []
+    monkeypatch.setattr(receipts, "record", lambda **kw: events.append(kw) or kw)
+    monkeypatch.setattr(cap, "_alert_publish_blocked", lambda *a, **kw: None)
+    monkeypatch.setattr(cap.config, "lasso_via_zernio_enabled", lambda: True)
+    monkeypatch.setattr(cap, "_lasso_zernio_missing", lambda: [])
+    store = _FakeStore([_row("preflight")])
+
+    def zernio(*_args, **_kwargs):
+        raise ZernioPreflightError("no connected account")
+
+    summary = cap.publish_due(RUN_DATE, store=store, now=LATE_NOW,
+                              zernio_publish=zernio)
+    assert summary["failed"] == ["preflight"]
+    assert events[-1]["decision"] == "preflight_refused"
+    assert events[-1]["attempted"] is False
+
+
 def test_explicit_provider_rejection_proving_no_post_reverts_for_retry(
         armed, monkeypatch):
     from types import SimpleNamespace

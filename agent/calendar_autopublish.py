@@ -1457,15 +1457,15 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 else:
                     result = zernio_publish(draft, account, scheduled_for=None)
             except Exception as e:
-                _receipt.record(lane="calendar", row=row, decision="provider_result",
-                                attempted=True, outcome="exception",
-                                reason=type(e).__name__)
                 # A deterministic Zernio preflight refusal (missing/expired account,
                 # profile/page/media) happens before create_post is called, so it is
                 # safe to release the owned claim for a later tick after repair. Keep
                 # post-create exceptions held: a timeout or malformed 2xx may have
                 # created a real post and an automatic retry could duplicate it.
                 if getattr(e, "definitive_no_post", False):
+                    _receipt.record(lane="calendar", row=row,
+                                    decision="preflight_refused", attempted=False,
+                                    outcome="preflight_refused", reason=type(e).__name__)
                     _reason = f"provider preflight proved no post: {type(e).__name__}: {e}"
                     _reverted = _revert_to_pending(
                         store, row_id, reject_reason=_reason, gym_id=gym_id,
@@ -1479,6 +1479,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                     failed.append(row_id)
                     _note_repeat_failure(row_id, gym_id, e)
                     continue
+                _receipt.record(lane="calendar", row=row, decision="provider_result",
+                                attempted=True, outcome="exception",
+                                reason=type(e).__name__)
                 # Once a publisher is called, an exception is ambiguous: a timeout may
                 # arrive after the provider accepted the post. Retrying can create a
                 # duplicate, so retain the owned claim for reconciliation.
