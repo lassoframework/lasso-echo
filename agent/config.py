@@ -4722,3 +4722,24 @@ def visual_scene_guard_flag():
     if raw in ("", "0", "false", "no", "off"):
         return False
     return None
+
+
+def visual_scene_candidate_flag():
+    """Tri-state read of AGENT_VISUAL_SCENE_CANDIDATE, OFF by default.
+
+    Gates ONLY the emission of owner-attested CANDIDATE pHash scene evidence
+    (the ``visual_scene_candidate`` staging contract, redesign item (a) in
+    docs/VISUAL_SCENE_GUARD_DRAFT.md) by agent/visual_writer_prepare.py. The
+    evidence is advisory staging metadata: it never counts as use, never
+    excludes other candidates, and arming this flag arms NO enforcement — the
+    guard stays non-operational regardless (SCENE_GUARD_OPERATIONAL=False).
+
+    Mirrors visual_scene_guard_flag exactly: True (explicitly on), False (off
+    or unset — byte-for-byte today's behavior, no candidate payload), None
+    (ambiguous value — counts as ARMED fail-closed, never a silent default)."""
+    raw = (os.environ.get("AGENT_VISUAL_SCENE_CANDIDATE", "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    return None

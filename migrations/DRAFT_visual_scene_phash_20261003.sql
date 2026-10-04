@@ -1,7 +1,14 @@
 -- DRAFT / UNAPPLIED / INCOMPLETE — DO NOT APPLY, DO NOT ACTIVATE.
 --
--- STATUS: INCOMPLETE — Astra review 2026-10-03
+-- STATUS: INCOMPLETE — DRAFT / UNAPPLIED / OFF — SUPERSEDED as a write path (2026-10-03)
 -- ---------------------------------------------------------------------------
+-- SUPERSEDED: the redesign has landed as
+-- migrations/DRAFT_visual_scene_claim_wave_20261003.sql (candidate staging +
+-- occupied scenes + review holds + in-claim visual_scene_claim_guard). Apply
+-- order: DRAFT_visual_global_history_20261002.sql, then THIS file, then the
+-- claim-wave draft, then any activation draft (last). Nothing here is a valid
+-- write target; the table sketch below remains only as the historical shape.
+--
 -- The prep-time writer architecture this file was drafted for was REJECTED:
 -- recording a scene at preparation time marks UNUSED candidates as used, the
 -- record is not atomic with the real visual_global_usage claim (which happens
@@ -96,7 +103,7 @@ create or replace function public.visual_scene_record_use(
 ) returns void language plpgsql security definer set search_path = public as $$
 declare v_phash text;
 begin
-  raise exception 'visual_scene_record_use is a REJECTED prep-time write path (Astra review 2026-10-03); scene recording must move into the claim transaction before this file is applied' using errcode='0A000';
+  raise exception 'visual_scene_record_use is a REJECTED prep-time write path, SUPERSEDED by in-claim visual_scene_claim_guard in DRAFT_visual_scene_claim_wave_20261003.sql; never callable' using errcode='0A000';
 end;
 $$;
 
@@ -105,7 +112,7 @@ create or replace function public.visual_scene_record_use_tx(
   p_used_date date, p_evidence jsonb
 ) returns void language plpgsql security invoker set search_path = public as $$
 begin
-  raise exception 'visual_scene_record_use_tx is a REJECTED prep-time write path (Astra review 2026-10-03); scene recording must move into the claim transaction before this file is applied' using errcode='0A000';
+  raise exception 'visual_scene_record_use_tx is a REJECTED prep-time write path, SUPERSEDED by in-claim visual_scene_claim_guard in DRAFT_visual_scene_claim_wave_20261003.sql; never callable' using errcode='0A000';
 end;
 $$;
 
