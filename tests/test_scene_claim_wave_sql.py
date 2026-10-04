@@ -551,9 +551,14 @@ def test_wave_trigger_installs_committed_held_row_contract(wave, guard, guard_tr
     # BEFORE the scan (which takes the single fleet advisory lock)
     assert guard_trigger.index("perform public.visual_group_lock_scene_components") < scan
     # engages only on armed, active, unambiguous, unsent rows with a date
+    # The claim-refusal preflight also checks for scene authority. Inspect
+    # the scene decision's own gate, rather than the first occurrence.
+    scene = guard_trigger.index("-- wave-3 scene decision")
+    gate_start = guard_trigger.index("if not finalized", scene)
     engage = guard_trigger.index(
-        "to_regprocedure('public.visual_scene_claim_scan(public.content_calendar,uuid)') is not null")
-    gate = guard_trigger[guard_trigger.rindex("if not finalized", 0, engage):engage]
+        "to_regprocedure('public.visual_scene_claim_scan(public.content_calendar,uuid)') is not null",
+        gate_start)
+    gate = guard_trigger[gate_start:engage]
     assert "public.visual_group_row_active(new)" in gate
     assert "not public.visual_group_row_ambiguous(new)" in gate
     assert "new.post_date is not null" in gate

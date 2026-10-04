@@ -42,6 +42,11 @@
 -- presence of the scene claim authority (the scene draft is applied after
 -- the exact-byte ledger); when the scene draft is absent this trigger
 -- behaves exactly as the pre-wave-3 exact-byte guard.
+-- The unambiguous-NEW scene gate carries ONE narrow exception:
+-- is_publish_claim_transition admits the authoritative pending/approved ->
+-- publishing claim-token transition (NEW is ambiguous by construction) so
+-- the claim-time freshness scan runs on the SAME locks, scan, held
+-- mutation, sync and hold-last path; every other ambiguous NEW still skips.
 -- ---------------------------------------------------------------------------
 
 create table if not exists public.visual_group_usage_sibling (
@@ -198,6 +203,67 @@ returns boolean language sql stable security definer set search_path = public as
      or p_row.late_post_id is not null or exists(
        select 1 from public.visual_group_usage_sibling s where s.gym_id=public.visual_group_tenant_id(p_row.gym_id)::text
          and s.calendar_row_id=p_row.id and s.ambiguous)),false);
+$$;
+
+-- Publish-claim freshness exception (Astra/Sol architecture finding,
+-- 2026-10-04): the authoritative claim RPC turns an eligible OLD
+-- pending/approved row into a NEW publishing row carrying its claim token
+-- and reservation. That makes NEW ambiguous BY CONSTRUCTION
+-- (publish_claim_token non-null), so the plain
+-- `not visual_group_row_ambiguous(new)` scene gate would skip the
+-- claim-time freshness scan. This NARROW predicate recognizes exactly that
+-- transition and nothing else:
+--   * OLD is the same row: active variant, pending/approved, unpublished,
+--     unclaimed (token, reservation AND late-post all clear), ready
+--     (dated, imaged, no not-ready reason) and unambiguous. OLD's key may
+--     be NULL: the BEFORE trigger hydrates alias-resolvable media to the
+--     authoritative resolved group BEFORE this predicate runs, and that
+--     hydration is admitted below (Terra independent-audit P0, 2026-10-04
+--     -- a keyed-only predicate skipped the freshness scan exactly on the
+--     hydrated rows that need it);
+--   * NEW keeps tenant, account, post date, group and every media-identity
+--     column byte-for-byte and only gains the claim markers:
+--     status='publishing', non-null claim token AND reservation, still
+--     unpublished, no late-post marker, same variant status.
+-- Anything broader (identity/media change, pre-set OLD markers, already
+-- ambiguous OLD, finalize or late-post shape) is NOT a publish claim and
+-- fails closed to the ordinary ambiguity gate. Trigger-internal; PUBLIC /
+-- service callers must never key behavior off it.
+create or replace function public.is_publish_claim_transition(
+  p_old public.content_calendar,p_new public.content_calendar
+) returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce(p_old.id is not null and p_new.id=p_old.id
+    and p_old.variant_status='active' and p_old.status in ('pending','approved')
+    and p_old.published_at is null and p_old.publish_claim_token is null
+    and p_old.publish_reservation_day is null and p_old.late_post_id is null
+    and p_old.media_not_ready_reason is null
+    and p_old.post_date is not null
+    and nullif(btrim(p_old.image_url),'') is not null
+    and not public.visual_group_row_ambiguous(p_old)
+    and p_new.status='publishing'
+    and p_new.publish_claim_token is not null
+    and p_new.publish_reservation_day is not null
+    and p_new.published_at is null and p_new.late_post_id is null
+    and p_new.variant_status is not distinct from p_old.variant_status
+    and public.visual_group_tenant_id(p_new.gym_id)
+        is not distinct from public.visual_group_tenant_id(p_old.gym_id)
+    and p_new.account is not distinct from p_old.account
+    and p_new.post_date is not distinct from p_old.post_date
+    -- Authoritative identity only: an unchanged OLD key must be carried
+    -- through byte-for-byte; a NULL OLD key is admitted ONLY when NEW's
+    -- key is exactly the group resolved from the row's own registered
+    -- delivered aliases (the trigger's hydration above). A caller-supplied
+    -- key that disagrees with the resolution is never trusted.
+    and p_new.visual_group_key is not null
+    and (p_new.visual_group_key is not distinct from p_old.visual_group_key
+      or (p_old.visual_group_key is null
+        and p_new.visual_group_key is not distinct from
+            public.visual_group_resolve_row(p_new)))
+    and p_new.image_url is not distinct from p_old.image_url
+    and not exists(select 1 from
+      (values('source_media_url'),('thumbnail_url'),('source_media_asset_id'),
+             ('drive_file_id'),('byte_hash'),('r2_key')) x(k)
+      where to_jsonb(p_new)->>k is distinct from to_jsonb(p_old)->>k),false);
 $$;
 
 -- Publication markers cannot erase original attempt uncertainty. Look at
@@ -552,6 +618,48 @@ begin
          nullif(btrim(new.image_url),'') is null or new.media_not_ready_reason is not null) then
         raise exception 'visual media not ready for approval, claim or finalize' using errcode='23514';
       end if;
+      -- CLAIM FAIL-CLOSED (Terra independent-audit P0, 2026-10-04): the
+      -- claim RPC pre-read can select an OLD pending/approved row whose
+      -- usage sibling is ambiguous with NULL original_claim_token -- the
+      -- 'ambiguous original claim/provider IDs' guard above only fires when
+      -- the original IDs are known. A false is_publish_claim_transition
+      -- alone merely SKIPS the freshness scan; the minted token would still
+      -- commit and be returned. Refuse any fresh-token claim transition on
+      -- an unreconciled ambiguous OLD row outright: the RPC's UPDATE rolls
+      -- back, no token is returned, and no provider send can reference it.
+      -- Clean-OLD writes (including non-claim-shape token writes) and
+      -- marker updates that do not mint a token are untouched.
+      if tg_op='UPDATE' and not finalized
+         and old.publish_claim_token is null
+         and new.publish_claim_token is not null
+         and public.visual_group_row_ambiguous(old)
+         and not public.visual_group_row_reconciled_here(old) then
+        raise exception 'publish claim refused: unreconciled ambiguous send identity'
+          using errcode='23514';
+      end if;
+      -- CLAIM FAIL-CLOSED, false predicate (Terra independent-audit P0,
+      -- 2026-10-04): for an armed tenant with the scene claim authority
+      -- installed, EVERY fresh-token UPDATE (OLD token NULL -> NEW token
+      -- non-NULL) must be the authoritative publish-claim transition.
+      -- A false is_publish_claim_transition may not merely SKIP the
+      -- freshness scan: a clean OLD row written with status='publishing' +
+      -- fresh token + reservation but CHANGED media, post date or account
+      -- (or token without reservation, or any other non-claim shape) is
+      -- refused outright -- the UPDATE raises and rolls back, no token is
+      -- committed or returned. Runs AFTER the authoritative key
+      -- resolution/hydration above, so the keyed and hydrated null-key
+      -- canonical claim shapes still pass is_publish_claim_transition on
+      -- the resolved identity. Updates that mint no token, terminal /
+      -- recovery updates where OLD already carries a token, and tenants
+      -- whose scene claim authority is not yet installed are untouched.
+      if tg_op='UPDATE' and not finalized
+         and old.publish_claim_token is null
+         and new.publish_claim_token is not null
+         and to_regprocedure('public.visual_scene_claim_scan(public.content_calendar,uuid)') is not null
+         and not public.is_publish_claim_transition(old,new) then
+        raise exception 'publish claim refused: not an authoritative claim transition'
+          using errcode='23514';
+      end if;
       -- ---------------------------------------------------------------------
       -- WAVE-3 SCENE DECISION (moved out of the removed early scene trigger
       -- content_calendar_scene_wave_claim_guard; see this file's header).
@@ -565,7 +673,13 @@ begin
       -- ---------------------------------------------------------------------
       if not finalized
          and public.visual_group_row_active(new)
-         and not public.visual_group_row_ambiguous(new)
+         and (not public.visual_group_row_ambiguous(new)
+           -- Publish-claim freshness: the authoritative claim transition is
+           -- ambiguous by construction; run the SAME component locks, fleet
+           -- scan, held mutation, sync and hold-last path for it instead of
+           -- skipping the claim-time freshness check. Narrow predicate
+           -- only; every other ambiguous NEW still skips.
+           or (tg_op='UPDATE' and public.is_publish_claim_transition(old,new)))
          and new.post_date is not null
          and to_regprocedure('public.visual_scene_claim_scan(public.content_calendar,uuid)') is not null then
         if new.visual_group_key is not null then
@@ -1157,13 +1271,14 @@ begin
     where n.nspname='public' and p.proname in
       ('visual_group_enforcement_on','visual_group_row_aliases','visual_group_resolve_row',
        'visual_group_row_active','visual_group_row_review_pending','visual_group_row_ambiguous',
+       'is_publish_claim_transition',
        'visual_group_finalization_requires_evidence','visual_group_finalization_evidenced','visual_group_sync_row',
        'visual_group_guard_trigger','visual_group_sibling_keep_ambiguity',
        'visual_group_tenant_id','visual_group_tenant_strict','visual_group_tenant_register',
        'visual_group_sibling_reconciled','visual_group_group_reconciled','visual_group_row_reconciled_here','visual_group_reconcile_ambiguous','visual_group_swap_siblings','visual_group_swap_redate','visual_group_scene_members','visual_group_link_scene',
        'visual_group_swap_siblings_media','visual_group_apply_media_swap') loop
     execute format('revoke all on function %s from public,anon,authenticated',f.signature);
-    if f.proname in ('visual_group_apply_media_swap','visual_group_sync_row') then
+    if f.proname in ('visual_group_apply_media_swap','visual_group_sync_row','is_publish_claim_transition') then
       -- Implementation helpers accept caller-supplied records/sets. Only the
       -- calendar trigger and validated wrappers may invoke their mutations.
       execute format('revoke all on function %s from service_role',f.signature);

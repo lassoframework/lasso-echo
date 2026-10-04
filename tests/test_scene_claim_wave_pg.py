@@ -2081,3 +2081,271 @@ def test_unrelated_exact_prepare_makes_backfill_retry_then_succeed():
             prepare.wait(timeout=30)
         _sql("select pg_terminate_backend(pid) from pg_stat_activity "
              "where pid<>pg_backend_pid() and datname=current_database()")
+
+
+# ---- publish-claim transition freshness (Astra/Sol finding, 2026-10-04) ----
+#
+# The authoritative claim RPC turns an eligible OLD pending/approved row
+# into a NEW publishing row carrying its claim token + reservation, which
+# makes NEW ambiguous BY CONSTRUCTION. The merged guard's scene branch used
+# to require `not visual_group_row_ambiguous(new)`, skipping the claim-time
+# freshness scan. `is_publish_claim_transition` now admits exactly that one
+# transition to the SAME locks/scan/held-mutation/sync/hold-last path.
+
+def _claim_update(row_id, date="2026-10-10", reservation=True):
+    """Simulated PR230 claim-RPC write shape (the real token mint is an
+    activation-draft 0A000 stub; the persisted-state transition is what the
+    guard sees). Runs with triggers ENABLED in an ordinary session."""
+    res = f", publish_reservation_day = '{date}'" if reservation else ""
+    _sql("update public.content_calendar set status = 'publishing',"
+         " publish_claim_token = gen_random_uuid()"
+         f"{res} where id = '{row_id}'")
+
+
+def _forced_clean_insert(tid, group, url, date="2026-10-10",
+                         status="pending", keyed=True):
+    """FORCED-DRIFT staging only: insert a clean, keyed, ready row with the
+    trigger chain disabled (session_replication_role=replica is scratch-DB
+    only, never production). This stages the post-staging drift the
+    claim-time freshness scan defends against; it is NOT a reachable normal
+    write path — armed writers record occupancy at staging time.
+    keyed=False leaves visual_group_key NULL to stage the Terra P0 shape:
+    alias-resolvable media whose key is only hydrated by the BEFORE trigger
+    at claim time."""
+    cols = "(gym_id, account, post_date, status, variant_status," \
+           " image_url, source_media_url"
+    vals = f"('{tid}', 'ig', '{date}', '{status}', 'active'," \
+           f" '{url}', '{url}'"
+    if keyed:
+        cols += ", visual_group_key"
+        vals += f", '{group}'"
+    return _one(
+        "set session_replication_role = replica; "
+        "insert into public.content_calendar"
+        f"{cols}) values {vals}) returning id")
+
+
+def test_publish_claim_transition_clean_claim_passes_and_keeps_token():
+    # Clean publish claim through the freshness gate: no conflict, the row
+    # commits publishing with its token and reservation, no hold, and the
+    # staging-time occupancy is unchanged (idempotent re-record).
+    tid, group = _seed_tenant()
+    url, _fp, _cand = _seed_object(tid, group, _phash())
+    row_id = _insert_row(tid, group, url)
+    assert len(_occupied(tid)) == 1
+    _claim_update(row_id)
+    row = _row(row_id)
+    assert row["status"] == "publishing"
+    assert row["variant_status"] == "active"
+    assert row["media_not_ready_reason"] is None
+    assert row["publish_claim_token"] is not None
+    assert row["publish_reservation_day"] == "2026-10-10"
+    assert _holds(tid) == []
+    assert len(_occupied(tid)) == 1
+
+
+def test_publish_claim_transition_forced_drift_conflict_commits_held_row():
+    # FORCED-DRIFT DEFENSE (staged via owner SQL with the trigger disabled;
+    # not a reachable normal exploit — armed writers record occupancy at
+    # staging time). Tenant A occupies a scene; tenant B's near-match row is
+    # staged clean by bypass; the authoritative publish-claim transition
+    # must run the freshness scan and commit HELD with a durable open hold.
+    tid_a, group_a = _seed_tenant()
+    base = _phash()
+    url_a, _fpa, _ca = _seed_object(tid_a, group_a, base)
+    _insert_row(tid_a, group_a, url_a)
+    assert len(_occupied(tid_a)) == 1
+    tid_b, group_b = _seed_tenant()
+    url_b, _fpb, _cb = _seed_object(tid_b, group_b, _near(base, 2))
+    row_id = _forced_clean_insert(tid_b, group_b, url_b)
+    # drift staged: clean pending row, no occupancy, no hold
+    assert _row(row_id)["media_not_ready_reason"] is None
+    assert _occupied(tid_b) == []
+    assert _holds(tid_b) == []
+    # the authoritative claim transition hits the freshness scan: HELD.
+    _claim_update(row_id)
+    row = _row(row_id)
+    assert row["status"] == "pending"
+    assert row["variant_status"] == "archived"
+    assert row["media_not_ready_reason"] == "scene_review_hold"
+    assert row["publish_claim_token"] is None
+    assert row["publish_reservation_day"] is None
+    holds = _holds(tid_b)
+    assert len(holds) == 1
+    assert holds[0]["state"] == "open"
+    assert holds[0]["hold_kind"] == "near_frame"
+    assert holds[0]["calendar_row_id"] == row_id
+    # no occupancy for the rejected claim; the persisted claimant returns
+    # NULL and the held row is never approvable
+    assert _occupied(tid_b) == []
+    assert _one("select public.visual_scene_publish_claim_guarded("
+                f"'{row_id}') is null") == "t"
+    assert _one("select public.visual_scene_approval_guarded("
+                f"'{row_id}')") == "f"
+
+
+def test_publish_claim_transition_hydrated_null_key_conflict_commits_held():
+    # TERRA P0-1 REGRESSION — FORCED-DRIFT DEFENSE (owner-only staging with
+    # triggers disabled; not a reachable normal write path). OLD row has
+    # NULL visual_group_key but alias-resolvable media; the BEFORE trigger
+    # hydrates the authoritative resolved key at claim time. The claim-time
+    # freshness scan must run against that RESOLVED NEW identity: the
+    # near-frame collision with tenant A commits HELD with no token — a
+    # keyed-only predicate used to skip the scan and return the token.
+    tid_a, group_a = _seed_tenant()
+    base = _phash()
+    url_a, _fpa, _ca = _seed_object(tid_a, group_a, base)
+    _insert_row(tid_a, group_a, url_a)
+    assert len(_occupied(tid_a)) == 1
+    tid_b, group_b = _seed_tenant()
+    url_b, _fpb, _cb = _seed_object(tid_b, group_b, _near(base, 2))
+    row_id = _forced_clean_insert(tid_b, None, url_b, keyed=False)
+    # drift staged: clean pending row, NULL key, no occupancy, no hold
+    assert _row(row_id)["visual_group_key"] is None
+    assert _occupied(tid_b) == []
+    assert _holds(tid_b) == []
+    # the authoritative claim transition hydrates the resolved key and hits
+    # the freshness scan on that identity: HELD.
+    _claim_update(row_id)
+    row = _row(row_id)
+    assert row["status"] == "pending"
+    assert row["variant_status"] == "archived"
+    assert row["media_not_ready_reason"] == "scene_review_hold"
+    assert row["publish_claim_token"] is None
+    assert row["publish_reservation_day"] is None
+    # the held row carries the trigger-resolved authoritative key, proving
+    # the scan ran on the resolved identity, not a caller hint
+    assert row["visual_group_key"] == group_b
+    holds = _holds(tid_b)
+    assert len(holds) == 1
+    assert holds[0]["state"] == "open"
+    assert holds[0]["hold_kind"] == "near_frame"
+    assert holds[0]["calendar_row_id"] == row_id
+    assert _occupied(tid_b) == []
+    assert _one("select public.visual_scene_publish_claim_guarded("
+                f"'{row_id}') is null") == "t"
+
+
+def test_claim_on_unreconciled_ambiguous_old_sibling_returns_no_token():
+    # TERRA P0-2 REGRESSION: an OLD pending row whose usage sibling is
+    # ambiguous with NULL original_claim_token passes the claim RPC pre-read
+    # and no earlier guard (the original-IDs guard needs known IDs). The
+    # claim must be REFUSED outright — the UPDATE raises and rolls back, so
+    # no token is committed or returned and no provider send can reference
+    # it. A false is_publish_claim_transition that merely skips the
+    # freshness scan is not sufficient.
+    tid, group = _seed_tenant()
+    url, _fp, _cand = _seed_object(tid, group, _phash())
+    row_id = _insert_row(tid, group, url)
+    # Stage the unreconciled ambiguous prior-attempt evidence directly
+    # (owner-only staging of persisted sibling state; sibling rows are
+    # normally written by the guard's sync path). NULL original_claim_token
+    # is exactly the Terra P0 shape.
+    _sql("insert into public.visual_group_usage_sibling"
+         "(gym_id, group_key, calendar_row_id, channel, ambiguous,"
+         " original_claim_token, original_image_url) values "
+         f"('{tid}', '{group}', '{row_id}', 'ig', true, null, '{url}')"
+         " on conflict (gym_id, group_key, calendar_row_id) do update set"
+         " ambiguous = true, original_claim_token = null")
+    # Real claimant update shape: status + reservation + fresh token.
+    res = _run("update public.content_calendar set status = 'publishing',"
+               " publish_claim_token = gen_random_uuid(),"
+               " publish_reservation_day = '2026-10-10'"
+               f" where id = '{row_id}'", check=False)
+    assert res.returncode != 0
+    assert ("publish claim refused: unreconciled ambiguous send identity"
+            in res.stderr)
+    # rollback: no token, no reservation, no status change, no hold writes
+    row = _row(row_id)
+    assert row["status"] == "pending"
+    assert row["publish_claim_token"] is None
+    assert row["publish_reservation_day"] is None
+    assert _holds(tid) == []
+
+
+def test_claim_shape_without_reservation_is_rejected_and_returns_no_token():
+    # TERRA P0-3 REGRESSION — narrowness pin turned fail-closed: a fresh-token
+    # UPDATE that does NOT match the exact claim shape (here: token WITHOUT
+    # reservation) is not admitted by is_publish_claim_transition, and the
+    # merged trigger now REFUSES it outright instead of merely skipping the
+    # freshness scan and committing the token. The UPDATE raises and rolls
+    # back: no token, no reservation, no status change, no hold writes.
+    tid_a, group_a = _seed_tenant()
+    base = _phash()
+    url_a, _fpa, _ca = _seed_object(tid_a, group_a, base)
+    _insert_row(tid_a, group_a, url_a)
+    tid_b, group_b = _seed_tenant()
+    url_b, _fpb, _cb = _seed_object(tid_b, group_b, _near(base, 2))
+    # FORCED-DRIFT staging only (owner SQL, triggers disabled; see
+    # _forced_clean_insert): stages the clean unoccupied OLD row.
+    row_id = _forced_clean_insert(tid_b, group_b, url_b)
+    res = _run("update public.content_calendar set status = 'publishing',"
+               " publish_claim_token = gen_random_uuid()"
+               f" where id = '{row_id}'", check=False)
+    assert res.returncode != 0
+    assert ("publish claim refused: not an authoritative claim transition"
+            in res.stderr)
+    row = _row(row_id)
+    assert row["status"] == "pending"
+    assert row["publish_claim_token"] is None
+    assert row["publish_reservation_day"] is None
+    assert _holds(tid_b) == []
+
+
+def _assert_claim_with_identity_change_rejected(row_id, tid, extra_set):
+    """Shared assertion: a clean OLD row written with the full claim shape
+    (status + fresh token + reservation) but a CHANGED identity column must
+    be refused by the fail-closed fresh-token guard with rollback."""
+    res = _run("update public.content_calendar set status = 'publishing',"
+               " publish_claim_token = gen_random_uuid(),"
+               " publish_reservation_day = '2026-10-10',"
+               f" {extra_set} where id = '{row_id}'", check=False)
+    assert res.returncode != 0
+    assert ("publish claim refused: not an authoritative claim transition"
+            in res.stderr)
+    row = _row(row_id)
+    assert row["status"] == "pending"
+    assert row["variant_status"] == "active"
+    assert row["media_not_ready_reason"] is None
+    assert row["publish_claim_token"] is None
+    assert row["publish_reservation_day"] is None
+    assert _holds(tid) == []
+
+
+def test_claim_with_changed_media_is_rejected_and_returns_no_token():
+    # TERRA P0-3 REGRESSION: clean OLD keyed row, full claim shape, but the
+    # SAME write swaps the delivered media. Both URLs are valid registered,
+    # attested objects in this tenant, so the ONLY reason to refuse is the
+    # fresh-token fail-closed guard (a false is_publish_claim_transition may
+    # never merely skip the scan).
+    tid, group_a = _seed_tenant()
+    url_a, _fpa, _ca = _seed_object(tid, group_a, _phash())
+    row_id = _insert_row(tid, group_a, url_a)
+    url_b, _fpb, _cb = _seed_object(tid, group_a, _phash())
+    _assert_claim_with_identity_change_rejected(
+        row_id, tid,
+        f"image_url = '{url_b}', source_media_url = '{url_b}'")
+    row = _row(row_id)
+    assert row["visual_group_key"] == group_a
+
+
+def test_claim_with_changed_post_date_is_rejected_and_returns_no_token():
+    # TERRA P0-3 REGRESSION: clean OLD row, full claim shape, but the SAME
+    # write moves the post date. Refused by the fresh-token guard; rollback
+    # leaves the row pending with no token.
+    tid, group = _seed_tenant()
+    url, _fp, _cand = _seed_object(tid, group, _phash())
+    row_id = _insert_row(tid, group, url)
+    _assert_claim_with_identity_change_rejected(
+        row_id, tid, "post_date = '2026-10-11'")
+
+
+def test_claim_with_changed_account_is_rejected_and_returns_no_token():
+    # TERRA P0-3 REGRESSION: clean OLD row, full claim shape, but the SAME
+    # write moves the account. Refused by the fresh-token guard; rollback
+    # leaves the row pending with no token.
+    tid, group = _seed_tenant()
+    url, _fp, _cand = _seed_object(tid, group, _phash())
+    row_id = _insert_row(tid, group, url)
+    _assert_claim_with_identity_change_rejected(
+        row_id, tid, "account = 'fb'")
