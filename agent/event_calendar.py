@@ -50,6 +50,39 @@ _MIN_MONTH_FOR_GATE = 10
 _FEED_REACHABLE = ("pending", "approved", "publishing", "published", "coach_review")
 
 
+def _stamp_logical_post_ids(rows, log):
+    """Give each newly staged event post its own durable logical identity.
+
+    ``event_id`` ties an entire event arc together.  It is deliberately not this
+    identity: each independently scheduled beat needs a separate UUID.  The event
+    lane currently stages only one Instagram feed per arc row, with no Facebook or
+    Story clones.  Preserve a valid ID if the same in-memory row is retried.  A bad
+    row or an invalid pre-existing value stops the write rather than persisting an
+    unverifiable group.
+    """
+    import uuid
+
+    for row in rows:
+        if not isinstance(row, dict):
+            log("event logical post id: refusing non-dict row")
+            return False
+        value = str(row.get("logical_post_id") or "").strip()
+        if value:
+            try:
+                uuid.UUID(value)
+            except (AttributeError, TypeError, ValueError):
+                log("event logical post id: refusing invalid existing UUID")
+                return False
+            row["logical_post_id"] = value
+            continue
+        try:
+            row["logical_post_id"] = str(uuid.uuid4())
+        except Exception as exc:  # noqa: BLE001 - a row without identity never stages
+            log(f"event logical post id: mint failed ({type(exc).__name__})")
+            return False
+    return True
+
+
 def _cat(row):
     return str((row or {}).get("pillar") or (row or {}).get("category") or "").lower()
 
@@ -419,6 +452,8 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     to_stage, held_media = _attach_media(gym_id, to_stage, log,
                                          picker=media_picker,
                                          host=media_host_fn)
+    if not _stamp_logical_post_ids(to_stage, log):
+        return {"ok": False, "reason": "logical post id stamp failed", "staged": 0}
     inserted = 0
     inserter = getattr(store, "insert_rows", None)
     if inserter is not None and to_stage:
