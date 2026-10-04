@@ -14,6 +14,8 @@ import urllib.parse
 import threading
 import urllib.request
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import connect_web, db  # noqa: E402
@@ -71,6 +73,41 @@ def test_public_healthz_reports_railway_build_identity(monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("explicit_port", "railway_port", "connect_port", "expected_port"),
+    [
+        (9100, "9200", "9300", 9100),
+        (None, "9200", "9300", 9200),
+        (None, None, "9300", 9300),
+        (None, None, None, 8090),
+    ],
+)
+def test_serve_prefers_explicit_then_railway_then_connect_port(
+        monkeypatch, explicit_port, railway_port, connect_port, expected_port):
+    captured = {}
+
+    class Server:
+        def __init__(self, address, handler):
+            captured["address"] = address
+            captured["handler"] = handler
+
+        def serve_forever(self):
+            captured["served"] = True
+
+    monkeypatch.setattr("http.server.ThreadingHTTPServer", Server)
+    for name, value in (("PORT", railway_port),
+                        ("AGENT_CONNECT_PORT", connect_port)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    connect_web.serve(explicit_port)
+
+    assert captured["address"] == ("0.0.0.0", expected_port)
+    assert captured["served"] is True
 
 
 def _arm(monkeypatch):
