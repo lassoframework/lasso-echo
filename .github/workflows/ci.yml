@@ -234,15 +234,11 @@ jobs:
         run: |
           set -euo pipefail
           # pytest exits non-zero on collection errors / no tests, which the
-          # step above already surfaced. Here we fail the job if the run only
-          # produced skips: with the DSN set, the patch proof must exercise
-          # the disposable database instead of skipping.
-          if ! grep -qE '^tests/.*(PASSED|FAILED|ERROR)' patch-pytest.log; then
-            echo "No test items ran in tests/test_scene_candidate_patch_pg.py" >&2
-            exit 1
-          fi
-          if grep -q 'SKIPPED' patch-pytest.log && ! grep -qE '^tests/.*(PASSED|FAILED)' patch-pytest.log; then
-            echo "tests/test_scene_candidate_patch_pg.py skipped entirely; DSN guard not exercised" >&2
+          # step above already surfaced. With -q, pytest prints a compact
+          # dotted module line instead of individual PASSED item lines. Require
+          # at least one passed test in its summary so an all-skipped run fails.
+          if ! grep -qE '[1-9][0-9]* passed' patch-pytest.log; then
+            echo "tests/test_scene_candidate_patch_pg.py had no passed tests; DSN guard not exercised" >&2
             exit 1
           fi
 
