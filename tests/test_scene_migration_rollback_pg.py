@@ -110,12 +110,27 @@ KEY_TABLES = (
 KEY_FUNCTIONS = (
     "visual_group_activate_guard", "visual_scene_register_candidate",
     "claim_calendar_publish_slot_owned", "approve_calendar_row_if_media_ready",
+    # visual_group_guard_trigger is a TRIGGER FUNCTION installed by
+    # DRAFT_visual_group_claim_trigger_20261002.sql (create or replace
+    # function public.visual_group_guard_trigger() returns trigger), not a
+    # pg_trigger row; it is probed via pg_proc like the other functions.
+    "visual_group_guard_trigger",
 )
-KEY_TRIGGER = "visual_group_guard_trigger"
-# Generated per-object member tables installed by the scene-wave draft.
-MEMBER_TABLES = (
-    "visual_global_scene_object_member_source",
-    "visual_global_scene_object_member_delivered",
+# Real pg_trigger rows the frozen stack installs (verified against the
+# migration DDL): the content_calendar guard pair from the group claim
+# trigger draft, the immutable/guard triggers on the scene staging tables
+# and the scene object member table from the claim-wave/global-history
+# drafts, plus the history backfill activation receipt on
+# visual_group_activation. The scene claim wave merges into the group guard;
+# its separate trigger name appears only in a superseded comment.
+KEY_TRIGGERS = (
+    "content_calendar_visual_group_guard",
+    "content_calendar_visual_group_truncate_guard",
+    "visual_scene_candidate_immutable",
+    "visual_scene_occupied_immutable",
+    "visual_scene_review_hold_guard",
+    "visual_global_scene_object_member_immutable",
+    "visual_scene_history_activation_receipt",
 )
 
 # The two RPCs whose preexisting baseline definitions/ACLs the 8th draft
@@ -436,7 +451,7 @@ def test_migration_stack_visible_in_transaction_and_absent_after_rollback(
         f"must be stripped from the frozen stack, got {stripped_total}")
 
     probes = []
-    for t in KEY_TABLES + MEMBER_TABLES:
+    for t in KEY_TABLES:
         probes.append(
             f"select 'NEW_OBJECT:r:{t}' where exists (select 1 from pg_class"
             f" join pg_namespace on pg_namespace.oid=pg_class.relnamespace"
@@ -446,10 +461,11 @@ def test_migration_stack_visible_in_transaction_and_absent_after_rollback(
             f"select 'NEW_OBJECT:f:{f}' where exists (select 1 from pg_proc"
             f" join pg_namespace on pg_namespace.oid=pg_proc.pronamespace"
             f" where nspname='public' and proname='{f}');")
-    probes.append(
-        f"select 'NEW_OBJECT:t:{KEY_TRIGGER}' where exists"
-        f" (select 1 from pg_trigger where tgname='{KEY_TRIGGER}'"
-        f" and not tgisinternal);")
+    for t in KEY_TRIGGERS:
+        probes.append(
+            f"select 'NEW_OBJECT:t:{t}' where exists"
+            f" (select 1 from pg_trigger where tgname='{t}'"
+            f" and not tgisinternal);")
     # Full in-transaction state of the replaced RPCs (body hash + ACL).
     for name in REPLACED_RPCS:
         probes.append(RPC_STATE_SQL.format(name=name) + ";")
@@ -463,9 +479,9 @@ def test_migration_stack_visible_in_transaction_and_absent_after_rollback(
         + done.stderr)
     seen = {ln for ln in done.stdout.splitlines()
             if ln.startswith("NEW_OBJECT:")}
-    expected = {f"NEW_OBJECT:r:{t}" for t in KEY_TABLES + MEMBER_TABLES} | \
+    expected = {f"NEW_OBJECT:r:{t}" for t in KEY_TABLES} | \
                {f"NEW_OBJECT:f:{f}" for f in KEY_FUNCTIONS} | \
-               {f"NEW_OBJECT:t:{KEY_TRIGGER}"}
+               {f"NEW_OBJECT:t:{t}" for t in KEY_TRIGGERS}
     missing = expected - seen
     assert not missing, f"objects not visible before rollback: {sorted(missing)}"
     installed = {ln.removeprefix("NEW_OBJECT:") for ln in seen}
@@ -509,9 +525,12 @@ def test_migration_stack_visible_in_transaction_and_absent_after_rollback(
         assert _rpc_state(name) == baseline_rpc_state[name], \
             f"{name}: baseline definition/ACL not restored after rollback"
     # Explicit contract spot-checks, post-rollback.
-    assert _one("select count(*) from pg_class c join pg_namespace n"
-                " on n.oid=c.relnamespace where n.nspname='public'"
-                " and c.relname like 'visual\\_global\\_scene\\_object\\_member\\_%'") == "0", \
-        "generated object-member tables survived rollback"
-    assert _one(f"select count(*) from pg_trigger where"
-                f" tgname='{KEY_TRIGGER}' and not tgisinternal") == "0"
+    for t in KEY_TABLES:
+        assert _one("select count(*) from pg_class c join pg_namespace n"
+                    " on n.oid=c.relnamespace where n.nspname='public'"
+                    f" and c.relname='{t}'") == "0", \
+            f"table {t} survived rollback"
+    for t in KEY_TRIGGERS:
+        assert _one(f"select count(*) from pg_trigger where"
+                    f" tgname='{t}' and not tgisinternal") == "0", \
+            f"trigger {t} survived rollback"
