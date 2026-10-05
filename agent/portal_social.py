@@ -875,7 +875,45 @@ def _published_is_final(row, action, draft_id):
     return None
 
 
-def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
+# Portal ECHO_VERIFIED_APPROVAL_PROOF_CONTRACT.md snapshot fields (Echo half,
+# 2026-10-05). The object is the exact visible card at tap, NOT actor identity:
+# the Clerk actor and write access are proven separately by the portal.
+_PROOF_SNAPSHOT_FORMATS = ("feed", "story")
+_PROOF_SNAPSHOT_PLATFORMS = ("instagram", "facebook", "googlebusiness")
+_PROOF_SNAPSHOT_DAY_KEY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_expected_creative(expected):
+    """Validate + normalize the portal's visible-card snapshot. Returns
+    (normalized, None) when the snapshot is well-formed, else (None, reason).
+    caption may be string or null; media_url must be a nonempty final
+    image/video URL; day_key is the YYYY-MM-DD visible post_date; format is
+    feed/story; platform is the canonical account platform. scheduled_for is
+    NOT part of the contract (/social keys on post_date; scheduled_at can be
+    synthesized while the DB is null) and is never required."""
+    if not isinstance(expected, dict):
+        return None, "expected_creative must be an object"
+    caption = expected.get("caption")
+    if caption is not None and not isinstance(caption, str):
+        return None, "caption must be a string or null"
+    media_url = str(expected.get("media_url") or "").strip()
+    if not media_url:
+        return None, "media_url must be a nonempty URL"
+    day_key = str(expected.get("day_key") or "").strip()
+    if not _PROOF_SNAPSHOT_DAY_KEY.match(day_key):
+        return None, "day_key must be YYYY-MM-DD"
+    fmt = str(expected.get("format") or "").strip().lower()
+    if fmt not in _PROOF_SNAPSHOT_FORMATS:
+        return None, "format must be feed or story"
+    platform = str(expected.get("platform") or "").strip().lower()
+    if platform not in _PROOF_SNAPSHOT_PLATFORMS:
+        return None, "platform must be instagram, facebook or googlebusiness"
+    return {"caption": caption, "media_url": media_url, "day_key": day_key,
+            "format": fmt, "platform": platform}, None
+
+
+def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store,
+                             expected_creative=None):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:
         return short
@@ -887,11 +925,33 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
         # an already PUBLISHED row is also a clean no-op (the approval already ran its
         # course), never a status rewrite back to 'approved'.
         if (row.get("status") or "") == _pcs.action_status("approve"):
+            if config.approval_proof_enabled():
+                expected, why = _validate_expected_creative(expected_creative)
+                if expected is None:
+                    return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                                 "error": "review_refresh_required", "detail": why}
+                recover = getattr(sb_store, "recover_unproved_approval", None)
+                recovered = (recover(account_key, draft_id, expected)
+                             if callable(recover) else None)
+                if recovered is not None:
+                    digest = recovered.get("approval_digest")
+                    if isinstance(digest, str) and digest.strip():
+                        return 200, {"ok": True, "action": "approve", "draft_id": draft_id,
+                                     "approval_state": "approved_unproved_retry",
+                                     "idempotent": True, "approval_digest": digest}
+                return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                             "error": "review_refresh_required"}
+            # APPROVAL-PROOF CONTRACT: explicitly distinguishable from a NEW
+            # approval; the portal must NOT stamp a verified-approval proof
+            # for an idempotent replay.
             return 200, {"ok": True, "action": "approve", "draft_id": draft_id,
-                         "detail": "Already approved.", "idempotent": True}
+                         "detail": "Already approved.", "idempotent": True,
+                         "approval_state": "already_approved"}
         if str(row.get("status") or "").lower() == "published":
+            # Distinguishable terminal state; never mints a new stamp.
             return 200, {"ok": True, "action": "approve", "draft_id": draft_id,
-                         "detail": "Already published.", "idempotent": True}
+                         "detail": "Already published.", "idempotent": True,
+                         "approval_state": "published"}
         # MID-CLAIM GUARD (audit 2026-08-25 MAJOR): a row in 'publishing' is owned by the
         # publisher for the seconds between the atomic claim and the result. Approving it
         # here would flip it back to 'approved' — claimable AGAIN next tick — and the SAME
@@ -924,14 +984,55 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
                                   "approving"}
         # The production store uses an atomic DB predicate so media removal
         # between the pre-read and this write cannot approve a stale hold.
+        # APPROVAL PROVENANCE (defect 1 repair, 2026-10-05): an Echo bearer
+        # token authenticates the gym's approval INTENT, never a verified
+        # HUMAN. The RPC records status='approved' + a digest of the exact
+        # content served and leaves approval_kind/approved_by UNPROVED (NULL);
+        # the browser-body actor_id is spoofable and is NOT forwarded (the RPC
+        # takes no actor parameter at all). Human provenance is stamped only
+        # by the PORTAL, server-side, via calendar_stamp_verified_approval
+        # with an authenticated Clerk actor and this response's
+        # approval_digest (docs/ECHO_VERIFIED_APPROVAL_PROOF_CONTRACT.md).
+        # VISIBLE-CARD SNAPSHOT GATE (Echo half of the portal
+        # ECHO_VERIFIED_APPROVAL_PROOF contract, 2026-10-05): only when
+        # AGENT_APPROVAL_PROOF is ON does Echo require the portal's
+        # expected_creative snapshot. Absent/malformed snapshot, or a compare
+        # mismatch inside the atomic RPC, is a 409 review_refresh_required:
+        # no status change, no digest. Flag OFF ignores the body field
+        # entirely and keeps the legacy wire + error shape.
+        _proof = config.approval_proof_enabled()
+        _expected = None
+        if _proof:
+            _expected, _why = _validate_expected_creative(expected_creative)
+            if _expected is None:
+                return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                             "error": "review_refresh_required",
+                             "detail": _why}
         approve_ready = getattr(sb_store, "approve_ready", None)
-        updated = (approve_ready(account_key, draft_id) if callable(approve_ready)
-                   else sb_store.set_status(account_key, draft_id,
-                                            _pcs.action_status("approve")))
+        if callable(approve_ready):
+            updated = (approve_ready(account_key, draft_id)
+                       if _expected is None
+                       else approve_ready(account_key, draft_id,
+                                          expected_creative=_expected))
+        else:
+            updated = sb_store.set_status(account_key, draft_id,
+                                          _pcs.action_status("approve"))
         if updated is None:
+            if _proof:
+                # Stale snapshot OR the row changed under the tap: the card
+                # the human saw is no longer the locked row. Fail closed into
+                # fresh review; the digest is NOT stamped.
+                return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                             "error": "review_refresh_required"}
             return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
                          "error": "post changed before approval; refresh and review it again"}
-        return 200, _action_result("approve", draft_id, updated)
+        # NEW approval: explicit approval_state + idempotent=False + the
+        # digest the portal must present to calendar_stamp_verified_approval.
+        result = _action_result("approve", draft_id, updated)
+        result["approval_state"] = "approved"
+        result["idempotent"] = False
+        result["approval_digest"] = str((updated or {}).get("approval_digest") or "")
+        return 200, result
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}
@@ -2439,14 +2540,20 @@ def _handle_kill_supabase(account_key, draft_id, actor_id, confirm, reader, sb_s
 # POST /portal/<token>/posts/<id>/approve  (idempotent)
 # ==========================================================================
 
-def handle_approve(account_key, draft_id, actor_id, store=None, reader=None, sb_store=None):
+def handle_approve(account_key, draft_id, actor_id, store=None, reader=None,
+                   sb_store=None, expected_creative=None):
     """Approve a post. Idempotent: approving an already-APPROVED post is a clean 200
     no-op (never a double publish). With Supabase creds present, flips the shared
     content_calendar row's status to 'approved' (NO publish). Otherwise delegates to
-    portal_approvals.approve, which runs the same gated publish Slack uses."""
+    portal_approvals.approve, which runs the same gated publish Slack uses.
+
+    expected_creative (optional): the portal's visible-card snapshot, required
+    and compared ONLY when AGENT_APPROVAL_PROOF is ON; ignored (legacy) when
+    OFF."""
     if config.portal_calendar_supabase_enabled():
         return _handle_approve_supabase(account_key, draft_id, actor_id, reader,
-                                        sb_store or _pcs.SupabaseCalendarStore())
+                                        sb_store or _pcs.SupabaseCalendarStore(),
+                                        expected_creative=expected_creative)
     draft, short = _action_preamble(account_key, draft_id, actor_id, store, reader)
     if short is not None:
         return short

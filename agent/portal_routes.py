@@ -123,7 +123,8 @@ def handle_portal_library(account_key):
 
 
 def handle_portal_action(action, account_key, draft_id, actor_id, note="",
-                         store=None, confirm=False, reason="", gbp=None):
+                         store=None, confirm=False, reason="", gbp=None,
+                         expected_creative=None):
     """
     POST /portal/<token>/{approve|edit|deny|kill}
 
@@ -156,6 +157,18 @@ def handle_portal_action(action, account_key, draft_id, actor_id, note="",
     # Shared Supabase data plane wins when creds are present (the live portal
     # path). No creds -> the existing portal_approvals/SQLite path, unchanged.
     if store is None and config.portal_calendar_supabase_enabled():
+        if action == "approve" and config.approval_proof_enabled():
+            # LEGACY APPROVE ROUTE, proof flag ON: route through the SAME
+            # guarded portal_social handler as the Part-B posts route, so the
+            # visible-card snapshot gate (absent/malformed/stale ->
+            # 409 review_refresh_required, no status change, no digest) is
+            # enforced on EVERY approve path. Flag OFF keeps the legacy
+            # set_status lane below byte-for-byte.
+            from . import portal_social as _ps
+            return _ps._handle_approve_supabase(
+                account_key, draft_id, actor_id, None,
+                _pcs.SupabaseCalendarStore(),
+                expected_creative=expected_creative)
         return _handle_action_supabase(action, account_key, draft_id, note,
                                        reason=reason, gbp=gbp)
 

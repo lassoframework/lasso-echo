@@ -509,18 +509,63 @@ class SupabaseCalendarStore:
                 return row
         return None
 
-    def approve_ready(self, account_key, row_id):
+    def approve_ready(self, account_key, row_id, expected_creative=None):
         """Approve only when this gym's row still has publishable media.
 
         The RPC checks status, media URL, and needs-media reason in one database
         UPDATE. A portal pre-read alone cannot protect against a concurrent media
         removal between the check and the approval write. An unapplied migration
         fails closed instead of falling back to the generic status PATCH.
+
+        APPROVAL PROVENANCE (draft, 2026-10-05, repair pass 2): the same atomic
+        UPDATE records status='approved' plus a canonical digest of the row's
+        exact publish-relevant fields (caption/account/format/date, the FINAL
+        image_url, and the rendered/source identity fields byte_hash /
+        source_media_asset_id / source_media_url; the publisher-stamped
+        scheduled_at is never bound). REVIEW DEFECT 1: an Echo bearer token is
+        NOT a verified human identity, so this RPC leaves approval_kind /
+        approved_by / approved_at UNPROVED (NULL) and takes NO actor parameter
+        -- no body-supplied identity is ever forwarded. Human provenance is
+        stamped only by calendar_stamp_verified_approval, called by the PORTAL
+        with its service role and an authenticated Clerk actor after this
+        approval succeeds (portal-side contract; Echo never calls it). The
+        claim-side proof gate requires a nonempty trusted approved_by, so an
+        Echo-only approval cannot publish in Manual mode while armed.
         """
+        payload = {"p_row_id": row_id, "p_gym_id": account_key}
+        # VISIBLE-CARD SNAPSHOT (portal ECHO_VERIFIED_APPROVAL_PROOF contract,
+        # Echo half 2026-10-05): when the portal sends its expected_creative,
+        # the SAME atomic RPC UPDATE also compares caption/media_url/day_key/
+        # format/platform against the locked row; a stale snapshot returns
+        # zero rows and nothing is stamped. Sent ONLY when present, so the
+        # flag-OFF wire shape is byte-for-byte the legacy 2-arg call (the
+        # migration's p_expected DEFAULTs to NULL = legacy behavior). No
+        # actor parameter: an Echo bearer token never mints human proof.
+        if expected_creative is not None:
+            payload["p_expected"] = expected_creative
         r = self._client().post(
             self._rest("rpc/approve_calendar_row_if_media_ready"),
             headers=self._headers({"Content-Type": "application/json"}),
-            json={"p_row_id": row_id, "p_gym_id": account_key}, timeout=30,
+            json=payload, timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if len(rows) != 1 or str(rows[0].get("gym_id")) != str(account_key):
+            return None
+        return rows[0]
+
+    def recover_unproved_approval(self, account_key, row_id, expected_creative):
+        """Return a fresh locked-row digest only for an exact unproved retry.
+
+        The RPC checks the current creative and digest atomically. It never
+        accepts an actor or changes proof state; the portal stamps that later.
+        """
+        r = self._client().post(
+            self._rest("rpc/calendar_recover_unproved_approval"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"p_row_id": row_id, "p_gym_id": account_key,
+                  "p_expected": expected_creative}, timeout=30,
         )
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
@@ -2005,20 +2050,37 @@ class SupabaseCalendarStore:
         return len(rows) == 1
 
     def claim_publish_slot(self, row_id, gym_id, local_day, timezone_name,
-                           capacity, approved_only):
+                           capacity, approved_only, require_proof=False):
         """Atomically reserve a platform slot and return this claim's UUID token.
 
         No split count/claim fallback: an unavailable RPC holds the post. The SQL
         function serializes all workers for this gym with an advisory lock. A
         distinct token on each successful claim prevents a stale worker from
         reverting a later worker's claim of the same row.
+
+        APPROVAL PROOF GATE (draft, 2026-10-05): ``require_proof`` asks the RPC
+        to re-read the gym's CURRENT autonomy from the DB inside the claim
+        transaction and, unless the gym is definitively autonomous right now,
+        atomically reject a row lacking a fresh VERIFIED human approval
+        (approval_kind='human' + nonempty trusted approved_by, stamped only by
+        the portal's calendar_stamp_verified_approval) whose canonical digest
+        -- including the FINAL image_url -- matches the row's current
+        publish-relevant fields. An
+        Auto->Manual flip is therefore enforced at the claim itself, not from
+        this worker's earlier snapshot. The parameter is sent ONLY when True so
+        a pre-provenance migration keeps today's behavior; when True and the
+        migration is unapplied the RPC errors and the claim fails closed
+        (nothing is published).
         """
+        payload = {"p_row_id": row_id, "p_gym_id": gym_id,
+                   "p_day": local_day, "p_timezone": timezone_name,
+                   "p_capacity": capacity, "p_approved_only": approved_only}
+        if require_proof:
+            payload["p_require_approval_proof"] = True
         r = self._client().post(
             self._rest("rpc/claim_calendar_publish_slot_owned"),
             headers=self._headers({"Content-Type": "application/json"}),
-            json={"p_row_id": row_id, "p_gym_id": gym_id,
-                  "p_day": local_day, "p_timezone": timezone_name,
-                  "p_capacity": capacity, "p_approved_only": approved_only},
+            json=payload,
             timeout=30,
         )
         if r.status_code >= 400:

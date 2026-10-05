@@ -2827,6 +2827,12 @@ def build_server(port=None):
                 except Exception:
                     return self._send_json({"error": "invalid JSON"}, 400)
                 draft_id = body.get("draft_id", "")
+                # actor_id is browser-body data: SPOOFABLE attribution only.
+                # It must NEVER become trusted approval proof: Echo's approve
+                # RPC takes no actor and leaves approval_kind/approved_by
+                # UNPROVED. Human proof is stamped only by the portal's
+                # service-role calendar_stamp_verified_approval with an
+                # authenticated Clerk actor (portal handoff contract).
                 actor_id = body.get("actor_id", "")
                 note = body.get("note", "")
                 # The approver's explicit "reason why" note, distinct from the new
@@ -2837,9 +2843,17 @@ def build_server(port=None):
                 # GBP structured fields forwarded on edit (G1): a `gbp` object carrying
                 # topic/cta/event/offer/location. Passed through so Echo persists them.
                 gbp = body.get("gbp") if isinstance(body.get("gbp"), dict) else None
+                # Portal visible-card snapshot (ECHO_VERIFIED_APPROVAL_PROOF
+                # contract; sent only when the PORTAL flag is on). Echo
+                # requires/compares it ONLY when AGENT_APPROVAL_PROOF is on;
+                # flag OFF it is ignored and the legacy wire is unchanged.
+                expected_creative = (body.get("expected_creative")
+                                     if isinstance(body.get("expected_creative"), dict)
+                                     else None)
                 status, resp = _pr.handle_portal_action(
                     pt_action, account_key, draft_id, actor_id, note=note,
                     confirm=bool(body.get("confirm", False)), reason=reason, gbp=gbp,
+                    expected_creative=expected_creative,
                 )
                 return self._send_json(resp, status)
 
@@ -2956,6 +2970,12 @@ def build_server(port=None):
                     body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
                 except Exception:
                     return self._send_json({"error": "invalid JSON"}, 400)
+                # actor_id is browser-body data: SPOOFABLE attribution only.
+                # It must NEVER become trusted approval proof: Echo's approve
+                # RPC takes no actor and leaves approval_kind/approved_by
+                # UNPROVED. Human proof is stamped only by the portal's
+                # service-role calendar_stamp_verified_approval with an
+                # authenticated Clerk actor (portal handoff contract).
                 actor_id = body.get("actor_id", "")
                 note = body.get("note", "")
                 # The approver's explicit "reason why", distinct from the new caption.
@@ -2965,8 +2985,15 @@ def build_server(port=None):
                 from .store import PendingStore
                 store = PendingStore()
                 if ps_action == "approve":
+                    # Portal visible-card snapshot; required/compared only when
+                    # AGENT_APPROVAL_PROOF is ON (see handle_approve). Flag OFF
+                    # it is ignored and the legacy behavior is unchanged.
+                    _expected = (body.get("expected_creative")
+                                 if isinstance(body.get("expected_creative"), dict)
+                                 else None)
                     status, resp = _ps.handle_approve(account_key, ps_post_id, actor_id,
-                                                      store=store)
+                                                      store=store,
+                                                      expected_creative=_expected)
                 elif ps_action == "edit":
                     status, resp = _ps.handle_edit(account_key, ps_post_id, actor_id,
                                                    note=note, store=store, reason=reason)

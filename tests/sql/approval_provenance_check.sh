@@ -1,0 +1,285 @@
+#!/bin/bash
+# Disposable-Postgres check for migrations/calendar_approval_provenance_20261005.sql.
+# Spins up a throwaway cluster in $TMPDIR, builds a MINIMAL schema (only the
+# columns the migration's functions touch), applies the DRAFT migration, and
+# asserts the proof-gate contract. Destroys the cluster on exit. No live data.
+# NOTE: needs an environment that permits Postgres shared memory (shmget) —
+# run it OUTSIDE the Codex sandbox (e.g. a maintainer shell with
+# PATH=/opt/homebrew/opt/postgresql@17/bin:$PATH).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/approval_proof_pg.XXXXXX")"
+SOCK="$WORK/sock"; DATA="$WORK/data"; LOG="$WORK/pg.log"
+mkdir -p "$SOCK"
+cleanup() { pg_ctl -D "$DATA" -m immediate stop >/dev/null 2>&1 || true; rm -rf "$WORK"; }
+trap cleanup EXIT
+
+initdb -D "$DATA" -U postgres --no-sync >/dev/null
+pg_ctl -D "$DATA" -l "$LOG" -o "-k $SOCK -p 55444 -c listen_addresses=''" -w start >/dev/null
+
+psql -h "$SOCK" -p 55444 -U postgres -d postgres -v ON_ERROR_STOP=1 -q <<'SQL'
+create role anon;
+create role authenticated;
+create role service_role;
+create table gyms (id uuid primary key, slug text, name text);
+create table echo_intake_tokens (gym_id uuid, echo_account_key text);
+create table echo_gym_settings (gym_id uuid primary key, autonomous boolean,
+                                autonomy_updated_by text);
+create table content_calendar (
+  id uuid primary key, gym_id text, status text,
+  published_at timestamptz, late_post_id text, variant_status text,
+  image_url text, media_not_ready_reason text, account text, format text,
+  post_date date, caption text, scheduled_at timestamptz,
+  source_media_asset_id text, source_media_url text, byte_hash text,
+  publish_reservation_day date, publish_claim_token uuid);
+SQL
+
+psql -h "$SOCK" -p 55444 -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
+  -f "$ROOT/migrations/calendar_approval_provenance_20261005.sql"
+
+PASS=0; FAIL=0
+check() { # name expected actual
+  if [ "$2" = "$3" ]; then PASS=$((PASS+1)); echo "ok   - $1";
+  else FAIL=$((FAIL+1)); echo "FAIL - $1 (expected [$2], got [$3])"; fi
+}
+q() { psql -h "$SOCK" -p 55444 -U postgres -d postgres -v ON_ERROR_STOP=1 -qAtc "$1"; }
+
+GYM_UUID="11111111-1111-1111-1111-111111111111"
+OTHER_GYM="99999999-9999-9999-9999-999999999999"
+q "insert into gyms values ('$GYM_UUID','swift-river-crossfit','Swift River')"
+q "insert into gyms values ('$OTHER_GYM','other-gym','Other Gym')"
+q "insert into echo_gym_settings values ('$GYM_UUID', false, 'test')"
+q "insert into echo_gym_settings values ('$OTHER_GYM', false, 'test')"
+SWIFT="swiftrivercrossfitd23567"  # normalised slug + fingerprint, like production
+q "insert into echo_intake_tokens values ('$GYM_UUID','$SWIFT')"
+q "insert into echo_intake_tokens values ('$OTHER_GYM','othergym999999')"
+
+mkrow() { # id suffix status
+  q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+     values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$1','$SWIFT','$2','active','https://cdn/$1.jpg','instagram','feed','2026-08-10','caption $1')"
+}
+CLAIM() { q "select claim_calendar_publish_slot_owned('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$1','$SWIFT','2026-08-10','America/New_York',2,true,true)"; }
+DIGEST_OF() { q "select approval_digest from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$1'"; }
+
+# R1: Echo approve records status+digest but leaves provenance UNPROVED
+mkrow 01 pending
+check "echo approve updates row" "1" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01','$SWIFT')")"
+check "echo approve leaves kind NULL (unproved)" "" "$(q "select coalesce(approval_kind,'') from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01'")"
+check "echo approve leaves actor NULL" "" "$(q "select coalesce(approved_by,'') from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01'")"
+check "echo approve leaves approved_at NULL" "" "$(q "select coalesce(approved_at::text,'') from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01'")"
+check "echo approve stores digest" "t" "$(q "select approval_digest is not null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01'")"
+check "digest matches recomputation" "t" "$(q "select approval_digest = calendar_approval_digest(content_calendar.*) from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01'")"
+
+# defect 1: Echo-token-only approval NEVER claims in Manual, digest or not
+check "echo-only approval held at claim (Manual)" "" "$(CLAIM 01)"
+
+# defect 1: the stamp RPC mints the human proof, atomically verified
+D01="$(DIGEST_OF 01)"
+# wrong gym -> zero rows, nothing stamped
+check "stamp rejects wrong gym" "0" "$(q "select count(*) from calendar_stamp_verified_approval('$OTHER_GYM','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01','clerk-user-1','$D01')")"
+check "wrong-gym attempt stamped nothing" "" "$(q "select coalesce(approval_kind,'') from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01'")"
+# wrong digest -> zero rows
+check "stamp rejects wrong echo digest" "0" "$(q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01','clerk-user-1','deadbeef')")"
+# empty actor -> zero rows (no actor, no human proof)
+check "stamp rejects empty actor" "0" "$(q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01','   ','$D01')")"
+# spoof attempt: digest is right but actor is a body string -- the RPC cannot
+# tell; the CONTRACT is that only the portal's authenticated Clerk session
+# calls this. Verified here: gate requires nonempty actor (above) and the
+# claim requires the stamp.
+# happy path: exactly one row with the exact four fields
+STAMP01="$(q "select gym_id::text||'|'||clerk_actor_id||'|'||approval_digest from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01','clerk-user-1','$D01')")"
+check "stamp returns exactly one row" "1" "$(test -n "$STAMP01" && echo 1 || echo 0)"
+check "stamp returns exact fields" "$GYM_UUID|clerk-user-1|$D01" "$STAMP01"
+check "stamp refuses to replace first human actor" "0" "$(q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01','clerk-user-2','$D01')")"
+check "stamp sets human kind + actor" "human|clerk-user-1" "$(q "select approval_kind||'|'||approved_by from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01'")"
+# publisher stamps scheduled_at AFTER approval; claim must still pass
+q "update content_calendar set scheduled_at='2026-08-10 14:00:00+00' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01'"
+C01="$(CLAIM 01)"
+check "verified human proof claims in Manual" "1" "$([ -n "$C01" ] && echo 1 || echo 0)"
+
+# defect 2: image mutation between Echo approve and the portal stamp -> the
+# stamp's digest check fails closed (0 rows, no stamp)
+mkrow 02 pending
+q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa02','$SWIFT')" >/dev/null
+D02="$(DIGEST_OF 02)"
+q "update content_calendar set image_url='https://cdn/02-reframed.jpg' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa02'"
+check "stamp rejects stale digest after image mutation" "0" "$(q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa02','clerk-user-1','$D02')")"
+
+# defect 2: image mutation AFTER the human stamp -> claim fails closed
+mkrow 03 pending
+q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa03','$SWIFT')" >/dev/null
+D03="$(DIGEST_OF 03)"
+q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa03','clerk-user-1','$D03')" >/dev/null
+q "update content_calendar set image_url='https://cdn/03-reburned.jpg' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa03'"
+check "post-stamp image mutation held at claim" "" "$(CLAIM 03)"
+
+# defect 3: superseded variant can never be approved
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa04','$SWIFT','pending','superseded','https://cdn/04.jpg','instagram','feed','2026-08-10','caption 04')"
+check "approve refuses non-active variant" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa04','$SWIFT')")"
+
+# defect 1: approved row with NO provenance at all fails closed in Manual
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa05','$SWIFT','approved','active','https://cdn/05.jpg','instagram','feed','2026-08-10','caption 05')"
+check "unproved approved row held (Manual)" "" "$(CLAIM 05)"
+
+# defect 5: caption edit after the human stamp invalidates the proof
+mkrow 06 pending
+q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa06','$SWIFT')" >/dev/null
+D06="$(DIGEST_OF 06)"
+q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa06','clerk-user-1','$D06')" >/dev/null
+q "update content_calendar set caption='edited after approval' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa06'"
+check "post-approval caption edit held" "" "$(CLAIM 06)"
+
+# stamp refuses a published row (terminal, no new stamp)
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption,published_at)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa07','$SWIFT','published','active','https://cdn/07.jpg','instagram','feed','2026-08-10','caption 07', now())"
+check "stamp refuses published row" "0" "$(q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa07','clerk-user-1','whatever')")"
+
+# defect 4: Auto -> Manual flip is read from the DB INSIDE the claim txn.
+q "update echo_gym_settings set autonomous=true where gym_id='$GYM_UUID'"
+mkrow 08 pending
+C08="$(q "select claim_calendar_publish_slot_owned('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa08','$SWIFT','2026-08-10','America/New_York',2,false,true)")"
+check "autonomous gym: pending row claims, gate armed" "1" "$([ -n "$C08" ] && echo 1 || echo 0)"
+q "update echo_gym_settings set autonomous=false where gym_id='$GYM_UUID'"
+mkrow 09 pending
+check "Auto->Manual flip holds pending row at claim" "" "$(CLAIM 09)"
+
+# A plausible six-hex suffix is not an account mapping.
+q "update echo_gym_settings set autonomous=true where gym_id='$GYM_UUID'"
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa11','swiftrivercrossfitabcdef','pending','active','https://cdn/11.jpg','instagram','feed','2026-08-10','caption 11')"
+check "arbitrary suffix cannot inherit autonomy" "" "$(q "select claim_calendar_publish_slot_owned('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa11','swiftrivercrossfitabcdef','2026-08-10','America/New_York',2,false,true)")"
+q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa11','swiftrivercrossfitabcdef')" >/dev/null
+D11="$(DIGEST_OF 11)"
+check "arbitrary suffix cannot receive human stamp" "0" "$(q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa11','clerk-user-1','$D11')")"
+if q "insert into echo_intake_tokens values ('$OTHER_GYM','$SWIFT')" >/dev/null 2>&1; then
+  check "duplicate account key rejected" "rejected" "inserted"
+else
+  check "duplicate account key rejected" "rejected" "rejected"
+fi
+
+# ---- visible-card snapshot compare (Echo half, 2026-10-05) -------------------
+# p_expected rides the SAME atomic UPDATE as status+digest: a stale snapshot
+# matches zero rows, flips nothing and stamps nothing (Echo 409s
+# review_refresh_required). p_expected DEFAULT NULL is the legacy flag-OFF
+# behavior (2-arg call still works and still approves).
+SNAP() { echo "{\"caption\": \"caption $1\", \"media_url\": \"https://cdn/$1.jpg\", \"day_key\": \"2026-08-10\", \"format\": \"feed\", \"platform\": \"instagram\"}"; }
+
+# matching snapshot approves and stamps digest, provenance still UNPROVED
+mkrow 20 pending
+check "matching snapshot approves" "1" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa20','$SWIFT','$(SNAP 20)'::jsonb)")"
+check "snapshot approve leaves kind NULL" "" "$(q "select coalesce(approval_kind,'') from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa20'")"
+check "snapshot approve stores digest" "t" "$(q "select approval_digest is not null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa20'")"
+
+# legacy 2-arg call (p_expected DEFAULT NULL) is byte-for-byte old behavior
+mkrow 21 pending
+check "flag-off 2-arg approve still works" "1" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa21','$SWIFT')")"
+
+# stale caption -> zero rows, nothing stamped
+mkrow 22 pending
+q "update content_calendar set caption='edited AFTER the tap' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa22'"
+check "stale caption refuses" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa22','$SWIFT','$(SNAP 22)'::jsonb)")"
+check "stale caption flipped nothing" "pending" "$(q "select status from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa22'")"
+check "stale caption stamped nothing" "t" "$(q "select approval_digest is null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa22'")"
+
+# stale final photo
+mkrow 23 pending
+q "update content_calendar set image_url='https://cdn/23-NEW.jpg' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa23'"
+check "stale photo refuses" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa23','$SWIFT','$(SNAP 23)'::jsonb)")"
+
+# stale visible date
+mkrow 24 pending
+q "update content_calendar set post_date='2026-08-11' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa24'"
+check "stale date refuses" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa24','$SWIFT','$(SNAP 24)'::jsonb)")"
+
+# stale platform (canonical account)
+mkrow 25 pending
+q "update content_calendar set account='facebook' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa25'"
+check "stale platform refuses" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa25','$SWIFT','$(SNAP 25)'::jsonb)")"
+
+# stale format (row really is a story now; snapshot says feed)
+mkrow 26 pending
+q "update content_calendar set format='story' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa26'"
+check "stale format refuses" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa26','$SWIFT','$(SNAP 26)'::jsonb)")"
+
+# NULL format on the row is the same effective 'feed' as the snapshot says
+mkrow 27 pending
+q "update content_calendar set format=null where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa27'"
+check "null format matches effective feed" "1" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa27','$SWIFT','$(SNAP 27)'::jsonb)")"
+
+# An actual null caption matches the null value in the visible-card snapshot.
+mkrow 28 pending
+q "update content_calendar set caption=null where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa28'"
+NULL_CAPTION_SNAPSHOT='{"caption": null, "media_url": "https://cdn/28.jpg", "day_key": "2026-08-10", "format": "feed", "platform": "instagram"}'
+check "null row caption matches null snapshot caption" "1" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa28','$SWIFT','$NULL_CAPTION_SNAPSHOT'::jsonb)")"
+
+mkrow 29 pending
+SPACED_MEDIA_SNAPSHOT='{"caption": "caption 29", "media_url": " https://cdn/29.jpg ", "day_key": "2026-08-10", "format": "feed", "platform": "instagram"}'
+check "media URL is exact" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa29','$SWIFT','$SPACED_MEDIA_SNAPSHOT'::jsonb)")"
+
+mkrow 30 pending
+q "update content_calendar set caption=null where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa30'"
+EMPTY_CAPTION_SNAPSHOT='{"caption": "", "media_url": "https://cdn/30.jpg", "day_key": "2026-08-10", "format": "feed", "platform": "instagram"}'
+check "null and empty captions stay distinct" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa30','$SWIFT','$EMPTY_CAPTION_SNAPSHOT'::jsonb)")"
+
+# wrong gym + valid snapshot still cannot approve (scope is orthogonal)
+mkrow 33 pending
+check "snapshot cannot cross gyms" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa33','othergym999999','$(SNAP 33)'::jsonb)")"
+
+# A failed portal stamp can be retried only after a fresh exact-card review.
+mkrow 34 pending
+q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34','$SWIFT','$(SNAP 34)'::jsonb)" >/dev/null
+check "unproved retry returns current row" "1" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34','$SWIFT','$(SNAP 34)'::jsonb)")"
+check "unproved retry rejects stale caption" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34','$SWIFT','$(SNAP 35)'::jsonb)")"
+q "update content_calendar set caption='changed' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34'"
+check "unproved retry rejects edited digest" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34','$SWIFT','$(SNAP 34)'::jsonb)")"
+mkrow 36 pending
+q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa36','$SWIFT','$(SNAP 36)'::jsonb)" >/dev/null
+D36="$(DIGEST_OF 36)"
+q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa36','clerk-user-1','$D36')" >/dev/null
+check "proved approval cannot recover" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa36','$SWIFT','$(SNAP 36)'::jsonb)")"
+
+# Keep the resolver's settings-row lock open across a transaction. A mode
+# update must wait for that claim-side transaction, never pass it mid-claim.
+cat >"$WORK/lock-holder.sql" <<SQL
+begin;
+select calendar_gym_is_autonomous('$SWIFT');
+\! touch "$WORK/lock-acquired"
+select pg_sleep(2);
+commit;
+SQL
+psql -h "$SOCK" -p 55444 -U postgres -d postgres -v ON_ERROR_STOP=1 -qAt \
+  -f "$WORK/lock-holder.sql" >"$WORK/lock-holder.out" 2>"$WORK/lock-holder.err" &
+HOLDER_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -e "$WORK/lock-acquired" ] && break
+  sleep 0.1
+done
+check "claim-side resolver acquired settings lock" "yes" "$([ -e "$WORK/lock-acquired" ] && echo yes || echo no)"
+if q "set lock_timeout='200ms'; update echo_gym_settings set autonomous=false where gym_id='$GYM_UUID'" >/dev/null 2>&1; then
+  check "mode update waits for claim transaction" "blocked" "updated"
+else
+  check "mode update waits for claim transaction" "blocked" "blocked"
+fi
+if q "set lock_timeout='200ms'; update echo_intake_tokens set echo_account_key='movedkey' where gym_id='$GYM_UUID'" >/dev/null 2>&1; then
+  check "token reassignment waits for claim transaction" "blocked" "updated"
+else
+  check "token reassignment waits for claim transaction" "blocked" "blocked"
+fi
+wait "$HOLDER_PID"
+q "update echo_gym_settings set autonomous=false where gym_id='$GYM_UUID'"
+
+# defect 4: unresolved gym (no gyms row) fails closed even on the Auto lane
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa10','ghostgym','pending','active','https://cdn/10.jpg','instagram','feed','2026-08-10','caption 10')"
+check "unresolved gym fails closed" "" "$(q "select claim_calendar_publish_slot_owned('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa10','ghostgym','2026-08-10','America/New_York',2,false,true)")"
+
+# flag OFF contract: gate param FALSE keeps legacy behavior for a Manual gym
+q "update content_calendar set account='facebook' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa05'"
+check "flag-off claim ignores provenance entirely" "1" "$(q "select case when claim_calendar_publish_slot_owned('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa05','$SWIFT','2026-08-10','America/New_York',2,true,false) is not null then '1' else '' end")"
+
+echo "---"
+echo "pass=$PASS fail=$FAIL"
+[ "$FAIL" -eq 0 ]

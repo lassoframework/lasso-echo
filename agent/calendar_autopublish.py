@@ -1302,18 +1302,55 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         claim_token = None
         try:
             claim_slot = getattr(store, "claim_publish_slot", None)
+            # DURABLE APPROVAL PROOF (draft, AGENT_APPROVAL_PROOF default OFF):
+            # when armed, EVERY lane passes require_proof to the atomic claim.
+            # The RPC then re-reads the gym's CURRENT autonomy from the
+            # authoritative DB inside the claim transaction: a definitively
+            # autonomous gym keeps today's behavior exactly; any other gym
+            # (Manual, newly flipped Auto->Manual, or an unresolved/ambiguous
+            # lookup) must carry a fresh VERIFIED human approval (human kind +
+            # nonempty trusted actor, stamped only via the portal's
+            # calendar_stamp_verified_approval) whose canonical digest matches
+            # the locked row's exact publish-relevant content
+            # (caption/account/format/date, the FINAL image_url and the
+            # rendered/source identity; the publisher-stamped scheduled_at is
+            # deliberately not bound). A post-approval auto-fit reframe or
+            # story reburn changes image_url and therefore fails the row
+            # CLOSED into fresh review -- changed pixels never publish under
+            # an old approval. Enforcement lives in the DB claim, not a
+            # Python pre-read, so a mid-flight Auto->Manual flip is caught
+            # atomically. When the store cannot carry the requirement (legacy
+            # injected store, unapplied migration), fail CLOSED: hold the row
+            # rather than publish under an unproved approval.
+            require_proof = config.approval_proof_enabled()
             if callable(claim_slot):
                 # Refresh after preflight: a long render/reframe can cross the
                 # gym's midnight before this atomic reservation.
                 reservation_day = _local_now(now, gym_tz).date().isoformat()
-                won = claim_slot(row_id, gym_id, reservation_day, gym_tz,
-                                 _publish_capacity(gym_id, row, store,
-                                                   reservation_day), approved_only)
+                if require_proof:
+                    try:
+                        won = claim_slot(row_id, gym_id, reservation_day, gym_tz,
+                                         _publish_capacity(gym_id, row, store,
+                                                           reservation_day),
+                                         approved_only, require_proof=True)
+                    except TypeError:
+                        # A store whose claim cannot carry the proof requirement
+                        # must never claim in Manual mode while armed.
+                        won = None
+                else:
+                    won = claim_slot(row_id, gym_id, reservation_day, gym_tz,
+                                     _publish_capacity(gym_id, row, store,
+                                                       reservation_day), approved_only)
             else:
-                # Legacy injectable test stores have no RPC. The production
-                # Supabase store always exposes claim_publish_slot and fails
-                # closed if its migration has not been applied.
-                won = store.mark_publishing(row_id)
+                if require_proof:
+                    # The legacy mark_publishing fallback cannot verify durable
+                    # human-approval proof atomically; hold the row.
+                    won = None
+                else:
+                    # Legacy injectable test stores have no RPC. The production
+                    # Supabase store always exposes claim_publish_slot and fails
+                    # closed if its migration has not been applied.
+                    won = store.mark_publishing(row_id)
         except Exception as e:
             failed.append(row_id)
             print(f"[calendar-autopublish] claim failed for row {row_id}: "
