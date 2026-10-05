@@ -553,7 +553,7 @@ def test_live_apply_writes_group_and_terminal_receipt_atomically(pg):
     _claim("gym-ok", "act-ok", fp, asset, NEW_FOR("gym-ok"), primary, sibling)
     assert _apply("gym-ok", "act-ok", fp, [primary, sibling], asset) == "succeeded"
     moved = sql(f"select count(*) from public.content_calendar where id in ('{primary}','{sibling}')"
-                f" and image_url='{NEW_FOR("gym-ok")}' and source_media_asset_id='{asset}'")
+                f" and image_url='{NEW_FOR('gym-ok')}' and source_media_asset_id='{asset}'")
     assert moved == "2"
     # the unrelated same-date post is untouched
     assert sql(f"select image_url from public.content_calendar where id='{other}'") == \
@@ -783,14 +783,14 @@ def test_live_apply_rejects_repicked_foreign_or_tokenized_media(pg):
                " where gym_id='gym-repk' and action_id='act-repk'") == "selected"
     # tokenized prepared URL is refused before mutation
     err = sql(f"select public.portal_action_receipt_apply('gym-repk','act-repk','{fp}',"
-              f"'{rows_for(NEW_FOR("gym-repk") + '?sig=t', asset)}'::jsonb)", expect_error=True)
+              f"'{rows_for(NEW_FOR('gym-repk') + '?sig=t', asset)}'::jsonb)", expect_error=True)
     assert "not allowlisted" in err
     assert sql(f"select image_url from public.content_calendar where id='{primary}'") == OLD
     # foreign asset id in the prepared media is refused before mutation
     sql("insert into public.media_asset(id, gym_id, content_hash, eligible)"
         " values('foreign-asset','gym-other','h',true)")
     err = sql(f"select public.portal_action_receipt_apply('gym-repk','act-repk','{fp}',"
-              f"'{rows_for(NEW_FOR("gym-repk"), 'foreign-asset')}'::jsonb)", expect_error=True)
+              f"'{rows_for(NEW_FOR('gym-repk'), 'foreign-asset')}'::jsonb)", expect_error=True)
     assert "frozen selection" in err or "own-tenant allowlisted" in err
     assert sql(f"select image_url from public.content_calendar where id='{primary}'") == OLD
     # the exact frozen identity still applies cleanly
