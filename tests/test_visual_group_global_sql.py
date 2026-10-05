@@ -136,8 +136,9 @@ def test_selected_bytes_and_group_members_are_bound_before_claim():
     assert "m.object_role='source'" in complete
     assert "m.object_role='delivered'" in complete
     row_verify = sql.split(
-        "create or replace function public.visual_global_row_bytes_verified(", 1
+        "create or replace function public.visual_global_row_bytes_verified_for(", 1
     )[1].split("end;\n$$;", 1)[0]
+    assert "public.visual_global_row_bytes_verified_for(p_row,p_row.visual_group_key)" in sql
     assert "visual_global_row_fingerprint(p_row)" not in row_verify
     assert "to_jsonb(p_row)->>'thumbnail_url'" in row_verify
     assert "is distinct from\n      (to_jsonb(p_row)->>'image_url')" in row_verify
