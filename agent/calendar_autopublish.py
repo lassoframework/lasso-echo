@@ -1656,7 +1656,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         from .media_reuse_policy import publish_hold_reason
         _reuse_reason = publish_hold_reason(
             row, gym_id, store, now=now,
-            library_path=getattr(account, "library_path", None))
+            library_path=(account.library_path()
+                          if callable(getattr(account, "library_path", None))
+                          else getattr(account, "library_path", None)))
         if _reuse_reason:
             _reverted = _revert_to_pending(
                 store, row_id, reject_reason=_reuse_reason, gym_id=gym_id,
