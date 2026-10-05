@@ -195,7 +195,13 @@ create index if not exists visual_scene_candidate_scene_idx
   on public.visual_scene_candidate (tenant_id, group_key);
 create index if not exists visual_scene_candidate_phash_idx
   on public.visual_scene_candidate (phash);
-create index if not exists visual_scene_candidate_object_idx
+-- One candidate per exact delivered object per scene and role. Registration is
+-- IDEMPOTENT on this identity (visual_scene_register_candidate returns the
+-- existing candidate_id for an exact identical retry instead of minting a
+-- fresh UUID) and a conflicting pHash/fingerprint/evidence for the same
+-- identity is refused — the evidence a hold was reviewed against can never be
+-- duplicated or drifted by a retry.
+create unique index if not exists visual_scene_candidate_object_uq
   on public.visual_scene_candidate (tenant_id, group_key, object_role, exact_url);
 
 -- ---------------------------------------------------------------------------
@@ -375,7 +381,9 @@ $$;
 -- visual_global_object_attestation, evidence must carry verified_bytes
 -- matching the attested md5, and object_role declares which delivered object
 -- of the calendar row the candidate binds to. Registration NEVER consumes a
--- scene.
+-- scene and is IDEMPOTENT on (tenant, group, object_role, exact_url): an exact
+-- identical retry returns the existing candidate_id, while a conflicting
+-- pHash/fingerprint/evidence for the same identity is refused.
 -- ---------------------------------------------------------------------------
 create or replace function public.visual_scene_register_candidate(
   p_tenant text, p_group_key text, p_phash text,
@@ -383,6 +391,7 @@ create or replace function public.visual_scene_register_candidate(
   p_object_role text default 'display'
 ) returns uuid language plpgsql security definer set search_path = public as $$
 declare v_tenant text; v_id uuid;
+  v_existing public.visual_scene_candidate%rowtype;
 begin
   v_tenant := public.visual_group_tenant_strict(p_tenant)::text;
   if p_tenant is distinct from v_tenant then
@@ -410,6 +419,28 @@ begin
         and o.exact_url = p_exact_url and o.fingerprint = p_fingerprint) then
     raise exception 'candidate phash is not backed by owner-attested exact bytes'
       using errcode='23514';
+  end if;
+  -- IDEMPOTENT REGISTRATION under concurrency: serialize registrations of the
+  -- same delivered-object identity, then either return the EXISTING candidate
+  -- for an exact identical retry (a fresh UUID for the same evidence would
+  -- double-bind the row's delivered object and make
+  -- visual_scene_hold_resolve reject an otherwise valid live row) or refuse a
+  -- conflicting one. The first row's evidence is preserved untouched; the
+  -- candidate table is append-only/immutable.
+  perform pg_advisory_xact_lock(hashtextextended(
+    'visual_scene_candidate', hashtextextended(
+      v_tenant || ':' || p_group_key || ':' || p_object_role || ':' || p_exact_url, 0)));
+  select c.* into v_existing from public.visual_scene_candidate c
+    where c.tenant_id = v_tenant and c.group_key = p_group_key
+      and c.object_role = p_object_role and c.exact_url = p_exact_url;
+  if found then
+    if v_existing.phash <> p_phash
+        or v_existing.fingerprint <> p_fingerprint
+        or v_existing.evidence <> p_evidence then
+      raise exception 'conflicting scene candidate evidence for the same delivered object'
+        using errcode='23514';
+    end if;
+    return v_existing.candidate_id;
   end if;
   insert into public.visual_scene_candidate
     (tenant_id, group_key, object_role, phash, exact_url, fingerprint, evidence, attested_by)

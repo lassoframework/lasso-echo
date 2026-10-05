@@ -77,7 +77,7 @@ KEY_TRIGGERS = (
 KEY_INDEXES = (
     "visual_scene_candidate_scene_idx",
     "visual_scene_candidate_phash_idx",
-    "visual_scene_candidate_object_idx",
+    "visual_scene_candidate_object_uq",
     "visual_scene_phash_occupied_tenant_date_idx",
     "visual_scene_review_hold_state_idx",
     "visual_scene_review_hold_scene_idx",

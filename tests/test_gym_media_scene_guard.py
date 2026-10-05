@@ -85,17 +85,18 @@ class _Resp:
 
 
 class FakeSceneHttp:
-    """Scripted PostgREST for tenant_alias + a paginated visual_scene_phash
-    full scan. Rows are served in the pinned full-primary-key order
-    (phash, tenant_id, group_key) like the ordered real server; pass
-    unordered=True to violate that ordering on purpose."""
+    """Scripted PostgREST for tenant_alias + a paginated
+    visual_scene_phash_occupied full scan. Rows are served in the pinned
+    full-primary-key order (phash, tenant_id, group_key, used_date) of the
+    integrated DRAFT schema like the ordered real server; pass unordered=True
+    to violate that ordering on purpose."""
 
     def __init__(self, tenant_rows, scene_rows, fail_on=None, unordered=False):
         self._tenant = tenant_rows
         self._scenes = (list(reversed(scene_rows)) if unordered
                         else sorted(scene_rows, key=lambda r: (
                             str(r.get("phash")), str(r.get("tenant_id")),
-                            str(r.get("group_key")))))
+                            str(r.get("group_key")), str(r.get("used_date")))))
         self._fail_on = fail_on
         self.calls = []
 
@@ -253,7 +254,8 @@ def test_scene_scan_paginates_with_proven_pages(monkeypatch):
     calls = [call for call in http.calls if "visual_scene_phash" in call[0]]
     assert [call[2]["Range"] for call in calls] == ["0-99", "100-199"]
     assert all(call[2]["Prefer"] == "count=exact" for call in calls)
-    assert all(call[1]["order"] == "phash.asc,tenant_id.asc,group_key.asc"
+    assert all(call[1]["order"]
+               == "phash.asc,tenant_id.asc,group_key.asc,used_date.asc"
                for call in calls)
 
 
@@ -417,3 +419,122 @@ def test_unfingerprintable_photo_fails_closed(monkeypatch):
     with pytest.raises(gms.SceneLedgerUnavailable):
         gms.pickable(GYM, store=store, now=NOW_DT, ledger_http=http,
                      scene_read_bytes=_no_bytes, strict_claims=True)
+
+
+# ---- integration-contract fixes (2026-10-05): occupied table, full-PK order,
+# ---- scheduled target date ---------------------------------------------------
+
+def test_scene_read_targets_the_integrated_occupied_table(monkeypatch):
+    """The scan must read visual_scene_phash_occupied (the integrated DRAFT
+    schema), never the rejected prep-time sketch table visual_scene_phash."""
+    _creds(monkeypatch)
+    http = FakeSceneHttp([{"alias_key": GYM, "tenant_id": TENANT}], [])
+    gms.cross_tenant_scene_phashes(GYM, http=http)
+    scene_calls = [c for c in http.calls if "scene_phash" in c[0]]
+    assert scene_calls
+    assert all("visual_scene_phash_occupied" in c[0] for c in scene_calls)
+    assert not any(c[0].rstrip("/").endswith("visual_scene_phash")
+                   for c in scene_calls)
+
+
+def test_used_date_participates_in_the_pinned_order(monkeypatch):
+    """used_date is part of the integrated PK: same (phash, tenant, group) rows
+    with different used_dates are ordered by date, and a server that splits
+    them out of order proves the snapshot was not honored — fail closed."""
+    _creds(monkeypatch)
+    rows = [_scene(MINE, TENANT, used_date=TODAY),
+            _scene(MINE, TENANT, used_date=YESTERDAY)]
+    http = FakeSceneHttp([{"alias_key": GYM, "tenant_id": TENANT}], rows)
+    own, known = gms.cross_tenant_scene_phashes(GYM, http=http)
+    assert known == {MINE: {TENANT: {TODAY, YESTERDAY}}}
+    # Same phash/tenant/group, but the server emits the later date first.
+    reversed_http = FakeSceneHttp([{"alias_key": GYM, "tenant_id": TENANT}],
+                                  rows)
+    reversed_http._scenes = list(rows)  # TODAY before YESTERDAY: date disorder
+    with pytest.raises(gms.SceneLedgerUnavailable):
+        gms.cross_tenant_scene_phashes(GYM, http=reversed_http)
+
+
+def test_scene_target_date_prefers_the_scheduled_date():
+    """The scheduled post_date, not execution now, drives the same-day sibling
+    decision; an unparseable date is unknowable (fail closed upstream)."""
+    assert gms._scene_target_date("2026-10-04", NOW_DT) == "2026-10-04"
+    assert gms._scene_target_date(NOW_DT.date(), NOW_DT) == TODAY
+    assert gms._scene_target_date(NOW_DT, None) == TODAY
+    assert gms._scene_target_date(None, NOW_DT) == TODAY
+    assert gms._scene_target_date(None, NOW_DT.date()) == TODAY
+    assert gms._scene_target_date("not-a-date", NOW_DT) is None
+    assert gms._scene_target_date("2026-13-40", NOW_DT) is None
+    assert gms._scene_target_date(None, None) is None
+
+
+def test_scheduled_post_date_drives_the_same_day_sibling_decision(
+        monkeypatch, scene_hashes):
+    """A same-tenant near frame used TODAY: the photo is a legal sibling when
+    the slot is SCHEDULED today, but a cross-date hold when the slot is
+    scheduled tomorrow — even though the build runs today. (Operational flag
+    monkeypatched ON to pin the read-machinery policy at the pickable level;
+    production stays pinned SCENE_GUARD_OPERATIONAL = False.)"""
+    _creds(monkeypatch)
+    monkeypatch.setenv(gms.SCENE_GUARD_FLAG_ENV, "true")
+    monkeypatch.setattr(gms, "SCENE_GUARD_OPERATIONAL", True)
+    store = FakeMediaStore(assets=[_photo("p1"), _photo("p3")])
+    http = FakeSceneHttp([{"alias_key": GYM, "tenant_id": TENANT}],
+                         [_scene(NEAR, TENANT, used_date=TODAY)])
+    # Scheduled TODAY: same-tenant same-date sibling is legal; p1 stays.
+    picks = gms.pickable(GYM, store=store, now=NOW_DT, ledger_http=http,
+                         scene_read_bytes=_read_bytes, post_date=TODAY)
+    assert [a["id"] for a in picks] == ["p1", "p3"]
+    # Scheduled TOMORROW with the build running today: the same near frame is
+    # a same-tenant CROSS-DATE reuse — held, never auto-approved.
+    picks = gms.pickable(GYM, store=store, now=NOW_DT, ledger_http=http,
+                         scene_read_bytes=_read_bytes, post_date="2026-10-04")
+    assert [a["id"] for a in picks] == ["p3"]
+    # No scheduled date: the execution date (today) is the only target date.
+    picks = gms.pickable(GYM, store=store, now=NOW_DT, ledger_http=http,
+                         scene_read_bytes=_read_bytes)
+    assert [a["id"] for a in picks] == ["p1", "p3"]
+    # An unparseable scheduled date fails closed exactly like ledger doubt.
+    assert gms.pickable(GYM, store=store, now=NOW_DT, ledger_http=http,
+                        scene_read_bytes=_read_bytes,
+                        post_date="someday") == []
+    with pytest.raises(gms.SceneLedgerUnavailable):
+        gms.pickable(GYM, store=store, now=NOW_DT, ledger_http=http,
+                     scene_read_bytes=_read_bytes, post_date="someday",
+                     strict_claims=True)
+
+
+def test_pick_media_forwards_the_scheduled_post_date(monkeypatch, scene_hashes):
+    """pick_media passes post_date through to the pickable scene decision.
+    (pick_media has no test-only ledger injection by design; the scene inputs
+    are monkeypatched at the seam the pickable tests exercise.)"""
+    _creds(monkeypatch)
+    monkeypatch.setenv(gms.SCENE_GUARD_FLAG_ENV, "true")
+    monkeypatch.setattr(gms, "SCENE_GUARD_OPERATIONAL", True)
+    monkeypatch.setattr(
+        gms, "cross_tenant_scene_phashes",
+        lambda base, http=None: (TENANT, {NEAR: {TENANT: {TODAY}}}))
+    monkeypatch.setattr(
+        gms, "_scene_fingerprint_for",
+        lambda asset, scene_module, read_bytes:
+        f"scene:phash64:{SCENE_MAP[str(asset['id'])]}")
+    store = FakeMediaStore(assets=[_photo("p1"), _photo("p3")])
+    asset = gms.pick_media(GYM, store=store, now=NOW_DT,
+                           post_date="2026-10-04")
+    # p1 is held (cross-date for a slot scheduled tomorrow); p3 picks.
+    assert asset is not None and asset["id"] == "p3"
+
+
+def test_pool_kinds_forwards_the_scheduled_post_date(monkeypatch):
+    """The media-mix preflight uses the scheduled date for scene eligibility."""
+    seen = []
+
+    def pickable(*args, **kwargs):
+        seen.append(kwargs["post_date"])
+        return [{"kind": "photo"}, {"kind": "video"}]
+
+    monkeypatch.setattr(gms, "pickable", pickable)
+
+    assert gms.pool_kinds(GYM, now=NOW_DT, post_date="2026-10-04") == {
+        "photo", "video"}
+    assert seen == ["2026-10-04"]
