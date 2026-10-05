@@ -369,6 +369,8 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=
                                  "error": "the note is only an edit-rationale block "
                                           "([why]/[reason]); send the new caption "
                                           "text itself"}
+                from .copy_gate import format_caption
+                note = format_caption(note)
                 if not _rotation.is_gate_clean(
                         note, approved_claims=_edit_gate_claims(account_key)):
                     return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
@@ -424,6 +426,8 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=
             # and can never re-enter the caption through a requeue.
             from .portal_social import _split_note_meta
             note, reason = _split_note_meta(note, reason)
+            from .copy_gate import format_caption
+            note = format_caption(note)
             changed = bool((note or "").strip()) and note.strip() != before.strip()
             if changed:
                 from . import rotation as _rotation

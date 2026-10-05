@@ -45,7 +45,8 @@ class _DashRE:
     """Shim so _DASH_RE.search(text) delegates to copy_gate.violations."""
     def search(self, text):
         from . import copy_gate
-        return bool(copy_gate.violations(text or ""))
+        return any(v in {"banned_dash", "intraword_hyphen"}
+                   for v in copy_gate.violations(text or ""))
 
 _DASH_RE = _DashRE()
 

@@ -4870,3 +4870,9 @@ settled.
   ruling): backslash in any pinned field; non-scalar (dict/list) values. The
   `swap_media` / `_visual_media_cas` quoted-encoding
   scope note above is unchanged and still needs its own task.
+
+## Gym caption sentence spacing and semicolon rule (2026-10-05)
+
+- [~] New and edited calendar captions are formatted with one blank line between sentences. The shared copy gate rewrites semicolons in plain copy and treats any remaining semicolon as a publish violation. LASSO's approved copy bank punctuation was updated without changing claims.
+- [~] A tenant-scoped, before-caption CAS can reformat existing active pending feed rows only. It refuses held, Story, approved and published rows. No live calendar rows have been changed by this source patch.
+- [ ] Integrate, run the complete suite in a dependency-complete environment, deploy, audit the future fleet read-only, and apply/review any eligible CrossFit Local feed corrections. Story overlays need separate reburn review.

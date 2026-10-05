@@ -97,6 +97,28 @@ def test_violations_clean_text():
     assert v == []
 
 
+def test_semicolon_is_removed_by_house_scrub_and_rejected_if_unscrubbed():
+    assert copy_gate.scrub("Move well; build strength.") == "Move well, build strength."
+    assert "semicolon" in copy_gate.violations("Move well; build strength.")
+
+
+def test_caption_sentences_get_blank_line_without_changing_words():
+    raw = ("You're welcome here. Classes meet at 6.30 pm!\n"
+           "Dr. Lee coaches too.\n\nBook a class.\n#CrossFitLocal")
+    expected = ("You're welcome here.\n\nClasses meet at 6.30 pm!\n\n"
+                "Dr. Lee coaches too.\n\nBook a class.\n\n#CrossFitLocal")
+    assert copy_gate.format_caption(raw) == expected
+    assert copy_gate.format_caption(expected) == expected
+
+
+def test_caption_semicolon_and_inline_url():
+    assert copy_gate.format_caption(
+        "Ready to train; come see us. Visit https://example.com/classes."
+    ) == "Ready to train, come see us.\n\nVisit https://example.com/classes."
+    with pytest.raises(ValueError, match="protected URL"):
+        copy_gate.format_caption("Visit https://example.com/a;b for details.")
+
+
 # ---------------------------------------------------------------------------
 # 10. ASK_RE matches expected call-to-action phrases
 # ---------------------------------------------------------------------------

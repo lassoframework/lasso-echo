@@ -309,6 +309,10 @@ def plan_for(day_key, path=None, *, pillar=None):
         else:
             plan_category = "doctrine"
 
+    from .copy_gate import format_caption
+    raw_caption = format_caption(raw_caption)
+    raw_summary = format_caption(raw_summary)
+
     # Fragments: approved copy lines only + the citation anchor when a real
     # doctrine angle was found (citation is non-empty). The lasso_now fallback
     # is NOT added to fragments (it is not an approved copy line; it lives in

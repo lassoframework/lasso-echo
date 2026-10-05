@@ -142,7 +142,7 @@ Body: A more expensive lead that shows up is cheaper than a cheap lead that ghos
 ### Pillar: Book: Forms and Websites
 Source: The Full Gym, Chapter 5. Objection A5: "Facebook leads are junk."
 Hook: Facebook leads are not junk. Unmanaged leads are.
-Body: Sending traffic to a weak website doesn't improve lead quality; it kills conversion.
+Body: Sending traffic to a weak website doesn't improve lead quality. It kills conversion.
 Body: The most expensive lead is the one you get and then lose.
 
 ### Pillar: Book: Creative That Stops the Scroll
@@ -200,8 +200,8 @@ Body: People will pay for what is important to them.
 ### Pillar: Book: The Consultation
 Source: The Full Gym, Chapter 13.
 Hook: Silence is a sales skill.
-Body: Opinions can be debated; data cannot.
-Body: It's not about where you're starting; it's about where you're going.
+Body: Opinions can be debated. Data cannot.
+Body: It's not about where you're starting. It's about where you're going.
 
 ### Pillar: Book: The Gym Floor Goldmine
 Source: The Full Gym, Chapter 14.
@@ -218,7 +218,7 @@ Body: Your job isn't to lower the price. Your job is to raise the perceived valu
 
 ### Pillar: Book: Objection Handling
 Source: The Full Gym, Chapter 16.
-Hook: Objections are not rejection; they're signals.
+Hook: Objections are not rejection. They're signals.
 Body: No one likes being sold to, but everyone loves buying.
 Body: There's always someone who can do it cheaper, but not necessarily better.
 
@@ -226,14 +226,14 @@ Body: There's always someone who can do it cheaper, but not necessarily better.
 Source: The Full Gym, Chapter 17.
 Hook: The lead you keep avoiding calling might be your biggest client of the year.
 Hook: Every call has one goal: book the appointment.
-Body: Following up is not an interruption to the business; it is a central part of it.
+Body: Following up is not an interruption to the business. It is a central part of it.
 Body: Smile while talking. People can sense it.
 
 ### Pillar: Book: A Process for Your Team
 Source: The Full Gym, Chapter 18. Objection A14: "sales only works when I do it."
 Hook: Sales only works when you do it? Then you have a gift, not a system.
 Body: A process creates predictability. Without a defined system, results depend on the individual.
-Body: A sales system isn't about replacing the owner; it's about freeing the owner to lead.
+Body: A sales system isn't about replacing the owner. It's about freeing the owner to lead.
 
 ### Pillar: Book: Role Play
 Source: The Full Gym, Chapter 19.

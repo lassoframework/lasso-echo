@@ -549,6 +549,45 @@ def test_patch_caption_cross_gym_returns_none(monkeypatch):
     assert result is None
 
 
+def test_existing_pending_feed_caption_correction_uses_exact_cas(monkeypatch):
+    before = "Start here. Meet your coach; book a class."
+    after = "Start here.\n\nMeet your coach, book a class."
+    current = {"id": "row-1", "gym_id": "crossfitlocal", "status": "pending",
+               "variant_status": "active", "format": "feed",
+               "post_date": "2026-10-12", "caption": before,
+               "media_not_ready_reason": None, "published_at": None}
+    http = _FakeHTTP(patch_resp=_Resp(200, [dict(current, caption=after)]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().format_pending_feed_caption_cas(
+        "crossfitlocal", current)
+    assert result["caption"] == after
+    method, _, params, _, payload = http.calls[0]
+    assert method == "patch"
+    assert params["caption"] == f"eq.{before}"
+    assert params["gym_id"] == "eq.crossfitlocal"
+    assert params["status"] == "eq.pending"
+    assert params["media_not_ready_reason"] == "is.null"
+    assert payload == {"caption": after}
+
+
+@pytest.mark.parametrize("change", [
+    {"status": "approved"}, {"format": "story"},
+    {"media_not_ready_reason": "needs media"}, {"gym_id": "other"},
+])
+def test_existing_caption_correction_refuses_owned_or_held_rows(monkeypatch, change):
+    current = {"id": "row-1", "gym_id": "crossfitlocal", "status": "pending",
+               "variant_status": "active", "format": "feed",
+               "post_date": "2026-10-12", "caption": "One. Two.",
+               "media_not_ready_reason": None, "published_at": None}
+    current.update(change)
+    http = _FakeHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    assert pcs.SupabaseCalendarStore().format_pending_feed_caption_cas(
+        "crossfitlocal", current) is None
+    assert http.calls == []
+
+
 # ---- patch_media: backfill a stale image-less arc row (Pete/Zanshin, 2026-08-31) --
 
 def test_patch_media_recovers_held_row_with_image_and_asset(monkeypatch):
