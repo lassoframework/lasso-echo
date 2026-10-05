@@ -577,9 +577,9 @@ class SupabaseCalendarStore:
                 # The asset/Drive identity attests A, not input rendition B.
                 candidate["source_media_asset_id"] = None
                 candidate["drive_file_id"] = None
-            prepared = visual_writer_prepare.prepare(
+            prepared = self._calendar_visual_payload(visual_writer_prepare.prepare(
                 self, account_key, candidate, render_evidence=render_evidence,
-                poster_render_evidence=poster_render_evidence)
+                poster_render_evidence=poster_render_evidence))
             if (current.get("visual_group_key")
                     and prepared["visual_group_key"] != current["visual_group_key"]):
                 raise visual_writer_prepare.VisualPreparationError(
@@ -614,9 +614,9 @@ class SupabaseCalendarStore:
         candidate = dict(current)
         candidate.update(patch)
         candidate.pop("visual_group_key", None)
-        prepared = visual_writer_prepare.prepare(
+        prepared = self._calendar_visual_payload(visual_writer_prepare.prepare(
             self, account_key, candidate, render_evidence=render_evidence,
-            poster_render_evidence=poster_render_evidence)
+            poster_render_evidence=poster_render_evidence))
         patch["visual_group_key"] = prepared["visual_group_key"]
         patch["byte_hash"] = prepared["byte_hash"]
         return patch
@@ -756,9 +756,22 @@ class SupabaseCalendarStore:
                     or evidence.get("delivered_exact_url") != row.get("image_url")):
                 raise visual_writer_prepare.VisualPreparationError(
                     "render evidence does not bind the scoped media replacement")
-        return visual_writer_prepare.prepare(
+        prepared = visual_writer_prepare.prepare(
             self, account_key, row, render_evidence=render_evidence,
             poster_render_evidence=poster_render_evidence)
+        return self._calendar_visual_payload(prepared)
+
+    @staticmethod
+    def _calendar_visual_payload(prepared):
+        """Keep durable preparation receipts out of content_calendar writes.
+
+        ``scene_candidate`` is registered through its owner-only RPC during
+        preparation. It is transport metadata rather than a content_calendar
+        column, so forwarding it to PostgREST would reject an otherwise valid
+        prepared insert or patch.
+        """
+        return {key: value for key, value in prepared.items()
+                if key != "scene_candidate"}
 
     def _prepare_visual_replacement(self, account_key, current, payload,
                                     render_evidence=None, poster_render_evidence=None):
@@ -772,9 +785,11 @@ class SupabaseCalendarStore:
                 "replacement requires an explicit source; existing raw source cannot be discarded")
         new_source = patch.get("source_media_url")
         same_source = bool(new_source) and new_source == current.get("source_media_url")
+        new_asset_id = patch.get("source_media_asset_id", current.get("source_media_asset_id"))
+        same_asset = new_asset_id == current.get("source_media_asset_id")
         for field in ("source_media_url", "source_media_asset_id", "drive_file_id",
                       "byte_hash", "r2_key", "source_media_content_hash"):
-            if field == "source_media_content_hash" and same_source:
+            if field == "source_media_content_hash" and same_source and same_asset:
                 # Source unchanged (e.g. a no-image backfill retaining its raw
                 # source): the old Drive byte identity still proves origin.
                 continue

@@ -819,3 +819,58 @@ def test_replacement_payload_clears_a_stale_content_hash(armed, monkeypatch):
         KEY, "row-1", {"image_url": FINAL}, current=current)
     assert payload["source_media_url"] is None
     assert payload["source_media_content_hash"] is None
+
+
+def test_same_source_with_a_new_asset_clears_the_old_content_hash(armed, monkeypatch):
+    monkeypatch.setattr(
+        prep, "prepare",
+        lambda _store, _key, row, **_kwargs: {**row, "visual_group_key": "vg_scene",
+                                                "byte_hash": "derived:test"})
+    current = calendar_row(source_media_url=RAW, source_media_asset_id="asset-old",
+                           drive_file_id="asset-old", source_media_content_hash=HASH)
+    payload = store(HTTP(current=current))._prepare_visual_replacement(
+        KEY, current,
+        {"image_url": FINAL, "source_media_url": RAW,
+         "source_media_asset_id": "asset-new", "drive_file_id": "asset-new"},
+        evidence())
+    assert payload["source_media_asset_id"] == "asset-new"
+    assert payload["source_media_content_hash"] is None
+
+
+def _prepared_with_scene_candidate(_store, _key, row, **_kwargs):
+    return {**row, "visual_group_key": "vg_scene", "byte_hash": "derived:test",
+            "scene_candidate": {"candidate_id": "33333333-3333-4333-8333-333333333333",
+                                "usage_claimed": False}}
+
+
+def _calendar_write_payloads(http):
+    writes = [call[-1] for call in http.calls
+              if call[1] == "content_calendar" and call[0] in ("post", "patch")]
+    return [row for payload in writes for row in (payload if isinstance(payload, list) else [payload])]
+
+
+@pytest.mark.parametrize("boundary", ["patch_media", "swap_media", "candidate", "insert_rows"])
+def test_prepared_scene_candidate_never_reaches_shared_calendar_writes(
+        armed, staging, monkeypatch, boundary):
+    monkeypatch.setattr(prep, "prepare", _prepared_with_scene_candidate)
+    http = HTTP(current=calendar_row(image_url=""))
+    assert write(boundary, http, evidence())
+    assert _calendar_write_payloads(http)
+    assert all("scene_candidate" not in payload for payload in _calendar_write_payloads(http))
+
+
+def test_prepared_scene_candidate_never_reaches_patch_image_write(armed, monkeypatch):
+    monkeypatch.setattr(prep, "prepare", _prepared_with_scene_candidate)
+    http = HTTP(current=calendar_row(format="story", source_media_url=RAW))
+    assert store(http).patch_image_url(KEY, "row-1", FINAL, render_evidence=evidence())
+    assert _calendar_write_payloads(http)
+    assert all("scene_candidate" not in payload for payload in _calendar_write_payloads(http))
+
+
+def test_prepared_scene_candidate_never_reaches_feed_rehost_patch(armed, monkeypatch):
+    monkeypatch.setattr(prep, "prepare", _prepared_with_scene_candidate)
+    http = HTTP(current=calendar_row(format="feed", image_url=RAW, source_media_url=RAW))
+    assert store(http).patch_image_url(
+        KEY, "row-1", FINAL, render_evidence=evidence(operation="rehost"))
+    assert _calendar_write_payloads(http)
+    assert all("scene_candidate" not in payload for payload in _calendar_write_payloads(http))
