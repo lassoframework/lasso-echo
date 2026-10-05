@@ -2827,13 +2827,15 @@ def test_story_row_with_semicolon_is_held_until_media_is_corrected(armed, monkey
     assert store.rows["story1"]["caption"] == story_caption
 
 
-# ---- paired Story source-proof recheck after caption cleanup (PR29705) ------
+# ---- paired Story source-integrity hold after caption cleanup (PR29705) -----
 # The paired feed gate proves the Story source over the caption as read, then
 # the meta-strip / semicolon auto-heal can legitimately change that caption.
-# The proof must be re-measured on the FINAL cleaned row before any claim or
-# network call; an unchanged caption must not pay a second RPC.
+# The prepared Story was bound to the PRE-cleanup caption and the proof is by
+# feed ID only, so a changed caption is ALWAYS held (waiting, unclaimed) -- a
+# second ID-only proof could pass against stale DB text. An unchanged caption
+# pays no second RPC and publishes.
 
-def test_lasso_feed_rechecks_paired_proof_after_caption_cleanup(armed, monkeypatch):
+def test_lasso_feed_caption_change_after_proof_holds_without_recheck(armed, monkeypatch):
     monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
     monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
     row = _row("recheck-feed", post_date="2026-10-05",
@@ -2841,9 +2843,9 @@ def test_lasso_feed_rechecks_paired_proof_after_caption_cleanup(armed, monkeypat
     row["slot_index"] = 0
     store = _PreservingStore([row])
     proofs = []
-    # First proof (pre-cleanup) passes; the recheck on the cleaned caption fails.
+    # The ID-only proof is rigged ALWAYS true; the hold must not consult it.
     monkeypatch.setattr(store, "lasso_paired_story_ready_for_feed",
-                        lambda _: proofs.append(1) or len(proofs) == 1,
+                        lambda _: proofs.append(1) or True,
                         raising=False)
     failures = []
     monkeypatch.setattr(cap, "_note_repeat_failure",
@@ -2857,11 +2859,52 @@ def test_lasso_feed_rechecks_paired_proof_after_caption_cleanup(armed, monkeypat
     assert result["waiting"] == ["recheck-feed"]
     assert store.publishing_calls == []          # never claimed
     assert pub.calls == []                       # no network call
-    assert len(proofs) == 2, "the proof must be re-measured on the cleaned caption"
+    assert len(proofs) == 1, "a changed caption holds; only the first proof runs"
     assert failures == [("recheck-feed", "lasso",
                          "paired Story source proof invalid after caption "
                          "cleanup; feed remains held")]
     assert store.rows["recheck-feed"]["status"] == "pending"
+
+
+def test_lasso_feed_caption_change_holds_even_when_persistence_fails(armed, monkeypatch):
+    """The lead's counterexample: the persistence patch FAILS (DB keeps the old
+    caption), so an ID-only recheck would return true against text the outgoing
+    caption no longer matches. The row must still hold with no claim/network."""
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
+    row = _row("unpersisted-feed", post_date="2026-10-05",
+               caption="Move well; build strength with us today.")
+    row["slot_index"] = 0
+
+    class _FailingPatchStore(_FakeStore):
+        def patch_caption_preserve_status(self, gym_id, row_id, new_caption):
+            raise OSError("store unavailable")   # DB keeps the OLD caption
+
+    store = _FailingPatchStore([row])
+    proofs = []
+    monkeypatch.setattr(store, "lasso_paired_story_ready_for_feed",
+                        lambda _: proofs.append(1) or True,   # always true
+                        raising=False)
+    failures = []
+    monkeypatch.setattr(cap, "_note_repeat_failure",
+                        lambda rid, gym, exc: failures.append((rid, gym, str(exc))))
+    pub = _FakePublisher()
+
+    result = cap.publish_due("2026-10-05", store=store, publisher=pub,
+                             now="2026-10-05T23:59:00-04:00", catch_all=True)
+
+    assert result["published"] == []
+    assert result["waiting"] == ["unpersisted-feed"]
+    assert store.publishing_calls == []
+    assert pub.calls == []
+    assert len(proofs) == 1
+    assert failures == [("unpersisted-feed", "lasso",
+                         "paired Story source proof invalid after caption "
+                         "cleanup; feed remains held")]
+    # The failed patch means the DB row still carries the pre-cleanup caption.
+    assert store.rows["unpersisted-feed"]["caption"] == \
+        "Move well; build strength with us today."
+    assert store.rows["unpersisted-feed"]["status"] == "pending"
 
 
 def test_lasso_feed_with_unchanged_caption_pays_no_second_proof(armed, monkeypatch):

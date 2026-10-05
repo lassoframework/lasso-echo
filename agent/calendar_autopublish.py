@@ -1513,15 +1513,18 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             continue
         row = formatted
 
-        # SOURCE-INTEGRITY RECHECK (PR29705 review). Cleanup above may have
-        # changed the caption AFTER the paired-Story source proof was measured.
-        # A proof taken over the old text says nothing about the final send, so
-        # re-prove against the cleaned row BEFORE the claim; a failed recheck
-        # leaves the row waiting and unclaimed via the existing repeated-
-        # failure note. Unchanged caption: no second RPC.
+        # SOURCE-INTEGRITY HOLD (PR29705 review, lead counterexample). Cleanup
+        # above may have changed the caption AFTER the paired-Story source proof
+        # was measured. The prepared Story was bound to the PRE-cleanup caption,
+        # and _paired_lasso_story_prepared proves by feed ID only -- a second
+        # ID-only proof can return true while the outgoing caption differs from
+        # what the Story was bound to (e.g. the persistence patch failed and the
+        # DB still holds the old text). So a changed caption is ALWAYS held
+        # here, waiting and unclaimed, via the existing repeated-failure note;
+        # the next preparation tick repairs against the persisted cleanup.
+        # Unchanged caption: no second RPC, no behavior change.
         if (paired_lasso_feed
-                and str(row.get("caption") or "") != str(paired_proven_caption or "")
-                and not _paired_lasso_story_prepared(row, store)):
+                and str(row.get("caption") or "") != str(paired_proven_caption or "")):
             _note_repeat_failure(row_id, gym_id, RuntimeError(
                 "paired Story source proof invalid after caption cleanup; "
                 "feed remains held"))
