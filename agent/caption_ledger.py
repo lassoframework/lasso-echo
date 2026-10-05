@@ -175,6 +175,86 @@ def is_blocked(gym_id: str, caption_text: str, planned_date: str,
             or is_verbatim_blocked(gym_id, caption_text, planned_date, db=db))
 
 
+def is_blocked_strict(gym_id: str, caption_text: str, planned_date: str,
+                      db=None) -> bool:
+    """Fail-closed check for autonomous LASSO caption repairs.
+
+    The ordinary planner's checks deliberately fail open on KV errors. A
+    repair must never replace an already prepared caption when the durable
+    ledger cannot be read or contains malformed data.
+    """
+    _db = db if db is not None else _default_db()
+    if db is None and not _db.kv_is_durable():
+        raise RuntimeError("caption ledger is not durable")
+    planned = date.fromisoformat(planned_date)
+    if not str(caption_text or "").strip():
+        raise ValueError("empty caption")
+    raw = _kv_get(_db, ledger_key(gym_id, caption_hash(caption_text)))
+    if raw:
+        record = json.loads(raw)
+        if not isinstance(record, dict):
+            raise ValueError("malformed fuzzy caption ledger")
+        last_used = record.get("last_used")
+        if last_used:
+            used = date.fromisoformat(str(last_used))
+            if used != planned and (
+                (HARD_BLOCK_SAME_MONTH and used.year == planned.year
+                 and used.month == planned.month)
+                or abs((planned - used).days) < COOLDOWN_DAYS
+            ):
+                return True
+    raw = _kv_get(_db, verbatim_key(gym_id, verbatim_hash(caption_text)))
+    if raw:
+        record = json.loads(raw)
+        if not isinstance(record, dict) or not isinstance(record.get("dates"), list):
+            raise ValueError("malformed verbatim caption ledger")
+        for value in record["dates"]:
+            used = date.fromisoformat(str(value))
+            if used != planned and abs((planned - used).days) < VERBATIM_BLOCK_DAYS:
+                return True
+    return False
+
+
+def record_staged_strict(gym_id: str, caption_text: str, date_str: str,
+                         db=None) -> None:
+    """Record both ledger keys, propagating errors for the guarded repair."""
+    _db = db if db is not None else _default_db()
+    if db is None and not _db.kv_is_durable():
+        raise RuntimeError("caption ledger is not durable")
+    date.fromisoformat(date_str)
+    if not str(caption_text or "").strip():
+        raise ValueError("empty caption")
+    key = ledger_key(gym_id, caption_hash(caption_text))
+    raw = _kv_get(_db, key)
+    fuzzy = json.loads(raw) if raw else {"last_used": "", "uses": 0}
+    if not isinstance(fuzzy, dict):
+        raise ValueError("malformed fuzzy caption ledger")
+    if not fuzzy.get("last_used") or date_str > str(fuzzy["last_used"]):
+        fuzzy["last_used"] = date_str
+    fuzzy["uses"] = int(fuzzy.get("uses", 0)) + 1
+    _kv_set(_db, key, json.dumps(fuzzy))
+    key = verbatim_key(gym_id, verbatim_hash(caption_text))
+    raw = _kv_get(_db, key)
+    verbatim = json.loads(raw) if raw else {"dates": [], "uses": 0}
+    if not isinstance(verbatim, dict) or not isinstance(verbatim.get("dates"), list):
+        raise ValueError("malformed verbatim caption ledger")
+    dates = [str(value) for value in verbatim["dates"]]
+    if date_str not in dates:
+        dates.append(date_str)
+    verbatim["dates"] = sorted(dates)[-_VERBATIM_MAX_DATES:]
+    verbatim["uses"] = int(verbatim.get("uses", 0)) + 1
+    _kv_set(_db, key, json.dumps(verbatim))
+    # A write API returning normally is insufficient for an autonomous swap.
+    # Confirm the durable record is readable before the caller changes copy.
+    stored = json.loads(_kv_get(_db, key))
+    if date_str not in stored.get("dates", []):
+        raise RuntimeError("caption verbatim ledger stamp missing")
+    fuzzy_stored = json.loads(_kv_get(
+        _db, ledger_key(gym_id, caption_hash(caption_text))))
+    if not fuzzy_stored.get("last_used"):
+        raise RuntimeError("caption fuzzy ledger stamp missing")
+
+
 def _record_verbatim(gym_id: str, caption_text: str, date_str: str, db_obj) -> None:
     """Append date_str to the verbatim record's bounded dates list. Empty
     captions are never recorded. Never raises (callers already swallow, this

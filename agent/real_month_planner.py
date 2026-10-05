@@ -1516,7 +1516,8 @@ def plan_span_months(start_date, days=30):
     return sorted(months)
 
 
-def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
+def apply_month_plan(account_key, drafts, sb_store, *, span_months=None,
+                     preserve_existing=False):
     """Apply the real month plan through the injectable SupabaseCalendarStore:
     DELETE-then-INSERT, GYM SCOPED, across the full planned span.
 
@@ -1540,6 +1541,9 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
                 "upserted": 0, "deleted": 0}
     if account_key == config.demo_calendar_gym_id():
         return {"ok": False, "reason": "refusing to plan over the demo gym id",
+                "upserted": 0, "deleted": 0}
+    if preserve_existing and account_key != "lasso":
+        return {"ok": False, "reason": "preserve_existing is LASSO only",
                 "upserted": 0, "deleted": 0}
 
     # ASK COVERAGE (AGENT_ASK_COVERAGE, default OFF; LASSO/B2B lane only —
@@ -1674,6 +1678,32 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
     deleted = 0
     inserted = 0
     try:
+        if preserve_existing:
+            # Grade-fix refill is additive. Its fresh plan may be generated
+            # after an expensive visual review, so deleting pending rows would
+            # destroy the ready visual and its paired Story. A complete active
+            # read is mandatory; partial reads fail before any write.
+            complete = getattr(sb_store, "rows_in_range_complete", None)
+            if not callable(complete):
+                raise RuntimeError("complete LASSO calendar read unavailable")
+            existing = []
+            for month in months:
+                year, number = int(month[:4]), int(month[5:7])
+                existing.extend(complete(
+                    account_key, f"{month}-01",
+                    f"{month}-{monthrange(year, number)[1]:02d}"))
+            if not all(isinstance(r, dict) and r.get("gym_id") == account_key
+                       for r in existing):
+                raise RuntimeError("LASSO calendar read out of scope")
+            occupied_posts = {
+                (str(r.get("post_date") or "")[:10], r.get("slot_index") or 0)
+                for r in existing if r.get("status") not in ("denied", "killed")
+            }
+            # If even one sibling of a logical post exists, retain the entire
+            # prepared group. Only entirely empty day/ordinal groups refill.
+            rows = [r for r in rows
+                    if (str(r.get("post_date") or "")[:10],
+                        r.get("slot_index") or 0) not in occupied_posts]
         # PRESERVE APPROVALS: never overwrite a slot a human already approved/published.
         from .portal_calendar_store import preserve_and_prune
         rows, _locked = preserve_and_prune(sb_store, account_key, months, rows)
@@ -1734,9 +1764,10 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
                     "upserted": 0, "deleted": 0}
 
         delete_month = getattr(sb_store, "delete_month", None)
-        for month in months:
-            if delete_month is not None:
-                deleted += delete_month(account_key, month) or 0
+        if not preserve_existing:
+            for month in months:
+                if delete_month is not None:
+                    deleted += delete_month(account_key, month) or 0
         insert_rows = getattr(sb_store, "insert_rows", None)
         if insert_rows is not None and rows:
             saved_rows = insert_rows(account_key, rows) or []

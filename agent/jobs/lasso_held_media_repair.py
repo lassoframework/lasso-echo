@@ -17,6 +17,7 @@ from agent.infographic_artifacts import ArtifactStore
 from agent.portal_calendar_store import SupabaseCalendarStore
 
 HOLD_REASON = "cross_date_media_repeat_needs_new_visual"
+CAPTION_HOLD_REASON = "caption_changed_needs_new_visual"
 GYM = "lasso"
 ACCOUNTS = {"instagram": "lasso_ig", "facebook": "lasso_fb"}
 ACCOUNT = "lasso_ig"
@@ -47,16 +48,19 @@ def _row_account_key(row):
 
 
 def _eligible(row, first, last, account_key=ACCOUNT):
+    fmt = str((row or {}).get("format") or "").lower()
+    reason = (row or {}).get("media_not_ready_reason")
     return (isinstance(row, dict)
             and all(key in row for key in _CAS_COLUMNS)
             and row["gym_id"] == GYM
             and row["status"] == "pending"
             and row["variant_status"] == "active"
             and _row_account_key(row) == account_key
-            and str(row["format"] or "").lower() == "feed"
+            and (fmt == "feed" or (fmt == "story" and reason == CAPTION_HOLD_REASON))
             and first <= str(row["post_date"] or "")[:10] <= last
-            and row["media_not_ready_reason"] == HOLD_REASON
-            and isinstance(row["caption"], str) and bool(row["caption"].strip())
+            and reason in (HOLD_REASON, CAPTION_HOLD_REASON)
+            and isinstance(row["caption"], str)
+            and (fmt == "story" or bool(row["caption"].strip()))
             and isinstance(row["image_url"], str) and bool(row["image_url"].strip())
             and row["published_at"] is None and row["late_post_id"] is None
             and row["publish_claim_token"] is None
@@ -218,6 +222,43 @@ def _reuse_ig_for_fb(store, fb_row):
     return url, True
 
 
+def _paired_feed_for_story(store, story):
+    """Return the exact reviewed feed source; hold on ambiguity or stale media."""
+    day = str(story["post_date"])[:10]
+    logical_id = story.get("logical_post_id")
+    rows = (store.list_active_logical_post_rows(GYM, logical_id) if logical_id
+            else store.rows_in_range_repeat_hold(GYM, day, day))
+    if not isinstance(rows, list):
+        raise RuntimeError("paired Story feed read incomplete")
+    matches = [row for row in rows if isinstance(row, dict)
+               and row.get("gym_id") == GYM
+               and str(row.get("account") or "").lower() ==
+                   str(story.get("account") or "").lower()
+               and str(row.get("format") or "").lower() == "feed"
+               and row.get("variant_status") == "active"
+               and str(row.get("post_date") or "")[:10] == day
+               and row.get("slot_index") == story.get("slot_index")
+               and (not logical_id or row.get("logical_post_id") == logical_id)]
+    if len(matches) != 1:
+        return None
+    feed = matches[0]
+    if (feed.get("media_not_ready_reason") is not None
+            or feed.get("status") not in ("pending", "approved", "published")
+            or not isinstance(feed.get("caption"), str)
+            or not feed["caption"].strip()
+            or story.get("caption") not in ("", feed["caption"])):
+        return None
+    if not _same_row(feed, store.get_row(GYM, feed["id"])):
+        return None
+    source_id = f"content_calendar:{feed['id']}:caption"
+    source_hash = hashlib.sha256(feed["caption"].encode("utf-8")).hexdigest()
+    artifact = _reviewed_artifact_record(
+        store, source_id, source_hash, _row_account_key(feed))
+    if not artifact or artifact["image_url"] != feed.get("image_url"):
+        return None
+    return feed
+
+
 def _replace_exact(store, current, new_url, account_key=ACCOUNT):
     """Clear one hold only if every generation-relevant row field still matches."""
     if not _eligible(current, str(current["post_date"])[:10],
@@ -225,6 +266,9 @@ def _replace_exact(store, current, new_url, account_key=ACCOUNT):
         return None
     if not isinstance(new_url, str) or not new_url.startswith("https://"):
         return None
+    if (current["media_not_ready_reason"] == CAPTION_HOLD_REASON
+            and new_url == current["image_url"]):
+        return None  # a caption change needs a genuinely new reviewed visual
     params = {key: _eq(current[key]) for key in _CAS_COLUMNS}
     payload = {"image_url": new_url, "source_media_url": new_url,
                "source_media_asset_id": None,
@@ -255,7 +299,7 @@ def _replace_exact(store, current, new_url, account_key=ACCOUNT):
 
 def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         host_fn=None, max_per_day=MAX_PER_DAY, account_key=ACCOUNT):
-    """Repair at most three held feed visuals per date in this run."""
+    """Repair at most three held feeds and their three held Stories per date."""
     summary = {"ok": False, "attempted": 0, "generated": 0, "reused": 0,
                "repaired": 0, "skipped": 0, "errors": 0}
     if not (account_key in ACCOUNTS.values()
@@ -284,16 +328,30 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         return summary
     summary["ok"] = True
     rows = sorted((row for row in rows if _eligible(row, first, last, account_key)),
-                  key=lambda row: (row["post_date"], row.get("slot_index") or 0,
-                                   str(row["id"])))
-    per_day = {first: 0, last: 0}
+                  key=lambda row: (row["post_date"],
+                                   0 if row["format"] == "feed" else 1,
+                                   row.get("slot_index") or 0, str(row["id"])))
+    per_day = {}
     for row in rows:
         row_day = str(row["post_date"])[:10]
-        if per_day[row_day] >= max_per_day:
+        kind = str(row["format"]).lower()
+        count_key = (row_day, kind)
+        if per_day.get(count_key, 0) >= max_per_day:
             summary["skipped"] += 1
             continue
+        source_row = row
+        if kind == "story":
+            try:
+                feed = _paired_feed_for_story(store, row)
+            except Exception:
+                summary["errors"] += 1
+                continue
+            if feed is None:
+                summary["skipped"] += 1
+                continue
+            source_row = dict(row, caption=feed["caption"])
         source_id = f"content_calendar:{row['id']}:caption"
-        source_hash = hashlib.sha256(row["caption"].encode("utf-8")).hexdigest()
+        source_hash = hashlib.sha256(source_row["caption"].encode("utf-8")).hexdigest()
         # One distributed lease per row/caption serializes paid attempts.
         cache_key = "held-feed:" + hashlib.sha256(
             f"{source_id}:{source_hash}".encode("utf-8")).hexdigest()
@@ -305,13 +363,13 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
                 summary["skipped"] += 1
                 continue
             summary["attempted"] += 1
-            per_day[row_day] += 1
+            per_day[count_key] = per_day.get(count_key, 0) + 1
             fresh = store.get_row(GYM, row["id"])
             if not _same_row(row, fresh):
                 summary["skipped"] += 1
                 continue
             url = None
-            if account_key == ACCOUNTS["facebook"]:
+            if kind == "feed" and account_key == ACCOUNTS["facebook"]:
                 url, mirror_found = _reuse_ig_for_fb(store, row)
                 if mirror_found and not url:
                     summary["skipped"] += 1
@@ -323,12 +381,21 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
                 summary["reused"] += 1
             else:
                 result = variant_regen.generate_variant_image(
-                    row, account_key, generate_fn=generate_fn, host_fn=host_fn)
+                    source_row, account_key, generate_fn=generate_fn, host_fn=host_fn)
                 if not result.get("ok"):
                     summary["errors"] += 1
                     continue
                 url = result["image_url"]
                 summary["generated"] += 1
+            if row["media_not_ready_reason"] == CAPTION_HOLD_REASON:
+                reviewed = _reviewed_artifact_record(
+                    store, source_id, source_hash, account_key)
+                if not reviewed or reviewed["image_url"] != url:
+                    summary["errors"] += 1
+                    continue
+            if kind == "story" and _paired_feed_for_story(store, row) is None:
+                summary["skipped"] += 1
+                continue
             fresh = store.get_row(GYM, row["id"])
             if not _same_row(row, fresh):
                 summary["skipped"] += 1

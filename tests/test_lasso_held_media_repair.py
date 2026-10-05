@@ -335,6 +335,87 @@ def test_disarmed_repair_never_reads_or_generates(monkeypatch):
     assert store.patches == []
 
 
+def test_caption_change_rebuilds_feed_then_paired_story_from_same_source(monkeypatch):
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair.infographic_evidence, "brain_snapshot",
+                        lambda: {"source": "hash"})
+    logical_id = "11111111-1111-4111-8111-111111111111"
+    feed = _row("feed", caption="New approved source copy.",
+                logical_post_id=logical_id,
+                media_not_ready_reason=repair.CAPTION_HOLD_REASON)
+    story = _row("story", format="story", caption="", logical_post_id=logical_id,
+                 media_not_ready_reason=repair.CAPTION_HOLD_REASON)
+    store, artifacts = _Store([feed, story]), _Artifacts()
+    generated = []
+    def fake_generate(row, account, **kwargs):
+        generated.append((row["id"], row["caption"], row["format"]))
+        url = f"https://new.example/{row['id']}.png"
+        source_id = f"content_calendar:{row['id']}:caption"
+        source_hash = repair.hashlib.sha256(row["caption"].encode()).hexdigest()
+        store.cache[(repair._eq(source_id), repair._eq(source_hash))] = [{
+            "image_url": url,
+            "source_identity": {"source_id": source_id, "source_hash": source_hash},
+            "evidence": {"policy_version": repair.infographic_evidence.POLICY_VERSION,
+                         "brain_snapshot": {"source": "hash"},
+                         "brief_model": "gpt-6-astra", "grade_status": "PASS",
+                         "image_sha256": "reviewed-hash", "review_response_id": "review"},
+        }]
+        return {"ok": True, "image_url": url}
+    monkeypatch.setattr(variant_regen, "generate_variant_image", fake_generate)
+
+    out = repair.run(store=store, artifact_store=artifacts)
+    assert out["repaired"] == out["generated"] == 2
+    assert generated == [("feed", feed["caption"], "feed"),
+                         ("story", feed["caption"], "story")]
+    assert store.rows["feed"]["media_not_ready_reason"] is None
+    assert store.rows["story"]["media_not_ready_reason"] is None
+    assert store.rows["story"]["caption"] == ""
+    assert store.rows["story"]["image_url"].endswith("/story.png")
+
+
+def test_caption_story_stays_held_while_feed_or_review_is_unready(monkeypatch):
+    _armed(monkeypatch)
+    feed = _row("feed", caption="New approved source copy.",
+                media_not_ready_reason=repair.CAPTION_HOLD_REASON)
+    story = _row("story", format="story", caption="",
+                 media_not_ready_reason=repair.CAPTION_HOLD_REASON)
+    store, artifacts = _Store([feed, story]), _Artifacts()
+    monkeypatch.setattr(variant_regen, "generate_variant_image",
+                        lambda row, account, **kw: {"ok": True,
+                        "image_url": f"https://new.example/{row['id']}.png"})
+    out = repair.run(store=store, artifact_store=artifacts)
+    assert out["repaired"] == 0
+    assert store.rows["feed"]["media_not_ready_reason"] == repair.CAPTION_HOLD_REASON
+    assert store.rows["story"]["media_not_ready_reason"] == repair.CAPTION_HOLD_REASON
+    assert len(store.patches) == 0
+
+
+def test_caption_hold_cannot_clear_by_reusing_the_old_visual(monkeypatch):
+    _armed(monkeypatch)
+    row = _row("feed", media_not_ready_reason=repair.CAPTION_HOLD_REASON)
+    store = _Store([row])
+    assert repair._replace_exact(store, row, row["image_url"]) is None
+    assert store.patches == []
+
+
+def test_story_needs_its_own_review_even_after_feed_is_ready(monkeypatch):
+    _armed(monkeypatch)
+    caption = "New approved source copy."
+    feed = _row("feed", caption=caption, image_url="https://new.example/feed.png",
+                media_not_ready_reason=None)
+    story = _row("story", format="story", caption="",
+                 media_not_ready_reason=repair.CAPTION_HOLD_REASON)
+    store, artifacts = _Store([feed, story]), _Artifacts()
+    _reviewed_ig_artifact(monkeypatch, store, feed)
+    monkeypatch.setattr(variant_regen, "generate_variant_image",
+                        lambda row, account, **kw: {"ok": True,
+                        "image_url": "https://new.example/story.png"})
+    out = repair.run(store=store, artifact_store=artifacts)
+    assert out["generated"] == 1 and out["repaired"] == 0
+    assert store.rows["story"]["media_not_ready_reason"] == repair.CAPTION_HOLD_REASON
+    assert store.patches == []
+
+
 def test_daily_runner_repairs_ahead_of_drafting_even_if_voice_is_missing(monkeypatch):
     from agent import runner
     monkeypatch.setattr(runner.config, "master_enabled", lambda: True)

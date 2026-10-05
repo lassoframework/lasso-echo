@@ -1528,6 +1528,34 @@ class SupabaseCalendarStore:
             raise ValueError("pending media read scope mismatch")
         return rows
 
+    def active_rows_on_day_complete(self, account_key, day):
+        """Exact-count read of every active status for a caption/Story swap.
+
+        The general forward-book read omits draft and queued rows. A stale
+        paired Story in either state must still receive a media hold before
+        its feed caption changes.
+        """
+        response = self._client().get(
+            self._rest(_TABLE),
+            params={"gym_id": f"eq.{account_key}", "post_date": f"eq.{day}",
+                    "variant_status": "eq.active", "select": "*",
+                    "limit": "1000", "order": "id"},
+            headers=self._headers({"Prefer": "count=exact"}), timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code,
+                                   _scrub((response.text or "")[:200]))
+        rows = response.json()
+        total = (getattr(response, "headers", {}) or {}).get(
+            "Content-Range", "").rsplit("/", 1)[-1]
+        if (not isinstance(rows, list) or not total.isdigit()
+                or int(total) != len(rows)
+                or any(not isinstance(row, dict)
+                       or row.get("gym_id") != account_key
+                       or str(row.get("post_date") or "")[:10] != day
+                       or row.get("variant_status") != "active" for row in rows)):
+            raise ValueError("paired Story read incomplete")
+        return rows
+
     # ---- variant pairing (0318): v2 creative candidates -----------------------
     # A "logical post" can have MORE THAN ONE content_calendar row once this
     # ships: exactly one 'active' row (the live/publishing creative) plus zero
@@ -3469,7 +3497,8 @@ class SupabaseCalendarStore:
         return None
 
     def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None,
-                           levers=None):
+                           levers=None, expected_row=None,
+                           force_caption_visual_hold=False):
         """PATCH a WIPEABLE row's caption and/or pillar (the grade self-fix lane,
         AGENT_GRADE_SELF_FIX), filtered by id AND gym_id AND a server-side
         status IN (pending,draft,queued) guard, so a human-owned row (approved /
@@ -3501,6 +3530,18 @@ class SupabaseCalendarStore:
         for key, value in (levers or {}).items():
             if key in _LEVER_COLUMNS and value is not None:
                 fields[key] = value
+        caption_visual_hold = (
+            account_key == "lasso" and expected_row is not None
+            and ((caption is not None and caption != expected_row.get("caption"))
+                 or force_caption_visual_hold))
+        if caption_visual_hold:
+            if (expected_row.get("media_not_ready_reason") not in
+                    (None, "caption_changed_needs_new_visual",
+                     "cross_date_media_repeat_needs_new_visual")):
+                return None
+            # Set in the SAME PostgREST PATCH as the new caption. The old image
+            # is never publishable even if the runner sees this row immediately.
+            fields["media_not_ready_reason"] = "caption_changed_needs_new_visual"
         if not fields:
             return None
         fields["status"] = "pending"
@@ -3509,6 +3550,29 @@ class SupabaseCalendarStore:
             "gym_id": f"eq.{account_key}",
             "status": f"in.({','.join(_WIPEABLE_STATUSES)})",
         }
+        if expected_row is not None:
+            # Autonomous caption repair must target the exact active generation.
+            # A late publisher, visual swap, or concurrent rewrite makes the
+            # compare-and-swap return zero rows instead of clobbering its work.
+            if (str(expected_row.get("id")) != str(row_id)
+                    or str(expected_row.get("gym_id")) != str(account_key)
+                    or expected_row.get("status") not in _WIPEABLE_STATUSES
+                    or expected_row.get("variant_status") != "active"
+                    or not expected_row.get("created_at")):
+                return None
+            for column in ("post_date", "account", "format", "slot_index",
+                           "logical_post_id", "created_at", "caption", "image_url",
+                           "source_media_url", "thumbnail_url",
+                           "media_not_ready_reason", "source_media_asset_id",
+                           "published_at", "late_post_id", "publish_claim_token",
+                           "publish_reservation_day", "scheduled_at"):
+                value = expected_row.get(column)
+                encoded = _eq_filter(value)
+                if encoded is None:
+                    return None
+                params[column] = encoded
+            params["status"] = f"eq.{expected_row['status']}"
+            params["variant_status"] = "eq.active"
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -3522,7 +3586,15 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         for row in (r.json() or []):
-            if str(row.get("gym_id")) == str(account_key):
+            if (str(row.get("gym_id")) == str(account_key)
+                    and (expected_row is None or (
+                        str(row.get("id")) == str(row_id)
+                        and ("caption" not in fields or
+                             row.get("caption") == fields["caption"])
+                        and (not caption_visual_hold or
+                             row.get("media_not_ready_reason") ==
+                             "caption_changed_needs_new_visual")
+                        and row.get("status") == "pending"))):
                 return row
         return None
 
