@@ -778,6 +778,11 @@ def _strip_or_hold_meta(row, gym_id, store):
         return row
     if not (body or "").strip():
         return None
+    from .copy_gate import format_caption
+    try:
+        body = format_caption(body)
+    except ValueError:
+        return None
     patched = None
     try:
         patcher = getattr(store, "patch_caption_preserve_status", None)

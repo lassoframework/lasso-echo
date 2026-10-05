@@ -267,10 +267,11 @@ def test_publish_lane_strips_clean_meta_suffix_and_publishes_body(_armed):
     assert summary["published"] == ["r1"]
     # the OUTBOUND caption is the clean body — the rationale never hit the network
     assert len(pub.calls) == 1
-    assert pub.calls[0].caption == CLEAN_BODY
+    from agent.copy_gate import format_caption
+    assert pub.calls[0].caption == format_caption(CLEAN_BODY)
     assert "[why]" not in pub.calls[0].caption.lower()
     # and the stored caption was cleaned through the status-preserving patch
-    assert store.preserve_patches == [("lasso", "r1", CLEAN_BODY)]
+    assert store.preserve_patches == [("lasso", "r1", format_caption(CLEAN_BODY))]
 
 
 def test_publish_lane_holds_all_meta_caption(_armed):
@@ -294,7 +295,18 @@ def test_publish_lane_strip_survives_a_store_without_the_patch_method(_armed):
     pub = _FakePublisher()
     summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert summary["published"] == ["r3"]
-    assert pub.calls[0].caption == CLEAN_BODY
+    from agent.copy_gate import format_caption
+    assert pub.calls[0].caption == format_caption(CLEAN_BODY)
+
+
+def test_meta_strip_formats_local_send_even_if_patch_fails():
+    class _FailedPatch:
+        def patch_caption_preserve_status(self, *args):
+            raise RuntimeError("offline patch failed")
+
+    row = _row("r4", "Start here. Meet your coach; book a class. [why] test note")
+    cleaned = cap._strip_or_hold_meta(row, "lasso", _FailedPatch())
+    assert cleaned["caption"] == "Start here.\n\nMeet your coach, book a class."
 
 
 def test_gbp_worker_strips_meta_suffix_before_send():

@@ -549,6 +549,18 @@ def test_patch_caption_cross_gym_returns_none(monkeypatch):
     assert result is None
 
 
+def test_specialized_caption_patches_format_before_write(monkeypatch):
+    http = _FakeHTTP(patch_resp=_Resp(200, [_row("id-c", gym_id="lasso")]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    store = pcs.SupabaseCalendarStore()
+    store.patch_caption_preserve_status("lasso", "id-c", "One. Two; three.")
+    store.patch_caption_for_hashtag_backfill(
+        "lasso", "id-c", "One. Two; three.", expected_status="approved")
+    expected = "One.\n\nTwo, three."
+    assert http.calls[0][4] == {"caption": expected}
+    assert http.calls[1][4] == {"caption": expected, "status": "pending"}
+
+
 def test_existing_pending_feed_caption_correction_uses_exact_cas(monkeypatch):
     before = "Start here. Meet your coach; book a class."
     after = "Start here.\n\nMeet your coach, book a class."

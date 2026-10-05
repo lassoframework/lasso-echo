@@ -1804,6 +1804,7 @@ class SupabaseCalendarStore:
         server-side race guard as patch_caption (never touches a row mid-publish or
         already published). Returns the updated row dict, or None when zero rows
         matched."""
+        from .copy_gate import format_caption
         params = {
             "id": f"eq.{row_id}",
             "gym_id": f"eq.{account_key}",
@@ -1816,7 +1817,7 @@ class SupabaseCalendarStore:
                 "Content-Type": "application/json",
                 "Prefer": "return=representation",
             }),
-            json={"caption": new_caption},
+            json={"caption": format_caption(new_caption)},
             timeout=30,
         )
         if r.status_code >= 400:
@@ -1847,7 +1848,8 @@ class SupabaseCalendarStore:
             "late_post_id": "is.null",
             "variant_status": "eq.active",
         }
-        payload = {"caption": new_caption}
+        from .copy_gate import format_caption
+        payload = {"caption": format_caption(new_caption)}
         if expected == "approved":
             payload["status"] = "pending"
         r = self._client().patch(
@@ -3545,6 +3547,8 @@ class SupabaseCalendarStore:
                 or current.get("format") != "feed"
                 or current.get("media_not_ready_reason") is not None
                 or current.get("published_at") is not None
+                or current.get("late_post_id") is not None
+                or current.get("publish_claim_token") is not None
                 or not current.get("id") or not current.get("post_date")):
             return None
         before = current.get("caption")
@@ -3558,7 +3562,12 @@ class SupabaseCalendarStore:
                            ("status", "pending"), ("variant_status", "active"),
                            ("format", "feed"), ("post_date", current["post_date"]),
                            ("caption", before), ("media_not_ready_reason", None),
-                           ("published_at", None)):
+                           ("published_at", None), ("late_post_id", None),
+                           ("publish_claim_token", None),
+                           *((key, current[key]) for key in (
+                               "account", "image_url", "source_media_url",
+                               "source_media_asset_id", "created_at")
+                             if key in current)):
             encoded = _eq_filter(value)
             if encoded is None:
                 raise ValueError(f"cannot safely compare {key} for caption correction")

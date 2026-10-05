@@ -4875,4 +4875,5 @@ settled.
 
 - [~] New and edited calendar captions are formatted with one blank line between sentences. The shared copy gate rewrites semicolons in plain copy and treats any remaining semicolon as a publish violation. LASSO's approved copy bank punctuation was updated without changing claims.
 - [~] A tenant-scoped, before-caption CAS can reformat existing active pending feed rows only. It refuses held, Story, approved and published rows. No live calendar rows have been changed by this source patch.
+- [~] `scripts/audit_gym_caption_format.py` audits the complete paginated future book without exposing caption text. Optional `--apply` requires a matching target digest and new private receipt, and verifies every changed row after its exact CAS. The operator command has only been tested offline.
 - [ ] Integrate, run the complete suite in a dependency-complete environment, deploy, audit the future fleet read-only, and apply/review any eligible CrossFit Local feed corrections. Story overlays need separate reburn review.
