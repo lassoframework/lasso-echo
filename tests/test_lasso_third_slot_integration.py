@@ -64,7 +64,7 @@ def test_real_calendar_mirror_preserves_third_slot_ordinal():
     assert rows[0]["slot_index"] == 2
 
 
-def test_preserve_and_prune_admits_ordinal_two_only_for_lasso_feed_window(monkeypatch):
+def test_preserve_and_prune_admits_lasso_feed_and_story_third_slot_in_window(monkeypatch):
     _enable_window(monkeypatch)
     monkeypatch.setattr(config, "lasso_editorial_calendar_enabled", lambda: True)
     monkeypatch.setattr(config, "cadence_2x_enabled", lambda: True)
@@ -92,7 +92,7 @@ def test_preserve_and_prune_admits_ordinal_two_only_for_lasso_feed_window(monkey
     assert preserve_and_prune(
         Store(), "lasso", ["2026-11"], [row("2026-11-09")]
     )[0] == []
-    assert preserve_and_prune(Store(), "lasso", ["2026-09"], [row(fmt="story")])[0] == []
+    assert preserve_and_prune(Store(), "lasso", ["2026-09"], [row(fmt="story")])[0] == [row(fmt="story")]
 
 
 def test_publish_capacity_uses_actual_local_claim_day_for_feed_and_story(monkeypatch):

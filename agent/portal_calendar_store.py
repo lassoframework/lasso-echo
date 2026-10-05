@@ -4317,16 +4317,14 @@ def preserve_and_prune(store, account_key, months, rows):
                 # Compatibility for injected legacy resolvers in offline callers.
                 base_capacity = resolve_posts_per_day(account_key, store)
             if (str(account_key).strip().lower() == "lasso"
-                    and str(row.get("format") or "feed").strip().lower() == "feed"):
+                    and str(row.get("format") or "feed").strip().lower() in ("feed", "story")):
                 try:
                     if config.lasso_three_feed_enabled() or \
                             config.lasso_summit_daily_enabled(day_key):
                         return max(base_capacity, 3)
                 except (TypeError, ValueError):
                     pass
-            # Summit's third slot is feed-only. The dated cadence resolver may
-            # report three for LASSO, but paired stories retain their existing
-            # two-slot capacity.
+            # Client Stories retain their two-slot preservation capacity.
             return min(base_capacity, 2)
         existing = []
         # A failed preservation read must never risk an approved post.
