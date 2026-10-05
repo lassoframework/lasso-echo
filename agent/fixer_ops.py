@@ -194,6 +194,14 @@ _BUSINESS_FIELDS = frozenset({
     "schema_version", "contract_version", "ticket_id", "client_id",
     "request_key", "merged_sha", "check_id", "params",
 })
+OPS_MEDIA_SWAP_EVIDENCE_PATH = (
+    ROUTE_PREFIX + "/business-evidence/observe-ops-media-swap"
+)
+OPS_MEDIA_SWAP_EVIDENCE_CONTRACT = "echo-ops-media-swap-evidence-v1"
+_OPS_MEDIA_SWAP_EVIDENCE_FIELDS = frozenset({
+    "schema_version", "contract_version", "ticket_id", "client_id",
+    "request_key", "reservation_key", "row_id",
+})
 
 # Named so a FIXER that asks for one of these gets a 403 that says WHY, not a 404 that
 # reads like a typo. Nothing here has an implementation and nothing here may get one
@@ -391,6 +399,178 @@ def _run_business_evidence(raw_body, deps, now=None):
     if any(key not in record for key in keys):
         return 503, {"error": "evidence_unavailable"}
     return 200, {**{key: record[key] for key in keys}, "params": dict(params)}
+
+
+def _run_ops_media_swap_evidence(raw_body, deps, now=None):
+    """Observe one receipt-bound media swap without a code-release identity."""
+    if raw_body and len(raw_body) > MAX_BODY_BYTES:
+        return 413, {"error": "too_large"}
+    try:
+        body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+    except Exception:  # noqa: BLE001 - malformed transport input
+        return 400, {"error": "bad_request", "detail": "invalid JSON"}
+    if (not isinstance(body, dict)
+            or set(body) != _OPS_MEDIA_SWAP_EVIDENCE_FIELDS):
+        return 400, {"error": "bad_request", "detail": "invalid ops media swap evidence schema"}
+    if (body.get("schema_version") != 1
+            or body.get("contract_version") != OPS_MEDIA_SWAP_EVIDENCE_CONTRACT):
+        return 400, {"error": "bad_request", "detail": "unsupported ops media swap evidence contract"}
+    ticket_id = body.get("ticket_id")
+    client_id = body.get("client_id")
+    request_key = body.get("request_key")
+    reservation_key = body.get("reservation_key")
+    row_id = body.get("row_id")
+    if (not isinstance(ticket_id, str) or not _BUSINESS_UUID.fullmatch(ticket_id)
+            or not isinstance(client_id, str) or not _BUSINESS_UUID.fullmatch(client_id)
+            or not isinstance(request_key, str) or not _BUSINESS_REQUEST_KEY.fullmatch(request_key)
+            or not isinstance(reservation_key, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{8,128}", reservation_key) is None
+            or not isinstance(row_id, str) or not _BUSINESS_ROW_ID.fullmatch(row_id)):
+        return 400, {"error": "bad_request", "detail": "invalid ops media swap evidence identity"}
+
+    # Match the code-release observer's ticket/client and current-request gates.
+    read = _business_reader(deps)
+    try:
+        rows = read("support_tickets", {
+            "id": f"eq.{ticket_id}",
+            "select": "id,product,client_id,created_at,raw_text,verification_before", "limit": "2"})
+    except Exception:  # noqa: BLE001 - source errors never become evidence
+        return 503, {"error": "evidence_unavailable"}
+    if (not isinstance(rows, list) or len(rows) > 2
+            or any(not isinstance(row, dict) for row in rows)):
+        return 503, {"error": "evidence_unavailable"}
+    if not rows:
+        return 404, {"error": "ticket_not_found"}
+    if len(rows) != 1 or rows[0].get("id") != ticket_id:
+        return 409, {"error": "ticket_identity_unconfirmed"}
+    ticket = rows[0]
+    if ticket.get("product") != "echo" or ticket.get("client_id") != client_id:
+        return 409, {"error": "ticket_tenant_mismatch"}
+    current_request_key = _business_request_key(read, ticket)
+    if current_request_key is None:
+        return 503, {"error": "evidence_unavailable"}
+    if current_request_key != request_key:
+        return 409, {"error": "request_identity_mismatch"}
+
+    from . import fixer_business_evidence as evidence
+    from . import fixer_ops_receipts as receipts
+    receipt_store = deps.get("receipt_store")
+    if receipt_store is None:
+        try:
+            receipt_store = receipts.default_store()
+        except receipts.ReceiptError:
+            receipt_store = None
+    if receipt_store is None:
+        return 503, {"error": "evidence_unavailable"}
+    def receipt_read(key, echo_key):
+        return receipts.get_receipt(receipt_store, key, echo_key)
+
+    record = evidence.observe_ops_media_swap(
+        gym_key=client_id, request_key=request_key,
+        params={"reservation_key": reservation_key, "row_id": row_id},
+        deps={"read": read, "receipt_read": receipt_read},
+        ticket_id=ticket_id, now=now)
+    if not isinstance(record, dict):
+        return 503, {"error": "evidence_unavailable"}
+    keys = ("schema_version", "source", "check_id", "gym_key", "request_key",
+            "merged_sha", "captured_at", "outcome", "verified",
+            "symptom_resolved", "evidence", "reason")
+    if any(key not in record for key in keys):
+        return 503, {"error": "evidence_unavailable"}
+    # The observer's own reads can take long enough for a new requester message
+    # or a ticket reassignment to land.  Bind the response to a second exact
+    # ticket read, never the pre-observation object.
+    try:
+        final_rows = read("support_tickets", {
+            "id": f"eq.{ticket_id}",
+            "select": "id,product,client_id,created_at,raw_text,verification_before", "limit": "2"})
+    except Exception:  # noqa: BLE001 - source errors never become evidence
+        return 503, {"error": "evidence_unavailable"}
+    if (not isinstance(final_rows, list) or len(final_rows) > 2
+            or any(not isinstance(row, dict) for row in final_rows)):
+        return 503, {"error": "evidence_unavailable"}
+    if not final_rows:
+        return 404, {"error": "ticket_not_found"}
+    if len(final_rows) != 1 or final_rows[0].get("id") != ticket_id:
+        return 409, {"error": "ticket_identity_unconfirmed"}
+    final_ticket = final_rows[0]
+    if (final_ticket.get("product") != "echo"
+            or final_ticket.get("client_id") != client_id):
+        return 409, {"error": "ticket_tenant_mismatch"}
+    final_request_key = _business_request_key(read, final_ticket)
+    if final_request_key is None:
+        return 503, {"error": "evidence_unavailable"}
+    if final_request_key != request_key:
+        return 409, {"error": "request_identity_mismatch"}
+    # Re-read server-owned bindings after observation.  The call parameters are
+    # only a pointer; a successful proof response carries the ticket, resolved
+    # Echo tenant, and a digest of the receipt's independent swap proof.
+    try:
+        echo_key = evidence._resolve_echo_gym_key(read, client_id)
+        receipt = receipts.get_receipt(receipt_store, reservation_key, echo_key)
+    except Exception:  # noqa: BLE001 - a binding read fault is never proof
+        receipt = None
+        echo_key = None
+    receipt_result = receipt.get("result") if isinstance(receipt, dict) else None
+    proof = receipt_result.get("swap_proof") if isinstance(receipt_result, dict) else None
+    try:
+        receipt_started = evidence._parse_utc_timestamp(
+            receipt.get("created_at") if isinstance(receipt, dict) else None)
+        receipt_finished = evidence._parse_utc_timestamp(
+            receipt.get("finished_at") if isinstance(receipt, dict) else None)
+        timestamps_valid = receipt_finished >= receipt_started
+    except Exception:  # noqa: BLE001 - malformed receipt clocks cannot bind proof
+        timestamps_valid = False
+    proof_hashes = (proof.get("before_image_sha256"), proof.get("after_image_sha256"),
+                    proof.get("caption_sha256")) if isinstance(proof, dict) else ()
+    proof_valid = (
+        len(proof_hashes) == 3
+        and all(isinstance(value, str) and evidence._HEX_SHA256.fullmatch(value)
+                for value in proof_hashes)
+        and proof_hashes[0] != proof_hashes[1]
+        and isinstance(proof.get("after_asset_id"), str)
+        and evidence._MEDIA_ID.fullmatch(proof["after_asset_id"]) is not None
+    )
+    receipt_bound = (
+        isinstance(echo_key, str)
+        and isinstance(receipt, dict)
+        and receipt.get("schema_version") == 1
+        and receipt.get("key") == reservation_key
+        and receipt.get("gym_key") == echo_key
+        and receipt.get("ticket_id") == final_ticket["id"]
+        and receipt.get("request_key") == final_request_key
+        and receipt.get("action") == "swap_media"
+        and receipt.get("status") == "done"
+        and isinstance(receipt.get("created_at"), str)
+        and isinstance(receipt.get("finished_at"), str)
+        and timestamps_valid
+        and isinstance(receipt_result, dict)
+        and receipt_result.get("row_id") == row_id
+        and isinstance(proof, dict)
+        and proof.get("row_id") == row_id
+        and proof_valid
+    )
+    response = {**{key: record[key] for key in keys},
+                "ticket_id": final_ticket["id"],
+                "echo_gym_key": echo_key if isinstance(echo_key, str) else "",
+                "params": {"reservation_key": reservation_key, "row_id": row_id}}
+    if receipt_bound:
+        proof_digest = hashlib.sha256(json.dumps(
+            proof, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")).hexdigest()
+        response["receipt"] = {
+            "key": receipt["key"], "gym_key": receipt["gym_key"],
+            "ticket_id": receipt["ticket_id"], "request_key": receipt["request_key"],
+            "action": receipt["action"], "status": receipt.get("status"),
+            "row_id": receipt_result["row_id"],
+            "created_at": receipt["created_at"], "finished_at": receipt["finished_at"],
+            "proof_digest": proof_digest,
+        }
+    # A verified observation without a second server-side receipt binding is an
+    # unavailable proof, not a successful response with caller-supplied identity.
+    if record.get("verified") is True and not receipt_bound:
+        return 503, {"error": "evidence_unavailable"}
+    return 200, response
 
 
 # --------------------------------------------------------------------------------------
@@ -2103,6 +2283,10 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
         if method != "POST":
             return 405, {"error": "method_not_allowed"}
         return _run_business_evidence(raw_body, deps, now=now)
+    if path == OPS_MEDIA_SWAP_EVIDENCE_PATH:
+        if method != "POST":
+            return 405, {"error": "method_not_allowed"}
+        return _run_ops_media_swap_evidence(raw_body, deps, now=now)
     if path.startswith(ROUTE_PREFIX + "/evidence/media-source/"):
         if method != "GET":
             return 405, {"error": "method_not_allowed"}
