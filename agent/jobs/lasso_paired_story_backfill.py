@@ -39,6 +39,17 @@ ZONE = ZoneInfo("America/New_York")
 RPC = "rpc/stage_lasso_paired_story"
 
 
+def measured_story_evidence(evidence, digest):
+    """Require dimensions measured from the exact reviewed image bytes."""
+    measured = evidence.get("verified_dimensions") if isinstance(evidence, dict) else None
+    return (isinstance(measured, dict)
+            and evidence.get("aspect") == "9:16"
+            and evidence.get("pixels") == "1080x1920"
+            and type(measured.get("width")) is int and measured["width"] == 1080
+            and type(measured.get("height")) is int and measured["height"] == 1920
+            and measured.get("image_sha256") == digest)
+
+
 def deterministic_id(account, feed_id, slot):
     return str(uuid.uuid5(uuid.NAMESPACE_URL,
         f"lasso|{account}|{uuid.UUID(str(feed_id))}|story|slot{int(slot)}"))
@@ -206,7 +217,7 @@ def plan_one(store, item):
             or evidence.get("grade_status") != "PASS"
             or evidence.get("image_sha256") != story_sha
             or evidence.get("policy_version") != policy
-            or evidence.get("aspect") != "9:16"
+            or not measured_story_evidence(evidence, story_sha)
             or any(recorded_source.get(key) != value for key, value in expected_source.items())):
         raise ValueError("9:16 reviewed artifact is not bound to this exact feed")
 
@@ -237,6 +248,7 @@ def plan_one(store, item):
     return {"account": account, "date": day, "slot_index": slot,
             "feed_id": feed_id, "feed_status": feed["status"],
             "feed_caption": feed["caption"], "feed_image_url": feed["image_url"],
+            "feed_pillar": feed["pillar"],
             "feed_scheduled_at": feed["scheduled_at"],
             "feed_logical_post_id": feed.get("logical_post_id"),
             "story_id": story_id, "story_image_url": story_url,

@@ -58,9 +58,12 @@ def test_source_bound_reused_artifact_stages_once(monkeypatch):
                             "source_hash": daily.hashlib.sha256(feed["caption"].encode()).hexdigest()},
         "evidence": {"grade_status": "PASS", "aspect": "9:16",
                      "pixels": "1080x1920", "image_sha256": "a" * 64,
+                     "verified_dimensions": {"width": 1080, "height": 1920,
+                                             "image_sha256": "a" * 64},
                      "policy_version": daily.infographic_evidence.POLICY_VERSION}})
     monkeypatch.setattr(daily.stage, "plan_one", lambda *a: {"state": "ready"})
     monkeypatch.setattr(daily.stage, "apply_one", lambda *a: {"result": "inserted"})
+    monkeypatch.setattr(daily, "_verify_staged_pair", lambda *a: None)
     monkeypatch.setattr(daily.variant_regen, "generate_variant_image",
                         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("spent")))
     class Artifacts: available = True
@@ -68,6 +71,29 @@ def test_source_bound_reused_artifact_stages_once(monkeypatch):
                        artifact_store=Artifacts())
     assert result["reused"] == result["staged"] == 1
     assert result["generated"] == 0
+
+
+def test_autonomous_insert_reads_exact_story_and_feed_link(monkeypatch):
+    action = {"story_id": "story", "feed_id": "feed", "account": "instagram",
+              "date": "2026-10-07", "slot_index": 0,
+              "story_image_url": "https://example.com/story.png",
+              "story_scheduled_at": "2026-10-07T07:45:00-04:00",
+              "feed_pillar": "doctrine", "feed_logical_post_id": "logical"}
+    story = {"id": "story", "gym_id": "lasso", "account": "instagram",
+             "post_date": "2026-10-07", "slot_index": 0, "format": "story",
+             "variant_status": "active", "status": "pending", "caption": "",
+             "pillar": "doctrine", "image_url": action["story_image_url"],
+             "source_media_url": action["story_image_url"],
+             "logical_post_id": "logical", "media_not_ready_reason": None,
+             "scheduled_at": "2026-10-07T11:45:00Z"}
+    link = {"story_id": "story", "feed_id": "feed"}
+    monkeypatch.setattr(daily.stage, "_one", lambda _, table, __:
+                        story if table == "content_calendar" else link)
+    daily._verify_staged_pair(object(), action)
+    link["feed_id"] = "another-feed"
+    import pytest
+    with pytest.raises(RuntimeError, match="source-link"):
+        daily._verify_staged_pair(object(), action)
 
 
 def test_release_only_after_feed_receipt(monkeypatch):

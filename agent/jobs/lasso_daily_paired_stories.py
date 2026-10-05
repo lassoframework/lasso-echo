@@ -82,8 +82,7 @@ def _candidate_artifact(store, tenant, source_id, source_hash):
         source = artifact.get("source_identity") or {}
         if (source == {"source_id": source_id, "source_hash": source_hash}
                 and evidence.get("grade_status") == "PASS"
-                and evidence.get("aspect") == "9:16"
-                and evidence.get("pixels") == "1080x1920"
+                and stage.measured_story_evidence(evidence, artifact.get("image_sha256"))
                 and evidence.get("policy_version") == infographic_evidence.POLICY_VERSION
                 and evidence.get("brain_snapshot") == infographic_evidence.brain_snapshot()
                 and artifact.get("image_sha256") == evidence.get("image_sha256")
@@ -104,6 +103,39 @@ def _eligible(feed, account, day):
             and feed.get("media_not_ready_reason") is None
             and str(feed.get("caption") or "").strip()
             and str(feed.get("image_url") or "").startswith("https://"))
+
+
+def _verify_staged_pair(store, action):
+    """Read the committed Story and durable feed link after the stage RPC."""
+    story = stage._one(store, "content_calendar", {
+        "gym_id": "eq.lasso", "id": "eq." + action["story_id"], "select": "*"})
+    link = stage._one(store, "lasso_managed_paired_stories", {
+        "story_id": "eq." + action["story_id"], "select": "story_id,feed_id"})
+    try:
+        schedule_matches = (stage.datetime.fromisoformat(
+            str(story.get("scheduled_at")).replace("Z", "+00:00")) ==
+            stage.datetime.fromisoformat(
+                str(action["story_scheduled_at"]).replace("Z", "+00:00")))
+    except (TypeError, ValueError):
+        schedule_matches = False
+    if (link.get("story_id") != action["story_id"]
+            or link.get("feed_id") != action["feed_id"]
+            or story.get("id") != action["story_id"]
+            or story.get("gym_id") != "lasso"
+            or str(story.get("account") or "").lower() != action["account"]
+            or str(story.get("post_date") or "")[:10] != action["date"]
+            or story.get("slot_index") != action["slot_index"]
+            or story.get("format") != "story"
+            or story.get("variant_status") != "active"
+            or story.get("status") not in ("pending", "approved", "publishing", "published")
+            or story.get("caption") != ""
+            or story.get("pillar") != action["feed_pillar"]
+            or story.get("image_url") != action["story_image_url"]
+            or story.get("source_media_url") != action["story_image_url"]
+            or story.get("logical_post_id") != action["feed_logical_post_id"]
+            or story.get("media_not_ready_reason") is not None
+            or not schedule_matches):
+        raise RuntimeError("staged Story or source-link readback mismatch")
 
 
 def run(*, now=None, account="instagram", store=None, artifact_store=None,
@@ -211,8 +243,8 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                 recorded = artifact.get("source_identity") or {}
                 if (recorded != {"source_id": source_id, "source_hash": source_hash}
                         or evidence.get("grade_status") != "PASS"
-                        or evidence.get("aspect") != "9:16"
-                        or evidence.get("pixels") != "1080x1920"
+                        or not stage.measured_story_evidence(
+                            evidence, artifact.get("image_sha256"))
                         or evidence.get("image_sha256") != artifact.get("image_sha256")
                         or evidence.get("policy_version") != infographic_evidence.POLICY_VERSION):
                     summary["blocked"] += 1
@@ -229,6 +261,7 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                     continue
                 receipt = stage.apply_one(store, action)
                 if receipt.get("result") in ("inserted", "idempotent"):
+                    _verify_staged_pair(store, action)
                     summary["staged"] += 1
                 else:
                     summary["blocked"] += 1

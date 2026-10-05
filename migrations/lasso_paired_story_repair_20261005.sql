@@ -34,6 +34,10 @@ begin
        and a.evidence->>'image_sha256' = a.image_sha256
        and nullif(a.evidence->>'policy_version', '') is not null
        and a.evidence->>'aspect' = '9:16'
+       and a.evidence->>'pixels' = '1080x1920'
+       and a.evidence->'verified_dimensions'->>'width' = '1080'
+       and a.evidence->'verified_dimensions'->>'height' = '1920'
+       and a.evidence->'verified_dimensions'->>'image_sha256' = a.image_sha256
        and (
          (a.tenant = 'lasso'
           and a.source_identity->>'source_id' =
@@ -209,6 +213,10 @@ begin
           and a.evidence->>'image_sha256' = p_story_sha256
           and a.evidence->>'policy_version' = p_policy_version
           and a.evidence->>'aspect' = '9:16'
+          and a.evidence->>'pixels' = '1080x1920'
+          and a.evidence->'verified_dimensions'->>'width' = '1080'
+          and a.evidence->'verified_dimensions'->>'height' = '1920'
+          and a.evidence->'verified_dimensions'->>'image_sha256' = p_story_sha256
           and a.source_identity->>'source_hash' = p_source_hash
      ) or not public.lasso_story_review_matches(f.id, p_story_image_url) then
     return jsonb_build_object('result','conflict','reason','reviewed_source_mismatch');

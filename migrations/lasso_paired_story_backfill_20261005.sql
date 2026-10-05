@@ -13,6 +13,7 @@ create table if not exists public.lasso_managed_paired_stories (
   created_at timestamptz not null default now()
 );
 revoke all on public.lasso_managed_paired_stories from public, anon, authenticated;
+grant select on public.lasso_managed_paired_stories to service_role;
 
 -- Existing ambiguous legacy NULL slots must be reconciled before this guard
 -- is installed. The migration fails without changing calendar rows.
@@ -181,6 +182,10 @@ begin
        and a.evidence->>'image_sha256' = p_story_sha256
        and a.evidence->>'policy_version' = p_policy_version
        and a.evidence->>'aspect' = '9:16'
+       and a.evidence->>'pixels' = '1080x1920'
+       and a.evidence->'verified_dimensions'->>'width' = '1080'
+       and a.evidence->'verified_dimensions'->>'height' = '1920'
+       and a.evidence->'verified_dimensions'->>'image_sha256' = p_story_sha256
        and a.source_identity->>'source_hash' = p_source_hash
        and (
          (p_artifact_tenant = 'lasso'

@@ -115,7 +115,7 @@ def plan_one(store, item):
             or evidence.get("grade_status") != "PASS"
             or evidence.get("image_sha256") != digest
             or evidence.get("policy_version") != policy
-            or evidence.get("aspect") != "9:16"
+            or not base.measured_story_evidence(evidence, digest)
             or any(recorded.get(k) != v for k, v in expected.items())):
         raise ValueError("9:16 artifact does not prove exact feed source")
     return {"story_id": story_id, "feed_id": feed_id, "account": account,

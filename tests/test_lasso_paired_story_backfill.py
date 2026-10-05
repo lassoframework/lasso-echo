@@ -29,7 +29,10 @@ def fixture(monkeypatch, *, account="instagram", logical=LOGICAL_ID,
     artifact = {"tenant": "lasso", "image_url": STORY_URL,
                 "image_sha256": DIGEST,
                 "evidence": {"grade_status": "PASS", "image_sha256": DIGEST,
-                             "policy_version": "review-v1", "aspect": "9:16"},
+                             "policy_version": "review-v1", "aspect": "9:16",
+                             "pixels": "1080x1920", "verified_dimensions": {
+                                 "width": 1080, "height": 1920,
+                                 "image_sha256": DIGEST}},
                 "source_identity": identity}
     monkeypatch.setattr(job, "_feed", lambda store, feed_id: feed)
     monkeypatch.setattr(job, "_artifact", lambda store, url, tenant: artifact)
@@ -108,6 +111,17 @@ def test_reviewed_real_story_required(monkeypatch):
     artifact["evidence"]["aspect"] = "9:16"
     item["story_image_url"] = "https://cdn.example/approved-feed.png"
     with pytest.raises(ValueError, match="source feed"):
+        job.plan_one(store, item)
+
+
+def test_manifest_refuses_declared_aspect_without_measured_dimensions(monkeypatch):
+    store, item, _, artifact = fixture(monkeypatch)
+    artifact["evidence"].pop("verified_dimensions")
+    with pytest.raises(ValueError, match="9:16 reviewed artifact"):
+        job.plan_one(store, item)
+    artifact["evidence"]["verified_dimensions"] = {
+        "width": 1080, "height": 1920, "image_sha256": "b" * 64}
+    with pytest.raises(ValueError, match="9:16 reviewed artifact"):
         job.plan_one(store, item)
 
 

@@ -23,7 +23,9 @@ def setup(monkeypatch):
              "media_not_ready_reason": "paired_feed_not_ready",
              "published_at": None, "late_post_id": None, "publish_claim_token": None}
     artifact = {"image_sha256": DIGEST, "evidence": {"grade_status": "PASS",
-                "image_sha256": DIGEST, "policy_version": "v1", "aspect": "9:16"},
+                "image_sha256": DIGEST, "policy_version": "v1", "aspect": "9:16",
+                "pixels": "1080x1920", "verified_dimensions": {
+                    "width": 1080, "height": 1920, "image_sha256": DIGEST}},
                 "source_identity": {"source_id": f"content_calendar:{FEED_ID}:caption",
                 "source_hash": repair.hashlib.sha256(feed["caption"].encode()).hexdigest()}}
     monkeypatch.setattr(repair.base, "_feed", lambda *_: feed)
@@ -79,6 +81,13 @@ def test_repair_refuses_slot_with_historical_published_story(monkeypatch):
                   "published_at": "2026-10-07T12:00:00Z", "late_post_id": "late"}
     monkeypatch.setattr(repair.base, "_active_day", lambda *_: [feed, story, historical])
     with pytest.raises(ValueError, match="historical Story already published"):
+        repair.plan_one(store, item)
+
+
+def test_repair_refuses_unmeasured_aspect_declaration(monkeypatch):
+    store, item, _, _, artifact = setup(monkeypatch)
+    artifact["evidence"].pop("verified_dimensions")
+    with pytest.raises(ValueError, match="does not prove"):
         repair.plan_one(store, item)
 
 
