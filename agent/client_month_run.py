@@ -2849,25 +2849,38 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         delete_preserve = _out_of_span_preserve_dates(
             months, span_first, span_last, preserve_dates=locked_days)
         bounded_delete_read = callable(getattr(store, "list_month", None))
-        delete_month = getattr(store, "delete_month", None)
-        for month in months:
-            if delete_month is not None:
-                try:
-                    deleted += delete_month(base_key, month,
-                                            preserve_dates=delete_preserve) or 0
-                except TypeError:      # older store/test fakes without the kwarg
-                    if bounded_delete_read:
-                        raise RuntimeError("bounded store cannot preserve dates")
-                    deleted += delete_month(base_key, month) or 0
-        insert_rows = getattr(store, "insert_rows", None)
-        if insert_rows is not None and clean_rows:
-            store_rows = [{k: v for k, v in r.items()
-                           if k != "_served_reservation_id"} for r in clean_rows]
+        store_rows = [{k: v for k, v in r.items()
+                       if k != "_served_reservation_id"} for r in clean_rows]
+        atomic_enabled = getattr(store, "atomic_month_replace_enabled", None)
+        if callable(atomic_enabled) and atomic_enabled():
+            replace = getattr(store, "replace_months_atomic", None)
+            if not callable(replace):
+                raise RuntimeError("atomic month replacement method unavailable")
             insert_started = True
-            inserted += len(_insert_rows_with_poster_evidence(
-                insert_rows, base_key, store_rows,
-                poster_render_evidence_by_url,
-                render_evidence_by_url=render_evidence_by_url) or [])
+            receipt = replace(
+                base_key, months, store_rows, preserve_dates=delete_preserve,
+                poster_render_evidence_by_url=poster_render_evidence_by_url,
+                render_evidence_by_url=render_evidence_by_url)
+            deleted = receipt["deleted"]
+            inserted = receipt["inserted"]
+        else:
+            delete_month = getattr(store, "delete_month", None)
+            for month in months:
+                if delete_month is not None:
+                    try:
+                        deleted += delete_month(base_key, month,
+                                                preserve_dates=delete_preserve) or 0
+                    except TypeError:      # older store/test fakes without the kwarg
+                        if bounded_delete_read:
+                            raise RuntimeError("bounded store cannot preserve dates")
+                        deleted += delete_month(base_key, month) or 0
+            insert_rows = getattr(store, "insert_rows", None)
+            if insert_rows is not None and clean_rows:
+                insert_started = True
+                inserted += len(_insert_rows_with_poster_evidence(
+                    insert_rows, base_key, store_rows,
+                    poster_render_evidence_by_url,
+                    render_evidence_by_url=render_evidence_by_url) or [])
     except Exception as exc:  # noqa: BLE001
         log(f"store write failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",

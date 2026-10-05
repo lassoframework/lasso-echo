@@ -27,6 +27,7 @@ the row exists and never issues a write that could touch it.
 """
 
 import calendar as _calendar
+import os as _os
 import re as _re
 import time as _time
 
@@ -3389,6 +3390,170 @@ class SupabaseCalendarStore:
                 or rows[0].get("status") != "pending" or rows[0].get("variant_status") != "active"):
             return None
         return rows[0]
+
+    def atomic_month_replace_enabled(self):
+        """Draft cutover switch. The SQL migration must be applied before arming."""
+        return _os.environ.get("ECHO_ATOMIC_MONTH_REPLACE_DRAFT", "").lower() in (
+            "1", "true", "yes")
+
+    def replace_months_atomic(self, account_key, months, rows, *, preserve_dates=(),
+                              render_evidence_by_url=None,
+                              poster_render_evidence_by_url=None):
+        """Replace active machine rows in one database transaction with month CAS.
+
+        Every preparation step and read happens before the RPC. A failed RPC can
+        have an unknown outcome, but its database effects cannot be half applied.
+        The draft path refuses batches changed by a stage belt; that is safer than
+        deleting a full month for a shortened prepared batch.
+        """
+        if not self.atomic_month_replace_enabled():
+            raise PortalStoreError(503, "atomic month replacement is not armed")
+        months = sorted(set(months or ()))
+        if not months or not rows:
+            raise ValueError("atomic month replacement requires months and rows")
+        import datetime as _dt
+        for month in months:
+            if (not isinstance(month, str) or len(month) != 7
+                    or _dt.date.fromisoformat(month + "-01").strftime("%Y-%m") != month):
+                raise ValueError("invalid replacement month")
+
+        expected = []
+        protected_story_ids = []
+        month_rows = {}
+        for month in months:
+            current = self.list_month(account_key, month)
+            if not isinstance(current, list) or len(current) >= 1000:
+                raise PortalStoreError(503, "month read may be partial")
+            month_rows[month] = current
+            first = month + "-01"
+            last = f"{month}-{_calendar.monthrange(int(month[:4]), int(month[5:]))[1]:02d}"
+            try:
+                _record_confirmed_story_holds(account_key, current)
+                incidents = _story_incident_targets(self, account_key, first, last)
+                from .fixer_business_seed import validate_story_created_at
+                protected_story_ids.extend(
+                    str(r["id"]) for r in current
+                    if r.get("format") == "story" and
+                    (_is_story_media_hold(r) or
+                     (r.get("id"), validate_story_created_at(r.get("created_at")))
+                     in incidents))
+            except Exception:
+                # Match delete_month's read-failure posture: retain every Story.
+                protected_story_ids.extend(
+                    str(r["id"]) for r in current if r.get("format") == "story")
+            expected.extend({
+                "id": str(r["id"]), "status": r.get("status"),
+                "variant_status": r.get("variant_status"),
+                "media_not_ready_reason": r.get("media_not_ready_reason"),
+                "post_date": str(r.get("post_date") or "")[:10],
+                "account": r.get("account"), "format": r.get("format"),
+                "caption": r.get("caption"), "image_url": r.get("image_url"),
+                "thumbnail_url": r.get("thumbnail_url"),
+                "source_media_url": r.get("source_media_url"),
+            } for r in current)
+
+        from .copy_gate import bound_opening_hook
+        payload = []
+        for row in rows:
+            clean = {k: v for k, v in dict(row).items() if k != "id"}
+            clean["gym_id"] = account_key
+            if clean.get("post_date", "")[:7] not in months:
+                raise ValueError("row outside replacement months")
+            if clean.get("caption") is not None:
+                clean["caption"] = bound_opening_hook(clean["caption"])
+            if clean.get("logical_post_id") is not None:
+                import uuid as _uuid
+                clean["logical_post_id"] = str(_uuid.UUID(str(clean["logical_post_id"])))
+            payload.append(clean)
+        from .plan_horizon import belt_filter as _horizon_belt
+        payload, _ = _horizon_belt(account_key, payload)
+        payload = _stage_belts(account_key, payload)
+        if len(payload) != len(rows):
+            raise PortalStoreError(409, "stage belt changed atomic month batch")
+
+        keep_dates = {str(d)[:10] for d in preserve_dates}
+        protect_ids = set(protected_story_ids)
+
+        def survives(current):
+            if str(current.get("post_date") or "")[:10] in keep_dates:
+                return True
+            if current.get("format") == "story" and str(current.get("id")) in protect_ids:
+                return True
+            status = str(current.get("status") or "").lower()
+            return (status not in _WIPEABLE_STATUSES and bool(status)) or (
+                current.get("media_not_ready_reason") is not None)
+
+        class _ReplacementView:
+            def __init__(self, source):
+                self.source = source
+                self.failed = False
+
+            def list_month(self, gym, month):
+                try:
+                    current = (month_rows[month] if month in month_rows
+                               else self.source.list_month(gym, month))
+                except Exception:
+                    self.failed = True
+                    raise
+                return [r for r in current if month not in month_rows or survives(r)]
+
+        view = _ReplacementView(self)
+        media_payload = _media_stage_belt(view, account_key, payload)
+        if view.failed or len(media_payload) != len(payload):
+            raise PortalStoreError(409, "media belt changed atomic month batch")
+        live = {"pending", "approved", "publishing", "published", "coach_review"}
+        survivor_slots = {
+            key for current in month_rows.values() for row in current
+            if survives(row) and str(row.get("status") or "").lower() in live
+            for key in [_dedupe_slot_key(row)] if key is not None
+        }
+        deduped = _dedupe_slots(self, account_key, payload, existing=survivor_slots)
+        if len(deduped) != len(payload):
+            raise PortalStoreError(409, "slot belt changed atomic month batch")
+        from . import visual_writer_prepare
+        prepared_write = visual_writer_prepare.enabled()
+        if prepared_write:
+            payload = [self._prepare_visual_row(
+                account_key, row,
+                render_evidence=(render_evidence_by_url or {}).get(row.get("image_url")),
+                poster_render_evidence=(poster_render_evidence_by_url or {}).get(
+                    (row.get("image_url"), row.get("thumbnail_url"))))
+                for row in payload]
+        # Keep the batch homogeneous, as insert_rows does for PostgREST.
+        all_keys = set().union(*(r.keys() for r in payload))
+        payload = [{k: r.get(k) for k in all_keys} for r in payload]
+        response = self._client().post(
+            self._rest("rpc/echo_replace_calendar_months_atomic_draft"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"p_gym_id": account_key, "p_months": months,
+                  "p_expected": sorted(expected, key=lambda r: r["id"]),
+                  "p_rows": payload,
+                  "p_preserve_dates": sorted({str(d)[:10] for d in preserve_dates}),
+                  "p_protected_story_ids": sorted(set(protected_story_ids))},
+            timeout=60)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code,
+                                   _scrub((response.text or "")[:200]))
+        result = response.json()
+        if not isinstance(result, dict):
+            raise PortalStoreError(502, "atomic month receipt missing")
+        inserted = result.get("rows")
+        if (not isinstance(inserted, list) or len(inserted) != len(payload)
+                or result.get("inserted") != len(payload)
+                or not isinstance(result.get("deleted"), int)
+                or any(not isinstance(r, dict) or r.get("gym_id") != account_key
+                       or not r.get("id") for r in inserted)):
+            raise PortalStoreError(502, "atomic month receipt unverified")
+        if prepared_write:
+            unmatched = list(payload)
+            for row in inserted:
+                matches = [candidate for candidate in unmatched
+                           if all(key in row and row[key] == value
+                                  for key, value in candidate.items())]
+                if not matches:
+                    raise PortalStoreError(502, "atomic visual receipt unverified")
+                unmatched.remove(matches[0])
+        return result
 
     def delete_month(self, account_key, month, *, preserve_human=True,
                      preserve_dates=()):

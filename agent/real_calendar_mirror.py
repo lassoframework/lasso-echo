@@ -509,6 +509,7 @@ def mirror_to_supabase(account_key, store, sb_store):
 
     deleted = 0
     inserted = 0
+    atomic_started = False
     try:
         # PRESERVE APPROVALS: never overwrite a slot a human already approved/published.
         from .portal_calendar_store import preserve_and_prune
@@ -532,29 +533,44 @@ def mirror_to_supabase(account_key, store, sb_store):
                                   "delivered render evidence; aborted before month deletion",
                         "missing_render_evidence_urls": sorted(set(missing_render_proof)),
                         "upserted": 0, "inserted": 0, "deleted": 0}
-        delete_month = getattr(sb_store, "delete_month", None)
-        for month in months:
-            if delete_month is not None:
-                deleted += delete_month(account_key, month) or 0
-        insert_rows = getattr(sb_store, "insert_rows", None)
-        if insert_rows is not None and real_rows:
-            if ((poster_evidence_by_url or render_evidence_by_url)
-                    and visual_writer_prepare.enabled()):
-                # Poster proof is a side channel, never a row column: the store binds
-                # each (image_url, thumbnail_url) pair to its rendition receipt at the
-                # prepared-writer boundary. A TypeError can happen after an internal
-                # write, so it must fail the mirror rather than retrying without proof.
-                kwargs = {}
-                if poster_evidence_by_url:
-                    kwargs["poster_render_evidence_by_url"] = poster_evidence_by_url
-                if render_evidence_by_url:
-                    kwargs["render_evidence_by_url"] = render_evidence_by_url
-                inserted += len(insert_rows(account_key, real_rows, **kwargs) or [])
-            else:
-                inserted += len(insert_rows(account_key, real_rows) or [])
+        atomic_enabled = getattr(sb_store, "atomic_month_replace_enabled", None)
+        if callable(atomic_enabled) and atomic_enabled():
+            if not months or not real_rows:
+                return {"ok": True, "upserted": 0, "inserted": 0,
+                        "deleted": 0, "months": months, "noop_empty": True}
+            replace = getattr(sb_store, "replace_months_atomic", None)
+            if not callable(replace):
+                raise RuntimeError("atomic month replacement method unavailable")
+            atomic_started = True
+            receipt = replace(
+                account_key, months, real_rows,
+                poster_render_evidence_by_url=poster_evidence_by_url,
+                render_evidence_by_url=render_evidence_by_url)
+            deleted = receipt["deleted"]
+            inserted = receipt["inserted"]
+        else:
+            delete_month = getattr(sb_store, "delete_month", None)
+            for month in months:
+                if delete_month is not None:
+                    deleted += delete_month(account_key, month) or 0
+            insert_rows = getattr(sb_store, "insert_rows", None)
+            if insert_rows is not None and real_rows:
+                if ((poster_evidence_by_url or render_evidence_by_url)
+                        and visual_writer_prepare.enabled()):
+                    # A TypeError can happen after an internal write; never retry
+                    # without the side-channel evidence.
+                    kwargs = {}
+                    if poster_evidence_by_url:
+                        kwargs["poster_render_evidence_by_url"] = poster_evidence_by_url
+                    if render_evidence_by_url:
+                        kwargs["render_evidence_by_url"] = render_evidence_by_url
+                    inserted += len(insert_rows(account_key, real_rows, **kwargs) or [])
+                else:
+                    inserted += len(insert_rows(account_key, real_rows) or [])
     except Exception as exc:
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
-                "upserted": inserted, "deleted": deleted}
+                "upserted": inserted, "deleted": deleted,
+                "atomic_outcome_unknown": atomic_started}
 
     return {"ok": True, "upserted": inserted, "inserted": inserted,
             "deleted": deleted, "months": months}
