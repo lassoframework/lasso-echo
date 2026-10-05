@@ -899,7 +899,7 @@ begin
   -- never saw; refuse.
   if (select count(*) from public.visual_scene_candidate c
       join public.visual_scene_row_delivered_object(v_row) d
-        on d.object_role = c.object_role and c.exact_url = c.exact_url
+        on d.object_role = c.object_role and d.exact_url = c.exact_url
       where c.tenant_id = v_hold.tenant_id and c.group_key = v_resolved) <> 1
       or public.visual_scene_row_candidate(v_row) is distinct from v_hold.candidate_id then
     raise exception 'bound scene candidate for the live row is not uniquely the reviewed candidate; refusing resolution'

@@ -534,6 +534,47 @@ def test_hold_resolve_validates_inputs_and_missing_hold():
     assert "decision approved|rejected" in bad.stderr
 
 
+def test_hold_resolve_ignores_unrelated_same_role_candidate_for_other_url():
+    tid_a, group_a = _seed_tenant()
+    tid_b, group_b = _seed_tenant()
+    url_a, _, cand_a = _seed_object(tid_a, group_a, _CODEBOOK[13])
+    row_a = _insert_row(tid_a, group_a, url_a)
+    assert _decide(row_a, cand_a)["decision"] == "claimed"
+
+    url_b, fp_b, cand_b = _seed_object(
+        tid_b, group_b, _near(_CODEBOOK[13], 3))
+    row_b = _insert_row(tid_b, group_b, url_b, date="2026-10-12")
+    blocked = _decide(row_b, cand_b)
+    assert blocked["decision"] == "blocked"
+    assert blocked["reason"] == "near_frame_conflict"
+    hold_id = blocked["hold_ids"][0]
+    _sql("update public.content_calendar set status='pending',"
+         "variant_status='archived', media_not_ready_reason='scene_review_hold'"
+         f" where id='{row_b}'")
+
+    # Same tenant, group, and role as the reviewed candidate, but bound to a
+    # distinct attested URL. This must not make the reviewed candidate
+    # ambiguous or invalidate the hold's exact row binding.
+    distractor_url, distractor_fp, distractor = _seed_object(
+        tid_b, group_b, _CODEBOOK[14])
+    assert distractor_url != url_b and distractor_fp != fp_b
+    assert distractor != cand_b
+
+    resolved = json.loads(_one(
+        "select public.visual_scene_hold_resolve("
+        f"'{hold_id}'::uuid, 'approved', 'scene-ledger-reviewer',"
+        " jsonb_build_object('review','unrelated same-role candidate'))::text"))
+    assert resolved["state"] == "approved"
+    assert resolved["exemption_scope"]["candidate_id"] == cand_b
+    assert resolved["exemption_scope"]["exact_url"] == url_b
+    # A different candidate cannot consume the approval exemption.
+    other_row = _insert_row(tid_b, group_b, distractor_url,
+                            date="2026-10-12")
+    other = _decide(other_row, distractor)
+    assert other["decision"] == "claimed"
+    assert _occupied_count() == 2
+
+
 def test_internal_claim_paths_revoked_from_service_role():
     for fn in ("visual_scene_claim_scan(public.content_calendar,uuid)",
                "visual_scene_claim_decide(public.content_calendar,uuid)",
