@@ -1,14 +1,13 @@
--- LASSO pairs each of its three daily feeds with a Story. Run this after
--- calendar_approval_provenance_20261005.sql so its seven-argument proof gate
--- remains intact. No six-argument RPC is recreated.
--- All client gyms keep their existing two-slot capacity.
+-- LASSO's third daily Story uses the same atomic claim and media guard as
+-- its paired feed. Apply after calendar_claim_media_guard_20261002.sql.
+-- Only canonical gym_id lasso can request capacity three; client gyms stay at two.
 begin;
 do $$
 begin
   if to_regprocedure(
-      'public.claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean,boolean)'
+      'public.claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean)'
      ) is null then
-    raise exception 'Apply approval-provenance claim before three-Story capacity';
+    raise exception 'Apply media-guard claim before three-Story capacity';
   end if;
 end;
 $$;
@@ -24,13 +23,11 @@ alter table public.content_calendar
     )
   );
 
--- Same proof, media, ownership, per-account/format counter and tenant guards
--- as the frozen approval-provenance claim. Only the LASSO format allowlist for
--- capacity three changes from feed to feed-or-story.
+-- The claim below is the frozen media-guard claim with only its LASSO format
+-- allowlist widened from feed to feed-or-story.
 create or replace function public.claim_calendar_publish_slot_owned(
   p_row_id uuid, p_gym_id text, p_day date, p_timezone text,
-  p_capacity integer, p_approved_only boolean,
-  p_require_approval_proof boolean default false
+  p_capacity integer, p_approved_only boolean
 ) returns uuid
 language plpgsql security definer set search_path = public
 as $$
@@ -38,7 +35,6 @@ declare
   v_row public.content_calendar%rowtype;
   v_used integer;
   v_token uuid;
-  v_enforce_proof boolean;
 begin
   if p_capacity < 1 or p_capacity > 3 or p_day is null or p_timezone is null
       or nullif(btrim(p_gym_id), '') is null then
@@ -49,16 +45,6 @@ begin
   end if;
 
   perform pg_advisory_xact_lock(hashtextextended(p_gym_id, 0));
-
-  -- ATOMIC MODE CHECK (armed only when the caller passes TRUE, which Echo does
-  -- for every lane behind AGENT_APPROVAL_PROOF): decide Manual vs Autonomous
-  -- from the authoritative DB NOW, inside the claim's own transaction and
-  -- with a settings-row lock -- never from a stale publisher snapshot. A
-  -- completed Auto->Manual flip therefore takes effect at the next claim. Any
-  -- resolver ambiguity enforces the proof gate (fail closed).
-  v_enforce_proof := p_require_approval_proof
-                     and not public.calendar_gym_is_autonomous(p_gym_id);
-
   select * into v_row from public.content_calendar
     where id = p_row_id and gym_id = p_gym_id
       and status in ('pending', 'approved') and published_at is null
@@ -70,32 +56,9 @@ begin
   if not found or (p_approved_only and v_row.status <> 'approved') then
     return null;
   end if;
-  -- A gym the DB says is Manual right now may only publish APPROVED rows,
-  -- even if the worker's stale snapshot ran the autonomous lane.
-  if v_enforce_proof and v_row.status <> 'approved' then
-    return null;
-  end if;
   if p_capacity = 3 and
       coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed') not in ('feed', 'story') then
     return null;
-  end if;
-
-  -- APPROVAL PROOF GATE: a fresh VERIFIED human approval whose digest matches
-  -- the LOCKED row. Review defect 1: approval_kind='human' can only be stamped
-  -- by calendar_stamp_verified_approval, which requires a nonempty Clerk actor
-  -- -- an Echo bearer token alone (approval_kind NULL) NEVER satisfies this
-  -- gate. approved_by must be NONEMPTY: proof without a trusted actor is not
-  -- proof. The digest binds the FINAL image_url, so changed pixels (auto-fit,
-  -- reburn, swap) after the stamp fail closed here.
-  if v_enforce_proof then
-    if v_row.approval_kind is distinct from 'human'
-        or nullif(btrim(coalesce(v_row.approved_by, '')), '') is null
-        or v_row.approved_at is null
-        or v_row.approval_digest is null
-        or v_row.approval_digest is distinct from
-           public.calendar_approval_digest(v_row) then
-      return null;
-    end if;
   end if;
 
   select count(*) into v_used from public.content_calendar
@@ -122,10 +85,8 @@ begin
 end;
 $$;
 
-revoke all on function public.claim_calendar_publish_slot_owned(
-  uuid, text, date, text, integer, boolean, boolean)
+revoke all on function public.claim_calendar_publish_slot_owned(uuid, text, date, text, integer, boolean)
   from public, anon, authenticated;
-grant execute on function public.claim_calendar_publish_slot_owned(
-  uuid, text, date, text, integer, boolean, boolean)
+grant execute on function public.claim_calendar_publish_slot_owned(uuid, text, date, text, integer, boolean)
   to service_role;
 commit;

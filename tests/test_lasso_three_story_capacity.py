@@ -60,11 +60,11 @@ def test_story_slot_change_applies_during_summit_only_window(monkeypatch):
 
 def test_story_claim_migration_only_widens_lasso_format_guard():
     root = Path(__file__).resolve().parents[1] / "migrations"
-    previous = (root / "calendar_approval_provenance_20261005.sql").read_text()
+    previous = (root / "calendar_claim_media_guard_20261002.sql").read_text()
     current = (root / "lasso_three_story_capacity_20261005.sql").read_text()
     guard = "coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed')"
     assert "p_capacity = 3 and p_gym_id <> 'lasso'" in current
-    assert "claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean,boolean)" in current
+    assert "claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean)" in current
     assert "slot_index = 2\n      and gym_id = 'lasso'" in current
     assert "'feed', 'story'" in current
     assert "media_not_ready_reason is null" in current
