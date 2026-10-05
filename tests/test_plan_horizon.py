@@ -216,6 +216,16 @@ def test_store_insert_rows_applies_horizon_belt():
                if r["post_date"] == _d(40))
 
 
+def test_store_formats_all_gym_captions_before_stage():
+    http = _FakeHTTP()
+    row = _row(10)
+    row["caption"] = "You can start here. Come train; meet the coaches."
+    inserted = _sb_store(http).insert_rows("crossfitlocal", [row])
+    assert inserted[0]["caption"] == (
+        "You can start here.\n\nCome train, meet the coaches.")
+    assert http.posted[0][0]["caption"] == inserted[0]["caption"]
+
+
 def test_store_insert_rows_lets_lasso_sprint_row_through():
     http = _FakeHTTP()
     inserted = _sb_store(http).insert_rows("lasso", [

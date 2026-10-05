@@ -146,6 +146,7 @@ def _portal_env(monkeypatch, tmp_path):
 
 def test_portal_edit_with_inline_why_saves_body_and_learns_reason(_portal_env):
     from agent import tenant_brain
+    from agent.copy_gate import format_caption
     store = _FakeEditStore([{
         "id": "uuid-1", "gym_id": "eng", "post_date": "2026-08-22",
         "account": "facebook", "status": "pending", "caption": "old caption",
@@ -155,9 +156,9 @@ def test_portal_edit_with_inline_why_saves_body_and_learns_reason(_portal_env):
     status, body = ps.handle_edit("eng", "uuid-1", "U1", note=note, sb_store=store)
     assert status == 200
     # the caption written to the store is the BODY only — the rationale never lands
-    assert store.caption_patches == [("uuid-1", CLEAN_BODY)]
+    assert store.caption_patches == [("uuid-1", format_caption(CLEAN_BODY))]
     assert "[why]" not in body["caption"].lower()
-    assert body["caption"] == CLEAN_BODY
+    assert body["caption"] == format_caption(CLEAN_BODY)
     # the rationale (label stripped) is captured as the edit's reason...
     assert body["reason_captured"] is True
     assert "Removed word parents" in body["reason"]
@@ -275,10 +276,11 @@ def test_publish_lane_strips_clean_meta_suffix_and_publishes_body(_armed):
     assert summary["published"] == ["r1"]
     # the OUTBOUND caption is the clean body — the rationale never hit the network
     assert len(pub.calls) == 1
-    assert pub.calls[0].caption == CLEAN_BODY
+    from agent.copy_gate import format_caption
+    assert pub.calls[0].caption == format_caption(CLEAN_BODY)
     assert "[why]" not in pub.calls[0].caption.lower()
     # and the stored caption was cleaned through the status-preserving patch
-    assert store.preserve_patches == [("lasso", "r1", CLEAN_BODY)]
+    assert store.preserve_patches == [("lasso", "r1", format_caption(CLEAN_BODY))]
 
 
 def test_publish_lane_holds_all_meta_caption(_armed):
@@ -302,7 +304,18 @@ def test_publish_lane_strip_survives_a_store_without_the_patch_method(_armed):
     pub = _FakePublisher()
     summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert summary["published"] == ["r3"]
-    assert pub.calls[0].caption == CLEAN_BODY
+    from agent.copy_gate import format_caption
+    assert pub.calls[0].caption == format_caption(CLEAN_BODY)
+
+
+def test_meta_strip_formats_local_send_even_if_patch_fails():
+    class _FailedPatch:
+        def patch_caption_preserve_status(self, *args):
+            raise RuntimeError("offline patch failed")
+
+    row = _row("r4", "Start here. Meet your coach; book a class. [why] test note")
+    cleaned = cap._strip_or_hold_meta(row, "lasso", _FailedPatch())
+    assert cleaned["caption"] == "Start here.\n\nMeet your coach, book a class."
 
 
 def test_proof_lane_strips_then_holds_for_fresh_human_approval(
@@ -324,7 +337,8 @@ def test_proof_lane_strips_then_holds_for_fresh_human_approval(
     assert summary["waiting"] == ["proved-meta"]
     assert pub.calls == []
     assert store.preserve_patches == []
-    assert store.rows["proved-meta"]["caption"] == CLEAN_BODY
+    from agent.copy_gate import format_caption
+    assert store.rows["proved-meta"]["caption"] == format_caption(CLEAN_BODY)
     assert store.rows["proved-meta"]["status"] == "pending"
     assert alerts == [("proved-meta", "lasso", True)]
 

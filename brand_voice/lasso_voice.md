@@ -253,17 +253,17 @@ strong hook. They historically underperform.
 
 ### Cadence note for Echo (read this first)
 
-The full LASSO standard below is 2 posts/day on Instagram with mandatory cross
-distribution. **Stage 1 ships a deliberately reduced cadence: one feed post per
-day per account, draft only, hold for approval.** That is on purpose, to prove the
-voice and the gates before volume. The calendar grows toward the full standard as
-trust is earned per account.
+LASSO's own Instagram account runs three feed posts and three paired Stories every day. Echo publishes
+autonomously from approved source material and this voice guide, without a
+per-post approval step. Account publishing settings and content safety gates
+still govern each release.
 
 ### Instagram (full standard)
 
-- 2 posts per day, Monday to Saturday. Sunday optional. Never gap more than 2
-  days. (A 53 day gap in early 2026 killed momentum.)
-- Times: 10:00 AM ET and 6:00 PM ET. Only these windows.
+- 3 feed posts with a matching Story for each every day, including Sunday. Keep the calendar filled and
+  recover missed posts through the guarded catch-up path.
+- Spread posts across three distinct daily slots in the account's configured
+  posting timezone. The live calendar controls the exact times.
 - Format guide: carousels (5 to 10 slides) for educational and wins (2x
   engagement, highest saves). Reels (30 to 60 sec) for bold takes and reach.
 - Never two videos or two carousels back to back the same day. Alternate.

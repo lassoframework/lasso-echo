@@ -795,6 +795,133 @@ def test_catch_all_publishes_every_due_row_regardless_of_slot(armed):
     assert summary["waiting"] == []                     # NOTHING left behind
 
 
+def test_lasso_paired_story_waits_for_its_feed_slot_even_in_catch_all(
+        armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    pm_story = _row("pm-story", fmt="story")
+    pm_story["slot_index"] = 1
+    paired_feed = _row("pm-feed", status="published",
+                       published_at=_edt("18:31"), late_post_id="FEED-1")
+    paired_feed["slot_index"] = 1
+    store = _PairedFeedStore([paired_feed, pm_story])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    before = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                             now=_edt("18:30"), catch_all=True)
+    assert before["published"] == []
+    assert before["waiting"] == ["pm-story"]
+    assert store.publishing_calls == []
+
+    after = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                            now=_edt("18:45"), catch_all=True)
+    assert after["published"] == ["pm-story"]
+
+
+class _PairedFeedStore(_FakeStore):
+    def due_rows(self, gym_id, run_date):
+        return [row for row in super().due_rows(gym_id, run_date)
+                if row.get("status") in ("pending", "approved")]
+
+    def list_active_logical_post_rows(self, gym, logical_id):
+        assert gym == "lasso"
+        return [dict(row) for row in self.rows.values()
+                if row.get("logical_post_id") == logical_id]
+
+    def rows_in_range_complete(self, gym, first, last):
+        assert gym == "lasso" and first == last
+        return [dict(row) for row in self.rows.values()
+                if row.get("gym_id") == gym and row.get("post_date") == first]
+
+
+def _paired_rows(*, logical_id="11111111-1111-4111-8111-111111111111",
+                 feed_status="published", feed_media_id="META-1"):
+    feed = _row("paired-feed", status=feed_status,
+                published_at=(_edt("18:31") if feed_status == "published" else None),
+                late_post_id=feed_media_id if feed_status == "published" else None)
+    story = _row("paired-story", fmt="story")
+    for row in (feed, story):
+        row["slot_index"] = 1
+        row["logical_post_id"] = logical_id
+    return feed, story
+
+
+def test_lasso_paired_story_requires_delivered_logical_feed(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    feed, story = _paired_rows()
+    store = _PairedFeedStore([feed, story])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="STORY-1"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                              now=_edt("18:45"), catch_all=True)
+    assert summary["published"] == ["paired-story"]
+    assert store.rows["paired-story"]["status"] == "published"
+
+
+def test_lasso_story_accepts_persisted_zernio_dedup_receipt(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    feed, story = _paired_rows(feed_media_id="")
+    store = _PairedFeedStore([feed, story])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="S"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                              now=_edt("18:45"), catch_all=True)
+    assert summary["published"] == ["paired-story"]
+
+
+def test_summit_only_direct_ticks_include_third_story(armed, monkeypatch):
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: False)
+    monkeypatch.setattr(config, "lasso_summit_daily_enabled", lambda day: True)
+    monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
+    monkeypatch.setattr(cap, "publish_due", lambda *args, **kwargs: {"ok": True})
+    kv = _FakeKV()
+    cap.run_slot_ticks(RUN_DATE, now=_edt("19:00"), kv=kv)
+    assert kv.get(cap._slot_fire_key(RUN_DATE, "12:15")) == "done"
+    assert kv.get(cap._slot_fire_key(RUN_DATE, "18:45")) == "done"
+
+
+def test_lasso_story_holds_until_logical_feed_is_actually_live(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    for status, media_id in (("pending", None), ("publishing", None),
+                             ("published", None)):
+        feed, story = _paired_rows(feed_status=status, feed_media_id=media_id)
+        if status == "pending":
+            feed["image_url"] = ""  # the paired feed is held, not publishable
+        store = _PairedFeedStore([feed, story])
+        pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="S"))
+        summary = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                                  now=_edt("18:45"), catch_all=True)
+        assert summary["published"] == []
+        assert summary["waiting"] == ["paired-story"]
+        assert store.publishing_calls == []
+
+
+def test_lasso_story_with_logical_id_never_falls_back_to_slot(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    feed, story = _paired_rows()
+    feed["logical_post_id"] = "22222222-2222-4222-8222-222222222222"
+    store = _PairedFeedStore([feed, story])
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=_FakePublisher(),
+                              now=_edt("18:45"), catch_all=True)
+    assert summary["published"] == []
+    assert summary["waiting"] == ["paired-story"]
+
+
+def test_legacy_lasso_story_pairs_by_exact_date_account_and_slot(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    feed, story = _paired_rows(logical_id=None)
+    store = _PairedFeedStore([feed, story])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="S"))
+    assert cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                           now=_edt("18:45"))["published"] == ["paired-story"]
+
+    feed, story = _paired_rows(logical_id=None)
+    other = dict(feed, id="ambiguous-feed")
+    store = _PairedFeedStore([feed, other, story])
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=_FakePublisher(),
+                              now=_edt("18:45"))
+    assert summary["published"] == []
+    assert summary["waiting"] == ["paired-story"]
+
+
 def test_once_a_day_single_call_orphans_nothing(armed):
     # Simulate the real ONCE/DAY scheduler: a single publish_due at 10am ET with
     # catch_all=True. Every due row publishes that day; none is orphaned.
@@ -891,6 +1018,28 @@ def test_run_slot_ticks_last_slot_is_catch_all(armed):
     # Exactly-once: three rows, three published records total.
     assert len(store.published_calls) == 3
     assert kv.get(cap._slot_fire_key(RUN_DATE, "18:30")) == "done"
+
+
+def test_lasso_three_story_direct_tick_fires_after_pm_feed(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    story = _row("pm-story", fmt="story")
+    story["slot_index"] = 1
+    feed = _row("pm-feed", status="published", published_at=_edt("18:31"),
+                late_post_id="FEED-1")
+    feed["slot_index"] = 1
+    store = _PairedFeedStore([feed, story])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    kv = _FakeKV()
+
+    cap.run_slot_ticks(RUN_DATE, store=store, publisher=pub,
+                       now=_edt("18:30"), kv=kv)
+    assert store.rows["pm-story"]["status"] == "pending"
+    assert kv.get(cap._slot_fire_key(RUN_DATE, "18:45")) != "done"
+
+    cap.run_slot_ticks(RUN_DATE, store=store, publisher=pub,
+                       now=_edt("18:45"), kv=kv)
+    assert store.rows["pm-story"]["status"] == "published"
+    assert kv.get(cap._slot_fire_key(RUN_DATE, "18:45")) == "done"
 
 
 def test_run_slot_ticks_multi_tick_across_day_orphans_nothing_exactly_once(armed):
@@ -2541,3 +2690,100 @@ def test_calendar_grade_obeys_caption_cooldown_switch_and_story_exemption(
     assert bool(checked) is blocked
     assert len(pub.calls) == (0 if blocked else 1)
     assert store.rows['cooldown-row']['status'] == ('pending' if blocked else 'published')
+
+
+# ---- legacy semicolon auto-heal at the publish boundary (2026-10-05) --------
+# Rows approved before the copy_gate semicolon rail shipped keep their
+# semicolons (the correction lanes skip approved/held/Story/published rows),
+# so the publish_guard copy_violation rail would silently stop every one of
+# them at schedule time. The publish boundary now auto-formats a due FEED row
+# (semicolons -> commas, status preserved) and publishes clean; a semicolon
+# glued inside a URL (format_caption refuses to corrupt the link) HOLDS the
+# row instead. Story rows pass through untouched (burned-media semantics).
+
+class _PreservingStore(_FakeStore):
+    """_FakeStore plus the status-preserving caption patch the heal uses."""
+
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.preserve_patches = []      # (gym_id, row_id, caption)
+
+    def patch_caption_preserve_status(self, gym_id, row_id, new_caption):
+        self.preserve_patches.append((gym_id, row_id, new_caption))
+        r = self.rows.get(row_id)
+        if r is None:
+            return None
+        r["caption"] = new_caption      # status DELIBERATELY untouched
+        return dict(r)
+
+
+def test_approved_legacy_semicolon_caption_is_formatted_and_publishes(armed):
+    store = _PreservingStore([_row(
+        "semi1", status="approved",
+        caption="Move well; build strength. Book a class; bring a friend.")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["published"] == ["semi1"]
+    sent = pub.calls[0][0].caption
+    assert ";" not in sent, "a raw semicolon must never reach the wire"
+    assert "Move well, build strength." in sent
+    # persisted through the STATUS-PRESERVING patch (approval kept), and the row
+    # went on to publish this same tick
+    assert store.preserve_patches == [("lasso", "semi1", sent)]
+    assert store.rows["semi1"]["status"] == "published"
+
+
+def test_semicolon_heal_survives_a_store_without_the_patch_method(armed):
+    """A legacy/fake store lacking patch_caption_preserve_status still publishes
+    the CLEAN caption — the local row is authoritative for the send."""
+    class _NoPatchStore(_FakeStore):
+        patch_caption_preserve_status = None
+    store = _NoPatchStore([_row(
+        "semi2", status="approved",
+        caption="Move well; build strength. Book a class today with us.")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["published"] == ["semi2"]
+    assert ";" not in pub.calls[0][0].caption
+
+
+def test_semicolon_glued_inside_url_holds_the_row(armed):
+    """format_caption raises rather than corrupt a link; the row is HELD (never
+    claimed) for a human edit instead of publishing or crashing the lane."""
+    store = _PreservingStore([_row(
+        "badurl", status="approved",
+        caption="Visit https://example.com/a;b for details. Book a class today.")])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["published"] == []
+    assert "badurl" in summary["waiting"]
+    assert pub.calls == []
+    assert store.preserve_patches == []
+    assert store.rows["badurl"]["status"] == "approved"   # untouched
+
+
+def test_story_row_with_semicolon_is_held_until_media_is_corrected(armed, monkeypatch):
+    """A Story's old media may contain the semicolon, so it must not publish."""
+    from agent import story_image
+    story_caption = "Story words; burned onto media."
+    store = _PreservingStore([_row(
+        "story1", fmt="story", status="approved", caption=story_caption,
+        image_url="https://cdn.example.com/story_burned_y.png")])
+    store.rows["story1"]["source_media_url"] = "https://cdn.example.com/raw/y.jpg"
+    monkeypatch.setattr(story_image, "story_media_carries_caption",
+                        lambda url, caption: True)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["published"] == []
+    assert "story1" in summary["waiting"]
+    assert pub.calls == []
+    assert store.preserve_patches == []
+    assert store.rows["story1"]["caption"] == story_caption

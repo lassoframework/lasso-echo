@@ -232,20 +232,34 @@ def slot_time_for_row(row, n=None):
     2x CADENCE (CADENCE_SPEC.md D6): a FEED row stamped with a cadence slot_index
     (0 or 1 — written only by a 2x plan) gets the DETERMINISTIC pair from
     config.cadence_slot_times() (default 07:30 / 18:30) instead of the id-hash,
-    which could collide both of a day's feeds onto one slot. Applies only while
-    ECHO_CADENCE_2X_ENABLED is armed; flag off (or no slot_index on the row) is
-    the pre-cadence hash path, byte-for-byte. Stories keep their midday slot."""
+    which could collide both of a day's feeds onto one slot. Applies while
+    ECHO_CADENCE_2X_ENABLED or LASSO's durable 3x cadence is armed; otherwise
+    the pre-cadence hash path is unchanged. Durable LASSO Stories with a slot
+    index follow their matching feed by 15 minutes."""
     fmt = (row.get("format") or "feed").strip().lower()
     si = row.get("slot_index")
+    lasso_paired = (
+        str(row.get("gym_id") or "").strip().lower() == "lasso"
+        and (config.lasso_three_feed_enabled()
+             or _lasso_summit_daily_enabled(row.get("gym_id"),
+                                            row.get("post_date"))))
+    if fmt == "story" and si in (0, 1, 2) and lasso_paired:
+        feed_slot = config.cadence_slot_times()[int(si)] if si in (0, 1) else "12:00"
+        hour, minute = (int(part) for part in feed_slot.split(":"))
+        # A configured late feed must never wrap its Story to the next day's
+        # early hours, where a same-day slot comparison would send it early.
+        story_minute = min(hour * 60 + minute + 15, 23 * 60 + 59)
+        return f"{story_minute // 60:02d}:{story_minute % 60:02d}"
     # LASSO Summit daily runway: the extra FEED owns a third, distinct local
     # slot.  Scope this by both tenant and the row's explicit calendar day so
     # enabling the campaign cannot change clients or spill beyond its window.
-    # Stories retain the existing 12:30 slot.
+    # The Summit-only third Story follows its noon feed at 12:15.
     if (fmt == "feed" and si == 2
             and _lasso_three_feed_enabled(row.get("gym_id"),
                                           row.get("post_date"))):
         return "12:00"
-    if (fmt == "feed" and si in (0, 1) and config.cadence_2x_enabled()):
+    if (fmt == "feed" and si in (0, 1)
+            and (config.cadence_2x_enabled() or lasso_paired)):
         return config.cadence_slot_times()[int(si)]
     if n is None:
         n = len(SPRINT_SLOT_TIMES)
@@ -288,14 +302,53 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
         # Compatibility for narrow injected resolvers predating the dated API.
         # The production resolver accepts `day` and always takes the path above.
         capacity = resolve_posts_per_day(gym_id, store)
-    is_feed = (row.get("format") or "feed").strip().lower() == "feed"
-    if (is_feed
+    fmt = (row.get("format") or "feed").strip().lower()
+    is_feed = fmt == "feed"
+    # Both the durable cadence and the dated Summit cadence pair each feed
+    # with a Story, so their publish capacity must agree with the planner.
+    if (fmt in ("feed", "story")
             and _lasso_three_feed_enabled(gym_id, local_claim_day)):
         return max(capacity, 3)
-    # The temporary third slot belongs to the extra Summit feed only. Stories
-    # retain their existing capacity even though the dated cadence resolver
-    # correctly reports three for LASSO as a whole.
     return capacity if is_feed else min(capacity, 2)
+
+
+def _paired_lasso_feed_published(story, store):
+    """Require one exact, live IG feed before its durable paired Story.
+
+    A logical_post_id is authoritative when present. Older rows without one
+    use the same date, account and slot index; ambiguity or a failed complete
+    read holds the Story. A publishing claim alone never counts as delivery.
+    """
+    if (story.get("gym_id") != "lasso"
+            or (story.get("format") or "").strip().lower() != "story"
+            or story.get("slot_index") not in (0, 1, 2)
+            or not story.get("post_date")):
+        return False
+    logical_id = story.get("logical_post_id")
+    try:
+        if logical_id:
+            rows = store.list_active_logical_post_rows("lasso", logical_id)
+        else:
+            day = str(story["post_date"])[:10]
+            rows = store.rows_in_range_complete("lasso", day, day)
+    except Exception:
+        return False
+    if not isinstance(rows, list):
+        return False
+    matches = [row for row in rows if isinstance(row, dict)
+               and row.get("gym_id") == "lasso"
+               and str(row.get("account") or "").strip().lower() ==
+                   str(story.get("account") or "").strip().lower()
+               and (row.get("format") or "feed").strip().lower() == "feed"
+               and str(row.get("post_date") or "")[:10] ==
+                   str(story["post_date"])[:10]
+               and row.get("slot_index") == story["slot_index"]
+               and (row.get("variant_status") or "active") == "active"
+               and (not logical_id or row.get("logical_post_id") == logical_id)]
+    return (len(matches) == 1
+            and matches[0].get("status") == "published"
+            and bool(matches[0].get("published_at"))
+            and matches[0].get("late_post_id") is not None)
 
 
 def assign_slots(rows):
@@ -803,6 +856,11 @@ def _strip_or_hold_meta(row, gym_id, store):
         return row
     if not (body or "").strip():
         return None
+    from .copy_gate import format_caption
+    try:
+        body = format_caption(body)
+    except ValueError:
+        return None
     if config.approval_proof_enabled():
         persisted = False
         try:
@@ -826,6 +884,83 @@ def _strip_or_hold_meta(row, gym_id, store):
     row = dict(patched or row)
     row["caption"] = body   # what we SEND is clean even when the patch failed
     _note_meta_stripped(row.get("id"), gym_id)
+    return row
+
+
+def _note_caption_formatted(row_id, gym_id):
+    """One deduped ops notice per row when the publish boundary SELF-HEALED a legacy
+    approved caption by auto-formatting it (semicolons -> commas). The post still
+    publishes — this is visibility, not a hold."""
+    try:
+        from . import db, ops_alerts
+        key = f"capformat_healed_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
+            f"{gym_id}: row {row_id} carried a pre-copy-rail caption with "
+            "semicolons. Echo auto-formatted it at the publish boundary "
+            "(semicolons became commas) and published the clean caption."))
+    except Exception:
+        pass  # an alert failure must never block the publish lane
+
+
+def _alert_caption_format_held(row_id, gym_id):
+    """One deduped ops alert per row when a due caption is HELD at the publish
+    boundary because it cannot be safely auto-formatted. A Story may already
+    have the words burned into its media, or a URL may contain the semicolon.
+    A human must correct the copy and media; the row retries once fixed."""
+    try:
+        from . import db, ops_alerts
+        key = f"capformat_held_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
+            f"{gym_id}: row {row_id} HELD at the publish boundary — its caption "
+            "contains a semicolon that cannot be safely auto-formatted. "
+            "Edit the caption and re-render Story media if applicable; "
+            "the row retries once fixed."))
+    except Exception:
+        pass  # an alert failure must never block the publish lane
+
+
+def _format_caption_at_publish(row, gym_id, store):
+    """LEGACY SEMICOLON AUTO-HEAL at the publish boundary (ultrareview 2026-10-05).
+    Rows approved before the copy_gate semicolon rail shipped keep their semicolons
+    forever — the correction lanes deliberately skip approved/held/Story/published
+    rows — so the publish_guard copy_violation rail would silently stop every one
+    of them at schedule time. Instead, a due FEED row whose caption still carries
+    semicolons is auto-formatted HERE (semicolons -> commas via copy_gate's
+    format_caption), persisted through the STATUS-PRESERVING patch (an approved row
+    stays approved), and publishes clean this tick. Runs unconditionally, like the
+    meta-strip gate, so a raw semicolon can never reach the wire under any flag
+    combination. STORY rows with semicolons are held because the text may already
+    be burned into the media. A caption whose semicolon sits inside a protected
+    URL also returns None. The caller HOLDS either row and alerts once."""
+    caption = row.get("caption") or ""
+    if _is_story_row(row):
+        # A Story caption may already be burned into the image or video. Never
+        # send the old media while its text still contains a semicolon.
+        return None if ";" in caption else row
+    if ";" not in caption:
+        return row
+    from .copy_gate import format_caption
+    try:
+        clean = format_caption(caption)
+    except ValueError:
+        return None
+    if clean == caption:
+        return row
+    patched = None
+    try:
+        patcher = getattr(store, "patch_caption_preserve_status", None)
+        if patcher is not None:
+            patched = patcher(row.get("gym_id") or gym_id, row.get("id"), clean)
+    except Exception as e:  # noqa: BLE001 - persistence is best effort here
+        print(f"[calendar-autopublish] caption format patch failed for "
+              f"{row.get('id')}: {type(e).__name__}: {e}")
+    row = dict(patched or row)
+    row["caption"] = clean  # what we SEND is clean even when the patch failed
+    _note_caption_formatted(row.get("id"), gym_id)
     return row
 
 
@@ -1246,8 +1381,20 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         row_date = str(row.get("post_date") or run_date)[:10]
         past_date = row_date < gym_local_today
         future_date = row_date > gym_local_today
-        if not catch_all and (future_date or
-                              (not past_date and not is_due(row, now, gym_tz))):
+        # Paired LASSO Stories wait for their feed-following slot even during
+        # the last-slot catch-all sweep. A future local date always waits.
+        paired_lasso_story = (
+            str(gym_id or "").strip().lower() == "lasso"
+            and (row.get("format") or "feed").strip().lower() == "story"
+            and row.get("slot_index") in (0, 1, 2)
+            and _lasso_three_feed_enabled(gym_id, row_date))
+        if ((paired_lasso_story and
+             (future_date or (not past_date and not is_due(row, now, gym_tz))))
+                or (not paired_lasso_story and not catch_all and
+                    (future_date or (not past_date and not is_due(row, now, gym_tz))))):
+            waiting.append(row_id)
+            continue
+        if paired_lasso_story and not _paired_lasso_feed_published(row, store):
             waiting.append(row_id)
             continue
 
@@ -1289,6 +1436,17 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             _alert_meta_leak_held(row_id, gym_id)
             continue
         row = cleaned
+
+        # LEGACY SEMICOLON AUTO-HEAL (2026-10-05): an approved FEED row carrying
+        # semicolons is auto-formatted (status preserved) and publishes clean,
+        # rather than tripping the publish_guard copy rail and silently stopping.
+        # Story rows with semicolons and unformattable URLs hold with an alert.
+        formatted = _format_caption_at_publish(row, gym_id, store)
+        if formatted is None:
+            waiting.append(row_id)
+            _alert_caption_format_held(row_id, gym_id)
+            continue
+        row = formatted
 
         # STORY CAPTION MUST BE ON THE MEDIA (Dale, 2026-08-17): a story publishes with
         # an EMPTY body, so its caption lives only on the rendered media. When a client
@@ -1973,7 +2131,15 @@ def run_slot_ticks(run_date, *, gym_id="lasso", store=None, publisher=None,
         kv = _kv_default()
 
     fired = []
-    slots = SPRINT_SLOT_TIMES or []
+    slots = list(SPRINT_SLOT_TIMES or [])
+    if _lasso_three_feed_enabled(gym_id, run_date):
+        # The direct-publisher fallback also needs ticks at the paired times.
+        # Its old final 18:30 catch-all cannot send the 18:45 Story early.
+        slots = sorted(set(slots) | {
+            slot_time_for_row({"gym_id": "lasso", "format": fmt,
+                               "slot_index": si, "post_date": run_date})
+            for fmt in ("feed", "story") for si in (0, 1, 2)
+        })
     last_slot = slots[-1] if slots else None
     for slot_time in slots:
         if not _slot_reached(slot_time, now):
