@@ -506,7 +506,31 @@ def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
         # cropped/delivered URL: a transform names its true raw source, a
         # same-object row names the delivered object itself.
         row["source_media_url"] = source_media_url
+    # GBP posts are singleton logical objects. Identity does not derive from
+    # date, image, or any IG/FB/Story grouping.
+    if config.logical_post_id_enabled():
+        _ensure_logical_post_id(row)
     return row
+
+
+def _ensure_logical_post_id(row):
+    """Assign one stable UUID to this GBP row object, preserving valid retries.
+
+    Invalid pre-existing identity is a hard error: replacing it could turn a
+    retry into a second logical post. Callers must not persist an unkeyed row.
+    """
+    existing = row.get("logical_post_id")
+    if existing is not None:
+        try:
+            uuid.UUID(str(existing))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("invalid logical_post_id") from exc
+        return str(existing)
+    assigned = str(uuid.uuid4())
+    # Validate the generated value before allowing this row to reach storage.
+    uuid.UUID(assigned)
+    row["logical_post_id"] = assigned
+    return assigned
 
 
 # ---- B9: an empty GBP month must name what is MISSING ---------------------------

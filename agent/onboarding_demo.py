@@ -28,6 +28,7 @@ HARD RAILS (this module exists inside the no-fabrication gate, not around it):
 """
 
 from datetime import date, timedelta
+import uuid
 
 from . import config
 
@@ -93,6 +94,34 @@ def enabled():
     return config.onboarding_demo_enabled()
 
 
+def _logical_post_ids_enabled():
+    """Read the identity writer flag; older deployments default to OFF."""
+    try:
+        enabled_fn = getattr(config, "logical_post_id_enabled", None)
+        return bool(enabled_fn()) if callable(enabled_fn) else False
+    except Exception:  # noqa: BLE001 - preserve legacy behavior on unknown flag state
+        return False
+
+
+def _ensure_logical_post_id(row):
+    """Assign or preserve a valid UUID when enabled; return False on unsafe identity."""
+    if not _logical_post_ids_enabled():
+        return True
+    existing = row.get("logical_post_id")
+    if existing is not None:
+        try:
+            uuid.UUID(str(existing))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        return True
+    try:
+        row["logical_post_id"] = str(uuid.uuid4())
+        uuid.UUID(row["logical_post_id"])
+        return True
+    except Exception:  # noqa: BLE001 - never insert a sample with unkeyed identity
+        return False
+
+
 def is_sample_row(row):
     """True when a content_calendar row is a seeded SAMPLE. Checks BOTH markers so a
     row stays detectable if a caption is edited or a pillar is re-written."""
@@ -129,7 +158,7 @@ def build_rows(base_key, *, days=14, start=None, account="instagram",
         feed_caption = (f"{SAMPLE_PREFIX}This is where {headline} will go.\n\n{body}\n\n"
                         "This is a sample so you can see your calendar before your "
                         "content is ready. It will be replaced by your real post.")
-        rows.append({
+        feed_row = {
             "gym_id": base_key,
             "account": account,
             "post_date": day,
@@ -138,10 +167,14 @@ def build_rows(base_key, *, days=14, start=None, account="instagram",
             "caption": feed_caption,
             "image_url": img,
             "status": "draft",
-        })
+        }
+        if not _ensure_logical_post_id(feed_row):
+            raise ValueError("unable to assign sample feed logical_post_id")
+        rows.append(feed_row)
         if mirror_facebook:
-            rows.append({**rows[-1], "account": "facebook"})
-        rows.append({
+            # This explicit mirror is a sibling row for the same sample feed.
+            rows.append({**feed_row, "account": "facebook"})
+        story_row = {
             "gym_id": base_key,
             "account": account,
             "post_date": day,
@@ -151,7 +184,12 @@ def build_rows(base_key, *, days=14, start=None, account="instagram",
                         f"{_STORY_LINES[i % len(_STORY_LINES)]}"),
             "image_url": img,
             "status": "draft",
-        })
+        }
+        # A Story is a separate logical post even though it is scheduled on the
+        # same day and may display the same sample image.
+        if not _ensure_logical_post_id(story_row):
+            raise ValueError("unable to assign sample Story logical_post_id")
+        rows.append(story_row)
     return rows
 
 
@@ -176,7 +214,11 @@ def seed(base_key, *, days=14, store=None, start=None, image_for_day=None, log=N
         return {"ok": True, "reason": "gym already has real content", "seeded": 0}
     if existing:
         return {"ok": True, "reason": "already sampled", "seeded": 0}
-    rows = build_rows(base_key, days=days, start=start, image_for_day=image_for_day)
+    try:
+        rows = build_rows(base_key, days=days, start=start, image_for_day=image_for_day)
+    except Exception as exc:  # noqa: BLE001 - uncertain identity means no sample insert
+        log(f"{base_key}: sample identity assignment failed ({type(exc).__name__})")
+        return {"ok": False, "reason": "sample identity assignment failed", "seeded": 0}
     try:
         written = store.insert_rows(base_key, rows) or []
     except Exception as exc:  # noqa: BLE001 - a demo must never sink the scan

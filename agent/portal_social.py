@@ -39,7 +39,10 @@ HARD COPY RULES (grep-asserted in tests): no em/en/hyphen dashes and never the w
 "vendor" in any client-facing string here. Verified stats only.
 """
 
+import hashlib
+import json
 import os
+import re
 from datetime import datetime, timezone
 
 from . import config, db as _db
@@ -1209,16 +1212,635 @@ def _handle_deny_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
 # the gym's approval always keeps exactly the pixels it approved.
 # ==========================================================================
 
+# ---- durable swap action receipts (DRAFT v3, 2026-10-04) --------------------
+#
+# An explicit opaque client action_id binds one swap to one durable,
+# tenant-scoped receipt (public.portal_action_receipt; migration
+# migrations/portal_action_receipt_draft_20261004.sql is a DRAFT applied by the
+# database operator only). ALL receipt access goes through the three SECURITY
+# DEFINER RPC wrappers on SupabaseCalendarStore -- this module NEVER reads,
+# inserts, updates or patches the receipt table directly.
+#
+# The binding contract (Portal PR750 sends ONLY action_id):
+#   * the request fingerprint is derived from the immutable request tuple
+#     (gym, row, actor, action, action_id) BEFORE any calendar row is read;
+#   * begin runs FIRST after the auth/capability gates and captures the
+#     before_state itself, so an exact same-binding replay returns the stored
+#     terminal outcome even when the row was since deleted or its media moved;
+#   * a conflicting reuse (different post, actor or fingerprint) is a 409;
+#   * a missing or historical-NULL logical_post_id row is HELD for manual
+#     review -- sibling grouping by date/media inference is never a fallback;
+#   * the swap group is EXACTLY the claim RPC's frozen member manifest
+#     (gym_id, logical_post_id, variant_status='active'): no
+#     media_swap.sibling_rows, no date/media inference, no per-row swap_media
+#     writes on this path -- one apply RPC writes the whole group atomically;
+#   * success is ONLY the persisted terminal receipt apply returns; a timeout
+#     or lost response is reconciled by replaying the same apply, never by
+#     trusting a mutable row read or a raw write response.
+#
+# Flag: ECHO_SWAP_ACTION_RECEIPT (default OFF). OFF + an explicit action_id is
+# a 503 (never a silently non-idempotent swap); callers that send no action_id
+# keep the legacy path byte-for-byte.
+
+_RECEIPT_ACTION = "swap-media"
+# Sentinel distinguishing "client sent no action_id key at all" (legacy
+# path) from an explicit value -- an explicit JSON null, empty string or
+# non-string must be REJECTED on the receipt path, never silently
+# treated as the legacy no-ID call.
+_NO_ACTION_ID = object()
+_RECEIPT_MAX_ACTION_ID = 128
+_RECEIPT_ACTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,127}\Z")
+_RECEIPT_MEDIA_KEYS = ("image_url", "source_media_url", "thumbnail_url",
+                       "source_media_asset_id")
+
+
+def _swap_receipts_enabled():
+    """ECHO_SWAP_ACTION_RECEIPT, default OFF. The durable idempotency receipt
+    for portal photo swaps. NEW capability, ships dark; arm by hand only after
+    the DRAFT migration is applied."""
+    return config._truthy(os.environ.get("ECHO_SWAP_ACTION_RECEIPT", "false"))
+
+
+def _swap_receipt_gyms():
+    """ECHO_SWAP_ACTION_RECEIPT_GYMS, default EMPTY. Comma-separated exact
+    account keys permitted on the explicit-action_id receipt path. Whitespace
+    around each config entry is trimmed and matching is exact; absent or
+    empty means NO gym is allowed -- fail closed, never a wildcard enable."""
+    raw = os.environ.get("ECHO_SWAP_ACTION_RECEIPT_GYMS", "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _swap_receipt_gym_allowed(account_key):
+    """Exact account-key membership in the receipt
+    allowlist. A missing gym or a missing list is NOT allowed."""
+    return isinstance(account_key, str) and account_key in _swap_receipt_gyms()
+
+
+def _receipt_fingerprint(account_key, draft_id, actor_id, action_id):
+    """Immutable binding over the request tuple ONLY (gym, row, actor, action,
+    action_id), computable before any calendar row is read. The media the
+    request was issued against is captured by SQL begin as before_state, never
+    by this fingerprint."""
+    bind = {"action": _RECEIPT_ACTION, "gym": str(account_key),
+            "row": str(draft_id), "actor": str(actor_id or ""),
+            "action_id": str(action_id)}
+    raw = json.dumps(bind, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _receipt_clean_url(url):
+    """A public object identity URL: http(s) only, never signed/tokenized (no
+    query or fragment). Anything else is unsafe to freeze onto a receipt."""
+    if not isinstance(url, str) or not url:
+        return False
+    low = url.lower()
+    if not (low.startswith("https://") or low.startswith("http://")):
+        return False
+    return "?" not in url and "#" not in url
+
+
+def _receipt_media_identity(source, require_asset_id=False):
+    """The allowlisted per-row media identity for claim/apply, or None when any
+    identity piece is missing or unsafe (the caller then HOLDS: no claim, no
+    write). Keys with empty values are omitted so SQL's NULL-tolerant equality
+    sees exactly the frozen shape."""
+    source = source or {}
+    image_url = source.get("image_url")
+    if not _receipt_clean_url(image_url):
+        return None
+    out = {"image_url": image_url}
+    for key in ("source_media_url", "thumbnail_url"):
+        value = source.get(key)
+        if value:
+            if not _receipt_clean_url(value):
+                return None
+            out[key] = value
+    asset_id = source.get("source_media_asset_id") or source.get("asset_id")
+    if asset_id:
+        out["source_media_asset_id"] = str(asset_id)
+    elif require_asset_id:
+        return None
+    return out
+
+
+_RECEIPT_LOCAL_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+#: Provenance prefix for a tenant-owned local-library pick (no media_asset row
+#: exists; the SQL claim/apply allowlists this exact prefix and nothing else).
+RECEIPT_LOCAL_ASSET_PREFIX = "local:"
+
+
+def _receipt_selected_asset(pick):
+    """The claim selected_asset: asset_id + public object identity keys only.
+    None (hold) when the asset id is missing or any URL is unsafe.
+
+    A Drive pick carries its media_asset id. A LOCAL-library pick has no Drive
+    asset id (media_swap._finish leaves it empty): its durable provenance is
+    ``local:<library key>`` -- the library-relative name inside the gym's OWN
+    library root (media_swap.local_candidates / library_path_for), which the
+    SQL claim accepts without a media_asset row. A pick with neither a Drive
+    asset id nor a safe local key is unproven media: hold, never claim."""
+    identity = _receipt_media_identity(pick)
+    if identity is None:
+        return None
+    asset_id = identity.pop("source_media_asset_id", None)
+    if not asset_id:
+        key = str((pick or {}).get("key") or "")
+        if (str((pick or {}).get("source") or "") != "local"
+                or not _RECEIPT_LOCAL_KEY_RE.match(key) or ".." in key):
+            return None
+        asset_id = RECEIPT_LOCAL_ASSET_PREFIX + key
+    out = {"asset_id": asset_id, "image_url": identity["image_url"]}
+    for key in ("source_media_url", "thumbnail_url"):
+        if key in identity:
+            out[key] = identity[key]
+    kind = (pick or {}).get("kind")
+    if kind:
+        out["kind"] = str(kind)
+    key = (pick or {}).get("key")
+    if key:
+        out["key"] = str(key)
+    return out
+
+
+def _receipt_identity_matches(pick, selected):
+    """Exact equality over the WHOLE frozen selected identity (asset id /
+    provenance, hosted object, source and thumbnail URLs). A concurrent claim
+    loser whose candidate shares only the hosted URL -- or nothing -- is NOT
+    the frozen selection and must never be settled as if it were."""
+    own = _receipt_selected_asset(pick)
+    if own is None or not isinstance(selected, dict):
+        return False
+    return all(str(own.get(key) or "") == str(selected.get(key) or "")
+               for key in ("asset_id", "image_url", "source_media_url",
+                           "thumbnail_url"))
+
+
+def _settle_receipt_ledgers(ms, account_key, receipt, own_pick=None):
+    """Settle the usage ledgers against the receipt's FROZEN selected asset --
+    durable, exact-asset-bound and idempotent, so a lost apply response that
+    committed is settled by the terminal replay, never skipped. A losing
+    reservation was already released and is NEVER settled here.
+
+    own_pick (this attempt's reservation) is used only when its identity is
+    exactly the frozen selection. Otherwise the settlement pick is rebuilt
+    from the receipt: a Drive asset re-derives the deterministic byte-bound
+    claim key (gym_media_selector.drive_content_claim_id) so claim_done is an
+    idempotent no-op when the first attempt already settled, and the usage
+    stamp itself is never repeated (_drive_stamped -- reserve_local_pick
+    stamped pre-claim; stamp_use is not idempotent). A 'local:' asset
+    re-reserves through the once-only served ledger keyed by the library file.
+    Best-effort: a ledger hiccup never turns a committed swap into a failure.
+    """
+    try:
+        selected = receipt.get("selected_asset") or {}
+        before = receipt.get("before_state") or {}
+        asset_id = str(selected.get("asset_id") or "")
+        if not asset_id or not before:
+            return
+        if own_pick is not None and _receipt_identity_matches(own_pick, selected):
+            ms.after_swap(account_key, before, own_pick)
+            return
+        pick = {"source": ("local" if asset_id.startswith(RECEIPT_LOCAL_ASSET_PREFIX)
+                           else "drive"),
+                "kind": str(selected.get("kind") or "photo"),
+                "key": str(selected.get("key") or ""),
+                "source_media_asset_id": asset_id}
+        if pick["source"] == "local":
+            lib = ms.library_path_for(account_key)
+            key = asset_id[len(RECEIPT_LOCAL_ASSET_PREFIX):]
+            path = os.path.join(lib, key) if lib else ""
+            if not path:
+                return
+            pick["path"] = path
+        else:
+            from . import gym_media_index as _idx
+            from . import gym_media_selector as _sel
+            store = _idx.default_store()
+            asset = store.get_asset(asset_id) if store is not None else None
+            if not asset:
+                return
+            base = _sel.base_gym_key(account_key)
+            pick["_drive_claim_id"] = _sel.drive_content_claim_id(base, asset)
+            pick["_drive_claim_account"] = f"{base}_gbp"
+            pick["_drive_stamped"] = True
+        ms.after_swap(account_key, before, pick)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[portal-social] receipt swap ledger settle failed for "
+              f"{receipt.get('action_id')}: {type(exc).__name__}")
+
+
+def _receipt_store_capable(sb_store):
+    return all(callable(getattr(sb_store, name, None)) for name in
+               ("action_receipt_begin", "action_receipt_claim",
+                "action_receipt_apply", "get_row",
+                "list_active_logical_post_rows"))
+
+
+def _receipt_short(account_key, draft_id, action_id, status, error, reason):
+    return status, {"ok": False, "action": _RECEIPT_ACTION, "draft_id": draft_id,
+                    "action_id": action_id, "error": error, "reason": reason,
+                    "recreate_budget": _budget_state(account_key)}
+
+
+def _receipt_unknown(account_key, draft_id, action_id):
+    return _receipt_short(account_key, draft_id, action_id, 503,
+                          "Photo swap outcome could not be verified.",
+                          "swap_outcome_unknown")
+
+
+def _receipt_success_body(account_key, draft_id, action_id, receipt,
+                          idempotent=False):
+    """Built ONLY from a persisted terminal receipt's after_state and
+    sibling_outcomes -- never from a mutable row re-read or a raw write
+    response."""
+    after = receipt.get("after_state") or {}
+    outcomes = [o for o in (receipt.get("sibling_outcomes") or [])
+                if isinstance(o, dict)]
+    swapped = [o.get("id") for o in outcomes
+               if o.get("swapped") and o.get("id") and str(o.get("id")) != str(draft_id)]
+    left = [o.get("id") for o in outcomes if not o.get("swapped") and o.get("id")]
+    kind = _media_kind(after.get("image_url", "") or "")
+    body = {"ok": True, "action": _RECEIPT_ACTION, "draft_id": draft_id,
+            "action_id": action_id,
+            "siblings_swapped": swapped, "siblings_left": left,
+            "sibling_results": [],
+            "image_public_url": (after.get("thumbnail_url")
+                                 or after.get("image_url", "")),
+            "media_kind": kind,
+            "video_url": after.get("image_url", "") if kind == "video" else None,
+            "caption": after.get("caption", ""),
+            "status": after.get("status", "pending"),
+            "day_key": after.get("post_date", ""),
+            "free": True,
+            "recreate_budget": _budget_state(account_key)}
+    if idempotent:
+        body["idempotent"] = True
+    return body
+
+
+def _receipt_failed_body(account_key, draft_id, action_id, receipt):
+    err = receipt.get("error") or {}
+    reason = str(err.get("reason") or "swap_failed")
+    try:
+        code = int(receipt.get("response_status") or 409)
+    except (TypeError, ValueError):
+        code = 409
+    if not 400 <= code <= 599:
+        code = 409
+    body = {"ok": False, "action": _RECEIPT_ACTION, "draft_id": draft_id,
+            "action_id": action_id, "idempotent": True,
+            "error": "This photo swap could not be completed.",
+            "reason": reason,
+            "recreate_budget": _budget_state(account_key)}
+    return code, body
+
+
+def _handle_swap_media_receipt(sb_store, account_key, draft_id, actor_id,
+                               action_id, picker=None):
+    """The explicit-action-id swap path (ECHO_SWAP_ACTION_RECEIPT). Runs the
+    begin RPC BEFORE any calendar row read; every outcome is derived from the
+    durable receipt, and the media write is exactly one apply RPC over the
+    frozen member manifest. Legacy (no action_id) never enters here."""
+    from . import media_swap as _ms
+
+    # (1) Presence and shape: an explicit action_id is validated as sent. An
+    # empty, non-string or out-of-shape value is a 400 -- it must NEVER fall
+    # into the legacy no-ID path.
+    if not isinstance(action_id, str):
+        return _receipt_short(account_key, draft_id, str(action_id)[:64], 400,
+                              "action_id must be an opaque string",
+                              "invalid_action_id")
+    # Validated AS SENT: surrounding whitespace is rejected by the anchored
+    # shape below, never stripped -- a stripped id would fingerprint a request
+    # tuple the client never sent.
+    if (not action_id or len(action_id) > _RECEIPT_MAX_ACTION_ID
+            or not _RECEIPT_ACTION_ID_RE.match(action_id)):
+        return _receipt_short(account_key, draft_id, action_id, 400,
+                              "action_id must be 1-128 opaque characters",
+                              "invalid_action_id")
+
+    # (2) Capability gates: flag OFF + explicit action_id refuses closed; a
+    # store without the RPC wrappers can never run this path.
+    if not _swap_receipts_enabled():
+        return _receipt_short(account_key, draft_id, action_id, 503,
+                              "action receipts are not enabled for this gym",
+                              "receipts_disabled")
+    if not _receipt_store_capable(sb_store):
+        return _receipt_short(account_key, draft_id, action_id, 503,
+                              "action receipts are unavailable on this store",
+                              "receipt_store_unavailable")
+
+    # (3) Immutable fingerprint from the request tuple, BEFORE any row read.
+    fp = _receipt_fingerprint(account_key, draft_id, actor_id, action_id)
+
+    # (4) BEGIN FIRST: SQL binds the tuple and captures before_state itself.
+    # The same binding replays terminally even when the row was deleted or its
+    # media moved; a conflicting reuse 409s; a missing / historical-NULL row is
+    # a manual-review hold with no receipt and no heuristic fallback.
+    try:
+        receipt = sb_store.action_receipt_begin(
+            account_key, action_id, _RECEIPT_ACTION, draft_id, actor_id, fp)
+    except _pcs.ReceiptHoldError:
+        return _receipt_short(account_key, draft_id, action_id, 409,
+                              "This post needs a manual review before its photo can be swapped.",
+                              "swap_manual_review")
+    except _pcs.ReceiptConflictError:
+        return _receipt_short(account_key, draft_id, action_id, 409,
+                              "This action_id is already bound to a different request.",
+                              "action_id_conflict")
+    except Exception:  # noqa: BLE001 - receipt durability failure refuses the swap
+        return _receipt_short(account_key, draft_id, action_id, 503,
+                              "action receipt could not be persisted; refusing to swap",
+                              "receipt_store_unavailable")
+
+    status = receipt.get("status")
+    if status == "succeeded":
+        # Exact terminal replay: the stored outcome verbatim, no row read. The
+        # frozen selection's ledger settlement is idempotent, so a first
+        # attempt whose success response was lost before settling is settled
+        # HERE (a committed apply is never reported without settlement).
+        _settle_receipt_ledgers(_ms, account_key, receipt)
+        return 200, _receipt_success_body(account_key, draft_id, action_id,
+                                          receipt, idempotent=True)
+    if status == "failed":
+        return _receipt_failed_body(account_key, draft_id, action_id, receipt)
+    if status not in ("started", "selected"):
+        # 'uncertain' or anything unexpected: fail closed, always.
+        return _receipt_unknown(account_key, draft_id, action_id)
+
+    own_pick = None        # a reserve_local_pick reservation THIS attempt owns
+    apply_started = False  # once the apply RPC is invoked the outcome is unknown
+    try:
+        if status == "started":
+            # FRESH SELECTION. The row exists (begin just captured it); a race
+            # delete means we cannot pick safely, so hold for manual review
+            # rather than inferring anything.
+            try:
+                row = sb_store.get_row(account_key, draft_id)
+            except Exception:  # noqa: BLE001
+                row = None
+            if row is None:
+                return _receipt_short(
+                    account_key, draft_id, action_id, 409,
+                    "This post needs a manual review before its photo can be swapped.",
+                    "swap_manual_review")
+            final = _published_is_final(row, _RECEIPT_ACTION, draft_id)
+            if final is not None:
+                return final
+            if str(row.get("status") or "") not in ("pending", "coach_review"):
+                return 409, {"ok": False, "action": _RECEIPT_ACTION,
+                             "draft_id": draft_id, "action_id": action_id,
+                             "error": "This post is no longer waiting for review.",
+                             "reason": "not_swappable",
+                             "recreate_budget": _budget_state(account_key)}
+            logical = row.get("logical_post_id")
+            if not logical:
+                # Historical NULL: manual-review hold, never a heuristic group.
+                return _receipt_short(
+                    account_key, draft_id, action_id, 409,
+                    "This post needs a manual review before its photo can be swapped.",
+                    "swap_manual_review")
+
+            # The swap group is derived ONLY from (gym, logical_post_id,
+            # active) rows -- the exact scope the claim RPC freezes into the
+            # member manifest. media_swap.sibling_rows and any date/media
+            # inference are deliberately NOT consulted on this path.
+            members = sb_store.list_active_logical_post_rows(account_key, logical)
+            members = sorted((m for m in members if isinstance(m, dict)),
+                             key=lambda m: str(m.get("id") or ""))
+            member_ids = [str(m.get("id") or "") for m in members]
+            if str(draft_id) not in member_ids:
+                return _receipt_short(account_key, draft_id, action_id, 409,
+                                      "This post's swap group changed; nothing was swapped.",
+                                      "swap_group_stale")
+
+            # The picker renders the clicked primary itself; passing the
+            # primary among `siblings` would render its Story variant TWICE.
+            # Only the OTHER members are shaped as variants here; the claim
+            # still freezes the full member manifest for apply.
+            others = [m for m in members if str(m.get("id")) != str(draft_id)]
+            pick = (picker or _ms.pick_replacement)(account_key, row,
+                                                    store=sb_store,
+                                                    siblings=others)
+            if not pick.get("ok"):
+                return 409, {"ok": False, "action": _RECEIPT_ACTION,
+                             "draft_id": draft_id, "action_id": action_id,
+                             "error": _ms.client_message(pick.get("reason")),
+                             "reason": pick.get("reason"),
+                             "failed_sibling": pick.get("failed_sibling"),
+                             "recreate_budget": _budget_state(account_key)}
+            selected = _receipt_selected_asset(pick)
+            if selected is None:
+                return _receipt_short(account_key, draft_id, action_id, 409,
+                                      "verified media evidence is unavailable",
+                                      "media_evidence_unavailable")
+            variants = pick.get("siblings") or {}
+            # Every manifest member needs a shaped variant BEFORE anything is
+            # frozen: one missing or unsafe variant holds the whole group.
+            planned = {}
+            for mid in member_ids:
+                if mid == str(draft_id):
+                    continue
+                variant = variants.get(mid) or {}
+                if not variant.get("ok"):
+                    return 409, {"ok": False, "action": _RECEIPT_ACTION,
+                                 "draft_id": draft_id, "action_id": action_id,
+                                 "error": _ms.client_message(_ms.REASON_STORY_REBURN),
+                                 "reason": _ms.REASON_STORY_REBURN,
+                                 "failed_sibling": mid,
+                                 "recreate_budget": _budget_state(account_key)}
+                identity = _receipt_media_identity(variant)
+                if identity is None:
+                    return _receipt_short(account_key, draft_id, action_id, 409,
+                                          "verified media evidence is unavailable",
+                                          "media_evidence_unavailable")
+                # A variant of a LOCAL pick carries no Drive asset id of its
+                # own (media_swap._finish leaves it empty); its source asset
+                # identity is the selected local provenance. Drive variants
+                # already carry their asset id and are never overwritten.
+                if ("source_media_asset_id" not in identity
+                        and selected["asset_id"].startswith(
+                            RECEIPT_LOCAL_ASSET_PREFIX)):
+                    identity["source_media_asset_id"] = selected["asset_id"]
+                planned[mid] = identity
+
+            # Reserve the once-used media BEFORE the selection is frozen, so a
+            # frozen selection always implies a prior successful reservation.
+            if not _ms.reserve_local_pick(account_key, row, pick):
+                return _receipt_short(account_key, draft_id, action_id, 503,
+                                      "photo swap is held while media settles",
+                                      "reservation_unavailable")
+            own_pick = pick
+
+            try:
+                won = sb_store.action_receipt_claim(account_key, action_id, fp,
+                                                    selected, planned)
+            except _pcs.ReceiptHoldError:
+                _ms.release_local_pick(own_pick)
+                own_pick = None
+                return _receipt_short(
+                    account_key, draft_id, action_id, 409,
+                    "This post needs a manual review before its photo can be swapped.",
+                    "swap_manual_review")
+            except _pcs.ReceiptConflictError:
+                _ms.release_local_pick(own_pick)
+                own_pick = None
+                return _receipt_short(account_key, draft_id, action_id, 409,
+                                      "This post's swap group changed; nothing was swapped.",
+                                      "swap_group_stale")
+            except _pcs.ReceiptSelectionError:
+                _ms.release_local_pick(own_pick)
+                own_pick = None
+                return _receipt_short(account_key, draft_id, action_id, 409,
+                                      "verified media evidence is unavailable",
+                                      "media_evidence_unavailable")
+            except Exception:
+                # UNKNOWN: the claim may have persisted our selection. Retain
+                # the reservation (fail closed); the replay reconciles.
+                return _receipt_unknown(account_key, draft_id, action_id)
+            receipt = won
+
+        # From here the receipt is 'selected' (just claimed, or a replayed
+        # selection): the FROZEN selection and manifest govern -- the picker is
+        # never consulted again for this action_id.
+        frozen_selected = receipt.get("selected_asset") or {}
+        frozen_planned = receipt.get("planned_siblings") or {}
+        manifest = receipt.get("member_manifest") or {}
+        manifest_members = [m for m in (manifest.get("members") or [])
+                            if isinstance(m, dict)]
+        manifest_ids = sorted(str(m.get("calendar_row_id") or "")
+                              for m in manifest_members)
+        if (not frozen_selected.get("asset_id")
+                or not _receipt_clean_url(frozen_selected.get("image_url"))
+                or not manifest_ids or str(draft_id) not in manifest_ids):
+            # A frozen selection without verifiable evidence can never be
+            # applied: hold, never write.
+            return _receipt_short(account_key, draft_id, action_id, 409,
+                                  "verified media evidence is unavailable",
+                                  "media_evidence_unavailable")
+        # The prepared row set must cover the frozen manifest EXACTLY (primary
+        # plus every planned sibling); a stale sibling or a membership change
+        # aborts the whole group before any write.
+        prepared_rows = []
+        for mid in manifest_ids:
+            if mid in frozen_planned:
+                media = dict(frozen_planned[mid])
+            else:
+                media = {"image_url": frozen_selected.get("image_url"),
+                         "source_media_url": frozen_selected.get("source_media_url"),
+                         "thumbnail_url": frozen_selected.get("thumbnail_url"),
+                         "source_media_asset_id": frozen_selected.get("asset_id")}
+            identity = _receipt_media_identity(media)
+            if identity is None:
+                return _receipt_short(account_key, draft_id, action_id, 409,
+                                      "verified media evidence is unavailable",
+                                      "media_evidence_unavailable")
+            prepared_rows.append({"calendar_row_id": mid, "media": identity})
+        planned_ids = sorted(mid for mid in frozen_planned if mid in manifest_ids)
+        extra = sorted(set(frozen_planned) - set(manifest_ids))
+        covered = sorted({str(draft_id)} | set(planned_ids))
+        if extra or covered != manifest_ids:
+            if own_pick is not None:
+                _ms.release_local_pick(own_pick)
+                own_pick = None
+            return _receipt_short(account_key, draft_id, action_id, 409,
+                                  "This post's swap group changed; nothing was swapped.",
+                                  "swap_group_stale")
+
+        # If a concurrent claimant WON with a different selection, ours can
+        # never be written (apply validates against the frozen identity), so
+        # releasing our reservation is definite and safe. The winner's
+        # selection was already reserved by the winning attempt before its
+        # claim landed. The comparison is over the ENTIRE frozen identity
+        # (asset id / local provenance, image, source and thumbnail URLs):
+        # an equal hosted URL under a DIFFERENT asset id is still a losing
+        # reservation and is released, never settled.
+        if own_pick is not None and \
+                not _receipt_identity_matches(own_pick, frozen_selected):
+            _ms.release_local_pick(own_pick)
+            own_pick = None
+
+        apply_started = True
+        try:
+            final_receipt = sb_store.action_receipt_apply(
+                account_key, action_id, fp, {"rows": prepared_rows})
+        except _pcs.ReceiptHoldError:
+            if own_pick is not None:
+                _ms.release_local_pick(own_pick)
+                own_pick = None
+            return _receipt_short(
+                account_key, draft_id, action_id, 409,
+                "This post needs a manual review before its photo can be swapped.",
+                "swap_manual_review")
+        except _pcs.ReceiptConflictError:
+            # SQLSTATE 23514 from apply: the transaction raised and ROLLED BACK
+            # -- nothing was written. Releasing our own unused reservation is
+            # safe; the group itself is stale, so the client is told to stop.
+            if own_pick is not None:
+                _ms.release_local_pick(own_pick)
+                own_pick = None
+            return _receipt_short(account_key, draft_id, action_id, 409,
+                                  "This post's swap group changed; nothing was swapped.",
+                                  "swap_group_stale")
+        except _pcs.ReceiptSelectionError:
+            if own_pick is not None:
+                _ms.release_local_pick(own_pick)
+                own_pick = None
+            return _receipt_short(account_key, draft_id, action_id, 409,
+                                  "verified media evidence is unavailable",
+                                  "media_evidence_unavailable")
+        except Exception:
+            # UNKNOWN: the apply may have committed. Never infer the outcome
+            # from a mutable row; retain the reservation; the SAME apply is
+            # replayed by the next request with this action_id.
+            return _receipt_unknown(account_key, draft_id, action_id)
+        final_status = final_receipt.get("status")
+        if final_status == "failed":
+            if own_pick is not None:
+                _ms.release_local_pick(own_pick)
+                own_pick = None
+            return _receipt_failed_body(account_key, draft_id, action_id,
+                                        final_receipt)
+        if final_status != "succeeded":
+            return _receipt_unknown(account_key, draft_id, action_id)
+    except Exception as exc:  # noqa: BLE001
+        # Before apply starts nothing can have landed and our exact reservation
+        # is safe to release. Once apply starts the outcome is UNKNOWN: retain.
+        if own_pick is not None and not apply_started:
+            _ms.release_local_pick(own_pick)
+        body = {"ok": False, "action": _RECEIPT_ACTION, "draft_id": draft_id,
+                "action_id": action_id,
+                "error": f"store error: {type(exc).__name__}"}
+        return (503 if apply_started else 500), body
+
+    # Success is ONLY the persisted terminal receipt. Settle the usage ledgers
+    # against the FROZEN selection (a loser reservation was already released
+    # and is never settled): best-effort, idempotent, and re-run by every
+    # terminal replay, so a lost response can never skip settlement.
+    _settle_receipt_ledgers(_ms, account_key, final_receipt, own_pick=own_pick)
+    return 200, _receipt_success_body(account_key, draft_id, action_id,
+                                      final_receipt)
+
+
 def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=None,
-                      picker=None):
+                      picker=None, action_id=_NO_ACTION_ID):
     """Swap this post's photo for a fresh one. FREE and unlimited: the budget is
     neither read nor charged, and the response echoes the UNCHANGED budget so the
     client can see it cost nothing. The caption is untouched.
 
     Flag: config.media_swap_free_enabled() (ECHO_MEDIA_SWAP_FREE, default OFF).
-    Flag off -> 403 and not one store read is issued."""
+    Flag off -> 403 and not one store read is issued.
+
+    action_id (DRAFT receipts v3, 2026-10-04): an explicit opaque client
+    idempotency key. When present the swap runs the durable receipt path
+    (ECHO_SWAP_ACTION_RECEIPT, default OFF -> 503): begin binds the request
+    tuple before any row read, one claim freezes the exact active logical-post
+    group, one apply writes it atomically, and an exact replay returns the
+    persisted terminal receipt. Old callers pass nothing and get byte-for-byte
+    today's legacy behavior."""
     return _handle_swap_media(account_key, draft_id, actor_id, reader=reader,
-                              sb_store=sb_store, picker=picker)
+                              sb_store=sb_store, picker=picker,
+                              action_id=action_id)
 
 
 def handle_fixer_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=None,
@@ -1239,7 +1861,7 @@ def handle_fixer_swap_media(account_key, draft_id, actor_id, reader=None, sb_sto
 
 def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=None,
                        picker=None, allow_portal_social_disabled=False,
-                       require_fixer_entitlement=False):
+                       require_fixer_entitlement=False, action_id=_NO_ACTION_ID):
     """Shared implementation for public and authenticated Fixer swap requests."""
     short = _action_gates(account_key, draft_id, actor_id, reader,
                           allow_portal_social_disabled=allow_portal_social_disabled,
@@ -1262,7 +1884,23 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
     if not config.portal_calendar_supabase_enabled():
         return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
                      "error": "photo swap needs the shared calendar plane"}
+    if action_id is not _NO_ACTION_ID and not _swap_receipt_gym_allowed(account_key):
+        # Tenant allowlist (ECHO_SWAP_ACTION_RECEIPT_GYMS): an explicit
+        # action_id from a gym outside the list fails CLOSED with a 503
+        # BEFORE any store call -- never a silent fallback to the legacy
+        # non-idempotent path.
+        return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                     "account_key": account_key,
+                     "error": "action receipts are not enabled for this gym",
+                     "reason": "receipt_gym_not_allowed"}
     sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    if action_id is not _NO_ACTION_ID:
+        # Durable receipt path: begin runs BEFORE the first calendar row read,
+        # so an exact same-binding replay resolves from the receipt even when
+        # the row was since deleted or its media moved. The legacy path below
+        # is reached only when no action_id was sent at all.
+        return _handle_swap_media_receipt(sb_store, account_key, draft_id,
+                                          actor_id, action_id, picker=picker)
     pick = None
     local_landed = False
     primary_write_started = False

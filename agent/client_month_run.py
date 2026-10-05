@@ -47,6 +47,7 @@ path is offline-testable.
 
 import os
 import re
+import uuid
 
 from . import client_content, config, day_shape
 from . import cta_self_question_gate
@@ -55,6 +56,16 @@ from . import real_calendar_mirror as _mirror
 
 # Media extensions that count as a client having uploaded usable creative.
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+
+
+class InvalidLogicalPostIdentity(ValueError):
+    """A draft reached the month build carrying an unverifiable pre-stamped
+    logical_post_id.  This is FATAL for the whole rebuild: it must propagate out
+    of every lane's broad `except Exception` media-hold guard so _apply never
+    runs its month-grained delete.  Callers release local reservations / roll
+    back Drive assets and then re-raise; the outer build's finally releases any
+    unlanded reservations and restores released Drive stamps.  Subclasses
+    ValueError so the row-writer's fail-closed ValueError contract is unchanged."""
 
 
 def _base_of(account_key):
@@ -517,6 +528,22 @@ def _row_from_draft(base_key, draft):
     reservation_id = getattr(draft, "_served_reservation_id", None)
     if reservation_id:
         row["_served_reservation_id"] = reservation_id
+    # New client pairs receive their identity at _finish_feed_with_story, before the
+    # Story is cloned.  Existing drafts have no attribute and stay untouched: this
+    # forward-only writer never invents an identity while rebuilding old calendar rows.
+    if config.logical_post_id_enabled():
+        logical_post_id = (getattr(draft, "logical_post_id", "") or "").strip()
+        if logical_post_id:
+            try:
+                uuid.UUID(logical_post_id)
+            except (AttributeError, TypeError, ValueError) as exc:
+                # Fail closed BEFORE _to_rows/_apply: an unverifiable identity
+                # must never reach a row the store validates after a month has
+                # already been deleted.
+                raise ValueError(
+                    "invalid pre-stamped logical_post_id on draft "
+                    f"{getattr(draft, 'draft_id', '?')}: {logical_post_id!r}") from exc
+            row["logical_post_id"] = logical_post_id
     return row
 
 
@@ -585,10 +612,39 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
     _pre_autofit_url = getattr(feed, "creative_public_url", "")
     _maybe_format_feed(account, feed, library_path, log)
     _mark_feed(feed)
+    # A feed and its paired Story are one logical post even though they become three
+    # calendar rows after the Facebook mirror.  Mint before cloning so both drafts
+    # carry the same opaque identity without relying on image, date, or caption.
+    # A retry can pass the same draft through this helper again, so preserve its
+    # existing identity and mint only for a new pair.
+    if config.logical_post_id_enabled():
+        existing = (getattr(feed, "logical_post_id", "") or "").strip()
+        if existing:
+            try:
+                uuid.UUID(existing)
+            except (AttributeError, TypeError, ValueError) as exc:
+                # FATAL, never a media hold: callers treat [] as "held slot" and
+                # the build would continue to _apply's delete/insert with the bad
+                # draft still staged.  Rollback happens in the callers (local
+                # reservation release / Drive asset rollback) which re-raise.
+                log(f"abort {day_key} feed: invalid pre-stamped logical_post_id "
+                    "(an unverifiable identity aborts the whole rebuild BEFORE "
+                    "any delete)")
+                raise InvalidLogicalPostIdentity(
+                    f"invalid pre-stamped logical_post_id on feed "
+                    f"{getattr(feed, 'draft_id', '?')} for {day_key}: "
+                    f"{existing!r}") from exc
+            feed.logical_post_id = existing
+        else:
+            feed.logical_post_id = str(uuid.uuid4())
     out = [feed]
 
     # PAIRED STORY on the SAME photo (cloned from the feed; no second media consumed).
     story = _story_from_feed(feed)
+    # dataclasses.replace intentionally drops dynamic fields, so retain the pair
+    # identity explicitly on the Story clone.
+    if config.logical_post_id_enabled():
+        story.logical_post_id = feed.logical_post_id
     # The story must NOT carry the feed's 4:5 autofit reframe: restore the pre-autofit
     # media (story-format ON rebuilds a fresh 1080x1920; this keeps it correct when OFF).
     if getattr(story, "creative_public_url", "") != _pre_autofit_url:
@@ -1004,6 +1060,11 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                     account, base_key, account_key, platform, draft, day_key, slot_i,
                     slots, voice, banned_words, day_captions, library_path, log,
                     failed, extra, covered_slots, pillar, video_beats_only)
+            except InvalidLogicalPostIdentity:
+                # FATAL identity defect: return the in-flight Drive asset to the
+                # pool, then abort the WHOLE rebuild (never a media hold).
+                _rollback_drive_asset(draft, day_key, log)
+                raise
             except Exception as e:  # noqa: BLE001 - never lose the drafts already made
                 log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: staging raised "
                     f"{type(e).__name__}: {e}; returning the {len(extra)} draft(s) already "
@@ -1278,6 +1339,12 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             # build before a result is returned is a prewrite planning failure.
             _release_unlanded_reservations(drafts)
             _rollback_new_drive_drafts(drafts, log)
+            # apply_state records the result immediately after _apply returns,
+            # before any post-write reporting can raise, so result-is-None means
+            # NO calendar write happened: the OLD wipeable rows survive, and
+            # their released Drive assets must be stamped again (an
+            # InvalidLogicalPostIdentity prewrite abort previously stranded them).
+            _restore_released_drive_assets(base_key, released_drive, log)
         wrote = bool(_res.get("inserted"))
         if not wrote and _applied["result"] is not None and not _res.get("insert_outcome_unknown"):
             # Nothing landed (a no-op, a gate refusal, or a definite pre-insert
@@ -1432,6 +1499,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 rendition_budget=rendition_budget, covered_slots=covered_slots,
                 kind_prefs=(_PHOTO_KIND,), max_feed_count=max_feed_days)
             drive_photo_feeds = _record_drive_prepass(photo_pre, "Drive photo")
+        except InvalidLogicalPostIdentity:
+            raise  # FATAL: an unverifiable identity aborts the rebuild pre-delete
         except Exception as e:  # noqa: BLE001 - the pre-pass never sinks the month
             drive_photo_feeds = 0
             log(f"{base_key}: Drive photo pre-pass skipped ({type(e).__name__}: {e})")
@@ -1663,6 +1732,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 day_captions_seed=pre_captions,
                 max_feed_count=max(0, max_feed_days - drive_photo_feeds - built_feeds))
             _record_drive_prepass(video_pre, "video")
+        except InvalidLogicalPostIdentity:
+            raise  # FATAL: an unverifiable identity aborts the rebuild pre-delete
         except Exception as e:  # noqa: BLE001 - the pre-pass never sinks the month
             log(f"{base_key}: video pre-pass skipped ({type(e).__name__}: {e})")
 
@@ -1714,6 +1785,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                                     for d in drive_extra if getattr(d, "day_key", ""))
                 log(f"{base_key}: +{len(drive_extra)} post(s) from the connected "
                     "Drive pool (PENDING, gap-fill)")
+        except InvalidLogicalPostIdentity:
+            raise  # FATAL: an unverifiable identity aborts the rebuild pre-delete
         except Exception as e:  # noqa: BLE001 - the lane never sinks the month
             log(f"{base_key}: gym-drive lane skipped ({type(e).__name__}: {e})")
 
@@ -1741,6 +1814,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 built_days += filled
                 log(f"{base_key}: +{filled} spaced repeat day(s) the Drive pool "
                     "could not cover (never an empty day)")
+        except InvalidLogicalPostIdentity:
+            raise  # FATAL: an unverifiable identity aborts the rebuild pre-delete
         except Exception as e:  # noqa: BLE001 - the fallback never sinks the month
             log(f"{base_key}: no-empty-day fallback skipped ({type(e).__name__}: {e})")
 
@@ -2294,6 +2369,28 @@ def _story_from_feed(feed):
     return story
 
 
+
+def _logical_post_ids_valid(rows, log):
+    """Pre-write guard (ECHO_LOGICAL_POST_ID_ENABLED ON only): every pre-stamped
+    logical_post_id must be a valid UUID BEFORE the first delete or insert. A
+    malformed identity would otherwise reach store validation only after _apply
+    has already deleted a month — fail closed here with zero deletes/inserts.
+    Flag OFF: no new failure mode, always valid."""
+    if not config.logical_post_id_enabled():
+        return True
+    for row in rows or []:
+        value = str((row or {}).get("logical_post_id") or "").strip()
+        if not value:
+            continue
+        try:
+            uuid.UUID(value)
+        except (AttributeError, TypeError, ValueError):
+            log(f"invalid pre-stamped logical_post_id {value!r}; aborting "
+                "before any delete or insert")
+            return False
+    return True
+
+
 def _to_rows(base_key, drafts):
     """Map drafts -> content_calendar rows, mirroring real_month_planner.to_calendar_rows:
     a FEED row is cross-posted to instagram AND facebook; a STORY row is instagram-only.
@@ -2415,6 +2512,11 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     if base_key == config.demo_calendar_gym_id():
         return {"ok": False, "reason": "refusing to plan over the demo gym id",
                 "upserted": 0, "deleted": 0}
+    if not _logical_post_ids_valid(rows, log):
+        return {"ok": False,
+                "reason": "invalid pre-stamped logical_post_id; aborted before "
+                          "any delete",
+                "upserted": 0, "inserted": 0, "deleted": 0}
     from datetime import timedelta
     span = {(start + timedelta(days=i)).isoformat()[:7] for i in range(days)}
     for r in rows:
@@ -3048,6 +3150,13 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
         # No insert request has started, so every exact reservation is unlanded.
         _release_unlanded_reservations(drafts)
         raise
+    if not _logical_post_ids_valid(clean_rows, log):
+        # Nothing has been requested from the store: every exact reservation is
+        # unlanded and the denied rows stay eligible for a repaired retry.
+        _release_unlanded_reservations(drafts)
+        return {"ok": False, "reason": "invalid pre-stamped logical_post_id; "
+                "aborted before insert", "backfilled": 0,
+                "days_needing": len(todo), "skipped": skipped}
     try:
         store_rows = [{k: v for k, v in r.items()
                        if k != "_served_reservation_id"} for r in clean_rows]

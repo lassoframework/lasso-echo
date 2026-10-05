@@ -50,6 +50,55 @@ _MIN_MONTH_FOR_GATE = 10
 _FEED_REACHABLE = ("pending", "approved", "publishing", "published", "coach_review")
 
 
+def _stamp_logical_post_ids(rows, log):
+    """Give each newly staged event post its own durable logical identity.
+
+    ``event_id`` ties an entire event arc together.  It is deliberately not this
+    identity: each independently scheduled beat needs a separate UUID.  The event
+    lane currently stages only one Instagram feed per arc row, with no Facebook or
+    Story clones.  Preserve a valid ID if the same in-memory row is retried.  A bad
+    row or an invalid pre-existing value stops the write rather than persisting an
+    unverifiable group.
+    """
+    import uuid
+
+    from . import config  # noqa: PLC0415
+    if not config.logical_post_id_enabled():
+        # Flag OFF (default): behave exactly as before the identity feature — no
+        # stamping, no validation, no new failure mode.
+        return True
+
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            log("event logical post id: refusing non-dict row")
+            return False
+        value = str(row.get("logical_post_id") or "").strip()
+        if value:
+            try:
+                uuid.UUID(value)
+            except (AttributeError, TypeError, ValueError):
+                log("event logical post id: refusing invalid existing UUID")
+                return False
+            if value in seen:
+                # Two independent arc rows sharing one identity would make the
+                # durable group unverifiable; stop before any insert.
+                log("event logical post id: refusing duplicate existing UUID "
+                    "within one arc")
+                return False
+            seen.add(value)
+            row["logical_post_id"] = value
+            continue
+        try:
+            minted = str(uuid.uuid4())
+        except Exception as exc:  # noqa: BLE001 - a row without identity never stages
+            log(f"event logical post id: mint failed ({type(exc).__name__})")
+            return False
+        seen.add(minted)
+        row["logical_post_id"] = minted
+    return True
+
+
 def _cat(row):
     return str((row or {}).get("pillar") or (row or {}).get("category") or "").lower()
 
@@ -419,6 +468,8 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     to_stage, held_media = _attach_media(gym_id, to_stage, log,
                                          picker=media_picker,
                                          host=media_host_fn)
+    if not _stamp_logical_post_ids(to_stage, log):
+        return {"ok": False, "reason": "logical post id stamp failed", "staged": 0}
     inserted = 0
     inserter = getattr(store, "insert_rows", None)
     if inserter is not None and to_stage:
@@ -674,7 +725,14 @@ _TRANSIENT_KEYS = ("arc_kind", "recap_blocked", "arc_note", "_media_asset")
 
 
 def _db_row(row):
-    return {k: v for k, v in (row or {}).items() if k not in _TRANSIENT_KEYS}
+    payload = {k: v for k, v in (row or {}).items() if k not in _TRANSIENT_KEYS}
+    from . import config  # noqa: PLC0415
+    if not config.logical_post_id_enabled():
+        # Flag OFF (default): the column must never reach an insert against the
+        # old schema, even if a caller pre-stamped the in-memory row. The row
+        # itself is left untouched (this is a copy) so caller state is preserved.
+        payload.pop("logical_post_id", None)
+    return payload
 
 
 def cancel_event(store, gym_id, event_id, *, ended=False, logger=None):

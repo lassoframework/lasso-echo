@@ -2981,8 +2981,18 @@ def build_server(port=None):
                     status, resp = _ps.handle_deny(account_key, ps_post_id, actor_id,
                                                    note=note, store=store, **_extra)
                 elif ps_action == "swap-media":
+                    # Durable idempotency (DRAFT v3, 2026-10-04): the portal may send
+                    # an opaque action_id. Its PRESENCE and RAW VALUE are preserved
+                    # and forwarded verbatim -- the handler validates type/shape
+                    # (an explicit empty or non-string action_id is a 400, never a
+                    # silent fall into the legacy no-ID path) and binds it to a
+                    # tenant-scoped receipt (ECHO_SWAP_ACTION_RECEIPT, default OFF).
+                    # Only pass the kwarg when the client actually sent the key, so
+                    # the old call shape is byte-for-byte unchanged.
+                    _extra = {"action_id": body.get("action_id")} \
+                        if "action_id" in body else {}
                     status, resp = _ps.handle_swap_media(account_key, ps_post_id,
-                                                         actor_id)
+                                                         actor_id, **_extra)
                 elif ps_action == "recreate-caption":
                     status, resp = _ps.handle_recreate_caption(account_key, ps_post_id,
                                                                actor_id)

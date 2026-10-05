@@ -42,6 +42,8 @@ status is terminal (published/publishing/denied/killed/failed) are never
 touched; an empty caption stays empty; a re-run is byte-identical.
 """
 
+import uuid
+
 from . import config
 from . import demo_calendar_queue as _demo
 from .accounts import Platform
@@ -133,6 +135,45 @@ def _pillar(draft):
     return (getattr(draft, "category", "") or "").strip()
 
 
+
+def _logical_post_id(draft):
+    """Read one draft's DURABLE logical_post_id for its row. Pure: never mints,
+    never mutates the draft.
+
+    Behind config.logical_post_id_enabled() (added on the integration branch; absent
+    here, so an AttributeError reads as flag OFF). When the flag is OFF this returns
+    None and the row omits the key entirely (byte-for-byte prior shape).
+
+    When ON: an existing VALID logical_post_id on the draft is preserved verbatim
+    (it is the draft's durable identity across mirror delete/reinsert cycles,
+    stamped once by PendingStore.ensure_logical_post_id before any calendar write).
+    An absent id returns None here; mirror_to_supabase stamps and re-reads the
+    store BEFORE building rows, so a durable id is always present by then. An
+    existing but INVALID (non-UUID) value raises ValueError BEFORE any mirror
+    write — a row without a durable, carryable identity must abort the mirror,
+    not be rewritten with a fresh id that breaks delete/reinsert identity.
+
+    No feed/story sibling inference: date/photo/caption matches never share an id;
+    every independent draft owns its own stamped singleton UUID.
+    """
+    try:
+        enabled = bool(config.logical_post_id_enabled())
+    except AttributeError:
+        enabled = False
+    if not enabled:
+        return None
+    existing = getattr(draft, "logical_post_id", "") or ""
+    if not existing:
+        return None
+    try:
+        return str(uuid.UUID(str(existing)))
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(
+            "draft %r carries invalid logical_post_id %r; refusing to "
+            "silently replace identity (fail closed)"
+            % (getattr(draft, "draft_id", None), existing))
+
+
 def _real_row(account_key, draft, caption=None):
     """One real draft folded into the content_calendar row shape. gym_id == account_key;
     account == the draft's platform; format from is_story/draft_type. No field invented:
@@ -208,6 +249,9 @@ def _real_row(account_key, draft, caption=None):
     if getattr(draft, "needs_media", False):
         row["media_not_ready_reason"] = (
             getattr(draft, "blocked_reason", "") or "purpose_built_media_required")
+    logical = _logical_post_id(draft)
+    if logical:
+        row["logical_post_id"] = logical
     return row
 
 
@@ -215,6 +259,23 @@ def _row_source_id(draft):
     """The draft's own id (the demo-id guard reads this; it is NOT written to the row).
     Empty when the draft has none."""
     return getattr(draft, "draft_id", "") or ""
+
+
+def _draft_eligible(draft):
+    """PURE predicate: is this draft a real calendar candidate? True when it is NOT
+    a demo-manifest draft, carries hosted media or an explicit needs-media hold,
+    and resolves to a post_date. Shared by collect_real_drafts and the mirror's
+    durability preflight so both agree on exactly which drafts need a stamped
+    identity. No I/O, no mutation."""
+    draft_id = getattr(draft, "draft_id", "") or ""
+    if _demo.is_demo_draft_id(draft_id):
+        return False  # demo content never enters a real gym's calendar
+    if (not (getattr(draft, "creative_public_url", "") or "").strip()
+            and not getattr(draft, "needs_media", False)):
+        return False  # neither hosted media nor an explicit recoverable media hold
+    if not _post_date(draft):
+        return False  # cannot place on a calendar day
+    return True
 
 
 def collect_real_drafts(account_key, store, poster_evidence_out=None):
@@ -246,15 +307,9 @@ def collect_real_drafts(account_key, store, poster_evidence_out=None):
         return []
     rows = []
     for draft in lister(account_key) or []:
-        draft_id = getattr(draft, "draft_id", "") or ""
-        if _demo.is_demo_draft_id(draft_id):
-            continue  # demo content never enters a real gym's calendar
-        if (not (getattr(draft, "creative_public_url", "") or "").strip()
-                and not getattr(draft, "needs_media", False)):
-            continue  # neither hosted media nor an explicit recoverable media hold
+        if not _draft_eligible(draft):
+            continue
         row = _real_row(account_key, draft)
-        if not row["post_date"]:
-            continue  # cannot place on a calendar day
         rows.append(row)
         poster_evidence = getattr(draft, "poster_render_evidence", None)
         if poster_evidence and poster_evidence_out is not None:
@@ -321,15 +376,57 @@ def mirror_to_supabase(account_key, store, sb_store):
         return {"ok": False, "reason": "refusing to mirror the demo gym id",
                 "upserted": 0, "deleted": 0}
 
+    # DURABLE IDENTITY PREFLIGHT (flag ON only): stamp/verify every eligible source
+    # draft's logical_post_id in the PendingStore BEFORE ANY calendar delete or
+    # insert, then re-read. Without this the collected rows would mint ephemeral
+    # ids that the next mirror run remints, breaking immutable identity across the
+    # delete/reinsert cycle. Any failure here raises with ZERO calendar writes.
+    try:
+        lp_enabled = bool(config.logical_post_id_enabled())
+    except AttributeError:
+        lp_enabled = False
+    if lp_enabled:
+        ensure = getattr(store, "ensure_logical_post_id", None)
+        lister = getattr(store, "list_for_account", None)
+        if ensure is None or lister is None:
+            raise ValueError(
+                "logical_post_id flag ON but the draft store cannot durably "
+                "stamp ids (no ensure_logical_post_id); refusing to mirror "
+                "without durable identity (fail closed)")
+        for draft in lister(account_key) or []:
+            if not _draft_eligible(draft):
+                continue
+            ensure(account_key, getattr(draft, "draft_id", "") or "")
+        # Stamped durably; collect_real_drafts below re-lists the store, so the
+        # rehydrated drafts carry the persisted ids (never same-object stash).
+
     # Real rows, gym-forced, with any stray id stripped (belt and braces; _real_row no
     # longer emits one). A real gym never carries a demo id, so a demo-id row is dropped.
     poster_evidence_by_url = {}
-    real_rows = [{k: v for k, v in row.items() if k != "id"}
-                 for row in collect_real_drafts(
-                     account_key, store,
-                     poster_evidence_out=poster_evidence_by_url)
-                 if not _demo.is_demo_draft_id(row.get("id"))
-                 and str(row.get("gym_id")) == str(account_key)]
+    real_rows = []
+    for row in collect_real_drafts(
+            account_key, store,
+            poster_evidence_out=poster_evidence_by_url):
+        if (_demo.is_demo_draft_id(row.get("id"))
+                or str(row.get("gym_id")) != str(account_key)):
+            continue
+        row = {k: v for k, v in row.items() if k != "id"}
+        # Fail closed BEFORE any delete or insert: a logical_post_id reaching
+        # insert_rows must be a valid UUID; an invalid one aborts the whole mirror
+        # with ValueError (never a silent strip + identity-less delete/reinsert).
+        lp = row.get("logical_post_id")
+        if lp is not None:
+            try:
+                row["logical_post_id"] = str(uuid.UUID(str(lp)))
+            except (ValueError, AttributeError, TypeError):
+                raise ValueError(
+                    "collected row carries invalid logical_post_id %r; "
+                    "aborting mirror before any store write (fail closed)" % lp)
+        elif lp_enabled:
+            raise ValueError(
+                "collected row is missing its durable logical_post_id after "
+                "preflight; aborting mirror before any store write (fail closed)")
+        real_rows.append(row)
     # Months to reconcile: every month a real draft lands in.
     months = sorted({r["post_date"][:7] for r in real_rows if r.get("post_date")})
 
