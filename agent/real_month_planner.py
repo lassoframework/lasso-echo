@@ -54,7 +54,7 @@ HARD RULES (never weakened):
 import uuid as _uuid
 
 from calendar import monthrange
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 
 from . import config
@@ -509,6 +509,13 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
     midweek_video = (_midweek_video_days(start, days, sprint_day_fn)
                      if video_mix else set())
 
+    _durable_three = False
+    if _summit_daily_on:
+        try:
+            _durable_three = bool(config.lasso_three_feed_enabled())
+        except Exception:
+            _durable_three = False
+
     slots = []
     for i in range(days):
         d = (start + timedelta(days=i)).isoformat()
@@ -524,10 +531,18 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
         # never converted, and sprint days never reach here.
         if video_mix and d in midweek_video and base == _VIDEO_MIX_MIDWEEK_FROM:
             base = "podcast"
+        summit_active = not _summit_daily_on or d <= config.SUMMIT_END_DATE
+        active_sprint = summit_active and sprint_day_fn(d)
         category, overridden = _override_category(
-            d, base, book_dates=book_dates, summit_day_fn=summit_day_fn,
-            welcome_dates=welcome_dates, sprint_day_fn=sprint_day_fn)
-        if sprint_day_fn(d):
+            d, base, book_dates=book_dates,
+            summit_day_fn=summit_day_fn if summit_active else None,
+            welcome_dates=welcome_dates,
+            sprint_day_fn=(lambda _day: active_sprint))
+        if not summit_active and category == "summit":
+            # Friday's base rotation survives the dated override. It must stop
+            # naming the closed campaign even when the editorial lane is dark.
+            category, overridden = "doctrine", True
+        if active_sprint:
             # SPRINT day: N summit feed posts + N paired stories from the real sprint
             # assets, AND the day's other slot stays VARIED (the base rotation pillar for
             # the date) so the sprint never buries the calendar. Blake's cadence: 1 summit
@@ -593,7 +608,8 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
             slots.append(PlanSlot(post_date=d, category=category, fmt=STORY,
                                   base_category=base, overridden=overridden,
                                   cadence_slot=0, video_preferred=_vp))
-            second = _next_fallback_category(category)
+            second = _next_fallback_category(
+                category, day_key=d if _summit_daily_on else None)
             _vp2 = bool(mark_video and second == "podcast")
             slots.append(PlanSlot(post_date=d, category=second, fmt=FEED,
                                   base_category=base, overridden=True,
@@ -601,14 +617,9 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
             slots.append(PlanSlot(post_date=d, category=second, fmt=STORY,
                                   base_category=base, overridden=True,
                                   cadence_slot=1, video_preferred=_vp2))
-            _durable_three = False
-            if str(account_key or "").strip().lower() in _LASSO_SUMMIT_DAILY_ACCOUNTS:
-                try:
-                    _durable_three = bool(config.lasso_three_feed_enabled())
-                except Exception:
-                    _durable_three = False
             if int(posts_per_day or 1) >= 3 and _durable_three:
-                third = _next_fallback_category(second)
+                third = _next_fallback_category(
+                    second, day_key=d if _summit_daily_on else None)
                 _vp3 = bool(mark_video and third == "podcast")
                 slots.append(PlanSlot(post_date=d, category=third, fmt=FEED,
                                       base_category=base, overridden=True,
@@ -629,7 +640,12 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
             slots = _apply_reels_floor(slots)
     if _summit_daily_on:
         from .lasso_editorial import normalize_summit_daily
-        slots = normalize_summit_daily(slots, summit_daily_fn)
+        slots = normalize_summit_daily(
+            slots, lambda day: day <= config.SUMMIT_END_DATE and summit_daily_fn(day))
+    if _summit_daily_on and _durable_three and int(posts_per_day or 1) >= 3:
+        slots = _distinct_post_campaign_feeds(slots)
+    if _summit_daily_on:
+        slots = _pair_lasso_third_story(slots)
     return slots
 
 
@@ -712,12 +728,13 @@ def _apply_reels_floor(slots, floor_fraction=None):
     return out
 
 
-def _next_fallback_category(category):
+def _next_fallback_category(category, *, day_key=None):
     """The pillar a 2x day's SECOND slot draws: the next entry in _FALLBACK_ORDER
     after `category` (wrapping), guaranteed != category. A category outside the
     fallback order (book/welcome/summit overrides) starts from the top of the
     order. Deterministic and pure."""
-    order = list(_FALLBACK_ORDER)
+    order = [c for c in _FALLBACK_ORDER
+             if not (day_key and day_key > config.SUMMIT_END_DATE and c == "summit")]
     if category in order:
         idx = (order.index(category) + 1) % len(order)
     else:
@@ -725,6 +742,63 @@ def _next_fallback_category(category):
     if order[idx] == category:
         idx = (idx + 1) % len(order)
     return order[idx]
+
+
+def _distinct_post_campaign_feeds(slots):
+    """Keep LASSO's three post-campaign feeds distinct after editorial/mix relabels.
+
+    The platform cap can turn ordinal 1 into ordinal 0's category. Repoint only
+    that duplicate or an expired Summit label to another approved everyday pillar,
+    and keep its paired Story on the same pillar. This plans a source category;
+    build_month_drafts still requires a real builder result to stage anything.
+    """
+    used = {}
+    paired = {}
+    out = []
+    everyday = tuple(c for c in _FALLBACK_ORDER if c != "summit")
+    for slot in slots:
+        if slot.post_date <= config.SUMMIT_END_DATE or slot.fmt != FEED:
+            out.append(slot)
+            continue
+        taken = used.setdefault(slot.post_date, set())
+        category = slot.category
+        if category == "summit" or category in taken:
+            category = next(c for c in everyday if c not in taken)
+            slot = replace(slot, category=category, overridden=True,
+                           is_sprint=False, summit_daily=False, slot_index=0,
+                           video_preferred=bool(slot.video_preferred and
+                                                category == "podcast"))
+        taken.add(category)
+        paired[(slot.post_date, slot.cadence_slot)] = (
+            category, slot.video_preferred)
+        out.append(slot)
+    return [replace(slot, category=paired[(slot.post_date, slot.cadence_slot)][0],
+                    video_preferred=paired[(slot.post_date, slot.cadence_slot)][1],
+                    overridden=True, is_sprint=False, summit_daily=False,
+                    slot_index=0)
+            if (slot.post_date > config.SUMMIT_END_DATE and slot.fmt == STORY
+                and (slot.post_date, slot.cadence_slot) in paired
+                and (slot.category, slot.video_preferred)
+                    != paired[(slot.post_date, slot.cadence_slot)])
+            else slot for slot in out]
+
+
+def _pair_lasso_third_story(slots):
+    """Give the third LASSO feed its own Story slot and source identity.
+
+    Run after Summit/editorial normalization so ordinal 2 points at the actual
+    selected feed, including a sprint asset moved to the Summit daily slot.
+    The draft pass still requires a genuine 9:16 Story builder result; planning
+    never treats a square feed image as a publishable Story.
+    """
+    existing = {(s.post_date, s.cadence_slot) for s in slots if s.fmt == STORY}
+    out = list(slots)
+    for feed in slots:
+        if (feed.fmt == FEED and feed.cadence_slot == 2
+                and (feed.post_date, 2) not in existing):
+            out.append(replace(feed, fmt=STORY))
+            existing.add((feed.post_date, 2))
+    return out
 
 
 def _cap_platform(slots, video_mix=False):
@@ -936,14 +1010,20 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
                 log(f"skip {slot.post_date} summit sprint story slot "
                     f"{slot.slot_index}: no sprint feed for the slot to pair to")
                 continue
-            if sprint_story_builder is None:
-                log(f"skip {slot.post_date} summit sprint story slot "
-                    f"{slot.slot_index}: no sprint_story_builder wired")
-                continue
-            story = _safe_call_sprint_story(
+            story = (_safe_call_sprint_story(
                 sprint_story_builder, target, slot.post_date, slot.slot_index,
                 feed_draft, log,
                 f"{slot.post_date} summit sprint story slot {slot.slot_index}")
+                if sprint_story_builder is not None else None)
+            if (story is None and slot.cadence_slot == 2
+                    and story_builder is not None):
+                # The additive Summit feed may use a dated Astra infographic
+                # without a pre-rendered sprint Story. Render a genuine 9:16
+                # Story from that exact feed via the ordinary source-bound
+                # Story builder; never reuse the square feed pixels as-is.
+                story = _safe_call_story(
+                    story_builder, target, slot.post_date, feed_draft, log,
+                    f"{slot.post_date} Summit third-slot story")
             if story is None:
                 log(f"skip {slot.post_date} summit sprint story slot "
                     f"{slot.slot_index}: no genuine 9:16 sprint asset (never a cropped feed)")
@@ -1046,6 +1126,10 @@ def _build_feed_with_fallback(slot, builders, target, log, exclude_captions=()):
                 fallbacks, _pb.load_playbook(_resolve_gym_id(target)))
         except Exception:
             pass
+    if slot.post_date > config.SUMMIT_END_DATE:
+        # A retained pre-cutoff slot or a weighted fallback must never call the
+        # closed campaign builder and turn old Summit material into new copy.
+        order = [cat for cat in order if cat != "summit"]
     for cat in order:
         if cat in tried:
             continue

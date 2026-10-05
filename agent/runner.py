@@ -990,6 +990,24 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         # agent disarmed. say nothing publicly; just report state to the caller.
         return {"status": "disabled", "drafts": []}
 
+    # Prepare today's and tomorrow's held LASSO feed visuals before drafting or
+    # the calendar publish sweep. Tomorrow's runway matters because the daily
+    # draw may run after the first local feed slot. This job only replaces media
+    # on an exact pending held row; it cannot claim or publish a post.
+    if config.lasso_three_feed_enabled():
+        try:
+            from .jobs import lasso_held_media_repair
+            repair = lasso_held_media_repair.run(now=scheduled_for)
+            if repair.get("ok"):
+                print("[lasso-held-media] "
+                      f"attempted={repair['attempted']} generated={repair['generated']} "
+                      f"reused={repair['reused']} repaired={repair['repaired']} "
+                      f"skipped={repair['skipped']} errors={repair['errors']}")
+            else:
+                print(f"[lasso-held-media] held: {repair.get('reason', 'unavailable')}")
+        except Exception as exc:
+            print(f"[lasso-held-media] failed: {type(exc).__name__}")
+
     poster = poster or SlackPoster()
     voice = load_voice(voice_path or config.VOICE_DOC_PATH)
 
