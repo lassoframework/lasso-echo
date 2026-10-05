@@ -603,11 +603,19 @@ class SupabaseCalendarStore:
         # image. Callers that know the replacement asset supply it explicitly.
         for field in ("source_media_url", "source_media_asset_id", "drive_file_id",
                       "byte_hash", "r2_key", "source_media_content_hash"):
-            if (field in ("source_media_url", "source_media_content_hash") and is_story
+            if (field == "source_media_url" and is_story
+                    and (current.get("source_media_url") == patch.get("image_url")
+                         or render_evidence is not None)):
+                continue
+            if (field == "source_media_content_hash" and is_story
+                    and patch.get("source_media_asset_id",
+                                  current.get("source_media_asset_id"))
+                    == current.get("source_media_asset_id")
                     and (current.get("source_media_url") == patch.get("image_url")
                          or render_evidence is not None)):
                 # Story raw source (and therefore its Drive byte identity) is
-                # retained: same-source render evidence proves retention.
+                # retained: same-source render evidence proves retention only
+                # while the Drive asset identity also remains unchanged.
                 continue
             if field not in patch and current.get(field):
                 patch[field] = None

@@ -807,15 +807,40 @@ def test_same_source_and_asset_identity_retains_content_hash(armed, monkeypatch)
     assert payload.get("source_media_content_hash", HASH) == HASH
 
 
-def test_story_reburn_with_same_source_evidence_retains_the_content_hash(armed):
+def test_story_reburn_with_same_source_and_asset_retains_the_content_hash(armed, monkeypatch):
+    monkeypatch.setattr(
+        prep, "prepare",
+        lambda _store, _key, row, **_kwargs: {**row, "visual_group_key": "vg_scene",
+                                                "byte_hash": "derived:test"})
     current = calendar_row(format="story", source_media_url=RAW,
+                           source_media_asset_id="asset-old",
                            source_media_content_hash=HASH)
     http = HTTP(current=current)
-    result = store(http).patch_image_url(KEY, "row-1", FINAL,
-                                         render_evidence=evidence())
-    assert result is not None
-    assert result["source_media_url"] == RAW
-    assert result["source_media_content_hash"] == HASH
+    payload = store(http)._prepare_visual_media(
+        KEY, "row-1", {"image_url": FINAL, "source_media_asset_id": "asset-old"},
+        current=current,
+        render_evidence=evidence())
+    assert "source_media_url" not in payload
+    assert "source_media_content_hash" not in payload
+
+
+@pytest.mark.parametrize("replacement_asset", ["asset-new", None])
+def test_story_reburn_with_changed_asset_identity_clears_content_hash(
+        armed, monkeypatch, replacement_asset):
+    monkeypatch.setattr(
+        prep, "prepare",
+        lambda _store, _key, row, **_kwargs: {**row, "visual_group_key": "vg_scene",
+                                                "byte_hash": "derived:test"})
+    current = calendar_row(format="story", source_media_url=RAW,
+                           source_media_asset_id="asset-old",
+                           source_media_content_hash=HASH)
+    patch = {"image_url": FINAL}
+    if replacement_asset is not None:
+        patch["source_media_asset_id"] = replacement_asset
+    http = HTTP(current=current)
+    payload = store(http)._prepare_visual_media(
+        KEY, "row-1", patch, current=current, render_evidence=evidence())
+    assert payload["source_media_content_hash"] is None
 
 
 def test_replacement_payload_clears_a_stale_content_hash(armed, monkeypatch):
