@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -9,6 +10,51 @@ from agent.drafter import DraftStatus
 
 
 DAY = "2026-11-07"
+
+
+def test_dated_summit_catalog_has_no_unsupported_scarcity_or_attendance_claims():
+    from pathlib import Path
+
+    catalog = json.loads(Path(summit.CATALOG_PATH).read_text())
+    for entry in catalog["posts"]:
+        copy = " ".join((entry["caption"], entry["on_image"]["headline"]))
+        assert "seats are selling fast" not in copy.lower()
+        assert "join 100 serious operators" not in copy.lower()
+
+
+def _first_sentence(text):
+    return text.split(". ", 1)[0].strip()
+
+
+def test_dated_summit_catalog_has_no_repeated_opening_sentence():
+    from pathlib import Path
+    from collections import Counter
+
+    catalog = json.loads(Path(summit.CATALOG_PATH).read_text())
+    openers = [_first_sentence(entry["caption"]) for entry in catalog["posts"]]
+    counts = Counter(openers)
+    repeated = {opener: n for opener, n in counts.items() if n > 2}
+    assert not repeated, f"openers used on more than 2 days: {repeated}"
+
+
+def test_dated_summit_catalog_varies_repeated_campaign_headline():
+    from pathlib import Path
+    from collections import Counter
+
+    catalog = json.loads(Path(summit.CATALOG_PATH).read_text())
+    headlines = [entry["on_image"]["headline"] for entry in catalog["posts"]]
+    counts = Counter(headlines)
+    repeated = {h: n for h, n in counts.items() if n > 2}
+    assert not repeated, f"headlines used on more than 2 days: {repeated}"
+
+
+def test_dated_summit_nov1_copy_does_not_claim_event_is_this_week():
+    from pathlib import Path
+
+    catalog = json.loads(Path(summit.CATALOG_PATH).read_text())
+    entry = next(e for e in catalog["posts"] if e["date"] == "2026-11-01")
+    copy = " ".join((entry["caption"], entry["on_image"]["headline"])).lower()
+    assert "this week" not in copy
 
 
 class Artifacts:

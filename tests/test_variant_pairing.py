@@ -19,6 +19,7 @@ Covers:
     SAME pipeline daily_studio uses) rather than a bespoke path.
 """
 
+import hashlib
 import os
 import sys
 
@@ -522,6 +523,74 @@ def test_generate_variant_image_generate_failure_reason(monkeypatch):
         _row("orig-1", caption="fact one"), "eng",
         generate_fn=lambda *a, **k: None)
     assert out == {"ok": False, "reason": vr.REASON_GENERATE_FAILED}
+
+
+def test_lasso_variant_uses_exact_scheduled_caption_and_records_its_source(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    monkeypatch.setenv("AGENT_LASSO_INFOGRAPHIC_QUALITY", "true")
+    from agent import infographic_artifacts
+
+    caption = "Your team can see the next step.\n\nOne clear follow up keeps work moving."
+    row = _row("lasso-post-1", gym_id="lasso", caption=caption, pillar="summit")
+    seen = {}
+
+    def fake_generate(headline, facts, **kwargs):
+        seen["headline"] = headline
+        seen["facts"] = facts
+        seen["kwargs"] = kwargs
+        return {"path": "/tmp/lasso-v2.png", "prompt": "graded", "model": "astra",
+                "route": "astra:test"}
+
+    class FakeArtifactStore:
+        def save(self, account_key, url, path, source):
+            seen["artifact"] = (account_key, url, path, source)
+
+    monkeypatch.setattr(infographic_artifacts, "ArtifactStore", FakeArtifactStore)
+    out = vr.generate_variant_image(row, "lasso_ig", generate_fn=fake_generate,
+        host_fn=lambda path, key: "https://cdn.example/lasso-v2.png")
+
+    assert out["ok"] is True
+    assert seen["headline"] == "Your team can see the next step."
+    assert seen["facts"] == [caption]
+    assert seen["kwargs"]["draft_id"] == row["id"]
+    assert seen["kwargs"]["cta"] == seen["kwargs"]["footer"] == ""
+    assert seen["artifact"][3] == {
+        "source_id": "content_calendar:lasso-post-1:caption",
+        "source_hash": hashlib.sha256(caption.encode("utf-8")).hexdigest(),
+    }
+
+
+def test_lasso_variant_requires_row_identity_for_artifact_provenance(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    monkeypatch.setenv("AGENT_LASSO_INFOGRAPHIC_QUALITY", "true")
+    row = _row("", gym_id="lasso", caption="Approved scheduled copy")
+    out = vr.generate_variant_image(row, "lasso_ig",
+        generate_fn=lambda *args, **kwargs: pytest.fail("must not generate"))
+    assert out == {"ok": False, "reason": "caption_source_unavailable"}
+
+
+def test_lasso_story_variant_keeps_caption_and_story_canvas(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    monkeypatch.setenv("AGENT_LASSO_INFOGRAPHIC_QUALITY", "true")
+    from agent import infographic_artifacts
+    monkeypatch.setattr(infographic_artifacts.ArtifactStore, "save",
+        lambda *args, **kwargs: {})
+    seen = {}
+
+    def fake_generate(headline, facts, **kwargs):
+        seen.update(headline=headline, facts=facts, kwargs=kwargs)
+        return {"path": "/tmp/story-v2.png"}
+
+    row = _row("lasso-story-1", gym_id="lasso", fmt="story",
+        caption="A clear next step helps the team.")
+    out = vr.generate_variant_image(row, "lasso_ig", generate_fn=fake_generate,
+        host_fn=lambda path, key: "https://cdn.example/story-v2.png")
+
+    assert out["ok"] is True
+    assert seen["facts"] == [row["caption"]]
+    assert seen["kwargs"]["surface"] == "story"
+    assert seen["kwargs"]["aspect"] == "9:16"
+    assert seen["kwargs"]["pixels"] == "1080x1920"
 
 
 # ---------------------------------------------------------------------------

@@ -231,20 +231,31 @@ def slot_time_for_row(row, n=None):
     2x CADENCE (CADENCE_SPEC.md D6): a FEED row stamped with a cadence slot_index
     (0 or 1 — written only by a 2x plan) gets the DETERMINISTIC pair from
     config.cadence_slot_times() (default 07:30 / 18:30) instead of the id-hash,
-    which could collide both of a day's feeds onto one slot. Applies only while
-    ECHO_CADENCE_2X_ENABLED is armed; flag off (or no slot_index on the row) is
-    the pre-cadence hash path, byte-for-byte. Stories keep their midday slot."""
+    which could collide both of a day's feeds onto one slot. Applies while
+    ECHO_CADENCE_2X_ENABLED or LASSO's durable 3x cadence is armed; otherwise
+    the pre-cadence hash path is unchanged. Durable LASSO Stories with a slot
+    index follow their matching feed by 15 minutes."""
     fmt = (row.get("format") or "feed").strip().lower()
     si = row.get("slot_index")
+    lasso_durable = (str(row.get("gym_id") or "").strip().lower() == "lasso"
+                     and config.lasso_three_feed_enabled())
+    if fmt == "story" and si in (0, 1, 2) and lasso_durable:
+        feed_slot = config.cadence_slot_times()[int(si)] if si in (0, 1) else "12:00"
+        hour, minute = (int(part) for part in feed_slot.split(":"))
+        # A configured late feed must never wrap its Story to the next day's
+        # early hours, where a same-day slot comparison would send it early.
+        story_minute = min(hour * 60 + minute + 15, 23 * 60 + 59)
+        return f"{story_minute // 60:02d}:{story_minute % 60:02d}"
     # LASSO Summit daily runway: the extra FEED owns a third, distinct local
     # slot.  Scope this by both tenant and the row's explicit calendar day so
     # enabling the campaign cannot change clients or spill beyond its window.
-    # Stories retain the existing 12:30 slot.
+    # Summit-only Stories retain the existing 12:30 slot.
     if (fmt == "feed" and si == 2
             and _lasso_three_feed_enabled(row.get("gym_id"),
                                           row.get("post_date"))):
         return "12:00"
-    if (fmt == "feed" and si in (0, 1) and config.cadence_2x_enabled()):
+    if (fmt == "feed" and si in (0, 1)
+            and (config.cadence_2x_enabled() or lasso_durable)):
         return config.cadence_slot_times()[int(si)]
     if n is None:
         n = len(SPRINT_SLOT_TIMES)
@@ -291,10 +302,52 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
     if (is_feed
             and _lasso_three_feed_enabled(gym_id, local_claim_day)):
         return max(capacity, 3)
-    # The temporary third slot belongs to the extra Summit feed only. Stories
-    # retain their existing capacity even though the dated cadence resolver
-    # correctly reports three for LASSO as a whole.
+    # The durable LASSO cadence pairs each of its three feeds with a Story.
+    # The temporary Summit-only third slot remains feed-only.
+    if ((row.get("format") or "feed").strip().lower() == "story"
+            and str(gym_id or "").strip().lower() == "lasso"
+            and config.lasso_three_feed_enabled()):
+        return max(capacity, 3)
     return capacity if is_feed else min(capacity, 2)
+
+
+def _paired_lasso_feed_published(story, store):
+    """Require one exact, live IG feed before its durable paired Story.
+
+    A logical_post_id is authoritative when present. Older rows without one
+    use the same date, account and slot index; ambiguity or a failed complete
+    read holds the Story. A publishing claim alone never counts as delivery.
+    """
+    if (story.get("gym_id") != "lasso"
+            or (story.get("format") or "").strip().lower() != "story"
+            or story.get("slot_index") not in (0, 1, 2)
+            or not story.get("post_date")):
+        return False
+    logical_id = story.get("logical_post_id")
+    try:
+        if logical_id:
+            rows = store.list_active_logical_post_rows("lasso", logical_id)
+        else:
+            day = str(story["post_date"])[:10]
+            rows = store.rows_in_range_repeat_hold("lasso", day, day)
+    except Exception:
+        return False
+    if not isinstance(rows, list):
+        return False
+    matches = [row for row in rows if isinstance(row, dict)
+               and row.get("gym_id") == "lasso"
+               and str(row.get("account") or "").strip().lower() ==
+                   str(story.get("account") or "").strip().lower()
+               and (row.get("format") or "feed").strip().lower() == "feed"
+               and str(row.get("post_date") or "")[:10] ==
+                   str(story["post_date"])[:10]
+               and row.get("slot_index") == story["slot_index"]
+               and (row.get("variant_status") or "active") == "active"
+               and (not logical_id or row.get("logical_post_id") == logical_id)]
+    return (len(matches) == 1
+            and matches[0].get("status") == "published"
+            and bool(matches[0].get("published_at"))
+            and bool(matches[0].get("late_post_id")))
 
 
 def assign_slots(rows):
@@ -1209,8 +1262,20 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         row_date = str(row.get("post_date") or run_date)[:10]
         past_date = row_date < gym_local_today
         future_date = row_date > gym_local_today
-        if not catch_all and (future_date or
-                              (not past_date and not is_due(row, now, gym_tz))):
+        # Paired LASSO Stories wait for their feed-following slot even during
+        # the last-slot catch-all sweep. A future local date always waits.
+        paired_lasso_story = (
+            str(gym_id or "").strip().lower() == "lasso"
+            and (row.get("format") or "feed").strip().lower() == "story"
+            and row.get("slot_index") in (0, 1, 2)
+            and config.lasso_three_feed_enabled())
+        if ((paired_lasso_story and
+             (future_date or (not past_date and not is_due(row, now, gym_tz))))
+                or (not paired_lasso_story and not catch_all and
+                    (future_date or (not past_date and not is_due(row, now, gym_tz))))):
+            waiting.append(row_id)
+            continue
+        if paired_lasso_story and not _paired_lasso_feed_published(row, store):
             waiting.append(row_id)
             continue
 
@@ -1886,7 +1951,15 @@ def run_slot_ticks(run_date, *, gym_id="lasso", store=None, publisher=None,
         kv = _kv_default()
 
     fired = []
-    slots = SPRINT_SLOT_TIMES or []
+    slots = list(SPRINT_SLOT_TIMES or [])
+    if str(gym_id or "").strip().lower() == "lasso" and config.lasso_three_feed_enabled():
+        # The direct-publisher fallback also needs ticks at the paired times.
+        # Its old final 18:30 catch-all cannot send the 18:45 Story early.
+        slots = sorted(set(slots) | {
+            slot_time_for_row({"gym_id": "lasso", "format": fmt,
+                               "slot_index": si, "post_date": run_date})
+            for fmt in ("feed", "story") for si in (0, 1, 2)
+        })
     last_slot = slots[-1] if slots else None
     for slot_time in slots:
         if not _slot_reached(slot_time, now):
