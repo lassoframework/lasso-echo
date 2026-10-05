@@ -1261,6 +1261,21 @@ def _swap_receipts_enabled():
     return config._truthy(os.environ.get("ECHO_SWAP_ACTION_RECEIPT", "false"))
 
 
+def _swap_receipt_gyms():
+    """ECHO_SWAP_ACTION_RECEIPT_GYMS, default EMPTY. Comma-separated exact
+    account keys permitted on the explicit-action_id receipt path. Whitespace
+    around each config entry is trimmed and matching is exact; absent or
+    empty means NO gym is allowed -- fail closed, never a wildcard enable."""
+    raw = os.environ.get("ECHO_SWAP_ACTION_RECEIPT_GYMS", "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _swap_receipt_gym_allowed(account_key):
+    """Exact account-key membership in the receipt
+    allowlist. A missing gym or a missing list is NOT allowed."""
+    return isinstance(account_key, str) and account_key in _swap_receipt_gyms()
+
+
 def _receipt_fingerprint(account_key, draft_id, actor_id, action_id):
     """Immutable binding over the request tuple ONLY (gym, row, actor, action,
     action_id), computable before any calendar row is read. The media the
@@ -1869,6 +1884,15 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
     if not config.portal_calendar_supabase_enabled():
         return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
                      "error": "photo swap needs the shared calendar plane"}
+    if action_id is not _NO_ACTION_ID and not _swap_receipt_gym_allowed(account_key):
+        # Tenant allowlist (ECHO_SWAP_ACTION_RECEIPT_GYMS): an explicit
+        # action_id from a gym outside the list fails CLOSED with a 503
+        # BEFORE any store call -- never a silent fallback to the legacy
+        # non-idempotent path.
+        return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                     "account_key": account_key,
+                     "error": "action receipts are not enabled for this gym",
+                     "reason": "receipt_gym_not_allowed"}
     sb_store = sb_store or _pcs.SupabaseCalendarStore()
     if action_id is not _NO_ACTION_ID:
         # Durable receipt path: begin runs BEFORE the first calendar row read,

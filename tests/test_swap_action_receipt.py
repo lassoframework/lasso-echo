@@ -43,6 +43,9 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_SOCIAL_BILLING_DELEGATED", "true")
     monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
     monkeypatch.setenv("ECHO_SWAP_ACTION_RECEIPT", "true")
+    # default test env: this gym IS on the tenant allowlist (empty config
+    # would fail closed for every gym -- see the allowlist tests below)
+    monkeypatch.setenv("ECHO_SWAP_ACTION_RECEIPT_GYMS", "zanshin")
     yield
 
 
@@ -463,6 +466,8 @@ def test_published_gate_survives_on_the_receipt_path(monkeypatch):
 
 
 def test_tenant_isolation_of_receipts(monkeypatch):
+    # both tenants under test must be on the receipt allowlist
+    monkeypatch.setenv("ECHO_SWAP_ACTION_RECEIPT_GYMS", "zanshin, othergym")
     other = _row(row_id=ROW3, gym_id="othergym", logical=LOGICAL2)
     store = _ReceiptStore([_row(), other])
     _wire(monkeypatch)
@@ -682,3 +687,70 @@ def test_terminal_replay_settles_drive_via_deterministic_claim_key(monkeypatch):
     assert pick["_drive_claim_account"] == f"{GYM}_gbp"
     assert pick["_drive_stamped"] is True
     assert seen_claims == [(GYM, "asset-1")]
+
+
+# ---- tenant allowlist (ECHO_SWAP_ACTION_RECEIPT_GYMS) ------------------------
+# Comma-separated exact account keys; default EMPTY means nobody -- an
+# explicit action_id from a gym outside the list is a fail-closed 503 BEFORE
+# any store call, never a silent fallback to the legacy non-idempotent path.
+
+def test_allowlisted_gym_runs_the_receipt_path(monkeypatch):
+    # exact match, whitespace around config entries trimmed
+    monkeypatch.setenv("ECHO_SWAP_ACTION_RECEIPT_GYMS", " other-gym , zanshin ,")
+    store = _ReceiptStore([_row()])
+    _wire(monkeypatch)
+    status, body = ps.handle_swap_media("zanshin", ROW1, "actor-1",
+                                        action_id="act-1", sb_store=store,
+                                        picker=_picker([]))
+    assert status == 200 and body["ok"] is True
+    assert [c[0] for c in store.calls][0] == "begin"
+
+
+def test_noncanonical_request_gym_cannot_alias_allowlisted_tenant(monkeypatch):
+    monkeypatch.setenv("ECHO_SWAP_ACTION_RECEIPT_GYMS", "zanshin")
+    store = _ReceiptStore([_row()])
+    _wire(monkeypatch)
+    for gym in ("ZANSHIN", " zanshin "):
+        status, body = ps.handle_swap_media(gym, ROW1, "actor-1",
+                                            action_id="act-1", sb_store=store,
+                                            picker=_picker([]))
+        assert status == 503 and body["reason"] == "receipt_gym_not_allowed"
+    assert store.calls == [] and store.receipts == {}
+
+
+def test_gym_outside_allowlist_is_503_before_any_store_call(monkeypatch):
+    monkeypatch.setenv("ECHO_SWAP_ACTION_RECEIPT_GYMS", "other-gym")
+    store = _ReceiptStore([_row()])
+    _wire(monkeypatch)
+    status, body = ps.handle_swap_media(GYM, ROW1, "actor-1", action_id="act-1",
+                                        sb_store=store, picker=_picker([]))
+    assert status == 503 and body["ok"] is False
+    assert body["reason"] == "receipt_gym_not_allowed"
+    assert body["account_key"] == GYM
+    assert store.calls == [] and store.receipts == {}
+
+
+def test_empty_allowlist_enables_no_gym(monkeypatch):
+    store = _ReceiptStore([_row()])
+    _wire(monkeypatch)
+    for raw in ("", "   ", " , ,"):
+        monkeypatch.setenv("ECHO_SWAP_ACTION_RECEIPT_GYMS", raw)
+        status, body = ps.handle_swap_media(GYM, ROW1, "actor-1",
+                                            action_id="act-1", sb_store=store,
+                                            picker=_picker([]))
+        assert status == 503 and body["reason"] == "receipt_gym_not_allowed"
+    assert store.calls == [] and store.receipts == {}
+
+
+def test_no_action_id_keeps_legacy_path_regardless_of_allowlist(monkeypatch):
+    monkeypatch.setenv("ECHO_SWAP_ACTION_RECEIPT_GYMS", "other-gym")
+    store = _LegacyStore([_row()])
+    monkeypatch.setattr(msw, "after_swap", lambda *a, **k: None)
+    monkeypatch.setattr(msw, "reserve_local_pick", lambda *a, **k: True)
+    monkeypatch.setattr(msw, "release_local_pick", lambda *a, **k: None)
+    monkeypatch.setattr(msw, "sibling_rows", lambda *a, **k: [])
+    status, body = ps.handle_swap_media(GYM, ROW1, "actor-1", sb_store=store,
+                                        picker=_picker([]))
+    assert status == 200 and body["ok"] is True
+    # the legacy per-row write ran; the allowlist gate never engaged
+    assert store.swaps == [(ROW1, "https://cdn/new.jpg")]
