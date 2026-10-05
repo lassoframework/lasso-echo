@@ -1682,12 +1682,22 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
     patched. Mutates the local row dicts to match so the caller's regrade sees
     the fix even before a store re-read. LASSO raises
     PartialLassoCaptionRepair after an uncertain ledger stamp or a partial
-    calendar write; the sweep re-reads and stops before another repair pass."""
+    calendar write; the sweep re-reads and stops before another repair pass.
+
+    THE AUTONOMOUS GATE (PR296 review, 2026-10-05). The strict-ledger +
+    sibling-CAS + partial-repair lane applies ONLY when the LASSO autonomous
+    switch (AGENT_LASSO_3X_ENABLED, config.lasso_three_feed_enabled) is armed.
+    With that flag OFF the LASSO book keeps the OLD mechanical self-fix: a
+    plain per-row patch of wipeable rows, still carrying expected_row so the
+    store's visual-hold and source-link protections apply, but never routed
+    through strict-ledger refusal and never raising PartialLassoCaptionRepair.
+    Flag ON never bypasses the strict ledger."""
     patcher = getattr(store, "patch_pending_plan", None)
     if patcher is None:
         return False
 
-    lasso_guard = str(gym_id).strip().lower() == "lasso"
+    lasso_base = str(gym_id).strip().lower() == "lasso"
+    lasso_guard = lasso_base and config.lasso_three_feed_enabled()
     if lasso_guard:
         from agent import caption_ledger
         from agent.jobs import lasso_paired_story_backfill
@@ -1850,7 +1860,11 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
             kwargs = {"caption": new_cap, "pillar": (new_cat or None)}
             if levers:
                 kwargs["levers"] = levers
-            if lasso_guard:
+            if lasso_guard or lasso_base:
+                # LASSO always patches through the exact-row CAS so the store's
+                # visual-hold / source-link protections fire; flag OFF keeps the
+                # old best-effort semantics (a CAS miss is a skip, never a
+                # partial), flag ON (lasso_guard) escalates below.
                 kwargs["expected_row"] = dict(r)
             updated = patcher(gym_id, r.get("id"), **kwargs)
         except TypeError:
@@ -1884,7 +1898,7 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
                         f"{type(exc).__name__}")
             continue
         if updated:
-            r.update(updated if lasso_guard else {})
+            r.update(updated if (lasso_guard or lasso_base) else {})
             r["caption"] = new_cap
             if new_cat:
                 r["pillar"] = new_cat

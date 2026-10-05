@@ -13,6 +13,14 @@ def _armed_caption_history(monkeypatch):
     monkeypatch.setattr(config, "caption_cooldown_enabled", lambda: True)
 
 
+# The strict-ledger autonomous lane in grade_fix is gated on the LASSO
+# autonomous switch (AGENT_LASSO_3X_ENABLED). Most tests here exercise that
+# lane, so arm it by default; flag-OFF tests override it back to False.
+@pytest.fixture(autouse=True)
+def _armed_lasso_autonomous(monkeypatch):
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: True)
+
+
 def _row(day, slot, account, fmt="feed", *, caption="Approved source copy", rid=None):
     return {
         "id": rid or f"{day}-{slot}-{account}-{fmt}", "gym_id": "lasso",
@@ -294,6 +302,8 @@ def test_lasso_date_repair_stamps_ledger_and_keeps_siblings_together(monkeypatch
 def test_lasso_date_repair_holds_when_ledger_unavailable(monkeypatch):
     row = _row("2026-10-08", 0, "instagram")
     class Store:
+        def active_rows_on_day_complete(self, gym, day):
+            return [dict(row)]
         def patch_pending_plan(self, *a, **k):
             raise AssertionError("no patch after ledger failure")
     def fail(*a, **k):
@@ -572,3 +582,104 @@ def test_waiting_story_hold_cas_miss_is_partial_after_stamp(monkeypatch):
     assert stamped, "the ledger was stamped before the CAS missed"
     assert caught.value.applied_ids == ()
     assert rows[0]["caption"] == "Approved source copy"
+
+
+# ---------------------------------------------------------------------------
+# PR296 review gating: with the LASSO autonomous switch (AGENT_LASSO_3X_ENABLED)
+# OFF, the OLD mechanical self-fix must still work -- expected_row CAS and the
+# store's visual-hold/source protections intact, but never a strict-ledger
+# refusal and never a PartialLassoCaptionRepair.
+# ---------------------------------------------------------------------------
+
+def test_flag_off_lasso_mechanical_repair_never_touches_strict_ledger(monkeypatch):
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: False)
+
+    def _forbidden(*a, **k):
+        raise AssertionError("flag OFF must not route through the strict ledger")
+
+    monkeypatch.setattr(caption_ledger, "is_blocked_strict", _forbidden)
+    monkeypatch.setattr(caption_ledger, "record_staged_strict", _forbidden)
+    day = "2026-10-08"
+    rows = [_row(day, 0, "instagram", rid="ig"),
+            _row(day, 0, "facebook", rid="fb"),
+            _row(day, 0, "instagram", "story", caption="", rid="story")]
+    calls = []
+
+    class Store:
+        def patch_pending_plan(self, gym, rid, *, caption=None, pillar=None,
+                               expected_row=None, levers=None,
+                               force_caption_visual_hold=False,
+                               caption_hold_source_feed=None):
+            assert expected_row is not None, "flag OFF keeps the exact-row CAS"
+            calls.append(rid)
+            current = next(r for r in rows if r["id"] == rid)
+            assert current["caption"] == expected_row["caption"]
+            if caption is not None:
+                current["caption"] = caption
+            # The store's visual hold fires on a LASSO caption change.
+            current["media_not_ready_reason"] = "caption_changed_needs_new_visual"
+            return dict(current)
+
+    new = "A source grounded caption with a different opening."
+    assert grade_fix._patch_date_rows("lasso", rows, Store(), new, "doctrine",
+                                      lambda *_: None)
+    assert set(calls) == {"ig", "fb", "story"}
+    assert all(r["caption"] == new for r in rows)
+    assert all(r["media_not_ready_reason"] == "caption_changed_needs_new_visual"
+               for r in rows)
+
+
+def test_flag_off_lasso_cas_miss_is_a_skip_not_a_partial(monkeypatch):
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: False)
+    monkeypatch.setattr(caption_ledger, "is_blocked_strict",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("strict ledger must stay unused")))
+    day = "2026-10-08"
+    rows = [_row(day, 0, "instagram", rid="ig"),
+            _row(day, 0, "facebook", rid="fb")]
+
+    class Store:
+        def patch_pending_plan(self, gym, rid, *, caption=None, pillar=None,
+                               expected_row=None, levers=None,
+                               force_caption_visual_hold=False,
+                               caption_hold_source_feed=None):
+            if rid == "fb":
+                return None  # a concurrent write beats the second feed CAS
+            current = next(r for r in rows if r["id"] == rid)
+            if caption is not None:
+                current["caption"] = caption
+            current["media_not_ready_reason"] = "caption_changed_needs_new_visual"
+            return dict(current)
+
+    new = "Fresh source grounded copy with a different opening."
+    assert grade_fix._patch_date_rows("lasso", rows, Store(), new, "doctrine",
+                                      lambda *_: None)
+    assert rows[0]["caption"] == new
+    assert rows[1]["caption"] == "Approved source copy"  # skipped, not partial
+
+
+def test_flag_on_lasso_repair_enforces_strict_ledger(monkeypatch):
+    # The autouse fixture arms AGENT_LASSO_3X_ENABLED; the disabled-history
+    # refusal must still refuse, and the repair must honor a blocked ledger.
+    row = _row("2026-10-08", 0, "instagram")
+    monkeypatch.setattr(config, "caption_cooldown_enabled", lambda: False)
+    with pytest.raises(RuntimeError, match="requires cooldown history"):
+        caption_ledger.is_blocked_strict("lasso", row["caption"], "2026-10-08",
+                                         db=object())
+    monkeypatch.setattr(caption_ledger, "is_blocked_strict", lambda *a, **k: True)
+    stamped = []
+    monkeypatch.setattr(caption_ledger, "record_staged_strict",
+                        lambda *a, **k: stamped.append(a))
+
+    class Store:
+        def active_rows_on_day_complete(self, gym, day):
+            return [dict(row)]
+
+        def patch_pending_plan(self, *a, **k):
+            raise AssertionError("a blocked caption is never patched")
+
+    assert not grade_fix._patch_date_rows("lasso", [row], Store(),
+                                          "Fresh source grounded copy",
+                                          "doctrine", lambda *_: None)
+    assert stamped == []
+    assert row["caption"] == "Approved source copy"
