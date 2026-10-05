@@ -1105,6 +1105,13 @@ def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
     # a '[why] ...' rationale pasted into the note is captured as the reason, never
     # saved into the caption (the ENG 2026-08-23 leak class, closed at the source).
     note, reason = _split_note_meta(note, reason)
+    from .copy_gate import format_caption
+    try:
+        note = format_caption(note)
+    except ValueError:
+        return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
+                     "error": "The caption has a semicolon inside a URL. "
+                              "Edit the link before saving."}
     # the fabrication gate runs BEFORE any store touch: an unsupported claim is refused
     # 422 whether or not the row exists, so a stat can never reach the caption. Gated
     # against THIS gym's own approved claims (LASSO globals only for LASSO itself).

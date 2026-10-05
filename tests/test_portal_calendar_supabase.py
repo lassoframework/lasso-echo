@@ -1518,7 +1518,7 @@ def test_insert_rows_rejects_non_uuid_before_network_when_preserving():
 def test_insert_rows_one_bad_caption_does_not_abort_the_batch():
     """format_caption raises ValueError when a semicolon is glued inside a
     protected URL span. insert_rows is where EVERY calendar-building lane
-    converges, so one bad caption is omitted without aborting the valid rows."""
+    converges, so one bad caption is retained on hold without aborting valid rows."""
     http = _FakeHTTP(post_resp=_Resp(201, []))
     store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
                                       service_key="svc", http=http)
@@ -1530,7 +1530,20 @@ def test_insert_rows_one_bad_caption_does_not_abort_the_batch():
     ]
     store.insert_rows("gritx", rows)
     sent = [c for c in http.calls if c[0] == "post"][0][4]
-    assert len(sent) == 1, "only the valid row is staged"
-    assert all(o["post_date"] != "2026-08-14" for o in sent)
+    assert len(sent) == 2, "the calendar slot remains visible"
+    bad = next(o for o in sent if o["post_date"] == "2026-08-14")
+    assert bad["media_not_ready_reason"] == "caption_url_semicolon"
     good = next(o for o in sent if o["post_date"] == "2026-08-15")
     assert ";" not in good["caption"], "the formattable row is still cleaned"
+
+
+def test_insert_rows_wraps_long_hook_without_extra_paragraph():
+    http = _FakeHTTP(post_resp=_Resp(201, []))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc", http=http)
+    sentence = "Training with our coaches helps you build strength and confidence while keeping your effort steady through every class and every week."
+    store.insert_rows("gritx", [{"post_date": "2026-08-15", "format": "feed",
+                                 "image_url": "u2", "caption": sentence}])
+    sent = [c for c in http.calls if c[0] == "post"][0][4][0]["caption"]
+    assert "\n" in sent and "\n\n" not in sent
+    assert sent.replace("\n", " ") == sentence
