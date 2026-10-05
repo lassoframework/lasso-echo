@@ -1226,6 +1226,28 @@ def test_swap_media_is_status_guarded_to_waiting_rows(monkeypatch):
                        "media_not_ready_reason": None}
 
 
+def test_swap_media_explicit_none_clears_source_but_omission_preserves_it(monkeypatch):
+    """Omitting source_media_url keeps legacy callers' behavior, while an
+    explicit None clears stale provenance in the same pixels PATCH."""
+    http = _FakeHTTP(patch_resp=_Resp(200, [_row("id-m", gym_id="gritx", status="pending")]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    store = pcs.SupabaseCalendarStore()
+    store.swap_media("gritx", "id-m", "https://cdn/new.jpg")
+    assert http.calls[0][4] == {
+        "image_url": "https://cdn/new.jpg",
+        "media_not_ready_reason": None,
+    }
+
+    http.calls.clear()
+    store.swap_media("gritx", "id-m", "https://cdn/newer.jpg", source_media_url=None)
+    assert http.calls[0][4] == {
+        "image_url": "https://cdn/newer.jpg",
+        "source_media_url": None,
+        "media_not_ready_reason": None,
+    }
+
+
 def test_swap_media_zero_match_returns_none(monkeypatch):
     """A row that got approved/claimed between the sweep's read and its write matches
     zero rows -> None (the race loser is the sweep, never the approval)."""
