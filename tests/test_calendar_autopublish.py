@@ -2769,6 +2769,41 @@ def test_semicolon_heal_survives_a_store_without_the_patch_method(armed):
     assert ";" not in pub.calls[0][0].caption
 
 
+@pytest.mark.parametrize("caption", [
+    "1. Warm up. 2. Cool down for 3. Final stretch now.",
+    "1. Hold for 2. Rest.",
+    "1. Squats 2. Lunges",
+])
+def test_ambiguous_numbered_caption_waits_without_send_or_mutation(armed, caption):
+    store = _PreservingStore([_row("ambiguous", status="approved", caption=caption)])
+    before = dict(store.rows["ambiguous"])
+    pub = _FakePublisher()
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert "ambiguous" in summary["waiting"]
+    assert pub.calls == []
+    assert store.preserve_patches == []
+    assert store.rows["ambiguous"] == before
+
+
+def test_numbered_lines_with_an_ambiguous_quantity_still_wait(armed):
+    store = _PreservingStore([_row("list-lines", status="approved",
+        caption="1. Warm up.\n2. Cool down for 3. Final stretch now.")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    # The second line still has an ambiguous inline number, so it must wait.
+    assert "list-lines" in summary["waiting"]
+    assert pub.calls == []
+
+
+def test_unambiguous_numbered_lines_publish(armed):
+    store = _PreservingStore([_row("list-safe", status="approved",
+        caption="1. Warm up.\n2. Cool down.\n3. Stretch.")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert summary["published"] == ["list-safe"]
+    assert pub.calls[0][0].caption == "1. Warm up.\n\n2. Cool down.\n\n3. Stretch."
+
+
 def test_semicolon_glued_inside_url_holds_the_row(armed):
     """format_caption raises rather than corrupt a link; the row is HELD (never
     claimed) for a human edit instead of publishing or crashing the lane."""

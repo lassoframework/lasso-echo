@@ -881,8 +881,8 @@ def _alert_caption_format_held(row_id, gym_id):
             return
         _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
             f"{gym_id}: row {row_id} HELD at the publish boundary — its caption "
-            "contains a semicolon that cannot be safely auto-formatted. "
-            "Edit the caption and re-render Story media if applicable; "
+            "cannot be safely auto-formatted. Check protected URL semicolons, "
+            "put numbered list items on separate lines, and re-render Story media if applicable; "
             "the row retries once fixed."))
     except Exception:
         pass  # an alert failure must never block the publish lane
@@ -897,6 +897,8 @@ def _format_caption_at_publish(row, gym_id, store):
     approval. Story text may be burned into media, so a Story with a semicolon
     holds for correction rather than silently changing its saved caption.
     A protected URL containing a semicolon also holds instead of being damaged.
+    Ambiguous inline numbered lists wait for items to be placed on separate
+    lines, preserving copy and approval rather than guessing sentence ends.
     """
     caption = row.get("caption") or ""
     if _is_story_row(row):
@@ -905,7 +907,7 @@ def _format_caption_at_publish(row, gym_id, store):
         return None if ";" in caption else row
     from .copy_gate import format_caption
     try:
-        clean = format_caption(caption)
+        clean = format_caption(caption, reject_ambiguous_lists=True)
     except ValueError:
         return None
     if clean == caption:
