@@ -1690,6 +1690,7 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
     lasso_guard = str(gym_id).strip().lower() == "lasso"
     if lasso_guard:
         from agent import caption_ledger
+        from agent.jobs import lasso_paired_story_backfill
         # The LASSO autonomous lane never rewrites a partial or stale sibling
         # group. Reserve the new caption in the durable production ledger before
         # touching any calendar row; a failed reservation is an honest skip.
@@ -1705,6 +1706,80 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
         if len(dates) != 1:
             return False
         day = next(iter(dates))
+
+        # READ-ONLY SIBLING VALIDATION, BEFORE ANY WRITE (2026-10-05). Stories
+        # have an empty publish caption by design, so the duplicate hash group
+        # usually contains feeds only; their exact siblings must be found and
+        # judged here, before the ledger stamp, so a refusal leaves nothing
+        # behind. Only failures AFTER the stamp raise PartialLassoCaptionRepair.
+        feed_by_key = {}
+        for r in date_rows:
+            if str(r.get("format") or "").lower() == "feed":
+                feed_by_key[(r.get("logical_post_id"), r.get("slot_index"),
+                             str(r.get("account") or "").lower())] = r
+        if not feed_by_key:
+            log(f"{gym_id} {day}: no feed rows in the repair group; refusing "
+                "repair before any write")
+            return False
+        reader = getattr(store, "active_rows_on_day_complete", None)
+        if reader is None:
+            log(f"{gym_id} {day}: complete sibling read unavailable; refusing "
+                "repair before any write")
+            return False
+        try:
+            day_rows = reader(gym_id, day)
+        except Exception as exc:  # noqa: BLE001
+            log(f"{gym_id} {day}: complete sibling read failed before any "
+                f"write: {type(exc).__name__}")
+            return False
+        if not isinstance(day_rows, list):
+            log(f"{gym_id} {day}: complete sibling read malformed; refusing "
+                "repair before any write")
+            return False
+        stories = [r for r in day_rows
+                   if r.get("gym_id") == gym_id
+                   and str(r.get("format") or "").lower() == "story"
+                   and r.get("variant_status") == "active"
+                   and (r.get("logical_post_id"), r.get("slot_index"),
+                        str(r.get("account") or "").lower()) in feed_by_key]
+        holds = []          # (story, paired feed) pairs to hold after the stamp
+        for story in stories:
+            story_key = (story.get("logical_post_id"), story.get("slot_index"),
+                         str(story.get("account") or "").lower())
+            if _is_wipeable(story) and story.get("created_at"):
+                holds.append((story, feed_by_key[story_key]))
+                continue
+            # A non-wipeable sibling is skippable ONLY when it is a published
+            # row the DATABASE ITSELF proves unrelated to this feed (the
+            # reviewed historical legacy-null incident exception). A presumed-
+            # absent source, an RPC failure, or a REAL paired published Story
+            # all fail closed -- before a single write.
+            if (str(story.get("status") or "").lower() == "published"
+                    and story.get("id")):
+                feed = feed_by_key.get(story_key)
+                if feed is None:
+                    log(f"{gym_id} {day}: published sibling Story "
+                        f"{story.get('id')} has no feed in this repair group; "
+                        "refusing repair before any write")
+                    return False
+                try:
+                    unrelated = lasso_paired_story_backfill \
+                        .unrelated_published_story(store, story["id"], feed["id"])
+                except Exception as exc:  # noqa: BLE001
+                    log(f"{gym_id} {day}: historical Story source check "
+                        f"unavailable ({type(exc).__name__}); refusing repair "
+                        "before any write")
+                    return False
+                if unrelated:
+                    continue        # DB-proven unrelated: leave it untouched
+                log(f"{gym_id} {day}: sibling Story {story['id']} is the real "
+                    "published pair of this feed; refusing repair before any "
+                    "write")
+                return False
+            log(f"{gym_id} {day}: sibling Story {story.get('id')} changed "
+                "before the repair could start; refusing before any write")
+            return False
+
         try:
             if caption_ledger.is_blocked_strict(gym_id, new_cap, day):
                 return False
@@ -1724,32 +1799,14 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
             error = PartialLassoCaptionRepair(gym_id, day, applied_ids, reason)
             log(str(error))
             raise error
-        # Stories have an empty publish caption by design, so the duplicate
-        # hash group usually contains feeds only. Read their exact siblings and
-        # hold those 9:16 visuals BEFORE changing any feed caption.
+        # Hold the validated 9:16 Story visuals BEFORE changing any feed
+        # caption. The group was read above; the exact-row CAS in
+        # patch_pending_plan is what catches a change after that read, and a
+        # CAS miss here is a genuine partial (the ledger is already stamped).
         try:
-            reader = getattr(store, "active_rows_on_day_complete")
-            day_rows = reader(gym_id, day)
-            if not isinstance(day_rows, list):
-                partial("complete sibling read unavailable after ledger stamp")
-            feed_keys = {
-                (r.get("logical_post_id"), r.get("slot_index"),
-                 str(r.get("account") or "").lower())
-                for r in date_rows if str(r.get("format") or "").lower() == "feed"
-            }
-            if not feed_keys:
-                partial("no feed keys after ledger stamp")
-            stories = [r for r in day_rows
-                       if r.get("gym_id") == gym_id
-                       and str(r.get("format") or "").lower() == "story"
-                       and r.get("variant_status") == "active"
-                       and (r.get("logical_post_id"), r.get("slot_index"),
-                            str(r.get("account") or "").lower()) in feed_keys]
-            if any(not _is_wipeable(r) or not r.get("created_at") for r in stories):
-                partial("sibling Story changed after ledger stamp")
             old_captions = {str(r.get("caption") or "") for r in date_rows
                             if str(r.get("format") or "").lower() == "feed"}
-            for story in stories:
+            for story, paired_feed in holds:
                 old_story_caption = str(story.get("caption") or "")
                 # An independently written Story keeps its own copy; its
                 # visual stays held until an operator resolves that mismatch.
@@ -1757,7 +1814,8 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
                                  and old_story_caption else None)
                 updated = patcher(
                     gym_id, story["id"], caption=story_caption,
-                    expected_row=dict(story), force_caption_visual_hold=True)
+                    expected_row=dict(story), force_caption_visual_hold=True,
+                    caption_hold_source_feed=dict(paired_feed))
                 if not updated or updated.get("media_not_ready_reason") != \
                         "caption_changed_needs_new_visual":
                     partial(f"Story hold CAS missed for {story['id']}")

@@ -266,10 +266,16 @@ def test_lasso_date_repair_stamps_ledger_and_keeps_siblings_together(monkeypatch
             return [dict(r) for r in rows]
         def patch_pending_plan(self, gym, rid, *, caption=None, pillar=None,
                                expected_row, levers=None,
-                               force_caption_visual_hold=False):
+                               force_caption_visual_hold=False,
+                               caption_hold_source_feed=None):
             calls.append((rid, dict(expected_row)))
             current = next(r for r in rows if r["id"] == rid)
             assert current["caption"] == expected_row["caption"]
+            if force_caption_visual_hold:
+                assert caption_hold_source_feed is not None
+                assert caption_hold_source_feed["format"] == "feed"
+                assert caption_hold_source_feed["slot_index"] == \
+                    expected_row["slot_index"]
             if caption is not None:
                 current["caption"] = caption
             current["media_not_ready_reason"] = "caption_changed_needs_new_visual"
@@ -314,7 +320,8 @@ def test_lasso_partial_caption_patch_is_explicit_and_changed_rows_stay_held(monk
             return [dict(r) for r in rows]
         def patch_pending_plan(self, gym, rid, *, caption=None, pillar=None,
                                expected_row, levers=None,
-                               force_caption_visual_hold=False):
+                               force_caption_visual_hold=False,
+                               caption_hold_source_feed=None):
             if rid == "fb":
                 return None  # a concurrent write beats the second feed CAS
             current = next(r for r in rows if r["id"] == rid)
@@ -351,7 +358,8 @@ def test_lasso_mechanical_caption_change_still_holds_existing_visual(monkeypatch
             return [dict(row)]
         def patch_pending_plan(self, gym, rid, *, caption=None, pillar=None,
                                expected_row, levers=None,
-                               force_caption_visual_hold=False):
+                               force_caption_visual_hold=False,
+                               caption_hold_source_feed=None):
             assert expected_row["caption"] == "Old CTA"
             assert caption == "Approved booking CTA"
             return dict(row, caption=caption,
@@ -359,3 +367,208 @@ def test_lasso_mechanical_caption_change_still_holds_existing_visual(monkeypatch
     assert grade_fix._patch_date_rows("lasso", [row], Store(),
                                       "Approved booking CTA", None, lambda *_: None)
     assert row["media_not_ready_reason"] == "caption_changed_needs_new_visual"
+
+
+# ---------------------------------------------------------------------------
+# Cloud review 2026-10-05: a normal pending 'paired_feed_not_ready' Story must
+# be holdable through the exact source-linked CAS, and a published sibling
+# Story must fail closed unless the DB proves it unrelated -- both judged
+# BEFORE the ledger stamp.
+# ---------------------------------------------------------------------------
+
+def _waiting_story(day, slot, account, rid="story-waiting"):
+    row = _row(day, slot, account, "story", caption="", rid=rid)
+    row["media_not_ready_reason"] = "paired_feed_not_ready"
+    return row
+
+
+def _published_story(day, slot, account, rid="story-historical"):
+    row = _row(day, slot, account, "story", caption="", rid=rid)
+    row["status"] = "published"
+    row["published_at"] = "2026-10-02T12:00:00Z"
+    row["late_post_id"] = "18123456789012345"
+    return row
+
+
+def test_waiting_story_hold_allowed_only_with_source_link():
+    story = _waiting_story("2026-10-08", 0, "instagram")
+    feed = _row("2026-10-08", 0, "instagram", rid="feed-1")
+    calls = []
+
+    class HTTP:
+        def patch(self, url, *, params, headers, json, timeout):
+            calls.append((params, json))
+            return SimpleNamespace(status_code=200,
+                                   json=lambda: [dict(story, **json)])
+
+    store = SupabaseCalendarStore(url="https://example.test", service_key="test",
+                                  http=HTTP())
+    # Without the paired source feed the widened hold stays refused.
+    assert store.patch_pending_plan("lasso", story["id"], expected_row=dict(story),
+                                    force_caption_visual_hold=True) is None
+    # A feed that does not actually pair with the Story is no link at all.
+    assert store.patch_pending_plan(
+        "lasso", story["id"], expected_row=dict(story),
+        force_caption_visual_hold=True,
+        caption_hold_source_feed=dict(feed, slot_index=1)) is None
+    # A claimed Story is never eligible even with the right feed.
+    claimed = dict(story, publish_claim_token="tok")
+    assert store.patch_pending_plan(
+        "lasso", story["id"], expected_row=claimed,
+        force_caption_visual_hold=True,
+        caption_hold_source_feed=dict(feed)) is None
+    assert calls == []
+    after = store.patch_pending_plan("lasso", story["id"], expected_row=dict(story),
+                                     force_caption_visual_hold=True,
+                                     caption_hold_source_feed=dict(feed))
+    assert after["media_not_ready_reason"] == "caption_changed_needs_new_visual"
+    params, payload = calls[0]
+    assert payload["media_not_ready_reason"] == "caption_changed_needs_new_visual"
+    assert params["media_not_ready_reason"] == "eq.paired_feed_not_ready"
+    assert params["status"] == "eq.pending"
+
+
+def test_lasso_repair_holds_waiting_story_and_stamps_after_read(monkeypatch):
+    day = "2026-10-08"
+    ig = _row(day, 0, "instagram", rid="ig")
+    fb = _row(day, 0, "facebook", rid="fb")
+    story = _waiting_story(day, 0, "instagram")
+    rows = [ig, fb, story]
+    sequence = []
+    patched = []
+    monkeypatch.setattr(caption_ledger, "is_blocked_strict", lambda *a, **k: False)
+    monkeypatch.setattr(caption_ledger, "record_staged_strict",
+                        lambda *a, **k: sequence.append("stamp"))
+
+    class Store:
+        def active_rows_on_day_complete(self, gym, date):
+            sequence.append("read")
+            return [dict(r) for r in rows]
+
+        def patch_pending_plan(self, gym, rid, *, caption=None, pillar=None,
+                               expected_row, levers=None,
+                               force_caption_visual_hold=False,
+                               caption_hold_source_feed=None):
+            patched.append((rid, force_caption_visual_hold,
+                            caption_hold_source_feed))
+            current = next(r for r in rows if r["id"] == rid)
+            if caption is not None:
+                current["caption"] = caption
+            current["media_not_ready_reason"] = "caption_changed_needs_new_visual"
+            return dict(current)
+
+    new = "A source grounded caption with a different opening."
+    assert grade_fix._patch_date_rows("lasso", rows, Store(), new, "doctrine",
+                                      lambda *_: None)
+    assert sequence == ["read", "stamp"]
+    story_call = next(c for c in patched if c[0] == "story-waiting")
+    assert story_call[1] is True
+    assert story_call[2]["id"] == "ig"
+    assert story["media_not_ready_reason"] == "caption_changed_needs_new_visual"
+    assert all(r["caption"] == new for r in (ig, fb))
+
+
+def _published_sibling_setup(monkeypatch, day="2026-10-08"):
+    ig = _row(day, 0, "instagram", rid="feed81276931-0000-0000-0000-000000000000")
+    fb = _row(day, 0, "facebook", rid="fb")
+    story = _published_story(day, 0, "instagram")
+    rows = [ig, fb]
+    stamped = []
+    patched = []
+    monkeypatch.setattr(caption_ledger, "is_blocked_strict", lambda *a, **k: False)
+    monkeypatch.setattr(caption_ledger, "record_staged_strict",
+                        lambda *a, **k: stamped.append(a))
+
+    class Store:
+        def active_rows_on_day_complete(self, gym, date):
+            return [dict(r) for r in rows] + [dict(story)]
+
+        def patch_pending_plan(self, gym, rid, *, caption=None, pillar=None,
+                               expected_row, levers=None,
+                               force_caption_visual_hold=False,
+                               caption_hold_source_feed=None):
+            patched.append(rid)
+            current = next(r for r in rows if r["id"] == rid)
+            if caption is not None:
+                current["caption"] = caption
+            current["media_not_ready_reason"] = "caption_changed_needs_new_visual"
+            return dict(current)
+
+    return rows, story, Store(), stamped, patched
+
+
+def test_lasso_repair_refuses_real_published_pair_before_stamp(monkeypatch):
+    rows, story, store, stamped, patched = _published_sibling_setup(monkeypatch)
+    monkeypatch.setattr(
+        "agent.jobs.lasso_paired_story_backfill.unrelated_published_story",
+        lambda _store, story_id, feed_id: False)
+    assert not grade_fix._patch_date_rows("lasso", rows, store,
+                                          "Fresh source grounded copy",
+                                          "doctrine", lambda *_: None)
+    assert stamped == [] and patched == []
+    assert story["status"] == "published"
+
+
+def test_lasso_repair_fails_closed_when_historical_check_unavailable(monkeypatch):
+    rows, story, store, stamped, patched = _published_sibling_setup(monkeypatch)
+
+    def _down(_store, story_id, feed_id):
+        raise RuntimeError("historical Story source preflight unavailable")
+
+    monkeypatch.setattr(
+        "agent.jobs.lasso_paired_story_backfill.unrelated_published_story", _down)
+    assert not grade_fix._patch_date_rows("lasso", rows, store,
+                                          "Fresh source grounded copy",
+                                          "doctrine", lambda *_: None)
+    assert stamped == [] and patched == []
+
+
+def test_lasso_repair_skips_only_db_proven_unrelated_published_story(monkeypatch):
+    rows, story, store, stamped, patched = _published_sibling_setup(monkeypatch)
+    checked = []
+    feed_id = rows[0]["id"]
+
+    def _unrelated(_store, story_id, fid):
+        checked.append((story_id, fid))
+        return True
+
+    monkeypatch.setattr(
+        "agent.jobs.lasso_paired_story_backfill.unrelated_published_story",
+        _unrelated)
+    new = "Fresh source grounded copy with a different opening."
+    assert grade_fix._patch_date_rows("lasso", rows, store, new, "doctrine",
+                                      lambda *_: None)
+    assert checked == [("story-historical", feed_id)]
+    assert stamped, "a proven exception still stamps the ledger before writing"
+    assert set(patched) == {rows[0]["id"], "fb"}
+    assert story["media_not_ready_reason"] is None  # historical row untouched
+    assert all(r["caption"] == new for r in rows)
+
+
+def test_waiting_story_hold_cas_miss_is_partial_after_stamp(monkeypatch):
+    day = "2026-10-08"
+    ig = _row(day, 0, "instagram", rid="ig")
+    story = _waiting_story(day, 0, "instagram")
+    rows = [ig, story]
+    stamped = []
+    monkeypatch.setattr(caption_ledger, "is_blocked_strict", lambda *a, **k: False)
+    monkeypatch.setattr(caption_ledger, "record_staged_strict",
+                        lambda *a, **k: stamped.append(a))
+
+    class Store:
+        def active_rows_on_day_complete(self, gym, date):
+            return [dict(r) for r in rows]
+
+        def patch_pending_plan(self, gym, rid, *, caption=None, pillar=None,
+                               expected_row, levers=None,
+                               force_caption_visual_hold=False,
+                               caption_hold_source_feed=None):
+            return None  # a concurrent write beats the Story hold CAS
+
+    with pytest.raises(grade_fix.PartialLassoCaptionRepair) as caught:
+        grade_fix._patch_date_rows("lasso", rows, Store(),
+                                   "Fresh source grounded copy", "doctrine",
+                                   lambda *_: None)
+    assert stamped, "the ledger was stamped before the CAS missed"
+    assert caught.value.applied_ids == ()
+    assert rows[0]["caption"] == "Approved source copy"

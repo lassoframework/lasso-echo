@@ -132,6 +132,35 @@ def _eq_filter(value):
     return f"eq.{value}"
 
 
+def _paired_story_hold_source_link(expected_row, feed):
+    """True when `expected_row` is an unclaimed pending active LASSO Story and
+    `feed` identifies its exact source feed row.
+
+    A pending Story holding 'paired_feed_not_ready' is waiting on its paired
+    feed's visual, so a caption-driven visual hold on it is legitimate — but
+    ONLY through an exact CAS whose caller proves the story/feed linkage with
+    the same identity the pairing lanes use (gym, account, post_date,
+    slot_index, logical_post_id). Anything less fails closed: the hold reason
+    stays in the rejected set and patch_pending_plan returns None.
+    """
+    if not isinstance(feed, dict):
+        return False
+    if (str(expected_row.get("format") or "").lower() != "story"
+            or expected_row.get("status") != "pending"
+            or expected_row.get("variant_status") != "active"
+            or expected_row.get("published_at") is not None
+            or expected_row.get("late_post_id") is not None
+            or expected_row.get("publish_claim_token") is not None):
+        return False
+    if (str(feed.get("format") or "").lower() != "feed"
+            or str(feed.get("gym_id") or "") != str(expected_row.get("gym_id") or "")
+            or str(feed.get("post_date") or "")[:10]
+            != str(expected_row.get("post_date") or "")[:10]):
+        return False
+    return all(feed.get(column) == expected_row.get(column)
+               for column in ("account", "slot_index", "logical_post_id"))
+
+
 def _slot_key(row):
     """The (post_date, account, format) a row occupies, normalized. Two rows with the
     same slot key are the same calendar cell (a rebuild must not create a second one).
@@ -3569,7 +3598,8 @@ class SupabaseCalendarStore:
 
     def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None,
                            levers=None, expected_row=None,
-                           force_caption_visual_hold=False):
+                           force_caption_visual_hold=False,
+                           caption_hold_source_feed=None):
         """PATCH a WIPEABLE row's caption and/or pillar (the grade self-fix lane,
         AGENT_GRADE_SELF_FIX), filtered by id AND gym_id AND a server-side
         status IN (pending,draft,queued) guard, so a human-owned row (approved /
@@ -3592,6 +3622,11 @@ class SupabaseCalendarStore:
         learner reads: metrics_sync copies these columns onto post_metrics and
         monthly_retro compares on them. A caller that changes the caption must
         pass the re-stamped levers so the label keeps telling the truth.
+
+        `caption_hold_source_feed` is the paired feed row dict, accepted only
+        alongside `force_caption_visual_hold` on a LASSO Story whose current
+        hold is 'paired_feed_not_ready' (a normal Story waiting on its feed's
+        visual). Without that source link the widened hold stays refused.
         """
         fields = {}
         if caption is not None:
@@ -3607,9 +3642,19 @@ class SupabaseCalendarStore:
             and ((caption is not None and caption != expected_row.get("caption"))
                  or force_caption_visual_hold))
         if caption_visual_hold:
-            if (expected_row.get("media_not_ready_reason") not in
-                    (None, "caption_changed_needs_new_visual",
-                     "cross_date_media_repeat_needs_new_visual")):
+            hold_reason = expected_row.get("media_not_ready_reason")
+            if hold_reason == "paired_feed_not_ready":
+                # The ONLY widened case: an exact, unclaimed, pending, active
+                # LASSO Story CAS whose caller names the paired source feed
+                # (_paired_story_hold_source_link). The CAS params below already
+                # pin status/variant/claim columns server-side, so the link
+                # check is what keeps this from broadening to unrelated holds.
+                if not (force_caption_visual_hold
+                        and _paired_story_hold_source_link(
+                            expected_row, caption_hold_source_feed)):
+                    return None
+            elif hold_reason not in (None, "caption_changed_needs_new_visual",
+                                     "cross_date_media_repeat_needs_new_visual"):
                 return None
             # Set in the SAME PostgREST PATCH as the new caption. The old image
             # is never publishable even if the runner sees this row immediately.
