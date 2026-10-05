@@ -184,6 +184,116 @@ def _reviewed_ig_artifact(monkeypatch, store, ig_row):
     store.cache[(repair._eq(source_id), repair._eq(source_hash))] = [record]
 
 
+def _story_artifact_for(ig_row, url):
+    """A 9:16 Story artifact sharing the exact feed id/caption source."""
+    source_id = f"content_calendar:{ig_row['id']}:caption"
+    source_hash = repair.hashlib.sha256(ig_row["caption"].encode()).hexdigest()
+    return {
+        "image_url": url,
+        "source_identity": {"source_id": source_id, "source_hash": source_hash},
+        "evidence": {"policy_version": repair.infographic_evidence.POLICY_VERSION,
+                     "brain_snapshot": {"source": "hash"},
+                     "brief_model": "gpt-6-astra", "grade_status": "PASS",
+                     "image_sha256": "story-image-hash",
+                     "review_response_id": "review", "aspect": "9:16",
+                     "pixels": "1080x1920",
+                     "verified_dimensions": {"width": 1080, "height": 1920,
+                                             "image_sha256": "story-image-hash"}},
+    }
+
+
+def test_newer_story_artifact_never_shadows_feed_artwork_for_reuse(monkeypatch):
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair.infographic_evidence, "brain_snapshot",
+                        lambda: {"source": "hash"})
+    feed = _row("feed", caption="Approved feed copy.")
+    store, artifacts = _Store([feed]), _Artifacts()
+    _reviewed_ig_artifact(monkeypatch, store, dict(feed, image_url="https://cdn.example/feed-art.png"))
+    source_id = "content_calendar:feed:caption"
+    source_hash = repair.hashlib.sha256(feed["caption"].encode()).hexdigest()
+    # created_at.desc: the Story render is the NEWEST record for this source.
+    store.cache[(repair._eq(source_id), repair._eq(source_hash))].insert(
+        0, _story_artifact_for(feed, "https://cdn.example/story-art.png"))
+    monkeypatch.setattr(variant_regen, "generate_variant_image",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            AssertionError("valid feed artifact must be reused")))
+    out = repair.run(store=store, artifact_store=artifacts)
+    assert out["reused"] == out["repaired"] == 1
+    assert out["generated"] == 0
+    assert store.rows["feed"]["image_url"] == "https://cdn.example/feed-art.png"
+    assert store.rows["feed"]["media_not_ready_reason"] is None
+
+
+def test_only_story_artifacts_means_no_feed_reuse(monkeypatch):
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair.infographic_evidence, "brain_snapshot",
+                        lambda: {"source": "hash"})
+    feed = _row("feed", caption="Approved feed copy.")
+    store, artifacts = _Store([feed]), _Artifacts()
+    source_id = "content_calendar:feed:caption"
+    source_hash = repair.hashlib.sha256(feed["caption"].encode()).hexdigest()
+    store.cache[(repair._eq(source_id), repair._eq(source_hash))] = [
+        _story_artifact_for(feed, "https://cdn.example/story-art.png")]
+    generated = []
+    monkeypatch.setattr(variant_regen, "generate_variant_image",
+                        lambda row, account, **kw: generated.append(row["id"]) or
+                        {"ok": True, "image_url": "https://new.example/feed.png"})
+    out = repair.run(store=store, artifact_store=artifacts)
+    assert out["reused"] == 0
+    assert out["generated"] == out["repaired"] == 1
+    assert generated == ["feed"]
+    assert store.rows["feed"]["image_url"] == "https://new.example/feed.png"
+
+
+def test_facebook_mirror_ignores_story_only_ig_artifacts(monkeypatch):
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair.config, "lasso_infographic_quality_enabled",
+                        lambda key: key in ("lasso_ig", "lasso_fb"))
+    monkeypatch.setattr(repair.infographic_evidence, "brain_snapshot",
+                        lambda: {"source": "hash"})
+    caption = "The same approved copy."
+    ig = _row("ig", caption=caption, image_url="https://cdn.example/ig-feed.png",
+              media_not_ready_reason=None)
+    fb = _row("fb", account="facebook", caption=caption)
+    store, artifacts = _Store([ig, fb]), _Artifacts()
+    # The IG source has only a Story render; the FB mirror must keep waiting
+    # rather than bind 9:16 media as feed artwork or pay for a new visual.
+    source_id = "content_calendar:ig:caption"
+    source_hash = repair.hashlib.sha256(caption.encode()).hexdigest()
+    store.cache[(repair._eq(source_id), repair._eq(source_hash))] = [
+        _story_artifact_for(ig, "https://cdn.example/ig-story.png")]
+    monkeypatch.setattr(variant_regen, "generate_variant_image",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            AssertionError("story-only mirror must not generate")))
+    out = repair.run(store=store, artifact_store=artifacts, account_key="lasso_fb")
+    assert out["generated"] == out["repaired"] == out["reused"] == 0
+    assert out["skipped"] == 1
+    assert store.rows["fb"]["media_not_ready_reason"] == repair.HOLD_REASON
+
+
+def test_malformed_dimension_claim_fails_closed_without_reuse_or_spend(
+        monkeypatch):
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair.infographic_evidence, "brain_snapshot",
+                        lambda: {"source": "hash"})
+    feed = _row("feed", caption="Approved feed copy.")
+    store, artifacts = _Store([feed]), _Artifacts()
+    _reviewed_ig_artifact(monkeypatch, store, feed)
+    source_id = "content_calendar:feed:caption"
+    source_hash = repair.hashlib.sha256(feed["caption"].encode()).hexdigest()
+    record = store.cache[(repair._eq(source_id), repair._eq(source_hash))][0]
+    record["evidence"]["aspect"] = "4:5"
+    record["evidence"]["verified_dimensions"] = {"width": "1080", "height": 1350}
+    monkeypatch.setattr(variant_regen, "generate_variant_image",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            AssertionError("malformed record must not spend")))
+    out = repair.run(store=store, artifact_store=artifacts)
+    assert out["errors"] == 1
+    assert out["generated"] == out["repaired"] == out["reused"] == 0
+    assert store.patches == []
+    assert store.rows["feed"]["media_not_ready_reason"] == repair.HOLD_REASON
+
+
 def test_exact_facebook_mirror_reuses_ig_reviewed_visual_and_records_provenance(
         monkeypatch):
     _armed(monkeypatch)

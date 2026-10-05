@@ -18,8 +18,8 @@ import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from agent import (calendar_autopublish, config, infographic_evidence,
-                   variant_regen, visual_writer_prepare)
+from agent import (calendar_autopublish, config, feed_image,
+                   infographic_evidence, variant_regen, visual_writer_prepare)
 from agent.infographic_artifacts import ArtifactStore
 from agent.portal_calendar_store import SupabaseCalendarStore
 
@@ -90,8 +90,38 @@ def _eq(value):
     return f"eq.{value}"
 
 
+FEED_ASPECTS = ("4:5", "1:1", "1.91:1")
+
+
+def _feed_format_evidence(evidence):
+    """True only when reviewed evidence is usable as FEED artwork.
+
+    Feed and Story artifacts now share the exact feed id/caption source
+    identity in one tenant, so the most recent PASS artifact can be a 9:16
+    Story render. Only supported feed aspects (an unstamped legacy feed
+    review, or a stamped 4:5/1:1/1.91:1 within the platform's feed ratio
+    band) may be reused. A present but unreadable dimension claim is an
+    error, never a silent miss: reusing or regenerating from a malformed
+    record could bill twice or bind Story media to a feed row.
+    """
+    aspect = evidence.get("aspect")
+    if aspect not in (None, "") and aspect not in FEED_ASPECTS:
+        return False
+    measured = evidence.get("verified_dimensions")
+    if measured is None:
+        return True
+    if not isinstance(measured, dict):
+        raise RuntimeError("reviewed artifact lookup malformed")
+    width, height = measured.get("width"), measured.get("height")
+    if (type(width) is not int or type(height) is not int
+            or width <= 0 or height <= 0):
+        raise RuntimeError("reviewed artifact lookup malformed")
+    ratio = width / height
+    return feed_image.MIN_RATIO <= ratio <= feed_image.MAX_RATIO
+
+
 def _reviewed_artifact_record(store, source_id, source_hash, account_key=ACCOUNT):
-    """Reuse a persisted reviewed image before any new paid generation.
+    """Reuse a persisted reviewed FEED image before any new paid generation.
 
     A failed or incomplete lookup is an error, not a cache miss: generating in
     that state could bill repeatedly for the same row after a process restart.
@@ -122,7 +152,8 @@ def _reviewed_artifact_record(store, source_id, source_hash, account_key=ACCOUNT
                 and evidence.get("brief_model") == "gpt-6-astra"
                 and evidence.get("grade_status") == "PASS"
                 and evidence.get("image_sha256")
-                and evidence.get("review_response_id")):
+                and evidence.get("review_response_id")
+                and _feed_format_evidence(evidence)):
             return row
     return None
 
