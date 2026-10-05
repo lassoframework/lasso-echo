@@ -33,10 +33,11 @@ class FakeStore:
         self.linked = linked
         self.rpc_result = rpc_result
         self.calls = []
+        self.extra_rows = []
 
     def rows_in_range_complete(self, gym, first, last, *, all_statuses=False):
         assert (gym, first, last, all_statuses) == ("lasso", job.FIRST, job.LAST, True)
-        return [self.feed, self.story]
+        return [self.feed, self.story, *self.extra_rows]
 
     def _client(self):
         return self
@@ -85,6 +86,16 @@ def test_missing_registry_or_held_story_cannot_call_release():
         assert not any(call[0] == "POST" for call in store.calls)
 
 
+def test_published_historical_story_does_not_displace_managed_pending_story():
+    store = FakeStore()
+    historical = row("story", "44444444-4444-4444-8444-444444444444")
+    historical.update(status="published", published_at="2026-10-03T13:00:00Z",
+                      late_post_id="historical-provider-id")
+    store.extra_rows = [historical]
+    assert job.run(account="instagram", store=store,
+                   today="2026-10-06")["released"] == 1
+
+
 def test_window_and_account_are_bounded():
     store = FakeStore()
     assert job.run(account="instagram", store=store, today="2026-10-12")["attempted"] == 0
@@ -100,11 +111,16 @@ def test_window_and_account_are_bounded():
 def test_sql_requires_exact_story_proof_and_narrow_hold_cas():
     assert "lasso_managed_paired_stories m" in SQL
     assert "public.lasso_story_current_source(s.id)" in SQL
+    assert "public.lasso_unrelated_published_story(c.id, f.id)" in SQL
+    assert "and c.status = 'pending'" in SQL
+    assert "c.slot_index is null or c.slot_index = f.slot_index" in SQL
     assert "prepared_backlog_waiting_for_story_and_capacity" in SQL
     assert "f.status <> 'pending'" in SQL
     assert "s.status <> 'pending'" in SQL
     assert "f.publish_claim_token is not null" in SQL
     assert "s.publish_claim_token is not null" in SQL
+    assert "f.publish_reservation_day is distinct from" in SQL
+    assert "s.publish_reservation_day is distinct from" in SQL
     assert "media_not_ready_reason = null" in SQL
     assert "grant execute on function public.release_lasso_backlog_feed_hold" in SQL
     assert "to service_role" in SQL

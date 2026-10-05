@@ -18,12 +18,12 @@ FEED_FIELDS = ("id", "gym_id", "account", "post_date", "slot_index",
                "format", "status", "variant_status", "caption", "image_url",
                "pillar", "scheduled_at", "logical_post_id",
                "media_not_ready_reason", "published_at", "late_post_id",
-               "publish_claim_token")
+               "publish_claim_token", "publish_reservation_day")
 STORY_FIELDS = ("id", "gym_id", "account", "post_date", "slot_index",
                 "format", "status", "variant_status", "caption", "image_url",
                 "source_media_url", "pillar", "scheduled_at", "logical_post_id",
                 "media_not_ready_reason", "published_at", "late_post_id",
-                "publish_claim_token")
+                "publish_claim_token", "publish_reservation_day")
 
 
 def _rows(store, table, params):

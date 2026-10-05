@@ -1,6 +1,7 @@
 -- Release only the October 2–5 LASSO prepared-backlog feed hold after its
 -- exact managed, reviewed, pending Story has committed. No provider action.
--- Requires lasso_paired_story_backfill and lasso_paired_story_repair migrations.
+-- Requires lasso_paired_story_backfill, lasso_paired_story_repair, and
+-- lasso_paired_story_published_legacy_coexistence migrations.
 begin;
 
 create or replace function public.release_lasso_backlog_feed_hold(
@@ -22,12 +23,13 @@ begin
      or not (p_expected_feed ?& array['id','gym_id','account','post_date',
        'slot_index','format','status','variant_status','caption','image_url',
        'pillar','scheduled_at','logical_post_id','media_not_ready_reason',
-       'published_at','late_post_id','publish_claim_token'])
+       'published_at','late_post_id','publish_claim_token',
+       'publish_reservation_day'])
      or not (p_expected_story ?& array['id','gym_id','account','post_date',
        'slot_index','format','status','variant_status','caption','image_url',
        'source_media_url','pillar','scheduled_at','logical_post_id',
        'media_not_ready_reason','published_at','late_post_id',
-       'publish_claim_token'])
+       'publish_claim_token','publish_reservation_day'])
      or p_expected_feed->>'id' is distinct from p_feed_id::text
      or p_expected_story->>'id' is distinct from p_story_id::text
      or p_expected_feed->>'media_not_ready_reason' is distinct from
@@ -79,7 +81,9 @@ begin
         nullif(p_expected_feed->>'published_at','')::timestamptz
      or f.late_post_id::text is distinct from p_expected_feed->>'late_post_id'
      or f.publish_claim_token is distinct from
-        nullif(p_expected_feed->>'publish_claim_token','')::uuid then
+        nullif(p_expected_feed->>'publish_claim_token','')::uuid
+     or f.publish_reservation_day is distinct from
+        nullif(p_expected_feed->>'publish_reservation_day','')::date then
     return jsonb_build_object('result','conflict','reason','feed_changed');
   end if;
   if f.media_not_ready_reason is distinct from
@@ -133,7 +137,9 @@ begin
         nullif(p_expected_story->>'published_at','')::timestamptz
      or s.late_post_id::text is distinct from p_expected_story->>'late_post_id'
      or s.publish_claim_token is distinct from
-        nullif(p_expected_story->>'publish_claim_token','')::uuid then
+        nullif(p_expected_story->>'publish_claim_token','')::uuid
+     or s.publish_reservation_day is distinct from
+        nullif(p_expected_story->>'publish_reservation_day','')::date then
     return jsonb_build_object('result','conflict','reason','story_changed');
   end if;
   select count(*) into v_count from public.content_calendar c
@@ -142,15 +148,18 @@ begin
      and lower(btrim(coalesce(c.format,'feed'))) = 'story'
      and c.slot_index = f.slot_index
      and coalesce(c.variant_status,'active') = 'active'
-     and c.status not in ('denied','killed','failed');
+     and c.status = 'pending';
   if v_count <> 1 or exists (
     select 1 from public.content_calendar c
      where c.gym_id = 'lasso' and c.post_date = v_day
        and lower(btrim(coalesce(c.account,''))) = v_account
        and lower(btrim(coalesce(c.format,'feed'))) = 'story'
-       and c.slot_index is null
        and coalesce(c.variant_status,'active') = 'active'
-       and c.status not in ('denied','killed','failed')) then
+       and (c.status is null or c.status not in ('denied','killed','failed'))
+       and c.id <> s.id
+       and (c.slot_index is null or c.slot_index = f.slot_index)
+       and (c.status is distinct from 'published'
+            or not public.lasso_unrelated_published_story(c.id, f.id))) then
     return jsonb_build_object('result','conflict','reason','ambiguous_story_slot');
   end if;
   if not exists (select 1 from public.lasso_managed_paired_stories m
