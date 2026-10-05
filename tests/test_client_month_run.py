@@ -17,6 +17,7 @@ client; a client with no media WAITS. Asserts:
 
 import os
 import sys
+from datetime import date
 
 import pytest
 
@@ -1769,6 +1770,45 @@ def test_guarded_video_poster_success_sets_evidence_and_feeds_side_channel(
     assert video_rows and all(
         side_channel[(r["image_url"], r["thumbnail_url"])] == _poster_evidence()
         for r in video_rows)
+
+
+def test_story_clone_preserves_dynamic_render_evidence(tmp_path):
+    feed = _video_draft(tmp_path)
+    evidence = {"operation": "rehost", "source_exact_url": "https://cdn/raw.jpg",
+                "delivered_exact_url": feed.creative_public_url,
+                "source_fingerprint": "source", "delivered_fingerprint": "delivered"}
+    feed.render_evidence = evidence
+
+    story = cmr._story_from_feed(feed)
+
+    assert story is not feed
+    assert story.render_evidence == evidence
+    assert cmr._render_evidence_by_url([feed, story]) == {
+        feed.creative_public_url: evidence}
+
+
+def test_apply_refuses_transformed_row_without_render_evidence_before_delete(
+        monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    store = _FakeStore()
+    row = {"gym_id": "gritx", "post_date": "2026-08-01", "account": "instagram",
+           "format": "feed", "image_url": "https://cdn/delivered.jpg",
+           "source_media_url": "https://cdn/source.jpg", "caption": "Caption"}
+    evidence_a = {"delivered_exact_url": "https://cdn/delivered.jpg",
+                  "source_exact_url": "https://cdn/source-a.jpg"}
+    evidence_b = {"delivered_exact_url": "https://cdn/delivered.jpg",
+                  "source_exact_url": "https://cdn/source-b.jpg"}
+    conflicted_map = cmr._merge_render_evidence_by_url(
+        {"https://cdn/delivered.jpg": evidence_a},
+        {"https://cdn/delivered.jpg": evidence_b})
+
+    result = cmr._apply("gritx", [row], date(2026, 8, 1), 1, store,
+                        lambda _message: None,
+                        render_evidence_by_url=conflicted_map)
+
+    assert result["ok"] is False
+    assert "aborted before month deletion" in result["reason"]
+    assert store.deleted == [] and store.inserted == []
 
 
 def test_guarded_video_poster_failure_holds_the_slot(monkeypatch, tmp_path):

@@ -2423,6 +2423,12 @@ def _story_from_feed(feed):
             story.poster_render_evidence = poster_evidence
         except Exception:  # noqa: BLE001 - a frozen/edge draft never blocks the build
             pass
+    render_evidence = getattr(feed, "render_evidence", None)
+    if render_evidence:
+        try:
+            story.render_evidence = render_evidence
+        except Exception:  # noqa: BLE001 - preserve fail-closed writer behavior
+            pass
     return story
 
 
@@ -2584,6 +2590,30 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     months = sorted(span)
     clean_rows = [{k: v for k, v in r.items() if k != "id"}
                   for r in rows if str(r.get("gym_id")) == str(base_key)]
+    # A distinct delivered object cannot be recreated by the prepared writer without
+    # draft-owned render proof. Check before month deletion so a missing or collided
+    # sidechannel never erases the currently staged calendar. Later byte/readback
+    # failures remain writer failures and are not made atomic by this preflight.
+    if _visual_writer_guard_enabled():
+        evidence_by_url = render_evidence_by_url or {}
+        missing_render_proof = []
+        for row in clean_rows:
+            source_url = row.get("source_media_url")
+            delivered_url = row.get("image_url")
+            if not source_url or source_url == delivered_url:
+                continue
+            evidence = evidence_by_url.get(delivered_url)
+            if (not isinstance(evidence, dict)
+                    or evidence.get("delivered_exact_url") != delivered_url):
+                missing_render_proof.append(delivered_url)
+        if missing_render_proof:
+            return {"ok": False,
+                    "reason": "transformed visual row lacks exact render evidence; "
+                              "aborted before month deletion",
+                    "missing_render_evidence_urls": sorted(set(missing_render_proof)),
+                    "upserted": 0, "inserted": 0, "deleted": 0,
+                    "months": sorted({r.get("post_date", "")[:7]
+                                      for r in clean_rows if r.get("post_date")})}
     # SOURCE LINEAGE SCHEMA GATE (ECHO_SOURCE_MEDIA_CONTENT_HASH_ENABLED, default
     # OFF). _real_row only emits source_media_content_hash when the feature is ON,
     # so a hash-carrying row proves the feature is armed. Prove the destination
