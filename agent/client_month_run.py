@@ -1870,15 +1870,22 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     from . import gbp_mirror as _gbp_mirror
     # NOTE: no store= is passed. `store` here is the calendar store; the mirror needs a
     # GbpStore (connection posture + the CTA link live only there) and builds its own.
+    # Drive-provenance side channel: byte-bound source->crop render evidence for
+    # mirrored GBP rows, forwarded to the prepared writer keyed by the cropped
+    # image_url (evidence is NOT a content_calendar column). Empty when the
+    # global writer is disarmed.
+    _gbp_render_evidence = {}
     _gbp_rows = _gbp_mirror.rows_for(base_key, drafts, library_path=library_path,
-                                     logger=log)
+                                     logger=log,
+                                     render_evidence_sink=_gbp_render_evidence)
     if _gbp_rows:
         rows.extend(_gbp_rows)
     try:
         result = _apply(base_key, rows, start, days, store, log,
                         locked_days=locked_feed_days, allow_reshape=allow_reshape,
                         poster_render_evidence_by_url=_poster_render_evidence_by_url(
-                            drafts))
+                            drafts),
+                        render_evidence_by_url=_gbp_render_evidence or None)
     except Exception:
         # _apply catches remote write failures and returns their unknown-outcome
         # flag. An exception escaping its contract is a prewrite planning failure.
@@ -2083,16 +2090,22 @@ def _poster_render_evidence_by_url(drafts):
     return out
 
 
-def _insert_rows_with_poster_evidence(insert_rows, base_key, rows, evidence_by_url):
+def _insert_rows_with_poster_evidence(insert_rows, base_key, rows, evidence_by_url,
+                                      render_evidence_by_url=None):
     """Forward poster proof through the prepared writer boundary.
 
     A TypeError from a prepared call is ambiguous: the store may have written before
     failing internally.  Never retry that write without the proof.  Flag-off retains
     the plain legacy call for older stores and test fakes.
     """
-    if evidence_by_url and _visual_writer_guard_enabled():
-        return insert_rows(base_key, rows,
-                           poster_render_evidence_by_url=evidence_by_url)
+    if _visual_writer_guard_enabled():
+        kwargs = {}
+        if evidence_by_url:
+            kwargs["poster_render_evidence_by_url"] = evidence_by_url
+        if render_evidence_by_url:
+            kwargs["render_evidence_by_url"] = render_evidence_by_url
+        if kwargs:
+            return insert_rows(base_key, rows, **kwargs)
     return insert_rows(base_key, rows)
 
 
@@ -2492,7 +2505,8 @@ def _out_of_span_preserve_dates(months, span_first, span_last,
 
 
 def _apply(base_key, rows, start, days, store, log, locked_days=(),
-           allow_reshape=False, poster_render_evidence_by_url=None):
+           allow_reshape=False, poster_render_evidence_by_url=None,
+           render_evidence_by_url=None):
     """Delete-then-insert, gym-scoped, across every month the rows land in PLUS the full
     planned span. Rows are inserted WITHOUT an id (DB mints the uuid). Mirrors
     apply_month_plan. Refuses the demo gym id. Never raises out.
@@ -2741,7 +2755,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             insert_started = True
             inserted += len(_insert_rows_with_poster_evidence(
                 insert_rows, base_key, store_rows,
-                poster_render_evidence_by_url) or [])
+                poster_render_evidence_by_url,
+                render_evidence_by_url=render_evidence_by_url) or [])
     except Exception as exc:  # noqa: BLE001
         log(f"store write failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",

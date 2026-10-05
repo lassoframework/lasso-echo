@@ -476,7 +476,7 @@ def _alert_drive_claim_hold(portal_gym_key, picks, reason):
 def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
          topic_type, pillar, cta_type=gbp.DEFAULT_CTA, cta_url="",
          event=None, offer=None, gbp_location_id=None, fmt="update",
-         status="pending", source_media_url=None):
+         status="pending", source_media_url=None, source_media_asset_id=None):
     """One content_calendar GBP row dict (no id; DB mints it). account is the literal
     'googlebusiness'; gym_id is the portal_gym_key canonical join. status is 'pending'
     (owner-visible) normally, or 'coach_review' (withheld from the owner) for a gym's
@@ -506,6 +506,11 @@ def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
         # cropped/delivered URL: a transform names its true raw source, a
         # same-object row names the delivered object itself.
         row["source_media_url"] = source_media_url
+    if source_media_asset_id:
+        # The Drive/media-library asset the raw source came from (future global
+        # one-use provenance). Propagated, never minted: a caller passes only an
+        # id it already carries on the mirrored feed draft.
+        row["source_media_asset_id"] = str(source_media_asset_id)
     # GBP posts are singleton logical objects. Identity does not derive from
     # date, image, or any IG/FB/Story grouping.
     if config.logical_post_id_enabled():
