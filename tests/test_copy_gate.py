@@ -121,6 +121,15 @@ def test_caption_semicolon_and_inline_url():
         copy_gate.format_caption("Visit https://example.com/a;b for details.")
 
 
+def test_caption_etc_abbreviation_does_not_split_paragraph():
+    # "etc." ends an abbreviation, not a sentence: no spurious blank line.
+    raw = "Bring a towel, water bottle, etc. to class."
+    assert copy_gate.format_caption(raw) == raw
+    assert copy_gate.format_caption(
+        "We have rowers, bikes, etc. Every class is coached. Book a spot.") == (
+        "We have rowers, bikes, etc. Every class is coached.\n\nBook a spot.")
+
+
 # ---------------------------------------------------------------------------
 # 10. ASK_RE matches expected call-to-action phrases
 # ---------------------------------------------------------------------------

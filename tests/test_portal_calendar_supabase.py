@@ -1513,3 +1513,24 @@ def test_insert_rows_rejects_non_uuid_before_network_when_preserving():
     with pytest.raises(ValueError):
         store.insert_rows("lasso", [{"id": "not-a-uuid"}], preserve_ids=True)
     assert not http.calls
+
+
+def test_insert_rows_one_bad_caption_does_not_abort_the_batch():
+    """format_caption raises ValueError when a semicolon is glued inside a
+    protected URL span. insert_rows is where EVERY calendar-building lane
+    converges, so one bad caption is omitted without aborting the valid rows."""
+    http = _FakeHTTP(post_resp=_Resp(201, []))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc", http=http)
+    rows = [
+        {"post_date": "2026-08-14", "format": "feed", "image_url": "u1",
+         "caption": "Visit https://example.com/a;b for details."},   # raises
+        {"post_date": "2026-08-15", "format": "feed", "image_url": "u2",
+         "caption": "Good caption; book a class today."},            # formats
+    ]
+    store.insert_rows("gritx", rows)
+    sent = [c for c in http.calls if c[0] == "post"][0][4]
+    assert len(sent) == 1, "only the valid row is staged"
+    assert all(o["post_date"] != "2026-08-14" for o in sent)
+    good = next(o for o in sent if o["post_date"] == "2026-08-15")
+    assert ";" not in good["caption"], "the formattable row is still cleaned"

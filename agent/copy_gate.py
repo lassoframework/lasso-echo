@@ -164,7 +164,8 @@ def violations(text: str) -> list[str]:
 # Periods in URLs, decimals and common abbreviated names are not sentence ends.
 _CAPTION_SENTENCE_END = re.compile(r"([.!?][\"'”’)]*)[ \t]+(?=\S)")
 _CAPTION_ABBREVIATIONS = frozenset(("mr.", "mrs.", "ms.", "dr.", "prof.",
-                                    "st.", "vs.", "e.g.", "i.e.", "a.m.", "p.m."))
+                                    "st.", "vs.", "e.g.", "i.e.", "a.m.", "p.m.",
+                                    "etc."))
 
 
 def format_caption(text: str) -> str:

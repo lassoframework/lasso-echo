@@ -28,6 +28,15 @@ _READBACK = ("id", "gym_id", "post_date", "status", "variant_status", "account",
              "image_url", "source_media_url", "source_media_asset_id",
              "thumbnail_url", "logical_post_id", "created_at", "scheduled_at",
              "slot_index", "time_slot", "late_post_id", "publish_claim_token")
+# Columns the format_pending_feed_caption_cas WHERE clause actually guards.
+# The post-write readback must compare only these; concurrent changes to
+# unguarded columns (scheduled_at, slot_index, time_slot, thumbnail_url,
+# logical_post_id) are unrelated to the caption fix and must not abort a run.
+_CAS_GUARDED = ("id", "gym_id", "status", "variant_status", "format",
+                "post_date", "caption", "media_not_ready_reason",
+                "published_at", "late_post_id", "publish_claim_token",
+                "account", "image_url", "source_media_url",
+                "source_media_asset_id", "created_at")
 
 
 def _hash(value):
@@ -38,6 +47,10 @@ def _hash(value):
 
 def _snapshot(row):
     return {field: row.get(field) for field in _READBACK}
+
+
+def _cas_snapshot(row):
+    return {field: row.get(field) for field in _CAS_GUARDED}
 
 
 def _eligible(row):
@@ -160,6 +173,7 @@ def run(*, start, end, gym=None, apply=False, expected_digest=None,
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "state": "before_write", "completed": [], "conflicts": [],
                 "inflight_id": None}
+    receipt_errors = []
     try:
         _receipt(receipt_path, progress, create=True)
     except Exception as exc:
@@ -182,15 +196,23 @@ def run(*, start, end, gym=None, apply=False, expected_digest=None,
             progress["conflicts"].append(row_id)
             progress["inflight_id"] = None
             progress["state"] = "cas_conflict"
-            _receipt(receipt_path, progress)
+            try:
+                _receipt(receipt_path, progress)
+            except Exception as exc:
+                return {"ok": False, "reason": "receipt update failed after CAS conflict; reconcile",
+                        "receipt": receipt_path, "inflight_id": row_id,
+                        "changed": len(progress["completed"]),
+                        "conflicts": progress["conflicts"],
+                        "receipt_errors": [{"state": "cas_conflict", "id": row_id,
+                                            "error": type(exc).__name__}]}
             continue
         try:
             current = store.get_row(before["gym_id"], row_id)
         except Exception as exc:
             return {"ok": False, "reason": f"readback uncertain:{type(exc).__name__}",
                     "receipt": receipt_path, "inflight_id": row_id}
-        expected = {**before, "caption": after}
-        if current is None or _snapshot(current) != expected:
+        expected = _cas_snapshot({**before, "caption": after})
+        if current is None or _cas_snapshot(current) != expected:
             return {"ok": False, "reason": "readback mismatch; reconcile receipt",
                     "receipt": receipt_path, "inflight_id": row_id}
         progress["completed"].append({"id": row_id, "gym_id": before["gym_id"],
@@ -200,12 +222,28 @@ def run(*, start, end, gym=None, apply=False, expected_digest=None,
                                       "after_row_sha256": _hash(_snapshot(current))})
         progress["inflight_id"] = None
         progress["state"] = "partial_verified"
-        _receipt(receipt_path, progress)
+        try:
+            _receipt(receipt_path, progress)
+        except Exception as exc:
+            return {"ok": False, "reason": "receipt update failed after verified write; reconcile",
+                    "receipt": receipt_path, "inflight_id": row_id,
+                    "changed": len(progress["completed"]),
+                    "conflicts": progress["conflicts"],
+                    "receipt_errors": [{"state": "partial_verified", "id": row_id,
+                                        "error": type(exc).__name__}]}
     progress["state"] = ("verified" if not progress["conflicts"] else "partial_conflicts")
-    _receipt(receipt_path, progress)
-    return {"ok": not progress["conflicts"], "receipt": receipt_path,
-            "target_digest": audit["target_digest"],
-            "changed": len(progress["completed"]), "conflicts": progress["conflicts"]}
+    try:
+        _receipt(receipt_path, progress)
+    except Exception as exc:
+        receipt_errors.append({"state": progress["state"],
+                               "error": type(exc).__name__})
+    result = {"ok": not progress["conflicts"] and not receipt_errors,
+              "receipt": receipt_path,
+              "target_digest": audit["target_digest"],
+              "changed": len(progress["completed"]), "conflicts": progress["conflicts"]}
+    if receipt_errors:
+        result["receipt_errors"] = receipt_errors
+    return result
 
 
 def main(argv=None):

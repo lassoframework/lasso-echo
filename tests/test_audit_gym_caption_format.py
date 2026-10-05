@@ -95,3 +95,111 @@ def test_malformed_partial_read_refused_before_audit_or_write():
         audit.inspect([_row("a"), _row("a")], start="2026-10-05", end="2026-12-05")
     with pytest.raises(ValueError, match="incomplete"):
         audit.inspect([{"id": "a"}], start="2026-10-05", end="2026-12-05")
+
+
+def test_concurrent_unguarded_column_change_does_not_abort(tmp_path):
+    store = _Store([_row("a"), _row("b")])
+    dry = audit.run(start="2026-10-05", end="2026-12-05", store=store)
+    original_cas = store.format_pending_feed_caption_cas
+
+    def cas_with_unrelated_update(gym_id, current):
+        changed = original_cas(gym_id, current)
+        if changed is not None:
+            live = store.rows[current["id"]]
+            live["thumbnail_url"] = "https://cdn.example/new-thumb.jpg"
+            live["scheduled_at"] = "2026-10-12T15:00:00+00:00"
+        return changed
+
+    store.format_pending_feed_caption_cas = cas_with_unrelated_update
+    result = audit.run(start="2026-10-05", end="2026-12-05", store=store,
+                       apply=True, expected_digest=dry["audit"]["target_digest"],
+                       receipt_path=str(tmp_path / "receipt.json"),
+                       today="2026-10-05")
+    assert result["ok"] and result["changed"] == 2 and result["conflicts"] == []
+    assert store.writes == ["a", "b"]
+
+
+def test_guarded_column_change_still_aborts_readback(tmp_path):
+    store = _Store([_row("a")])
+    dry = audit.run(start="2026-10-05", end="2026-12-05", store=store)
+    original_cas = store.format_pending_feed_caption_cas
+
+    def cas_with_guarded_update(gym_id, current):
+        changed = original_cas(gym_id, current)
+        if changed is not None:
+            store.rows[current["id"]]["image_url"] = "https://cdn.example/other.jpg"
+        return changed
+
+    store.format_pending_feed_caption_cas = cas_with_guarded_update
+    result = audit.run(start="2026-10-05", end="2026-12-05", store=store,
+                       apply=True, expected_digest=dry["audit"]["target_digest"],
+                       receipt_path=str(tmp_path / "receipt.json"),
+                       today="2026-10-05")
+    assert not result["ok"] and result["reason"] == "readback mismatch; reconcile receipt"
+    assert result["inflight_id"] == "a"
+
+
+def test_receipt_oserror_after_verified_write_returns_structured_result(tmp_path, monkeypatch):
+    store = _Store([_row("a"), _row("b")])
+    dry = audit.run(start="2026-10-05", end="2026-12-05", store=store)
+    original_receipt = audit._receipt
+
+    def flaky_receipt(path, value, *, create=False):
+        if not create and value.get("state") == "partial_verified":
+            raise OSError("disk full")
+        return original_receipt(path, value, create=create)
+
+    monkeypatch.setattr(audit, "_receipt", flaky_receipt)
+    result = audit.run(start="2026-10-05", end="2026-12-05", store=store,
+                       apply=True, expected_digest=dry["audit"]["target_digest"],
+                       receipt_path=str(tmp_path / "receipt.json"),
+                       today="2026-10-05")
+    assert store.writes == ["a"], "stop before another write without a durable receipt"
+    assert result["changed"] == 1 and result["conflicts"] == []
+    assert not result["ok"]
+    errors = result["receipt_errors"]
+    assert len(errors) == 1
+    assert {error["id"] for error in errors} == {"a"}
+    assert all(error["error"] == "OSError" and error["state"] == "partial_verified"
+               for error in errors)
+
+
+def test_final_summary_receipt_oserror_returns_structured_result(tmp_path, monkeypatch):
+    store = _Store([_row("a")])
+    dry = audit.run(start="2026-10-05", end="2026-12-05", store=store)
+    original_receipt = audit._receipt
+
+    def flaky_receipt(path, value, *, create=False):
+        if not create and value.get("state") == "verified":
+            raise OSError("disk full")
+        return original_receipt(path, value, create=create)
+
+    monkeypatch.setattr(audit, "_receipt", flaky_receipt)
+    result = audit.run(start="2026-10-05", end="2026-12-05", store=store,
+                       apply=True, expected_digest=dry["audit"]["target_digest"],
+                       receipt_path=str(tmp_path / "receipt.json"),
+                       today="2026-10-05")
+    assert store.writes == ["a"] and result["changed"] == 1
+    assert not result["ok"]
+    assert result["receipt_errors"] == [{"state": "verified", "error": "OSError"}]
+
+
+def test_conflict_receipt_oserror_still_records_conflict(tmp_path, monkeypatch):
+    store = _Store([_row("a")])
+    dry = audit.run(start="2026-10-05", end="2026-12-05", store=store)
+    store.format_pending_feed_caption_cas = lambda _gym, _current: None
+    original_receipt = audit._receipt
+
+    def flaky_receipt(path, value, *, create=False):
+        if not create and value.get("state") == "cas_conflict":
+            raise OSError("disk full")
+        return original_receipt(path, value, create=create)
+
+    monkeypatch.setattr(audit, "_receipt", flaky_receipt)
+    result = audit.run(start="2026-10-05", end="2026-12-05", store=store,
+                       apply=True, expected_digest=dry["audit"]["target_digest"],
+                       receipt_path=str(tmp_path / "receipt.json"),
+                       today="2026-10-05")
+    assert not result["ok"] and result["conflicts"] == ["a"]
+    assert result["receipt_errors"] == [
+        {"state": "cas_conflict", "id": "a", "error": "OSError"}]

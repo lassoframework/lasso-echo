@@ -3137,8 +3137,26 @@ class SupabaseCalendarStore:
                 # Every calendar-building lane converges here. Prompts and individual
                 # generators can miss the hook limit, so enforce the grader's exact
                 # first-line rule at the persistence boundary without dropping words.
-                clean["caption"] = format_caption(
-                    bound_opening_hook(format_caption(clean["caption"])))
+                # A semicolon glued inside a protected URL/handle span makes
+                # format_caption raise; ONE bad caption must not abort the whole
+                # batch. Drop only this invalid row, including Stories whose
+                # words may be burned into media before publish.
+                try:
+                    clean["caption"] = format_caption(
+                        bound_opening_hook(format_caption(clean["caption"])))
+                except ValueError:
+                    print(f"[portal-calendar-store] insert_rows: {account_key} "
+                          f"{clean.get('post_date')} row dropped — semicolon "
+                          "inside a protected URL")
+                    try:
+                        from . import ops_alerts
+                        ops_alerts.alert(
+                            f"{account_key}: calendar row for {clean.get('post_date')} "
+                            "was not staged because its caption has a semicolon "
+                            "inside a URL. Edit the link and rebuild the slot.")
+                    except Exception:
+                        pass
+                    continue
             if preserve_ids:
                 import uuid
                 # Explicit stable UUIDs support crash-safe automatic render retries.
