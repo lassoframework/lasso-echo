@@ -31,8 +31,10 @@ tap: every row lands PENDING and flows through publish_guard like any other.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -252,9 +254,11 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             # pre-render pass catches up); a missing converter marks it not-eligible.
             local_for_vision = tmp_path
             public_override = None
+            original_source_url = ""
+            rendition_evidence = None
             needs = _idx.needs_rendition(asset, info)
             try:
-                rend_url, _converted = _idx.ensure_rendition(
+                rend_url, converted = _idx.ensure_rendition(
                     asset, tmp_path, store=store, probe_info=info,
                     budget=rendition_budget)
             except _idx.RenditionBudgetExhausted:
@@ -268,6 +272,32 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                 continue
             if rend_url:
                 public_override = rend_url
+                # A delivery rendition is never its own raw source.  Host the
+                # downloaded Drive object separately so a later guarded writer has
+                # one exact URL for the original bytes.  This is deliberately done
+                # only on the rendition branch: original-served drafts already use
+                # their delivery URL as the same-object source.
+                original_source_url = media_host.host_media(str(tmp_path), gym_base)
+                if not original_source_url or original_source_url == rend_url:
+                    print(f"[gym-media-builder] no hosted original source for "
+                          f"rendition {title!r}; holding the slot")
+                    return None
+                if writer_prep_enabled():
+                    # Cached renditions have no observed conversion edge in this
+                    # invocation.  Never fabricate one from matching filenames,
+                    # hashes, or a cache key; an armed writer holds them until a
+                    # separately evidenced conversion path can establish it.
+                    if not converted:
+                        print(f"[gym-media-builder] cached rendition {title!r} has "
+                              "no conversion receipt; holding the slot (writer prep)")
+                        return None
+                    rendition_evidence = rendition_evidence_for(
+                        tmp_path, original_source_url, rend_url,
+                        asset.get("content_hash"))
+                    if rendition_evidence is None:
+                        print(f"[gym-media-builder] original/rendition readback "
+                              f"failed for {title!r}; holding the slot (writer prep)")
+                        return None
                 if asset.get("kind") == _idx.KIND_PHOTO:
                     # For a HEIC photo, vision must analyze the JPEG rendition, not
                     # the undecodable original. Re-download the rendition locally.
@@ -406,10 +436,9 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             # sweep can flip this PENDING post back to needs_media (§4, §8).
             source_media_asset_id=str(asset["id"]),
         )
-        # Keep the hosted original as provenance when it is also the served media.
-        # A rendition URL is a transformed delivery asset, not the raw source.
-        if not public_override:
-            draft.source_media_url = public_url
+        # Keep an exact hosted original as provenance.  A rendition URL is a
+        # transformed delivery asset, never raw-source evidence.
+        draft.source_media_url = original_source_url or public_url
         # ORIGINAL-SOURCE LINEAGE (2026-10-05): the Drive md5Checksum recorded at
         # indexing (media_asset.content_hash) is the durable byte identity of the
         # ORIGINAL bytes. It is stamped on BOTH original-served and rendition-backed
@@ -420,6 +449,11 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
         src_content_hash = str(asset.get("content_hash") or "").strip()
         if src_content_hash:
             draft.source_media_content_hash = src_content_hash
+        if rendition_evidence:
+            # Side channel consumed by the calendar writer integration. It is not a
+            # content_calendar column: only the privileged writer may turn these
+            # observations into owner receipts.
+            draft.render_evidence = rendition_evidence
         if poster_url:
             draft.thumbnail_url = poster_url          # -> content_calendar.thumbnail_url
         if poster_evidence:
@@ -507,6 +541,50 @@ def video_poster_url(video_path, work_dir, tenant):
         print(f"[gym-media-builder] poster skipped for "
               f"{os.path.basename(str(video_path))}: {type(exc).__name__}")
         return ""
+
+
+def rendition_evidence_for(source_path, source_exact_url, delivered_exact_url,
+                           drive_content_hash):
+    """Observe one newly-created Drive rendition edge, or return ``None``.
+
+    The exact hosted original is read back and must equal the bytes downloaded
+    from Drive.  Its MD5 must also match the Drive checksum recorded on the
+    asset.  The delivered rendition is independently read back.  Callers invoke
+    this only when ``ensure_rendition`` reports a new conversion; a pre-existing
+    cache entry has no conversion observation in this process and must never get
+    a synthetic receipt.
+    """
+    try:
+        from . import visual_writer_prepare
+
+        local_bytes = Path(source_path).read_bytes()
+        source_bytes = visual_writer_prepare._exact_bytes(
+            source_exact_url, visual_writer_prepare._bytes_for_url, "source")
+        delivered_bytes = visual_writer_prepare._exact_bytes(
+            delivered_exact_url, visual_writer_prepare._bytes_for_url, "delivered")
+        if source_bytes != local_bytes:
+            return None
+        expected = str(drive_content_hash or "").strip().lower()
+        source_md5 = hashlib.md5(source_bytes).hexdigest()
+        if not expected or source_md5 != expected:
+            return None
+        delivered_md5 = hashlib.md5(delivered_bytes).hexdigest()
+        return {
+            "source_exact_url": source_exact_url,
+            "delivered_exact_url": delivered_exact_url,
+            "source_fingerprint": "md5:" + source_md5,
+            "delivered_fingerprint": "md5:" + delivered_md5,
+            "source_byte_length": len(source_bytes),
+            "delivered_byte_length": len(delivered_bytes),
+            "operation": "render",
+            "evidence_ref": ("gym_media_builder:rendition:" + source_md5 + ":"
+                             + delivered_md5 + ":" + str(uuid.uuid4())),
+            "observed_by": "gym_media_builder",
+            "rendered_by": "gym_media_index.ensure_rendition",
+        }
+    except Exception as exc:  # noqa: BLE001 - provenance failure holds the draft
+        print(f"[gym-media-builder] rendition evidence failed: {type(exc).__name__}")
+        return None
 
 
 def video_poster_with_evidence(video_path, work_dir, tenant, source_exact_url):

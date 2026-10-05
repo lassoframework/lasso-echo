@@ -62,9 +62,7 @@ def test_original_photo_stamps_source_content_hash(monkeypatch, tmp_path):
 
 
 def test_rendition_backed_draft_keeps_source_identity_separate(monkeypatch, tmp_path):
-    """HEIC -> JPEG rendition: the delivered URL is transformed, so it must NOT
-    be recorded as source_media_url — but the ORIGINAL byte identity (the Drive
-    md5Checksum) still stamps the draft, lineage intact."""
+    """HEIC -> JPEG keeps a separately hosted original URL and Drive MD5."""
     monkeypatch.setattr("agent.gym_media_index.heic_to_jpeg",
                         lambda src, dest: open(dest, "wb").write(b"jpg") or dest)
     monkeypatch.setattr("agent.gym_media_index.ensure_rendition",
@@ -74,9 +72,46 @@ def test_rendition_backed_draft_keeps_source_identity_separate(monkeypatch, tmp_
     draft, _ = _build(monkeypatch, tmp_path, asset, blobs=b"heic")
     assert draft is not None
     assert draft.creative_public_url == "https://cdn.fake/rend.jpg"
-    # the rendition URL is delivery, not source evidence
-    assert not getattr(draft, "source_media_url", "")
+    # the rendition URL is delivery, while the original is hosted separately.
+    assert draft.source_media_url == "https://cdn.fake/served.jpg"
+    assert draft.source_media_url != draft.creative_public_url
     assert draft.source_media_content_hash == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def test_new_rendition_under_writer_prep_requires_observed_original_edge(monkeypatch, tmp_path):
+    """A newly converted rendition carries source->delivery observations only
+    after hosted-original readback proves the indexed Drive MD5."""
+    import hashlib
+    source = b"original-heic-bytes"
+    delivered = b"rendered-jpeg-bytes"
+    digest = hashlib.md5(source).hexdigest()
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setattr("agent.gym_media_index.heic_to_jpeg",
+                        lambda src, dest: open(dest, "wb").write(delivered) or dest)
+    monkeypatch.setattr("agent.gym_media_index.ensure_rendition",
+                        lambda asset, src, **k: ("https://cdn.fake/rend.jpg", True))
+    monkeypatch.setattr("agent.visual_writer_prepare._exact_bytes",
+                        lambda url, _reader, _role: source if url.endswith("served.jpg") else delivered)
+    asset = make_asset("h2", gym_id="pierce", kind="photo", title="IMG.HEIC",
+                       mime="image/heic", content_hash=digest)
+    draft, _ = _build(monkeypatch, tmp_path, asset, blobs=source)
+    assert draft is not None
+    assert draft.source_media_url == "https://cdn.fake/served.jpg"
+    assert draft.render_evidence["source_exact_url"] == draft.source_media_url
+    assert draft.render_evidence["delivered_exact_url"] == draft.creative_public_url
+
+
+def test_cached_rendition_under_writer_prep_holds_without_conversion_receipt(monkeypatch,
+                                                                               tmp_path):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setattr("agent.gym_media_index.heic_to_jpeg",
+                        lambda src, dest: open(dest, "wb").write(b"jpg") or dest)
+    monkeypatch.setattr("agent.gym_media_index.ensure_rendition",
+                        lambda asset, src, **k: ("https://cdn.fake/rend.jpg", False))
+    asset = make_asset("h3", gym_id="pierce", kind="photo", title="IMG.HEIC",
+                       mime="image/heic", content_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    draft, _ = _build(monkeypatch, tmp_path, asset, blobs=b"heic")
+    assert draft is None
 
 
 def test_missing_content_hash_asset_never_stages(monkeypatch, tmp_path):
