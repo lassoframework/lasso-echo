@@ -619,6 +619,13 @@ def test_null_key_published_history_attributes_or_holds_scene_link():
     # The foreign tenant's unresolved row was not attributed anywhere.
     assert sql("select count(*) from public.visual_global_usage_member "
                f"where tenant_id={q(foreign)}") == "0"
+    # The attributed members have no local ledger row; the exact null-key
+    # published anchor exempts them in history coverage without blanketing.
+    assert sql("select count(*) from public.visual_global_history_coverage() "
+               f"where tenant_id={q(tid)} and issue<>'ready'") == "0"
+    assert sql("select count(*) from public.visual_global_history_coverage() "
+               f"where tenant_id={q(tid)} and group_key={q(group_b)} "
+               "and issue='ready'") == "2"
 
     # A later cross-date claim of the same bytes is denied by the attributed
     # history instead of repeating the old image.
@@ -830,6 +837,16 @@ def test_null_key_same_date_distinct_renditions_attribute_and_refresh_idempotent
     assert sql("select state from public.visual_global_usage_member "
                f"where tenant_id={q(tid)} and group_key={q(group)} "
                f"and fingerprint={q(delivered_3_md5)}") == "reserved"
+    # No ledger rows exist in this fixture: the historically anchored
+    # published members are exempted by their exact null-key anchor proof,
+    # while the unanchored keyed member is never blanket-exempted.
+    assert sql("select count(*) from public.visual_global_history_coverage() "
+               f"where tenant_id={q(tid)} and fingerprint in "
+               f"({q(source_md5)},{q(delivered_1_md5)},{q(delivered_2_md5)}) "
+               "and issue='ready'") == "3"
+    assert sql("select issue from public.visual_global_history_coverage() "
+               f"where tenant_id={q(tid)} and fingerprint={q(delivered_3_md5)}"
+               ) == "global_member_without_local_ledger"
 
 
 def test_historical_attribution_never_promotes_keyed_reserved_and_holds_cross_date():
@@ -887,6 +904,15 @@ def test_historical_attribution_never_promotes_keyed_reserved_and_holds_cross_da
                f"where tenant_id={q(tid)} and group_key={q(group)} "
                f"and fingerprint in ({q(source_md5)},{q(delivered_k_md5)}) "
                "and state='reserved'") == "2"
+    # The historical member is anchored by its exact null-key published row;
+    # the keyed reserved members have no ledger in this fixture and stay held.
+    assert sql("select issue from public.visual_global_history_coverage() "
+               f"where tenant_id={q(tid)} and fingerprint={q(delivered_h_md5)}"
+               ) == "ready"
+    assert sql("select count(*) from public.visual_global_history_coverage() "
+               f"where tenant_id={q(tid)} and fingerprint in "
+               f"({q(source_md5)},{q(delivered_k_md5)}) "
+               "and issue='global_member_without_local_ledger'") == "2"
 
     # A different-date null-key published row reusing the attributed
     # rendition is rejected by the active calendar trigger before it lands.
@@ -907,3 +933,212 @@ def test_historical_attribution_never_promotes_keyed_reserved_and_holds_cross_da
                f"where calendar_row_id={q(hist_2)}::uuid") == "0"
     assert sql("select count(*) from public.content_calendar "
                f"where id={q(hist_2)}::uuid") == "0"
+
+
+def impnk_scene(prefix, tid, group, source_url, renditions):
+    source, source_md5 = read_receipt(tid, source_url, (prefix + " raw").encode())
+    hashes = {}
+    for name, url in renditions.items():
+        receipt, md5 = read_receipt(tid, url, (prefix + " " + name).encode())
+        render = render_receipt(tid, source, receipt, source_url, url, source_md5, md5)
+        prepare(tid, group, source, receipt, render)
+        hashes[name] = md5
+    return source_md5, hashes
+
+
+def test_import_history_claims_null_key_subset_after_keyed_ledgers():
+    # A keyed reserved ledger owns the complete scene; a null-key published
+    # row on the same date verifiably consumed the shared source plus its own
+    # distinct rendition. Import claims the keyed complete-scene set first,
+    # then the historical subset, and history never promotes reserved bytes.
+    source_url = "https://test/impnk-source-" + uuid.uuid4().hex
+    delivered_k = "https://test/impnk-delivered-keyed-" + uuid.uuid4().hex
+    delivered_h = "https://test/impnk-delivered-hist-" + uuid.uuid4().hex
+    delivered_u = "https://test/impnk-delivered-untouched-" + uuid.uuid4().hex
+    tid, group = tenant_and_group(delivered_k)
+    source_md5, hashes = impnk_scene("impnk", tid, group, source_url, {
+        "keyed": delivered_k, "hist": delivered_h, "untouched": delivered_u})
+    sql("insert into public.visual_group_usage_ledger "
+        "(gym_id,group_key,reserved_date,channel,state) "
+        f"values({q(tid)},{q(group)},'2026-09-15','instagram','reserved')")
+    hist_id = str(uuid.uuid4())
+    sql("insert into public.content_calendar "
+        "(id,gym_id,post_date,status,account,image_url,source_media_url,byte_hash,"
+        "published_at) "
+        f"values({q(hist_id)}::uuid,{q(tid)},'2026-09-15','published','instagram',"
+        f"{q(delivered_h)},{q(source_url)},{q('derived:' + hashes['hist'])},now())")
+    # Before import the verified null-key published row reports not_imported
+    # for exactly its consumed subset and never for the untouched rendition.
+    assert sql("select count(*) from public.visual_global_coverage() "
+               f"where calendar_row_id={q(hist_id)}::uuid "
+               "and issue='not_imported'") == "2"
+    assert sql("select count(*) from public.visual_global_coverage() "
+               f"where calendar_row_id={q(hist_id)}::uuid "
+               f"and fingerprint={q(hashes['untouched'])}") == "0"
+    result = json.loads(sql("select public.visual_global_import_history()"))
+    assert result["imported_local_groups"] == 1
+    assert result["imported_null_key_rows"] == 1
+    # Keyed full set imported reserved on its date; historical attribution
+    # never promoted any owner or member to published.
+    assert sql("select count(*) from public.visual_global_usage "
+               f"where tenant_id={q(tid)} and used_date='2026-09-15' "
+               "and state='reserved'") == "4"
+    assert sql("select count(*) from public.visual_global_usage "
+               f"where tenant_id={q(tid)} and state='published'") == "0"
+    assert sql("select count(*) from public.visual_global_coverage() "
+               "where issue<>'ready'") == "0"
+    assert sql("select count(*) from public.visual_global_history_coverage() "
+               "where issue<>'ready'") == "0"
+    # The historical row was never mutated to carry a key, date or media swap.
+    assert sql("select visual_group_key is null and status='published' "
+               f"and post_date='2026-09-15' and image_url={q(delivered_h)} "
+               f"from public.content_calendar where id={q(hist_id)}::uuid") == "t"
+
+
+def test_import_history_holds_unresolved_null_key_history_and_rolls_back():
+    source_url = "https://test/imphold-source-" + uuid.uuid4().hex
+    delivered = "https://test/imphold-delivered-" + uuid.uuid4().hex
+    tid, group = tenant_and_group(delivered)
+    source_md5, hashes = impnk_scene("imphold", tid, group, source_url,
+                                     {"keyed": delivered})
+    sql("insert into public.visual_group_usage_ledger "
+        "(gym_id,group_key,reserved_date,channel,state) "
+        f"values({q(tid)},{q(group)},'2026-09-15','instagram','reserved')")
+    unknown_id = str(uuid.uuid4())
+    sql("insert into public.content_calendar "
+        "(id,gym_id,post_date,status,account,image_url,source_media_url,published_at) "
+        f"values({q(unknown_id)}::uuid,{q(tid)},'2026-09-14','published','instagram',"
+        f"{q('https://test/imphold-unknown-img-' + uuid.uuid4().hex)},"
+        f"{q('https://test/imphold-unknown-src-' + uuid.uuid4().hex)},now())")
+    assert sql("select issue from public.visual_global_coverage() "
+               f"where calendar_row_id={q(unknown_id)}::uuid") == "unresolved_group"
+    # The unknown row blocks the whole import; the keyed ledger import rolls
+    # back with it, leaving no global writes behind.
+    with pytest.raises(RuntimeError, match="calendar coverage incomplete"):
+        sql("select public.visual_global_import_history()")
+    assert sql("select count(*) from public.visual_global_usage") == "0"
+    assert sql("select count(*) from public.visual_global_usage_member") == "0"
+
+
+def test_import_history_rolls_back_everything_on_cross_date_historical_conflict():
+    source_url = "https://test/impxdate-source-" + uuid.uuid4().hex
+    delivered_k = "https://test/impxdate-delivered-keyed-" + uuid.uuid4().hex
+    delivered_h = "https://test/impxdate-delivered-hist-" + uuid.uuid4().hex
+    tid, group = tenant_and_group(delivered_k)
+    source_md5, hashes = impnk_scene("impxdate", tid, group, source_url, {
+        "keyed": delivered_k, "hist": delivered_h})
+    sql("insert into public.visual_group_usage_ledger "
+        "(gym_id,group_key,reserved_date,channel,state) "
+        f"values({q(tid)},{q(group)},'2026-09-15','instagram','reserved')")
+    hist_id = str(uuid.uuid4())
+    sql("insert into public.content_calendar "
+        "(id,gym_id,post_date,status,account,image_url,source_media_url,byte_hash,"
+        "published_at) "
+        f"values({q(hist_id)}::uuid,{q(tid)},'2026-09-16','published','instagram',"
+        f"{q(delivered_h)},{q(source_url)},{q('derived:' + hashes['hist'])},now())")
+    # The historical row reuses the keyed source bytes on a different date:
+    # the claim conflict aborts the statement, rolling the keyed import back.
+    with pytest.raises(RuntimeError, match="already used by another client or date"):
+        sql("select public.visual_global_import_history()")
+    assert sql("select count(*) from public.visual_global_usage") == "0"
+    assert sql("select count(*) from public.visual_global_usage_member") == "0"
+    assert sql("select count(*) from public.visual_global_coverage() "
+               f"where calendar_row_id={q(hist_id)}::uuid "
+               "and issue='not_imported'") == "2"
+
+
+def test_history_coverage_anchored_published_mix_ready_and_forged_mix_held():
+    # Historical attribution lands first, then a keyed reserved ledger imports
+    # over the same bytes: the published members stay published under a
+    # reserved ledger and are accepted only through the exact anchor proof.
+    source_url = "https://test/impmix-source-" + uuid.uuid4().hex
+    delivered_h = "https://test/impmix-delivered-hist-" + uuid.uuid4().hex
+    tid, group = tenant_and_group(delivered_h)
+    source_md5, hashes = impnk_scene("impmix", tid, group, source_url,
+                                     {"hist": delivered_h})
+    hist_id = str(uuid.uuid4())
+    sql("insert into public.content_calendar "
+        "(id,gym_id,post_date,status,account,image_url,source_media_url,byte_hash,"
+        "published_at) "
+        f"values({q(hist_id)}::uuid,{q(tid)},'2026-09-15','published','instagram',"
+        f"{q(delivered_h)},{q(source_url)},{q('derived:' + hashes['hist'])},now())")
+    sql("select public.visual_global_claim_historical_row("
+        f"{q(tid)},{q(group)},'2026-09-15',{q(hist_id)}::uuid,'instagram',"
+        f"array[{q(source_md5)},{q(hashes['hist'])}])")
+    sql("insert into public.visual_group_usage_ledger "
+        "(gym_id,group_key,reserved_date,channel,state) "
+        f"values({q(tid)},{q(group)},'2026-09-15','instagram','reserved')")
+    result = json.loads(sql("select public.visual_global_import_history()"))
+    assert result["imported_local_groups"] == 1
+    assert result["imported_null_key_rows"] == 1
+    # The keyed reserved claim never rewrote the anchored published members.
+    assert sql("select count(*) from public.visual_global_usage_member "
+               f"where tenant_id={q(tid)} and group_key={q(group)} "
+               f"and state='published' and calendar_row_id={q(hist_id)}::uuid") == "2"
+    assert sql("select count(*) from public.visual_global_history_coverage() "
+               f"where tenant_id={q(tid)} and issue<>'ready'") == "0"
+
+    # A forged published member under the same reserved ledger without the
+    # exact anchor proof stays held and blocks any further import. Published
+    # members are immutable, so the forgery adds a new scene byte whose member
+    # points at a nonexistent row instead of a real null-key published anchor.
+    delivered_f = "https://test/impmix-delivered-forge-" + uuid.uuid4().hex
+    receipt_f, forge_md5 = read_receipt(tid, delivered_f, b"impmix forged render")
+    source_row = sql("select receipt_id from public.visual_global_object_read_receipt "
+                     f"where tenant_id={q(tid)} and exact_url={q(source_url)}")
+    render_f = render_receipt(tid, source_row, receipt_f, source_url, delivered_f,
+                              source_md5, forge_md5)
+    prepare(tid, group, source_row, receipt_f, render_f)
+    sql("insert into public.visual_global_usage(fingerprint,tenant_id,used_date,state) "
+        f"values({q(forge_md5)},{q(tid)},'2026-09-15','reserved')")
+    sql("insert into public.visual_global_usage_member"
+        "(tenant_id,group_key,fingerprint,calendar_row_id,channel,used_date,state) "
+        f"values({q(tid)},{q(group)},{q(forge_md5)},{q(str(uuid.uuid4()))}::uuid,"
+        "'instagram','2026-09-15','published')")
+    assert sql("select issue from public.visual_global_history_coverage() "
+               f"where tenant_id={q(tid)} "
+               f"and fingerprint={q(forge_md5)}") == "global_member_state_mismatch"
+    with pytest.raises(RuntimeError, match="post-import coverage incomplete"):
+        sql("select public.visual_global_import_history()")
+
+
+def test_import_history_anchors_orphan_members_and_keeps_orphan_usage_held():
+    # A null-key published row imports with no local ledger at all: its
+    # members are orphans covered only by the exact anchor proof. An orphan
+    # global owner without any member remains an activation blocker.
+    source_url = "https://test/imporph-source-" + uuid.uuid4().hex
+    delivered_h = "https://test/imporph-delivered-hist-" + uuid.uuid4().hex
+    tid, group = tenant_and_group(delivered_h)
+    source_md5, hashes = impnk_scene("imporph", tid, group, source_url,
+                                     {"hist": delivered_h})
+    hist_id = str(uuid.uuid4())
+    sql("insert into public.content_calendar "
+        "(id,gym_id,post_date,status,account,image_url,source_media_url,byte_hash,"
+        "published_at) "
+        f"values({q(hist_id)}::uuid,{q(tid)},'2026-09-15','published','instagram',"
+        f"{q(delivered_h)},{q(source_url)},{q('derived:' + hashes['hist'])},now())")
+    assert sql("select count(*) from public.visual_global_coverage() "
+               f"where calendar_row_id={q(hist_id)}::uuid "
+               "and issue='not_imported'") == "2"
+    result = json.loads(sql("select public.visual_global_import_history()"))
+    assert result["imported_local_groups"] == 0
+    assert result["imported_null_key_rows"] == 1
+    assert sql("select count(*) from public.visual_global_usage "
+               f"where tenant_id={q(tid)} and used_date='2026-09-15' "
+               "and state='published'") == "2"
+    assert sql("select count(*) from public.visual_global_usage_member "
+               f"where tenant_id={q(tid)} and group_key={q(group)} "
+               f"and state='published' and channel='instagram' "
+               f"and calendar_row_id={q(hist_id)}::uuid") == "2"
+    assert sql("select count(*) from public.visual_global_coverage() "
+               "where issue<>'ready'") == "0"
+    assert sql("select count(*) from public.visual_global_history_coverage() "
+               "where issue<>'ready'") == "0"
+    # Orphan usage without any member stays held and blocks re-import.
+    fingerprint = "md5:" + hashlib.md5(uuid.uuid4().bytes).hexdigest()
+    sql("insert into public.visual_global_usage(fingerprint,tenant_id,used_date,state) "
+        f"values({q(fingerprint)},{q(tid)},'2026-10-08','published')")
+    assert sql("select issue from public.visual_global_history_coverage() "
+               f"where fingerprint={q(fingerprint)}") == "global_usage_without_member"
+    with pytest.raises(RuntimeError, match="post-import coverage incomplete"):
+        sql("select public.visual_global_import_history()")

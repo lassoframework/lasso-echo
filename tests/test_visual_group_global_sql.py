@@ -80,7 +80,7 @@ def test_released_local_history_is_imported_and_covered():
     global_sql = _sql("DRAFT_visual_global_history_20261002.sql")
     activation = _sql("DRAFT_visual_group_activation_20261002.sql")
     importer = global_sql.split("create or replace function public.visual_global_import_history()", 1)[1].split("end;\n$$;", 1)[0]
-    assert "for r in select l.* from public.visual_group_usage_ledger l\n      order by" in importer
+    assert "for lrow in select l.* from public.visual_group_usage_ledger l\n      order by" in importer
     coverage = global_sql.split("create or replace function public.visual_global_history_coverage()", 1)[1].split("$$;", 1)[0]
     assert "where l.state<>'released'" not in coverage
     assert "when l.state='published' then 'published' else 'reserved'" in coverage
@@ -109,7 +109,7 @@ def test_global_import_is_owner_only_and_takes_calendar_barrier():
     assert "lock table public.content_calendar in share row exclusive mode" in importer
     assert "lock table public.visual_group_usage_ledger, public.visual_group_alias" in importer
     assert "from public.visual_group_usage_ledger l" in importer
-    assert "for r in select l.* from public.visual_group_usage_ledger l\n      order by" in importer
+    assert "for lrow in select l.* from public.visual_group_usage_ledger l\n      order by" in importer
     assert "from public,anon,authenticated,service_role" in sql.split(
         "revoke all on function public.visual_global_import_history()", 1)[1].split(";", 1)[0]
     assert "grant execute on function public.visual_global_import_history() to service_role" not in sql
@@ -170,7 +170,7 @@ def test_import_and_activation_enumerate_phase1_objects_and_fail_closed():
     assert "visual_global_object_lineage" in importer
     assert "occupied scene has incomplete byte evidence" in importer
     assert "staged history has no original date" in importer
-    assert "r.state='published'" in importer
+    assert "lrow.state='published'" in importer
     assert "visual_global_claim_fingerprint_set" in importer
     assert "visual_global_claim_scene(public.content_calendar,boolean,boolean)" in activation
     assert "visual_global_object_attestation" in activation
@@ -290,3 +290,37 @@ def test_source_rendition_rpc_consumes_owner_receipts_without_claiming_usage():
     assert "'history_refreshed',v_refreshed>0" in rpc
     assert "revoke all on public.visual_global_object_read_receipt, public.visual_global_render_receipt" in sql
     assert "grant execute on function public.visual_global_prepare_source_rendition(text,text,uuid,uuid,uuid,text)\n  to service_role" in sql
+
+
+def test_import_orders_keyed_ledgers_before_null_key_historical_subsets():
+    sql = _sql("DRAFT_visual_global_history_20261002.sql")
+    importer = sql.split(
+        "create or replace function public.visual_global_import_history()", 1
+    )[1].split("end;\n$$;", 1)[0]
+    keyed = importer.index(
+        "for lrow in select l.* from public.visual_group_usage_ledger l")
+    historical = importer.index("where c.visual_group_key is null")
+    assert keyed < historical
+    assert "visual_global_claim_historical_row" in importer
+    assert "visual_global_row_verified_fingerprints(r,v_resolved)" in importer
+    assert "visual_group_resolve_row" in importer
+    assert "'imported_null_key_rows',v_historical" in importer
+    assert "order by c.post_date,c.id" in importer
+    coverage = sql.split(
+        "create or replace function public.visual_global_coverage()", 1
+    )[1].split("$$;", 1)[0]
+    assert "public.visual_group_resolve_row(c)" in coverage
+    assert "public.visual_global_row_verified_fingerprints(c,rg.resolved_group)" in coverage
+    assert "'unresolved_group'" in coverage
+    assert "'not_imported'" in coverage
+    assert "c.visual_group_key is null and m.state not in ('reserved','published')" in coverage
+    history = sql.split(
+        "create or replace function public.visual_global_history_coverage()", 1
+    )[1].split("$$;", 1)[0]
+    assert "global_member_without_local_ledger" in history
+    assert "global_member_not_in_current_scene" in history
+    assert "global_usage_without_member" in history
+    assert "c.id=m.calendar_row_id and c.visual_group_key is null" in history
+    assert "public.visual_group_resolve_row(c)=m.group_key" in history
+    assert "c.account is not distinct from m.channel" in history
+    assert "no blanket" in history

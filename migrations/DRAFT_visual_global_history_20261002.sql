@@ -1375,7 +1375,8 @@ $$;
 -- Released local rows are imported as reserved because staging consumes bytes.
 create or replace function public.visual_global_import_history()
 returns jsonb language plpgsql security definer set search_path = public as $$
-declare r record; v_count integer:=0; v_fingerprints text[];
+declare r public.content_calendar; lrow record; v_count integer:=0; v_historical integer:=0;
+  v_fingerprints text[]; v_tenant text; v_resolved text;
 begin
   if current_setting('transaction_isolation')<>'read committed' then
     raise exception 'global history import requires READ COMMITTED' using errcode='25006';
@@ -1418,19 +1419,54 @@ begin
   end if;
   -- Validate every live calendar selection before making global writes. Rows
   -- whose complete fingerprint set is not yet imported report not_imported.
+  -- A verified null-key published row also reports not_imported before its
+  -- subset is claimed; unresolved, unmapped or unattested historical rows
+  -- hold the entire import here.
   if exists(select 1 from public.visual_global_coverage() c
       where c.issue not in ('ready','not_imported')) then
     raise exception 'global history import refused: calendar coverage incomplete'
       using errcode='23514';
   end if;
-  for r in select l.* from public.visual_group_usage_ledger l
+  -- Keyed complete-scene ledgers always import first so the keyed full-set
+  -- invariant and any same-date reserved members exist before historical
+  -- subset attribution runs.
+  for lrow in select l.* from public.visual_group_usage_ledger l
       order by (l.state='published') desc,l.gym_id,l.group_key loop
     select array_agg(fingerprint order by fingerprint) into v_fingerprints
-      from public.visual_global_scene_fingerprints(r.gym_id,r.group_key);
-    perform public.visual_global_claim_fingerprint_set(r.gym_id,r.group_key,
-      r.reserved_date,r.calendar_row_id,r.channel,r.state='published',
-      r.ambiguous,v_fingerprints);
+      from public.visual_global_scene_fingerprints(lrow.gym_id,lrow.group_key);
+    perform public.visual_global_claim_fingerprint_set(lrow.gym_id,lrow.group_key,
+      lrow.reserved_date,lrow.calendar_row_id,lrow.channel,lrow.state='published',
+      lrow.ambiguous,v_fingerprints);
     v_count:=v_count+1;
+  end loop;
+  -- Published rows whose group key was never recorded attribute only their
+  -- own verified byte subset under their original publication date, without
+  -- mutating the row. The coverage preflight above already refused any
+  -- unresolved, unmapped, undated or unattested row, so a failure here means
+  -- the data changed mid-import and aborts the whole import, keyed claims
+  -- included; a partial historical import never persists.
+  for r in select c.* from public.content_calendar c
+      where c.visual_group_key is null
+        and (c.status='published' or c.published_at is not null)
+      order by c.post_date,c.id loop
+    v_tenant:=public.visual_group_tenant_id(r.gym_id)::text;
+    if v_tenant is null then
+      raise exception 'global history import refused: published history is unresolved'
+        using errcode='23514';
+    end if;
+    v_resolved:=public.visual_group_resolve_row(r);
+    if v_resolved is null or r.post_date is null then
+      raise exception 'global history import refused: published history is unresolved'
+        using errcode='23514';
+    end if;
+    v_fingerprints:=public.visual_global_row_verified_fingerprints(r,v_resolved);
+    if v_fingerprints is null then
+      raise exception 'global history import refused: published history is unattested'
+        using errcode='23514';
+    end if;
+    perform public.visual_global_claim_historical_row(
+      v_tenant,v_resolved,r.post_date,r.id,r.account,v_fingerprints);
+    v_historical:=v_historical+1;
   end loop;
   if exists(select 1 from public.visual_global_coverage() where issue<>'ready')
       or exists(select 1 from public.visual_global_history_coverage() where issue<>'ready') then
@@ -1438,6 +1474,7 @@ begin
       using errcode='23514';
   end if;
   return jsonb_build_object('imported_local_groups',v_count,
+    'imported_null_key_rows',v_historical,
     'global_fingerprints',(select count(*) from public.visual_global_usage));
 end;
 $$;
@@ -1450,21 +1487,24 @@ language sql stable security definer set search_path = public as $$
     c.visual_group_key,fp.fingerprint,c.status,c.post_date,
     case
       when public.visual_group_tenant_id(c.gym_id) is null then 'unmapped_tenant'
-      when c.visual_group_key is null then 'unresolved_group'
+      when rg.resolved_group is null then 'unresolved_group'
       when not public.visual_global_scene_complete(
-          public.visual_group_tenant_id(c.gym_id)::text,c.visual_group_key)
+          public.visual_group_tenant_id(c.gym_id)::text,rg.resolved_group)
         then 'incomplete_scene_byte_evidence'
       when fp.fingerprint is null then 'missing_verified_fingerprint'
-      when not public.visual_global_row_bytes_verified(c)
+      when c.visual_group_key is not null
+          and not public.visual_global_row_bytes_verified(c)
         then 'selected_media_bytes_unverified'
       when (c.status='published' or c.published_at is not null) and c.post_date is null
         then 'published_date_unverified'
-      when not exists(select 1 from public.visual_group_usage_ledger l
+      when c.visual_group_key is not null
+          and not exists(select 1 from public.visual_group_usage_ledger l
           where l.gym_id=public.visual_group_tenant_id(c.gym_id)::text
             and l.group_key=c.visual_group_key and l.state<>'released'
             and l.reserved_date is not distinct from c.post_date)
         then 'missing_matching_local_ledger'
-      when (c.status='published' or c.published_at is not null) and
+      when c.visual_group_key is not null
+          and (c.status='published' or c.published_at is not null) and
           not exists(select 1 from public.visual_group_usage_ledger l
           where l.gym_id=public.visual_group_tenant_id(c.gym_id)::text
             and l.group_key=c.visual_group_key and l.state='published')
@@ -1475,19 +1515,37 @@ language sql stable security definer set search_path = public as $$
         then 'global_owner_or_date_conflict'
       when m.fingerprint is null then 'missing_global_member'
       when m.used_date is distinct from c.post_date
-          or ((c.status='published' or c.published_at is not null)
+          or (c.visual_group_key is null and m.state not in ('reserved','published'))
+          or (c.visual_group_key is not null
+              and (c.status='published' or c.published_at is not null)
               and m.state<>'published')
-          or (not (c.status='published' or c.published_at is not null)
+          or (c.visual_group_key is not null
+              and not (c.status='published' or c.published_at is not null)
               and m.state not in ('reserved','published'))
         then 'global_member_state_mismatch'
       else 'ready' end
   from public.content_calendar c
-  left join lateral public.visual_global_scene_fingerprints(
-    public.visual_group_tenant_id(c.gym_id)::text,c.visual_group_key) fp on true
+  left join lateral (select case
+      when c.visual_group_key is not null then c.visual_group_key
+      when c.status='published' or c.published_at is not null
+        then public.visual_group_resolve_row(c) end as resolved_group) rg on true
+  left join lateral (
+    -- Keyed rows are covered against every byte of their complete scene.
+    -- Null-key published rows are covered only against the exact byte subset
+    -- the row itself verifiably consumed, so an untouched scene rendition is
+    -- never reported as consumed by a row that never selected it.
+    select unnest(case
+      when rg.resolved_group is null then null::text[]
+      when c.visual_group_key is not null then
+        (select array_agg(f.fingerprint order by f.fingerprint)
+          from public.visual_global_scene_fingerprints(
+            public.visual_group_tenant_id(c.gym_id)::text,c.visual_group_key) f)
+      else public.visual_global_row_verified_fingerprints(c,rg.resolved_group)
+    end) as fingerprint) fp on true
   left join public.visual_global_usage g on g.fingerprint=fp.fingerprint
   left join public.visual_global_usage_member m
     on m.tenant_id=public.visual_group_tenant_id(c.gym_id)::text
-      and m.group_key=c.visual_group_key and m.fingerprint=fp.fingerprint
+      and m.group_key=rg.resolved_group and m.fingerprint=fp.fingerprint
   where c.status='published' or c.published_at is not null
     or public.visual_group_row_active(c) or public.visual_group_row_ambiguous(c);
 $$;
@@ -1509,9 +1567,26 @@ language sql stable security definer set search_path = public as $$
         then 'global_owner_or_date_conflict'
       when m.fingerprint is null then 'missing_global_member'
       when m.state='released' then 'legacy_released_global_member'
+      -- A keyed reserved/released ledger may share a byte with a null-key
+      -- published row that verifiably consumed it on the same date. Such a
+      -- published member is accepted only with that exact historical anchor
+      -- proof: the row anchors by id, stays null-key and published, resolves
+      -- to this canonical tenant and group, matches the member date and
+      -- channel, and its attested subset contains this exact fingerprint.
+      -- A forged published member without that proof stays held.
       when m.used_date is distinct from l.reserved_date
-          or m.state is distinct from case
+          or (m.state is distinct from case
             when l.state='published' then 'published' else 'reserved' end
+          and not (m.state='published' and exists(
+            select 1 from public.content_calendar c
+              where c.id=m.calendar_row_id and c.visual_group_key is null
+                and (c.status='published' or c.published_at is not null)
+                and public.visual_group_tenant_id(c.gym_id)::text=m.tenant_id
+                and public.visual_group_resolve_row(c)=m.group_key
+                and c.post_date is not null and c.post_date=m.used_date
+                and c.account is not distinct from m.channel
+                and coalesce(public.visual_global_row_verified_fingerprints(
+                    c,m.group_key) @> array[m.fingerprint],false))))
         then 'global_member_state_mismatch'
       else 'ready' end
   from public.visual_group_usage_ledger l
@@ -1524,10 +1599,26 @@ language sql stable security definer set search_path = public as $$
   union all
   -- A member left by an older one-fingerprint authority must correspond to a
   -- retained local ledger row and remain in that scene's complete byte set.
+  -- The only exemption is a published member anchored to a null-key
+  -- published calendar row whose own attested subset contains this exact
+  -- fingerprint (canonical tenant, resolved group, verified date and
+  -- channel); every other orphan member stays held. There is no blanket
+  -- exemption for ledgerless members.
   select m.tenant_id,m.group_key,m.fingerprint,m.used_date,
     coalesce(l.state,'missing'),
-    case when l.group_key is null then 'global_member_without_local_ledger'
-      else 'global_member_not_in_current_scene' end
+    case
+      when l.group_key is not null then 'global_member_not_in_current_scene'
+      when m.state='published' and exists(
+        select 1 from public.content_calendar c
+          where c.id=m.calendar_row_id and c.visual_group_key is null
+            and (c.status='published' or c.published_at is not null)
+            and public.visual_group_tenant_id(c.gym_id)::text=m.tenant_id
+            and public.visual_group_resolve_row(c)=m.group_key
+            and c.post_date is not null and c.post_date=m.used_date
+            and c.account is not distinct from m.channel
+            and coalesce(public.visual_global_row_verified_fingerprints(
+                c,m.group_key) @> array[m.fingerprint],false)) then 'ready'
+      else 'global_member_without_local_ledger' end
   from public.visual_global_usage_member m
   left join public.visual_group_usage_ledger l
     on l.gym_id=m.tenant_id and l.group_key=m.group_key
