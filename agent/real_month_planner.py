@@ -1472,16 +1472,17 @@ def to_calendar_rows(drafts, account_key):
         # status is normalized to the portal vocabulary by the mirror; the planner's
         # freshly built drafts are PENDING, so this reads 'pending'.
         rows.append(row)
-        # Cross-post: a FEED goes to both Instagram AND Facebook (the same cross-post
-        # the daily runner does to lasso_ig + lasso_fb), so the client calendar shows FB
-        # coverage and never reads as Instagram-only. Stories are Instagram-only in Echo
-        # (STORY_ACCOUNTS), so they are NOT duplicated. Emit a paired Facebook row for
-        # each Instagram feed; never double a row that is already Facebook.
-        if row.get("format") == "feed" and (row.get("account") or "").lower() in (
-                "instagram", "ig", ""):
+        # LASSO owns both pages. A genuinely built 9:16 Story follows its
+        # matching feed on each page using the same reviewed media and logical
+        # post id. Client gym Story routing keeps its existing account scope.
+        if ((row.get("format") == "feed" or
+             (account_key == "lasso" and row.get("format") == "story"))
+                and (row.get("account") or "").lower() in (
+                    "instagram", "ig", "")):
             fb = dict(row)
             fb["account"] = "facebook"
-            fb["caption"] = clean_caption
+            if row.get("format") == "feed":
+                fb["caption"] = clean_caption
             rows.append(fb)
     if account_key == 'lasso' and config.lasso_editorial_calendar_enabled():
         from .calendar_autopublish import scheduled_iso_for_row
