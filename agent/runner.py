@@ -1014,6 +1014,22 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         except Exception as exc:
             print(f"[lasso-held-media] failed: {type(exc).__name__}")
 
+    # Stage up to three genuinely reviewed, source-bound 9:16 Stories per
+    # account for today and tomorrow. The job skips occupied slots, leases paid
+    # generation, and uses the guarded insert-only RPC. It cannot publish.
+    if config.lasso_three_feed_enabled() and config.calendar_autopublish_enabled():
+        try:
+            from .jobs import lasso_daily_paired_stories
+            for account in ("instagram", "facebook"):
+                result = lasso_daily_paired_stories.run(now=scheduled_for, account=account)
+                print(f"[lasso-paired-stories] {account} "
+                      f"staged={result['staged']} generated={result['generated']} "
+                      f"reused={result['reused']} occupied={result['occupied']} "
+                      f"blocked={result['blocked']} "
+                      f"reason={result.get('reason', 'ok')}")
+        except Exception as exc:
+            print(f"[lasso-paired-stories] failed: {type(exc).__name__}")
+
     poster = poster or SlackPoster()
     voice = load_voice(voice_path or config.VOICE_DOC_PATH)
 

@@ -24,6 +24,10 @@ Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF).
 """
 
 import hashlib
+import json
+import os
+from pathlib import Path
+import uuid
 
 from . import config, media_host
 
@@ -31,6 +35,7 @@ REASON_DISABLED = "disabled"
 REASON_NO_CAPTION = "no_caption"
 REASON_GENERATE_FAILED = "generate_failed"
 REASON_HOSTING = "hosting_unavailable"
+REASON_STORY_ASPECT = "story_aspect_unverified"
 
 _CLIENT_MESSAGES = {
     REASON_NO_CAPTION: "This post has no caption yet, so there is nothing to "
@@ -39,7 +44,50 @@ _CLIENT_MESSAGES = {
                             "post. Nothing changed; try again shortly.",
     REASON_HOSTING: "The new image was generated but could not be hosted. "
                     "Nothing changed; try again shortly.",
+    REASON_STORY_ASPECT: "The Story image could not be verified at 1080 x 1920. "
+                         "Nothing changed; try again shortly.",
 }
+
+
+def _attest_reviewed_story_dimensions(path):
+    """Stamp measured 9:16 dimensions onto the existing PASS review receipt.
+
+    The reviewer grade and source copy are never fabricated or changed. This
+    only adds a measurement of the exact bytes whose SHA-256 the review already
+    covers. A conflicting aspect/pixel claim or unreadable image fails closed.
+    """
+    from PIL import Image
+    from .infographic_evidence import reviewed_asset
+
+    image = Path(path)
+    review_path = Path(str(image) + ".review.json")
+    reviewed = reviewed_asset(image)
+    if not reviewed:
+        return False
+    try:
+        with Image.open(image) as opened:
+            opened.load()
+            dimensions = opened.size
+        if dimensions != (1080, 1920):
+            return False
+        if reviewed.get("aspect") not in (None, "", "9:16"):
+            return False
+        if reviewed.get("pixels") not in (None, "", "1080x1920"):
+            return False
+        reviewed["aspect"] = "9:16"
+        reviewed["pixels"] = "1080x1920"
+        reviewed["verified_dimensions"] = {"width": 1080, "height": 1920,
+            "image_sha256": reviewed["image_sha256"]}
+        temp = review_path.with_name(review_path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            temp.write_text(json.dumps(reviewed, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8")
+            os.replace(temp, review_path)
+        finally:
+            temp.unlink(missing_ok=True)
+        return reviewed_asset(image) is not None
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def enabled():
@@ -128,6 +176,8 @@ def generate_variant_image(row, account_key, client=None, generate_fn=None,
                 surface=surface, account_key=account_key, **extra)
     if not result or not result.get("path"):
         return {"ok": False, "reason": REASON_GENERATE_FAILED}
+    if lasso_quality and is_story and not _attest_reviewed_story_dimensions(result["path"]):
+        return {"ok": False, "reason": REASON_STORY_ASPECT}
 
     host = host_fn or media_host.host_media
     url = host(result["path"], account_key)

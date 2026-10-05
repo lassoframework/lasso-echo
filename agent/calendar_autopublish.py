@@ -1131,6 +1131,16 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         from . import zernio_publisher
         zernio_publish = zernio_publisher.publish
 
+    # Repaired Stories stay held until their exact feed has a real publish
+    # receipt. Release through the database's source-proof RPC before due_rows
+    # filters media-held rows. A failed release never blocks the feed lane.
+    if gym_id == "lasso" and hasattr(store, "_client"):
+        try:
+            from .jobs.lasso_daily_paired_stories import release_ready_holds
+            release_ready_holds(store, run_date)
+        except Exception as exc:
+            print(f"[lasso-paired-story-release] held: {type(exc).__name__}")
+
     # catchup_days (client lane): also pick up recent-past rows the client approved
     # AFTER their day passed, so a late approval publishes instead of stranding.
     try:
