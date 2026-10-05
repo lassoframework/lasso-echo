@@ -78,6 +78,7 @@ def _body(action="reset_recreate_budget", **args):
 @pytest.fixture
 def armed(monkeypatch):
     monkeypatch.setenv(FO.SECRET_ENV, SECRET)
+    monkeypatch.setenv(FO.RECEIPT_STORE_AUTHORITY_ENV, "true")
 
 
 # ---- auth -------------------------------------------------------------------------------
@@ -86,6 +87,47 @@ def test_missing_secret_env_is_503_not_open(monkeypatch):
     monkeypatch.delenv(FO.SECRET_ENV, raising=False)
     status, body = _post("reset_recreate_budget", _body(), secret=SECRET)
     assert status == 503 and body["error"] == "ops_secret_unset"
+
+
+def test_non_authoritative_host_refuses_keyed_action_before_receipt_or_side_effect(armed,
+                                                                                    monkeypatch):
+    """The intake service cannot create a second ledger through a request field."""
+    monkeypatch.delenv(FO.RECEIPT_STORE_AUTHORITY_ENV, raising=False)
+    calls, receipts = [], {}
+    body = {**_keyed_body(row_id="row-failed-1"), "receipt_store_authority": "worker"}
+    status, response = _post("reset_recreate_budget", body, deps={
+        "bus": FakeBus(), "receipt_store": receipts,
+        "reset_recreate_budget": lambda gym: calls.append(gym) or {
+            "before": {"limit": 1, "used": 1, "remaining": 0},
+            "after": {"limit": 1, "used": 0, "remaining": 1},
+        },
+    })
+    assert status == 503 and response == {
+        "error": "receipt_store_not_authoritative", "action": "reset_recreate_budget"}
+    assert calls == [] and receipts == {}
+
+
+def test_non_authoritative_host_refuses_keyed_swap_before_reservation_or_swap(armed,
+                                                                                monkeypatch):
+    monkeypatch.delenv(FO.RECEIPT_STORE_AUTHORITY_ENV, raising=False)
+    calls, receipts = [], {}
+    status, response = _post("swap_media", _keyed_swap_body(row_id="row-abc-123"), deps={
+        "bus": FakeBus(), "receipt_store": receipts,
+        "handle_swap_media": lambda *args: calls.append(args) or (200, {"ok": True}),
+    })
+    assert status == 503 and response == {
+        "error": "receipt_store_not_authoritative", "action": "swap_media"}
+    assert calls == [] and receipts == {}
+
+
+def test_non_authoritative_host_refuses_receipt_read(armed, monkeypatch):
+    monkeypatch.delenv(FO.RECEIPT_STORE_AUTHORITY_ENV, raising=False)
+    store = {}
+    FR.begin(store, KEY, "reset_recreate_budget", GYM, TICKET, {})
+    status, response = FO.handle(
+        "GET", f"{FO.ROUTE_PREFIX}/receipts/{KEY}?gym_key={GYM}", _hdr(), b"",
+        deps={"receipt_store": store}, log=lambda *a: None)
+    assert status == 503 and response == {"error": "receipt_store_not_authoritative"}
 
 
 def test_wrong_or_missing_header_is_401(armed):

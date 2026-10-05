@@ -45,6 +45,7 @@ class Reader:
 
 def post(monkeypatch, body, reader, secret="secret", http_get=None, receipt_read=None):
     monkeypatch.setenv("FIXER_OPS_SECRET", "secret")
+    monkeypatch.setenv(fixer_ops.RECEIPT_STORE_AUTHORITY_ENV, "true")
     return fixer_ops.handle("POST", proof.PATH,
                             lambda name, default="": secret if name == "X-Fixer-Ops-Secret" else default,
                             json.dumps(body).encode(),
@@ -65,6 +66,18 @@ def test_secret_and_method_gate_precede_all_reads(monkeypatch):
     assert post(monkeypatch, payload(), reader, secret="wrong")[0] == 401
     assert fixer_ops.handle("GET", proof.PATH, lambda key, default="": "secret",
                             deps={"staff_adoption_read": reader})[0] == 405
+    assert reader.calls == []
+
+
+def test_non_authoritative_host_refuses_staff_receipt_proof_before_reads(monkeypatch):
+    reader = Reader()
+    monkeypatch.setenv("FIXER_OPS_SECRET", "secret")
+    monkeypatch.delenv(fixer_ops.RECEIPT_STORE_AUTHORITY_ENV, raising=False)
+    status, body = fixer_ops.handle(
+        "POST", proof.PATH,
+        lambda name, default="": "secret" if name == "X-Fixer-Ops-Secret" else default,
+        json.dumps(payload()).encode(), deps={"staff_adoption_read": reader}, log=lambda *_: None)
+    assert (status, body) == (503, {"error": "receipt_store_not_authoritative"})
     assert reader.calls == []
 
 

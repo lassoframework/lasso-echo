@@ -172,6 +172,7 @@ def _reserved(store, key=KEY, action="reset_recreate_budget", gym=GYM, ticket=TI
 @pytest.fixture
 def armed(monkeypatch):
     monkeypatch.setenv(FO.SECRET_ENV, SECRET)
+    monkeypatch.setenv(FO.RECEIPT_STORE_AUTHORITY_ENV, "true")
 
 
 # ---- module: ReceiptError + payload_hash -------------------------------------------------
