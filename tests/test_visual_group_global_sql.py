@@ -324,3 +324,35 @@ def test_import_orders_keyed_ledgers_before_null_key_historical_subsets():
     assert "public.visual_group_resolve_row(c)=m.group_key" in history
     assert "c.account is not distinct from m.channel" in history
     assert "no blanket" in history
+
+
+def test_historical_claim_enforces_component_wide_date_barrier():
+    sql = _sql("DRAFT_visual_global_history_20261002.sql")
+    claim = sql.split("create or replace function public.visual_global_claim_historical_row(", 1)[1].split("end;\n$$;", 1)[0]
+    assert claim.index("visual group has conflicting historical membership") < claim.index(
+        "linked visual scene has a conflicting component-wide usage date")
+    barrier = claim.split("linked visual scene has a conflicting component-wide usage date", 1)[0]
+    assert "public.visual_group_scene_members(" in barrier
+    assert "cm.state in ('reserved','published')" in barrier
+    assert "cm.used_date is distinct from p_date" in barrier
+    coverage = sql.split("create or replace function public.visual_global_coverage()", 1)[1].split("$$;", 1)[0]
+    assert "'component_usage_date_conflict'" in coverage
+    assert coverage.index("'component_usage_date_conflict'") < coverage.index("'not_imported'")
+
+
+def test_keyed_same_date_reservation_gains_append_only_published_attribution():
+    sql = _sql("DRAFT_visual_global_history_20261002.sql")
+    assert "create table if not exists public.visual_global_published_attribution" in sql
+    assert "unique (tenant_id, group_key, fingerprint, calendar_row_id)" in sql
+    assert "alter table public.visual_global_published_attribution enable row level security" in sql
+    assert "on public.visual_global_published_attribution for each row execute function public.visual_global_immutable()" in sql
+    claim = sql.split("create or replace function public.visual_global_claim_historical_row(", 1)[1].split("end;\n$$;", 1)[0]
+    member = claim.index("on conflict (tenant_id,group_key,fingerprint) do nothing")
+    receipt = claim.index("insert into public.visual_global_published_attribution")
+    assert member < receipt
+    assert "on conflict (tenant_id,group_key,fingerprint,calendar_row_id) do nothing" in claim
+    importer = sql.split("create or replace function public.visual_global_import_history()", 1)[1].split("end;\n$$;", 1)[0]
+    assert "public.visual_global_published_attribution" in importer.split("nowait", 1)[0]
+    history = sql.split("create or replace function public.visual_global_history_coverage()", 1)[1].split("$$;", 1)[0]
+    assert history.count("public.visual_global_published_attribution pa") == 2
+    assert "pa.calendar_row_id=m.calendar_row_id" in history

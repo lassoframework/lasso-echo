@@ -71,16 +71,41 @@ create table if not exists public.visual_global_release_history (
   released_at timestamptz not null default now()
 );
 
+-- Append-only durable proof that one verified published null-key calendar row
+-- consumed one exact byte on its own verified publication date. Historical
+-- attribution writes this receipt even when a keyed same-date reservation
+-- already owns the member row, so releasing that reservation, deleting the
+-- calendar row, or re-running the import never erases the publication proof.
+-- Attribution never promotes or rewrites the keyed reservation or member;
+-- rows are immutable and re-import is an idempotent no-op.
+create table if not exists public.visual_global_published_attribution (
+  id bigint generated always as identity primary key,
+  tenant_id text not null,
+  group_key text not null,
+  fingerprint text not null references public.visual_global_usage(fingerprint),
+  calendar_row_id uuid not null,
+  channel text,
+  used_date date not null,
+  attributed_at timestamptz not null default now(),
+  unique (tenant_id, group_key, fingerprint, calendar_row_id),
+  foreign key (tenant_id, group_key) references public.visual_group(gym_id, group_key)
+);
+create index if not exists visual_global_published_attribution_fingerprint_idx
+  on public.visual_global_published_attribution(fingerprint);
+
 -- These are owner-only writes. The service role can inspect receipts but must
 -- use the validated SECURITY DEFINER functions to bind and import history.
 alter table public.visual_global_identity enable row level security;
 alter table public.visual_global_usage enable row level security;
 alter table public.visual_global_usage_member enable row level security;
 alter table public.visual_global_release_history enable row level security;
+alter table public.visual_global_published_attribution enable row level security;
 revoke all on public.visual_global_identity, public.visual_global_usage,
-  public.visual_global_usage_member, public.visual_global_release_history from public, anon, authenticated, service_role;
+  public.visual_global_usage_member, public.visual_global_release_history,
+  public.visual_global_published_attribution from public, anon, authenticated, service_role;
 grant select on public.visual_global_identity, public.visual_global_usage,
-  public.visual_global_usage_member, public.visual_global_release_history to service_role;
+  public.visual_global_usage_member, public.visual_global_release_history,
+  public.visual_global_published_attribution to service_role;
 
 create or replace function public.visual_global_immutable()
 returns trigger language plpgsql set search_path = public as $$
@@ -97,6 +122,10 @@ create trigger visual_global_identity_immutable before update or delete
 drop trigger if exists visual_global_release_immutable on public.visual_global_release_history;
 create trigger visual_global_release_immutable before update or delete
   on public.visual_global_release_history for each row execute function public.visual_global_immutable();
+drop trigger if exists visual_global_published_attribution_immutable
+  on public.visual_global_published_attribution;
+create trigger visual_global_published_attribution_immutable before update or delete
+  on public.visual_global_published_attribution for each row execute function public.visual_global_immutable();
 create or replace function public.visual_global_member_guard()
 returns trigger language plpgsql set search_path = public as $$
 begin
@@ -1161,6 +1190,20 @@ begin
         using errcode='23514';
     end if;
   end loop;
+  -- A manually linked scene is one visual subject: every staged or published
+  -- member anywhere in the connected component pins the whole component to
+  -- one date. Two attested published null-key rows with DISTINCT fingerprints
+  -- in the same linked scene therefore cannot carry different dates even
+  -- though neither byte has its own owner conflict; same-date siblings pass.
+  if exists(select 1 from public.visual_global_usage_member cm
+      where cm.tenant_id=p_tenant
+        and cm.group_key in (select public.visual_group_scene_members(
+          p_tenant,p_group_key))
+        and cm.state in ('reserved','published')
+        and cm.used_date is distinct from p_date) then
+    raise exception 'linked visual scene has a conflicting component-wide usage date'
+      using errcode='23514';
+  end if;
   foreach v_hash in array v_fingerprints loop
     -- The historical row verifiably published this byte, so an absent owner
     -- is created published. An existing owner already passed the tenant/date
@@ -1184,6 +1227,15 @@ begin
       (tenant_id,group_key,fingerprint,calendar_row_id,channel,used_date,state,ambiguous)
       values(p_tenant,p_group_key,v_hash,p_row_id,p_channel,p_date,'published',false)
       on conflict (tenant_id,group_key,fingerprint) do nothing;
+    -- Durable append-only proof that THIS published row consumed this byte on
+    -- this date. When a keyed same-date reservation already owns the member
+    -- row, the member stays keyed and reserved above; this receipt still
+    -- records the publication, and survives keyed-member release, calendar
+    -- row deletion and import re-runs without ever being rewritten.
+    insert into public.visual_global_published_attribution
+      (tenant_id,group_key,fingerprint,calendar_row_id,channel,used_date)
+      values(p_tenant,p_group_key,v_hash,p_row_id,p_channel,p_date)
+      on conflict (tenant_id,group_key,fingerprint,calendar_row_id) do nothing;
   end loop;
   return v_fingerprints;
 end;
@@ -1397,7 +1449,8 @@ begin
     public.visual_group_reconciliation, public.tenant_alias,
     public.visual_global_object_attestation,
     public.visual_global_scene_object_member, public.visual_global_object_lineage,
-    public.visual_global_usage, public.visual_global_usage_member
+    public.visual_global_usage, public.visual_global_usage_member,
+    public.visual_global_published_attribution
     in share row exclusive mode nowait;
   if exists(select 1 from public.visual_group_reconciliation e
       where e.outcome='confirmed_published'
@@ -1509,6 +1562,21 @@ language sql stable security definer set search_path = public as $$
           where l.gym_id=public.visual_group_tenant_id(c.gym_id)::text
             and l.group_key=c.visual_group_key and l.state='published')
         then 'published_row_without_permanent_local_ledger'
+      -- Component-wide date parity for null-key published rows: a manually
+      -- linked scene is one visual subject, so any staged or published member
+      -- anywhere in the connected component pins the whole component to one
+      -- date. Distinct fingerprints in sibling groups do not evade the check;
+      -- the row's own same-date members never flag it.
+      when c.visual_group_key is null
+          and (c.status='published' or c.published_at is not null)
+          and c.post_date is not null
+          and exists(select 1 from public.visual_global_usage_member cm
+            where cm.tenant_id=public.visual_group_tenant_id(c.gym_id)::text
+              and cm.group_key in (select public.visual_group_scene_members(
+                public.visual_group_tenant_id(c.gym_id)::text, rg.resolved_group))
+              and cm.state in ('reserved','published')
+              and cm.used_date is distinct from c.post_date)
+        then 'component_usage_date_conflict'
       when g.fingerprint is null then 'not_imported'
       when g.tenant_id<>public.visual_group_tenant_id(c.gym_id)::text
           or g.used_date is distinct from c.post_date
@@ -1577,7 +1645,7 @@ language sql stable security definer set search_path = public as $$
       when m.used_date is distinct from l.reserved_date
           or (m.state is distinct from case
             when l.state='published' then 'published' else 'reserved' end
-          and not (m.state='published' and exists(
+          and not (m.state='published' and (exists(
             select 1 from public.content_calendar c
               where c.id=m.calendar_row_id and c.visual_group_key is null
                 and (c.status='published' or c.published_at is not null)
@@ -1586,7 +1654,13 @@ language sql stable security definer set search_path = public as $$
                 and c.post_date is not null and c.post_date=m.used_date
                 and c.account is not distinct from m.channel
                 and coalesce(public.visual_global_row_verified_fingerprints(
-                    c,m.group_key) @> array[m.fingerprint],false))))
+                    c,m.group_key) @> array[m.fingerprint],false))
+            or exists(select 1 from public.visual_global_published_attribution pa
+              where pa.tenant_id=m.tenant_id and pa.group_key=m.group_key
+                and pa.fingerprint=m.fingerprint
+                and pa.calendar_row_id=m.calendar_row_id
+                and pa.channel is not distinct from m.channel
+                and pa.used_date=m.used_date))))
         then 'global_member_state_mismatch'
       else 'ready' end
   from public.visual_group_usage_ledger l
@@ -1608,7 +1682,7 @@ language sql stable security definer set search_path = public as $$
     coalesce(l.state,'missing'),
     case
       when l.group_key is not null then 'global_member_not_in_current_scene'
-      when m.state='published' and exists(
+      when m.state='published' and (exists(
         select 1 from public.content_calendar c
           where c.id=m.calendar_row_id and c.visual_group_key is null
             and (c.status='published' or c.published_at is not null)
@@ -1617,7 +1691,13 @@ language sql stable security definer set search_path = public as $$
             and c.post_date is not null and c.post_date=m.used_date
             and c.account is not distinct from m.channel
             and coalesce(public.visual_global_row_verified_fingerprints(
-                c,m.group_key) @> array[m.fingerprint],false)) then 'ready'
+                c,m.group_key) @> array[m.fingerprint],false))
+        or exists(select 1 from public.visual_global_published_attribution pa
+          where pa.tenant_id=m.tenant_id and pa.group_key=m.group_key
+            and pa.fingerprint=m.fingerprint
+            and pa.calendar_row_id=m.calendar_row_id
+            and pa.channel is not distinct from m.channel
+            and pa.used_date=m.used_date)) then 'ready'
       else 'global_member_without_local_ledger' end
   from public.visual_global_usage_member m
   left join public.visual_group_usage_ledger l
