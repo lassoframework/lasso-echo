@@ -320,8 +320,8 @@ def test_ledger_rejects_total_above_bounded_batch(monkeypatch):
 # ---- the infographic fallback decision (photos first) ------------------------
 
 class _ReadyStore(FakeMediaStore):
-    def list_sources(self, _base):
-        return [{"kind": "gym_drive", "active": True,
+    def list_sources(self, _base, include_inactive=False):
+        return [{"id": "src1", "gym_id": _base, "kind": "gym_drive", "active": True,
                  "revoked_externally": False, "sync_status": "ready",
                  "sync_finished_at": "2026-10-02T00:00:00Z"}]
 

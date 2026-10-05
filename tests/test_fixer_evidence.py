@@ -27,7 +27,7 @@ def test_full_contract_and_no_secret_fields():
     assert result['generation_history']['status']=='empty'
     assert result['previous_grade']['status']=='available'
     assert 'xoxb' not in json.dumps(result) and 'https://' not in json.dumps(result)
-    assert {t for t,p in calls}=={'support_tickets','content_calendar','gym_social_grades','media_asset'}
+    assert {t for t,p in calls}=={'support_tickets','content_calendar','gym_social_grades','media_asset','media_source'}
     assert calls[1][1]['limit']=='501'
     assert 'updated_at' not in calls[1][1]['select']
 
@@ -89,8 +89,10 @@ def test_actual_sqlite_reads_cannot_initialize_or_modify(tmp_path):
 
 def test_media_inventory_uses_real_eligibility_and_cooldown():
  deps,tables,_=fixture()
+ tables['media_source']=[{'id':'src1','gym_id':GYM,'active':True}]
  tables['media_asset']=[
   {'id':'1','gym_id':GYM,'kind':'photo','eligible':True,'excluded_by_coach':False,'last_used_at':None,
+   'source_id':'src1',
    **bound_review_fields('1', GYM)},
   {'id':'2','gym_id':GYM,'kind':'video','eligible':True,'excluded_by_coach':True},
   {'id':'3','gym_id':GYM,'kind':'video','eligible':True,'last_used_at':'2026-09-10T00:00:00Z'},

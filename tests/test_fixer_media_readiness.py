@@ -39,7 +39,7 @@ def _asset(asset_id, **changes):
                             "gym_id": GYM, "people_detected": False,
                             "observed_at": "2026-09-01T00:00:00+00:00"},
         "people_detected": False, "consent_status": "not_required",
-        "used_count": 0, "last_used_at": None,
+        "used_count": 0, "last_used_at": None, "source_id": "src1",
     }
     asset.update(changes)
     return asset
@@ -74,6 +74,10 @@ class _Assets:
     def list_assets(self, gym_key):
         self.calls.append(("list_assets", gym_key))
         return [dict(asset) for asset in self.assets]
+
+    def list_sources(self, gym_key, include_inactive=False):
+        # Cross-gym source guard evidence: one active same-gym source for src1.
+        return [{"id": "src1", "gym_id": gym_key, "active": True}]
 
     def __getattr__(self, name):
         pytest.fail(f"readiness must not call media_store.{name}")

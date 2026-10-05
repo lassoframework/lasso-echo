@@ -336,16 +336,29 @@ def test_stage_arc_does_not_stamp_mismatched_or_count_only_insert_receipt(monkey
         assert stamped == []
 
 
+
+def _arm_source_guard(monkeypatch, gym_id, source_id="src1"):
+    """Give the cross-gym source guard real same-gym active source evidence for
+    the offline event tests (the guard fails closed without it)."""
+    from agent import gym_media_selector as _sel
+    from tests.gym_media_fakes import FakeMediaStore, make_source
+    store = FakeMediaStore(sources=[make_source(source_id, gym_id=gym_id)])
+    monkeypatch.setattr(_sel._idx, "default_store", lambda: store)
+
+
 # ---- an image-less arc row must never be staged ----------------------------------
-def test_attach_media_gives_rows_a_photo_and_stamps_the_asset():
+def test_attach_media_gives_rows_a_photo_and_stamps_the_asset(monkeypatch):
     """Event rows used to be staged with NO image_url at all — media_ids existed on
     GymEvent but was never consumed anywhere, so every event post for every gym was
     unpublishable. Each row now gets a real photo from the gym's own pool."""
     from agent import event_calendar as ec
+    _arm_source_guard(monkeypatch, "zanshinfitness630e22")
     rows = [{"post_date": "2026-10-03", "account": "instagram", "format": "feed"},
             {"post_date": "2026-10-04", "account": "instagram", "format": "feed"}]
-    picked = [{"id": "a1", "title": "one.jpg", "source_media_url": "https://drive.test/raw/a1"},
-              {"id": "a2", "title": "two.jpg", "source_media_url": "https://drive.test/raw/a2"}]
+    picked = [{"id": "a1", "title": "one.jpg", "gym_id": "zanshinfitness630e22",
+               "source_id": "src1", "source_media_url": "https://drive.test/raw/a1"},
+              {"id": "a2", "title": "two.jpg", "gym_id": "zanshinfitness630e22",
+               "source_id": "src1", "source_media_url": "https://drive.test/raw/a2"}]
     kept, held = ec._attach_media(
         "zanshinfitness630e22", rows, lambda m: None,
         picker=lambda exclude: next((a for a in picked if a["id"] not in exclude), None),
@@ -358,12 +371,14 @@ def test_attach_media_gives_rows_a_photo_and_stamps_the_asset():
         "https://drive.test/raw/a1", "https://drive.test/raw/a2"]
 
 
-def test_attach_media_does_not_claim_hosted_rendition_as_raw_source():
+def test_attach_media_does_not_claim_hosted_rendition_as_raw_source(monkeypatch):
     from agent import event_calendar as ec
+    _arm_source_guard(monkeypatch, "g")
     rows = [{"post_date": "2026-10-03", "account": "instagram", "format": "feed"}]
     kept, held = ec._attach_media(
         "g", rows, lambda m: None,
-        picker=lambda exclude: {"id": "a1", "title": "x.jpg"},
+        picker=lambda exclude: {"id": "a1", "title": "x.jpg",
+                                "gym_id": "g", "source_id": "src1"},
         host=lambda *a: "https://cdn.test/transformed.jpg")
     assert not held
     assert kept[0]["image_url"] == "https://cdn.test/transformed.jpg"
@@ -437,7 +452,7 @@ def _stale_row(rid, post_date, status, event_id="evt_x", image_url=""):
             "caption": "unchanged"}
 
 
-def test_backfill_missing_media_holds_approved_and_patches_pending_rows():
+def test_backfill_missing_media_holds_approved_and_patches_pending_rows(monkeypatch):
     """Pending rows can be backfilled; approved content awaits owner reapproval."""
     from agent import event_calendar as ec
     rows = [
@@ -446,7 +461,9 @@ def test_backfill_missing_media_holds_approved_and_patches_pending_rows():
         _stale_row("r3", "2026-09-26", "denied"),   # denied: never touched
     ]
     store = _BackfillStore(rows)
-    picked = [{"id": "a1", "title": "one.jpg", "source_media_url": "https://drive.test/a1"}]
+    _arm_source_guard(monkeypatch, "zanshinfitness630e22")
+    picked = [{"id": "a1", "title": "one.jpg", "gym_id": "zanshinfitness630e22",
+               "source_id": "src1", "source_media_url": "https://drive.test/a1"}]
     res = ec.backfill_missing_media(
         store, "zanshinfitness630e22", "evt_x",
         picker=lambda exclude: next((a for a in picked if a["id"] not in exclude), None),
