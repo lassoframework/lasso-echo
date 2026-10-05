@@ -483,9 +483,8 @@ def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
          event=None, offer=None, gbp_location_id=None, fmt="update",
          status="pending", source_media_url=None, source_media_asset_id=None):
     """One content_calendar GBP row dict (no id; DB mints it). account is the literal
-    'googlebusiness'; gym_id is the portal_gym_key canonical join. status is 'pending'
-    (owner-visible) normally, or 'coach_review' (withheld from the owner) for a gym's
-    first month under GATE 2."""
+    'googlebusiness'; gym_id is the portal_gym_key canonical join. New rows use 'pending'
+    for the owner's normal approval flow."""
     row = {
         "gym_id": portal_gym_key,
         "account": gbp.PLATFORM,             # 'googlebusiness'

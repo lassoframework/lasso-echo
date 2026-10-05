@@ -167,6 +167,16 @@ def test_retired_coach_review_status_cannot_be_written():
     assert not store.rows
 
 
+def test_retired_coach_review_release_entrypoint_is_absent():
+    assert not hasattr(gd, "release")
+
+
+def test_retired_release_command_cannot_become_a_gym_run(monkeypatch):
+    monkeypatch.setattr(gd, "run", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("retired release command must not run")))
+    assert gd.main(["release", "lasso"]) == 2
+
+
 def test_gate1_unconfirmed_offer_not_written():
     _seed()
     store = _Store()
