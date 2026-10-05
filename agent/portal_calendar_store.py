@@ -608,6 +608,7 @@ class SupabaseCalendarStore:
                          or render_evidence is not None)):
                 continue
             if (field == "source_media_content_hash" and is_story
+                    and bool(current.get("source_media_asset_id"))
                     and patch.get("source_media_asset_id",
                                   current.get("source_media_asset_id"))
                     == current.get("source_media_asset_id")

@@ -843,6 +843,19 @@ def test_story_reburn_with_changed_asset_identity_clears_content_hash(
     assert payload["source_media_content_hash"] is None
 
 
+def test_story_reburn_without_asset_identity_clears_content_hash(armed, monkeypatch):
+    monkeypatch.setattr(
+        prep, "prepare",
+        lambda _store, _key, row, **_kwargs: {**row, "visual_group_key": "vg_scene",
+                                                "byte_hash": "derived:test"})
+    current = calendar_row(format="story", source_media_url=RAW,
+                           source_media_content_hash=HASH)
+    payload = store(HTTP(current=current))._prepare_visual_media(
+        KEY, "row-1", {"image_url": FINAL}, current=current,
+        render_evidence=evidence())
+    assert payload["source_media_content_hash"] is None
+
+
 def test_replacement_payload_clears_a_stale_content_hash(armed, monkeypatch):
     # Exercise the shared replacement payload loop independently of the owner
     # receipt boundary. A changed source must clear its old Drive byte identity.
