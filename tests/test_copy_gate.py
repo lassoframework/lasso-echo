@@ -135,6 +135,12 @@ def test_caption_numbered_lists_and_ellipsis_pause_keep_their_text_together():
         assert copy_gate.format_caption(raw) == raw
     assert copy_gate.format_caption("Wait... what if you tried? Start today.") == (
         "Wait... what if you tried?\n\nStart today.")
+    assert copy_gate.format_caption("Try this. 1. Squats 2. Lunges. Join us.") == (
+        "Try this.\n\n1. Squats 2. Lunges.\n\nJoin us.")
+    assert copy_gate.format_caption("1. Warm up. 2. Cool down. 3. Stretch.") == (
+        "1. Warm up.\n\n2. Cool down.\n\n3. Stretch.")
+    assert copy_gate.format_caption("Wait... Take a breath. Join us.") == (
+        "Wait... Take a breath.\n\nJoin us.")
     assert copy_gate.format_caption("Start at level 1. Build from there.") == (
         "Start at level 1.\n\nBuild from there.")
 

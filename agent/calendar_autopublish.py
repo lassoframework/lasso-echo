@@ -862,7 +862,8 @@ def _note_caption_formatted(row_id, gym_id):
         _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
             f"{gym_id}: row {row_id} carried a pre-copy-rail caption with "
             "semicolons. Echo auto-formatted it at the publish boundary "
-            "(semicolons became commas). The caption is ready for the remaining "
+            "(semicolons became commas and sentence gaps were standardized). "
+            "The caption is ready for the remaining "
             "publish checks."))
     except Exception:
         pass  # an alert failure must never block the publish lane
@@ -921,6 +922,9 @@ def _format_caption_at_publish(row, gym_id, store):
     row["caption"] = clean  # what we SEND is clean even when the patch failed
     if ";" in caption:
         _note_caption_formatted(row.get("id"), gym_id)
+    else:
+        print(f"[calendar-autopublish] formatted legacy caption spacing for "
+              f"{gym_id}/{row.get('id')}; awaiting remaining publish checks")
     return row
 
 

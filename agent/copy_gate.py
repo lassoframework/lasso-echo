@@ -204,11 +204,11 @@ def format_caption(text: str) -> str:
                 continue
             next_text = line[match.end():].lstrip()
             if re.fullmatch(r"\d+\.", last_word):
-                prefix = line[:match.start() - len(last_word[:-1])].rstrip()
+                prefix = line[start:match.start() - len(last_word[:-1])].strip()
                 if numbered_list or not prefix or prefix.endswith(":"):
                     numbered_list = True
                     continue
-            if last_word.endswith("...") and next_text and next_text[0].islower():
+            if last_word.rstrip("\"'”’)]").endswith("..."):
                 continue
             if (last_word in _CAPTION_CONTEXT_ABBREVIATIONS and next_text
                     and (next_text[0].islower() or next_text[0].isdigit())):
