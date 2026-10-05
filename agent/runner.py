@@ -970,31 +970,25 @@ def _unused_client_photo_available(account, path, day_key):
         return True
 
 
-def run_daily(poster=None, voice_path=None, library_path=None,
-              scheduled_for=None, accounts=None, store=None):
-    """
-    Returns a list of Draft objects produced this run (one per account, or a
-    blocked marker). Side effects: posts approval cards to Slack AND saves each
-    non-blocked draft to the pending store so the listener can act on it later.
-    """
-    _trust_startup_warning()
-    results = []
-    # The scheduler distinguishes a genuinely silent posting-day run from the
-    # calendar-authority mode that intentionally suppresses legacy LASSO cards.
-    # Track every cadence-eligible account and only report an expected zero when
-    # ALL of them reached that explicit cardless path.
-    posting_accounts = []
-    intentionally_cardless_accounts = []
+def _lasso_held_media_and_story_preparation(scheduled_for):
+    """Repair held LASSO visuals, then stage source-bound paired Stories.
 
-    if not config.master_enabled():
-        # agent disarmed. say nothing publicly; just report state to the caller.
-        return {"status": "disabled", "drafts": []}
-
-    # Prepare today's and tomorrow's held LASSO visuals before drafting or the
-    # calendar publish sweep. Tomorrow matters because the draw runs after the
-    # first local feed slot. During the dated October incident window, include
-    # at most two older held rows per account and run, after the current runway.
-    # This job only replaces media on an exact pending held row; it cannot post.
+    Runs AFTER every calendar-mutating job in run_daily (drafting, refills,
+    grade_sweep remediation, sweeps) and immediately before the final calendar
+    publish block, exactly once per draw. A Story artifact binds the feed
+    caption present at staging time (source_hash over feed["caption"]), so
+    staging here — after grade_fix caption remediation — means tonight's pairs
+    bind the FINAL caption instead of stranding on a pre-remediation one until
+    the next nightly draw. Held-feed repair stays strictly BEFORE Story
+    preparation so a repaired visual exists before its Story is staged. Both
+    jobs keep their existing flags, bounds, both-accounts coverage, and the
+    dynamic _client_publish_limits lookback; neither can publish.
+    """
+    # Prepare today's and tomorrow's held LASSO visuals. Tomorrow matters
+    # because the draw runs after the first local feed slot. During the dated
+    # October incident window, include at most two older held rows per account
+    # and run, after the current runway. This job only replaces media on an
+    # exact pending held row; it cannot post.
     if config.lasso_three_feed_enabled():
         try:
             from .jobs import lasso_held_media_repair
@@ -1041,6 +1035,33 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                       f"reason={result.get('reason', 'ok')}")
         except Exception as exc:
             print(f"[lasso-paired-stories] failed: {type(exc).__name__}")
+
+
+def run_daily(poster=None, voice_path=None, library_path=None,
+              scheduled_for=None, accounts=None, store=None):
+    """
+    Returns a list of Draft objects produced this run (one per account, or a
+    blocked marker). Side effects: posts approval cards to Slack AND saves each
+    non-blocked draft to the pending store so the listener can act on it later.
+    """
+    _trust_startup_warning()
+    results = []
+    # The scheduler distinguishes a genuinely silent posting-day run from the
+    # calendar-authority mode that intentionally suppresses legacy LASSO cards.
+    # Track every cadence-eligible account and only report an expected zero when
+    # ALL of them reached that explicit cardless path.
+    posting_accounts = []
+    intentionally_cardless_accounts = []
+
+    if not config.master_enabled():
+        # agent disarmed. say nothing publicly; just report state to the caller.
+        return {"status": "disabled", "drafts": []}
+
+    # NOTE: the LASSO held-media repair + paired-Story preparation sequence
+    # runs at the END of this draw (see _lasso_held_media_and_story_preparation,
+    # invoked immediately before the calendar publish block below), AFTER every
+    # calendar-mutating job, so Stories bind post-remediation captions tonight
+    # instead of stranding a held feed until the next nightly draw.
 
     poster = poster or SlackPoster()
     voice = load_voice(voice_path or config.VOICE_DOC_PATH)
@@ -2136,6 +2157,16 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 print(f"[real-mirror] {account.key}: {type(e).__name__}: {e}")
                 ops_alerts.alert(f"real-calendar mirror failed for {account.key}: "
                                  f"{type(e).__name__}: {e}. The draft run is unaffected.")
+
+    # LASSO HELD-MEDIA REPAIR + PAIRED-STORY PREPARATION: this is the LAST
+    # calendar-mutation-adjacent step before publishing. It runs AFTER every
+    # calendar-mutating job in this draw (drafting, refills, grade_sweep's
+    # grade_fix caption remediation, every sweep above) so each staged Story
+    # binds the FINAL feed caption tonight; run earlier, a caption repaired by
+    # grade_sweep strands its pre-remediation Story behind the exact
+    # caption-equality proof until the next nightly draw. Held-feed repair runs
+    # first, Story preparation second, exactly once per draw.
+    _lasso_held_media_and_story_preparation(scheduled_for)
 
     # CALENDAR AUTO-PUBLISHER (AGENT_CALENDAR_AUTOPUBLISH, OFF by default; ALSO needs
     # AGENT_PUBLISH_ENABLED). publish_due() self-guards on BOTH flags, so an unguarded
