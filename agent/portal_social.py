@@ -913,8 +913,12 @@ def _validate_expected_creative(expected):
 
 
 def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store,
-                             expected_creative=None):
-    short = _action_gates(account_key, draft_id, actor_id, reader)
+                             expected_creative=None,
+                             allow_portal_social_disabled=False,
+                             allow_client_billing_inactive=False):
+    short = _action_gates(account_key, draft_id, actor_id, reader,
+                          allow_portal_social_disabled=allow_portal_social_disabled,
+                          allow_client_billing_inactive=allow_client_billing_inactive)
     if short is not None:
         return short
     try:

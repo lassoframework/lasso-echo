@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import config
 from agent import portal_calendar_store as pcs
+from agent import portal_routes
 
 
 def _snapshot(**over):
@@ -279,6 +280,51 @@ def test_flag_on_case_insensitive_format_and_platform(monkeypatch):
                      expected_creative=_snapshot(format="FEED",
                                                  platform="INSTAGRAM"))
     assert status == 200
+
+
+def test_legacy_approve_proof_keeps_legacy_access_gates(monkeypatch):
+    """The proof flag adds a snapshot guard, never the Part-B product gate.
+
+    The legacy route is already behind portal-approval token handling.  Calling
+    the common Supabase approval handler must retain its row ownership and
+    proof checks while skipping only the portal-social feature and billing
+    gates that legacy customers do not have.
+    """
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.setattr(portal_routes.config, "portal_approvals_enabled",
+                        lambda: True)
+    monkeypatch.setattr(portal_routes.config, "portal_calendar_supabase_enabled",
+                        lambda: True)
+
+    calls = {}
+
+    class _LegacyStore:
+        def get_row(self, account_key, row_id):
+            calls["loaded"] = (account_key, row_id)
+            return _full_row()
+
+        def approve_ready(self, account_key, row_id, expected_creative=None):
+            calls["approved"] = (account_key, row_id, expected_creative)
+            return {**_full_row(), "status": "approved",
+                    "approval_digest": "digest-abc"}
+
+    store = _LegacyStore()
+    monkeypatch.setattr(portal_routes._pcs, "SupabaseCalendarStore",
+                        lambda: store)
+    # These are deliberately false. The legacy approval route must still run.
+    monkeypatch.setattr("agent.portal_social.config.portal_social_enabled",
+                        lambda: False)
+    monkeypatch.setattr("agent.portal_social.is_social_active",
+                        lambda *args, **kwargs: False)
+
+    status, body = portal_routes.handle_portal_action(
+        "approve", "gymx", "r1", "legacy-actor",
+        expected_creative=_snapshot())
+
+    assert status == 200
+    assert body["approval_digest"] == "digest-abc"
+    assert calls["loaded"] == ("gymx", "r1")
+    assert calls["approved"] == ("gymx", "r1", _snapshot())
 
 
 def test_flag_on_row_changed_under_tap_fails_closed(monkeypatch):

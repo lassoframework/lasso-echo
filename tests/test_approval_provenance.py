@@ -524,6 +524,51 @@ def test_armed_lane_fails_closed_on_store_without_proof_claim(proof_armed):
     assert store.rows["fresh"]["status"] == "approved"
 
 
+def test_armed_lane_fails_closed_on_legacy_claim_signature(proof_armed):
+    class _OldSignatureStore(_ProofStore):
+        def claim_publish_slot(self, row_id, gym_id, day, timezone_name, capacity,
+                               approved_only):
+            raise AssertionError("legacy claim must not be called while proof is armed")
+
+    store = _OldSignatureStore([human_prove(_row("fresh"))],
+                               autonomy={"lasso": False})
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
+                              publisher=pub, now=LATE_NOW, approved_only=True)
+
+    assert summary["published"] == []
+    assert summary["waiting"] == ["fresh"]
+    assert summary["failed"] == []
+    assert pub.calls == []
+
+
+def test_armed_claim_internal_typeerror_surfaces_as_failure(
+        proof_armed, monkeypatch, capsys):
+    class _BrokenProofStore(_ProofStore):
+        def claim_publish_slot(self, row_id, gym_id, day, timezone_name, capacity,
+                               approved_only, require_proof=False):
+            raise TypeError("internal claim defect")
+
+    repeat_failures = []
+    monkeypatch.setattr(cap, "_note_repeat_failure",
+                        lambda row_id, gym_id, exc:
+                        repeat_failures.append((row_id, gym_id, str(exc))))
+    store = _BrokenProofStore([human_prove(_row("broken"))],
+                              autonomy={"lasso": False})
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
+                              publisher=pub, now=LATE_NOW, approved_only=True)
+
+    assert summary["published"] == []
+    assert summary["failed"] == ["broken"]
+    assert summary["waiting"] == []
+    assert pub.calls == []
+    assert repeat_failures == [("broken", "lasso", "internal claim defect")]
+    assert "TypeError: internal claim defect" in capsys.readouterr().out
+
+
 # ---- digest contract ---------------------------------------------------------
 
 @pytest.mark.parametrize("field,new_value", [

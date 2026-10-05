@@ -164,11 +164,18 @@ def handle_portal_action(action, account_key, draft_id, actor_id, note="",
             # 409 review_refresh_required, no status change, no digest) is
             # enforced on EVERY approve path. Flag OFF keeps the legacy
             # set_status lane below byte-for-byte.
+            # The proof flag binds an approval to the exact content served; it
+            # is NOT a product/billing gate. This route is already gated by
+            # AGENT_PORTAL_APPROVALS + token auth above, so a gym on the
+            # legacy portal-approvals product alone (AGENT_PORTAL_SOCIAL_ENABLED
+            # OFF, no social subscription) must NOT start 403/402ing here.
             from . import portal_social as _ps
             return _ps._handle_approve_supabase(
                 account_key, draft_id, actor_id, None,
                 _pcs.SupabaseCalendarStore(),
-                expected_creative=expected_creative)
+                expected_creative=expected_creative,
+                allow_portal_social_disabled=True,
+                allow_client_billing_inactive=True)
         return _handle_action_supabase(action, account_key, draft_id, note,
                                        reason=reason, gbp=gbp)
 

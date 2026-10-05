@@ -232,6 +232,8 @@ check "snapshot cannot cross gyms" "0" "$(q "select count(*) from approve_calend
 mkrow 34 pending
 q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34','$SWIFT','$(SNAP 34)'::jsonb)" >/dev/null
 check "unproved retry returns current row" "1" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34','$SWIFT','$(SNAP 34)'::jsonb)")"
+MIXED_CASE_SNAPSHOT='{"caption": "caption 34", "media_url": "https://cdn/34.jpg", "day_key": "2026-08-10", "format": " FEED ", "platform": " INSTAGRAM "}'
+check "unproved retry normalizes format and platform" "1" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34','$SWIFT','$MIXED_CASE_SNAPSHOT'::jsonb)")"
 check "unproved retry rejects stale caption" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34','$SWIFT','$(SNAP 35)'::jsonb)")"
 q "update content_calendar set caption='changed' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34'"
 check "unproved retry rejects edited digest" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa34','$SWIFT','$(SNAP 34)'::jsonb)")"

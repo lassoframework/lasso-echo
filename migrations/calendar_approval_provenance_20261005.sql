@@ -222,9 +222,9 @@ begin
       or v_row.image_url is distinct from p_expected->>'media_url'
       or v_row.post_date::text is distinct from p_expected->>'day_key'
       or coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed')
-         is distinct from p_expected->>'format'
+         is distinct from coalesce(nullif(lower(btrim(coalesce(p_expected->>'format', ''))), ''), 'feed')
       or coalesce(nullif(lower(btrim(v_row.account)), ''), '')
-         is distinct from p_expected->>'platform' then
+         is distinct from lower(btrim(coalesce(p_expected->>'platform', ''))) then
     return;
   end if;
   return next v_row;

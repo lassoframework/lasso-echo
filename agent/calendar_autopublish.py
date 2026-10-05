@@ -27,6 +27,7 @@ Exactly-once design (the claim):
 Nothing here logs a token or secret. The manual approval path is untouched.
 """
 
+import inspect
 import os
 import re
 from datetime import datetime, time, timedelta, timezone
@@ -757,6 +758,33 @@ def _note_meta_stripped(row_id, gym_id):
         pass  # an alert failure must never block the publish lane
 
 
+def _alert_meta_reapproval_held(row_id, gym_id, persisted):
+    """Tell ops why proof-gated cleanup did not publish this approved row."""
+    try:
+        from . import db, ops_alerts
+        key = f"metaleak_reapproval_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        detail = (
+            "Echo removed the internal block and reset the row to pending"
+            if persisted else
+            "Echo could not safely persist the cleaned caption"
+        )
+        result = ops_alerts.alert(
+            f"{gym_id}: row {row_id} HELD before publish because removing its "
+            "[why]/[reason] edit-rationale block changes the approved creative. "
+            f"{detail}. A human must review and approve the cleaned caption before "
+            "it can publish.")
+        if not _alert_confirmed(result):
+            return
+        db.kv_set(key, "1")
+    except Exception:
+        pass  # an alert failure must never weaken the publish hold
+
+
+_META_REAPPROVAL_REQUIRED = object()
+
+
 def _strip_or_hold_meta(row, gym_id, store):
     """FINAL GATE for internal edit-rationale blocks (CrossFit ENG live FB post,
     2026-08-23 00:02 ET: a caption published ending with '[why] Removed word parents
@@ -764,20 +792,29 @@ def _strip_or_hold_meta(row, gym_id, store):
     unlike the publish_guard recheck this is not behind AGENT_CALENDAR_GRADE, because
     this class of leak must never be publishable under any flag combination.
 
-    A clean SUFFIX (real caption body, then the meta block) is STRIPPED and the clean
-    body publishes this tick — the self-heal Blake wants, no human tap. The stripped
-    caption is persisted through the STATUS-PRESERVING patch (patch_caption would
-    reset an approved row to pending and un-approve it); a patch failure still
-    publishes the clean body (the local row is authoritative for THIS send). An
-    all-meta caption returns None: the caller HOLDS the row (never claimed) and
-    alerts once. Story rows heal too: cleaning the row's caption makes the burned
-    media read stale, so the existing reburn lane re-renders it with clean words."""
+    With durable approval proof armed, stripping changes digest-bound creative. The
+    cleaned caption is therefore persisted through patch_caption (which resets the
+    row to pending) and the row is held for fresh human approval. A missing/failed
+    patch also holds. With proof disabled, the legacy status-preserving self-heal is
+    retained. An all-meta caption returns None for the existing rewrite hold."""
     from . import post_quality
     body, meta = post_quality.split_meta_suffix(row.get("caption") or "")
     if not meta:
         return row
     if not (body or "").strip():
         return None
+    if config.approval_proof_enabled():
+        persisted = False
+        try:
+            patcher = getattr(store, "patch_caption", None)
+            if callable(patcher):
+                persisted = patcher(row.get("gym_id") or gym_id,
+                                    row.get("id"), body) is not None
+        except Exception as e:  # noqa: BLE001 - the hold remains fail closed
+            print(f"[calendar-autopublish] proof meta-strip caption patch failed for "
+                  f"{row.get('id')}: {type(e).__name__}: {e}")
+        _alert_meta_reapproval_held(row.get("id"), gym_id, persisted)
+        return _META_REAPPROVAL_REQUIRED
     patched = None
     try:
         patcher = getattr(store, "patch_caption_preserve_status", None)
@@ -1239,10 +1276,14 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
         # INTERNAL EDIT-RATIONALE FINAL GATE (CrossFit ENG, 2026-08-23): a caption
         # carrying a bracketed meta block ([why]/[reason]/...) never reaches the
-        # network. Clean suffix -> stripped and published (self-heal); all-meta ->
+        # network. Clean suffix -> stripped and published in the legacy lane, or
+        # reset to pending + held for fresh approval when proof is armed. All-meta ->
         # held + one alert. BEFORE the story-stale check on purpose: a cleaned story
-        # caption then mismatches its burned media and the reburn lane re-renders it.
+        # in the legacy lane then mismatches its burned media and is re-rendered.
         cleaned = _strip_or_hold_meta(row, gym_id, store)
+        if cleaned is _META_REAPPROVAL_REQUIRED:
+            waiting.append(row_id)
+            continue
         if cleaned is None:
             waiting.append(row_id)
             _alert_meta_leak_held(row_id, gym_id)
@@ -1329,11 +1370,20 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 reservation_day = _local_now(now, gym_tz).date().isoformat()
                 if require_proof:
                     try:
+                        signature = inspect.signature(claim_slot)
+                        supports_proof = (
+                            "require_proof" in signature.parameters
+                            or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                                   for p in signature.parameters.values())
+                        )
+                    except (TypeError, ValueError):
+                        supports_proof = False
+                    if supports_proof:
                         won = claim_slot(row_id, gym_id, reservation_day, gym_tz,
                                          _publish_capacity(gym_id, row, store,
                                                            reservation_day),
                                          approved_only, require_proof=True)
-                    except TypeError:
+                    else:
                         # A store whose claim cannot carry the proof requirement
                         # must never claim in Manual mode while armed.
                         won = None

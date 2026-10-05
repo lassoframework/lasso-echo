@@ -223,6 +223,14 @@ class _FakeCalStore:
         r["caption"] = new_caption          # status DELIBERATELY untouched
         return dict(r)
 
+    def patch_caption(self, gym_id, row_id, new_caption):
+        r = self.rows.get(row_id)
+        if r is None or r.get("gym_id") != gym_id:
+            return None
+        r["caption"] = new_caption
+        r["status"] = "pending"             # fresh approval is required
+        return dict(r)
+
     def mark_publishing(self, row_id):
         r = self.rows.get(row_id)
         if not r or r.get("status") not in ("pending", "approved") \
@@ -295,6 +303,57 @@ def test_publish_lane_strip_survives_a_store_without_the_patch_method(_armed):
     summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert summary["published"] == ["r3"]
     assert pub.calls[0].caption == CLEAN_BODY
+
+
+def test_proof_lane_strips_then_holds_for_fresh_human_approval(
+        _armed, monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    alerts = []
+    monkeypatch.setattr(cap, "_alert_meta_reapproval_held",
+                        lambda row_id, gym_id, persisted:
+                        alerts.append((row_id, gym_id, persisted)))
+    store = _FakeCalStore([
+        _row("proved-meta", f"{CLEAN_BODY}\n\n{LEAKED_META}", status="approved")
+    ])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True)
+
+    assert summary["published"] == []
+    assert summary["waiting"] == ["proved-meta"]
+    assert pub.calls == []
+    assert store.preserve_patches == []
+    assert store.rows["proved-meta"]["caption"] == CLEAN_BODY
+    assert store.rows["proved-meta"]["status"] == "pending"
+    assert alerts == [("proved-meta", "lasso", True)]
+
+
+def test_proof_lane_patch_failure_still_holds_original_approved_row(
+        _armed, monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    alerts = []
+    monkeypatch.setattr(cap, "_alert_meta_reapproval_held",
+                        lambda row_id, gym_id, persisted:
+                        alerts.append((row_id, gym_id, persisted)))
+
+    class _FailingPatchStore(_FakeCalStore):
+        def patch_caption(self, gym_id, row_id, new_caption):
+            raise RuntimeError("write unavailable")
+
+    original = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    store = _FailingPatchStore([_row("patch-failed", original, status="approved")])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True)
+
+    assert summary["published"] == []
+    assert summary["waiting"] == ["patch-failed"]
+    assert pub.calls == []
+    assert store.rows["patch-failed"]["caption"] == original
+    assert store.rows["patch-failed"]["status"] == "approved"
+    assert alerts == [("patch-failed", "lasso", False)]
 
 
 def test_gbp_worker_strips_meta_suffix_before_send():
