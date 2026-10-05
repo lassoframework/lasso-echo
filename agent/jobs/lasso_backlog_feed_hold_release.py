@@ -54,8 +54,7 @@ def _pending(row, fmt, account):
     return (row.get("gym_id") == "lasso"
             and row.get("account") == account
             and row.get("format") == fmt
-            and row.get("post_date") in ("2026-10-02", "2026-10-03",
-                                         "2026-10-04", "2026-10-05")
+            and FIRST <= str(row.get("post_date") or "") <= LAST
             and row.get("slot_index") in (0, 1, 2)
             and row.get("status") == "pending"
             and row.get("variant_status") == "active"

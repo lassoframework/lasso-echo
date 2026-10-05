@@ -857,6 +857,44 @@ def test_lasso_paired_story_requires_delivered_logical_feed(armed, monkeypatch):
     assert store.rows["paired-story"]["status"] == "published"
 
 
+def test_due_lasso_feed_missing_story_is_held_and_reports_stall(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
+    row = _row("missing-story-feed", post_date="2026-10-05")
+    row["slot_index"] = 0
+    store = _FakeStore([row])
+    monkeypatch.setattr(store, "lasso_paired_story_ready_for_feed", lambda _: False,
+                        raising=False)
+    failures = []
+    monkeypatch.setattr(cap, "_note_repeat_failure",
+                        lambda rid, gym, exc: failures.append((rid, gym, str(exc))))
+    pub = _FakePublisher()
+    result = cap.publish_due("2026-10-05", store=store, publisher=pub,
+                             now="2026-10-05T23:59:00-04:00", catch_all=True)
+    assert result["waiting"] == [row["id"]]
+    assert result["published"] == []
+    assert store.publishing_calls == []
+    assert failures == [(row["id"], "lasso",
+                         "paired Story source proof unavailable; feed remains held")]
+
+
+def test_lasso_hold_release_jobs_require_cadence_flag(armed, monkeypatch):
+    from agent.jobs import lasso_backlog_feed_hold_release as backlog
+    from agent.jobs import lasso_daily_paired_stories as paired
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: False)
+    monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
+    store = _FakeStore([])
+    store._client = lambda: None
+    def forbidden(*args, **kwargs):
+        raise AssertionError("disarmed release job called")
+    monkeypatch.setattr(backlog, "run", forbidden)
+    monkeypatch.setattr(paired, "release_ready_holds", forbidden)
+    result = cap.publish_due("2026-10-05", store=store,
+                             publisher=_FakePublisher(),
+                             now="2026-10-05T23:59:00-04:00")
+    assert result["published"] == []
+
+
 def test_lasso_story_accepts_persisted_zernio_dedup_receipt(armed, monkeypatch):
     monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
     feed, story = _paired_rows(feed_media_id="")

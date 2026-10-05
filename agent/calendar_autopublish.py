@@ -1254,7 +1254,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
     # A reviewed managed Story unlocks only the exact dated incident feed hold.
     # This CAS never changes captions, visuals, claims or another hold reason.
-    if gym_id == "lasso" and hasattr(store, "_client"):
+    if (gym_id == "lasso" and config.lasso_three_feed_enabled()
+            and hasattr(store, "_client")):
         try:
             from .jobs import lasso_backlog_feed_hold_release
             for paired_account in ("instagram", "facebook"):
@@ -1266,7 +1267,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
     # Repaired Stories stay held until their exact feed has a real publish
     # receipt. Release through the database's source-proof RPC before due_rows
     # filters media-held rows. A failed release never blocks the feed lane.
-    if gym_id == "lasso" and hasattr(store, "_client"):
+    if (gym_id == "lasso" and config.lasso_three_feed_enabled()
+            and hasattr(store, "_client")):
         try:
             from .jobs.lasso_daily_paired_stories import release_ready_holds
             release_ready_holds(store, run_date, catchup_days=catchup_days)
@@ -1427,6 +1429,11 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             and row_date >= "2026-10-02"
             and _lasso_three_feed_enabled(gym_id, row_date))
         if paired_lasso_feed and not _paired_lasso_story_prepared(row, store):
+            # A due feed without its reviewed Story is an actionable stall.
+            # Keep it unclaimed; use the existing persisted threshold/dedupe
+            # so repeated minute ticks produce one operational alert per day.
+            _note_repeat_failure(row_id, gym_id, RuntimeError(
+                "paired Story source proof unavailable; feed remains held"))
             waiting.append(row_id)
             continue
 
