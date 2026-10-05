@@ -133,6 +133,23 @@ def test_video_poster_evidence_survives_store_and_real_calendar_mirror(tmp_path)
     }
 
 
+def test_render_evidence_survives_pending_store_round_trip_without_calendar_column(tmp_path):
+    store = PendingStore(str(tmp_path / "render_evidence.db"))
+    draft = _draft(draft_id="render1", day_key="2026-07-03", draft_type="feed")
+    draft.creative_public_url = "https://cdn.example/delivered.jpg"
+    draft.render_evidence = {
+        "operation": "render", "source_exact_url": "https://cdn.example/source.jpg",
+        "delivered_exact_url": draft.creative_public_url,
+        "source_fingerprint": "source", "delivered_fingerprint": "delivered"}
+    store.put(draft)
+
+    restored = store.get("render1")
+    assert restored.render_evidence == draft.render_evidence
+    rows = real_mirror.collect_real_drafts("lasso_ig", store)
+    assert len(rows) == 1
+    assert "render_evidence" not in rows[0]
+
+
 def test_log_post_mirrors_to_posts_table(tmp_path):
     postlog.log_post("lasso_ig", "instagram", "hello", "M1", "would_publish", "d9",
                      path=str(tmp_path / "log.jsonl"))

@@ -1885,7 +1885,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                         locked_days=locked_feed_days, allow_reshape=allow_reshape,
                         poster_render_evidence_by_url=_poster_render_evidence_by_url(
                             drafts),
-                        render_evidence_by_url=_gbp_render_evidence or None)
+                        render_evidence_by_url=_merge_render_evidence_by_url(
+                            _render_evidence_by_url(drafts), _gbp_render_evidence) or None)
     except Exception:
         # _apply catches remote write failures and returns their unknown-outcome
         # flag. An exception escaping its contract is a prewrite planning failure.
@@ -2087,6 +2088,49 @@ def _poster_render_evidence_by_url(drafts):
         thumb = (getattr(draft, "thumbnail_url", "") or "").strip()
         if image and thumb:
             out[(image, thumb)] = evidence
+    return out
+
+
+def _render_evidence_by_url(drafts):
+    """Build the prepared-writer side channel from draft-owned rendition proof.
+
+    The key is the exact delivered creative URL. Reject mismatched or malformed
+    evidence here; the prepared writer independently checks the bytes. If multiple
+    drafts claim one URL with different evidence, omit that URL rather than letting
+    one row's lineage attest another row's creative.
+    """
+    out = {}
+    conflicted = set()
+    for draft in drafts or ():
+        evidence = getattr(draft, "render_evidence", None)
+        url = getattr(draft, "creative_public_url", "") or ""
+        if (not isinstance(url, str) or not url or not isinstance(evidence, dict)
+                or evidence.get("delivered_exact_url") != url):
+            continue
+        if url in out and out[url] != evidence:
+            conflicted.add(url)
+        else:
+            out[url] = evidence
+    for url in conflicted:
+        out.pop(url, None)
+    return out
+
+
+def _merge_render_evidence_by_url(*maps):
+    """Merge URL keyed proof maps without choosing between conflicting claims."""
+    out = {}
+    conflicted = set()
+    for mapping in maps:
+        for url, evidence in (mapping or {}).items():
+            if (not isinstance(url, str) or not url or not isinstance(evidence, dict)
+                    or evidence.get("delivered_exact_url") != url):
+                continue
+            if url in out and out[url] != evidence:
+                conflicted.add(url)
+            else:
+                out[url] = evidence
+    for url in conflicted:
+        out.pop(url, None)
     return out
 
 
@@ -3206,7 +3250,8 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
             _reservation_state["insert_started"] = True
         inserted_rows = _insert_rows_with_poster_evidence(
             insert_rows, base_key, store_rows,
-            _poster_render_evidence_by_url(drafts)) or []
+            _poster_render_evidence_by_url(drafts),
+            render_evidence_by_url=_render_evidence_by_url(drafts)) or []
         inserted = len(inserted_rows)
     except Exception as exc:  # noqa: BLE001
         # The insert request may have reached the remote store before the exception;

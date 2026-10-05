@@ -1860,3 +1860,43 @@ def test_prepared_insert_does_not_retry_typeerror_without_poster_proof(monkeypat
                                               evidence)
     assert len(calls) == 1
     assert calls[0][1]["poster_render_evidence_by_url"] == evidence
+
+
+def test_drive_render_evidence_is_forwarded_by_exact_delivered_url(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    delivered = "https://cdn/rendered.jpg"
+    evidence = {"operation": "render", "source_exact_url": "https://cdn/source.jpg",
+                "delivered_exact_url": delivered, "source_fingerprint": "src",
+                "delivered_fingerprint": "dst"}
+    draft = type("Draft", (), {"creative_public_url": delivered,
+                               "render_evidence": evidence})()
+    side_channel = cmr._render_evidence_by_url([draft])
+    assert side_channel == {delivered: evidence}
+
+    calls = []
+    def store_fn(base_key, rows, *, render_evidence_by_url=None):
+        calls.append((rows, render_evidence_by_url))
+        return rows
+
+    row = {"image_url": delivered}
+    cmr._insert_rows_with_poster_evidence(
+        store_fn, "gritx", [row], {}, render_evidence_by_url=side_channel)
+    assert calls == [([row], side_channel)]
+    assert "render_evidence" not in row
+
+
+def test_drive_render_evidence_rejects_mismatch_and_cross_row_collision():
+    one = {"operation": "render", "delivered_exact_url": "https://cdn/shared.jpg",
+           "source_exact_url": "https://cdn/one.jpg"}
+    two = {"operation": "render", "delivered_exact_url": "https://cdn/shared.jpg",
+           "source_exact_url": "https://cdn/two.jpg"}
+    a = type("Draft", (), {"creative_public_url": "https://cdn/shared.jpg",
+                           "render_evidence": one})()
+    b = type("Draft", (), {"creative_public_url": "https://cdn/shared.jpg",
+                           "render_evidence": two})()
+    mismatch = type("Draft", (), {"creative_public_url": "https://cdn/other.jpg",
+                                  "render_evidence": one})()
+    assert cmr._render_evidence_by_url([a, b, mismatch]) == {}
+    assert cmr._merge_render_evidence_by_url(
+        {"https://cdn/shared.jpg": one},
+        {"https://cdn/shared.jpg": two}) == {}

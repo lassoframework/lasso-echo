@@ -42,6 +42,10 @@ def _to_dict(d: Draft):
         # column.
         "thumbnail_url": getattr(d, "thumbnail_url", ""),
         "poster_render_evidence": getattr(d, "poster_render_evidence", {}),
+        # Drive/photo rendition proof survives PendingStore so the real calendar
+        # mirror can send it through the prepared writer side channel. Draft JSON
+        # only; never a content_calendar field.
+        "render_evidence": getattr(d, "render_evidence", {}),
         "scheduled_for": d.scheduled_for,
         "status": d.status.value,
         "blocked_reason": d.blocked_reason,
@@ -150,6 +154,9 @@ def _from_dict(r):
     poster_evidence = r.get("poster_render_evidence", {})
     if isinstance(poster_evidence, dict) and poster_evidence:
         draft.poster_render_evidence = poster_evidence
+    render_evidence = r.get("render_evidence", {})
+    if isinstance(render_evidence, dict) and render_evidence:
+        draft.render_evidence = render_evidence
     return draft
 
 

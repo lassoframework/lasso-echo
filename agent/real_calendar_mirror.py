@@ -298,7 +298,8 @@ def _draft_eligible(draft):
     return True
 
 
-def collect_real_drafts(account_key, store, poster_evidence_out=None):
+def collect_real_drafts(account_key, store, poster_evidence_out=None,
+                        render_evidence_out=None):
     """The gym's REAL drafts as content_calendar row dicts.
 
     Included: a draft for THIS account that carries a real hosted creative URL or an
@@ -319,6 +320,10 @@ def collect_real_drafts(account_key, store, poster_evidence_out=None):
     mirror_to_supabase forwards the dict to insert_rows(poster_render_evidence_by_url=...)
     so the guarded calendar writer can bind each video row's distinct thumbnail to a
     byte-bound rendition receipt.
+
+    render_evidence_out: optional URL-keyed side channel from draft-owned rendition
+    evidence. Evidence is accepted only when its exact delivered URL matches the row
+    creative URL; conflicting claims for one URL are omitted.
     """
     if not account_key or store is None:
         return []
@@ -337,6 +342,20 @@ def collect_real_drafts(account_key, store, poster_evidence_out=None):
             thumb = row.get("thumbnail_url") or ""
             if image and thumb:
                 poster_evidence_out[(image, thumb)] = poster_evidence
+        render_evidence = getattr(draft, "render_evidence", None)
+        delivered = row.get("image_url") or ""
+        if (isinstance(render_evidence, dict) and isinstance(delivered, str) and delivered
+                and render_evidence.get("delivered_exact_url") == delivered
+                and render_evidence_out is not None):
+            if delivered in render_evidence_out:
+                if render_evidence_out[delivered] != render_evidence:
+                    render_evidence_out[delivered] = None
+            else:
+                render_evidence_out[delivered] = render_evidence
+    if render_evidence_out is not None:
+        for url in [url for url, evidence in render_evidence_out.items()
+                    if not isinstance(evidence, dict)]:
+            render_evidence_out.pop(url, None)
     return rows
 
 
@@ -453,6 +472,7 @@ def mirror_to_supabase(account_key, store, sb_store):
     # Real rows, gym-forced, with any stray id stripped (belt and braces; _real_row no
     # longer emits one). A real gym never carries a demo id, so a demo-id row is dropped.
     poster_evidence_by_url = {}
+    render_evidence_by_url = {}
     real_rows = []
     try:
         hash_enabled = bool(config.source_media_content_hash_enabled())
@@ -460,7 +480,8 @@ def mirror_to_supabase(account_key, store, sb_store):
         hash_enabled = False
     for row in collect_real_drafts(
             account_key, store,
-            poster_evidence_out=poster_evidence_by_url):
+            poster_evidence_out=poster_evidence_by_url,
+            render_evidence_out=render_evidence_by_url):
         if (_demo.is_demo_draft_id(row.get("id"))
                 or str(row.get("gym_id")) != str(account_key)):
             continue
@@ -499,14 +520,18 @@ def mirror_to_supabase(account_key, store, sb_store):
         insert_rows = getattr(sb_store, "insert_rows", None)
         if insert_rows is not None and real_rows:
             from . import visual_writer_prepare
-            if poster_evidence_by_url and visual_writer_prepare.enabled():
+            if ((poster_evidence_by_url or render_evidence_by_url)
+                    and visual_writer_prepare.enabled()):
                 # Poster proof is a side channel, never a row column: the store binds
                 # each (image_url, thumbnail_url) pair to its rendition receipt at the
                 # prepared-writer boundary. A TypeError can happen after an internal
                 # write, so it must fail the mirror rather than retrying without proof.
-                inserted += len(insert_rows(
-                    account_key, real_rows,
-                    poster_render_evidence_by_url=poster_evidence_by_url) or [])
+                kwargs = {}
+                if poster_evidence_by_url:
+                    kwargs["poster_render_evidence_by_url"] = poster_evidence_by_url
+                if render_evidence_by_url:
+                    kwargs["render_evidence_by_url"] = render_evidence_by_url
+                inserted += len(insert_rows(account_key, real_rows, **kwargs) or [])
             else:
                 inserted += len(insert_rows(account_key, real_rows) or [])
     except Exception as exc:
