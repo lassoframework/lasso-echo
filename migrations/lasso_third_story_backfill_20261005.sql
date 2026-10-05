@@ -77,7 +77,7 @@ begin
   -- (LIVE-feed path).
   if not exists (
     select 1 from public.echo_infographic_artifacts a
-     where a.tenant = 'lasso' and a.image_url = p_feed_image_url
+     where a.tenant in ('lasso', 'lasso_ig') and a.image_url = p_feed_image_url
        and a.source_identity->>'source_hash' = p_source_hash
        and (p_caption_hash is null or
             a.source_identity->>'source_id' =

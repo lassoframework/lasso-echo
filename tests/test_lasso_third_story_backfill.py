@@ -15,6 +15,25 @@ DIGEST = "a" * 64
 LOGICAL = "319e7d10-7d82-4545-8d95-aee4bb2b1168"
 
 
+def test_repaired_feed_artifact_can_use_ig_tenant(monkeypatch):
+    seen = []
+    def fake_read(_store, _table, params):
+        seen.append(params["tenant"])
+        return [{"tenant": "lasso_ig"}] if params["tenant"] == "eq.lasso_ig" else []
+    monkeypatch.setattr(job, "_read", fake_read)
+    assert job._artifact(object(), FEED_URL, ("lasso", "lasso_ig"))["tenant"] == "lasso_ig"
+    assert seen == ["eq.lasso", "eq.lasso_ig"]
+
+
+def test_malformed_manifest_item_isolated(monkeypatch):
+    monkeypatch.setattr(job, "plan_one", lambda _store, item, _catalog: {
+        "date": item["date"], "story_id": "story", "feed_id": "feed"})
+    results = job.run({"stories": [{"feed_id": "missing-date"}, {"date": DAY}]},
+                      object(), CATALOG)
+    assert results[0]["receipt"]["result"] == "blocked"
+    assert results[1]["receipt"]["result"] == "dry_run"
+
+
 def fixture(monkeypatch, *, logical=LOGICAL, occupied=None, aspect="9:16"):
     entry = job._catalog_entry(DAY, catalog_path=CATALOG)
     source, _ = job._source_identity(entry)
@@ -33,7 +52,7 @@ def fixture(monkeypatch, *, logical=LOGICAL, occupied=None, aspect="9:16"):
                       "evidence": {"grade_status": "PASS", "image_sha256": DIGEST,
                                    "policy_version": "reviewed-v1", "aspect": aspect}}
     monkeypatch.setattr(job, "_feed", lambda _store, _id: feed)
-    monkeypatch.setattr(job, "_artifact", lambda _store, url:
+    monkeypatch.setattr(job, "_artifact", lambda _store, url, *_tenants:
                         feed_artifact if url == FEED_URL else story_artifact)
     monkeypatch.setattr(job, "_story_rows", lambda _store, _day: occupied or [])
     item = {"date": DAY, "feed_id": FEED_ID, "story_image_url": STORY_URL,
@@ -137,7 +156,7 @@ def live_fixture(monkeypatch, *, day=DAY, caption=LIVE_CAPTION, feed_url=FEED_UR
                       "evidence": {"grade_status": "PASS", "image_sha256": DIGEST,
                                    "policy_version": "reviewed-v1", "aspect": "9:16"}}
     monkeypatch.setattr(job, "_feed", lambda _store, _id: feed)
-    monkeypatch.setattr(job, "_artifact", lambda _store, url:
+    monkeypatch.setattr(job, "_artifact", lambda _store, url, *_tenants:
                         feed_artifact if url == feed_url else story_artifact)
     monkeypatch.setattr(job, "_story_rows", lambda _store, _day: [])
     item = {"date": day, "feed_id": FEED_ID, "story_image_url": STORY_URL,

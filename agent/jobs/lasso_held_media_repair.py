@@ -184,8 +184,10 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         cache_key = "held-feed:" + hashlib.sha256(
             f"{source_id}:{source_hash}".encode("utf-8")).hexdigest()
         owner = str(uuid.uuid4())
+        claimed = False
         try:
-            if not artifact_store.claim(ACCOUNT, cache_key, owner):
+            claimed = artifact_store.claim(ACCOUNT, cache_key, owner)
+            if not claimed:
                 summary["skipped"] += 1
                 continue
             summary["attempted"] += 1
@@ -216,8 +218,9 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         except Exception:
             summary["errors"] += 1
         finally:
-            try:
-                artifact_store.release(ACCOUNT, cache_key, owner)
-            except Exception:
-                summary["errors"] += 1
+            if claimed:
+                try:
+                    artifact_store.release(ACCOUNT, cache_key, owner)
+                except Exception:
+                    summary["errors"] += 1
     return summary

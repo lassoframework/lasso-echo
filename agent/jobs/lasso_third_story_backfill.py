@@ -91,9 +91,14 @@ def _feed(store, feed_id):
         "gym_id": "eq.lasso", "select": "*"})
 
 
-def _artifact(store, image_url):
-    return _one(store, ARTIFACT_TABLE, {"tenant": "eq.lasso",
-        "image_url": "eq." + image_url, "select": "*"})
+def _artifact(store, image_url, tenants=("lasso",)):
+    rows = []
+    for tenant in tenants:
+        rows.extend(_read(store, ARTIFACT_TABLE, {"tenant": "eq." + tenant,
+            "image_url": "eq." + image_url, "select": "*", "limit": "2"}))
+    if len(rows) != 1:
+        raise ValueError(f"expected one reviewed artifact, found {len(rows)}")
+    return rows[0]
 
 
 def _story_rows(store, day):
@@ -161,7 +166,7 @@ def plan_one(store, item, catalog_path):
             raise ValueError("live feed caption lacks approved Summit facts")
         caption_hash = _caption_hash(caption)
         expected_hash = caption_hash
-    feed_artifact = _artifact(store, feed["image_url"])
+    feed_artifact = _artifact(store, feed["image_url"], ("lasso", "lasso_ig"))
     feed_evidence = feed_artifact.get("evidence") or {}
     if (feed_artifact.get("source_identity", {}).get("source_hash") != expected_hash
             or feed_evidence.get("grade_status") != "PASS"
@@ -225,11 +230,13 @@ def run(manifest, store, catalog_path, *, apply=False, on_result=None):
     items = manifest.get("stories") if isinstance(manifest, dict) else None
     if not isinstance(items, list) or not items or len(items) > 47:
         raise ValueError("manifest needs 1-47 dated Story items")
-    dates = [str(item.get("date") or "") for item in items]
+    dates = [str(item.get("date") or "") if isinstance(item, dict) else ""
+             for item in items]
     if len(set(dates)) != len(dates):
         raise ValueError("duplicate dates in manifest")
     results = []
-    for item in sorted(items, key=lambda x: x["date"]):
+    for item in sorted(items, key=lambda x: str(x.get("date") or "")
+                       if isinstance(x, dict) else ""):
         try:
             action = plan_one(store, item, catalog_path)
             receipt = apply_one(store, action) if apply else {"result": "dry_run"}
@@ -243,7 +250,7 @@ def run(manifest, store, catalog_path, *, apply=False, on_result=None):
             results.append({"date": action["date"], "story_id": action["story_id"],
                             "feed_id": action["feed_id"], "receipt": receipt})
         except Exception as exc:
-            results.append({"date": item.get("date"), "receipt": {
+            results.append({"date": item.get("date") if isinstance(item, dict) else None, "receipt": {
                 "result": "blocked", "reason": type(exc).__name__, "detail": str(exc)[:220]}})
         if on_result is not None:
             on_result(results)
