@@ -553,11 +553,20 @@ def test_lasso_variant_uses_exact_scheduled_caption_and_records_its_source(monke
     assert seen["headline"] == "Your team can see the next step."
     assert seen["facts"] == [caption]
     assert seen["kwargs"]["draft_id"] == row["id"]
-    assert seen["kwargs"]["cta"] == seen["kwargs"]["footer"] == ""
+    assert seen["kwargs"]["cta"] == ""
+    assert seen["kwargs"]["footer"] is None
     assert seen["artifact"][3] == {
         "source_id": "content_calendar:lasso-post-1:caption",
         "source_hash": hashlib.sha256(caption.encode("utf-8")).hexdigest(),
     }
+
+
+def test_lasso_variant_uses_only_cta_present_in_scheduled_caption(monkeypatch):
+    from agent import content_planner
+    monkeypatch.setattr(content_planner, "load_source_doc", lambda: type(
+        "Doc", (), {"ctas": ["Book a growth call", "Save this for later"]})())
+    assert vr._caption_approved_cta("One clear step. Book a growth call") == "Book a growth call"
+    assert vr._caption_approved_cta("One clear step for your team") == ""
 
 
 def test_lasso_variant_requires_row_identity_for_artifact_provenance(monkeypatch):

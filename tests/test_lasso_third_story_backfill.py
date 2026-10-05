@@ -122,7 +122,8 @@ def test_rpc_payload_is_narrow_and_readback_required(monkeypatch):
 
 def test_sql_grants_service_role_only_and_checks_active_slot():
     sql = (CATALOG.parents[1] / "migrations" / "lasso_third_story_backfill_20261005.sql").read_text()
-    assert "lock table public.content_calendar in share row exclusive mode" in sql
+    assert "lock table public.content_calendar" not in sql
+    assert "for update" in sql
     assert "pg_advisory_xact_lock" in sql
     assert "occupied_story_slot" in sql
     assert "a.evidence->>'aspect' = '9:16'" in sql

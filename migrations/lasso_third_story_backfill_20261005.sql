@@ -50,9 +50,8 @@ begin
     return jsonb_build_object('result','conflict','reason','invalid_input');
   end if;
 
-  -- Also conflicts with ordinary INSERT/UPDATE/DELETE writers. The advisory
-  -- lock provides the per-gym/day coordination contract for this RPC.
-  lock table public.content_calendar in share row exclusive mode;
+  -- The source row lock, per-day advisory lock, and unique active slot index
+  -- coordinate this insert without blocking calendar writers for other gyms.
   select * into v_feed from public.content_calendar
    where id = p_feed_id and gym_id = 'lasso' and lower(btrim(account)) = 'instagram'
      and lower(btrim(coalesce(format, 'feed'))) = 'feed'
@@ -63,8 +62,7 @@ begin
   end if;
   v_day := v_feed.post_date;
   perform pg_advisory_xact_lock(hashtextextended('lasso|instagram|' || v_day::text, 0));
-  if (p_caption_hash is null and v_day not between date '2026-09-23' and date '2026-11-08')
-     or (p_caption_hash is not null and v_day not between date '2026-09-23' and date '2026-11-08')
+  if v_day not between date '2026-09-23' and date '2026-11-08'
      or v_feed.status not in ('pending','approved','publishing','published')
      or v_feed.caption is distinct from p_feed_caption
      or v_feed.image_url is distinct from p_feed_image_url

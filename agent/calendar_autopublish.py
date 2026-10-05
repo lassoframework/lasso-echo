@@ -301,14 +301,11 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
         # Compatibility for narrow injected resolvers predating the dated API.
         # The production resolver accepts `day` and always takes the path above.
         capacity = resolve_posts_per_day(gym_id, store)
-    is_feed = (row.get("format") or "feed").strip().lower() == "feed"
-    if (is_feed
-            and _lasso_three_feed_enabled(gym_id, local_claim_day)):
-        return max(capacity, 3)
+    fmt = (row.get("format") or "feed").strip().lower()
+    is_feed = fmt == "feed"
     # Both the durable cadence and the dated Summit cadence pair each feed
     # with a Story, so their publish capacity must agree with the planner.
-    if ((row.get("format") or "feed").strip().lower() == "story"
-            and str(gym_id or "").strip().lower() == "lasso"
+    if (fmt in ("feed", "story")
             and _lasso_three_feed_enabled(gym_id, local_claim_day)):
         return max(capacity, 3)
     return capacity if is_feed else min(capacity, 2)

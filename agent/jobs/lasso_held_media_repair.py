@@ -28,7 +28,7 @@ _CAS_COLUMNS = (
     "source_media_asset_id", "thumbnail_url", "created_at",
     "media_not_ready_reason", "published_at", "late_post_id",
     "publish_claim_token", "publish_reservation_day", "slot_index",
-    "scheduled_at",
+    "scheduled_at", "logical_post_id",
 )
 
 
@@ -74,7 +74,7 @@ def _eq(value):
     return f"eq.{value}"
 
 
-def _reviewed_existing_artifact(store, source_id, source_hash, account_key=ACCOUNT):
+def _reviewed_artifact_record(store, source_id, source_hash, account_key=ACCOUNT):
     """Reuse a persisted reviewed image before any new paid generation.
 
     A failed or incomplete lookup is an error, not a cache miss: generating in
@@ -107,8 +107,115 @@ def _reviewed_existing_artifact(store, source_id, source_hash, account_key=ACCOU
                 and evidence.get("grade_status") == "PASS"
                 and evidence.get("image_sha256")
                 and evidence.get("review_response_id")):
-            return row["image_url"]
+            return row
     return None
+
+
+def _reviewed_existing_artifact(store, source_id, source_hash, account_key=ACCOUNT):
+    record = _reviewed_artifact_record(store, source_id, source_hash, account_key)
+    return record["image_url"] if record else None
+
+
+def _mirror_ig_sibling(store, fb_row):
+    """Find one exact active IG sibling, or refuse an ambiguous mirror.
+
+    A present logical_post_id is authoritative. Legacy rows use their date and
+    slot; exact caption equality keeps platform-specific FB copy independent.
+    Returns (sibling, ambiguous_or_missing_logical_group).
+    """
+    logical_id = fb_row.get("logical_post_id")
+    day = str(fb_row["post_date"])[:10]
+    if logical_id:
+        rows = store.list_active_logical_post_rows(GYM, logical_id)
+    else:
+        rows = store.rows_in_range_repeat_hold(GYM, day, day)
+    if not isinstance(rows, list):
+        raise RuntimeError("mirror sibling read incomplete")
+    same_slot = [row for row in rows if isinstance(row, dict)
+                 and row.get("gym_id") == GYM
+                 and str(row.get("account") or "").lower() in ("instagram", "ig")
+                 and str(row.get("format") or "").lower() == "feed"
+                 and row.get("variant_status") == "active"
+                 and str(row.get("post_date") or "")[:10] == day
+                 and row.get("slot_index") == fb_row.get("slot_index")
+                 and (not logical_id or row.get("logical_post_id") == logical_id)]
+    exact = [row for row in same_slot if row.get("caption") == fb_row["caption"]]
+    if len(exact) > 1 or (logical_id and len(same_slot) != 1):
+        return None, True
+    if not exact:
+        return None, False
+    return exact[0], False
+
+
+def _reuse_ig_for_fb(store, fb_row):
+    """Return (reviewed URL, mirror_found) after FB provenance is durable.
+
+    A matching mirror whose IG visual is not yet repaired waits. It never pays
+    for a different FB visual merely because the IG artifact is unavailable.
+    """
+    ig_row, ambiguous = _mirror_ig_sibling(store, fb_row)
+    if ambiguous:
+        return None, True
+    if ig_row is None:
+        return None, False
+    if ig_row.get("media_not_ready_reason") is not None:
+        return None, True
+    if not _same_row(ig_row, store.get_row(GYM, ig_row["id"])):
+        return None, True
+    ig_source_id = f"content_calendar:{ig_row['id']}:caption"
+    source_hash = hashlib.sha256(fb_row["caption"].encode("utf-8")).hexdigest()
+    ig_artifact = _reviewed_artifact_record(store, ig_source_id, source_hash, ACCOUNT)
+    if not ig_artifact or ig_row.get("image_url") != ig_artifact["image_url"]:
+        return None, True
+
+    fb_source = {"source_id": f"content_calendar:{fb_row['id']}:caption",
+                 "source_hash": source_hash}
+    fb_evidence = dict(ig_artifact["evidence"])
+    fb_evidence["mirror_reuse_from"] = {
+        "tenant": ACCOUNT, "source_id": ig_source_id,
+        "source_hash": source_hash}
+    url = ig_artifact["image_url"]
+    # ArtifactStore's source-aware cache query is by row/caption. Its table's
+    # unique tenant+URL key also needs checking before insert so another FB
+    # source's evidence is never overwritten by a mirror reuse.
+    def fb_record_for_url():
+        response = store._client().get(
+            store._rest("echo_infographic_artifacts"),
+            params={"tenant": f"eq.{ACCOUNTS['facebook']}", "image_url": _eq(url),
+                    "select": "image_url,evidence,source_identity", "limit": "2"},
+            headers=store._headers(), timeout=30)
+        if response.status_code >= 400:
+            raise RuntimeError("FB reviewed artifact lookup failed")
+        rows = response.json()
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise RuntimeError("FB reviewed artifact lookup incomplete")
+        return rows[0] if rows else None
+
+    existing = fb_record_for_url()
+    if existing is None:
+        response = store._client().post(
+            store._rest("echo_infographic_artifacts"),
+            params={"on_conflict": "tenant,image_url"},
+            headers=store._headers({"Content-Type": "application/json",
+                                    "Prefer": "resolution=ignore-duplicates"}),
+            json={"tenant": ACCOUNTS["facebook"], "image_url": url,
+                  "image_sha256": fb_evidence["image_sha256"],
+                  "evidence": fb_evidence, "source_identity": fb_source},
+            timeout=30)
+        if response.status_code >= 400:
+            raise RuntimeError("FB mirror artifact persistence failed")
+        existing = fb_record_for_url()
+    if (not isinstance(existing, dict)
+            or existing.get("source_identity") != fb_source
+            or existing.get("image_url") != url
+            or existing.get("evidence", {}).get("mirror_reuse_from") !=
+                fb_evidence["mirror_reuse_from"]
+            or existing.get("evidence", {}).get("image_sha256") !=
+                ig_artifact["evidence"]["image_sha256"]):
+        raise RuntimeError("FB mirror artifact provenance conflict")
+    if not _same_row(ig_row, store.get_row(GYM, ig_row["id"])):
+        return None, True
+    return url, True
 
 
 def _replace_exact(store, current, new_url, account_key=ACCOUNT):
@@ -203,7 +310,15 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
             if not _same_row(row, fresh):
                 summary["skipped"] += 1
                 continue
-            url = _reviewed_existing_artifact(store, source_id, source_hash, account_key)
+            url = None
+            if account_key == ACCOUNTS["facebook"]:
+                url, mirror_found = _reuse_ig_for_fb(store, row)
+                if mirror_found and not url:
+                    summary["skipped"] += 1
+                    continue
+            if not url:
+                url = _reviewed_existing_artifact(store, source_id, source_hash,
+                                                  account_key)
             if url:
                 summary["reused"] += 1
             else:

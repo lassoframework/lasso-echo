@@ -78,6 +78,18 @@ def _lasso_caption_brief(row):
     return headline, [caption]
 
 
+def _caption_approved_cta(caption):
+    """Render a Brain CTA only when this scheduled caption actually contains it."""
+    try:
+        from .content_planner import load_source_doc
+        doc = load_source_doc()
+        matches = [cta for cta in (doc.ctas if doc else ())
+                   if cta and cta.casefold() in caption.casefold()]
+        return max(matches, key=len) if matches else ""
+    except Exception:
+        return ""
+
+
 def generate_variant_image(row, account_key, client=None, generate_fn=None,
                            host_fn=None):
     """Generate ONE new image for the logical post `row` already represents,
@@ -107,7 +119,11 @@ def generate_variant_image(row, account_key, client=None, generate_fn=None,
     surface = "story" if is_story else "feed post"
 
     gen = generate_fn or _default_generate
-    extra = {"cta": "", "footer": "", "draft_id": str(row["id"])} if lasso_quality else {}
+    # The caption remains the source of claim text. A CTA must already occur in
+    # that caption; None lets creative_studio render its approved URL footer.
+    extra = ({"cta": _caption_approved_cta(str(row["caption"])),
+              "footer": None, "draft_id": str(row["id"])}
+             if lasso_quality else {})
     result = gen(headline, facts, client=client, aspect=aspect, pixels=pixels,
                 surface=surface, account_key=account_key, **extra)
     if not result or not result.get("path"):
