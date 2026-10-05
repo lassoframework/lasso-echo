@@ -58,6 +58,14 @@ class FakeMediaStore:
             out.append(dict(s))
         return out
 
+    def get_source(self, source_id):
+        """The CURRENT row for one source by ID (any gym, active or not), or
+        None — the same narrow contract as SupabaseMediaStore.get_source, so
+        the sync guard's persisted-row re-read works against this fake without
+        failing open."""
+        s = self.sources.get(source_id)
+        return dict(s) if s else None
+
     def find_source_by_folder(self, folder_id):
         for s in self.sources.values():
             if s.get("folder_id") == folder_id:

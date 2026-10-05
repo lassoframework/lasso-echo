@@ -121,6 +121,18 @@ class SupabaseMediaStore:
                              {"select": "*", "folder_id": f"eq.{folder_id}"})
         return rows[0] if rows else None
 
+    def get_source(self, source_id):
+        """The CURRENT persisted row for ONE source by ID (any gym, active or
+        not), or None. Narrowly scoped defense-in-depth read for the sync
+        guard (agent/jobs/sync_gym_media.sync_source, 2026-10-05): the caller-
+        supplied source dict is never trusted for tenant/folder/active
+        ownership; the row is re-read by ID immediately before any Drive walk
+        or write so a forged or rewritten in-memory copy cannot steer the
+        sync."""
+        rows = self._get_all(_SOURCE_TABLE,
+                             {"select": "*", "id": f"eq.{source_id}"})
+        return rows[0] if rows else None
+
     def insert_source(self, row):
         r = self._client().post(
             self._rest(_SOURCE_TABLE), json=[dict(row)],
