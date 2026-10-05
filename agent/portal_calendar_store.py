@@ -27,6 +27,7 @@ the row exists and never issues a write that could touch it.
 """
 
 import calendar as _calendar
+import re as _re
 import time as _time
 
 from . import config
@@ -246,6 +247,32 @@ class PortalStoreError(Exception):
         self.status = status
         self.detail = detail
         super().__init__(f"supabase {status}: {detail}")
+
+
+_UUID_RE = _re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+class ReceiptStoreError(PortalStoreError):
+    """A receipt RPC failed or returned something that fails strict parsing.
+    The swap outcome is UNKNOWN: fail closed, never guess from a mutable row."""
+
+
+class ReceiptConflictError(ReceiptStoreError):
+    """SQLSTATE 23514: the action_id is bound to a different request tuple, or
+    the frozen swap group went stale / drifted. Definite: nothing was written
+    by THIS call (the RPC raises inside its transaction, which rolls back)."""
+
+
+class ReceiptHoldError(ReceiptConflictError):
+    """SQLSTATE 23514 manual-review hold: the primary row is missing or carries
+    a historical NULL logical_post_id. No receipt persists; route to a human."""
+
+
+class ReceiptSelectionError(ReceiptStoreError):
+    """SQLSTATE 22023: the selection / prepared payload failed the allowlist.
+    Definite no-write, and it will fail identically on replay."""
 
 
 # The learning-lever columns patch_pending_plan is allowed to re-stamp when a
@@ -860,6 +887,148 @@ class SupabaseCalendarStore:
             if str(row.get("gym_id")) == str(account_key):
                 return row
         return None
+
+    # ---- durable portal action receipts (DRAFT, flag-gated, v3 2026-10-04) ----
+    #
+    # Backing table + RPCs: public.portal_action_receipt and the three SECURITY
+    # DEFINER functions in migrations/portal_action_receipt_draft_20261004.sql
+    # (DRAFT, applied by the database operator only; EXECUTE is service_role
+    # only and the table itself has NO direct PostgREST write grant at all).
+    # Every method here is an RPC wrapper: this client NEVER reads, inserts,
+    # updates or patches the receipt table directly. Callers must gate behind
+    # portal_social._swap_receipts_enabled() (ECHO_SWAP_ACTION_RECEIPT, default
+    # OFF); with the flag off none of these are ever invoked.
+    #
+    # Frozen RPC contract (see the migration header):
+    #   begin(gym, action_id, action, row_uuid, actor, fingerprint)
+    #     -- binds the request tuple BEFORE any row read and captures the
+    #     -- before_state ITSELF; no caller-provided before_state exists.
+    #   claim_selection(gym, action_id, fingerprint, selected_asset,
+    #     planned_siblings) -- CAS-freezes the winner's selection and the exact
+    #     active member manifest (gym, logical_post_id, variant_status=active).
+    #   apply(gym, action_id, fingerprint, prepared) -- ONE transaction that
+    #     writes the exact frozen group and persists the terminal receipt.
+    #
+    # All wrappers fail closed: a non-2xx, an unparseable body, or a returned
+    # row whose tenant / action_id / fingerprint / status does not match the
+    # request exactly raises ReceiptStoreError (never a guessed outcome).
+
+    _RECEIPT_STATUSES = ("started", "selected", "succeeded", "failed", "uncertain")
+
+    def _receipt_rpc(self, fn, args, account_key, action_id,
+                     expect_fingerprint=None, timeout=60):
+        """POST one receipt RPC and strictly parse the typed receipt row back."""
+        try:
+            r = self._client().post(
+                self._rest(f"rpc/{fn}"),
+                headers=self._headers({"Content-Type": "application/json"}),
+                json=args, timeout=timeout)
+        except PortalStoreError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transport failure: unknown outcome
+            raise ReceiptStoreError(0, f"rpc {fn} transport: {type(exc).__name__}")
+        if r.status_code >= 400:
+            code, message = "", ""
+            try:
+                err = r.json()
+                if isinstance(err, dict):
+                    code = str(err.get("code") or "")
+                    message = str(err.get("message") or "")
+            except Exception:  # noqa: BLE001 - fall through to generic below
+                pass
+            detail = _scrub((message or r.text or "")[:200])
+            if code == "23514" and "held for manual review" in message:
+                raise ReceiptHoldError(r.status_code, detail)
+            if code == "23514":
+                raise ReceiptConflictError(r.status_code, detail)
+            if code == "22023":
+                raise ReceiptSelectionError(r.status_code, detail)
+            raise ReceiptStoreError(r.status_code, detail)
+        try:
+            data = r.json()
+        except Exception as exc:  # noqa: BLE001
+            raise ReceiptStoreError(r.status_code,
+                                    f"rpc {fn} unparseable response: {type(exc).__name__}")
+        if not isinstance(data, dict):
+            raise ReceiptStoreError(r.status_code, f"rpc {fn} did not return a receipt row")
+        if str(data.get("gym_id") or "") != str(account_key):
+            raise ReceiptStoreError(r.status_code, f"rpc {fn} returned a foreign-tenant receipt")
+        if str(data.get("action_id") or "") != str(action_id):
+            raise ReceiptStoreError(r.status_code, f"rpc {fn} returned a different action_id")
+        if data.get("status") not in self._RECEIPT_STATUSES:
+            raise ReceiptStoreError(r.status_code, f"rpc {fn} returned an unknown receipt status")
+        if expect_fingerprint is not None and \
+                str(data.get("request_fingerprint") or "") != str(expect_fingerprint):
+            raise ReceiptStoreError(r.status_code, f"rpc {fn} returned a mismatched binding")
+        return data
+
+    def action_receipt_begin(self, account_key, action_id, action, row_id,
+                             actor_id, fingerprint):
+        """Bind (gym, action_id) to the immutable request tuple and return the
+        receipt. SQL captures before_state itself; there is no before_state
+        argument here by contract. Raises ReceiptConflictError on a conflicting
+        reuse, ReceiptHoldError when the row is missing or historical-NULL
+        (manual review), ReceiptStoreError on anything unexpected."""
+        return self._receipt_rpc(
+            "portal_action_receipt_begin",
+            {"p_gym_id": str(account_key), "p_action_id": str(action_id),
+             "p_action": str(action), "p_row_id": str(row_id),
+             "p_actor_id": str(actor_id or ""),
+             "p_request_fingerprint": str(fingerprint)},
+            account_key, action_id, expect_fingerprint=fingerprint, timeout=30)
+
+    def action_receipt_claim(self, account_key, action_id, fingerprint,
+                             selected_asset, planned_siblings):
+        """CAS-freeze the selection and exact active member manifest. The
+        returned row carries the WINNER's frozen selection (a concurrent loser
+        must govern itself by it, never by its own candidate)."""
+        return self._receipt_rpc(
+            "portal_action_receipt_claim_selection",
+            {"p_gym_id": str(account_key), "p_action_id": str(action_id),
+             "p_request_fingerprint": str(fingerprint),
+             "p_selected_asset": dict(selected_asset or {}),
+             "p_planned_siblings": dict(planned_siblings or {})},
+            account_key, action_id, expect_fingerprint=fingerprint, timeout=30)
+
+    def action_receipt_apply(self, account_key, action_id, fingerprint, prepared):
+        """Atomically write the exact frozen group and persist the terminal
+        receipt in the same transaction. Success is ONLY the returned persisted
+        terminal receipt; a timeout or lost response is reconciled by replaying
+        this same call, never by reading a mutable calendar row."""
+        return self._receipt_rpc(
+            "portal_action_receipt_apply",
+            {"p_gym_id": str(account_key), "p_action_id": str(action_id),
+             "p_request_fingerprint": str(fingerprint),
+             "p_prepared": dict(prepared or {})},
+            account_key, action_id, expect_fingerprint=fingerprint, timeout=60)
+
+    def list_active_logical_post_rows(self, account_key, logical_post_id):
+        """Every own-tenant active content_calendar row of one logical post,
+        ascending id. This is a READ scoped exactly like the claim RPC's frozen
+        member manifest (gym_id + logical_post_id + variant_status=active) -- it
+        exists only so a FIRST selection can plan per-row variants; the claim's
+        frozen manifest remains the sole authority on the swap group."""
+        if not _UUID_RE.match(str(logical_post_id or "")):
+            raise PortalStoreError(400, "logical_post_id must be a uuid")
+        params = {"gym_id": f"eq.{account_key}",
+                  "logical_post_id": f"eq.{logical_post_id}",
+                  "variant_status": "eq.active",
+                  "order": "id.asc"}
+        r = self._client().get(self._rest(_TABLE), params=params,
+                               headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not isinstance(rows, list):
+            raise PortalStoreError(500, "logical-post row listing was not a list")
+        out = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise PortalStoreError(500, "logical-post row was not an object")
+            if str(row.get("gym_id") or "") != str(account_key):
+                raise PortalStoreError(500, "logical-post listing leaked a foreign row")
+            out.append(row)
+        return out
 
     def list_future_media_maintenance_rows(self, start_iso, end_iso):
         """Complete cross-gym active future book for a maintenance dry run.

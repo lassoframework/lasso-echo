@@ -123,6 +123,24 @@ def test_social_reads_content_calendar(monkeypatch):
     assert body["posts"][1]["caption"] == ""
 
 
+def test_social_exposes_explicit_hold_on_approved_row_without_changing_status(monkeypatch):
+    held = _row("held", gym_id="swiftriver", status="approved")
+    held["media_not_ready_reason"] = "Incident approval provenance review 2026-10-05"
+    ready = _row("ready", gym_id="swiftriver", status="approved")
+    store = _FakeStore([held, ready])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+
+    status, body = ps.handle_social("swiftriver", "2026-08")
+    assert status == 200
+    posts = {post["id"]: post for post in body["posts"]}
+    assert posts["held"]["status"] == "approved"
+    assert posts["held"]["needs_media"] is True
+    assert posts["held"]["media_not_ready_reason"] == held["media_not_ready_reason"]
+    assert posts["ready"]["status"] == "approved"
+    assert posts["ready"]["needs_media"] is False
+    assert posts["ready"]["media_not_ready_reason"] == ""
+
+
 def test_client_gym_keeps_story_caption(monkeypatch):
     # Blake 2026-08-18: story captions show for CLIENT gyms (only LASSO is blanked). A gym
     # owner (Dale/ENG) must see the story caption to read + approve it — blanking it made the
