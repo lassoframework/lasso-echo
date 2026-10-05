@@ -293,6 +293,81 @@ def test_static_p1_send_return_record_and_permissions():
                          src)
 
 
+def test_static_p1_owner_policies_all_force_rls_tables():
+    """P1 ordinary-owner repair (static): EVERY FORCE-RLS table this
+    package owns carries a narrow owner-passing policy so the SECURITY
+    DEFINER RPC chain stays executable for an ordinary non-BYPASSRLS
+    function owner (FORCE RLS constrains the owner too). Each policy
+    admits ONLY current_user = the live table owner via
+    pg_get_userbyid(relowner); no FORCE-RLS table gains any direct DML
+    grant to a non-owner role."""
+    src = _src()
+    tables = ("visual_scene_attester_binding",
+              "visual_scene_attester_prepared",
+              "visual_scene_attester_event",
+              "visual_scene_attester_send_return")
+    for t in tables:
+        assert re.search(r"alter table public\." + t +
+                         r"\s*enable row level security", src), t
+        assert re.search(r"alter table public\." + t +
+                         r"\s*force row level security", src), t
+    expected = {
+        "visual_scene_attester_binding":
+            ["visual_scene_attester_binding_read",
+             "visual_scene_attester_binding_owner_read"],
+        "visual_scene_attester_prepared":
+            ["visual_scene_attester_prepared_read",
+             "visual_scene_attester_prepared_owner_rw"],
+        "visual_scene_attester_event":
+            ["visual_scene_attester_event_read",
+             "visual_scene_attester_event_owner_insert"],
+        "visual_scene_attester_send_return":
+            ["visual_scene_attester_send_return_owner_rw"],
+    }
+    for t, names in expected.items():
+        policies = re.findall(r"create policy (\w+)\s*on\s*public\." + t,
+                              src)
+        assert policies == names, (t, policies)
+        owner_pols = [n for n in names if n.endswith(("_owner_read",
+                      "_owner_rw", "_owner_insert"))]
+        assert len(owner_pols) == 1, (t, owner_pols)
+        pol = re.search(r"create policy " + owner_pols[0] + r"(.*?);",
+                        src, re.S).group(1)
+        assert "as permissive" in pol and "to public" in pol
+        assert "current_user =" in pol
+        assert "pg_get_userbyid" in pol and "relowner" in pol
+        assert t in pol  # owner lookup pinned to THIS table
+    # Command scoping: binding owner may only SELECT; event owner may only
+    # INSERT; prepared/send_return owners need read+write (WITH CHECK).
+    pol = re.search(r"create policy "
+                    r"visual_scene_attester_binding_owner_read(.*?);",
+                    src, re.S).group(1)
+    assert "for select" in pol and "with check" not in pol
+    pol = re.search(r"create policy "
+                    r"visual_scene_attester_event_owner_insert(.*?);",
+                    src, re.S).group(1)
+    assert "for insert" in pol and "with check" in pol \
+        and "using" not in pol.replace("using (", "", 0)
+    for name in ("visual_scene_attester_prepared_owner_rw",
+                 "visual_scene_attester_send_return_owner_rw"):
+        pol = re.search(r"create policy " + name + r"(.*?);", src,
+                        re.S).group(1)
+        assert "for all" in pol
+        assert "using (current_user =" in pol
+        assert "with check (current_user =" in pol
+    # Still NO direct DML grant on any FORCE-RLS table to a non-owner
+    # role (the only grants anywhere are the evidence SELECTs).
+    for t in tables:
+        assert not re.search(
+            r"grant (insert|update|delete|all)[^;]*on public\." + t,
+            src, re.I), t
+    # The activation-hold language is gone: the repair is complete and the
+    # ordinary-owner end-to-end path is exercised by the PG test.
+    assert "NOT yet proven executable" not in src
+    assert "PARTIAL RLS REPAIR" not in src
+    assert "test_pg_ordinary_owner_end_to_end" in src
+
+
 def test_static_p1_attest_terminate_enforces_send_return_identity():
     """P1 seam repair (static): attest_terminate refuses a delivered
     outcome whose provider post id is not byte-identical to the immutable
@@ -1853,3 +1928,160 @@ def test_pg_send_return_force_rls_owner_policy(scratch):
         _sql(f"alter table public.visual_scene_attester_send_return "
              f"owner to {owner};")
         _sql("drop role if exists att_owner_probe;")
+
+
+def test_pg_ordinary_owner_end_to_end(scratch):
+    """P1 ordinary-owner repair (real PostgreSQL, NO superuser masking):
+    ownership of EVERY public table and function in the scratch
+    stack is transferred to a fresh NOLOGIN, non-superuser, non-BYPASSRLS
+    probe role, then the ACTUAL runtime path is executed AS the split
+    attester roles:
+
+      scene_attester:        claim_prepare -> send_start
+                             -> record_send_return
+      scene_attester_verifier: verifier_read -> attest_terminate
+
+    Under FORCE RLS this succeeds ONLY because each runtime table's
+    owner-passing policy admits the probe owner. Negative direct-caller
+    access under the same ordinary owner:
+
+      * scene_attester direct SELECT/INSERT on send_return: permission
+        denied (no grant at all — double denial with FORCE RLS);
+      * scene_attester direct INSERT on the event log and direct UPDATE
+        on the prepared snapshot: permission denied (no DML grants);
+      * scene_attester direct SELECT on prepared/binding still works
+        (intended evidence SELECT scope) but sees the rows only through
+        the named-role read policies, never through the owner policies;
+      * scene_attester can never certify: attest_terminate refuses with
+        permission denied; the verifier can never record: it loses
+        EXECUTE on record_send_return.
+
+    Ownership is restored afterwards (scratch DB only, never production).
+    """
+    probe = "att_owner_probe"
+    _sql(f"drop role if exists {probe}; create role {probe} nologin;")
+    real_owner = _one("select current_user")
+    transfer = f"""
+do $$
+declare r record;
+begin
+  for r in select c.relname from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+           where n.nspname = 'public' and c.relkind = 'r' loop
+    execute format('alter table public.%I owner to {probe}', r.relname);
+  end loop;
+  for r in select p.oid::regprocedure::text as fn from pg_proc p
+            join pg_namespace n on n.oid = p.pronamespace
+           where n.nspname = 'public' loop
+    execute format('alter function %s owner to {probe}', r.fn);
+  end loop;
+end $$;
+"""
+    restore = f"""
+do $$
+declare r record;
+begin
+  for r in select c.relname from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+           where n.nspname = 'public' and c.relkind = 'r' loop
+    execute format('alter table public.%I owner to {real_owner}',
+                   r.relname);
+  end loop;
+  for r in select p.oid::regprocedure::text as fn from pg_proc p
+            join pg_namespace n on n.oid = p.pronamespace
+           where n.nspname = 'public' loop
+    execute format('alter function %s owner to {real_owner}', r.fn);
+  end loop;
+end $$;
+"""
+    _sql(transfer)
+    try:
+        # The probe is genuinely ordinary: no login, no superuser, no
+        # BYPASSRLS, and ownership actually moved.
+        assert _one("select rolsuper::text || '|' || rolbypassrls::text "
+                    f"|| '|' || rolcanlogin::text from pg_roles where "
+                    f"rolname = '{probe}'") == "f|f|f"
+        assert _one("select pg_get_userbyid(relowner) from pg_class "
+                    "where oid = 'public.visual_scene_attester_send_return'"
+                    "::regclass") == probe
+        assert _one("select pg_get_userbyid(proowner) from pg_proc "
+                    "where oid = 'public.visual_scene_attester_claim_prepare"
+                    "(jsonb)'::regprocedure") == probe
+
+        # ACTUAL PATH under the ordinary owner: prepare -> send_start ->
+        # record send return -> verifier read -> attest+terminate.
+        s = _setup_claimable()
+        s["payload_sha"] = _sha256("fixture_sha256_owner")
+        token = json.loads(_call_as_ok(
+            "scene_attester", "visual_scene_attester_claim_prepare",
+            _claim_payload(s)))["claim_attempt_id"]
+        assert json.loads(_call_as_ok(
+            "scene_attester", "visual_scene_attester_send_start",
+            {"claim_attempt_id": token,
+             "attester_id": "attester-1"}))["state"] == "send_started"
+        rec = json.loads(_call_as_ok(
+            "scene_attester", "visual_scene_attester_record_send_return",
+            {"claim_attempt_id": token, "attester_id": "attester-1",
+             "provider_post_id": "post_owner"}))
+        assert rec["recorded"] is True and rec["replayed"] is False
+        read = json.loads(_call_as_ok(
+            "scene_attester_verifier",
+            "visual_scene_attester_verifier_read",
+            {"claim_attempt_id": token}))
+        assert read["prepared"]["claim_attempt_id"] == token
+        assert read["binding"]["binding_id"] == s["bid"]
+        assert read["send_return"]["provider_post_id"] == "post_owner"
+        out = json.loads(_call_as_ok(
+            "scene_attester_verifier",
+            "visual_scene_attester_attest_terminate",
+            {"claim_attempt_id": token, "verifier_id": "verifier-1",
+             "outcome": "delivered", "provider_post_id": "post_owner",
+             "readback_evidence": {"seen": True}}))
+        assert out["state"] == "finalized"
+        assert _one("select state from "
+                    "public.visual_scene_attester_prepared "
+                    f"where claim_attempt_id = '{token}'") == "finalized"
+
+        # NEGATIVE DIRECT CALLER ACCESS under the same ordinary owner.
+        _fails("set role scene_attester; select count(*) from "
+               "public.visual_scene_attester_send_return;",
+               "permission denied")
+        _fails("set role scene_attester; insert into "
+               "public.visual_scene_attester_send_return ("
+               "claim_attempt_id, tenant_id, calendar_row_id, binding_id,"
+               " attester_id, provider_post_id) values (gen_random_uuid(),"
+               f" '{s['tid']}', gen_random_uuid(), '{s['bid']}',"
+               " 'attester-1', 'post_x');", "permission denied")
+        _fails("set role scene_attester; insert into "
+               "public.visual_scene_attester_event (claim_attempt_id,"
+               f" calendar_row_id, event, actor) values ('{token}',"
+               " gen_random_uuid(), 'direct', 'attester-1');",
+               "permission denied")
+        _fails("set role scene_attester; update "
+               "public.visual_scene_attester_prepared set state ="
+               f" 'finalized' where claim_attempt_id = '{token}';",
+               "permission denied")
+        _fails("set role service_role; select count(*) from "
+               "public.visual_scene_attester_send_return;",
+               "permission denied")
+        # Evidence SELECT scope stays intact for the attester roles.
+        assert _one("set role scene_attester; select count(*) from "
+                    "public.visual_scene_attester_prepared where "
+                    f"claim_attempt_id = '{token}';") == "1"
+        assert _one("set role scene_attester_verifier; select count(*) "
+                    "from public.visual_scene_attester_binding where "
+                    f"binding_id = '{s['bid']}';") == "1"
+        # Split authority still holds under the ordinary owner.
+        _call_as_fails("scene_attester",
+                       "visual_scene_attester_attest_terminate",
+                       {"claim_attempt_id": token,
+                        "verifier_id": "verifier-1", "outcome": "failed"},
+                       "permission denied")
+        _call_as_fails("scene_attester_verifier",
+                       "visual_scene_attester_record_send_return",
+                       {"claim_attempt_id": token,
+                        "attester_id": "attester-1",
+                        "provider_post_id": "post_x"}, "permission denied")
+    finally:
+        _sql(restore)
+        _sql(f"drop role if exists {probe};")

@@ -98,22 +98,36 @@
 --         send-return record, tenant-scoped by the claim itself. It fails
 --         closed (raises) when any authoritative row is missing or the
 --         prepared/binding/attempt tenants disagree.
---      c. FAIL-CLOSED SEND-RETURN TABLE BOUNDARY (PARTIAL RLS REPAIR)
---         (2026-10-05 independent-review repair):
---         visual_scene_attester_send_return keeps ENABLE + FORCE ROW
---         LEVEL SECURITY with NO direct grants to any role, and carries
---         exactly ONE narrow policy,
---         visual_scene_attester_send_return_owner_rw, passing ONLY for
---         the role that owns the table. Without it, FORCE RLS also
---         constrained the table owner. This policy solves access to THIS
---         table only. The other FORCE-RLS prepared, binding and event
---         tables still have role-specific SELECT policies and no event
---         INSERT policy for an ordinary non-BYPASSRLS function owner.
---         Therefore the composite RPCs are NOT yet proven executable
---         under that owner. Before activation, repair those policies or
---         enforce a privileged-owner installation contract and run the
---         full RPC path under the actual owner on real PostgreSQL. Keep
---         this DRAFT migration unapplied until that review passes.
+--      c. FAIL-CLOSED FORCE-RLS OWNER BOUNDARY (2026-10-05 independent-
+--         review repair, COMPLETED for the four runtime tables):
+--         every FORCE-RLS table this package owns
+--         (visual_scene_attester_binding, ..._prepared, ..._event,
+--         ..._send_return) keeps ENABLE + FORCE ROW LEVEL SECURITY with
+--         NO direct DML grants to any non-owner role, and each carries a
+--         narrow owner-passing policy so the SECURITY DEFINER RPC chain
+--         stays EXECUTABLE when installed by an ORDINARY non-BYPASSRLS
+--         owner (FORCE RLS constrains the table owner too):
+--           * binding:  owner SELECT (the RPCs read binding identity);
+--           * prepared: owner SELECT/INSERT/UPDATE (claim_prepare inserts,
+--             send_start/attest_terminate select FOR UPDATE and update the
+--             state machine; the guard trigger still blocks DELETE and
+--             freezes evidence columns);
+--           * event:    owner INSERT only (append-only log; reads for the
+--             attester roles keep their own SELECT policy);
+--           * send_return: exactly ONE policy,
+--             visual_scene_attester_send_return_owner_rw (for all), with
+--             NO direct grants at all — the sender writes only through
+--             record_send_return and the verifier reads only through
+--             verifier_read.
+--         Every policy admits ONLY current_user = the table's live owner
+--         (pg_get_userbyid(relowner)); a superuser/BYPASSRLS owner would
+--         bypass RLS entirely, so the operational contract stays: install
+--         with an ordinary owner. The full prepare -> send_start ->
+--         record_send_return -> verifier_read path under a transferred
+--         ordinary non-BYPASSRLS owner is exercised by the PG integration
+--         test (test_pg_ordinary_owner_end_to_end). Keep this DRAFT
+--         migration unapplied until that review passes on the target
+--         PostgreSQL.
 --
 -- RUNTIME PREREQUISITE — AUTHORITATIVE PROVIDER OBSERVATION BOUNDARY:
 --      SQL alone CANNOT prove that readback_evidence reflects a real
@@ -407,6 +421,20 @@ create policy visual_scene_attester_binding_read
   for select to scene_attester, scene_attester_verifier,
     service_role using (true);
 
+-- Owner-passing SELECT: FORCE RLS constrains the table owner too, so the
+-- SECURITY DEFINER RPCs (owned by the applying role) can read binding
+-- identity only through this policy when the owner is an ordinary
+-- non-BYPASSRLS role. Admits ONLY current_user = the live table owner.
+drop policy if exists visual_scene_attester_binding_owner_read
+  on public.visual_scene_attester_binding;
+create policy visual_scene_attester_binding_owner_read
+  on public.visual_scene_attester_binding
+  as permissive for select to public
+  using (current_user = (select pg_get_userbyid(c.relowner)
+                           from pg_class c
+                          where c.oid =
+                            'public.visual_scene_attester_binding'::regclass));
+
 -- ----------------------------------------------------------------------------
 -- Immutable prepared snapshot (per exact claim token) + attester state.
 -- ----------------------------------------------------------------------------
@@ -542,6 +570,27 @@ create policy visual_scene_attester_prepared_read
   for select to scene_attester, scene_attester_verifier,
     service_role using (true);
 
+-- Owner-passing SELECT/INSERT/UPDATE: claim_prepare INSERTs the frozen
+-- snapshot; send_start/attest_terminate SELECT ... FOR UPDATE and UPDATE
+-- the state machine. Under FORCE RLS an ordinary non-BYPASSRLS owner is
+-- constrained too, so without this policy the whole RPC chain would fail
+-- closed for that owner. The guard trigger still blocks DELETE/TRUNCATE
+-- and freezes evidence columns, so the RLS-level ALL adds no reachable
+-- destructive path. Admits ONLY current_user = the live table owner.
+drop policy if exists visual_scene_attester_prepared_owner_rw
+  on public.visual_scene_attester_prepared;
+create policy visual_scene_attester_prepared_owner_rw
+  on public.visual_scene_attester_prepared
+  as permissive for all to public
+  using (current_user = (select pg_get_userbyid(c.relowner)
+                           from pg_class c
+                          where c.oid =
+                            'public.visual_scene_attester_prepared'::regclass))
+  with check (current_user = (select pg_get_userbyid(c.relowner)
+                                from pg_class c
+                               where c.oid =
+                            'public.visual_scene_attester_prepared'::regclass));
+
 -- ----------------------------------------------------------------------------
 -- Append-only attester event log.
 -- ----------------------------------------------------------------------------
@@ -583,6 +632,22 @@ create policy visual_scene_attester_event_read
   on public.visual_scene_attester_event
   for select to scene_attester, scene_attester_verifier,
     service_role using (true);
+
+-- Owner-passing INSERT ONLY: the SECURITY DEFINER RPCs append events;
+-- under FORCE RLS an ordinary non-BYPASSRLS owner is constrained too, so
+-- this WITH CHECK is what keeps the RPC chain executable for that owner.
+-- The owner holds no SELECT-through-policy here beyond the read policy's
+-- named roles (the RPCs never read the log); DELETE/UPDATE stay blocked
+-- by the append-only trigger. Admits ONLY current_user = the live owner.
+drop policy if exists visual_scene_attester_event_owner_insert
+  on public.visual_scene_attester_event;
+create policy visual_scene_attester_event_owner_insert
+  on public.visual_scene_attester_event
+  as permissive for insert to public
+  with check (current_user = (select pg_get_userbyid(c.relowner)
+                                from pg_class c
+                               where c.oid =
+                            'public.visual_scene_attester_event'::regclass));
 
 -- ----------------------------------------------------------------------------
 -- SCENE-HELD STRUCTURED REFUSAL (P0). When the persisted-state claimant
@@ -1250,8 +1315,9 @@ alter table public.visual_scene_attester_send_return
   force row level security;
 -- FORCE RLS stays: every ordinary role INCLUDING the table owner is
 -- constrained. Exactly ONE narrow policy passes the owner for THIS table.
--- Other FORCE-RLS runtime tables still prevent an ordinary non-BYPASSRLS
--- owner from executing the full RPC chain (header 7c activation hold).
+-- The binding/prepared/event FORCE-RLS tables carry matching narrow
+-- owner-passing policies (header 7c), so the full RPC chain is executable
+-- under an ordinary non-BYPASSRLS owner.
 -- Every other role is denied twice: no table grant exists (42501), and
 -- the policy check itself requires current_user = table owner. A
 -- superuser / BYPASSRLS owner would bypass RLS entirely. Reads for every
