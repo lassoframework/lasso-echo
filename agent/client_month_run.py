@@ -676,22 +676,6 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
     return out
 
 
-def _is_first_month(base_key, store, log):
-    """GATE 2: True when this gym has NO owner-visible content_calendar row yet (its first,
-    not-yet-released month). A store without has_owner_visible_rows (test fakes, legacy) is
-    treated as ESTABLISHED (returns False) so the gate only ever engages against the real
-    Supabase store — nothing withheld by accident."""
-    checker = getattr(store, "has_owner_visible_rows", None)
-    if not callable(checker):
-        return False
-    try:
-        return not checker(base_key)
-    except Exception as exc:  # noqa: BLE001 - a check failure must never withhold blindly
-        log(f"{base_key}: first-month check failed ({type(exc).__name__}); treating as "
-            "established (not withheld)")
-        return False
-
-
 # The gym-drive lane fills these people-forward slots (spec §7). Kept in the order
 # a month rotates through them so consecutive Drive days do not repeat one pillar.
 _GYM_DRIVE_PILLARS = ("faces", "community", "results")
@@ -1857,25 +1841,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 "approved CTA that reads as a single ask (never an invented one)")
 
     rows = _to_rows(base_key, drafts)
-    # GATE 2 (coach-screens-first-month, Blake 2026-08-17): a CLIENT gym's FIRST month on
-    # every platform is WITHHELD from the owner ('coach_review') until a coach screens and
-    # releases it — the coach SOP enforced in software. Established gyms (any owner-visible
-    # row already) are grandfathered, never re-withheld on a rebuild. LASSO's own account is
-    # exempt (not a client gym). Safe default: a store lacking the signal is treated as
-    # established (no withhold), so nothing changes for it.
-    if (config.coach_screen_first_month_enabled() and base_key != "lasso"
-            and _is_first_month(base_key, store, log)):
-        for r in rows:
-            r["status"] = "coach_review"
-        log(f"{base_key}: FIRST month -> written 'coach_review' (withheld from owner "
-            "until a coach releases it; GATE 2)")
+    # All new calendar rows remain pending for the owner's normal approval path.
     # GOOGLE BUSINESS MIRROR (AGENT_GBP_MIRROR, default OFF; Blake 2026-09-02: "anytime
     # you post to ig, fb or whatever goes to google as well"). The same build-time
     # cross-post the Facebook leg does, with the two things a Google post cannot share
     # with an Instagram post done properly: a 1200x900 crop hosted BEFORE approval, and a
     # Google-native caption that must clear the A+ gate or the row is skipped. Appended
-    # AFTER the GATE 2 loop on purpose: a GBP row is never 'coach_review' (Blake ruled it
-    # out for Google), it is always the owner's own 'pending' tap. See agent/gbp_mirror.py.
+    # GBP rows also enter the owner's standard pending approval path. See agent/gbp_mirror.py.
     from . import gbp_mirror as _gbp_mirror
     # NOTE: no store= is passed. `store` here is the calendar store; the mirror needs a
     # GbpStore (connection posture + the CTA link live only there) and builds its own.
@@ -2856,11 +2828,17 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             replace = getattr(store, "replace_months_atomic", None)
             if not callable(replace):
                 raise RuntimeError("atomic month replacement method unavailable")
-            insert_started = True
+            # The store signals immediately before RPC dispatch. Its validation
+            # and reads happen first, so those failures have a known no-write outcome.
+            def mark_write_start():
+                nonlocal insert_started
+                insert_started = True
+
             receipt = replace(
                 base_key, months, store_rows, preserve_dates=delete_preserve,
                 poster_render_evidence_by_url=poster_render_evidence_by_url,
-                render_evidence_by_url=render_evidence_by_url)
+                render_evidence_by_url=render_evidence_by_url,
+                on_write_start=mark_write_start)
             deleted = receipt["deleted"]
             inserted = receipt["inserted"]
         else:
@@ -3273,11 +3251,6 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
 
     try:
         rows = _to_rows(base_key, drafts)
-        # GATE 2 safety: withhold a first-month replacement exactly as its month would be.
-        if (config.coach_screen_first_month_enabled() and base_key != "lasso"
-                and _is_first_month(base_key, store, log)):
-            for r in rows:
-                r["status"] = "coach_review"
         from . import gbp_mirror as _gbp_mirror
         rows.extend(_gbp_mirror.rows_for(base_key, drafts, library_path=library_path,
                                          logger=log))

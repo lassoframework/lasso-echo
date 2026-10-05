@@ -23,6 +23,8 @@ class _AtomicStore:
 
     def replace_months_atomic(self, gym, months, rows, **kwargs):
         self.calls.append((gym, months, rows, kwargs))
+        if callable(kwargs.get("on_write_start")):
+            kwargs["on_write_start"]()
         if self.fail:
             raise RuntimeError("rpc unavailable")
         return {"deleted": 2, "inserted": len(rows), "rows": rows}
@@ -62,6 +64,52 @@ def test_client_apply_rpc_failure_never_uses_split_writer(monkeypatch):
     assert result["ok"] is False
     assert result["insert_outcome_unknown"] is True
     assert len(store.calls) == 1
+
+
+class _AtomicPreflightStore(_AtomicStore):
+    """Expose the same HTTP boundary as SupabaseCalendarStore for _apply."""
+    def __init__(self, fail_before_post=False, fail_post=False):
+        super().__init__()
+        self.fail_before_post = fail_before_post
+        self.fail_post = fail_post
+
+    def _client(self):
+        return self
+
+    def post(self, *_args, **_kwargs):
+        if self.fail_post:
+            raise TimeoutError("connection lost after request dispatch")
+        return object()
+
+    def replace_months_atomic(self, gym, months, rows, **kwargs):
+        self.calls.append((gym, months, rows, kwargs))
+        if self.fail_before_post:
+            raise ValueError("pre-POST validation rejected batch")
+        kwargs["on_write_start"]()
+        self._client().post("rpc")
+        if self.fail_post:
+            raise TimeoutError("connection lost after request dispatch")
+        return {"deleted": 0, "inserted": len(rows), "rows": rows}
+
+
+def test_pre_post_atomic_validation_is_not_reported_as_unknown_write(monkeypatch):
+    monkeypatch.setattr(pcs, "preserve_and_prune",
+                        lambda _store, _gym, _months, rows: (rows, []))
+    store = _AtomicPreflightStore(fail_before_post=True)
+    result = cmr._apply("gym", [_row()], date(2026, 10, 15), 1,
+                        store, lambda _message: None)
+    assert result["ok"] is False
+    assert result["insert_outcome_unknown"] is False
+
+
+def test_atomic_transport_failure_after_post_is_unknown(monkeypatch):
+    monkeypatch.setattr(pcs, "preserve_and_prune",
+                        lambda _store, _gym, _months, rows: (rows, []))
+    store = _AtomicPreflightStore(fail_post=True)
+    result = cmr._apply("gym", [_row()], date(2026, 10, 15), 1,
+                        store, lambda _message: None)
+    assert result["ok"] is False
+    assert result["insert_outcome_unknown"] is True
 
 
 def test_real_mirror_routes_to_one_atomic_call(monkeypatch):
@@ -124,4 +172,20 @@ def test_store_refuses_partial_month_read_before_rpc(monkeypatch):
     store.list_month = lambda *_: [{}] * 1000
     with pytest.raises(pcs.PortalStoreError, match="partial"):
         store.replace_months_atomic("gym", ["2026-10"], [_row()])
+    assert http.calls == []
+
+
+def test_store_client_preparation_failure_precedes_write_start(monkeypatch):
+    monkeypatch.setenv("ECHO_ATOMIC_MONTH_REPLACE_DRAFT", "1")
+    monkeypatch.setattr(pcs, "_record_confirmed_story_holds", lambda *_: None)
+    monkeypatch.setattr(pcs, "_story_incident_targets", lambda *_: set())
+    http = _Http()
+    store = pcs.SupabaseCalendarStore("https://example.test", "test-key", http)
+    store.list_month = lambda *_: []
+    store._client = lambda: (_ for _ in ()).throw(RuntimeError("client setup failed"))
+    started = []
+    with pytest.raises(RuntimeError, match="client setup failed"):
+        store.replace_months_atomic("gym", ["2026-10"], [_row()],
+                                    on_write_start=lambda: started.append(True))
+    assert started == []
     assert http.calls == []

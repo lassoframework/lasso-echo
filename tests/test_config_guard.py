@@ -80,3 +80,12 @@ def test_code_scan_finds_vars():
     assert len(found) >= 15, (
         f"Expected at least 15 env vars in agent/config.py, found {len(found)}: {sorted(found)}"
     )
+
+
+def test_retired_coach_screen_cannot_be_rearmed_by_stale_env(monkeypatch):
+    from agent import config
+
+    monkeypatch.setenv("AGENT_COACH_SCREEN_FIRST_MONTH", "true")
+    monkeypatch.setenv("AGENT_GBP_COACH_SCREEN", "true")
+    assert config.coach_screen_first_month_enabled() is False
+    assert config.gbp_coach_screen_enabled() is False

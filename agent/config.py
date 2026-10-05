@@ -1876,12 +1876,8 @@ def gbp_mirror_active_for(gym_id) -> bool:
 
 
 def gbp_coach_screen_enabled() -> bool:
-    """GATE 2 (coach-screens-first-month): when ON (the DEFAULT), a gym's FIRST GBP month
-    is written in the withheld 'coach_review' status so the OWNER never sees or approves it
-    until a coach screens and releases it. Set AGENT_GBP_COACH_SCREEN=false only to bypass
-    the screen (e.g. a gym a coach has already vetted). The owner /social read hides
-    coach_review rows; the release flips them to 'pending'."""
-    return _truthy(os.environ.get("AGENT_GBP_COACH_SCREEN", "true"))
+    """Retired: new Google posts use the normal owner approval flow."""
+    return False
 
 
 def story_source_media_enabled() -> bool:
@@ -1905,14 +1901,8 @@ def gbp_publish_window_enabled() -> bool:
 
 
 def coach_screen_first_month_enabled() -> bool:
-    """GATE 2 for the FB/IG CLIENT month (Blake, 2026-08-17): coach screens every gym's
-    FIRST month on EVERY platform before the owner sees it — the coach SOP (walk the owner
-    through their first approvals) now enforced in software. When ON (the DEFAULT), a
-    CLIENT gym's first FB/IG month is written 'coach_review' (withheld) until released.
-    Gyms with a month already in flight are grandfathered (they already have owner-visible
-    rows, so they are not first-month). Set AGENT_COACH_SCREEN_FIRST_MONTH=false to bypass.
-    LASSO's own dogfood account is exempt (it is not a client gym)."""
-    return _truthy(os.environ.get("AGENT_COACH_SCREEN_FIRST_MONTH", "true"))
+    """Retired: new client posts use the normal owner approval flow."""
+    return False
 
 
 def welcome_digest_enabled() -> bool:

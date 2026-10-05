@@ -365,7 +365,7 @@ class _StoreWithHistory(_FakeStore):
         return self._has_visible
 
 
-def test_gate2_first_month_withheld_as_coach_review(tmp_path):
+def test_first_month_rows_remain_pending_for_owner_approval(tmp_path):
     _stock_clean("gritx_ig")
     lib = _lib(tmp_path, n=6)
     store = _StoreWithHistory(has_visible=False)   # brand-new gym, no prior rows
@@ -373,8 +373,7 @@ def test_gate2_first_month_withheld_as_coach_review(tmp_path):
         _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
         library_path=lib, store=store, banned_words=())
     assert out["ok"] is True and store.inserted
-    assert all(r["status"] == "coach_review" for r in store.inserted), \
-        "a gym's first month must be withheld from the owner until a coach releases it"
+    assert all(r["status"] == "pending" for r in store.inserted)
 
 
 def test_gate2_established_gym_grandfathered_pending(tmp_path):
@@ -839,6 +838,7 @@ def test_deny_backfill_replaces_denied_feed_with_reused_photo(monkeypatch, tmp_p
         "the replacement must not hand back the denied post's own photo"
     # a real, non-empty caption grounded in an approved source.
     assert ig_feed[0]["caption"].strip()
+    assert all(r["status"] == "pending" for r in store.inserted)
 
 
 # ---- 9b2. denied-slot backfill is serialized against build_client_month AND itself

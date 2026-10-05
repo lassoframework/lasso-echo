@@ -3398,7 +3398,8 @@ class SupabaseCalendarStore:
 
     def replace_months_atomic(self, account_key, months, rows, *, preserve_dates=(),
                               render_evidence_by_url=None,
-                              poster_render_evidence_by_url=None):
+                              poster_render_evidence_by_url=None,
+                              on_write_start=None):
         """Replace active machine rows in one database transaction with month CAS.
 
         Every preparation step and read happens before the RPC. A failed RPC can
@@ -3522,15 +3523,17 @@ class SupabaseCalendarStore:
         # Keep the batch homogeneous, as insert_rows does for PostgREST.
         all_keys = set().union(*(r.keys() for r in payload))
         payload = [{k: r.get(k) for k in all_keys} for r in payload]
-        response = self._client().post(
-            self._rest("rpc/echo_replace_calendar_months_atomic_draft"),
-            headers=self._headers({"Content-Type": "application/json"}),
-            json={"p_gym_id": account_key, "p_months": months,
-                  "p_expected": sorted(expected, key=lambda r: r["id"]),
-                  "p_rows": payload,
-                  "p_preserve_dates": sorted({str(d)[:10] for d in preserve_dates}),
-                  "p_protected_story_ids": sorted(set(protected_story_ids))},
-            timeout=60)
+        client = self._client()
+        url = self._rest("rpc/echo_replace_calendar_months_atomic_draft")
+        headers = self._headers({"Content-Type": "application/json"})
+        request_body = {"p_gym_id": account_key, "p_months": months,
+                        "p_expected": sorted(expected, key=lambda r: r["id"]),
+                        "p_rows": payload,
+                        "p_preserve_dates": sorted({str(d)[:10] for d in preserve_dates}),
+                        "p_protected_story_ids": sorted(set(protected_story_ids))}
+        if on_write_start is not None:
+            on_write_start()
+        response = client.post(url, headers=headers, json=request_body, timeout=60)
         if response.status_code >= 400:
             raise PortalStoreError(response.status_code,
                                    _scrub((response.text or "")[:200]))

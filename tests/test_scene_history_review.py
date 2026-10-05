@@ -112,6 +112,18 @@ def test_bare_32hex_hash_normalizes_to_md5_fingerprint():
     assert queue[0]["classification"] == shr.PROVED
 
 
+def test_derived_md5_byte_hash_normalizes_to_history_fingerprint():
+    cal = FakeCalendar([published_row("r1", byte_hash="derived:md5:" + "a" * 32)])
+    queue = shr.build_review_queue(
+        GYM, cal, ReadOnlyMediaStore(),
+        FakeHistory(occupied=[occupied(FP_A, row_id="r1")]))
+    assert queue[0]["classification"] == shr.PROVED
+
+
+def test_source_md5_namespace_is_not_collapsed_into_derived_bytes():
+    assert shr._fingerprint("source:md5:" + "a" * 32) is None
+
+
 # -------------------------------------------------------- unresolved reasons
 
 def test_row_without_any_media_binding_is_unresolved():

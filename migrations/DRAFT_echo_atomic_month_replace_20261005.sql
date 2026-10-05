@@ -63,6 +63,20 @@ begin
         raise exception 'calendar month changed since preflight' using errcode = '40001';
     end if;
 
+    -- coach_review is a retired workflow state. Never carry a legacy row through
+    -- a month replacement or accept it as staged input: an operator must first
+    -- reconcile the row to an explicit non-publishing state.
+    if exists (
+        select 1 from public.content_calendar c
+          where c.gym_id = p_gym_id
+            and left(c.post_date::text, 7) = any(p_months)
+            and c.variant_status = 'active'
+            and c.status = 'coach_review'
+    ) then
+        raise exception 'legacy coach_review row requires explicit status migration'
+          using errcode = '23514';
+    end if;
+
     for row_value in select value from jsonb_array_elements(p_rows) loop
         if jsonb_typeof(row_value) <> 'object'
            or row_value->>'gym_id' is distinct from p_gym_id

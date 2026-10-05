@@ -694,16 +694,15 @@ def test_gate1_offer_skipped_when_not_confirmed():
     assert not any(r["gbp_topic_type"] == "OFFER" for r in store.rows)
 
 
-def test_gate2_initial_status_written_on_every_row():
-    # coach_review (withheld) status rides onto every planned row for a first month
+def test_retired_coach_review_initial_status_is_rejected():
     _seed()
     store = _Store()
     out = gp.plan_gbp_month(
         "lasso", "lasso_ig", voice=_voice(), library_path="/x", city="Carmel",
         store=store, start=date(2026, 9, 1), offer=None, events=[],
         initial_status="coach_review", caption_fn=_cap, image_fn=_img)
-    assert out["ok"] and store.rows
-    assert all(r["status"] == "coach_review" for r in store.rows)
+    assert not out["ok"] and out["reason"] == "unsupported initial status"
+    assert not store.rows
 
 
 def test_no_offer_skips_offer_slot():

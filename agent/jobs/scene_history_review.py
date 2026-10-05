@@ -76,11 +76,15 @@ def _log(msg):
 def _fingerprint(value):
     """Canonical 'md5:<32hex>' fingerprint, or None when the value is not an
     MD5 byte fingerprint (a sha256, a URL, a Drive id — none of those are
-    comparable to the md5-keyed draft ledger)."""
+    comparable to the md5-keyed draft ledger). Calendar ``byte_hash`` is
+    written as ``derived:md5:<hex>``; accept that explicit namespace while
+    keeping source-byte identities distinct."""
     if not value:
         return None
     v = str(value).strip().lower()
-    if v.startswith("md5:"):
+    if v.startswith("derived:md5:"):
+        v = v[len("derived:md5:"):]
+    elif v.startswith("md5:"):
         v = v[4:]
     if _MD5_RE.match(v):
         return f"md5:{v}"
