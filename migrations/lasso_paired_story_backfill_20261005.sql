@@ -124,7 +124,7 @@ begin
   v_account := lower(btrim(coalesce(p_account, '')));
   if p_feed_id is null or p_story_id is null or p_feed_id = p_story_id
      or v_account not in ('instagram', 'facebook')
-     or p_day not between date '2026-10-02' and date '2026-11-08'
+     or p_day < date '2026-10-02'
      or p_slot not in (0, 1, 2)
      or p_feed_status not in ('pending', 'approved', 'published')
      or nullif(btrim(coalesce(p_feed_caption, '')), '') is null
@@ -163,7 +163,11 @@ begin
      or v_feed.image_url is distinct from p_feed_image_url
      or v_feed.scheduled_at is distinct from p_feed_scheduled_at
      or v_feed.logical_post_id is distinct from p_feed_logical_post_id
-     or v_feed.media_not_ready_reason is not null
+     or (v_feed.media_not_ready_reason is not null and not
+         (v_feed.media_not_ready_reason =
+          'prepared_backlog_waiting_for_story_and_capacity'
+          and v_feed.status = 'pending'
+          and v_feed.post_date between date '2026-10-02' and date '2026-10-05'))
      or (v_feed.status = 'published' and
          (v_feed.published_at is null or v_feed.late_post_id is null))
      or (v_feed.status in ('pending', 'approved') and

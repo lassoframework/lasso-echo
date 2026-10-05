@@ -20,7 +20,7 @@ begin
   v_account := lower(btrim(coalesce(f.account, '')));
   if v_account not in ('instagram', 'facebook')
      or f.slot_index not in (0, 1, 2)
-     or f.post_date not between date '2026-10-02' and date '2026-11-08'
+     or f.post_date < date '2026-10-02'
      or p_story_url is null or p_story_url = f.image_url then
     return false;
   end if;
@@ -105,6 +105,101 @@ begin
 end;
 $$;
 
+-- Feed preflight: a feed is claimable only when its exact account/day/slot has
+-- one usable Story already prepared. The Story may carry the paired-feed hold:
+-- the feed publishes first, then the receipt releases that hold. Special
+-- Summit Stories staged by PR293 retain their separate catalog/live proof.
+create or replace function public.lasso_paired_story_ready_for_feed(p_feed_id uuid)
+returns boolean language plpgsql security definer set search_path = public stable
+as $$
+declare
+  f public.content_calendar%rowtype;
+  s public.content_calendar%rowtype;
+begin
+  select * into f from public.content_calendar where id = p_feed_id
+    and gym_id = 'lasso'
+    and lower(btrim(coalesce(format, 'feed'))) = 'feed'
+    and coalesce(variant_status, 'active') = 'active';
+  if not found or f.post_date < date '2026-10-02'
+     or lower(btrim(coalesce(f.account, ''))) not in ('instagram','facebook')
+     or f.slot_index not in (0,1,2)
+     or f.status not in ('pending','approved')
+     or f.media_not_ready_reason is not null
+     or nullif(btrim(coalesce(f.caption, '')), '') is null
+     or f.image_url !~ '^https://' then
+    return false;
+  end if;
+  if (
+    select count(*) from public.content_calendar c
+     where c.gym_id = 'lasso' and c.post_date = f.post_date
+       and lower(btrim(coalesce(c.account, ''))) = lower(btrim(f.account))
+       and lower(btrim(coalesce(c.format, 'feed'))) = 'story'
+       and coalesce(c.variant_status, 'active') = 'active'
+       and coalesce(c.status, 'pending') not in ('denied','killed','failed')
+       and (c.slot_index = f.slot_index or c.slot_index is null)
+  ) <> 1 then return false; end if;
+  select * into s from public.content_calendar c
+   where c.gym_id = 'lasso' and c.post_date = f.post_date
+     and lower(btrim(coalesce(c.account, ''))) = lower(btrim(f.account))
+     and lower(btrim(coalesce(c.format, 'feed'))) = 'story'
+     and coalesce(c.variant_status, 'active') = 'active'
+     and coalesce(c.status, 'pending') not in ('denied','killed','failed')
+     and c.slot_index = f.slot_index;
+  if not found or s.status not in ('pending','approved','published')
+     or s.media_not_ready_reason is distinct from null
+        and s.media_not_ready_reason <> 'paired_feed_not_ready'
+     or (s.status = 'published' and
+         (s.published_at is null or s.late_post_id is null))
+     or (s.status in ('pending','approved') and
+         (s.published_at is not null or s.late_post_id is not null))
+     or s.pillar is distinct from f.pillar
+     or s.caption is distinct from ''
+     or s.logical_post_id is distinct from f.logical_post_id
+     or s.image_url !~ '^https://'
+     or s.image_url = f.image_url
+     or s.source_media_url is distinct from s.image_url
+     or s.scheduled_at is null
+     or (s.scheduled_at at time zone 'America/New_York')::date <> f.post_date
+     or (f.scheduled_at is not null and
+         s.scheduled_at <> f.scheduled_at + interval '15 minutes') then
+    return false;
+  end if;
+  if exists (select 1 from public.lasso_managed_paired_stories m
+             where m.story_id = s.id and m.feed_id = f.id) then
+    return public.lasso_story_current_source(s.id);
+  end if;
+  if exists (select 1 from public.lasso_managed_paired_stories m
+             where m.story_id = s.id) then
+    return false;
+  end if;
+  -- The only unregistered exception is the existing, reviewed third-slot
+  -- Summit Story path. It binds its own rendered 9:16 object to this exact
+  -- feed UUID/image and to the same reviewed feed source hash.
+  if lower(btrim(f.account)) <> 'instagram' or f.slot_index <> 2
+     or lower(btrim(coalesce(f.pillar, ''))) <> 'summit' then
+    return false;
+  end if;
+  return exists (
+    select 1 from public.echo_infographic_artifacts story_art
+    join public.echo_infographic_artifacts feed_art
+      on feed_art.image_url = f.image_url
+     and feed_art.tenant in ('lasso','lasso_ig')
+     and feed_art.source_identity->>'source_hash' =
+         story_art.source_identity->>'source_hash'
+     and feed_art.evidence->>'grade_status' = 'PASS'
+     and feed_art.evidence->>'image_sha256' = feed_art.image_sha256
+    where story_art.tenant = 'lasso' and story_art.image_url = s.image_url
+      and story_art.evidence->>'grade_status' = 'PASS'
+      and story_art.evidence->>'image_sha256' = story_art.image_sha256
+      and story_art.evidence->>'aspect' = '9:16'
+      and story_art.evidence->>'pixels' = '1080x1920'
+      and story_art.source_identity->>'source_feed_id' = f.id::text
+      and story_art.source_identity->>'source_feed_image_url' = f.image_url
+      and story_art.source_identity->>'source_hash' ~ '^[0-9a-f]{64}$'
+  );
+end;
+$$;
+
 create or replace function public.repair_lasso_paired_story(
   p_story_id uuid, p_feed_id uuid,
   p_expected_story jsonb, p_expected_feed jsonb,
@@ -140,7 +235,7 @@ begin
   end if;
   v_account := lower(btrim(coalesce(s.account, '')));
   if v_account not in ('instagram','facebook')
-     or s.post_date not between date '2026-10-02' and date '2026-11-08'
+     or s.post_date < date '2026-10-02'
      or s.slot_index not in (0, 1, 2)
      or s.status <> 'pending' or s.variant_status <> 'active'
      or s.published_at is not null or s.late_post_id is not null
@@ -190,7 +285,11 @@ begin
         nullif(p_expected_feed->>'scheduled_at','')::timestamptz
      or f.logical_post_id is distinct from
         nullif(p_expected_feed->>'logical_post_id','')::uuid
-     or f.media_not_ready_reason is not null
+     or (f.media_not_ready_reason is not null and not
+         (f.media_not_ready_reason =
+          'prepared_backlog_waiting_for_story_and_capacity'
+          and f.status = 'pending'
+          and f.post_date between date '2026-10-02' and date '2026-10-05'))
      or (f.status = 'published' and
          (f.published_at is null or f.late_post_id is null))
      or (f.status in ('pending','approved') and
@@ -333,7 +432,7 @@ declare
 begin
   if new.gym_id <> 'lasso'
      or lower(btrim(coalesce(new.format, 'feed'))) <> 'story'
-     or new.post_date not between date '2026-10-02' and date '2026-11-08'
+     or new.post_date < date '2026-10-02'
      or new.status <> 'publishing' or old.status = 'publishing' then
     return new;
   end if;
@@ -404,6 +503,10 @@ revoke all on function public.release_lasso_paired_story_hold(uuid)
 grant execute on function public.lasso_story_review_matches(uuid,text)
   to service_role;
 grant execute on function public.lasso_story_current_source(uuid)
+  to service_role;
+revoke all on function public.lasso_paired_story_ready_for_feed(uuid)
+  from public, anon, authenticated;
+grant execute on function public.lasso_paired_story_ready_for_feed(uuid)
   to service_role;
 grant execute on function public.repair_lasso_paired_story(
   uuid,uuid,jsonb,jsonb,text,text,text,text,text,timestamptz)

@@ -319,6 +319,54 @@ class SupabaseCalendarStore:
     def _rest(self, path):
         return f"{self._url}/rest/v1/{path}"
 
+    def managed_lasso_paired_story_ids(self, story_ids):
+        """Read exact Story IDs protected by the paired-feed registry.
+
+        A failed or partial read raises; calendar reconciliation must then keep
+        every retained LASSO Story instead of overwriting an unknown managed
+        row with a planner rerender.
+        """
+        from uuid import UUID
+        if not isinstance(story_ids, (list, tuple, set)) or len(story_ids) > 1000:
+            raise ValueError("invalid managed Story lookup size")
+        ids = sorted({str(UUID(str(value))) for value in story_ids})
+        found = set()
+        for start in range(0, len(ids), 100):
+            group = ids[start:start + 100]
+            response = self._client().get(
+                self._rest("lasso_managed_paired_stories"),
+                params={"story_id": "in.(" + ",".join(group) + ")",
+                        "select": "story_id,feed_id", "limit": str(len(group) + 1)},
+                headers=self._headers(), timeout=30)
+            if response.status_code >= 400:
+                raise RuntimeError("managed LASSO Story registry read failed")
+            rows = response.json()
+            if not isinstance(rows, list) or len(rows) > len(group):
+                raise RuntimeError("managed LASSO Story registry read incomplete")
+            for row in rows:
+                if (not isinstance(row, dict)
+                        or str(row.get("story_id")) not in group
+                        or not row.get("feed_id")
+                        or row["story_id"] in found):
+                    raise RuntimeError("managed LASSO Story registry response malformed")
+                found.add(row["story_id"])
+        return found
+
+    def lasso_paired_story_ready_for_feed(self, feed_id):
+        """Database source proof immediately before claiming a LASSO feed."""
+        from uuid import UUID
+        canonical = str(UUID(str(feed_id)))
+        response = self._client().post(
+            self._rest("rpc/lasso_paired_story_ready_for_feed"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"p_feed_id": canonical}, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError("LASSO paired Story preflight unavailable")
+        ready = response.json()
+        if type(ready) is not bool:
+            raise RuntimeError("LASSO paired Story preflight malformed")
+        return ready
+
     # ---- read ---------------------------------------------------------------
     def list_month(self, account_key, month):
         """
@@ -3892,6 +3940,19 @@ def _reconcile_story_media_holds(store, calendar_gym_key, proposed):
     retained = [row for row in existing if isinstance(row, dict) and row.get("format") == "story"
                 and row.get("gym_id") == calendar_gym_key
                 and row.get("variant_status") == "active"]
+    protected_ids = set()
+    if calendar_gym_key == "lasso":
+        pending_ids = [row["id"] for row in retained if row.get("status") == "pending"]
+        try:
+            reader = getattr(store, "managed_lasso_paired_story_ids")
+            protected_ids = reader(pending_ids)
+            if (not isinstance(protected_ids, set)
+                    or not protected_ids.issubset(set(pending_ids))):
+                raise ValueError("managed Story registry returned invalid IDs")
+        except Exception as exc:
+            print(f"[calendar] LASSO Story registry unconfirmed: {type(exc).__name__}; "
+                  "retained pending rows protected")
+            protected_ids = set(pending_ids)
     output, recovered = [], []
     for row in proposed:
         if row.get("format") == "story" and sum(_story_slot(r) == _story_slot(row) for r in stories) != 1:
@@ -3908,6 +3969,11 @@ def _reconcile_story_media_holds(store, calendar_gym_key, proposed):
         if targets[0].get("status") != "pending":
             # The planner never creates a sibling over a human/publisher row,
             # even with the optional content-dedupe belt disabled.
+            continue
+        if targets[0]["id"] in protected_ids:
+            # This exact Story/feed pair was independently reviewed and staged
+            # through the guarded RPC. A later planner rerender may not replace
+            # its image or clear its feed hold, even if the hold already lifted.
             continue
         if _is_story_media_hold(row):
             # Same failed slot: keep its source generation and retry seed, even

@@ -1,4 +1,4 @@
-"""Insert only missing reviewed LASSO Stories for the Oct 2-Nov 8 book.
+"""Insert only missing reviewed LASSO Stories from the October 2 book onward.
 
 The manifest names one exact feed UUID and a separately hosted, reviewed 9:16
 Story object per entry. Media preparation is an upstream step: render from the
@@ -34,9 +34,18 @@ if str(ROOT) not in sys.path:
 
 from agent.portal_calendar_store import SupabaseCalendarStore
 
-FIRST, LAST = date(2026, 10, 2), date(2026, 11, 8)
+FIRST, LAST = date(2026, 10, 2), date.max
+BACKLOG_FEED_HOLD = "prepared_backlog_waiting_for_story_and_capacity"
 ZONE = ZoneInfo("America/New_York")
 RPC = "rpc/stage_lasso_paired_story"
+
+
+def allowed_feed_hold(feed, day):
+    hold = feed.get("media_not_ready_reason")
+    return hold is None or (hold == BACKLOG_FEED_HOLD
+                            and date(2026, 10, 2) <= date.fromisoformat(day)
+                            <= date(2026, 10, 5)
+                            and feed.get("status") == "pending")
 
 
 def measured_story_evidence(evidence, digest):
@@ -167,7 +176,7 @@ def plan_one(store, item):
         raise ValueError("Story must name exact IG/FB account and slot 0-2")
     parsed = date.fromisoformat(day)
     if not FIRST <= parsed <= LAST:
-        raise ValueError("date outside Oct 2-Nov 8 LASSO book boundary")
+        raise ValueError("date before LASSO paired-Story book boundary")
     feed_id = str(uuid.UUID(str(item["feed_id"])))
     story_url = str(item.get("story_image_url") or "").strip()
     story_sha = str(item.get("story_sha256") or "")
@@ -188,7 +197,7 @@ def plan_one(store, item):
             or feed.get("slot_index") != slot
             or feed.get("variant_status") != "active"
             or feed.get("status") not in {"pending", "approved", "published"}
-            or feed.get("media_not_ready_reason") is not None
+            or not allowed_feed_hold(feed, day)
             or not str(feed.get("caption") or "").strip()
             or not str(feed.get("image_url") or "").startswith("https://")
             or story_url == feed.get("image_url")):

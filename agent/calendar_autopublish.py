@@ -350,6 +350,15 @@ def _paired_lasso_feed_published(story, store):
             and matches[0].get("late_post_id") is not None)
 
 
+def _paired_lasso_story_prepared(feed, store):
+    """Fail closed unless the DB proves one exact usable Story for this feed."""
+    try:
+        reader = getattr(store, "lasso_paired_story_ready_for_feed")
+        return reader(feed["id"]) is True
+    except Exception:
+        return False
+
+
 def assign_slots(rows):
     """
     Given a day+account's content_calendar rows, return [(row, slot_time)] where
@@ -1137,7 +1146,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
     if gym_id == "lasso" and hasattr(store, "_client"):
         try:
             from .jobs.lasso_daily_paired_stories import release_ready_holds
-            release_ready_holds(store, run_date)
+            release_ready_holds(store, run_date, catchup_days=catchup_days)
         except Exception as exc:
             print(f"[lasso-paired-story-release] held: {type(exc).__name__}")
 
@@ -1286,6 +1295,15 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             waiting.append(row_id)
             continue
         if paired_lasso_story and not _paired_lasso_feed_published(row, store):
+            waiting.append(row_id)
+            continue
+        paired_lasso_feed = (
+            str(gym_id or "").strip().lower() == "lasso"
+            and (row.get("format") or "feed").strip().lower() == "feed"
+            and row.get("slot_index") in (0, 1, 2)
+            and row_date >= "2026-10-02"
+            and _lasso_three_feed_enabled(gym_id, row_date))
+        if paired_lasso_feed and not _paired_lasso_story_prepared(row, store):
             waiting.append(row_id)
             continue
 

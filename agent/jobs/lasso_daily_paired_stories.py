@@ -15,9 +15,11 @@ from agent import config, infographic_evidence, variant_regen, visual_writer_pre
 from agent.infographic_artifacts import ArtifactStore
 from agent.portal_calendar_store import SupabaseCalendarStore
 from agent.jobs import lasso_paired_story_backfill as stage
+from agent.jobs import lasso_paired_story_repair as repair
 
 ACCOUNTS = {"instagram": "lasso_ig", "facebook": "lasso_fb"}
-MAX_PER_RUN = 6  # Two days, three slots, one account per invocation.
+MAX_PER_RUN = 9  # Six current/next-day pairs plus three catchup repairs.
+MAX_BACKLOG_PER_RUN = 3
 
 
 def _system_ready(store):
@@ -28,13 +30,30 @@ def _system_ready(store):
     return response.status_code == 200 and response.json() is True
 
 
-def release_ready_holds(store, day):
-    """Release only DB-proven paired holds after the feed has a receipt."""
-    if not stage.FIRST <= stage.date.fromisoformat(day) <= stage.LAST:
+def release_ready_holds(store, day, *, catchup_days=0):
+    """Release DB-proven holds over the publisher's exact catchup window."""
+    run_day = stage.date.fromisoformat(day)
+    if type(catchup_days) is not int or catchup_days < 0:
+        raise ValueError("invalid paired Story catchup window")
+    end = min(stage.LAST, run_day)
+    first = max(stage.FIRST, run_day - timedelta(days=catchup_days))
+    if first > end:
         return {"released": 0, "blocked": 0}
     if not _system_ready(store):
         return {"released": 0, "blocked": 0}
-    rows = stage._active_day(store, day)
+    complete_reader = getattr(store, "rows_in_range_complete", None)
+    if callable(complete_reader):
+        rows = complete_reader("lasso", first.isoformat(), end.isoformat())
+    else:
+        # Narrow injected stores use the same complete, paginated day reader.
+        rows = []
+        for offset in range((end - first).days + 1):
+            rows.extend(stage._active_day(store, (first + timedelta(days=offset)).isoformat()))
+    if not isinstance(rows, list) or any(
+        not isinstance(r, dict) or r.get("gym_id") != "lasso"
+        or not first.isoformat() <= str(r.get("post_date") or "")[:10] <= end.isoformat()
+        for r in rows):
+        raise RuntimeError("paired Story catchup read incomplete")
     held = [r for r in rows if r.get("gym_id") == "lasso"
             and r.get("account") in ACCOUNTS
             and r.get("format") == "story"
@@ -42,12 +61,15 @@ def release_ready_holds(store, day):
             and r.get("status") == "pending"
             and r.get("variant_status") == "active"
             and r.get("media_not_ready_reason") == "paired_feed_not_ready"]
-    if len(held) > 6:
-        raise RuntimeError("paired Story hold count exceeds daily bound")
+    # Today's Stories first, then newest backlog. The same call still attempts
+    # every eligible held row across the catchup window; no fixed seven-day gap.
+    held.sort(key=lambda r: (-stage.date.fromisoformat(str(r["post_date"])[:10]).toordinal(),
+                             r["account"], r["slot_index"]))
     result = {"released": 0, "blocked": 0}
     for story in held:
         feed = [r for r in rows if r.get("account") == story["account"]
                 and r.get("format") == "feed"
+                and str(r.get("post_date") or "")[:10] == str(story["post_date"])[:10]
                 and r.get("slot_index") == story["slot_index"]
                 and r.get("variant_status") == "active"]
         if len(feed) != 1 or feed[0].get("status") != "published" or not feed[0].get("published_at") \
@@ -100,12 +122,12 @@ def _eligible(feed, account, day):
             and feed.get("slot_index") in (0, 1, 2)
             and feed.get("variant_status") == "active"
             and feed.get("status") in ("pending", "approved", "published")
-            and feed.get("media_not_ready_reason") is None
+            and stage.allowed_feed_hold(feed, day)
             and str(feed.get("caption") or "").strip()
             and str(feed.get("image_url") or "").startswith("https://"))
 
 
-def _verify_staged_pair(store, action):
+def _verify_staged_pair(store, action, *, expected_hold=None):
     """Read the committed Story and durable feed link after the stage RPC."""
     story = stage._one(store, "content_calendar", {
         "gym_id": "eq.lasso", "id": "eq." + action["story_id"], "select": "*"})
@@ -118,6 +140,10 @@ def _verify_staged_pair(store, action):
                 str(action["story_scheduled_at"]).replace("Z", "+00:00")))
     except (TypeError, ValueError):
         schedule_matches = False
+    feed_pillar = (action["feed_pillar"] if "feed_pillar" in action else
+                   action["expected_feed"]["pillar"])
+    logical_id = (action["feed_logical_post_id"] if "feed_logical_post_id" in action else
+                  action["expected_feed"]["logical_post_id"])
     if (link.get("story_id") != action["story_id"]
             or link.get("feed_id") != action["feed_id"]
             or story.get("id") != action["story_id"]
@@ -129,21 +155,24 @@ def _verify_staged_pair(store, action):
             or story.get("variant_status") != "active"
             or story.get("status") not in ("pending", "approved", "publishing", "published")
             or story.get("caption") != ""
-            or story.get("pillar") != action["feed_pillar"]
+            or story.get("pillar") != feed_pillar
             or story.get("image_url") != action["story_image_url"]
             or story.get("source_media_url") != action["story_image_url"]
-            or story.get("logical_post_id") != action["feed_logical_post_id"]
-            or story.get("media_not_ready_reason") is not None
+            or story.get("logical_post_id") != logical_id
+            or story.get("media_not_ready_reason") != expected_hold
             or not schedule_matches):
         raise RuntimeError("staged Story or source-link readback mismatch")
 
 
 def run(*, now=None, account="instagram", store=None, artifact_store=None,
-        generate_fn=None, host_fn=None, max_per_run=MAX_PER_RUN):
+        generate_fn=None, host_fn=None, max_per_run=MAX_PER_RUN,
+        catchup_days=0):
     summary = {"ok": False, "account": account, "eligible": 0, "generated": 0,
-               "reused": 0, "staged": 0, "occupied": 0, "blocked": 0}
+               "reused": 0, "staged": 0, "repaired": 0,
+               "occupied": 0, "blocked": 0}
     if (account not in ACCOUNTS or type(max_per_run) is not int
-            or not 1 <= max_per_run <= MAX_PER_RUN):
+            or not 1 <= max_per_run <= MAX_PER_RUN
+            or type(catchup_days) is not int or not 0 <= catchup_days <= 37):
         summary["reason"] = "invalid account or cap"
         return summary
     tenant = ACCOUNTS[account]
@@ -175,7 +204,9 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
         summary["reason"] = "managed Story migration preflight failed"
         return summary
     summary["ok"] = True
-    for offset in (0, 1):
+    offsets = [0, 1] + [-n for n in range(1, catchup_days + 1)]
+    backlog_attempts = 0
+    for offset in offsets:
         day = (today + timedelta(days=offset)).isoformat()
         if not stage.FIRST <= today + timedelta(days=offset) <= stage.LAST:
             continue
@@ -196,12 +227,36 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                         and (r.get("variant_status") or "active") == "active"
                         and (r.get("status") or "pending") not in ("denied", "killed", "failed")
                         and r.get("slot_index") in (None, slot)]
-            if occupied:
+            repair_target = None
+            if len(occupied) == 1 and occupied[0].get("slot_index") == slot:
+                candidate = occupied[0]
+                if (candidate.get("status") == "pending"
+                        and candidate.get("variant_status") == "active"
+                        and candidate.get("published_at") is None
+                        and candidate.get("late_post_id") is None
+                        and candidate.get("publish_claim_token") is None
+                        and candidate.get("logical_post_id") == feed.get("logical_post_id")
+                        and candidate.get("media_not_ready_reason") in
+                        (None, "paired_feed_not_ready")):
+                    try:
+                        if store.lasso_paired_story_ready_for_feed(feed["id"]) is True:
+                            summary["occupied"] += 1
+                            continue
+                    except Exception:
+                        # Missing/failed source proof never certifies a safe
+                        # existing Story; the exact repair RPC still validates.
+                        pass
+                    repair_target = candidate
+            if occupied and repair_target is None:
                 summary["occupied"] += 1
                 continue
             if summary["eligible"] >= max_per_run:
                 continue
+            if offset < 0 and backlog_attempts >= MAX_BACKLOG_PER_RUN:
+                continue
             summary["eligible"] += 1
+            if offset < 0:
+                backlog_attempts += 1
             source_id = f"content_calendar:{feed['id']}:caption"
             source_hash = hashlib.sha256(feed["caption"].encode("utf-8")).hexdigest()
             cache_key = "paired-story:" + hashlib.sha256(
@@ -219,12 +274,16 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                     # lease. Another daily tick may have staged or generated it.
                     fresh = stage._feed(store, str(feed["id"]))
                     fresh_day = stage._active_day(store, day)
-                    if fresh != feed or any(
+                    fresh_occupied = [r for r in fresh_day if (
                         str(r.get("account") or "").lower() == account
                         and str(r.get("format") or "").lower() == "story"
                         and (r.get("variant_status") or "active") == "active"
                         and (r.get("status") or "pending") not in ("denied", "killed", "failed")
-                        and r.get("slot_index") in (None, slot) for r in fresh_day):
+                        and r.get("slot_index") in (None, slot))]
+                    if (fresh != feed or (repair_target is None and fresh_occupied)
+                            or (repair_target is not None and
+                                (len(fresh_occupied) != 1 or
+                                 fresh_occupied[0] != repair_target))):
                         summary["occupied"] += 1
                         continue
                     artifact = _candidate_artifact(store, tenant, source_id, source_hash)
@@ -255,16 +314,27 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                         "story_sha256": artifact.get("image_sha256"),
                         "artifact_tenant": tenant,
                         "policy_version": evidence.get("policy_version")}
-                action = stage.plan_one(store, item)
-                if action["state"] != "ready":
-                    summary["occupied"] += 1
-                    continue
-                receipt = stage.apply_one(store, action)
-                if receipt.get("result") in ("inserted", "idempotent"):
-                    _verify_staged_pair(store, action)
-                    summary["staged"] += 1
+                if repair_target is not None:
+                    repair_item = dict(item, story_id=str(repair_target["id"]))
+                    action = repair.plan_one(store, repair_item)
+                    receipt = repair.apply_one(store, action)
+                    if receipt.get("result") == "repaired":
+                        _verify_staged_pair(store, action,
+                            expected_hold=receipt.get("hold_reason"))
+                        summary["repaired"] += 1
+                    else:
+                        summary["blocked"] += 1
                 else:
-                    summary["blocked"] += 1
+                    action = stage.plan_one(store, item)
+                    if action["state"] != "ready":
+                        summary["occupied"] += 1
+                        continue
+                    receipt = stage.apply_one(store, action)
+                    if receipt.get("result") in ("inserted", "idempotent"):
+                        _verify_staged_pair(store, action)
+                        summary["staged"] += 1
+                    else:
+                        summary["blocked"] += 1
             except Exception:
                 summary["blocked"] += 1
             finally:

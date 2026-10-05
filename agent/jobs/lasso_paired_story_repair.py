@@ -92,7 +92,7 @@ def plan_one(store, item):
             or url == feed.get("image_url")
             or feed.get("format") != "feed" or feed.get("variant_status") != "active"
             or feed.get("status") not in ("pending", "approved", "published")
-            or feed.get("media_not_ready_reason") is not None
+            or not base.allowed_feed_hold(feed, day)
             or not str(feed.get("caption") or "").strip()
             or not str(feed.get("image_url") or "").startswith("https://")):
         raise ValueError("feed or reviewed Story media invalid")
