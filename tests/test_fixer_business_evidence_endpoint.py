@@ -331,3 +331,182 @@ def test_other_registered_checks_reach_only_their_fixed_reader(check_id, params,
     status, body = post(payload(check_id=check_id, params=params), reader)
     assert status == 200 and body["verified"] is True
     assert [table for table, _ in reader.calls][-1] == terminal_table
+
+
+OPS_SWAP_KEY = "swap-aimee-001"
+OPS_SWAP_ROW = "calendar_row_99"
+
+
+def ops_swap_payload(**patch):
+    value = {
+        "schema_version": 1,
+        "contract_version": FO.OPS_MEDIA_SWAP_EVIDENCE_CONTRACT,
+        "ticket_id": TICKET_ID,
+        "client_id": CLIENT_ID,
+        "request_key": REQUEST_KEY,
+        "reservation_key": OPS_SWAP_KEY,
+        "row_id": OPS_SWAP_ROW,
+    }
+    value.update(patch)
+    return value
+
+
+def ops_swap_receipt():
+    before_url, after_url, caption = "https://img/old.jpg", "https://img/new.jpg", "Copy"
+    digest = lambda value: hashlib.sha256(value.encode()).hexdigest()
+    return {
+        "schema_version": 1, "key": OPS_SWAP_KEY, "action": "swap_media",
+        "gym_key": ECHO_KEY, "ticket_id": TICKET_ID, "status": "done",
+        "request_key": REQUEST_KEY,
+        "created_at": "2026-09-19T11:30:00+00:00", "finished_at": NOW.isoformat(),
+        "result": {"row_id": OPS_SWAP_ROW, "postcondition_verified": True,
+                   "swap_proof": {"row_id": OPS_SWAP_ROW,
+                                  "before_image_sha256": digest(before_url),
+                                  "after_image_sha256": digest(after_url),
+                                  "caption_sha256": digest(caption),
+                                  "before_asset_id": None,
+                                  "after_asset_id": "drive_asset_1"}},
+    }
+
+
+class OpsSwapReader(Reader):
+    def __init__(self, *, calendar=None, asset=None, **kwargs):
+        super().__init__(calendar=[{
+            "id": OPS_SWAP_ROW, "gym_id": ECHO_KEY, "status": "pending",
+            "caption": "Copy", "image_url": "https://img/new.jpg",
+            "source_media_asset_id": "drive_asset_1"}] if calendar is None else calendar,
+            **kwargs)
+        self.asset = make_asset("drive_asset_1", gym_id=ECHO_KEY) if asset is None else asset
+        self.asset.update(consent_member_ref=None, release_ref=None, consent_expires_at=None)
+
+    def __call__(self, table, params):
+        if table == "media_asset":
+            self.calls.append((table, dict(params)))
+            return [dict(self.asset)]
+        return super().__call__(table, params)
+
+
+def post_ops_swap(value, reader, *, secret=SECRET, receipt_store=None):
+    return FO.handle(
+        "POST", FO.OPS_MEDIA_SWAP_EVIDENCE_PATH, headers(secret),
+        json.dumps(value).encode(),
+        deps={"business_evidence": {"read": reader}, "receipt_store": receipt_store or {}},
+        now=NOW, log=lambda *_: None)
+
+
+def test_ops_media_swap_observer_has_its_own_exact_contract_and_auth_gate():
+    reader = OpsSwapReader()
+    status, body = post_ops_swap(ops_swap_payload(), reader, secret="wrong")
+    assert (status, body["error"]) == (401, "unauthorized")
+    assert reader.calls == []
+
+    malformed = ops_swap_payload(extra=True)
+    status, body = post_ops_swap(malformed, reader)
+    assert (status, body["error"]) == (400, "bad_request")
+    assert reader.calls == []
+
+    status, body = post_ops_swap(ops_swap_payload(row_id="short"), reader)
+    assert (status, body["error"]) == (400, "bad_request")
+    assert reader.calls == []
+
+
+def test_ops_media_swap_observer_rechecks_tenant_and_current_request():
+    wrong_tenant = OpsSwapReader()
+    status, body = post_ops_swap(
+        ops_swap_payload(client_id="33333333-3333-4333-8333-333333333333"),
+        wrong_tenant)
+    assert (status, body["error"]) == (409, "ticket_tenant_mismatch")
+    assert [table for table, _ in wrong_tenant.calls] == ["support_tickets"]
+
+    stale_request = OpsSwapReader()
+    status, body = post_ops_swap(ops_swap_payload(request_key="a" * 64), stale_request)
+    assert (status, body["error"]) == (409, "request_identity_mismatch")
+    assert [table for table, _ in stale_request.calls] == [
+        "support_tickets", "support_messages"]
+
+
+def test_ops_media_swap_observer_returns_only_bound_observation_and_fails_closed():
+    receipt = {OPS_SWAP_KEY: ops_swap_receipt()}
+    status, body = post_ops_swap(ops_swap_payload(), OpsSwapReader(), receipt_store=receipt)
+    assert status == 200
+    assert set(body) == {
+        "schema_version", "source", "check_id", "gym_key", "request_key",
+        "merged_sha", "captured_at", "outcome", "verified", "symptom_resolved",
+        "evidence", "reason", "ticket_id", "echo_gym_key", "params", "receipt"}
+    assert body["check_id"] == "media_swap_completed"
+    assert body["merged_sha"] == ""
+    assert body["verified"] is True and body["symptom_resolved"] is True
+    assert body["ticket_id"] == TICKET_ID
+    assert body["echo_gym_key"] == ECHO_KEY
+    assert body["params"] == {"reservation_key": OPS_SWAP_KEY, "row_id": OPS_SWAP_ROW}
+    assert body["receipt"] == {
+        "key": OPS_SWAP_KEY, "gym_key": ECHO_KEY, "ticket_id": TICKET_ID,
+        "request_key": REQUEST_KEY, "action": "swap_media", "status": "done",
+        "row_id": OPS_SWAP_ROW, "created_at": "2026-09-19T11:30:00+00:00",
+        "finished_at": NOW.isoformat(),
+        "proof_digest": hashlib.sha256(json.dumps(
+            receipt[OPS_SWAP_KEY]["result"]["swap_proof"], sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False).encode()).hexdigest(),
+    }
+
+    unverified = OpsSwapReader(calendar=[{
+        "id": OPS_SWAP_ROW, "gym_id": ECHO_KEY, "status": "approved",
+        "caption": "Copy", "image_url": "https://img/new.jpg",
+        "source_media_asset_id": "drive_asset_1"}])
+    status, body = post_ops_swap(ops_swap_payload(), unverified, receipt_store=receipt)
+    assert status == 200 and body["verified"] is False
+    assert body["outcome"] == "unverified"
+
+    status, body = post_ops_swap(ops_swap_payload(), OpsSwapReader(), receipt_store={})
+    assert status == 200 and body["verified"] is False
+    assert body["outcome"] == "unknown"
+    assert "receipt" not in body
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda receipt: receipt.update(gym_key="othergym"),
+    lambda receipt: receipt.update(ticket_id="33333333-3333-4333-8333-333333333333"),
+    lambda receipt: receipt.update(request_key="a" * 64),
+    lambda receipt: receipt["result"].update(row_id="calendar_row_98"),
+    lambda receipt: receipt.update(action="other_action"),
+    lambda receipt: receipt.update(status="unknown"),
+    lambda receipt: receipt.update(created_at="not-a-timestamp"),
+    lambda receipt: receipt.update(finished_at="not-a-timestamp"),
+    lambda receipt: receipt["result"]["swap_proof"].clear(),
+])
+def test_ops_media_swap_receipt_identity_and_proof_fail_closed(mutate):
+    receipt = ops_swap_receipt()
+    mutate(receipt)
+    status, body = post_ops_swap(ops_swap_payload(), OpsSwapReader(),
+                                 receipt_store={OPS_SWAP_KEY: receipt})
+    assert status == 200
+    assert body["verified"] is False
+    assert body["outcome"] in {"unverified", "unknown"}
+    assert "receipt" not in body
+
+
+def test_ops_media_swap_empty_calendar_is_not_replaced_with_default_fixture():
+    status, body = post_ops_swap(ops_swap_payload(), OpsSwapReader(calendar=[]),
+                                 receipt_store={OPS_SWAP_KEY: ops_swap_receipt()})
+    assert status == 200
+    assert body["verified"] is False and body["outcome"] == "unknown"
+
+
+def test_ops_media_swap_refuses_requester_thread_changed_during_observation():
+    class MutatingReader(OpsSwapReader):
+        def __init__(self):
+            super().__init__()
+            self.ticket_reads = 0
+
+        def __call__(self, table, params):
+            if table == "support_tickets":
+                self.ticket_reads += 1
+                if self.ticket_reads == 2:
+                    self.messages = [{**MESSAGE, "body": "A newer request arrived"}]
+            return super().__call__(table, params)
+
+    reader = MutatingReader()
+    status, body = post_ops_swap(ops_swap_payload(), reader,
+                                 receipt_store={OPS_SWAP_KEY: ops_swap_receipt()})
+    assert (status, body["error"]) == (409, "request_identity_mismatch")
+    assert reader.ticket_reads == 2
