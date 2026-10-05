@@ -291,7 +291,8 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     # calendar_row_id that pointed at nothing, and the coach got status="staged" while
     # NO card ever reached the approval queue. The row lands PENDING like every other
     # lane's, so the human tap is untouched — but it now actually exists.
-    row_id, cal_err = _stage_calendar_row(gym_id, draft, cal_store=cal_store)
+    row_id, cal_err = _stage_calendar_row(gym_id, draft, request_id,
+                                                  cal_store=cal_store)
     if cal_err:
         # Never claim staged when the client-visible artifact was not created. The
         # segments are stamped at step 9 (below), so nothing needs rolling back here.
@@ -412,7 +413,7 @@ def _remember_calendar_row(gym_id, request_id, row_id):
 
 
 # ---- helpers ----------------------------------------------------------------
-def _stage_calendar_row(gym_id, draft, *, cal_store=None):
+def _stage_calendar_row(gym_id, draft, request_id=None, *, cal_store=None):
     """Write the rendered story into content_calendar as a PENDING row so it reaches
     the approval queue. Returns (row_id_or_None, error_string_or_None).
 
@@ -428,6 +429,12 @@ def _stage_calendar_row(gym_id, draft, *, cal_store=None):
     # The publisher routes on `account` and SKIPS anything that is not a real
     # platform, so a row with a gym key there would sit pending forever. Refuse to
     # stage one rather than create a card that can never go out.
+    # Stamp the calendar row with the Story Studio request identity. The row's
+    # identity IS the request: a rebuild that mints a NEW request_id must produce a
+    # NEW logical identity, never reuse an existing row grouped by date or image.
+    from . import config as _cfg  # noqa: PLC0415 - local: function rebinds `config` below
+    if _cfg.logical_post_id_enabled():
+        row["logical_post_id"] = str(request_id or draft.draft_id)
     acct = str(row.get("account") or "").strip().lower()
     if acct not in ("instagram", "facebook"):
         return None, f"the story has no valid publish target (account={acct!r})"

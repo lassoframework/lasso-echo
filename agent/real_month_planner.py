@@ -51,6 +51,8 @@ HARD RULES (never weakened):
     unchanged. Nothing here publishes or hosts.
 """
 
+import uuid as _uuid
+
 from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -869,6 +871,12 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
                     "never fabricated)")
                 continue
             draft = _stamp(draft, slot, FEED)
+            if (config.logical_post_id_enabled()
+                    and not _ensure_logical_post_id(draft)):
+                log(f"skip {slot.post_date} summit sprint feed slot "
+                    f"{slot.slot_index}: could not mint a logical_post_id for the "
+                    "new feed draft (fail closed, not staged)")
+                continue
             sprint_feed_by_slot[(slot.post_date, slot.slot_index)] = draft
             drafts.append(draft)
             continue
@@ -888,6 +896,11 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
                 log(f"skip {slot.post_date} Summit daily feed: no approved dated asset")
                 continue
             draft = _stamp(draft, slot, FEED)
+            if (config.logical_post_id_enabled()
+                    and not _ensure_logical_post_id(draft)):
+                log(f"skip {slot.post_date} Summit daily feed: could not mint a "
+                    "logical_post_id for the new feed draft (fail closed, not staged)")
+                continue
             feed_by_date[(slot.post_date, slot.cadence_slot)] = draft
             built_category[(slot.post_date, slot.cadence_slot)] = "summit"
             drafts.append(draft)
@@ -904,6 +917,11 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
         # and to_calendar_rows show the true pillar (never the empty one).
         eff_slot = slot if built_cat == slot.category else _reslot(slot, built_cat)
         draft = _stamp(draft, eff_slot, FEED)
+        if (config.logical_post_id_enabled()
+                and not _ensure_logical_post_id(draft)):
+            log(f"skip {slot.post_date}: could not mint a logical_post_id for the "
+                "new feed draft (fail closed, not staged)")
+            continue
         feed_by_date[(slot.post_date, slot.cadence_slot)] = draft
         built_category[(slot.post_date, slot.cadence_slot)] = built_cat
         drafts.append(draft)
@@ -931,6 +949,11 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
                     f"{slot.slot_index}: no genuine 9:16 sprint asset (never a cropped feed)")
                 continue
             story = _stamp(story, slot, STORY)
+            story = _pair_story_logical_post_id(story, feed_draft, log,
+                                                f"{slot.post_date} summit sprint "
+                                                f"story slot {slot.slot_index}")
+            if story is None:
+                continue
             drafts.append(story)
             continue
         feed_draft = feed_by_date.get((slot.post_date, slot.cadence_slot))
@@ -952,6 +975,10 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
         built_cat = built_category.get((slot.post_date, slot.cadence_slot), slot.category)
         eff_slot = slot if built_cat == slot.category else _reslot(slot, built_cat)
         story = _stamp(story, eff_slot, STORY)
+        story = _pair_story_logical_post_id(story, feed_draft, log,
+                                            f"{slot.post_date} {slot.category} story")
+        if story is None:
+            continue
         drafts.append(story)
     return drafts
 
@@ -1148,6 +1175,155 @@ def _safe_call_story(story_builder, target, day_key, feed_draft, log, label):
         return None
 
 
+# ---- logical post identity (bounded, forward-only; 2026-10-04) ---------------------
+# Each NEW logical content post (one feed + its genuinely paired 9:16 story + the FB
+# mirror clone) shares ONE logical_post_id UUID. The id is minted at feed-draft
+# creation, propagated to the story ONLY across the explicit construction relation
+# (story_builder(target, day_key, feed_draft) / the sprint equivalent, which builds the
+# story FROM that exact feed draft), and carried onto the calendar row. Membership is
+# NEVER inferred from date, photo URL/basename or caption. An existing valid UUID on a
+# draft (a retry of the same draft) is preserved, never re-minted. A present-but-invalid
+# id (malformed/nonstring) on a feed or story, or a story carrying a DIFFERENT valid id
+# than its source feed's, is a FATAL planning error (LogicalPostIdError): the whole
+# build aborts so apply_month_plan's delete/insert never runs against a corrupt plan.
+# Fail-closed throughout: a new feed whose logical_post_id cannot be assigned is never
+# staged, and neither is a story that cannot carry its source feed's id. Historical
+# rows are never backfilled here.
+
+
+class LogicalPostIdError(ValueError):
+    """FATAL planning error: a draft arrived asserting an unusable or forged
+    logical_post_id identity while ECHO_LOGICAL_POST_ID_ENABLED is ON.
+
+    Raised for any present-but-invalid (malformed or nonstring nonempty)
+    logical_post_id on a feed or story draft, and for a story carrying a valid id
+    that DIFFERS from its source feed's (a forged/ambiguous pairing). Identity is
+    never repaired: raising aborts build_month_drafts so the caller
+    (real_month_run.plan_and_build -> lasso_remap / grade_fix._lasso_refill) fails
+    BEFORE apply_month_plan's delete/insert, rather than staging a reduced month and
+    wiping existing pending calendar rows. Missing/empty ids on a NEW draft still
+    mint/pair normally; only ASSERTED identities are fatal. Never raised with the
+    rollout flag OFF."""
+
+def _normalize_logical_post_id(value):
+    """Return the canonical lowercase UUID string for a valid logical_post_id, else ''.
+    Invalid/missing values are treated as absent (never coerced into one)."""
+    raw = (value or "").strip() if isinstance(value, str) else ""
+    if not raw:
+        return ""
+    try:
+        return str(_uuid.UUID(raw))
+    except (ValueError, AttributeError, TypeError):
+        return ""
+
+
+def _logical_post_id_present(raw):
+    """True when `raw` ASSERTS an identity: any nonempty string (even malformed) or
+    any non-None nonstring value. Missing/None/blank-string means ABSENT -- the
+    caller may mint. A present-but-invalid value must NEVER be repaired by
+    reminting or overwriting (fail closed instead)."""
+    if raw is None:
+        return False
+    if isinstance(raw, str):
+        return bool(raw.strip())
+    return True
+
+
+def _ensure_logical_post_id(draft):
+    """Mint a fresh UUID logical_post_id onto a NEW feed draft, preserving an existing
+    valid one (retry of the same draft). A mint or assignment failure aborts the
+    whole plan before apply_month_plan can delete existing pending rows. Never
+    invented for a slot that produced no draft. A draft that ARRIVES carrying a malformed or nonstring
+    nonempty logical_post_id raises LogicalPostIdError (fatal): that value is an
+    asserted identity and is never reminted over (identity repair is forbidden), and
+    a corrupt identity must abort the whole plan before apply_month_plan can delete
+    existing rows. Callers gate on
+    config.logical_post_id_enabled(): with the rollout flag OFF (default) this
+    helper is never invoked and the lane behaves exactly as before the identity
+    feature."""
+    try:
+        raw = getattr(draft, "logical_post_id", "")
+        if _logical_post_id_present(raw):
+            norm = _normalize_logical_post_id(raw)
+            if norm:
+                return norm
+            shown = raw if isinstance(raw, str) else type(raw).__name__
+            raise LogicalPostIdError(
+                f"draft asserts a malformed logical_post_id {shown!r}; an "
+                "asserted identity is never repaired or reminted over, and a "
+                "corrupt identity must abort the whole plan before any apply "
+                "(fatal, not a per-slot skip)")
+        new_id = str(_uuid.uuid4())
+        draft.logical_post_id = new_id
+        if _normalize_logical_post_id(getattr(draft, "logical_post_id", "")) != new_id:
+            raise LogicalPostIdError(
+                "draft did not retain minted logical_post_id; aborting the plan "
+                "before any calendar apply")
+        return new_id
+    except LogicalPostIdError:
+        raise
+    except Exception as exc:
+        raise LogicalPostIdError(
+            "could not mint or assign logical_post_id; aborting the plan before "
+            "any calendar apply"
+        ) from exc
+
+
+def _pair_story_logical_post_id(story, feed_draft, log, label):
+    """Carry the feed draft's logical_post_id onto its genuinely paired story.
+
+    The ONLY relation honored here is the explicit construction one: the story was
+    built by the injected story builder FROM this exact feed draft. Date, photo
+    URL/basename and caption are NEVER used to decide pairing. A story carrying a
+    MALFORMED id, a story carrying a DIFFERENT valid id than its source feed's, or a
+    source feed carrying a malformed id is a FATAL planning error: raises
+    LogicalPostIdError so the whole build aborts before apply_month_plan (no pair is
+    invented, no identity repaired, no reduced month staged over existing rows). A
+    story whose feed carries NO id, or which cannot accept the paired id, aborts
+    the plan before any calendar apply. When the ECHO_LOGICAL_POST_ID_ENABLED rollout flag is OFF
+    (default) the story passes through untouched: no pairing, no error, no skip."""
+    if not config.logical_post_id_enabled():
+        return story
+    feed_raw = getattr(feed_draft, "logical_post_id", "")
+    feed_id = _normalize_logical_post_id(feed_raw)
+    if not feed_id:
+        if _logical_post_id_present(feed_raw):
+            raise LogicalPostIdError(
+                f"{label}: source feed draft carries a malformed logical_post_id "
+                f"{feed_raw!r}; an asserted identity is never repaired, aborting "
+                "the plan before any apply")
+        raise LogicalPostIdError(
+            f"{label}: source feed draft carries no logical_post_id; aborting "
+            "the plan before any apply")
+    story_raw = getattr(story, "logical_post_id", "")
+    story_id = _normalize_logical_post_id(story_raw)
+    if _logical_post_id_present(story_raw) and not story_id:
+        shown = (story_raw if isinstance(story_raw, str)
+                 else type(story_raw).__name__)
+        raise LogicalPostIdError(
+            f"{label}: story carries a malformed logical_post_id {shown!r}; an "
+            "asserted identity is never overwritten with the feed's id (no "
+            "identity repair), aborting the plan before any apply")
+    if not story_id:
+        try:
+            story.logical_post_id = feed_id
+        except Exception as exc:
+            raise LogicalPostIdError(
+                f"{label}: story cannot carry its source feed's logical_post_id; "
+                "aborting the plan before any apply"
+            ) from exc
+        if _normalize_logical_post_id(getattr(story, "logical_post_id", "")) != feed_id:
+            raise LogicalPostIdError(
+                f"{label}: story did not retain its source feed's logical_post_id; "
+                "aborting the plan before any apply")
+    elif story_id != feed_id:
+        raise LogicalPostIdError(
+            f"{label}: story carries its own logical_post_id {story_id} distinct "
+            f"from its source feed's {feed_id}; a forged/mismatched pairing is a "
+            "fatal planning error, aborting before any apply (no pair invented)")
+    return story
+
+
 def _stamp(draft, slot, fmt):
     """Stamp the plan's category + format + date onto the draft so to_calendar_rows maps
     them straight through, WITHOUT inventing content. category is set to the slot's
@@ -1200,6 +1376,15 @@ def to_calendar_rows(drafts, account_key):
         row = _mirror._real_row(account_key, draft, caption=clean_caption)
         if not row["post_date"]:
             continue
+        # LOGICAL POST ID: pass the draft's logical_post_id straight through when it
+        # is a valid UUID (the IG feed row, its FB mirror clone below via dict(row),
+        # and the genuinely paired story row all then share one UUID). Omitted when
+        # absent so pre-migration inserts never carry an unknown column, and historical
+        # rows are never backfilled.
+        _lpid = (_normalize_logical_post_id(getattr(draft, "logical_post_id", ""))
+                 if config.logical_post_id_enabled() else "")
+        if _lpid:
+            row["logical_post_id"] = _lpid
         # status is normalized to the portal vocabulary by the mirror; the planner's
         # freshly built drafts are PENDING, so this reads 'pending'.
         rows.append(row)

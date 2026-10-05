@@ -48,12 +48,41 @@ SAFETY RAILS
 """
 
 import os
+import uuid
 
 from . import config
 
 SEED_MAX_PER_RUN = 3
 SEED_DAYS_AHEAD = 2
 _SCRAPE_MARK_PREFIX = "deep_brain_scraped_"
+
+
+def _logical_post_ids_enabled():
+    """Read the forward-only identity flag; old deployments default to OFF."""
+    try:
+        enabled = getattr(config, "logical_post_id_enabled", None)
+        return bool(enabled()) if callable(enabled) else False
+    except Exception:  # noqa: BLE001 - flag uncertainty never changes legacy behavior
+        return False
+
+
+def _ensure_logical_post_id(row):
+    """Stamp one generated standalone row, preserving valid same-object retries."""
+    if not _logical_post_ids_enabled():
+        return True
+    existing = row.get("logical_post_id")
+    if existing is not None:
+        try:
+            uuid.UUID(str(existing))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        return True
+    try:
+        row["logical_post_id"] = str(uuid.uuid4())
+        uuid.UUID(row["logical_post_id"])
+        return True
+    except Exception:  # noqa: BLE001 - never stage an unkeyed generated post
+        return False
 
 # CLIENT-SAFE REVIEW MARK (2026-09-11): every row this module inserts is
 # machine-generated from a scrape, ungrounded in any human-approved brand
@@ -286,6 +315,9 @@ def seed_gaps(base, account, store, *, log=None, today=None,
             "format": "feed", "pillar": NEEDS_CLIENT_SAFE_REVIEW_PILLAR,
             "caption": headline, "image_url": url, "status": "pending",
         }
+        if not _ensure_logical_post_id(row):
+            log(f"{base} {day}: logical post identity unavailable; holding seed batch")
+            return 0
         # The generated PNG is hosted byte-for-byte as rendered; it is not
         # cropped or otherwise transformed after hosting. When the global
         # prepared writer is armed, explicitly identify that same hosted object

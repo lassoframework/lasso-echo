@@ -4738,3 +4738,17 @@ def auto_reels_debounce_seconds():
         return max(60, min(3600, int(os.environ.get("AGENT_AUTO_REELS_DEBOUNCE_SECONDS", "300"))))
     except ValueError:
         return 300
+
+
+def logical_post_id_enabled() -> bool:
+    """
+    FORWARD-ONLY logical_post_id writer switch (ECHO_LOGICAL_POST_ID_ENABLED).
+    Default OFF. When OFF, no forward writer stamps a logical_post_id: calendar
+    rows carry no new key and no skip/hold/failure is caused by stamping — every
+    lane behaves exactly as it did before the identity feature landed. When ON,
+    new IG feed + FB mirror + paired Story share one minted UUID, event and GBP
+    posts get singleton UUIDs, Story Studio stamps the request identity, and an
+    invalid or unassignable identity fails closed. The calendar store still
+    accepts caller-provided IDs and the migration is unchanged either way.
+    """
+    return _truthy(os.environ.get("ECHO_LOGICAL_POST_ID_ENABLED", "false"))

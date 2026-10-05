@@ -23,12 +23,48 @@ Scope guards:
 
 import os
 import time
+import uuid
 from datetime import date, timedelta
 
 from . import config
 
 FILL_DAYS_AHEAD = 2          # look this many days ahead for empty days
 FILL_MAX_PER_RUN = 2         # cards per scan pass (drip, never flood)
+
+
+def _logical_post_ids_enabled():
+    """Read the forward-only identity flag; old deployments default to OFF."""
+    try:
+        enabled = getattr(config, "logical_post_id_enabled", None)
+        return bool(enabled()) if callable(enabled) else False
+    except Exception:  # noqa: BLE001 - flag uncertainty never changes legacy behavior
+        return False
+
+
+def _ensure_logical_post_id(draft):
+    """Stamp a newly generated standalone feed draft when the feature is armed.
+
+    Preserve valid identity on retry of the same draft object. Invalid existing
+    identity or an assignment failure returns False so the caller holds it.
+    """
+    if not _logical_post_ids_enabled():
+        return True
+    existing = getattr(draft, "logical_post_id", None)
+    # None or "" (the Draft dataclass default on mirror-built drafts) is ABSENT
+    # identity, not a malformed one: mint below. A NON-EMPTY invalid value still
+    # fails closed so the caller holds the draft.
+    if existing:
+        try:
+            uuid.UUID(str(existing))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        return True
+    try:
+        draft.logical_post_id = str(uuid.uuid4())
+        uuid.UUID(draft.logical_post_id)
+        return True
+    except Exception:  # noqa: BLE001 - never stage an unkeyed generated post
+        return False
 
 # CLIENT-SAFE REVIEW MARK (2026-09-11, same requirement as no_media_astra_seed.py's
 # NEEDS_CLIENT_SAFE_REVIEW_PILLAR): every row here is Echo's own scrape-grounded
@@ -463,6 +499,9 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             category=_with_review_mark(getattr(source, "category", "")),
             image_engine=f"{_res.engine}:{_res.model}" if _res is not None else "",
         )
+        if not _ensure_logical_post_id(draft):
+            log(f"{base} {day}: logical post identity unavailable; holding infographic")
+            continue
         draft.is_story = False
         if not _stamp_same_object_source(draft, hosted, log, f"{base} {day}"):
             continue
@@ -494,7 +533,25 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         log(f"{base}: infographic day taken before insert; holding drafts")
         return {"ok": True, "filled": 0, "gaps": len(gaps),
                 "reason": "calendar day taken before insert"}
-    rows = _to_rows(base, drafts)
+    # Convert each generated draft independently. _to_rows explicitly creates
+    # the Instagram feed and its Facebook cross-post together; carrying the
+    # draft's ID onto those rows preserves that known relationship without
+    # matching unrelated rows by date, caption, or image.
+    if not _logical_post_ids_enabled():
+        # Preserve the legacy batch conversion exactly while the feature is off.
+        rows = _to_rows(base, drafts)
+    else:
+        rows = []
+        for draft in drafts:
+            draft_rows = _to_rows(base, [draft])
+            logical_post_id = getattr(draft, "logical_post_id", None)
+            if not logical_post_id:
+                log(f"{base}: logical post identity missing before insert; holding batch")
+                return {"ok": False, "reason": "logical post identity unavailable",
+                        "filled": 0, "gaps": len(gaps)}
+            for row in draft_rows:
+                row["logical_post_id"] = logical_post_id
+            rows.extend(draft_rows)
     clean = [{k: v for k, v in r.items() if k != "id"} for r in rows]
     try:
         inserted = len(store.insert_rows(base, clean) or [])
