@@ -29,7 +29,7 @@ def test_lasso_third_feed_has_noon_slot_without_moving_regular_or_story(monkeypa
     assert autopublish.slot_time_for_row(dict(base, slot_index=2)) == "12:00"
     assert autopublish.slot_time_for_row(
         dict(base, format="story", slot_index=2, id="story")
-    ) == "12:30"
+    ) == "12:15"
 
     # The same ordinal cannot open another tenant or a day outside the campaign.
     assert autopublish.slot_time_for_row(
@@ -95,7 +95,7 @@ def test_preserve_and_prune_admits_ordinal_two_only_for_lasso_feed_window(monkey
     assert preserve_and_prune(Store(), "lasso", ["2026-09"], [row(fmt="story")])[0] == []
 
 
-def test_publish_capacity_uses_actual_local_claim_day_and_stays_feed_only(monkeypatch):
+def test_publish_capacity_uses_actual_local_claim_day_for_feed_and_story(monkeypatch):
     _enable_window(monkeypatch)
     monkeypatch.setattr(config, "cadence_2x_enabled", lambda: True)
 
@@ -110,7 +110,7 @@ def test_publish_capacity_uses_actual_local_claim_day_and_stays_feed_only(monkey
     # date or the worker/server UTC date.
     assert autopublish._publish_capacity("lasso", feed, Store(), WINDOW_DAY) == 3
     assert autopublish._publish_capacity("lasso", feed, Store(), "2026-11-09") == 2
-    assert autopublish._publish_capacity("lasso", story, Store(), WINDOW_DAY) == 2
+    assert autopublish._publish_capacity("lasso", story, Store(), WINDOW_DAY) == 3
     assert autopublish._publish_capacity("client", feed, Store(), WINDOW_DAY) == 2
 
 

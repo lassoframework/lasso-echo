@@ -64,7 +64,7 @@ class _Store:
     def patch(self, url, params, headers, json, timeout):
         assert url == "content_calendar"
         self.patches.append((params, json))
-        rid = params["id"].removeprefix('eq."').removesuffix('"')
+        rid = params["id"].removeprefix('eq.')
         row = self.rows[rid]
         # Simulate the database's full-field CAS, including a racing caption edit.
         if any(params[key] != repair._eq(row[key]) for key in repair._CAS_COLUMNS):

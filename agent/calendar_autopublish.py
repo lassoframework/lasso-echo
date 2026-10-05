@@ -237,9 +237,12 @@ def slot_time_for_row(row, n=None):
     index follow their matching feed by 15 minutes."""
     fmt = (row.get("format") or "feed").strip().lower()
     si = row.get("slot_index")
-    lasso_durable = (str(row.get("gym_id") or "").strip().lower() == "lasso"
-                     and config.lasso_three_feed_enabled())
-    if fmt == "story" and si in (0, 1, 2) and lasso_durable:
+    lasso_paired = (
+        str(row.get("gym_id") or "").strip().lower() == "lasso"
+        and (config.lasso_three_feed_enabled()
+             or _lasso_summit_daily_enabled(row.get("gym_id"),
+                                            row.get("post_date"))))
+    if fmt == "story" and si in (0, 1, 2) and lasso_paired:
         feed_slot = config.cadence_slot_times()[int(si)] if si in (0, 1) else "12:00"
         hour, minute = (int(part) for part in feed_slot.split(":"))
         # A configured late feed must never wrap its Story to the next day's
@@ -249,13 +252,13 @@ def slot_time_for_row(row, n=None):
     # LASSO Summit daily runway: the extra FEED owns a third, distinct local
     # slot.  Scope this by both tenant and the row's explicit calendar day so
     # enabling the campaign cannot change clients or spill beyond its window.
-    # Summit-only Stories retain the existing 12:30 slot.
+    # The Summit-only third Story follows its noon feed at 12:15.
     if (fmt == "feed" and si == 2
             and _lasso_three_feed_enabled(row.get("gym_id"),
                                           row.get("post_date"))):
         return "12:00"
     if (fmt == "feed" and si in (0, 1)
-            and (config.cadence_2x_enabled() or lasso_durable)):
+            and (config.cadence_2x_enabled() or lasso_paired)):
         return config.cadence_slot_times()[int(si)]
     if n is None:
         n = len(SPRINT_SLOT_TIMES)
@@ -302,11 +305,11 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
     if (is_feed
             and _lasso_three_feed_enabled(gym_id, local_claim_day)):
         return max(capacity, 3)
-    # The durable LASSO cadence pairs each of its three feeds with a Story.
-    # The temporary Summit-only third slot remains feed-only.
+    # Both the durable cadence and the dated Summit cadence pair each feed
+    # with a Story, so their publish capacity must agree with the planner.
     if ((row.get("format") or "feed").strip().lower() == "story"
             and str(gym_id or "").strip().lower() == "lasso"
-            and config.lasso_three_feed_enabled()):
+            and _lasso_three_feed_enabled(gym_id, local_claim_day)):
         return max(capacity, 3)
     return capacity if is_feed else min(capacity, 2)
 
@@ -329,7 +332,7 @@ def _paired_lasso_feed_published(story, store):
             rows = store.list_active_logical_post_rows("lasso", logical_id)
         else:
             day = str(story["post_date"])[:10]
-            rows = store.rows_in_range_repeat_hold("lasso", day, day)
+            rows = store.rows_in_range_complete("lasso", day, day)
     except Exception:
         return False
     if not isinstance(rows, list):
@@ -1268,7 +1271,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             str(gym_id or "").strip().lower() == "lasso"
             and (row.get("format") or "feed").strip().lower() == "story"
             and row.get("slot_index") in (0, 1, 2)
-            and config.lasso_three_feed_enabled())
+            and _lasso_three_feed_enabled(gym_id, row_date))
         if ((paired_lasso_story and
              (future_date or (not past_date and not is_due(row, now, gym_tz))))
                 or (not paired_lasso_story and not catch_all and

@@ -827,7 +827,7 @@ class _PairedFeedStore(_FakeStore):
         return [dict(row) for row in self.rows.values()
                 if row.get("logical_post_id") == logical_id]
 
-    def rows_in_range_repeat_hold(self, gym, first, last):
+    def rows_in_range_complete(self, gym, first, last):
         assert gym == "lasso" and first == last
         return [dict(row) for row in self.rows.values()
                 if row.get("gym_id") == gym and row.get("post_date") == first]

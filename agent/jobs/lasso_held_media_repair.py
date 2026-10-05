@@ -24,7 +24,7 @@ HORIZON_DAYS = 1
 _CAS_COLUMNS = (
     "id", "gym_id", "status", "variant_status", "account", "format",
     "post_date", "caption", "image_url", "source_media_url",
-    "source_media_asset_id", "drive_file_id", "thumbnail_url", "created_at",
+    "source_media_asset_id", "thumbnail_url", "created_at",
     "media_not_ready_reason", "published_at", "late_post_id",
     "publish_claim_token", "publish_reservation_day", "slot_index",
     "scheduled_at",
@@ -65,8 +65,7 @@ def _same_row(left, right):
 def _eq(value):
     if value is None:
         return "is.null"
-    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-    return f'eq."{escaped}"'
+    return f"eq.{value}"
 
 
 def _reviewed_existing_artifact(store, source_id, source_hash):
@@ -115,7 +114,7 @@ def _replace_exact(store, current, new_url):
         return None
     params = {key: _eq(current[key]) for key in _CAS_COLUMNS}
     payload = {"image_url": new_url, "source_media_url": new_url,
-               "source_media_asset_id": None, "drive_file_id": None,
+               "source_media_asset_id": None,
                "thumbnail_url": None, "media_not_ready_reason": None}
     if visual_writer_prepare.enabled():
         payload = store._prepare_visual_replacement(GYM, current, payload)

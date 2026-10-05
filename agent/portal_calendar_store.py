@@ -3552,10 +3552,11 @@ class SupabaseCalendarStore:
     _REPEAT_HOLD_PAGE_SIZE = 500
     _REPEAT_HOLD_MAX_PAGES = 100        # 50k rows: a hard tripwire, far past any real book
 
-    def rows_in_range_repeat_hold(self, account_key, start_iso, end_iso):
-        """COMPLETE tenant-scoped read for the cross-date repeat HOLD lane ONLY
-        (Blake: rows_in_range caps at 1000; a hold must never rest on a partial
-        book). Id-cursor pagination, active statuses, date range. Every page is
+    def rows_in_range_complete(self, account_key, start_iso, end_iso):
+        """Complete tenant-scoped read of active rows in a date range.
+
+        Unlike rows_in_range, this read does not cap at 1000 rows. Id-cursor
+        pagination covers active statuses and the requested date range. Every page is
         validated; ANY error, malformed row, out-of-scope row, duplicate or
         non-ascending id, or a runaway page count fails the ENTIRE read --
         never a partial result."""
@@ -3605,6 +3606,10 @@ class SupabaseCalendarStore:
             if len(page) < self._REPEAT_HOLD_PAGE_SIZE:
                 return rows
         raise PortalStoreError(0, "repeat hold read exceeded maximum page count")
+
+    def rows_in_range_repeat_hold(self, account_key, start_iso, end_iso):
+        """Compatibility entry point for the cross-date repeat hold lane."""
+        return self.rows_in_range_complete(account_key, start_iso, end_iso)
 
     def rows_in_range(self, account_key, start_iso, end_iso):
         """Return all non-denied content_calendar rows for account_key with

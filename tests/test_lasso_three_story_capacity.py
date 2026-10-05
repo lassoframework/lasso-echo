@@ -20,8 +20,8 @@ def test_durable_lasso_three_stories(monkeypatch):
     assert _capacity(monkeypatch, "lasso", "story", durable=True) == 3
 
 
-def test_summit_only_keeps_story_limit_at_two(monkeypatch):
-    assert _capacity(monkeypatch, "lasso", "story", summit=True) == 2
+def test_summit_only_pairs_third_story(monkeypatch):
+    assert _capacity(monkeypatch, "lasso", "story", summit=True) == 3
     assert _capacity(monkeypatch, "lasso", "feed", summit=True) == 3
 
 
@@ -48,12 +48,12 @@ def test_lasso_story_slot_does_not_wrap_into_next_morning(monkeypatch):
     assert cap.slot_time_for_row(row) == "23:59"
 
 
-def test_story_slot_change_is_lasso_durable_only(monkeypatch):
+def test_story_slot_change_applies_during_summit_only_window(monkeypatch):
     monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "false")
     monkeypatch.setenv("AGENT_LASSO_SUMMIT_DAILY_ENABLED", "true")
     lasso = {"gym_id": "lasso", "post_date": "2026-10-05",
              "format": "story", "slot_index": 2}
-    assert cap.slot_time_for_row(lasso) == "12:30"
+    assert cap.slot_time_for_row(lasso) == "12:15"
     monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
     assert cap.slot_time_for_row({**lasso, "gym_id": "client-gym"}) == "12:30"
 
