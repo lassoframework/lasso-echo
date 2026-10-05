@@ -44,7 +44,7 @@ def _row(row_id="p1", gym_id="zanshin", status="pending", fmt="feed"):
 
 
 class _Store:
-    """Enforces the same gym isolation and the same pending/coach_review write guard
+    """Enforces the same gym isolation and the pending-only write guard
     the real SupabaseCalendarStore.swap_media applies server-side."""
 
     def __init__(self, rows=None):
@@ -71,7 +71,7 @@ class _Store:
         r = self._rows.get(row_id)
         if not r or str(r.get("gym_id")) != str(account_key):
             return None
-        if r.get("status") not in ("pending", "coach_review"):
+        if r.get("status") != "pending":
             return None                      # the server-side status guard
         r["image_url"] = image_url
         if source_media_url is not None:
@@ -793,12 +793,14 @@ def test_pick_replacement_shapes_a_variant_for_every_sibling(monkeypatch):
     assert posters == [1], "ONE poster per swap, not one per variant"
 
 
-def test_the_handler_swaps_pending_siblings_and_leaves_approved_ones(monkeypatch):
+def test_the_handler_swaps_pending_siblings_and_leaves_locked_ones(monkeypatch):
     monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
     rows = _sib_rows()
     rows[1]["status"] = "pending"
+    rows[2]["status"] = "pending"
     approved_fb = dict(rows[1], id="p6", status="approved")   # same post, gym approved it
-    store = _Store(rows + [approved_fb])
+    retired_review = dict(rows[1], id="p7", status="coach_review")
+    store = _Store(rows + [approved_fb, retired_review])
     monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
     settled = {}
     monkeypatch.setattr(msw, "after_swap",
@@ -816,13 +818,14 @@ def test_the_handler_swaps_pending_siblings_and_leaves_approved_ones(monkeypatch
                                         picker=_picker)
     assert status == 200
     assert sorted(body["siblings_swapped"]) == ["p2", "p3"]
-    assert body["siblings_left"] == ["p6"]
+    assert sorted(body["siblings_left"]) == ["p6", "p7"]
     swapped_ids = [s[0] for s in store.swaps]
-    assert sorted(swapped_ids) == ["p1", "p2", "p3"], "p4/p5/p6 must never be touched"
+    assert sorted(swapped_ids) == ["p1", "p2", "p3"], "locked siblings must never be touched"
     for rid in ("p1", "p2", "p3"):
         assert store._rows[rid]["image_url"] == "https://cdn/squat.mp4"
         assert store._rows[rid]["source_media_asset_id"] == "v1"
     assert store._rows["p6"]["image_url"] == "https://cdn/old.jpg"
+    assert store._rows["p7"]["image_url"] == "https://cdn/old.jpg"
     # the ledger settle saw the post-swap book and the ids that moved
     assert sorted(settled["swapped_ids"]) == ["p1", "p2", "p3"]
     assert any(r["id"] == "p6" for r in settled["book_rows"])

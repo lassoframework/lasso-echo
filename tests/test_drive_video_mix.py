@@ -430,7 +430,7 @@ def test_swap_media_carries_thumbnail_and_asset_id_and_nothing_else(monkeypatch)
                       "caption": "never"})
     assert out is not None
     _m, _u, params, _h, payload = http.calls[0]
-    assert params["status"] == "in.(pending,coach_review)"
+    assert params["status"] == "eq.pending"
     assert payload == {"image_url": "https://cdn/squat.mp4",
                        "thumbnail_url": "https://cdn/squat__poster.jpg",
                        "source_media_asset_id": "v1",
