@@ -786,7 +786,7 @@ class SupabaseCalendarStore:
         new_source = patch.get("source_media_url")
         same_source = bool(new_source) and new_source == current.get("source_media_url")
         new_asset_id = patch.get("source_media_asset_id", current.get("source_media_asset_id"))
-        same_asset = new_asset_id == current.get("source_media_asset_id")
+        same_asset = bool(new_asset_id) and new_asset_id == current.get("source_media_asset_id")
         for field in ("source_media_url", "source_media_asset_id", "drive_file_id",
                       "byte_hash", "r2_key", "source_media_content_hash"):
             if field == "source_media_content_hash" and same_source and same_asset:

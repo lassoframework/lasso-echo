@@ -780,7 +780,7 @@ def test_swap_payload_for_a_new_source_clears_the_old_drive_content_hash(armed, 
     assert payload["source_media_asset_id"] is None
 
 
-def test_backfill_keeping_the_same_source_retains_the_content_hash(armed):
+def test_backfill_without_asset_identity_clears_the_content_hash(armed):
     current = calendar_row(image_url="", format="feed", source_media_url=RAW,
                            source_media_content_hash=HASH)
     http = HTTP(current=current)
@@ -788,8 +788,22 @@ def test_backfill_keeping_the_same_source_retains_the_content_hash(armed):
         KEY, "row-1", FINAL, source_media_url=RAW, render_evidence=evidence())
     assert result is not None
     assert result["source_media_url"] == RAW
-    assert result["source_media_content_hash"] == HASH
+    assert result["source_media_content_hash"] is None
     payload = _patch_payload(http)
+    assert payload["source_media_content_hash"] is None
+
+
+def test_same_source_and_asset_identity_retains_content_hash(armed, monkeypatch):
+    monkeypatch.setattr(
+        prep, "prepare",
+        lambda _store, _key, row, **_kwargs: {**row, "visual_group_key": "vg_scene",
+                                                "byte_hash": "derived:test"})
+    current = calendar_row(source_media_url=RAW, source_media_asset_id="asset-old",
+                           source_media_content_hash=HASH)
+    payload = store(HTTP(current=current))._prepare_visual_replacement(
+        KEY, current,
+        {"image_url": FINAL, "source_media_url": RAW,
+         "source_media_asset_id": "asset-old"}, evidence())
     assert payload.get("source_media_content_hash", HASH) == HASH
 
 
