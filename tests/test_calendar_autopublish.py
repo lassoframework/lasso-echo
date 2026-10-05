@@ -2735,6 +2735,24 @@ def test_approved_legacy_semicolon_caption_is_formatted_and_publishes(armed):
     assert store.rows["semi1"]["status"] == "published"
 
 
+def test_approved_legacy_spacing_is_formatted_before_publish(armed, monkeypatch):
+    notices = []
+    monkeypatch.setattr(cap, "_note_caption_formatted", lambda *args: notices.append(args))
+    store = _PreservingStore([_row(
+        "spacing1", status="approved",
+        caption="Move well today. Build strength tomorrow. Join us.")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["published"] == ["spacing1"]
+    sent = pub.calls[0][0].caption
+    assert sent == "Move well today.\n\nBuild strength tomorrow.\n\nJoin us."
+    assert store.preserve_patches == [("lasso", "spacing1", sent)]
+    assert store.rows["spacing1"]["status"] == "published"
+    assert notices == []
+
+
 def test_semicolon_heal_survives_a_store_without_the_patch_method(armed):
     """A legacy/fake store lacking patch_caption_preserve_status still publishes
     the CLEAN caption — the local row is authoritative for the send."""
@@ -2749,6 +2767,41 @@ def test_semicolon_heal_survives_a_store_without_the_patch_method(armed):
 
     assert summary["published"] == ["semi2"]
     assert ";" not in pub.calls[0][0].caption
+
+
+@pytest.mark.parametrize("caption", [
+    "1. Warm up. 2. Cool down for 3. Final stretch now.",
+    "1. Hold for 2. Rest.",
+    "1. Squats 2. Lunges",
+])
+def test_ambiguous_numbered_caption_waits_without_send_or_mutation(armed, caption):
+    store = _PreservingStore([_row("ambiguous", status="approved", caption=caption)])
+    before = dict(store.rows["ambiguous"])
+    pub = _FakePublisher()
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert "ambiguous" in summary["waiting"]
+    assert pub.calls == []
+    assert store.preserve_patches == []
+    assert store.rows["ambiguous"] == before
+
+
+def test_numbered_lines_with_an_ambiguous_quantity_still_wait(armed):
+    store = _PreservingStore([_row("list-lines", status="approved",
+        caption="1. Warm up.\n2. Cool down for 3. Final stretch now.")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    # The second line still has an ambiguous inline number, so it must wait.
+    assert "list-lines" in summary["waiting"]
+    assert pub.calls == []
+
+
+def test_unambiguous_numbered_lines_publish(armed):
+    store = _PreservingStore([_row("list-safe", status="approved",
+        caption="1. Warm up.\n2. Cool down.\n3. Stretch.")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert summary["published"] == ["list-safe"]
+    assert pub.calls[0][0].caption == "1. Warm up.\n\n2. Cool down.\n\n3. Stretch."
 
 
 def test_semicolon_glued_inside_url_holds_the_row(armed):

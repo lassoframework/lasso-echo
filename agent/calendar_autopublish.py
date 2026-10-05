@@ -862,7 +862,9 @@ def _note_caption_formatted(row_id, gym_id):
         _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
             f"{gym_id}: row {row_id} carried a pre-copy-rail caption with "
             "semicolons. Echo auto-formatted it at the publish boundary "
-            "(semicolons became commas) and published the clean caption."))
+            "(semicolons became commas and sentence gaps were standardized). "
+            "The caption is ready for the remaining "
+            "publish checks."))
     except Exception:
         pass  # an alert failure must never block the publish lane
 
@@ -879,36 +881,33 @@ def _alert_caption_format_held(row_id, gym_id):
             return
         _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
             f"{gym_id}: row {row_id} HELD at the publish boundary — its caption "
-            "contains a semicolon that cannot be safely auto-formatted. "
-            "Edit the caption and re-render Story media if applicable; "
+            "cannot be safely auto-formatted. Check protected URL semicolons, "
+            "put numbered list items on separate lines, and re-render Story media if applicable; "
             "the row retries once fixed."))
     except Exception:
         pass  # an alert failure must never block the publish lane
 
 
 def _format_caption_at_publish(row, gym_id, store):
-    """LEGACY SEMICOLON AUTO-HEAL at the publish boundary (ultrareview 2026-10-05).
-    Rows approved before the copy_gate semicolon rail shipped keep their semicolons
-    forever — the correction lanes deliberately skip approved/held/Story/published
-    rows — so the publish_guard copy_violation rail would silently stop every one
-    of them at schedule time. Instead, a due FEED row whose caption still carries
-    semicolons is auto-formatted HERE (semicolons -> commas via copy_gate's
-    format_caption), persisted through the STATUS-PRESERVING patch (an approved row
-    stays approved), and publishes clean this tick. Runs unconditionally, like the
-    meta-strip gate, so a raw semicolon can never reach the wire under any flag
-    combination. STORY rows with semicolons are held because the text may already
-    be burned into the media. A caption whose semicolon sits inside a protected
-    URL also returns None. The caller HOLDS either row and alerts once."""
+    """Format legacy non-Story copy at the final publish boundary.
+
+    Approved rows and media-held rows are excluded from the bulk correction,
+    but may later reach this lane with old sentence spacing. Format the exact
+    caption sent to the network and best-effort persist it without resetting
+    approval. Story text may be burned into media, so a Story with a semicolon
+    holds for correction rather than silently changing its saved caption.
+    A protected URL containing a semicolon also holds instead of being damaged.
+    Ambiguous inline numbered lists wait for items to be placed on separate
+    lines, preserving copy and approval rather than guessing sentence ends.
+    """
     caption = row.get("caption") or ""
     if _is_story_row(row):
         # A Story caption may already be burned into the image or video. Never
         # send the old media while its text still contains a semicolon.
         return None if ";" in caption else row
-    if ";" not in caption:
-        return row
     from .copy_gate import format_caption
     try:
-        clean = format_caption(caption)
+        clean = format_caption(caption, reject_ambiguous_lists=True)
     except ValueError:
         return None
     if clean == caption:
@@ -923,7 +922,11 @@ def _format_caption_at_publish(row, gym_id, store):
               f"{row.get('id')}: {type(e).__name__}: {e}")
     row = dict(patched or row)
     row["caption"] = clean  # what we SEND is clean even when the patch failed
-    _note_caption_formatted(row.get("id"), gym_id)
+    if ";" in caption:
+        _note_caption_formatted(row.get("id"), gym_id)
+    else:
+        print(f"[calendar-autopublish] formatted legacy caption spacing for "
+              f"{gym_id}/{row.get('id')}; awaiting remaining publish checks")
     return row
 
 
@@ -1396,9 +1399,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             continue
         row = cleaned
 
-        # LEGACY SEMICOLON AUTO-HEAL (2026-10-05): an approved FEED row carrying
-        # semicolons is auto-formatted (status preserved) and publishes clean,
-        # rather than tripping the publish_guard copy rail and silently stopping.
+        # Legacy non-Story copy is formatted before sending, including approved
+        # rows that the safe pending-row backfill intentionally left alone.
         # Story rows with semicolons and unformattable URLs hold with an alert.
         formatted = _format_caption_at_publish(row, gym_id, store)
         if formatted is None:
