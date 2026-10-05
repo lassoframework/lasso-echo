@@ -305,6 +305,181 @@ def cropped_url(draft, ctx, library_path, log):
                 pass
 
 
+def _global_writer_armed():
+    """True when the global prepared writer (AGENT_VISUAL_GLOBAL_WRITER_PREP) guards
+    calendar writes. Unknown state fails CLOSED (same posture as
+    gbp_planner._global_writer_enabled): an armed writer rejects any staged GBP row
+    without explicit source lineage, and a mirrored row shares the month build's
+    insert batch with the feed rows, so an unprovable mirror would take the gym's
+    real month down with it."""
+    try:
+        from . import visual_writer_prepare
+        return bool(visual_writer_prepare.enabled())
+    except Exception:  # noqa: BLE001
+        return True
+
+
+# Stable extensions the crop lane accepts as stills; anything else is normalized to
+# .jpg so the qualified basename (and therefore the planner's crop-cache key) stays
+# stable for identical bytes.
+_MIRROR_SRC_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _mirror_src_dir():
+    """Mirror-owned, content-addressed source-staging dir, co-located with the
+    planner's own crop cache so one cache sweep cleans both. Never raises."""
+    base = None
+    try:
+        from . import rotation
+        if hasattr(rotation, "_cache_dir"):
+            base = rotation._cache_dir(None)
+    except Exception:  # noqa: BLE001
+        base = None
+    if not base:
+        try:
+            base = config.data_dir() or "/tmp"
+        except Exception:  # noqa: BLE001
+            base = "/tmp"
+    d = os.path.join(base, "gbp_mirror_src")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = "/tmp"
+    return d
+
+
+def _hash_qualified_source(account_key, src_path, log):
+    """Materialize one verified raw still under a deterministic, mirror-owned,
+    CONTENT-HASH-QUALIFIED basename, and return that path (None on failure).
+
+    gbp_planner._cropped_image caches its 1200x900 crop by
+    `{account}_{basename}_gbp.jpg` freshness-checked only against the source's
+    mtime, so two DIFFERENT photos that share a basename (first/same.jpg,
+    second/same.jpg) can collide on one crop: whichever photo was cropped first
+    wins, and the second photo's render evidence then attests the first photo's
+    pixels. Qualifying the basename with the sha256 of the exact bytes being
+    cropped makes the crop-cache key content-unique, so different bytes can
+    never share a crop while identical bytes deterministically reuse both the
+    staged source and its crop. Written atomically (temp + os.replace); an
+    identical existing file is kept as-is (same-content repeat is stable)."""
+    import hashlib
+    import tempfile
+    try:
+        with open(src_path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        log(f"mirror source materialization failed for {src_path}: {exc}")
+        return None
+    if not raw:
+        log(f"mirror source materialization failed for {src_path}: empty file")
+        return None
+    digest = hashlib.sha256(raw).hexdigest()[:16]
+    stem, ext = os.path.splitext(os.path.basename(src_path))
+    ext = ext.lower() if ext.lower() in _MIRROR_SRC_EXTS else ".jpg"
+    try:
+        d = _mirror_src_dir()
+        dest = os.path.join(d, f"{account_key}_{stem}_{digest}{ext}")
+        if os.path.isfile(dest):
+            try:
+                with open(dest, "rb") as fh:
+                    if fh.read() == raw:
+                        return dest   # same content: stable path, no rewrite
+            except OSError:
+                pass                   # fall through and rewrite atomically
+        fd, tmp = tempfile.mkstemp(prefix=".mirror_src_", dir=d)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+            os.replace(tmp, dest)      # atomic: readers never see partial bytes
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return dest
+    except OSError as exc:
+        log(f"mirror source materialization failed for {src_path}: {exc}")
+        return None
+
+
+def cropped_with_provenance(draft, ctx, library_path, log):
+    """The mirrored row's image PLUS its exact source lineage, or None (HOLD).
+
+    Returns {"url", ...} where url is the hosted 1200x900 crop exactly as
+    cropped_url() produces. When the draft carries Drive provenance
+    (source_media_asset_id / source_media_url) OR the global prepared writer is
+    armed, the crop goes through gbp_planner._transformed_gbp_image with the
+    draft's exact RAW source URL, which:
+
+      * byte-verifies the served raw source against the exact local still the
+        crop is derived from (a stale/unreadable source URL is a HOLD, never an
+        attestation),
+      * builds byte-bound source->delivered render evidence the prepared writer
+        re-verifies at the insert boundary,
+      * holds (returns None) when either cannot be established.
+
+    The cropped URL is NEVER named as the raw source. A Drive draft with no
+    explicit raw source URL is held rather than relabeled (the same ruling
+    client_month_run._capture_raw_hosted_source applies to the feed row: a
+    Drive rendition is not raw). With the writer disarmed and no Drive
+    provenance on the draft this is the byte-for-byte legacy crop path.
+
+    PROVENANCE LANE, crop-cache collision repair (2026-10-05): the served raw
+    source is first byte-verified against the local still, then the still is
+    materialized under a mirror-owned, content-hash-qualified basename (see
+    _hash_qualified_source) and THAT path is handed to
+    gbp_planner._transformed_gbp_image. gbp_planner's crop cache keys on
+    account+basename+mtime, so an unqualified basename lets two different
+    same-named photos share one crop and falsify the second photo's render
+    evidence; the content hash makes the cache key unique per byte content.
+    """
+    import types
+    path, cleanup = _local_still(draft, library_path, log)
+    if not path:
+        return None
+    try:
+        from . import gbp_planner
+        raw_url = (getattr(draft, "source_media_url", "") or "").strip()
+        asset_id = (getattr(draft, "source_media_asset_id", "") or "").strip()
+        if not _global_writer_armed() and not (asset_id or raw_url):
+            url = gbp_planner._cropped_image_url(
+                ctx["account_gen_key"], types.SimpleNamespace(path=path),
+                post_date_of(draft))
+            return {"url": url} if url else None
+        if not raw_url:
+            log(f"{post_date_of(draft)}: GBP mirror held — Drive provenance "
+                "without an explicit raw source URL is never relabeled")
+            return None
+        if not gbp_planner._url_bytes_match(raw_url, path):
+            log(f"{post_date_of(draft)}: GBP mirror held \u2014 served raw source "
+                "bytes do not match the local still (fail-closed, never an "
+                "invented attestation)")
+            return None
+        materialized = _hash_qualified_source(ctx["account_gen_key"], path, log)
+        if not materialized:
+            log(f"{post_date_of(draft)}: GBP mirror held \u2014 raw source could "
+                "not be materialized under a content-hash-qualified name")
+            return None
+        prov = gbp_planner._transformed_gbp_image(
+            ctx["account_gen_key"], types.SimpleNamespace(path=materialized),
+            post_date_of(draft), source_url=raw_url)
+        if not prov:
+            log(f"{post_date_of(draft)}: GBP mirror held — raw source bytes could "
+                "not be verified against the cropped still (fail-closed, never an "
+                "invented attestation)")
+            return None
+        if asset_id:
+            prov["source_media_asset_id"] = asset_id
+        return prov
+    finally:
+        if cleanup:
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
+
+
 def _caption_cache_dir():
     try:
         base = config.data_dir() or "/tmp"
@@ -400,7 +575,8 @@ def gbp_caption(draft, ctx, caption_fn=None, base_key="", cache=True):
 # ---- the mirror ------------------------------------------------------------------------
 
 def rows_for(base_key, drafts, *, library_path=None, store=None, ctx=None,
-             caption_fn=None, image_fn=None, address_fn=None, logger=None):
+             caption_fn=None, image_fn=None, address_fn=None, logger=None,
+             render_evidence_sink=None):
     """The googlebusiness rows that mirror this build's FEED drafts. [] when the flag is
     off, the gym is not connected, its city/voice cannot be resolved, or nothing cleared
     the gates. NEVER raises: a mirror failure must never sink the gym's real month.
@@ -432,7 +608,8 @@ def rows_for(base_key, drafts, *, library_path=None, store=None, ctx=None,
             return []
         from . import gbp_planner
         rows = []
-        skipped_caption = skipped_media = skipped_video = 0
+        skipped_caption = skipped_media = skipped_video = held_provenance = 0
+        armed = _global_writer_armed()
         for draft in candidates:
             day_key = post_date_of(draft)
             # REMOTE VIDEO (audit D7): a Drive-lane video has no local file, so
@@ -443,8 +620,28 @@ def rows_for(base_key, drafts, *, library_path=None, store=None, ctx=None,
                     and image_fn is None):
                 skipped_video += 1
                 continue
-            img_url = (image_fn(draft, day_key) if image_fn is not None
-                       else cropped_url(draft, ctx, library_path, log))
+            prov = None
+            if image_fn is not None:
+                # An injected image URL is an opaque delivered object: no local
+                # still exists to byte-bind a source against, so this seam can
+                # never carry render evidence. Under the armed prepared writer
+                # that row is unprovable -> HOLD (fail-closed), never staged.
+                img_url = image_fn(draft, day_key)
+                if img_url and armed:
+                    held_provenance += 1
+                    continue
+            else:
+                prov = cropped_with_provenance(draft, ctx, library_path, log)
+                img_url = (prov or {}).get("url")
+                if prov is None:
+                    raw = (getattr(draft, "source_media_url", "") or "").strip()
+                    if armed or raw or \
+                            (getattr(draft, "source_media_asset_id", "") or "").strip():
+                        # a provenance-bearing row that could not be attested is
+                        # HELD, never staged unprovable (and never counted as a
+                        # plain missing-still skip)
+                        held_provenance += 1
+                        continue
             if not img_url:
                 skipped_media += 1
                 continue
@@ -452,15 +649,29 @@ def rows_for(base_key, drafts, *, library_path=None, store=None, ctx=None,
             if not cap:
                 skipped_caption += 1
                 continue
-            rows.append(gbp_planner._row(
+            row = gbp_planner._row(
                 base_key, ctx["account_gen_key"], day_key, cap, img_url,
                 topic_type="STANDARD",
                 pillar=(getattr(draft, "category", "") or "").strip(),
                 cta_type=gbp.DEFAULT_CTA, cta_url=ctx["cta_url"],
-                fmt="update", status="pending"))
+                fmt="update", status="pending",
+                source_media_url=(prov or {}).get("source_media_url"),
+                source_media_asset_id=(prov or {}).get("source_media_asset_id"))
+            evidence = (prov or {}).get("render_evidence")
+            if armed:
+                # The prepared writer rejects a transformed row whose proof
+                # never reaches the insert boundary — and this row shares the
+                # month build's batch with the feed rows, so an unforwardable
+                # attestation is a HOLD, never a staged unprovable row.
+                if not evidence or render_evidence_sink is None:
+                    held_provenance += 1
+                    continue
+                render_evidence_sink[img_url] = evidence
+            rows.append(row)
         log(f"{base_key}: mirrored {len(rows)} feed post(s) to Google Business "
             f"({skipped_caption} skipped on the A+ caption gate, {skipped_media} with no "
             f"croppable still, {skipped_video} remote video(s) with no poster to crop, "
+            f"{held_provenance} held with unprovable source lineage, "
             f"of {len(candidates)} feed candidate(s))")
         return rows
     except Exception as exc:  # noqa: BLE001 - the mirror never sinks the real month
