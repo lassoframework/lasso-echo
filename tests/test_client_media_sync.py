@@ -653,6 +653,42 @@ def test_drive_only_gym_builds_from_connected_pool_not_awaiting(monkeypatch):
         assert row["status"] == "pending"      # still lands PENDING, no gate weakened
 
 
+@pytest.mark.parametrize("build_result", [
+    {"ok": True, "noop_empty": True, "upserted": 0},
+    {"ok": False, "awaiting_media": True, "upserted": 0},
+])
+def test_drive_only_empty_first_build_reaches_infographic_fill_same_pass(
+        monkeypatch, build_result):
+    """A Drive-only first build gets its photo-lane attempt before the existing
+    Astra fallback is offered the still-empty calendar."""
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    _arm_drive_pool(monkeypatch, [])
+    monkeypatch.setenv("AGENT_CLIENT_INFOGRAPHIC_FILL", "true")
+
+    import agent.client_month_run as cmr
+    from agent import client_infographic_fill as cif
+    events = []
+
+    def _empty_build(*args, **kwargs):
+        events.append("drive_month_attempt")
+        return build_result
+
+    def _fallback(base, account, store, *, voice, logger=None, **kwargs):
+        events.append(("infographic_fill", base, voice is not None))
+        return {"ok": True, "filled": 0}
+
+    monkeypatch.setattr(cmr, "build_client_month", _empty_build)
+    monkeypatch.setattr(cif, "fill_gaps", _fallback)
+    store = FakeStore()
+
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=FakeR2())
+
+    assert out["ok"] is True
+    assert events == ["drive_month_attempt", ("infographic_fill", "gritx", True)]
+    assert store.inserted == [] and store.deleted == []
+
+
 def test_drive_only_gym_with_stale_sample_rows_still_builds(monkeypatch):
     """MARKER-DEADLOCK REGRESSION (Dean Holcomb / CrossFit Reverb, live, 2026-08-31):
     the FIRST post-fix scan for Dean landed on 'has_calendar' (skip) instead of
