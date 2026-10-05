@@ -2735,6 +2735,21 @@ def test_approved_legacy_semicolon_caption_is_formatted_and_publishes(armed):
     assert store.rows["semi1"]["status"] == "published"
 
 
+def test_approved_legacy_spacing_is_formatted_before_publish(armed):
+    store = _PreservingStore([_row(
+        "spacing1", status="approved",
+        caption="Move well today. Build strength tomorrow. Join us.")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["published"] == ["spacing1"]
+    sent = pub.calls[0][0].caption
+    assert sent == "Move well today.\n\nBuild strength tomorrow.\n\nJoin us."
+    assert store.preserve_patches == [("lasso", "spacing1", sent)]
+    assert store.rows["spacing1"]["status"] == "published"
+
+
 def test_semicolon_heal_survives_a_store_without_the_patch_method(armed):
     """A legacy/fake store lacking patch_caption_preserve_status still publishes
     the CLEAN caption — the local row is authoritative for the send."""
