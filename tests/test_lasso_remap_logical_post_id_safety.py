@@ -125,6 +125,46 @@ def test_unassignable_feed_id_after_valid_draft_aborts_before_any_store_write():
     assert len(store.pending_rows) == 2
 
 
+class _SilentIdentityDraft(Draft):
+    """Mimics a proxy/ORM draft whose setter silently discards the identity."""
+
+    def __setattr__(self, name, value):
+        if name == "logical_post_id" and getattr(self, "_ignore_identity", False):
+            return
+        super().__setattr__(name, value)
+
+
+def test_silent_feed_setter_aborts_before_month_apply():
+    valid = _draft("f-valid", day_key=DAY1)
+    ignored = _SilentIdentityDraft(**vars(_draft("f-ignored", day_key=DAY2)))
+    ignored._ignore_identity = True
+    feeds = iter([valid, ignored])
+    store = _RecordingStore()
+    with pytest.raises(rmp.LogicalPostIdError, match="did not retain minted"):
+        _build_then_apply(
+            [_slot(DAY1, "feed"), _slot(DAY2, "feed")],
+            {"platform": lambda _t, _d: next(feeds)}, store)
+    assert store.deleted == []
+    assert store.inserted == []
+    assert len(store.pending_rows) == 2
+
+
+def test_silent_story_setter_aborts_before_month_apply():
+    feed = _draft("f-valid", day_key=DAY1)
+    story = _SilentIdentityDraft(**vars(_draft(
+        "s-ignored", day_key=DAY1, is_story=True, caption="")))
+    story._ignore_identity = True
+    store = _RecordingStore()
+    with pytest.raises(rmp.LogicalPostIdError, match="did not retain"):
+        _build_then_apply(
+            [_slot(DAY1, "feed"), _slot(DAY1, "story")],
+            {"platform": lambda _t, _d: feed}, store,
+            story_builder=lambda _t, _d, _f: story)
+    assert store.deleted == []
+    assert store.inserted == []
+    assert len(store.pending_rows) == 2
+
+
 def test_malformed_story_id_after_valid_pair_aborts_before_any_store_write():
     feed1 = _draft("f-valid", day_key=DAY1)
     story1 = _draft("s-valid", day_key=DAY1, is_story=True, caption="")

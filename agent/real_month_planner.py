@@ -1255,6 +1255,10 @@ def _ensure_logical_post_id(draft):
                 "(fatal, not a per-slot skip)")
         new_id = str(_uuid.uuid4())
         draft.logical_post_id = new_id
+        if _normalize_logical_post_id(getattr(draft, "logical_post_id", "")) != new_id:
+            raise LogicalPostIdError(
+                "draft did not retain minted logical_post_id; aborting the plan "
+                "before any calendar apply")
         return new_id
     except LogicalPostIdError:
         raise
@@ -1308,6 +1312,10 @@ def _pair_story_logical_post_id(story, feed_draft, log, label):
                 f"{label}: story cannot carry its source feed's logical_post_id; "
                 "aborting the plan before any apply"
             ) from exc
+        if _normalize_logical_post_id(getattr(story, "logical_post_id", "")) != feed_id:
+            raise LogicalPostIdError(
+                f"{label}: story did not retain its source feed's logical_post_id; "
+                "aborting the plan before any apply")
     elif story_id != feed_id:
         raise LogicalPostIdError(
             f"{label}: story carries its own logical_post_id {story_id} distinct "
