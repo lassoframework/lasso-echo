@@ -1678,7 +1678,10 @@ def _restage_args(ctx):
 def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_RENDER_BUDGET,
                       deps=None, log=print, steps=None):
     """The PR #98 post-deploy recipe as one function: (0) prerender every active Drive
-    source filed under this gym (stale keys remapped), (1) observe_denials, (2)
+    source filed under this gym (stale keys resolved for SCOPING only — the
+    persisted row is passed through unchanged and a stale-keyed source is
+    REFUSED by the sync guard before any Drive walk/insert, never re-keyed),
+    (1) observe_denials, (2)
     build_client_month for `days` from `start_date` (today). Returns a summary; each step's
     outcome is appended to `steps` as it finishes so a poller sees progress."""
     deps = deps or {}
@@ -1702,8 +1705,14 @@ def run_restage_month(gym_key, *, days=21, start_date="", render_budget=DEFAULT_
             resolved = _gmr._resolve_stale_fingerprint(src.get("gym_id"))
             if resolved != gym_key:
                 continue
-            src = dict(src)
-            src["gym_id"] = resolved
+            # Pass the ORIGINAL PERSISTED row through UNCHANGED (independent-
+            # review P0, 2026-10-05): rewriting src["gym_id"] = resolved here
+            # used to launder a stale-keyed source into a live-tenant sync,
+            # multiplying the cross-gym media_asset mismatch rows. sync_source
+            # re-reads the persisted row by ID, refuses a caller-rewritten
+            # ownership field, and refuses a stale-keyed source before any
+            # Drive walk or insert — ownership reconciliation is an
+            # evidence-reviewed rebind, never an in-memory rewrite.
             prerender.append(_sync.sync_source(src, store=store, log=log,
                                                render_budget=render_budget))
     out["prerender"] = prerender

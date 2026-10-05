@@ -22,7 +22,7 @@ the per-gym pilot allowlist). For each ACTIVE, gym-drive media_source, staggered
      pool.
   7. Per-GYM new-asset digest to the coach channel (best effort).
 
-Degrades cleanly: no SA key / no Supabase creds -> one log line, no-op. Nothing
+Degrades cleanly: no SA key / no Supabase creds -> the identity check fails closed (tenant_identity_unestablished) or the lane is unarmed, so nothing is walked or inserted — a log line, no-op. Nothing
 here stages, publishes, or writes calendar rows (beyond flipping a pending row
 whose media vanished). NOTHING here logs a secret.
 
@@ -55,6 +55,65 @@ _OWNED_FIELDS = ("kind", "title", "mime_type", "size_bytes", "content_hash",
                  "drive_modified", "source_id")
 
 _STAGGER_SEC = 30.0
+
+
+def _tenant_identity(gym_id):
+    """(established, resolved_key) for the tenant-source binding guard.
+
+    established False means identity CANNOT be established: the account-key
+    identity plane was unreadable/truncated, or the stored key is not a uniquely
+    registered tenant. The sync fails closed in that case (see sync_source).
+
+    This deliberately does NOT use gym_media_routes._resolve_stale_fingerprint:
+    that wrapper is written for the request path, where returning the key
+    UNCHANGED on any uncertainty is the safe repair. For the sync guard an
+    unchanged return is ambiguous — it means both "this IS the live key" and "we
+    could not tell". account_key_resolve.resolve_known_source_keys removes the
+    ambiguity: one COMPLETE fresh plane read, and a key is returned ONLY when it
+    is proven live or uniquely mapped to a live key; every uncertainty returns
+    nothing. It never raises (an uncertain identity authorizes no write).
+    """
+    try:
+        from .. import account_key_resolve as _akr  # noqa: PLC0415
+        verified = _akr.resolve_known_source_keys([gym_id])
+    except Exception:  # noqa: BLE001 - the guard itself must never crash the sync
+        return False, gym_id
+    if gym_id not in verified:
+        return False, gym_id
+    return True, verified[gym_id]
+
+
+def _resolve_verified_keys(gym_ids, log=None):
+    """ONE complete fresh identity-plane read for a whole nightly run.
+
+    resolve_known_source_keys is a full-fleet snapshot; calling it once per
+    SOURCE would multiply an expensive fleet-wide read by the fleet size (and a
+    partially-failing per-source read could suppress an entire fleet's pass one
+    source at a time with no single alarm). run() calls this exactly once and
+    passes the trusted per-run result into sync_source(verified_keys=...).
+
+    Fail closed: ANY exception or incomplete read returns {}, which makes every
+    source this run refuse with tenant_identity_unestablished (skips one pass;
+    never writes on an unproven identity). Never raises.
+    """
+    try:
+        from .. import account_key_resolve as _akr  # noqa: PLC0415
+        return _akr.resolve_known_source_keys(list(dict.fromkeys(gym_ids)))
+    except Exception as e:  # noqa: BLE001 - uncertain identity authorizes no write
+        if log:
+            log(f"batched tenant-identity resolution failed "
+                f"({type(e).__name__}: {e}); every source this run will be "
+                f"refused (fail closed, retry on the next scheduled pass)")
+        return {}
+
+
+def _identity_from_verified(verified, gym_id):
+    """(established, resolved) from a TRUSTED per-run batch result. The batch
+    was produced by a complete fresh resolve_known_source_keys read this same
+    run, so absence from the map means unproven identity (fail closed)."""
+    if gym_id not in verified:
+        return False, gym_id
+    return True, verified[gym_id]
 
 
 def _drop_reingested(rows, gym_id, log):
@@ -370,10 +429,19 @@ def _prerender_pass(gym_id, drive, store, merged, seen_ids, probe_fn, log, *,
 
 def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
                 now_iso=None, probe_budget=None, render_budget=None, host_fn=None,
-                sweep_missing=True, emit_digest=True):
+                sweep_missing=True, emit_digest=True, verified_keys=None):
     """Sync ONE media_source. Returns a per-source summary dict. Never raises out of
     a normal degrade path; a 403 on the walk marks the source revoked_externally and
-    returns a revoked summary."""
+    returns a revoked summary.
+
+    Arming lanes (2026-10-05): the nightly run() applies the per-gym pilot
+    allowlist before calling this. The authorized DIRECT lanes — the Fixer
+    re-stage recipe (agent/fixer_ops.run_restage_month) and the client_dm_support
+    gym_drive_sync action — carry their OWN arming (Fixer job authorization /
+    AGENT_CLIENT_DM_AUTOFIX) and pass the persisted store row unchanged. This
+    function's persisted-row re-read plus fail-closed identity guard is their
+    safety boundary, so it deliberately does NOT re-check the pilot allowlist
+    (re-checking it here would silently break the authorized manual recipe)."""
     log = log or (lambda m: print(f"[gym-media] {m}"))
     from ..integrations import drive_client as _dc
     drive = drive or _dc.DriveClient()
@@ -383,18 +451,115 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
     gym_id = source.get("gym_id")
     source_id = source.get("id")
     folder_id = source.get("folder_id")
-    # STALE-KEY RESOLUTION HERE TOO (audit round 5 MAJOR 2): run() remaps a source's
-    # stale gym_id (a portal link minted before a re-key) before calling this, but a
-    # direct caller (the Tough Temple re-stage recipe: media_source under
-    # toughtemple086f51, media_asset under toughtemple52040e) got the raw row, listed
-    # ZERO existing assets under the stale key, re-inserted every file, hit the PK and
-    # rendered nothing. Same resolver, same rule, so the recipe cannot be wrong again.
-    from .. import gym_media_routes as _gm_routes
-    resolved = _gm_routes._resolve_stale_fingerprint(gym_id)
-    if resolved != gym_id:
-        log(f"source {source_id} carries stale key {gym_id!r}; resolved to {resolved!r} "
-            "for this sync (the media_source row itself was NOT rewritten)")
-        gym_id = resolved
+    # DEFENSE IN DEPTH (independent-review P0, 2026-10-05): never trust the
+    # caller-supplied source dict for tenant/folder/active ownership. Re-read
+    # the CURRENT persisted row by source ID from the store BEFORE any Drive
+    # walk or write: a caller that forged or rewrote gym_id / folder_id /
+    # active in memory is refused here even when it would also pass the
+    # identity guard below. Fail CLOSED: an unreadable/missing row, a field
+    # that disagrees with the persisted row, or a persisted-inactive source all
+    # refuse the pass. Test fakes implement the same narrow get_source-by-ID
+    # contract (tests/gym_media_fakes.FakeMediaStore.get_source); a store with
+    # no way to re-read the row refuses rather than failing open.
+    current = None
+    get_source = getattr(store, "get_source", None)
+    if callable(get_source):
+        try:
+            current = get_source(source_id)
+        except Exception as e:  # noqa: BLE001 - fail closed, never fail open
+            log(f"source {source_id}: could not re-read the persisted source "
+                f"row ({type(e).__name__}: {e}); refusing this pass")
+            current = None
+    if current is None:
+        log(f"REFUSED source {source_id}: the persisted media_source row could "
+            f"not be re-read by ID from the store (missing, unreadable, or the "
+            f"store cannot re-read by ID); no walk, no insert, no rewrite — "
+            f"the caller-supplied row is never trusted for ownership")
+        return {"ok": False, "refused": "source_row_unreadable",
+                "gym_id": gym_id}
+    drift = [f for f in ("gym_id", "folder_id")
+             if source.get(f) != current.get(f)]
+    if drift:
+        log(f"REFUSED source {source_id}: caller-supplied {', '.join(drift)} "
+            f"disagrees with the persisted media_source row (stored gym_id "
+            f"{current.get('gym_id')!r}, folder {current.get('folder_id')!r}); "
+            f"a caller may not forge or rewrite ownership — no walk, no "
+            f"insert, no rewrite")
+        return {"ok": False, "refused": "source_row_mismatch",
+                "gym_id": current.get("gym_id"), "fields": drift}
+    if current.get("active") is False:
+        log(f"REFUSED source {source_id}: the persisted media_source row is "
+            f"inactive (disconnected); a caller may not resurrect it with an "
+            f"in-memory active=True copy — no walk, no insert")
+        return {"ok": False, "refused": "source_inactive",
+                "gym_id": current.get("gym_id")}
+    # The persisted row is authoritative from here on.
+    source = current
+    gym_id = source.get("gym_id")
+    folder_id = source.get("folder_id")
+    # STALE-KEY GUARD (audit round 5 MAJOR 2 + the 2026-10-05 tenant-source binding
+    # guard): a direct caller (the Tough Temple re-stage recipe: media_source under
+    # toughtemple086f51, media_asset under toughtemple52040e) used to get the raw row,
+    # list ZERO existing assets under the stale key, and re-insert every file. The
+    # identity check is still applied HERE (not only in run()) so every entry point
+    # hits the same rule — but the rule is now REFUSAL, not silent in-memory
+    # re-keying: a stored gym_id that does not resolve to the registered tenant
+    # fails closed before any walk/insert. The check uses _tenant_identity (NOT the
+    # request-path wrapper gym_media_routes._resolve_stale_fingerprint, which swallows
+    # resolver failures and returns the key unchanged): the sync must fail closed when
+    # identity cannot be ESTABLISHED at all, not only when the established identity
+    # DIFFERS from the stored key.
+    stored_gym_id = gym_id
+    # Identity verification: a TRUSTED per-run batch result (verified_keys,
+    # produced once per run() by _resolve_verified_keys) is used as-is — the
+    # fresh complete plane read already happened this run. A DIRECT caller (no
+    # verified_keys) gets its own fresh complete verification via
+    # _tenant_identity every call: no caching, no stale cross-call trust.
+    if verified_keys is None:
+        established, resolved = _tenant_identity(gym_id)
+    else:
+        established, resolved = _identity_from_verified(verified_keys, gym_id)
+    if not established:
+        # IDENTITY UNESTABLISHED (2026-10-05, independent-review P2): the identity
+        # plane was unreadable/truncated, or the stored key is not a uniquely
+        # registered tenant. Treating the row as legitimate here is exactly the
+        # hole the binding guard exists to close, so the source is refused for
+        # this pass — never walked, never inserted, row never rewritten. The next
+        # scheduled run re-checks, so a transient plane outage only skips passes,
+        # never data. Normal legitimate sources (key proven live by a complete
+        # read) are unaffected.
+        log(f"REFUSED source {source_id}: tenant identity for stored gym_id "
+            f"{stored_gym_id!r} could not be established (identity plane "
+            f"unreadable or key not a uniquely-registered tenant); no assets "
+            f"indexed and the source row was NOT rewritten (retry on the next "
+            f"scheduled pass; if the key is genuinely stale, reconcile it by an "
+            f"evidence-reviewed source rebind or the controlled migration in "
+            f"migrations/DRAFT_media_asset_source_gym_guard_20261005.sql — the "
+            f"PR #262 immutable-gym guard forbids a plain UPDATE of "
+            f"media_source.gym_id, and a silent rewrite is never allowed)")
+        return {"ok": False, "refused": "tenant_identity_unestablished",
+                "gym_id": stored_gym_id}
+    if resolved != stored_gym_id:
+        # TENANT-SOURCE BINDING GUARD (2026-10-05): a source row whose stored
+        # gym_id does NOT resolve to the currently-registered tenant is refused
+        # for this pass — never walked, never inserted. Silently syncing it under
+        # the resolved tenant is exactly how production ended up with media_asset
+        # rows whose gym_id differs from their linked media_source.gym_id (95 rows
+        # at last count): those rows must not be silently used OR multiplied.
+        # The media_source row itself is NEVER rewritten here (ownership fixes
+        # are an evidence-reviewed rebind / controlled migration — the PR #262
+        # immutable-gym guard forbids a plain UPDATE); the alert this log fires
+        # is the operator's cue.
+        log(f"REFUSED source {source_id}: stored gym_id {stored_gym_id!r} does not "
+            f"match resolved tenant {resolved!r}; no assets indexed and the source "
+            f"row was NOT rewritten (reconcile by an evidence-reviewed source "
+            f"rebind or the controlled migration in "
+            f"migrations/DRAFT_media_asset_source_gym_guard_20261005.sql — the "
+            f"PR #262 immutable-gym guard forbids a plain UPDATE of "
+            f"media_source.gym_id, and a silent rewrite is never allowed — then "
+            f"request a re-sync)")
+        return {"ok": False, "refused": "source_gym_mismatch",
+                "gym_id": stored_gym_id, "resolved_gym_id": resolved}
 
     # 1. walk (403 -> revoked_externally + notify, no crash)
     try:
@@ -686,27 +851,60 @@ def run(drive=None, store=None, probe_fn=None, log=None, now_iso=None,
         log(f"could not list sources: {type(e).__name__}: {e}")
         return {"ok": False, "reason": f"source list failed: {type(e).__name__}"}
 
-    # DEFENSIVE READ-SIDE RESOLUTION (the CrossFit Reverb class, live 2026-08-31): a
-    # source can land with a STALE account-key fingerprint (a portal connect-link
-    # self-decodes its OWN key from its signed payload, so it keeps working under
-    # whatever key it was minted with even after the gym is later re-canonicalized).
-    # A stray source's gym_id is remapped to the currently-registered gym IN MEMORY
-    # ONLY for this sync pass -- the media_source row itself is never rewritten here
-    # (that is a by-hand fix or a fresh bind), so the alert fired by
-    # _resolve_stale_fingerprint is the operator's cue to actually fix the row.
-    # See gym_media_routes._resolve_stale_fingerprint for the resolution rule.
-    from .. import gym_media_routes as _gm_routes
+    # TENANT-SOURCE BINDING GUARD (2026-10-05, supersedes the 2026-08-31 in-memory
+    # remap): a source can land with a STALE account-key fingerprint (a portal
+    # connect-link self-decodes its OWN key from its signed payload, so it keeps
+    # working under whatever key it was minted with even after the gym is later
+    # re-canonicalized). The remap is gone because it silently produced
+    # media_asset rows under a gym_id that differs from their source's
+    # media_source.gym_id (95 such rows in production at last count — they must
+    # not be silently used or multiplied). Now: resolve for the ARMING check only,
+    # pass the row through with its STORED gym_id, and let sync_source refuse it
+    # (fail closed, no walk, no insert). The media_source row itself is never
+    # rewritten here — reconciliation is an evidence-reviewed source rebind or
+    # the controlled migration in
+    # migrations/DRAFT_media_asset_source_gym_guard_20261005.sql (the PR #262
+    # immutable-gym guard forbids a plain UPDATE); the refusal log is the
+    # operator's cue to reconcile the row.
+    #
+    # ONE complete fresh identity-plane read for the WHOLE run (independent-
+    # review 2026-10-05): resolve_known_source_keys is a full-fleet snapshot, so
+    # resolving per source would multiply that fleet-wide read by the fleet
+    # size. The SAME trusted per-run result drives BOTH the pilot-allowlist
+    # arming check below AND sync_source's fail-closed guard (independent-review
+    # P1): the request-path wrapper gym_media_routes._resolve_stale_fingerprint
+    # is NEVER used here — it swallows resolver failures and returns the key
+    # unchanged, which would let the allowlist arm a gym the guard then refuses
+    # (or vice versa). A gym whose identity the batch could not prove stays
+    # UNARMED this run: no walk, no insert. A failure returns {} and every
+    # source is skipped fail-closed (one skipped pass, never a write on an
+    # unproven identity). Direct sync_source callers (no verified_keys) still
+    # get their own fresh complete verification.
+    verified_keys = _resolve_verified_keys(
+        [s.get("gym_id") for s in raw_sources if s.get("gym_id")], log=log)
     sources = []
     for s in raw_sources:
         gym_id = s.get("gym_id")
-        resolved = _gm_routes._resolve_stale_fingerprint(gym_id)
+        established, resolved = _identity_from_verified(verified_keys, gym_id)
+        if not established:
+            # UNPROVEN identity -> UNARMED this run (the allowlist and the
+            # guard read the SAME fresh batch, so they can never disagree; an
+            # unarmed gym stays unarmed).
+            log(f"source {s.get('id')}: tenant identity for stored gym_id "
+                f"{gym_id!r} could not be established this run; the source "
+                f"stays UNARMED (no walk, no insert — fail closed, retry on "
+                f"the next scheduled pass)")
+            continue
         if resolved != gym_id:
-            log(f"source {s.get('id')} carries stale key {gym_id!r}; resolved to "
-                f"{resolved!r} for this sync (the media_source row itself was NOT "
-                f"rewritten)")
-            s = dict(s)
-            s["gym_id"] = resolved
-        if config.gym_drive_connect_active_for(s.get("gym_id")):
+            # NOT remapped in memory anymore: sync_source refuses sources whose
+            # stored gym_id does not resolve to the registered tenant (the
+            # 2026-10-05 tenant-source binding guard). The arming flag is still
+            # checked against the RESOLVED tenant so a stale-keyed source does
+            # not silently bypass the per-gym pilot allowlist either way.
+            log(f"source {s.get('id')} carries stale key {gym_id!r} (resolves to "
+                f"{resolved!r}); it will be REFUSED by the sync, not silently "
+                f"re-keyed (the media_source row itself is never rewritten here)")
+        if config.gym_drive_connect_active_for(resolved):
             sources.append(s)
 
     results = []
@@ -717,7 +915,7 @@ def run(drive=None, store=None, probe_fn=None, log=None, now_iso=None,
             results.append(sync_source(
                 source, drive=drive, store=store, probe_fn=probe_fn, log=log,
                 now_iso=now_iso, probe_budget=probe_budget,
-                render_budget=render_budget))
+                render_budget=render_budget, verified_keys=verified_keys))
         except Exception as e:  # noqa: BLE001 - one source never sinks the run
             log(f"source {source.get('id')} failed: {type(e).__name__}: {e}")
             results.append({"ok": False, "error": type(e).__name__,

@@ -1944,3 +1944,81 @@ def test_restage_readback_follows_pages_and_refuses_an_ambiguous_full_unpaged_re
 
     with pytest.raises(FO._ReadbackUnavailable, match="may be truncated"):
         FO._read_month_rows(FullUnpaged(), GYM, "2026-09")
+
+
+# ---- restage_month REAL prerender path (independent-review P0, 2026-10-05) ----------
+
+def _real_prerender_env(monkeypatch, store, drive):
+    """Wire run_restage_month's real (no deps["sync_sources"]) prerender path to
+    in-memory fakes: the fake media store, a fake Drive, and a proven-live
+    identity plane. Returns the spy list of source dicts handed to sync_source."""
+    from agent import gym_media_index as _idx
+    from agent.jobs import sync_gym_media as _sync
+    from agent.integrations import drive_client as _dc
+
+    seen = []
+    real_sync_source = _sync.sync_source
+
+    def spy(source, **kw):
+        seen.append(source)
+        return real_sync_source(source, **kw)
+
+    monkeypatch.setattr(_idx, "default_store", lambda: store)
+    monkeypatch.setattr(_sync, "sync_source", spy)
+    monkeypatch.setattr(_sync, "_tenant_identity", lambda g: (True, g))
+    monkeypatch.setattr(_dc, "DriveClient", lambda: drive)
+    monkeypatch.setattr(_sync, "_post_digest", lambda *a, **k: None)
+    return seen
+
+
+def _light_deps():
+    return {"observe_denials": lambda **kw: {"checked": 0, "rolled_back": 0},
+            "build_month": lambda gym, start, days: {"ok": True, "upserted": 0}}
+
+
+def test_restage_prerender_passes_the_persisted_source_through_unchanged(monkeypatch):
+    """The recipe must hand sync_source the ORIGINAL persisted media_source row:
+    no in-memory gym_id rewrite. A live, matching source still syncs normally."""
+    from tests.gym_media_fakes import FakeMediaStore, FakeDrive, make_source, photo
+    from agent import gym_media_routes as _gmr
+    monkeypatch.setattr(_gmr, "_resolve_stale_fingerprint", lambda g, **kw: g)
+    store = FakeMediaStore(sources=[make_source("src1", gym_id=GYM, folder_id="f1")])
+    drive = FakeDrive(files=[photo("p1")])
+    seen = _real_prerender_env(monkeypatch, store, drive)
+    out = FO.run_restage_month(GYM, days=1, deps=_light_deps(), log=lambda *a: None)
+    assert len(seen) == 1
+    assert seen[0]["gym_id"] == GYM, "the stored key is passed through, not rewritten"
+    assert seen[0]["folder_id"] == "f1"
+    assert out["prerender"][0]["ok"] is True
+    assert store.assets["p1"]["gym_id"] == GYM
+
+
+def test_restage_prerender_stale_source_is_refused_before_any_walk_or_insert(monkeypatch):
+    """Regression through the REAL Fixer prerender path (the Tough Temple class):
+    a source filed under a stale fingerprint is scoped to this gym by the
+    RESOLVED key, but the persisted row goes through unchanged and the sync
+    guard REFUSES it — no Drive walk, no insert, no ownership rewrite."""
+    from tests.gym_media_fakes import FakeMediaStore, FakeDrive, make_source, photo
+    from agent import gym_media_routes as _gmr
+    from agent.jobs import sync_gym_media as _sync
+    stale, live = "toughtemple086f51", "toughtemple52040e"
+    monkeypatch.setattr(_gmr, "_resolve_stale_fingerprint",
+                        lambda g, **kw: live if g == stale else g)
+    store = FakeMediaStore(sources=[make_source("srcstale", gym_id=stale,
+                                                folder_id="foldstale")])
+    walked = []
+    drive = FakeDrive(files=[photo("p1")])
+    orig_walk = drive.walk
+    drive.walk = lambda *a, **k: walked.append(a) or orig_walk(*a, **k)
+    seen = _real_prerender_env(monkeypatch, store, drive)
+    monkeypatch.setattr(_sync, "_tenant_identity",
+                        lambda g: (True, live) if g == stale else (True, g))
+    out = FO.run_restage_month(live, days=1, deps=_light_deps(), log=lambda *a: None)
+    assert len(seen) == 1, "the stale-keyed source is still scoped to this gym"
+    assert seen[0]["gym_id"] == stale, "row passed through unchanged, never re-keyed"
+    r = out["prerender"][0]
+    assert r["ok"] is False and r["refused"] == "source_gym_mismatch"
+    assert walked == [], "a refused source is never walked"
+    assert store.assets == {}, "a refused source inserts nothing"
+    assert store.sources["srcstale"]["gym_id"] == stale
+    assert not store.source_updates

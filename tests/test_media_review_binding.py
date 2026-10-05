@@ -27,9 +27,15 @@ def test_copied_evidence_and_changed_bytes_fail_closed():
 
 def test_sync_byte_swap_revokes_all_old_evidence(monkeypatch):
     monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest", lambda *a, **k: None)
+    # This test exercises sync mechanics, not the identity plane: stub the
+    # 2026-10-05 binding guard's identity check as proven-live-and-itself.
+    monkeypatch.setattr("agent.jobs.sync_gym_media._tenant_identity",
+                        lambda g: (True, g))
     old = _ready("p1", "pierce", "bytes-v1")
     old.update(rendition_url="https://example.invalid/old", vision_json={"old": True})
-    store = FakeMediaStore(assets=[old])
+    store = FakeMediaStore(
+        sources=[make_source("src1", gym_id="pierce", folder_id="fold1")],
+        assets=[old])
     result = sync_gym_media.sync_source(
         make_source("src1", gym_id="pierce", folder_id="fold1"),
         drive=FakeDrive(files=[photo("p1", md5="bytes-v2")]), store=store,

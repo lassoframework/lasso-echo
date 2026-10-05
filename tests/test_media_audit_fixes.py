@@ -45,6 +45,19 @@ def _env(monkeypatch, tmp_path):
     client_content.clear_drive_pool_cache()
 
 
+@pytest.fixture(autouse=True)
+def _established_tenant_identity(monkeypatch):
+    """The 2026-10-05 binding guard requires an ESTABLISHED tenant identity before
+    any walk/insert. These tests exercise sync mechanics, not the identity plane,
+    so every stored gym_id is stubbed as proven-live-and-itself by default; the
+    guard tests below override this stub explicitly."""
+    from agent.jobs import sync_gym_media as job
+    monkeypatch.setattr(job, "_tenant_identity", lambda g: (True, g))
+    # Batch identity seam used by run() (2026-10-05): same default stub.
+    monkeypatch.setattr(job, "_resolve_verified_keys",
+                        lambda ids, log=None: {g: g for g in ids})
+
+
 # ---- shared offline harness ---------------------------------------------------------
 class _CalStore:
     """A calendar store with list_month, so the guard/release paths see existing rows."""
@@ -1302,14 +1315,28 @@ def test_a_raise_mid_lane_keeps_finished_drafts_and_rolls_back_the_in_flight_ass
                 if r["format"] == "feed"}) == 40
 
 
-# ---- MAJOR 2: sync_source resolves a stale gym_id exactly like run() -----------------
-def test_sync_source_resolves_a_stale_gym_id_before_touching_the_store(monkeypatch):
+# ---- MAJOR 2 -> 2026-10-05 GUARD: sync_source REFUSES a stale gym_id ------------
+# The original MAJOR-2 fix remapped a stale gym_id in memory so a direct caller
+# resolved exactly like run(). The 2026-10-05 tenant-source binding guard
+# supersedes the remap: the in-memory re-key silently produced production
+# media_asset rows whose gym_id differs from their media_source.gym_id (95 rows;
+# never to be silently used or multiplied). Now BOTH entry points hit the same
+# resolver, and a stored gym_id that does not resolve to the registered tenant
+# is REFUSED before the store is touched — no walk, no listing, no insert, and
+# the media_source row is never rewritten.
+def test_sync_source_refuses_a_stale_gym_id_before_touching_the_store(monkeypatch):
     from agent.jobs import sync_gym_media as job
     from tests.gym_media_fakes import make_source, photo
     monkeypatch.setattr(job, "_post_digest", lambda *a, **k: None)
-    monkeypatch.setattr("agent.gym_media_routes._resolve_stale_fingerprint",
-                        lambda g, **k: "toughtemple52040e" if g == "toughtemple086f51" else g)
-    # the asset already indexed under the REAL key (id == the Drive file id)
+    # Identity established, but the stored key is a stale fingerprint that maps
+    # onto the live tenant (binding guard refuses before any walk/insert).
+    from agent.jobs import sync_gym_media as _job
+    monkeypatch.setattr(
+        _job, "_tenant_identity",
+        lambda g: (True, "toughtemple52040e") if g == "toughtemple086f51"
+        else (True, g))
+    # an asset already indexed under the REAL key must NOT be silently re-read or
+    # multiplied through the stale-keyed source row
     existing = make_asset("p1", gym_id="toughtemple52040e", source_id="src1", kind="photo")
     store = FakeMediaStore(sources=[make_source("src1", gym_id="toughtemple086f51")],
                            assets=[existing])
@@ -1323,10 +1350,14 @@ def test_sync_source_resolves_a_stale_gym_id_before_touching_the_store(monkeypat
     drive = FakeDrive(files=[photo("p1")])
     out = job.sync_source(make_source("src1", gym_id="toughtemple086f51"), drive=drive,
                           store=store, probe_fn=lambda p: None, log=lambda m: None)
-    assert out["ok"] and out["gym_id"] == "toughtemple52040e"
-    assert listed and set(listed) == {"toughtemple52040e"}, "listed under the RESOLVED key"
-    assert out["inserted"] == 0, "the existing asset is recognised, not re-inserted"
+    assert out["ok"] is False
+    assert out["refused"] == "source_gym_mismatch"
+    assert out["gym_id"] == "toughtemple086f51", "reports the STORED key, not the resolved one"
+    assert out["resolved_gym_id"] == "toughtemple52040e"
+    assert listed == [], "a refused source never lists assets under the resolved key"
+    assert out.get("inserted", 0) == 0
     assert len(store.assets) == 1 and store.assets["p1"]["gym_id"] == "toughtemple52040e"
+    assert not store.source_updates, "ownership must never be rewritten by sync"
 
 
 def test_recipe_step_0b_remap_matches_run(monkeypatch):
