@@ -109,6 +109,8 @@ def test_caption_sentences_get_blank_line_without_changing_words():
                 "Dr. Lee coaches too.\n\nBook a class.\n\n#CrossFitLocal")
     assert copy_gate.format_caption(raw) == expected
     assert copy_gate.format_caption(expected) == expected
+    assert copy_gate.format_caption("The 6 a.m. class starts soon. Join us.") == (
+        "The 6 a.m. class starts soon.\n\nJoin us.")
 
 
 def test_caption_semicolon_and_inline_url():
