@@ -213,7 +213,7 @@ class GbpStore:
     def mark_status(self, row_id, status):
         return self._patch(row_id, {"status": status})
 
-    def claim_publishing(self, row_id):
+    def claim_publishing(self, row_id, *, gym_id=None, require_proof=None):
         """EXACTLY-ONCE claim for the GBP lane, now carrying a durable logical-attempt
         UUID (2026-10-02): one conditional PATCH flips approved -> publishing AND writes
         a fresh publish_claim_token in the same write, so the token is the DB-persisted
@@ -221,10 +221,47 @@ class GbpStore:
         live Zernio create uses as its Idempotency-Key; an ambiguous send later keeps
         the row in 'publishing' WITH this token for manual provider readback.
 
-        Returns the persisted token string on a won claim, None on a lost claim (zero
+        With proof enabled, returns the locked claimed creative (including its
+        persisted token); Manual or unresolved gyms must have current human proof.
+        Flag OFF returns the persisted token string on a won claim, None on a lost claim (zero
         rows updated: another worker owns it or its status changed). Raises
         PortalStoreError when the returned row does not carry the exact token we wrote
         (schema/API drift) — never proceed on an unverified token."""
+        if require_proof is None:
+            require_proof = config.approval_proof_enabled()
+        if require_proof:
+            # The DB locks the current autonomy mapping and creative together,
+            # checks human proof for Manual/unresolved gyms, and returns exactly
+            # the creative it claimed. Never fall back to the legacy PATCH.
+            if not gym_id:
+                raise PortalStoreError(422, "GBP proof claim requires the gym identity")
+            r = self._s._client().post(
+                self._s._rest("rpc/claim_calendar_gbp_publish_owned"),
+                headers=self._s._headers({"Content-Type": "application/json"}),
+                json={"p_row_id": row_id, "p_gym_id": gym_id}, timeout=30)
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            rows = r.json()
+            if rows == []:
+                return None
+            if not isinstance(rows, list) or len(rows) != 1:
+                raise PortalStoreError(502, "GBP proof claim returned an invalid creative")
+            row = rows[0]
+            try:
+                token = str(uuid.UUID(str(row.get("publish_claim_token"))))
+            except (AttributeError, TypeError, ValueError):
+                raise PortalStoreError(502, "GBP proof claim returned an invalid token")
+            if (str(row.get("id")) != str(row_id)
+                    or row.get("gym_id") != gym_id
+                    or row.get("account") != PLATFORM
+                    or row.get("status") != "publishing"
+                    or row.get("variant_status") != "active"
+                    or row.get("published_at") is not None
+                    or row.get("late_post_id") is not None
+                    or not (row.get("image_url") or "").strip()
+                    or row.get("media_not_ready_reason") is not None):
+                raise PortalStoreError(409, "GBP proof claim returned an inconsistent creative")
+            return dict(row, publish_claim_token=token)
         token = str(uuid.uuid4())
         # MEDIA HOLD GUARD (2026-10-02, Sol review release-blocker): the claim PATCH
         # carries every precondition server-side so a held/archived/claimed/published

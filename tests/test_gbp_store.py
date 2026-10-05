@@ -6,6 +6,7 @@ store's own _get. Offline via a fake base store capturing PostgREST params.
 
 import os
 import sys
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -367,3 +368,49 @@ def test_claim_publishing_returned_row_with_hold_or_blank_image_raises_and_retai
             assert e.status == 409
         # exactly one HTTP call (the claim PATCH); no release/overwrite followed
         assert len(http.calls) == 1
+
+# Proof-gated GBP claims use the database RPC exclusively.
+def _proof_row(**changes):
+    row = dict(id="r1", gym_id="gym", account="googlebusiness", status="publishing",
+               variant_status="active", image_url="https://cdn/current.jpg",
+               publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111")
+    row.update(changes)
+    return row
+
+
+class _ProofHttp(_Http):
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.calls.append({"url": url, "json": json})
+        return self.responses.pop(0)
+
+
+def test_proof_claim_returns_locked_creative_and_never_patches(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    current = _proof_row(caption="current creative")
+    http = _ProofHttp([_Resp([current])])
+    out = GbpStore(base=_Base(http)).claim_publishing("r1", gym_id="gym")
+    assert out == current
+    assert http.calls == [{"url": "https://x/rpc/claim_calendar_gbp_publish_owned",
+                           "json": {"p_row_id": "r1", "p_gym_id": "gym"}}]
+
+
+@pytest.mark.parametrize("response", [[], None, [{"id": "r1"}],
+    [_proof_row(gym_id="other")], [_proof_row(status="approved")],
+    [_proof_row(publish_claim_token="bad")], [_proof_row(image_url=" ")],
+    [_proof_row(), _proof_row()]])
+def test_proof_claim_denial_or_invalid_response_never_falls_back(response):
+    http = _ProofHttp([_Resp(response)])
+    store = GbpStore(base=_Base(http))
+    if response == []:
+        assert store.claim_publishing("r1", gym_id="gym", require_proof=True) is None
+    else:
+        with pytest.raises(PortalStoreError):
+            store.claim_publishing("r1", gym_id="gym", require_proof=True)
+    assert len(http.calls) == 1 and "rpc/" in http.calls[0]["url"]
+
+
+def test_proof_claim_missing_rpc_holds_without_legacy_patch():
+    http = _ProofHttp([_Resp(None, status_code=404)])
+    with pytest.raises(PortalStoreError):
+        GbpStore(base=_Base(http)).claim_publishing("r1", gym_id="gym", require_proof=True)
+    assert len(http.calls) == 1

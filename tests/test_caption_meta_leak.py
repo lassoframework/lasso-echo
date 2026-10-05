@@ -519,6 +519,20 @@ class _FakeSweepStore:
         r["caption"] = new_caption          # status untouched, by contract
         return dict(r)
 
+    def patch_caption_for_meta_sweep(self, gym_id, row_id, new_caption, *,
+                                    expected_status, expected_caption):
+        r = self.rows.get(row_id)
+        if (r is None or r.get("status") != expected_status
+                or (r.get("caption") or "") != expected_caption):
+            return None
+        r["caption"] = new_caption
+        if expected_status == "approved":
+            r["status"] = "pending"
+        for key in ("approval_kind", "approved_by", "approved_at",
+                    "approval_digest"):
+            r[key] = None
+        return dict(r)
+
 
 def test_sweep_cleans_waiting_rows_and_preserves_approved_status():
     dirty = f"{CLEAN_BODY}\n\n{LEAKED_META}"
@@ -565,3 +579,69 @@ def test_sweep_dry_run_writes_nothing():
     assert [d["id"] for d in results[0]["cleaned"]] == ["w1"]
     assert store.preserve_patches == []
     assert store.rows["w1"]["caption"] == dirty
+
+
+def test_sweep_proof_mode_invalidates_approved_creative(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    dirty = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    store = _FakeSweepStore([{
+        "id": "proof-row", "gym_id": "eng", "post_date": "2026-08-24",
+        "account": "facebook", "status": "approved", "caption": dirty,
+        "approval_kind": "human", "approved_by": "actor-1",
+        "approved_at": "2026-08-20T12:00:00Z", "approval_digest": "old-digest",
+    }])
+    results = caption_meta_sweep.run(gym_ids=["eng"], store=store,
+                                     today_iso="2026-08-23", alert=lambda _: None)
+    assert [d["id"] for d in results[0]["cleaned"]] == ["proof-row"]
+    row = store.rows["proof-row"]
+    assert row["caption"] == CLEAN_BODY
+    assert row["status"] == "pending"
+    assert all(row[key] is None for key in
+               ("approval_kind", "approved_by", "approved_at", "approval_digest"))
+
+
+def test_sweep_proof_mode_fails_closed_without_invalidation_writer(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    class _LegacyOnlyStore(_FakeSweepStore):
+        patch_caption_for_meta_sweep = None
+    dirty = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    store = _LegacyOnlyStore([{
+        "id": "legacy-row", "gym_id": "eng", "post_date": "2026-08-24",
+        "account": "facebook", "status": "approved", "caption": dirty,
+    }])
+    results = caption_meta_sweep.run(gym_ids=["eng"], store=store,
+                                     today_iso="2026-08-23", alert=lambda _: None)
+    assert results[0]["errors"] == 1
+    assert results[0]["cleaned"] == []
+    assert store.rows["legacy-row"]["caption"] == dirty
+    assert store.rows["legacy-row"]["status"] == "approved"
+
+
+def test_sweep_proof_mode_same_status_caption_race_is_held(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    dirty = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    concurrent_edit = f"{CLEAN_BODY} We added a Saturday class."
+
+    class _ConcurrentEditStore(_FakeSweepStore):
+        def patch_caption_for_meta_sweep(self, gym_id, row_id, new_caption, *,
+                                        expected_status, expected_caption):
+            # Model a client edit landing after rows_in_range but before PATCH.
+            self.rows[row_id]["caption"] = concurrent_edit
+            return super().patch_caption_for_meta_sweep(
+                gym_id, row_id, new_caption, expected_status=expected_status,
+                expected_caption=expected_caption)
+
+    store = _ConcurrentEditStore([{
+        "id": "race-row", "gym_id": "eng", "post_date": "2026-08-24",
+        "account": "facebook", "status": "approved", "caption": dirty,
+        "approval_kind": "human", "approved_by": "actor-1",
+        "approved_at": "2026-08-20T12:00:00Z", "approval_digest": "old-digest",
+    }])
+    results = caption_meta_sweep.run(gym_ids=["eng"], store=store,
+                                     today_iso="2026-08-23", alert=lambda _: None)
+    assert results[0]["cleaned"] == []
+    assert [d["id"] for d in results[0]["held"]] == ["race-row"]
+    row = store.rows["race-row"]
+    assert row["caption"] == concurrent_edit
+    assert row["status"] == "approved"
+    assert row["approval_digest"] == "old-digest"

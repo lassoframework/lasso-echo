@@ -1087,3 +1087,97 @@ def test_publish_due_gbp_claim_exception_sends_nothing():
     out = gw.publish_due_gbp(store, c, run_date="2026-10-02", draft=False)
     assert c.calls == []
     assert out["published"] == 0 and store.published == []
+
+@pytest.mark.parametrize("claim_result", [None, True, "legacy-token"])
+def test_proof_gate_never_sends_without_returned_claimed_creative(monkeypatch, claim_result):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    class ProofStore(_Store):
+        def claim_publishing(self, row_id, *, gym_id, require_proof):
+            assert gym_id == "gym" and require_proof is True
+            return claim_result
+    store = ProofStore([_row(id="r1", gym_id="gym")], {"gym": [_c()]})
+    client = _FakeClient()
+    gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
+    assert client.calls == []
+
+
+def test_proof_gate_missing_claim_holds(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    client = _FakeClient()
+    store = _Store([_row(id="r1", gym_id="gym")], {"gym": [_c()]})
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
+    assert client.calls == [] and out["held"] == 1
+
+
+def test_proof_gate_sends_exact_returned_creative(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    fresh = _row(id="r1", gym_id="gym", status="publishing",
+                 caption="fresh approved creative", image_url="https://cdn/fresh.jpg",
+                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111")
+    class ProofStore(_TokenStore):
+        def claim_publishing(self, row_id, *, gym_id, require_proof):
+            self.tokens[row_id] = fresh["publish_claim_token"]
+            return dict(fresh)
+    sent = []
+    def publish(row, connections, **kwargs):
+        sent.append((dict(row), kwargs["idempotency_key"]))
+        return {"status": "published", "late_post_id": "new-post", "mode": "live"}
+    monkeypatch.setattr(gw, "publish_one", publish)
+    store = ProofStore([_row(id="r1", gym_id="gym", caption="stale")], {"gym": [_c()]})
+    gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=False)
+    assert sent == [(fresh, fresh["publish_claim_token"])]
+    assert store.published == [("r1", "new-post")]
+
+
+def test_proof_claimed_caption_metadata_holds_and_releases_without_send(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    fresh = _row(id="r1", gym_id="gym", status="publishing", format="feed",
+                 caption=_GOOD_CAPTION + "\n[why] internal editing rationale",
+                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111")
+    class ProofStore(_TokenStore):
+        def claim_publishing(self, row_id, *, gym_id, require_proof):
+            self.tokens[row_id] = fresh["publish_claim_token"]
+            return dict(fresh)
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    store = ProofStore([fresh], {"gym": [_c()]})
+    client = _FakeClient()
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
+    assert client.calls == [] and out["held"] == 1
+    assert store.released == [("r1", "approved")]
+    assert store.published == [] and store.failed == []
+    assert fresh["caption"].endswith("[why] internal editing rationale")
+
+
+def test_flag_off_preserves_gbp_caption_metadata_cleanup(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "false")
+    client = _FakeClient()
+    out = gw.publish_gbp_row(_row(caption=_GOOD_CAPTION + "\n[why] internal"),
+                             _conn(), client=client, draft=False)
+    assert out["ok"] and client.calls[0]["payload"]["content"] == _GOOD_CAPTION
+
+
+def test_proof_photo_drop_sends_exact_claimed_image_and_resolved_destination(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    fresh = _row(id="r1", gym_id="gym", status="publishing", format="photo",
+                 image_url="https://cdn/approved-photo.jpg", gbp_location_id="locations/1",
+                 caption="[why] gallery uploads carry no caption",
+                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111")
+    class ProofStore(_TokenStore):
+        def claim_publishing(self, row_id, *, gym_id, require_proof):
+            self.tokens[row_id] = fresh["publish_claim_token"]
+            return dict(fresh)
+    class PhotoClient:
+        def __init__(self):
+            self.calls = []
+        def create_gmb_media(self, account_id, image_url):
+            self.calls.append((account_id, image_url))
+            return {"_id": "photo-id"}
+    stale = dict(fresh, image_url="https://cdn/stale-photo.jpg")
+    conn = _c()
+    store = ProofStore([stale], {"gym": [conn]})
+    client = PhotoClient()
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
+    assert client.calls == [(conn["zernio_account_id"], fresh["image_url"])]
+    assert out["published"] == 1
+    assert fresh["caption"] == "[why] gallery uploads carry no caption"

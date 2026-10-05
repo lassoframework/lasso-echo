@@ -1872,6 +1872,52 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def patch_caption_for_meta_sweep(self, account_key, row_id, new_caption, *,
+                                    expected_status, expected_caption):
+        """Clean a caption while invalidating its approval proof atomically.
+
+        The status allowlist excludes rows already claimed or published. Pending
+        rows remain pending; approved rows return to pending for fresh human
+        approval. A schema with durable approval proof must provide these columns.
+        """
+        expected = str(expected_status or "").strip().lower()
+        if expected not in ("pending", "approved", "coach_review"):
+            return None
+        from .copy_gate import format_caption
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+            "status": f"eq.{expected}",
+            # Exact observed creative CAS. A status-only guard would permit a
+            # stale sweep read to overwrite a concurrent same-status human edit.
+            "caption": f"eq.{expected_caption}",
+            "published_at": "is.null",
+            "late_post_id": "is.null",
+            "variant_status": "eq.active",
+        }
+        payload = {
+            "caption": format_caption(new_caption),
+            "approval_kind": None,
+            "approved_by": None,
+            "approved_at": None,
+            "approval_digest": None,
+        }
+        if expected == "approved":
+            payload["status"] = "pending"
+        r = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }), json=payload, timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     def patch_caption_for_hashtag_backfill(self, account_key, row_id, new_caption,
                                            *, expected_status):
         """Atomically patch a safe future IG row during the one-off hashtag backfill.

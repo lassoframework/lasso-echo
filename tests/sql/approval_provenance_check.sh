@@ -32,7 +32,9 @@ create table content_calendar (
   image_url text, media_not_ready_reason text, account text, format text,
   post_date date, caption text, scheduled_at timestamptz,
   source_media_asset_id text, source_media_url text, byte_hash text,
-  publish_reservation_day date, publish_claim_token uuid);
+  publish_reservation_day date, publish_claim_token uuid,
+  pillar text, gbp_topic_type text, gbp_cta_type text, gbp_cta_url text,
+  gbp_event jsonb, gbp_offer jsonb, gbp_location_id text);
 SQL
 
 psql -h "$SOCK" -p 55444 -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
@@ -281,6 +283,55 @@ check "unresolved gym fails closed" "" "$(q "select claim_calendar_publish_slot_
 # flag OFF contract: gate param FALSE keeps legacy behavior for a Manual gym
 q "update content_calendar set account='facebook' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa05'"
 check "flag-off claim ignores provenance entirely" "1" "$(q "select case when claim_calendar_publish_slot_owned('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa05','$SWIFT','2026-08-10','America/New_York',2,true,false) is not null then '1' else '' end")"
+
+# LASSO's already-live capacity-three exception includes Stories. The proof
+# flag is off here, so capacity/format semantics remain independent of proof.
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+   values ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb01','lasso','approved','active','https://cdn/story.jpg','instagram','story','2026-08-10','story')"
+check "capacity-three LASSO Story claim succeeds with proof flag off" "1" "$(q "select case when claim_calendar_publish_slot_owned('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb01','lasso','2026-08-10','America/New_York',3,true,false) is not null then '1' else '' end")"
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+   values ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb02','lasso','approved','active','https://cdn/reel.jpg','instagram','reel','2026-08-10','unsupported')"
+check "capacity-three LASSO unsupported format is rejected" "" "$(q "select claim_calendar_publish_slot_owned('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb02','lasso','2026-08-10','America/New_York',3,true,false)")"
+
+
+# GBP uses a guarded claim with a returned creative, independent of IG/FB capacity.
+GBP_ID="cccccccc-cccc-cccc-cccc-cccccccccc01"
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption,gbp_topic_type,gbp_location_id) values ('$GBP_ID','$SWIFT','approved','active','https://cdn/gbp.jpg','googlebusiness','photo','2026-08-10','GBP caption','STANDARD','locations/1')"
+GBP_CLAIM() { q "select count(*) from claim_calendar_gbp_publish_owned('$GBP_ID','$SWIFT')"; }
+check "GBP Manual bare approved held" "0" "$(GBP_CLAIM)"
+q "update content_calendar set status='pending' where id='$GBP_ID'"
+check "GBP pending held" "0" "$(GBP_CLAIM)"
+q "update content_calendar set status='approved',approval_kind='human',approved_by='user_coach',approved_at=now(),approval_digest=calendar_approval_digest(content_calendar.*) where id='$GBP_ID'"
+for FIELD in caption image_url gbp_topic_type gbp_cta_type gbp_cta_url gbp_location_id pillar; do
+  q "update content_calendar set $FIELD='changed' where id='$GBP_ID'"
+  check "GBP stale $FIELD digest held" "0" "$(GBP_CLAIM)"
+  q "update content_calendar set approval_digest=calendar_approval_digest(content_calendar.*) where id='$GBP_ID'"
+done
+for FIELD in gbp_event gbp_offer; do
+  q "update content_calendar set $FIELD='{\"title\":\"changed\"}'::jsonb where id='$GBP_ID'"
+  check "GBP stale $FIELD digest held" "0" "$(GBP_CLAIM)"
+  q "update content_calendar set approval_digest=calendar_approval_digest(content_calendar.*) where id='$GBP_ID'"
+done
+check "GBP exact human proof photo claims" "1" "$(GBP_CLAIM)"
+check "GBP repeated claim loses" "0" "$(GBP_CLAIM)"
+check "GBP returned/current creative retained" "changed" "$(q "select caption from content_calendar where id='$GBP_ID'")"
+q "update content_calendar set status='approved',publish_claim_token=null,approval_kind=null,approved_by=null,approved_at=null,approval_digest=null where id='$GBP_ID'"
+q "update echo_gym_settings set autonomous=true where gym_id='$GYM_UUID'"
+check "GBP autonomous bare approved claims" "1" "$(GBP_CLAIM)"
+q "update content_calendar set status='approved',publish_claim_token=null where id='$GBP_ID'"
+q "update echo_gym_settings set autonomous=false where gym_id='$GYM_UUID'"
+check "GBP Auto to Manual holds old approved" "0" "$(GBP_CLAIM)"
+q "update content_calendar set gym_id='ghostgym' where id='$GBP_ID'"
+check "GBP unresolved gym holds" "0" "$(q "select count(*) from claim_calendar_gbp_publish_owned('$GBP_ID','ghostgym')")"
+q "update content_calendar set gym_id='$SWIFT',approval_kind='human',approved_by='user_coach',approved_at=now() where id='$GBP_ID'"
+q "update content_calendar set approval_digest=calendar_approval_digest(content_calendar.*) where id='$GBP_ID'"
+# Two actual database sessions compete; only the first may claim and retain ownership.
+q "begin; select count(*) from claim_calendar_gbp_publish_owned('$GBP_ID','$SWIFT'); select pg_sleep(1); commit" > "$WORK/gbp-first" &
+GBP_FIRST_PID=$!
+q "select count(*) from claim_calendar_gbp_publish_owned('$GBP_ID','$SWIFT')" > "$WORK/gbp-second" &
+GBP_SECOND_PID=$!
+wait "$GBP_FIRST_PID" "$GBP_SECOND_PID"
+check "GBP concurrent claims have one winner" "1" "$(awk '/^[01]$/ {s+=$1} END {print s}' "$WORK/gbp-first" "$WORK/gbp-second")"
 
 echo "---"
 echo "pass=$PASS fail=$FAIL"

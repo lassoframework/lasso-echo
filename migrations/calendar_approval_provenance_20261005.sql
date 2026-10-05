@@ -116,7 +116,21 @@ as $$
     coalesce(nullif(btrim(p_row.image_url), ''), ''),
     coalesce(nullif(btrim(to_jsonb(p_row)->>'byte_hash'), ''), ''),
     coalesce(nullif(btrim(to_jsonb(p_row)->>'source_media_asset_id'), ''), ''),
-    coalesce(nullif(btrim(to_jsonb(p_row)->>'source_media_url'), ''), '')
+    coalesce(nullif(btrim(to_jsonb(p_row)->>'source_media_url'), ''), ''),
+    -- Preserve existing IG/FB digests. GBP proof also binds provider fields,
+    -- including the destination and structured offers/events. jsonb::text has
+    -- canonical key ordering, independent of input JSON key order.
+    case when lower(btrim(p_row.account)) = 'googlebusiness' then
+      jsonb_build_object(
+        'gym_id', p_row.gym_id,
+        'pillar', to_jsonb(p_row)->'pillar',
+        'gbp_topic_type', to_jsonb(p_row)->'gbp_topic_type',
+        'gbp_cta_type', to_jsonb(p_row)->'gbp_cta_type',
+        'gbp_cta_url', to_jsonb(p_row)->'gbp_cta_url',
+        'gbp_event', to_jsonb(p_row)->'gbp_event',
+        'gbp_offer', to_jsonb(p_row)->'gbp_offer',
+        'gbp_location_id', to_jsonb(p_row)->'gbp_location_id'
+      )::text else null end
   ));
 $$;
 
@@ -468,7 +482,7 @@ begin
     return null;
   end if;
   if p_capacity = 3 and
-      coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed') <> 'feed' then
+      coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed') not in ('feed', 'story') then
     return null;
   end if;
 
@@ -519,4 +533,49 @@ revoke all on function public.claim_calendar_publish_slot_owned(
   from public, anon, authenticated;
 grant execute on function public.claim_calendar_publish_slot_owned(
   uuid, text, date, text, integer, boolean, boolean)
+  to service_role;
+
+-- GBP has its own cadence and photo format; do not route it through the
+-- IG/FB slot-capacity RPC. This gated-only claim preserves approved-only GBP
+-- selection, serializes current mode with publication, and returns the exact
+-- creative whose proof passed. The caller must send this returned snapshot.
+create or replace function public.claim_calendar_gbp_publish_owned(
+  p_row_id uuid, p_gym_id text
+) returns setof public.content_calendar
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_row public.content_calendar%rowtype;
+  v_enforce_proof boolean;
+begin
+  if p_row_id is null or nullif(btrim(coalesce(p_gym_id, '')), '') is null then
+    return;
+  end if;
+  perform pg_advisory_xact_lock(hashtextextended(p_gym_id, 0));
+  v_enforce_proof := not public.calendar_gym_is_autonomous(p_gym_id);
+  select * into v_row from public.content_calendar c
+    where c.id = p_row_id and c.gym_id = p_gym_id
+      and c.account = 'googlebusiness' and c.status = 'approved'
+      and c.variant_status = 'active' and c.published_at is null
+      and c.late_post_id is null and c.publish_claim_token is null
+      and c.media_not_ready_reason is null
+      and nullif(btrim(coalesce(c.image_url, '')), '') is not null
+    for update;
+  if not found then return; end if;
+  if v_enforce_proof and (
+      v_row.approval_kind is distinct from 'human'
+      or nullif(btrim(coalesce(v_row.approved_by, '')), '') is null
+      or v_row.approved_at is null or v_row.approval_digest is null
+      or v_row.approval_digest is distinct from
+         public.calendar_approval_digest(v_row)) then
+    return;
+  end if;
+  return query update public.content_calendar c
+    set status = 'publishing', publish_claim_token = gen_random_uuid()
+    where c.id = p_row_id returning c.*;
+end;
+$$;
+revoke all on function public.claim_calendar_gbp_publish_owned(uuid, text)
+  from public, anon, authenticated;
+grant execute on function public.claim_calendar_gbp_publish_owned(uuid, text)
   to service_role;

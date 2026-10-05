@@ -94,8 +94,21 @@ def sweep_gym(gym_id, store, *, dry_run=False, today_iso=None, log=None):
             out["cleaned"].append(desc)
             continue
         try:
-            updated = store.patch_caption_preserve_status(
-                gym_id, row.get("id"), body.strip())
+            from agent import config
+            if config.approval_proof_enabled():
+                # Caption is part of the approved creative digest. A hygiene
+                # cleanup therefore needs a fresh human review whenever it
+                # changes the stored caption; never preserve stale proof.
+                patch = getattr(store, "patch_caption_for_meta_sweep", None)
+                if patch is None:
+                    raise RuntimeError(
+                        "approval-proof mode requires atomic caption/proof invalidation")
+                updated = patch(gym_id, row.get("id"), body.strip(),
+                                expected_status=desc["status"],
+                                expected_caption=row.get("caption") or "")
+            else:
+                updated = store.patch_caption_preserve_status(
+                    gym_id, row.get("id"), body.strip())
         except Exception as exc:  # noqa: BLE001 - one row never stops the sweep
             log(f"{gym_id} {desc['id']}: caption clean failed: "
                 f"{type(exc).__name__}: {exc}")

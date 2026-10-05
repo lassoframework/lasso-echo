@@ -100,6 +100,14 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
     from . import post_quality as _pq
     _body, _meta = _pq.split_meta_suffix(caption)
     if _meta:
+        if not draft and config.approval_proof_enabled():
+            # This snapshot already passed the atomic proof claim. Removing
+            # metadata now would send different text from the approved digest.
+            # No provider call was attempted; the orchestrator releases the
+            # token and holds this creative until it is cleaned and reapproved.
+            return {"ok": False, "status": "approved", "late_post_id": "",
+                    "reject_reason": "caption metadata requires cleanup and fresh approval",
+                    "held": "approval_creative_change", "mode": ""}
         caption = _body.strip()
         row = dict(row)
         row["caption"] = caption
@@ -468,6 +476,7 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
     summary. A per-row failure never blocks the others."""
     from .zernio import _to_utc_iso  # reuse the tz normalizer for published_at
     rows = store.approved_gbp_rows(run_date) or []
+    require_proof = config.approval_proof_enabled()
     by_gym = {}
     for r in rows:
         by_gym.setdefault(r.get("gym_id"), []).append(r)
@@ -492,15 +501,33 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
             claim = getattr(store, "claim_publishing", None)
             claim_token = None
             claim_won = False
+            if require_proof and not draft and claim is None:
+                held += 1
+                continue  # no atomic proof-capable claim: no provider call
             if claim is not None and not draft:
                 try:
-                    claimed = claim(row.get("id"))
+                    if require_proof:
+                        claimed = claim(row.get("id"), gym_id=gym, require_proof=True)
+                    else:
+                        claimed = claim(row.get("id"))
                 except Exception as e:  # noqa: BLE001
                     print(f"[gbp] claim failed for row {row.get('id')}: "
                           f"{type(e).__name__}; skipping this tick")
                     continue
                 if not claimed:
                     continue                      # someone else owns it: skip
+                if require_proof:
+                    # Publish the exact locked creative returned by the proof
+                    # claim, never the potentially stale prefetch snapshot.
+                    if (not isinstance(claimed, dict)
+                            or str(claimed.get("id")) != str(row.get("id"))
+                            or claimed.get("gym_id") != gym
+                            or claimed.get("status") != "publishing"
+                            or not claimed.get("publish_claim_token")):
+                        held += 1
+                        continue
+                    row = claimed
+                    claim_token = claimed["publish_claim_token"]
                 claim_won = True
                 # New stores return the PERSISTED publish_claim_token; it becomes
                 # the Zernio Idempotency-Key. Legacy fakes return True — proceed
