@@ -98,6 +98,20 @@ acceptance. `visual_global_import_history()` and both coverage reports are
 draft mechanisms, not evidence that historical records are complete. Keep all
 flags OFF.
 
+Historical null-key import hardening (2026-10-05 review fixes, still DRAFT /
+unapplied): a manually linked scene is one visual subject, so historical
+attribution now enforces a component-wide date barrier -- two attested
+published null-key rows with distinct fingerprints in the same linked scene
+must share one date; a different-date sibling is rejected by
+`visual_global_claim_historical_row`, refused at the importer barrier and
+flagged as `component_usage_date_conflict` in calendar coverage (same-date
+siblings pass). When a keyed same-date reserved owner/member already exists,
+historical attribution never promotes or overwrites it; instead an immutable
+append-only `visual_global_published_attribution` receipt records the
+published row's proof, surviving keyed-member release, calendar-row deletion
+and import re-runs, and is accepted as anchor proof in history coverage.
+Real PostgreSQL regression: `tests/test_visual_global_history_pg.py`.
+
 Owner: isolated `codex/echo-global-ledger-db-20261002` worktree. Base: PR230
 `0ab9f8c`. Governing acceptance: `global-media-release-plan-20261002.md`.
 All three new migrations remain `DRAFT_`; no production SQL or enforcement flag
