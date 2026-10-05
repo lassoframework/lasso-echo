@@ -7,9 +7,8 @@ Asserts:
   * Window boundaries: 2026-09-23 and 2026-11-08 are IN, 2026-09-22 and
     2026-11-09 are OUT (inclusive window, config + cadence + planner agree).
   * Other tenants NEVER get capacity 3 (lasso base only, canonical 'lasso').
-  * Exactly 3 feed slots per in-window LASSO day at 2x: TWO regular feeds plus
-    ONE Summit feed; the Summit slot is additive (summit_daily=True) and never
-    replaces a regular slot. Paired stories keep existing semantics (2/day).
+  * Exactly 3 feed and 3 paired Story slots per in-window LASSO day at 2x:
+    TWO regular feeds plus ONE Summit feed. Every feed has its own Story source.
   * Weekly and sprint Summit slots move to the additive ordinal 2; their vacated
     regular slot is replaced with a varied non-Summit topic.
   * The SQL migration keeps the owned-claim signature and only opens capacity 3
@@ -20,6 +19,7 @@ import os
 import re
 import sys
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import cadence, config  # noqa: E402
 from agent import real_month_planner as rmp  # noqa: E402
+from agent.drafter import Draft, DraftStatus  # noqa: E402
 
 ACCT = "lasso"
 # 2026-10-05 is a Monday inside the Summit daily window.
@@ -156,7 +157,7 @@ def test_durable_lasso_three_feed_cadence_after_summit(monkeypatch):
                                          day="2027-01-15") == 1
 
 
-def test_durable_lasso_three_feed_plan_is_three_feeds_two_stories(monkeypatch):
+def test_durable_lasso_three_feed_plan_pairs_every_story(monkeypatch):
     monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
     monkeypatch.setenv("AGENT_LASSO_EDITORIAL_CALENDAR", "true")
     plan = rmp.plan_month("lasso", "2026-11-09", days=3, posts_per_day=3,
@@ -171,7 +172,9 @@ def test_durable_lasso_three_feed_plan_is_three_feeds_two_stories(monkeypatch):
         stories = [s for s in slots if s.fmt == "story"]
         assert [s.cadence_slot for s in feeds] == [0, 1, 2], day_key
         assert len({s.category for s in feeds}) == 3, day_key
-        assert {s.cadence_slot for s in stories} == {0, 1}, day_key
+        assert {s.cadence_slot for s in stories} == {0, 1, 2}, day_key
+        assert {s.cadence_slot: s.category for s in stories} == {
+            s.cadence_slot: s.category for s in feeds}, day_key
         assert not any(s.summit_daily for s in slots)
 
     client = rmp.plan_month(
@@ -181,6 +184,116 @@ def test_durable_lasso_three_feed_plan_is_three_feeds_two_stories(monkeypatch):
         welcome_dates=set(), video_mix=False, reels_floor=False,
         testimonial=False, summit_daily_fn=lambda _d: False)
     assert len([s for s in client if s.fmt == "feed"]) == 2
+
+
+@pytest.mark.parametrize("editorial", [False, True])
+def test_durable_three_feed_plan_retires_summit_after_campaign(monkeypatch, editorial):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    monkeypatch.setenv("AGENT_LASSO_EDITORIAL_CALENDAR", str(editorial).lower())
+    plan = rmp.plan_month(
+        "lasso", "2026-11-09", days=60, posts_per_day=3,
+        book_dates=set(), summit_day_fn=lambda _d: True,
+        sprint_day_fn=lambda _d: True,
+        sprint_feed_count_fn=lambda _d: 1,
+        welcome_dates=set(), video_mix=False, reels_floor=False,
+        testimonial=False, summit_daily_fn=lambda _d: True)
+    for day_key, slots in _by_date(plan).items():
+        feeds = [s for s in slots if s.fmt == "feed"]
+        stories = [s for s in slots if s.fmt == "story"]
+        assert [s.cadence_slot for s in feeds] == [0, 1, 2], day_key
+        assert {s.cadence_slot for s in stories} == {0, 1, 2}, day_key
+        assert len({s.category for s in feeds}) == 3, day_key
+        assert all(s.category != "summit" and not s.summit_daily
+                   and not s.is_sprint for s in slots), day_key
+
+
+def test_expired_summit_is_not_a_builder_fallback():
+    called = []
+
+    def builder(category):
+        def build(_account, _day):
+            called.append(category)
+            return SimpleNamespace(caption=f"Source-backed {category} caption")
+        return build
+
+    slot = rmp.PlanSlot("2026-11-09", "summit", "feed")
+    draft, category = rmp._build_feed_with_fallback(
+        slot, {"summit": builder("summit"), "podcast": builder("podcast")},
+        None, lambda _message: None)
+    assert category == "podcast" and draft is not None
+    assert called == ["podcast"]
+
+
+def test_daily_summit_story_uses_its_own_feed(monkeypatch):
+    from agent import lasso_daily_summit
+
+    plan = _plan(days=1, posts_per_day=2,
+                 summit_daily_fn=lambda _day: True)
+    source_feeds = []
+
+    def draft(category, day, *, story=False):
+        return Draft(
+            draft_id=f"{day}-{category}-{'story' if story else 'feed'}",
+            account_key="lasso_ig", platform="instagram",
+            caption=f"Approved {category} source", hashtags=[],
+            creative_path="genuine-story.png" if story else "feed.png",
+            creative_public_url=("https://cdn.example/genuine-story.png" if story
+                                 else "https://cdn.example/feed.png"),
+            scheduled_for="", status=DraftStatus.PENDING,
+            is_story=story, day_key=day,
+            draft_type="story" if story else "feed", category=category)
+
+    monkeypatch.setattr(
+        lasso_daily_summit, "build_daily_summit",
+        lambda _target, day: draft("summit", day))
+
+    def story_builder(_target, day, feed):
+        source_feeds.append((feed.cadence_slot_index, feed.category))
+        return draft(feed.category, day, story=True)
+
+    builders = {category: (lambda _target, day, cat=category: draft(cat, day))
+                for category in ("podcast", "platform", "b2b", "doctrine")}
+    drafts = rmp.build_month_drafts(
+        plan, builders, story_builder=story_builder, account="lasso")
+    feeds = [d for d in drafts if not d.is_story]
+    stories = [d for d in drafts if d.is_story]
+    assert {d.cadence_slot_index for d in feeds} == {0, 1, 2}
+    assert {d.cadence_slot_index for d in stories} == {0, 1, 2}
+    assert (2, "summit") in source_feeds
+    assert all(d.creative_public_url.endswith("genuine-story.png") for d in stories)
+
+
+def test_sprint_summit_third_story_falls_back_to_genuine_story_builder():
+    plan = _plan(days=1, posts_per_day=2,
+                 sprint_day_fn=lambda _day: True,
+                 sprint_feed_count_fn=lambda _day: 1,
+                 summit_daily_fn=lambda _day: True)
+    feeds_seen = []
+
+    def draft(category, day, *, story=False):
+        return Draft(
+            draft_id=f"{day}-{category}-{'story' if story else 'feed'}",
+            account_key="lasso_ig", platform="instagram",
+            caption=f"Approved {category} source", hashtags=[],
+            creative_path="story.png" if story else "feed.png",
+            creative_public_url=("https://cdn.example/story.png" if story
+                                 else "https://cdn.example/feed.png"),
+            scheduled_for="", status=DraftStatus.PENDING,
+            is_story=story, day_key=day,
+            draft_type="story" if story else "feed", category=category)
+
+    def story_builder(_target, day, feed):
+        feeds_seen.append(feed.cadence_slot_index)
+        return draft(feed.category, day, story=True)
+
+    builders = {category: (lambda _target, day, cat=category: draft(cat, day))
+                for category in ("podcast", "platform", "b2b", "doctrine")}
+    drafts = rmp.build_month_drafts(
+        plan, builders, story_builder=story_builder, account="lasso",
+        sprint_builder=lambda _target, day, _index: draft("summit", day),
+        sprint_story_builder=lambda *_args: None)
+    assert {d.cadence_slot_index for d in drafts if d.is_story} == {0, 1, 2}
+    assert 2 in feeds_seen
 
 
 # ---- planner shape ----------------------------------------------------------
@@ -208,7 +321,8 @@ def test_planner_exactly_3_two_regular_one_summit():
         assert summit_feeds[0].summit_daily is True    # additive, marked
         assert summit_feeds[0].is_sprint is False
         assert not any(s.summit_daily for s in regular_feeds)
-        assert len(stories) == 2, d                    # existing story semantics
+        assert len(stories) == 3, d
+        assert {s.cadence_slot for s in stories} == {0, 1, 2}, d
         # regular slots untouched: the 2x cadence pair is intact
         assert {s.cadence_slot for s in regular_feeds} == {0, 1}
     assert any(s.summit_daily for s in plan)           # the extra fires in-window
@@ -258,7 +372,7 @@ def test_planner_moves_sprint_artwork_to_extra_slot():
     for d, slots in _by_date(plan).items():
         feeds = [s for s in slots if s.fmt == "feed"]
         stories = [s for s in slots if s.fmt == "story"]
-        assert len(feeds) == 3 and len(stories) == 2, d
+        assert len(feeds) == 3 and len(stories) == 3, d
         assert [s.cadence_slot for s in feeds] == [0, 1, 2]
         assert all(s.category != "summit" for s in feeds[:2])
         assert feeds[2].category == "summit" and feeds[2].summit_daily
@@ -327,11 +441,11 @@ def test_production_flags_shape_all_47_days_and_preserve_manifest_slots(monkeypa
         feeds = [s for s in slots if s.fmt == "feed"]
         stories = [s for s in slots if s.fmt == "story"]
         assert len(feeds) == 3, day_key
-        assert len(stories) == 2, day_key
+        assert len(stories) == 3, day_key
         assert [s.cadence_slot for s in feeds] == [0, 1, 2], day_key
         assert all(s.category != "summit" for s in feeds[:2]), day_key
         assert feeds[2].category == "summit" and feeds[2].summit_daily, day_key
-        assert {s.cadence_slot for s in stories} == {0, 1}, day_key
+        assert {s.cadence_slot for s in stories} == {0, 1, 2}, day_key
 
     manifest = json.loads(MANIFEST.read_text())
     for entry in manifest["assets"]:
