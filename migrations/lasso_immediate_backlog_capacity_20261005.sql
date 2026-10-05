@@ -9,7 +9,10 @@
 -- Caller must pass capacity fifteen only in this window; all other tenants
 -- and capacity values retain the preceding owned, media-guarded claim
 -- behavior. Capacity, approved_only, day and timezone are NULL-safe: a NULL
--- argument claims nothing.
+-- argument claims nothing. A pending/approved row still carrying a claim
+-- token or reservation day (a stale or queued claim) is never claimable at
+-- any capacity, and elevated capacities fail closed on NULL post_date or
+-- NULL account rows whose comparisons would otherwise evaluate NULL.
 begin;
 
 create or replace function public.claim_calendar_publish_slot_owned(
@@ -56,6 +59,21 @@ begin
       and media_not_ready_reason is null
     for update;
   if not found or (p_approved_only and v_row.status <> 'approved') then
+    return null;
+  end if;
+  -- A pending/approved row still carrying a claim token or reservation day is
+  -- a stale or queued claim, not a fresh row. It must never be claimable at
+  -- ANY capacity until its claim state is explicitly reconciled.
+  if v_row.publish_claim_token is not null
+      or v_row.publish_reservation_day is not null then
+    return null;
+  end if;
+  -- Elevated capacities compare post_date and account. A NULL there would
+  -- evaluate those comparisons to NULL and slip past the guards, so elevated
+  -- claims fail closed for null-dated or null-account rows.
+  if p_capacity in (5, 15) and
+      (v_row.post_date is null
+       or nullif(btrim(coalesce(v_row.account, '')), '') is null) then
     return null;
   end if;
   if p_capacity in (3, 5, 15) and

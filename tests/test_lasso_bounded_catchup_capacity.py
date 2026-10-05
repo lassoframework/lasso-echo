@@ -201,15 +201,21 @@ def pg():
 
 
 def _insert(sql, *, gym="lasso", account="instagram", fmt="feed",
-            post_date, status="pending", reservation=None, published=False):
+            post_date, status="pending", reservation=None, published=False,
+            claim_token=None):
     row_id = str(_uuid.uuid4())
     published_cols = "now(), 'receipt'" if published else "null, null"
     sql(f"""insert into public.content_calendar
       (id,gym_id,account,post_date,format,caption,image_url,status,
-       variant_status,publish_reservation_day,published_at,late_post_id)
-      values ('{row_id}','{gym}','{account}','{post_date}','{fmt}','cap',
+       variant_status,publish_reservation_day,published_at,late_post_id,
+       publish_claim_token)
+      values ('{row_id}','{gym}',
+       {f"'{account}'" if account is not None else "null"},
+       {f"'{post_date}'" if post_date is not None else "null"},
+       '{fmt}','cap',
        'https://cdn.example/m.png','{status}','active',
-       {f"'{reservation}'" if reservation else "null"},{published_cols});""")
+       {f"'{reservation}'" if reservation else "null"},{published_cols},
+       {f"'{claim_token}'::uuid" if claim_token else "null"});""")
     return row_id
 
 
@@ -326,3 +332,61 @@ def test_rpc_claim_is_exactly_once_and_other_tenants_unchanged(pg):
     client2 = _insert(sql, gym="client-gym", post_date="2026-10-02")
     assert _claim(sql, client2, gym="client-gym", day="2026-10-05",
                   capacity=15) == "NULL"
+
+
+def test_rpc_refuses_stale_claim_state_at_any_capacity(pg):
+    sql = pg
+    sql("delete from public.content_calendar;")
+    stale_token = _insert(sql, post_date="2026-10-02",
+                          claim_token=str(_uuid.uuid4()))
+    stale_reservation = _insert(sql, post_date="2026-10-02",
+                                reservation="2026-10-04")
+    # Stale/queued claim state is never claimable at the elevated capacity...
+    assert _claim(sql, stale_token, day="2026-10-05", capacity=15) == "NULL"
+    assert _claim(sql, stale_reservation, day="2026-10-05",
+                  capacity=15) == "NULL"
+    # ...nor at the residual or normal capacities.
+    assert _claim(sql, stale_token, day="2026-10-07", capacity=5) == "NULL"
+    assert _claim(sql, stale_reservation, day="2026-10-07",
+                  capacity=5) == "NULL"
+    assert _claim(sql, stale_token, day="2026-10-05", capacity=3) == "NULL"
+    assert _claim(sql, stale_reservation, day="2026-10-05",
+                  capacity=3) == "NULL"
+    # The refused rows keep their original claim state untouched.
+    assert sql(f"select status from public.content_calendar "
+               f"where id='{stale_token}'") == "pending"
+    assert sql(f"select publish_claim_token is not null from "
+               f"public.content_calendar where id='{stale_token}'") == "t"
+
+
+def test_rpc_elevated_capacity_fails_closed_on_null_date_or_account(pg):
+    sql = pg
+    sql("delete from public.content_calendar;")
+    null_date = _insert(sql, post_date=None)
+    null_account = _insert(sql, post_date="2026-10-02", account=None)
+    # Elevated comparisons would evaluate NULL for these rows: fail closed.
+    assert _claim(sql, null_date, day="2026-10-05", capacity=15) == "NULL"
+    assert _claim(sql, null_account, day="2026-10-05", capacity=15) == "NULL"
+    assert _claim(sql, null_date, day="2026-10-07", capacity=5) == "NULL"
+    assert _claim(sql, null_account, day="2026-10-07", capacity=5) == "NULL"
+    assert sql("select count(*) from public.content_calendar "
+               "where status='publishing'") == "0"
+
+
+def test_rpc_legitimate_fresh_rows_still_claim(pg):
+    sql = pg
+    sql("delete from public.content_calendar;")
+    # Fresh current-day and strict-backlog rows claim at 15 on Oct 5-6...
+    current = _insert(sql, post_date="2026-10-05")
+    backlog = _insert(sql, post_date="2026-10-02")
+    assert _claim(sql, current, day="2026-10-05", capacity=15) != "NULL"
+    assert _claim(sql, backlog, day="2026-10-05", capacity=15) != "NULL"
+    # ...at the residual 5 on Oct 7-11, and at the normal 3 for LASSO.
+    residual = _insert(sql, post_date="2026-10-07")
+    normal = _insert(sql, post_date="2026-10-08")
+    assert _claim(sql, residual, day="2026-10-07", capacity=5) != "NULL"
+    assert _claim(sql, normal, day="2026-10-08", capacity=3) != "NULL"
+    # A fresh claim stamps exactly one token and the reservation day.
+    assert sql(f"select publish_claim_token is not null and "
+               f"publish_reservation_day = date '2026-10-05' from "
+               f"public.content_calendar where id='{backlog}'") == "t"

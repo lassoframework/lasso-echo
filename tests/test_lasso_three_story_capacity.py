@@ -125,6 +125,11 @@ def test_immediate_capacity_migration_preserves_owned_claim_guards():
     # The residual Oct 7-11 two-extra mode is retained, narrowed off Oct 5-6.
     assert "p_day between date '2026-10-07' and date '2026-10-11'" in sql
     assert "v_backlog_used >= 2" in sql
+    # Stale/queued claim state and NULL-comparison rows fail closed.
+    assert "v_row.publish_claim_token is not null" in sql
+    assert "v_row.publish_reservation_day is not null" in sql
+    assert "v_row.post_date is null" in sql
+    assert "nullif(btrim(coalesce(v_row.account, '')), '') is null" in sql
     # Every pre-existing owned-claim guarantee is preserved verbatim.
     for fragment in (
         "id = p_row_id and gym_id = p_gym_id",
