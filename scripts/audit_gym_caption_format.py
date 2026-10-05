@@ -44,7 +44,9 @@ def _eligible(row):
     return (row["status"] == "pending" and row["variant_status"] == "active"
             and row["format"] == "feed"
             and row["media_not_ready_reason"] is None
-            and row["published_at"] is None)
+            and row["published_at"] is None
+            and row.get("late_post_id") is None
+            and row.get("publish_claim_token") is None)
 
 
 def inspect(rows, *, start, end, gym=None):
@@ -224,6 +226,11 @@ def main(argv=None):
                      expected_digest=args.expected_digest, receipt_path=args.receipt)
     except Exception as exc:
         result = {"ok": False, "reason": f"audit failed:{type(exc).__name__}"}
+    # The exact target manifest stays in the private apply receipt. Routine
+    # audits need counts and the digest, not hundreds of row hashes on stdout.
+    if isinstance(result.get("audit"), dict):
+        result["audit"] = {key: value for key, value in result["audit"].items()
+                           if key != "targets"}
     print(json.dumps(result, sort_keys=True))
     return 0 if result["ok"] else 1
 
