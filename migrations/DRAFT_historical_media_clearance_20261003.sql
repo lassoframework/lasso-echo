@@ -36,7 +36,11 @@
 -- receipt for the SAME asset at its CURRENT content_hash (e.g. a corrected
 -- review after a Drive byte change). At most ONE active (unrevoked) receipt
 -- may exist per (gym_id, asset_id); recording against an active receipt is
--- refused until it is revoked.
+-- refused until it is revoked. This is a DATABASE invariant, not just RPC
+-- logic (2026-10-03 P2 repair): a partial unique index
+-- (gym_id, asset_id) WHERE revoked_at IS NULL rejects a second active
+-- receipt even from direct DML that bypasses the RPC, and concurrent
+-- record RPCs cannot both win the check-then-insert race.
 -- FIRST_SEEN STAMP (2026-10-03 repair): this DRAFT also declares
 -- media_asset.first_indexed_at (idempotent ADD COLUMN IF NOT EXISTS — the
 -- production column already exists, nullable, fully populated 3605/3605) and
@@ -63,6 +67,7 @@
 -- DROP TRIGGER media_historical_clearance_guard ON
 -- public.media_historical_clearance,
 -- DROP FUNCTION public.media_historical_clearance_guard(),
+-- DROP INDEX public.media_historical_clearance_one_active,
 -- DROP TABLE public.media_historical_clearance (then, if no other consumer
 -- needs it, DROP INDEX public.media_source_id_gym_key). Once any 'known_used' or
 -- 'cleared' receipt has been consumed by writers, the table is permanent
@@ -196,6 +201,15 @@ create index if not exists media_historical_clearance_hash_idx
   on public.media_historical_clearance (gym_id, content_hash);
 create index if not exists media_historical_clearance_asset_idx
   on public.media_historical_clearance (gym_id, asset_id);
+-- DURABLE SINGLE-ACTIVE-RECEIPT INVARIANT (2026-10-03 P2 repair): at most
+-- one ACTIVE (unrevoked) receipt per (gym_id, asset_id), enforced by the
+-- database even under direct DML or a concurrent check-then-insert race
+-- (the RPC's pre-check alone cannot close a race between two record calls).
+-- Revoked versions remain untouched, so revoke-then-re-record as the next
+-- version keeps working.
+create unique index if not exists media_historical_clearance_one_active
+  on public.media_historical_clearance (gym_id, asset_id)
+  where revoked_at is null;
 
 -- These are owner-only writes. The service role can inspect receipts but must
 -- use the validated SECURITY DEFINER RPCs to record or revoke them.

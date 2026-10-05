@@ -16,6 +16,8 @@ import os
 
 import pytest
 
+pytest_plugins = ["pg_fixture"]
+
 
 def pytest_configure(config):
     config.addinivalue_line(
