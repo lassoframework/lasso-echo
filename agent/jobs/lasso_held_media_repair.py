@@ -18,7 +18,8 @@ import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from agent import config, infographic_evidence, variant_regen, visual_writer_prepare
+from agent import (calendar_autopublish, config, infographic_evidence,
+                   variant_regen, visual_writer_prepare)
 from agent.infographic_artifacts import ArtifactStore
 from agent.portal_calendar_store import SupabaseCalendarStore
 
@@ -29,11 +30,11 @@ ACCOUNTS = {"instagram": "lasso_ig", "facebook": "lasso_fb"}
 ACCOUNT = "lasso_ig"
 MAX_PER_DAY = 3
 HORIZON_DAYS = 1
-INCIDENT_BACKLOG_FIRST = "2026-10-02"
-INCIDENT_BACKLOG_LAST = "2026-10-05"
+# Kept for the runner's recovery-window detection; this job no longer gates
+# past coverage on fixed dates (see run()).
 INCIDENT_RECOVERY_FIRST = "2026-10-06"
 INCIDENT_RECOVERY_LAST = "2026-10-11"
-MAX_INCIDENT_BACKLOG_PER_RUN = 2
+MAX_PAST_PER_RUN = 2
 _CAS_COLUMNS = (
     "id", "gym_id", "status", "variant_status", "account", "format",
     "post_date", "caption", "image_url", "source_media_url",
@@ -274,11 +275,16 @@ def _replace_exact(store, current, new_url, account_key=ACCOUNT):
 def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         host_fn=None, max_per_day=MAX_PER_DAY, account_key=ACCOUNT,
         include_incident_backlog=False):
-    """Repair current runway; optional dated outage replay is capped per run.
+    """Repair the current runway plus held rows inside the publisher catchup.
 
-    The normal daily runner does not request the historical window. A recovery
-    invocation can opt in only during October 6–11, after caption CAS has put
-    changed rows on hold. No row is published by this job.
+    Past coverage follows the publisher's dynamic catchup window
+    (``_client_publish_limits``), not fixed outage dates: an Oct 7 hold is
+    still repaired on an Oct 8 retry, and rows that age out of the publisher
+    window age out here too. Past-day paid attempts stay capped at
+    MAX_PAST_PER_RUN per run, and only the two feed media holds are ever
+    cleared. ``include_incident_backlog`` is accepted for the deployed
+    runner's recovery-window call and no longer changes coverage. No row is
+    published by this job.
     """
     summary = {"ok": False, "attempted": 0, "generated": 0, "reused": 0,
                "repaired": 0, "skipped": 0, "errors": 0}
@@ -293,11 +299,15 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         return summary
     day = _local_day(now)
     today = day.isoformat()
-    if include_incident_backlog and not (
-            INCIDENT_RECOVERY_FIRST <= today <= INCIDENT_RECOVERY_LAST):
-        summary["reason"] = "incident recovery window closed"
+    try:
+        catchup_days, _ = calendar_autopublish._client_publish_limits(
+            GYM, today, config.client_daily_publish_cap())
+    except Exception:
+        catchup_days = None
+    if type(catchup_days) is not int or catchup_days < 0:
+        summary["reason"] = "publisher catchup window unavailable"
         return summary
-    first = INCIDENT_BACKLOG_FIRST if include_incident_backlog else today
+    first = (day - timedelta(days=catchup_days)).isoformat()
     last = (day + timedelta(days=HORIZON_DAYS)).isoformat()
     store = store or SupabaseCalendarStore()
     artifact_store = artifact_store or ArtifactStore()
@@ -313,10 +323,7 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         summary["reason"] = "held calendar read malformed"
         return summary
     summary["ok"] = True
-    rows = sorted((row for row in rows if _eligible(row, first, last, account_key)
-                   and (str(row["post_date"])[:10] >= today
-                        or INCIDENT_BACKLOG_FIRST <= str(row["post_date"])[:10]
-                                                 <= INCIDENT_BACKLOG_LAST)),
+    rows = sorted((row for row in rows if _eligible(row, first, last, account_key)),
                   key=lambda row: (str(row["post_date"])[:10] < today,
                                    row["post_date"],
                                    0 if row["format"] == "feed" else 1,
@@ -325,8 +332,8 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
     backlog_attempted = 0
     for row in rows:
         row_day = str(row["post_date"])[:10]
-        incident_backlog = row_day < today
-        if incident_backlog and backlog_attempted >= MAX_INCIDENT_BACKLOG_PER_RUN:
+        past_day = row_day < today
+        if past_day and backlog_attempted >= MAX_PAST_PER_RUN:
             summary["skipped"] += 1
             continue
         kind = str(row["format"]).lower()
@@ -347,7 +354,7 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
                 summary["skipped"] += 1
                 continue
             summary["attempted"] += 1
-            if incident_backlog:
+            if past_day:
                 backlog_attempted += 1
             per_day[count_key] = per_day.get(count_key, 0) + 1
             fresh = store.get_row(GYM, row["id"])

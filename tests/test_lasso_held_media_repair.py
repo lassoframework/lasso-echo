@@ -38,7 +38,9 @@ class _Store:
 
     def list_pending_media_between(self, gym, first, last):
         self.reads += 1
-        assert (gym, first, last) == ("lasso", "2026-10-05", "2026-10-06")
+        # 2026-10-05 is outside the incident window, so the publisher catchup
+        # lookback is the default seven days.
+        assert (gym, first, last) == ("lasso", "2026-09-28", "2026-10-06")
         return [deepcopy(row) for row in self.rows.values()]
 
     def get_row(self, gym, rid):
@@ -447,17 +449,20 @@ def test_daily_runner_repairs_ahead_of_drafting_even_if_voice_is_missing(monkeyp
     ]
 
 
-def test_explicit_incident_backlog_is_dated_and_two_attempts_per_run(monkeypatch):
+def test_past_coverage_follows_publisher_catchup_window_not_fixed_dates(
+        monkeypatch):
     _armed(monkeypatch)
     monkeypatch.setattr(repair, "_local_day", lambda now: date(2026, 10, 6))
     rows = [_row("current", day="2026-10-06")]
     rows += [_row(f"old-{i}", day="2026-10-02") for i in range(3)]
-    rows += [_row("outside", day="2026-10-01")]
+    rows += [_row("outside", day="2026-09-28")]
 
     class Store(_Store):
         def list_pending_media_between(self, gym, first, last):
             self.reads += 1
-            assert (gym, first, last) == ("lasso", "2026-10-02", "2026-10-07")
+            # During the incident window the publisher lookback still covers
+            # Oct 2, but never earlier than the dynamic catchup boundary.
+            assert (gym, first, last) == ("lasso", "2026-09-29", "2026-10-07")
             return [deepcopy(row) for row in self.rows.values()]
 
     store = Store(rows)
@@ -466,8 +471,9 @@ def test_explicit_incident_backlog_is_dated_and_two_attempts_per_run(monkeypatch
         generated.append(row["id"])
         return {"ok": True, "image_url": f"https://new.example/{row['id']}.png"}
     monkeypatch.setattr(variant_regen, "generate_variant_image", fake_generate)
-    out = repair.run(store=store, artifact_store=_Artifacts(),
-                     include_incident_backlog=True)
+    out = repair.run(store=store, artifact_store=_Artifacts())
+    # Current runway first, then at most two past attempts per run so a held
+    # backlog can never become an unbounded paid generation wave.
     assert out["attempted"] == out["repaired"] == 3
     assert generated == ["current", "old-0", "old-1"]
     assert store.rows["old-2"]["media_not_ready_reason"] == repair.HOLD_REASON
@@ -501,22 +507,55 @@ def test_daily_runner_autonomously_opts_in_only_during_recovery_dates(monkeypatc
     assert all("include_incident_backlog" not in kwargs for kwargs in calls)
 
 
-def test_incident_backlog_requires_explicit_opt_in_and_expires(monkeypatch):
+def test_past_hold_ages_out_with_the_publisher_catchup_window(monkeypatch):
     _armed(monkeypatch)
     monkeypatch.setattr(repair, "_local_day", lambda now: date(2026, 10, 6))
     class Store(_Store):
         def list_pending_media_between(self, gym, first, last):
             self.reads += 1
-            assert (gym, first, last) == ("lasso", "2026-10-06", "2026-10-07")
+            assert (gym, first, last) == ("lasso", "2026-09-29", "2026-10-07")
             return [deepcopy(row) for row in self.rows.values()]
     store = Store([_row("old", day="2026-10-02")])
+    monkeypatch.setattr(variant_regen, "generate_variant_image",
+                        lambda row, account, **kw: {"ok": True,
+                        "image_url": "https://new.example/old.png"})
+    # No recovery-window opt-in is needed: Oct 2 is inside the publisher
+    # catchup window on Oct 6, so the held feed repairs on a normal run.
     out = repair.run(store=store, artifact_store=_Artifacts())
-    assert out["attempted"] == 0
-    assert store.rows["old"]["media_not_ready_reason"] == repair.HOLD_REASON
+    assert out["attempted"] == out["repaired"] == 1
+    assert store.rows["old"]["media_not_ready_reason"] is None
 
+    # On Oct 12 the same row is older than the publisher catchup window; it
+    # ages out exactly like an unpublishable catchup row and keeps its hold.
     monkeypatch.setattr(repair, "_local_day", lambda now: date(2026, 10, 12))
-    out = repair.run(store=store, artifact_store=_Artifacts(),
-                     include_incident_backlog=True)
-    assert out["ok"] is False
-    assert out["reason"] == "incident recovery window closed"
-    assert store.reads == 1
+    store.rows["old"] = _row("old", day="2026-10-02")
+    class LateStore(_Store):
+        def list_pending_media_between(self, gym, first, last):
+            self.reads += 1
+            assert (gym, first, last) == ("lasso", "2026-10-05", "2026-10-13")
+            return [deepcopy(row) for row in self.rows.values()]
+    late = LateStore([_row("old", day="2026-10-02")])
+    out = repair.run(store=late, artifact_store=_Artifacts())
+    assert out["attempted"] == 0
+    assert late.rows["old"]["media_not_ready_reason"] == repair.HOLD_REASON
+    assert late.patches == []
+
+
+def test_oct7_held_feed_still_repairs_on_oct8_retry(monkeypatch):
+    """Regression: fixed Oct 2-5 backlog bounds silently dropped Oct 6/7 holds."""
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair, "_local_day", lambda now: date(2026, 10, 8))
+    class Store(_Store):
+        def list_pending_media_between(self, gym, first, last):
+            self.reads += 1
+            # The publisher catchup lookback on Oct 8 reaches Oct 1.
+            assert (gym, first, last) == ("lasso", "2026-10-01", "2026-10-09")
+            return [deepcopy(row) for row in self.rows.values()]
+    store = Store([_row("oct7", day="2026-10-07")])
+    monkeypatch.setattr(variant_regen, "generate_variant_image",
+                        lambda row, account, **kw: {"ok": True,
+                        "image_url": "https://new.example/oct7.png"})
+    out = repair.run(store=store, artifact_store=_Artifacts())
+    assert out["attempted"] == out["generated"] == out["repaired"] == 1
+    assert store.rows["oct7"]["media_not_ready_reason"] is None
+    assert store.rows["oct7"]["image_url"] == "https://new.example/oct7.png"
