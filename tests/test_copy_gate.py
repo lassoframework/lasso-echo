@@ -139,6 +139,9 @@ def test_caption_numbered_lists_and_ellipsis_pause_keep_their_text_together():
         "Try this.\n\n1. Squats 2. Lunges.\n\nJoin us.")
     assert copy_gate.format_caption("1. Warm up. 2. Cool down. 3. Stretch.") == (
         "1. Warm up.\n\n2. Cool down.\n\n3. Stretch.")
+    assert copy_gate.format_caption(
+        "1. Squats 2. Lunges 3. Hold for 30. Great work today.") == (
+        "1. Squats 2. Lunges 3. Hold for 30.\n\nGreat work today.")
     assert copy_gate.format_caption("Wait... Take a breath. Join us.") == (
         "Wait... Take a breath.\n\nJoin us.")
     assert copy_gate.format_caption("Start at level 1. Build from there.") == (

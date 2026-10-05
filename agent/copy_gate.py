@@ -196,7 +196,7 @@ def format_caption(text: str) -> str:
             blocks.append(line)
             continue
         start = 0
-        numbered_list = False
+        next_list_number = None
         for match in _CAPTION_SENTENCE_END.finditer(line):
             part = line[start:match.end(1)].strip()
             last_word = part.split()[-1].lower() if part.split() else ""
@@ -205,8 +205,9 @@ def format_caption(text: str) -> str:
             next_text = line[match.end():].lstrip()
             if re.fullmatch(r"\d+\.", last_word):
                 prefix = line[start:match.start() - len(last_word[:-1])].strip()
-                if numbered_list or not prefix or prefix.endswith(":"):
-                    numbered_list = True
+                number = int(last_word[:-1])
+                if number == next_list_number or not prefix or prefix.endswith(":"):
+                    next_list_number = number + 1
                     continue
             if last_word.rstrip("\"'”’)]").endswith("..."):
                 continue
@@ -215,7 +216,7 @@ def format_caption(text: str) -> str:
                 continue
             blocks.append(part)
             start = match.end()
-            numbered_list = False
+            next_list_number = None
         tail = line[start:].strip()
         if tail:
             blocks.append(tail)
