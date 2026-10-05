@@ -200,7 +200,7 @@ Photo drops obey the same gate as posts: the worker fires **at publish time** (`
 
 Worker fires on `approved` + `scheduled_at` reached, **after checking:**
 
-1. Connection row status = `connected`. A `needs_reconnect` gym holds its posts silently — no failure spam. **On reconnect, held posts re-slot into the next valid 8 to 10am window** (never publish at a stale timestamp), and any OFFER row whose offer window lapsed during the outage reverts to `pending` for coach review instead of publishing a dead offer.
+1. Connection row status = `connected`. A `needs_reconnect` gym holds its posts silently — no failure spam. **On reconnect, held posts re-slot into the next valid 8 to 10am window** (never publish at a stale timestamp), and any OFFER row whose offer window lapsed during the outage reverts to `pending` for the owner's normal approval flow instead of publishing a dead offer.
 2. Row resolves to **exactly one** connection via `portal_gym_key` (+ `gbp_location_id`). The planner stamps `gbp_location_id` on every row for gyms with more than one connection. If the worker resolves 0 or 2+ connections, the row goes to `failed` with `reject_reason='connection routing'` and a staff alert — never a silent hold.
 
 ```json

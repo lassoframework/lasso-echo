@@ -1730,7 +1730,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             log(f"{base_key}: video pre-pass skipped ({type(e).__name__}: {e})")
 
     # §4 weak_match: no image cleared the content-score floor for these slots — the best
-    # available was planned and must reach the coach (never silent). One summary staff alert
+    # available was planned and must reach ops (never silent). One summary staff alert
     # per build, not per day.
     weak = sum(1 for d in drafts if getattr(d, "weak_match", False))
     if weak:
@@ -1741,7 +1741,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                              "fresher material for those pillars")
         except Exception:  # noqa: BLE001
             pass
-        log(f"{base_key}: {weak} weak_match pick(s) flagged for the coach")
+        log(f"{base_key}: {weak} weak_match pick(s) flagged for ops media alert")
 
     # Days the UPLOADED library covered (Lane A only, locked days excluded): the
     # small-library digest compares the library against these + the fallback fills,

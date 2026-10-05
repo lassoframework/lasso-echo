@@ -182,7 +182,7 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     vision); flagged/unanalyzed images are never auto-picked (guardrail 13); a cluster inside
     a per-platform reuse window is skipped (§3); the rest are scored on slot-job fit
     (vision.content_score) and the best is chosen deterministically. Below VISION_SCORE_FLOOR
-    the best available is still returned but flagged `weak_match` for the coach (never silent,
+    the best available is still returned but flagged `weak_match` for an ops alert (never silent,
     §4). None when nothing plannable remains.
 
     exclude_keys: creative basenames that must NOT be picked (photos already on the gym's
@@ -330,7 +330,7 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
         best_score, _rk, _name, best = cands[0]
         if best_score < vision.VISION_SCORE_FLOOR:
             try:
-                best.weak_match = True     # planned but flagged for the coach (§4, never silent)
+                best.weak_match = True     # planned with an ops alert (§4, never silent)
             except Exception:
                 pass
         return best
@@ -833,14 +833,14 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
             category=category,
         )
         # §4 weak_match: no image cleared the score floor -> the best available was planned
-        # and flagged for the coach. Never silent: carry it on the draft + log it.
+        # and flagged for ops. Never silent: carry it on the draft + log it.
         if getattr(image, "weak_match", False):
             try:
                 draft.weak_match = True
             except Exception:
                 pass
             print(f"[vision] weak_match pick for {account.key} {day_key} "
-                  f"(pillar {category}) -> coach review")
+                  f"(pillar {category}) -> ops media alert")
         # stale_reuse: the legacy branch's library was exhausted within the reuse
         # window, so this photo is a repeat, not fresh (Pete/Zanshin, Dean/Reverb,
         # 2026-09-07). Carried onto the draft so client_month_run can leave the day
