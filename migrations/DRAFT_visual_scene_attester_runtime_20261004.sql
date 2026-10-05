@@ -38,18 +38,50 @@
 --      authorize another send: the composite refuses any row whose prior
 --      snapshot has send_started_at set and is not finalized.
 --
---   5. NARROW ROLE: scene_attester (NOLOGIN, NO PASSWORD — none is embedded
---      here; login credentials are an operational secret, never SQL). It
---      holds EXECUTE on exactly three functions and SELECT on the evidence
---      tables. It has NO table DML anywhere.
+--   5. SPLIT ROLES — FAIL-CLOSED SENDER vs INDEPENDENT VERIFIER:
+--      scene_attester (SENDER: claim_prepare + send_start only) and
+--      scene_attester_verifier (VERIFIER: attest_terminate only). Both are
+--      NOLOGIN, NO PASSWORD — no credential is embedded here; login
+--      credentials are an operational secret, never SQL. Neither role has
+--      ANY table DML anywhere; both hold SELECT on the evidence tables.
+--      No single role can both start a send and certify its outcome:
+--      visual_scene_attester_attest_terminate is revoked from
+--      scene_attester and granted ONLY to scene_attester_verifier, and the
+--      function body ALSO refuses a verifier_id identical to the snapshot's
+--      sending attester_id (defense in depth, not a substitute for the
+--      role split — attester_id/verifier_id are caller-supplied labels).
+--      A FAIL-CLOSED SPLIT-AUTHORITY PREFLIGHT at install refuses (23514)
+--      when EITHER attester role pre-existed as LOGIN, or when ANY
+--      pre-existing role already holds effective membership in BOTH
+--      attester roles (directly or transitively via pg_auth_members) —
+--      such a bridge would silently defeat the split, so installing
+--      enforcement on top of it must fail, not bless it.
 --
 --   6. ATOMIC ATTEST+TERMINAL (visual_scene_attester_attest_terminate):
 --      writes the owner-only authoritative attestation AND calls the
---      receipt package's terminate in ONE transaction. service_role
---      EXECUTE on the old standalone terminate is REVOKED here; only this
---      function may finalize a provider outcome. Outcome 'ambiguous' never
---      finalizes: it parks the snapshot in ambiguous_hold, leaves the row
---      held, and writes an event (unknown/ambiguous hold preserved).
+--      receipt package's terminate in ONE transaction. service_role AND
+--      the sending role scene_attester lose EXECUTE on the old standalone
+--      terminate here; only this function may finalize a provider outcome,
+--      and only the independent scene_attester_verifier role may call it.
+--      Outcome 'ambiguous' never finalizes: it parks the snapshot in
+--      ambiguous_hold, leaves the row held, and writes an event
+--      (unknown/ambiguous hold preserved).
+--
+-- RUNTIME PREREQUISITE — AUTHORITATIVE PROVIDER OBSERVATION BOUNDARY:
+--      SQL alone CANNOT prove that readback_evidence reflects a real
+--      provider readback. The only authoritative immutable boundary this
+--      package can enforce is the role split above plus the frozen
+--      evidence snapshot. Successful terminalization therefore REQUIRES
+--      that scene_attester_verifier credentials be issued ONLY to an
+--      independently operated verifier process that performs an
+--      externally authenticated Zernio readback (provider-API response
+--      captured and hashed by the verifier, never by the sender) BEFORE
+--      calling attest_terminate. Until that independent verifier process
+--      and its credential custody exist, DO NOT grant LOGIN to
+--      scene_attester_verifier: with no verifier credential issued,
+--      successful terminalization stays DISABLED and every send parks in
+--      send_started/ambiguous_hold. That is the intended fail-closed
+--      default, not an outage.
 --
 -- HONEST LIMITS (read before grading):
 --   * This package CANNOT prevent direct out-of-band provider sends by
@@ -59,6 +91,12 @@
 --   * The Zernio readback that justifies an attestation is application
 --     integration, not SQL; this package binds and freezes the evidence
 --     the attester asserts and makes anything unmatched impossible.
+--   * verifier_id is a caller-supplied label. The in-body independence
+--     check (verifier_id != snapshot attester_id) is defense in depth
+--     ONLY; the load-bearing control is the scene_attester_verifier ROLE
+--     split plus the credential-custody prerequisite above. A caller
+--     holding BOTH roles' credentials can still self-certify with two
+--     different labels — prevent that operationally, never in SQL.
 --   * The composite's claim leg is NOT a private token mint: it calls the
 --     production authoritative claimant
 --     claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean)
@@ -182,6 +220,85 @@ begin
   if not exists (select 1 from pg_roles where rolname = 'scene_attester') then
     create role scene_attester nologin;
   end if;
+  if not exists (select 1 from pg_roles
+                 where rolname = 'scene_attester_verifier') then
+    create role scene_attester_verifier nologin;
+  end if;
+end $$;
+
+-- ----------------------------------------------------------------------------
+-- FAIL-CLOSED SPLIT-AUTHORITY PREFLIGHT (P1 repair, 2026-10-05;
+-- catalog-visibility correction 2026-10-05). The sender/verifier split
+-- is only as strong as the existing role graph: a pre-existing LOGIN
+-- role holding BOTH scene_attester and scene_attester_verifier
+-- (directly or transitively — every pg_auth_members edge bridges,
+-- since SET ROLE crosses a NO INHERIT edge too), or either attester
+-- role itself pre-existing as LOGIN, would let one login both start a
+-- send and certify its outcome. Installing new enforcement on top of
+-- such a bridge would silently bless it, so the install REFUSES
+-- (errcode 23514). Revoke the bridge / recreate the roles NOLOGIN,
+-- then re-run.
+--
+-- Catalog-visibility note: pg_roles.rolpassword is ALWAYS the literal
+-- '********' in PostgreSQL (it never exposes whether a password is
+-- stored; only the superuser-readable pg_authid does). Any
+-- rolpassword-based null test therefore matches EVERY role and would
+-- refuse even freshly created NOLOGIN passwordless roles — it is not a
+-- usable check for this migration's execution role. A stored
+-- password on a NOLOGIN role is inert (it cannot authenticate without
+-- LOGIN), so the load-bearing checks here are: (a) neither attester
+-- role may be LOGIN, and (b) no role may bridge both. Ordinary
+-- superusers/service roles are unaffected: pg_auth_members holds only
+-- explicit GRANT edges, so a superuser that is NOT a member of either
+-- attester role is never flagged by the reachability scan.
+-- ----------------------------------------------------------------------------
+do $$
+declare
+  v_bridge text;
+begin
+  if exists (select 1 from pg_roles
+             where rolname in ('scene_attester', 'scene_attester_verifier')
+               and rolcanlogin) then
+    raise exception 'visual_scene_attester_runtime fail-closed '
+      'split-authority preflight: scene_attester / '
+      'scene_attester_verifier pre-existed as LOGIN; recreate them '
+      'NOLOGIN and re-run (credentials are operational, never SQL)'
+      using errcode = '23514';
+  end if;
+
+  -- Effective-membership reachability over pg_auth_members. Plain UNION
+  -- (not UNION ALL) dedupes (member, grp) pairs, so a membership cycle
+  -- terminates. Any role whose reachable set covers BOTH attester roles —
+  -- including either attester role itself being a member of the other —
+  -- defeats the split and fails the install closed.
+  with recursive reach(member, grp) as (
+      select m.member, m.roleid from pg_auth_members m
+    union
+      select r.member, m.roleid
+        from reach r join pg_auth_members m on m.member = r.grp)
+  select r.rolname into v_bridge
+    from pg_roles r
+   where (r.rolname = 'scene_attester'
+          or exists (select 1 from reach x join pg_roles g
+                       on g.oid = x.grp
+                      where x.member = r.oid
+                        and g.rolname = 'scene_attester'))
+     and (r.rolname = 'scene_attester_verifier'
+          or exists (select 1 from reach x join pg_roles g
+                       on g.oid = x.grp
+                      where x.member = r.oid
+                        and g.rolname = 'scene_attester_verifier'))
+   order by r.rolname
+   limit 1;
+  if v_bridge is not null then
+    raise exception 'visual_scene_attester_runtime fail-closed '
+      'split-authority preflight: role % already holds effective '
+      'membership in BOTH scene_attester and scene_attester_verifier '
+      '(directly or transitively); one login spanning both roles defeats '
+      'the sender/verifier split — revoke the bridging membership before '
+      'installing', v_bridge
+      using errcode = '23514';
+  end if;
 end $$;
 
 -- ----------------------------------------------------------------------------
@@ -239,7 +356,8 @@ drop policy if exists visual_scene_attester_binding_read
   on public.visual_scene_attester_binding;
 create policy visual_scene_attester_binding_read
   on public.visual_scene_attester_binding
-  for select to scene_attester, service_role using (true);
+  for select to scene_attester, scene_attester_verifier,
+    service_role using (true);
 
 -- ----------------------------------------------------------------------------
 -- Immutable prepared snapshot (per exact claim token) + attester state.
@@ -373,7 +491,8 @@ drop policy if exists visual_scene_attester_prepared_read
   on public.visual_scene_attester_prepared;
 create policy visual_scene_attester_prepared_read
   on public.visual_scene_attester_prepared
-  for select to scene_attester, service_role using (true);
+  for select to scene_attester, scene_attester_verifier,
+    service_role using (true);
 
 -- ----------------------------------------------------------------------------
 -- Append-only attester event log.
@@ -414,7 +533,8 @@ drop policy if exists visual_scene_attester_event_read
   on public.visual_scene_attester_event;
 create policy visual_scene_attester_event_read
   on public.visual_scene_attester_event
-  for select to scene_attester, service_role using (true);
+  for select to scene_attester, scene_attester_verifier,
+    service_role using (true);
 
 -- ----------------------------------------------------------------------------
 -- SCENE-HELD STRUCTURED REFUSAL (P0). When the persisted-state claimant
@@ -825,7 +945,7 @@ declare
   v_token    uuid := nullif(p->>'claim_attempt_id','')::uuid;
   v_outcome  text := p->>'outcome';
   v_post     text := nullif(btrim(coalesce(p->>'provider_post_id','')),'');
-  v_attester text := nullif(btrim(coalesce(p->>'attester_id','')),'');
+  v_verifier text := nullif(btrim(coalesce(p->>'verifier_id','')),'');
   v_ev       jsonb := p->'readback_evidence';
   v_snap     public.visual_scene_attester_prepared%rowtype;
   v_attempt  public.visual_scene_original_use_attempt%rowtype;
@@ -834,10 +954,11 @@ declare
   v_term     jsonb;
   v_recorded_state text;
 begin
-  if v_token is null or v_attester is null
+  if v_token is null or v_verifier is null
      or v_outcome not in ('delivered','confirmed_no_send','ambiguous') then
-    raise exception 'attest_terminate: outcome must be delivered, '
-      'confirmed_no_send or ambiguous' using errcode = '22023';
+    raise exception 'attest_terminate: verifier_id is required and outcome '
+      'must be delivered, confirmed_no_send or ambiguous'
+      using errcode = '22023';
   end if;
   if v_outcome = 'delivered' and v_post is null then
     raise exception 'attest_terminate: delivered requires provider_post_id'
@@ -856,9 +977,17 @@ begin
     raise exception 'attest_terminate: no prepared snapshot for this claim '
       'token' using errcode = '22023';
   end if;
-  if v_snap.attester_id is distinct from v_attester then
-    raise exception 'attest_terminate: attester identity does not match the '
-      'prepared snapshot' using errcode = '23505';
+  -- FAIL-CLOSED SENDER/VERIFIER SPLIT (defense in depth under the role
+  -- split: the load-bearing control is that EXECUTE here is granted ONLY
+  -- to scene_attester_verifier, never to the sending role). A verifier
+  -- identity identical to the SENDING attester identity is
+  -- self-certification and refuses BEFORE any state, replay or hold
+  -- handling. verifier_id is caller-supplied, so this check cannot
+  -- replace separate credential custody for the two roles.
+  if v_snap.attester_id is not distinct from v_verifier then
+    raise exception 'attest_terminate: verifier identity must be '
+      'independent of the sending attester (self-certification refused)'
+      using errcode = '23505';
   end if;
 
   -- Replay: validate the request against immutable terminal records before
@@ -877,12 +1006,18 @@ begin
       then 'confirmed_delivered'
       when v_outcome = 'confirmed_no_send' then 'confirmed_no_send'
       else null end;
+    if v_att.attested_by is distinct from v_verifier then
+      raise exception 'attest_terminate: finalized replay verifier does '
+        'not match the recorded attestation' using errcode = '23505';
+    end if;
     if v_att.outcome is distinct from v_outcome
        or v_attempt.state is distinct from v_recorded_state
        or v_att.provider_post_id is distinct from v_post
+       or v_att.readback_evidence is distinct from v_ev
        or v_attempt.provider_post_id is distinct from v_post then
       raise exception 'attest_terminate: finalized replay conflicts with the '
-        'recorded outcome or provider post identity' using errcode = '23505';
+        'recorded outcome, readback evidence, or provider post identity'
+        using errcode = '23505';
     end if;
     if v_outcome = 'delivered' then
       select * into v_receipt from public.visual_scene_original_use_receipt
@@ -913,7 +1048,7 @@ begin
     end if;
     insert into public.visual_scene_attester_event (
       claim_attempt_id, calendar_row_id, event, actor, detail)
-    values (v_token, v_snap.calendar_row_id, 'ambiguous_hold', v_attester,
+    values (v_token, v_snap.calendar_row_id, 'ambiguous_hold', v_verifier,
       coalesce(v_ev, '{}'::jsonb));
     return jsonb_build_object('claim_attempt_id', v_token,
       'state', 'ambiguous_hold', 'replayed',
@@ -948,7 +1083,7 @@ begin
     v_attempt.expected_channel,
     case when v_outcome = 'delivered' then v_post end,
     v_attempt.delivered_url, v_attempt.delivered_md5,
-    v_attempt.delivered_phash, v_ev, v_attester);
+    v_attempt.delivered_phash, v_ev, v_verifier);
 
   -- TERMINAL LEG (same transaction): mints the receipt / releases the
   -- claim exactly as the receipt package defines. Unknown is not accepted
@@ -959,8 +1094,8 @@ begin
     'outcome', v_outcome,
     'provider_post_id', v_post,
     'outcome_evidence', jsonb_build_object(
-      'attester_runtime', true, 'attester_id', v_attester,
-      'binding_id', v_snap.binding_id)));
+      'attester_runtime', true, 'verifier_id', v_verifier,
+      'sender_id', v_snap.attester_id, 'binding_id', v_snap.binding_id)));
 
   update public.visual_scene_attester_prepared
     set state = 'finalized', finalized_at = now()
@@ -968,7 +1103,7 @@ begin
   insert into public.visual_scene_attester_event (
     claim_attempt_id, calendar_row_id, event, actor, detail)
   values (v_token, v_snap.calendar_row_id,
-    'finalized_' || v_outcome, v_attester,
+    'finalized_' || v_outcome, v_verifier,
     jsonb_build_object('provider_post_id', v_post,
       'binding_id', v_snap.binding_id));
 
@@ -979,45 +1114,60 @@ end $$;
 
 -- ----------------------------------------------------------------------------
 -- GRANTS: revoke the standalone entry points; grant only the composite
--- runtime. service_role keeps SELECT on the evidence tables but loses
--- EXECUTE on the old standalone prepare AND terminate — separate claim /
--- prepare / terminate calls are not acceptable to this runtime, and only
--- visual_scene_attester_attest_terminate may finalize a provider outcome.
+-- runtime under a FAIL-CLOSED sender/verifier split. service_role keeps
+-- SELECT on the evidence tables but loses EXECUTE on the old standalone
+-- prepare AND terminate — separate claim / prepare / terminate calls are
+-- not acceptable to this runtime. scene_attester (SENDER) may claim and
+-- start a send but can NEVER certify it: it holds no EXECUTE on
+-- visual_scene_attester_attest_terminate. scene_attester_verifier
+-- (INDEPENDENT VERIFIER) holds EXECUTE on attest_terminate ONLY — it
+-- cannot claim, prepare or start a send, so it can never certify its own
+-- send. Only visual_scene_attester_attest_terminate may finalize a
+-- provider outcome, and only the verifier role may call it.
 -- ----------------------------------------------------------------------------
 revoke all on function public.visual_scene_original_use_prepare(jsonb)
-  from public, anon, authenticated, service_role, scene_attester;
+  from public, anon, authenticated, service_role, scene_attester,
+    scene_attester_verifier;
 revoke all on function public.visual_scene_original_use_terminate(jsonb)
-  from public, anon, authenticated, service_role, scene_attester;
+  from public, anon, authenticated, service_role, scene_attester,
+    scene_attester_verifier;
 revoke all on function public.visual_scene_original_use_check_ambiguity(
   text, uuid, date, uuid, text, text)
-  from public, anon, authenticated, service_role, scene_attester;
+  from public, anon, authenticated, service_role, scene_attester,
+    scene_attester_verifier;
 
 revoke all on public.visual_scene_attester_binding
-  from public, anon, authenticated, service_role, scene_attester;
+  from public, anon, authenticated, service_role, scene_attester,
+    scene_attester_verifier;
 revoke all on public.visual_scene_attester_prepared
-  from public, anon, authenticated, service_role, scene_attester;
+  from public, anon, authenticated, service_role, scene_attester,
+    scene_attester_verifier;
 revoke all on public.visual_scene_attester_event
-  from public, anon, authenticated, service_role, scene_attester;
+  from public, anon, authenticated, service_role, scene_attester,
+    scene_attester_verifier;
 grant select on public.visual_scene_attester_binding
-  to scene_attester, service_role;
+  to scene_attester, scene_attester_verifier, service_role;
 grant select on public.visual_scene_attester_prepared
-  to scene_attester, service_role;
+  to scene_attester, scene_attester_verifier, service_role;
 grant select on public.visual_scene_attester_event
-  to scene_attester, service_role;
+  to scene_attester, scene_attester_verifier, service_role;
 
 revoke all on function public.visual_scene_attester_scene_hold_refusal(uuid, text)
-  from public, anon, authenticated, service_role, scene_attester;
+  from public, anon, authenticated, service_role, scene_attester,
+    scene_attester_verifier;
 revoke all on function public.visual_scene_attester_claim_prepare(jsonb)
-  from public, anon, authenticated, service_role;
+  from public, anon, authenticated, service_role,
+    scene_attester_verifier;
 revoke all on function public.visual_scene_attester_send_start(jsonb)
-  from public, anon, authenticated, service_role;
+  from public, anon, authenticated, service_role,
+    scene_attester_verifier;
 revoke all on function public.visual_scene_attester_attest_terminate(jsonb)
-  from public, anon, authenticated, service_role;
+  from public, anon, authenticated, service_role, scene_attester;
 grant execute on function public.visual_scene_attester_claim_prepare(jsonb)
   to scene_attester;
 grant execute on function public.visual_scene_attester_send_start(jsonb)
   to scene_attester;
 grant execute on function public.visual_scene_attester_attest_terminate(jsonb)
-  to scene_attester;
+  to scene_attester_verifier;
 
 commit;

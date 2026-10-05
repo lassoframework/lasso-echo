@@ -4,8 +4,15 @@ adversarial checks on a disposable scratch DB.
 
 Covers the bounded package in
 migrations/DRAFT_visual_scene_attester_runtime_20261004.sql:
-  * role grants: scene_attester holds EXECUTE on exactly the three runtime
-    functions; service_role LOSES EXECUTE on the old standalone pre-send and terminal RPCs (separate claim/prepare/terminate calls are not acceptable);
+  * FAIL-CLOSED SPLIT AUTHORITY: scene_attester (sender) holds EXECUTE on
+    claim_prepare + send_start ONLY; scene_attester_verifier (independent
+    verifier) holds EXECUTE on attest_terminate ONLY; service_role LOSES
+    EXECUTE on the old standalone pre-send and terminal RPCs (separate
+    claim/prepare/terminate calls are not acceptable). No single role can
+    both start a send and certify its outcome; a verifier_id identical to
+    the sending attester_id refuses in-body (defense in depth — SQL alone
+    cannot prove provider readback; see the migration's RUNTIME
+    PREREQUISITE);
   * composite rollback: a prepare refusal rolls the freshly minted claim
     token back with it (claim and prepare are one transaction);
   * two-attester race: concurrent send_start on one token — exactly one
@@ -99,8 +106,37 @@ def test_static_file_is_draft_and_off():
 def test_static_no_embedded_password():
     src = _src().lower()
     assert "create role scene_attester nologin" in src
+    assert "create role scene_attester_verifier nologin" in src
     assert " encrypted password" not in src
     assert "with password" not in src
+
+
+def test_static_fail_closed_split_authority_preflight():
+    """P1 regression (static): the install must refuse when pre-existing
+    role state defeats the sender/verifier split — either attester role
+    pre-existing as LOGIN, or ANY role holding effective membership in
+    BOTH attester roles (directly or transitively via pg_auth_members).
+    Placement: after the roles are ensured to exist, before any table or
+    grant work; refusal is errcode 23514. The check must NOT predicate on
+    pg_roles.rolpassword: PG always masks it as the literal '********',
+    so `rolpassword is not null` matches every role (including fresh
+    NOLOGIN passwordless ones) and breaks clean installs."""
+    src = _src()
+    assert "pg_auth_members" in src
+    assert "rolcanlogin" in src
+    assert "rolpassword is not null" not in src
+    assert "with recursive reach(member, grp)" in src
+    marker = "split-authority preflight"
+    assert src.count(marker) >= 2  # both refusal branches carry the marker
+    pre = src.index(marker)
+    assert src.index("create role scene_attester_verifier nologin") < pre
+    assert pre < src.index("create table if not exists "
+                           "public.visual_scene_attester_binding")
+    assert pre < src.index("grant execute on function")
+    # Both refusal raises fail closed with the check-violation errcode.
+    for m in re.finditer(re.escape(marker), src):
+        window = src[max(0, m.start() - 300):m.start() + 900]
+        assert "raise exception" in window and "23514" in window
 
 
 def test_static_revokes_old_standalone_entry_points():
@@ -129,8 +165,59 @@ def test_static_runtime_functions_security_definer_pinned_path():
                      r"public\.visual_scene_attester_claim_prepare\(jsonb\)\s*"
                      r"to scene_attester", src)
     assert re.search(r"grant execute on function "
+                     r"public\.visual_scene_attester_send_start\(jsonb\)\s*"
+                     r"to scene_attester", src)
+    # FAIL-CLOSED SPLIT: attest_terminate is granted ONLY to the
+    # independent verifier role, never to the sending role.
+    assert re.search(r"grant execute on function "
                      r"public\.visual_scene_attester_attest_terminate\(jsonb\)"
-                     r"\s*to scene_attester", src)
+                     r"\s*to scene_attester_verifier", src)
+    assert not re.search(r"grant execute on function "
+                         r"public\.visual_scene_attester_attest_terminate"
+                         r"\(jsonb\)\s*to scene_attester[;\s]", src)
+    assert not re.search(r"grant execute on function "
+                         r"public\.visual_scene_attester_(claim_prepare|"
+                         r"send_start)\(jsonb\)[^;]*scene_attester_verifier",
+                         src)
+
+
+def test_static_split_authority_fail_closed():
+    """The sending role can never certify its own send: the verifier role
+    exists NOLOGIN, attest_terminate is revoked from scene_attester, the
+    function body refuses self-certification (verifier_id == sender
+    attester_id) BEFORE any state/replay handling, and the runtime
+    prerequisite for an externally authenticated provider readback is
+    documented (SQL alone cannot prove readback; without an issued
+    verifier credential, terminalization stays disabled)."""
+    src = _src()
+    assert "create role scene_attester_verifier nologin" in src
+    # attest_terminate is revoked from the SENDER, granted to the VERIFIER.
+    assert re.search(r"revoke all on function "
+                     r"public\.visual_scene_attester_attest_terminate\(jsonb\)"
+                     r"\s*from public, anon, authenticated, service_role, "
+                     r"scene_attester;", src)
+    # The verifier cannot claim or start a send.
+    for fn in ("claim_prepare", "send_start"):
+        assert re.search(r"revoke all on function "
+                         r"public\.visual_scene_attester_" + fn +
+                         r"\(jsonb\)\s*from public, anon, authenticated, "
+                         r"service_role,\s*scene_attester_verifier;", src)
+    body = src.split("create or replace function "
+                     "public.visual_scene_attester_attest_terminate", 1)[1]
+    # In-body independence check runs before any replay/state handling.
+    assert "verifier identity must be '" in body
+    assert "independent of the sending attester (self-certification refused)" \
+        in body
+    assert body.index("self-certification refused") \
+        < body.index("if v_snap.state = 'finalized' then")
+    # verifier_id is required and is what attests.
+    assert "attest_terminate: verifier_id is required" in body
+    assert "v_att.attested_by is distinct from v_verifier" in body
+    # Honest limit + runtime prerequisite documented.
+    assert "RUNTIME PREREQUISITE" in src
+    assert "externally authenticated Zernio readback" in src
+    assert "successful terminalization stays DISABLED" in src
+    assert "caller-supplied label" in src
 
 
 def test_static_tables_rls_and_snapshot_fields():
@@ -614,37 +701,131 @@ def _call_as(role, fn, payload):
 # ---- PG scenarios ------------------------------------------------------------
 
 def test_pg_role_grants(scratch):
-    """scene_attester may execute exactly the three runtime functions and
-    nothing else; service_role lost the old standalone entry points."""
+    """FAIL-CLOSED SPLIT: scene_attester (sender) may claim and start a
+    send but NEVER certify it; scene_attester_verifier may ONLY certify;
+    service_role lost the old standalone entry points and has no runtime
+    EXECUTE."""
     checks = [
         ("scene_attester", "visual_scene_attester_claim_prepare(jsonb)", True),
         ("scene_attester", "visual_scene_attester_send_start(jsonb)", True),
-        ("scene_attester", "visual_scene_attester_attest_terminate(jsonb)", True),
+        ("scene_attester", "visual_scene_attester_attest_terminate(jsonb)",
+         False),
         ("scene_attester", PREPARE_FN + "(jsonb)", False),
         ("scene_attester", TERMINATE_FN + "(jsonb)", False),
+        ("scene_attester_verifier",
+         "visual_scene_attester_claim_prepare(jsonb)", False),
+        ("scene_attester_verifier",
+         "visual_scene_attester_send_start(jsonb)", False),
+        ("scene_attester_verifier",
+         "visual_scene_attester_attest_terminate(jsonb)", True),
+        ("scene_attester_verifier", PREPARE_FN + "(jsonb)", False),
+        ("scene_attester_verifier", TERMINATE_FN + "(jsonb)", False),
         ("service_role", PREPARE_FN + "(jsonb)", False),
         ("service_role", TERMINATE_FN + "(jsonb)", False),
         ("service_role", "visual_scene_attester_claim_prepare(jsonb)", False),
-        ("service_role", "visual_scene_attester_attest_terminate(jsonb)", False),
+        ("service_role", "visual_scene_attester_attest_terminate(jsonb)",
+         False),
     ]
     for role, fn, expected in checks:
         got = _one(f"select has_function_privilege('{role}', "
                    f"'public.{fn}', 'execute')")
         assert got == ("t" if expected else "f"), (role, fn, got)
-    for tbl in ("visual_scene_attester_binding",
-                "visual_scene_attester_prepared",
-                "visual_scene_attester_event"):
-        assert _one(f"select has_table_privilege('scene_attester', "
-                    f"'public.{tbl}', 'insert')") == "f"
-        assert _one(f"select has_table_privilege('scene_attester', "
-                    f"'public.{tbl}', 'select')") == "t"
-    # Direct calls as scene_attester to the old entry points refuse.
+    for role in ("scene_attester", "scene_attester_verifier"):
+        for tbl in ("visual_scene_attester_binding",
+                    "visual_scene_attester_prepared",
+                    "visual_scene_attester_event"):
+            assert _one(f"select has_table_privilege('{role}', "
+                        f"'public.{tbl}', 'insert')") == "f"
+            assert _one(f"select has_table_privilege('{role}', "
+                        f"'public.{tbl}', 'select')") == "t"
+    # Direct calls to the old entry points refuse.
     done = _call_as("scene_attester", PREPARE_FN, {})
     assert done.returncode != 0
     assert "permission denied" in done.stderr
     done = _call_as("service_role", TERMINATE_FN, {})
     assert done.returncode != 0
     assert "permission denied" in done.stderr
+    # The split itself refuses at the ROLE level: the sender cannot
+    # certify and the verifier cannot claim or start.
+    done = _call_as("scene_attester",
+                    "visual_scene_attester_attest_terminate", {})
+    assert done.returncode != 0
+    assert "permission denied" in done.stderr
+    for fn in ("visual_scene_attester_claim_prepare",
+               "visual_scene_attester_send_start"):
+        done = _call_as("scene_attester_verifier", fn, {})
+        assert done.returncode != 0, fn
+        assert "permission denied" in done.stderr, fn
+
+
+def test_pg_preflight_refuses_preexisting_role_overlap(scratch):
+    """P1 regression (adversarial, disposable scratch DB): pre-existing
+    role state that bridges the sender/verifier split must make the
+    runtime install FAIL CLOSED; revoking the bridge must let the same
+    install succeed. Simulated role shapes only, scratch DB only."""
+    if not PG_READY:
+        pytest.skip("attester PG checks need SCENE_ATTESTER_TEST_DSN on a "
+                    "disposable local DB and both migrations present")
+    runtime = _runtime_body()
+    try:
+        # 1) A single LOGIN holding BOTH attester roles directly.
+        _sql("drop role if exists att_bridge; drop role if exists att_mid;")
+        _sql("create role att_bridge login;")
+        _sql("grant scene_attester, scene_attester_verifier to att_bridge;")
+        _fails(runtime, "split-authority preflight")
+
+        # 2) The same bridge formed only TRANSITIVELY
+        #    (att_bridge -> att_mid -> scene_attester_verifier).
+        _sql("revoke scene_attester_verifier from att_bridge;")
+        _sql("create role att_mid nologin;")
+        _sql("grant scene_attester_verifier to att_mid;")
+        _sql("grant att_mid to att_bridge;")
+        _fails(runtime, "split-authority preflight")
+
+        # 3) One attester role a member of the other.
+        _sql("revoke att_mid from att_bridge;")
+        _sql("grant scene_attester to scene_attester_verifier;")
+        _fails(runtime, "split-authority preflight")
+        _sql("revoke scene_attester from scene_attester_verifier;")
+
+        # 4) Either attester role itself pre-existing as LOGIN refuses.
+        _sql("drop role att_bridge; drop role att_mid;")
+        _sql("alter role scene_attester login;")
+        _fails(runtime, "split-authority preflight")
+        _sql("alter role scene_attester nologin;")
+        _sql("alter role scene_attester_verifier login;")
+        _fails(runtime, "split-authority preflight")
+        _sql("alter role scene_attester_verifier nologin;")
+
+        # 5) A NOLOGIN attester role with a stored password is INERT (it
+        #    cannot authenticate without LOGIN) and undetectable without
+        #    pg_authid — it must NOT trip the preflight.
+        _sql("alter role scene_attester password 'att_inert_pw';")
+        _apply(runtime)
+        _sql("alter role scene_attester password null;")
+
+        # 6) An ordinary LOGIN role that is NOT a member of either
+        #    attester role (e.g. a service/superuser-adjacent login) must
+        #    NOT be falsely rejected by the reachability scan.
+        _sql("create role att_unrelated login;")
+        _apply(runtime)
+        _sql("drop role att_unrelated;")
+
+        # 7) Clean role graph: the identical install passes again.
+        _apply(runtime)
+        assert _one("select has_function_privilege('scene_attester', "
+                    "'public.visual_scene_attester_claim_prepare(jsonb)', "
+                    "'execute')") == "t"
+        assert _one("select has_function_privilege('scene_attester', "
+                    "'public.visual_scene_attester_attest_terminate(jsonb)'"
+                    ", 'execute')") == "f"
+    finally:
+        # Never leave adversarial role state behind for later scenarios.
+        _sql("alter role scene_attester nologin; "
+             "alter role scene_attester_verifier nologin;")
+        _sql("revoke scene_attester from scene_attester_verifier; "
+             "revoke scene_attester_verifier from scene_attester;")
+        _sql("drop role if exists att_bridge; drop role if exists att_mid;")
 
 
 def test_pg_composite_claim_prepare_happy_and_rollback(scratch):
@@ -828,7 +1009,7 @@ def test_pg_ambiguous_hold_then_atomic_finalize(scratch):
           {"claim_attempt_id": token, "attester_id": "attester-1"})
     out = json.loads(_call("visual_scene_attester_attest_terminate",
                            {"claim_attempt_id": token,
-                            "attester_id": "attester-1",
+                            "verifier_id": "verifier-1",
                             "outcome": "ambiguous",
                             "readback_evidence": {"reason": "timeout"}}))
     assert out["state"] == "ambiguous_hold"
@@ -851,7 +1032,7 @@ def test_pg_ambiguous_hold_then_atomic_finalize(scratch):
     # Atomic finalize from the hold.
     out = json.loads(_call("visual_scene_attester_attest_terminate",
                            {"claim_attempt_id": token,
-                            "attester_id": "attester-1",
+                            "verifier_id": "verifier-1",
                             "outcome": "delivered",
                             "provider_post_id": "post_123",
                             "readback_evidence": {"seen": True}}))
@@ -872,8 +1053,10 @@ def test_pg_ambiguous_hold_then_atomic_finalize(scratch):
     for conflicting in (
         {"outcome": "confirmed_no_send"},
         {"outcome": "delivered", "provider_post_id": "post_other"},
+        {"outcome": "delivered", "provider_post_id": "post_123",
+         "readback_evidence": {"seen": False}},
     ):
-        replay = {"claim_attempt_id": token, "attester_id": "attester-1",
+        replay = {"claim_attempt_id": token, "verifier_id": "verifier-1",
                   "readback_evidence": {"seen": True}, **conflicting}
         stmt = ("select public.visual_scene_attester_attest_terminate('"
                 + json.dumps(replay).replace("'", "''") + "'::jsonb)")
@@ -881,32 +1064,44 @@ def test_pg_ambiguous_hold_then_atomic_finalize(scratch):
     # Identical replay of the finalized snapshot returns the recorded result.
     out = json.loads(_call("visual_scene_attester_attest_terminate",
                            {"claim_attempt_id": token,
-                            "attester_id": "attester-1",
+                            "verifier_id": "verifier-1",
                             "outcome": "delivered",
                             "provider_post_id": "post_123",
                             "readback_evidence": {"seen": True}}))
     assert out["replayed"] is True
+    # A replay by a DIFFERENT verifier identity conflicts with the recorded
+    # attestation (the recorded attester is immutable).
+    stmt = ("select public.visual_scene_attester_attest_terminate('"
+            + json.dumps({"claim_attempt_id": token,
+                          "verifier_id": "verifier-2",
+                          "outcome": "delivered",
+                          "provider_post_id": "post_123",
+                          "readback_evidence": {"seen": True}}
+                         ).replace("'", "''") + "'::jsonb)")
+    _fails(stmt, "finalized replay verifier does not match")
 
 
 def test_pg_atomic_terminal_rollback(scratch):
-    """A terminal refusal (here: foreign attester identity) rolls back
-    EVERYTHING: no attestation row, snapshot not finalized, row
-    unpublished, no receipt."""
+    """A terminal refusal (here: SELF-CERTIFICATION — verifier_id identical
+    to the sending attester_id) rolls back EVERYTHING: no attestation row,
+    snapshot not finalized, row unpublished, no receipt."""
     s = _setup_claimable()
     s["payload_sha"] = _sha256("fixture_sha256_9")
     token = json.loads(_call("visual_scene_attester_claim_prepare",
                              _claim_payload(s)))["claim_attempt_id"]
     _call("visual_scene_attester_send_start",
           {"claim_attempt_id": token, "attester_id": "attester-1"})
+    # The sender trying to certify its own send with its own identity
+    # refuses in-body BEFORE any state or attestation write.
     stmt = ("select public.visual_scene_attester_attest_terminate('"
             + json.dumps({"claim_attempt_id": token,
-                          "attester_id": "attester-foreign",
+                          "verifier_id": "attester-1",
                           "outcome": "delivered",
                           "provider_post_id": "post_x",
                           "readback_evidence": {"seen": True}}
                          ).replace("'", "''")
             + "'::jsonb)")
-    _fails(stmt, "attester identity does not match")
+    _fails(stmt, "independent of the sending attester")
     assert _one("select count(*) from "
                 "public.visual_scene_original_use_attestation "
                 f"where claim_attempt_id = '{token}'") == "0"
@@ -923,7 +1118,7 @@ def test_pg_atomic_terminal_rollback(scratch):
                               _claim_payload(s2)))["claim_attempt_id"]
     stmt = ("select public.visual_scene_attester_attest_terminate('"
             + json.dumps({"claim_attempt_id": token2,
-                          "attester_id": "attester-1",
+                          "verifier_id": "verifier-1",
                           "outcome": "delivered",
                           "provider_post_id": "post_y",
                           "readback_evidence": {"seen": True}}
@@ -933,6 +1128,54 @@ def test_pg_atomic_terminal_rollback(scratch):
     assert _one("select count(*) from "
                 "public.visual_scene_original_use_attestation "
                 f"where claim_attempt_id = '{token2}'") == "0"
+
+
+def test_pg_split_authority_end_to_end(scratch):
+    """Fail-closed sender/verifier split, end to end on scratch PG: the
+    SENDER role cannot certify even with a fully valid payload and a
+    distinct verifier_id (role-level refusal); the VERIFIER role executes
+    attest_terminate with an independent verifier_id and finalizes in one
+    transaction; the verifier cannot start the send it certifies."""
+    s = _setup_claimable()
+    s["payload_sha"] = _sha256("fixture_sha256_split")
+    token = json.loads(_call("visual_scene_attester_claim_prepare",
+                             _claim_payload(s)))["claim_attempt_id"]
+    _call("visual_scene_attester_send_start",
+          {"claim_attempt_id": token, "attester_id": "attester-1"})
+
+    # Sender role holds a valid payload but can NEVER certify its own send.
+    done = _call_as("scene_attester",
+                    "visual_scene_attester_attest_terminate",
+                    {"claim_attempt_id": token,
+                     "verifier_id": "verifier-1",
+                     "outcome": "delivered",
+                     "provider_post_id": "post_split",
+                     "readback_evidence": {"seen": True}})
+    assert done.returncode != 0
+    assert "permission denied" in done.stderr
+    assert _one("select count(*) from "
+                "public.visual_scene_original_use_attestation "
+                f"where claim_attempt_id = '{token}'") == "0"
+    assert _one("select state from public.visual_scene_attester_prepared "
+                f"where claim_attempt_id = '{token}'") == "send_started"
+
+    # Independent verifier role certifies; the recorded attester is the
+    # verifier identity, not the sender.
+    done = _call_as("scene_attester_verifier",
+                    "visual_scene_attester_attest_terminate",
+                    {"claim_attempt_id": token,
+                     "verifier_id": "verifier-1",
+                     "outcome": "delivered",
+                     "provider_post_id": "post_split",
+                     "readback_evidence": {"seen": True}})
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout.strip().splitlines()[-1])
+    assert out["state"] == "finalized" and out["outcome"] == "delivered"
+    assert _one("select attested_by from "
+                "public.visual_scene_original_use_attestation "
+                f"where claim_attempt_id = '{token}'") == "verifier-1"
+    assert _one("select status from public.content_calendar "
+                f"where id = '{s['row_id']}'") == "published"
 
 
 def _refused_by_claimant(payload, needle="refused by the authoritative "
