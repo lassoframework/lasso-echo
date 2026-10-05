@@ -513,13 +513,31 @@ def mirror_to_supabase(account_key, store, sb_store):
         # PRESERVE APPROVALS: never overwrite a slot a human already approved/published.
         from .portal_calendar_store import preserve_and_prune
         real_rows, _locked = preserve_and_prune(sb_store, account_key, months, real_rows)
+        from . import visual_writer_prepare
+        if visual_writer_prepare.enabled():
+            missing_render_proof = []
+            for row in real_rows:
+                source_url = row.get("source_media_url")
+                delivered_url = row.get("image_url")
+                if not source_url or source_url == delivered_url:
+                    continue
+                evidence = render_evidence_by_url.get(delivered_url)
+                if (not isinstance(evidence, dict)
+                        or evidence.get("source_exact_url") != source_url
+                        or evidence.get("delivered_exact_url") != delivered_url):
+                    missing_render_proof.append(delivered_url)
+            if missing_render_proof:
+                return {"ok": False,
+                        "reason": "transformed visual row lacks exact source and "
+                                  "delivered render evidence; aborted before month deletion",
+                        "missing_render_evidence_urls": sorted(set(missing_render_proof)),
+                        "upserted": 0, "inserted": 0, "deleted": 0}
         delete_month = getattr(sb_store, "delete_month", None)
         for month in months:
             if delete_month is not None:
                 deleted += delete_month(account_key, month) or 0
         insert_rows = getattr(sb_store, "insert_rows", None)
         if insert_rows is not None and real_rows:
-            from . import visual_writer_prepare
             if ((poster_evidence_by_url or render_evidence_by_url)
                     and visual_writer_prepare.enabled()):
                 # Poster proof is a side channel, never a row column: the store binds

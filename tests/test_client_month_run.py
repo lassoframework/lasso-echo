@@ -1811,6 +1811,23 @@ def test_apply_refuses_transformed_row_without_render_evidence_before_delete(
     assert store.deleted == [] and store.inserted == []
 
 
+def test_apply_refuses_render_evidence_for_wrong_source_before_delete(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    store = _FakeStore()
+    row = {"gym_id": "gritx", "post_date": "2026-08-01", "account": "instagram",
+           "format": "feed", "image_url": "https://cdn/delivered.jpg",
+           "source_media_url": "https://cdn/source.jpg", "caption": "Caption"}
+    wrong = {"source_exact_url": "https://cdn/other-source.jpg",
+             "delivered_exact_url": "https://cdn/delivered.jpg"}
+
+    result = cmr._apply("gritx", [row], date(2026, 8, 1), 1, store,
+                        lambda _message: None,
+                        render_evidence_by_url={"https://cdn/delivered.jpg": wrong})
+
+    assert result["ok"] is False
+    assert store.deleted == [] and store.inserted == []
+
+
 def test_guarded_video_poster_failure_holds_the_slot(monkeypatch, tmp_path):
     """Guard on, evidenced render unavailable: the day is HELD and no distinct
     unproven thumbnail is staged (never cleared/relabeled)."""

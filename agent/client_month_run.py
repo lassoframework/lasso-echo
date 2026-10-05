@@ -2604,7 +2604,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                 continue
             evidence = evidence_by_url.get(delivered_url)
             if (not isinstance(evidence, dict)
-                    or evidence.get("delivered_exact_url") != delivered_url):
+                    or evidence.get("delivered_exact_url") != delivered_url
+                    or evidence.get("source_exact_url") != source_url):
                 missing_render_proof.append(delivered_url)
         if missing_render_proof:
             return {"ok": False,

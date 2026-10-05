@@ -326,6 +326,7 @@ class _EvidenceSB:
         self.poster_evidence_by_url = None
         self.render_evidence_by_url = None
         self.inserted = []
+        self.deleted = []
 
     def list_month(self, account_key, month):
         return []
@@ -338,6 +339,7 @@ class _EvidenceSB:
         return rows
 
     def delete_month(self, account_key, month):
+        self.deleted.append((account_key, month))
         return 0
 
 
@@ -418,6 +420,25 @@ def test_collect_real_drafts_omits_mismatched_or_conflicting_render_proof():
         render_evidence_out=evidence)
     assert len(rows) == 3
     assert evidence == {}
+
+
+@pytest.mark.parametrize("proof", [None, {
+    "operation": "render", "source_exact_url": "https://cdn/wrong-source.jpg",
+    "delivered_exact_url": "https://cdn/rendered.jpg"}])
+def test_mirror_refuses_transformed_row_without_exact_source_proof_before_delete(
+        monkeypatch, proof):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    draft = _draft("render-preflight", url="https://cdn/rendered.jpg")
+    draft.source_media_url = "https://cdn/source.jpg"
+    if proof is not None:
+        draft.render_evidence = proof
+    sb = _EvidenceSB()
+
+    out = rcm.mirror_to_supabase("northside_ig", _EvidenceStore([draft]), sb)
+
+    assert out["ok"] is False
+    assert "aborted before month deletion" in out["reason"]
+    assert sb.deleted == [] and sb.inserted == []
 
 
 def test_flag_off_mirror_keeps_plain_insert(monkeypatch):
