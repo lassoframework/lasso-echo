@@ -826,11 +826,17 @@ def _client_drive_kind_available(account, kind):
         # pickable intentionally hides read failures as []; probe the authoritative
         # read once so a transient outage cannot be mistaken for an empty photo tier.
         assets = media_store.list_assets(base)
+        # CROSS-GYM SOURCE GUARD: the snapshot must also carry the authoritative
+        # same-gym active source rows, read once from the real store, or the
+        # selector's strict_claims pick fails closed on unproven evidence.
+        sources = media_store.list_sources(base)
         class Snapshot:
             def available(self):
                 return True
             def list_assets(self, _base):
                 return assets
+            def list_sources(self, _base, include_inactive=False):
+                return sources
         return bool(gym_media_selector.pickable(
             base, kind, store=Snapshot(), strict_claims=True))
     except Exception:  # noqa: BLE001 - uncertainty holds lower-priority video
@@ -948,11 +954,16 @@ def _unused_client_photo_available(account, path, day_key):
             return True
         base = gym_media_selector.base_gym_key(account.key)
         assets = media_store.list_assets(base)
+        # CROSS-GYM SOURCE GUARD: carry the authoritative same-gym active source
+        # rows too; a sources-only snapshot would fail closed every Drive pick.
+        sources = media_store.list_sources(base)
         class Snapshot:
             def available(self):
                 return True
             def list_assets(self, _base):
                 return assets
+            def list_sources(self, _base, include_inactive=False):
+                return sources
         return bool(gym_media_selector.pickable(
             base, "photo", store=Snapshot(), strict_claims=True))
     except Exception:  # noqa: BLE001 - unknown Drive inventory holds the video

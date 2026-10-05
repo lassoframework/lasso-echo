@@ -149,6 +149,18 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
     gym_base = _sel.base_gym_key(acct_key)
     platform = getattr(account, "platform", None) or acct_key or ""
 
+    # CROSS-GYM SOURCE GUARD, read-once per build (independent review P2,
+    # 2026-10-05): validate the gym's same-gym active source set ONCE and reuse it
+    # for every initial candidate check in the retry loop, instead of re-reading
+    # the store per candidate. The FRESH re-verification immediately before the
+    # durable usage stamp (below) intentionally re-reads and fails closed on drift.
+    try:
+        build_source_ids = _sel.verified_source_ids(store, gym_base)
+    except Exception as e:  # noqa: BLE001 - unproven evidence never stages
+        print(f"[gym-media-builder] linked-source evidence read failed for "
+              f"{gym_base} ({type(e).__name__}); holding the slot (fail closed)")
+        return None
+
     lib = Path(library_dir or tempfile.mkdtemp(prefix="gymmedia_"))
     lib.mkdir(parents=True, exist_ok=True)
 
@@ -197,6 +209,12 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
         # TENANT ISOLATION stage-time assertion (§1.5d): the picked asset MUST
         # belong to this gym. A mismatch is blocked, alerted, and NEVER staged.
         if not assert_tenant(asset, gym_base):
+            continue
+        # CROSS-GYM SOURCE GUARD (2026-10-05): the asset's linked media_source must
+        # exist, be active and belong to this gym BEFORE any hosting or stamping.
+        # Uses the build-once validated source set (no per-candidate store reads);
+        # the pre-stamp FRESH re-check below still catches any drift.
+        if not assert_source(asset, gym_base, store, source_ids=build_source_ids):
             continue
 
         title = asset.get("title") or f"{asset['id']}.bin"
@@ -424,6 +442,13 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             fresh = store.get_asset(asset["id"])
             if fresh is None or _sel._has_prior_use(fresh):
                 return None
+            # CROSS-GYM SOURCE GUARD: re-verify the linked source on the FRESH row
+            # before stamping; unproven evidence raises and fails closed below.
+            if not _sel.asset_source_ok(fresh, gym_base, store):
+                _vision_alert(f"{gym_base} {day_key}: Drive asset "
+                              f"{asset['id']} failed linked-source verification; "
+                              "draft held before approval/card persistence")
+                return None
             _sel.stamp_use(fresh, gym_base, day_key, store=store, now=now)
         except Exception as e:  # noqa: BLE001
             # The card must never become durable while its media is still
@@ -580,6 +605,40 @@ def assert_tenant(asset, gym_base):
         f"gym-media tenant isolation BLOCKED a cross-gym asset: asset "
         f"{asset.get('id')} is tagged gym={asset.get('gym_id')!r} but was picked "
         f"for gym={gym_base!r}. The row was blocked and never published.")
+    return False
+
+
+def assert_source(asset, gym_base, store, source_ids=None):
+    """CROSS-GYM SOURCE GUARD (2026-10-05): the picked asset's linked media_source
+    MUST exist, be active and belong to the same gym before the builder hosts or
+    stamps anything. A mismatch or missing source_id is BLOCKED (return False),
+    ops is alerted once, and the asset is never staged. Unproven evidence (store
+    cannot answer) also fails closed. Returns True only with complete same-gym
+    active source evidence.
+
+    source_ids: an already-validated same-gym active source-id set (the builder
+    reads it once per build and reuses it across retry candidates). When None the
+    evidence is read from the store; the pre-stamp re-check always reads fresh."""
+    sid = str((asset or {}).get("source_id") or "").strip()
+    try:
+        if sid and source_ids is not None:
+            return str(sid) in {str(i) for i in source_ids}
+        if sid and _sel.asset_source_ok(asset, gym_base, store):
+            return True
+    except Exception as e:  # noqa: BLE001 - unproven evidence never stages
+        _idx.dedup_alert(
+            f"source_evidence_unproven:{asset.get('id')}",
+            f"gym-media cross-gym source guard HELD an asset: the linked "
+            f"media_source evidence for asset {asset.get('id')} (source_id="
+            f"{sid!r}) could not be proven for gym={gym_base!r} "
+            f"({type(e).__name__}). The asset was blocked and never published.")
+        return False
+    _idx.dedup_alert(
+        f"source_mismatch:{asset.get('id')}",
+        f"gym-media cross-gym source guard BLOCKED an asset: asset "
+        f"{asset.get('id')} links source_id={sid!r} with no active same-gym "
+        f"media_source for gym={gym_base!r}. The asset was blocked and never "
+        "published.")
     return False
 
 

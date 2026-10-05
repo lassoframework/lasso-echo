@@ -69,6 +69,7 @@ class Reader:
                                   'created_at': '2026-09-23T11:00:00Z'}],
             'content_calendar': [self.row, *self.extra_book],
             'media_asset': [self.asset, *self.extra_assets],
+            'media_source': [{'id': 'src1', 'gym_id': ECHO_GYM, 'active': True}],
         }
         rows = list(tables[table])
         for name, condition in params.items():

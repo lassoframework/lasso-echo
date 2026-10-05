@@ -190,6 +190,12 @@ def real_media_depleted(base, *, now=None):
                 return True
             def list_assets(self, gym):
                 return assets
+            # The cross-gym source guard (gym_media_selector.verified_source_ids)
+            # needs the same source evidence this function already read above;
+            # delegate so the depletion read keeps one consistent snapshot.
+            def list_sources(self, gym, include_inactive=False):
+                return media_store.list_sources(
+                    gym, include_inactive=include_inactive)
         # pickable() expects a timezone-aware datetime (its `_now_utc` passes a
         # truthy `now` through untouched). Callers hand us ISO strings, so parse
         # first -- a TypeError here would be swallowed below as "inventory

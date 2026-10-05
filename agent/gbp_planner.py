@@ -298,11 +298,16 @@ def _drive_photo_candidate(account_key, day_key, used_ids):
         if not ready:
             return {"hold": True}
         assets = media_store.list_assets(base)
+        # CROSS-GYM SOURCE GUARD: the snapshot must expose the authoritative
+        # same-gym active source rows (already read above) or the selector fails
+        # closed on unproven evidence and no Drive photo can ever be picked.
         class Snapshot:
             def available(self):
                 return True
             def list_assets(self, _base):
                 return assets
+            def list_sources(self, _base, include_inactive=False):
+                return sources
         asset = gym_media_selector.pick_media(
             base, kind_preference="photo", store=Snapshot(),
             exclude_ids=tuple(used_ids))

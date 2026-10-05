@@ -852,6 +852,15 @@ def _swap_media_candidates_readiness(gym_key, row_id, deps, *, now=None):
                     raise RuntimeError("media snapshot scope mismatch")
                 return [dict(asset) for asset in assets]
 
+            def list_sources(self, account_key, include_inactive=False):
+                # The selector's cross-gym source guard requires linked-source
+                # evidence; delegate to the same already-probed store so a store
+                # without source evidence fails closed rather than fabricating it.
+                if account_key != gym_key:
+                    raise RuntimeError("media snapshot scope mismatch")
+                return media_store.list_sources(
+                    account_key, include_inactive=include_inactive)
+
         library = media_swap.library_path_for(gym_key)
         candidates = media_swap.candidates_for(
             gym_key, row, store=_SnapshotStore(), lib=library,
