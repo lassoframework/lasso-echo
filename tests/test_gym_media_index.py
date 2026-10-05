@@ -145,6 +145,30 @@ def test_ensure_rendition_heic_converts_and_caches(tmp_path):
     assert calls["heic"] == 1 and calls["host"] == 1     # no second convert/upload
 
 
+def test_forced_cached_rendition_proves_fresh_output_before_persisting(tmp_path):
+    """Writer prep may spend one fresh conversion even when a cache URL exists;
+    a failed output proof leaves the existing cache metadata untouched."""
+    import pytest
+    store = FakeMediaStore(assets=[make_asset("h2", kind="photo", title="IMG.HEIC",
+                                              mime="image/heic")])
+    asset = store.get_asset("h2")
+    src = tmp_path / "IMG.HEIC"
+    src.write_bytes(b"heicbytes")
+
+    def convert(_src, dest):
+        open(dest, "wb").write(b"fresh-jpeg")
+        return dest
+
+    old_url = "https://cdn.fake/old.jpg"
+    store.update_asset("h2", {"rendition_url": old_url, "rendition_key": "old"})
+    with pytest.raises(idx.RenditionProofFailed):
+        idx.ensure_rendition(store.get_asset("h2"), str(src), store=store,
+                             host_fn=lambda _path, _gym: "https://cdn.fake/new.jpg",
+                             heic_fn=convert, force_convert=True,
+                             proof_fn=lambda *_args: False)
+    assert store.get_asset("h2")["rendition_url"] == old_url
+
+
 def test_ensure_rendition_hevc_transcodes(tmp_path):
     store = FakeMediaStore(assets=[make_asset("v1", kind="video", title="clip.mov",
                                               mime="video/quicktime")])

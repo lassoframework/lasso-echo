@@ -88,8 +88,13 @@ def test_new_rendition_under_writer_prep_requires_observed_original_edge(monkeyp
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
     monkeypatch.setattr("agent.gym_media_index.heic_to_jpeg",
                         lambda src, dest: open(dest, "wb").write(delivered) or dest)
-    monkeypatch.setattr("agent.gym_media_index.ensure_rendition",
-                        lambda asset, src, **k: ("https://cdn.fake/rend.jpg", True))
+    def fresh_rendition(asset, src, **kwargs):
+        output = tmp_path / "fresh-rendition.jpg"
+        output.write_bytes(delivered)
+        assert kwargs["force_convert"] is True
+        assert kwargs["proof_fn"](src, output, "https://cdn.fake/rend.jpg") is True
+        return "https://cdn.fake/rend.jpg", True
+    monkeypatch.setattr("agent.gym_media_index.ensure_rendition", fresh_rendition)
     monkeypatch.setattr("agent.visual_writer_prepare._exact_bytes",
                         lambda url, _reader, _role: source if url.endswith("served.jpg") else delivered)
     asset = make_asset("h2", gym_id="pierce", kind="photo", title="IMG.HEIC",
@@ -106,8 +111,10 @@ def test_cached_rendition_under_writer_prep_holds_without_conversion_receipt(mon
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
     monkeypatch.setattr("agent.gym_media_index.heic_to_jpeg",
                         lambda src, dest: open(dest, "wb").write(b"jpg") or dest)
-    monkeypatch.setattr("agent.gym_media_index.ensure_rendition",
-                        lambda asset, src, **k: ("https://cdn.fake/rend.jpg", False))
+    def cache_without_fresh_edge(asset, src, **kwargs):
+        assert kwargs["force_convert"] is True
+        return "https://cdn.fake/rend.jpg", False
+    monkeypatch.setattr("agent.gym_media_index.ensure_rendition", cache_without_fresh_edge)
     asset = make_asset("h3", gym_id="pierce", kind="photo", title="IMG.HEIC",
                        mime="image/heic", content_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
     draft, _ = _build(monkeypatch, tmp_path, asset, blobs=b"heic")

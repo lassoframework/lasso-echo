@@ -343,6 +343,11 @@ class RenditionBudgetExhausted(Exception):
     eligible for the nightly pre-render pass."""
 
 
+class RenditionProofFailed(Exception):
+    """A fresh rendition could not be bound to its hosted bytes.  The caller
+    skips this candidate without persisting a misleading cache record."""
+
+
 class RenditionBudget:
     """A per-build / per-request cap on the number of TRANSCODES (audit R-D1 #3).
     libx264 at source resolution inside the month build was unbounded: 56 unrenditioned
@@ -454,7 +459,8 @@ def rendition_key(gym_id, content_hash, ext):
 
 def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=None,
                      public_url_fn=None, heic_fn=None, hevc_fn=None, probe_fn=None,
-                     probe_info=None, budget=None, timeout=RENDITION_TIMEOUT_SEC):
+                     probe_info=None, budget=None, timeout=RENDITION_TIMEOUT_SEC,
+                     force_convert=False, proof_fn=None):
     """Produce (or reuse) a playable/serveable rendition for a HEIC photo or an
     HEVC / odd-container video and return its public url. Cache is keyed by
     content_hash under gym_id/... in Echo's bucket, so a SECOND use is a pure cache
@@ -488,7 +494,7 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
     content_hash = asset.get("content_hash")
 
     # Already cached? Reuse without any decode/transcode.
-    if asset.get("rendition_url"):
+    if asset.get("rendition_url") and not force_convert:
         return asset["rendition_url"], False
 
     info = probe_info
@@ -502,7 +508,7 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
     key = rendition_key(gym_id, content_hash, ext)
     # Cache hit by content-addressed key (a re-run before the url was persisted).
     try:
-        if exists_fn(key):
+        if not force_convert and exists_fn(key):
             url = public_url_fn(key)
             _persist_rendition(store, asset, key, url)
             return url, False
@@ -527,6 +533,13 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
         if not url:
             print(f"[gym-media] rendition upload returned no url for {title!r}")
             return None, False
+        if proof_fn is not None:
+            try:
+                proven = proof_fn(src_path, out_path, url)
+            except Exception as exc:  # noqa: BLE001 - proof failure is a hard hold
+                raise RenditionProofFailed("rendition proof callback failed") from exc
+            if proven is not True:
+                raise RenditionProofFailed("hosted rendition does not match fresh output")
         # Persist the REAL object key the host wrote (echo/<tenant>/<sha1>/<name>),
         # not the content-hash lookup key (audit R-D1: rendition_key held a key that
         # did not exist in R2).

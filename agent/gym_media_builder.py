@@ -257,10 +257,34 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             original_source_url = ""
             rendition_evidence = None
             needs = _idx.needs_rendition(asset, info)
+            proof_state = {}
+            if needs:
+                # Establish the original object before conversion so the fresh
+                # conversion proof can bind both exact hosted endpoints.
+                original_source_url = media_host.host_media(str(tmp_path), gym_base)
+                if not original_source_url:
+                    print(f"[gym-media-builder] no hosted original source for "
+                          f"rendition {title!r}; trying the next asset")
+                    continue
+
+            def _proof_fresh_rendition(_source_path, output_path, delivered_url):
+                evidence = rendition_evidence_for(
+                    _source_path, output_path, original_source_url, delivered_url,
+                    asset.get("content_hash"))
+                if evidence is None:
+                    return False
+                proof_state["evidence"] = evidence
+                return True
+
             try:
                 rend_url, converted = _idx.ensure_rendition(
                     asset, tmp_path, store=store, probe_info=info,
-                    budget=rendition_budget)
+                    budget=rendition_budget,
+                    # A cached URL proves no conversion edge for this draft. Under
+                    # the guarded writer, spend this build's one conversion budget
+                    # to observe one fresh, byte-bound edge instead.
+                    force_convert=bool(needs and writer_prep_enabled()),
+                    proof_fn=_proof_fresh_rendition if needs and writer_prep_enabled() else None)
             except _idx.RenditionBudgetExhausted:
                 print(f"[gym-media-builder] transcode budget spent; {title!r} skipped "
                       "until the nightly pre-render pass renders it")
@@ -270,6 +294,10 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                 print(f"[gym-media-builder] {title!r} transcode timed out ({e}); skipped")
                 _note_rendition_missing(store, asset)
                 continue
+            except _idx.RenditionProofFailed as e:
+                print(f"[gym-media-builder] rendition proof failed for {title!r} "
+                      f"({e}); trying the next asset")
+                continue
             if rend_url:
                 public_override = rend_url
                 # A delivery rendition is never its own raw source.  Host the
@@ -277,11 +305,10 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                 # one exact URL for the original bytes.  This is deliberately done
                 # only on the rendition branch: original-served drafts already use
                 # their delivery URL as the same-object source.
-                original_source_url = media_host.host_media(str(tmp_path), gym_base)
                 if not original_source_url or original_source_url == rend_url:
                     print(f"[gym-media-builder] no hosted original source for "
-                          f"rendition {title!r}; holding the slot")
-                    return None
+                          f"rendition {title!r}; trying the next asset")
+                    continue
                 if writer_prep_enabled():
                     # Cached renditions have no observed conversion edge in this
                     # invocation.  Never fabricate one from matching filenames,
@@ -289,15 +316,13 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                     # separately evidenced conversion path can establish it.
                     if not converted:
                         print(f"[gym-media-builder] cached rendition {title!r} has "
-                              "no conversion receipt; holding the slot (writer prep)")
-                        return None
-                    rendition_evidence = rendition_evidence_for(
-                        tmp_path, original_source_url, rend_url,
-                        asset.get("content_hash"))
+                              "no fresh conversion edge; trying the next asset")
+                        continue
+                    rendition_evidence = proof_state.get("evidence")
                     if rendition_evidence is None:
                         print(f"[gym-media-builder] original/rendition readback "
-                              f"failed for {title!r}; holding the slot (writer prep)")
-                        return None
+                              f"failed for {title!r}; trying the next asset")
+                        continue
                 if asset.get("kind") == _idx.KIND_PHOTO:
                     # For a HEIC photo, vision must analyze the JPEG rendition, not
                     # the undecodable original. Re-download the rendition locally.
@@ -543,8 +568,8 @@ def video_poster_url(video_path, work_dir, tenant):
         return ""
 
 
-def rendition_evidence_for(source_path, source_exact_url, delivered_exact_url,
-                           drive_content_hash):
+def rendition_evidence_for(source_path, delivered_path, source_exact_url,
+                           delivered_exact_url, drive_content_hash):
     """Observe one newly-created Drive rendition edge, or return ``None``.
 
     The exact hosted original is read back and must equal the bytes downloaded
@@ -560,9 +585,12 @@ def rendition_evidence_for(source_path, source_exact_url, delivered_exact_url,
         local_bytes = Path(source_path).read_bytes()
         source_bytes = visual_writer_prepare._exact_bytes(
             source_exact_url, visual_writer_prepare._bytes_for_url, "source")
+        expected_delivered = Path(delivered_path).read_bytes()
         delivered_bytes = visual_writer_prepare._exact_bytes(
             delivered_exact_url, visual_writer_prepare._bytes_for_url, "delivered")
         if source_bytes != local_bytes:
+            return None
+        if delivered_bytes != expected_delivered:
             return None
         expected = str(drive_content_hash or "").strip().lower()
         source_md5 = hashlib.md5(source_bytes).hexdigest()
