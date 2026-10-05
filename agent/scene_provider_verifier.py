@@ -14,20 +14,41 @@ Authority model (repair of the Sol-reviewed flaws):
     identity or provider post id: those are fetched through an INJECTED
     read-only ``reader`` bound to the scene_attester_verifier credential.
     A caller-supplied dict is refused (``caller_supplied_identity``).
-  * KNOWN SQL SEAM (fail closed, stated exactly): the DRAFT migration grants
-    SELECT on ``visual_scene_attester_prepared`` / ``_binding`` / ``_event``
-    to scene_attester_verifier, but ``visual_scene_original_use_attempt``
-    (expected_provider, expected_channel, expected_provider_account_id,
-    provider_post_id) is readable by service_role ONLY and the migration
-    defines NO security-definer read function for the verifier role. When the
-    reader cannot return the attempt row through a safe API the adapter
-    refuses with ``missing_seam_verifier_attempt_read`` and names the gap.
-    A caller dict is NEVER used as a substitute authority.
-  * The provider post id comes only from the authoritative attempt row. The
-    DRAFT schema sets ``attempt.provider_post_id`` only at terminate time,
-    so before finalization there is NO immutable record of the send-returned
-    Zernio post id: the adapter HOLDS with
-    ``missing_seam_provider_post_id_store`` rather than inferring one.
+  * Authoritative read path (P1 seam repair, DRAFT/UNAPPLIED/OFF): the
+    migration now defines ``visual_scene_attester_verifier_read``, a
+    SECURITY DEFINER read RPC granted to scene_attester_verifier ONLY
+    (revoked from public, anon, authenticated, service_role AND the
+    sending role). It takes a claim_attempt_id and nothing else, derives
+    tenant scope from the claim's own rows, and returns the exact
+    immutable prepared snapshot, binding, attempt row and send-return
+    record — failing closed (raising) when a required row is missing or
+    the prepared/binding/attempt tenants disagree. When the reader cannot
+    return the attempt row through this API the adapter refuses with
+    ``missing_seam_verifier_attempt_read``. A caller dict is NEVER used
+    as a substitute authority.
+  * Immutable provider post id (P1 seam repair, DRAFT/UNAPPLIED/OFF): the
+    sender records, ONCE and before finalization, the provider post id it
+    ASSERTS the send returned, through
+    ``visual_scene_attester_record_send_return`` (scene_attester EXECUTE
+    only; append-only, first-write-wins; tenant, binding and sender
+    identity copied from the frozen snapshot, never caller-asserted).
+    The verifier reads that record through the read RPC and
+    ``attest_terminate`` refuses any delivered outcome whose post id
+    differs from it. The adapter's post id comes ONLY from the immutable
+    send-return record; when no record exists yet (send in flight or
+    never returned) the adapter HOLDS with
+    ``provider_post_id_unrecorded`` rather than inferring one, and a
+    terminal attempt post id that disagrees with the send-return record
+    is a data-integrity refusal, never an override.
+  * TRUTH BOUNDARY — the send-return record is SENDER-ASSERTED, not
+    independently provider-authenticated: no adapter yet captures and
+    binds the authenticated provider send response (request/response
+    correlation) to the recorded id. Even when every readback check
+    passes, final delivered activation HOLDS with
+    ``missing_seam_send_return_correlation`` until a real send-return
+    adapter/API correlation contract exists. This hold is never relaxed
+    by delivered media verification success, and failed/partial holds are
+    never released by it either.
 
 Scope (refuse everything else):
   * Zernio-routed Instagram / Facebook feed and story posts;
@@ -73,7 +94,7 @@ import hashlib
 import json
 import re
 
-ADAPTER_VERSION = "scene_provider_verifier/2.0"
+ADAPTER_VERSION = "scene_provider_verifier/2.1"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MD5_RE = re.compile(r"^md5:[0-9a-f]{32}$")
@@ -111,15 +132,24 @@ _SURFACES = ("feed", "story")
 
 # Exact SQL seams this adapter reports verbatim (no secrets, no inference).
 SEAM_ATTEMPT_READ = (
-    "DRAFT_visual_scene_attester_runtime_20261004.sql grants SELECT on "
-    "visual_scene_original_use_attempt to service_role only; no "
-    "security-definer read function exists for scene_attester_verifier, "
-    "so the verifier cannot authoritatively read the attempt row")
+    "the authoritative read must come through "
+    "visual_scene_attester_verifier_read (security definer, granted to "
+    "scene_attester_verifier only); the attempt row is not directly "
+    "readable by the verifier role and no caller-supplied record is a "
+    "substitute authority")
 SEAM_POST_ID_STORE = (
-    "visual_scene_original_use_attempt.provider_post_id is set only by "
-    "terminate; no immutable store records the send-returned provider post "
-    "id before finalization, so the verifier has no known immutable post "
-    "id to read back")
+    "visual_scene_attester_send_return is the only immutable "
+    "pre-finalization provider post id record (written once by the "
+    "sending role through visual_scene_attester_record_send_return); "
+    "without it there is no known immutable post id to read back")
+SEAM_SEND_RETURN_CORRELATION = (
+    "visual_scene_attester_send_return records the provider post id the "
+    "SENDER asserts the send returned; no adapter yet captures and binds "
+    "the authenticated provider send response (request/response "
+    "correlation) to that record, so the recorded id is sender-asserted, "
+    "not independently provider-authenticated, and final delivered "
+    "activation must HOLD until a real send-return adapter/API "
+    "correlation contract exists")
 SEAM_DELIVERED_MEDIA = (
     "Zernio GET /v1/posts/{id} echoes the submitted request mediaItems; "
     "hashes in submitted mediaItems are sender-supplied request fields, "
@@ -169,12 +199,16 @@ class SceneProviderVerifier:
               scene_attester_verifier role; the ONLY terminal boundary this
               adapter may use (visual_scene_attester_attest_terminate).
     reader:   callable ``reader(claim_attempt_id) -> dict`` bound to the
-              read-only scene_attester_verifier credential. Returns
-              {"prepared": {...}, "binding": {...}, "attempt": {...}} from
-              the authoritative tables. A None ``attempt`` (or a raised
-              MissingSeamError) is the SQL read seam: the adapter refuses
-              closed and names it. The reader is the ONLY source of snapshot,
-              binding, destination identity and provider post id.
+              read-only scene_attester_verifier credential
+              (visual_scene_attester_verifier_read). Returns
+              {"prepared": {...}, "binding": {...}, "attempt": {...},
+              "send_return": {...} | None} from the authoritative tables.
+              A None ``attempt`` (or a raised MissingSeamError) is the
+              read-path failure: the adapter refuses closed and names it.
+              A None ``send_return`` means no immutable provider post id
+              has been recorded yet: the adapter HOLDS, never infers.
+              The reader is the ONLY source of snapshot, binding,
+              destination identity and provider post id.
     verifier_id: stable independent verifier identity label. Must differ from
               the snapshot's sending attester_id (defense in depth; the role
               split is the load-bearing control).
@@ -202,7 +236,15 @@ class SceneProviderVerifier:
 
         Returns a decision dict. ``decision`` is one of:
           delivered                      -> attest_terminate was called
-                                            (result under ``terminal``);
+                                            (result under ``terminal``).
+                                            CURRENTLY UNREACHABLE: the
+                                            send-return record is
+                                            sender-asserted, so the final
+                                            delivered gate HOLDS with
+                                            missing_seam_send_return_correlation
+                                            until a real send-return
+                                            adapter/API correlation
+                                            contract exists;
                                             confirmed_no_send is NEVER
                                             released: no irreversible
                                             no-delivery provider contract
@@ -256,8 +298,12 @@ class SceneProviderVerifier:
             return _result("refused", "missing_seam_verifier_attempt_read",
                            seam=SEAM_ATTEMPT_READ)
 
+        send_return = records.get("send_return")
+        if send_return is not None and not isinstance(send_return, dict):
+            return _result("refused", "authoritative_read_malformed")
         try:
-            ctx = self._validate_records(token, prepared, binding, attempt)
+            ctx = self._validate_records(token, prepared, binding, attempt,
+                                         send_return)
         except VerifierInputError as exc:
             return _result("refused", f"authoritative_record_mismatch:{exc}")
 
@@ -271,11 +317,11 @@ class SceneProviderVerifier:
             return scope
 
         # The known immutable provider post id comes ONLY from the
-        # authoritative attempt row. The DRAFT schema stores it only at
-        # terminate time, so pre-finalization there is nothing to read back:
-        # HOLD and name the seam instead of inferring an id.
+        # sender's immutable pre-finalization send-return record. When no
+        # record exists yet the send is in flight (or never returned):
+        # HOLD instead of inferring an id from anywhere else.
         if not ctx["provider_post_id"]:
-            return _result("hold", "missing_seam_provider_post_id_store",
+            return _result("hold", "provider_post_id_unrecorded",
                            hold={"seam": SEAM_POST_ID_STORE})
 
         # Provider readback of the KNOWN immutable post id. A read failure,
@@ -328,7 +374,8 @@ class SceneProviderVerifier:
 
     # -- authoritative record validation ------------------------------------
 
-    def _validate_records(self, token, prepared, binding, attempt):
+    def _validate_records(self, token, prepared, binding, attempt,
+                          send_return=None):
         def req(row, key, label):
             value = _s(row.get(key))
             if not value:
@@ -350,9 +397,9 @@ class SceneProviderVerifier:
                 attempt, "expected_channel", "attempt").lower(),
             "expected_provider_account_id": req(
                 attempt, "expected_provider_account_id", "attempt"),
-            # The ONLY source of the provider post id is the authoritative
-            # attempt row; never caller-supplied, never inferred.
-            "provider_post_id": _s(attempt.get("provider_post_id")),
+            # Terminal attempt post id (null pre-finalization); must
+            # agree with the immutable send-return record when both exist.
+            "attempt_provider_post_id": _s(attempt.get("provider_post_id")),
             "delivered_url": req(prepared, "delivered_url", "prepared"),
             "delivered_sha256": req(prepared, "delivered_sha256", "prepared"),
             "delivered_md5": req(prepared, "delivered_md5", "prepared"),
@@ -455,6 +502,32 @@ class SceneProviderVerifier:
         caption = ctx["prepared_caption"]
         if caption is not None and not isinstance(caption, str):
             raise VerifierInputError("malformed prepared.prepared_caption")
+
+        # Immutable send-return record: the ONLY source of the provider
+        # post id this adapter will read back. Validate its binding to
+        # this exact claim and tenant; a terminal attempt post id that
+        # disagrees with it is a data-integrity refusal, never an
+        # override. Absent record -> post id stays empty and the caller
+        # HOLDS (provider_post_id_unrecorded).
+        ctx["provider_post_id"] = ""
+        if send_return is not None:
+            if _s(send_return.get("claim_attempt_id")) != token:
+                raise VerifierInputError("send_return claim_attempt_id "
+                                         "mismatch")
+            if _s(send_return.get("tenant_id")) != ctx["tenant_id"]:
+                raise VerifierInputError("send_return tenant mismatch")
+            if _s(send_return.get("binding_id")) != b["binding_id"]:
+                raise VerifierInputError("send_return binding mismatch")
+            sr_post = _s(send_return.get("provider_post_id"))
+            if not sr_post:
+                raise VerifierInputError("missing "
+                                         "send_return.provider_post_id")
+            if (ctx["attempt_provider_post_id"]
+                    and ctx["attempt_provider_post_id"] != sr_post):
+                raise VerifierInputError(
+                    "terminal attempt provider_post_id conflicts with the "
+                    "immutable send-return record")
+            ctx["provider_post_id"] = sr_post
         return ctx
 
     # -- scope gate ---------------------------------------------------------
@@ -613,12 +686,31 @@ class SceneProviderVerifier:
             # or wrong fingerprint. Never partially accept.
             return _result("refused", "media_identity_mismatch")
         evidence["media_fingerprints_verified"] = actual
-        return None
+
+        # (3) SEND-RETURN CORRELATION SEAM — final delivered gate. The
+        # immutable send-return record is the SENDER's asserted post id,
+        # not independently provider-authenticated: no adapter yet
+        # captures and binds the authenticated provider send response
+        # (request/response correlation) to that record. Even with every
+        # content, media, destination, surface and status check green,
+        # delivered activation HOLDS here until a real send-return
+        # adapter/API correlation contract exists. Never relaxed by
+        # delivered media verification success; never a path to attest.
+        evidence["missing_seams"].append(SEAM_SEND_RETURN_CORRELATION)
+        return _result("hold", "missing_seam_send_return_correlation",
+                       evidence=evidence)
 
     # -- terminal boundary --------------------------------------------------
 
     def _attest(self, ctx, outcome, evidence):
         """Call attest_terminate ONLY after every check has passed.
+
+        UNREACHABLE TODAY (by design): the send-return correlation seam
+        hold in _check_readback precedes this path, because the immutable
+        send-return record is sender-asserted, not independently
+        provider-authenticated. Retained intact for the future real
+        send-return adapter/API correlation contract; do NOT wire around
+        the hold without one.
 
         confirmed_no_send carries provider_post_id=None: the attempt schema
         enforces (state='confirmed_delivered') = (provider_post_id is not

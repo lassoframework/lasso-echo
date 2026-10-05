@@ -181,6 +181,138 @@ def test_static_runtime_functions_security_definer_pinned_path():
                          src)
 
 
+def test_static_p1_verifier_read_rpc_permissions():
+    """P1 seam repair (static): the verifier-only authoritative read RPC is
+    SECURITY DEFINER with a pinned search_path, is granted EXECUTE ONLY to
+    scene_attester_verifier, and is revoked from public, anon,
+    authenticated, service_role AND the sending role — the sender can never
+    use the verifier read path as an oracle and service_role cannot bypass
+    the attempt table's SELECT scope."""
+    src = _src()
+    m = re.search(r"create or replace function "
+                  r"public\.visual_scene_attester_verifier_read\(p jsonb\)"
+                  r"(.*?)as \$\$", src, re.S)
+    assert m, "verifier_read"
+    assert "security definer" in m.group(1)
+    assert "set search_path = public" in m.group(1)
+    assert re.search(r"grant execute on function "
+                     r"public\.visual_scene_attester_verifier_read\(jsonb\)"
+                     r"\s*to scene_attester_verifier", src)
+    assert re.search(r"revoke all on function "
+                     r"public\.visual_scene_attester_verifier_read\(jsonb\)"
+                     r"\s*from public, anon, authenticated, service_role, "
+                     r"scene_attester;", src)
+    # Never granted to the sender or to service_role.
+    assert not re.search(r"grant execute on function "
+                         r"public\.visual_scene_attester_verifier_read"
+                         r"\(jsonb\)[^;]*\bto (scene_attester|service_role|"
+                         r"public|anon|authenticated)\b", src)
+    body = src.split("create or replace function "
+                     "public.visual_scene_attester_verifier_read", 1)[1]
+    # Claim token only; tenant scope derived from the claim's own rows,
+    # fail closed on missing rows or tenant disagreement.
+    assert "verifier_read: claim_attempt_id is required" in body
+    assert "prepared, binding and attempt tenants '" in body
+    assert "disagree; refusing cross-tenant read" in body
+    assert "visual_scene_original_use_attempt" in body
+
+
+def test_static_p1_send_return_record_and_permissions():
+    """P1 seam repair (static): the immutable pre-finalization provider
+    post id record is append-only, FORCE RLS with EXACTLY ONE narrow
+    owner-only policy (fail-closed but EXECUTABLE: FORCE RLS constrains
+    the table owner too, so the SECURITY DEFINER functions — owned by the
+    applying role — need a policy passing only current_user = table
+    owner, otherwise the boundary would refuse the owner itself unless
+    the owner held BYPASSRLS) and NO direct grants to any role; the
+    sender-only record function is SECURITY DEFINER with a pinned path,
+    requires a send_started snapshot whose frozen attester_id matches,
+    copies tenant/binding/sender identity from the frozen snapshot (never
+    caller-asserted), and is first-write-wins (identical replay returns
+    replayed=true, conflicting post id raises without updating). The
+    recorded id is documented as SENDER-ASSERTED, never
+    provider-authenticated."""
+    src = _src()
+    assert re.search(r"create table if not exists "
+                     r"public\.visual_scene_attester_send_return", src)
+    assert re.search(r"alter table public\.visual_scene_attester_send_return"
+                     r"\s*enable row level security", src)
+    assert re.search(r"alter table public\.visual_scene_attester_send_return"
+                     r"\s*force row level security", src)
+    # Exactly ONE policy on the send-return table: the owner-only repair.
+    policies = re.findall(
+        r"create policy (\w+)\s*on\s*"
+        r"public\.visual_scene_attester_send_return", src)
+    assert policies == ["visual_scene_attester_send_return_owner_rw"]
+    pol = re.search(
+        r"create policy visual_scene_attester_send_return_owner_rw(.*?);",
+        src, re.S).group(1)
+    assert "as permissive for all to public" in pol
+    assert "using (current_user =" in pol and "with check (current_user =" in pol
+    assert "pg_get_userbyid" in pol and "relowner" in pol
+    assert not re.search(r"grant \w+ on "
+                         r"public\.visual_scene_attester_send_return", src)
+    # Honesty: sender-asserted, never provider-authenticated.
+    assert "SENDER-ASSERTED, not" in src
+    assert "independently provider-authenticated" in src
+    assert "provider-authenticated post id" not in src
+    assert "visual_scene_attester_send_return is append-only" in src
+    assert "visual_scene_attester_send_return identity is immutable" in src
+    assert re.search(r"before update or delete on "
+                     r"public\.visual_scene_attester_send_return", src)
+    assert re.search(r"before truncate on "
+                     r"public\.visual_scene_attester_send_return", src)
+
+    m = re.search(r"create or replace function "
+                  r"public\.visual_scene_attester_record_send_return"
+                  r"\(p jsonb\)(.*?)as \$\$", src, re.S)
+    assert m, "record_send_return"
+    assert "security definer" in m.group(1)
+    assert "set search_path = public" in m.group(1)
+    assert re.search(r"grant execute on function\s*"
+                     r"public\.visual_scene_attester_record_send_return"
+                     r"\(jsonb\)\s*to scene_attester", src)
+    assert re.search(r"revoke all on function\s*"
+                     r"public\.visual_scene_attester_record_send_return"
+                     r"\(jsonb\)\s*from public, anon, authenticated, "
+                     r"service_role,\s*scene_attester_verifier;", src)
+    # Never granted to the verifier: a verifier can never record the
+    # identity it later checks.
+    assert not re.search(r"grant execute on function "
+                         r"public\.visual_scene_attester_record_send_return"
+                         r"\(jsonb\)[^;]*scene_attester_verifier", src)
+    body = src.split("create or replace function "
+                     "public.visual_scene_attester_record_send_return", 1)[1]
+    assert "attester identity does not match '" in body
+    assert "has no started '" in body
+    assert "provider post id conflicts '" in body
+    assert "with the immutable send-return record" in body
+    assert "v_snap.tenant_id, v_snap.calendar_row_id, v_snap.binding_id" in body
+    # No UPDATE of the send-return table anywhere in the runtime.
+    assert not re.search(r"update public\.visual_scene_attester_send_return",
+                         src)
+
+
+def test_static_p1_attest_terminate_enforces_send_return_identity():
+    """P1 seam repair (static): attest_terminate refuses a delivered
+    outcome whose provider post id is not byte-identical to the immutable
+    send-return record, BEFORE replay/state handling, so both fresh
+    finalization and finalized replay are bound to the same immutable
+    identity."""
+    src = _src()
+    body = src.split("create or replace function "
+                     "public.visual_scene_attester_attest_terminate", 1)[1]
+    assert "attest_terminate: delivered outcome does not match '" in body
+    assert "the immutable send-return provider post identity" in body
+    assert "visual_scene_attester_send_return" in body
+    assert body.index("immutable send-return provider post identity") \
+        < body.index("if v_snap.state = 'finalized' then")
+    # The adapter validates this top-level field on both replay and the
+    # first successful finalization; a committed receipt must not look held.
+    assert re.search(r"'provider_post_id', v_post,\s*"
+                     r"'terminal', v_term, 'replayed', false", body)
+
+
 def test_static_split_authority_fail_closed():
     """The sending role can never certify its own send: the verifier role
     exists NOLOGIN, attest_terminate is revoked from scene_attester, the
@@ -698,6 +830,19 @@ def _call_as(role, fn, payload):
     return done
 
 
+def _call_as_ok(role, fn, payload):
+    done = _call_as(role, fn, payload)
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip().splitlines()[-1]
+
+
+def _call_as_fails(role, fn, payload, needle):
+    done = _call_as(role, fn, payload)
+    assert done.returncode != 0, "expected failure, got success"
+    assert needle in done.stderr, done.stderr
+    return done.stderr
+
+
 # ---- PG scenarios ------------------------------------------------------------
 
 def test_pg_role_grants(scratch):
@@ -725,6 +870,19 @@ def test_pg_role_grants(scratch):
         ("service_role", "visual_scene_attester_claim_prepare(jsonb)", False),
         ("service_role", "visual_scene_attester_attest_terminate(jsonb)",
          False),
+        # P1 send-return boundaries: record is SENDER-only, the
+        # authoritative read is VERIFIER-only.
+        ("scene_attester",
+         "visual_scene_attester_record_send_return(jsonb)", True),
+        ("scene_attester", "visual_scene_attester_verifier_read(jsonb)",
+         False),
+        ("scene_attester_verifier",
+         "visual_scene_attester_record_send_return(jsonb)", False),
+        ("scene_attester_verifier",
+         "visual_scene_attester_verifier_read(jsonb)", True),
+        ("service_role",
+         "visual_scene_attester_record_send_return(jsonb)", False),
+        ("service_role", "visual_scene_attester_verifier_read(jsonb)", False),
     ]
     for role, fn, expected in checks:
         got = _one(f"select has_function_privilege('{role}', "
@@ -738,6 +896,24 @@ def test_pg_role_grants(scratch):
                         f"'public.{tbl}', 'insert')") == "f"
             assert _one(f"select has_table_privilege('{role}', "
                         f"'public.{tbl}', 'select')") == "t"
+    # The send-return TABLE holds no direct grants for ANY non-owner role
+    # — not even SELECT; access flows only through the definer functions.
+    for role in ("scene_attester", "scene_attester_verifier",
+                 "service_role"):
+        for priv in ("select", "insert", "update", "delete"):
+            assert _one(f"select has_table_privilege('{role}', "
+                        f"'public.visual_scene_attester_send_return', "
+                        f"'{priv}')") == "f", (role, priv)
+    # Direct role-level refusals on the two new boundaries.
+    _call_as_fails("scene_attester_verifier",
+                   "visual_scene_attester_record_send_return", {},
+                   "permission denied")
+    _call_as_fails("scene_attester",
+                   "visual_scene_attester_verifier_read", {},
+                   "permission denied")
+    _call_as_fails("service_role",
+                   "visual_scene_attester_verifier_read", {},
+                   "permission denied")
     # Direct calls to the old entry points refuse.
     done = _call_as("scene_attester", PREPARE_FN, {})
     assert done.returncode != 0
@@ -1007,6 +1183,13 @@ def test_pg_ambiguous_hold_then_atomic_finalize(scratch):
                              _claim_payload(s)))["claim_attempt_id"]
     _call("visual_scene_attester_send_start",
           {"claim_attempt_id": token, "attester_id": "attester-1"})
+    # The SENDER records the exact send-returned post id (sender-asserted)
+    # before any delivered finalization can pass the immutable gate.
+    rec = json.loads(_call_as_ok(
+        "scene_attester", "visual_scene_attester_record_send_return",
+        {"claim_attempt_id": token, "attester_id": "attester-1",
+         "provider_post_id": "post_123"}))
+    assert rec["recorded"] is True and rec["replayed"] is False
     out = json.loads(_call("visual_scene_attester_attest_terminate",
                            {"claim_attempt_id": token,
                             "verifier_id": "verifier-1",
@@ -1050,17 +1233,22 @@ def test_pg_ambiguous_hold_then_atomic_finalize(scratch):
                 f"where claim_attempt_id = '{token}'") == "finalized"
     # A conflicting terminal replay must be refused even though the snapshot
     # is already finalized; compare against the recorded attestation/receipt.
-    for conflicting in (
-        {"outcome": "confirmed_no_send"},
-        {"outcome": "delivered", "provider_post_id": "post_other"},
-        {"outcome": "delivered", "provider_post_id": "post_123",
-         "readback_evidence": {"seen": False}},
+    # A post id the sender never recorded refuses at the immutable
+    # send-return gate BEFORE replay handling; other drift refuses against
+    # the recorded attestation/receipt.
+    for conflicting, needle in (
+        ({"outcome": "confirmed_no_send"}, "finalized replay conflicts"),
+        ({"outcome": "delivered", "provider_post_id": "post_other"},
+         "immutable send-return provider post identity"),
+        ({"outcome": "delivered", "provider_post_id": "post_123",
+          "readback_evidence": {"seen": False}},
+         "finalized replay conflicts"),
     ):
         replay = {"claim_attempt_id": token, "verifier_id": "verifier-1",
                   "readback_evidence": {"seen": True}, **conflicting}
         stmt = ("select public.visual_scene_attester_attest_terminate('"
                 + json.dumps(replay).replace("'", "''") + "'::jsonb)")
-        _fails(stmt, "finalized replay conflicts")
+        _fails(stmt, needle)
     # Identical replay of the finalized snapshot returns the recorded result.
     out = json.loads(_call("visual_scene_attester_attest_terminate",
                            {"claim_attempt_id": token,
@@ -1124,10 +1312,26 @@ def test_pg_atomic_terminal_rollback(scratch):
                           "readback_evidence": {"seen": True}}
                          ).replace("'", "''")
             + "'::jsonb)")
-    _fails(stmt, "terminal outcomes require a started send")
+    # The immutable send-return gate runs BEFORE replay/state handling:
+    # with no send-return record this is the gate refusal, and it must
+    # roll back identically (no attestation, no finalization).
+    _fails(stmt, "immutable send-return provider post identity")
     assert _one("select count(*) from "
                 "public.visual_scene_original_use_attestation "
                 f"where claim_attempt_id = '{token2}'") == "0"
+    # A STARTED send with NO send-return record also refuses at the gate:
+    # a delivered outcome can never introduce a post id the sender never
+    # recorded, and nothing finalizes.
+    _fails("select public.visual_scene_attester_attest_terminate('"
+           + json.dumps({"claim_attempt_id": token,
+                         "verifier_id": "verifier-1",
+                         "outcome": "delivered",
+                         "provider_post_id": "post_x",
+                         "readback_evidence": {"seen": True}}
+                        ).replace("'", "''") + "'::jsonb)",
+           "immutable send-return provider post identity")
+    assert _one("select state from public.visual_scene_attester_prepared "
+                f"where claim_attempt_id = '{token}'") == "send_started"
 
 
 def test_pg_split_authority_end_to_end(scratch):
@@ -1142,6 +1346,13 @@ def test_pg_split_authority_end_to_end(scratch):
                              _claim_payload(s)))["claim_attempt_id"]
     _call("visual_scene_attester_send_start",
           {"claim_attempt_id": token, "attester_id": "attester-1"})
+    # The SENDER role records the asserted send-return post id; the
+    # verifier can never record the identity it later checks.
+    rec = json.loads(_call_as_ok(
+        "scene_attester", "visual_scene_attester_record_send_return",
+        {"claim_attempt_id": token, "attester_id": "attester-1",
+         "provider_post_id": "post_split"}))
+    assert rec["recorded"] is True
 
     # Sender role holds a valid payload but can NEVER certify its own send.
     done = _call_as("scene_attester",
@@ -1459,3 +1670,186 @@ def test_pg_scene_conflict_durable_hold_no_raise(scratch):
     assert out2["hold_id"] == hold_id
     assert _one("select count(*) from public.visual_scene_review_hold "
                 f"where calendar_row_id = '{row_b}'") == "1"
+
+
+def test_pg_send_return_boundary(scratch):
+    """P1 send-return seam, direct PG assertions (disposable scratch DB):
+
+      * immutable replay/conflict: identical re-record replays without a
+        second event; a conflicting post id raises and changes nothing;
+      * role boundaries exercised AS the roles (never superuser-masked):
+        only scene_attester records, only scene_attester_verifier reads;
+      * the verifier-only read RPC returns the exact send-return record,
+        tenant-scoped by the claim's own rows;
+      * terminal mismatch: attest_terminate refuses a delivered outcome
+        whose post id differs from the immutable record, then finalizes
+        with the exact recorded id;
+      * FORCE RLS owner policy (fail-closed but EXECUTABLE): verified
+        with a NON-superuser probe OWNER role — no superuser masking.
+    """
+    s = _setup_claimable()
+    s["payload_sha"] = _sha256("fixture_sha256_sr")
+    token = json.loads(_call_as_ok(
+        "scene_attester", "visual_scene_attester_claim_prepare",
+        _claim_payload(s)))["claim_attempt_id"]
+
+    # Nothing to record before the send starts (sender role, in-body).
+    _call_as_fails("scene_attester",
+                   "visual_scene_attester_record_send_return",
+                   {"claim_attempt_id": token, "attester_id": "attester-1",
+                    "provider_post_id": "post_sr"},
+                   "has no started")
+    # The verifier role can NEVER record the identity it later checks.
+    _call_as_fails("scene_attester_verifier",
+                   "visual_scene_attester_record_send_return",
+                   {"claim_attempt_id": token, "attester_id": "attester-1",
+                    "provider_post_id": "post_sr"},
+                   "permission denied")
+
+    json.loads(_call_as_ok("scene_attester",
+                           "visual_scene_attester_send_start",
+                           {"claim_attempt_id": token,
+                            "attester_id": "attester-1"}))
+
+    # Attester identity must match the frozen snapshot exactly.
+    _call_as_fails("scene_attester",
+                   "visual_scene_attester_record_send_return",
+                   {"claim_attempt_id": token, "attester_id": "attester-2",
+                    "provider_post_id": "post_sr"},
+                   "attester identity does not match")
+
+    rec = json.loads(_call_as_ok(
+        "scene_attester", "visual_scene_attester_record_send_return",
+        {"claim_attempt_id": token, "attester_id": "attester-1",
+         "provider_post_id": "post_sr"}))
+    assert rec["recorded"] is True and rec["replayed"] is False
+    assert rec["provider_post_id"] == "post_sr"
+    # Tenant/binding/sender identity copied from the frozen snapshot.
+    assert _one("select tenant_id || '|' || binding_id::text || '|' || "
+                "attester_id from public.visual_scene_attester_send_return "
+                f"where claim_attempt_id = '{token}'") \
+        == f"{s['tid']}|{s['bid']}|attester-1"
+
+    # Immutable replay: identical re-record is a no-op success, writes no
+    # second event; a conflicting post id raises and changes nothing.
+    replay = json.loads(_call_as_ok(
+        "scene_attester", "visual_scene_attester_record_send_return",
+        {"claim_attempt_id": token, "attester_id": "attester-1",
+         "provider_post_id": "post_sr"}))
+    assert replay["replayed"] is True
+    assert _one("select count(*) from public.visual_scene_attester_event "
+                f"where claim_attempt_id = '{token}' "
+                "and event = 'send_return_recorded'") == "1"
+    _call_as_fails("scene_attester",
+                   "visual_scene_attester_record_send_return",
+                   {"claim_attempt_id": token, "attester_id": "attester-1",
+                    "provider_post_id": "post_OTHER"},
+                   "conflicts")
+    assert _one("select provider_post_id from "
+                "public.visual_scene_attester_send_return "
+                f"where claim_attempt_id = '{token}'") == "post_sr"
+
+    # Verifier-only authoritative read: exact send-return record, claim-
+    # derived tenant scope; the sender can never use it as an oracle.
+    read = json.loads(_call_as_ok("scene_attester_verifier",
+                                  "visual_scene_attester_verifier_read",
+                                  {"claim_attempt_id": token}))
+    assert read["prepared"]["claim_attempt_id"] == token
+    assert read["binding"]["binding_id"] == s["bid"]
+    assert read["attempt"]["tenant_id"] == s["tid"]
+    assert read["send_return"]["provider_post_id"] == "post_sr"
+    assert read["send_return"]["tenant_id"] == s["tid"]
+    _call_as_fails("scene_attester",
+                   "visual_scene_attester_verifier_read",
+                   {"claim_attempt_id": token}, "permission denied")
+
+    # Terminal mismatch: a delivered outcome whose post id differs from
+    # the immutable record refuses; the exact recorded id finalizes.
+    _call_as_fails("scene_attester_verifier",
+                   "visual_scene_attester_attest_terminate",
+                   {"claim_attempt_id": token, "verifier_id": "verifier-1",
+                    "outcome": "delivered", "provider_post_id": "post_OTHER",
+                    "readback_evidence": {"seen": True}},
+                   "immutable send-return provider post identity")
+    assert _one("select state from public.visual_scene_attester_prepared "
+                f"where claim_attempt_id = '{token}'") == "send_started"
+    out = json.loads(_call_as_ok(
+        "scene_attester_verifier", "visual_scene_attester_attest_terminate",
+        {"claim_attempt_id": token, "verifier_id": "verifier-1",
+         "outcome": "delivered", "provider_post_id": "post_sr",
+         "readback_evidence": {"seen": True}}))
+    assert out["state"] == "finalized" and out["outcome"] == "delivered"
+    assert _one("select provider_post_id from "
+                "public.visual_scene_original_use_receipt "
+                f"where claim_attempt_id = '{token}'") == "post_sr"
+
+
+def test_pg_send_return_force_rls_owner_policy(scratch):
+    """P1 review repair (real role/table boundary, NO superuser masking):
+    the send-return table keeps FORCE RLS, so even its owner is
+    constrained — the single owner-only policy is what makes the SECURITY
+    DEFINER functions executable. Proven with a NON-superuser probe owner:
+    ownership is transferred to a fresh NOLOGIN non-superuser role and all
+    checks run under `set role`, then ownership is restored.
+
+      * a NON-owner role with a direct grant is still refused by FORCE
+        RLS (SELECT sees zero rows; INSERT violates row-level security);
+      * the NON-superuser probe OWNER passes the policy: SELECT sees the
+        rows and an INSERT reaches the foreign-key check (23503) instead
+        of the RLS refusal (42501), proving WITH CHECK passes for owner.
+    """
+    s = _setup_claimable()
+    s["payload_sha"] = _sha256("fixture_sha256_rls")
+    token = json.loads(_call_as_ok(
+        "scene_attester", "visual_scene_attester_claim_prepare",
+        _claim_payload(s)))["claim_attempt_id"]
+    json.loads(_call_as_ok("scene_attester",
+                           "visual_scene_attester_send_start",
+                           {"claim_attempt_id": token,
+                            "attester_id": "attester-1"}))
+    json.loads(_call_as_ok("scene_attester",
+                           "visual_scene_attester_record_send_return",
+                           {"claim_attempt_id": token,
+                            "attester_id": "attester-1",
+                            "provider_post_id": "post_rls"}))
+
+    owner = _one("select pg_get_userbyid(relowner) from pg_class "
+                 "where oid = 'public.visual_scene_attester_send_return'"
+                 "::regclass")
+    probe_insert = (
+        "insert into public.visual_scene_attester_send_return ("
+        "claim_attempt_id, tenant_id, calendar_row_id, binding_id, "
+        "attester_id, provider_post_id) values ("
+        f"gen_random_uuid(), '{s['tid']}', gen_random_uuid(), "
+        f"'{s['bid']}', 'attester-1', 'post_probe')")
+    _sql("drop role if exists att_owner_probe; "
+         "create role att_owner_probe nologin;")
+    granted = False
+    try:
+        _sql("alter table public.visual_scene_attester_send_return "
+             "owner to att_owner_probe;")
+        # NON-owner WITH a direct grant: still refused twice over — the
+        # FORCE RLS policy admits only current_user = table owner.
+        _sql("grant select, insert on "
+             "public.visual_scene_attester_send_return to scene_attester;")
+        granted = True
+        assert _one("set role scene_attester; select count(*) from "
+                    "public.visual_scene_attester_send_return;") == "0"
+        _fails("set role scene_attester; " + probe_insert,
+               "row-level security")
+        # NON-superuser probe OWNER: the policy admits exactly this role,
+        # so the SECURITY DEFINER owner boundary is executable.
+        assert _one("set role att_owner_probe; select count(*) from "
+                    "public.visual_scene_attester_send_return;") == "1"
+        # WITH CHECK passes for the owner: the insert fails on the
+        # foreign key (random claim_attempt_id), NOT on row security.
+        _fails("set role att_owner_probe; " + probe_insert,
+               "foreign key")
+    finally:
+        if granted:
+            _sql("revoke select, insert on "
+                 "public.visual_scene_attester_send_return "
+                 "from scene_attester;")
+        _sql(f"alter table public.visual_scene_attester_send_return "
+             f"owner to {owner};")
+        _sql("drop role if exists att_owner_probe;")

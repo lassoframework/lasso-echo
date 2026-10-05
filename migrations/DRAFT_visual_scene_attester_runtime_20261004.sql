@@ -67,6 +67,54 @@
 --      ambiguous_hold, leaves the row held, and writes an event
 --      (unknown/ambiguous hold preserved).
 --
+--   7. P1 ACTIVATION SEAM REPAIRS (2026-10-05, still DRAFT/UNAPPLIED/OFF):
+--      a. IMMUTABLE SEND-RETURN PROVIDER POST IDENTITY
+--         (visual_scene_attester_send_return +
+--         visual_scene_attester_record_send_return): the SENDER records,
+--         once and before finalization, the provider post id it ASSERTS
+--         the send returned, against a send_started snapshot whose
+--         attester identity it must match. The record is append-only,
+--         first-write-wins: an identical re-record returns replayed=true;
+--         a conflicting one raises. Tenant/binding/sender identity are
+--         copied from the frozen snapshot, never from caller-asserted
+--         fields. attest_terminate refuses a delivered outcome whose post
+--         id is not byte-identical to the immutable send-return record.
+--         TRUTH BOUNDARY: the recorded id is SENDER-ASSERTED, not
+--         independently provider-authenticated. No adapter yet captures
+--         and binds the authenticated provider send response to this
+--         record, so it is a consistency fence the verifier's own
+--         authenticated readback is checked against — never proof that
+--         THIS send returned THIS id. Final delivered activation must
+--         therefore stay HELD until a real send-return adapter/API
+--         correlation contract exists (see the verifier adapter's
+--         missing_seam_send_return_correlation hold).
+--      b. VERIFIER-ONLY AUTHORITATIVE READ
+--         (visual_scene_attester_verifier_read): a SECURITY DEFINER read
+--         RPC granted to scene_attester_verifier ONLY (revoked from
+--         public, anon, authenticated, service_role AND scene_attester).
+--         It takes a claim_attempt_id and NOTHING else — no caller-
+--         supplied tenant, identity or post id — and returns the exact
+--         immutable prepared snapshot, binding, attempt row and
+--         send-return record, tenant-scoped by the claim itself. It fails
+--         closed (raises) when any authoritative row is missing or the
+--         prepared/binding/attempt tenants disagree.
+--      c. FAIL-CLOSED SEND-RETURN TABLE BOUNDARY (PARTIAL RLS REPAIR)
+--         (2026-10-05 independent-review repair):
+--         visual_scene_attester_send_return keeps ENABLE + FORCE ROW
+--         LEVEL SECURITY with NO direct grants to any role, and carries
+--         exactly ONE narrow policy,
+--         visual_scene_attester_send_return_owner_rw, passing ONLY for
+--         the role that owns the table. Without it, FORCE RLS also
+--         constrained the table owner. This policy solves access to THIS
+--         table only. The other FORCE-RLS prepared, binding and event
+--         tables still have role-specific SELECT policies and no event
+--         INSERT policy for an ordinary non-BYPASSRLS function owner.
+--         Therefore the composite RPCs are NOT yet proven executable
+--         under that owner. Before activation, repair those policies or
+--         enforce a privileged-owner installation contract and run the
+--         full RPC path under the actual owner on real PostgreSQL. Keep
+--         this DRAFT migration unapplied until that review passes.
+--
 -- RUNTIME PREREQUISITE — AUTHORITATIVE PROVIDER OBSERVATION BOUNDARY:
 --      SQL alone CANNOT prove that readback_evidence reflects a real
 --      provider readback. The only authoritative immutable boundary this
@@ -953,6 +1001,7 @@ declare
   v_receipt  public.visual_scene_original_use_receipt%rowtype;
   v_term     jsonb;
   v_recorded_state text;
+  v_return_post text;
 begin
   if v_token is null or v_verifier is null
      or v_outcome not in ('delivered','confirmed_no_send','ambiguous') then
@@ -988,6 +1037,24 @@ begin
     raise exception 'attest_terminate: verifier identity must be '
       'independent of the sending attester (self-certification refused)'
       using errcode = '23505';
+  end if;
+
+  -- IMMUTABLE SEND-RETURN GATE (delivered only): the provider post id the
+  -- verifier asserts must be byte-identical to the sender's immutable
+  -- pre-finalization send-return record. Runs BEFORE replay/state
+  -- handling so a finalized replay is validated against the same
+  -- immutable identity, and a delivered outcome can never introduce a
+  -- post id the sender never recorded. confirmed_no_send/ambiguous carry
+  -- no post id and skip this gate.
+  if v_outcome = 'delivered' then
+    select provider_post_id into v_return_post
+      from public.visual_scene_attester_send_return
+      where claim_attempt_id = v_token;
+    if not found or v_return_post is distinct from v_post then
+      raise exception 'attest_terminate: delivered outcome does not match '
+        'the immutable send-return provider post identity'
+        using errcode = '23505';
+    end if;
   end if;
 
   -- Replay: validate the request against immutable terminal records before
@@ -1109,7 +1176,279 @@ begin
 
   return jsonb_build_object('claim_attempt_id', v_token,
     'state', 'finalized', 'outcome', v_outcome,
+    'provider_post_id', v_post,
     'terminal', v_term, 'replayed', false);
+end $$;
+
+-- ----------------------------------------------------------------------------
+-- IMMUTABLE SEND-RETURN PROVIDER POST IDENTITY (P1 seam repair, DRAFT/OFF):
+-- the provider post id the SENDER ASSERTS the send returned (sender-asserted,
+-- not independently provider-authenticated), recorded ONCE by the
+-- sending role after send_start and BEFORE any finalization. Append-only,
+-- first-write-wins, NO direct table grants to any role: the sender writes
+-- only through visual_scene_attester_record_send_return and the verifier
+-- reads only through visual_scene_attester_verifier_read. The receipt
+-- package's attempt.provider_post_id remains the TERMINAL record; this
+-- table is the pre-finalization immutable identity attest_terminate
+-- enforces byte-for-byte on every delivered outcome.
+-- ----------------------------------------------------------------------------
+create table if not exists public.visual_scene_attester_send_return (
+  -- Exact claim-token binding: one send-return record per prepared
+  -- attempt token, ever.
+  claim_attempt_id      uuid primary key references
+    public.visual_scene_original_use_attempt (claim_attempt_id),
+  -- Tenant/binding/sender identity copied from the FROZEN prepared
+  -- snapshot at record time, never from caller-asserted fields.
+  tenant_id             text not null check (btrim(tenant_id) <> ''),
+  calendar_row_id       uuid not null,      -- evidence pointer, no FK
+  binding_id            uuid not null references
+    public.visual_scene_attester_binding (binding_id),
+  attester_id           text not null check (btrim(attester_id) <> ''),
+  provider_post_id      text not null check (btrim(provider_post_id) <> ''),
+  recorded_at           timestamptz not null default now()
+);
+
+comment on table public.visual_scene_attester_send_return is
+  'DRAFT/UNAPPLIED/OFF: immutable pre-finalization record of the '
+  'provider post id the SENDER ASSERTS the send returned, written once '
+  'per claim token by the sending role through '
+  'visual_scene_attester_record_send_return. Sender-asserted, not '
+  'independently provider-authenticated: a consistency fence the '
+  'verifier readback is checked against, never proof of provider return. '
+  'Append-only; no direct grants; read by the verifier only through '
+  'visual_scene_attester_verifier_read. attest_terminate refuses any '
+  'delivered outcome whose post id differs from this record.';
+
+create or replace function
+  public.visual_scene_attester_send_return_immutable()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' or tg_op = 'TRUNCATE' then
+    raise exception 'visual_scene_attester_send_return is append-only'
+      using errcode = '23514';
+  end if;
+  raise exception 'visual_scene_attester_send_return identity is immutable'
+    using errcode = '23514';
+end $$;
+
+drop trigger if exists visual_scene_attester_send_return_immutable
+  on public.visual_scene_attester_send_return;
+drop trigger if exists visual_scene_attester_send_return_immutable_truncate
+  on public.visual_scene_attester_send_return;
+create trigger visual_scene_attester_send_return_immutable
+  before update or delete on public.visual_scene_attester_send_return
+  for each row execute function
+    public.visual_scene_attester_send_return_immutable();
+create trigger visual_scene_attester_send_return_immutable_truncate
+  before truncate on public.visual_scene_attester_send_return
+  for each statement execute function
+    public.visual_scene_attester_send_return_immutable();
+
+alter table public.visual_scene_attester_send_return
+  enable row level security;
+alter table public.visual_scene_attester_send_return
+  force row level security;
+-- FORCE RLS stays: every ordinary role INCLUDING the table owner is
+-- constrained. Exactly ONE narrow policy passes the owner for THIS table.
+-- Other FORCE-RLS runtime tables still prevent an ordinary non-BYPASSRLS
+-- owner from executing the full RPC chain (header 7c activation hold).
+-- Every other role is denied twice: no table grant exists (42501), and
+-- the policy check itself requires current_user = table owner. A
+-- superuser / BYPASSRLS owner would bypass RLS entirely. Reads for every
+-- non-owner role still flow only through the
+-- security-definer verifier read RPC below.
+drop policy if exists visual_scene_attester_send_return_owner_rw
+  on public.visual_scene_attester_send_return;
+create policy visual_scene_attester_send_return_owner_rw
+  on public.visual_scene_attester_send_return
+  as permissive for all to public
+  using (current_user = (select pg_get_userbyid(c.relowner)
+                           from pg_class c
+                          where c.oid =
+                            'public.visual_scene_attester_send_return'::regclass))
+  with check (current_user = (select pg_get_userbyid(c.relowner)
+                                from pg_class c
+                               where c.oid =
+                            'public.visual_scene_attester_send_return'::regclass));
+
+-- ----------------------------------------------------------------------------
+-- SEND-RETURN RECORD (sender boundary; scene_attester EXECUTE only).
+-- Takes claim_attempt_id, attester_id and the provider post id the
+-- sender ASSERTS the send returned (sender-asserted, not independently
+-- provider-authenticated — see header 7a TRUTH BOUNDARY).
+-- Tenant, binding, calendar row and the canonical sender identity come
+-- from the FROZEN prepared snapshot: caller-asserted identity fields
+-- beyond the matched attester_id do not exist here. Requires a
+-- send_started snapshot (a send that never started can record nothing)
+-- whose frozen attester_id matches exactly. First-write-wins: an
+-- identical re-record returns replayed=true (the send may be retried
+-- after a crash between the provider return and this record); a
+-- conflicting post id or attester raises and changes nothing.
+-- ----------------------------------------------------------------------------
+create or replace function public.visual_scene_attester_record_send_return(p jsonb)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_token    uuid := nullif(p->>'claim_attempt_id','')::uuid;
+  v_attester text := nullif(btrim(coalesce(p->>'attester_id','')),'');
+  v_post     text := nullif(btrim(coalesce(p->>'provider_post_id','')),'');
+  v_snap     public.visual_scene_attester_prepared%rowtype;
+  v_existing public.visual_scene_attester_send_return%rowtype;
+begin
+  if v_token is null or v_attester is null or v_post is null then
+    raise exception 'record_send_return: claim_attempt_id, attester_id '
+      'and provider_post_id are required' using errcode = '22023';
+  end if;
+  select * into v_snap from public.visual_scene_attester_prepared
+    where claim_attempt_id = v_token for update;
+  if not found then
+    raise exception 'record_send_return: no prepared snapshot for this '
+      'claim token' using errcode = '22023';
+  end if;
+  if v_snap.attester_id is distinct from v_attester then
+    raise exception 'record_send_return: attester identity does not match '
+      'the prepared snapshot' using errcode = '23505';
+  end if;
+  select * into v_existing from public.visual_scene_attester_send_return
+    where claim_attempt_id = v_token;
+  if found then
+    -- Immutable first-write-wins replay: identical is a no-op success,
+    -- any drift is a refusal. NEVER updates the recorded identity.
+    if v_existing.provider_post_id is distinct from v_post then
+      raise exception 'record_send_return: provider post id conflicts '
+        'with the immutable send-return record' using errcode = '23505';
+    end if;
+    return jsonb_build_object('claim_attempt_id', v_token,
+      'provider_post_id', v_existing.provider_post_id,
+      'recorded', true, 'replayed', true);
+  end if;
+  if v_snap.state <> 'send_started' then
+    raise exception 'record_send_return: snapshot state % has no started '
+      'send to record', v_snap.state using errcode = '23514';
+  end if;
+  insert into public.visual_scene_attester_send_return (
+    claim_attempt_id, tenant_id, calendar_row_id, binding_id,
+    attester_id, provider_post_id)
+  values (
+    v_token, v_snap.tenant_id, v_snap.calendar_row_id, v_snap.binding_id,
+    v_snap.attester_id, v_post);
+  insert into public.visual_scene_attester_event (
+    claim_attempt_id, calendar_row_id, event, actor, detail)
+  values (v_token, v_snap.calendar_row_id, 'send_return_recorded',
+    v_snap.attester_id, jsonb_build_object('provider_post_id', v_post));
+  return jsonb_build_object('claim_attempt_id', v_token,
+    'provider_post_id', v_post, 'recorded', true, 'replayed', false);
+end $$;
+
+-- ----------------------------------------------------------------------------
+-- VERIFIER-ONLY AUTHORITATIVE READ (P1 seam repair, DRAFT/OFF). The ONLY
+-- read path the independent scene_attester_verifier role holds to the
+-- attempt row (which stays service_role-only for direct SELECT). Takes a
+-- claim_attempt_id and NOTHING ELSE: no caller-supplied tenant, identity,
+-- snapshot or post id can be injected. Tenant scoping is derived FROM the
+-- claim's own authoritative rows, and the function FAILS CLOSED (raises)
+-- when any required row is missing or the prepared/binding/attempt
+-- tenants disagree — a partial or cross-tenant read is never returned.
+-- The send-return record may legitimately be absent (send in flight) and
+-- is returned as null, never fabricated.
+-- ----------------------------------------------------------------------------
+create or replace function public.visual_scene_attester_verifier_read(p jsonb)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_token  uuid := nullif(p->>'claim_attempt_id','')::uuid;
+  v_snap   public.visual_scene_attester_prepared%rowtype;
+  v_bind   public.visual_scene_attester_binding%rowtype;
+  v_att    public.visual_scene_original_use_attempt%rowtype;
+  v_return public.visual_scene_attester_send_return%rowtype;
+begin
+  if v_token is null then
+    raise exception 'verifier_read: claim_attempt_id is required'
+      using errcode = '22023';
+  end if;
+  select * into v_snap from public.visual_scene_attester_prepared
+    where claim_attempt_id = v_token;
+  if not found then
+    raise exception 'verifier_read: no prepared snapshot for this claim '
+      'token' using errcode = '22023';
+  end if;
+  select * into v_bind from public.visual_scene_attester_binding
+    where binding_id = v_snap.binding_id;
+  if not found then
+    raise exception 'verifier_read: prepared snapshot binding is missing'
+      using errcode = '23514';
+  end if;
+  select * into v_att from public.visual_scene_original_use_attempt
+    where claim_attempt_id = v_token;
+  if not found then
+    raise exception 'verifier_read: no prepared attempt for this claim '
+      'token' using errcode = '23514';
+  end if;
+  -- Tenant scope is the claim's own; all three authoritative records must
+  -- agree exactly or the read fails closed.
+  if v_bind.tenant_id is distinct from v_snap.tenant_id
+     or v_att.tenant_id is distinct from v_snap.tenant_id then
+    raise exception 'verifier_read: prepared, binding and attempt tenants '
+      'disagree; refusing cross-tenant read' using errcode = '23514';
+  end if;
+  select * into v_return from public.visual_scene_attester_send_return
+    where claim_attempt_id = v_token;
+  if found and (v_return.tenant_id is distinct from v_snap.tenant_id
+     or v_return.binding_id is distinct from v_snap.binding_id) then
+    raise exception 'verifier_read: send-return record disagrees with the '
+      'prepared snapshot; refusing read' using errcode = '23514';
+  end if;
+  return jsonb_build_object(
+    'claim_attempt_id', v_token,
+    'tenant_id', v_snap.tenant_id,
+    'prepared', jsonb_build_object(
+      'claim_attempt_id', v_snap.claim_attempt_id,
+      'tenant_id', v_snap.tenant_id,
+      'calendar_row_id', v_snap.calendar_row_id,
+      'binding_id', v_snap.binding_id,
+      'attester_id', v_snap.attester_id,
+      'canonical_payload_sha256', v_snap.canonical_payload_sha256,
+      'source_url', v_snap.source_url,
+      'source_sha256', v_snap.source_sha256,
+      'source_md5', v_snap.source_md5,
+      'source_byte_length', v_snap.source_byte_length,
+      'delivered_url', v_snap.delivered_url,
+      'delivered_sha256', v_snap.delivered_sha256,
+      'delivered_md5', v_snap.delivered_md5,
+      'delivered_byte_length', v_snap.delivered_byte_length,
+      'delivered_phash', v_snap.delivered_phash,
+      'source_read_receipt', v_snap.source_read_receipt,
+      'delivered_read_receipt', v_snap.delivered_read_receipt,
+      'state', v_snap.state,
+      'lease_expires_at', v_snap.lease_expires_at,
+      'send_started_at', v_snap.send_started_at,
+      'finalized_at', v_snap.finalized_at),
+    'binding', jsonb_build_object(
+      'binding_id', v_bind.binding_id,
+      'tenant_id', v_bind.tenant_id,
+      'account_key', v_bind.account_key,
+      'zernio_profile_id', v_bind.zernio_profile_id,
+      'zernio_connected_account_id', v_bind.zernio_connected_account_id,
+      'channel', v_bind.channel,
+      'destination_page_id', v_bind.destination_page_id,
+      'surface', v_bind.surface),
+    'attempt', jsonb_build_object(
+      'claim_attempt_id', v_att.claim_attempt_id,
+      'tenant_id', v_att.tenant_id,
+      'expected_provider', v_att.expected_provider,
+      'expected_channel', v_att.expected_channel,
+      'expected_provider_account_id', v_att.expected_provider_account_id,
+      'provider_post_id', v_att.provider_post_id,
+      'delivered_url', v_att.delivered_url,
+      'delivered_md5', v_att.delivered_md5,
+      'delivered_phash', v_att.delivered_phash,
+      'state', v_att.state),
+    'send_return', case when v_return.claim_attempt_id is null then null
+      else jsonb_build_object(
+        'claim_attempt_id', v_return.claim_attempt_id,
+        'tenant_id', v_return.tenant_id,
+        'binding_id', v_return.binding_id,
+        'attester_id', v_return.attester_id,
+        'provider_post_id', v_return.provider_post_id,
+        'recorded_at', v_return.recorded_at) end);
 end $$;
 
 -- ----------------------------------------------------------------------------
@@ -1163,6 +1502,29 @@ revoke all on function public.visual_scene_attester_send_start(jsonb)
     scene_attester_verifier;
 revoke all on function public.visual_scene_attester_attest_terminate(jsonb)
   from public, anon, authenticated, service_role, scene_attester;
+
+-- P1 seam-repair boundaries: the send-return TABLE holds no direct grants
+-- at all (sender writes via record_send_return, verifier reads via
+-- verifier_read). record_send_return is a SENDER boundary: granted ONLY
+-- to scene_attester, never to the verifier (a verifier can never record
+-- the identity it later checks). verifier_read is a VERIFIER boundary:
+-- granted ONLY to scene_attester_verifier; revoked from service_role and
+-- scene_attester so the sender cannot use the verifier's read path as an
+-- oracle and service_role cannot bypass the attempt table's SELECT scope.
+revoke all on public.visual_scene_attester_send_return
+  from public, anon, authenticated, service_role, scene_attester,
+    scene_attester_verifier;
+revoke all on function
+  public.visual_scene_attester_record_send_return(jsonb)
+  from public, anon, authenticated, service_role,
+    scene_attester_verifier;
+revoke all on function public.visual_scene_attester_verifier_read(jsonb)
+  from public, anon, authenticated, service_role, scene_attester;
+grant execute on function
+  public.visual_scene_attester_record_send_return(jsonb)
+  to scene_attester;
+grant execute on function public.visual_scene_attester_verifier_read(jsonb)
+  to scene_attester_verifier;
 grant execute on function public.visual_scene_attester_claim_prepare(jsonb)
   to scene_attester;
 grant execute on function public.visual_scene_attester_send_start(jsonb)

@@ -79,6 +79,18 @@ def _attempt(**over):
     return attempt
 
 
+def _send_return(**over):
+    send_return = {
+        "claim_attempt_id": TOKEN,
+        "tenant_id": "gym-alpha",
+        "binding_id": BINDING_ID,
+        "attester_id": "sender-attester-1",
+        "provider_post_id": "zpost-123",
+    }
+    send_return.update(over)
+    return send_return
+
+
 def _platform_entry(**over):
     entry = {
         "platform": "instagram",
@@ -157,11 +169,16 @@ class FakeReader:
         return copy.deepcopy(self._records)
 
 
-def _records(prepared=None, binding=None, attempt=None):
+_UNSET = object()
+
+
+def _records(prepared=None, binding=None, attempt=None, send_return=_UNSET):
     return {
         "prepared": prepared if prepared is not None else _prepared(),
         "binding": binding if binding is not None else _binding(),
         "attempt": attempt if attempt is not None else _attempt(),
+        "send_return": (_send_return() if send_return is _UNSET
+                        else send_return),
     }
 
 
@@ -171,13 +188,15 @@ def _verifier(client, rpc, reader, **kw):
     return SceneProviderVerifier(client=client, rpc=rpc, reader=reader, **kw)
 
 
-def _run(prepared=None, binding=None, attempt=None, post=None, error=None,
+def _run(prepared=None, binding=None, attempt=None, send_return=_UNSET,
+         post=None, error=None,
          reader_error=None, records=None, **kw):
     client = FakeClient(post=post if post is not None else _readback(),
                         error=error)
     rpc = FakeRpc()
     reader = FakeReader(records=records if records is not None
-                        else _records(prepared, binding, attempt),
+                        else _records(prepared, binding, attempt,
+                                      send_return),
                         error=reader_error)
     out = _verifier(client, rpc, reader, **kw).verify(TOKEN)
     return out, client, rpc, reader
@@ -257,7 +276,7 @@ class TestAuthoritativeReadSeams(unittest.TestCase):
                                             "attempt": None})
         self.assertEqual(out["decision"], "refused")
         self.assertEqual(out["reason"], "missing_seam_verifier_attempt_read")
-        self.assertIn("visual_scene_original_use_attempt", out["seam"])
+        self.assertIn("visual_scene_attester_verifier_read", out["seam"])
         self.assertEqual(client.calls, [])
         self.assertEqual(rpc.calls, [])
 
@@ -294,44 +313,127 @@ class TestAuthoritativeReadSeams(unittest.TestCase):
         self.assertEqual(client.calls, [])
 
 
-class TestProviderPostIdSeam(unittest.TestCase):
-    def test_no_immutable_post_id_holds_before_provider_io(self):
-        # The DRAFT schema stores provider_post_id only at terminate time,
-        # so pre-finalization there is no known immutable id to read back.
-        out, client, rpc, _ = _run(attempt=_attempt(provider_post_id=None))
+class TestSendReturnRecord(unittest.TestCase):
+    def test_no_send_return_record_holds_before_provider_io(self):
+        # No immutable send-return record yet: the send is in flight (or
+        # never returned). HOLD, never infer a post id.
+        rec = _records()
+        rec["send_return"] = None
+        out, client, rpc, _ = _run(records=rec)
         self.assertEqual(out["decision"], "hold")
-        self.assertEqual(out["reason"], "missing_seam_provider_post_id_store")
+        self.assertEqual(out["reason"], "provider_post_id_unrecorded")
+        self.assertEqual(client.calls, [])
+        self.assertEqual(rpc.calls, [])
+
+    def test_terminal_attempt_post_id_alone_does_not_attest(self):
+        # Even a finalized attempt row's post id cannot substitute for the
+        # immutable send-return record.
+        rec = _records(send_return=None)
+        rec["attempt"]["provider_post_id"] = "zpost-123"
+        out, client, rpc, _ = _run(records=rec)
+        self.assertEqual(out["decision"], "hold")
+        self.assertEqual(out["reason"], "provider_post_id_unrecorded")
+        self.assertEqual(client.calls, [])
+        self.assertEqual(rpc.calls, [])
+
+    def test_immutable_id_conflict_with_terminal_attempt_refuses(self):
+        # attempt.provider_post_id (terminal) disagrees with the immutable
+        # send-return record: data-integrity refusal, never an override.
+        rec = _records(send_return=_send_return(provider_post_id="zpost-123"))
+        rec["attempt"]["provider_post_id"] = "zpost-OTHER"
+        out, client, rpc, _ = _run(records=rec)
+        self.assertEqual(out["decision"], "refused")
+        self.assertTrue(out["reason"].startswith(
+            "authoritative_record_mismatch"))
+        self.assertIn("send-return", out["reason"])
+        self.assertEqual(client.calls, [])
+        self.assertEqual(rpc.calls, [])
+
+    def test_send_return_wrong_tenant_refuses(self):
+        out, client, rpc, _ = _run(
+            send_return=_send_return(tenant_id="gym-OTHER"))
+        self.assertEqual(out["decision"], "refused")
+        self.assertTrue(out["reason"].startswith(
+            "authoritative_record_mismatch"))
+        self.assertEqual(client.calls, [])
+        self.assertEqual(rpc.calls, [])
+
+    def test_send_return_wrong_claim_refuses(self):
+        out, client, rpc, _ = _run(send_return=_send_return(
+            claim_attempt_id="33333333-3333-3333-3333-333333333333"))
+        self.assertEqual(out["decision"], "refused")
+        self.assertTrue(out["reason"].startswith(
+            "authoritative_record_mismatch"))
+        self.assertEqual(client.calls, [])
+        self.assertEqual(rpc.calls, [])
+
+    def test_send_return_wrong_binding_refuses(self):
+        out, client, rpc, _ = _run(send_return=_send_return(
+            binding_id="33333333-3333-3333-3333-333333333333"))
+        self.assertEqual(out["decision"], "refused")
+        self.assertTrue(out["reason"].startswith(
+            "authoritative_record_mismatch"))
+        self.assertEqual(client.calls, [])
+        self.assertEqual(rpc.calls, [])
+
+    def test_send_return_missing_post_id_refuses(self):
+        out, client, rpc, _ = _run(
+            send_return=_send_return(provider_post_id=""))
+        self.assertEqual(out["decision"], "refused")
+        self.assertTrue(out["reason"].startswith(
+            "authoritative_record_mismatch"))
+        self.assertEqual(client.calls, [])
+        self.assertEqual(rpc.calls, [])
+
+    def test_send_return_malformed_shape_refuses(self):
+        rec = _records()
+        rec["send_return"] = ["not", "a", "dict"]
+        out, client, rpc, _ = _run(records=rec)
+        self.assertEqual(out["decision"], "refused")
+        self.assertEqual(out["reason"], "authoritative_read_malformed")
         self.assertEqual(client.calls, [])
         self.assertEqual(rpc.calls, [])
 
 
-class TestExactMatchAttests(unittest.TestCase):
-    def test_exact_match_calls_verifier_rpc(self):
+class TestExactMatchHoldsAtCorrelationSeam(unittest.TestCase):
+    """Every content/media/destination/status check can pass, yet the
+    final delivered activation must still HOLD: the immutable send-return
+    record is SENDER-ASSERTED, not independently provider-authenticated,
+    and no send-return adapter/API correlation contract exists yet. No
+    terminal RPC is ever made from this path."""
+
+    def test_exact_match_verifies_all_checks_then_holds(self):
         out, client, rpc, reader = _run()
-        self.assertEqual(out["decision"], "delivered")
+        self.assertEqual(out["decision"], "hold")
+        self.assertEqual(out["reason"],
+                         "missing_seam_send_return_correlation")
         self.assertEqual(reader.calls, [TOKEN])
         self.assertEqual(client.calls, ["zpost-123"])
-        self.assertEqual(len(rpc.calls), 1)
-        fn, payload = rpc.calls[0]
-        self.assertEqual(fn, "visual_scene_attester_attest_terminate")
-        self.assertEqual(payload["outcome"], "delivered")
-        self.assertEqual(payload["provider_post_id"], "zpost-123")
-        self.assertEqual(payload["verifier_id"], "independent-verifier-1")
-        ev = payload["readback_evidence"]
+        # The terminal boundary is NEVER reached while the recorded post
+        # id is sender-asserted without a correlation contract.
+        self.assertEqual(rpc.calls, [])
+        ev = out["evidence"]
         self.assertEqual(ev["response_sha256"],
                          canonical_response_sha256(_readback()))
         self.assertEqual(ev["response_envelope"], "raw")
-        self.assertEqual(ev["missing_seams"], [])
+        # Every substantive check DID pass before the seam hold.
         self.assertTrue(ev["caption_verified"])
         self.assertEqual(
             ev["media_fingerprints_verified"][0]["sha256"], SHA_A)
         self.assertEqual(ev["platform_post_id"], "ig-media-9")
+        self.assertEqual(ev["outcome"], "delivered")
+        self.assertEqual(len(ev["missing_seams"]), 1)
+        self.assertIn("sender-asserted", ev["missing_seams"][0])
+        self.assertIn("not independently provider-authenticated",
+                      ev["missing_seams"][0])
 
     def test_zernio_object_account_id_is_normalized(self):
         entry = _platform_entry(accountId={"_id": "acct-ig-1"})
         out, _, rpc, _ = _run(post=_readback(platforms=[entry]))
-        self.assertEqual(out["decision"], "delivered")
-        self.assertEqual(len(rpc.calls), 1)
+        self.assertEqual(out["decision"], "hold")
+        self.assertEqual(out["reason"],
+                         "missing_seam_send_return_correlation")
+        self.assertEqual(rpc.calls, [])
 
     def test_gbp_omitted_topic_type_defaults_to_standard(self):
         entry = _platform_entry(platform="googlebusiness",
@@ -345,10 +447,16 @@ class TestExactMatchAttests(unittest.TestCase):
                            expected_provider_account_id="acct-gbp-1")
         out, _, rpc, _ = _run(binding=binding, attempt=attempt,
                               post=_readback(platforms=[entry]))
-        self.assertEqual(out["decision"], "delivered")
-        self.assertEqual(len(rpc.calls), 1)
+        self.assertEqual(out["decision"], "hold")
+        self.assertEqual(out["reason"],
+                         "missing_seam_send_return_correlation")
+        self.assertEqual(rpc.calls, [])
 
     def test_unverified_rpc_result_does_not_claim_attestation(self):
+        # _attest is unreachable through verify() today (the correlation
+        # seam hold precedes it); exercise its terminal-result
+        # verification directly so the future contract path stays honest.
+        ctx = {"claim_attempt_id": TOKEN, "provider_post_id": "zpost-123"}
         for response in (
                 {"state": "ambiguous_hold", "outcome": "delivered",
                  "claim_attempt_id": TOKEN},
@@ -365,33 +473,43 @@ class TestExactMatchAttests(unittest.TestCase):
                 {"state": "finalized", "outcome": "delivered",
                  "claim_attempt_id": TOKEN, "provider_post_id": "zpost-123"}):
             with self.subTest(response=response):
-                client = FakeClient(post=_readback())
                 rpc = FakeRpc(response=response)
-                reader = FakeReader(records=_records())
-                out = _verifier(client, rpc, reader).verify(TOKEN)
+                v = _verifier(FakeClient(), rpc, FakeReader())
+                out = v._attest(ctx, "delivered", {"probe": True})
                 self.assertEqual(out["decision"], "hold")
                 self.assertEqual(out["reason"], "terminal_result_unverified")
                 self.assertEqual(len(rpc.calls), 1)
+        # And a fully consistent terminal result WOULD attest, which is
+        # exactly why the correlation seam hold gates this path.
+        rpc = FakeRpc(response={
+            "state": "finalized", "outcome": "delivered",
+            "claim_attempt_id": TOKEN, "provider_post_id": "zpost-123",
+            "replayed": False})
+        v = _verifier(FakeClient(), rpc, FakeReader())
+        out = v._attest(ctx, "delivered", {"probe": True})
+        self.assertEqual(out["decision"], "delivered")
+        self.assertEqual(out["reason"], "attested")
 
     def test_evidence_is_deterministic_for_replay(self):
         # SQL replay requires byte-identical readback_evidence; no
         # wall-clock fields may leak into it.
-        out1, _, rpc1, _ = _run()
-        out2, _, rpc2, _ = _run()
-        self.assertEqual(rpc1.calls[0][1]["readback_evidence"],
-                         rpc2.calls[0][1]["readback_evidence"])
-        self.assertNotIn("captured_at",
-                         rpc1.calls[0][1]["readback_evidence"])
+        out1, _, _, _ = _run()
+        out2, _, _, _ = _run()
+        self.assertEqual(out1["evidence"], out2["evidence"])
+        self.assertNotIn("captured_at", out1["evidence"])
 
     def test_post_envelope_normalized_and_raw_hash_kept(self):
         envelope = {"post": _readback()}
         out, client, rpc, _ = _run(post=envelope)
-        self.assertEqual(out["decision"], "delivered")
-        ev = rpc.calls[0][1]["readback_evidence"]
+        self.assertEqual(out["decision"], "hold")
+        self.assertEqual(out["reason"],
+                         "missing_seam_send_return_correlation")
+        ev = out["evidence"]
         self.assertEqual(ev["response_envelope"], "post_envelope")
         # The auditable hash covers the EXACT captured envelope payload.
         self.assertEqual(ev["response_sha256"],
                          canonical_response_sha256(envelope))
+        self.assertEqual(rpc.calls, [])
 
     def test_malformed_envelope_refused(self):
         out, _, rpc, _ = _run(post={"post": ["not", "a", "dict"]})
