@@ -139,6 +139,7 @@ class FakeRpc:
         if self.response is not None:
             return copy.deepcopy(self.response)
         return {"claim_attempt_id": payload["claim_attempt_id"],
+                "provider_post_id": payload["provider_post_id"],
                 "state": "finalized", "outcome": payload["outcome"],
                 "replayed": False}
 
@@ -355,7 +356,14 @@ class TestExactMatchAttests(unittest.TestCase):
                  "claim_attempt_id": TOKEN},
                 {"state": "finalized", "outcome": "delivered",
                  "claim_attempt_id": "33333333-3333-3333-3333-333333333333"},
-                {"state": "finalized", "outcome": "delivered"}):
+                {"state": "finalized", "outcome": "delivered",
+                 "claim_attempt_id": TOKEN,
+                 "provider_post_id": "zpost-OTHER", "replayed": False},
+                {"state": "finalized", "outcome": "delivered",
+                 "claim_attempt_id": TOKEN, "provider_post_id": "zpost-123",
+                 "replayed": "false"},
+                {"state": "finalized", "outcome": "delivered",
+                 "claim_attempt_id": TOKEN, "provider_post_id": "zpost-123"}):
             with self.subTest(response=response):
                 client = FakeClient(post=_readback())
                 rpc = FakeRpc(response=response)

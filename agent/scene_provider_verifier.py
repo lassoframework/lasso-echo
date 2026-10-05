@@ -646,7 +646,10 @@ class SceneProviderVerifier:
                 or _s(terminal.get("state")) != "finalized"
                 or _s(terminal.get("outcome")) != outcome
                 or _s(terminal.get("claim_attempt_id"))
-                != ctx["claim_attempt_id"]):
+                != ctx["claim_attempt_id"]
+                or _s(terminal.get("provider_post_id"))
+                != _s(payload.get("provider_post_id"))
+                or not isinstance(terminal.get("replayed"), bool)):
             return _result("hold", "terminal_result_unverified",
                            evidence=evidence, terminal=terminal)
         return _result(outcome, "attested", evidence=evidence,
