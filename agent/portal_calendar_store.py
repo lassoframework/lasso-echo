@@ -3624,11 +3624,15 @@ class SupabaseCalendarStore:
     _REPEAT_HOLD_PAGE_SIZE = 500
     _REPEAT_HOLD_MAX_PAGES = 100        # 50k rows: a hard tripwire, far past any real book
 
-    def rows_in_range_complete(self, account_key, start_iso, end_iso):
+    def rows_in_range_complete(self, account_key, start_iso, end_iso, *,
+                               all_statuses=False):
         """Complete tenant-scoped read of active rows in a date range.
 
         Unlike rows_in_range, this read does not cap at 1000 rows. Id-cursor
-        pagination covers active statuses and the requested date range. Every page is
+        pagination covers active variants and the requested date range. By
+        default it includes forward-book statuses only; all_statuses=True is
+        for additive LASSO refill, where draft and queued rows own slots too.
+        Every page is
         validated; ANY error, malformed row, out-of-scope row, duplicate or
         non-ascending id, or a runaway page count fails the ENTIRE read --
         never a partial result."""
@@ -3638,13 +3642,14 @@ class SupabaseCalendarStore:
         for _ in range(self._REPEAT_HOLD_MAX_PAGES):
             params = {
                 "gym_id": f"eq.{account_key}",
-                "status": "in.(pending,approved,publishing,published,coach_review)",
                 "variant_status": "eq.active",
                 "post_date": f"gte.{start_iso}",
                 "and": f"(post_date.lte.{end_iso})",
                 "order": "id",
                 "limit": str(self._REPEAT_HOLD_PAGE_SIZE),
             }
+            if not all_statuses:
+                params["status"] = "in.(pending,approved,publishing,published,coach_review)"
             if last_id is not None:
                 params["id"] = f"gt.{last_id}"
             r = self._client().get(

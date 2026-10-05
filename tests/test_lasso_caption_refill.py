@@ -34,7 +34,8 @@ def test_lasso_refill_preserves_prepared_pair_and_fills_missing_slot(monkeypatch
         def __init__(self):
             self.inserted = []
             self.deleted = 0
-        def rows_in_range_complete(self, gym, first, last):
+        def rows_in_range_complete(self, gym, first, last, *, all_statuses=False):
+            assert all_statuses is True
             return prepared
         def insert_rows(self, gym, rows):
             self.inserted.extend(rows)
@@ -53,6 +54,54 @@ def test_lasso_refill_preserves_prepared_pair_and_fills_missing_slot(monkeypatch
     assert len(store.inserted) == 3
     assert {r["slot_index"] for r in store.inserted} == {1}
     assert store.deleted == 0
+
+
+def test_additive_refill_treats_draft_and_queued_as_occupied(monkeypatch):
+    day = "2026-10-08"
+    existing = [_row(day, 0, "instagram"), _row(day, 1, "instagram")]
+    existing[0]["status"] = "draft"
+    existing[1]["status"] = "queued"
+    proposed = [{k: v for k, v in _row(day, slot, "instagram",
+                                     caption=f"Approved source copy {slot}").items()
+                 if k != "id"} for slot in range(3)]
+    class Store:
+        def __init__(self):
+            self.inserted = []
+        def rows_in_range_complete(self, gym, first, last, *, all_statuses=False):
+            assert all_statuses is True
+            return existing
+        def insert_rows(self, gym, rows):
+            self.inserted.extend(rows)
+            return rows
+        def delete_month(self, *a, **k):
+            raise AssertionError("additive refill cannot delete")
+    store = Store()
+    monkeypatch.setattr(real_month_planner, "to_calendar_rows", lambda drafts, key: proposed)
+    monkeypatch.setattr("agent.portal_calendar_store.preserve_and_prune",
+                        lambda store, key, months, rows: (rows, 0))
+    monkeypatch.setattr("agent.cadence.resolve_posts_per_day", lambda *a, **k: 3)
+    out = real_month_planner.apply_month_plan(
+        "lasso", [object()], store, span_months=["2026-10"], preserve_existing=True)
+    assert out["ok"] and out["deleted"] == 0
+    assert [r["slot_index"] for r in store.inserted] == [2]
+
+
+def test_complete_calendar_read_includes_all_active_statuses_when_requested():
+    calls = []
+    class HTTP:
+        def get(self, url, *, params, headers, timeout):
+            calls.append(dict(params))
+            assert "status" not in params
+            return SimpleNamespace(status_code=200, json=lambda: [
+                _row("2026-10-08", 0, "instagram", rid="a") | {"status": "draft"},
+                _row("2026-10-08", 1, "instagram", rid="b") | {"status": "queued"},
+            ])
+    store = SupabaseCalendarStore(url="https://example.test", service_key="test", http=HTTP())
+    rows = store.rows_in_range_complete("lasso", "2026-10-01", "2026-10-31",
+                                        all_statuses=True)
+    assert [r["status"] for r in rows] == ["draft", "queued"]
+    assert calls[0]["variant_status"] == "eq.active"
+    assert calls[0]["limit"] == "500"
 
 
 def test_lasso_refill_fails_before_write_when_complete_read_missing(monkeypatch):

@@ -1691,7 +1691,8 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None,
                 year, number = int(month[:4]), int(month[5:7])
                 existing.extend(complete(
                     account_key, f"{month}-01",
-                    f"{month}-{monthrange(year, number)[1]:02d}"))
+                    f"{month}-{monthrange(year, number)[1]:02d}",
+                    all_statuses=True))
             if not all(isinstance(r, dict) and r.get("gym_id") == account_key
                        for r in existing):
                 raise RuntimeError("LASSO calendar read out of scope")
