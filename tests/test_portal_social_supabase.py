@@ -552,6 +552,17 @@ def test_edit_records_edit_diff_for_learning(monkeypatch, tmp_path):
     assert "Youth, parents" in diffs[-1]["after"]
 
 
+def test_edit_with_semicolon_inside_url_is_rejected_without_write():
+    from agent import portal_social as ps
+    store = _FakeStore([_row("id-url", gym_id="eng", status="pending")])
+    status, body = ps._handle_edit_supabase(
+        "eng", "id-url", "U_owner",
+        "Visit https://example.com/a;b for details.", None, store)
+    assert status == 422
+    assert "semicolon inside a URL" in body["error"]
+    assert store.caption_patches == []
+
+
 def test_edit_learning_keyed_to_generation_account(monkeypatch, tmp_path):
     # recorded under {base}_ig — the key drafter._brain_guidance reads — not the base
     monkeypatch.setenv("AGENT_TENANT_BRAIN_ENABLED", "true")

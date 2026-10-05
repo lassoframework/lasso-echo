@@ -309,6 +309,17 @@ def plan_for(day_key, path=None, *, pillar=None):
         else:
             plan_category = "doctrine"
 
+    from .copy_gate import format_caption
+    try:
+        raw_caption = format_caption(raw_caption)
+        raw_summary = format_caption(raw_summary)
+    except ValueError:
+        # This is approved source copy. Changing a semicolon inside a URL could
+        # change its destination, so use the planner's existing explicit block.
+        return {"blocked": True, "reason":
+                "Approved source copy has a semicolon inside a URL. "
+                "Edit the source before drafting."}
+
     # Fragments: approved copy lines only + the citation anchor when a real
     # doctrine angle was found (citation is non-empty). The lasso_now fallback
     # is NOT added to fragments (it is not an approved copy line; it lives in

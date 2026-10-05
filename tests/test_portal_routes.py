@@ -588,3 +588,74 @@ def test_deny_twice_does_not_double_rollback(monkeypatch):
     # stamp must be untouched (never double-restored, never cleared).
     assert media_store.assets["a1"]["used_count"] == 1
     assert media_store.assets["a1"]["last_used_at"] is not None
+
+
+# ==========================================================================
+# Coach edit/requeue with a semicolon glued inside a URL (ultrareview
+# 2026-10-05): copy_gate.format_caption raises ValueError rather than corrupt
+# the link. The route must answer a clean 422 — never crash, never write.
+# ==========================================================================
+
+class _EditCalendarStore:
+    """Stands in for SupabaseCalendarStore for the edit/requeue 422 tests."""
+
+    def __init__(self, rows):
+        self._rows = {r["id"]: dict(r) for r in rows}
+        self.caption_patches = []
+        self.requeues = []
+
+    def get_row(self, account_key, row_id):
+        r = self._rows.get(row_id)
+        if r is None or r.get("gym_id") != account_key:
+            return None
+        return dict(r)
+
+    def patch_caption(self, account_key, row_id, new_caption):
+        self.caption_patches.append((row_id, new_caption))
+        r = self._rows.get(row_id)
+        if r is None or r.get("gym_id") != account_key:
+            return None
+        r["caption"] = new_caption
+        r["status"] = "pending"
+        return dict(r)
+
+    def requeue(self, account_key, row_id, *, new_status, new_caption=None):
+        self.requeues.append((row_id, new_status, new_caption))
+        r = self._rows.get(row_id)
+        if r is None or r.get("gym_id") != account_key:
+            return None
+        r["status"] = new_status
+        if new_caption is not None:
+            r["caption"] = new_caption
+        return dict(r)
+
+
+BAD_URL_NOTE = "Come train with us. Visit https://example.com/a;b for details."
+
+
+def test_edit_note_with_semicolon_inside_url_is_a_clean_422(monkeypatch):
+    _deny_env(monkeypatch)
+    store = _EditCalendarStore([_row(status="pending")])
+    _patch_deny_calendar_store(monkeypatch, store)
+
+    status, body = portal_routes.handle_portal_action(
+        "edit", "eng", "r1", "actor", note=BAD_URL_NOTE)
+
+    assert status == 422
+    assert "semicolon" in body["error"]
+    assert store.caption_patches == [], "no write on a refused edit"
+    assert store._rows["r1"]["caption"] == "text"          # untouched
+
+
+def test_requeue_note_with_semicolon_inside_url_is_a_clean_422(monkeypatch):
+    _deny_env(monkeypatch)
+    store = _EditCalendarStore([_row(status="failed")])
+    _patch_deny_calendar_store(monkeypatch, store)
+
+    status, body = portal_routes.handle_portal_action(
+        "requeue", "eng", "r1", "actor", note=BAD_URL_NOTE)
+
+    assert status == 422
+    assert "semicolon" in body["error"]
+    assert store.requeues == [], "no write on a refused requeue"
+    assert store._rows["r1"]["status"] == "failed"         # untouched

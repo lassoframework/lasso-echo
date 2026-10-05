@@ -159,11 +159,11 @@ def test_maybe_format_story_uses_story_caption_override(monkeypatch):
 
     class _Feed:
         creative_path = "photo.jpg"
-        caption = "the FEED caption (should NOT be burned)"
+        caption = "The FEED caption. It should not be burned."
 
     class _Story:
         creative_path = "photo.jpg"
-        caption = "the CLIENT edited story caption"
+        caption = "The CLIENT edited this story. Meet the coach; book a class."
         creative_public_url = ""
         thumbnail_url = ""
 
@@ -177,7 +177,19 @@ def test_maybe_format_story_uses_story_caption_override(monkeypatch):
         key = "eng_ig"
         display_name = "CrossFit ENG"
 
-    kept = cmr._maybe_format_story(_Acct2(), _Story(), _Feed(), "lib", lambda m: None)
+    story = _Story()
+    kept = cmr._maybe_format_story(_Acct2(), story, _Feed(), "lib", lambda m: None)
     assert kept is True
     # the CLIENT's edited caption is what got burned, not the feed caption
-    assert seen["cap"] == "the CLIENT edited story caption"
+    expected = "The CLIENT edited this story.\n\nMeet the coach, book a class."
+    assert seen["cap"] == expected
+    assert story.caption == expected
+
+    seen.clear()
+    unedited_story = _Story()
+    unedited_story.caption = ""
+    assert cmr._maybe_format_story(
+        _Acct2(), unedited_story, _Feed(), "lib", lambda m: None) is True
+    fallback = "The FEED caption.\n\nIt should not be burned."
+    assert seen["cap"] == fallback
+    assert unedited_story.caption == fallback
