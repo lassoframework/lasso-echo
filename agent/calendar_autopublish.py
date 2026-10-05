@@ -350,7 +350,7 @@ def _paired_lasso_feed_published(story, store):
     return (len(matches) == 1
             and matches[0].get("status") == "published"
             and bool(matches[0].get("published_at"))
-            and bool(matches[0].get("late_post_id")))
+            and matches[0].get("late_post_id") is not None)
 
 
 def assign_slots(rows):
@@ -1955,7 +1955,7 @@ def run_slot_ticks(run_date, *, gym_id="lasso", store=None, publisher=None,
 
     fired = []
     slots = list(SPRINT_SLOT_TIMES or [])
-    if str(gym_id or "").strip().lower() == "lasso" and config.lasso_three_feed_enabled():
+    if _lasso_three_feed_enabled(gym_id, run_date):
         # The direct-publisher fallback also needs ticks at the paired times.
         # Its old final 18:30 catch-all cannot send the 18:45 Story early.
         slots = sorted(set(slots) | {

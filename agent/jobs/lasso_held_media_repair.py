@@ -1,4 +1,4 @@
-"""Bounded autonomous visual repair for LASSO's held Instagram feed runway.
+"""Bounded autonomous visual repair for LASSO's held feed runway.
 
 The caption is the generation source. A reviewed artifact is required before an
 exact-row compare-and-swap can replace the repeated image and clear its hold.
@@ -18,6 +18,7 @@ from agent.portal_calendar_store import SupabaseCalendarStore
 
 HOLD_REASON = "cross_date_media_repeat_needs_new_visual"
 GYM = "lasso"
+ACCOUNTS = {"instagram": "lasso_ig", "facebook": "lasso_fb"}
 ACCOUNT = "lasso_ig"
 MAX_PER_DAY = 3
 HORIZON_DAYS = 1
@@ -40,13 +41,18 @@ def _local_day(now):
     return instant.astimezone(ZoneInfo(config.POSTING_TIMEZONE)).date()
 
 
-def _eligible(row, first, last):
+def _row_account_key(row):
+    platform = str(row.get("account") or "").lower()
+    return ACCOUNTS.get("instagram" if platform == "ig" else platform)
+
+
+def _eligible(row, first, last, account_key=ACCOUNT):
     return (isinstance(row, dict)
             and all(key in row for key in _CAS_COLUMNS)
             and row["gym_id"] == GYM
             and row["status"] == "pending"
             and row["variant_status"] == "active"
-            and str(row["account"] or "").lower() in ("instagram", "ig")
+            and _row_account_key(row) == account_key
             and str(row["format"] or "").lower() == "feed"
             and first <= str(row["post_date"] or "")[:10] <= last
             and row["media_not_ready_reason"] == HOLD_REASON
@@ -68,7 +74,7 @@ def _eq(value):
     return f"eq.{value}"
 
 
-def _reviewed_existing_artifact(store, source_id, source_hash):
+def _reviewed_existing_artifact(store, source_id, source_hash, account_key=ACCOUNT):
     """Reuse a persisted reviewed image before any new paid generation.
 
     A failed or incomplete lookup is an error, not a cache miss: generating in
@@ -76,7 +82,7 @@ def _reviewed_existing_artifact(store, source_id, source_hash):
     """
     response = store._client().get(
         store._rest("echo_infographic_artifacts"),
-        params={"tenant": f"eq.{ACCOUNT}",
+        params={"tenant": f"eq.{account_key}",
                 "source_identity->>source_id": _eq(source_id),
                 "source_identity->>source_hash": _eq(source_hash),
                 "select": "image_url,evidence,source_identity",
@@ -105,10 +111,10 @@ def _reviewed_existing_artifact(store, source_id, source_hash):
     return None
 
 
-def _replace_exact(store, current, new_url):
+def _replace_exact(store, current, new_url, account_key=ACCOUNT):
     """Clear one hold only if every generation-relevant row field still matches."""
     if not _eligible(current, str(current["post_date"])[:10],
-                     str(current["post_date"])[:10]):
+                     str(current["post_date"])[:10], account_key):
         return None
     if not isinstance(new_url, str) or not new_url.startswith("https://"):
         return None
@@ -141,12 +147,13 @@ def _replace_exact(store, current, new_url):
 
 
 def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
-        host_fn=None, max_per_day=MAX_PER_DAY):
-    """Repair at most three held feed visuals per local date, today and tomorrow."""
+        host_fn=None, max_per_day=MAX_PER_DAY, account_key=ACCOUNT):
+    """Repair at most three held feed visuals per date in this run."""
     summary = {"ok": False, "attempted": 0, "generated": 0, "reused": 0,
                "repaired": 0, "skipped": 0, "errors": 0}
-    if not (config.lasso_three_feed_enabled()
-            and config.lasso_infographic_quality_enabled(ACCOUNT)
+    if not (account_key in ACCOUNTS.values()
+            and config.lasso_three_feed_enabled()
+            and config.lasso_infographic_quality_enabled(account_key)
             and variant_regen.enabled()):
         summary["reason"] = "lasso reviewed regeneration not armed"
         return summary
@@ -169,7 +176,7 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         summary["reason"] = "held calendar read malformed"
         return summary
     summary["ok"] = True
-    rows = sorted((row for row in rows if _eligible(row, first, last)),
+    rows = sorted((row for row in rows if _eligible(row, first, last, account_key)),
                   key=lambda row: (row["post_date"], row.get("slot_index") or 0,
                                    str(row["id"])))
     per_day = {first: 0, last: 0}
@@ -186,7 +193,7 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         owner = str(uuid.uuid4())
         claimed = False
         try:
-            claimed = artifact_store.claim(ACCOUNT, cache_key, owner)
+            claimed = artifact_store.claim(account_key, cache_key, owner)
             if not claimed:
                 summary["skipped"] += 1
                 continue
@@ -196,12 +203,12 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
             if not _same_row(row, fresh):
                 summary["skipped"] += 1
                 continue
-            url = _reviewed_existing_artifact(store, source_id, source_hash)
+            url = _reviewed_existing_artifact(store, source_id, source_hash, account_key)
             if url:
                 summary["reused"] += 1
             else:
                 result = variant_regen.generate_variant_image(
-                    row, ACCOUNT, generate_fn=generate_fn, host_fn=host_fn)
+                    row, account_key, generate_fn=generate_fn, host_fn=host_fn)
                 if not result.get("ok"):
                     summary["errors"] += 1
                     continue
@@ -211,7 +218,7 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
             if not _same_row(row, fresh):
                 summary["skipped"] += 1
                 continue
-            if _replace_exact(store, fresh, url):
+            if _replace_exact(store, fresh, url, account_key):
                 summary["repaired"] += 1
             else:
                 summary["skipped"] += 1
@@ -220,7 +227,7 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         finally:
             if claimed:
                 try:
-                    artifact_store.release(ACCOUNT, cache_key, owner)
+                    artifact_store.release(account_key, cache_key, owner)
                 except Exception:
                     summary["errors"] += 1
     return summary

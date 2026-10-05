@@ -63,7 +63,7 @@ begin
   end if;
   v_day := v_feed.post_date;
   perform pg_advisory_xact_lock(hashtextextended('lasso|instagram|' || v_day::text, 0));
-  if (p_caption_hash is null and v_day not between date '2026-10-01' and date '2026-11-08')
+  if (p_caption_hash is null and v_day not between date '2026-09-23' and date '2026-11-08')
      or (p_caption_hash is not null and v_day not between date '2026-09-23' and date '2026-11-08')
      or v_feed.status not in ('pending','approved','publishing','published')
      or v_feed.caption is distinct from p_feed_caption

@@ -857,6 +857,27 @@ def test_lasso_paired_story_requires_delivered_logical_feed(armed, monkeypatch):
     assert store.rows["paired-story"]["status"] == "published"
 
 
+def test_lasso_story_accepts_persisted_zernio_dedup_receipt(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    feed, story = _paired_rows(feed_media_id="")
+    store = _PairedFeedStore([feed, story])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="S"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                              now=_edt("18:45"), catch_all=True)
+    assert summary["published"] == ["paired-story"]
+
+
+def test_summit_only_direct_ticks_include_third_story(armed, monkeypatch):
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: False)
+    monkeypatch.setattr(config, "lasso_summit_daily_enabled", lambda day: True)
+    monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
+    monkeypatch.setattr(cap, "publish_due", lambda *args, **kwargs: {"ok": True})
+    kv = _FakeKV()
+    cap.run_slot_ticks(RUN_DATE, now=_edt("19:00"), kv=kv)
+    assert kv.get(cap._slot_fire_key(RUN_DATE, "12:15")) == "done"
+    assert kv.get(cap._slot_fire_key(RUN_DATE, "18:45")) == "done"
+
+
 def test_lasso_story_holds_until_logical_feed_is_actually_live(armed, monkeypatch):
     monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
     for status, media_id in (("pending", None), ("publishing", None),

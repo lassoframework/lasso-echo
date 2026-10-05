@@ -997,14 +997,20 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     if config.lasso_three_feed_enabled():
         try:
             from .jobs import lasso_held_media_repair
-            repair = lasso_held_media_repair.run(now=scheduled_for)
-            if repair.get("ok"):
-                print("[lasso-held-media] "
-                      f"attempted={repair['attempted']} generated={repair['generated']} "
-                      f"reused={repair['reused']} repaired={repair['repaired']} "
-                      f"skipped={repair['skipped']} errors={repair['errors']}")
-            else:
-                print(f"[lasso-held-media] held: {repair.get('reason', 'unavailable')}")
+            for account_key in ("lasso_ig", "lasso_fb"):
+                try:
+                    repair = lasso_held_media_repair.run(now=scheduled_for,
+                                                         account_key=account_key)
+                    if repair.get("ok"):
+                        print(f"[lasso-held-media] {account_key} "
+                              f"attempted={repair['attempted']} generated={repair['generated']} "
+                              f"reused={repair['reused']} repaired={repair['repaired']} "
+                              f"skipped={repair['skipped']} errors={repair['errors']}")
+                    else:
+                        print(f"[lasso-held-media] {account_key} held: "
+                              f"{repair.get('reason', 'unavailable')}")
+                except Exception as exc:
+                    print(f"[lasso-held-media] {account_key} failed: {type(exc).__name__}")
         except Exception as exc:
             print(f"[lasso-held-media] failed: {type(exc).__name__}")
 

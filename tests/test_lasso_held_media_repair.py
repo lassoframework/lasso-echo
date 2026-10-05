@@ -126,6 +126,23 @@ def test_repair_is_lasso_ig_feed_only_and_capped_per_day(monkeypatch):
     assert store.rows["client"]["media_not_ready_reason"] == repair.HOLD_REASON
 
 
+def test_facebook_held_feed_repairs_in_its_own_tenant(monkeypatch):
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair.config, "lasso_infographic_quality_enabled",
+                        lambda key: key in ("lasso_ig", "lasso_fb"))
+    store, artifacts = _Store([_row("fb", account="facebook"), _row("ig")]), _Artifacts()
+    generated = []
+    def fake_generate(row, account, **kwargs):
+        generated.append((row["id"], account))
+        return {"ok": True, "image_url": f"https://new.example/{row['id']}.png"}
+    monkeypatch.setattr(variant_regen, "generate_variant_image", fake_generate)
+    out = repair.run(store=store, artifact_store=artifacts, account_key="lasso_fb")
+    assert out["repaired"] == 1
+    assert generated == [("fb", "lasso_fb")]
+    assert artifacts.claims[0][0] == artifacts.releases[0][0] == "lasso_fb"
+    assert store.rows["ig"]["media_not_ready_reason"] == repair.HOLD_REASON
+
+
 def test_changed_row_after_generation_is_not_swapped_and_cached_artifact_reuses(
         monkeypatch):
     _armed(monkeypatch)
@@ -193,4 +210,7 @@ def test_daily_runner_repairs_ahead_of_drafting_even_if_voice_is_missing(monkeyp
 
     out = runner.run_daily(poster=Poster(), scheduled_for="2026-10-05T12:00:00+00:00")
     assert out["status"] == "no_voice"
-    assert calls == [{"now": "2026-10-05T12:00:00+00:00"}]
+    assert calls == [
+        {"now": "2026-10-05T12:00:00+00:00", "account_key": "lasso_ig"},
+        {"now": "2026-10-05T12:00:00+00:00", "account_key": "lasso_fb"},
+    ]
