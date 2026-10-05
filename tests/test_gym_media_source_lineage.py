@@ -102,7 +102,7 @@ def test_cross_gym_asset_never_stamps_or_stages(monkeypatch, tmp_path):
                          content_hash="cccccccccccccccccccccccccccccccc")
     monkeypatch.setattr("agent.gym_media_selector.pick_media",
                         lambda gym_id, kind_preference=None, store=None, now=None,
-                        exclude_ids=(): foreign if "x" not in exclude_ids else None)
+                        exclude_ids=(), post_date=None: foreign if "x" not in exclude_ids else None)
     draft = builder.build_gym_media_draft(
         _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
         store=FakeMediaStore(), drive=FakeDrive(blobs={"x": b"jpg"}),
