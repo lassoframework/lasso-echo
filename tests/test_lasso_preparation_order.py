@@ -189,3 +189,67 @@ def test_preparation_gate_flag_disabled_runs_nothing(monkeypatch, tmp_path):
 
     assert [e for e in events if e[0] == "held_media_repair"] == []
     assert [e for e in events if e[0] == "paired_stories"] == []
+
+
+def test_no_voice_draw_prepares_exactly_once_when_flag_on(monkeypatch, tmp_path):
+    """(c) A missing voice doc blocks DRAFTING, not the autonomous preparation
+    lane: held-media repair + paired-Story preparation run exactly once BEFORE
+    the no_voice early return, and nothing drafts or publishes."""
+    db_path = str(tmp_path / "echo.db")
+    monkeypatch.setenv("AGENT_DB_PATH", db_path)
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
+
+    events = []
+    calendar_state = {"feeds": {
+        "instagram": {"caption": "draft caption ig"},
+        "facebook": {"caption": "draft caption fb"},
+    }}
+    _wire_preparation_spies(monkeypatch, events, calendar_state)
+    _wire_publish_due_spy(monkeypatch, events)
+
+    out = run_daily(poster=_FakePoster(),
+                    voice_path=str(tmp_path / "missing_voice.md"),
+                    library_path=str(tmp_path),
+                    scheduled_for="2026-10-05T14:30:00+00:00",
+                    accounts=[_lasso_account()], store=PendingStore(path=db_path))
+    assert out == {"status": "no_voice", "drafts": []}
+
+    paired = [e for e in events if e[0] == "paired_stories"]
+    held = [e for e in events if e[0] == "held_media_repair"]
+    assert {e[1] for e in paired} == {"instagram", "facebook"}
+    assert len(paired) == 2, f"pairing ran {len(paired)} times, expected once per account"
+    assert {e[1] for e in held} == {"lasso_ig", "lasso_fb"}
+    assert len(held) == 2
+    # Held-feed repair strictly before Story preparation.
+    kinds = [e[0] for e in events]
+    assert kinds.index("held_media_repair") < kinds.index("paired_stories")
+    # No drafting happened (no_voice) and the publish block never ran.
+    assert "publish_due" not in kinds
+
+
+def test_no_voice_draw_runs_no_preparation_when_flag_off(monkeypatch, tmp_path):
+    """(d) The no_voice preparation call is an intentional fail-closed gate:
+    with AGENT_LASSO_3X_ENABLED off, nothing in the preparation lane runs."""
+    db_path = str(tmp_path / "echo.db")
+    monkeypatch.setenv("AGENT_DB_PATH", db_path)
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.delenv("AGENT_LASSO_3X_ENABLED", raising=False)
+    monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
+
+    events = []
+    calendar_state = {"feeds": {
+        "instagram": {"caption": "draft caption ig"},
+        "facebook": {"caption": "draft caption fb"},
+    }}
+    _wire_preparation_spies(monkeypatch, events, calendar_state)
+    _wire_publish_due_spy(monkeypatch, events)
+
+    out = run_daily(poster=_FakePoster(),
+                    voice_path=str(tmp_path / "missing_voice.md"),
+                    library_path=str(tmp_path),
+                    scheduled_for="2026-10-05T14:30:00+00:00",
+                    accounts=[_lasso_account()], store=PendingStore(path=db_path))
+    assert out == {"status": "no_voice", "drafts": []}
+    assert events == []

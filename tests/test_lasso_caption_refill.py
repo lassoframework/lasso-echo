@@ -683,3 +683,57 @@ def test_flag_on_lasso_repair_enforces_strict_ledger(monkeypatch):
                                           "doctrine", lambda *_: None)
     assert stamped == []
     assert row["caption"] == "Approved source copy"
+
+
+# ---------------------------------------------------------------------------
+# PR29705 review: the caption visual hold is an autonomous-lane behavior. Flag
+# OFF keeps the old mechanical CAS with NO new hold; flag ON keeps the hold
+# and every source guard. Same gate on the LASSO B2B regen context.
+# ---------------------------------------------------------------------------
+
+def test_caption_visual_hold_gated_on_autonomous_flag(monkeypatch):
+    current = _row("2026-10-08", 0, "instagram", rid="gate1")
+    calls = []
+
+    class HTTP:
+        def patch(self, url, *, params, headers, json, timeout):
+            calls.append((params, json))
+            return SimpleNamespace(status_code=200,
+                                   json=lambda: [dict(current, **json)])
+
+    store = SupabaseCalendarStore(url="https://example.test", service_key="test",
+                                  http=HTTP())
+    # Flag OFF (the autouse fixture arms it; override here): the mechanical
+    # caption CAS still lands, but NO visual hold is set.
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: False)
+    after = store.patch_pending_plan("lasso", "gate1", caption="Fresh source copy",
+                                     expected_row=dict(current))
+    assert after is not None
+    assert calls[0][1] == {"caption": "Fresh source copy", "status": "pending"}
+    assert "media_not_ready_reason" not in calls[0][1]
+    assert after["media_not_ready_reason"] is None
+    # Flag ON: the hold returns, in the same PATCH as the caption.
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: True)
+    after = store.patch_pending_plan("lasso", "gate1", caption="Fresher copy",
+                                     expected_row=dict(current))
+    assert after["media_not_ready_reason"] == "caption_changed_needs_new_visual"
+    assert calls[1][1]["media_not_ready_reason"] == \
+        "caption_changed_needs_new_visual"
+
+
+def test_lasso_b2b_caption_regen_gated_on_autonomous_flag(monkeypatch):
+    sentinel_calls = []
+
+    def _sentinel_regen(log):
+        sentinel_calls.append(1)
+        return lambda row, avoid, cat="": None
+
+    monkeypatch.setattr(grade_fix, "_lasso_caption_regen", _sentinel_regen)
+    # Flag OFF: the existing B2B behavior (None); the generator is untouched.
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: False)
+    assert grade_fix._default_caption_regen("lasso", "B2B", lambda *_: None) is None
+    assert sentinel_calls == []
+    # Flag ON: the source-guarded regen context is built, as before.
+    monkeypatch.setattr(config, "lasso_three_feed_enabled", lambda: True)
+    assert grade_fix._default_caption_regen("lasso", "B2B", lambda *_: None) is not None
+    assert sentinel_calls == [1]

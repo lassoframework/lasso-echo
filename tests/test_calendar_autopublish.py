@@ -2825,3 +2825,59 @@ def test_story_row_with_semicolon_is_held_until_media_is_corrected(armed, monkey
     assert pub.calls == []
     assert store.preserve_patches == []
     assert store.rows["story1"]["caption"] == story_caption
+
+
+# ---- paired Story source-proof recheck after caption cleanup (PR29705) ------
+# The paired feed gate proves the Story source over the caption as read, then
+# the meta-strip / semicolon auto-heal can legitimately change that caption.
+# The proof must be re-measured on the FINAL cleaned row before any claim or
+# network call; an unchanged caption must not pay a second RPC.
+
+def test_lasso_feed_rechecks_paired_proof_after_caption_cleanup(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
+    row = _row("recheck-feed", post_date="2026-10-05",
+               caption="Move well; build strength with us today.")
+    row["slot_index"] = 0
+    store = _PreservingStore([row])
+    proofs = []
+    # First proof (pre-cleanup) passes; the recheck on the cleaned caption fails.
+    monkeypatch.setattr(store, "lasso_paired_story_ready_for_feed",
+                        lambda _: proofs.append(1) or len(proofs) == 1,
+                        raising=False)
+    failures = []
+    monkeypatch.setattr(cap, "_note_repeat_failure",
+                        lambda rid, gym, exc: failures.append((rid, gym, str(exc))))
+    pub = _FakePublisher()
+
+    result = cap.publish_due("2026-10-05", store=store, publisher=pub,
+                             now="2026-10-05T23:59:00-04:00", catch_all=True)
+
+    assert result["published"] == []
+    assert result["waiting"] == ["recheck-feed"]
+    assert store.publishing_calls == []          # never claimed
+    assert pub.calls == []                       # no network call
+    assert len(proofs) == 2, "the proof must be re-measured on the cleaned caption"
+    assert failures == [("recheck-feed", "lasso",
+                         "paired Story source proof invalid after caption "
+                         "cleanup; feed remains held")]
+    assert store.rows["recheck-feed"]["status"] == "pending"
+
+
+def test_lasso_feed_with_unchanged_caption_pays_no_second_proof(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
+    row = _row("clean-feed", post_date="2026-10-05",
+               caption="Move well and build strength with us today.")
+    row["slot_index"] = 0
+    store = _FakeStore([row])
+    proofs = []
+    monkeypatch.setattr(store, "lasso_paired_story_ready_for_feed",
+                        lambda _: proofs.append(1) or True, raising=False)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    result = cap.publish_due("2026-10-05", store=store, publisher=pub,
+                             now="2026-10-05T23:59:00-04:00", catch_all=True)
+
+    assert result["published"] == ["clean-feed"]
+    assert len(proofs) == 1, "an unchanged caption must not pay a second proof RPC"

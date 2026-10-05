@@ -1460,6 +1460,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 "paired Story source proof unavailable; feed remains held"))
             waiting.append(row_id)
             continue
+        # The Story artifact binds a source proof over THIS caption. The
+        # cleanup gates below (_strip_or_hold_meta / _format_caption_at_publish)
+        # can legitimately change it, so the proof is re-measured against the
+        # final cleaned row before any claim/network call — but ONLY when the
+        # caption actually moved, so a clean row pays no extra RPC.
+        paired_proven_caption = row.get("caption") if paired_lasso_feed else None
 
         account = _account_for(row, gym_id)
         if account is None:
@@ -1506,6 +1512,21 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             _alert_caption_format_held(row_id, gym_id)
             continue
         row = formatted
+
+        # SOURCE-INTEGRITY RECHECK (PR29705 review). Cleanup above may have
+        # changed the caption AFTER the paired-Story source proof was measured.
+        # A proof taken over the old text says nothing about the final send, so
+        # re-prove against the cleaned row BEFORE the claim; a failed recheck
+        # leaves the row waiting and unclaimed via the existing repeated-
+        # failure note. Unchanged caption: no second RPC.
+        if (paired_lasso_feed
+                and str(row.get("caption") or "") != str(paired_proven_caption or "")
+                and not _paired_lasso_story_prepared(row, store)):
+            _note_repeat_failure(row_id, gym_id, RuntimeError(
+                "paired Story source proof invalid after caption cleanup; "
+                "feed remains held"))
+            waiting.append(row_id)
+            continue
 
         # STORY CAPTION MUST BE ON THE MEDIA (Dale, 2026-08-17): a story publishes with
         # an EMPTY body, so its caption lives only on the rendered media. When a client

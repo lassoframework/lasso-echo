@@ -1940,7 +1940,11 @@ def _default_caption_regen(gym_id, profile, log):
     Returns None when the context cannot be assembled (other B2B or a missing
     account/voice): the caller then leaves captions alone and the defect is
     reported through the deduped held alert, never fixed dishonestly."""
-    if profile == "B2B" and str(gym_id).strip().lower() == "lasso":
+    if (profile == "B2B" and str(gym_id).strip().lower() == "lasso"
+            and config.lasso_three_feed_enabled()):
+        # PR29705 review: the autonomous LASSO source-matched regen belongs to
+        # the armed autonomous lane. Flag OFF keeps the existing B2B behavior
+        # (None; the generator is never touched), flag ON is unchanged.
         return _lasso_caption_regen(log)
     if profile == "B2B":
         return None

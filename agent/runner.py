@@ -1067,6 +1067,14 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     voice = load_voice(voice_path or config.VOICE_DOC_PATH)
 
     if voice is None:
+        # A missing voice blocks DRAFTING, not the autonomous LASSO preparation
+        # lane: held feeds and paired Stories for already-staged rows still
+        # prepare tonight (the job cannot publish). Gated on the same switch as
+        # the end-of-draw call — flag OFF stays the intentional fail-closed
+        # no-op. The normal branch keeps its single call AFTER every calendar
+        # mutation (post-grade ordering), exactly once per draw either way.
+        if config.lasso_three_feed_enabled():
+            _lasso_held_media_and_story_preparation(scheduled_for)
         poster.post_notice(":warning: Brand voice doc missing or empty. "
                            "Drafting nothing until it's in place.")
         return {"status": "no_voice", "drafts": []}

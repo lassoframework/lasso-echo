@@ -3639,6 +3639,11 @@ class SupabaseCalendarStore:
                 fields[key] = value
         caption_visual_hold = (
             account_key == "lasso" and expected_row is not None
+            # PR29705 review: the caption visual hold belongs to the autonomous
+            # LASSO lane. With AGENT_LASSO_3X_ENABLED OFF this PATCH keeps the
+            # old mechanical CAS behavior and sets NO new hold; every condition
+            # below (and the paired-Story source guard) is unchanged when ON.
+            and config.lasso_three_feed_enabled()
             and ((caption is not None and caption != expected_row.get("caption"))
                  or force_caption_visual_hold))
         if caption_visual_hold:
