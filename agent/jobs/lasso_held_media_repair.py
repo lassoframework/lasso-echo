@@ -131,14 +131,19 @@ def _reviewed_artifact_rows(store, source_id, source_hash, account_key):
     a valid older feed artifact behind newer 9:16 Story renders. Pagination
     is a deterministic immutable keyset: rows are ordered by image_url
     ascending (immutable, part of the (tenant, image_url) primary key) with a
-    strict `gt` cursor on the last seen image_url, so timestamp ties and
-    concurrent Story inserts between page reads can neither duplicate nor
-    skip a row. Each page must strictly advance the cursor; a duplicate or
-    non-advancing page, a read error, an overlong page or the hard page bound
-    fails closed rather than silently truncating into a paid duplicate
-    render. A short page is completion, not failure.
+    strict `gt` cursor on the last seen image_url (both evaluated by the
+    database's own ICU collation, never by Python string order), so
+    timestamp ties and concurrent Story inserts between page reads can
+    neither duplicate nor skip a row. Validation is collation-agnostic: no
+    URL may repeat anywhere in the scan and every record needs a non-empty
+    string URL; a duplicate (any repeating or non-advancing page resurfaces
+    an already seen URL), a malformed record, a read error, an overlong
+    page or the hard page bound fails closed rather than silently
+    truncating into a paid duplicate render. A short page is completion,
+    not failure.
     """
     rows = []
+    seen = set()
     cursor = None
     for _ in range(ARTIFACT_LOOKUP_MAX_PAGES):
         params = {"tenant": f"eq.{account_key}",
@@ -157,20 +162,24 @@ def _reviewed_artifact_rows(store, source_id, source_hash, account_key):
         batch = response.json()
         if not isinstance(batch, list) or len(batch) > ARTIFACT_LOOKUP_PAGE:
             raise RuntimeError("reviewed artifact lookup incomplete")
-        page_urls = []
+        # Progress and duplicate validation must be collation-agnostic: the
+        # database sorts image_url under its ICU locale, which legitimately
+        # differs from Python string order. Only checks that hold under ANY
+        # server comparator are safe: no URL may repeat anywhere in the scan
+        # (a repeating or non-advancing page always resurfaces an already
+        # seen URL), and every record must carry a non-empty string URL.
         for row in batch:
-            if not isinstance(row, dict) or not isinstance(
-                    row.get("image_url"), str):
+            if (not isinstance(row, dict)
+                    or not isinstance(row.get("image_url"), str)
+                    or not row["image_url"]):
                 raise RuntimeError("reviewed artifact lookup malformed")
-            page_urls.append(row["image_url"])
-        if page_urls != sorted(page_urls) or len(page_urls) != len(set(page_urls)):
-            raise RuntimeError("reviewed artifact lookup cursor did not advance")
-        if cursor is not None and page_urls and page_urls[0] <= cursor:
-            raise RuntimeError("reviewed artifact lookup cursor did not advance")
+            if row["image_url"] in seen:
+                raise RuntimeError("reviewed artifact lookup cursor did not advance")
+            seen.add(row["image_url"])
         rows.extend(batch)
         if len(batch) < ARTIFACT_LOOKUP_PAGE:
             return rows
-        cursor = page_urls[-1]
+        cursor = batch[-1]["image_url"]
     raise RuntimeError("reviewed artifact lookup exceeded bound")
 
 

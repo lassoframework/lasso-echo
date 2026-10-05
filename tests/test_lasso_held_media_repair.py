@@ -20,6 +20,26 @@ def _row(rid, day="2026-10-05", **overrides):
     return row
 
 
+def _icu_key(url):
+    """Approximate the database's ICU en_US collation for URL strings.
+
+    Punctuation sorts before digits and digits before letters; within
+    punctuation '_' precedes '-'. Reproduces the live read-only probe order:
+    a_b.png, a-b.png, a0.png, ab.png (Python sorted() would give a-b, a0,
+    a_b, ab).
+    """
+    primary = []
+    for ch in url:
+        if ch.isalpha():
+            primary.append((2, 0, ch))
+        elif ch.isdigit():
+            primary.append((1, 0, ch))
+        else:
+            sub = 0 if ch == "_" else 1 if ch == "-" else 2
+            primary.append((0, sub, ch))
+    return (primary, url)
+
+
 class _Response:
     status_code = 200
 
@@ -66,14 +86,16 @@ class _Store:
             return _Response(self.by_url.get((params["tenant"], params["image_url"]), []))
         key = (params["source_identity->>source_id"],
                params["source_identity->>source_hash"])
-        # Simulate the server's immutable keyset contract: image_url ascending,
-        # strict gt cursor, bounded page size.
+        # Simulate the server's immutable keyset contract under the database's
+        # ICU collation: image_url ascending (ICU order), strict gt cursor,
+        # bounded page size.
         assert params["order"] == "image_url.asc"
-        rows = sorted(self.cache.get(key, []), key=lambda r: r["image_url"])
+        rows = sorted(self.cache.get(key, []), key=lambda r: _icu_key(r["image_url"]))
         cursor = params.get("image_url")
         if cursor is not None:
             assert str(cursor).startswith("gt.")
-            rows = [r for r in rows if r["image_url"] > str(cursor)[3:]]
+            marker = _icu_key(str(cursor)[3:])
+            rows = [r for r in rows if _icu_key(r["image_url"]) > marker]
         limit = int(params.get("limit", "50"))
         return _Response(rows[:limit])
 
@@ -810,11 +832,12 @@ class _PagedStore(_Store):
         assert params["order"] == "image_url.asc"
         key = (params["source_identity->>source_id"],
                params["source_identity->>source_hash"])
-        rows = sorted(self.cache.get(key, []), key=lambda r: r["image_url"])
+        rows = sorted(self.cache.get(key, []), key=lambda r: _icu_key(r["image_url"]))
         cursor = params.get("image_url")
         if cursor is not None:
             assert str(cursor).startswith("gt.")
-            rows = [r for r in rows if r["image_url"] > str(cursor)[3:]]
+            marker = _icu_key(str(cursor)[3:])
+            rows = [r for r in rows if _icu_key(r["image_url"]) > marker]
         limit = int(params["limit"])
         page = self.page_reads
         self.page_reads += 1
@@ -909,6 +932,44 @@ def test_non_advancing_duplicate_page_fails_closed_without_spend(monkeypatch):
     assert out["generated"] == out["repaired"] == out["reused"] == 0
     assert store.patches == []
     assert store.rows["feed"]["media_not_ready_reason"] == repair.HOLD_REASON
+
+
+def test_icu_ordered_pages_reuse_feed_artifact_without_false_hold(monkeypatch):
+    feed = _row("feed", caption="Approved paged copy.")
+    # The live DB (ICU en_US.UTF-8) orders these a_b, a-b, a0, ab. Python
+    # sorted() would call this sequence out of order; the lookup must trust
+    # the server comparator and still complete and reuse.
+    artifacts = [
+        _story_artifact_for(feed, "https://cdn.example/a_b.png"),
+        _story_artifact_for(feed, "https://cdn.example/a-b.png"),
+        _story_artifact_for(feed, "https://cdn.example/a0.png"),
+        _feed_artifact_for(feed, "https://cdn.example/ab.png"),
+    ]
+    assert [r["image_url"] for r in
+            sorted(artifacts, key=lambda r: _icu_key(r["image_url"]))] == [
+        "https://cdn.example/a_b.png", "https://cdn.example/a-b.png",
+        "https://cdn.example/a0.png", "https://cdn.example/ab.png"]
+    store, _ = _paged_reuse_setup(monkeypatch, artifacts)
+    out = repair.run(store=store, artifact_store=_Artifacts())
+    assert out["reused"] == out["repaired"] == 1
+    assert out["generated"] == out["errors"] == 0
+    assert store.rows["feed"]["image_url"] == "https://cdn.example/ab.png"
+    assert store.rows["feed"]["media_not_ready_reason"] is None
+
+
+def test_malformed_url_field_fails_closed_without_spend(monkeypatch):
+    feed = _row("feed", caption="Approved paged copy.")
+    for bad_url in ("", None, 42):
+        bad = _feed_artifact_for(feed, "https://cdn.example/zz-feed.png")
+        bad["image_url"] = bad_url
+        artifacts = [
+            _story_artifact_for(feed, "https://cdn.example/a-story.png"), bad]
+        store, _ = _paged_reuse_setup(monkeypatch, artifacts)
+        out = repair.run(store=store, artifact_store=_Artifacts())
+        assert out["errors"] == 1
+        assert out["generated"] == out["repaired"] == out["reused"] == 0
+        assert store.patches == []
+        assert store.rows["feed"]["media_not_ready_reason"] == repair.HOLD_REASON
 
 
 def test_malformed_artifact_on_later_page_holds_without_spend(monkeypatch):
