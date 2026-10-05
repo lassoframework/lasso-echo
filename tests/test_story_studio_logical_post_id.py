@@ -137,3 +137,25 @@ def test_rebuild_with_new_request_id_stamps_a_new_identity(monkeypatch, tmp_path
     ids = [r[1].get("logical_post_id") for r in _STAGED_ROWS]
     assert ids == [first["request_id"], new_id], \
         "each staged row keeps its own request identity; no date/image grouping"
+
+
+# ---- rollout flag (ECHO_LOGICAL_POST_ID_ENABLED, default OFF) --------------
+
+
+@pytest.fixture(autouse=True)
+def _logical_post_id_flag_on(monkeypatch):
+    """Existing tests in this file exercise the ON behavior."""
+    monkeypatch.setenv("ECHO_LOGICAL_POST_ID_ENABLED", "true")
+
+
+def test_flag_defaults_off_and_staged_row_carries_no_key(monkeypatch, tmp_path):
+    monkeypatch.delenv("ECHO_LOGICAL_POST_ID_ENABLED", raising=False)
+    from agent import config
+    assert config.logical_post_id_enabled() is False
+    res = _create(monkeypatch, tmp_path,
+                  {"gym_id": "pierce", "asset_ids": ["a0", "a1"],
+                   "brief": "Members crushed today",
+                   "identity_tokens": ["Pierce"], "requested_by": "coach1"})
+    assert res["status"] == "staged"
+    assert len(_STAGED_ROWS) == 1
+    assert "logical_post_id" not in _STAGED_ROWS[0][1]

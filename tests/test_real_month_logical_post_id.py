@@ -10,9 +10,11 @@ Contract under test:
   date, photo URL/basename or caption.
 - An unrelated post on the same date with the same photo gets a DIFFERENT UUID.
 - An existing valid logical_post_id on a draft (retry of the same draft) is preserved.
-- An ambiguous source relation (story builder returns a story already carrying a
-  DIFFERENT valid id) invents no pair: the story keeps its own id, the lane is logged
-  as a hold, and the story is NOT staged (the feed is preserved).
+- A forged/mismatched pair (story carrying a DIFFERENT valid id than its source
+  feed) or any present-but-invalid logical_post_id is a FATAL planning error:
+  LogicalPostIdError aborts the whole build before apply_month_plan can delete
+  existing calendar rows (P1 safety, 2026-10-04). No pair is invented and no
+  asserted identity is repaired.
 - A new feed draft whose logical_post_id cannot be minted/assigned aborts the lane:
   the feed is never staged, and its paired story has no source to pair to.
 - A draft with no logical_post_id emits a row WITHOUT the key (no backfill, no
@@ -24,6 +26,8 @@ import sys
 import uuid as _uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+import pytest  # noqa: E402
 
 from agent import real_month_planner as rmp  # noqa: E402
 from agent.drafter import Draft, DraftStatus  # noqa: E402
@@ -137,36 +141,29 @@ def test_no_pairing_inferred_for_bare_drafts_sharing_date_photo_caption():
     assert all("logical_post_id" not in r for r in rows)
 
 
-def test_ambiguous_story_identity_holds_the_story_and_is_never_staged():
-    # P1 A (fail closed): a story whose builder stamped a DIFFERENT valid id than its
-    # source feed is an ambiguous source relation. The lane is logged as a hold, the
-    # story is NOT appended/staged, and the calendar rows never contain it. The feed,
-    # which is safely keyed, is preserved.
+def test_ambiguous_story_identity_is_a_fatal_planning_error():
+    # P1 safety (2026-10-04): a story whose builder stamped a DIFFERENT valid id
+    # than its source feed is a forged/ambiguous pairing -- a FATAL planning error.
+    # build_month_drafts raises LogicalPostIdError so the whole plan aborts BEFORE
+    # apply_month_plan can delete existing pending rows; no pair is invented and no
+    # identity is repaired.
     feed = _draft("f1")
     story = _draft("s1", is_story=True, draft_type="story", caption="")
     story_own = str(_uuid.uuid4())
     story.logical_post_id = story_own   # builder stamped a DIFFERENT valid id
-    messages = []
-    drafts = rmp.build_month_drafts(
-        _plan(_feed_slot(), _story_slot()), _builders(feed),
-        story_builder=_story_builder(story), account=ACCT, logger=messages.append)
-    # The feed is preserved; the ambiguous story is held, not staged.
-    assert [d for d in drafts if getattr(d, "draft_id", "") == "s1"] == []
-    assert any(d is feed for d in drafts)
-    rows = rmp.to_calendar_rows(drafts, ACCT)
-    assert rows, "the feed (and its FB mirror) must survive the hold"
-    assert all(r["format"] != "story" for r in rows)
-    assert all(getattr(r, "get", lambda _k, _d=None: None)("logical_post_id") != story_own
-               for r in rows)
-    assert getattr(story, "logical_post_id", "") == story_own
+    with pytest.raises(rmp.LogicalPostIdError):
+        rmp.build_month_drafts(
+            _plan(_feed_slot(), _story_slot()), _builders(feed),
+            story_builder=_story_builder(story), account=ACCT,
+            logger=lambda m: None)
+    assert getattr(story, "logical_post_id", "") == story_own, \
+        "a forged identity must never be overwritten"
     assert getattr(feed, "logical_post_id", "") != story_own
-    assert any("ambiguous pairing" in m and "hold" in m for m in messages)
 
 
-def test_feed_with_unkeyable_draft_is_not_staged(monkeypatch):
-    # P1 B (fail closed): when a freshly built feed draft cannot accept a minted
-    # logical_post_id, the lane is skipped entirely — the unkeyed feed is never
-    # appended or persisted.
+def test_feed_with_unkeyable_draft_aborts_plan(monkeypatch):
+    # A mint failure aborts the full plan so a later calendar apply cannot
+    # replace existing pending rows with a reduced draft list.
     class _BoomUuid:
         UUID = _uuid.UUID
 
@@ -177,18 +174,17 @@ def test_feed_with_unkeyable_draft_is_not_staged(monkeypatch):
     monkeypatch.setattr(rmp, "_uuid", _BoomUuid)
     feed = _draft("f1")
     story = _draft("s1", is_story=True, draft_type="story", caption="")
-    messages = []
-    drafts = rmp.build_month_drafts(
-        _plan(_feed_slot(), _story_slot()), _builders(feed),
-        story_builder=_story_builder(story), account=ACCT, logger=messages.append)
-    assert drafts == [], "an unkeyed new feed must abort the whole day's staging"
+    with pytest.raises(rmp.LogicalPostIdError, match="could not mint or assign"):
+        rmp.build_month_drafts(
+            _plan(_feed_slot(), _story_slot()), _builders(feed),
+            story_builder=_story_builder(story), account=ACCT,
+            logger=lambda m: None)
     assert getattr(feed, "logical_post_id", "") in ("", None)
-    assert any("logical_post_id" in m and "fail closed" in m for m in messages)
 
 
-def test_story_that_cannot_accept_the_paired_id_is_skipped():
-    # P1 B (fail closed): a paired story that rejects its source feed's id is never
-    # staged; pairing is never guessed from date/photo/caption.
+def test_story_that_cannot_accept_the_paired_id_aborts_plan():
+    # A paired story that rejects its source feed's id aborts the plan before
+    # a reduced feed-only month can replace an existing story.
     class _NonAssignableStory:
         def __init__(self):
             object.__setattr__(self, "is_story", True)
@@ -203,26 +199,72 @@ def test_story_that_cannot_accept_the_paired_id_is_skipped():
 
     feed = _draft("f1")
     story = _NonAssignableStory()
-    messages = []
-    drafts = rmp.build_month_drafts(
-        _plan(_feed_slot(), _story_slot()), _builders(feed),
-        story_builder=lambda _t, _d, _f: story, account=ACCT,
-        logger=messages.append)
-    assert any(d is feed for d in drafts)
-    assert all(d is not story for d in drafts)
-    rows = rmp.to_calendar_rows(drafts, ACCT)
-    assert rows and all(r["format"] != "story" for r in rows)
-    assert any("not staged" in m for m in messages)
+    with pytest.raises(rmp.LogicalPostIdError, match="cannot carry"):
+        rmp.build_month_drafts(
+            _plan(_feed_slot(), _story_slot()), _builders(feed),
+            story_builder=lambda _t, _d, _f: story, account=ACCT,
+            logger=lambda m: None)
 
 
-def test_invalid_story_id_is_replaced_by_the_explicit_pair_id():
+def test_malformed_story_id_is_fatal_and_is_never_overwritten():
+    # P1 safety (2026-10-04): a story arriving with a MALFORMED nonempty
+    # logical_post_id asserts an identity. The lane must NOT overwrite it with the
+    # feed's id (no identity repair) and must NOT silently skip: it raises
+    # LogicalPostIdError, aborting the whole plan before any store mutation.
     feed = _draft("f1")
     story = _draft("s1", is_story=True, draft_type="story", caption="")
     story.logical_post_id = "not-a-uuid"
-    rmp.build_month_drafts(
+    with pytest.raises(rmp.LogicalPostIdError):
+        rmp.build_month_drafts(
+            _plan(_feed_slot(), _story_slot()), _builders(feed),
+            story_builder=_story_builder(story), account=ACCT,
+            logger=lambda m: None)
+    assert getattr(story, "logical_post_id", "") == "not-a-uuid", \
+        "a malformed asserted identity must never be overwritten"
+
+
+def test_malformed_feed_id_is_fatal_and_is_never_reminted():
+    # P1 safety (2026-10-04): a feed draft arriving with a MALFORMED nonempty
+    # logical_post_id raises LogicalPostIdError -- the plan aborts before apply,
+    # the draft is never staged, and the asserted identity is never reminted over.
+    feed = _draft("f1")
+    feed.logical_post_id = "corrupt-not-a-uuid"
+    story = _draft("s1", is_story=True, draft_type="story", caption="")
+    with pytest.raises(rmp.LogicalPostIdError):
+        rmp.build_month_drafts(
+            _plan(_feed_slot(), _story_slot()), _builders(feed),
+            story_builder=_story_builder(story), account=ACCT,
+            logger=lambda m: None)
+    assert getattr(feed, "logical_post_id", "") == "corrupt-not-a-uuid", \
+        "a malformed asserted identity must never be reminted over"
+
+
+def test_nonstring_feed_id_is_fatal():
+    # P1 safety (2026-10-04): a nonstring nonempty value is also an asserted
+    # (unusable) identity: fatal, never minted over.
+    feed = _draft("f1")
+    feed.logical_post_id = 12345
+    with pytest.raises(rmp.LogicalPostIdError):
+        rmp.build_month_drafts(
+            _plan(_feed_slot()), _builders(feed), account=ACCT,
+            logger=lambda m: None)
+    assert getattr(feed, "logical_post_id", "") == 12345
+
+
+def test_flag_off_malformed_ids_pass_through_unchanged(monkeypatch):
+    # OFF (default): the identity lane never runs -- malformed pre-stamped ids are
+    # neither repaired nor cause skips, exactly as before the feature.
+    monkeypatch.delenv("ECHO_LOGICAL_POST_ID_ENABLED", raising=False)
+    feed = _draft("f1")
+    feed.logical_post_id = "corrupt-not-a-uuid"
+    story = _draft("s1", is_story=True, draft_type="story", caption="")
+    story.logical_post_id = "also-not-a-uuid"
+    drafts = rmp.build_month_drafts(
         _plan(_feed_slot(), _story_slot()), _builders(feed),
         story_builder=_story_builder(story), account=ACCT, logger=lambda m: None)
-    assert getattr(story, "logical_post_id", "") == feed.logical_post_id
+    assert len(drafts) == 2, "OFF must stage exactly as before"
+    assert feed.logical_post_id == "corrupt-not-a-uuid"
+    assert story.logical_post_id == "also-not-a-uuid"
 
 
 # ---- retry preserves an existing valid id ----------------------------------
@@ -239,3 +281,71 @@ def test_existing_valid_feed_id_is_preserved_not_reminted():
     assert story.logical_post_id == keep
     rows = rmp.to_calendar_rows(drafts, ACCT)
     assert {r["logical_post_id"] for r in rows} == {keep}
+
+
+# ---- rollout flag (ECHO_LOGICAL_POST_ID_ENABLED, default OFF) --------------
+
+
+@pytest.fixture(autouse=True)
+def _logical_post_id_flag_on(monkeypatch):
+    """Existing tests in this file exercise the ON behavior."""
+    monkeypatch.setenv("ECHO_LOGICAL_POST_ID_ENABLED", "true")
+
+
+def test_flag_defaults_off_mints_nothing_pairs_nothing_and_stages(monkeypatch):
+    # OFF: no minting, no pairing, no skip/hold caused by stamping — the feed and
+    # its story stage exactly as before the identity feature, with no new key.
+    monkeypatch.delenv("ECHO_LOGICAL_POST_ID_ENABLED", raising=False)
+    from agent import config
+    assert config.logical_post_id_enabled() is False
+    feed = _draft("f1")
+    story = _draft("s1", is_story=True, draft_type="story", caption="")
+    drafts = rmp.build_month_drafts(
+        _plan(_feed_slot(), _story_slot()), _builders(feed),
+        story_builder=_story_builder(story), account=ACCT, logger=lambda m: None)
+    assert len(drafts) == 2, "OFF must not skip or hold anything for stamping"
+    assert (getattr(feed, "logical_post_id", "") or "") == ""
+    assert (getattr(story, "logical_post_id", "") or "") == ""
+    rows = rmp.to_calendar_rows(drafts, ACCT)
+    assert all("logical_post_id" not in r for r in rows)
+
+
+def test_flag_off_unkeyable_draft_is_not_a_failure(monkeypatch):
+    # The fail-closed mint path is an ON-only behavior: with the flag OFF a forced
+    # uuid4 failure causes no skip.
+    monkeypatch.delenv("ECHO_LOGICAL_POST_ID_ENABLED", raising=False)
+
+    class _BoomUuid:
+        UUID = _uuid.UUID
+
+        @staticmethod
+        def uuid4():
+            raise RuntimeError("forced mint failure")
+
+    monkeypatch.setattr(rmp, "_uuid", _BoomUuid)
+    feed = _draft("f1")
+    drafts = rmp.build_month_drafts(
+        _plan(_feed_slot()), _builders(feed), account=ACCT, logger=lambda m: None)
+    assert len(drafts) == 1
+
+
+def test_flag_off_pre_stamped_draft_row_omits_logical_post_id(monkeypatch):
+    # The leak fix: to_calendar_rows must not forward a pre-stamped
+    # logical_post_id into content_calendar rows while the rollout flag is OFF.
+    monkeypatch.delenv("ECHO_LOGICAL_POST_ID_ENABLED", raising=False)
+    feed = _draft("f1")
+    feed.logical_post_id = "11111111-2222-3333-4444-555555555555"
+    story = _draft("s1", is_story=True, draft_type="story", caption="")
+    story.logical_post_id = "11111111-2222-3333-4444-555555555555"
+    rows = rmp.to_calendar_rows([feed, story], ACCT)
+    assert rows, "rows still stage with the flag OFF"
+    assert all("logical_post_id" not in r for r in rows)
+
+
+def test_flag_on_pre_stamped_draft_row_keeps_logical_post_id(monkeypatch):
+    monkeypatch.setenv("ECHO_LOGICAL_POST_ID_ENABLED", "true")
+    feed = _draft("f1")
+    feed.logical_post_id = "11111111-2222-3333-4444-555555555555"
+    rows = rmp.to_calendar_rows([feed], ACCT)
+    assert {r["logical_post_id"] for r in rows} == {
+        "11111111-2222-3333-4444-555555555555"}

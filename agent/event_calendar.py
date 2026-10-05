@@ -62,6 +62,13 @@ def _stamp_logical_post_ids(rows, log):
     """
     import uuid
 
+    from . import config  # noqa: PLC0415
+    if not config.logical_post_id_enabled():
+        # Flag OFF (default): behave exactly as before the identity feature — no
+        # stamping, no validation, no new failure mode.
+        return True
+
+    seen = set()
     for row in rows:
         if not isinstance(row, dict):
             log("event logical post id: refusing non-dict row")
@@ -73,13 +80,22 @@ def _stamp_logical_post_ids(rows, log):
             except (AttributeError, TypeError, ValueError):
                 log("event logical post id: refusing invalid existing UUID")
                 return False
+            if value in seen:
+                # Two independent arc rows sharing one identity would make the
+                # durable group unverifiable; stop before any insert.
+                log("event logical post id: refusing duplicate existing UUID "
+                    "within one arc")
+                return False
+            seen.add(value)
             row["logical_post_id"] = value
             continue
         try:
-            row["logical_post_id"] = str(uuid.uuid4())
+            minted = str(uuid.uuid4())
         except Exception as exc:  # noqa: BLE001 - a row without identity never stages
             log(f"event logical post id: mint failed ({type(exc).__name__})")
             return False
+        seen.add(minted)
+        row["logical_post_id"] = minted
     return True
 
 
@@ -709,7 +725,14 @@ _TRANSIENT_KEYS = ("arc_kind", "recap_blocked", "arc_note", "_media_asset")
 
 
 def _db_row(row):
-    return {k: v for k, v in (row or {}).items() if k not in _TRANSIENT_KEYS}
+    payload = {k: v for k, v in (row or {}).items() if k not in _TRANSIENT_KEYS}
+    from . import config  # noqa: PLC0415
+    if not config.logical_post_id_enabled():
+        # Flag OFF (default): the column must never reach an insert against the
+        # old schema, even if a caller pre-stamped the in-memory row. The row
+        # itself is left untouched (this is a copy) so caller state is preserved.
+        payload.pop("logical_post_id", None)
+    return payload
 
 
 def cancel_event(store, gym_id, event_id, *, ended=False, logger=None):

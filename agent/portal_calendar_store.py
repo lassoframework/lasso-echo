@@ -1419,10 +1419,15 @@ class SupabaseCalendarStore:
             "variant_of": anchor_id,
             "variant_status": "candidate",
         }
-        # The candidate is an alternate creative for the SAME logical post, so it
-        # inherits the anchor's logical_post_id (never re-minted) when the anchor
-        # carries one. Absent/NULL anchor IDs leave the candidate NULL.
-        if anchor_row.get("logical_post_id") is not None:
+        # Identity inheritance depends on the rollout flag. OFF (default): the
+        # generic store keeps honoring the caller-supplied anchor snapshot (with a
+        # loud rejection of a malformed id), as it always has. ON: the caller's
+        # anchor_row is only a SNAPSHOT -- the candidate's logical_post_id is taken
+        # from the registered anchor row fetched in THIS tenant below (never from
+        # the caller), and any identity the caller asserted that does not match the
+        # registered row rejects the write before INSERT.
+        logical_write = config.logical_post_id_enabled()
+        if not logical_write and anchor_row.get("logical_post_id") is not None:
             import uuid as _uuid
             try:
                 payload["logical_post_id"] = str(
@@ -1437,31 +1442,62 @@ class SupabaseCalendarStore:
             payload["source_media_asset_id"] = source_media_asset_id
         from . import visual_writer_prepare
         prepared_write = visual_writer_prepare.enabled()
-        if prepared_write:
+        if prepared_write or logical_write:
+            def _anchor_reject(detail):
+                if prepared_write:
+                    raise visual_writer_prepare.VisualPreparationError(detail)
+                raise PortalStoreError(404, detail)
+
             if str(anchor_row.get("gym_id")) != str(account_key) or not anchor_id:
-                raise visual_writer_prepare.VisualPreparationError(
+                _anchor_reject(
                     "variant anchor is not registered to the calendar tenant")
             registered_anchor = self.get_row(account_key, anchor_row.get("id"))
             if (registered_anchor is None
                     or str(registered_anchor.get("gym_id")) != str(account_key)
                     or str(registered_anchor.get("id")) != str(anchor_row.get("id"))):
-                raise visual_writer_prepare.VisualPreparationError(
+                _anchor_reject(
                     "variant anchor is not registered to the calendar tenant")
+            compared_keys = ["account", "post_date", "format", "pillar", "caption",
+                             "variant_of"]
+            if logical_write:
+                # ON, the anchor's logical identity is part of the snapshot: a
+                # caller asserting an id the registered row does not carry (a
+                # forged or stale identity) is an anchor-change, rejected here.
+                compared_keys.append("logical_post_id")
             if any(registered_anchor.get(key) != anchor_row.get(key) for key in
-                   ("account", "post_date", "format", "pillar", "caption", "variant_of")):
-                raise visual_writer_prepare.VisualPreparationError(
-                    "variant anchor changed before visual preparation")
+                   compared_keys):
+                _anchor_reject("variant anchor changed before visual preparation"
+                               if prepared_write else
+                               "variant anchor changed before variant creation")
             if str(anchor_id) != str(registered_anchor["id"]):
                 group_anchor = self.get_row(account_key, anchor_id)
                 if (group_anchor is None
                         or str(group_anchor.get("gym_id")) != str(account_key)
                         or str(group_anchor.get("id")) != str(anchor_id)):
-                    raise visual_writer_prepare.VisualPreparationError(
+                    _anchor_reject(
                         "variant anchor is not registered to the calendar tenant")
-            if source_media_url is not None:
-                payload["source_media_url"] = source_media_url
-            payload = self._prepare_visual_row(
-                account_key, payload, render_evidence, poster_render_evidence)
+            if logical_write:
+                # The candidate is an alternate creative for the SAME logical post:
+                # its id is the REGISTERED anchor's trusted id (never the caller's,
+                # never re-minted). A historical anchor (NULL) leaves the
+                # candidate NULL -- the caller cannot inject identity into it.
+                trusted_id = registered_anchor.get("logical_post_id")
+                if trusted_id is None:
+                    payload.pop("logical_post_id", None)
+                else:
+                    import uuid as _uuid
+                    try:
+                        payload["logical_post_id"] = str(
+                            _uuid.UUID(str(trusted_id)))
+                    except (ValueError, AttributeError, TypeError):
+                        raise ValueError(
+                            "registered anchor logical_post_id must be a UUID; got "
+                            f"{trusted_id!r}")
+            if prepared_write:
+                if source_media_url is not None:
+                    payload["source_media_url"] = source_media_url
+                payload = self._prepare_visual_row(
+                    account_key, payload, render_evidence, poster_render_evidence)
         r = self._client().post(
             self._rest(_TABLE),
             headers=self._headers({"Content-Type": "application/json",

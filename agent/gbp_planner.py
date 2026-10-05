@@ -508,7 +508,8 @@ def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
         row["source_media_url"] = source_media_url
     # GBP posts are singleton logical objects. Identity does not derive from
     # date, image, or any IG/FB/Story grouping.
-    _ensure_logical_post_id(row)
+    if config.logical_post_id_enabled():
+        _ensure_logical_post_id(row)
     return row
 
 

@@ -12,6 +12,9 @@ backs up, separate from the git-tracked voice doc and config.
 
 import json
 import os
+import sqlite3
+import time
+import uuid
 
 from . import config, ops_alerts
 from .drafter import Draft, DraftStatus
@@ -52,6 +55,10 @@ def _to_dict(d: Draft):
         "needs_media": d.needs_media,
         "force_approval": d.force_approval,
         "image_engine": d.image_engine,
+        # Durable logical-post identity (flag-gated mirror feature). Persisted so a
+        # rehydrated Draft keeps the SAME identity across the mirror's
+        # delete/reinsert cycle; never inferred from date/photo/caption.
+        "logical_post_id": getattr(d, "logical_post_id", "") or "",
     }
 
 
@@ -122,6 +129,7 @@ def _from_dict(r):
         is_story=bool(r.get("is_story", False)),
         day_key=r.get("day_key", ""),
         draft_type=r.get("draft_type", ""),
+        logical_post_id=r.get("logical_post_id", "") or "",
         slack_channel=r.get("slack_channel", ""),
         slack_ts=r.get("slack_ts", ""),
         needs_media=bool(r.get("needs_media", False)),
@@ -140,6 +148,10 @@ def _from_dict(r):
     if isinstance(poster_evidence, dict) and poster_evidence:
         draft.poster_render_evidence = poster_evidence
     return draft
+
+
+class _RevisionConflict(Exception):
+    """Internal: the row moved under us during a conditional stamp; retry."""
 
 
 class PendingStore:
@@ -173,9 +185,67 @@ class PendingStore:
         return self._db.connect()
 
     def put(self, draft: Draft):
+        """Insert or replace one draft.
+
+        LOGICAL IDENTITY GUARD (the immutable logical_post_id ruling): inside ONE
+        BEGIN IMMEDIATE transaction, a stored VALID logical_post_id can never be
+        silently erased or replaced by a routine write. An incoming draft that omits
+        the id inherits the stored one; an incoming draft carrying a DIFFERENT valid
+        id is refused with ValueError (a conflicting identity is a bug, never a
+        silent overwrite). An invalid incoming non-empty id is likewise refused.
+        Fail closed before any write: a row owned by a different
+        account_key is refused (no cross-tenant transfer or overwrite),
+        and a stored non-empty invalid id is refused rather than silently
+        erased by INSERT OR REPLACE.
+        """
         try:
             with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 rec = _to_dict(draft)
+                incoming = (rec.get("logical_post_id") or "").strip()
+                if incoming:
+                    try:
+                        incoming = str(uuid.UUID(incoming))
+                    except (ValueError, AttributeError, TypeError):
+                        raise ValueError(
+                            f"put: draft {draft.draft_id!r} carries invalid "
+                            f"logical_post_id {incoming!r}; refusing write")
+                    rec["logical_post_id"] = incoming
+                row = conn.execute(
+                    "SELECT account_key, data FROM drafts WHERE draft_id=?",
+                    (draft.draft_id,)).fetchone()
+                if row is not None:
+                    # Owner check BEFORE any write: a draft_id that collides
+                    # across accounts is a different tenant's row. It is never
+                    # read for identity and never overwritten by REPLACE.
+                    if str(row["account_key"] or "") != str(draft.account_key or ""):
+                        raise ValueError(
+                            f"put: draft {draft.draft_id!r} is owned by a "
+                            "different account_key; refusing cross-tenant write")
+                    try:
+                        existing = json.loads(row["data"] or "{}")
+                    except Exception:
+                        existing = {}
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    stored = (existing.get("logical_post_id") or "").strip()
+                    if stored:
+                        try:
+                            stored = str(uuid.UUID(stored))
+                        except (ValueError, AttributeError, TypeError):
+                            raise ValueError(
+                                f"put: draft {draft.draft_id!r} stores invalid "
+                                f"logical_post_id {stored!r}; fail closed, "
+                                "refusing to erase a corrupt identity")
+                    if stored:
+                        if incoming and incoming != stored:
+                            raise ValueError(
+                                f"put: draft {draft.draft_id!r} conflicts with "
+                                "stored logical_post_id; refusing to replace "
+                                "immutable identity")
+                        if not incoming:
+                            # Stale whole-draft write: preserve the durable id.
+                            rec["logical_post_id"] = stored
                 conn.execute(
                     "INSERT OR REPLACE INTO drafts "
                     "(draft_id, account_key, status, day_key, draft_type, data) "
@@ -189,6 +259,91 @@ class PendingStore:
             ops_alerts.alert(msg)
             raise
         return draft
+
+    def ensure_logical_post_id(self, account_key, draft_id,
+                               expected_updated_at=None, retries=3):
+        """Durably stamp (or verify) one draft's immutable logical_post_id.
+
+        Tenant-scoped and atomic: every attempt runs under SQLite BEGIN IMMEDIATE
+        (the write lock is held for the whole read-check-write, so two stampers
+        serialize and the loser reads back the winner's id). Behavior:
+
+          * Row missing -> KeyError. Row owned by a DIFFERENT account_key ->
+            ValueError (a cross-tenant stamp is never written).
+          * Stored VALID UUID -> returned verbatim, zero writes (idempotent).
+          * Stored INVALID non-empty value -> ValueError (fail closed; never
+            silently remint over a corrupt identity).
+          * Absent/empty -> a fresh uuid4 is written into the row's data JSON with
+            a compare-and-swap on the row's updated_at revision; the new id is
+            returned only after the write commits.
+          * expected_updated_at, when given, must match the row's CURRENT
+            revision before any write; a mismatch is a conflict.
+
+        Conflicts and transient SQLITE_BUSY are retried with a fresh read-back,
+        bounded by `retries`; an unresolved conflict raises RuntimeError rather
+        than guessing. A draft_id that is empty raises ValueError immediately.
+        """
+        if not draft_id:
+            raise ValueError("ensure_logical_post_id: empty draft_id")
+        attempts = max(1, int(retries))
+        last_conflict = None
+        for _ in range(attempts):
+            try:
+                with self._conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute(
+                        "SELECT account_key, data, updated_at FROM drafts "
+                        "WHERE draft_id=?", (draft_id,)).fetchone()
+                    if row is None:
+                        raise KeyError(
+                            f"ensure_logical_post_id: no draft row {draft_id!r}")
+                    if str(row["account_key"] or "") != str(account_key or ""):
+                        raise ValueError(
+                            f"ensure_logical_post_id: draft {draft_id!r} is not "
+                            f"owned by account {account_key!r}; refusing "
+                            "cross-tenant stamp")
+                    revision = row["updated_at"] or ""
+                    if (expected_updated_at is not None
+                            and revision != expected_updated_at):
+                        raise _RevisionConflict(revision)
+                    try:
+                        data = json.loads(row["data"] or "{}")
+                    except Exception:
+                        data = {}
+                    if not isinstance(data, dict):
+                        data = {}
+                    existing = (data.get("logical_post_id") or "").strip()
+                    if existing:
+                        try:
+                            conn.commit()
+                            return str(uuid.UUID(existing))
+                        except (ValueError, AttributeError, TypeError):
+                            raise ValueError(
+                                f"ensure_logical_post_id: draft {draft_id!r} "
+                                f"carries invalid logical_post_id {existing!r}; "
+                                "fail closed, refusing to remint")
+                    new_id = str(uuid.uuid4())
+                    data["logical_post_id"] = new_id
+                    cur = conn.execute(
+                        "UPDATE drafts SET data=?, updated_at=datetime('now') "
+                        "WHERE draft_id=? AND account_key=? AND updated_at=?",
+                        (json.dumps(data), draft_id, account_key, revision))
+                    if cur.rowcount != 1:
+                        raise _RevisionConflict(revision)
+                    conn.commit()
+                    return new_id
+            except _RevisionConflict as e:
+                last_conflict = e  # fresh read-back on the next attempt
+                continue
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower():
+                    raise
+                last_conflict = e
+                time.sleep(0.05)
+                continue
+        raise RuntimeError(
+            f"ensure_logical_post_id: could not durably stamp {draft_id!r} "
+            f"after {attempts} attempts ({last_conflict!r})")
 
     def get(self, draft_id):
         with self._conn() as conn:

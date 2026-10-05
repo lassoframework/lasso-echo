@@ -147,3 +147,29 @@ def test_variant_candidate_rejects_invalid_anchor_id():
         _store(http).create_variant_candidate(
             "gym1", anchor, "https://img.test/v2.jpg")
     assert not http.posted
+
+
+# ---- rollout flag (ECHO_LOGICAL_POST_ID_ENABLED, default OFF) --------------
+# The generic calendar store is NOT behind the flag: it keeps accepting
+# caller-provided logical_post_id values and rejecting invalid ones regardless
+# (covered above). Only the forward writers are gated. This pins the config
+# contract the writers read.
+
+def test_logical_post_id_flag_defaults_off(monkeypatch):
+    monkeypatch.delenv("ECHO_LOGICAL_POST_ID_ENABLED", raising=False)
+    from agent import config
+    assert config.logical_post_id_enabled() is False
+
+
+def test_logical_post_id_flag_truthy_pattern(monkeypatch):
+    from agent import config
+    monkeypatch.setenv("ECHO_LOGICAL_POST_ID_ENABLED", "true")
+    assert config.logical_post_id_enabled() is True
+    monkeypatch.setenv("ECHO_LOGICAL_POST_ID_ENABLED", "1")
+    assert config.logical_post_id_enabled() is True
+    monkeypatch.setenv("ECHO_LOGICAL_POST_ID_ENABLED", "yes")
+    assert config.logical_post_id_enabled() is True
+    monkeypatch.setenv("ECHO_LOGICAL_POST_ID_ENABLED", "0")
+    assert config.logical_post_id_enabled() is False
+    monkeypatch.setenv("ECHO_LOGICAL_POST_ID_ENABLED", "nonsense")
+    assert config.logical_post_id_enabled() is False

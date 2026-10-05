@@ -107,6 +107,11 @@ class Draft:
     # creative_public_url because the delivered asset may be a crop or burn.
     # Kept last so existing positional Draft construction stays compatible.
     source_media_url: str = ""
+    # Durable logical-post identity (flag AGENT logical_post_id, integration branch):
+    # a UUID stamped once by PendingStore.ensure_logical_post_id so the real-calendar
+    # mirror's delete/reinsert cycle keeps one immutable identity per draft. Empty
+    # until stamped; never inferred from date/photo/caption.
+    logical_post_id: str = ""
 
 
 def _make_id(account_key, creative_path, scheduled_for):

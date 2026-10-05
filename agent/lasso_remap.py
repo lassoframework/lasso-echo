@@ -57,7 +57,8 @@ def remap(gym_id="lasso", *, month=None, write=False, store=None, logger=None) -
     """Rebuild the LASSO forward calendar with the video mix for one month (or the next
     30 days). Reuses plan_and_build + apply_month_plan; approved/published days are
     preserved, only unapproved future days are replaced. `write` False -> dry run
-    (plan + grade preview, no store writes). Returns a summary dict; never raises out."""
+    (plan + grade preview, no store writes). Returns a summary dict on normal
+    runs. A fatal logical-post identity error propagates before any calendar write."""
     log = logger or (lambda m: print(f"[lasso-remap] {m}"))
     if not config.real_month_plan_enabled():
         log("AGENT_REAL_MONTH_PLAN is OFF; nothing to remap (no-op).")

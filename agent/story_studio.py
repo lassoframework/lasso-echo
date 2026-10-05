@@ -432,7 +432,9 @@ def _stage_calendar_row(gym_id, draft, request_id=None, *, cal_store=None):
     # Stamp the calendar row with the Story Studio request identity. The row's
     # identity IS the request: a rebuild that mints a NEW request_id must produce a
     # NEW logical identity, never reuse an existing row grouped by date or image.
-    row["logical_post_id"] = str(request_id or draft.draft_id)
+    from . import config as _cfg  # noqa: PLC0415 - local: function rebinds `config` below
+    if _cfg.logical_post_id_enabled():
+        row["logical_post_id"] = str(request_id or draft.draft_id)
     acct = str(row.get("account") or "").strip().lower()
     if acct not in ("instagram", "facebook"):
         return None, f"the story has no valid publish target (account={acct!r})"
