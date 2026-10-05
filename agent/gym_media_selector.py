@@ -58,6 +58,42 @@ REUSE_COOLDOWN_DAYS = 90
 # remains the authority and this read never mutates ledger state.
 GLOBAL_LEDGER_FLAG_ENV = "AGENT_VISUAL_GLOBAL_LEDGER"
 
+# DRAFT HISTORICAL MEDIA CLEARANCE (2026-10-03): when
+# AGENT_HISTORICAL_MEDIA_CLEARANCE is explicitly enabled, every candidate
+# PREDATING the gym's configured activation cutoff
+# (AGENT_HISTORICAL_MEDIA_CLEARANCE_CUTOFF_<GYM_ID>) must carry an explicit,
+# current-hash, reviewer-bound 'cleared' receipt in
+# public.media_historical_clearance (agent/historical_media_clearance.py).
+# Assets first seen at/after the cutoff are EXEMPT (they never went through
+# the historical backlog; normal review + global ledger still gate them).
+# known_used / held / uncleared are all excluded; nothing is auto-cleared.
+# Tri-state flag, default OFF = byte-for-byte legacy behavior; an ambiguous
+# value or ANY clearance-read failure fails closed exactly like the
+# claim/ledger failures below.
+from .historical_media_clearance import (  # noqa: E402
+    HISTORICAL_CLEARANCE_FLAG_ENV,
+    HistoricalClearanceUnavailable,
+    asset_is_historical,
+    clearance_cutoff,
+    clearance_status,
+    historical_clearance_flag,
+)
+
+
+def _historical_clearance_rows(base, store, flag):
+    """ONE implementation of the historical-clearance read, shared by
+    pickable() and cooldown_fallback(). Returns the gym's receipt rows, or
+    raises HistoricalClearanceUnavailable on an ambiguous flag or ANY read
+    failure (fail closed — uncertainty is never treated as 'cleared')."""
+    if flag is None:
+        raise HistoricalClearanceUnavailable(
+            f"{HISTORICAL_CLEARANCE_FLAG_ENV} has an ambiguous value")
+    try:
+        return store.list_historical_clearances(base)
+    except Exception as exc:  # noqa: BLE001 - an unreadable ledger proves nothing
+        raise HistoricalClearanceUnavailable(
+            "historical clearance read failed") from exc
+
 
 class GlobalLedgerUnavailable(RuntimeError):
     """The global visual ledger could not prove a photo's global usage status."""
@@ -402,10 +438,10 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
         print(f"[gym-media-selector] claim read failed for {base}: {type(e).__name__}")
         return []
 
-    cutoff = now - timedelta(days=REUSE_COOLDOWN_DAYS)
+    reuse_cutoff = now - timedelta(days=REUSE_COOLDOWN_DAYS)
     from .media_reuse_policy import reuse_months, months_before
     if reuse_months(base):
-        cutoff = months_before(now, reuse_months(base))
+        reuse_cutoff = months_before(now, reuse_months(base))
     month = now.strftime("%Y-%m")
     excl = {str(i) for i in (exclude_ids or ()) if i}
 
@@ -447,6 +483,31 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
                   f"{type(e).__name__}")
             return []
 
+    # DRAFT HISTORICAL MEDIA CLEARANCE: with the flag ON, only assets first
+    # seen before the gym cutoff with an explicit current-hash 'cleared'
+    # receipt stay in the pool (known_used, held and uncleared are all
+    # excluded; newer assets are exempt from this gate only). Flag OFF never
+    # touches the table.
+    # Ambiguous value or ANY read failure fails closed exactly like the claim
+    # and ledger failures above: strict callers get the exception, the
+    # planning read gets an empty pool.
+    clearance_flag = historical_clearance_flag()
+    clearance_rows = []
+    # Per-gym activation watermark. None (unset/unparseable) fails CLOSED:
+    # every asset is treated as historical. Only assets first seen BEFORE the
+    # cutoff need a clearance receipt; newer assets are exempt here (normal
+    # review + global ledger still apply below).
+    historical_cutoff = clearance_cutoff(base) if clearance_flag else None
+    if clearance_flag is not False:
+        try:
+            clearance_rows = _historical_clearance_rows(base, store, clearance_flag)
+        except Exception as e:  # noqa: BLE001 - unproven clearance closes the pool
+            if strict_claims:
+                raise
+            print(f"[gym-media-selector] historical clearance read failed for "
+                  f"{base}: {type(e).__name__}")
+            return []
+
     candidates = []
     for a in assets:
         # TENANT re-assertion (defense in depth): even though the store filtered by
@@ -470,6 +531,9 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
             # can never be proven globally unused: fail closed, exclude it.
             if not fp or fp in ledger_used:
                 continue
+        if (clearance_flag and asset_is_historical(a, historical_cutoff)
+                and clearance_status(a, clearance_rows) != "cleared"):
+            continue
         # GLOBAL ONCE-USED RULE: any prior stage-use is out forever for automatic
         # selection, independent of the cooldown clocks below. Stage-use is
         # permanent — rollback on a deny settles the record WITHOUT restoring
@@ -479,7 +543,7 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
             continue
         used_at = _parse_ts(a.get("last_used_at"))
         if used_at is not None:
-            if used_at > cutoff:               # inside the 90-day reuse cooldown
+            if used_at > reuse_cutoff:         # inside the 90-day reuse cooldown
                 continue
             if used_at.strftime("%Y-%m") == month:   # already used this month
                 continue
@@ -529,6 +593,20 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
     used_hashes = {_byte_hash(a)
                    for a in assets if str(a.get("gym_id") or "") == base
                    and _has_prior_use(a) and _byte_hash(a)}
+    # DRAFT HISTORICAL MEDIA CLEARANCE: the explicit swap lane never bypasses
+    # per-asset clearance either (same per-gym cutoff as pickable). Flag OFF =
+    # byte-for-byte legacy; ambiguous flag or ANY read failure fails closed to
+    # no fallback.
+    clearance_flag = historical_clearance_flag()
+    clearance_rows = []
+    historical_cutoff = clearance_cutoff(base) if clearance_flag else None
+    if clearance_flag is not False:
+        try:
+            clearance_rows = _historical_clearance_rows(base, store, clearance_flag)
+        except Exception as e:  # noqa: BLE001 - unproven clearance closes fallback
+            print(f"[gym-media-selector] historical clearance read failed for "
+                  f"{base}: {type(e).__name__}")
+            return []
     candidates = []
     for asset in assets:
         if str(asset.get("gym_id") or "") != base:
@@ -538,6 +616,9 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
         if _has_prior_use(asset) or (_byte_hash(asset) and _byte_hash(asset) in used_hashes):
             continue
         if not is_usable(asset) or str(asset.get("id")) in excl:
+            continue
+        if (clearance_flag and asset_is_historical(asset, historical_cutoff)
+                and clearance_status(asset, clearance_rows) != "cleared"):
             continue
         if (str(asset.get("id")) in claimed_ids
                 or (_byte_hash(asset) and _byte_hash(asset) in claimed_hashes)):

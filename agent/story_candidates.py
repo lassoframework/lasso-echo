@@ -166,6 +166,32 @@ def discover_candidates(gym_id, asset_ids=None, *, store=None, now=None,
               f"{type(e).__name__}: {e}")
         return [], {}
 
+    # DRAFT HISTORICAL MEDIA CLEARANCE (2026-10-03): the raw Story/Reel lane
+    # selects from the SAME media_asset pool as gym_media_selector, so it is
+    # gated by the SAME shared fail-closed clearance logic. Flag OFF =
+    # byte-for-byte legacy. Flag ON: a pre-cutoff asset needs an explicit
+    # current-hash 'cleared' receipt (identity quadruple incl. source_id).
+    # An ambiguous flag value or ANY clearance-read failure fails closed:
+    # strict callers get HistoricalClearanceUnavailable, non-strict callers
+    # get an empty discovery.
+    clearance_flag = False
+    clearance_rows = []
+    historical_cutoff = None
+    from . import historical_media_clearance as _hmc
+    clearance_flag = _hmc.historical_clearance_flag()
+    if clearance_flag is not False:
+        try:
+            from . import gym_media_selector as _gms
+            clearance_rows = _gms._historical_clearance_rows(
+                gym_id, store, clearance_flag)
+        except Exception as e:  # noqa: BLE001 - unproven clearance closes discovery
+            if strict:
+                raise
+            print(f"[story-candidates] historical clearance read failed for "
+                  f"{gym_id}: {type(e).__name__}")
+            return [], {}
+    historical_cutoff = _hmc.clearance_cutoff(gym_id) if clearance_flag else None
+
     wanted = {str(a) for a in (asset_ids or [])}
     ambiguous_ids = _pending_ambiguous_ids(gym_id, strict=True) if strict else _pending_ambiguous_ids(gym_id)
 
@@ -177,6 +203,10 @@ def discover_candidates(gym_id, asset_ids=None, *, store=None, now=None,
         ok, _reason = _eligible_raw(a, gym_id, ambiguous_ids=ambiguous_ids,
                                     ledger_lookup=ledger_lookup, strict=strict)
         if not ok:
+            continue
+        if (clearance_flag
+                and _hmc.asset_is_historical(a, historical_cutoff)
+                and _hmc.clearance_status(a, clearance_rows) != "cleared"):
             continue
         window = _seg_window(a)
         if window is None:
