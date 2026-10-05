@@ -243,3 +243,23 @@ def test_third_pair_changed_or_unlisted_evidence_refuses(pg):
         f"where id='{HISTORICAL3}'")
     assert sql(f"select public.lasso_unrelated_published_story("
                f"'{HISTORICAL3}','{FEED3}')") == "f"
+    sql(f"update public.content_calendar set pillar='doctrine' "
+        f"where id='{HISTORICAL3}'")
+
+
+def test_third_pair_null_metadata_refuses(pg):
+    sql = pg
+    # Erased feed metadata must refuse, never fall through a NULL predicate.
+    restores = {"slot_index": "0", "status": "'published'",
+                "variant_status": "'active'", "post_date": "'2026-10-04'",
+                "gym_id": "'lasso'"}
+    for column, original in restores.items():
+        sql(f"update public.content_calendar set {column}=null "
+            f"where id='{FEED3}'")
+        assert sql(f"select public.lasso_unrelated_published_story("
+                   f"'{HISTORICAL3}','{FEED3}')") == "f", column
+        sql(f"update public.content_calendar set {column}={original} "
+            f"where id='{FEED3}'")
+    # Restoring correct values reopens the exception.
+    assert sql(f"select public.lasso_unrelated_published_story("
+               f"'{HISTORICAL3}','{FEED3}')") == "t"

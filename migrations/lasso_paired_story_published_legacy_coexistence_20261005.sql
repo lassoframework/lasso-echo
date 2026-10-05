@@ -59,25 +59,29 @@ Save this for later.'::text, true)
   if not found then return false; end if;
   select * into s from public.content_calendar where id = p_story_id;
   select * into f from public.content_calendar where id = p_feed_id;
+  -- Every expected-field comparison is null-safe: erased metadata must
+  -- refuse, never fall through an IF guard on a NULL predicate.
   if s.id is null or f.id is null
-     or s.gym_id <> 'lasso' or f.gym_id <> 'lasso'
-     or s.post_date <> f.post_date
-     or s.post_date <> v_day
+     or s.gym_id is distinct from 'lasso' or f.gym_id is distinct from 'lasso'
+     or s.post_date is distinct from f.post_date
+     or s.post_date is distinct from v_day
      or lower(btrim(coalesce(s.account, ''))) <> 'instagram'
      or lower(btrim(coalesce(f.account, ''))) <> 'instagram'
      or lower(btrim(coalesce(s.format, 'feed'))) <> 'story'
      or lower(btrim(coalesce(f.format, 'feed'))) <> 'feed'
-     or s.slot_index <> v_slot or f.slot_index <> v_slot
-     or s.variant_status <> 'active' or f.variant_status <> 'active'
-     or s.status <> 'published' or s.published_at is null
+     or s.slot_index is distinct from v_slot
+     or f.slot_index is distinct from v_slot
+     or s.variant_status is distinct from 'active'
+     or f.variant_status is distinct from 'active'
+     or s.status is distinct from 'published' or s.published_at is null
      or s.late_post_id is null
-     or f.status not in ('pending','approved','published')
+     or coalesce(f.status, '') not in ('pending','approved','published')
      or (f.status = 'published' and
          (f.published_at is null or f.late_post_id is null))
-     or (f.status in ('pending','approved') and
+     or (coalesce(f.status, '') in ('pending','approved') and
          (f.published_at is not null or f.late_post_id is not null))
      or (v_require_published and
-         (f.status <> 'published'
+         (f.status is distinct from 'published'
           or f.published_at is null or f.late_post_id is null))
      or s.pillar is distinct from v_story_pillar
      or f.pillar is distinct from v_feed_pillar
@@ -88,7 +92,7 @@ Save this for later.'::text, true)
      or s.logical_post_id is not null
      or (to_jsonb(s)->>'source_media_asset_id') is not null
      or s.caption is distinct from ''
-     or s.image_url !~ '^https://'
+     or coalesce(s.image_url, '') !~ '^https://'
      or s.source_media_url is distinct from s.image_url then
     return false;
   end if;
