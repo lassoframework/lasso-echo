@@ -2735,7 +2735,9 @@ def test_approved_legacy_semicolon_caption_is_formatted_and_publishes(armed):
     assert store.rows["semi1"]["status"] == "published"
 
 
-def test_approved_legacy_spacing_is_formatted_before_publish(armed):
+def test_approved_legacy_spacing_is_formatted_before_publish(armed, monkeypatch):
+    notices = []
+    monkeypatch.setattr(cap, "_note_caption_formatted", lambda *args: notices.append(args))
     store = _PreservingStore([_row(
         "spacing1", status="approved",
         caption="Move well today. Build strength tomorrow. Join us.")])
@@ -2748,6 +2750,7 @@ def test_approved_legacy_spacing_is_formatted_before_publish(armed):
     assert sent == "Move well today.\n\nBuild strength tomorrow.\n\nJoin us."
     assert store.preserve_patches == [("lasso", "spacing1", sent)]
     assert store.rows["spacing1"]["status"] == "published"
+    assert notices == []
 
 
 def test_semicolon_heal_survives_a_store_without_the_patch_method(armed):

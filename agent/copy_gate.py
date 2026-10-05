@@ -196,17 +196,26 @@ def format_caption(text: str) -> str:
             blocks.append(line)
             continue
         start = 0
+        numbered_list = False
         for match in _CAPTION_SENTENCE_END.finditer(line):
             part = line[start:match.end(1)].strip()
             last_word = part.split()[-1].lower() if part.split() else ""
             if last_word in _CAPTION_ABBREVIATIONS:
                 continue
             next_text = line[match.end():].lstrip()
+            if re.fullmatch(r"\d+\.", last_word):
+                prefix = line[:match.start() - len(last_word[:-1])].rstrip()
+                if numbered_list or not prefix or prefix.endswith(":"):
+                    numbered_list = True
+                    continue
+            if last_word.endswith("...") and next_text and next_text[0].islower():
+                continue
             if (last_word in _CAPTION_CONTEXT_ABBREVIATIONS and next_text
                     and (next_text[0].islower() or next_text[0].isdigit())):
                 continue
             blocks.append(part)
             start = match.end()
+            numbered_list = False
         tail = line[start:].strip()
         if tail:
             blocks.append(tail)

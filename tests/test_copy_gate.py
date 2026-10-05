@@ -130,6 +130,15 @@ def test_caption_etc_abbreviation_does_not_split_paragraph():
         "We have rowers, bikes, etc.\n\nEvery class is coached.\n\nBook a spot.")
 
 
+def test_caption_numbered_lists_and_ellipsis_pause_keep_their_text_together():
+    for raw in ("1. Squats 2. Lunges", "Try this: 1. Warm up 2. Stretch 3. Cool down."):
+        assert copy_gate.format_caption(raw) == raw
+    assert copy_gate.format_caption("Wait... what if you tried? Start today.") == (
+        "Wait... what if you tried?\n\nStart today.")
+    assert copy_gate.format_caption("Start at level 1. Build from there.") == (
+        "Start at level 1.\n\nBuild from there.")
+
+
 def test_caption_month_and_unit_abbreviations_use_next_word_context():
     assert copy_gate.format_caption("Classes start Oct. 5 at 7 a.m. Book a spot.") == (
         "Classes start Oct. 5 at 7 a.m.\n\nBook a spot.")
