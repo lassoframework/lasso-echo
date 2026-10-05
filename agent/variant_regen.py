@@ -15,14 +15,15 @@ and the human picks between the two later via swap_variant.
 
 THE GENERATION ITSELF reuses creative_studio.generate — the SAME Astra-first,
 grade-gated pipeline every normal build uses (Astra -> retry -> Gemini ->
-"needs human"; house-style grade retries; no fabrication). The only new
-decision here is WHAT drives the brief for an ALREADY-SCHEDULED post that has
-no separately-stored "headline": the row's own pillar (a short, approved
-label — 'nutrition', 'community', ...) is the headline, and its own caption
-is the fact set. Nothing is invented that the row didn't already carry.
+"needs human"; house-style grade retries; no fabrication). For LASSO's reviewed
+infographic path, the scheduled caption itself is the complete source. Other
+accounts use the row's pillar as a short headline and its caption as the fact
+set.
 
 Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF).
 """
+
+import hashlib
 
 from . import config, media_host
 
@@ -65,6 +66,30 @@ def _facts_for(row):
     return parts[:6] or [caption]
 
 
+def _lasso_caption_brief(row):
+    """Keep the scheduled caption intact as approved concept context.
+
+    A short, verbatim first sentence serves as the on-image headline. No
+    copy-bank block, rewritten claim, or unrelated CTA can replace the row.
+    """
+    caption = str(row.get("caption") or "").strip()
+    first_line = next((line.strip() for line in caption.splitlines() if line.strip()), "")
+    headline = first_line.split(". ", 1)[0].strip() or caption
+    return headline, [caption]
+
+
+def _caption_approved_cta(caption):
+    """Render a Brain CTA only when this scheduled caption actually contains it."""
+    try:
+        from .content_planner import load_source_doc
+        doc = load_source_doc()
+        matches = [cta for cta in (doc.ctas if doc else ())
+                   if cta and cta.casefold() in caption.casefold()]
+        return max(matches, key=len) if matches else ""
+    except Exception:
+        return ""
+
+
 def generate_variant_image(row, account_key, client=None, generate_fn=None,
                            host_fn=None):
     """Generate ONE new image for the logical post `row` already represents,
@@ -81,22 +106,24 @@ def generate_variant_image(row, account_key, client=None, generate_fn=None,
     if not facts:
         return {"ok": False, "reason": REASON_NO_CAPTION}
 
+    lasso_quality = config.lasso_infographic_quality_enabled(account_key)
     headline = str(row.get("pillar") or "").strip() or "A new take on this post"
-    copy = None
-    if config.lasso_infographic_quality_enabled(account_key):
-        from .lasso_infographic_content import select_copy
-        try:
-            copy = select_copy(str(row.get("caption") or headline))
-        except ValueError:
-            return {"ok": False, "reason": "brain_source_unavailable"}
-        headline, facts = copy["headline"], copy["facts"]
+    if lasso_quality:
+        if not row.get("id") or str(row.get("gym_id") or "").strip().lower() not in {
+                "lasso", "lasso-framework-llc"}:
+            return {"ok": False, "reason": "caption_source_unavailable"}
+        headline, facts = _lasso_caption_brief(row)
     is_story = "story" in str(row.get("format") or "").lower()
     aspect = "9:16" if is_story else None
     pixels = "1080x1920" if is_story else None
     surface = "story" if is_story else "feed post"
 
     gen = generate_fn or _default_generate
-    extra = {"cta": copy["cta"], "footer": copy.get("footer")} if copy else {}
+    # The caption remains the source of claim text. A CTA must already occur in
+    # that caption; None lets creative_studio render its approved URL footer.
+    extra = ({"cta": _caption_approved_cta(str(row["caption"])),
+              "footer": None, "draft_id": str(row["id"])}
+             if lasso_quality else {})
     result = gen(headline, facts, client=client, aspect=aspect, pixels=pixels,
                 surface=surface, account_key=account_key, **extra)
     if not result or not result.get("path"):
@@ -107,11 +134,13 @@ def generate_variant_image(row, account_key, client=None, generate_fn=None,
     if not url:
         return {"ok": False, "reason": REASON_HOSTING}
 
-    if copy:
+    if lasso_quality:
         from .infographic_artifacts import ArtifactStore
+        caption = str(row["caption"])
         try:
             ArtifactStore().save(account_key, url, result["path"],
-                {"source_id": copy["source_id"], "source_hash": copy["source_hash"]})
+                {"source_id": f"content_calendar:{row['id']}:caption",
+                 "source_hash": hashlib.sha256(caption.encode("utf-8")).hexdigest()})
         except Exception:
             return {"ok": False, "reason": "review_evidence_not_saved"}
 
@@ -120,8 +149,9 @@ def generate_variant_image(row, account_key, client=None, generate_fn=None,
 
 
 def _default_generate(headline, facts, client=None, aspect=None, pixels=None,
-                      surface=None, account_key=None, cta="", footer=None):
+                      surface=None, account_key=None, cta="", footer=None, draft_id=""):
     from . import creative_studio
     return creative_studio.generate(
         headline, facts, client=client, aspect=aspect, pixels=pixels,
-        surface=surface, account_key=account_key, cta=cta, footer=footer)
+        surface=surface, account_key=account_key, cta=cta, footer=footer,
+        draft_id=draft_id)

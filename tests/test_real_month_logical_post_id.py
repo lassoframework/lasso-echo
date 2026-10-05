@@ -106,6 +106,23 @@ def test_fb_mirror_clone_shares_the_feed_uuid():
     assert st[0]["logical_post_id"] == shared
 
 
+def test_lasso_fb_story_mirrors_reviewed_ig_pair():
+    feed = _draft("lasso-feed")
+    story = _draft("lasso-story", is_story=True, draft_type="story", caption="")
+    drafts = rmp.build_month_drafts(
+        _plan(_feed_slot(0), _story_slot(0)), _builders(feed),
+        story_builder=_story_builder(story), account="lasso", logger=lambda m: None)
+    rows = rmp.to_calendar_rows(drafts, "lasso")
+    assert {(r["account"], r["format"]) for r in rows} == {
+        ("instagram", "feed"), ("instagram", "story"),
+        ("facebook", "feed"), ("facebook", "story")}
+    assert len({r["logical_post_id"] for r in rows}) == 1
+    ig_story = next(r for r in rows if r["account"] == "instagram" and r["format"] == "story")
+    fb_story = next(r for r in rows if r["account"] == "facebook" and r["format"] == "story")
+    assert fb_story["image_url"] == ig_story["image_url"]
+    assert fb_story["slot_index"] == ig_story["slot_index"] == 0
+
+
 # ---- independent same-day same-photo post gets a different UUID ------------
 
 def test_same_day_same_photo_independent_posts_get_different_uuids():

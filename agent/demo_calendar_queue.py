@@ -86,9 +86,8 @@ DEMO_POSTS = [
     {"num": 3, "date": "2026-08-08", "pillar": "We do the heavy lifting",
      "filename": "demo_03_heavy_lifting.png", "is_story": True,
      "hook": "We run your social media for you.",
-     "body": ("We plan the month, draft every post, and track what is working. A human "
-              "approves every post before it goes live. You get the results without "
-              "doing the work."),
+     "body": ("We plan the month, draft every post, and track what is working. "
+              "Echo handles the content calendar so your team can focus on the gym."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 4, "date": "2026-08-09", "pillar": "The portal",
      "filename": "demo_04_portal.png", "is_story": True,
@@ -117,9 +116,8 @@ DEMO_POSTS = [
     {"num": 8, "date": "2026-08-13", "pillar": "We do the heavy lifting",
      "filename": "demo_08_heavy_lifting_b.png", "is_story": True,
      "hook": "We run your social media for you.",
-     "body": ("We plan the month, draft every post, and track what is working. A human "
-              "approves every post before it goes live. You get the results without "
-              "doing the work."),
+     "body": ("We plan the month, draft every post, and track what is working. "
+              "Echo handles the content calendar so your team can focus on the gym."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 9, "date": "2026-08-14", "pillar": "The portal",
      "filename": "demo_09_cockpit.png", "is_story": True,
@@ -149,9 +147,8 @@ DEMO_POSTS = [
     {"num": 13, "date": "2026-08-18", "pillar": "We do the heavy lifting",
      "filename": "demo_13_plan_draft_track.png", "is_story": True,
      "hook": "We run your social media for you.",
-     "body": ("We plan the month, draft every post, and track what is working. A human "
-              "approves every post before it goes live. You get the results without "
-              "doing the work."),
+     "body": ("We plan the month, draft every post, and track what is working. "
+              "Echo handles the content calendar so your team can focus on the gym."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 14, "date": "2026-08-19", "pillar": "The portal",
      "filename": "demo_14_one_screen_b.png", "is_story": True,
@@ -179,9 +176,8 @@ DEMO_POSTS = [
     {"num": 18, "date": "2026-08-23", "pillar": "We do the heavy lifting",
      "filename": "demo_18_human_approves.png", "is_story": True,
      "hook": "We run your social media for you.",
-     "body": ("We plan the month, draft every post, and track what is working. A human "
-              "approves every post before it goes live. You get the results without "
-              "doing the work."),
+     "body": ("We plan the month, draft every post, and track what is working. "
+              "Echo handles the content calendar so your team can focus on the gym."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 19, "date": "2026-08-24", "pillar": "The portal",
      "filename": "demo_19_cockpit_b.png", "is_story": True,
@@ -210,9 +206,8 @@ DEMO_POSTS = [
     {"num": 23, "date": "2026-08-28", "pillar": "We do the heavy lifting",
      "filename": "demo_23_plan_grid.png", "is_story": True,
      "hook": "We run your social media for you.",
-     "body": ("We plan the month, draft every post, and track what is working. A human "
-              "approves every post before it goes live. You get the results without "
-              "doing the work."),
+     "body": ("We plan the month, draft every post, and track what is working. "
+              "Echo handles the content calendar so your team can focus on the gym."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 24, "date": "2026-08-29", "pillar": "The portal",
      "filename": "demo_24_one_screen_c.png", "is_story": True,
@@ -241,9 +236,8 @@ DEMO_POSTS = [
     {"num": 28, "date": "2026-09-02", "pillar": "We do the heavy lifting",
      "filename": "demo_28_plan_draft_track_b.png", "is_story": True,
      "hook": "We run your social media for you.",
-     "body": ("We plan the month, draft every post, and track what is working. A human "
-              "approves every post before it goes live. You get the results without "
-              "doing the work."),
+     "body": ("We plan the month, draft every post, and track what is working. "
+              "Echo handles the content calendar so your team can focus on the gym."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 29, "date": "2026-09-03", "pillar": "The portal",
      "filename": "demo_29_cockpit_c.png", "is_story": True,

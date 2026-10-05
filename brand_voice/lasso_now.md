@@ -3,8 +3,10 @@
 Purpose: the approved material Echo writes LASSO's daily posts from. Echo drafts
 ONLY from what is on this page plus the brand bible. If a fact is not here, Echo
 does not post it. No fabrication. No em, en, or hyphen dashes in any copy. No
-prices in a caption unless the exact wording is approved below. One post per day,
-held for Blake's approval, then published to the LASSO Facebook Page and Instagram.
+prices in a caption unless the exact wording is approved below. For LASSO's own
+Instagram account, Echo publishes three feed posts with a paired Story for each
+post every day from approved source material without per-post approval from Blake. Facebook distribution follows
+the account's configured publishing rules.
 
 ## The one-line story
 We get the leads. We nurture them. All you do is sell.
@@ -47,7 +49,7 @@ Named case studies (verified):
 - "Hoosier CrossFit: +49.3% YoY." (platform_2026_case_hoosier)
 - "CrossFit Liminal: +66% in 12 months." (platform_2026_case_liminal)
 
-## Content pillars (Echo rotates one per day)
+## Content pillars (Echo rotates across three daily Instagram feed posts)
 1. All in one offer
 2. Sales are now
 3. We do the heavy lifting
@@ -81,7 +83,7 @@ Body: We get the leads and nurture them. You do the one thing only you can do: s
 ### Pillar: We do the heavy lifting
 Hook: We run your social media for you.
 Body: We plan the month, draft every post, and track what is working.
-Body: A human approves every post before it goes live. You get the results without doing the work.
+Body: Echo handles the content calendar so your team can focus on the gym.
 
 ### Pillar: The portal
 Hook: Every lead, every post, every result. One screen.
