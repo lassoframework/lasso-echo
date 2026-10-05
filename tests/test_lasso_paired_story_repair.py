@@ -324,3 +324,39 @@ def test_rpc_refuses_unrelated_hold_and_story_drift(pg):
     assert sql(f"select image_url from public.content_calendar "
                f"where id='{PG_STORY}'") == PG_OLD_URL
     assert sql("select count(*) from public.lasso_managed_paired_stories") == "0"
+
+
+def test_ready_rpc_accepts_valid_leased_feed_and_rejects_leaseless_publishing(pg):
+    """The publisher's post-claim source revalidation reads readiness on the
+    LEASED feed: 'publishing' is acceptable ONLY with a real lease (claim token
+    + reservation day, no publish receipt). A bare 'publishing' row and a
+    leased row with a receipt stay excluded, and the Story still cannot publish
+    before the feed receipt lands."""
+    sql = pg
+    receipt = _json.loads(_pg_seed(sql, "paired_feed_not_ready"))
+    assert receipt["result"] == "repaired"
+    ready = f"select public.lasso_paired_story_ready_for_feed('{PG_FEED}')"
+    assert sql(ready) == "t"                      # pending feed: ready
+
+    # A bare 'publishing' row (no lease) is NOT readable.
+    sql(f"update public.content_calendar set status='publishing' "
+        f"where id='{PG_FEED}'")
+    assert sql(ready) == "f"
+
+    # A valid lease (token + reservation day, no receipt) IS readable.
+    sql(f"update public.content_calendar set "
+        f"publish_claim_token='55555555-5555-4555-8555-555555555555', "
+        f"publish_reservation_day='2026-10-03' where id='{PG_FEED}'")
+    assert sql(ready) == "t"
+
+    # The Story send still requires the real feed receipt: claiming the Story
+    # while its feed is merely leased is refused by the source-proof guard.
+    with pytest.raises(_subprocess.CalledProcessError) as blocked:
+        sql(f"update public.content_calendar set status='publishing' "
+            f"where id='{PG_STORY}'")
+    assert "source proof missing or held" in blocked.value.stderr
+
+    # A lease carrying a publish receipt is not a lease at all: excluded again.
+    sql(f"update public.content_calendar set published_at=now(), "
+        f"late_post_id='receipt' where id='{PG_FEED}'")
+    assert sql(ready) == "f"

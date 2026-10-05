@@ -413,6 +413,17 @@ def _paired_lasso_story_prepared(feed, store):
         return False
 
 
+# The outgoing source fields a leased paired LASSO feed must still share with
+# the local due_rows snapshot after the owned claim (see publish_due). The
+# claim RPC pins OWNERSHIP, not outgoing content: caption/media patched while
+# pending between the paired-Story proof and the claim would otherwise send
+# content the prepared Story was never bound to.
+_PAIRED_FEED_SOURCE_FIELDS = (
+    "caption", "image_url", "source_media_url", "source_media_asset_id",
+    "thumbnail_url", "account", "format", "post_date", "slot_index",
+    "logical_post_id", "pillar", "scheduled_at", "media_not_ready_reason")
+
+
 def assign_slots(rows):
     """
     Given a day+account's content_calendar rows, return [(row, slot_time)] where
@@ -1615,6 +1626,44 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # claim. Legacy injected stores return True and use their own rollback
         # behavior; Supabase rollback refuses to run without this token.
         claim_token = won if isinstance(won, str) else None
+
+        # LEASED-ROW SOURCE REVALIDATION (paired LASSO feed, owned string-token
+        # claim only; legacy bool-claim test stores skip this gate entirely).
+        # due_rows is a SNAPSHOT: caption/media can be patched while pending
+        # between the paired-Story proof above and this claim, and the claim
+        # RPC pins ownership, not outgoing content. Re-fetch the leased row and
+        # require the SAME claim token with status 'publishing', field-for-field
+        # equality of the outgoing source with the snapshot, and Story readiness
+        # measured against the LEASED feed row -- all BEFORE any content-ledger
+        # stamp or network call. Anything less rolls back with the owned token
+        # and the existing repeated-failure note; a failed rollback is recovery
+        # work, exactly like the other pre-network blocks.
+        if paired_lasso_feed and claim_token:
+            leased = None
+            try:
+                _get_row = getattr(store, "get_row", None)
+                if callable(_get_row):
+                    leased = _get_row(gym_id, row_id)
+            except Exception:  # noqa: BLE001 - an unreadable lease fails closed
+                leased = None
+            lease_ok = (
+                isinstance(leased, dict)
+                and str(leased.get("publish_claim_token") or "") == str(claim_token)
+                and str(leased.get("status") or "") == "publishing"
+                and all(leased.get(_f) == row.get(_f)
+                        for _f in _PAIRED_FEED_SOURCE_FIELDS))
+            if not lease_ok or not _paired_lasso_story_prepared(leased, store):
+                _note_repeat_failure(row_id, gym_id, RuntimeError(
+                    "leased paired feed changed after the Story source proof; "
+                    "feed remains held"))
+                _reverted = _revert_to_pending(
+                    row_id=row_id, store=store, gym_id=gym_id,
+                    expected_claim_token=claim_token,
+                    reject_reason="leased_feed_source_mismatch")
+                if not _reverted:
+                    recovery_required.append(row_id)
+                failed.append(row_id)
+                continue
 
         # CONTENT IDEMPOTENCY, WRITTEN BEFORE THE NETWORK CALL (2026-09-05 incident).
         #

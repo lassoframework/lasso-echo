@@ -127,7 +127,16 @@ begin
   if not found or f.post_date < date '2026-10-02'
      or lower(btrim(coalesce(f.account, ''))) not in ('instagram','facebook')
      or f.slot_index not in (0,1,2)
-     or f.status not in ('pending','approved')
+     -- A leased feed ('publishing') is readable by the publisher's post-claim
+     -- source revalidation ONLY while the lease is real: an owned claim token
+     -- and reservation day, and no publish receipt yet. Any other non-pending
+     -- status (including a bare 'publishing' with no lease) stays excluded.
+     or (f.status not in ('pending','approved')
+         and not (f.status = 'publishing'
+                  and f.publish_claim_token is not null
+                  and f.publish_reservation_day is not null
+                  and f.published_at is null
+                  and f.late_post_id is null))
      or f.media_not_ready_reason is not null
      or nullif(btrim(coalesce(f.caption, '')), '') is null
      or f.image_url !~ '^https://' then

@@ -2924,3 +2924,146 @@ def test_lasso_feed_with_unchanged_caption_pays_no_second_proof(armed, monkeypat
 
     assert result["published"] == ["clean-feed"]
     assert len(proofs) == 1, "an unchanged caption must not pay a second proof RPC"
+
+
+# ---- leased-row source revalidation for paired LASSO feeds (freeze) ---------
+# due_rows is a snapshot; the owned claim pins ownership, not outgoing content.
+# After a successful string-token claim the publisher re-fetches the leased row
+# and requires the same token, 'publishing', source-field equality with the
+# snapshot, and Story readiness on the LEASED row -- before any ledger stamp
+# or network call.
+
+class _LeasedPairStore(_FakeStore):
+    """Owned string-token claim plus get_row over the live row dict."""
+
+    TOKEN = "44444444-4444-4444-8444-444444444444"
+
+    def __init__(self, rows, mutate=None):
+        super().__init__(rows)
+        self._mutate = mutate
+        self.get_row_calls = 0
+        self.ready_calls = 0
+
+    def claim_publish_slot(self, row_id, gym_id, day, timezone_name,
+                           capacity, approved_only):
+        row = self.rows.get(row_id)
+        if not row or row.get("status") not in ("pending", "approved"):
+            return None
+        row.update(status="publishing", publish_claim_token=self.TOKEN,
+                   publish_reservation_day=day)
+        if self._mutate:
+            self._mutate(row)          # a patch landing while the row was pending
+        return self.TOKEN
+
+    def get_row(self, gym_id, row_id):
+        self.get_row_calls += 1
+        row = self.rows.get(row_id)
+        return dict(row) if row and row.get("gym_id") == gym_id else None
+
+    def lasso_paired_story_ready_for_feed(self, feed_id):
+        self.ready_calls += 1
+        return True
+
+    def mark_publish_failed(self, row_id, revert_status="pending",
+                            reject_reason=None, gym_id=None,
+                            expected_claim_token=None):
+        self.failed_calls.append(row_id)
+        row = self.rows.get(row_id)
+        if (not row or expected_claim_token != row.get("publish_claim_token")):
+            return None
+        row.update(status=revert_status, publish_claim_token=None,
+                   reject_reason=reject_reason)
+        return dict(row)
+
+    def mark_published(self, row_id, media_id, published_at,
+                       expected_claim_token=None):
+        row = self.rows.get(row_id)
+        if (not row or expected_claim_token != row.get("publish_claim_token")):
+            return None
+        self.published_calls.append((row_id, media_id, published_at))
+        row.update(status="published", published_at=published_at,
+                   late_post_id=media_id, publish_claim_token=None)
+        return dict(row)
+
+
+def _leased_pair_row(row_id="leased-feed"):
+    row = _row(row_id, post_date="2026-10-05",
+               caption="Move well and build strength with us today.")
+    row["slot_index"] = 0
+    return row
+
+
+def test_leased_pair_mutated_between_proof_and_claim_rolls_back(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
+    store = _LeasedPairStore([_leased_pair_row()],
+                             mutate=lambda row: row.update(
+                                 caption="patched while pending"))
+    stamps = []
+
+    class LedgerSpy:
+        def get(self, key, default=""):
+            return ""
+        def set(self, key, value):
+            stamps.append((key, value))
+
+    monkeypatch.setattr(cap, "_kv_default", lambda: LedgerSpy())
+    failures = []
+    monkeypatch.setattr(cap, "_note_repeat_failure",
+                        lambda rid, gym, exc: failures.append((rid, gym, str(exc))))
+    pub = _FakePublisher()
+
+    result = cap.publish_due("2026-10-05", store=store, publisher=pub,
+                             now="2026-10-05T23:59:00-04:00", catch_all=True)
+
+    assert result["published"] == []
+    assert result["failed"] == ["leased-feed"]
+    assert pub.calls == []                        # no network call
+    assert stamps == []                           # no content-ledger stamp
+    assert store.get_row_calls == 1
+    # The snapshot/lease mismatch short-circuits: no second readiness RPC.
+    assert store.ready_calls == 1
+    assert failures == [("leased-feed", "lasso",
+                         "leased paired feed changed after the Story source "
+                         "proof; feed remains held")]
+    rolled = store.rows["leased-feed"]
+    assert rolled["status"] == "pending"
+    assert rolled["publish_claim_token"] is None
+    assert rolled["reject_reason"] == "leased_feed_source_mismatch"
+
+
+def test_leased_pair_unchanged_publishes_with_readiness_on_lease(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
+    store = _LeasedPairStore([_leased_pair_row()])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    result = cap.publish_due("2026-10-05", store=store, publisher=pub,
+                             now="2026-10-05T23:59:00-04:00", catch_all=True)
+
+    assert result["published"] == ["leased-feed"]
+    assert store.get_row_calls == 1
+    # First proof on the snapshot, second on the leased row.
+    assert store.ready_calls == 2
+    assert store.rows["leased-feed"]["status"] == "published"
+
+
+def test_legacy_bool_claim_store_skips_the_lease_gate(armed, monkeypatch):
+    """Legacy injectable stores return True from mark_publishing (no string
+    token); the re-fetch gate must not apply to them."""
+    monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
+    monkeypatch.setattr(config, "lasso_via_zernio_enabled", lambda: False)
+
+    class _LegacyStore(_FakeStore):
+        def lasso_paired_story_ready_for_feed(self, feed_id):
+            return True
+        def get_row(self, gym_id, row_id):
+            raise AssertionError("lease gate must not run on a bool claim")
+
+    store = _LegacyStore([_leased_pair_row("legacy-feed")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    result = cap.publish_due("2026-10-05", store=store, publisher=pub,
+                             now="2026-10-05T23:59:00-04:00", catch_all=True)
+
+    assert result["published"] == ["legacy-feed"]
