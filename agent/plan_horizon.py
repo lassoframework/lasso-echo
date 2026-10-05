@@ -40,8 +40,8 @@ DELIBERATE EXEMPTIONS (row-level, narrow — never a loophole every row can ride
 
 RAILS: already-approved/published rows are untouched everywhere. The clamp and the belt
 govern what gets BUILT/STAGED; the retirement sweep governs what is left OVER, and it
-only ever touches rows in a pre-approval, machine-owned status (pending / coach_review)
-that are also non-exempt and beyond the horizon. An approved, publishing, published,
+only ever touches pending rows that are non-exempt and beyond the horizon. Unsupported
+legacy rows stay protected for operator reconciliation. An approved, publishing, published,
 denied, killed, or failed row is never a candidate — the sweep cannot delete a decision
 a human made. AGENT_PLAN_HORIZON_DAYS=0 disables the cap entirely (emergency escape
 hatch: the flag exists to raise/lower the number, not to disable the principle), and
@@ -160,13 +160,12 @@ def belt_filter(account_key, rows, *, now=None, alert=None):
 
 # ---- retirement (the belt's retroactive counterpart) --------------------------------
 
-# The ONLY statuses the retirement sweep may delete. Both are pre-approval,
-# machine-owned states: 'pending' waits for the gym, 'coach_review' waits for a LASSO
-# coach — neither is a decision anyone has made yet, and the next month build re-stages
-# the day when it comes inside the window. Everything else is explicitly out of reach:
+# The ONLY status the retirement sweep may delete is a pending row beyond the horizon.
+# Retired coach_review states are protected for operator reconciliation. Everything else
+# is explicitly out of reach:
 # approved / publishing / published are live or promised, and denied / killed / failed
 # are decisions a human already made. Widening this tuple would break that promise.
-RETIREABLE_STATUSES = ("pending", "coach_review")
+RETIREABLE_STATUSES = ("pending",)
 
 
 def select_retirable(rows, *, now=None, statuses=RETIREABLE_STATUSES):

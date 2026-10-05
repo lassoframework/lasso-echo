@@ -584,7 +584,7 @@ def rows_for(base_key, drafts, *, library_path=None, store=None, ctx=None,
     Every row is built by gbp_planner._row, so its shape is the planner's own
     (account='googlebusiness', gbp_topic_type='STANDARD', gbp_cta_type/url, format
     'update'), it carries NO gbp_location_id (the worker binds the gym's connection at
-    publish time), and its status is 'pending' — the owner's tap, never a coach screen.
+    publish time), and its status is 'pending' — the owner's normal approval flow.
     """
     log = logger or (lambda m: print(f"[gbp-mirror] {m}"))
     # PER-GYM ROLLOUT (same rung Echo Vision and the Story Studio render lane use): the

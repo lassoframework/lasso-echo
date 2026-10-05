@@ -8,7 +8,7 @@ Covers:
   * blocked_keys: cross-day pending/approved block; same-date exempt; published
     blocks only inside the trailing repeat window; GBP rows are out of scope
   * surviving_keys: span-month wipeable rows are FREE (the rebuild replaces
-    them); coach_review + out-of-span pendings + trailing published still block
+    them); retired coach_review + out-of-span pendings + trailing published still block
   * the DENY BACKFILL never reuses a photo pending on another day, and falls
     back to maximum spacing (one digest) when the library is too small
   * the MONTH BUILD never re-picks a photo published in the trailing window
@@ -137,13 +137,13 @@ def test_surviving_keys_frees_span_wipeables_keeps_the_rest():
     from datetime import date
     store = _Store([
         _row("2026-08-20", "wipe.jpg", "pending"),          # in-span pending: replaced
-        _row("2026-08-21", "coach.jpg", "coach_review"),    # NOT wipeable: survives
+        _row("2026-08-21", "legacy.jpg", "coach_review"),  # retired coach_review state is protected
         _row("2026-08-22", "appr.jpg", "approved"),         # survives
         _row("2026-08-05", "pub.jpg", "published"),         # trailing window: survives
     ])
     keys = media_guard.surviving_keys("gritx", store, date(2026, 8, 15), 30)
     assert "wipe.jpg" not in keys, "the rebuild replaces span pendings; photo is free"
-    assert {"coach.jpg", "appr.jpg", "pub.jpg"} <= keys
+    assert {"legacy.jpg", "appr.jpg", "pub.jpg"} <= keys
 
 
 def test_surviving_keys_flag_off_is_empty(monkeypatch):

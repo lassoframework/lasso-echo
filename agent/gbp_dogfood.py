@@ -249,7 +249,7 @@ def run(portal_gym_key="lasso", *, city=None, cta_url=None, days=30, now=None,
     # GATE 1: OFFER only for a gym whose live offer a human has confirmed (default: none).
     offer_confirmed = base in config.gbp_offer_confirmed_gyms()
     # Every gym's new Google post is owner-visible for its normal approval flow.
-    # The retired first-month coach screen must never hide new rows.
+    # New rows always follow the normal owner approval flow.
     initial_status = "pending"
 
     facts = None
@@ -277,7 +277,7 @@ def run(portal_gym_key="lasso", *, city=None, cta_url=None, days=30, now=None,
 def main(argv=None):
     argv = list(argv if argv is not None else sys.argv[1:])
     if argv and argv[0] == "release":
-        print("coach review release is retired")
+        print("Unsupported command.")
         return 2
     gym = argv[0] if argv else "lasso"
     # city passed as 2nd arg (real); LASSO's is Carmel.

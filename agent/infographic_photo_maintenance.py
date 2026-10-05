@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 from . import media_swap
 
 _ACTIVE = {"pending", "approved", "coach_review"}
-_WAITING = {"pending", "coach_review"}
+_WAITING = {"pending"}
 _IGFILL = re.compile(r"(?:^|/)igfill_\d{4}-\d{2}-\d{2}(?:[_-]|\.)", re.I)
 _BEFORE = ("id", "gym_id", "post_date", "status", "variant_status", "caption",
            "image_url", "source_media_url", "source_media_asset_id")

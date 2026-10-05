@@ -183,7 +183,7 @@ def _locked_calendar_state(base_key, start, days, store, log, library_path=None)
     # CROSS-DAY MEDIA GUARD (Blake, 2026-08-31: a client saw the same photo across
     # different weeks): also exclude every photo that will SURVIVE this rebuild on
     # the gym's book — published within the trailing repeat window (the span-months
-    # read above missed last month's publishes), coach_review rows (NOT wipeable, so
+    # read above missed last month's publishes), retired coach_review rows (NOT wipeable, so
     # they survive the delete), and wipeable rows OUTSIDE the span months. Wipeable
     # rows INSIDE the span are about to be replaced, so their photos stay free —
     # excluding them would starve the very rebuild that releases them. Read failure

@@ -431,11 +431,8 @@ class SupabaseCalendarStore:
         return r.json() or []
 
     def has_owner_visible_rows(self, account_key):
-        """GATE 2 (coach-screens-first-month): True if the gym has EVER had an owner-visible
-        content_calendar row (any status EXCEPT 'coach_review', any account, any date). A
-        gym with none is in its FIRST, not-yet-released month; a gym with any is established
-        and grandfathered (never re-withheld on a rebuild)."""
-        params = {"gym_id": f"eq.{account_key}", "status": "neq.coach_review",
+        """True if the gym has any normal, owner-visible active calendar row."""
+        params = {"gym_id": f"eq.{account_key}",
                   # 0318: a 'candidate' row (an unchosen Astra v2, never itself
                   # owner-visible in the review sense this gate cares about)
                   # must not count as "the gym already has a released month".
@@ -635,11 +632,11 @@ class SupabaseCalendarStore:
             if (not isinstance(current, dict)
                     or str(current.get("id")) != str(row_id)
                     or str(current.get("gym_id")) != str(account_key)
-                    or current.get("status") not in ("pending", "coach_review")):
+                    or current.get("status") != "pending"):
                 return None
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"}
         if expected_row is None:
-            params["status"] = "in.(pending,coach_review)"
+            params["status"] = "eq.pending"
         else:
             required = ("id", "gym_id", "status", "format", "image_url",
                         "caption", "source_media_url", "published_at", "late_post_id",
@@ -818,9 +815,7 @@ class SupabaseCalendarStore:
             return None  # already has a real image; never overwrite
         if not (image_url or "").strip():
             return None
-        # A real replacement resolves the explicit hold in the SAME scoped write.
-        # Do not change status: it remains pending / coach_review and must pass the
-        # ordinary approval gate before it can publish.
+        # A real replacement resolves the explicit media hold in the SAME scoped write.
         payload = {"image_url": image_url, "media_not_ready_reason": None}
         if source_media_asset_id:
             payload["source_media_asset_id"] = source_media_asset_id
@@ -829,7 +824,7 @@ class SupabaseCalendarStore:
         if prepared_write:
             if (str(current.get("gym_id")) != str(account_key)
                     or str(current.get("id")) != str(row_id)
-                    or current.get("status") not in ("pending", "coach_review")
+                    or current.get("status") != "pending"
                     or any(current.get(key) is not None for key in
                            ("published_at", "late_post_id", "publish_claim_token"))):
                 return None
@@ -848,7 +843,7 @@ class SupabaseCalendarStore:
         # media after the prefetch but before this write. PostgREST's OR predicate
         # permits only a still-null or still-empty image_url to be recovered.
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
-                  "status": "in.(pending,coach_review)",
+                  "status": "eq.pending",
                   "or": "(image_url.is.null,image_url.eq.)"}
         if prepared_write:
             params = self._visual_media_cas(current, params)
@@ -874,7 +869,7 @@ class SupabaseCalendarStore:
         """CROSS-DAY MEDIA GUARD sweep (Blake, 2026-08-31): re-point a WAITING row's
         media to a fresh photo because its current photo already sits on another day
         of the gym's book. STATUS-GUARDED SERVER-SIDE: the PATCH itself is filtered to
-        status in (pending, coach_review), so an approved / publishing / published row
+        status in (pending or a retired coach_review state), so an approved / publishing / published row
         can NEVER be swapped through this method — the gym's approval and anything
         live keep exactly the pixels they had. Caption, status and date are untouched.
         source_media_url (when given) is updated too, so a later edited-caption story
@@ -891,7 +886,7 @@ class SupabaseCalendarStore:
         if not (image_url or "").strip():
             return None
         # This is a real replacement, so release any earlier needs-media hold in
-        # the same pending / coach_review-scoped write. Status itself is unchanged.
+        # the same pending-scoped write. Status itself is unchanged.
         payload = {"image_url": image_url, "media_not_ready_reason": None}
         if source_media_url is not _SOURCE_MEDIA_UNSET:
             payload["source_media_url"] = source_media_url
@@ -902,12 +897,12 @@ class SupabaseCalendarStore:
         prepared_write = visual_writer_prepare.enabled()
         current = None
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
-                  "status": "in.(pending,coach_review)"}
+                  "status": "eq.pending"}
         if prepared_write:
             current = self.get_row(account_key, row_id)
             if (current is None or str(current.get("gym_id")) != str(account_key)
                     or str(current.get("id")) != str(row_id)
-                    or current.get("status") not in ("pending", "coach_review")
+                    or current.get("status") != "pending"
                     or any(current.get(key) is not None for key in
                            ("published_at", "late_post_id", "publish_claim_token"))):
                 return None
@@ -4187,9 +4182,8 @@ def _live_slots_for(store, account_key, dates):
         return None
     # EXACTLY the statuses rows_in_range can return (its own positive allowlist at the
     # top of this file). "draft" was dead code here -- that reader never returns it -- and
-    # "coach_review" WAS being returned while missing from this set, so a coach-review slot
-    # read as free and a re-plan stacked on top of it. 105 forward draft rows and every
-    # coach_review row were invisible to this pass.
+    # Retired coach_review rows still occupy their slots; do not silently stack
+    # new content on top of that retired row.
     live = {"pending", "approved", "publishing", "published", "coach_review"}
     out = set()
     for r in (rows or []):
