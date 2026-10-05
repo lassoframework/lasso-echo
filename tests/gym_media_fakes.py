@@ -29,6 +29,16 @@ class FakeMediaStore:
     def __init__(self, sources=None, assets=None, up=True):
         self.sources = {s["id"]: dict(s) for s in (sources or [])}
         self.assets = {a["id"]: dict(a) for a in (assets or [])}
+        # CROSS-GYM SOURCE GUARD fixtures (2026-10-05): the selector now requires
+        # a linked active same-gym media_source for every pickable asset. Fixtures
+        # that seed assets but never model the source table stand in an active
+        # same-gym source per referenced source_id (the historical happy path);
+        # mismatch tests pass explicit sources (or none) to exercise the guard.
+        if sources is None:
+            for a in self.assets.values():
+                sid = a.get("source_id")
+                if sid and sid not in self.sources:
+                    self.sources[sid] = make_source(sid, gym_id=a.get("gym_id"))
         self._up = up
         self.updates = []
         self.source_updates = []
@@ -287,8 +297,11 @@ class SyncedEmptyDriveIndex:
     def available(self):
         return True
 
-    def list_sources(self, _base):
-        return [{"kind": "gym_drive", "active": True,
+    def list_sources(self, base, include_inactive=False):
+        # Row must satisfy the cross-gym source guard's evidence contract (id,
+        # same gym, active) or strict pickable reads fail closed on it.
+        return [{"id": f"{base}-src", "gym_id": base, "kind": "gym_drive",
+                 "active": True,
                  "revoked_externally": False, "sync_status": "ready",
                  "sync_finished_at": "2026-10-02T00:00:00Z"}]
 

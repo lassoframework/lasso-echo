@@ -641,6 +641,23 @@ def _attach_media(gym_id, rows, log, *, picker=None, host=None):
         if not asset:
             held.append(row)
             continue
+        # CROSS-GYM SOURCE GUARD (2026-10-05): even an INJECTED picker can hand
+        # back a wrong-gym or wrongly-sourced asset. Require asset.gym_id == this
+        # gym AND a linked media_source that exists, is active and carries the
+        # same gym BEFORE hosting or stamping. Fail closed: any doubt holds the row.
+        try:
+            if (str(asset.get("gym_id") or "") != str(gym_id or "")
+                    or not _sel.asset_source_ok(asset, gym_id)):
+                log(f"event media: cross-gym source guard held asset "
+                    f"{asset.get('id')} (source_id="
+                    f"{str(asset.get('source_id') or '')!r}) for {gym_id}")
+                held.append(row)
+                continue
+        except Exception as exc:  # noqa: BLE001 - unproven evidence never hosts
+            log(f"event media: source evidence unproven for asset "
+                f"{asset.get('id')} ({type(exc).__name__}); row held")
+            held.append(row)
+            continue
         try:
             url = (host or _host_asset)(asset, gym_id, _dc)
         except Exception as exc:  # noqa: BLE001

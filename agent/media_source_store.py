@@ -90,6 +90,30 @@ class SupabaseMediaStore:
             params["active"] = "eq.true"
         return self._get_all(_SOURCE_TABLE, params)
 
+    def active_source_ids(self, gym_id):
+        """The set of media_source ids that EXIST, are ACTIVE and belong to
+        gym_id -- the only sources an asset may legitimately point at.
+
+        CROSS-GYM SOURCE GUARD (2026-10-05): production carried media_asset rows
+        whose gym_id disagreed with the linked media_source.gym_id, so asset-side
+        gym filtering alone is not proof of ownership. This is the evidence read
+        the selector/builder/event lanes gate on. Defense in depth: the query is
+        gym-scoped AND each returned row is re-asserted client-side. FAILS CLOSED:
+        any contradictory or incomplete row raises MediaStoreError; the caller
+        must treat that as an empty pool, never as "no source requirement"."""
+        if not gym_id:
+            raise MediaStoreError(400, "active_source_ids requires a gym_id (tenant isolation)")
+        out = set()
+        for s in self.list_sources(gym_id):
+            if (not isinstance(s, dict)
+                    or str(s.get("gym_id") or "") != str(gym_id)
+                    or s.get("active") is not True
+                    or not s.get("id")):
+                raise MediaStoreError(
+                    409, "media_source evidence contradicts the gym filter")
+            out.add(s["id"])
+        return out
+
     def find_source_by_folder(self, folder_id):
         """The source bound to this folder_id ANYWHERE (any gym, active or not),
         or None. The hijack check (spec §1.5a) reads this before a bind."""

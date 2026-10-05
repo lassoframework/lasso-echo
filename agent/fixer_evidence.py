@@ -235,6 +235,15 @@ def gather(ticket_id, *, deps=None, now=None):
         assets = read('media_asset', {'gym_id': f'eq.{gym}', 'select': 'id,gym_id,kind,eligible,excluded_by_coach,last_used_at,used_count', 'limit': '1001'})
         if len(assets) > 1000 or any(a.get('gym_id') != gym for a in assets):
             raise EvidenceError('media_scope_or_size')
+        # Cross-gym source guard evidence: the selector refuses assets whose
+        # linked media_source is not proven active and same-gym. Snapshot those
+        # rows with the same tenant scope; a missing table fails closed.
+        try:
+            sources = read('media_source', {'gym_id': f'eq.{gym}', 'select': 'id,gym_id,active', 'limit': '1001'}) or []
+        except KeyError:
+            sources = []
+        if len(sources) > 1000 or any(not isinstance(srow, dict) or srow.get('gym_id') != gym for srow in sources):
+            raise EvidenceError('media_source_scope_or_size')
         # Only use the selector with an already-confirmed local array; no network fallback.
         from .gym_media_selector import pickable
         class Store:
@@ -244,6 +253,17 @@ def gather(ticket_id, *, deps=None, now=None):
                 if _gym != gym:
                     raise EvidenceError('media_tenant_mismatch')
                 return assets
+            def list_sources(self, _gym, include_inactive=False):
+                # Cross-gym source guard: surface only the snapshotted same-gym
+                # active media_source rows; absent evidence fails closed.
+                if _gym != gym:
+                    raise EvidenceError('media_tenant_mismatch')
+                out = []
+                for srow in sources:
+                    if not include_inactive and srow.get('active') is not True:
+                        continue
+                    out.append(dict(srow))
+                return out
         available = pickable(gym, store=Store(), now=captured)
         return {'status': 'available' if assets else 'empty', 'total_assets': len(assets),
                 'pickable_count': len(available),

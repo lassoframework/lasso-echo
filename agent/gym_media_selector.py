@@ -305,6 +305,56 @@ def base_gym_key(account_key):
     return base
 
 
+class SourceEvidenceUnavailable(RuntimeError):
+    """The store could not prove the media_source evidence an asset needs."""
+
+
+def verified_source_ids(store, base):
+    """The set of media_source ids that EXIST, are ACTIVE and belong to `base`.
+
+    CROSS-GYM SOURCE GUARD (2026-10-05): production carried media_asset rows whose
+    gym_id disagreed with the linked media_source.gym_id, so asset.gym_id alone is
+    not proof of ownership. Every pick, host and stamp requires the asset's linked
+    source to exist, be active and carry the SAME gym. FAILS CLOSED: a store that
+    cannot answer, a failed read, or any row contradicting the gym filter raises
+    SourceEvidenceUnavailable; callers must treat that as an empty pool."""
+    # Boundary validation (independent review P1, 2026-10-05): full rows via
+    # list_sources are validated HERE, at the selector boundary, so an adapter
+    # whose active_source_ids returns ids without gym/active proof cannot bypass
+    # the guard. IDs alone are never ownership evidence.
+    list_sources = getattr(store, "list_sources", None)
+    if callable(list_sources):
+        try:
+            rows = list_sources(base) or []
+        except Exception as exc:  # noqa: BLE001
+            raise SourceEvidenceUnavailable(
+                f"media_source evidence read failed ({type(exc).__name__})") from exc
+        out = set()
+        for row in rows:
+            if (not isinstance(row, dict)
+                    or str(row.get("gym_id") or "") != str(base)
+                    or row.get("active") is not True
+                    or not row.get("id")):
+                raise SourceEvidenceUnavailable(
+                    "media_source evidence contradicts the gym filter")
+            out.add(str(row["id"]))
+        return out
+    raise SourceEvidenceUnavailable("store cannot prove media_source ownership from full rows")
+
+
+def asset_source_ok(asset, gym_base, store=None):
+    """True ONLY when the asset's linked media_source exists, is active and belongs
+    to the same gym. A missing/empty source_id is False; unproven evidence raises
+    SourceEvidenceUnavailable (fail closed). `store` defaults to the lane's
+    default store when not supplied."""
+    sid = str((asset or {}).get("source_id") or "").strip()
+    if not sid:
+        return False
+    if store is None:
+        store = _idx.default_store()
+    return sid in verified_source_ids(store, base_gym_key(gym_base))
+
+
 def drive_asset_claim_id(gym_id, asset_id):
     """Legacy asset-ID claim key, retained for outstanding reservations."""
     return f"gbp_media:{base_gym_key(gym_id)}:{asset_id}"
@@ -401,6 +451,17 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
             raise
         print(f"[gym-media-selector] claim read failed for {base}: {type(e).__name__}")
         return []
+    # CROSS-GYM SOURCE GUARD (2026-10-05): every pickable asset must also link to
+    # a media_source that exists, is active and carries THIS gym. Missing or
+    # unproven evidence fails closed exactly like an unreadable claim set.
+    try:
+        source_ids = verified_source_ids(store, base)
+    except Exception as e:  # noqa: BLE001 - unproven source evidence closes the pool
+        if strict_claims:
+            raise
+        print(f"[gym-media-selector] media_source evidence read failed for {base}: "
+              f"{type(e).__name__}")
+        return []
 
     cutoff = now - timedelta(days=REUSE_COOLDOWN_DAYS)
     from .media_reuse_policy import reuse_months, months_before
@@ -452,6 +513,9 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
         # TENANT re-assertion (defense in depth): even though the store filtered by
         # gym, never trust a row whose gym_id does not match this pick.
         if str(a.get("gym_id") or "") != base:
+            continue
+        # CROSS-GYM SOURCE GUARD: no proven active same-gym media_source, no pick.
+        if str(a.get("source_id") or "") not in source_ids:
             continue
         # eligible IS TRUE (null/unprobed fails closed) and not hidden by the coach.
         # ONE implementation, shared with client_dm_support.probes — see is_usable.
@@ -525,6 +589,14 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
     except Exception as e:  # noqa: BLE001 - unknown claims close the fallback
         print(f"[gym-media-selector] claim read failed for {base}: {type(e).__name__}")
         return []
+    # CROSS-GYM SOURCE GUARD (2026-10-05): the explicit lane never bypasses the
+    # linked-source evidence requirement either; unproven evidence fails closed.
+    try:
+        source_ids = verified_source_ids(store, base)
+    except Exception as e:  # noqa: BLE001
+        print(f"[gym-media-selector] media_source evidence read failed for {base}: "
+              f"{type(e).__name__}")
+        return []
     excl = {str(i) for i in (exclude_ids or ()) if i}
     used_hashes = {_byte_hash(a)
                    for a in assets if str(a.get("gym_id") or "") == base
@@ -532,6 +604,8 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
     candidates = []
     for asset in assets:
         if str(asset.get("gym_id") or "") != base:
+            continue
+        if str(asset.get("source_id") or "") not in source_ids:
             continue
         # GLOBAL ONCE-USED RULE: the explicit lane may skip the cooldown clocks
         # but never re-offers an already-staged asset.

@@ -48,8 +48,8 @@ def _env(monkeypatch, tmp_path):
         def available(self):
             return True
 
-        def list_sources(self, _base):
-            return [{"kind": "gym_drive", "active": True,
+        def list_sources(self, _base, include_inactive=False):
+            return [{"id": "src1", "gym_id": _base, "kind": "gym_drive", "active": True,
                      "revoked_externally": False, "sync_status": "ready",
                      "sync_finished_at": "2026-10-02T00:00:00Z"}]
 
@@ -387,8 +387,8 @@ def test_indexed_drive_photo_holds_infographic_even_with_drive_flags_off(
         def available(self):
             return True
 
-        def list_sources(self, _base):
-            return [{"kind": "gym_drive", "active": True,
+        def list_sources(self, _base, include_inactive=False):
+            return [{"id": "src1", "gym_id": _base, "kind": "gym_drive", "active": True,
                      "revoked_externally": False, "sync_status": "ready",
                      "sync_finished_at": "2026-10-02T00:00:00Z"}]
 
@@ -412,8 +412,8 @@ def test_astra_gate_holds_when_drive_claim_read_fails_with_candidate(monkeypatch
     from tests.gym_media_fakes import FakeMediaStore, make_asset
 
     class ReadyStore(FakeMediaStore):
-        def list_sources(self, _base):
-            return [{"kind": "gym_drive", "active": True,
+        def list_sources(self, _base, include_inactive=False):
+            return [{"id": "src1", "gym_id": _base, "kind": "gym_drive", "active": True,
                      "sync_status": "ready", "sync_finished_at": "2026-10-02T00:00:00Z"}]
 
     media_store = ReadyStore(assets=[make_asset("photo", gym_id="gymx")])
@@ -428,8 +428,8 @@ def test_astra_gate_holds_when_legacy_claim_hash_cannot_be_mapped(monkeypatch):
     from tests.gym_media_fakes import FakeMediaStore, make_asset
 
     class ReadyStore(FakeMediaStore):
-        def list_sources(self, _base):
-            return [{"kind": "gym_drive", "active": True,
+        def list_sources(self, _base, include_inactive=False):
+            return [{"id": "src1", "gym_id": _base, "kind": "gym_drive", "active": True,
                      "sync_status": "ready", "sync_finished_at": "2026-10-02T00:00:00Z"}]
 
     monkeypatch.setattr(gym_media_index, "default_store",
@@ -448,8 +448,8 @@ def test_unsynced_drive_source_holds_the_infographic_fallback(monkeypatch):
         def available(self):
             return True
 
-        def list_sources(self, _base):
-            return [{"kind": "gym_drive", "active": True,
+        def list_sources(self, _base, include_inactive=False):
+            return [{"id": "src1", "gym_id": _base, "kind": "gym_drive", "active": True,
                      "revoked_externally": False, "sync_status": "syncing"}]
 
         def list_assets(self, _base):
@@ -473,7 +473,7 @@ def test_never_connected_empty_drive_source_list_allows_last_resort(monkeypatch)
         def available(self):
             return True
 
-        def list_sources(self, _base):
+        def list_sources(self, _base, include_inactive=False):
             return []
 
         def list_assets(self, _base):
@@ -491,7 +491,7 @@ def test_connected_drive_with_no_source_row_holds_until_sync_proof(monkeypatch):
     class MissingSourceIndex:
         def available(self):
             return True
-        def list_sources(self, _base):
+        def list_sources(self, _base, include_inactive=False):
             return []
 
     monkeypatch.setattr(config, "gym_drive_connect_active_for", lambda _base: True)
@@ -507,7 +507,7 @@ def test_non_drive_source_rows_still_allow_never_connected_fallback(monkeypatch)
     class NonDriveIndex:
         def available(self):
             return True
-        def list_sources(self, _base):
+        def list_sources(self, _base, include_inactive=False):
             return [{"kind": "portal_upload", "active": True}]
         def list_assets(self, _base):
             raise AssertionError("no Drive connection means no Drive inventory read")
@@ -525,7 +525,7 @@ def test_drive_source_read_failure_still_holds_last_resort(monkeypatch):
         def available(self):
             return True
 
-        def list_sources(self, _base):
+        def list_sources(self, _base, include_inactive=False):
             raise OSError("inventory unavailable")
 
     monkeypatch.setattr(gym_media_index, "default_store",

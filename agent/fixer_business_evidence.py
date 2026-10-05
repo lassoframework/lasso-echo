@@ -86,7 +86,9 @@ _MEDIA_FIELDS = ('id', 'gym_id', 'kind', 'eligible', 'excluded_by_coach',
                  'review_status', 'reviewed_by', 'reviewed_at', 'content_hash',
                  'review_content_hash', 'moderation_status', 'moderation_json',
                  'people_detected', 'consent_status', 'consent_member_ref',
-                 'release_ref', 'consent_expires_at', 'last_used_at', 'used_count')
+                 'release_ref', 'consent_expires_at', 'last_used_at', 'used_count',
+                 'source_id')
+_MEDIA_SOURCE_FIELDS = ('id', 'gym_id', 'active')
 
 
 class CheckRefused(Exception):
@@ -379,14 +381,28 @@ def _tenant_snapshot(ctx, table, gym_key, fields):
 class _MediaSnapshotStore:
     """In-memory adapter for the production selector; never accesses the default store."""
 
-    def __init__(self, rows):
+    def __init__(self, rows, sources=()):
         self.rows = rows
+        self.sources = list(sources)
 
     def available(self):
         return True
 
     def list_assets(self, _gym_key):
         return self.rows
+
+    def list_sources(self, _gym_key, include_inactive=False):
+        # The selector's cross-gym source guard needs the same snapshotted
+        # evidence; an unsnapshotted source table must fail closed upstream
+        # (sources default to empty), never to a live read.
+        out = []
+        for row in self.sources:
+            if row.get('gym_id') != _gym_key:
+                continue
+            if not include_inactive and row.get('active') is not True:
+                continue
+            out.append(dict(row))
+        return out
 
 
 def _check_media_swap_candidate_available(ctx):
@@ -426,8 +442,17 @@ def _check_media_swap_candidate_available(ctx):
                 raise CheckUnavailable('reader_partial')
             if asset_id:
                 blocked.add(asset_id)
+    # The cross-gym source guard (gym_media_selector) requires snapshotted
+    # media_source evidence for the same tenant before any asset is a candidate;
+    # an unreadable or incomplete source snapshot fails closed like the assets.
+    sources = _tenant_snapshot(ctx, 'media_source', echo_key, _MEDIA_SOURCE_FIELDS)
+    for source in sources:
+        if any(field not in source for field in _MEDIA_SOURCE_FIELDS):
+            raise CheckUnavailable('reader_partial')
+        if type(source['active']) is not bool:
+            raise CheckUnavailable('reader_partial')
     candidates = gym_media_selector.pickable(
-        echo_key, store=_MediaSnapshotStore(assets), now=ctx.observed_at,
+        echo_key, store=_MediaSnapshotStore(assets, sources), now=ctx.observed_at,
         exclude_ids=blocked)
     # The portal's Drive swap accepts photos and videos only.
     candidates = [row for row in candidates if row['kind'] in ('photo', 'video')]
