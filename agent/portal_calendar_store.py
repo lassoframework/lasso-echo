@@ -161,6 +161,44 @@ def _paired_story_hold_source_link(expected_row, feed):
                for column in ("account", "slot_index", "logical_post_id"))
 
 
+_PREPARED_BACKLOG_HOLD = "prepared_backlog_waiting_for_story_and_capacity"
+
+
+def _prepared_backlog_caption_hold_transition_ok(expected_row):
+    """Narrow gate for the Oct 2-5 2026 prepared-backlog caption swap.
+
+    Four LASSO feeds hold 'prepared_backlog_waiting_for_story_and_capacity'
+    while waiting on reviewed Story media and capacity; their approved copy
+    apply must move them to 'caption_changed_needs_new_visual' atomically with
+    the new caption CAS. True ONLY for a canonical owned LASSO FEED: gym
+    lasso, IG/FB account, post_date inside the incident window and not future
+    dated, slot 0-2, pending/active, and completely unclaimed (no claim token,
+    no late post id, no publish receipt). The exact-row CAS pins every one of
+    these server-side; this check decides whether the hold may TRANSITION
+    (never clear) at all. Stories, other tenants, foreign holds and stale
+    snapshots fail closed.
+    """
+    from datetime import date as _date
+    day = str(expected_row.get("post_date") or "")[:10]
+    try:
+        d = _date.fromisoformat(day)
+    except ValueError:
+        return False
+    return (
+        str(expected_row.get("gym_id") or "") == "lasso"
+        and str(expected_row.get("account") or "").strip().lower()
+        in ("instagram", "facebook")
+        and _date(2026, 10, 2) <= d <= _date(2026, 10, 5)
+        and d <= _date.today()
+        and expected_row.get("slot_index") in (0, 1, 2)
+        and str(expected_row.get("format") or "").lower() == "feed"
+        and expected_row.get("status") == "pending"
+        and expected_row.get("variant_status") == "active"
+        and expected_row.get("publish_claim_token") is None
+        and expected_row.get("late_post_id") is None
+        and expected_row.get("published_at") is None)
+
+
 def _slot_key(row):
     """The (post_date, account, format) a row occupies, normalized. Two rows with the
     same slot key are the same calendar cell (a rebuild must not create a second one).
@@ -3627,6 +3665,10 @@ class SupabaseCalendarStore:
         alongside `force_caption_visual_hold` on a LASSO Story whose current
         hold is 'paired_feed_not_ready' (a normal Story waiting on its feed's
         visual). Without that source link the widened hold stays refused.
+        One further transition is allowed for a canonical owned Oct 2-5 2026
+        LASSO feed: 'prepared_backlog_waiting_for_story_and_capacity' moves to
+        'caption_changed_needs_new_visual' atomically with the new caption
+        (_prepared_backlog_caption_hold_transition_ok; never a clear).
         """
         fields = {}
         if caption is not None:
@@ -3646,6 +3688,20 @@ class SupabaseCalendarStore:
             and config.lasso_three_feed_enabled()
             and ((caption is not None and caption != expected_row.get("caption"))
                  or force_caption_visual_hold))
+        if (expected_row is not None
+                and expected_row.get("media_not_ready_reason")
+                == _PREPARED_BACKLOG_HOLD
+                and ((caption is not None
+                      and caption != expected_row.get("caption"))
+                     or force_caption_visual_hold)):
+            # The prepared-backlog hold may only ever TRANSITION (never be
+            # cleared, never be left behind by a caption change), and only
+            # through the gated autonomous path. Flag OFF, a non-canonical row,
+            # a claimed/receipt row or a stale snapshot all fail CLOSED here --
+            # before any write -- so the copy apply can never partially reserve.
+            if not (caption_visual_hold
+                    and _prepared_backlog_caption_hold_transition_ok(expected_row)):
+                return None
         if caption_visual_hold:
             hold_reason = expected_row.get("media_not_ready_reason")
             if hold_reason == "paired_feed_not_ready":
@@ -3657,6 +3713,14 @@ class SupabaseCalendarStore:
                 if not (force_caption_visual_hold
                         and _paired_story_hold_source_link(
                             expected_row, caption_hold_source_feed)):
+                    return None
+            elif hold_reason == _PREPARED_BACKLOG_HOLD:
+                # The Oct 2-5 prepared-backlog copy apply: the hold TRANSITIONS
+                # to caption_changed_needs_new_visual atomically with the new
+                # caption, only for the canonical owned LASSO feed the gate
+                # proves. The old hold is never CLEARED here -- the CAS params
+                # below pin it server-side and the payload replaces it.
+                if not _prepared_backlog_caption_hold_transition_ok(expected_row):
                     return None
             elif hold_reason not in (None, "caption_changed_needs_new_visual",
                                      "cross_date_media_repeat_needs_new_visual"):
