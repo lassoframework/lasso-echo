@@ -3609,7 +3609,8 @@ class SupabaseCalendarStore:
 
     def rows_in_range_repeat_hold(self, account_key, start_iso, end_iso):
         """Compatibility entry point for the cross-date repeat hold lane."""
-        return self.rows_in_range_complete(account_key, start_iso, end_iso)
+        return SupabaseCalendarStore.rows_in_range_complete(
+            self, account_key, start_iso, end_iso)
 
     def rows_in_range(self, account_key, start_iso, end_iso):
         """Return all non-denied content_calendar rows for account_key with
