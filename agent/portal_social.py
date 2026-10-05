@@ -888,7 +888,7 @@ def _validate_expected_creative(expected):
     (normalized, None) when the snapshot is well-formed, else (None, reason).
     caption may be string or null; media_url must be a nonempty final
     image/video URL; day_key is the YYYY-MM-DD visible post_date; format is
-    feed/story; platform is the canonical account platform. scheduled_for is
+    feed/story (plus GBP photo); platform is the canonical account platform. scheduled_for is
     NOT part of the contract (/social keys on post_date; scheduled_at can be
     synthesized while the DB is null) and is never required."""
     if not isinstance(expected, dict):
@@ -903,11 +903,12 @@ def _validate_expected_creative(expected):
     if not _PROOF_SNAPSHOT_DAY_KEY.match(day_key):
         return None, "day_key must be YYYY-MM-DD"
     fmt = str(expected.get("format") or "").strip().lower()
-    if fmt not in _PROOF_SNAPSHOT_FORMATS:
-        return None, "format must be feed or story"
     platform = str(expected.get("platform") or "").strip().lower()
     if platform not in _PROOF_SNAPSHOT_PLATFORMS:
         return None, "platform must be instagram, facebook or googlebusiness"
+    if fmt not in _PROOF_SNAPSHOT_FORMATS and not (
+            platform == "googlebusiness" and fmt == "photo"):
+        return None, "format must be feed or story (googlebusiness also allows photo)"
     return {"caption": caption, "media_url": media_url, "day_key": day_key,
             "format": fmt, "platform": platform}, None
 

@@ -396,3 +396,22 @@ def test_validate_expected_creative_requires_known_platform():
     import agent.portal_social as ps
     _, err = ps._validate_expected_creative(_snapshot(platform="twitter"))
     assert err is not None
+
+
+def test_validate_expected_creative_allows_googlebusiness_photo_only():
+    import agent.portal_social as ps
+    norm, err = ps._validate_expected_creative(
+        _snapshot(format="photo", platform="googlebusiness"))
+    assert err is None
+    assert norm["format"] == "photo"
+    assert norm["platform"] == "googlebusiness"
+
+    # Feed/story remain valid for GBP and IG/FB, while GBP's photo format
+    # cannot accidentally broaden the Instagram/Facebook snapshot contract.
+    for platform in ("instagram", "facebook", "googlebusiness"):
+        for fmt in ("feed", "story"):
+            assert ps._validate_expected_creative(
+                _snapshot(format=fmt, platform=platform))[1] is None
+    for platform in ("instagram", "facebook"):
+        assert ps._validate_expected_creative(
+            _snapshot(format="photo", platform=platform))[1] is not None

@@ -211,6 +211,19 @@ mkrow 27 pending
 q "update content_calendar set format=null where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa27'"
 check "null format matches effective feed" "1" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa27','$SWIFT','$(SNAP 27)'::jsonb)")"
 
+# Google Business photo is a supported visible-card format. The same atomic
+# snapshot compare still rejects a stale format or canonical platform.
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa37','$SWIFT','pending','active','https://cdn/37.jpg','googlebusiness','photo','2026-08-10','caption 37')"
+GBP_PHOTO_SNAPSHOT='{"caption": "caption 37", "media_url": "https://cdn/37.jpg", "day_key": "2026-08-10", "format": "photo", "platform": "googlebusiness"}'
+check "matching GBP photo snapshot approves" "1" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa37','$SWIFT','$GBP_PHOTO_SNAPSHOT'::jsonb)")"
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa38','$SWIFT','pending','active','https://cdn/38.jpg','googlebusiness','photo','2026-08-10','caption 38')"
+q "update content_calendar set format='feed' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa38'"
+GBP_STALE_FORMAT='{"caption": "caption 38", "media_url": "https://cdn/38.jpg", "day_key": "2026-08-10", "format": "photo", "platform": "googlebusiness"}'
+check "stale GBP photo format refuses" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa38','$SWIFT','$GBP_STALE_FORMAT'::jsonb)")"
+check "stale GBP photo format leaves pending" "pending" "$(q "select status from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa38'")"
+
 # An actual null caption matches the null value in the visible-card snapshot.
 mkrow 28 pending
 q "update content_calendar set caption=null where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa28'"
