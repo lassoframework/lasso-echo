@@ -62,11 +62,20 @@ class _Store:
 
     def get(self, url, params, headers, timeout):
         assert url == "echo_infographic_artifacts"
-        if "image_url" in params:
+        if "image_url" in params and str(params["image_url"]).startswith("eq."):
             return _Response(self.by_url.get((params["tenant"], params["image_url"]), []))
         key = (params["source_identity->>source_id"],
                params["source_identity->>source_hash"])
-        return _Response(self.cache.get(key, []))
+        # Simulate the server's immutable keyset contract: image_url ascending,
+        # strict gt cursor, bounded page size.
+        assert params["order"] == "image_url.asc"
+        rows = sorted(self.cache.get(key, []), key=lambda r: r["image_url"])
+        cursor = params.get("image_url")
+        if cursor is not None:
+            assert str(cursor).startswith("gt.")
+            rows = [r for r in rows if r["image_url"] > str(cursor)[3:]]
+        limit = int(params.get("limit", "50"))
+        return _Response(rows[:limit])
 
     def post(self, url, params, headers, json, timeout):
         assert url == "echo_infographic_artifacts"
@@ -778,26 +787,48 @@ def test_hold_older_than_catchup_window_is_refused_without_paid_attempt(
 
 
 class _PagedStore(_Store):
-    """Artifact fake that honors the server-side limit/offset page contract."""
+    """Artifact fake enforcing the immutable image_url keyset contract.
 
-    def __init__(self, rows, fail_pages=()):
+    Asserts the client never uses offset pagination, applies the strict gt
+    cursor and ascending order server-side, and can fail one page or inject a
+    concurrent insert / a non-advancing page.
+    """
+
+    def __init__(self, rows, fail_pages=(), insert_after_page=None,
+                 inserted_rows=(), replay_page=None):
         super().__init__(rows)
         self.fail_pages = set(fail_pages)
+        self.insert_after_page = insert_after_page
+        self.inserted_rows = list(inserted_rows)
+        self.replay_page = replay_page
         self.page_reads = 0
+        self._first_page = None
 
     def get(self, url, params, headers, timeout):
         assert url == "echo_infographic_artifacts"
-        assert "image_url" not in params
+        assert "offset" not in params
+        assert params["order"] == "image_url.asc"
         key = (params["source_identity->>source_id"],
                params["source_identity->>source_hash"])
-        rows = self.cache.get(key, [])
+        rows = sorted(self.cache.get(key, []), key=lambda r: r["image_url"])
+        cursor = params.get("image_url")
+        if cursor is not None:
+            assert str(cursor).startswith("gt.")
+            rows = [r for r in rows if r["image_url"] > str(cursor)[3:]]
         limit = int(params["limit"])
-        offset = int(params.get("offset", "0"))
-        page = offset // limit
+        page = self.page_reads
         self.page_reads += 1
         if page in self.fail_pages:
             return type("R", (), {"status_code": 500, "json": lambda self: {}})()
-        return _Response(rows[offset:offset + limit])
+        batch = rows[:limit]
+        if page == 0:
+            self._first_page = deepcopy(batch)
+        if self.replay_page is not None and page == self.replay_page:
+            # A buggy/duplicating server returns an earlier page again.
+            batch = deepcopy(self._first_page)
+        if self.insert_after_page is not None and page == self.insert_after_page:
+            self.cache.setdefault(key, []).extend(deepcopy(self.inserted_rows))
+        return _Response(batch)
 
 
 def _feed_artifact_for(row, url):
@@ -818,8 +849,10 @@ def _paged_reuse_setup(monkeypatch, artifacts, **store_kwargs):
     _armed(monkeypatch)
     monkeypatch.setattr(repair.infographic_evidence, "brain_snapshot",
                         lambda: {"source": "hash"})
-    # One record per page exercises the real pagination contract.
+    # One record per page exercises the real pagination contract; the page
+    # bound is lifted except in the dedicated bound-exceeded test.
     monkeypatch.setattr(repair, "ARTIFACT_LOOKUP_PAGE", 1)
+    monkeypatch.setattr(repair, "ARTIFACT_LOOKUP_MAX_PAGES", 10)
     feed = _row("feed", caption="Approved paged copy.")
     store = _PagedStore([feed], **store_kwargs)
     source_id = "content_calendar:feed:caption"
@@ -831,30 +864,60 @@ def _paged_reuse_setup(monkeypatch, artifacts, **store_kwargs):
     return store, feed
 
 
-def test_feed_artifact_past_newer_story_renders_is_reused_without_spend(
+def test_feed_artifact_among_tied_story_renders_is_reused_without_spend(
         monkeypatch):
     feed = _row("feed", caption="Approved paged copy.")
-    artifacts = [_story_artifact_for(feed, "https://cdn.example/story-new.png"),
-                 _story_artifact_for(feed, "https://cdn.example/story-mid.png"),
-                 _feed_artifact_for(feed, "https://cdn.example/feed-old.png")]
-    store, row = _paged_reuse_setup(monkeypatch, artifacts)
+    # All artifacts share one created_at timestamp; offset ordering on
+    # created_at.desc could not paginate these deterministically, but the
+    # immutable image_url keyset can.
+    artifacts = ([_story_artifact_for(feed, f"https://cdn.example/s{i}.png")
+                  for i in range(4)]
+                 + [_feed_artifact_for(feed, "https://cdn.example/zz-feed.png")])
+    store, _ = _paged_reuse_setup(monkeypatch, artifacts)
     out = repair.run(store=store, artifact_store=_Artifacts())
-    # The valid older feed artifact sits beyond the first page of newer 9:16
-    # Story renders; the complete bounded lookup still finds and reuses it.
-    # Three full one-record pages plus the terminating short page.
-    assert store.page_reads == 4
+    # Five one-record pages plus the terminating short page.
+    assert store.page_reads == 6
     assert out["reused"] == out["repaired"] == 1
     assert out["generated"] == out["errors"] == 0
-    assert store.rows["feed"]["image_url"] == "https://cdn.example/feed-old.png"
+    assert store.rows["feed"]["image_url"] == "https://cdn.example/zz-feed.png"
     assert store.rows["feed"]["media_not_ready_reason"] is None
+
+
+def test_concurrent_story_insert_between_pages_never_false_misses(monkeypatch):
+    feed = _row("feed", caption="Approved paged copy.")
+    artifacts = [_story_artifact_for(feed, "https://cdn.example/a-story.png"),
+                 _feed_artifact_for(feed, "https://cdn.example/zz-feed.png")]
+    inserted = [_story_artifact_for(feed, "https://cdn.example/m-story.png")]
+    store, _ = _paged_reuse_setup(monkeypatch, artifacts,
+                                  insert_after_page=0, inserted_rows=inserted)
+    out = repair.run(store=store, artifact_store=_Artifacts())
+    # The insert lands between page reads and sorts into the unread keyspace:
+    # the scan stays complete and duplicate-free and still finds the feed art.
+    assert out["reused"] == out["repaired"] == 1
+    assert out["generated"] == out["errors"] == 0
+    assert store.rows["feed"]["image_url"] == "https://cdn.example/zz-feed.png"
+    assert store.rows["feed"]["media_not_ready_reason"] is None
+
+
+def test_non_advancing_duplicate_page_fails_closed_without_spend(monkeypatch):
+    feed = _row("feed", caption="Approved paged copy.")
+    artifacts = [_story_artifact_for(feed, "https://cdn.example/a-story.png"),
+                 _feed_artifact_for(feed, "https://cdn.example/zz-feed.png")]
+    store, _ = _paged_reuse_setup(monkeypatch, artifacts, replay_page=1)
+    out = repair.run(store=store, artifact_store=_Artifacts())
+    assert out["errors"] == 1
+    assert out["generated"] == out["repaired"] == out["reused"] == 0
+    assert store.patches == []
+    assert store.rows["feed"]["media_not_ready_reason"] == repair.HOLD_REASON
 
 
 def test_malformed_artifact_on_later_page_holds_without_spend(monkeypatch):
     feed = _row("feed", caption="Approved paged copy.")
-    bad = _feed_artifact_for(feed, "https://cdn.example/feed-bad.png")
+    bad = _feed_artifact_for(feed, "https://cdn.example/zz-bad.png")
     bad["evidence"]["aspect"] = "4:5"
     bad["evidence"]["verified_dimensions"] = {"width": "1080", "height": 1350}
-    artifacts = [_story_artifact_for(feed, "https://cdn.example/story.png"), bad]
+    artifacts = [_story_artifact_for(feed, "https://cdn.example/a-story.png"),
+                 bad]
     store, _ = _paged_reuse_setup(monkeypatch, artifacts)
     out = repair.run(store=store, artifact_store=_Artifacts())
     assert out["errors"] == 1
@@ -865,9 +928,9 @@ def test_malformed_artifact_on_later_page_holds_without_spend(monkeypatch):
 
 def test_pagination_read_error_holds_without_spend(monkeypatch):
     feed = _row("feed", caption="Approved paged copy.")
-    artifacts = [_story_artifact_for(feed, "https://cdn.example/story-a.png"),
-                 _story_artifact_for(feed, "https://cdn.example/story-b.png"),
-                 _feed_artifact_for(feed, "https://cdn.example/feed-old.png")]
+    artifacts = [_story_artifact_for(feed, "https://cdn.example/a-story.png"),
+                 _story_artifact_for(feed, "https://cdn.example/m-story.png"),
+                 _feed_artifact_for(feed, "https://cdn.example/zz-feed.png")]
     store, _ = _paged_reuse_setup(monkeypatch, artifacts, fail_pages={1})
     out = repair.run(store=store, artifact_store=_Artifacts())
     assert out["errors"] == 1
@@ -880,7 +943,7 @@ def test_lookup_beyond_page_bound_fails_closed_without_spend(monkeypatch):
     feed = _row("feed", caption="Approved paged copy.")
     artifacts = [_story_artifact_for(feed, f"https://cdn.example/s{i}.png")
                  for i in range(5)] + [
-                 _feed_artifact_for(feed, "https://cdn.example/feed-old.png")]
+                 _feed_artifact_for(feed, "https://cdn.example/zz-feed.png")]
     store, _ = _paged_reuse_setup(monkeypatch, artifacts)
     monkeypatch.setattr(repair, "ARTIFACT_LOOKUP_MAX_PAGES", 4)
     out = repair.run(store=store, artifact_store=_Artifacts())

@@ -128,32 +128,49 @@ def _reviewed_artifact_rows(store, source_id, source_hash, account_key):
     """Read EVERY artifact under one shared feed/caption tenant key.
 
     Feed and Story renders share this key, so any fixed small window can hide
-    a valid older feed artifact behind newer 9:16 Story renders. Stable
-    created_at-desc pagination walks the whole key, bounded by
-    ARTIFACT_LOOKUP_MAX_PAGES; exceeding the bound, a short/overlong page or a
-    read error fails closed rather than silently truncating into a paid
-    duplicate render.
+    a valid older feed artifact behind newer 9:16 Story renders. Pagination
+    is a deterministic immutable keyset: rows are ordered by image_url
+    ascending (immutable, part of the (tenant, image_url) primary key) with a
+    strict `gt` cursor on the last seen image_url, so timestamp ties and
+    concurrent Story inserts between page reads can neither duplicate nor
+    skip a row. Each page must strictly advance the cursor; a duplicate or
+    non-advancing page, a read error, an overlong page or the hard page bound
+    fails closed rather than silently truncating into a paid duplicate
+    render. A short page is completion, not failure.
     """
     rows = []
-    for page in range(ARTIFACT_LOOKUP_MAX_PAGES):
+    cursor = None
+    for _ in range(ARTIFACT_LOOKUP_MAX_PAGES):
+        params = {"tenant": f"eq.{account_key}",
+                  "source_identity->>source_id": _eq(source_id),
+                  "source_identity->>source_hash": _eq(source_hash),
+                  "select": "image_url,evidence,source_identity",
+                  "order": "image_url.asc",
+                  "limit": str(ARTIFACT_LOOKUP_PAGE)}
+        if cursor is not None:
+            params["image_url"] = f"gt.{cursor}"
         response = store._client().get(
-            store._rest("echo_infographic_artifacts"),
-            params={"tenant": f"eq.{account_key}",
-                    "source_identity->>source_id": _eq(source_id),
-                    "source_identity->>source_hash": _eq(source_hash),
-                    "select": "image_url,evidence,source_identity",
-                    "order": "created_at.desc",
-                    "limit": str(ARTIFACT_LOOKUP_PAGE),
-                    "offset": str(page * ARTIFACT_LOOKUP_PAGE)},
+            store._rest("echo_infographic_artifacts"), params=params,
             headers=store._headers(), timeout=30)
         if response.status_code >= 400:
             raise RuntimeError("reviewed artifact lookup failed")
         batch = response.json()
         if not isinstance(batch, list) or len(batch) > ARTIFACT_LOOKUP_PAGE:
             raise RuntimeError("reviewed artifact lookup incomplete")
+        page_urls = []
+        for row in batch:
+            if not isinstance(row, dict) or not isinstance(
+                    row.get("image_url"), str):
+                raise RuntimeError("reviewed artifact lookup malformed")
+            page_urls.append(row["image_url"])
+        if page_urls != sorted(page_urls) or len(page_urls) != len(set(page_urls)):
+            raise RuntimeError("reviewed artifact lookup cursor did not advance")
+        if cursor is not None and page_urls and page_urls[0] <= cursor:
+            raise RuntimeError("reviewed artifact lookup cursor did not advance")
         rows.extend(batch)
         if len(batch) < ARTIFACT_LOOKUP_PAGE:
             return rows
+        cursor = page_urls[-1]
     raise RuntimeError("reviewed artifact lookup exceeded bound")
 
 
