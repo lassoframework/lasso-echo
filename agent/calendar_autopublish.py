@@ -303,6 +303,18 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
         capacity = resolve_posts_per_day(gym_id, store)
     fmt = (row.get("format") or "feed").strip().lower()
     is_feed = fmt == "feed"
+    row_day = str(row.get("post_date") or "")[:10]
+    if (str(gym_id or "").strip().lower() == "lasso"
+            and fmt in ("feed", "story")
+            and _lasso_immediate_backlog_day(local_claim_day)
+            and _lasso_three_feed_enabled(gym_id, local_claim_day)
+            and (row_day == local_claim_day
+                 or ("2026-10-02" <= row_day <= "2026-10-05"
+                     and row_day < local_claim_day))):
+        # The RPC independently enforces 3 current + 12 backlog rows per
+        # account and format on the actual local publish day (Oct 5-6 only).
+        # Backlog is strictly before the publish day, so Oct 5 is never both.
+        return 15
     if (str(gym_id or "").strip().lower() == "lasso"
             and fmt in ("feed", "story")
             and _lasso_incident_catchup_day(local_claim_day)
@@ -321,6 +333,10 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
     return capacity if is_feed else min(capacity, 2)
 
 
+def _lasso_immediate_backlog_day(day):
+    return "2026-10-05" <= str(day or "")[:10] <= "2026-10-06"
+
+
 def _lasso_incident_catchup_day(day):
     return "2026-10-06" <= str(day or "")[:10] <= "2026-10-11"
 
@@ -330,6 +346,14 @@ def _client_publish_limits(gym_id, run_date, configured_cap):
     if (str(gym_id or "").strip().lower() != "lasso"
             or not _lasso_three_feed_enabled(gym_id, run_date)):
         return CLIENT_CATCHUP_DAYS, configured_cap
+    if _lasso_immediate_backlog_day(run_date):
+        # Oct 2 remains in the query through Oct 6. The RPC gates the twelve
+        # extra backlog pairs per account, format and actual local day, and
+        # never counts an Oct 5 current-day row as backlog on Oct 5.
+        from datetime import date as _date
+        lookback = (_date.fromisoformat(str(run_date)[:10])
+                    - _date(2026, 10, 2)).days
+        return max(CLIENT_CATCHUP_DAYS, lookback), 50
     if _lasso_incident_catchup_day(run_date):
         # Oct 2 remains in the query through Oct 11. The RPC gates the two
         # extra outage pairs per account, format and actual local day.
