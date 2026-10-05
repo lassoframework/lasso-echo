@@ -1,13 +1,15 @@
 """DRAFT transaction wiring acceptance on a fresh, private local PG17 cluster.
 
-No supplied DSN is accepted. Missing PG17/pytest dependencies FAIL this suite;
-no skip can be mistaken for acceptance. Existing scene-ledger fixture helpers
-are reused for exact-byte attestation setup. Every server is stopped on exit.
-Unknown historical coverage/backfill and cloud Ultra Review remain release gates.
+No supplied DSN is accepted. CI without PG17 skips these optional integration
+checks; a release requires a separate recorded PG17 run. Existing scene-ledger
+fixture helpers are reused for exact-byte attestation setup. Every server is
+stopped on exit. Historical coverage and cloud review remain release gates.
 """
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import uuid
@@ -18,7 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("scene_fixture", ROOT / "tests/test_scene_ledger_claim_pg.py")
 ledger = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ledger)
-BIN = Path("/opt/homebrew/opt/postgresql@17/bin")
+_PG17 = Path(os.environ.get("ECHO_SCENE_TEST_PG_BIN", "/opt/homebrew/opt/postgresql@17/bin"))
+_PATH_POSTGRES = shutil.which("postgres")
+BIN = _PG17 if (_PG17 / "postgres").exists() else (
+    Path(_PATH_POSTGRES).parent if _PATH_POSTGRES else Path("/nonexistent"))
 DRAFT = ROOT / "migrations/DRAFT_visual_scene_calendar_transaction_20261005.sql"
 
 
@@ -28,8 +33,13 @@ def command(args, **kwargs):
 
 @pytest.fixture(scope="module", autouse=True)
 def cluster():
-    assert (BIN / "postgres").exists(), "PG17 missing; fail closed, no acceptance"
-    assert "17." in command([str(BIN / "postgres"), "--version"]).stdout
+    available = (BIN / "postgres").exists()
+    if available:
+        available = "17." in command([str(BIN / "postgres"), "--version"]).stdout
+    if not available and os.environ.get("ECHO_SCENE_REQUIRE_PG17") == "1":
+        pytest.fail("PG17 required for release acceptance but unavailable")
+    if not available:
+        pytest.skip("PG17 unavailable; release acceptance requires a recorded private PG17 run")
     with tempfile.TemporaryDirectory(prefix="echo-scene-txn-") as temp:
         base = Path(temp)
         data = base / "data"
