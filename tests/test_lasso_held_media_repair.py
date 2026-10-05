@@ -466,6 +466,33 @@ def test_explicit_incident_backlog_is_dated_and_two_attempts_per_run(monkeypatch
     assert store.rows["outside"]["media_not_ready_reason"] == repair.HOLD_REASON
 
 
+def test_daily_runner_autonomously_opts_in_only_during_recovery_dates(monkeypatch):
+    from agent import runner
+    monkeypatch.setattr(runner.config, "master_enabled", lambda: True)
+    monkeypatch.setattr(runner.config, "lasso_three_feed_enabled", lambda: True)
+    monkeypatch.setattr(runner, "load_voice", lambda path: None)
+    calls = []
+    monkeypatch.setattr(repair, "run", lambda **kwargs:
+                        calls.append(kwargs) or {"ok": True, "attempted": 0,
+                        "generated": 0, "reused": 0, "repaired": 0,
+                        "skipped": 0, "errors": 0})
+
+    class Poster:
+        def post_notice(self, message):
+            pass
+
+    runner.run_daily(poster=Poster(), scheduled_for="2026-10-06T12:00:00+00:00")
+    assert calls == [
+        {"now": "2026-10-06T12:00:00+00:00", "account_key": "lasso_ig",
+         "include_incident_backlog": True},
+        {"now": "2026-10-06T12:00:00+00:00", "account_key": "lasso_fb",
+         "include_incident_backlog": True},
+    ]
+    calls.clear()
+    runner.run_daily(poster=Poster(), scheduled_for="2026-10-12T12:00:00+00:00")
+    assert all("include_incident_backlog" not in kwargs for kwargs in calls)
+
+
 def test_incident_backlog_requires_explicit_opt_in_and_expires(monkeypatch):
     _armed(monkeypatch)
     monkeypatch.setattr(repair, "_local_day", lambda now: date(2026, 10, 6))
