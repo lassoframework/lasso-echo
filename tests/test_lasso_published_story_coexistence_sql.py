@@ -151,8 +151,8 @@ def _setup_third_pair(sql):
        published_at,late_post_id)
       values
       ('{FEED3}','lasso','instagram','2026-10-04','doctrine','feed',
-       '{CAPTION3}','{FEED3_URL}','{FEED3_URL}','pending',
-       '2026-10-04T07:30:00-04:00',0,'active',null,null),
+       '{CAPTION3}','{FEED3_URL}','{FEED3_URL}','published',
+       '2026-10-04T07:30:00-04:00',0,'active',now(),'feed-receipt-3'),
       ('{HISTORICAL3}','lasso','instagram','2026-10-04','doctrine','story',
        '','{OLD3_URL}','{OLD3_URL}','published',
        '2026-10-04T07:45:00-04:00',0,'active',now(),'legacy-receipt-3');""")
@@ -173,24 +173,43 @@ def test_third_pair_stages_and_claims_managed_story(pg):
     assert sql(f"select public.lasso_unrelated_published_story("
                f"'{HISTORICAL3}','{FEED3}')") == "t"
     result = sql(f"""select public.stage_lasso_paired_story(
-      '{FEED3}','instagram','2026-10-04',0,'pending','{CAPTION3}','{FEED3_URL}',
+      '{FEED3}','instagram','2026-10-04',0,'published','{CAPTION3}','{FEED3_URL}',
       '2026-10-04T07:30:00-04:00',null,'{NEW_STORY3}','{STORY3_URL}',
       '{DIGEST}','lasso_ig','{CAPTION3_SHA256}','review-v1',
       '2026-10-04T07:45:00-04:00');""")
     assert json.loads(result)["result"] == "inserted"
-    assert sql(f"select public.lasso_paired_story_ready_for_feed('{FEED3}')") == "t"
+    # ready_for_feed governs only pending/approved feeds; for an already
+    # published feed the meaningful proof is staging plus the claim below.
     assert sql("select count(*) from public.content_calendar where format='story' "
                f"and post_date='2026-10-04'") == "2"
-    # The historical row is preserved untouched.
+    # The historical row is preserved byte-for-byte.
     assert sql(f"select image_url from public.content_calendar "
                f"where id='{HISTORICAL3}'") == OLD3_URL
+    assert sql(f"select status || '|' || late_post_id from public.content_calendar "
+               f"where id='{HISTORICAL3}'") == "published|legacy-receipt-3"
     # Claim guard still governs the new managed Story.
-    pg(f"update public.content_calendar set status='published', published_at=now(), "
-       f"late_post_id='feed-receipt-3' where id='{FEED3}'")
     try:
         pg(f"update public.content_calendar set status='publishing' where id='{NEW_STORY3}'")
     except subprocess.CalledProcessError as exc:
         pytest.fail(exc.stderr)
+
+
+def test_third_pair_pending_feed_refuses(pg):
+    sql = pg
+    # The third feed was independently observed published; a pending or
+    # approved third feed must refuse the exception.
+    sql(f"update public.content_calendar set status='pending', published_at=null, "
+        f"late_post_id=null where id='{FEED3}'")
+    assert sql(f"select public.lasso_unrelated_published_story("
+               f"'{HISTORICAL3}','{FEED3}')") == "f"
+    sql(f"update public.content_calendar set status='approved' where id='{FEED3}'")
+    assert sql(f"select public.lasso_unrelated_published_story("
+               f"'{HISTORICAL3}','{FEED3}')") == "f"
+    # Restore the observed published state; the exception reopens.
+    sql(f"update public.content_calendar set status='published', published_at=now(), "
+        f"late_post_id='feed-receipt-3' where id='{FEED3}'")
+    assert sql(f"select public.lasso_unrelated_published_story("
+               f"'{HISTORICAL3}','{FEED3}')") == "t"
 
 
 def test_third_pair_changed_or_unlisted_evidence_refuses(pg):
