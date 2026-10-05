@@ -437,3 +437,51 @@ def test_daily_runner_repairs_ahead_of_drafting_even_if_voice_is_missing(monkeyp
         {"now": "2026-10-05T12:00:00+00:00", "account_key": "lasso_ig"},
         {"now": "2026-10-05T12:00:00+00:00", "account_key": "lasso_fb"},
     ]
+
+
+def test_explicit_incident_backlog_is_dated_and_two_attempts_per_run(monkeypatch):
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair, "_local_day", lambda now: date(2026, 10, 6))
+    rows = [_row("current", day="2026-10-06")]
+    rows += [_row(f"old-{i}", day="2026-10-02") for i in range(3)]
+    rows += [_row("outside", day="2026-10-01")]
+
+    class Store(_Store):
+        def list_pending_media_between(self, gym, first, last):
+            self.reads += 1
+            assert (gym, first, last) == ("lasso", "2026-10-02", "2026-10-07")
+            return [deepcopy(row) for row in self.rows.values()]
+
+    store = Store(rows)
+    generated = []
+    def fake_generate(row, account, **kwargs):
+        generated.append(row["id"])
+        return {"ok": True, "image_url": f"https://new.example/{row['id']}.png"}
+    monkeypatch.setattr(variant_regen, "generate_variant_image", fake_generate)
+    out = repair.run(store=store, artifact_store=_Artifacts(),
+                     include_incident_backlog=True)
+    assert out["attempted"] == out["repaired"] == 3
+    assert generated == ["current", "old-0", "old-1"]
+    assert store.rows["old-2"]["media_not_ready_reason"] == repair.HOLD_REASON
+    assert store.rows["outside"]["media_not_ready_reason"] == repair.HOLD_REASON
+
+
+def test_incident_backlog_requires_explicit_opt_in_and_expires(monkeypatch):
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair, "_local_day", lambda now: date(2026, 10, 6))
+    class Store(_Store):
+        def list_pending_media_between(self, gym, first, last):
+            self.reads += 1
+            assert (gym, first, last) == ("lasso", "2026-10-06", "2026-10-07")
+            return [deepcopy(row) for row in self.rows.values()]
+    store = Store([_row("old", day="2026-10-02")])
+    out = repair.run(store=store, artifact_store=_Artifacts())
+    assert out["attempted"] == 0
+    assert store.rows["old"]["media_not_ready_reason"] == repair.HOLD_REASON
+
+    monkeypatch.setattr(repair, "_local_day", lambda now: date(2026, 10, 12))
+    out = repair.run(store=store, artifact_store=_Artifacts(),
+                     include_incident_backlog=True)
+    assert out["ok"] is False
+    assert out["reason"] == "incident recovery window closed"
+    assert store.reads == 1

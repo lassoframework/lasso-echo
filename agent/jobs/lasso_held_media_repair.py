@@ -23,6 +23,11 @@ ACCOUNTS = {"instagram": "lasso_ig", "facebook": "lasso_fb"}
 ACCOUNT = "lasso_ig"
 MAX_PER_DAY = 3
 HORIZON_DAYS = 1
+INCIDENT_BACKLOG_FIRST = "2026-10-02"
+INCIDENT_BACKLOG_LAST = "2026-10-05"
+INCIDENT_RECOVERY_FIRST = "2026-10-06"
+INCIDENT_RECOVERY_LAST = "2026-10-11"
+MAX_INCIDENT_BACKLOG_PER_RUN = 2
 _CAS_COLUMNS = (
     "id", "gym_id", "status", "variant_status", "account", "format",
     "post_date", "caption", "image_url", "source_media_url",
@@ -298,8 +303,14 @@ def _replace_exact(store, current, new_url, account_key=ACCOUNT):
 
 
 def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
-        host_fn=None, max_per_day=MAX_PER_DAY, account_key=ACCOUNT):
-    """Repair at most three held feeds and their three held Stories per date."""
+        host_fn=None, max_per_day=MAX_PER_DAY, account_key=ACCOUNT,
+        include_incident_backlog=False):
+    """Repair current runway; optional dated outage replay is capped per run.
+
+    The normal daily runner does not request the historical window. A recovery
+    invocation can opt in only during October 6–11, after caption CAS has put
+    changed rows on hold. No row is published by this job.
+    """
     summary = {"ok": False, "attempted": 0, "generated": 0, "reused": 0,
                "repaired": 0, "skipped": 0, "errors": 0}
     if not (account_key in ACCOUNTS.values()
@@ -312,7 +323,13 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         summary["reason"] = "invalid repair cap"
         return summary
     day = _local_day(now)
-    first, last = day.isoformat(), (day + timedelta(days=HORIZON_DAYS)).isoformat()
+    today = day.isoformat()
+    if include_incident_backlog and not (
+            INCIDENT_RECOVERY_FIRST <= today <= INCIDENT_RECOVERY_LAST):
+        summary["reason"] = "incident recovery window closed"
+        return summary
+    first = INCIDENT_BACKLOG_FIRST if include_incident_backlog else today
+    last = (day + timedelta(days=HORIZON_DAYS)).isoformat()
     store = store or SupabaseCalendarStore()
     artifact_store = artifact_store or ArtifactStore()
     if not artifact_store.available:
@@ -327,13 +344,22 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         summary["reason"] = "held calendar read malformed"
         return summary
     summary["ok"] = True
-    rows = sorted((row for row in rows if _eligible(row, first, last, account_key)),
-                  key=lambda row: (row["post_date"],
+    rows = sorted((row for row in rows if _eligible(row, first, last, account_key)
+                   and (str(row["post_date"])[:10] >= today
+                        or INCIDENT_BACKLOG_FIRST <= str(row["post_date"])[:10]
+                                                 <= INCIDENT_BACKLOG_LAST)),
+                  key=lambda row: (str(row["post_date"])[:10] < today,
+                                   row["post_date"],
                                    0 if row["format"] == "feed" else 1,
                                    row.get("slot_index") or 0, str(row["id"])))
     per_day = {}
+    backlog_attempted = 0
     for row in rows:
         row_day = str(row["post_date"])[:10]
+        incident_backlog = row_day < today
+        if incident_backlog and backlog_attempted >= MAX_INCIDENT_BACKLOG_PER_RUN:
+            summary["skipped"] += 1
+            continue
         kind = str(row["format"]).lower()
         count_key = (row_day, kind)
         if per_day.get(count_key, 0) >= max_per_day:
@@ -363,6 +389,8 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
                 summary["skipped"] += 1
                 continue
             summary["attempted"] += 1
+            if incident_backlog:
+                backlog_attempted += 1
             per_day[count_key] = per_day.get(count_key, 0) + 1
             fresh = store.get_row(GYM, row["id"])
             if not _same_row(row, fresh):

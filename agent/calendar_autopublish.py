@@ -303,12 +303,42 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
         capacity = resolve_posts_per_day(gym_id, store)
     fmt = (row.get("format") or "feed").strip().lower()
     is_feed = fmt == "feed"
+    if (str(gym_id or "").strip().lower() == "lasso"
+            and fmt in ("feed", "story")
+            and _lasso_incident_catchup_day(local_claim_day)
+            and _lasso_three_feed_enabled(gym_id, local_claim_day)
+            and str(row.get("post_date") or "")[:10] in
+                {local_claim_day, "2026-10-02", "2026-10-03",
+                 "2026-10-04", "2026-10-05"}):
+        # The RPC independently enforces 3 current + 2 outage rows per account
+        # and format on the actual local publish day. This is not a general 5x.
+        return 5
     # Both the durable cadence and the dated Summit cadence pair each feed
     # with a Story, so their publish capacity must agree with the planner.
     if (fmt in ("feed", "story")
             and _lasso_three_feed_enabled(gym_id, local_claim_day)):
         return max(capacity, 3)
     return capacity if is_feed else min(capacity, 2)
+
+
+def _lasso_incident_catchup_day(day):
+    return "2026-10-06" <= str(day or "")[:10] <= "2026-10-11"
+
+
+def _client_publish_limits(gym_id, run_date, configured_cap):
+    """Keep LASSO's feed/Story pairs whole without changing client caps."""
+    if (str(gym_id or "").strip().lower() != "lasso"
+            or not _lasso_three_feed_enabled(gym_id, run_date)):
+        return CLIENT_CATCHUP_DAYS, configured_cap
+    if _lasso_incident_catchup_day(run_date):
+        # Oct 2 remains in the query through Oct 11. The RPC gates the two
+        # extra outage pairs per account, format and actual local day.
+        from datetime import date as _date
+        lookback = (_date.fromisoformat(str(run_date)[:10])
+                    - _date(2026, 10, 2)).days
+        return max(CLIENT_CATCHUP_DAYS, lookback), 20
+    # Three feed and three paired Story posts on each of IG and FB.
+    return CLIENT_CATCHUP_DAYS, 12
 
 
 def _paired_lasso_feed_published(story, store):
@@ -2446,12 +2476,14 @@ def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
             # first tick of its post_date). No orphans: a same-day row whose slot has
             # passed is is_due on every later tick, and a PAST-DATE row (catchup_days)
             # is always due — the lane runs every ~1 min, so nothing is stranded.
+            catchup_days, daily_cap = _client_publish_limits(
+                base, run_date, config.client_daily_publish_cap())
             summary = publish_due(run_date, gym_id=base, store=store, notifier=notifier,
                                   now=now, catch_all=False,
                                   approved_only=not autonomous,
                                   zernio_publish=zernio_publish,
-                                  catchup_days=CLIENT_CATCHUP_DAYS,
-                                  daily_cap=config.client_daily_publish_cap())
+                                  catchup_days=catchup_days,
+                                  daily_cap=daily_cap)
             summary["gym"] = base
             summary["autonomous"] = autonomous
             out.append(summary)
