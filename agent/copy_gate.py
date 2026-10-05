@@ -158,6 +158,17 @@ def violations(text: str) -> list[str]:
     if _EMAIL_RE.search(s): v.append("email_address")
     return v
 
+
+def lasso_violations(text: str) -> list[str]:
+    """LASSO house punctuation on ordinary copy, preserving URLs and handles."""
+    problems = violations(text)
+    plain = _PROTECTED_RE.sub("", str(text))
+    if ":" in plain:
+        problems.append("banned_colon")
+    if ";" in plain:
+        problems.append("banned_semicolon")
+    return problems
+
 HOOK_MAX_CHARS = 125
 
 

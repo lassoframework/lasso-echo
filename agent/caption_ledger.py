@@ -183,6 +183,9 @@ def is_blocked_strict(gym_id: str, caption_text: str, planned_date: str,
     repair must never replace an already prepared caption when the durable
     ledger cannot be read or contains malformed data.
     """
+    from agent import config
+    if not config.caption_cooldown_enabled():
+        raise RuntimeError("strict caption ledger requires cooldown history")
     _db = db if db is not None else _default_db()
     if db is None and not _db.kv_is_durable():
         raise RuntimeError("caption ledger is not durable")
@@ -218,12 +221,22 @@ def is_blocked_strict(gym_id: str, caption_text: str, planned_date: str,
 def record_staged_strict(gym_id: str, caption_text: str, date_str: str,
                          db=None) -> None:
     """Record both ledger keys, propagating errors for the guarded repair."""
+    from agent import config
+    if not config.caption_cooldown_enabled():
+        raise RuntimeError("strict caption ledger requires cooldown history")
     _db = db if db is not None else _default_db()
     if db is None and not _db.kv_is_durable():
         raise RuntimeError("caption ledger is not durable")
     date.fromisoformat(date_str)
     if not str(caption_text or "").strip():
         raise ValueError("empty caption")
+    verbatim_key_name = verbatim_key(gym_id, verbatim_hash(caption_text))
+    verbatim_raw = _kv_get(_db, verbatim_key_name)
+    verbatim = json.loads(verbatim_raw) if verbatim_raw else {"dates": [], "uses": 0}
+    if not isinstance(verbatim, dict) or not isinstance(verbatim.get("dates"), list):
+        raise ValueError("malformed verbatim caption ledger")
+    dates = [str(value) for value in verbatim["dates"]]
+    already_staged = date_str in dates
     key = ledger_key(gym_id, caption_hash(caption_text))
     raw = _kv_get(_db, key)
     fuzzy = json.loads(raw) if raw else {"last_used": "", "uses": 0}
@@ -231,22 +244,17 @@ def record_staged_strict(gym_id: str, caption_text: str, date_str: str,
         raise ValueError("malformed fuzzy caption ledger")
     if not fuzzy.get("last_used") or date_str > str(fuzzy["last_used"]):
         fuzzy["last_used"] = date_str
-    fuzzy["uses"] = int(fuzzy.get("uses", 0)) + 1
+    # A same-date retry after an interrupted guarded repair is idempotent.
+    fuzzy["uses"] = int(fuzzy.get("uses", 0)) + (0 if already_staged else 1)
     _kv_set(_db, key, json.dumps(fuzzy))
-    key = verbatim_key(gym_id, verbatim_hash(caption_text))
-    raw = _kv_get(_db, key)
-    verbatim = json.loads(raw) if raw else {"dates": [], "uses": 0}
-    if not isinstance(verbatim, dict) or not isinstance(verbatim.get("dates"), list):
-        raise ValueError("malformed verbatim caption ledger")
-    dates = [str(value) for value in verbatim["dates"]]
-    if date_str not in dates:
+    if not already_staged:
         dates.append(date_str)
     verbatim["dates"] = sorted(dates)[-_VERBATIM_MAX_DATES:]
-    verbatim["uses"] = int(verbatim.get("uses", 0)) + 1
-    _kv_set(_db, key, json.dumps(verbatim))
+    verbatim["uses"] = int(verbatim.get("uses", 0)) + (0 if already_staged else 1)
+    _kv_set(_db, verbatim_key_name, json.dumps(verbatim))
     # A write API returning normally is insufficient for an autonomous swap.
     # Confirm the durable record is readable before the caller changes copy.
-    stored = json.loads(_kv_get(_db, key))
+    stored = json.loads(_kv_get(_db, verbatim_key_name))
     if date_str not in stored.get("dates", []):
         raise RuntimeError("caption verbatim ledger stamp missing")
     fuzzy_stored = json.loads(_kv_get(

@@ -567,6 +567,12 @@ def test_craft_pass_b2b_gets_mechanics_but_never_the_llm_regen(monkeypatch):
     no repair path at all is what left 116 of LASSO's 121 forward rows flagged
     'no ask' with nothing able to clear them (2026-08-31)."""
     monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    # LASSO's mechanical lane now shares the guarded caption provenance path:
+    # it needs the same durable ledger precondition as a regenerated caption.
+    monkeypatch.setattr("agent.caption_ledger.is_blocked_strict",
+                        lambda *a, **k: False)
+    monkeypatch.setattr("agent.caption_ledger.record_staged_strict",
+                        lambda *a, **k: None)
     cta = "Book a call and we will look at your numbers."
     calls = []
 

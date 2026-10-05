@@ -3,9 +3,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent import caption_ledger, real_month_planner
-from agent.jobs import grade_fix
+from agent import caption_ledger, config, copy_gate, real_month_planner
+from agent.jobs import grade_fix, grade_sweep
 from agent.portal_calendar_store import SupabaseCalendarStore
+
+
+@pytest.fixture(autouse=True)
+def _armed_caption_history(monkeypatch):
+    monkeypatch.setattr(config, "caption_cooldown_enabled", lambda: True)
 
 
 def _row(day, slot, account, fmt="feed", *, caption="Approved source copy", rid=None):
@@ -135,6 +140,24 @@ def test_lasso_regen_uses_only_original_source_topic(monkeypatch):
     assert regen(_row("2026-10-08", 0, "instagram", caption="unknown source"), set()) is None
 
 
+def test_lasso_copy_gate_preserves_url_cta_but_rejects_prose_punctuation(monkeypatch):
+    assert not copy_gate.lasso_violations("Book at https://lasso-framework.com/start")
+    assert "banned_colon" in copy_gate.lasso_violations("Next step: book your call")
+    assert "banned_semicolon" in copy_gate.lasso_violations("Plan; then act")
+    doc = SimpleNamespace(
+        copy_bank={"source": {"hooks": ["Build a system your team can run."],
+                              "bodies": ["Give every lead one clear next step."]}},
+        ctas=["Book at https://lasso-framework.com/start"],
+        pillars_with_copy=lambda: ["source"])
+    monkeypatch.setattr("agent.content_planner.load_source_doc", lambda: doc)
+    monkeypatch.setattr(caption_ledger, "is_blocked_strict", lambda *a, **k: False)
+    regen = grade_fix._lasso_caption_regen(lambda *_: None)
+    out = regen(_row("2026-10-08", 0, "instagram",
+                     caption="Build a system your team can run."), set())
+    assert out is not None
+    assert out[0].endswith("https://lasso-framework.com/start")
+
+
 def test_strict_ledger_fails_closed_and_stamps_both_keys():
     class KV:
         def __init__(self):
@@ -157,6 +180,40 @@ def test_strict_ledger_fails_closed_and_stamps_both_keys():
     kv.fail = True
     with pytest.raises(OSError):
         caption_ledger.is_blocked_strict("lasso", cap, "2026-10-10", db=kv)
+
+
+def test_strict_ledger_refuses_disabled_history(monkeypatch):
+    monkeypatch.setattr(config, "caption_cooldown_enabled", lambda: False)
+    with pytest.raises(RuntimeError, match="requires cooldown history"):
+        caption_ledger.is_blocked_strict("lasso", "Fresh copy", "2026-10-08", db=object())
+    with pytest.raises(RuntimeError, match="requires cooldown history"):
+        caption_ledger.record_staged_strict("lasso", "Fresh copy", "2026-10-08", db=object())
+
+
+def test_strict_ledger_retry_is_idempotent_but_distinct_same_day_copy_counts():
+    class KV:
+        def __init__(self):
+            self.values = {}
+        def kv_get(self, key, default=""):
+            return self.values.get(key, default)
+        def kv_set(self, key, value):
+            self.values[key] = value
+    import json
+    kv = KV()
+    first, second, day = "Fresh copy.", "Fresh copy!", "2026-10-08"
+    assert caption_ledger.caption_hash(first) == caption_ledger.caption_hash(second)
+    caption_ledger.record_staged_strict("lasso", first, day, db=kv)
+    caption_ledger.record_staged_strict("lasso", first, day, db=kv)
+    caption_ledger.record_staged_strict("lasso", second, day, db=kv)
+    fuzzy = json.loads(kv.values[caption_ledger.ledger_key(
+        "lasso", caption_ledger.caption_hash(first))])
+    first_verbatim = json.loads(kv.values[caption_ledger.verbatim_key(
+        "lasso", caption_ledger.verbatim_hash(first))])
+    second_verbatim = json.loads(kv.values[caption_ledger.verbatim_key(
+        "lasso", caption_ledger.verbatim_hash(second))])
+    assert fuzzy["uses"] == 2
+    assert first_verbatim == {"dates": [day], "uses": 1}
+    assert second_verbatim == {"dates": [day], "uses": 1}
 
 
 def test_exact_caption_patch_filters_original_generation():
@@ -239,3 +296,66 @@ def test_lasso_date_repair_holds_when_ledger_unavailable(monkeypatch):
     assert not grade_fix._patch_date_rows("lasso", [row], Store(),
                                           "Fresh caption", "doctrine", lambda *_: None)
     assert row["caption"] == "Approved source copy"
+
+
+def test_lasso_partial_caption_patch_is_explicit_and_changed_rows_stay_held(monkeypatch):
+    day = "2026-10-08"
+    rows = [_row(day, 0, "instagram", rid="ig"),
+            _row(day, 0, "facebook", rid="fb"),
+            _row(day, 0, "instagram", "story", rid="story")]
+    rows[-1]["caption"] = ""
+    monkeypatch.setattr(caption_ledger, "is_blocked_strict", lambda *a, **k: False)
+    stamped = []
+    monkeypatch.setattr(caption_ledger, "record_staged_strict",
+                        lambda *args: stamped.append(args))
+
+    class Store:
+        def active_rows_on_day_complete(self, gym, date):
+            return [dict(r) for r in rows]
+        def patch_pending_plan(self, gym, rid, *, caption=None, pillar=None,
+                               expected_row, levers=None,
+                               force_caption_visual_hold=False):
+            if rid == "fb":
+                return None  # a concurrent write beats the second feed CAS
+            current = next(r for r in rows if r["id"] == rid)
+            if caption is not None:
+                current["caption"] = caption
+            current["media_not_ready_reason"] = "caption_changed_needs_new_visual"
+            return dict(current)
+
+    with pytest.raises(grade_fix.PartialLassoCaptionRepair) as caught:
+        grade_fix._patch_date_rows("lasso", rows, Store(),
+                                   "Fresh source grounded copy", "doctrine",
+                                   lambda *_: None)
+    assert caught.value.applied_ids == ("story", "ig")
+    assert stamped
+    assert rows[0]["caption"] == "Fresh source grounded copy"
+    assert rows[0]["media_not_ready_reason"] == "caption_changed_needs_new_visual"
+    assert rows[2]["media_not_ready_reason"] == "caption_changed_needs_new_visual"
+    assert rows[1]["caption"] == "Approved source copy"
+    report = grade_sweep._merge_fix(
+        {"ok": True, "actions": []},
+        {"ok": False, "partial": True,
+         "partial_row_ids": list(caught.value.applied_ids), "actions": []})
+    assert report["partial"] is True
+    assert report["partial_row_ids"] == ["story", "ig"]
+    assert report["ok"] is False
+
+
+def test_lasso_mechanical_caption_change_still_holds_existing_visual(monkeypatch):
+    row = _row("2026-10-08", 0, "instagram", caption="Old CTA")
+    monkeypatch.setattr(caption_ledger, "is_blocked_strict", lambda *a, **k: False)
+    monkeypatch.setattr(caption_ledger, "record_staged_strict", lambda *a, **k: None)
+    class Store:
+        def active_rows_on_day_complete(self, gym, date):
+            return [dict(row)]
+        def patch_pending_plan(self, gym, rid, *, caption=None, pillar=None,
+                               expected_row, levers=None,
+                               force_caption_visual_hold=False):
+            assert expected_row["caption"] == "Old CTA"
+            assert caption == "Approved booking CTA"
+            return dict(row, caption=caption,
+                        media_not_ready_reason="caption_changed_needs_new_visual")
+    assert grade_fix._patch_date_rows("lasso", [row], Store(),
+                                      "Approved booking CTA", None, lambda *_: None)
+    assert row["media_not_ready_reason"] == "caption_changed_needs_new_visual"

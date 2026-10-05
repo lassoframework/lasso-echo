@@ -113,6 +113,21 @@ _CAPTION_MIN, _CAPTION_MAX = 150, 500   # regen acceptance band (grader median w
 _HOOK_MAX = 125                          # copy_gate hook_too_long band
 _OVERCAP_MAX_ITER = 6                    # bounded convergence for the over-cap pass
 
+
+class PartialLassoCaptionRepair(RuntimeError):
+    """A guarded repair reserved copy or wrote rows before a later CAS failed.
+
+    Callers must re-read the calendar before retrying. Successfully changed
+    rows carry a visual hold, so a partial repair cannot publish stale artwork.
+    """
+
+    def __init__(self, gym_id, day, applied_ids, reason):
+        self.gym_id = gym_id
+        self.day = day
+        self.applied_ids = tuple(applied_ids)
+        super().__init__(f"{gym_id} {day}: partial caption repair; "
+                         f"applied={self.applied_ids}; {reason}")
+
 # LLM WALL-CLOCK BUDGET PER GYM PER PASS (2026-08-31). Measured live: one
 # _clean_draft_for_day regen costs 6 to 8 SECONDS. gritx alone has 30 flagged
 # posts, so the old "LLM first, always" craft pass cost ~4 minutes for ONE gym
@@ -1665,7 +1680,9 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
     together and stays ONE post). Non-wipeable rows are skipped here AND blocked
     server-side by patch_pending_plan. Returns True when at least one row was
     patched. Mutates the local row dicts to match so the caller's regrade sees
-    the fix even before a store re-read."""
+    the fix even before a store re-read. LASSO raises
+    PartialLassoCaptionRepair after an uncertain ledger stamp or a partial
+    calendar write; the sweep re-reads and stops before another repair pass."""
     patcher = getattr(store, "patch_pending_plan", None)
     if patcher is None:
         return False
@@ -1681,6 +1698,9 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
                                  or r.get("variant_status") != "active"
                                  for r in date_rows)):
             return False
+        if all(str(r.get("caption") or "") == new_cap for r in date_rows
+               if str(r.get("format") or "").lower() == "feed"):
+            return False
         dates = {str(r.get("post_date") or "")[:10] for r in date_rows}
         if len(dates) != 1:
             return False
@@ -1688,10 +1708,22 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
         try:
             if caption_ledger.is_blocked_strict(gym_id, new_cap, day):
                 return False
-            caption_ledger.record_staged_strict(gym_id, new_cap, day)
         except Exception as exc:  # noqa: BLE001
             log(f"{gym_id} {day}: caption ledger unavailable: {type(exc).__name__}")
             return False
+        try:
+            caption_ledger.record_staged_strict(gym_id, new_cap, day)
+        except Exception as exc:  # noqa: BLE001
+            # A two-key ledger write can itself partially persist. A normal
+            # False would report a pure no-op even when one key was stamped.
+            raise PartialLassoCaptionRepair(
+                gym_id, day, (), f"ledger reservation uncertain: {type(exc).__name__}") from exc
+        applied_ids = []
+
+        def partial(reason):
+            error = PartialLassoCaptionRepair(gym_id, day, applied_ids, reason)
+            log(str(error))
+            raise error
         # Stories have an empty publish caption by design, so the duplicate
         # hash group usually contains feeds only. Read their exact siblings and
         # hold those 9:16 visuals BEFORE changing any feed caption.
@@ -1699,14 +1731,14 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
             reader = getattr(store, "active_rows_on_day_complete")
             day_rows = reader(gym_id, day)
             if not isinstance(day_rows, list):
-                return False
+                partial("complete sibling read unavailable after ledger stamp")
             feed_keys = {
                 (r.get("logical_post_id"), r.get("slot_index"),
                  str(r.get("account") or "").lower())
                 for r in date_rows if str(r.get("format") or "").lower() == "feed"
             }
             if not feed_keys:
-                return False
+                partial("no feed keys after ledger stamp")
             stories = [r for r in day_rows
                        if r.get("gym_id") == gym_id
                        and str(r.get("format") or "").lower() == "story"
@@ -1714,7 +1746,7 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
                        and (r.get("logical_post_id"), r.get("slot_index"),
                             str(r.get("account") or "").lower()) in feed_keys]
             if any(not _is_wipeable(r) or not r.get("created_at") for r in stories):
-                return False
+                partial("sibling Story changed after ledger stamp")
             old_captions = {str(r.get("caption") or "") for r in date_rows
                             if str(r.get("format") or "").lower() == "feed"}
             for story in stories:
@@ -1728,7 +1760,8 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
                     expected_row=dict(story), force_caption_visual_hold=True)
                 if not updated or updated.get("media_not_ready_reason") != \
                         "caption_changed_needs_new_visual":
-                    return False
+                    partial(f"Story hold CAS missed for {story['id']}")
+                applied_ids.append(story["id"])
                 story["media_not_ready_reason"] = "caption_changed_needs_new_visual"
                 if story_caption is not None:
                     story["caption"] = story_caption
@@ -1736,9 +1769,10 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
                     if original.get("id") == story["id"]:
                         original["media_not_ready_reason"] = story["media_not_ready_reason"]
                         original["caption"] = story["caption"]
+        except PartialLassoCaptionRepair:
+            raise
         except Exception as exc:  # noqa: BLE001
-            log(f"{gym_id} {day}: paired Story hold failed: {type(exc).__name__}")
-            return False
+            partial(f"paired Story hold failed: {type(exc).__name__}")
 
     # RE-STAMP THE LEARNING LEVERS against the caption we are actually writing.
     # They were stamped at stage time against the pre-repair text and nothing
@@ -1765,7 +1799,7 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
             if lasso_guard:
                 # Never retry an autonomous repair through a legacy patcher
                 # without its exact-row compare-and-swap.
-                return False
+                partial(f"exact caption patcher unavailable for {r.get('id')}")
             # A store predating the levers kwarg (older fakes, other callers).
             # The caption fix must never be lost over a metadata refresh.
             #
@@ -1788,17 +1822,22 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
             log(f"{gym_id} {r.get('post_date')}: caption patch failed: "
                 f"{type(exc).__name__}")
             if lasso_guard:
-                return False
+                partial(f"exact caption patch failed for {r.get('id')}: "
+                        f"{type(exc).__name__}")
             continue
         if updated:
+            r.update(updated if lasso_guard else {})
             r["caption"] = new_cap
             if new_cat:
                 r["pillar"] = new_cat
             r.update(levers)
+            if lasso_guard:
+                applied_ids.append(r.get("id"))
+                if r.get("media_not_ready_reason") != "caption_changed_needs_new_visual":
+                    partial(f"caption patch lacked visual hold for {r.get('id')}")
             patched_any = True
         elif lasso_guard:
-            log(f"{gym_id} {day}: exact caption CAS missed; repair held")
-            return False
+            partial(f"exact caption CAS missed for {r.get('id')}")
     return patched_any
 
 
@@ -1946,7 +1985,7 @@ def _lasso_caption_regen(log):
                     for cta in doc.ctas or [""]:
                         candidate = "\n\n".join(
                             [hook, *ordered_bodies, *([cta] if cta else [])])
-                        if (any(mark in candidate for mark in ("—", "–", "-", ":", ";"))
+                        if (copy_gate.lasso_violations(candidate)
                                 or caption_ledger.caption_hash(candidate) in existing_hashes):
                             continue
                         try:
