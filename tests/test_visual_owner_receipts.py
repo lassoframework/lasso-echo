@@ -136,3 +136,29 @@ def test_prepare_uses_configured_owner_writer_only_when_available(monkeypatch):
                             render_evidence=evidence(), isolated_test_callbacks=True)
     assert prepared["visual_group_key"] == "vg_scene"
     assert seen["source_bytes"] == SOURCE and seen["delivered_bytes"] == DELIVERED
+
+
+def test_owner_scene_receipt_computes_exact_bytes_and_stable_retry(monkeypatch):
+    monkeypatch.setattr("agent.visual_scene.scene_fingerprint", lambda data: "scene:phash64:0123456789abcdef" if data == SOURCE else None)
+    connections = [Connection(), Connection()]
+    results = [owner.produce_scene(tenant=TENANT, group_key="vg_scene", object_role="display",
+        exact_url=SOURCE_URL, exact_bytes=SOURCE, connection_factory=lambda c=c: c)
+        for c in connections]
+    assert results[0] == results[1]
+    assert results[0]["fingerprint"] == owner._md5(SOURCE)
+    for c in connections:
+        statement, params = c.cursor_obj.calls[0]
+        assert "visual_scene_owner_phash_receipt" in statement
+        assert params[1:8] == (TENANT,"vg_scene","display",SOURCE_URL,owner._md5(SOURCE),"0123456789abcdef",len(SOURCE))
+        assert c.committed and c.closed
+
+
+def test_owner_scene_receipt_rejects_unknown_bytes_and_service_configuration(monkeypatch):
+    monkeypatch.setattr("agent.visual_scene.scene_fingerprint", lambda data: None)
+    with pytest.raises(owner.OwnerReceiptError, match="no decodable"):
+        owner.produce_scene(tenant=TENANT,group_key="vg_scene",object_role="display",
+            exact_url=SOURCE_URL,exact_bytes=SOURCE,connection_factory=lambda: pytest.fail("no DB"))
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_OWNER_RECEIPTS","1")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_DSN","test-only")
+    monkeypatch.setenv("AGENT_VISUAL_RECEIPT_OWNER_ROLE","service_role")
+    assert owner.default_scene_writer() is None

@@ -352,6 +352,18 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def source_media_content_hash_schema_ready(self):
+        """Return True only when PostgREST proves the lineage column is selectable."""
+        r = self._client().get(
+            self._rest(_TABLE), params={"select": "source_media_content_hash", "limit": "0"},
+            headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            return False
+        try:
+            return isinstance(r.json(), list)
+        except Exception:
+            return False
+
     def list_media_publish_history(self, account_key, since):
         """Complete cross-platform send history for a strict reuse decision.
 
@@ -553,6 +565,9 @@ class SupabaseCalendarStore:
             # invent an A -> C render receipt or discard A to pass preparation.
             patch["source_media_url"] = current.get("source_media_url") or current["image_url"]
             patch["r2_key"] = None
+            # The patch retains the ORIGINAL source (or, when none was recorded,
+            # the evidence-bound old image itself), so the Drive content hash
+            # stays valid here; the clearing loops below cover source changes.
             candidate = dict(current)
             candidate.update(patch)
             candidate["source_media_url"] = current["image_url"]
@@ -562,9 +577,9 @@ class SupabaseCalendarStore:
                 # The asset/Drive identity attests A, not input rendition B.
                 candidate["source_media_asset_id"] = None
                 candidate["drive_file_id"] = None
-            prepared = visual_writer_prepare.prepare(
+            prepared = self._calendar_visual_payload(visual_writer_prepare.prepare(
                 self, account_key, candidate, render_evidence=render_evidence,
-                poster_render_evidence=poster_render_evidence)
+                poster_render_evidence=poster_render_evidence))
             if (current.get("visual_group_key")
                     and prepared["visual_group_key"] != current["visual_group_key"]):
                 raise visual_writer_prepare.VisualPreparationError(
@@ -586,19 +601,30 @@ class SupabaseCalendarStore:
                     "render evidence does not bind the scoped story replacement")
         # A replacement must not carry a stale source identity from the old
         # image. Callers that know the replacement asset supply it explicitly.
-        for field in ("source_media_url", "source_media_asset_id", "drive_file_id", "byte_hash", "r2_key"):
+        for field in ("source_media_url", "source_media_asset_id", "drive_file_id",
+                      "byte_hash", "r2_key", "source_media_content_hash"):
             if (field == "source_media_url" and is_story
-                    and (current.get(field) == patch.get("image_url")
+                    and (current.get("source_media_url") == patch.get("image_url")
                          or render_evidence is not None)):
+                continue
+            if (field == "source_media_content_hash" and is_story
+                    and patch.get("source_media_asset_id",
+                                  current.get("source_media_asset_id"))
+                    == current.get("source_media_asset_id")
+                    and (current.get("source_media_url") == patch.get("image_url")
+                         or render_evidence is not None)):
+                # Story raw source (and therefore its Drive byte identity) is
+                # retained: same-source render evidence proves retention only
+                # while the Drive asset identity also remains unchanged.
                 continue
             if field not in patch and current.get(field):
                 patch[field] = None
         candidate = dict(current)
         candidate.update(patch)
         candidate.pop("visual_group_key", None)
-        prepared = visual_writer_prepare.prepare(
+        prepared = self._calendar_visual_payload(visual_writer_prepare.prepare(
             self, account_key, candidate, render_evidence=render_evidence,
-            poster_render_evidence=poster_render_evidence)
+            poster_render_evidence=poster_render_evidence))
         patch["visual_group_key"] = prepared["visual_group_key"]
         patch["byte_hash"] = prepared["byte_hash"]
         return patch
@@ -738,9 +764,22 @@ class SupabaseCalendarStore:
                     or evidence.get("delivered_exact_url") != row.get("image_url")):
                 raise visual_writer_prepare.VisualPreparationError(
                     "render evidence does not bind the scoped media replacement")
-        return visual_writer_prepare.prepare(
+        prepared = visual_writer_prepare.prepare(
             self, account_key, row, render_evidence=render_evidence,
             poster_render_evidence=poster_render_evidence)
+        return self._calendar_visual_payload(prepared)
+
+    @staticmethod
+    def _calendar_visual_payload(prepared):
+        """Keep durable preparation receipts out of content_calendar writes.
+
+        ``scene_candidate`` is registered through its owner-only RPC during
+        preparation. It is transport metadata rather than a content_calendar
+        column, so forwarding it to PostgREST would reject an otherwise valid
+        prepared insert or patch.
+        """
+        return {key: value for key, value in prepared.items()
+                if key != "scene_candidate"}
 
     def _prepare_visual_replacement(self, account_key, current, payload,
                                     render_evidence=None, poster_render_evidence=None):
@@ -752,7 +791,16 @@ class SupabaseCalendarStore:
                 and current.get("source_media_url") != current.get("image_url")):
             raise visual_writer_prepare.VisualPreparationError(
                 "replacement requires an explicit source; existing raw source cannot be discarded")
-        for field in ("source_media_url", "source_media_asset_id", "drive_file_id", "byte_hash", "r2_key"):
+        new_source = patch.get("source_media_url")
+        same_source = bool(new_source) and new_source == current.get("source_media_url")
+        new_asset_id = patch.get("source_media_asset_id", current.get("source_media_asset_id"))
+        same_asset = bool(new_asset_id) and new_asset_id == current.get("source_media_asset_id")
+        for field in ("source_media_url", "source_media_asset_id", "drive_file_id",
+                      "byte_hash", "r2_key", "source_media_content_hash"):
+            if field == "source_media_content_hash" and same_source and same_asset:
+                # Source unchanged (e.g. a no-image backfill retaining its raw
+                # source): the old Drive byte identity still proves origin.
+                continue
             if field not in patch and current.get(field):
                 patch[field] = None
         candidate = {**current, **patch}

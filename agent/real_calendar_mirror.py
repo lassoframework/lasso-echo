@@ -226,6 +226,26 @@ def _real_row(account_key, draft, caption=None):
     src_asset = getattr(draft, "source_media_asset_id", "") or ""
     if src_asset:
         row["source_media_asset_id"] = src_asset
+    # gym_media_drive ORIGINAL-SOURCE LINEAGE (2026-10-05): the Drive md5Checksum
+    # the asset was indexed under, carried separately from source_media_url /
+    # image_url. Those are delivery addresses (a hosted-original URL or a
+    # transformed rendition URL); this is the original-byte identity, so a
+    # rendition-backed row proves WHICH Drive bytes it came from. Stamped ONLY
+    # when present (the column exists after the
+    # DRAFT_content_calendar_source_media_content_hash migration is applied);
+    # omitted otherwise so a pre-migration insert never carries an unknown column.
+    # EMISSION IS FLAG-GATED (ECHO_SOURCE_MEDIA_CONTENT_HASH_ENABLED, default OFF):
+    # direct callers (client_month_run._row_from_draft, real_month_planner
+    # to_calendar_rows) insert this row after a month delete, so emitting an
+    # unknown pre-migration column while the feature is OFF could cost the month.
+    try:
+        _hash_enabled = bool(config.source_media_content_hash_enabled())
+    except AttributeError:
+        _hash_enabled = False
+    src_hash = (str(getattr(draft, "source_media_content_hash", "") or "").strip()
+                if _hash_enabled else "")
+    if src_hash:
+        row["source_media_content_hash"] = src_hash
     # Planned cadence: a draft carries its slot ordinal so publish-time slot times
     # are deterministic. Ordinals 0/1 are the regular AM/PM feeds; LASSO's guarded,
     # dated Summit runway may add ordinal 2. Preserve the planner's ordinal exactly.
@@ -400,10 +420,44 @@ def mirror_to_supabase(account_key, store, sb_store):
         # Stamped durably; collect_real_drafts below re-lists the store, so the
         # rehydrated drafts carry the persisted ids (never same-object stash).
 
+    # Source lineage schema gate. The feature remains OFF unless deliberately
+    # enabled. When enabled, prove the destination column is queryable before the
+    # month delete/insert transaction begins; an unreadable/missing-column schema
+    # must never erase a previously mirrored month.
+    try:
+        hash_enabled = bool(config.source_media_content_hash_enabled())
+    except AttributeError:
+        hash_enabled = False
+    if hash_enabled:
+        lister = getattr(store, "list_for_account", None)
+        candidates = [d for d in (lister(account_key) or []) if _draft_eligible(d)] if lister else []
+        has_hash = any(str(getattr(d, "source_media_content_hash", "") or "").strip()
+                       for d in candidates)
+        if has_hash:
+            ready = getattr(sb_store, "source_media_content_hash_schema_ready", None)
+            if ready is None:
+                raise ValueError(
+                    "source_media_content_hash flag ON but calendar store cannot "
+                    "prove schema readiness; refusing month deletion (fail closed)")
+            try:
+                schema_ready = ready()
+            except Exception as exc:
+                raise ValueError(
+                    "source_media_content_hash schema readiness check failed; "
+                    "refusing month deletion (fail closed)") from exc
+            if schema_ready is not True:
+                raise ValueError(
+                    "source_media_content_hash column is not confirmed ready; "
+                    "refusing month deletion (fail closed)")
+
     # Real rows, gym-forced, with any stray id stripped (belt and braces; _real_row no
     # longer emits one). A real gym never carries a demo id, so a demo-id row is dropped.
     poster_evidence_by_url = {}
     real_rows = []
+    try:
+        hash_enabled = bool(config.source_media_content_hash_enabled())
+    except AttributeError:
+        hash_enabled = False
     for row in collect_real_drafts(
             account_key, store,
             poster_evidence_out=poster_evidence_by_url):
@@ -411,6 +465,8 @@ def mirror_to_supabase(account_key, store, sb_store):
                 or str(row.get("gym_id")) != str(account_key)):
             continue
         row = {k: v for k, v in row.items() if k != "id"}
+        if not hash_enabled:
+            row.pop("source_media_content_hash", None)
         # Fail closed BEFORE any delete or insert: a logical_post_id reaching
         # insert_rows must be a valid UUID; an invalid one aborts the whole mirror
         # with ValueError (never a silent strip + identity-less delete/reinsert).

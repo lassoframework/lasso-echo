@@ -35,6 +35,9 @@
 --   drop function if exists public.visual_scene_register_candidate(text,text,text,text,text,jsonb,text,text);
 --   drop function if exists public.visual_scene_hamming(text,text);
 --   drop trigger if exists visual_scene_occupied_immutable on public.visual_scene_phash_occupied;
+--   drop trigger if exists visual_scene_owner_phash_receipt_immutable on public.visual_scene_owner_phash_receipt;
+--   drop trigger if exists visual_scene_owner_phash_receipt_no_truncate on public.visual_scene_owner_phash_receipt;
+--   drop function if exists public.visual_scene_receipt_no_truncate();
 --   drop trigger if exists visual_scene_candidate_immutable on public.visual_scene_candidate;
 --   drop trigger if exists visual_scene_review_hold_guard on public.visual_scene_review_hold;
 --   drop function if exists public.visual_scene_immutable();
@@ -42,6 +45,7 @@
 --   drop table if exists public.visual_scene_review_hold;
 --   drop table if exists public.visual_scene_phash_occupied;
 --   drop table if exists public.visual_scene_candidate;
+--   drop table if exists public.visual_scene_owner_phash_receipt;
 -- The frozen md5-keyed exact-byte ledger (visual_global_usage, its members and
 -- the visual_global_claim_scene path) is NOT touched by this file and needs no
 -- rollback.
@@ -172,6 +176,28 @@ begin;
 --   'poster'  — the video poster/thumbnail (content_calendar.thumbnail_url),
 --               only when distinct from image_url.
 -- ---------------------------------------------------------------------------
+-- Dedicated owner-only computed pHash receipts. Never writable by service_role.
+-- The owner producer calculates both fingerprints from one exact byte buffer.
+create table if not exists public.visual_scene_owner_phash_receipt (
+  receipt_id uuid primary key,
+  tenant_id text not null,
+  group_key text not null,
+  object_role text not null check (object_role in ('display','poster')),
+  exact_url text not null check (btrim(exact_url) <> ''),
+  fingerprint text not null check (fingerprint ~ '^md5:[0-9a-f]{32}$'),
+  phash char(16) not null check (phash ~ '^[0-9a-f]{16}$'),
+  byte_length bigint not null check (byte_length > 0),
+  algorithm text not null check (algorithm = 'echo-dct-phash64-v1'),
+  created_at timestamptz not null default now(),
+  foreign key (tenant_id, group_key, exact_url, fingerprint)
+    references public.visual_global_object_attestation(tenant_id, group_key, exact_url, fingerprint)
+);
+alter table public.visual_scene_owner_phash_receipt enable row level security;
+revoke all on public.visual_scene_owner_phash_receipt
+  from public, anon, authenticated, service_role;
+-- Provision the separate owner role explicitly during reviewed activation;
+-- this draft grants NO mint privilege to application roles.
+
 create table if not exists public.visual_scene_candidate (
   candidate_id uuid primary key default gen_random_uuid(),
   tenant_id    text        not null,
@@ -195,7 +221,13 @@ create index if not exists visual_scene_candidate_scene_idx
   on public.visual_scene_candidate (tenant_id, group_key);
 create index if not exists visual_scene_candidate_phash_idx
   on public.visual_scene_candidate (phash);
-create index if not exists visual_scene_candidate_object_idx
+-- One candidate per exact delivered object per scene and role. Registration is
+-- IDEMPOTENT on this identity (visual_scene_register_candidate returns the
+-- existing candidate_id for an exact identical retry instead of minting a
+-- fresh UUID) and a conflicting pHash/fingerprint/evidence for the same
+-- identity is refused — the evidence a hold was reviewed against can never be
+-- duplicated or drifted by a retry.
+create unique index if not exists visual_scene_candidate_object_uq
   on public.visual_scene_candidate (tenant_id, group_key, object_role, exact_url);
 
 -- ---------------------------------------------------------------------------
@@ -338,6 +370,24 @@ begin
 end;
 $$;
 
+drop trigger if exists visual_scene_owner_phash_receipt_immutable on public.visual_scene_owner_phash_receipt;
+create trigger visual_scene_owner_phash_receipt_immutable
+  before update or delete on public.visual_scene_owner_phash_receipt
+  for each row execute function public.visual_scene_immutable();
+create or replace function public.visual_scene_receipt_no_truncate()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  raise exception 'owner scene receipts are immutable' using errcode='23514';
+end;
+$$;
+revoke all on function public.visual_scene_receipt_no_truncate()
+  from public, anon, authenticated, service_role;
+drop trigger if exists visual_scene_owner_phash_receipt_no_truncate on public.visual_scene_owner_phash_receipt;
+create trigger visual_scene_owner_phash_receipt_no_truncate
+  before truncate on public.visual_scene_owner_phash_receipt
+  for each statement execute function public.visual_scene_receipt_no_truncate();
+
+
 drop trigger if exists visual_scene_candidate_immutable on public.visual_scene_candidate;
 create trigger visual_scene_candidate_immutable
   before update or delete on public.visual_scene_candidate
@@ -375,7 +425,9 @@ $$;
 -- visual_global_object_attestation, evidence must carry verified_bytes
 -- matching the attested md5, and object_role declares which delivered object
 -- of the calendar row the candidate binds to. Registration NEVER consumes a
--- scene.
+-- scene and is IDEMPOTENT on (tenant, group, object_role, exact_url): an exact
+-- identical retry returns the existing candidate_id, while a conflicting
+-- pHash/fingerprint/evidence for the same identity is refused.
 -- ---------------------------------------------------------------------------
 create or replace function public.visual_scene_register_candidate(
   p_tenant text, p_group_key text, p_phash text,
@@ -383,6 +435,7 @@ create or replace function public.visual_scene_register_candidate(
   p_object_role text default 'display'
 ) returns uuid language plpgsql security definer set search_path = public as $$
 declare v_tenant text; v_id uuid;
+  v_existing public.visual_scene_candidate%rowtype;
 begin
   v_tenant := public.visual_group_tenant_strict(p_tenant)::text;
   if p_tenant is distinct from v_tenant then
@@ -410,6 +463,43 @@ begin
         and o.exact_url = p_exact_url and o.fingerprint = p_fingerprint) then
     raise exception 'candidate phash is not backed by owner-attested exact bytes'
       using errcode='23514';
+  end if;
+  -- MD5 attestation alone cannot authorize caller-selected scene similarity.
+  -- Validate the immutable owner computation BEFORE the idempotent return.
+  if not exists(select 1 from public.visual_scene_owner_phash_receipt r
+      join public.visual_global_object_attestation o
+        on o.tenant_id=r.tenant_id and o.group_key=r.group_key
+        and o.exact_url=r.exact_url and o.fingerprint=r.fingerprint
+      where r.receipt_id::text = p_evidence->>'owner_phash_receipt'
+        and r.tenant_id=v_tenant and r.group_key=p_group_key
+        and r.object_role=p_object_role and r.exact_url=p_exact_url
+        and r.fingerprint=p_fingerprint and r.phash=p_phash
+        and r.byte_length=o.byte_length
+        and r.algorithm='echo-dct-phash64-v1') then
+    raise exception 'candidate needs matching immutable owner pHash receipt'
+      using errcode='23514';
+  end if;
+  -- IDEMPOTENT REGISTRATION under concurrency: serialize registrations of the
+  -- same delivered-object identity, then either return the EXISTING candidate
+  -- for an exact identical retry (a fresh UUID for the same evidence would
+  -- double-bind the row's delivered object and make
+  -- visual_scene_hold_resolve reject an otherwise valid live row) or refuse a
+  -- conflicting one. The first row's evidence is preserved untouched; the
+  -- candidate table is append-only/immutable.
+  perform pg_advisory_xact_lock(hashtextextended(
+    'visual_scene_candidate', hashtextextended(
+      v_tenant || ':' || p_group_key || ':' || p_object_role || ':' || p_exact_url, 0)));
+  select c.* into v_existing from public.visual_scene_candidate c
+    where c.tenant_id = v_tenant and c.group_key = p_group_key
+      and c.object_role = p_object_role and c.exact_url = p_exact_url;
+  if found then
+    if v_existing.phash <> p_phash
+        or v_existing.fingerprint <> p_fingerprint
+        or v_existing.evidence <> p_evidence then
+      raise exception 'conflicting scene candidate evidence for the same delivered object'
+        using errcode='23514';
+    end if;
+    return v_existing.candidate_id;
   end if;
   insert into public.visual_scene_candidate
     (tenant_id, group_key, object_role, phash, exact_url, fingerprint, evidence, attested_by)

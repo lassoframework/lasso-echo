@@ -254,7 +254,7 @@ def test_tenant_assertion_blocks_cross_gym(monkeypatch, tmp_path):
     foreign = make_asset("x", gym_id="other_gym", kind="photo")
     monkeypatch.setattr("agent.gym_media_selector.pick_media",
                         lambda gym_id, kind_preference=None, store=None, now=None,
-                        exclude_ids=(): foreign if "x" not in exclude_ids else None)
+                        exclude_ids=(), post_date=None: foreign if "x" not in exclude_ids else None)
     store = FakeMediaStore()
     drive = FakeDrive(blobs={"x": b"jpg"})
     draft = builder.build_gym_media_draft(
