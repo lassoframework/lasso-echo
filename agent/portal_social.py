@@ -2208,7 +2208,8 @@ def handle_recreate_caption(account_key, draft_id, actor_id, reader=None,
     # pixels silently diverge. Same call `_handle_edit_supabase` already makes;
     # `maybe_reburn_story` is itself gated on `story_reburn.should_reburn(row)` and
     # is a no-op for a feed row, so this is always safe to call unconditionally.
-    reburned = maybe_reburn_story(account_key, updated, result["caption"], sb_store)
+    reburned = maybe_reburn_story(account_key, updated,
+                                 updated.get("caption") or "", sb_store)
     # Charge the budget only after a successful, persisted recreate.
     spend_recreate(account_key)
     return 200, {"ok": True, "action": "recreate-caption", "draft_id": draft_id,

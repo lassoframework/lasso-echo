@@ -164,8 +164,10 @@ def violations(text: str) -> list[str]:
 # Periods in URLs, decimals and common abbreviated names are not sentence ends.
 _CAPTION_SENTENCE_END = re.compile(r"([.!?][\"'”’)]*)[ \t]+(?=\S)")
 _CAPTION_ABBREVIATIONS = frozenset(("mr.", "mrs.", "ms.", "dr.", "prof.",
-                                    "st.", "vs.", "e.g.", "i.e.", "a.m.", "p.m.",
-                                    "etc."))
+                                    "st.", "vs.", "e.g.", "i.e."))
+_CAPTION_CONTEXT_ABBREVIATIONS = frozenset((
+    "jan.", "feb.", "mar.", "apr.", "jun.", "jul.", "aug.", "sep.", "sept.",
+    "oct.", "nov.", "dec.", "ave.", "ft.", "no.", "a.m.", "p.m.", "etc."))
 
 
 def format_caption(text: str) -> str:
@@ -198,6 +200,10 @@ def format_caption(text: str) -> str:
             part = line[start:match.end(1)].strip()
             last_word = part.split()[-1].lower() if part.split() else ""
             if last_word in _CAPTION_ABBREVIATIONS:
+                continue
+            next_text = line[match.end():].lstrip()
+            if (last_word in _CAPTION_CONTEXT_ABBREVIATIONS and next_text
+                    and (next_text[0].islower() or next_text[0].isdigit())):
                 continue
             blocks.append(part)
             start = match.end()

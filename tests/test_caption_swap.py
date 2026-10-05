@@ -322,19 +322,28 @@ def test_handle_recreate_caption_reburns_a_story_so_pixels_never_diverge_from_te
     import agent.client_media_sync as _cms
     monkeypatch.setattr(_cms, "_banned_words_for", lambda key: ())
     monkeypatch.setattr(cs, "recreate_caption",
-                       lambda *a, **k: {"ok": True, "caption": "A new story caption.",
+                       lambda *a, **k: {"ok": True, "caption": "A new story caption. Join us.",
                                         "hashtags": []})
+
+    from agent.copy_gate import format_caption
+    original_patch = store.patch_caption
+    store.patch_caption = lambda account_key, row_id, caption: original_patch(
+        account_key, row_id, format_caption(caption))
 
     import agent.story_reburn as _sr
     monkeypatch.setattr(_sr, "should_reburn", lambda row: row.get("format") == "story")
-    monkeypatch.setattr(_sr, "reburn",
-                       lambda *a, **k: "https://cdn/reburned.jpg")
+    burned = []
+    def _reburn(source_url, caption, *args, **kwargs):
+        burned.append(caption)
+        return "https://cdn/reburned.jpg"
+    monkeypatch.setattr(_sr, "reburn", _reburn)
 
     status, body = ps.handle_recreate_caption("zanshin", "p1", "u1")
     assert status == 200
     assert body["story_reburned"] is True
     assert store.image_url_patches == [("p1", "https://cdn/reburned.jpg")]
     assert store._rows["p1"]["image_url"] == "https://cdn/reburned.jpg"
+    assert burned == [store._rows["p1"]["caption"]]
 
 
 def test_handle_recreate_caption_feed_never_touches_image_url(monkeypatch, lib):

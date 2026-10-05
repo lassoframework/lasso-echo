@@ -146,6 +146,7 @@ def _portal_env(monkeypatch, tmp_path):
 
 def test_portal_edit_with_inline_why_saves_body_and_learns_reason(_portal_env):
     from agent import tenant_brain
+    from agent.copy_gate import format_caption
     store = _FakeEditStore([{
         "id": "uuid-1", "gym_id": "eng", "post_date": "2026-08-22",
         "account": "facebook", "status": "pending", "caption": "old caption",
@@ -155,9 +156,9 @@ def test_portal_edit_with_inline_why_saves_body_and_learns_reason(_portal_env):
     status, body = ps.handle_edit("eng", "uuid-1", "U1", note=note, sb_store=store)
     assert status == 200
     # the caption written to the store is the BODY only — the rationale never lands
-    assert store.caption_patches == [("uuid-1", CLEAN_BODY)]
+    assert store.caption_patches == [("uuid-1", format_caption(CLEAN_BODY))]
     assert "[why]" not in body["caption"].lower()
-    assert body["caption"] == CLEAN_BODY
+    assert body["caption"] == format_caption(CLEAN_BODY)
     # the rationale (label stripped) is captured as the edit's reason...
     assert body["reason_captured"] is True
     assert "Removed word parents" in body["reason"]

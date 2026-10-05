@@ -806,11 +806,10 @@ def _note_caption_formatted(row_id, gym_id):
         key = f"capformat_healed_{gym_id}_{row_id}"
         if db.kv_get(key):
             return
-        db.kv_set(key, "1")
-        ops_alerts.alert(
+        _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
             f"{gym_id}: row {row_id} carried a pre-copy-rail caption with "
             "semicolons. Echo auto-formatted it at the publish boundary "
-            "(semicolons became commas) and published the clean caption.")
+            "(semicolons became commas) and published the clean caption."))
     except Exception:
         pass  # an alert failure must never block the publish lane
 
@@ -825,12 +824,11 @@ def _alert_caption_format_held(row_id, gym_id):
         key = f"capformat_held_{gym_id}_{row_id}"
         if db.kv_get(key):
             return
-        db.kv_set(key, "1")
-        ops_alerts.alert(
+        _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
             f"{gym_id}: row {row_id} HELD at the publish boundary — its caption "
             "contains a semicolon that cannot be safely auto-formatted. "
             "Edit the caption and re-render Story media if applicable; "
-            "the row retries once fixed.")
+            "the row retries once fixed."))
     except Exception:
         pass  # an alert failure must never block the publish lane
 

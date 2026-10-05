@@ -127,7 +127,18 @@ def test_caption_etc_abbreviation_does_not_split_paragraph():
     assert copy_gate.format_caption(raw) == raw
     assert copy_gate.format_caption(
         "We have rowers, bikes, etc. Every class is coached. Book a spot.") == (
-        "We have rowers, bikes, etc. Every class is coached.\n\nBook a spot.")
+        "We have rowers, bikes, etc.\n\nEvery class is coached.\n\nBook a spot.")
+
+
+def test_caption_month_and_unit_abbreviations_use_next_word_context():
+    assert copy_gate.format_caption("Classes start Oct. 5 at 7 a.m. Book a spot.") == (
+        "Classes start Oct. 5 at 7 a.m.\n\nBook a spot.")
+    assert copy_gate.format_caption("Walk 200 ft. to our front door. Come in.") == (
+        "Walk 200 ft. to our front door.\n\nCome in.")
+    assert copy_gate.format_caption("No. 1 is showing up. Start today.") == (
+        "No. 1 is showing up.\n\nStart today.")
+    assert copy_gate.format_caption("No. We have room for you.") == (
+        "No.\n\nWe have room for you.")
 
 
 # ---------------------------------------------------------------------------
