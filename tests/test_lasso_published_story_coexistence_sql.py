@@ -1,4 +1,4 @@
-"""Disposable PostgreSQL proof for the two exact legacy Story exceptions."""
+"""Disposable PostgreSQL proof for the exact legacy Story exceptions."""
 
 import hashlib
 import json
@@ -19,6 +19,21 @@ FEED_URL = "https://example.com/feed.png"
 STORY_URL = "https://example.com/reviewed-story.png"
 OLD_URL = "https://example.com/legacy-story.png"
 DIGEST = "a" * 64
+
+# Third pair verified by receipt published-feed-story-gap-2c6e3489.json.
+FEED3 = "2c6e3489-d965-5abc-b11b-7105047353cf"
+HISTORICAL3 = "810b7a15-d187-4f73-bad9-3fab15954cc0"
+NEW_STORY3 = "34343434-3434-4434-8434-343434343434"
+CAPTION3 = ("Spend more time with the people in front of you.\n\n"
+            "LASSO plans your content, creates the posts, and keeps the "
+            "calendar moving. See the plan in one place.\n\n"
+            "Save this for later.")
+FEED3_URL = ("https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/"
+             "echo/lasso/91d16553122dcf21/direct_2c6e3489.png")
+STORY3_URL = "https://example.com/reviewed-story-oct4.png"
+OLD3_URL = ("https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/"
+            "echo/lasso_ig/dcad077060d7579d/2026-10-04_810b7a15.png")
+CAPTION3_SHA256 = ("68df52b993d8ee3af07ac939a7ad4775965fd412540c07d430f04e6c77aae7da")
 
 
 def _run(*args):
@@ -126,3 +141,86 @@ def test_unlisted_or_ambiguous_historical_pair_is_refused(pg):
     sql(f"delete from public.echo_infographic_artifacts where image_url='{OLD_URL}'")
     sql(f"update public.content_calendar set pillar='platform' where id='{HISTORICAL}'")
     assert sql(f"select public.lasso_unrelated_published_story('{HISTORICAL}','{FEED}')") == "f"
+
+
+def _setup_third_pair(sql):
+    assert hashlib.sha256(CAPTION3.encode()).hexdigest() == CAPTION3_SHA256
+    sql(f"""insert into public.content_calendar
+      (id,gym_id,account,post_date,pillar,format,caption,image_url,
+       source_media_url,status,scheduled_at,slot_index,variant_status,
+       published_at,late_post_id)
+      values
+      ('{FEED3}','lasso','instagram','2026-10-04','doctrine','feed',
+       '{CAPTION3}','{FEED3_URL}','{FEED3_URL}','pending',
+       '2026-10-04T07:30:00-04:00',0,'active',null,null),
+      ('{HISTORICAL3}','lasso','instagram','2026-10-04','doctrine','story',
+       '','{OLD3_URL}','{OLD3_URL}','published',
+       '2026-10-04T07:45:00-04:00',0,'active',now(),'legacy-receipt-3');""")
+    evidence = {"grade_status": "PASS", "image_sha256": DIGEST,
+                "policy_version": "review-v1", "aspect": "9:16",
+                "pixels": "1080x1920", "verified_dimensions": {
+                    "width": 1080, "height": 1920, "image_sha256": DIGEST}}
+    source = {"source_id": f"content_calendar:{FEED3}:caption",
+              "source_hash": CAPTION3_SHA256}
+    sql("insert into public.echo_infographic_artifacts values "
+        f"('lasso_ig','{STORY3_URL}','{DIGEST}',"
+        f"'{json.dumps(evidence)}'::jsonb,'{json.dumps(source)}'::jsonb)")
+
+
+def test_third_pair_stages_and_claims_managed_story(pg):
+    sql = pg
+    _setup_third_pair(sql)
+    assert sql(f"select public.lasso_unrelated_published_story("
+               f"'{HISTORICAL3}','{FEED3}')") == "t"
+    result = sql(f"""select public.stage_lasso_paired_story(
+      '{FEED3}','instagram','2026-10-04',0,'pending','{CAPTION3}','{FEED3_URL}',
+      '2026-10-04T07:30:00-04:00',null,'{NEW_STORY3}','{STORY3_URL}',
+      '{DIGEST}','lasso_ig','{CAPTION3_SHA256}','review-v1',
+      '2026-10-04T07:45:00-04:00');""")
+    assert json.loads(result)["result"] == "inserted"
+    assert sql(f"select public.lasso_paired_story_ready_for_feed('{FEED3}')") == "t"
+    assert sql("select count(*) from public.content_calendar where format='story' "
+               f"and post_date='2026-10-04'") == "2"
+    # The historical row is preserved untouched.
+    assert sql(f"select image_url from public.content_calendar "
+               f"where id='{HISTORICAL3}'") == OLD3_URL
+    # Claim guard still governs the new managed Story.
+    pg(f"update public.content_calendar set status='published', published_at=now(), "
+       f"late_post_id='feed-receipt-3' where id='{FEED3}'")
+    try:
+        pg(f"update public.content_calendar set status='publishing' where id='{NEW_STORY3}'")
+    except subprocess.CalledProcessError as exc:
+        pytest.fail(exc.stderr)
+
+
+def test_third_pair_changed_or_unlisted_evidence_refuses(pg):
+    sql = pg
+    # Unlisted feed for the same historical Story refuses.
+    assert sql(f"select public.lasso_unrelated_published_story('{HISTORICAL3}',"
+               "'00000000-0000-4000-8000-000000000003')") == "f"
+    # Changed legacy image URL refuses.
+    sql(f"update public.content_calendar set image_url='{OLD3_URL}.moved', "
+        f"source_media_url='{OLD3_URL}.moved' where id='{HISTORICAL3}'")
+    assert sql(f"select public.lasso_unrelated_published_story("
+               f"'{HISTORICAL3}','{FEED3}')") == "f"
+    sql(f"update public.content_calendar set image_url='{OLD3_URL}', "
+        f"source_media_url='{OLD3_URL}' where id='{HISTORICAL3}'")
+    # Changed feed image URL refuses.
+    sql(f"update public.content_calendar set image_url='{FEED3_URL}.moved', "
+        f"source_media_url='{FEED3_URL}.moved' where id='{FEED3}'")
+    assert sql(f"select public.lasso_unrelated_published_story("
+               f"'{HISTORICAL3}','{FEED3}')") == "f"
+    sql(f"update public.content_calendar set image_url='{FEED3_URL}', "
+        f"source_media_url='{FEED3_URL}' where id='{FEED3}'")
+    # Changed feed caption refuses (sha256 binding).
+    sql("update public.content_calendar set caption='edited caption' "
+        f"where id='{FEED3}'")
+    assert sql(f"select public.lasso_unrelated_published_story("
+               f"'{HISTORICAL3}','{FEED3}')") == "f"
+    sql(f"update public.content_calendar set caption='{CAPTION3}' "
+        f"where id='{FEED3}'")
+    # Pillar mismatch refuses.
+    sql(f"update public.content_calendar set pillar='platform' "
+        f"where id='{HISTORICAL3}'")
+    assert sql(f"select public.lasso_unrelated_published_story("
+               f"'{HISTORICAL3}','{FEED3}')") == "f"
