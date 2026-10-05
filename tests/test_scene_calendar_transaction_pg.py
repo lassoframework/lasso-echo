@@ -252,9 +252,12 @@ def test_exact_byte_collision_rolls_back_clean_scene_claim():
             f"('{other}','{other_group}','{other_url}','{fp}','{role}')")
     ledger._sql("insert into public.visual_group_alias(gym_id,alias_kind,alias_value,group_key) values "
         f"('{other}','canonical_url','{other_url}','{other_group}')")
+    ledger._sql("insert into public.visual_scene_owner_phash_receipt "
+        "(receipt_id,tenant_id,group_key,object_role,exact_url,fingerprint,phash,byte_length,algorithm) "
+        f"values (gen_random_uuid(),'{other}','{other_group}','display','{other_url}','{fp}','aaaaaaaaaaaaaaaa',1024,'echo-dct-phash64-v1')")
     ledger._sql("select public.visual_scene_register_candidate("
         f"'{other}','{other_group}','aaaaaaaaaaaaaaaa','{other_url}','{fp}',"
-        f"jsonb_build_object('verified_bytes','{fp}'),'transaction-test','display')")
+        f"jsonb_build_object('verified_bytes','{fp}','owner_phash_receipt',(select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{other_url}')),'transaction-test','display')")
     failed = ledger._run("insert into public.content_calendar(gym_id,account,post_date,status,variant_status,image_url,source_media_url,visual_group_key) values "
         f"('{other}','ig','2026-10-10','pending','active','{other_url}','{other_url}','{other_group}')", check=False)
     assert failed.returncode != 0

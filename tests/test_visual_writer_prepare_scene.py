@@ -88,6 +88,11 @@ def writer_calls(monkeypatch):
         return {"read_receipt": str(uuid.uuid4()), "render_receipt": None}
 
     monkeypatch.setattr(owner, "default_same_object_writer", lambda: writer)
+    def scene_writer(**args):
+        return {"receipt_id": str(uuid.uuid4()),
+                "phash": prep._scene_fingerprint(args["exact_bytes"]).rsplit(":", 1)[-1],
+                "fingerprint": prep._md5(args["exact_bytes"])}
+    monkeypatch.setattr(owner, "default_scene_writer", lambda: scene_writer)
     return calls
 
 

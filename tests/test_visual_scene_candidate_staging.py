@@ -87,6 +87,11 @@ def setup(monkeypatch):
                 "render_receipt": str(uuid.uuid4())}
     monkeypatch.setattr(owner, "default_same_object_writer", lambda: same_writer)
     monkeypatch.setattr(owner, "default_writer", lambda: rendition_writer)
+    def scene_writer(**args):
+        data = args["exact_bytes"]
+        receipt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, args["exact_url"] + args["object_role"]))
+        return {"receipt_id": receipt_id, "phash": PHASH[data], "fingerprint": prep._md5(data)}
+    monkeypatch.setattr(owner, "default_scene_writer", lambda: scene_writer)
     return store
 
 def registrations(store):
@@ -101,7 +106,8 @@ def test_same_object_registers_after_owner_preparation_and_retries(setup):
         "p_tenant": TENANT, "p_group_key": GROUP, "p_phash": PHASH[DATA[RAW]],
         "p_exact_url": RAW, "p_fingerprint": prep._md5(DATA[RAW]),
         "p_evidence": {"source": "owner_prepared_exact_object_bytes",
-                       "verified_bytes": prep._md5(DATA[RAW]), "byte_length": len(DATA[RAW])},
+                       "verified_bytes": prep._md5(DATA[RAW]), "byte_length": len(DATA[RAW]),
+                       "owner_phash_receipt": str(uuid.uuid5(uuid.NAMESPACE_URL, RAW + "display"))},
         "p_actor": "visual_writer_prepare", "p_object_role": "display"}
     assert [name for name, _ in setup.calls[:2]] == [
         "visual_global_prepare_source_rendition", "visual_scene_register_candidate"]
@@ -205,3 +211,18 @@ def test_candidate_transport_failure_is_preparation_error(setup, monkeypatch):
     monkeypatch.setattr(prep, "_rpc", fail_candidate)
     with pytest.raises(prep.VisualPreparationError, match="candidate registration failed"):
         prep.prepare(setup, "gym", {"image_url": RAW, "source_media_url": RAW})
+
+
+def test_armed_scene_guard_requires_owner_scene_producer(setup, monkeypatch):
+    monkeypatch.setattr(owner,"default_scene_writer",lambda: None)
+    with pytest.raises(prep.VisualPreparationError,match="owner scene receipt producer is unavailable"):
+        prep.prepare(setup,"gym",{"image_url":RAW,"source_media_url":RAW})
+    assert registrations(setup) == []
+
+
+def test_armed_scene_guard_refuses_receipt_hash_mismatch(setup, monkeypatch):
+    monkeypatch.setattr(owner,"default_scene_writer",lambda: lambda **args: {
+        "receipt_id":str(uuid.uuid4()),"phash":"ffffffffffffffff","fingerprint":prep._md5(args["exact_bytes"])})
+    with pytest.raises(prep.VisualPreparationError,match="owner scene receipt production failed"):
+        prep.prepare(setup,"gym",{"image_url":RAW,"source_media_url":RAW})
+    assert registrations(setup) == []

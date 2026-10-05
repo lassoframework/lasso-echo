@@ -207,10 +207,13 @@ def _seed_object(tid, group, phash=None):
          f"('{tid}', 'canonical_url', '{url}', '{group}')")
     cand = None
     if phash is not None:
+        _sql("insert into public.visual_scene_owner_phash_receipt "
+             "(receipt_id,tenant_id,group_key,object_role,exact_url,fingerprint,phash,byte_length,algorithm) "
+             f"values (gen_random_uuid(),'{tid}','{group}','display','{url}','{fp}','{phash}',1024,'echo-dct-phash64-v1')")
         cand = _one(
             "select public.visual_scene_register_candidate("
             f"'{tid}', '{group}', '{phash}', '{url}', '{fp}',"
-            f" jsonb_build_object('verified_bytes', '{fp}'),"
+            f" jsonb_build_object('verified_bytes', '{fp}', 'owner_phash_receipt', (select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{url}' limit 1)),"
             " 'scene-ledger-test', 'display')")
     return url, fp, cand
 
@@ -606,7 +609,7 @@ def test_register_candidate_exact_retry_is_idempotent_under_concurrency():
     url, fp, cand = _seed_object(tid, group, _CODEBOOK[15])
     call = ("select public.visual_scene_register_candidate("
             f"'{tid}', '{group}', '{_CODEBOOK[15]}', '{url}', '{fp}',"
-            f" jsonb_build_object('verified_bytes', '{fp}'),"
+            f" jsonb_build_object('verified_bytes', '{fp}', 'owner_phash_receipt', (select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{url}' limit 1)),"
             " 'scene-ledger-test', 'display')")
     # Sequential exact retry: same id, still one candidate row.
     assert _one(call) == cand
@@ -627,14 +630,14 @@ def test_register_candidate_conflicting_evidence_refused():
     # Conflicting pHash (same attested bytes).
     bad = _run("select public.visual_scene_register_candidate("
                f"'{tid}', '{group}', '{_CODEBOOK[14]}', '{url}', '{fp}',"
-               f" jsonb_build_object('verified_bytes', '{fp}'),"
+               f" jsonb_build_object('verified_bytes', '{fp}', 'owner_phash_receipt', (select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{url}' limit 1)),"
                " 'scene-ledger-test', 'display')", check=False)
     assert bad.returncode != 0
-    assert "conflicting scene candidate evidence" in bad.stderr
+    assert "matching immutable owner pHash receipt" in bad.stderr
     # Conflicting evidence payload (same pHash, extra key).
     bad = _run("select public.visual_scene_register_candidate("
                f"'{tid}', '{group}', '{_CODEBOOK[15]}', '{url}', '{fp}',"
-               f" jsonb_build_object('verified_bytes', '{fp}', 'extra', 'x'),"
+               f" jsonb_build_object('verified_bytes', '{fp}', 'owner_phash_receipt', (select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{url}' limit 1), 'extra', 'x'),"
                " 'scene-ledger-test', 'display')", check=False)
     assert bad.returncode != 0
     assert "conflicting scene candidate evidence" in bad.stderr
@@ -695,7 +698,7 @@ def test_identical_registration_retry_keeps_hold_resolvable():
     retry = _one("select public.visual_scene_register_candidate("
                  f"'{tid_b}', '{group_b}', '{_near(_CODEBOOK[15], 3)}',"
                  f" '{url_b}', '{fp_b}',"
-                 f" jsonb_build_object('verified_bytes', '{fp_b}'),"
+                 f" jsonb_build_object('verified_bytes', '{fp_b}', 'owner_phash_receipt', (select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{url_b}' limit 1)),"
                  " 'scene-ledger-test', 'display')")
     assert retry == cand_b
     assert _one("select count(*) from public.visual_scene_candidate"
@@ -712,3 +715,28 @@ def test_identical_registration_retry_keeps_hold_resolvable():
     out = _decide(row_b, cand_b)
     assert out["decision"] == "claimed"
     assert _occupied_count() == 2
+
+
+def test_service_role_cannot_forge_scene_similarity_or_mint_receipts():
+    tid, group = _seed_tenant()
+    url, fp, candidate = _seed_object(tid, group, _CODEBOOK[15])
+    receipt = _one("select receipt_id::text from public.visual_scene_owner_phash_receipt")
+    evidence = f"jsonb_build_object('verified_bytes','{fp}','owner_phash_receipt','{receipt}')"
+    legal = ("set role service_role; select public.visual_scene_register_candidate("
+        f"'{tid}','{group}','{_CODEBOOK[15]}','{url}','{fp}',{evidence},'scene-ledger-test','display')")
+    assert _one(legal) == candidate
+    forged = _run(legal.replace(_CODEBOOK[15], _CODEBOOK[14]), check=False)
+    assert forged.returncode and "matching immutable owner pHash receipt" in forged.stderr
+    wrong_role = _run(legal.replace("'display')", "'poster')"),check=False)
+    assert wrong_role.returncode and "matching immutable owner pHash receipt" in wrong_role.stderr
+    missing = _run(legal.replace(receipt,str(uuid.uuid4())),check=False)
+    assert missing.returncode and "matching immutable owner pHash receipt" in missing.stderr
+    for mutation in (
+        "insert into public.visual_scene_owner_phash_receipt select * from public.visual_scene_owner_phash_receipt",
+        "update public.visual_scene_owner_phash_receipt set phash='0000000000000000'",
+        "delete from public.visual_scene_owner_phash_receipt",
+        "truncate public.visual_scene_owner_phash_receipt"):
+        denied = _run("set role service_role; " + mutation,check=False)
+        assert denied.returncode and "permission denied" in denied.stderr
+    immutable = _run("update public.visual_scene_owner_phash_receipt set phash='0000000000000000'",check=False)
+    assert immutable.returncode and "immutable" in immutable.stderr

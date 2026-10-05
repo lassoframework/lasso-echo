@@ -98,7 +98,7 @@ def _prepare_poster_edge(store, tenant, group, image_url, image_bytes, image_has
         raise VisualPreparationError("poster registration returned conflicting identity")
     return {"role": "poster", "exact_url": poster_url,
             "fingerprint": poster_hash, "byte_length": len(poster),
-            "scene_fingerprint": _scene_fingerprint(poster)}
+            "scene_fingerprint": _scene_fingerprint(poster), "exact_bytes": poster}
 
 
 def _rpc(store, name, arguments):
@@ -311,7 +311,7 @@ def _scene_guard_armed():
     return state is True
 
 
-def _prepared_scene_candidate(store, tenant, group, prepared, objects):
+def _prepared_scene_candidate(store, tenant, group, prepared, objects, exact_objects):
     """Stage only the actual displayed object after owner byte preparation.
 
     Advisory candidate emission remains independently optional. When the scene
@@ -339,8 +339,20 @@ def _prepared_scene_candidate(store, tenant, group, prepared, objects):
         raise VisualPreparationError("displayed scene candidate has no decodable pHash")
     if not re.fullmatch(r"md5:[0-9a-f]{32}", str(entry["fingerprint"])):
         raise VisualPreparationError("displayed scene candidate has no verified MD5")
-    # Keep this evidence stable across retries: do not include generated receipt
-    # IDs, timestamps, or caller-supplied candidate identity. Raw source objects
+    from . import visual_owner_receipts
+    scene_writer = visual_owner_receipts.default_scene_writer()
+    if not callable(scene_writer):
+        raise VisualPreparationError("owner scene receipt producer is unavailable")
+    try:
+        receipt = scene_writer(tenant=tenant, group_key=group, object_role=role,
+                               exact_url=url, exact_bytes=exact_objects[url])
+        receipt_id = str(uuid.UUID(str(receipt["receipt_id"])))
+        if receipt["phash"] != entry["phash"] or receipt["fingerprint"] != entry["fingerprint"]:
+            raise ValueError("owner scene receipt differs from displayed bytes")
+    except Exception as exc:
+        raise VisualPreparationError("owner scene receipt production failed") from exc
+    # Owner receipt IDs are deterministic for the exact byte binding. Keep
+    # timestamps and caller-supplied candidate identity out. Raw source objects
     # never acquire the SQL display role merely because their pHash decodes.
     arguments = {
         "p_tenant": tenant, "p_group_key": group,
@@ -348,7 +360,8 @@ def _prepared_scene_candidate(store, tenant, group, prepared, objects):
         "p_fingerprint": entry["fingerprint"],
         "p_evidence": {"source": "owner_prepared_exact_object_bytes",
                        "verified_bytes": entry["fingerprint"],
-                       "byte_length": entry["byte_length"]},
+                       "byte_length": entry["byte_length"],
+                       "owner_phash_receipt": receipt_id},
         "p_actor": "visual_writer_prepare", "p_object_role": role,
     }
     try:
@@ -514,7 +527,8 @@ def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url
     if poster is not None:
         objects.append((poster["role"], poster["exact_url"], poster["fingerprint"],
                         poster["byte_length"], poster["scene_fingerprint"]))
-    candidate = _prepared_scene_candidate(store, tenant, group, prepared, objects)
+    candidate = _prepared_scene_candidate(store, tenant, group, prepared, objects,
+        {poster["exact_url"]: poster["exact_bytes"]} if poster is not None else {delivered_url: delivered})
     if candidate is not None:
         prepared["scene_candidate"] = candidate
     prepared["visual_group_key"] = group
@@ -628,7 +642,8 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
     if poster is not None:
         objects.append((poster["role"], poster["exact_url"], poster["fingerprint"],
                         poster["byte_length"], poster["scene_fingerprint"]))
-    candidate = _prepared_scene_candidate(store, tenant, group, prepared, objects)
+    candidate = _prepared_scene_candidate(store, tenant, group, prepared, objects,
+        {poster["exact_url"]: poster["exact_bytes"]} if poster is not None else {url: data})
     if candidate is not None:
         prepared["scene_candidate"] = candidate
     prepared["visual_group_key"] = group

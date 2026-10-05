@@ -51,11 +51,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 KEY_TABLES = (
+    "visual_scene_owner_phash_receipt",
     "visual_scene_candidate",
     "visual_scene_phash_occupied",
     "visual_scene_review_hold",
 )
 KEY_FUNCTIONS = (
+    "visual_scene_receipt_no_truncate()",
     "visual_scene_hamming(text,text)",
     "visual_scene_register_candidate(text,text,text,text,text,jsonb,text,text)",
     "visual_scene_row_delivered_object(public.content_calendar)",
@@ -70,6 +72,8 @@ KEY_FUNCTIONS = (
     "visual_scene_review_hold_mutation()",
 )
 KEY_TRIGGERS = (
+    ("visual_scene_owner_phash_receipt", "visual_scene_owner_phash_receipt_immutable"),
+    ("visual_scene_owner_phash_receipt", "visual_scene_owner_phash_receipt_no_truncate"),
     ("visual_scene_candidate", "visual_scene_candidate_immutable"),
     ("visual_scene_phash_occupied", "visual_scene_occupied_immutable"),
     ("visual_scene_review_hold", "visual_scene_review_hold_guard"),
