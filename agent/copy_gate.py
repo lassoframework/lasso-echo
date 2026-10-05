@@ -89,6 +89,7 @@ def scrub_prompt(text: str) -> str:
 def _scrub_plain(t: str) -> str:
     t = _DASH_RE.sub(", ", t)
     t = _INTRAWORD_HYPHEN_RE.sub(" ", t)
+    t = t.replace(";", ",")
     t = re.sub(r"\s+,", ",", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t
@@ -152,11 +153,75 @@ def violations(text: str) -> list[str]:
     plain = _PROTECTED_RE.sub("", s)
     if _DASH_RE.search(plain): v.append("banned_dash")
     if _INTRAWORD_HYPHEN_RE.search(plain): v.append("intraword_hyphen")
+    if ";" in s: v.append("semicolon")
     # Checked on the RAW text, never the _PROTECTED_RE-stripped `plain`: an email's domain half
     # (zanshin.fit) is exactly the shape _PROTECTED_RE exists to protect (real URLs/domains), so
     # stripping it first would hide the email behind its own protection.
     if _EMAIL_RE.search(s): v.append("email_address")
     return v
+
+
+def lasso_violations(text: str) -> list[str]:
+    """LASSO house punctuation on ordinary copy, preserving URLs and handles."""
+    problems = violations(text)
+    plain = _PROTECTED_RE.sub("", str(text))
+    if ":" in plain:
+        problems.append("banned_colon")
+    if ";" in plain:
+        problems.append("banned_semicolon")
+    return problems
+
+
+# Periods in URLs, decimals and common abbreviated names are not sentence ends.
+_CAPTION_SENTENCE_END = re.compile(r"([.!?][\"'”’)]*)[ \t]+(?=\S)")
+_CAPTION_ABBREVIATIONS = frozenset(("mr.", "mrs.", "ms.", "dr.", "prof.",
+                                    "st.", "vs.", "e.g.", "i.e."))
+_CAPTION_CONTEXT_ABBREVIATIONS = frozenset((
+    "jan.", "feb.", "mar.", "apr.", "jun.", "jul.", "aug.", "sep.", "sept.",
+    "oct.", "nov.", "dec.", "ave.", "ft.", "no.", "a.m.", "p.m.", "etc."))
+
+
+def format_caption(text: str) -> str:
+    """Keep every caption sentence on its own paragraph, with one blank line.
+
+    This is a presentation rule for generated and edited calendar copy. It leaves
+    the words and punctuation intact, and is idempotent so repeated staging cannot
+    add extra blank lines. Hashtag and URL lines are kept as standalone blocks.
+    """
+    source = str(text or "")
+    chunks, last = [], 0
+    for protected in _PROTECTED_RE.finditer(source):
+        chunks.append(source[last:protected.start()].replace(";", ","))
+        chunks.append(protected.group(0))
+        last = protected.end()
+    chunks.append(source[last:].replace(";", ","))
+    cleaned = "".join(chunks)
+    if ";" in cleaned:
+        raise ValueError("caption contains a semicolon in a protected URL")
+    blocks = []
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#") or line.startswith("http"):
+            blocks.append(line)
+            continue
+        start = 0
+        for match in _CAPTION_SENTENCE_END.finditer(line):
+            part = line[start:match.end(1)].strip()
+            last_word = part.split()[-1].lower() if part.split() else ""
+            if last_word in _CAPTION_ABBREVIATIONS:
+                continue
+            next_text = line[match.end():].lstrip()
+            if (last_word in _CAPTION_CONTEXT_ABBREVIATIONS and next_text
+                    and (next_text[0].islower() or next_text[0].isdigit())):
+                continue
+            blocks.append(part)
+            start = match.end()
+        tail = line[start:].strip()
+        if tail:
+            blocks.append(tail)
+    return "\n\n".join(blocks)
 
 HOOK_MAX_CHARS = 125
 

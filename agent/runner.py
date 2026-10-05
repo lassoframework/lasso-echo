@@ -990,17 +990,24 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         # agent disarmed. say nothing publicly; just report state to the caller.
         return {"status": "disabled", "drafts": []}
 
-    # Prepare today's and tomorrow's held LASSO feed visuals before drafting or
-    # the calendar publish sweep. Tomorrow's runway matters because the daily
-    # draw may run after the first local feed slot. This job only replaces media
-    # on an exact pending held row; it cannot claim or publish a post.
+    # Prepare today's and tomorrow's held LASSO visuals before drafting or the
+    # calendar publish sweep. Tomorrow matters because the draw runs after the
+    # first local feed slot. During the dated October incident window, include
+    # at most two older held rows per account and run, after the current runway.
+    # This job only replaces media on an exact pending held row; it cannot post.
     if config.lasso_three_feed_enabled():
         try:
             from .jobs import lasso_held_media_repair
+            repair_day = lasso_held_media_repair._local_day(scheduled_for).isoformat()
+            incident_recovery = (
+                lasso_held_media_repair.INCIDENT_RECOVERY_FIRST <= repair_day
+                <= lasso_held_media_repair.INCIDENT_RECOVERY_LAST)
             for account_key in ("lasso_ig", "lasso_fb"):
                 try:
-                    repair = lasso_held_media_repair.run(now=scheduled_for,
-                                                         account_key=account_key)
+                    repair_args = {"now": scheduled_for, "account_key": account_key}
+                    if incident_recovery:
+                        repair_args["include_incident_backlog"] = True
+                    repair = lasso_held_media_repair.run(**repair_args)
                     if repair.get("ok"):
                         print(f"[lasso-held-media] {account_key} "
                               f"attempted={repair['attempted']} generated={repair['generated']} "

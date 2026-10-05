@@ -57,8 +57,8 @@ def _guard_verbatim(quote_text):
         v = ["hyphen"]
     if v:
         raise ValueError(
-            "quote card refused: quote text carries a dash character (em, en, or "
-            f"hyphen) [{', '.join(v)}]. On-image copy is dash free; use 'to' not a dash range.")
+            f"quote card refused: quote text has prohibited copy [{', '.join(v)}]. "
+            "Remove the listed characters or private contact details before rendering.")
 
 
 def split_caps_emphasis(quote_text, caps_span=None):

@@ -303,12 +303,42 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
         capacity = resolve_posts_per_day(gym_id, store)
     fmt = (row.get("format") or "feed").strip().lower()
     is_feed = fmt == "feed"
+    if (str(gym_id or "").strip().lower() == "lasso"
+            and fmt in ("feed", "story")
+            and _lasso_incident_catchup_day(local_claim_day)
+            and _lasso_three_feed_enabled(gym_id, local_claim_day)
+            and str(row.get("post_date") or "")[:10] in
+                {local_claim_day, "2026-10-02", "2026-10-03",
+                 "2026-10-04", "2026-10-05"}):
+        # The RPC independently enforces 3 current + 2 outage rows per account
+        # and format on the actual local publish day. This is not a general 5x.
+        return 5
     # Both the durable cadence and the dated Summit cadence pair each feed
     # with a Story, so their publish capacity must agree with the planner.
     if (fmt in ("feed", "story")
             and _lasso_three_feed_enabled(gym_id, local_claim_day)):
         return max(capacity, 3)
     return capacity if is_feed else min(capacity, 2)
+
+
+def _lasso_incident_catchup_day(day):
+    return "2026-10-06" <= str(day or "")[:10] <= "2026-10-11"
+
+
+def _client_publish_limits(gym_id, run_date, configured_cap):
+    """Keep LASSO's feed/Story pairs whole without changing client caps."""
+    if (str(gym_id or "").strip().lower() != "lasso"
+            or not _lasso_three_feed_enabled(gym_id, run_date)):
+        return CLIENT_CATCHUP_DAYS, configured_cap
+    if _lasso_incident_catchup_day(run_date):
+        # Oct 2 remains in the query through Oct 11. The RPC gates the two
+        # extra outage pairs per account, format and actual local day.
+        from datetime import date as _date
+        lookback = (_date.fromisoformat(str(run_date)[:10])
+                    - _date(2026, 10, 2)).days
+        return max(CLIENT_CATCHUP_DAYS, lookback), 20
+    # Three feed and three paired Story posts on each of IG and FB.
+    return CLIENT_CATCHUP_DAYS, 12
 
 
 def _paired_lasso_feed_published(story, store):
@@ -840,6 +870,11 @@ def _strip_or_hold_meta(row, gym_id, store):
         return row
     if not (body or "").strip():
         return None
+    from .copy_gate import format_caption
+    try:
+        body = format_caption(body)
+    except ValueError:
+        return None
     patched = None
     try:
         patcher = getattr(store, "patch_caption_preserve_status", None)
@@ -851,6 +886,83 @@ def _strip_or_hold_meta(row, gym_id, store):
     row = dict(patched or row)
     row["caption"] = body   # what we SEND is clean even when the patch failed
     _note_meta_stripped(row.get("id"), gym_id)
+    return row
+
+
+def _note_caption_formatted(row_id, gym_id):
+    """One deduped ops notice per row when the publish boundary SELF-HEALED a legacy
+    approved caption by auto-formatting it (semicolons -> commas). The post still
+    publishes — this is visibility, not a hold."""
+    try:
+        from . import db, ops_alerts
+        key = f"capformat_healed_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
+            f"{gym_id}: row {row_id} carried a pre-copy-rail caption with "
+            "semicolons. Echo auto-formatted it at the publish boundary "
+            "(semicolons became commas) and published the clean caption."))
+    except Exception:
+        pass  # an alert failure must never block the publish lane
+
+
+def _alert_caption_format_held(row_id, gym_id):
+    """One deduped ops alert per row when a due caption is HELD at the publish
+    boundary because it cannot be safely auto-formatted. A Story may already
+    have the words burned into its media, or a URL may contain the semicolon.
+    A human must correct the copy and media; the row retries once fixed."""
+    try:
+        from . import db, ops_alerts
+        key = f"capformat_held_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
+            f"{gym_id}: row {row_id} HELD at the publish boundary — its caption "
+            "contains a semicolon that cannot be safely auto-formatted. "
+            "Edit the caption and re-render Story media if applicable; "
+            "the row retries once fixed."))
+    except Exception:
+        pass  # an alert failure must never block the publish lane
+
+
+def _format_caption_at_publish(row, gym_id, store):
+    """LEGACY SEMICOLON AUTO-HEAL at the publish boundary (ultrareview 2026-10-05).
+    Rows approved before the copy_gate semicolon rail shipped keep their semicolons
+    forever — the correction lanes deliberately skip approved/held/Story/published
+    rows — so the publish_guard copy_violation rail would silently stop every one
+    of them at schedule time. Instead, a due FEED row whose caption still carries
+    semicolons is auto-formatted HERE (semicolons -> commas via copy_gate's
+    format_caption), persisted through the STATUS-PRESERVING patch (an approved row
+    stays approved), and publishes clean this tick. Runs unconditionally, like the
+    meta-strip gate, so a raw semicolon can never reach the wire under any flag
+    combination. STORY rows with semicolons are held because the text may already
+    be burned into the media. A caption whose semicolon sits inside a protected
+    URL also returns None. The caller HOLDS either row and alerts once."""
+    caption = row.get("caption") or ""
+    if _is_story_row(row):
+        # A Story caption may already be burned into the image or video. Never
+        # send the old media while its text still contains a semicolon.
+        return None if ";" in caption else row
+    if ";" not in caption:
+        return row
+    from .copy_gate import format_caption
+    try:
+        clean = format_caption(caption)
+    except ValueError:
+        return None
+    if clean == caption:
+        return row
+    patched = None
+    try:
+        patcher = getattr(store, "patch_caption_preserve_status", None)
+        if patcher is not None:
+            patched = patcher(row.get("gym_id") or gym_id, row.get("id"), clean)
+    except Exception as e:  # noqa: BLE001 - persistence is best effort here
+        print(f"[calendar-autopublish] caption format patch failed for "
+              f"{row.get('id')}: {type(e).__name__}: {e}")
+    row = dict(patched or row)
+    row["caption"] = clean  # what we SEND is clean even when the patch failed
+    _note_caption_formatted(row.get("id"), gym_id)
     return row
 
 
@@ -1341,6 +1453,17 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             _alert_meta_leak_held(row_id, gym_id)
             continue
         row = cleaned
+
+        # LEGACY SEMICOLON AUTO-HEAL (2026-10-05): an approved FEED row carrying
+        # semicolons is auto-formatted (status preserved) and publishes clean,
+        # rather than tripping the publish_guard copy rail and silently stopping.
+        # Story rows with semicolons and unformattable URLs hold with an alert.
+        formatted = _format_caption_at_publish(row, gym_id, store)
+        if formatted is None:
+            waiting.append(row_id)
+            _alert_caption_format_held(row_id, gym_id)
+            continue
+        row = formatted
 
         # STORY CAPTION MUST BE ON THE MEDIA (Dale, 2026-08-17): a story publishes with
         # an EMPTY body, so its caption lives only on the rendered media. When a client
@@ -2474,12 +2597,14 @@ def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
             # first tick of its post_date). No orphans: a same-day row whose slot has
             # passed is is_due on every later tick, and a PAST-DATE row (catchup_days)
             # is always due — the lane runs every ~1 min, so nothing is stranded.
+            catchup_days, daily_cap = _client_publish_limits(
+                base, run_date, config.client_daily_publish_cap())
             summary = publish_due(run_date, gym_id=base, store=store, notifier=notifier,
                                   now=now, catch_all=False,
                                   approved_only=not autonomous,
                                   zernio_publish=zernio_publish,
-                                  catchup_days=CLIENT_CATCHUP_DAYS,
-                                  daily_cap=config.client_daily_publish_cap())
+                                  catchup_days=catchup_days,
+                                  daily_cap=daily_cap)
             summary["gym"] = base
             summary["autonomous"] = autonomous
             out.append(summary)

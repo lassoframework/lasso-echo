@@ -2690,3 +2690,100 @@ def test_calendar_grade_obeys_caption_cooldown_switch_and_story_exemption(
     assert bool(checked) is blocked
     assert len(pub.calls) == (0 if blocked else 1)
     assert store.rows['cooldown-row']['status'] == ('pending' if blocked else 'published')
+
+
+# ---- legacy semicolon auto-heal at the publish boundary (2026-10-05) --------
+# Rows approved before the copy_gate semicolon rail shipped keep their
+# semicolons (the correction lanes skip approved/held/Story/published rows),
+# so the publish_guard copy_violation rail would silently stop every one of
+# them at schedule time. The publish boundary now auto-formats a due FEED row
+# (semicolons -> commas, status preserved) and publishes clean; a semicolon
+# glued inside a URL (format_caption refuses to corrupt the link) HOLDS the
+# row instead. Story rows pass through untouched (burned-media semantics).
+
+class _PreservingStore(_FakeStore):
+    """_FakeStore plus the status-preserving caption patch the heal uses."""
+
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.preserve_patches = []      # (gym_id, row_id, caption)
+
+    def patch_caption_preserve_status(self, gym_id, row_id, new_caption):
+        self.preserve_patches.append((gym_id, row_id, new_caption))
+        r = self.rows.get(row_id)
+        if r is None:
+            return None
+        r["caption"] = new_caption      # status DELIBERATELY untouched
+        return dict(r)
+
+
+def test_approved_legacy_semicolon_caption_is_formatted_and_publishes(armed):
+    store = _PreservingStore([_row(
+        "semi1", status="approved",
+        caption="Move well; build strength. Book a class; bring a friend.")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["published"] == ["semi1"]
+    sent = pub.calls[0][0].caption
+    assert ";" not in sent, "a raw semicolon must never reach the wire"
+    assert "Move well, build strength." in sent
+    # persisted through the STATUS-PRESERVING patch (approval kept), and the row
+    # went on to publish this same tick
+    assert store.preserve_patches == [("lasso", "semi1", sent)]
+    assert store.rows["semi1"]["status"] == "published"
+
+
+def test_semicolon_heal_survives_a_store_without_the_patch_method(armed):
+    """A legacy/fake store lacking patch_caption_preserve_status still publishes
+    the CLEAN caption — the local row is authoritative for the send."""
+    class _NoPatchStore(_FakeStore):
+        patch_caption_preserve_status = None
+    store = _NoPatchStore([_row(
+        "semi2", status="approved",
+        caption="Move well; build strength. Book a class today with us.")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["published"] == ["semi2"]
+    assert ";" not in pub.calls[0][0].caption
+
+
+def test_semicolon_glued_inside_url_holds_the_row(armed):
+    """format_caption raises rather than corrupt a link; the row is HELD (never
+    claimed) for a human edit instead of publishing or crashing the lane."""
+    store = _PreservingStore([_row(
+        "badurl", status="approved",
+        caption="Visit https://example.com/a;b for details. Book a class today.")])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["published"] == []
+    assert "badurl" in summary["waiting"]
+    assert pub.calls == []
+    assert store.preserve_patches == []
+    assert store.rows["badurl"]["status"] == "approved"   # untouched
+
+
+def test_story_row_with_semicolon_is_held_until_media_is_corrected(armed, monkeypatch):
+    """A Story's old media may contain the semicolon, so it must not publish."""
+    from agent import story_image
+    story_caption = "Story words; burned onto media."
+    store = _PreservingStore([_row(
+        "story1", fmt="story", status="approved", caption=story_caption,
+        image_url="https://cdn.example.com/story_burned_y.png")])
+    store.rows["story1"]["source_media_url"] = "https://cdn.example.com/raw/y.jpg"
+    monkeypatch.setattr(story_image, "story_media_carries_caption",
+                        lambda url, caption: True)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert summary["published"] == []
+    assert "story1" in summary["waiting"]
+    assert pub.calls == []
+    assert store.preserve_patches == []
+    assert store.rows["story1"]["caption"] == story_caption

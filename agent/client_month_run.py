@@ -2232,6 +2232,16 @@ def _maybe_format_story(account, story, feed, library_path, log):
     # equals the feed caption (the paired story is cloned from the feed). This is what
     # lets a saved story caption actually get BURNED onto the media on re-render.
     caption = (getattr(story, "caption", "") or getattr(feed, "caption", "") or "")
+    # The calendar write formats copy later, but these words become pixels NOW.
+    # Use the same caption for the burn and for the Story row so an edited Story
+    # keeps priority and the persisted text describes the rendered media.
+    from .copy_gate import format_caption
+    try:
+        caption = format_caption(caption)
+    except ValueError:
+        log("story format held: caption cannot meet the copy rule")
+        return False
+    story.caption = caption
     # Task #28 (§5c): keep the RAW (un-captioned) source url so an edited story caption can
     # re-burn IMMEDIATELY instead of only on the next monthly rebuild. Gated: written to
     # content_calendar.source_media_url only when AGENT_STORY_SOURCE_MEDIA is on (the column

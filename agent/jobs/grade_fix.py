@@ -86,8 +86,9 @@ it is actually the honest limit:
   4. CONTENT SUPPLY. A day gap with no unused media, and a category over-cap
      with no other approved source to move to, are supply problems. The lanes
      are asked once and an unfillable gap is recorded once, never re-announced.
-  5. B2B CAPTION CONTENT. LASSO's captions come from the pillar builders; only
-     the mechanical repair applies here, never the regen.
+  5. B2B CAPTION CONTENT. LASSO can regenerate a source-matched variant of
+     its approved copy when the durable ledger is available. Other B2B books
+     still have no default caption regeneration source.
   6. BODY SAMENESS ON A THIN LIBRARY. The body repair needs the regen to hand
      back a caption whose MIDDLE is genuinely different from every other post
      in the book. A gym with too few approved sources or pillars physically
@@ -111,6 +112,21 @@ _CRAFT_FLAGS = ("no_ask", "thin_caption", "hook_too_long")
 _CAPTION_MIN, _CAPTION_MAX = 150, 500   # regen acceptance band (grader median wants >= 150)
 _HOOK_MAX = 125                          # copy_gate hook_too_long band
 _OVERCAP_MAX_ITER = 6                    # bounded convergence for the over-cap pass
+
+
+class PartialLassoCaptionRepair(RuntimeError):
+    """A guarded repair reserved copy or wrote rows before a later CAS failed.
+
+    Callers must re-read the calendar before retrying. Successfully changed
+    rows carry a visual hold, so a partial repair cannot publish stale artwork.
+    """
+
+    def __init__(self, gym_id, day, applied_ids, reason):
+        self.gym_id = gym_id
+        self.day = day
+        self.applied_ids = tuple(applied_ids)
+        super().__init__(f"{gym_id} {day}: partial caption repair; "
+                         f"applied={self.applied_ids}; {reason}")
 
 # LLM WALL-CLOCK BUDGET PER GYM PER PASS (2026-08-31). Measured live: one
 # _clean_draft_for_day regen costs 6 to 8 SECONDS. gritx alone has 30 flagged
@@ -1664,10 +1680,99 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
     together and stays ONE post). Non-wipeable rows are skipped here AND blocked
     server-side by patch_pending_plan. Returns True when at least one row was
     patched. Mutates the local row dicts to match so the caller's regrade sees
-    the fix even before a store re-read."""
+    the fix even before a store re-read. LASSO raises
+    PartialLassoCaptionRepair after an uncertain ledger stamp or a partial
+    calendar write; the sweep re-reads and stops before another repair pass."""
     patcher = getattr(store, "patch_pending_plan", None)
     if patcher is None:
         return False
+
+    lasso_guard = str(gym_id).strip().lower() == "lasso"
+    if lasso_guard:
+        from agent import caption_ledger
+        # The LASSO autonomous lane never rewrites a partial or stale sibling
+        # group. Reserve the new caption in the durable production ledger before
+        # touching any calendar row; a failed reservation is an honest skip.
+        if (not date_rows or any(not _is_wipeable(r) or not r.get("id")
+                                 or not r.get("created_at")
+                                 or r.get("variant_status") != "active"
+                                 for r in date_rows)):
+            return False
+        if all(str(r.get("caption") or "") == new_cap for r in date_rows
+               if str(r.get("format") or "").lower() == "feed"):
+            return False
+        dates = {str(r.get("post_date") or "")[:10] for r in date_rows}
+        if len(dates) != 1:
+            return False
+        day = next(iter(dates))
+        try:
+            if caption_ledger.is_blocked_strict(gym_id, new_cap, day):
+                return False
+        except Exception as exc:  # noqa: BLE001
+            log(f"{gym_id} {day}: caption ledger unavailable: {type(exc).__name__}")
+            return False
+        try:
+            caption_ledger.record_staged_strict(gym_id, new_cap, day)
+        except Exception as exc:  # noqa: BLE001
+            # A two-key ledger write can itself partially persist. A normal
+            # False would report a pure no-op even when one key was stamped.
+            raise PartialLassoCaptionRepair(
+                gym_id, day, (), f"ledger reservation uncertain: {type(exc).__name__}") from exc
+        applied_ids = []
+
+        def partial(reason):
+            error = PartialLassoCaptionRepair(gym_id, day, applied_ids, reason)
+            log(str(error))
+            raise error
+        # Stories have an empty publish caption by design, so the duplicate
+        # hash group usually contains feeds only. Read their exact siblings and
+        # hold those 9:16 visuals BEFORE changing any feed caption.
+        try:
+            reader = getattr(store, "active_rows_on_day_complete")
+            day_rows = reader(gym_id, day)
+            if not isinstance(day_rows, list):
+                partial("complete sibling read unavailable after ledger stamp")
+            feed_keys = {
+                (r.get("logical_post_id"), r.get("slot_index"),
+                 str(r.get("account") or "").lower())
+                for r in date_rows if str(r.get("format") or "").lower() == "feed"
+            }
+            if not feed_keys:
+                partial("no feed keys after ledger stamp")
+            stories = [r for r in day_rows
+                       if r.get("gym_id") == gym_id
+                       and str(r.get("format") or "").lower() == "story"
+                       and r.get("variant_status") == "active"
+                       and (r.get("logical_post_id"), r.get("slot_index"),
+                            str(r.get("account") or "").lower()) in feed_keys]
+            if any(not _is_wipeable(r) or not r.get("created_at") for r in stories):
+                partial("sibling Story changed after ledger stamp")
+            old_captions = {str(r.get("caption") or "") for r in date_rows
+                            if str(r.get("format") or "").lower() == "feed"}
+            for story in stories:
+                old_story_caption = str(story.get("caption") or "")
+                # An independently written Story keeps its own copy; its
+                # visual stays held until an operator resolves that mismatch.
+                story_caption = (new_cap if old_story_caption in old_captions
+                                 and old_story_caption else None)
+                updated = patcher(
+                    gym_id, story["id"], caption=story_caption,
+                    expected_row=dict(story), force_caption_visual_hold=True)
+                if not updated or updated.get("media_not_ready_reason") != \
+                        "caption_changed_needs_new_visual":
+                    partial(f"Story hold CAS missed for {story['id']}")
+                applied_ids.append(story["id"])
+                story["media_not_ready_reason"] = "caption_changed_needs_new_visual"
+                if story_caption is not None:
+                    story["caption"] = story_caption
+                for original in date_rows:
+                    if original.get("id") == story["id"]:
+                        original["media_not_ready_reason"] = story["media_not_ready_reason"]
+                        original["caption"] = story["caption"]
+        except PartialLassoCaptionRepair:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            partial(f"paired Story hold failed: {type(exc).__name__}")
 
     # RE-STAMP THE LEARNING LEVERS against the caption we are actually writing.
     # They were stamped at stage time against the pre-repair text and nothing
@@ -1681,12 +1786,20 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
     for r in date_rows:
         if not _is_wipeable(r):
             continue                            # never touched, by policy
+        if lasso_guard and str(r.get("format") or "").lower() == "story":
+            continue  # exact sibling was held above; never unhold it here
         try:
             kwargs = {"caption": new_cap, "pillar": (new_cat or None)}
             if levers:
                 kwargs["levers"] = levers
+            if lasso_guard:
+                kwargs["expected_row"] = dict(r)
             updated = patcher(gym_id, r.get("id"), **kwargs)
         except TypeError:
+            if lasso_guard:
+                # Never retry an autonomous repair through a legacy patcher
+                # without its exact-row compare-and-swap.
+                partial(f"exact caption patcher unavailable for {r.get('id')}")
             # A store predating the levers kwarg (older fakes, other callers).
             # The caption fix must never be lost over a metadata refresh.
             #
@@ -1708,13 +1821,23 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
         except Exception as exc:  # noqa: BLE001
             log(f"{gym_id} {r.get('post_date')}: caption patch failed: "
                 f"{type(exc).__name__}")
+            if lasso_guard:
+                partial(f"exact caption patch failed for {r.get('id')}: "
+                        f"{type(exc).__name__}")
             continue
         if updated:
+            r.update(updated if lasso_guard else {})
             r["caption"] = new_cap
             if new_cat:
                 r["pillar"] = new_cat
             r.update(levers)
+            if lasso_guard:
+                applied_ids.append(r.get("id"))
+                if r.get("media_not_ready_reason") != "caption_changed_needs_new_visual":
+                    partial(f"caption patch lacked visual hold for {r.get('id')}")
             patched_any = True
+        elif lasso_guard:
+            partial(f"exact caption CAS missed for {r.get('id')}")
     return patched_any
 
 
@@ -1742,10 +1865,11 @@ def _default_caption_regen(gym_id, profile, log):
     context the scan/backfill lanes use, so every fresh caption clears the
     same A+ / banned-word / copy gates with the same opening/angle variety.
 
-    Returns None when the context cannot be assembled (B2B/LASSO — its captions
-    come from the pillar builders and the refill lane owns them — or a missing
+    Returns None when the context cannot be assembled (other B2B or a missing
     account/voice): the caller then leaves captions alone and the defect is
     reported through the deduped held alert, never fixed dishonestly."""
+    if profile == "B2B" and str(gym_id).strip().lower() == "lasso":
+        return _lasso_caption_regen(log)
     if profile == "B2B":
         return None
     try:
@@ -1819,6 +1943,58 @@ def _default_caption_regen(gym_id, profile, log):
             if avoid_category and cat and cat.lower() == str(avoid_category).lower():
                 continue
             return cap, cat
+        return None
+
+    return _regen
+
+
+def _lasso_caption_regen(log):
+    """Use only approved LASSO Now blocks for autonomous duplicate recovery.
+
+    Selection stays within the original source topic, never rewrites a sourced
+    sentence or attaches a new visual. No suitable variant means an honest skip.
+    """
+    from agent import content_planner, caption_ledger
+    doc = content_planner.load_source_doc()
+    if doc is None:
+        return None
+
+    def _regen(row, avoid_captions, avoid_category=""):
+        if avoid_category:
+            return None  # a source block is not a new editorial category
+        day = str((row or {}).get("post_date") or "")[:10]
+        existing_hashes = {caption_ledger.caption_hash(text)
+                           for text in avoid_captions if text}
+        original = str((row or {}).get("caption") or "")
+        # Keep the visual's original topic. A fresh pillar could make an
+        # already rendered infographic say one thing and its caption another.
+        pillars = [name for name in doc.pillars_with_copy()
+                   if any(hook in original
+                          for hook in doc.copy_bank[name].get("hooks") or [])]
+        if not pillars:
+            return None
+        start = content_planner._day_seq(day) % len(pillars)
+        for offset in range(len(pillars)):
+            pillar = pillars[(start + offset) % len(pillars)]
+            block = doc.copy_bank[pillar]
+            hooks, bodies = block.get("hooks") or [], block.get("bodies") or []
+            if not hooks or not bodies:
+                continue
+            for hook in hooks:
+                for ordered_bodies in (bodies, list(reversed(bodies))):
+                    for cta in doc.ctas or [""]:
+                        candidate = "\n\n".join(
+                            [hook, *ordered_bodies, *([cta] if cta else [])])
+                        if (copy_gate.lasso_violations(candidate)
+                                or caption_ledger.caption_hash(candidate) in existing_hashes):
+                            continue
+                        try:
+                            if caption_ledger.is_blocked_strict("lasso", candidate, day):
+                                continue
+                        except Exception as exc:  # noqa: BLE001
+                            log(f"lasso {day}: caption ledger unavailable: {type(exc).__name__}")
+                            return None
+                        return candidate, (row or {}).get("pillar") or ""
         return None
 
     return _regen
@@ -1908,7 +2084,8 @@ def _lasso_refill(gym_id, store, today_iso, log):
             return "no_content"
         span = real_month_planner.plan_span_months(today_iso, 30)
         res = real_month_planner.apply_month_plan(gym_id, drafts, store,
-                                                  span_months=span)
+                                                  span_months=span,
+                                                  preserve_existing=(gym_id == "lasso"))
         return "filled" if res.get("ok") else "held"
     except Exception as exc:  # noqa: BLE001
         log(f"{gym_id}: real month refill failed: {type(exc).__name__}")

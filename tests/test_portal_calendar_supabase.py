@@ -549,6 +549,57 @@ def test_patch_caption_cross_gym_returns_none(monkeypatch):
     assert result is None
 
 
+def test_specialized_caption_patches_format_before_write(monkeypatch):
+    http = _FakeHTTP(patch_resp=_Resp(200, [_row("id-c", gym_id="lasso")]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    store = pcs.SupabaseCalendarStore()
+    store.patch_caption_preserve_status("lasso", "id-c", "One. Two; three.")
+    store.patch_caption_for_hashtag_backfill(
+        "lasso", "id-c", "One. Two; three.", expected_status="approved")
+    expected = "One.\n\nTwo, three."
+    assert http.calls[0][4] == {"caption": expected}
+    assert http.calls[1][4] == {"caption": expected, "status": "pending"}
+
+
+def test_existing_pending_feed_caption_correction_uses_exact_cas(monkeypatch):
+    before = "Start here. Meet your coach; book a class."
+    after = "Start here.\n\nMeet your coach, book a class."
+    current = {"id": "row-1", "gym_id": "crossfitlocal", "status": "pending",
+               "variant_status": "active", "format": "feed",
+               "post_date": "2026-10-12", "caption": before,
+               "media_not_ready_reason": None, "published_at": None}
+    http = _FakeHTTP(patch_resp=_Resp(200, [dict(current, caption=after)]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().format_pending_feed_caption_cas(
+        "crossfitlocal", current)
+    assert result["caption"] == after
+    method, _, params, _, payload = http.calls[0]
+    assert method == "patch"
+    assert params["caption"] == f"eq.{before}"
+    assert params["gym_id"] == "eq.crossfitlocal"
+    assert params["status"] == "eq.pending"
+    assert params["media_not_ready_reason"] == "is.null"
+    assert payload == {"caption": after}
+
+
+@pytest.mark.parametrize("change", [
+    {"status": "approved"}, {"format": "story"},
+    {"media_not_ready_reason": "needs media"}, {"gym_id": "other"},
+])
+def test_existing_caption_correction_refuses_owned_or_held_rows(monkeypatch, change):
+    current = {"id": "row-1", "gym_id": "crossfitlocal", "status": "pending",
+               "variant_status": "active", "format": "feed",
+               "post_date": "2026-10-12", "caption": "One. Two.",
+               "media_not_ready_reason": None, "published_at": None}
+    current.update(change)
+    http = _FakeHTTP()
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    assert pcs.SupabaseCalendarStore().format_pending_feed_caption_cas(
+        "crossfitlocal", current) is None
+    assert http.calls == []
+
+
 # ---- patch_media: backfill a stale image-less arc row (Pete/Zanshin, 2026-08-31) --
 
 def test_patch_media_recovers_held_row_with_image_and_asset(monkeypatch):
@@ -1462,3 +1513,37 @@ def test_insert_rows_rejects_non_uuid_before_network_when_preserving():
     with pytest.raises(ValueError):
         store.insert_rows("lasso", [{"id": "not-a-uuid"}], preserve_ids=True)
     assert not http.calls
+
+
+def test_insert_rows_one_bad_caption_does_not_abort_the_batch():
+    """format_caption raises ValueError when a semicolon is glued inside a
+    protected URL span. insert_rows is where EVERY calendar-building lane
+    converges, so one bad caption is retained on hold without aborting valid rows."""
+    http = _FakeHTTP(post_resp=_Resp(201, []))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc", http=http)
+    rows = [
+        {"post_date": "2026-08-14", "format": "feed", "image_url": "u1",
+         "caption": "Visit https://example.com/a;b for details."},   # raises
+        {"post_date": "2026-08-15", "format": "feed", "image_url": "u2",
+         "caption": "Good caption; book a class today."},            # formats
+    ]
+    store.insert_rows("gritx", rows)
+    sent = [c for c in http.calls if c[0] == "post"][0][4]
+    assert len(sent) == 2, "the calendar slot remains visible"
+    bad = next(o for o in sent if o["post_date"] == "2026-08-14")
+    assert bad["media_not_ready_reason"] == "caption_url_semicolon"
+    good = next(o for o in sent if o["post_date"] == "2026-08-15")
+    assert ";" not in good["caption"], "the formattable row is still cleaned"
+
+
+def test_insert_rows_wraps_long_hook_without_extra_paragraph():
+    http = _FakeHTTP(post_resp=_Resp(201, []))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc", http=http)
+    sentence = "Training with our coaches helps you build strength and confidence while keeping your effort steady through every class and every week."
+    store.insert_rows("gritx", [{"post_date": "2026-08-15", "format": "feed",
+                                 "image_url": "u2", "caption": sentence}])
+    sent = [c for c in http.calls if c[0] == "post"][0][4][0]["caption"]
+    assert "\n" in sent and "\n\n" not in sent
+    assert sent.replace("\n", " ") == sentence

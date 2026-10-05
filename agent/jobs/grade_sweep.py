@@ -45,6 +45,8 @@ import inspect
 import json
 from datetime import date, timedelta, timezone, datetime
 
+from .grade_fix import PartialLassoCaptionRepair
+
 
 def _today():
     return date.today().isoformat()
@@ -254,6 +256,12 @@ def _merge_fix(agg: dict, step: dict) -> dict:
         dates = agg.setdefault("gap_dates", [])
         if day not in dates:
             dates.append(day)
+    if (step or {}).get("partial"):
+        agg["partial"] = True
+        ids = agg.setdefault("partial_row_ids", [])
+        for row_id in (step or {}).get("partial_row_ids") or []:
+            if row_id not in ids:
+                ids.append(row_id)
     agg["ok"] = bool(agg.get("ok", True)) and bool((step or {}).get("ok", False))
     agg["passes"] = int(agg.get("passes") or 0) + 1
     return agg
@@ -569,6 +577,15 @@ def run(gyms=None, store=None, now=None, alert_fn=None, business_seed_fn=None) -
                         step = grade_fix.remediate_forward_book(
                             gym_id, forward_rows, store, profile=profile,
                             defects=f_grade.defects, today_iso=today_str)
+                    except PartialLassoCaptionRepair as exc:
+                        # A row or ledger key may already have changed. Stop
+                        # this pass, re-read below, and report the exact rows
+                        # instead of treating a partial write as an honest no-op.
+                        print(f"[grade-sweep] {gym_id}: {exc}")
+                        step = {"ok": False, "partial": True,
+                                "partial_row_ids": list(exc.applied_ids),
+                                "actions": ["partial LASSO caption repair held; "
+                                            "retry after fresh calendar read"]}
                     except Exception as exc:  # noqa: BLE001 - never sink the sweep
                         print(f"[grade-sweep] {gym_id}: self-fix failed: "
                               f"{type(exc).__name__}: {exc}")

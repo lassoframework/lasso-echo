@@ -54,6 +54,12 @@ def test_dash_bearing_quote_raises(tmp_path, bad):
         qc.render_quote_card(bad, GUEST, 140, out)
 
 
+def test_semicolon_quote_reports_actual_copy_violation():
+    with pytest.raises(ValueError, match="semicolon") as exc:
+        qc._guard_verbatim("Train well; show up tomorrow.")
+    assert "dash character" not in str(exc.value)
+
+
 # ---- render output -------------------------------------------------------------------
 def test_render_produces_1080_png(tmp_path):
     out = os.path.join(str(tmp_path), "card.png")
