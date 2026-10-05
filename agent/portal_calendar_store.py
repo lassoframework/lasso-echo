@@ -565,6 +565,9 @@ class SupabaseCalendarStore:
             # invent an A -> C render receipt or discard A to pass preparation.
             patch["source_media_url"] = current.get("source_media_url") or current["image_url"]
             patch["r2_key"] = None
+            # The patch retains the ORIGINAL source (or, when none was recorded,
+            # the evidence-bound old image itself), so the Drive content hash
+            # stays valid here; the clearing loops below cover source changes.
             candidate = dict(current)
             candidate.update(patch)
             candidate["source_media_url"] = current["image_url"]
@@ -598,10 +601,13 @@ class SupabaseCalendarStore:
                     "render evidence does not bind the scoped story replacement")
         # A replacement must not carry a stale source identity from the old
         # image. Callers that know the replacement asset supply it explicitly.
-        for field in ("source_media_url", "source_media_asset_id", "drive_file_id", "byte_hash", "r2_key"):
-            if (field == "source_media_url" and is_story
-                    and (current.get(field) == patch.get("image_url")
+        for field in ("source_media_url", "source_media_asset_id", "drive_file_id",
+                      "byte_hash", "r2_key", "source_media_content_hash"):
+            if (field in ("source_media_url", "source_media_content_hash") and is_story
+                    and (current.get("source_media_url") == patch.get("image_url")
                          or render_evidence is not None)):
+                # Story raw source (and therefore its Drive byte identity) is
+                # retained: same-source render evidence proves retention.
                 continue
             if field not in patch and current.get(field):
                 patch[field] = None
@@ -764,7 +770,14 @@ class SupabaseCalendarStore:
                 and current.get("source_media_url") != current.get("image_url")):
             raise visual_writer_prepare.VisualPreparationError(
                 "replacement requires an explicit source; existing raw source cannot be discarded")
-        for field in ("source_media_url", "source_media_asset_id", "drive_file_id", "byte_hash", "r2_key"):
+        new_source = patch.get("source_media_url")
+        same_source = bool(new_source) and new_source == current.get("source_media_url")
+        for field in ("source_media_url", "source_media_asset_id", "drive_file_id",
+                      "byte_hash", "r2_key", "source_media_content_hash"):
+            if field == "source_media_content_hash" and same_source:
+                # Source unchanged (e.g. a no-image backfill retaining its raw
+                # source): the old Drive byte identity still proves origin.
+                continue
             if field not in patch and current.get(field):
                 patch[field] = None
         candidate = {**current, **patch}

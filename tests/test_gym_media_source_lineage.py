@@ -137,7 +137,14 @@ def _mirror_draft(**over):
     return d
 
 
-def test_mirror_row_carries_source_content_hash_distinct_from_delivery():
+def _hash_flag_on(monkeypatch):
+    from agent import config
+    monkeypatch.setattr(config, "source_media_content_hash_enabled", lambda: True,
+                        raising=False)
+
+
+def test_mirror_row_carries_source_content_hash_distinct_from_delivery(monkeypatch):
+    _hash_flag_on(monkeypatch)
     draft = _mirror_draft(source_media_url="https://cdn/served.jpg",
                           source_media_content_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     row = rcm.collect_real_drafts("pierce_ig", _FakeStore([draft]))[0]
@@ -148,13 +155,23 @@ def test_mirror_row_carries_source_content_hash_distinct_from_delivery():
     assert row["source_media_url"] == "https://cdn/served.jpg"
 
 
-def test_mirror_row_rendition_backed_lineage_differs_from_delivery_url():
+def test_mirror_row_rendition_backed_lineage_differs_from_delivery_url(monkeypatch):
+    _hash_flag_on(monkeypatch)
     draft = _mirror_draft(creative_public_url="https://cdn/rend.jpg",
                           source_media_content_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
     row = rcm.collect_real_drafts("pierce_ig", _FakeStore([draft]))[0]
     assert row["image_url"] == "https://cdn/rend.jpg"
     assert row["source_media_content_hash"] == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     assert "source_media_url" not in row  # rendition URL never copied as source
+
+
+def test_mirror_row_omits_hash_when_feature_off_by_default():
+    # OFF default: even a Drive-stamped draft must not emit the column, so the
+    # direct delete-then-insert callers never send an unknown pre-migration
+    # column while the feature is disabled.
+    draft = _mirror_draft(source_media_content_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    row = rcm.collect_real_drafts("pierce_ig", _FakeStore([draft]))[0]
+    assert "source_media_content_hash" not in row
 
 
 def test_mirror_omits_hash_when_draft_carries_none():

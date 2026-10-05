@@ -14,7 +14,9 @@ TENANT = "11111111-1111-4111-8111-111111111111"
 RAW = "https://media.example/raw.jpg?version=1"
 FINAL = "https://media.example/final.jpg?version=2"
 POSTER = "https://media.example/poster.jpg?version=3"
-DATA = {RAW: b"raw photo", FINAL: b"burned photo", POSTER: b"video poster"}
+ALT = "https://media.example/alt.jpg?version=4"
+DATA = {RAW: b"raw photo", FINAL: b"burned photo", POSTER: b"video poster",
+        ALT: b"alt photo"}
 
 
 def md5(data):
@@ -742,3 +744,78 @@ def test_flag_off_retains_distinct_poster_without_preparation(monkeypatch, stagi
     http = HTTP()
     assert write("insert_rows", http, thumbnail=POSTER)
     assert not any(call[1].startswith("visual_global_") or call[1] == "tenant_alias" for call in http.calls)
+
+
+
+# ---- Drive original-source lineage (source_media_content_hash) ----------------
+# A media replacement must never keep the OLD Drive asset's content hash once the
+# source changes; the hash is retained only when the exact same source is kept.
+
+HASH = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def _patch_payload(http):
+    patch_call = next(c for c in http.calls if c[0] == "patch")
+    return patch_call[-1]
+
+
+def test_swap_payload_for_a_new_source_clears_the_old_drive_content_hash(armed, monkeypatch):
+    # This unit covers the identity-clearing payload before the owner-only
+    # receipt RPC. The RPC fake models the older two-edge sequence globally,
+    # so using it for this one-edge case would assert fixture ordering rather
+    # than source-lineage behavior.
+    monkeypatch.setattr(
+        prep, "prepare",
+        lambda _store, _key, row, **_kwargs: {**row, "visual_group_key": "vg_scene",
+                                                "byte_hash": "derived:test"})
+    current = calendar_row(format="feed", source_media_url=RAW,
+                           source_media_asset_id="asset-old", drive_file_id="drive-old",
+                           source_media_content_hash=HASH)
+    http = HTTP(current=current)
+    payload = store(http)._prepare_visual_replacement(
+        KEY, current, {"image_url": POSTER, "source_media_url": FINAL},
+        poster_evidence())
+    assert payload["source_media_url"] == FINAL
+    assert payload["source_media_content_hash"] is None
+    assert payload["source_media_asset_id"] is None
+
+
+def test_backfill_keeping_the_same_source_retains_the_content_hash(armed):
+    current = calendar_row(image_url="", format="feed", source_media_url=RAW,
+                           source_media_content_hash=HASH)
+    http = HTTP(current=current)
+    result = store(http).patch_media(
+        KEY, "row-1", FINAL, source_media_url=RAW, render_evidence=evidence())
+    assert result is not None
+    assert result["source_media_url"] == RAW
+    assert result["source_media_content_hash"] == HASH
+    payload = _patch_payload(http)
+    assert payload.get("source_media_content_hash", HASH) == HASH
+
+
+def test_story_reburn_with_same_source_evidence_retains_the_content_hash(armed):
+    current = calendar_row(format="story", source_media_url=RAW,
+                           source_media_content_hash=HASH)
+    http = HTTP(current=current)
+    result = store(http).patch_image_url(KEY, "row-1", FINAL,
+                                         render_evidence=evidence())
+    assert result is not None
+    assert result["source_media_url"] == RAW
+    assert result["source_media_content_hash"] == HASH
+
+
+def test_replacement_payload_clears_a_stale_content_hash(armed, monkeypatch):
+    # Exercise the shared replacement payload loop independently of the owner
+    # receipt boundary. A changed source must clear its old Drive byte identity.
+    monkeypatch.setattr(
+        prep, "prepare",
+        lambda _store, _key, row, **_kwargs: {**row, "visual_group_key": "vg_scene",
+                                                "byte_hash": "derived:test"})
+    current = calendar_row(format="feed", variant_status="archived",
+                           source_media_url=RAW, source_media_asset_id="asset-old",
+                           source_media_content_hash=HASH)
+    http = HTTP(current=current)
+    payload = store(http)._prepare_visual_media(
+        KEY, "row-1", {"image_url": FINAL}, current=current)
+    assert payload["source_media_url"] is None
+    assert payload["source_media_content_hash"] is None

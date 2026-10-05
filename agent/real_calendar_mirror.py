@@ -234,7 +234,16 @@ def _real_row(account_key, draft, caption=None):
     # when present (the column exists after the
     # DRAFT_content_calendar_source_media_content_hash migration is applied);
     # omitted otherwise so a pre-migration insert never carries an unknown column.
-    src_hash = str(getattr(draft, "source_media_content_hash", "") or "").strip()
+    # EMISSION IS FLAG-GATED (ECHO_SOURCE_MEDIA_CONTENT_HASH_ENABLED, default OFF):
+    # direct callers (client_month_run._row_from_draft, real_month_planner
+    # to_calendar_rows) insert this row after a month delete, so emitting an
+    # unknown pre-migration column while the feature is OFF could cost the month.
+    try:
+        _hash_enabled = bool(config.source_media_content_hash_enabled())
+    except AttributeError:
+        _hash_enabled = False
+    src_hash = (str(getattr(draft, "source_media_content_hash", "") or "").strip()
+                if _hash_enabled else "")
     if src_hash:
         row["source_media_content_hash"] = src_hash
     # Planned cadence: a draft carries its slot ordinal so publish-time slot times
