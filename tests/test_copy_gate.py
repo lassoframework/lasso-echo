@@ -97,6 +97,50 @@ def test_violations_clean_text():
     assert v == []
 
 
+def test_semicolon_is_removed_by_house_scrub_and_rejected_if_unscrubbed():
+    assert copy_gate.scrub("Move well; build strength.") == "Move well, build strength."
+    assert "semicolon" in copy_gate.violations("Move well; build strength.")
+
+
+def test_caption_sentences_get_blank_line_without_changing_words():
+    raw = ("You're welcome here. Classes meet at 6.30 pm!\n"
+           "Dr. Lee coaches too.\n\nBook a class.\n#CrossFitLocal")
+    expected = ("You're welcome here.\n\nClasses meet at 6.30 pm!\n\n"
+                "Dr. Lee coaches too.\n\nBook a class.\n\n#CrossFitLocal")
+    assert copy_gate.format_caption(raw) == expected
+    assert copy_gate.format_caption(expected) == expected
+    assert copy_gate.format_caption("The 6 a.m. class starts soon. Join us.") == (
+        "The 6 a.m. class starts soon.\n\nJoin us.")
+
+
+def test_caption_semicolon_and_inline_url():
+    assert copy_gate.format_caption(
+        "Ready to train; come see us. Visit https://example.com/classes."
+    ) == "Ready to train, come see us.\n\nVisit https://example.com/classes."
+    with pytest.raises(ValueError, match="protected URL"):
+        copy_gate.format_caption("Visit https://example.com/a;b for details.")
+
+
+def test_caption_etc_abbreviation_does_not_split_paragraph():
+    # "etc." ends an abbreviation, not a sentence: no spurious blank line.
+    raw = "Bring a towel, water bottle, etc. to class."
+    assert copy_gate.format_caption(raw) == raw
+    assert copy_gate.format_caption(
+        "We have rowers, bikes, etc. Every class is coached. Book a spot.") == (
+        "We have rowers, bikes, etc.\n\nEvery class is coached.\n\nBook a spot.")
+
+
+def test_caption_month_and_unit_abbreviations_use_next_word_context():
+    assert copy_gate.format_caption("Classes start Oct. 5 at 7 a.m. Book a spot.") == (
+        "Classes start Oct. 5 at 7 a.m.\n\nBook a spot.")
+    assert copy_gate.format_caption("Walk 200 ft. to our front door. Come in.") == (
+        "Walk 200 ft. to our front door.\n\nCome in.")
+    assert copy_gate.format_caption("No. 1 is showing up. Start today.") == (
+        "No. 1 is showing up.\n\nStart today.")
+    assert copy_gate.format_caption("No. We have room for you.") == (
+        "No.\n\nWe have room for you.")
+
+
 # ---------------------------------------------------------------------------
 # 10. ASK_RE matches expected call-to-action phrases
 # ---------------------------------------------------------------------------

@@ -103,12 +103,13 @@ class _Acct:
 
 def test_maybe_format_story_flag_off_keeps_baseline(monkeypatch, tmp_path):
     monkeypatch.setattr(client_month_run.config, "story_format_enabled", lambda: False)
-    feed = _Draft("cap", str(tmp_path / "clip.mp4"))
-    story = _Draft("cap", str(tmp_path / "clip.mp4"))
+    feed = _Draft("First sentence. Second; clause.", str(tmp_path / "clip.mp4"))
+    story = _Draft("First sentence. Second; clause.", str(tmp_path / "clip.mp4"))
     # baseline: always keep, media untouched
     assert client_month_run._maybe_format_story(_Acct(), story, feed, tmp_path,
                                                 lambda m: None) is True
     assert story.creative_public_url == "raw-url"
+    assert story.caption == "First sentence. Second; clause."
 
 
 def test_maybe_format_story_drops_video_story_when_uncaptionable(monkeypatch, tmp_path):

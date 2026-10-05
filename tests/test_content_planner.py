@@ -71,6 +71,17 @@ def test_missing_doc_blocks(tmp_path):
     assert "missing" in plan["reason"].lower()
 
 
+def test_semicolon_inside_approved_url_blocks_plan(tmp_path):
+    source = FIXTURE.replace("Hook: Leads go cold in minutes.",
+                             "Hook: Visit https://example.com/a;b for details.")
+    path = tmp_path / "lasso_now.md"
+    path.write_text(source, encoding="utf-8")
+    plan = content_planner.plan_for("2026-07-01", path=str(path),
+                                    pillar="Speed To Lead")
+    assert plan["blocked"] is True
+    assert "semicolon inside a URL" in plan["reason"]
+
+
 # ---- 3. plan has pillar / caption / cta / hashtags --------------------------
 def test_plan_has_all_parts(tmp_path):
     plan = content_planner.plan_for("2026-07-01", path=_doc_path(tmp_path))
