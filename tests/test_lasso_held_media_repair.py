@@ -572,11 +572,12 @@ def _stub_repair_waves(monkeypatch):
     return repairs, pairings
 
 
-def test_no_voice_run_has_no_media_repair_wave_at_all(monkeypatch):
-    """Post-grade ordering: held-media repair runs after grade/drafting, so a
-    run without a voice doc exits at no_voice with zero repair or paired
-    Story calls — no repair wave, and no possibility of a double generation.
-    """
+def test_no_voice_run_makes_exactly_one_preparation_wave_and_never_drafts(
+        monkeypatch):
+    """Approved post-grade contract: a missing voice blocks DRAFTING, not the
+    autonomous LASSO preparation lane. A no_voice run performs exactly one
+    held-media + paired-Story preparation wave (gated on
+    lasso_three_feed_enabled), then exits: no drafting, no publishing."""
     from agent import runner
     _post_grade_preparation_helper(runner)
     monkeypatch.setattr(runner.config, "master_enabled", lambda: True)
@@ -592,8 +593,23 @@ def test_no_voice_run_has_no_media_repair_wave_at_all(monkeypatch):
 
     out = runner.run_daily(poster=Poster(), scheduled_for="2026-10-05T12:00:00+00:00")
     assert out["status"] == "no_voice"
-    assert repairs == []
-    assert pairings == []
+    assert out["drafts"] == []
+    # Exactly one bounded wave: one held-media repair call per account, one
+    # paired-Story preparation call per account, never a duplicate.
+    assert repairs == [
+        {"now": "2026-10-05T12:00:00+00:00", "account_key": "lasso_ig"},
+        {"now": "2026-10-05T12:00:00+00:00", "account_key": "lasso_fb"},
+    ]
+    assert [kw.get("account") for kw in pairings] == ["instagram", "facebook"]
+
+    # Flag OFF stays the intentional fail-closed no-op: no wave at all.
+    monkeypatch.setattr(runner.config, "lasso_three_feed_enabled",
+                        lambda: False)
+    repairs.clear()
+    pairings.clear()
+    out = runner.run_daily(poster=Poster(), scheduled_for="2026-10-05T12:00:00+00:00")
+    assert out["status"] == "no_voice"
+    assert repairs == [] and pairings == []
 
 
 def test_past_coverage_follows_publisher_catchup_window_not_fixed_dates(

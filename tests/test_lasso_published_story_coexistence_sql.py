@@ -62,7 +62,8 @@ def pg():
                 source_media_url text, source_media_asset_id text,
                 status text, scheduled_at timestamptz, slot_index integer,
                 variant_status text, logical_post_id uuid, media_not_ready_reason text,
-                published_at timestamptz, late_post_id text, publish_claim_token uuid);
+                published_at timestamptz, late_post_id text, publish_claim_token uuid,
+                publish_reservation_day date);
                 create table public.echo_infographic_artifacts (
                 tenant text, image_url text, image_sha256 text, evidence jsonb,
                 source_identity jsonb);""")
