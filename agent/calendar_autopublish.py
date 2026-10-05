@@ -1252,6 +1252,17 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         from . import zernio_publisher
         zernio_publish = zernio_publisher.publish
 
+    # A reviewed managed Story unlocks only the exact dated incident feed hold.
+    # This CAS never changes captions, visuals, claims or another hold reason.
+    if gym_id == "lasso" and hasattr(store, "_client"):
+        try:
+            from .jobs import lasso_backlog_feed_hold_release
+            for paired_account in ("instagram", "facebook"):
+                lasso_backlog_feed_hold_release.run(
+                    account=paired_account, store=store, today=run_date)
+        except Exception as exc:
+            print(f"[lasso-backlog-feed-release] held: {type(exc).__name__}")
+
     # Repaired Stories stay held until their exact feed has a real publish
     # receipt. Release through the database's source-proof RPC before due_rows
     # filters media-held rows. A failed release never blocks the feed lane.

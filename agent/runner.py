@@ -1026,9 +1026,14 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     # generation, and uses the guarded insert-only RPC. It cannot publish.
     if config.lasso_three_feed_enabled() and config.calendar_autopublish_enabled():
         try:
-            from .jobs import lasso_daily_paired_stories
+            from .jobs import lasso_daily_paired_stories, lasso_held_media_repair
+            from .calendar_autopublish import _client_publish_limits
+            pairing_day = lasso_held_media_repair._local_day(scheduled_for).isoformat()
+            pairing_lookback, _ = _client_publish_limits(
+                "lasso", pairing_day, config.client_daily_publish_cap())
             for account in ("instagram", "facebook"):
-                result = lasso_daily_paired_stories.run(now=scheduled_for, account=account)
+                result = lasso_daily_paired_stories.run(
+                    now=scheduled_for, account=account, catchup_days=pairing_lookback)
                 print(f"[lasso-paired-stories] {account} "
                       f"staged={result['staged']} generated={result['generated']} "
                       f"reused={result['reused']} occupied={result['occupied']} "
