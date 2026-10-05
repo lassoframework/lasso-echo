@@ -19,9 +19,6 @@ import pytest
 
 from agent import visual_scene as vs
 
-MIGRATION = (Path(__file__).resolve().parent.parent
-             / "migrations" / "DRAFT_visual_scene_phash_20261003.sql")
-
 FP_RE = re.compile(r"^scene:phash64:[0-9a-f]{16}$")
 
 
@@ -233,83 +230,19 @@ def test_matched_is_the_min_distance_known_hash():
 # --------------------------------------------------------------------------
 # DRAFT migration static release boundary
 # --------------------------------------------------------------------------
-
-@pytest.fixture(scope="module")
-def migration_sql():
-    # migrations/ is owned by the parent milestone; until the DRAFT scene
-    # migration lands there, the static release-boundary tests skip instead
-    # of erroring.
-    if not MIGRATION.exists():
-        pytest.skip(f"{MIGRATION.name} not present (parent-owned scope)")
-    return MIGRATION.read_text(encoding="utf-8")
-
-
-def test_migration_is_marked_draft_and_unapplied(migration_sql):
-    assert MIGRATION.name.startswith("DRAFT_")
-    head = migration_sql[:600].lower()
-    assert "draft" in head and "unapplied" in head
-
-
-def test_migration_is_additive_only(migration_sql):
-    sql = migration_sql.lower()
-    assert "create table if not exists public.visual_scene_phash" in sql
-    assert "alter table" not in sql.replace(
-        "alter table public.visual_scene_phash enable row level security", "")
-    assert "drop table" not in sql
-    # The frozen md5-keyed exact-byte ledger is untouched.
-    assert "visual_global_usage" not in re.sub(r"--[^\n]*", "", sql)
-
-
-def test_migration_never_writes_scene_links(migration_sql):
-    sql = re.sub(r"--[^\n]*", "", migration_sql).lower()
-    # No DML or call path to the human-only scene-link machinery (the words
-    # may appear in comments as a prohibition, never as an operation).
-    assert not re.search(r"\b(insert\s+into|update|delete\s+from)\s+\S*visual_group_scene_link", sql)
-    assert not re.search(r"\b(perform|select)\s+\S*visual_group_link_scene", sql)
-    # NO working write path exists: both record functions are the REJECTED
-    # prep-time architecture and their bodies only RAISE 0A000. There is no
-    # executable INSERT anywhere in the sketch.
-    assert not re.search(r"\binsert\s+into\b", sql)
-    for fn in ("visual_scene_record_use(", "visual_scene_record_use_tx("):
-        body = sql.split(f"create or replace function public.{fn}", 1)[1]
-        body = body.split("$$", 1)[1]
-        assert re.search(r"raise exception .* using errcode\s*=\s*'0a000'", body)
-        assert "rejected prep-time write path" in body
-    # The table sketch keeps its NOT NULL used_date and date-dimension index.
-    assert re.search(r"used_date\s+date\s+not\s+null", sql)
-    assert "visual_scene_phash_tenant_date_idx" in sql
-    # Table grants stay read-only; EXECUTE on record_use to service_role only;
-    # record_use_tx is granted to NO role (revoked from everyone incl.
-    # service_role). All moot while unapplied; pinned so a redesign starts
-    # from this shape.
-    assert re.search(r"grant\s+select\s+on\s+public\.visual_scene_phash\s+to\s+service_role", sql)
-    assert not re.search(r"grant\s+(insert|update|delete)", sql)
-    assert re.search(r"grant\s+execute\s+on\s+function\s+public\.visual_scene_record_use\("
-                     r"text,uuid,text,date,jsonb\)\s+to\s+service_role", sql)
-    assert not re.search(r"grant\s+execute\s+on\s+function\s+public\.visual_scene_record_use_tx", sql)
-    assert re.search(r"revoke\s+all\s+on\s+function\s+public\.visual_scene_record_use_tx\("
-                     r"text,uuid,text,date,jsonb\)\s+from\s+public,anon,authenticated,service_role", sql)
-    assert not re.search(r"grant\s+execute.*\bto\s+(public|anon|authenticated)\b", sql)
-
-
-def test_migration_is_an_incomplete_do_not_apply_sketch(migration_sql):
-    head = migration_sql[:2000].lower()
-    assert "incomplete" in head
-    assert "do not apply" in head and "do not activate" in head
-    # The STATUS section lists the required redesign before anything here may
-    # ever be applied or activated.
-    assert "status: incomplete" in head
-    for item in ("staging", "claim transaction", "review-hold",
-                 "server-side", "backfill"):
-        assert item in head, f"redesign item {item!r} missing from STATUS"
-    # Rollback is trivial: nothing is applied anywhere.
-    assert "delete the file" in migration_sql.lower()
-
+#
+# The rejected prep-time sketch migrations/DRAFT_visual_scene_phash_20261003.sql
+# was deliberately NOT ported into this integration (superseded by the
+# claim-prevention redesign). The minimal durable ledger lives in
+# migrations/DRAFT_visual_scene_ledger_20261005.sql and is pinned by the
+# disposable-PostgreSQL proofs in tests/test_scene_ledger_claim_pg.py and
+# tests/test_scene_ledger_rollback_pg.py instead of static text assertions.
 
 def test_global_history_migration_carries_no_scene_params():
     """The exact-byte global ledger migration is reverted to base: the prepare
     RPCs have their original signatures and no p_scene_* surface at all."""
-    sql = (MIGRATION.parent / "DRAFT_visual_global_history_20261002.sql") \
+    sql = (Path(__file__).resolve().parent.parent / "migrations"
+           / "DRAFT_visual_global_history_20261002.sql") \
         .read_text(encoding="utf-8").lower()
     assert "p_scene_phash" not in sql
     assert "visual_scene_record_use" not in sql
