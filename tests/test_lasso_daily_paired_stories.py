@@ -206,6 +206,52 @@ def test_occupied_pending_story_repaired_from_exact_feed_artifact(monkeypatch):
     assert verified == [(action, {"expected_hold": "paired_feed_not_ready"})]
 
 
+def test_media_held_story_is_repaired_from_exact_feed_through_rpc(monkeypatch):
+    _armed(monkeypatch)
+    for hold in ("caption_changed_needs_new_visual",
+                 "cross_date_media_repeat_needs_new_visual"):
+        feed = {"id": "feed", "gym_id": "lasso", "account": "instagram",
+                "format": "feed", "post_date": "2026-10-07", "slot_index": 0,
+                "variant_status": "active", "status": "pending", "pillar": "doctrine",
+                "logical_post_id": "logical", "media_not_ready_reason": None,
+                "caption": "Current caption", "image_url": "https://example.com/feed.png"}
+        story = {"id": "story", "gym_id": "lasso", "account": "instagram",
+                 "format": "story", "post_date": "2026-10-07", "slot_index": 0,
+                 "variant_status": "active", "status": "pending", "pillar": "old",
+                 "logical_post_id": "logical", "media_not_ready_reason": hold,
+                 "published_at": None, "late_post_id": None, "publish_claim_token": None}
+        monkeypatch.setattr(daily.stage, "_active_day", lambda _, day:
+                            [feed, story] if day == "2026-10-07" else [])
+        # The reused artifact binds the exact FEED id and caption, not the Story.
+        monkeypatch.setattr(daily, "_candidate_artifact", lambda *a: {
+            "image_url": "https://example.com/story.png", "image_sha256": "a" * 64,
+            "source_identity": {"source_id": "content_calendar:feed:caption",
+                                "source_hash": daily.hashlib.sha256(feed["caption"].encode()).hexdigest()},
+            "evidence": {"grade_status": "PASS", "aspect": "9:16",
+                         "pixels": "1080x1920", "image_sha256": "a" * 64,
+                         "verified_dimensions": {"width": 1080, "height": 1920,
+                                                 "image_sha256": "a" * 64},
+                         "policy_version": daily.infographic_evidence.POLICY_VERSION}})
+        action = {"story_id": "story", "feed_id": "feed", "account": "instagram",
+                  "date": "2026-10-07", "slot_index": 0}
+        monkeypatch.setattr(daily.repair, "plan_one", lambda _, item:
+                            action if item["story_id"] == "story" else None)
+        monkeypatch.setattr(daily.repair, "apply_one", lambda _, a:
+                            {"result": "repaired", "hold_reason": "paired_feed_not_ready"}
+                            if a is action else None)
+        verified = []
+        monkeypatch.setattr(daily, "_verify_staged_pair", lambda _, a, **kw:
+                            verified.append((a, kw)))
+        class Store:
+            def lasso_paired_story_ready_for_feed(self, _): return False
+        class Artifacts: available = True
+        result = daily.run(now="2026-10-07T06:00:00-04:00", store=Store(),
+                           artifact_store=Artifacts())
+        assert result["repaired"] == result["reused"] == 1
+        assert result["generated"] == result["staged"] == 0
+        assert verified == [(action, {"expected_hold": "paired_feed_not_ready"})]
+
+
 def test_backlog_preparation_hold_only_allows_exact_incident_window():
     feed = {"status": "pending", "media_not_ready_reason":
             daily.stage.BACKLOG_FEED_HOLD}

@@ -1,6 +1,10 @@
 -- Exact-CAS repair of an EXISTING pending LASSO Story. Requires the paired
 -- Story backfill migration. No row is deleted, re-dated, approved or published.
 -- The logical-post immutability trigger is preserved: mismatched IDs block.
+-- A Story held for the paired feed or for a generic media hold (caption
+-- change, cross-date media repeat) is re-bound to its exact feed source and
+-- registered in lasso_managed_paired_stories atomically; unless the feed is
+-- already published it keeps the paired-feed hold until a real feed receipt.
 begin;
 
 create or replace function public.lasso_story_review_matches(
@@ -244,7 +248,9 @@ begin
      or s.status <> 'pending' or s.variant_status <> 'active'
      or s.published_at is not null or s.late_post_id is not null
      or s.publish_claim_token is not null
-     or s.media_not_ready_reason not in ('paired_feed_not_ready')
+     or s.media_not_ready_reason not in ('paired_feed_not_ready',
+                                         'caption_changed_needs_new_visual',
+                                         'cross_date_media_repeat_needs_new_visual')
          and s.media_not_ready_reason is not null
      or s.caption is distinct from p_expected_story->>'caption'
      or s.pillar is distinct from p_expected_story->>'pillar'

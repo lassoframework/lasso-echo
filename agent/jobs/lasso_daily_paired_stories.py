@@ -21,6 +21,12 @@ from agent.jobs import lasso_paired_story_repair as repair
 ACCOUNTS = {"instagram": "lasso_ig", "facebook": "lasso_fb"}
 MAX_PER_RUN = 9  # Six current/next-day pairs plus three catchup repairs.
 MAX_BACKLOG_PER_RUN = 3
+# An existing pending Story with one of these media holds is repaired from its
+# exact paired feed through the guarded RPC, never by the generic held-media
+# swap: the artifact must bind the feed id/caption and the managed registry.
+REPAIRABLE_STORY_HOLDS = (None, "paired_feed_not_ready",
+                          "caption_changed_needs_new_visual",
+                          "cross_date_media_repeat_needs_new_visual")
 
 
 def _system_ready(store):
@@ -248,7 +254,7 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                         and candidate.get("publish_claim_token") is None
                         and candidate.get("logical_post_id") == feed.get("logical_post_id")
                         and candidate.get("media_not_ready_reason") in
-                        (None, "paired_feed_not_ready")):
+                        REPAIRABLE_STORY_HOLDS):
                     try:
                         if store.lasso_paired_story_ready_for_feed(feed["id"]) is True:
                             summary["occupied"] += 1

@@ -335,7 +335,7 @@ def test_disarmed_repair_never_reads_or_generates(monkeypatch):
     assert store.patches == []
 
 
-def test_caption_change_rebuilds_feed_then_paired_story_from_same_source(monkeypatch):
+def test_caption_change_repairs_feed_but_never_swaps_a_managed_story(monkeypatch):
     _armed(monkeypatch)
     monkeypatch.setattr(repair.infographic_evidence, "brain_snapshot",
                         lambda: {"source": "hash"})
@@ -364,13 +364,16 @@ def test_caption_change_rebuilds_feed_then_paired_story_from_same_source(monkeyp
     monkeypatch.setattr(variant_regen, "generate_variant_image", fake_generate)
 
     out = repair.run(store=store, artifact_store=artifacts)
-    assert out["repaired"] == out["generated"] == 2
-    assert generated == [("feed", feed["caption"], "feed"),
-                         ("story", feed["caption"], "story")]
+    # Only the feed is repaired. A managed Story is never regenerated from its
+    # own id nor swapped by a direct CAS here; the daily paired Story job owns
+    # it so the managed registry binding stays intact.
+    assert out["repaired"] == out["generated"] == 1
+    assert generated == [("feed", feed["caption"], "feed")]
     assert store.rows["feed"]["media_not_ready_reason"] is None
-    assert store.rows["story"]["media_not_ready_reason"] is None
-    assert store.rows["story"]["caption"] == ""
-    assert store.rows["story"]["image_url"].endswith("/story.png")
+    assert store.rows["story"]["media_not_ready_reason"] == repair.CAPTION_HOLD_REASON
+    assert store.rows["story"]["image_url"] == "https://old.example/story.jpg"
+    assert len(artifacts.claims) == 1
+    assert all(params["id"] == "eq.feed" for params, _ in store.patches)
 
 
 def test_caption_story_stays_held_while_feed_or_review_is_unready(monkeypatch):
@@ -398,22 +401,27 @@ def test_caption_hold_cannot_clear_by_reusing_the_old_visual(monkeypatch):
     assert store.patches == []
 
 
-def test_story_needs_its_own_review_even_after_feed_is_ready(monkeypatch):
+def test_generic_repair_never_generates_or_swaps_a_held_story(monkeypatch):
     _armed(monkeypatch)
     caption = "New approved source copy."
     feed = _row("feed", caption=caption, image_url="https://new.example/feed.png",
                 media_not_ready_reason=None)
-    story = _row("story", format="story", caption="",
-                 media_not_ready_reason=repair.CAPTION_HOLD_REASON)
-    store, artifacts = _Store([feed, story]), _Artifacts()
-    _reviewed_ig_artifact(monkeypatch, store, feed)
+    stories = [
+        _row("story-caption", format="story", caption="",
+             media_not_ready_reason=repair.CAPTION_HOLD_REASON),
+        _row("story-repeat", format="story", caption="",
+             media_not_ready_reason=repair.HOLD_REASON),
+    ]
+    store, artifacts = _Store([feed] + stories), _Artifacts()
     monkeypatch.setattr(variant_regen, "generate_variant_image",
-                        lambda row, account, **kw: {"ok": True,
-                        "image_url": "https://new.example/story.png"})
+                        lambda row, account, **kw: (_ for _ in ()).throw(
+                            AssertionError("held Story must never be regenerated here")))
     out = repair.run(store=store, artifact_store=artifacts)
-    assert out["generated"] == 1 and out["repaired"] == 0
-    assert store.rows["story"]["media_not_ready_reason"] == repair.CAPTION_HOLD_REASON
-    assert store.patches == []
+    assert out["attempted"] == out["generated"] == out["repaired"] == 0
+    assert artifacts.claims == [] and store.patches == []
+    assert store.rows["story-caption"]["media_not_ready_reason"] == \
+        repair.CAPTION_HOLD_REASON
+    assert store.rows["story-repeat"]["media_not_ready_reason"] == repair.HOLD_REASON
 
 
 def test_daily_runner_repairs_ahead_of_drafting_even_if_voice_is_missing(monkeypatch):

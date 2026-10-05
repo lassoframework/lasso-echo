@@ -21,6 +21,12 @@ from agent.jobs import lasso_paired_story_backfill as base
 from agent.portal_calendar_store import SupabaseCalendarStore
 
 RPC = "rpc/repair_lasso_paired_story"
+# Held Stories the daily paired Story job may repair from their exact feed:
+# the paired-feed wait plus both generic media holds. Anything else is not an
+# unclaimed pending exact feed pair and must keep its hold.
+REPAIRABLE_STORY_HOLDS = (None, "paired_feed_not_ready",
+                          "caption_changed_needs_new_visual",
+                          "cross_date_media_repeat_needs_new_visual")
 STORY_SNAPSHOT = ("account", "post_date", "slot_index", "status",
                   "variant_status", "pillar", "caption", "image_url",
                   "source_media_url", "media_not_ready_reason", "scheduled_at",
@@ -47,7 +53,7 @@ def plan_one(store, item):
             or story.get("variant_status") != "active"
             or story.get("published_at") or story.get("late_post_id") is not None
             or story.get("publish_claim_token") is not None
-            or story.get("media_not_ready_reason") not in (None, "paired_feed_not_ready")
+            or story.get("media_not_ready_reason") not in REPAIRABLE_STORY_HOLDS
             or str(feed.get("account") or "").strip().lower() != account
             or str(feed.get("post_date") or "")[:10] != day
             or feed.get("slot_index") != slot
