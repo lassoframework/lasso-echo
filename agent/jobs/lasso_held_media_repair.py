@@ -120,26 +120,50 @@ def _feed_format_evidence(evidence):
     return feed_image.MIN_RATIO <= ratio <= feed_image.MAX_RATIO
 
 
+ARTIFACT_LOOKUP_PAGE = 50
+ARTIFACT_LOOKUP_MAX_PAGES = 4
+
+
+def _reviewed_artifact_rows(store, source_id, source_hash, account_key):
+    """Read EVERY artifact under one shared feed/caption tenant key.
+
+    Feed and Story renders share this key, so any fixed small window can hide
+    a valid older feed artifact behind newer 9:16 Story renders. Stable
+    created_at-desc pagination walks the whole key, bounded by
+    ARTIFACT_LOOKUP_MAX_PAGES; exceeding the bound, a short/overlong page or a
+    read error fails closed rather than silently truncating into a paid
+    duplicate render.
+    """
+    rows = []
+    for page in range(ARTIFACT_LOOKUP_MAX_PAGES):
+        response = store._client().get(
+            store._rest("echo_infographic_artifacts"),
+            params={"tenant": f"eq.{account_key}",
+                    "source_identity->>source_id": _eq(source_id),
+                    "source_identity->>source_hash": _eq(source_hash),
+                    "select": "image_url,evidence,source_identity",
+                    "order": "created_at.desc",
+                    "limit": str(ARTIFACT_LOOKUP_PAGE),
+                    "offset": str(page * ARTIFACT_LOOKUP_PAGE)},
+            headers=store._headers(), timeout=30)
+        if response.status_code >= 400:
+            raise RuntimeError("reviewed artifact lookup failed")
+        batch = response.json()
+        if not isinstance(batch, list) or len(batch) > ARTIFACT_LOOKUP_PAGE:
+            raise RuntimeError("reviewed artifact lookup incomplete")
+        rows.extend(batch)
+        if len(batch) < ARTIFACT_LOOKUP_PAGE:
+            return rows
+    raise RuntimeError("reviewed artifact lookup exceeded bound")
+
+
 def _reviewed_artifact_record(store, source_id, source_hash, account_key=ACCOUNT):
     """Reuse a persisted reviewed FEED image before any new paid generation.
 
     A failed or incomplete lookup is an error, not a cache miss: generating in
     that state could bill repeatedly for the same row after a process restart.
     """
-    response = store._client().get(
-        store._rest("echo_infographic_artifacts"),
-        params={"tenant": f"eq.{account_key}",
-                "source_identity->>source_id": _eq(source_id),
-                "source_identity->>source_hash": _eq(source_hash),
-                "select": "image_url,evidence,source_identity",
-                "order": "created_at.desc", "limit": "2"},
-        headers=store._headers(), timeout=30)
-    if response.status_code >= 400:
-        raise RuntimeError("reviewed artifact lookup failed")
-    rows = response.json()
-    if not isinstance(rows, list) or len(rows) > 2:
-        raise RuntimeError("reviewed artifact lookup incomplete")
-    for row in rows:
+    for row in _reviewed_artifact_rows(store, source_id, source_hash, account_key):
         if not isinstance(row, dict):
             raise RuntimeError("reviewed artifact lookup malformed")
         evidence = row.get("evidence") or {}
