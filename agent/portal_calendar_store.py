@@ -44,6 +44,10 @@ _UUID_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 _TABLE = "content_calendar"
 
+# Preserve the historical meaning of omitting source_media_url while allowing an
+# explicit None to clear stale source provenance during a media replacement.
+_SOURCE_MEDIA_UNSET = object()
+
 # Portal facing statuses. The action verbs map to these column values.
 _ACTION_STATUS = {
     "approve": "approved",
@@ -827,7 +831,8 @@ class SupabaseCalendarStore:
                 return row
         return None
 
-    def swap_media(self, account_key, row_id, image_url, source_media_url=None,
+    def swap_media(self, account_key, row_id, image_url,
+                   source_media_url=_SOURCE_MEDIA_UNSET,
                    extra_fields=None, *, render_evidence=None,
                    poster_render_evidence=None):
         """CROSS-DAY MEDIA GUARD sweep (Blake, 2026-08-31): re-point a WAITING row's
@@ -852,7 +857,7 @@ class SupabaseCalendarStore:
         # This is a real replacement, so release any earlier needs-media hold in
         # the same pending / coach_review-scoped write. Status itself is unchanged.
         payload = {"image_url": image_url, "media_not_ready_reason": None}
-        if source_media_url is not None:
+        if source_media_url is not _SOURCE_MEDIA_UNSET:
             payload["source_media_url"] = source_media_url
         for col in _SWAP_EXTRA_COLUMNS:
             if col in (extra_fields or {}):
