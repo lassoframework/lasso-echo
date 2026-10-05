@@ -706,3 +706,56 @@ def test_oct7_held_feed_still_repairs_on_oct8_retry(monkeypatch):
     assert out["attempted"] == out["generated"] == out["repaired"] == 1
     assert store.rows["oct7"]["media_not_ready_reason"] is None
     assert store.rows["oct7"]["image_url"] == "https://new.example/oct7.png"
+
+
+def test_ordinary_oct13_hold_repairs_on_oct14_without_incident_opt_in(
+        monkeypatch):
+    """Once-a-day generation can fail on day N; the publisher retries for 7
+    days, so an ordinary N+1 run must repair the held feed with no incident
+    flag. A newer 9:16 Story artifact on the same source is never reused as
+    feed artwork even on this past-date path."""
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair.infographic_evidence, "brain_snapshot",
+                        lambda: {"source": "hash"})
+    monkeypatch.setattr(repair, "_local_day", lambda now: date(2026, 10, 14))
+    class Store(_Store):
+        def list_pending_media_between(self, gym, first, last):
+            self.reads += 1
+            # Oct 14 is outside the incident window: the plain 7-day catchup.
+            assert (gym, first, last) == ("lasso", "2026-10-07", "2026-10-15")
+            return [deepcopy(row) for row in self.rows.values()]
+    past = _row("oct13", day="2026-10-13", caption="Approved retry copy.")
+    store, artifacts = Store([past]), _Artifacts()
+    _reviewed_ig_artifact(monkeypatch, store,
+                          dict(past, image_url="https://cdn.example/oct13-feed.png"))
+    source_id = "content_calendar:oct13:caption"
+    source_hash = repair.hashlib.sha256(past["caption"].encode()).hexdigest()
+    store.cache[(repair._eq(source_id), repair._eq(source_hash))].insert(
+        0, _story_artifact_for(past, "https://cdn.example/oct13-story.png"))
+    monkeypatch.setattr(variant_regen, "generate_variant_image",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            AssertionError("valid feed artifact must be reused")))
+    out = repair.run(store=store, artifact_store=artifacts)
+    assert out["reused"] == out["repaired"] == 1
+    assert out["generated"] == 0
+    assert store.rows["oct13"]["image_url"] == "https://cdn.example/oct13-feed.png"
+    assert store.rows["oct13"]["media_not_ready_reason"] is None
+
+
+def test_hold_older_than_catchup_window_is_refused_without_paid_attempt(
+        monkeypatch):
+    _armed(monkeypatch)
+    monkeypatch.setattr(repair, "_local_day", lambda now: date(2026, 10, 14))
+    class Store(_Store):
+        def list_pending_media_between(self, gym, first, last):
+            self.reads += 1
+            assert (gym, first, last) == ("lasso", "2026-10-07", "2026-10-15")
+            return [deepcopy(row) for row in self.rows.values()]
+    store, artifacts = Store([_row("stale", day="2026-10-06")]), _Artifacts()
+    monkeypatch.setattr(variant_regen, "generate_variant_image",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            AssertionError("out-of-window hold must not spend")))
+    out = repair.run(store=store, artifact_store=artifacts)
+    assert out["attempted"] == out["generated"] == out["repaired"] == 0
+    assert artifacts.claims == [] and store.patches == []
+    assert store.rows["stale"]["media_not_ready_reason"] == repair.HOLD_REASON
