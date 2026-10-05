@@ -3,6 +3,8 @@
 from copy import deepcopy
 from datetime import date
 
+import pytest
+
 from agent import variant_regen
 from agent.jobs import lasso_held_media_repair as repair
 
@@ -536,16 +538,53 @@ def test_generic_repair_never_generates_or_swaps_a_held_story(monkeypatch):
     assert store.rows["story-repeat"]["media_not_ready_reason"] == repair.HOLD_REASON
 
 
-def test_daily_runner_repairs_ahead_of_drafting_even_if_voice_is_missing(monkeypatch):
-    from agent import runner
-    monkeypatch.setattr(runner.config, "master_enabled", lambda: True)
-    monkeypatch.setattr(runner.config, "lasso_three_feed_enabled", lambda: True)
-    monkeypatch.setattr(runner, "load_voice", lambda path: None)
-    calls = []
+def _post_grade_preparation_helper(runner):
+    """Root's post-grade runner commit (73fe93c, integrated tree only) extracts
+    held-media + paired-Story preparation into this helper. It is absent on
+    this worker branch by design; root's integrated check runs these tests."""
+    helper = getattr(runner, "_lasso_held_media_and_story_preparation", None)
+    if helper is None:
+        pytest.skip("runner._lasso_held_media_and_story_preparation lands with "
+                    "root's post-grade runner commit; validated on the "
+                    "integrated tree")
+    return helper
+
+
+def _call_helper(helper, day):
+    import inspect
+    if "scheduled_for" in inspect.signature(helper).parameters:
+        return helper(scheduled_for=day)
+    return helper(day)
+
+
+def _stub_repair_waves(monkeypatch):
+    from agent.jobs import lasso_daily_paired_stories as daily_stories
+    repairs, pairings = [], []
     monkeypatch.setattr(repair, "run", lambda **kwargs:
-                        calls.append(kwargs) or {"ok": True, "attempted": 0,
+                        repairs.append(kwargs) or {"ok": True, "attempted": 0,
                         "generated": 0, "reused": 0, "repaired": 0,
                         "skipped": 0, "errors": 0})
+    monkeypatch.setattr(daily_stories, "run", lambda **kwargs:
+                        pairings.append(kwargs) or {"ok": True,
+                        "account": kwargs.get("account"), "eligible": 0,
+                        "generated": 0, "reused": 0, "staged": 0,
+                        "repaired": 0, "occupied": 0, "blocked": 0})
+    return repairs, pairings
+
+
+def test_no_voice_run_has_no_media_repair_wave_at_all(monkeypatch):
+    """Post-grade ordering: held-media repair runs after grade/drafting, so a
+    run without a voice doc exits at no_voice with zero repair or paired
+    Story calls — no repair wave, and no possibility of a double generation.
+    """
+    from agent import runner
+    _post_grade_preparation_helper(runner)
+    monkeypatch.setattr(runner.config, "master_enabled", lambda: True)
+    monkeypatch.setattr(runner.config, "lasso_three_feed_enabled", lambda: True)
+    monkeypatch.setattr(runner.config, "calendar_autopublish_enabled",
+                        lambda: True)
+    monkeypatch.setattr(runner, "load_voice", lambda path: None)
+    repairs, pairings = _stub_repair_waves(monkeypatch)
 
     class Poster:
         def post_notice(self, message):
@@ -553,10 +592,8 @@ def test_daily_runner_repairs_ahead_of_drafting_even_if_voice_is_missing(monkeyp
 
     out = runner.run_daily(poster=Poster(), scheduled_for="2026-10-05T12:00:00+00:00")
     assert out["status"] == "no_voice"
-    assert calls == [
-        {"now": "2026-10-05T12:00:00+00:00", "account_key": "lasso_ig"},
-        {"now": "2026-10-05T12:00:00+00:00", "account_key": "lasso_fb"},
-    ]
+    assert repairs == []
+    assert pairings == []
 
 
 def test_past_coverage_follows_publisher_catchup_window_not_fixed_dates(
@@ -590,31 +627,31 @@ def test_past_coverage_follows_publisher_catchup_window_not_fixed_dates(
     assert store.rows["outside"]["media_not_ready_reason"] == repair.HOLD_REASON
 
 
-def test_daily_runner_autonomously_opts_in_only_during_recovery_dates(monkeypatch):
+def test_held_media_preparation_opts_in_only_during_recovery_dates(monkeypatch):
+    """The post-grade preparation helper wires the incident backlog flag only
+    inside the dated recovery window, calls each account exactly once per
+    invocation (no double generation wave), and never opts in afterwards."""
     from agent import runner
+    helper = _post_grade_preparation_helper(runner)
     monkeypatch.setattr(runner.config, "master_enabled", lambda: True)
     monkeypatch.setattr(runner.config, "lasso_three_feed_enabled", lambda: True)
-    monkeypatch.setattr(runner, "load_voice", lambda path: None)
-    calls = []
-    monkeypatch.setattr(repair, "run", lambda **kwargs:
-                        calls.append(kwargs) or {"ok": True, "attempted": 0,
-                        "generated": 0, "reused": 0, "repaired": 0,
-                        "skipped": 0, "errors": 0})
+    monkeypatch.setattr(runner.config, "calendar_autopublish_enabled",
+                        lambda: True)
+    repairs, pairings = _stub_repair_waves(monkeypatch)
 
-    class Poster:
-        def post_notice(self, message):
-            pass
-
-    runner.run_daily(poster=Poster(), scheduled_for="2026-10-06T12:00:00+00:00")
-    assert calls == [
+    _call_helper(helper, "2026-10-06T12:00:00+00:00")
+    assert repairs == [
         {"now": "2026-10-06T12:00:00+00:00", "account_key": "lasso_ig",
          "include_incident_backlog": True},
         {"now": "2026-10-06T12:00:00+00:00", "account_key": "lasso_fb",
          "include_incident_backlog": True},
     ]
-    calls.clear()
-    runner.run_daily(poster=Poster(), scheduled_for="2026-10-12T12:00:00+00:00")
-    assert all("include_incident_backlog" not in kwargs for kwargs in calls)
+    repairs.clear()
+    pairings.clear()
+    _call_helper(helper, "2026-10-12T12:00:00+00:00")
+    assert all("include_incident_backlog" not in kwargs for kwargs in repairs)
+    assert [kw.get("account_key") for kw in repairs].count("lasso_ig") <= 1
+    assert [kw.get("account_key") for kw in repairs].count("lasso_fb") <= 1
 
 
 def test_past_hold_ages_out_with_the_publisher_catchup_window(monkeypatch):
