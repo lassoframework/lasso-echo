@@ -3,7 +3,8 @@
 Each account/day/slot is inspected before any paid generation. One persisted
 source-bound 9:16 PASS artifact is reused when available. A distributed
 artifact lease and five-minute retry cooldown bound duplicate paid attempts.
-The guarded Story RPC only stages; it never publishes or edits existing rows.
+Guarded RPCs stage missing Stories or exactly repair stale, unclaimed pending
+Stories. They never publish, delete, or edit a claimed/published Story.
 """
 
 import hashlib
@@ -227,6 +228,16 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                         and (r.get("variant_status") or "active") == "active"
                         and (r.get("status") or "pending") not in ("denied", "killed", "failed")
                         and r.get("slot_index") in (None, slot)]
+            if (len(occupied) == 1 and occupied[0].get("status") == "published"
+                    and occupied[0].get("slot_index") == slot):
+                try:
+                    if stage.unrelated_published_story(
+                            store, occupied[0]["id"], feed["id"]):
+                        occupied = []
+                except Exception:
+                    # An unreadable exception is occupied, never permission to
+                    # spend on or stage a second Story in this slot.
+                    pass
             repair_target = None
             if len(occupied) == 1 and occupied[0].get("slot_index") == slot:
                 candidate = occupied[0]
@@ -280,6 +291,12 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                         and (r.get("variant_status") or "active") == "active"
                         and (r.get("status") or "pending") not in ("denied", "killed", "failed")
                         and r.get("slot_index") in (None, slot))]
+                    if (len(fresh_occupied) == 1
+                            and fresh_occupied[0].get("status") == "published"
+                            and fresh_occupied[0].get("slot_index") == slot
+                            and stage.unrelated_published_story(
+                                store, fresh_occupied[0]["id"], feed["id"])):
+                        fresh_occupied = []
                     if (fresh != feed or (repair_target is None and fresh_occupied)
                             or (repair_target is not None and
                                 (len(fresh_occupied) != 1 or

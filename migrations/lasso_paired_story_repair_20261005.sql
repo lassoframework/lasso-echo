@@ -137,6 +137,8 @@ begin
        and coalesce(c.variant_status, 'active') = 'active'
        and coalesce(c.status, 'pending') not in ('denied','killed','failed')
        and (c.slot_index = f.slot_index or c.slot_index is null)
+       and (c.status <> 'published' or c.slot_index is null
+            or not public.lasso_unrelated_published_story(c.id, f.id))
   ) <> 1 then return false; end if;
   select * into s from public.content_calendar c
    where c.gym_id = 'lasso' and c.post_date = f.post_date
@@ -144,7 +146,9 @@ begin
      and lower(btrim(coalesce(c.format, 'feed'))) = 'story'
      and coalesce(c.variant_status, 'active') = 'active'
      and coalesce(c.status, 'pending') not in ('denied','killed','failed')
-     and c.slot_index = f.slot_index;
+     and c.slot_index = f.slot_index
+     and (c.status <> 'published'
+          or not public.lasso_unrelated_published_story(c.id, f.id));
   if not found or s.status not in ('pending','approved','published')
      or s.media_not_ready_reason is distinct from null
         and s.media_not_ready_reason <> 'paired_feed_not_ready'
@@ -339,6 +343,7 @@ begin
       and coalesce(c.variant_status, 'active') = 'active'
       and c.status = 'published' and c.published_at is not null
       and c.late_post_id is not null
+      and not public.lasso_unrelated_published_story(c.id, f.id)
   ) then
     return jsonb_build_object('result','conflict','reason','historical_story_already_published');
   end if;
@@ -412,6 +417,7 @@ begin
       and coalesce(c.variant_status, 'active') = 'active'
       and c.status = 'published' and c.published_at is not null
       and c.late_post_id is not null
+      and not public.lasso_unrelated_published_story(c.id, f.id)
   ) then
     return jsonb_build_object('result','conflict','reason','historical_story_already_published');
   end if;
@@ -472,6 +478,7 @@ begin
       and coalesce(c.variant_status, 'active') = 'active'
       and c.status = 'published' and c.published_at is not null
       and c.late_post_id is not null
+      and not public.lasso_unrelated_published_story(c.id, f.id)
   ) then
     raise exception 'LASSO Story already published in paired slot'
       using errcode = '23514';
@@ -489,7 +496,7 @@ create trigger lasso_story_publish_source_guard
 -- installed as well as the stage RPC.
 create or replace function public.lasso_paired_story_system_ready()
 returns boolean language sql security definer set search_path = public stable
-as $$ select true $$;
+as $$ select to_regprocedure('public.lasso_unrelated_published_story(uuid,uuid)') is not null $$;
 
 revoke all on function public.lasso_story_review_matches(uuid,text)
   from public, anon, authenticated;

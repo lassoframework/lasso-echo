@@ -249,6 +249,8 @@ begin
        and coalesce(c.variant_status, 'active') = 'active'
        and coalesce(c.status, 'pending') not in ('denied', 'killed', 'failed')
        and (c.slot_index = p_slot or c.slot_index is null)
+       and (c.status <> 'published' or c.slot_index is null
+            or not public.lasso_unrelated_published_story(c.id, p_feed_id))
   ) then
     return jsonb_build_object('result', 'conflict', 'reason', 'occupied_story_slot');
   end if;

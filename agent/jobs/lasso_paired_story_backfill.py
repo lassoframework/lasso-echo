@@ -48,6 +48,17 @@ def allowed_feed_hold(feed, day):
                             and feed.get("status") == "pending")
 
 
+def unrelated_published_story(store, story_id, feed_id):
+    """Only the DB's exact reviewed incident exception can clear occupancy."""
+    response = store._client().post(
+        store._rest("rpc/lasso_unrelated_published_story"),
+        headers=store._headers({"Content-Type": "application/json"}),
+        json={"p_story_id": str(story_id), "p_feed_id": str(feed_id)}, timeout=30)
+    if response.status_code != 200 or type(response.json()) is not bool:
+        raise RuntimeError("historical Story source preflight unavailable")
+    return response.json() is True
+
+
 def measured_story_evidence(evidence, digest):
     """Require dimensions measured from the exact reviewed image bytes."""
     measured = evidence.get("verified_dimensions") if isinstance(evidence, dict) else None
@@ -238,6 +249,11 @@ def plan_one(store, item):
         and (row.get("variant_status") or "active") == "active"
         and (row.get("status") or "pending") not in {"denied", "killed", "failed"}
         and row.get("slot_index") in (None, slot)]
+    if len(occupied) == 1 and occupied[0].get("status") == "published" \
+            and occupied[0].get("slot_index") == slot \
+            and occupied[0].get("id") != story_id \
+            and unrelated_published_story(store, occupied[0]["id"], feed_id):
+        occupied = []
     if occupied and not (len(occupied) == 1
             and occupied[0].get("id") == story_id
             and occupied[0].get("image_url") == story_url

@@ -66,6 +66,20 @@ def test_null_feed_schedule_uses_publishers_canonical_pair(monkeypatch):
     assert action["story_scheduled_at"] == "2026-10-07T07:45:00-04:00"
 
 
+def test_unrelated_historical_story_requires_exact_db_exception(monkeypatch):
+    historical = {"id": "af677ffb-7834-455e-852c-b865a5155ac4",
+                  "account": "instagram", "format": "story", "post_date": DAY,
+                  "slot_index": 0, "variant_status": "active", "status": "published",
+                  "published_at": "2026-10-07T12:00:00Z", "late_post_id": "old"}
+    store, item, _, _ = fixture(monkeypatch, existing=[historical])
+    monkeypatch.setattr(job, "unrelated_published_story", lambda *a: False)
+    with pytest.raises(ValueError, match="active Story already occupies"):
+        job.plan_one(store, item)
+    monkeypatch.setattr(job, "unrelated_published_story", lambda _, story_id, feed_id:
+                        story_id == historical["id"] and feed_id == FEED_ID)
+    assert job.plan_one(store, item)["state"] == "ready"
+
+
 def test_facebook_cannot_use_ig_artifact_or_caption(monkeypatch):
     store, item, feed, artifact = fixture(monkeypatch, account="facebook")
     artifact["source_identity"]["source_account"] = "instagram"
