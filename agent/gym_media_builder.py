@@ -111,7 +111,8 @@ class _PickedCreative:
 
 def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None,
                           drive=None, now=None, library_dir=None, exclude_ids=(),
-                          slot_index=0, rendition_budget=None, kind_prefs=None):
+                          slot_index=0, rendition_budget=None,
+                          photo_rendition_budget=None, kind_prefs=None):
     """A PENDING Draft for `day_key` sourced from the gym's Drive media pool, or
     None (the planner then falls through to the existing uploaded-media logic).
     Only ever called when GYM_DRIVE_STAGE is ON AND the gym-drive lane is armed for
@@ -182,6 +183,11 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             return None
     if rendition_budget is None:
         rendition_budget = _idx.RenditionBudget(1)
+    # HEIC proof conversions are short image decodes, unlike bounded ffmpeg video
+    # transcodes.  They get an independent budget so an exhausted video cap cannot
+    # make an otherwise eligible Drive photo disappear from this month's plan.
+    if photo_rendition_budget is None:
+        photo_rendition_budget = _idx.RenditionBudget(1)
 
     def _pick(kind_pref, excl):
         # BUDGET SPENT (audit R-D1 #3): only a video that already carries a rendition
@@ -258,7 +264,7 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             rendition_evidence = None
             needs = _idx.needs_rendition(asset, info)
             proof_state = {}
-            if needs:
+            if needs and writer_prep_enabled():
                 # Establish the original object before conversion so the fresh
                 # conversion proof can bind both exact hosted endpoints.
                 original_source_url = media_host.host_media(str(tmp_path), gym_base)
@@ -279,7 +285,8 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             try:
                 rend_url, converted = _idx.ensure_rendition(
                     asset, tmp_path, store=store, probe_info=info,
-                    budget=rendition_budget,
+                    budget=(photo_rendition_budget if asset.get("kind") == _idx.KIND_PHOTO
+                            and needs and writer_prep_enabled() else rendition_budget),
                     # A cached URL proves no conversion edge for this draft. Under
                     # the guarded writer, spend this build's one conversion budget
                     # to observe one fresh, byte-bound edge instead.
@@ -305,11 +312,11 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                 # one exact URL for the original bytes.  This is deliberately done
                 # only on the rendition branch: original-served drafts already use
                 # their delivery URL as the same-object source.
-                if not original_source_url or original_source_url == rend_url:
-                    print(f"[gym-media-builder] no hosted original source for "
-                          f"rendition {title!r}; trying the next asset")
-                    continue
                 if writer_prep_enabled():
+                    if not original_source_url or original_source_url == rend_url:
+                        print(f"[gym-media-builder] no hosted original source for "
+                              f"rendition {title!r}; trying the next asset")
+                        continue
                     # Cached renditions have no observed conversion edge in this
                     # invocation.  Never fabricate one from matching filenames,
                     # hashes, or a cache key; an armed writer holds them until a
@@ -323,6 +330,11 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                         print(f"[gym-media-builder] original/rendition readback "
                               f"failed for {title!r}; trying the next asset")
                         continue
+                elif not original_source_url:
+                    # Preserve legacy best effort when the guarded writer is off:
+                    # source hosting improves provenance when available but never
+                    # makes an already valid rendition unstageable.
+                    original_source_url = media_host.host_media(str(tmp_path), gym_base) or ""
                 if asset.get("kind") == _idx.KIND_PHOTO:
                     # For a HEIC photo, vision must analyze the JPEG rendition, not
                     # the undecodable original. Re-download the rendition locally.
@@ -463,7 +475,7 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
         )
         # Keep an exact hosted original as provenance.  A rendition URL is a
         # transformed delivery asset, never raw-source evidence.
-        draft.source_media_url = original_source_url or public_url
+        draft.source_media_url = (original_source_url if public_override else public_url)
         # ORIGINAL-SOURCE LINEAGE (2026-10-05): the Drive md5Checksum recorded at
         # indexing (media_asset.content_hash) is the durable byte identity of the
         # ORIGINAL bytes. It is stamped on BOTH original-served and rendition-backed

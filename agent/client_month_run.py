@@ -950,7 +950,7 @@ def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, 
 def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                             covered_days, drive=None, store=None,
                             library_path="", slots_per_day=1, banned_words=(),
-                            rendition_budget=None, covered_slots=None,
+                            rendition_budget=None, photo_rendition_budget=None, covered_slots=None,
                             video_beats_only=False, kind_prefs=None,
                             day_captions_seed=None, failed_assets=None,
                             max_feed_count=None):
@@ -1044,6 +1044,7 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                 draft = gym_media_builder.build_gym_media_draft(
                     account, day_key, pillar, voice, source, store=store, drive=drive,
                     slot_index=slot_i, rendition_budget=rendition_budget,
+                    photo_rendition_budget=photo_rendition_budget,
                     kind_prefs=kind_prefs, exclude_ids=tuple(sorted(failed)))
             except Exception as e:  # noqa: BLE001 - the lane never sinks the month
                 log(f"[gym-drive] builder failed for {base_key} {day_key}: "
@@ -1405,6 +1406,11 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                          and config.gym_drive_connect_active_for(base_key)) else 0)
     max_feed_days = min(days * slots_per_day,
                         max(0, media_count - _used_in_lib) + _drive_budget)
+    # One bounded HEIC proof conversion per potential photo feed.  This is kept
+    # independent from the expensive video transcode cap, so cached HEIC evidence
+    # refreshes cannot starve the photo lane and trigger an inappropriate fallback.
+    from . import gym_media_index as _photo_gmi
+    photo_rendition_budget = _photo_gmi.RenditionBudget(max_feed_days)
 
     # `drafts` is the caller's list (build_client_month's try/finally reads it back to
     # roll unlanded Drive picks out of the pool); never rebound here.
@@ -1496,7 +1502,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 account, base_key, start, days, voice, log=log,
                 covered_days=locked_feed_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
-                rendition_budget=rendition_budget, covered_slots=covered_slots,
+                rendition_budget=rendition_budget, photo_rendition_budget=photo_rendition_budget,
+                covered_slots=covered_slots,
                 kind_prefs=(_PHOTO_KIND,), max_feed_count=max_feed_days)
             drive_photo_feeds = _record_drive_prepass(photo_pre, "Drive photo")
         except InvalidLogicalPostIdentity:
@@ -1727,7 +1734,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 # genuinely open PM slot after a local or Drive-photo AM post.
                 covered_days=locked_feed_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
-                rendition_budget=rendition_budget, covered_slots=covered_slots,
+                rendition_budget=rendition_budget, photo_rendition_budget=photo_rendition_budget,
+                covered_slots=covered_slots,
                 video_beats_only=True, kind_prefs=(_VIDEO_KIND,),
                 day_captions_seed=pre_captions,
                 max_feed_count=max(0, max_feed_days - drive_photo_feeds - built_feeds))
@@ -1773,7 +1781,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 # a day with one Lane-A feed here used to skip its open second slot.
                 covered_days=locked_feed_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
-                rendition_budget=rendition_budget, covered_slots=covered_slots,
+                rendition_budget=rendition_budget, photo_rendition_budget=photo_rendition_budget,
+                covered_slots=covered_slots,
                 day_captions_seed=pre_captions,
                 max_feed_count=max(0, max_feed_days - sum(
                     1 for d in drafts if not getattr(d, "is_story", False))))

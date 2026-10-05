@@ -39,13 +39,13 @@ def _wire(monkeypatch):
                         lambda path, gym: "https://cdn.fake/served.jpg")
 
 
-def _build(monkeypatch, tmp_path, asset, blobs=None):
+def _build(monkeypatch, tmp_path, asset, blobs=None, **kwargs):
     _wire(monkeypatch)
     store = FakeMediaStore(assets=[asset])
     drive = FakeDrive(blobs={asset["id"]: blobs or b"jpgbytes"})
     return builder.build_gym_media_draft(
         _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
-        store=store, drive=drive, library_dir=str(tmp_path)), store
+        store=store, drive=drive, library_dir=str(tmp_path), **kwargs), store
 
 
 # ---- builder stamping ------------------------------------------------------
@@ -119,6 +119,35 @@ def test_cached_rendition_under_writer_prep_holds_without_conversion_receipt(mon
                        mime="image/heic", content_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
     draft, _ = _build(monkeypatch, tmp_path, asset, blobs=b"heic")
     assert draft is None
+
+
+def test_writer_prep_heic_uses_independent_photo_budget(monkeypatch, tmp_path):
+    """An exhausted video budget cannot suppress an eligible HEIC photo."""
+    import hashlib
+    from agent import gym_media_index as idx
+    source, delivered = b"heic-original", b"jpeg-output"
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setattr("agent.gym_media_index.heic_to_jpeg",
+                        lambda src, dest: open(dest, "wb").write(delivered) or dest)
+    monkeypatch.setattr("agent.visual_writer_prepare._exact_bytes",
+                        lambda url, _reader, _role: source if url.endswith("served.jpg") else delivered)
+
+    def fresh_rendition(asset, src, **kwargs):
+        assert kwargs["budget"].limit == 1 and kwargs["budget"].used == 0
+        output = tmp_path / "budget-proof.jpg"
+        output.write_bytes(delivered)
+        assert kwargs["proof_fn"](src, output, "https://cdn.fake/rend.jpg") is True
+        return "https://cdn.fake/rend.jpg", True
+
+    monkeypatch.setattr("agent.gym_media_index.ensure_rendition", fresh_rendition)
+    asset = make_asset("h4", gym_id="pierce", kind="photo", title="IMG.HEIC",
+                       mime="image/heic", content_hash=hashlib.md5(source).hexdigest())
+    draft, store = _build(monkeypatch, tmp_path, asset, blobs=source,
+                          rendition_budget=idx.RenditionBudget(0),
+                          photo_rendition_budget=idx.RenditionBudget(1))
+    assert draft is not None
+    assert store.get_asset("h4")["eligible"] is True
+    assert store.get_asset("h4")["reject_reason"] is None
 
 
 def test_missing_content_hash_asset_never_stages(monkeypatch, tmp_path):
