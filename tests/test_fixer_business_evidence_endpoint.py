@@ -25,6 +25,7 @@ NOW = datetime(2026, 9, 19, 12, 0, tzinfo=timezone.utc)
 @pytest.fixture(autouse=True)
 def armed(monkeypatch):
     monkeypatch.setenv(FO.SECRET_ENV, SECRET)
+    monkeypatch.setenv(FO.RECEIPT_STORE_AUTHORITY_ENV, "true")
 
 
 def headers(secret=SECRET):
@@ -159,6 +160,20 @@ def test_completed_swap_route_requires_keyed_receipt_and_current_drive_proof():
                             bad_reader, receipt_store={key: receipt})
         assert status == 400 and body["error"] == "bad_request"
         assert bad_reader.calls == []
+
+
+def test_non_authoritative_host_refuses_only_receipt_backed_business_evidence(monkeypatch):
+    monkeypatch.delenv(FO.RECEIPT_STORE_AUTHORITY_ENV, raising=False)
+    reader = Reader()
+    request = payload(check_id="media_swap_completed",
+                      params={"reservation_key": "swap-aimee-001", "row_id": "calendar_row_99"})
+    status, body = post(request, reader, receipt_store={})
+    assert (status, body) == (503, {"error": "receipt_store_not_authoritative"})
+    assert reader.calls == []
+
+    # Ordinary business evidence stays available because it has no receipt read.
+    status, body = post(payload(), reader)
+    assert status == 200 and body["check_id"] == "calendar_row_status"
 
 
 @pytest.mark.parametrize("params", [{"min_count": 0}, {"min_count": True},
@@ -407,6 +422,14 @@ def test_ops_media_swap_observer_has_its_own_exact_contract_and_auth_gate():
 
     status, body = post_ops_swap(ops_swap_payload(row_id="short"), reader)
     assert (status, body["error"]) == (400, "bad_request")
+    assert reader.calls == []
+
+
+def test_non_authoritative_host_refuses_receipt_bound_ops_swap_evidence(monkeypatch):
+    monkeypatch.delenv(FO.RECEIPT_STORE_AUTHORITY_ENV, raising=False)
+    reader = OpsSwapReader()
+    status, body = post_ops_swap(ops_swap_payload(), reader)
+    assert (status, body) == (503, {"error": "receipt_store_not_authoritative"})
     assert reader.calls == []
 
 

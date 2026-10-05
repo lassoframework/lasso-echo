@@ -167,6 +167,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 SECRET_ENV = "FIXER_OPS_SECRET"
+# Only the Railway `echo` worker has the durable /data SQLite volume. Both the
+# worker's connect server and `echo-intake-web` mount this router, so receipt
+# operations need an explicit deployment identity instead of inferring authority
+# from a request field or the presence of a local SQLite path.
+RECEIPT_STORE_AUTHORITY_ENV = "FIXER_OPS_RECEIPT_STORE_AUTHORITY"
 HEADER = "X-Fixer-Ops-Secret"
 ACTOR = "fixer"
 ROUTE_PREFIX = "/ops/actions"
@@ -349,6 +354,11 @@ def _run_business_evidence(raw_body, deps, now=None):
             or not isinstance(merged_sha, str) or not _BUSINESS_RELEASE_SHA.fullmatch(merged_sha)
             or not isinstance(check_id, str) or not _business_params_valid(check_id, params)):
         return 400, {"error": "bad_request", "detail": "invalid business evidence identity or check"}
+    # This one business check reads the keyed swap receipt. Keep other business
+    # evidence checks available on their existing read-only surfaces, but never
+    # let intake-web substitute a receipt from its separate store.
+    if check_id == "media_swap_completed" and not receipt_store_authoritative():
+        return _receipt_store_not_authoritative()
 
     read = _business_reader(deps)
     try:
@@ -427,6 +437,10 @@ def _run_ops_media_swap_evidence(raw_body, deps, now=None):
             or re.fullmatch(r"[A-Za-z0-9_-]{8,128}", reservation_key) is None
             or not isinstance(row_id, str) or not _BUSINESS_ROW_ID.fullmatch(row_id)):
         return 400, {"error": "bad_request", "detail": "invalid ops media swap evidence identity"}
+    # This endpoint is receipt-bound by definition. It cannot prove a swap from
+    # intake-web's distinct local store.
+    if not receipt_store_authoritative():
+        return _receipt_store_not_authoritative()
 
     # Match the code-release observer's ticket/client and current-request gates.
     read = _business_reader(deps)
@@ -636,6 +650,24 @@ def volume_available():
         return bool(_db.kv_is_durable())
     except Exception:  # noqa: BLE001
         return False
+
+
+def receipt_store_authoritative():
+    """Whether this process is the explicitly configured receipt authority.
+
+    The safe default is false: an intake-web service with its own ephemeral or
+    separate volume must never reserve, replay, or disclose a receipt from a
+    divergent store. Railway must set this to the exact value ``true`` only on
+    the `echo` worker service.
+    """
+    return os.environ.get(RECEIPT_STORE_AUTHORITY_ENV) == "true"
+
+
+def _receipt_store_not_authoritative(action=None):
+    body = {"error": "receipt_store_not_authoritative"}
+    if action:
+        body["action"] = action
+    return 503, body
 
 
 # -- resend_connect_link -----------------------------------------------------------------
@@ -2102,6 +2134,11 @@ def run_action(action, gym_key, ticket_id, args, *, reservation_key=None,
         args = {}
     if not isinstance(args, dict):
         return 400, {"error": "bad_request", "detail": "args must be an object"}
+    # A reservation is the at-most-once boundary. Refuse before tenant reads,
+    # begin(), or any action-specific preflight if this process was not explicitly
+    # configured as the worker's one durable receipt authority.
+    if reservation_key is not None and not receipt_store_authoritative():
+        return _receipt_store_not_authoritative(action)
     tenant_refusal = _ticket_tenant(
         gym_key, ticket_id, deps, action=action, args=args,
         reservation_key=reservation_key)
@@ -2253,6 +2290,10 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
     if path == ROUTE_PREFIX + "/staff-adoption/business-proof":
         if method != "POST":
             return 405, {"error": "method_not_allowed"}
+        # The staff proof consumes a keyed swap receipt through receipt_read.
+        # Do not give the intake host a chance to supply a divergent reader.
+        if not receipt_store_authoritative():
+            return _receipt_store_not_authoritative()
         from . import fixer_staff_adoption_proof
         receipt_read = deps.get("staff_adoption_receipt_read")
         if receipt_read is None:
@@ -2363,6 +2404,10 @@ def handle(method, path, headers_get, raw_body=b"", *, deps=None, log=print, now
     if m:
         if method != "GET":
             return 405, {"error": "method_not_allowed"}
+        # Never let intake-web read a same-key receipt from its separate local
+        # store. The caller must use the worker's connect server instead.
+        if not receipt_store_authoritative():
+            return _receipt_store_not_authoritative()
         from .fixer_ops_receipts import ReceiptError, default_store, get_receipt
         query = parse_qs(parsed.query)
         gym_key = (query.get("gym_key") or [""])[0].strip()
