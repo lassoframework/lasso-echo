@@ -352,6 +352,18 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def source_media_content_hash_schema_ready(self):
+        """Return True only when PostgREST proves the lineage column is selectable."""
+        r = self._client().get(
+            self._rest(_TABLE), params={"select": "source_media_content_hash", "limit": "0"},
+            headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            return False
+        try:
+            return isinstance(r.json(), list)
+        except Exception:
+            return False
+
     def list_media_publish_history(self, account_key, since):
         """Complete cross-platform send history for a strict reuse decision.
 

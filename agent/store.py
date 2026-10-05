@@ -34,6 +34,8 @@ def _to_dict(d: Draft):
         # This is raw-source provenance, not a fallback for the delivered URL.
         # Keep an absent legacy value empty rather than inventing one.
         "source_media_url": d.source_media_url,
+        # Original Drive byte identity; never inferred from the delivered URL.
+        "source_media_content_hash": getattr(d, "source_media_content_hash", "") or "",
         # A video poster and its immutable render proof must survive the store
         # round trip before real_calendar_mirror builds the prepared-writer side
         # channel.  The proof remains draft JSON only; it is never a calendar
@@ -130,6 +132,7 @@ def _from_dict(r):
         day_key=r.get("day_key", ""),
         draft_type=r.get("draft_type", ""),
         logical_post_id=r.get("logical_post_id", "") or "",
+        source_media_content_hash=r.get("source_media_content_hash", "") or "",
         slack_channel=r.get("slack_channel", ""),
         slack_ts=r.get("slack_ts", ""),
         needs_media=bool(r.get("needs_media", False)),

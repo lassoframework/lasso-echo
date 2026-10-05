@@ -410,6 +410,16 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
         # A rendition URL is a transformed delivery asset, not the raw source.
         if not public_override:
             draft.source_media_url = public_url
+        # ORIGINAL-SOURCE LINEAGE (2026-10-05): the Drive md5Checksum recorded at
+        # indexing (media_asset.content_hash) is the durable byte identity of the
+        # ORIGINAL bytes. It is stamped on BOTH original-served and rendition-backed
+        # drafts so lineage survives even when the delivered URL is transformed.
+        # It comes ONLY from the indexed asset itself — never inferred from
+        # creative_public_url / rendition_url, which are delivery addresses, not
+        # source evidence (handoff: echo-drive-source-lineage-20261005).
+        src_content_hash = str(asset.get("content_hash") or "").strip()
+        if src_content_hash:
+            draft.source_media_content_hash = src_content_hash
         if poster_url:
             draft.thumbnail_url = poster_url          # -> content_calendar.thumbnail_url
         if poster_evidence:

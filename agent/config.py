@@ -4794,3 +4794,7 @@ def visual_scene_candidate_flag():
     if raw in ("", "0", "false", "no", "off"):
         return False
     return None
+
+def source_media_content_hash_enabled() -> bool:
+    """Emit original Drive byte hashes to content_calendar only after migration."""
+    return _truthy(os.environ.get("ECHO_SOURCE_MEDIA_CONTENT_HASH_ENABLED", "false"))
