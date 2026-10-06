@@ -50,7 +50,8 @@ def _distinct_poster_url(row, poster_render_evidence):
 
 
 def _prepare_poster_edge(store, tenant, group, image_url, image_bytes, image_hash,
-                         poster_url, poster_render_evidence, reader, receipt_writer):
+                         poster_url, poster_render_evidence, reader, receipt_writer,
+                         scene_armed=False):
     """Attest the poster as a second owner render edge image -> thumbnail.
 
     The selected image is this edge's source and the poster its delivered
@@ -100,6 +101,9 @@ def _prepare_poster_edge(store, tenant, group, image_url, image_bytes, image_has
         result.get("usage_claimed") is not False
     ):
         raise VisualPreparationError("poster registration returned conflicting identity")
+    return {"role": "poster", "exact_url": poster_url,
+            "fingerprint": poster_hash, "byte_length": len(poster),
+            "scene_fingerprint": _scene_fingerprint(poster) if scene_armed else None}
 
 
 def _rpc(store, name, arguments):
@@ -246,6 +250,84 @@ def _md5(data):
     return "md5:" + hashlib.md5(data).hexdigest()
 
 
+def _scene_fingerprint(data):
+    """Additive, advisory pHash scene evidence ('scene:phash64:<16 hex>') for
+    bytes whose exact md5 identity is already verified, or None.
+
+    ADVISORY METADATA ONLY (Astra rejection, see
+    docs/VISUAL_SCENE_GUARD_DRAFT.md): prep-time scene records were rejected as
+    an architecture — prep must not act as an enforcement writer. This helper
+    therefore never gates and never raises: undecodable bytes simply record
+    null evidence alongside the md5 identity, which stays the only authority."""
+    try:
+        from . import visual_scene
+        return visual_scene.scene_fingerprint(data)
+    except Exception:  # noqa: BLE001 - no scene evidence is not byte evidence
+        return None
+
+
+def _scene_evidence_armed():
+    """Read both OFF-default scene switches before doing any pHash work."""
+    try:
+        from . import config
+        return (config.visual_scene_candidate_flag() is not False or
+                config.visual_scene_guard_flag() is not False)
+    except Exception:  # noqa: BLE001 - config read failure means no new metadata
+        return False
+
+
+def _candidate_emission_armed():
+    """OFF-default tri-state read of AGENT_VISUAL_SCENE_CANDIDATE.
+
+    Unset/off -> False (no candidate payload, byte-for-byte prior behavior).
+    Explicitly on OR ambiguous -> True: an ambiguous flag value counts as
+    armed fail-closed, never a silent default. Emission is advisory staging
+    evidence only — it never gates, never raises and never counts as use, and
+    any failure to read the flag itself fails closed to no emission."""
+    try:
+        from . import config
+        return config.visual_scene_candidate_flag() is not False
+    except Exception:  # noqa: BLE001 - config read failure fails closed
+        return False
+
+
+def _scene_candidate(tenant, group, objects):
+    """Owner-attested CANDIDATE pHash evidence for the visual_scene_candidate
+    staging contract (docs/VISUAL_SCENE_GUARD_DRAFT.md redesign item (a)).
+
+    ``objects`` is an iterable of ``(role, exact_url, md5_fingerprint,
+    byte_length, scene_fingerprint_or_None)`` tuples — every one computed from
+    the EXACT verified object bytes this same call already attests (the same
+    bytes, same call that establishes md5 byte authority). Returns None when
+    emission is off.
+
+    The payload is CANDIDATE/STAGING evidence only: usage_claimed is False and
+    counts_as_use is False, so it never consumes a scene and never excludes
+    another candidate. It never gates and never raises. An object whose bytes
+    did not decode carries phash=None and stageable=False: the phash-NOT-NULL
+    staging table can never take it, and null pHash evidence is never treated
+    as DISTINCT (unknown fails closed)."""
+    if not _candidate_emission_armed():
+        return None
+    entries = []
+    for role, url, md5_fp, length, scene_fp in objects:
+        bare = None
+        if isinstance(scene_fp, str) and scene_fp.startswith("scene:phash64:"):
+            digest = scene_fp.rsplit(":", 1)[-1]
+            bare = digest if len(digest) == 16 else None
+        entries.append({"role": role, "phash": bare,
+                        "scene_fingerprint": scene_fp, "exact_url": url,
+                        "fingerprint": md5_fp, "byte_length": length,
+                        "stageable": bare is not None})
+    return {"kind": "visual_scene_candidate", "stage": "candidate",
+            "tenant_id": tenant, "group_key": group,
+            "usage_claimed": False, "counts_as_use": False,
+            "excludes_candidates": False,
+            "observed_by": "visual_writer_prepare",
+            "evidence_ref": "visual_writer_prepare:candidate_scene_evidence",
+            "objects": entries}
+
+
 def _known_group(store, tenant, row, source_url, *, required=True):
     response = store._client().get(
         store._rest("visual_group_alias"),
@@ -267,7 +349,8 @@ def _known_group(store, tenant, row, source_url, *, required=True):
     return group
 
 
-def _register_raw_source(store, tenant, prepared, source_url, source, asset):
+def _register_raw_source(store, tenant, prepared, source_url, source, asset,
+                         scene_fp=None, scene_armed=False):
     """Bind the observed raw object before any rendition receipt consumes it."""
     if not _own_media_url(source_url):
         raise VisualPreparationError("raw source URL is outside the configured media host")
@@ -284,12 +367,15 @@ def _register_raw_source(store, tenant, prepared, source_url, source, asset):
         if not asset or str(drive_id) != str(asset_id):
             raise VisualPreparationError("Drive ID has no matching tenant asset")
         aliases.append(("drive_id", str(drive_id)))
+    evidence = {"source": "raw_object_bytes", "verified_bytes": source_hash,
+                "delivered_url": source_url}
+    if scene_armed:
+        evidence["scene_fingerprint"] = scene_fp
     result = _rpc(store, "visual_global_prepare_bundle", {
         "p_tenant": tenant,
         "p_aliases": [{"alias_kind": kind, "alias_value": value} for kind, value in aliases],
         "p_fingerprint": source_hash,
-        "p_evidence": {"source": "raw_object_bytes", "verified_bytes": source_hash,
-                       "delivered_url": source_url},
+        "p_evidence": evidence,
         "p_actor": "visual_writer_prepare",
         "p_asset_id": str(asset_id) if asset else None,
     })
@@ -342,8 +428,12 @@ def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url
     if not callable(receipt_writer):
         raise VisualPreparationError("owner receipt producer is unavailable for source/rendition")
     group = _known_group(store, tenant, prepared, source_url, required=False)
+    scene_armed = _scene_evidence_armed()
+    source_scene = _scene_fingerprint(source) if scene_armed else None
+    delivered_scene = _scene_fingerprint(delivered) if scene_armed else None
     if group is None:
-        registered = _register_raw_source(store, tenant, prepared, source_url, source, asset)
+        registered = _register_raw_source(store, tenant, prepared, source_url, source, asset,
+                                          scene_fp=source_scene, scene_armed=scene_armed)
         group = _known_group(store, tenant, prepared, source_url)
         if group != registered:
             raise VisualPreparationError("raw source registration returned conflicting group")
@@ -377,11 +467,20 @@ def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url
     ):
         raise VisualPreparationError("source/rendition registration returned conflicting identity")
     poster_url = _distinct_poster_url(prepared, poster_render_evidence)
+    poster = None
     if poster_url is not None:
         # Second owner-attested render edge: selected image -> poster object.
-        _prepare_poster_edge(store, tenant, group, delivered_url, delivered,
-                             delivered_hash, poster_url, poster_render_evidence,
-                             reader, receipt_writer)
+        poster = _prepare_poster_edge(store, tenant, group, delivered_url, delivered,
+                                      delivered_hash, poster_url, poster_render_evidence,
+                                      reader, receipt_writer, scene_armed=scene_armed)
+    objects = [("source", source_url, source_hash, len(source), source_scene),
+               ("delivered", delivered_url, delivered_hash, len(delivered), delivered_scene)]
+    if poster is not None:
+        objects.append((poster["role"], poster["exact_url"], poster["fingerprint"],
+                        poster["byte_length"], poster["scene_fingerprint"]))
+    candidate = _scene_candidate(tenant, group, objects)
+    if candidate is not None:
+        prepared["scene_candidate"] = candidate
     prepared["visual_group_key"] = group
     prepared["byte_hash"] = "derived:" + delivered_hash
     return prepared
@@ -441,9 +540,12 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
     if supplied_hash and supplied_hash != "derived:" + digest:
         raise VisualPreparationError("row byte_hash does not match exact bytes")
 
+    scene_armed = _scene_evidence_armed()
+    scene_fp = _scene_fingerprint(data) if scene_armed else None
     group = _known_group(store, tenant, prepared, url, required=False)
     if group is None:
-        registered = _register_raw_source(store, tenant, prepared, url, data, asset)
+        registered = _register_raw_source(store, tenant, prepared, url, data, asset,
+                                          scene_fp=scene_fp, scene_armed=scene_armed)
         group = _known_group(store, tenant, prepared, url)
         if group != registered:
             raise VisualPreparationError("raw source registration returned conflicting group")
@@ -453,6 +555,8 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
     evidence = {"exact_url": url, "fingerprint": digest, "byte_length": len(data),
                 "evidence_ref": "visual_writer_prepare:same_object_exact_read",
                 "observed_by": "visual_writer_prepare"}
+    if scene_armed:
+        evidence["scene_fingerprint"] = scene_fp
     try:
         receipts = receipt_writer(tenant=tenant, group_key=group, exact_bytes=data,
                                   evidence=evidence, asset_id=str(asset_id) if asset else None)
@@ -477,12 +581,21 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
     )):
         raise VisualPreparationError("same-object registration returned conflicting identity")
     poster_url = _distinct_poster_url(prepared, poster_render_evidence)
+    poster = None
     if poster_url is not None:
         # The same-object writer is one-read form; the poster edge reuses the
         # configured source/rendition owner writer for image -> thumbnail.
-        _prepare_poster_edge(store, tenant, group, url, data, digest,
-                             poster_url, poster_render_evidence,
-                             read_bytes or _bytes_for_url, None)
+        poster = _prepare_poster_edge(store, tenant, group, url, data, digest,
+                                      poster_url, poster_render_evidence,
+                                      read_bytes or _bytes_for_url, None,
+                                      scene_armed=scene_armed)
+    objects = [("same_object", url, digest, len(data), scene_fp)]
+    if poster is not None:
+        objects.append((poster["role"], poster["exact_url"], poster["fingerprint"],
+                        poster["byte_length"], poster["scene_fingerprint"]))
+    candidate = _scene_candidate(tenant, group, objects)
+    if candidate is not None:
+        prepared["scene_candidate"] = candidate
     prepared["visual_group_key"] = group
     prepared["byte_hash"] = "derived:" + digest
     return prepared
@@ -515,9 +628,12 @@ def prepare_same_object(store, account_key, row_or_url, *, flag_on=None,
         store, account_key, {"image_url": url}, read_bytes=read_bytes,
         receipt_writer=receipt_writer,
         isolated_test_callbacks=isolated_test_callbacks)
-    return {"visual_group_key": prepared["visual_group_key"],
-            "byte_hash": prepared["byte_hash"], "usage_claimed": False,
-            "url": url}
+    result = {"visual_group_key": prepared["visual_group_key"],
+              "byte_hash": prepared["byte_hash"], "usage_claimed": False,
+              "url": url}
+    if prepared.get("scene_candidate") is not None:
+        result["scene_candidate"] = prepared["scene_candidate"]
+    return result
 
 
 def prepare(store, account_key, row, *, read_bytes=None, render_evidence=None,
