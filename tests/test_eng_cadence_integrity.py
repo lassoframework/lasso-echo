@@ -27,6 +27,23 @@ def _companion_rows(day, slot, caption, logical_post_id=None):
     ]
 
 
+def test_legacy_companion_identity_isolates_singleton_lanes():
+    meta = _companion_rows("2026-10-19", None, "Valid Meta copy")
+    gbp = {"post_date": "2026-10-19", "account": "googlebusiness",
+           "format": "photo"}
+    other = {"post_date": "2026-10-19", "account": "other_platform",
+             "format": "feed"}
+
+    meta_key = pcs._companion_group_key(meta[0])
+    assert all(pcs._companion_group_key(row) == meta_key for row in meta)
+    assert len({meta_key, pcs._companion_group_key(gbp),
+                pcs._companion_group_key(other)}) == 3
+
+    logical_id = "2eef7b05-c6fa-49bd-a9ec-0ca6a651892e"
+    assert pcs._companion_group_key({**meta[0], "logical_post_id": logical_id}) == (
+        "logical_post_id", logical_id)
+
+
 def test_stage_belt_never_leaves_orphan_stories_on_eng_short_days(monkeypatch):
     """Oct 19/28/29 lost slot-1 feeds but retained their paired IG Stories."""
     monkeypatch.setattr(pcs.config, "empty_caption_guard_enabled", lambda: True)
@@ -128,6 +145,23 @@ def test_companion_admission_drops_group_when_instagram_feed_is_blocked(monkeypa
     assert pcs._stage_belts("eng", payload) == []
 
 
+def test_stage_belt_keeps_slotless_gbp_when_legacy_meta_feed_is_blocked(monkeypatch):
+    monkeypatch.setattr(pcs.config, "logical_post_id_enabled", lambda: False)
+    monkeypatch.setattr(pcs.config, "empty_caption_guard_enabled", lambda: True)
+    monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: False)
+
+    meta = _companion_rows("2026-10-19", None, "Valid Meta copy")
+    meta[0]["caption"] = ""  # The Instagram anchor fails; FB and Story do not.
+    gbp = {
+        "gym_id": "eng", "post_date": "2026-10-19", "account": "googlebusiness",
+        "format": "photo", "caption": "", "image_url": "https://cdn.example/gbp.jpg",
+        "status": "pending",  # A 1x GBP photo has no slot_index or logical_post_id.
+    }
+    payload = [*meta, gbp]
+
+    assert pcs._stage_belts("eng", payload) == [gbp]
+
+
 def test_companion_admission_drops_feed_and_mirror_when_required_story_is_missing():
     payload = _companion_rows(
         "2026-10-19", 1, "valid caption",
@@ -135,6 +169,26 @@ def test_companion_admission_drops_feed_and_mirror_when_required_story_is_missin
     filtered = [row for row in payload if row["format"] != "story"]
 
     assert pcs._drop_companions_missing_instagram_feed(payload, filtered) == []
+
+
+def test_companion_admission_keeps_slotless_gbp_when_legacy_meta_is_incomplete(
+        monkeypatch):
+    monkeypatch.setattr(pcs.config, "logical_post_id_enabled", lambda: False)
+    meta = _companion_rows("2026-10-19", None, "Valid Meta copy")
+    gbp = {
+        "gym_id": "eng", "post_date": "2026-10-19", "account": "googlebusiness",
+        "format": "photo", "caption": "", "image_url": "https://cdn.example/gbp.jpg",
+        "status": "pending",  # Same date and missing slot/index as the Meta group.
+    }
+    planned = [*meta, gbp]
+
+    missing_feed = [*meta[1:], gbp]
+    assert pcs._drop_companions_missing_instagram_feed(
+        planned, missing_feed) == [gbp]
+
+    missing_story = [*meta[:2], gbp]
+    assert pcs._drop_companions_missing_instagram_feed(
+        planned, missing_story) == [gbp]
 
 
 def test_companion_admission_accepts_story_recovered_in_place():

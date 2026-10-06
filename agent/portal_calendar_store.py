@@ -4739,13 +4739,19 @@ def _live_slots_for(store, account_key, dates):
 
 
 def _companion_group_key(row):
-    """Stable sibling identity, with date/slot fallback for legacy producers."""
+    """Stable sibling identity, with platform-aware fallback for legacy rows."""
     r = row or {}
     logical_post_id = str(r.get("logical_post_id") or "").strip()
     if logical_post_id:
         return ("logical_post_id", logical_post_id)
-    return ("legacy_slot", str(r.get("post_date") or "")[:10],
-            r.get("slot_index"))
+    account = str(r.get("account") or "").strip().lower()
+    fmt = str(r.get("format") or "").strip().lower()
+    day = str(r.get("post_date") or "")[:10]
+    slot = r.get("slot_index")
+    if ((account in ("instagram", "ig", "") and fmt in ("feed", "story"))
+            or (account in ("facebook", "fb") and fmt == "feed")):
+        return ("legacy_meta_companions", day, slot)
+    return ("legacy_singleton", account, fmt, day, slot)
 
 
 def _drop_companions_missing_instagram_feed(planned, filtered, *, satisfied=()):
