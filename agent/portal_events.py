@@ -219,9 +219,15 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     # compare-and-set against the exact status we read. A concurrent cancel/end/status
     # transition therefore wins and cannot be overwritten by this stale merged row.
     # retime_arc above is pure; calendar staging remains strictly after this fence.
+    import uuid
+    # This UUID is the durable edit revision and the owner of every deterministic
+    # calendar row staged by this operation. Content alone is not a revision: two
+    # identical edits can interleave around the insert and otherwise both appear
+    # current (an ABA race). Lifecycle status ticks leave this revision untouched.
+    edit_revision = str(uuid.uuid4())
     audit = list(cur.get("audit") or [])
     audit.append({"action": "edit", "actor": str((body or {}).get("actor_id") or ""),
-                  "at": _now_iso()})
+                  "at": _now_iso(), "revision": edit_revision})
     try:
         saved = _estore.update_event_if_status(
             account_key, event_id, current_status, cur,
@@ -237,11 +243,9 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     stage_reason = ""
     inserted_rows = []
     if _store is not None and restage:
-        import uuid
-        staging_operation_id = str(uuid.uuid4())
         res = ec.stage_arc(_store, new_event, restage,
                            profile=_profile_for(account_key),
-                           operation_id=staging_operation_id)
+                           operation_id=edit_revision)
         staged = res.get("staged", 0)
         held_media = res.get("held_media", 0)
         stage_reason = res.get("reason", "")
@@ -453,7 +457,20 @@ def _same_event_edit_revision(expected, current):
             right = tuple(str(value) for value in (right or []))
         if left != right:
             return False
-    return True
+    return (_latest_edit_revision(expected) is not None
+            and _latest_edit_revision(expected) == _latest_edit_revision(current))
+
+
+def _latest_edit_revision(row):
+    """The newest durable edit token, ignoring lifecycle-only status changes."""
+    audit = row.get("audit") if isinstance(row, dict) else None
+    if not isinstance(audit, list):
+        return None
+    for entry in reversed(audit):
+        if isinstance(entry, dict) and entry.get("action") == "edit":
+            revision = entry.get("revision")
+            return str(revision) if revision else None
+    return None
 
 
 def _preview(row):

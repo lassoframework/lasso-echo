@@ -488,6 +488,56 @@ def test_later_same_status_edit_owns_rows_earlier_edit_cannot_compensate(monkeyp
     assert ev.rows[event_id]["offer_text"] == "Winner owns this revision"
 
 
+def test_identical_concurrent_edit_revision_compensates_losing_rows(monkeypatch):
+    """Identical content is not proof that an earlier staging operation still owns it."""
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    initial_ids = {row["id"] for row in cal.inserted}
+    interleaving = {}
+    identical_body = {
+        "starts_on": "2026-10-20", "ends_on": "2026-10-27",
+        "actor_id": "same-editor",
+    }
+
+    def _second_identical_edit_after_first_insert():
+        first_ids = {row["id"] for row in cal.inserted} - initial_ids
+        interleaving["first_ids"] = first_ids
+        status, response = pe.handle_edit_event(
+            "pete", event_id, identical_body,
+            store=cal, event_store=ev, today=date(2026, 9, 1))
+        interleaving["status"] = status
+        interleaving["response"] = response
+        interleaving["second_ids"] = (
+            {row["id"] for row in cal.inserted} - initial_ids - first_ids)
+
+    cal.after_insert = _second_identical_edit_after_first_insert
+    first_status, first_response = pe.handle_edit_event(
+        "pete", event_id, identical_body,
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert interleaving["status"] == 200
+    assert first_status == 409
+    assert first_response["compensated"] in (0, len(interleaving["first_ids"]))
+    assert interleaving["first_ids"]
+    assert interleaving["second_ids"]
+    rows = {row["id"]: row for row in cal.inserted}
+    assert all(rows[row_id]["status"] == "denied"
+               for row_id in interleaving["first_ids"])
+    assert all(rows[row_id]["status"] == "pending"
+               for row_id in interleaving["second_ids"])
+    active = [row for row in cal.inserted
+              if row.get("event_id") == event_id
+              and row.get("status") in ("pending", "draft", "queued")]
+    assert len(active) == interleaving["response"]["restaged"]
+    revisions = [entry.get("revision") for entry in ev.rows[event_id]["audit"]
+                 if entry.get("action") == "edit"]
+    assert len(revisions) == 2 and len(set(revisions)) == 2
+
+
 def test_edit_calendar_event_read_failure_fails_before_event_write(monkeypatch):
     monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
     cal, ev = _CalStore(), _EvStore()
