@@ -1002,19 +1002,7 @@ def _finish_pending_route_notice(bus, row, proof, identity, log, summary):
             return False
         ticket = bus.ticket(row["ticket_id"])
         if ticket:
-            resolved = bus.resolve_current_notice(
-                ticket, row["id"], token, att.get("delivery_expected_status"))
-            if isinstance(resolved, dict) and resolved.get("status") == "resolved":
-                summary["resolved"] = int(summary.get("resolved") or 0) + 1
-                _receipt(bus, ticket, posted, identity,
-                         (posted.get("attachments") or {}).get("kind"),
-                         posted.get("attachments") or {},
-                         where=f"Slack {intent.get('channel')}", summary=summary)
-                bus.finalize_fixer_delivery(row["id"],
-                                            "resolved_after_verified_slack")
-            elif ticket.get("request_version") != row.get("delivery_request_version"):
-                bus.finalize_fixer_delivery(row["id"],
-                                            "newer_request_preserved")
+            _finalize_fixer_post(bus, ticket, posted, identity, log, summary)
         return True
     except Exception as exc:  # noqa: BLE001 - exact readback can retry next sweep
         log(f"[slack-convo/outbox] pending route reconciliation failed "
@@ -1529,6 +1517,20 @@ def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
             f"row={row.get('id')}")
         return
     kind = att.get("kind")
+    # A successful client post is irreversible, but ticket closure is not yet
+    # earned. Persist and verify the exact ticket/source-message receipt first;
+    # an outage leaves this posted row pending for a sweep, never a resend.
+    try:
+        if kind not in RECEIPT_KINDS:
+            return
+        _receipt(bus, ticket, row, identity, kind, att,
+                 where=f"Slack {att['delivery_readback_channel']}", summary=summary)
+        if not bus.fixer_receipt_exists(row["id"], ticket["id"], _a.KIND_ESCALATION):
+            return
+    except Exception as exc:  # noqa: BLE001 - retry finalization without reposting
+        log(f"[slack-convo/outbox] FIXER receipt pending row={row['id']}: "
+            f"{type(exc).__name__}")
+        return
     direct_notice = (att.get("outreach") is True
                      and att.get("fixer_current_attempt_token")
                      and ticket.get("product") == "echo"
@@ -1546,9 +1548,6 @@ def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
                         and resolved.get("status") == "resolved"
                         and ticket.get("status") != "resolved"):
                     summary["resolved"] += 1
-            if kind in RECEIPT_KINDS:
-                _receipt(bus, ticket, row, identity, kind, att,
-                         where=f"Slack {intent.get('channel')}", summary=summary)
             current = bus.ticket(ticket["id"])
             if current and current.get("status") == "resolved":
                 bus.finalize_fixer_delivery(row["id"],
@@ -1568,17 +1567,8 @@ def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
             f"{type(exc).__name__}")
         return
     try:
-        if kind in RECEIPT_KINDS:
-            # Always cross the deterministic INSERT boundary.  A broad legacy
-            # receipt_for match must never suppress creation of the exact,
-            # ticket-bound receipt, and a duplicate INSERT validates the winner.
-            _receipt(bus, ticket, row, identity, kind, att,
-                     where=f"Slack {att['delivery_readback_channel']}", summary=summary)
-        receipt_done = (kind not in RECEIPT_KINDS
-                        or bus.fixer_receipt_exists(
-                            row["id"], ticket["id"], _a.KIND_ESCALATION))
         current = bus.ticket(ticket["id"])
-        if not receipt_done or not current:
+        if not current:
             return
         if current.get("status") == "resolved":
             reason = "resolved_after_verified_slack"

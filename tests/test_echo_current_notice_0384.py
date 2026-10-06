@@ -26,6 +26,21 @@ class NoticeBus:
         }
         self.row = None
         self.events = []
+        self.receipts = {}
+        self.receipt_available = True
+
+    def record_fixer_receipt_once(self, **kw):
+        if not self.receipt_available:
+            raise TimeoutError("receipt unavailable")
+        source = kw["source_message_id"]
+        if source not in self.receipts:
+            self.receipts[source] = deepcopy(kw)
+            self.events.append("receipt")
+        return deepcopy(self.receipts[source])
+
+    def fixer_receipt_exists(self, mid, tid, kind):
+        row = self.receipts.get(mid) or {}
+        return row.get("ticket_id") == tid and row.get("kind") == kind
 
     def ticket(self, _tid):
         return deepcopy(self.current)
@@ -163,6 +178,28 @@ def test_single_post_binds_after_exact_readback_then_resolves():
     assert bus.events.index("bind") < bus.events.index("posted")
     assert worker._resolve_delivered(bus, snapshot, result, log=lambda _msg: None)
     assert bus.current["status"] == "resolved"
+    assert bus.events.index("receipt") < bus.events.index("resolve")
+    assert len(bus.receipts) == 1
+
+
+def test_receipt_failure_leaves_exact_notice_pending_then_retries_without_send():
+    bus = NoticeBus()
+    snapshot, result, posts = _send(bus)
+    bus.receipt_available = False
+    assert not worker._resolve_delivered(bus, snapshot, result, log=lambda _msg: None)
+    assert bus.current["status"] == "verification"
+    assert bus.row["delivery_status"] == "posted"
+    assert "resolve" not in bus.events and "finalize" not in bus.events
+    bus.receipt_available = True
+    # A lost resolver response may retry the receipt step. Its source-message
+    # uniqueness boundary must retain one receipt for the one Slack post.
+    bus.record_fixer_receipt_once(
+        source_message_id=result.notice_id, ticket_id=TICKET_ID,
+        kind="escalation", body="durable", meta={})
+    assert worker._resolve_delivered(bus, snapshot, result, log=lambda _msg: None)
+    assert len(posts) == len(bus.receipts) == 1
+    assert bus.events.count("receipt") == 1
+    assert bus.events.index("receipt") < bus.events.index("resolve")
 
 
 def test_uncertain_first_post_is_held_and_never_bound():
@@ -268,6 +305,34 @@ def test_held_exact_readback_binds_without_reposting():
     assert len(posts) == 1
     assert bus.current["status"] == "resolved"
     assert bus.events[-2:] == ["resolve", "finalize"]
+    assert bus.events.index("receipt") < bus.events.index("resolve")
+    assert len(bus.receipts) == 1
+
+
+def test_held_route_receipt_outage_keeps_posted_notice_for_finalization():
+    bus = NoticeBus()
+    _snapshot, _result, posts = _send(bus)
+    bus.row["delivery_status"] = "held"
+    bus.row["attachments"]["fixer_route_pending"] = True
+    bus.row["attachments"]["fixer_route_uncertain"] = True
+    bus.current["slack_channel_id"] = None
+    bus.current["slack_thread_ts"] = None
+    bus.receipt_available = False
+    proof = {"delivery_readback_verified": True, "delivery_readback_ts": bus.ts}
+    summary = {"resolved": 0}
+    assert outbox._finish_pending_route_notice(
+        bus, deepcopy(bus.row), proof, SimpleNamespace(name="echo"),
+        lambda _msg: None, summary)
+    assert bus.row["delivery_status"] == "posted"
+    assert bus.current["status"] == "verification"
+    assert "resolve" not in bus.events and "finalize" not in bus.events
+    bus.receipt_available = True
+    outbox._finalize_fixer_post(
+        bus, bus.ticket(TICKET_ID), deepcopy(bus.row), SimpleNamespace(name="echo"),
+        lambda _msg: None, summary)
+    assert bus.current["status"] == "resolved"
+    assert len(posts) == len(bus.receipts) == 1
+    assert bus.events.index("receipt") < bus.events.index("resolve")
 
 
 def test_known_route_reserves_id_and_token_before_insert(monkeypatch):
