@@ -2616,9 +2616,11 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         from .portal_calendar_store import preserve_and_prune
         clean_rows, _locked = preserve_and_prune(store, base_key, months, clean_rows)
         planned_feed_slots = _instagram_feed_slots(clean_rows)
+        from . import cadence as _cadence
+        _slot_capacity = _cadence.resolve_posts_per_day(base_key, store)
         preflight = getattr(store, "preflight_cadence_rows", None)
         cadence_prevalidated = False
-        if (config.cadence_2x_enabled() and callable(preflight)
+        if (_slot_capacity == 2 and callable(preflight)
                 and planned_feed_slots):
             replace_dates = {
                 (start + timedelta(days=i)).isoformat()
@@ -2719,8 +2721,6 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         # (see day_shape.py's SLOT CAPACITY section) -- ported here so every
         # delete-then-insert rebuild lane carries the same belt, not just
         # real_month_planner's.
-        from . import cadence as _cadence
-        _slot_capacity = _cadence.resolve_posts_per_day(base_key, store)
         try:
             day_shape.assert_slot_capacity(
                 clean_rows, enabled=config.day_shape_assert_enabled(),

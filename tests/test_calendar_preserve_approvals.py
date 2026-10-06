@@ -447,7 +447,7 @@ def test_client_apply_data_state_keeps_hold_replaces_ready_and_reports_real_dele
     held = _persisted(account=account, format=fmt, time_slot='evening')
     ready = _persisted(id='ready', post_date='2026-08-14', media_not_ready_reason=None)
     store, http = _state_store(monkeypatch, [held, ready])
-    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 1)
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 2)
     proposals = [dict(held, media_not_ready_reason=None, caption='New held-slot proposal'),
                  dict(ready, caption='New ready-slot caption')]
     result = _apply('eng', proposals, date(2026, 8, 13), 19, store, lambda m: None)
@@ -474,7 +474,7 @@ def test_client_apply_downstream_feed_filter_fails_before_delete(monkeypatch):
 
     ready = _persisted(id='ready', media_not_ready_reason=None)
     store, http = _state_store(monkeypatch, [ready])
-    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 1)
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 2)
     monkeypatch.setattr(pcs, '_media_stage_belt', lambda *a, **kw: [])
 
     result = _apply('eng', [dict(ready, caption='New ready-slot caption')],
