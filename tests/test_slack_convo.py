@@ -908,6 +908,25 @@ def test_fixer_request_preamble_escapes_account_key_and_user():
     assert "&lt;!channel&gt;" in row and "&amp;fake" in row
 
 
+def test_fixer_request_product_override_is_separate_from_bot_identity():
+    scout = IDS.get("scout")
+    portal = A.fixer_request_text(scout, "portal-ticket-1", "posts broken",
+                                  _who(IG.CLIENT), "U_CLIENT", product="portal")
+    assert "ticket portal-ticket-1 for product portal" in portal
+    assert "for product scout" not in portal
+
+    # Existing calls still use the identity's own product; malformed ticket data
+    # also falls back safely instead of becoming trusted card metadata.
+    default = A.fixer_request_text(scout, "T1", "posts broken",
+                                   _who(IG.CLIENT), "U_CLIENT")
+    malformed = A.fixer_request_text(scout, "T2", "posts broken",
+                                     _who(IG.CLIENT), "U_CLIENT",
+                                     product="portal <!channel>")
+    assert "ticket T1 for product scout" in default
+    assert "ticket T2 for product scout" in malformed
+    assert "<!channel>" not in malformed
+
+
 # ======================================================================================
 # the outbox gates
 # ======================================================================================

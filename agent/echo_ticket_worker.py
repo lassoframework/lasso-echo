@@ -603,7 +603,7 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
         # the durable intake signal; an early acknowledgement would violate that
         # customer-contact gate before the FIXER has changed anything.
         text = _a.fixer_request_text(ident, tid, ticket.get("raw_text") or "", who,
-                                    who.slack_user_id)
+                                    who.slack_user_id, product=ticket.get("product"))
         row = bus.record_outbound(ticket_id=tid, author_type="system", body=text,
                                   delivery_status="held", kind=_a.KIND_FIXER_REQUEST,
                                   meta={"identity": identity_name,
