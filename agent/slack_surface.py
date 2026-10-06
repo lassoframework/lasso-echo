@@ -20,10 +20,12 @@ from .meta_publisher import _is_video
 
 def _requests():
     """Stdlib urllib adapter — same interface as requests, zero extra deps.
-    SlackPoster._send calls client.post(url, headers=..., data=..., timeout=...)
+    SlackPoster._send calls client.post(...) for writes and client.get(...)
+    for readback.
     and reads resp.status_code / resp.json() / resp.headers."""
     import json as _json
     import urllib.error as _ue
+    import urllib.parse as _up
     import urllib.request as _ur
 
     class _Resp:
@@ -48,6 +50,16 @@ def _requests():
                 # body and status rather than propagating an exception.
                 return _Resp(e.code, e.read(), dict(e.headers))
 
+        def get(self, url, headers=None, params=None, timeout=30):
+            query = _up.urlencode(params or {})
+            req = _ur.Request(f"{url}?{query}" if query else url,
+                              headers=headers or {}, method="GET")
+            try:
+                with _ur.urlopen(req, timeout=timeout) as r:
+                    return _Resp(r.status, r.read(), dict(r.headers))
+            except _ue.HTTPError as e:
+                return _Resp(e.code, e.read(), dict(e.headers))
+
     return _Client()
 
 
@@ -67,7 +79,7 @@ class SlackPoster:
         self._channel = channel or config.SLACK_CHANNEL_ID
         self._sleep = sleep or time.sleep
 
-    def _send(self, url, payload):
+    def _send(self, url, payload, *, method="post"):
         """THE one Slack transport: every send (post, thread reply, card edit)
         goes through here. Retries rate limits with backoff; degrades transport
         errors to a failed-send dict; never raises into a caller."""
@@ -75,13 +87,14 @@ class SlackPoster:
         delay = SLACK_BACKOFF_BASE_SEC
         for attempt in range(SLACK_MAX_RETRIES + 1):
             try:
-                resp = client.post(
-                    url,
-                    headers={"Authorization": f"Bearer {self._token}",
-                             "Content-Type": "application/json; charset=utf-8"},
-                    data=json.dumps(payload),
-                    timeout=30,
-                )
+                headers = {"Authorization": f"Bearer {self._token}"}
+                if method == "get":
+                    resp = client.get(url, headers=headers, params=payload, timeout=30)
+                else:
+                    resp = client.post(
+                        url, headers={**headers,
+                                      "Content-Type": "application/json; charset=utf-8"},
+                        data=json.dumps(payload), timeout=30)
             except Exception as e:
                 # A Slack outage/timeout must degrade to a failed send, never
                 # raise into the daily run or a card sweep.
@@ -112,6 +125,40 @@ class SlackPoster:
                 return {"ok": False, "error": "ratelimited"}
             return body if body is not None else {"ok": False}
         return {"ok": False, "error": "ratelimited"}
+
+    def read_conversation_messages(self, channel, *, thread_ts=None, ts=None,
+                                   oldest=None, max_pages=2):
+        """Return a complete bounded Slack read for one destination.
+
+        The caller must match text, sender, thread and timestamp itself. A partial
+        page set or API failure is never delivery evidence. Slack documents these
+        conversation reads as authenticated GET methods.
+        """
+        if not channel or (not ts and not oldest):
+            return {"ok": False, "error": "missing_readback_boundary"}
+        method = "conversations.replies" if thread_ts else "conversations.history"
+        payload = {"channel": channel, "limit": 100,
+                   "inclusive": True, "oldest": str(ts or oldest)}
+        if thread_ts:
+            payload["ts"] = thread_ts
+        if ts:
+            payload["latest"] = str(ts)
+        messages = []
+        cursor = ""
+        for _ in range(max_pages):
+            if cursor:
+                payload["cursor"] = cursor
+            result = self._send(f"https://slack.com/api/{method}", payload,
+                                method="get")
+            if not (result or {}).get("ok"):
+                return {"ok": False, "error": (result or {}).get("error") or "read_failed"}
+            messages.extend(result.get("messages") or [])
+            cursor = ((result.get("response_metadata") or {}).get("next_cursor") or "")
+            if not cursor and not result.get("has_more"):
+                return {"ok": True, "channel": channel, "messages": messages}
+            if not cursor:
+                return {"ok": False, "error": "pagination_without_cursor"}
+        return {"ok": False, "error": "readback_page_limit"}
 
     def post_approval_card(self, draft):
         """Post one approval card. Returns the Slack API response dict.
