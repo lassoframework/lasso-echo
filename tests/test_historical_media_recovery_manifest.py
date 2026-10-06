@@ -152,7 +152,7 @@ def test_missing_or_ambiguous_date_and_post_id_are_explicit(tmp_path):
     assert "missing_post_id" not in missing["unresolved_reasons"]
 
 
-def test_delivered_verification_requires_matching_media_host_content_address(tmp_path):
+def test_content_address_match_does_not_verify_that_bytes_were_fetched(tmp_path):
     media_dir = tmp_path / "bytes"
     media_dir.mkdir()
     correct = b"correct delivered bytes"
@@ -173,11 +173,15 @@ def test_delivered_verification_requires_matching_media_host_content_address(tmp
 
     _, verified, wrong_bytes, legacy = manifest.build_manifest(snapshot, media_dir)
     assert verified["local_bytes_read"] is True
-    assert verified["delivered_bytes_verified"] is True
-    assert "delivered_object_identity_unverified" not in verified["unresolved_reasons"]
+    assert verified["delivered_content_address_matches"] is True
+    assert verified["delivered_bytes_verified"] is False
+    assert "delivered_object_identity_unverified" in verified["unresolved_reasons"]
     assert wrong_bytes["local_bytes_read"] is True
+    assert wrong_bytes["delivered_content_address_matches"] is False
     assert wrong_bytes["delivered_bytes_verified"] is False
     assert "delivered_object_identity_unverified" in wrong_bytes["unresolved_reasons"]
     assert legacy["local_bytes_read"] is True
+    assert legacy["delivered_content_address_matches"] is False
     assert legacy["delivered_bytes_verified"] is False
     assert "delivered_object_identity_unverified" in legacy["unresolved_reasons"]
+    assert manifest.build_manifest(snapshot, media_dir)[0]["delivered_content_address_match_count"] == 1

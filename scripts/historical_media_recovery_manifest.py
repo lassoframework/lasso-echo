@@ -1,9 +1,11 @@
 """Build a deterministic, offline JSONL manifest for historical media review.
 
-This tool reads only supplied JSON snapshots and operator-saved delivered
-bytes. Delivered-byte hash matches are candidate evidence only; they never
-establish source lineage or original use. The tool makes no network, database,
-or production-state requests.
+This tool reads only supplied JSON snapshots and operator-saved local bytes.
+Content-address checks compare those bytes with a SHA-1 key embedded in a
+frozen URL; they do not prove that the object was fetched from that URL.
+Without an explicit fetch receipt, delivered-object identity remains
+unverified. No candidate or local hash establishes source lineage or original
+use. The tool makes no network, database, or production-state requests.
 """
 from __future__ import annotations
 
@@ -114,8 +116,8 @@ def _sha1_prefix(path):
     return digest.hexdigest()[:16]
 
 
-def _delivered_address_matches(reference, gym, path):
-    """Verify local bytes against a strict media-host content-addressed URL."""
+def _delivered_content_address_matches(reference, gym, path):
+    """Compare local bytes with a strict HTTPS media-host content address."""
     if not isinstance(reference, dict) or not isinstance(reference.get("value"), str) or not gym:
         return False
     value = reference["value"]
@@ -125,7 +127,7 @@ def _delivered_address_matches(reference, gym, path):
         parsed = urlsplit(value)
     except ValueError:
         return False
-    if (parsed.scheme not in ("http", "https") or not parsed.netloc or
+    if (parsed.scheme != "https" or not parsed.netloc or
             parsed.username or parsed.password or parsed.query or parsed.fragment):
         return False
     try:
@@ -206,7 +208,7 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
     refs = Counter(_row_ref(row) for row in rows if isinstance(row, dict) and _row_ref(row))
     output = []
     reason_counts = Counter()
-    malformed_rows = duplicate_rows = delivered_read_count = delivered_verified_count = 0
+    malformed_rows = duplicate_rows = delivered_read_count = content_address_match_count = 0
 
     for number, row in enumerate(rows, 1):
         if not isinstance(row, dict):
@@ -218,7 +220,8 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
                 "date": None, "provider": None, "delivered_reference": None,
                 "late_post_id": None, "provider_post_id": None,
                 "source_references": [], "delivered_bytes": {"status": "unavailable"},
-                "local_bytes_read": False, "delivered_bytes_verified": False,
+                "local_bytes_read": False, "delivered_content_address_matches": False,
+                "delivered_bytes_verified": False,
                 "source_lineage_verified": False,
                 "candidate_matches": {"basis": "delivered_md5_vs_asset_content_hash",
                                       "cardinality": 0, "asset_ids": []},
@@ -266,13 +269,15 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
                     byte_result = {"status": "unavailable", "reason": "local_bytes_unreadable"}
         if byte_result["status"] != "read":
             unresolved.append(byte_result["reason"])
-        delivered_verified = bool(
-            digest and _delivered_address_matches(delivered_ref, gym, path)
+        content_address_matches = bool(
+            digest and _delivered_content_address_matches(delivered_ref, gym, path)
         )
-        if delivered_verified:
-            delivered_verified_count += 1
-        else:
-            unresolved.append("delivered_object_identity_unverified")
+        if content_address_matches:
+            content_address_match_count += 1
+        # The supported input is a frozen URL plus local bytes, not an
+        # authenticated observation that those bytes came from that URL.
+        delivered_verified = False
+        unresolved.append("delivered_object_identity_unverified")
 
         candidates = []
         if gym and digest:
@@ -329,6 +334,7 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
             "delivered_reference": delivered_ref, "source_references": source_refs,
             "delivered_bytes": byte_result,
             "local_bytes_read": byte_result["status"] == "read",
+            "delivered_content_address_matches": content_address_matches,
             "delivered_bytes_verified": delivered_verified,
             "source_lineage_verified": False,
             "candidate_matches": {"basis": "delivered_md5_vs_asset_content_hash",
@@ -348,7 +354,7 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
         "duplicate_row_ref_count": duplicate_rows, "input_asset_count": len(assets),
         "malformed_asset_count": malformed_assets, "duplicate_asset_id_count": duplicate_assets,
         "delivered_bytes_read_count": delivered_read_count,
-        "delivered_bytes_verified_count": delivered_verified_count,
+        "delivered_content_address_match_count": content_address_match_count,
         "unresolved_row_count": sum(bool(r["unresolved_reasons"]) for r in output),
         "unresolved_reason_counts": dict(sorted(reason_counts.items())),
     }
