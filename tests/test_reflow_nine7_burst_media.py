@@ -131,6 +131,7 @@ def test_missing_coupled_sibling_refuses(monkeypatch, tmp_path):
 def test_scope_ticket_and_short_window_refused(monkeypatch, tmp_path):
     _, args = fixture(monkeypatch, tmp_path)
     for changed in ({"gym": "foreign"}, {"ticket": "wrong"},
+                    {"request_key": "different-operator-request-key"},
                     {"first": "2026-10-22"}, {"last": "2026-10-25"},
                     {"first": "2026-09-01"}):
         with pytest.raises(ValueError):

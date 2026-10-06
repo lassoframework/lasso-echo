@@ -24,6 +24,7 @@ from scripts.hold_future_media_repeats import _receipt
 
 GYM = "crossfitnine7f7dadc"
 TICKET = "b355c2cf-3b1d-4eec-8b23-282062f662f9"
+REQUEST_KEY = "1fba4eac7339d4c882b8392b7ca3f955d991b27b96cbd5af51bd596a7c8b8cae"
 TARGET_FIRST, TARGET_LAST = "2026-10-21", "2026-10-26"
 TARGET_ROOTS = {
     "2026-10-21": "9fd93969-e650-4c33-8c7f-7c6bca367173",
@@ -94,8 +95,8 @@ def _penalty(days, assignments, cohorts, *, first=None, last=None):
 
 
 def plan(store, *, gym, first, last, ticket, request_key, library_path, today=None):
-    if (gym != GYM or ticket != TICKET or not isinstance(request_key, str)
-            or len(request_key) < 20 or first > TARGET_FIRST or last < TARGET_LAST
+    if (gym != GYM or ticket != TICKET or request_key != REQUEST_KEY
+            or first > TARGET_FIRST or last < TARGET_LAST
             or (date.fromisoformat(last) - date.fromisoformat(first)).days > 30
             or first < (today or datetime.now(timezone.utc).date().isoformat())):
         raise ValueError("exact Nine7 ticket, future bounded window and request key required")

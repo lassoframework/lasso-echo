@@ -1552,7 +1552,7 @@ class SupabaseCalendarStore:
         if (not isinstance(current, dict) or any(key not in current for key in required)
                 or account_key != "crossfitnine7f7dadc"
                 or ticket != "b355c2cf-3b1d-4eec-8b23-282062f662f9"
-                or not isinstance(request_key, str) or len(request_key) < 20
+                or request_key != "1fba4eac7339d4c882b8392b7ca3f955d991b27b96cbd5af51bd596a7c8b8cae"
                 or not isinstance(first, str) or not isinstance(last, str)
                 or first > "2026-10-21" or last < "2026-10-26"
                 or (date.fromisoformat(last) - date.fromisoformat(first)).days > 30
