@@ -79,6 +79,16 @@ class _CalStore:
                 return r
         return None
 
+    def deny_event_wipeable_with_reason(self, gym_id, event_id, row_id, reason):
+        for r in self.inserted:
+            if (r.get("id") == row_id and r.get("gym_id") == gym_id
+                    and r.get("event_id") == event_id
+                    and r.get("status") in ("pending", "draft", "queued")):
+                r["status"] = "denied"
+                r["reject_reason"] = reason
+                return r
+        return None
+
     def list_rows_by_ids(self, gym_id, row_ids):
         wanted = set(row_ids)
         return [dict(row) for row in self.inserted
@@ -619,16 +629,14 @@ def test_date_edit_retires_old_pending_rows_but_preserves_protected(monkeypatch)
     assert response["removed"] == len(old_rows) - 1
 
 
-def test_date_edit_with_all_replacements_media_held_preserves_old_arc_and_rolls_back(
-        monkeypatch):
+def test_date_edit_accepts_all_replacements_intentionally_media_held(monkeypatch):
     monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
     cal, ev = _CalStore(), _EvStore()
     pe.handle_create_event(
         "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
         today=date(2026, 9, 1))
     event_id = next(iter(ev.rows))
-    event_before = dict(ev.rows[event_id])
-    rows_before = [dict(row) for row in cal.inserted]
+    old_ids = {row["id"] for row in cal.inserted}
     monkeypatch.setattr(
         "agent.event_calendar._attach_media",
         lambda gym_id, rows, log, picker=None, host=None: ([], list(rows)))
@@ -639,29 +647,25 @@ def test_date_edit_with_all_replacements_media_held_preserves_old_arc_and_rolls_
          "actor_id": "owner"},
         store=cal, event_store=ev, today=date(2026, 9, 1))
 
-    assert status == 502
-    assert response["error"] == "calendar staging failed"
-    assert response["reason"] == "replacement coverage incomplete"
-    assert response["rolled_back"] is True
-    assert ev.rows[event_id] == event_before
-    assert cal.inserted == rows_before
-    assert all(row["status"] == "pending" for row in cal.inserted)
+    assert status == 200
+    assert response["restaged"] == 0
+    assert response["held_media"] > 0
+    assert ev.rows[event_id]["starts_on"] == "2026-10-20"
+    assert {row["id"] for row in cal.inserted} == old_ids
+    assert all(row["status"] == "denied" for row in cal.inserted)
 
 
-def test_date_edit_with_approved_old_recap_and_new_recap_media_held_rolls_back(
+def test_date_edit_accepts_intentionally_held_new_recap_and_preserves_old_approval(
         monkeypatch):
-    """An approved recap on the old schedule cannot cover a missing new recap."""
     monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
     cal, ev = _CalStore(), _EvStore()
     pe.handle_create_event(
         "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
         today=date(2026, 9, 1))
     event_id = next(iter(ev.rows))
-    event_before = dict(ev.rows[event_id])
     old_ids = {row["id"] for row in cal.inserted}
     old_recap = cal.inserted[-1]
     old_recap["status"] = "approved"
-    old_rows_before = [dict(row) for row in cal.inserted]
 
     def _hold_new_recap(gym_id, rows, log, picker=None, host=None):
         return ([dict(row, image_url="https://cdn.test/e.jpg",
@@ -675,31 +679,29 @@ def test_date_edit_with_approved_old_recap_and_new_recap_media_held_rolls_back(
          "actor_id": "owner"},
         store=cal, event_store=ev, today=date(2026, 9, 1))
 
-    assert status == 502
-    assert response["reason"] == "replacement coverage incomplete"
-    assert response["rolled_back"] is True
-    assert ev.rows[event_id] == event_before
-    assert [row for row in cal.inserted if row["id"] in old_ids] == old_rows_before
+    assert status == 200
+    assert response["held_media"] == 1
+    assert ev.rows[event_id]["starts_on"] == "2026-10-20"
     assert old_recap["status"] == "approved"
-    attempted = [row for row in cal.inserted if row["id"] not in old_ids]
-    assert attempted and all(row["status"] == "denied" for row in attempted)
+    old_rows = [row for row in cal.inserted if row["id"] in old_ids]
+    assert all(row["status"] == "denied" for row in old_rows
+               if row["id"] != old_recap["id"])
+    replacements = [row for row in cal.inserted if row["id"] not in old_ids]
+    assert replacements and all(row["status"] == "pending" for row in replacements)
 
 
 @pytest.mark.parametrize("held_index", [0, 3])
-def test_date_edit_with_partial_gap_and_protected_old_row_rolls_back(
+def test_date_edit_accepts_intentionally_media_held_replacement(
         monkeypatch, held_index):
-    """A missing early or middle beat is not hidden by another protected old row."""
     monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
     cal, ev = _CalStore(), _EvStore()
     pe.handle_create_event(
         "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
         today=date(2026, 9, 1))
     event_id = next(iter(ev.rows))
-    event_before = dict(ev.rows[event_id])
     old_ids = {row["id"] for row in cal.inserted}
     protected = cal.inserted[-1]
     protected["status"] = "approved"
-    old_rows_before = [dict(row) for row in cal.inserted]
 
     def _hold_one(gym_id, rows, log, picker=None, host=None):
         held = rows[held_index]
@@ -715,14 +717,123 @@ def test_date_edit_with_partial_gap_and_protected_old_row_rolls_back(
          "actor_id": "owner"},
         store=cal, event_store=ev, today=date(2026, 9, 1))
 
+    assert status == 200
+    assert response["held_media"] == 1
+    assert ev.rows[event_id]["starts_on"] == "2026-10-20"
+    assert protected["status"] == "approved"
+    replacements = [row for row in cal.inserted if row["id"] not in old_ids]
+    assert replacements and len(replacements) == response["restaged"]
+    assert all(row["status"] == "pending" for row in replacements)
+
+
+def test_date_edit_accepts_legitimate_offer_ceiling_thinning(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    old_ids = {row["id"] for row in cal.inserted}
+    real_thin = ec.overlap_thin
+
+    def _thin_one(existing, rows):
+        thinned = real_thin(existing, rows)
+        return thinned[:-1]
+
+    monkeypatch.setattr(ec, "overlap_thin", _thin_one)
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    replacements = [row for row in cal.inserted if row["id"] not in old_ids]
+    assert status == 200
+    assert response["restaged"] == len(replacements)
+    assert replacements
+    assert ev.rows[event_id]["starts_on"] == "2026-10-20"
+
+
+def test_date_edit_accepts_legitimate_recap_hold(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "media_ids": [], "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 200
+    assert response["restaged"] > 0
+    assert ev.rows[event_id]["media_ids"] == []
+
+
+def test_date_edit_partial_durable_insert_rolls_back_atomically(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    event_before = dict(ev.rows[event_id])
+    old_ids = {row["id"] for row in cal.inserted}
+    real_insert = cal.insert_rows
+
+    def _commit_first_only(gym_id, rows, *, preserve_ids=False):
+        assert len(rows) > 1
+        return real_insert(gym_id, rows[:1], preserve_ids=preserve_ids)
+
+    cal.insert_rows = _commit_first_only
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    inserted = [row for row in cal.inserted if row["id"] not in old_ids]
     assert status == 502
     assert response["reason"] == "replacement coverage incomplete"
     assert response["rolled_back"] is True
     assert ev.rows[event_id] == event_before
-    assert [row for row in cal.inserted if row["id"] in old_ids] == old_rows_before
-    assert protected["status"] == "approved"
-    attempted = [row for row in cal.inserted if row["id"] not in old_ids]
-    assert attempted and all(row["status"] == "denied" for row in attempted)
+    assert len(inserted) == 1
+    assert inserted[0]["status"] == "denied"
+    assert all(row["status"] == "pending" for row in cal.inserted
+               if row["id"] in old_ids)
+
+
+def test_date_edit_count_only_insert_receipt_reconciles_exact_ids(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    event_before = dict(ev.rows[event_id])
+    old_ids = {row["id"] for row in cal.inserted}
+    real_insert = cal.insert_rows
+
+    def _commit_with_count_only(gym_id, rows, *, preserve_ids=False):
+        written = real_insert(gym_id, rows, preserve_ids=preserve_ids)
+        return len(written)
+
+    cal.insert_rows = _commit_with_count_only
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    inserted = [row for row in cal.inserted if row["id"] not in old_ids]
+    assert status == 502
+    assert response["reason"] == "replacement coverage incomplete"
+    assert response["rolled_back"] is True
+    assert ev.rows[event_id] == event_before
+    assert inserted and all(row["status"] == "denied" for row in inserted)
 
 
 def test_superseded_cleanup_preserves_concurrent_pending_media_hold(monkeypatch):

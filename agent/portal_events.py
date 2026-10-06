@@ -246,13 +246,15 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
         held_media = res.get("held_media", 0)
         stage_reason = res.get("reason", "")
         inserted_rows = res.get("_inserted_rows", [])
-        # Every requested replacement receives a deterministic operation UUID whose
-        # identity includes its event/date/account/format/arc-kind semantic key.  Prove
-        # exact durable coverage rather than comparing counts: a protected old row on
-        # the prior schedule must not make a missing new beat look complete, and an
-        # unrelated/extra receipt cannot conceal a held or filtered replacement.
+        # Prove exact durable coverage for the rows stage_arc actually attempted after
+        # its legitimate offer-ceiling, recap, occupancy, and media holds. Every such
+        # row carries a deterministic operation UUID. Intentionally held/thinned rows
+        # are not lost inserts, but a partial durable write still fails atomically.
+        expected_receipt = res.get("_expected_rows")
+        expected_rows = (expected_receipt
+                         if isinstance(expected_receipt, (list, tuple)) else [])
         required_replacement_ids = {
-            str(row.get("id")) for row in restage if row.get("id")
+            str(row.get("id")) for row in expected_rows if row.get("id")
         }
         durable_replacement_ids = {
             str(row.get("id")) for row in inserted_rows
@@ -260,11 +262,19 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
             and str(row.get("gym_id") or "") == str(account_key)
         }
         replacement_shortfall = (
-            len(required_replacement_ids) != len(restage)
+            not isinstance(expected_receipt, (list, tuple))
+            or len(required_replacement_ids) != len(expected_rows)
+            or any(str(row.get("gym_id") or "") != str(account_key)
+                   for row in expected_rows)
             or not required_replacement_ids.issubset(durable_replacement_ids)
         )
         if res.get("ok") is False or replacement_shortfall:
-            cleanup_rows = inserted_rows or res.get("_attempted_rows", [])
+            # On a partial or identity-less receipt, reconcile every deterministic
+            # operation-owned expected id. A count-only success can have committed
+            # rows even though it proves no identities; rolling back without checking
+            # those ids would leave active replacements tied to the old event revision.
+            cleanup_rows = (res.get("_attempted_rows") or expected_rows
+                            or inserted_rows)
             compensated = ec.compensate_staged_rows(
                 _store, account_key, cleanup_rows)
             reconciled = ec.confirm_staged_rows_inactive(

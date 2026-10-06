@@ -219,6 +219,16 @@ class _FakeStore:
             return r
         return None
 
+    def deny_event_wipeable_with_reason(self, gym_id, event_id, row_id, reason):
+        r = self.rows.get(row_id)
+        if (r and r.get("gym_id") == gym_id and r.get("event_id") == event_id
+                and r.get("status") in ("pending", "draft", "queued")):
+            r["status"] = "denied"
+            r["reject_reason"] = reason
+            self.denied.append((row_id, reason))
+            return r
+        return None
+
 
 def test_cancel_flips_pending_arc_rows_denied():
     ev = _event()
@@ -296,6 +306,23 @@ def test_ended_uses_event_ended_reason():
     assert res["reason"] == ec.REJECT_ENDED
 
 
+@pytest.mark.parametrize("ended", [False, True])
+@pytest.mark.parametrize("status", ["pending", "draft", "queued"])
+def test_terminal_sweep_denies_media_held_wipeable_rows(ended, status):
+    ev = _event()
+    row = {"id": "held-row", "gym_id": "pete", "event_id": ev.id,
+           "status": status, "media_not_ready_reason": "manual_visual_review"}
+    store = _FakeStore([row])
+
+    result = ec.cancel_event(store, "pete", ev.id, ended=ended)
+
+    assert result["ok"] is True
+    assert result["denied"] == 1
+    assert store.rows["held-row"]["status"] == "denied"
+    assert store.rows["held-row"]["reject_reason"] == (
+        ec.REJECT_ENDED if ended else ec.REJECT_CANCELLED)
+
+
 @pytest.mark.parametrize("claimed_status", ["approved", "publishing", "published"])
 def test_terminal_sweep_cannot_overwrite_concurrent_claim(claimed_status):
     class _ClaimRaceStore(_FakeStore):
@@ -321,7 +348,7 @@ def test_terminal_sweep_read_failure_never_reports_success():
         def list_event_rows(self, *_args):
             raise RuntimeError("calendar unavailable")
 
-        def deny_wipeable_with_reason(self, *_args):
+        def deny_event_wipeable_with_reason(self, *_args):
             raise AssertionError("no row identity was safely read")
 
     result = ec.cancel_event(_ReadFailureStore(), "pete", "event-1", ended=True)

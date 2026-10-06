@@ -506,6 +506,12 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
         return {"ok": False, "reason": "logical post id stamp failed", "staged": 0}
     inserted = 0
     inserted_rows = []
+    # This is the exact post-planner write set. Rows intentionally removed by the
+    # offer ceiling, recap hold, existing-slot guard, or media hold are not missing
+    # inserts. Edit callers compare durable receipts only against this set so those
+    # legitimate omissions can advance while a partial database insert still forces
+    # compensation and rollback.
+    expected_rows = [dict(_db_row(row), gym_id=gym_id) for row in to_stage]
     inserter = getattr(store, "insert_rows", None)
     if inserter is not None and to_stage:
         # Strip the transient planner-only keys the DB does not carry.
@@ -540,7 +546,8 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
             attempted_rows = [dict(row, gym_id=gym_id) for row in payload]
             return {"ok": False, "reason": f"insert failed {type(exc).__name__}",
                     "staged": 0, "ambiguous_insert": True,
-                    "_inserted_rows": [], "_attempted_rows": attempted_rows}
+                    "_inserted_rows": [], "_attempted_rows": attempted_rows,
+                    "_expected_rows": expected_rows}
     return {"ok": True, "staged": inserted, "held_recap": len(held_recap),
             "held_media": len(held_media),
             "thinned": len(arc_rows) - len(thinned),
@@ -550,7 +557,7 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
             # event transition racing after staging. Production insert_rows returns
             # exact persisted rows; a count alone is deliberately not treated as
             # enough identity to undo anything.
-            "_inserted_rows": inserted_rows}
+            "_inserted_rows": inserted_rows, "_expected_rows": expected_rows}
 
 
 def compensate_staged_rows(store, gym_id, rows, *, reason=REJECT_EDIT_CONFLICT,
@@ -900,7 +907,11 @@ def cancel_event(store, gym_id, event_id, *, ended=False, logger=None):
         log(f"cancel_event: event row read failed {type(exc).__name__}")
         return {"ok": False, "denied": 0, "reason": reason,
                 "error": "event_rows_unavailable"}
-    denier = getattr(store, "deny_wipeable_with_reason", None)
+    # Terminal state owns every remaining machine-wipeable event row, including a
+    # pending/draft/queued row carrying a media hold. This deliberately uses a
+    # separate store CAS from edit compensation: stale edit cleanup preserves holds,
+    # while terminal cleanup binds the exact event id and may retire them.
+    denier = getattr(store, "deny_event_wipeable_with_reason", None)
     denied = 0
     failed = False
     for row in rows:
@@ -909,7 +920,7 @@ def cancel_event(store, gym_id, event_id, *, ended=False, logger=None):
                 failed = True
                 continue
             try:
-                if denier(gym_id, row["id"], reason):
+                if denier(gym_id, event_id, row["id"], reason):
                     denied += 1
             except Exception as exc:  # noqa: BLE001
                 log(f"cancel_event: deny {row.get('id')} failed {type(exc).__name__}")

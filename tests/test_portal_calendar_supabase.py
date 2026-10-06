@@ -561,6 +561,27 @@ def test_specialized_caption_patches_format_before_write(monkeypatch):
     assert http.calls[1][4] == {"caption": expected, "status": "pending"}
 
 
+def test_terminal_event_deny_cas_includes_held_rows_but_preserves_protected(
+        monkeypatch):
+    returned = _row("row-1", gym_id="pete", status="denied")
+    returned["event_id"] = "event-1"
+    http = _FakeHTTP(patch_resp=_Resp(200, [returned]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().deny_event_wipeable_with_reason(
+        "pete", "event-1", "row-1", "event_cancelled")
+
+    assert result == returned
+    method, _, params, _, payload = http.calls[0]
+    assert method == "patch"
+    assert params == {
+        "id": "eq.row-1", "gym_id": "eq.pete", "event_id": "eq.event-1",
+        "status": "in.(pending,draft,queued)",
+    }
+    assert "media_not_ready_reason" not in params
+    assert payload == {"status": "denied", "reject_reason": "event_cancelled"}
+
+
 def test_existing_pending_feed_caption_correction_uses_exact_cas(monkeypatch):
     before = "Start here. Meet your coach; book a class."
     after = "Start here.\n\nMeet your coach, book a class."

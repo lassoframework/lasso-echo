@@ -221,6 +221,16 @@ class _CalStore:
             return r
         return None
 
+    def deny_event_wipeable_with_reason(self, gym_id, event_id, row_id, reason):
+        r = self.rows.get(row_id)
+        if (r and r.get("gym_id") == gym_id and r.get("event_id") == event_id
+                and r.get("status") in ("pending", "draft", "queued")):
+            r["status"] = "denied"
+            r["reject_reason"] = reason
+            self.denied.append((row_id, reason))
+            return r
+        return None
+
 
 def test_status_job_flips_ended_and_sweeps(monkeypatch):
     monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
@@ -258,7 +268,7 @@ def test_status_job_reports_terminal_calendar_read_failure(monkeypatch):
         def list_event_rows(self, *_args):
             raise RuntimeError("calendar unavailable")
 
-        def deny_wipeable_with_reason(self, *_args):
+        def deny_event_wipeable_with_reason(self, *_args):
             raise AssertionError("no unsafe write")
 
     result = es.run_status_job(

@@ -4070,6 +4070,41 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def deny_event_wipeable_with_reason(self, account_key, event_id, row_id,
+                                        reject_reason):
+        """Deny one exact event row after its event becomes terminal.
+
+        Unlike stale edit compensation, terminal cleanup intentionally includes
+        media-held pending/draft/queued rows. The server-side status CAS preserves a
+        concurrent approval, publish claim, publication, or other protected state;
+        event_id prevents a stale event sweep from touching a row outside its arc.
+        """
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+            "event_id": f"eq.{event_id}",
+            "status": f"in.({','.join(_WIPEABLE_STATUSES)})",
+        }
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"status": "denied", "reject_reason": reject_reason},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if (str(row.get("id")) == str(row_id)
+                    and str(row.get("gym_id")) == str(account_key)
+                    and str(row.get("event_id")) == str(event_id)
+                    and row.get("status") == "denied"):
+                return row
+        return None
+
     def list_rows_by_ids(self, account_key, row_ids):
         """Read exact calendar UUIDs within one gym for ambiguous-write reconciliation."""
         import uuid
