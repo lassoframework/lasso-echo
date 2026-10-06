@@ -1,13 +1,9 @@
 """Scene-fingerprint evidence at the visual writer-prepare boundary.
 
-FINAL CONTRACT (Astra rejection, 2026-10-03 — see
-docs/VISUAL_SCENE_GUARD_DRAFT.md): the prep-time scene writer architecture was
-rejected, so scene evidence here is ADVISORY METADATA ONLY. The
-`scene_fingerprint` evidence field rides alongside the md5 identity on
-receipts the writer builds from already-verified exact bytes; it never gates,
-never raises, and there is no scene RPC, no p_scene_* payload and no
-post_date requirement in ANY flag state. Undecodable bytes simply record null
-evidence; the md5 identity stays the only authority.
+The decoder records advisory pHash evidence alongside exact md5 identity.
+With the DRAFT scene guard armed, the writer durably stages a candidate backed
+by owner-attested displayed bytes; registration never records usage. Unknown
+flag values and undecodable displayed bytes fail closed under that guard.
 """
 import io
 import re
@@ -46,6 +42,8 @@ class HTTP:
         if name == "visual_global_prepare_bundle":
             self.registered = True
             return Response({"group_key": "vg_same", "fingerprint": json["p_fingerprint"]})
+        if name == "visual_scene_register_candidate":
+            return Response("33333333-3333-4333-8333-333333333333")
         if name == "visual_global_prepare_source_rendition":
             return Response({"group_key": json["p_group_key"],
                              "source_fingerprint": self.fingerprint,
@@ -90,6 +88,11 @@ def writer_calls(monkeypatch):
         return {"read_receipt": str(uuid.uuid4()), "render_receipt": None}
 
     monkeypatch.setattr(owner, "default_same_object_writer", lambda: writer)
+    def scene_writer(**args):
+        return {"receipt_id": str(uuid.uuid4()),
+                "phash": prep._scene_fingerprint(args["exact_bytes"]).rsplit(":", 1)[-1],
+                "fingerprint": prep._md5(args["exact_bytes"])}
+    monkeypatch.setattr(owner, "default_scene_writer", lambda: scene_writer)
     return calls
 
 
@@ -114,11 +117,10 @@ def _no_scene_surface(http):
             assert not any(str(k).startswith("p_scene_") for k in call[2])
 
 
-@pytest.mark.parametrize("scene_flag", [None, "true", "maybe"])
-def test_scene_evidence_is_advisory_in_every_flag_state(
+@pytest.mark.parametrize("scene_flag", [None, "false", "true"])
+def test_scene_evidence_and_guarded_registration(
         monkeypatch, writer_calls, scene_flag):
-    """Real image bytes: the scene_fingerprint evidence field is present and
-    namespaced, whatever AGENT_VISUAL_SCENE_GUARD says — it never gates."""
+    """Real bytes retain namespaced evidence and stage only when guarded."""
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
     if scene_flag is None:
         monkeypatch.delenv("AGENT_VISUAL_SCENE_GUARD", raising=False)
@@ -134,13 +136,16 @@ def test_scene_evidence_is_advisory_in_every_flag_state(
     fp = writer_calls[0]["evidence"]["scene_fingerprint"]
     assert FP_RE.fullmatch(fp)
     _no_scene_surface(http)
+    scene_calls = [call for call in http.calls if call[1] == "visual_scene_register_candidate"]
+    assert len(scene_calls) == (1 if scene_flag == "true" else 0)
+    if scene_flag == "true":
+        assert row["scene_candidate"]["candidate_id"] == "33333333-3333-4333-8333-333333333333"
 
 
-@pytest.mark.parametrize("scene_flag", [None, "true", "maybe"])
-def test_undecodable_bytes_record_null_evidence_and_never_raise(
+@pytest.mark.parametrize("scene_flag", [None, "false", "true"])
+def test_undecodable_displayed_bytes_fail_closed_only_when_guarded(
         monkeypatch, writer_calls, scene_flag):
-    """Undecodable bytes: scene_fingerprint is None and preparation succeeds —
-    even with the scene flag armed or ambiguous. md5 stays the only authority."""
+    """OFF keeps advisory null evidence; armed guard cannot stage unknown pHash."""
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
     if scene_flag is None:
         monkeypatch.delenv("AGENT_VISUAL_SCENE_GUARD", raising=False)
@@ -149,6 +154,11 @@ def test_undecodable_bytes_record_null_evidence_and_never_raise(
     data = b"exact bytes, but not an image"
     monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
     http = HTTP(fingerprint=_md5(data))
+    if scene_flag == "true":
+        with pytest.raises(prep.VisualPreparationError, match="pHash"):
+            prep.prepare(_store(http), "old-key", _same_object_row())
+        assert not any(call[1] == "visual_scene_register_candidate" for call in http.calls)
+        return
     row = prep.prepare(_store(http), "old-key", _same_object_row())
     assert row["visual_group_key"] == "vg_same"
     evidence = writer_calls[0]["evidence"]
@@ -164,5 +174,15 @@ def test_writer_prep_flag_off_is_legacy_passthrough(monkeypatch, writer_calls):
     http = HTTP()
     row = _same_object_row()
     assert prep.prepare(_store(http), "old-key", row) is row
+    assert http.calls == []
+    assert writer_calls == []
+
+
+def test_ambiguous_scene_guard_refuses_preparation_before_owner_write(monkeypatch, writer_calls):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setenv("AGENT_VISUAL_SCENE_GUARD", "maybe")
+    http = HTTP()
+    with pytest.raises(prep.VisualPreparationError, match="ambiguous"):
+        prep.prepare(_store(http), "old-key", _same_object_row())
     assert http.calls == []
     assert writer_calls == []

@@ -28,6 +28,7 @@ is exactly 16 hex chars. `_near(word, bits)` flips `bits` low bits for exact
 band control (<=6 near_frame, 7..30 uncertain).
 """
 
+import concurrent.futures
 import json
 import os
 import re
@@ -206,10 +207,13 @@ def _seed_object(tid, group, phash=None):
          f"('{tid}', 'canonical_url', '{url}', '{group}')")
     cand = None
     if phash is not None:
+        _sql("insert into public.visual_scene_owner_phash_receipt "
+             "(receipt_id,tenant_id,group_key,object_role,exact_url,fingerprint,phash,byte_length,algorithm) "
+             f"values (gen_random_uuid(),'{tid}','{group}','display','{url}','{fp}','{phash}',1024,'echo-dct-phash64-v1')")
         cand = _one(
             "select public.visual_scene_register_candidate("
             f"'{tid}', '{group}', '{phash}', '{url}', '{fp}',"
-            f" jsonb_build_object('verified_bytes', '{fp}'),"
+            f" jsonb_build_object('verified_bytes', '{fp}', 'owner_phash_receipt', (select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{url}' limit 1)),"
             " 'scene-ledger-test', 'display')")
     return url, fp, cand
 
@@ -594,3 +598,145 @@ def test_internal_claim_paths_revoked_from_service_role():
         assert _one(
             "select has_function_privilege('service_role',"
             f" 'public.{fn}', 'execute')") == "t", fn
+
+
+def test_register_candidate_exact_retry_is_idempotent_under_concurrency():
+    """Identical registration retries — sequential AND concurrent — return the
+    EXISTING candidate_id and insert no second row. A fresh UUID per retry
+    double-binds the row's delivered object and makes visual_scene_hold_resolve
+    reject an otherwise valid live row."""
+    tid, group = _seed_tenant()
+    url, fp, cand = _seed_object(tid, group, _CODEBOOK[15])
+    call = ("select public.visual_scene_register_candidate("
+            f"'{tid}', '{group}', '{_CODEBOOK[15]}', '{url}', '{fp}',"
+            f" jsonb_build_object('verified_bytes', '{fp}', 'owner_phash_receipt', (select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{url}' limit 1)),"
+            " 'scene-ledger-test', 'display')")
+    # Sequential exact retry: same id, still one candidate row.
+    assert _one(call) == cand
+    assert _one("select count(*) from public.visual_scene_candidate") == "1"
+    # Concurrent identical retries: both calls succeed with the SAME id.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: _one(call), range(4)))
+    assert results == [cand] * 4
+    assert _one("select count(*) from public.visual_scene_candidate") == "1"
+
+
+def test_register_candidate_conflicting_evidence_refused():
+    """Same (tenant, group, role, exact URL) with a conflicting pHash,
+    fingerprint or evidence payload is REFUSED — the reviewed evidence bound
+    to a delivered object can never be drifted by a re-registration."""
+    tid, group = _seed_tenant()
+    url, fp, cand = _seed_object(tid, group, _CODEBOOK[15])
+    # Conflicting pHash (same attested bytes).
+    bad = _run("select public.visual_scene_register_candidate("
+               f"'{tid}', '{group}', '{_CODEBOOK[14]}', '{url}', '{fp}',"
+               f" jsonb_build_object('verified_bytes', '{fp}', 'owner_phash_receipt', (select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{url}' limit 1)),"
+               " 'scene-ledger-test', 'display')", check=False)
+    assert bad.returncode != 0
+    assert "matching immutable owner pHash receipt" in bad.stderr
+    # Conflicting evidence payload (same pHash, extra key).
+    bad = _run("select public.visual_scene_register_candidate("
+               f"'{tid}', '{group}', '{_CODEBOOK[15]}', '{url}', '{fp}',"
+               f" jsonb_build_object('verified_bytes', '{fp}', 'owner_phash_receipt', (select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{url}' limit 1), 'extra', 'x'),"
+               " 'scene-ledger-test', 'display')", check=False)
+    assert bad.returncode != 0
+    assert "conflicting scene candidate evidence" in bad.stderr
+    # Conflicting fingerprint: the attestation ledger permits only one
+    # attested fingerprint per exact URL, so a second attestation cannot be
+    # seeded. Registration must reject the un-attested fingerprint before it
+    # can create or mutate a candidate.
+    fp2 = "md5:" + uuid.uuid4().hex
+    receipt = _one(
+        "insert into public.visual_global_object_read_receipt"
+        "(tenant_id, exact_url, fingerprint, byte_length, acquisition_method,"
+        " evidence_ref, observed_by) values "
+        f"('{tid}', '{url}', '{fp2}', 2048, 'verified_object_read',"
+        f" 'scratch-evidence', 'scene-ledger-test') returning receipt_id")
+    bad_attestation = _run(
+        "insert into public.visual_global_object_attestation"
+        "(exact_url, tenant_id, group_key, fingerprint, byte_length,"
+        " acquisition_method, evidence_ref, read_receipt, attested_by) values "
+        f"('{url}', '{tid}', '{group}', '{fp2}', 2048,"
+        f" 'verified_object_read', 'scratch-evidence', '{receipt}',"
+        " 'scene-ledger-test')", check=False)
+    assert bad_attestation.returncode != 0
+    assert "duplicate key value violates unique constraint" in bad_attestation.stderr
+    bad = _run("select public.visual_scene_register_candidate("
+               f"'{tid}', '{group}', '{_CODEBOOK[15]}', '{url}', '{fp2}',"
+               f" jsonb_build_object('verified_bytes', '{fp2}'),"
+               " 'scene-ledger-test', 'display')", check=False)
+    assert bad.returncode != 0
+    assert "candidate phash is not backed by owner-attested exact bytes" in bad.stderr
+    # The original row is untouched (append-only, immutable evidence).
+    assert _one("select count(*) from public.visual_scene_candidate") == "1"
+    assert _one("select candidate_id::text from public.visual_scene_candidate") == cand
+
+
+def test_identical_registration_retry_keeps_hold_resolvable():
+    """The reported defect end-to-end: a held claim, an exact-identical
+    registration retry (as a re-staging builder would issue), then hold
+    resolution. The retry must NOT mint a second candidate, so
+    visual_scene_hold_resolve still finds the reviewed candidate uniquely
+    bound and approves the otherwise valid live row."""
+    tid_a, group_a = _seed_tenant()
+    tid_b, group_b = _seed_tenant()
+    url_a, _, cand_a = _seed_object(tid_a, group_a, _near(_CODEBOOK[15], 0))
+    row_a = _insert_row(tid_a, group_a, url_a)
+    assert _decide(row_a, cand_a)["decision"] == "claimed"
+
+    url_b, fp_b, cand_b = _seed_object(
+        tid_b, group_b, _near(_CODEBOOK[15], 3))
+    row_b = _insert_row(tid_b, group_b, url_b, date="2026-10-12")
+    blocked = _decide(row_b, cand_b)
+    assert blocked["decision"] == "blocked"
+    hold_id = blocked["hold_ids"][0]
+    _sql("update public.content_calendar set status='pending',"
+         "variant_status='archived', media_not_ready_reason='scene_review_hold'"
+         f" where id='{row_b}'")
+
+    # Exact identical retry of candidate B's registration (builder re-staging).
+    retry = _one("select public.visual_scene_register_candidate("
+                 f"'{tid_b}', '{group_b}', '{_near(_CODEBOOK[15], 3)}',"
+                 f" '{url_b}', '{fp_b}',"
+                 f" jsonb_build_object('verified_bytes', '{fp_b}', 'owner_phash_receipt', (select receipt_id::text from public.visual_scene_owner_phash_receipt where exact_url='{url_b}' limit 1)),"
+                 " 'scene-ledger-test', 'display')")
+    assert retry == cand_b
+    assert _one("select count(*) from public.visual_scene_candidate"
+                f" where tenant_id = '{tid_b}'") == "1"
+
+    # The hold now resolves: the reviewed candidate is still uniquely bound.
+    resolved = json.loads(_one(
+        "select public.visual_scene_hold_resolve("
+        f"'{hold_id}'::uuid, 'approved', 'scene-ledger-reviewer',"
+        " jsonb_build_object('review','retry kept the candidate stable'))::text"))
+    assert resolved["state"] == "approved"
+    assert resolved["exemption_scope"]["candidate_id"] == cand_b
+    # The approval exempts the exact reviewed scope: the claim now lands.
+    out = _decide(row_b, cand_b)
+    assert out["decision"] == "claimed"
+    assert _occupied_count() == 2
+
+
+def test_service_role_cannot_forge_scene_similarity_or_mint_receipts():
+    tid, group = _seed_tenant()
+    url, fp, candidate = _seed_object(tid, group, _CODEBOOK[15])
+    receipt = _one("select receipt_id::text from public.visual_scene_owner_phash_receipt")
+    evidence = f"jsonb_build_object('verified_bytes','{fp}','owner_phash_receipt','{receipt}')"
+    legal = ("set role service_role; select public.visual_scene_register_candidate("
+        f"'{tid}','{group}','{_CODEBOOK[15]}','{url}','{fp}',{evidence},'scene-ledger-test','display')")
+    assert _one(legal) == candidate
+    forged = _run(legal.replace(_CODEBOOK[15], _CODEBOOK[14]), check=False)
+    assert forged.returncode and "matching immutable owner pHash receipt" in forged.stderr
+    wrong_role = _run(legal.replace("'display')", "'poster')"),check=False)
+    assert wrong_role.returncode and "matching immutable owner pHash receipt" in wrong_role.stderr
+    missing = _run(legal.replace(receipt,str(uuid.uuid4())),check=False)
+    assert missing.returncode and "matching immutable owner pHash receipt" in missing.stderr
+    for mutation in (
+        "insert into public.visual_scene_owner_phash_receipt select * from public.visual_scene_owner_phash_receipt",
+        "update public.visual_scene_owner_phash_receipt set phash='0000000000000000'",
+        "delete from public.visual_scene_owner_phash_receipt",
+        "truncate public.visual_scene_owner_phash_receipt"):
+        denied = _run("set role service_role; " + mutation,check=False)
+        assert denied.returncode and "permission denied" in denied.stderr
+    immutable = _run("update public.visual_scene_owner_phash_receipt set phash='0000000000000000'",check=False)
+    assert immutable.returncode and "immutable" in immutable.stderr
