@@ -365,6 +365,15 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     if isinstance(event, dict):
         event = ge.GymEvent.from_row(event)
     gym_id = event.gym_id
+    operation_row_ids = set()
+    if operation_id is not None:
+        # Stamp the complete requested arc before any planner, occupancy, recap, or
+        # media filter can remove a row.  The UUID identity includes the semantic
+        # event/date/account/format/arc-kind key, so edit callers can prove that every
+        # requested replacement was durably inserted rather than relying on a count.
+        operation_row_ids = _stamp_operation_row_ids(arc_rows, operation_id, log)
+        if operation_row_ids is None:
+            return {"ok": False, "reason": "invalid staging operation", "staged": 0}
     months = sorted({str(r.get("post_date"))[:7] for r in arc_rows if r.get("post_date")})
 
     existing = []
@@ -430,11 +439,6 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     # Stage only the NEW arc rows (existing rows already live). Recap rows that are
     # blocked (no media yet) are held out of staging until media arrives.
     to_stage = [r for r in thinned if not r.get("recap_blocked")]
-    operation_row_ids = set()
-    if operation_id is not None:
-        operation_row_ids = _stamp_operation_row_ids(to_stage, operation_id, log)
-        if operation_row_ids is None:
-            return {"ok": False, "reason": "invalid staging operation", "staged": 0}
     # RE-STAGE GUARD: stage_arc only ever ADDS, so staging an arc that is already on the
     # calendar duplicated every one of its days. Hit live on 2026-08-30 re-staging
     # Pete/Zanshin's Back to School promo: four dates came back twice, including three

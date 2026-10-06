@@ -59,7 +59,7 @@ class _EventStore:
             "type": "new_offer", "starts_on": "2026-10-01",
             "ends_on": "2026-10-14", "tz": "America/New_York",
             "offer_text": "Reserve a place", "link": "", "brief": "",
-            "media_ids": [], "status": status, "created_by": "owner",
+            "media_ids": ["m1"], "status": status, "created_by": "owner",
             "audit": [],
         }
         self.writes = 0
@@ -88,6 +88,7 @@ class _EventStore:
 class _CalendarStore:
     def __init__(self):
         self.reads = 0
+        self.inserted = []
 
     def list_event_rows(self, gym_id, event_id):
         self.reads += 1
@@ -95,13 +96,25 @@ class _CalendarStore:
 
     def list_month(self, gym_id, month):
         self.reads += 1
-        return []
+        return [dict(row) for row in self.inserted
+                if row.get("gym_id") == gym_id
+                and str(row.get("post_date"))[:7] == month]
+
+    def insert_rows(self, gym_id, rows, *, preserve_ids=False):
+        written = [{**row, "gym_id": gym_id} for row in rows]
+        self.inserted.extend(written)
+        return [dict(row) for row in written]
 
 
 @pytest.fixture(autouse=True)
 def _arm(monkeypatch):
     monkeypatch.setenv("AGENT_INTAKE_TOKEN_GRITX", "gritxtoken12345")
     monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_GRITX", "true")
+    monkeypatch.setattr(
+        "agent.event_calendar._attach_media",
+        lambda gym_id, rows, log, picker=None, host=None: (
+            [dict(row, image_url="https://cdn.test/event.jpg",
+                  source_media_asset_id="m1") for row in rows], []))
     intake_web._token_hits.clear()
 
 
