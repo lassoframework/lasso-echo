@@ -324,6 +324,14 @@ class PreWriteCASError(PortalStoreError):
     """CAS encoding refused before the calendar PATCH was attempted."""
 
 
+class CalendarInsertNotStartedError(PortalStoreError):
+    """The calendar POST definitely did not start; deleted rows may be restored."""
+
+
+class CadencePreconditionError(CalendarInsertNotStartedError):
+    """A required feed disappeared after preflight but before calendar POST."""
+
+
 _UUID_RE = _re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -3522,8 +3530,43 @@ class SupabaseCalendarStore:
 
     # ---- mirror writes (real-drafts calendar mirror) ------------------------
     # These write calendar rows only. NOTHING here publishes to any social account.
+    def preflight_cadence_rows(self, account_key, rows, *, replace_dates=()):
+        """Read-only cadence admission check used before a month is deleted.
+
+        Run every row-dropping belt against the still-intact book. Live-slot dedupe
+        is limited to this batch because the old wipeable rows are about to be
+        replaced. The admitted payload is then inserted with those belts frozen, so
+        no deterministic filter can first run after the delete.
+        """
+        planned = [dict(row or {}, gym_id=account_key) for row in (rows or ())]
+        normalized = []
+        from .copy_gate import bound_opening_hook, format_caption
+        for row in planned:
+            clean = dict(row)
+            try:
+                if "caption" in clean and clean["caption"] is not None:
+                    clean["caption"] = bound_opening_hook(
+                        format_caption(clean["caption"]))
+            except ValueError:
+                # The write path would retain this as a media hold. A required
+                # feed on hold cannot certify cadence, so leave it out and let
+                # the companion/required-slot checks refuse the rebuild.
+                continue
+            normalized.append(clean)
+        from .plan_horizon import belt_filter as _horizon_belt
+        planned, _ = _horizon_belt(account_key, planned)
+        filtered, _ = _horizon_belt(account_key, normalized)
+        filtered = _stage_belts(account_key, filtered)
+        filtered = _media_stage_belt(
+            self, account_key, filtered,
+            skip_wipeable_dates=replace_dates)
+        filtered = _preserve_held_slots(self, account_key, filtered)
+        filtered = _dedupe_slots(self, account_key, filtered, existing=set())
+        return _drop_companions_missing_instagram_feed(planned, filtered)
+
     def insert_rows(self, account_key, rows, *, preserve_ids=False,
-                    render_evidence_by_url=None, poster_render_evidence_by_url=None):
+                    render_evidence_by_url=None, poster_render_evidence_by_url=None,
+                    required_feed_slots=None, prevalidated_cadence=False):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -3617,13 +3660,15 @@ class SupabaseCalendarStore:
         # AGENT_PLAN_HORIZON_DAYS=0 disables (emergency escape hatch).
         from .plan_horizon import belt_filter as _horizon_belt
         payload, _ = _horizon_belt(account_key, payload)
-        payload = _stage_belts(account_key, payload)
+        planned_companions = list(payload)
+        if not prevalidated_cadence:
+            payload = _stage_belts(account_key, payload)
         # CROSS-DAY MEDIA BELT (fleet audit, 2026-08-31; flag AGENT_MEDIA_CROSS_DAY_GUARD,
         # the SAME flag media_guard already ships armed on). agent/media_guard.py calls
         # itself "the shared cross-day media guard for every photo-assigning lane" and was
         # wired into exactly TWO of them. This door is the one every staging lane walks
         # through, so the rule lives here too. See _media_stage_belt.
-        payload = _media_stage_belt(self, account_key, payload)
+            payload = _media_stage_belt(self, account_key, payload)
         # SLOT IDEMPOTENCY BELT (AUD-001, 2026-09-05; default ON because it PREVENTS
         # damage, same posture as the plan-horizon belt. AGENT_SLOT_DEDUPE=false is the
         # escape hatch).
@@ -3655,8 +3700,33 @@ class SupabaseCalendarStore:
         # Story recovery above uses its retained UUID; this barrier governs NEW
         # rows of every format. Caption/image changes cannot bypass it, and it
         # does not collapse numbered slots or channel siblings.
-        payload = _preserve_held_slots(self, account_key, payload)
-        payload = _dedupe_slots(self, account_key, payload)
+        if not prevalidated_cadence:
+            payload = _preserve_held_slots(self, account_key, payload)
+            payload = _dedupe_slots(self, account_key, payload)
+        else:
+            # Re-read only the durable/concurrent ownership barriers immediately
+            # before POST. Deterministic caption/media/in-batch filtering was frozen
+            # by preflight; these two checks must remain live so an approval or hold
+            # created after preflight is never stacked with a new row.
+            live_months = sorted({str(row.get("post_date") or "")[:7]
+                                  for row in payload
+                                  if str(row.get("post_date") or "")[:7]})
+            try:
+                payload, _ = _preserve_and_prune_strict(
+                    self, account_key, live_months, payload)
+            except Exception as exc:
+                raise CalendarInsertNotStartedError(
+                    503, "live human-owned slot read failed before calendar insert") from exc
+            payload = _preserve_held_slots(self, account_key, payload)
+            payload = _dedupe_slots(self, account_key, payload)
+        payload = _drop_companions_missing_instagram_feed(
+            planned_companions, payload)
+        if required_feed_slots is not None:
+            required = {tuple(slot) for slot in required_feed_slots}
+            actual = _instagram_feed_slots(payload)
+            if not required.issubset(actual):
+                raise CadencePreconditionError(
+                    409, "calendar cadence precondition failed before insert")
         if not payload:
             return recovered
         from . import visual_writer_prepare
@@ -3668,12 +3738,19 @@ class SupabaseCalendarStore:
             # Accepting a thumbnail-only key would attach one video's proof to
             # another video's image, so use the strict composite key and never
             # fall back to a thumbnail-only lookup.
-            payload = [self._prepare_visual_row(
-                account_key, row,
-                render_evidence=(render_evidence_by_url or {}).get(row.get("image_url")),
-                poster_render_evidence=(poster_render_evidence_by_url or {}).get(
-                    (row.get("image_url"), row.get("thumbnail_url"))))
-                for row in payload]
+            try:
+                payload = [self._prepare_visual_row(
+                    account_key, row,
+                    render_evidence=(render_evidence_by_url or {}).get(row.get("image_url")),
+                    poster_render_evidence=(poster_render_evidence_by_url or {}).get(
+                        (row.get("image_url"), row.get("thumbnail_url"))))
+                    for row in payload]
+            except Exception as exc:
+                if not prevalidated_cadence:
+                    raise
+                raise CalendarInsertNotStartedError(
+                    409, f"visual preparation failed before calendar insert: "
+                    f"{type(exc).__name__}") from exc
         all_keys = set()
         for r in payload:
             all_keys.update(r.keys())
@@ -3780,7 +3857,7 @@ class SupabaseCalendarStore:
         return rows[0]
 
     def delete_month(self, account_key, month, *, preserve_human=True,
-                     preserve_dates=()):
+                     preserve_dates=(), return_rows=False):
         """DELETE content_calendar rows for account_key whose post_date falls inside the
         calendar month `month` ('YYYY-MM'). Gym scoped: the filter carries BOTH
         gym_id=eq.<account_key> AND the month's date bounds, so a row belonging to another
@@ -3864,8 +3941,39 @@ class SupabaseCalendarStore:
         )
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        rows = r.json() or []
-        return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+        rows = [x for x in (r.json() or [])
+                if str(x.get("gym_id")) == str(account_key)]
+        return rows if return_rows else len(rows)
+
+    def restore_deleted_rows(self, account_key, rows):
+        """Restore exact rows deleted by this rebuild after a pre-POST refusal."""
+        import uuid
+        payload = []
+        for row in rows or ():
+            clean = dict(row or {})
+            if str(clean.get("gym_id")) != str(account_key):
+                raise ValueError("rollback row belongs to another gym")
+            clean["id"] = str(uuid.UUID(str(clean.get("id") or "")))
+            payload.append(clean)
+        if not payload:
+            return []
+        all_keys = set().union(*(row.keys() for row in payload))
+        payload = [{key: row.get(key) for key in all_keys} for row in payload]
+        response = self._client().post(
+            self._rest(_TABLE),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=payload, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(
+                response.status_code, _scrub((response.text or "")[:200]))
+        restored = response.json() or []
+        expected_ids = {row["id"] for row in payload}
+        actual_ids = {row.get("id") for row in restored
+                      if str(row.get("gym_id")) == str(account_key)}
+        if actual_ids != expected_ids:
+            raise PortalStoreError(502, "calendar rollback was incomplete")
+        return restored
 
     def locked_slots(self, account_key, month):
         """The set of (post_date, account, format) slots in `month` already occupied by a
@@ -4609,6 +4717,45 @@ def _live_slots_for(store, account_key, dates):
     return out
 
 
+def _companion_group_key(row):
+    """Stable sibling identity, with date/slot fallback for legacy producers."""
+    r = row or {}
+    logical_post_id = str(r.get("logical_post_id") or "").strip()
+    if logical_post_id:
+        return ("logical_post_id", logical_post_id)
+    return ("legacy_slot", str(r.get("post_date") or "")[:10],
+            r.get("slot_index"))
+
+
+def _drop_companions_missing_instagram_feed(planned, filtered):
+    """Never stage a mirror or Story after its planned Instagram feed was removed."""
+    def _is_ig_feed(row):
+        r = row or {}
+        return (str(r.get("format") or "").strip().lower() == "feed"
+                and str(r.get("account") or "").strip().lower()
+                in ("instagram", "ig", ""))
+
+    planned_feeds = {_companion_group_key(row) for row in (planned or ())
+                     if _is_ig_feed(row)}
+    kept_feeds = {_companion_group_key(row) for row in (filtered or ())
+                  if _is_ig_feed(row)}
+    missing = planned_feeds - kept_feeds
+    if not missing:
+        return filtered
+    return [row for row in (filtered or ())
+            if _companion_group_key(row) not in missing]
+
+
+def _instagram_feed_slots(rows):
+    return {(str((row or {}).get("post_date") or "")[:10],
+             (row or {}).get("slot_index"))
+            for row in (rows or ())
+            if str((row or {}).get("post_date") or "")[:10]
+            and str((row or {}).get("format") or "").strip().lower() == "feed"
+            and str((row or {}).get("account") or "").strip().lower()
+            in ("instagram", "ig", "")}
+
+
 def _stage_belts(account_key, payload):
     """Apply the stage-time empty-caption + verbatim-dedup belts to an
     insert_rows batch (see the insert_rows comment). Returns the rows that may
@@ -4651,13 +4798,20 @@ def _stage_belts(account_key, payload):
         except Exception:
             pass  # alerting never blocks staging
 
-    kept = []
+    # Feed + Facebook mirror + paired Story are one generated companion set.  Decide
+    # feed eligibility first, then remove the Story too if either feed leg is blocked.
+    # Production ENG proved why this must be atomic: the verbatim belt removed the IG
+    # and FB feeds for Oct 19/28/29 while their exempt Stories survived, leaving 27 of
+    # 30 feed slots and a misleadingly full-looking calendar.
+    decisions = []
+    blocked_companions = set()
+
     batch_dates_by_hash = {}   # verbatim hash -> set of post_dates staged in THIS batch
     for row in payload:
         caption = str(row.get("caption") or "")
         post_date = str(row.get("post_date") or "")[:10]
         if _is_story(row) or _is_gbp_photo_drop(row):
-            kept.append(row)
+            decisions.append((row, True))
             continue
         if empty_guard:
             try:
@@ -4668,6 +4822,8 @@ def _stage_belts(account_key, payload):
                         f"{post_date or 'unknown date'} at stage time (a feed post may "
                         "not ship without real words); the slot refills on the next "
                         "plan pass")
+                    blocked_companions.add(_companion_group_key(row))
+                    decisions.append((row, False))
                     continue
             except Exception:
                 pass
@@ -4684,13 +4840,17 @@ def _stage_belts(account_key, payload):
                         f"{post_date} at stage time (verbatim duplicate of a caption "
                         f"used within {_ledger.VERBATIM_BLOCK_DAYS} days); the slot "
                         "refills on the next plan pass with a fresh caption")
+                    blocked_companions.add(_companion_group_key(row))
+                    decisions.append((row, False))
                     continue
                 if h:
                     batch_dates_by_hash.setdefault(h, set()).add(post_date)
             except Exception:
                 pass
-        kept.append(row)
-    return kept
+        decisions.append((row, True))
+    return [row for row, allowed in decisions
+            if allowed and not (_is_story(row)
+                                and _companion_group_key(row) in blocked_companions)]
 
 
 # ---- CROSS-DAY MEDIA BELT ------------------------------------------------------
@@ -4772,7 +4932,8 @@ class _ReadProbe:
             raise
 
 
-def _media_stage_belt(store, account_key, payload, *, alert=None):
+def _media_stage_belt(store, account_key, payload, *, alert=None,
+                      skip_wipeable_dates=()):
     """Drop any incoming row whose photo already sits on a DIFFERENT day of this gym's
     book. Returns the rows that may stage.
 
@@ -4851,6 +5012,7 @@ def _media_stage_belt(store, account_key, payload, *, alert=None):
         state = media_guard.book_state(
             account_key, probe, start, (last - start).days + 1,
             log=lambda m: print(f"[portal-calendar-store] media belt: {m}"),
+            skip_wipeable_dates=skip_wipeable_dates,
             library_path=library_path or None)
         if probe.failed:
             _say(f"cross-day media belt STOOD DOWN for {account_key}: the book read "
@@ -4985,6 +5147,21 @@ def preserve_and_prune(store, account_key, months, rows):
     if not locked:
         return list(rows or []), 0
     kept = [r for r in (rows or []) if _slot_key(r) not in locked]
+    return kept, len(locked)
+
+
+def _preserve_and_prune_strict(store, account_key, months, rows):
+    """Fail-closed variant for the final prevalidated cadence write barrier."""
+    locked_slots = getattr(store, "locked_slots", None)
+    if not callable(locked_slots):
+        raise RuntimeError("locked slot reader unavailable")
+    locked = set()
+    for month in months:
+        result = locked_slots(account_key, month)
+        if not isinstance(result, set):
+            raise RuntimeError("locked slot read was not authoritative")
+        locked |= result
+    kept = [row for row in rows if _slot_key(row) not in locked]
     return kept, len(locked)
 
 

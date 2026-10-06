@@ -1350,7 +1350,8 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             # Nothing landed (a no-op, a gate refusal, or a definite pre-insert
             # failure): this build's own Drive picks never became rows.
             _rollback_new_drive_drafts(drafts, log)
-            if not _res.get("deleted_total", _res.get("deleted")):
+            if (_res.get("rollback_restored")
+                    or not _res.get("deleted_total", _res.get("deleted"))):
                 # ...and the OLD rows survive, so their released assets are stamped
                 # again. (deleted_total>0 with no insert: the old rows are gone, so
                 # their assets stay free, which is correct. The raw month-grained
@@ -1506,6 +1507,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             log(f"{base_key}: Drive photo pre-pass skipped ({type(e).__name__}: {e})")
     else:
         drive_photo_feeds = 0
+    # Captions already accepted anywhere in this build.  The stage-time caption
+    # cooldown is the final safety net, but it must not be the first place a duplicate
+    # is discovered: dropping a feed there used to leave its paired Story behind and
+    # silently thin a 2x month.  Seed this with Drive-photo pre-pass feeds, then make
+    # Lane A walk its existing approved-source alternatives before companions exist.
+    month_captions = [caption for captions in pre_captions.values()
+                      for caption in captions if caption]
     # Walk day keys as an UPPER bound (days), but STOP emitting feeds once we have
     # placed one per unique photo (max_feed_days). Stories reuse the feed's photo (a
     # feed + its paired story are the same asset), so stories do not consume the cap.
@@ -1564,7 +1572,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 exclude_keys=used_keys,
                 avoid_openings=recent_openings[-opening_window:],
                 angle=day_angle, avoid_angles=day_avoid_angles,
-                avoid_captions=tuple(day_captions),
+                avoid_captions=tuple(day_captions + (
+                    month_captions if config.caption_cooldown_enabled() else [])),
                 recent_formulas=tuple(recent_formulas[-_FORMULA_WINDOW:]),
                 avoid_categories=_heavy_pillars,
                 prefer_photos=True)
@@ -1693,6 +1702,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             covered_days.add(day_key)   # the gym-drive lane skips days already filled
             covered_slots.add((day_key, slot_i))
             day_captions.append(getattr(feed, "caption", "") or "")
+            month_captions.append(getattr(feed, "caption", "") or "")
             # The video pass runs after Lane A. Keep its same-day uniqueness map
             # current so it cannot stage a Drive caption that Lane A already used.
             pre_captions.setdefault(day_key, []).append(
@@ -2085,21 +2095,33 @@ def _poster_render_evidence_by_url(drafts):
 
 
 def _insert_rows_with_poster_evidence(insert_rows, base_key, rows, evidence_by_url,
-                                      render_evidence_by_url=None):
+                                      render_evidence_by_url=None,
+                                      required_feed_slots=None,
+                                      prevalidated_cadence=False):
     """Forward poster proof through the prepared writer boundary.
 
     A TypeError from a prepared call is ambiguous: the store may have written before
     failing internally.  Never retry that write without the proof.  Flag-off retains
     the plain legacy call for older stores and test fakes.
     """
+    kwargs = {}
+    if required_feed_slots is not None:
+        import inspect
+        try:
+            parameters = inspect.signature(insert_rows).parameters
+            if "required_feed_slots" in parameters:
+                kwargs["required_feed_slots"] = required_feed_slots
+            if "prevalidated_cadence" in parameters:
+                kwargs["prevalidated_cadence"] = prevalidated_cadence
+        except (TypeError, ValueError):
+            pass
     if _visual_writer_guard_enabled():
-        kwargs = {}
         if evidence_by_url:
             kwargs["poster_render_evidence_by_url"] = evidence_by_url
         if render_evidence_by_url:
             kwargs["render_evidence_by_url"] = render_evidence_by_url
-        if kwargs:
-            return insert_rows(base_key, rows, **kwargs)
+    if kwargs:
+        return insert_rows(base_key, rows, **kwargs)
     return insert_rows(base_key, rows)
 
 
@@ -2429,6 +2451,27 @@ def _to_rows(base_key, drafts):
     return rows
 
 
+def _instagram_feed_slots(rows):
+    """Return the logical Instagram feed slots represented by calendar rows.
+
+    At 1x the slot index is null and the date is the slot.  At 2x the two feeds
+    share a date and differ by slot_index.  Facebook mirrors and Stories are not
+    cadence units.
+    """
+    slots = set()
+    for row in rows or ():
+        item = row or {}
+        if str(item.get("format") or "").strip().lower() != "feed":
+            continue
+        if str(item.get("account") or "").strip().lower() not in (
+                "instagram", "ig", ""):
+            continue
+        post_date = str(item.get("post_date") or "")[:10]
+        if post_date:
+            slots.add((post_date, item.get("slot_index")))
+    return slots
+
+
 def _span_scoped_delete_claim(store, base_key, months, span_first, span_last,
                               preserve_dates=(), log=None):
     """How many of THIS gym's rows the month-grained delete in _apply will remove
@@ -2555,6 +2598,7 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     from . import lever_stamp as _levers
     _levers.apply_learning_stamps(base_key, clean_rows, logger=log)
     deleted = inserted = 0
+    deleted_row_snapshots = []
     insert_started = False
     planned_reservation_ids = set()
     try:
@@ -2563,6 +2607,38 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         # place (it only wipes fresh drafts). A rebuild can no longer revert an approval.
         from .portal_calendar_store import preserve_and_prune
         clean_rows, _locked = preserve_and_prune(store, base_key, months, clean_rows)
+        planned_feed_slots = _instagram_feed_slots(clean_rows)
+        preflight = getattr(store, "preflight_cadence_rows", None)
+        cadence_prevalidated = False
+        if (config.cadence_2x_enabled() and callable(preflight)
+                and planned_feed_slots):
+            replace_dates = {
+                (start + timedelta(days=i)).isoformat()
+                for i in range(max(1, int(days)))
+            } - {str(day)[:10] for day in (locked_days or ())}
+            import inspect
+            try:
+                supports_dates = "replace_dates" in inspect.signature(
+                    preflight).parameters
+            except (TypeError, ValueError):
+                supports_dates = False
+            admitted_rows = (preflight(base_key, clean_rows,
+                                       replace_dates=replace_dates)
+                             if supports_dates else preflight(base_key, clean_rows))
+            admitted_feed_slots = _instagram_feed_slots(admitted_rows)
+            if not planned_feed_slots.issubset(admitted_feed_slots):
+                log(f"{base_key}: cadence preflight refused "
+                    f"{len(planned_feed_slots) - len(admitted_feed_slots)} required "
+                    "Instagram feed slot(s); keeping the existing calendar")
+                return {"ok": False, "reason": "incomplete cadence preflight",
+                        "incomplete_cadence": True,
+                        "expected_feed_slots": len(planned_feed_slots),
+                        "admitted_feed_slots": len(admitted_feed_slots),
+                        "inserted_feed_slots": 0,
+                        "upserted": 0, "inserted": 0, "deleted": 0,
+                        "months": months}
+            clean_rows = admitted_rows
+            cadence_prevalidated = True
         planned_reservation_ids = {
             int(r["_served_reservation_id"]) for r in clean_rows
             if r.get("_served_reservation_id")}
@@ -2696,18 +2772,42 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         # the rebuild yields only a FEW feeds. Deleting-then-inserting-fewer shrank the
         # calendar every cycle (TopFuel drifted 39 -> 21 -> 3). If this build placed fewer
         # feeds than already exist, keep the existing calendar untouched. Feeds are counted as
-        # distinct instagram feed post_dates (the same unit the grow-guard uses).
-        new_feeds = len({r.get("post_date") for r in clean_rows
-                         if r.get("format") == "feed" and r.get("account") == "instagram"})
+        # logical Instagram slots: date alone at 1x, date + slot_index at 2x.
+        new_feed_slots = _instagram_feed_slots(clean_rows)
+        new_feeds = len(new_feed_slots)
         # POST-MERGE comparison (audit 2026-08-25 MAJOR): a grow build EXCLUDES locked
         # (human-owned approved/published) days from its own rows — their feeds survive the
         # delete via preserve_dates. Comparing only new_feeds against existing_feeds
         # (which counts the locked ones) wrongly read every incremental grow as a shrink
         # and no-op'd it, so a built gym could never grow. Compare what the calendar will
         # hold AFTER the write: this build's feeds + the preserved locked-day feeds.
-        locked_in_span = {str(d)[:10] for d in (locked_days or ())
-                          if str(d)[:7] in set(months)}
-        post_merge_feeds = new_feeds + len(locked_in_span)
+        locked_span_first = start.isoformat()
+        locked_span_after = (start + timedelta(days=max(1, int(days)))).isoformat()
+        locked_in_span = {
+            str(d)[:10] for d in (locked_days or ())
+            if locked_span_first <= str(d)[:10] < locked_span_after}
+        locked_feed_slots = set()
+        list_month = getattr(store, "list_month", None)
+        if callable(list_month) and locked_in_span:
+            try:
+                locked_rows = []
+                for month in months:
+                    locked_rows.extend(list_month(base_key, month) or [])
+                from .onboarding_demo import is_sample_row
+                locked_feed_slots = _instagram_feed_slots([
+                    row for row in locked_rows
+                    if str((row or {}).get("status") or "").lower()
+                    not in ("denied", "killed", "deleted")
+                    and not is_sample_row(row)
+                ])
+                locked_feed_slots = {
+                    slot for slot in locked_feed_slots
+                    if slot[0] in locked_in_span}
+            except Exception:  # noqa: BLE001 - preserve the old fail-open fallback
+                locked_feed_slots = {(day, None) for day in locked_in_span}
+        else:
+            locked_feed_slots = {(day, None) for day in locked_in_span}
+        post_merge_feeds = new_feeds + len(locked_feed_slots)
         try:
             from .client_media_sync import _existing_feed_count
             existing_feeds, count_ok = _existing_feed_count(store, base_key, start, days)
@@ -2725,7 +2825,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         if (not allow_reshape and count_ok and existing_feeds > 0
                 and post_merge_feeds < existing_feeds):
             log(f"{base_key}: rebuild would SHRINK feeds {existing_feeds} -> "
-                f"{post_merge_feeds} ({new_feeds} new + {len(locked_in_span)} locked); "
+                f"{post_merge_feeds} ({new_feeds} new + "
+                f"{len(locked_feed_slots)} locked); "
                 "keeping the existing calendar (grow-only, never shrink)")
             return {"ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
                     "months": months, "noop_shrink": True,
@@ -2746,8 +2847,17 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         for month in months:
             if delete_month is not None:
                 try:
-                    deleted += delete_month(base_key, month,
-                                            preserve_dates=delete_preserve) or 0
+                    import inspect
+                    supports_rows = "return_rows" in inspect.signature(
+                        delete_month).parameters
+                    result = delete_month(
+                        base_key, month, preserve_dates=delete_preserve,
+                        **({"return_rows": True} if supports_rows else {}))
+                    if isinstance(result, list):
+                        deleted_row_snapshots.extend(result)
+                        deleted += len(result)
+                    else:
+                        deleted += result or 0
                 except TypeError:      # older store/test fakes without the kwarg
                     if bounded_delete_read:
                         raise RuntimeError("bounded store cannot preserve dates")
@@ -2757,19 +2867,69 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             store_rows = [{k: v for k, v in r.items()
                            if k != "_served_reservation_id"} for r in clean_rows]
             insert_started = True
-            inserted += len(_insert_rows_with_poster_evidence(
+            inserted_rows = _insert_rows_with_poster_evidence(
                 insert_rows, base_key, store_rows,
                 poster_render_evidence_by_url,
-                render_evidence_by_url=render_evidence_by_url) or [])
+                render_evidence_by_url=render_evidence_by_url,
+                required_feed_slots=new_feed_slots,
+                prevalidated_cadence=cadence_prevalidated) or []
+            inserted += len(inserted_rows)
+            inserted_feed_slots = _instagram_feed_slots(inserted_rows)
+            # Require the write path to return every planned feed slot.  Human-owned
+            # rows and retained media holds were removed above, so any remaining
+            # shortfall means a stage-time belt dropped required cadence.
+            expected_feed_count = len(new_feed_slots)
+            actual_feed_count = len(inserted_feed_slots)
+            if actual_feed_count < expected_feed_count:
+                log(f"{base_key}: cadence staging incomplete: inserted "
+                    f"{actual_feed_count}/{expected_feed_count} Instagram "
+                    "feed slots; cadence remains pending and the scan will retry")
+                return {"ok": False, "reason": "incomplete cadence staging",
+                        "incomplete_cadence": True,
+                        "expected_feed_slots": expected_feed_count,
+                        "inserted_feed_slots": actual_feed_count,
+                        "upserted": inserted, "inserted": inserted,
+                        "deleted": deleted if span_claim is None else span_claim,
+                        "deleted_total": deleted, "months": months,
+                        "retained_reservation_ids": sorted(planned_reservation_ids)}
     except Exception as exc:  # noqa: BLE001
+        rollback_ok = False
+        rollback_attempted = False
+        try:
+            from .portal_calendar_store import CalendarInsertNotStartedError
+            known_pre_post_refusal = isinstance(
+                exc, CalendarInsertNotStartedError)
+        except Exception:  # noqa: BLE001
+            known_pre_post_refusal = False
+        restore = getattr(store, "restore_deleted_rows", None)
+        definite_pre_post_failure = not insert_started
+        if ((known_pre_post_refusal or definite_pre_post_failure)
+                and deleted_row_snapshots
+                and callable(restore)):
+            rollback_attempted = True
+            try:
+                restored = restore(base_key, deleted_row_snapshots) or []
+                rollback_ok = len(restored) == len(deleted_row_snapshots)
+                log(f"{base_key}: cadence changed after preflight; restored "
+                    f"{len(restored)}/{len(deleted_row_snapshots)} deleted row(s)")
+            except Exception as rollback_exc:  # noqa: BLE001
+                log(f"{base_key}: calendar rollback failed: "
+                    f"{type(rollback_exc).__name__}")
         log(f"store write failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
                 "upserted": inserted, "deleted": deleted, "months": months,
+                "deleted_total": deleted,
+                "effective_deleted": 0 if rollback_ok else deleted,
+                "rollback_restored": rollback_ok,
+                "rollback_failed": bool(rollback_attempted and not rollback_ok),
                 # Once the insert request started, its outcome may be unknown. Keep
                 # those exact reservations fail closed; pre-insert failures retain none.
                 "retained_reservation_ids": sorted(planned_reservation_ids)
-                if insert_started else [],
-                "insert_outcome_unknown": bool(insert_started)}
+                if (insert_started and not rollback_ok
+                    and not known_pre_post_refusal) else [],
+                "insert_outcome_unknown": bool(
+                    insert_started and not rollback_ok
+                    and not known_pre_post_refusal)}
     return {"ok": True, "upserted": inserted, "inserted": inserted,
             "deleted": deleted if span_claim is None else span_claim,
             "deleted_total": deleted, "months": months,
