@@ -6,6 +6,11 @@ It touches R2 only, never /data (the volume belongs to the listener service).
 It ships dark: every route except `/healthz` answers 404 until
 `AGENT_INTAKE_ENABLED=true` is set by hand.
 
+On a production shell (`railway ssh`), always use `/opt/venv/bin/python`, never
+a bare `python`. The Nix default interpreter has none of Echo's dependencies
+and will raise `ModuleNotFoundError: httpx` (and similar) that look like
+runtime failures. See AGENTS.md.
+
 ## Create the service (click by click)
 
 1. Open the Echo project in Railway (the one running the `listen` worker).
