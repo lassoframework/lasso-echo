@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from agent import accounts, echo_clients, registry_reconcile
 
 ZANSHIN = "630e22ab-0000-4000-8000-000000000001"
@@ -67,6 +69,53 @@ def test_calendar_base_wins_over_a_different_portal_token(monkeypatch, tmp_path)
                                           calendar_rows=[_calendar()])
     assert result["registered"] == [BASE]
     assert json.loads(path.read_text())[0]["base"] == BASE
+
+
+def test_partial_calendar_row_cannot_trigger_wrong_token_fallback(monkeypatch, tmp_path):
+    clients = _clients(token="zanshinportalminted630e22")
+    path = _registry(monkeypatch, tmp_path, clients)
+    result = registry_reconcile.reconcile(
+        clients=clients, calendar_rows=[{"gym_id": BASE}])
+    assert not result["ok"]
+    assert result["error"] == "approved calendar returned invalid rows"
+    assert result["registered"] == [] and not path.exists()
+
+    # A complete later pass sees the approved row and chooses its actual
+    # scheduled base, not the different unique portal token.
+    later = registry_reconcile.reconcile(clients=clients,
+                                         calendar_rows=[_calendar()])
+    assert later["registered"] == [BASE]
+    assert json.loads(path.read_text())[0]["base"] == BASE
+
+
+@pytest.mark.parametrize("missing", ["gym_id", "account", "post_date", "status",
+                                         "variant_status", "published_at"])
+def test_any_missing_calendar_identity_field_holds_entire_pass(monkeypatch, tmp_path,
+                                                                missing):
+    clients = _clients(token="zanshinportalminted630e22")
+    path = _registry(monkeypatch, tmp_path, clients)
+    row = _calendar()
+    del row[missing]
+    result = registry_reconcile.reconcile(clients=clients, calendar_rows=[row])
+    assert not result["ok"] and result["registered"] == []
+    assert result["error"] == "approved calendar returned invalid rows"
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("changed", [
+    {"status": "pending"}, {"variant_status": "candidate"},
+    {"account": "googlebusiness"}, {"published_at": "2026-10-05T17:00:00Z"},
+    {"post_date": "not-a-date"},
+])
+def test_calendar_filter_violation_never_falls_back_to_token(monkeypatch, tmp_path,
+                                                               changed):
+    clients = _clients(token="zanshinportalminted630e22")
+    path = _registry(monkeypatch, tmp_path, clients)
+    result = registry_reconcile.reconcile(
+        clients=clients, calendar_rows=[_calendar(**changed)])
+    assert not result["ok"] and result["registered"] == []
+    assert result["error"] == "approved calendar returned invalid rows"
+    assert not path.exists()
 
 
 def test_positive_marker_and_one_issued_key_can_register_without_calendar(monkeypatch, tmp_path):
@@ -164,7 +213,27 @@ def test_repair_cannot_take_over_an_unstamped_row_created_after_its_read(monkeyp
     assert path.read_text() == before
     result = registry_reconcile.reconcile(clients=clients,
                                           calendar_rows=[_calendar()])
-    assert result["registered"] == []
+    assert not result["ok"] and result["registered"] == []
+    assert path.read_text() == before
+
+
+@pytest.mark.parametrize("rows", [
+    [{}],
+    [{"base": "otherclient222222", "gym_id": "_ig"}],
+    [{"base": "otherclient222222", "gym_id": OTHER_CLIENT},
+     {"base": "otherclient222222", "gym_id": ADS_ONLY}],
+    [{"base": "otherclient222222", "gym_id": OTHER_CLIENT},
+     {"base": "otherclientalternate", "gym_id": OTHER_CLIENT}],
+])
+def test_any_invalid_registry_identity_blocks_all_writes(monkeypatch, tmp_path, rows):
+    clients = _clients()
+    path = _registry(monkeypatch, tmp_path, clients)
+    path.write_text(json.dumps(rows))
+    before = path.read_text()
+    result = registry_reconcile.reconcile(clients=clients,
+                                          calendar_rows=[_calendar()])
+    assert not result["ok"] and result["registered"] == []
+    assert result["error"].startswith("publisher registry contains")
     assert path.read_text() == before
 
 

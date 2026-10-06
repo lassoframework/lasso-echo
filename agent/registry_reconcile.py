@@ -8,11 +8,44 @@ An intake token by itself is never evidence of an Echo purchase.
 """
 
 import re
+from datetime import date
 
 from . import accounts, config, echo_clients
 
 _BASE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
 _PLATFORMS = frozenset(("instagram", "facebook"))
+_CALENDAR_FIELDS = frozenset(
+    ("gym_id", "account", "post_date", "status", "variant_status", "published_at"))
+
+
+def _valid_calendar_row(row):
+    """A partial row makes the whole read unknown, including token fallback.
+
+    PostgREST's query projects all six fields. If any is absent or malformed,
+    skipping that row could hide the real scheduled base and register a different
+    issued key instead. Validate before considering any registry write.
+    """
+    if not isinstance(row, dict) or not _CALENDAR_FIELDS.issubset(row):
+        return False
+    if not isinstance(row["gym_id"], str) or not _BASE.fullmatch(row["gym_id"]):
+        return False
+    # These values are guaranteed by _calendar_rows' server filters. A response
+    # violating them is not a complete proof of which base owns scheduled work.
+    if (not isinstance(row["account"], str)
+            or not isinstance(row["status"], str)
+            or not isinstance(row["variant_status"], str)
+            or row["account"] not in _PLATFORMS or row["status"] != "approved"
+            or row["variant_status"] != "active"
+            or row["published_at"] is not None):
+        return False
+    post_date = row["post_date"]
+    if not isinstance(post_date, str) or len(post_date) != 10:
+        return False
+    try:
+        date.fromisoformat(post_date)
+    except ValueError:
+        return False
+    return True
 
 
 def _approved_calendar_bases(rows, clients):
@@ -73,7 +106,7 @@ def reconcile(*, http=None, clients=None, calendar_rows=None):
         result["error"] = "approved calendar unreadable or incomplete"
         return result
     if (not isinstance(calendar_rows, list)
-            or any(not isinstance(row, dict) for row in calendar_rows)):
+            or any(not _valid_calendar_row(row) for row in calendar_rows)):
         result["error"] = "approved calendar returned invalid rows"
         return result
     try:
@@ -81,18 +114,29 @@ def reconcile(*, http=None, clients=None, calendar_rows=None):
     except accounts.RegistryUnreadable:
         result["error"] = "publisher registry unreadable"
         return result
-    if not all(isinstance(row, dict) for row in registry):
+    if not isinstance(registry, list):
         result["error"] = "publisher registry contains invalid rows"
         return result
 
     by_id, by_base = {}, {}
     for row in registry:
-        gid = echo_clients.normalize_key(row.get("gym_id"))
-        base = str(row.get("base") or "").strip()
-        if gid:
-            by_id.setdefault(gid, []).append(row)
-        if base:
-            by_base.setdefault(base, []).append(row)
+        if not isinstance(row, dict):
+            result["error"] = "publisher registry contains invalid rows"
+            return result
+        raw_gid, base = row.get("gym_id"), row.get("base")
+        if (not isinstance(raw_gid, str) or not raw_gid.strip()
+                or not isinstance(base, str) or not _BASE.fullmatch(base)):
+            result["error"] = "publisher registry contains missing identity"
+            return result
+        gid = echo_clients.normalize_key(raw_gid)
+        if not gid:
+            result["error"] = "publisher registry contains missing identity"
+            return result
+        if base in by_base or gid in by_id:
+            result["error"] = "publisher registry contains duplicate identity"
+            return result
+        by_id[gid] = [row]
+        by_base[base] = [row]
     calendar = _approved_calendar_bases(calendar_rows, clients)
     hardcoded = {echo_clients.normalize_key(key)
                  for key in echo_clients.hardcoded_bases()}
