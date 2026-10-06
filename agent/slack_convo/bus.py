@@ -631,6 +631,43 @@ class Bus:
             "attachments->>fixer_slack_delivery_intent": "not.is.null",
         }, fields)
 
+    def record_fixer_delivery_timestamp(self, message_id, intent, slack_ts, attempts=3):
+        """Persist Slack's successful POST timestamp across a stale-sweeper race.
+
+        A second worker may quarantine posting -> held while the POST caller is
+        waiting on Slack.  The timestamp still belongs to this row only when the
+        complete durable intent is unchanged and no different timestamp exists.
+        Compare the full attachment snapshot and exact status on every attempt;
+        conflicts fail closed instead of making the row resendable.
+        """
+        if not isinstance(intent, dict) or not isinstance(slack_ts, str) or not slack_ts:
+            return None
+        for _ in range(max(1, int(attempts))):
+            row = self.message(message_id)
+            if not row or row.get("delivery_status") not in {"posting", "held"}:
+                return None
+            att = row.get("attachments")
+            snapshot = dict(att or {})
+            if snapshot.get("fixer_slack_delivery_intent") != intent:
+                return None
+            if (row.get("delivery_status") == "held"
+                    and snapshot.get("fixer_slack_delivery_uncertain") is not True):
+                return None
+            existing = row.get("slack_ts")
+            if existing:
+                return row if existing == slack_ts else None
+            changed = self._patch(_MESSAGES, {
+                "id": f"eq.{message_id}",
+                "delivery_status": f"eq.{row['delivery_status']}",
+                "slack_ts": "is.null",
+                "attachments": ("is.null" if att is None else
+                                "eq." + json.dumps(snapshot, separators=(",", ":"),
+                                                   sort_keys=True)),
+            }, {"slack_ts": slack_ts})
+            if changed:
+                return changed
+        return None
+
     def prepare_fixer_delivery(self, message_id, intent):
         """Persist exact delivery intent only while this worker still owns posting."""
         row = self.message(message_id)
@@ -734,13 +771,17 @@ class Bus:
             eligible=lambda _row, att: bool(att.get("fixer_slack_delivery_uncertain")),
             updates=lambda _row, _att: {"fixer_reconcile_next_at": next_at})
 
-    def reconcile_held_fixer_delivery(self, message_id, proof):
+    def reconcile_held_fixer_delivery(self, message_id, proof, *,
+                                      expected_intent=None, expected_ts=None):
         """Promote a held uncertain delivery only after exact Slack readback."""
         return self._patch_held_fixer_attachments(
             message_id,
             eligible=lambda _row, att: bool(
                 att.get("fixer_slack_delivery_uncertain")
-                and att.get("fixer_slack_delivery_intent")),
+                and att.get("fixer_slack_delivery_intent")
+                and (expected_intent is None
+                     or att.get("fixer_slack_delivery_intent") == expected_intent)
+                and (expected_ts is None or _row.get("slack_ts") == expected_ts)),
             updates=lambda _row, _att: proof,
             fields={"delivery_status": "posted",
                     "slack_ts": proof["delivery_readback_ts"]})

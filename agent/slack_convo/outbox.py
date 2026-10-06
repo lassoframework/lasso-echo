@@ -806,6 +806,23 @@ _SLACK_ENTITIES = ("&amp;", "&lt;", "&gt;")
 _SLACK_RESERVED = {"&": "&amp;", "<": "&lt;", ">": "&gt;"}
 
 
+def _slack_entity_escape(value):
+    """Apply Slack's reserved-character storage escaping exactly once."""
+    escaped = []
+    index = 0
+    while index < len(value):
+        entity = next((item for item in _SLACK_ENTITIES
+                       if value.startswith(item, index)), None)
+        if entity:
+            escaped.append(entity)
+            index += len(entity)
+            continue
+        char = value[index]
+        escaped.append(_SLACK_RESERVED.get(char, char))
+        index += 1
+    return "".join(escaped)
+
+
 def _slack_readback_text_matches(intended, observed):
     """Match only documented Slack mrkdwn storage forms of the sent bytes.
 
@@ -831,7 +848,12 @@ def _slack_readback_text_matches(intended, observed):
                     or _SLACK_ESCAPED_MARKUP.match(intended, index))
         if explicit:
             token = explicit.group()
-            alternatives = (token,)
+            if (_SLACK_ESCAPED_MARKUP.fullmatch(token)
+                    or not token.lower().startswith(("<http://", "<https://", "<mailto:"))):
+                alternatives = (token,)
+            else:
+                escaped = f"<{_slack_entity_escape(token[1:-1])}>"
+                alternatives = tuple(dict.fromkeys((token, escaped)))
         else:
             url_match = (_SLACK_URL.match(intended, index)
                          if index == 0 or not (intended[index - 1].isalnum()
@@ -842,7 +864,11 @@ def _slack_readback_text_matches(intended, observed):
                 # link target as delivery proof.
                 token = url_match.group()
                 if token:
-                    alternatives = (token, f"<{token}>", f"<{token}|{token}>")
+                    escaped = _slack_entity_escape(token)
+                    alternatives = tuple(dict.fromkeys((
+                        token, escaped, f"<{token}>", f"<{escaped}>",
+                        f"<{token}|{token}>", f"<{escaped}|{escaped}>",
+                    )))
                 else:
                     token = intended[index]
                     alternatives = (token,)
@@ -955,7 +981,7 @@ def _claim(bus, row, log):
     return True
 
 
-def _recover_stale_claims(bus, identity, log, now=None, readback=None):
+def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=None):
     """A row still 'posting' after CLAIM_TIMEOUT_SECONDS is orphaned -- either a crash
     between claim and mark in THIS process, or (D26, the scenario the claim step exists for)
     a redeploy overlap / second consumer per D2 that crashed mid-post. Swept back to 'ready'
@@ -997,6 +1023,14 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None):
                 posted = bus.transition_fixer_delivery(
                     row["id"], "posted", slack_ts=proof["delivery_readback_ts"],
                     meta_update=proof)
+                if not posted:
+                    current = bus.message(row["id"])
+                    if ((current or {}).get("delivery_status") == "held"
+                            and (current or {}).get("slack_ts") == proof[
+                                "delivery_readback_ts"]):
+                        posted = bus.reconcile_held_fixer_delivery(
+                            row["id"], proof, expected_intent=intent,
+                            expected_ts=proof["delivery_readback_ts"])
                 if not posted or posted.get("delivery_status") != "posted":
                     _quarantine_fixer(bus, row["id"],
                                       "Slack readback succeeded but database commit failed", log)
@@ -1005,7 +1039,8 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None):
                 ticket = bus.ticket(row["ticket_id"])
                 if ticket:
                     _finalize_fixer_post(bus, ticket, posted, identity, log,
-                                         {"resolved": 0})
+                                         summary if isinstance(summary, dict)
+                                         else {"resolved": 0})
                 continue
             if (row.get("attachments") or {}).get("outreach") is True:
                 # The direct outreach path posts to Slack before its final DB mark.
@@ -1187,6 +1222,9 @@ def _recover_route_missing_fixer(bus, identity, member_check, log, now=None):
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     recovered = 0
+    membership = {}
+    membership_reads = 0
+    membership_read_limit = 5
     for row in rows:
         att = row.get("attachments") or {}
         recipient = att.get("recipient_kind", "client")
@@ -1235,11 +1273,16 @@ def _recover_route_missing_fixer(bus, identity, member_check, log, now=None):
                 fresh = _fresh_fixer_request(bus, fresh, att, body=body)
                 if not fresh or fresh.get("slack_channel_id") != channel:
                     continue
-            try:
-                member = bool(member_check and member_check(
-                    channel, config.APPROVER_SLACK_ID))
-            except Exception:  # noqa: BLE001 - membership is mandatory
-                member = False
+            if channel not in membership:
+                if membership_reads >= membership_read_limit:
+                    break
+                membership_reads += 1
+                try:
+                    membership[channel] = bool(member_check and member_check(
+                        channel, config.APPROVER_SLACK_ID))
+                except Exception:  # noqa: BLE001 - membership is mandatory
+                    membership[channel] = False
+            member = membership[channel]
             if not member:
                 continue
             # One final request/route read immediately precedes the message CAS.
@@ -1398,8 +1441,8 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
     readback = readback or getattr(post, "readback", None)
     member_check = member_check or (lambda channel, user: _blake_is_member(
         identity, channel, user))
-    summary["reclaimed"] = _recover_stale_claims(bus, identity, log, now=now,
-                                                   readback=readback)
+    summary["reclaimed"] = _recover_stale_claims(
+        bus, identity, log, now=now, readback=readback, summary=summary)
     _report_uncertain_outreach(bus, identity, log)
     _reconcile_held_fixer(bus, identity, readback, log, summary)
     summary["reclaimed"] += _recover_route_missing_fixer(
@@ -2002,7 +2045,11 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         if not isinstance(ts, str) or not ts:
             raise UncertainFixerDelivery("Slack post returned no message timestamp")
         try:
-            stamped = bus.transition_fixer_delivery(row["id"], "posting", slack_ts=ts)
+            record_timestamp = getattr(bus, "record_fixer_delivery_timestamp", None)
+            if callable(record_timestamp):
+                stamped = record_timestamp(row["id"], intent, ts)
+            else:  # older bounded test/store adapters; production Bus owns the race-safe path
+                stamped = bus.transition_fixer_delivery(row["id"], "posting", slack_ts=ts)
         except Exception as exc:  # noqa: BLE001
             raise UncertainFixerDelivery(
                 f"Slack accepted but timestamp persistence failed: {type(exc).__name__}") from exc
@@ -2014,6 +2061,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         try:
             posted = bus.transition_fixer_delivery(
                 row["id"], "posted", slack_ts=ts, meta_update=proof)
+            if not posted:
+                current = bus.message(row["id"])
+                if ((current or {}).get("delivery_status") == "held"
+                        and (current or {}).get("slack_ts") == ts):
+                    posted = bus.reconcile_held_fixer_delivery(
+                        row["id"], proof, expected_intent=intent, expected_ts=ts)
         except Exception as exc:  # noqa: BLE001
             raise UncertainFixerDelivery(
                 f"Slack verified but database completion failed: {type(exc).__name__}") from exc
