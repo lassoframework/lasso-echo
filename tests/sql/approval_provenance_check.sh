@@ -46,6 +46,11 @@ check() { # name expected actual
   else FAIL=$((FAIL+1)); echo "FAIL - $1 (expected [$2], got [$3])"; fi
 }
 q() { psql -h "$SOCK" -p 55444 -U postgres -d postgres -v ON_ERROR_STOP=1 -qAtc "$1"; }
+GBP_SNAPSHOT() { # id suffix, visible format; raw proof is read before a mutation
+  local id="$1" fmt="$2" proof
+  proof="$(q "select calendar_gbp_approval_snapshot(content_calendar.*) from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$id'")"
+  printf '{"caption":"caption %s","media_url":"https://cdn/%s.jpg","day_key":"2026-08-10","format":"%s","platform":"googlebusiness","gbp_proof":%s}' "$id" "$id" "$fmt" "$proof"
+}
 
 GYM_UUID="11111111-1111-1111-1111-111111111111"
 OTHER_GYM="99999999-9999-9999-9999-999999999999"
@@ -235,14 +240,84 @@ check "null format matches effective feed" "1" "$(q "select count(*) from approv
 # snapshot compare still rejects a stale format or canonical platform.
 q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
    values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa37','$SWIFT','pending','active','https://cdn/37.jpg','googlebusiness','photo','2026-08-10','caption 37')"
-GBP_PHOTO_SNAPSHOT='{"caption": "caption 37", "media_url": "https://cdn/37.jpg", "day_key": "2026-08-10", "format": "photo", "platform": "googlebusiness"}'
+GBP_PHOTO_SNAPSHOT="$(GBP_SNAPSHOT 37 photo)"
 check "matching GBP photo snapshot approves" "1" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa37','$SWIFT','$GBP_PHOTO_SNAPSHOT'::jsonb)")"
 q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
    values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa38','$SWIFT','pending','active','https://cdn/38.jpg','googlebusiness','photo','2026-08-10','caption 38')"
 q "update content_calendar set format='feed' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa38'"
-GBP_STALE_FORMAT='{"caption": "caption 38", "media_url": "https://cdn/38.jpg", "day_key": "2026-08-10", "format": "photo", "platform": "googlebusiness"}'
+GBP_STALE_FORMAT="$(GBP_SNAPSHOT 38 photo)"
 check "stale GBP photo format refuses" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa38','$SWIFT','$GBP_STALE_FORMAT'::jsonb)")"
 check "stale GBP photo format leaves pending" "pending" "$(q "select status from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa38'")"
+
+# Every format actually emitted by gbp_planner must retain its own row identity
+# through the locked approve and unproved-retry comparisons.
+GBP_ID=42
+for GBP_FORMAT in update event offer photo; do
+  q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+     values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$GBP_ID','$SWIFT','pending','active','https://cdn/$GBP_ID.jpg','googlebusiness','$GBP_FORMAT','2026-08-10','caption $GBP_ID')"
+  GBP_EXPECTED="$(GBP_SNAPSHOT "$GBP_ID" "$GBP_FORMAT")"
+  check "GBP $GBP_FORMAT exact snapshot approves" "1" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$GBP_ID','$SWIFT','$GBP_EXPECTED'::jsonb)")"
+  check "GBP $GBP_FORMAT exact retry compares" "1" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$GBP_ID','$SWIFT','$GBP_EXPECTED'::jsonb)")"
+  check "GBP $GBP_FORMAT keeps digest" "t" "$(q "select approval_digest = calendar_approval_digest(content_calendar.*) from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$GBP_ID'")"
+  GBP_ID=$((GBP_ID+1))
+done
+
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa46','$SWIFT','pending','active','https://cdn/46.jpg','googlebusiness','event','2026-08-10','caption 46')"
+GBP_STALE_EVENT="$(GBP_SNAPSHOT 46 offer)"
+check "GBP event cannot approve as offer" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa46','$SWIFT','$GBP_STALE_EVENT'::jsonb)")"
+check "GBP event/offer mismatch leaves pending" "pending" "$(q "select status from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa46'")"
+
+# The structured card is a required part of GBP proof. Every digest-bound field
+# is compared in the same UPDATE, including tenant identity, pillar, CTA,
+# location and raw event/offer JSON.
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption,gbp_topic_type,gbp_cta_type,gbp_cta_url,gbp_location_id,pillar)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa47','$SWIFT','pending','active','https://cdn/47.jpg','googlebusiness','update','2026-08-10','caption 47','STANDARD','BOOK','https://book.old','place-1','education')"
+GBP_CTA_BEFORE="$(GBP_SNAPSHOT 47 update)"
+check "GBP missing structured proof refuses" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa47','$SWIFT','{\"caption\":\"caption 47\",\"media_url\":\"https://cdn/47.jpg\",\"day_key\":\"2026-08-10\",\"format\":\"update\",\"platform\":\"googlebusiness\"}'::jsonb)")"
+check "GBP wrong gym identity refuses" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa47','$SWIFT',jsonb_set('$GBP_CTA_BEFORE'::jsonb,'{gbp_proof,gym_id}',to_jsonb('othergym'::text)))")"
+q "update content_calendar set gbp_cta_url='https://book.new' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa47'"
+check "GBP stale CTA refuses pending approve" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa47','$SWIFT','$GBP_CTA_BEFORE'::jsonb)")"
+check "GBP stale CTA leaves pending and unproved" "t" "$(q "select status='pending' and approval_digest is null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa47'")"
+
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption,gbp_topic_type,gbp_offer)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa48','$SWIFT','pending','active','https://cdn/48.jpg','googlebusiness','offer','2026-08-10','caption 48','OFFER','{\"couponCode\":\"SAVE10\",\"termsConditions\":\"Old terms\",\"redeemOnlineUrl\":\"https://offer.old\"}'::jsonb)"
+GBP_OFFER_BEFORE="$(GBP_SNAPSHOT 48 offer)"
+q "update content_calendar set gbp_offer=jsonb_set(gbp_offer,'{termsConditions}','\"New terms\"'::jsonb) where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa48'"
+check "GBP stale offer refuses pending approve" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa48','$SWIFT','$GBP_OFFER_BEFORE'::jsonb)")"
+
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption,gbp_topic_type,gbp_event)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa49','$SWIFT','pending','active','https://cdn/49.jpg','googlebusiness','event','2026-08-10','caption 49','EVENT','{\"title\":\"Open house\",\"schedule\":{\"startDate\":\"2026-08-10\",\"endDate\":\"2026-08-11\"}}'::jsonb)"
+GBP_EVENT_BEFORE="$(GBP_SNAPSHOT 49 event)"
+q "update content_calendar set gbp_event=jsonb_set(gbp_event,'{schedule,startDate}','\"2026-08-12\"'::jsonb) where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa49'"
+check "GBP stale event refuses pending approve" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa49','$SWIFT','$GBP_EVENT_BEFORE'::jsonb)")"
+
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption,pillar,gbp_location_id)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa50','$SWIFT','pending','active','https://cdn/50.jpg','googlebusiness','photo','2026-08-10','caption 50','photo','place-1')"
+GBP_LOCATION_BEFORE="$(GBP_SNAPSHOT 50 photo)"
+q "update content_calendar set gbp_location_id='place-2' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa50'"
+check "GBP stale location refuses pending approve" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa50','$SWIFT','$GBP_LOCATION_BEFORE'::jsonb)")"
+q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption,pillar)
+   values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa51','$SWIFT','pending','active','https://cdn/51.jpg','googlebusiness','update','2026-08-10','caption 51','education')"
+GBP_PILLAR_BEFORE="$(GBP_SNAPSHOT 51 update)"
+q "update content_calendar set pillar='promotion' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa51'"
+check "GBP stale pillar refuses pending approve" "0" "$(q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa51','$SWIFT','$GBP_PILLAR_BEFORE'::jsonb)")"
+
+# Approved but unproved legacy rows have no digest yet; these refusals prove
+# recovery independently rechecks raw structured content, not just the digest.
+for FIELD in cta offer event; do
+  case "$FIELD" in cta) ID=52; FORMAT=update;; offer) ID=53; FORMAT=offer;; event) ID=54; FORMAT=event;; esac
+  q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption,gbp_cta_url,gbp_offer,gbp_event)
+     values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$ID','$SWIFT','approved','active','https://cdn/$ID.jpg','googlebusiness','$FORMAT','2026-08-10','caption $ID','https://old','{\"termsConditions\":\"Old\"}'::jsonb,'{\"title\":\"Old\"}'::jsonb)"
+  BEFORE="$(GBP_SNAPSHOT "$ID" "$FORMAT")"
+  case "$FIELD" in
+    cta) q "update content_calendar set gbp_cta_url='https://new' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$ID'";;
+    offer) q "update content_calendar set gbp_offer='{\"termsConditions\":\"New\"}'::jsonb where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$ID'";;
+    event) q "update content_calendar set gbp_event='{\"title\":\"New\"}'::jsonb where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$ID'";;
+  esac
+  check "GBP stale $FIELD refuses unproved reaffirmation" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$ID','$SWIFT','$BEFORE'::jsonb)")"
+  check "GBP stale $FIELD leaves legacy digest null" "t" "$(q "select approval_digest is null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa$ID'")"
+done
 
 # An actual null caption matches the null value in the visible-card snapshot.
 mkrow 28 pending

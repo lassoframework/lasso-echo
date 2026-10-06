@@ -41,7 +41,8 @@
 --      UPDATE also requires variant_status='active' (review defect 3). When
 --      the portal sends its visible-card snapshot (p_expected, gated portal-
 --      side by PORTAL_ECHO_APPROVAL_PROOF), the SAME UPDATE additionally
---      requires caption/media_url/day_key/format/platform to match the locked
+--      requires caption/media_url/day_key/format/platform and the raw GBP
+--      provider object to match the locked
 --      row; a stale snapshot updates zero rows (Echo 409s
 --      review_refresh_required). p_expected DEFAULT NULL keeps the exact
 --      legacy flag-OFF behavior, and the old 2-arg signatures are dropped so
@@ -91,6 +92,30 @@ alter table public.content_calendar
 create unique index if not exists echo_intake_tokens_echo_account_key_unique
   on public.echo_intake_tokens (echo_account_key);
 
+-- The raw GBP fields served to the reviewer. Keep this ONE object shared by
+-- digest construction and both locked expected-card comparisons so a future
+-- provider field cannot be bound in one place but omitted in another.
+create or replace function public.calendar_gbp_approval_snapshot(
+  p_row public.content_calendar
+) returns jsonb
+language sql stable set search_path = public
+as $$
+  select jsonb_build_object(
+    'gym_id', p_row.gym_id,
+    'pillar', to_jsonb(p_row)->'pillar',
+    'gbp_topic_type', to_jsonb(p_row)->'gbp_topic_type',
+    'gbp_cta_type', to_jsonb(p_row)->'gbp_cta_type',
+    'gbp_cta_url', to_jsonb(p_row)->'gbp_cta_url',
+    'gbp_event', to_jsonb(p_row)->'gbp_event',
+    'gbp_offer', to_jsonb(p_row)->'gbp_offer',
+    'gbp_location_id', to_jsonb(p_row)->'gbp_location_id'
+  );
+$$;
+revoke all on function public.calendar_gbp_approval_snapshot(public.content_calendar)
+  from public, anon, authenticated;
+grant execute on function public.calendar_gbp_approval_snapshot(public.content_calendar)
+  to service_role;
+
 -- Canonical digest of the exact publish-relevant fields. Field order and
 -- normalization are part of the contract: lower/btrim account and format
 -- ('feed' default), ISO post_date, raw caption, the FINAL visible image_url,
@@ -121,16 +146,7 @@ as $$
     -- including the destination and structured offers/events. jsonb::text has
     -- canonical key ordering, independent of input JSON key order.
     case when lower(btrim(p_row.account)) = 'googlebusiness' then
-      jsonb_build_object(
-        'gym_id', p_row.gym_id,
-        'pillar', to_jsonb(p_row)->'pillar',
-        'gbp_topic_type', to_jsonb(p_row)->'gbp_topic_type',
-        'gbp_cta_type', to_jsonb(p_row)->'gbp_cta_type',
-        'gbp_cta_url', to_jsonb(p_row)->'gbp_cta_url',
-        'gbp_event', to_jsonb(p_row)->'gbp_event',
-        'gbp_offer', to_jsonb(p_row)->'gbp_offer',
-        'gbp_location_id', to_jsonb(p_row)->'gbp_location_id'
-      )::text else null end
+      public.calendar_gbp_approval_snapshot(p_row)::text else null end
   ));
 $$;
 
@@ -184,7 +200,8 @@ as $$
          -- string (no fetching -- the bound URL IS the
          -- identity); day_key is the visible post_date; format is the
          -- effective format ('feed' when unset); platform is the canonical
-         -- account platform. ALL of it is checked in THIS SAME UPDATE that
+         -- account platform. GBP also compares every raw digest-bound field.
+         -- ALL of it is checked in THIS SAME UPDATE that
          -- stamps status+digest: a stale snapshot matches zero rows, flips
          -- nothing and stamps nothing -- Echo answers 409
          -- review_refresh_required and the card re-enters review.
@@ -196,6 +213,8 @@ as $$
            = coalesce(nullif(lower(btrim(coalesce(p_expected->>'format', ''))), ''), 'feed')
          and coalesce(nullif(lower(btrim(c.account)), ''), '')
            = lower(btrim(coalesce(p_expected->>'platform', '')))
+         and (lower(btrim(c.account)) <> 'googlebusiness'
+              or public.calendar_gbp_approval_snapshot(c) = p_expected->'gbp_proof')
        )
      )
   returning *;
@@ -240,7 +259,10 @@ begin
       or coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed')
          is distinct from coalesce(nullif(lower(btrim(coalesce(p_expected->>'format', ''))), ''), 'feed')
       or coalesce(nullif(lower(btrim(v_row.account)), ''), '')
-         is distinct from lower(btrim(coalesce(p_expected->>'platform', ''))) then
+         is distinct from lower(btrim(coalesce(p_expected->>'platform', '')))
+      or (lower(btrim(v_row.account)) = 'googlebusiness' and
+          public.calendar_gbp_approval_snapshot(v_row)
+            is distinct from p_expected->'gbp_proof') then
     return;
   end if;
   if v_row.approval_digest is null then

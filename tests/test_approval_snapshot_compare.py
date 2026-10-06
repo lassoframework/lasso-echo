@@ -7,10 +7,10 @@ Absent/malformed snapshot or ANY compare mismatch -> 409
 review_refresh_required, no status change, no digest. Flag OFF keeps the
 legacy behavior byte-for-byte (snapshot ignored, legacy wire + error).
 
-Snapshot contract: caption (string or null, null/empty normalized the same
-as display), media_url (nonempty final image URL), day_key (YYYY-MM-DD
-visible post_date), format (feed/story), platform (instagram/facebook/
-googlebusiness). scheduled_for/scheduled_at are NOT required.
+Snapshot contract: caption (string or null), media_url (nonempty final image
+URL), day_key (YYYY-MM-DD visible post_date), format (IG/FB feed/story or GBP
+update/event/offer/photo), platform (instagram/facebook/googlebusiness).
+scheduled_for/scheduled_at are NOT required.
 
 No database, no network. The SQL compare itself lives in
 migrations/calendar_approval_provenance_20261005.sql and is exercised
@@ -36,6 +36,15 @@ def _snapshot(**over):
             "platform": "instagram"}
     snap.update(over)
     return snap
+
+
+def _gbp_proof(**over):
+    proof = {"gym_id": "gymx", "pillar": "education",
+             "gbp_topic_type": "STANDARD", "gbp_cta_type": "BOOK",
+             "gbp_cta_url": "https://book.example", "gbp_event": None,
+             "gbp_offer": None, "gbp_location_id": "place-1"}
+    proof.update(over)
+    return proof
 
 
 def _pending_row():
@@ -483,20 +492,54 @@ def test_validate_expected_creative_requires_known_platform():
     assert err is not None
 
 
-def test_validate_expected_creative_allows_googlebusiness_photo_only():
+def test_validate_expected_creative_keeps_platform_formats_separate():
     import agent.portal_social as ps
-    norm, err = ps._validate_expected_creative(
-        _snapshot(format="photo", platform="googlebusiness"))
-    assert err is None
-    assert norm["format"] == "photo"
-    assert norm["platform"] == "googlebusiness"
-
-    # Feed/story remain valid for GBP and IG/FB, while GBP's photo format
-    # cannot accidentally broaden the Instagram/Facebook snapshot contract.
-    for platform in ("instagram", "facebook", "googlebusiness"):
+    for fmt in ("update", "event", "offer", "photo"):
+        norm, err = ps._validate_expected_creative(
+            _snapshot(format=fmt, platform="googlebusiness",
+                      gbp_proof=_gbp_proof()))
+        assert err is None
+        assert norm["format"] == fmt
+        assert norm["platform"] == "googlebusiness"
+        assert norm["gbp_proof"] == _gbp_proof()
+        for platform in ("instagram", "facebook"):
+            assert ps._validate_expected_creative(
+                _snapshot(format=fmt, platform=platform))[1] is not None
+    for platform in ("instagram", "facebook"):
         for fmt in ("feed", "story"):
             assert ps._validate_expected_creative(
                 _snapshot(format=fmt, platform=platform))[1] is None
-    for platform in ("instagram", "facebook"):
+    for fmt in ("feed", "story", "unknown"):
         assert ps._validate_expected_creative(
-            _snapshot(format="photo", platform=platform))[1] is not None
+            _snapshot(format=fmt, platform="googlebusiness",
+                      gbp_proof=_gbp_proof()))[1] is not None
+
+
+def test_gbp_snapshot_requires_complete_raw_provider_fields():
+    import agent.portal_social as ps
+    base = _snapshot(format="offer", platform="googlebusiness")
+    assert ps._validate_expected_creative(base)[1] is not None
+    proof = _gbp_proof(gbp_offer={"termsConditions": "exact raw terms"})
+    assert ps._validate_expected_creative({**base, "gbp_proof": proof})[0]["gbp_proof"] == proof
+    missing = dict(proof)
+    missing.pop("gbp_location_id")
+    assert ps._validate_expected_creative({**base, "gbp_proof": missing})[1] is not None
+    assert ps._validate_expected_creative({**base, "gbp_proof":
+                                           {**proof, "gbp_event": []}})[1] is not None
+
+
+def test_content_calendar_post_preserves_each_gbp_row_format():
+    import agent.portal_social as ps
+    row = {"id": "one", "post_date": "2026-08-10", "account": "googlebusiness",
+           "image_url": "https://cdn.example/x.jpg", "caption": "Current caption",
+           **_gbp_proof(gbp_event={"schedule": {"startDate": "2026-08-10"}})}
+    for fmt in ("update", "event", "offer", "photo"):
+        post = ps._content_calendar_post({**row, "format": fmt})
+        assert post["format"] == fmt
+        assert post["gbp_proof"] == _gbp_proof(
+            gbp_event={"schedule": {"startDate": "2026-08-10"}})
+    # A newly introduced GBP format remains visible as itself. Approval's
+    # platform/format gate rejects it until there is an explicit contract.
+    assert ps._content_calendar_post({**row, "format": "new_type"})["format"] == "new_type"
+    assert ps._content_calendar_post({**row, "account": "instagram", "format": None})["format"] == "feed"
+    assert ps._content_calendar_post({"account": "googlebusiness", "format": "offer"})["gbp_proof"] is None

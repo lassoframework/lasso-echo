@@ -364,13 +364,27 @@ def _calendar_post(row, is_lasso=False):
     }
 
 
+_GBP_PROOF_KEYS = ("gym_id", "pillar", "gbp_topic_type", "gbp_cta_type",
+                   "gbp_cta_url", "gbp_event", "gbp_offer", "gbp_location_id")
+
+
+def _gbp_proof_from_row(row):
+    """Raw provider fields, with no display normalization or invented nulls.
+    Missing schema fields mean the card cannot carry complete approval proof."""
+    if not all(key in row for key in _GBP_PROOF_KEYS):
+        return None
+    return {key: row[key] for key in _GBP_PROOF_KEYS}
+
+
 def _content_calendar_post(row, is_lasso=False):
     """One shared content_calendar row folded into the portal post shape. Carries a
     STABLE id (content_calendar.id) that the portal POSTs back to /posts/<id>/... .
-    format is the row's own 'feed'/'story' value (never derived); a row with no format
-    stays 'feed'. No field is invented: empty caption / image stay empty strings."""
+    format is the row's own value. GBP uses update/event/offer/photo, which must
+    survive into the visible-card approval snapshot. Legacy IG/FB missing formats
+    still display as feed. No caption or image is invented."""
     fmt = (row.get("format") or "").strip().lower()
-    if fmt not in ("feed", "story"):
+    platform = (row.get("account") or "").strip().lower()
+    if platform != "googlebusiness" and fmt not in ("feed", "story"):
         fmt = "feed"
     # Go-live time: the stored stamp when present; else SYNTHESIZED from the row's own
     # deterministic slot (the same pure function the publisher stamps from), so a
@@ -392,7 +406,7 @@ def _content_calendar_post(row, is_lasso=False):
         # WHICH page this row posts to (instagram|facebook) — a feed cross-posted to
         # IG + FB is two rows; without this the portal renders two identical cards
         # with no way to tag them.
-        "platform": (row.get("account") or "").strip().lower(),
+        "platform": platform,
         # DISPLAY image: for a VIDEO row this is the hosted POSTER FRAME
         # (content_calendar.thumbnail_url) so the calendar shows a real frame instead
         # of a blank card — no portal change needed, because this field is display-only
@@ -423,8 +437,9 @@ def _content_calendar_post(row, is_lasso=False):
         "needs_media": bool((row.get("media_not_ready_reason") or "").strip())
                        or not (row.get("image_url") or "").strip(),
     }
-    # gym_id scopes the hosted fallback card (media_host tenant isolation); the portal
-    # post shape itself is unchanged (no new keys).
+    if platform == "googlebusiness":
+        post["gbp_proof"] = _gbp_proof_from_row(row)
+    # gym_id scopes the hosted fallback card (media_host tenant isolation).
     return _with_display_image(post, tenant=row.get("gym_id"))
 
 
@@ -878,7 +893,11 @@ def _published_is_final(row, action, draft_id):
 # Portal ECHO_VERIFIED_APPROVAL_PROOF_CONTRACT.md snapshot fields (Echo half,
 # 2026-10-05). The object is the exact visible card at tap, NOT actor identity:
 # the Clerk actor and write access are proven separately by the portal.
-_PROOF_SNAPSHOT_FORMATS = ("feed", "story")
+_PROOF_SNAPSHOT_FORMATS = {
+    "instagram": ("feed", "story"),
+    "facebook": ("feed", "story"),
+    "googlebusiness": ("update", "event", "offer", "photo"),
+}
 _PROOF_SNAPSHOT_PLATFORMS = ("instagram", "facebook", "googlebusiness")
 _PROOF_SNAPSHOT_DAY_KEY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -888,7 +907,8 @@ def _validate_expected_creative(expected):
     (normalized, None) when the snapshot is well-formed, else (None, reason).
     caption may be string or null; media_url must be a nonempty final
     image/video URL; day_key is the YYYY-MM-DD visible post_date; format is
-    feed/story (plus GBP photo); platform is the canonical account platform. scheduled_for is
+    feed/story for IG/FB or update/event/offer/photo for GBP; platform is the
+    canonical account platform. scheduled_for is
     NOT part of the contract (/social keys on post_date; scheduled_at can be
     synthesized while the DB is null) and is never required."""
     if not isinstance(expected, dict):
@@ -906,11 +926,28 @@ def _validate_expected_creative(expected):
     platform = str(expected.get("platform") or "").strip().lower()
     if platform not in _PROOF_SNAPSHOT_PLATFORMS:
         return None, "platform must be instagram, facebook or googlebusiness"
-    if fmt not in _PROOF_SNAPSHOT_FORMATS and not (
-            platform == "googlebusiness" and fmt == "photo"):
-        return None, "format must be feed or story (googlebusiness also allows photo)"
-    return {"caption": caption, "media_url": media_url, "day_key": day_key,
-            "format": fmt, "platform": platform}, None
+    if fmt not in _PROOF_SNAPSHOT_FORMATS[platform]:
+        return None, "format is invalid for platform"
+    normalized = {"caption": caption, "media_url": media_url,
+                  "day_key": day_key, "format": fmt, "platform": platform}
+    if platform == "googlebusiness":
+        proof = expected.get("gbp_proof")
+        if not isinstance(proof, dict) or set(proof) != set(_GBP_PROOF_KEYS):
+            return None, "complete gbp_proof is required"
+        if not isinstance(proof["gym_id"], str) or not proof["gym_id"]:
+            return None, "gbp_proof gym_id is required"
+        for key in _GBP_PROOF_KEYS:
+            if key in ("gym_id", "gbp_event", "gbp_offer"):
+                continue
+            if proof[key] is not None and not isinstance(proof[key], str):
+                return None, f"gbp_proof {key} must be text or null"
+        for key in ("gbp_event", "gbp_offer"):
+            if proof[key] is not None and not isinstance(proof[key], dict):
+                return None, f"gbp_proof {key} must be an object or null"
+        normalized["gbp_proof"] = proof
+    elif "gbp_proof" in expected:
+        return None, "gbp_proof is only valid for googlebusiness"
+    return normalized, None
 
 
 def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store,
