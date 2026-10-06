@@ -405,8 +405,10 @@ def test_swap_landed_but_representation_none_keeps_local_reservation(monkeypatch
 def test_prewrite_cas_refusal_releases_exact_local_reservation(monkeypatch, tmp_path):
     from agent import portal_calendar_store, rotation
     monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
-    store = _Store([_row("p1")])
-    pick = dict(_picker("zanshin", _row("p1")), path=str(tmp_path / "new.jpg"))
+    row = dict(_row("p1"), caption=r"Keep your feet \ hips aligned")
+    store = _Store([row])
+    pick = dict(_picker("zanshin", row), path=str(tmp_path / "new.jpg"))
+    before_budget = ps._budget_state("zanshin")
 
     def cas_refused(*args, **kwargs):
         raise portal_calendar_store.PreWriteCASError(
@@ -416,8 +418,10 @@ def test_prewrite_cas_refusal_releases_exact_local_reservation(monkeypatch, tmp_
     status, body = ps.handle_swap_media(
         "zanshin", "p1", "u1", sb_store=store, picker=lambda *a, **k: pick)
 
-    assert status == 500 and body["error"].endswith("PreWriteCASError")
-    assert store.get_row("zanshin", "p1")["image_url"] == "https://cdn/old.jpg"
+    assert status == 409 and body["reason"] == "swap_snapshot_unavailable"
+    assert "unchanged" in body["error"] and "PreWriteCASError" not in body["error"]
+    assert body["recreate_budget"] == before_budget
+    assert store.get_row("zanshin", "p1") == row
     assert rotation.load_served_strict().get("zanshin_ig", []) == []
 
 
@@ -667,17 +671,34 @@ def test_after_swap_stamps_the_new_drive_asset_and_settles_the_old_one(monkeypat
     assert _sel.pickable("zanshin", store=store, now=now) == []
 
 
-def test_drive_swap_stamp_failure_holds_before_calendar_write(monkeypatch):
-    from agent import gym_media_index, gym_media_selector
+@pytest.mark.parametrize("persisted", [False, True])
+def test_drive_swap_stamp_failure_holds_exact_claim(monkeypatch, persisted):
+    from agent import db, gym_media_index, gym_media_selector
     from tests.gym_media_fakes import FakeMediaStore, make_asset
     store = FakeMediaStore(assets=[make_asset("new_v", gym_id="zanshin")])
     monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
-    monkeypatch.setattr(gym_media_selector, "stamp_use",
-                        lambda *a, **k: (_ for _ in ()).throw(OSError("stamp down")))
+    stamp = gym_media_selector.stamp_use
+
+    def failed_stamp(*args, **kwargs):
+        if persisted:
+            stamp(*args, **kwargs)
+        raise OSError("stamp outcome unavailable")
+
+    monkeypatch.setattr(gym_media_selector, "stamp_use", failed_stamp)
     pick = {"source": "drive", "source_media_asset_id": "new_v"}
     assert msw.reserve_local_pick(
         "zanshin", {"post_date": "2026-09-20"}, pick) is False
     assert not pick.get("_drive_stamped")
+    # A failed stamp cannot establish whether a remote usage write persisted.
+    # Even generic prewrite cleanup must leave its exact byte claim protective.
+    msw.release_local_pick(pick)
+    claim_id = gym_media_selector.drive_content_claim_id("zanshin", store.get_asset("new_v"))
+    assert pick["_drive_claim_id"] == claim_id
+    assert db.socialapi_claim(claim_id, "zanshin_gbp")[0] == "in_flight"
+    assert store.get_asset("new_v")["used_count"] == int(persisted)
+    assert msw.reserve_local_pick(
+        "zanshin", {"post_date": "2026-09-20"},
+        {"source": "drive", "source_media_asset_id": "new_v"}) is False
 
 
 def test_prewrite_drive_swap_stamp_restores_on_definite_write_failure(monkeypatch,

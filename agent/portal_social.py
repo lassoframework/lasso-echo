@@ -2244,6 +2244,12 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                 and (not primary_write_started
                      or isinstance(exc, _pcs.PreWriteCASError))):
             _ms.release_local_pick(pick)
+        if not local_landed and isinstance(exc, _pcs.PreWriteCASError):
+            return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "reason": "swap_snapshot_unavailable",
+                         "error": ("Echo could not safely verify this post for a photo swap. "
+                                   "Your post is unchanged and your recreates were not touched."),
+                         "recreate_budget": _budget_state(account_key)}
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}
     return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,
