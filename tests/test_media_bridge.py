@@ -140,7 +140,8 @@ def test_depletion_alert_even_when_no_image_client(monkeypatch):
     monkeypatch.setenv('AGENT_CLIENT_INFOGRAPHIC_FILL','true')
     monkeypatch.setattr(config,'creative_studio_enabled',lambda:True)
     monkeypatch.setattr(client_sources,'approved_sources',lambda _: [object()])
-    monkeypatch.setattr(cif, 'real_media_depleted', lambda *a, **k: True)
+    monkeypatch.setattr(cif, 'real_media_status',
+                        lambda *a, **k: (cif.MEDIA_DEPLETED, 'proven empty'))
     monkeypatch.setattr(mb, 'bridge_days', lambda *a, **k: ['2026-10-01'])
     monkeypatch.setattr(cif,'_empty_upcoming_days',lambda *a,**k:['2026-10-01'])
     monkeypatch.setattr(creative_studio,'_default_client',lambda:None)
