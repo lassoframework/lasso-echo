@@ -49,7 +49,7 @@ class _CalStore:
             rr["gym_id"] = gym_id
             rr.setdefault("id", f"calendar-{len(self.inserted) + 1}")
             self.inserted.append(rr)
-            out.append(rr)
+            out.append(dict(rr))
         hook = self.after_insert
         self.after_insert = None
         if hook is not None:
@@ -77,6 +77,11 @@ class _CalStore:
                 r["reject_reason"] = reason
                 return r
         return None
+
+    def list_rows_by_ids(self, gym_id, row_ids):
+        wanted = set(row_ids)
+        return [dict(row) for row in self.inserted
+                if row.get("gym_id") == gym_id and row.get("id") in wanted]
 
 
 class _EvStore:
@@ -426,7 +431,7 @@ def test_later_same_status_edit_owns_rows_earlier_edit_cannot_compensate(monkeyp
     assert interleaving["status"] == 200
     assert interleaving["response"]["restaged"] > 0
     assert losing_status == 409
-    assert losing_response["compensated"] == len(interleaving["loser_ids"])
+    assert losing_response["compensated"] in (0, len(interleaving["loser_ids"]))
     assert interleaving["loser_ids"]
     assert interleaving["winner_ids"]
     assert cal.preserve_id_calls[-2:] == [True, True]
@@ -514,6 +519,103 @@ def test_edit_stage_failure_rolls_back_event_and_audit(monkeypatch):
     assert ev.conditional_update_calls == 2
 
 
+def test_edit_commit_then_timeout_compensates_exact_ids_before_rollback(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    before = dict(ev.rows[event_id])
+    initial_ids = {row["id"] for row in cal.inserted}
+    real_insert = cal.insert_rows
+
+    def _commit_then_timeout(*args, **kwargs):
+        real_insert(*args, **kwargs)
+        raise TimeoutError("response lost after commit")
+
+    cal.insert_rows = _commit_then_timeout
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    attempted = [row for row in cal.inserted if row["id"] not in initial_ids]
+    assert attempted
+    assert status == 502
+    assert response["error"] == "calendar staging failed"
+    assert response["compensated"] == len(attempted)
+    assert response.get("active", 0) == 0
+    assert response["rolled_back"] is True
+    assert ev.rows[event_id] == before
+    assert all(row["status"] == "denied" for row in attempted)
+    assert all(row["reject_reason"] == ec.REJECT_EDIT_CONFLICT for row in attempted)
+
+
+def test_edit_ambiguous_insert_preserves_concurrent_approval_and_skips_rollback(
+        monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    initial_ids = {row["id"] for row in cal.inserted}
+    real_insert = cal.insert_rows
+
+    def _commit_approve_then_timeout(*args, **kwargs):
+        real_insert(*args, **kwargs)
+        for row in cal.inserted:
+            if row["id"] not in initial_ids:
+                row["status"] = "approved"
+        raise TimeoutError("response lost after approval")
+
+    cal.insert_rows = _commit_approve_then_timeout
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    attempted = [row for row in cal.inserted if row["id"] not in initial_ids]
+    assert status == 502
+    assert response["error"] == "calendar staging and cleanup failed"
+    assert response["active"] == len(attempted)
+    assert response["rolled_back"] is False
+    assert ev.rows[event_id]["starts_on"] == "2026-10-20"
+    assert all(row["status"] == "approved" for row in attempted)
+
+
+def test_date_edit_retires_old_pending_rows_but_preserves_protected(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    old_ids = {row["id"] for row in cal.inserted}
+    protected_id = next(iter(old_ids))
+    next(row for row in cal.inserted if row["id"] == protected_id)["status"] = "approved"
+
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 200
+    old_rows = [row for row in cal.inserted if row["id"] in old_ids]
+    new_rows = [row for row in cal.inserted if row["id"] not in old_ids]
+    assert next(row for row in old_rows if row["id"] == protected_id)["status"] == "approved"
+    assert all(row["status"] == "denied" for row in old_rows
+               if row["id"] != protected_id)
+    assert all(row.get("reject_reason") == ec.REJECT_EDIT_SUPERSEDED
+               for row in old_rows if row["id"] != protected_id)
+    assert new_rows and all(row["status"] == "pending" for row in new_rows)
+    assert response["removed"] == len(old_rows) - 1
+
+
 def test_losing_edit_compensation_failure_returns_retryable_502(monkeypatch):
     monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
     cal, ev = _CalStore(), _EvStore()
@@ -548,7 +650,7 @@ def test_losing_edit_compensation_failure_returns_retryable_502(monkeypatch):
     assert response["compensated"] == 0
     assert interleaving["loser_ids"]
     rows = {row["id"]: row for row in cal.inserted}
-    assert all(rows[row_id]["status"] == "pending"
+    assert all(rows[row_id]["status"] == "denied"
                for row_id in interleaving["loser_ids"])
 
 

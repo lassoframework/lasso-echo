@@ -100,6 +100,25 @@ def test_event_edit_compensation_has_server_side_wipeable_status_cas(monkeypatch
     assert body == {"status": "denied", "reject_reason": "event_edit_conflict"}
 
 
+def test_operation_row_reconciliation_is_exact_and_gym_scoped(monkeypatch):
+    first = "11111111-1111-4111-8111-111111111111"
+    second = "22222222-2222-4222-8222-222222222222"
+    payload = [
+        {"id": first, "gym_id": "eng", "status": "pending"},
+        {"id": second, "gym_id": "other", "status": "pending"},
+    ]
+    http = _FakeHTTP(get_resp=_Resp(200, payload))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    rows = pcs.SupabaseCalendarStore().list_rows_by_ids("eng", [second, first])
+
+    assert rows == [payload[0]]
+    _, _, params, _ = next(call for call in http.calls if call[0] == "get")
+    assert params == {
+        "gym_id": "eq.eng", f"id": f"in.({first},{second})", "limit": "2",
+    }
+
+
 # ---- delete_month status guard -------------------------------------------
 
 def test_delete_month_preserves_human_rows_by_default(monkeypatch):

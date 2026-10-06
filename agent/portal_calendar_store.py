@@ -4066,6 +4066,27 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def list_rows_by_ids(self, account_key, row_ids):
+        """Read exact calendar UUIDs within one gym for ambiguous-write reconciliation."""
+        import uuid
+
+        ids = sorted({str(uuid.UUID(str(row_id))) for row_id in (row_ids or [])})
+        if not ids:
+            return []
+        if len(ids) > 200:
+            raise ValueError("operation row reconciliation exceeds 200 ids")
+        r = self._client().get(
+            self._rest(_TABLE),
+            params={"gym_id": f"eq.{account_key}",
+                    "id": f"in.({','.join(ids)})", "limit": str(len(ids))},
+            headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        expected = set(ids)
+        return [row for row in (r.json() or [])
+                if str(row.get("gym_id")) == str(account_key)
+                and str(row.get("id")) in expected]
+
     def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None,
                            levers=None, expected_row=None,
                            force_caption_visual_hold=False,

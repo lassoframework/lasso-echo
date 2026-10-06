@@ -34,6 +34,7 @@ REJECT_CANCELLED = "event_cancelled"
 REJECT_ENDED = "event_ended"
 REJECT_DEAD_LINK = "event_link_dead"
 REJECT_EDIT_CONFLICT = "event_edit_conflict"
+REJECT_EDIT_SUPERSEDED = "event_edit_superseded"
 
 # The A-gate protects an ALREADY-POPULATED month from being broken by an arc insert.
 # Below this many existing rows the calendar is a sparse seed (a brand-new gym or the
@@ -532,8 +533,10 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
                 durable_rows = []
             _stamp_media_usage(gym_id, durable_rows)
         except Exception as exc:  # noqa: BLE001
+            attempted_rows = [dict(row, gym_id=gym_id) for row in payload]
             return {"ok": False, "reason": f"insert failed {type(exc).__name__}",
-                    "staged": 0}
+                    "staged": 0, "ambiguous_insert": True,
+                    "_inserted_rows": [], "_attempted_rows": attempted_rows}
     return {"ok": True, "staged": inserted, "held_recap": len(held_recap),
             "held_media": len(held_media),
             "thinned": len(arc_rows) - len(thinned),
@@ -574,6 +577,42 @@ def compensate_staged_rows(store, gym_id, rows, *, reason=REJECT_EDIT_CONFLICT,
             failed = True
     return {"ok": not failed, "denied": denied, "reason": reason,
             **({"error": "edit_compensation_incomplete"} if failed else {})}
+
+
+def confirm_staged_rows_inactive(store, gym_id, rows, *, logger=None):
+    """Confirm exact operation-owned IDs are absent or no longer machine-wipeable.
+
+    An insert request can commit and then lose its response. Its deterministic row IDs
+    remain the only safe reconciliation handle. A rollback is permitted only after an
+    exact gym-scoped read proves none of those IDs can still publish as active drafts.
+    """
+    log = logger or (lambda m: print(f"[event-calendar] {m}"))
+    row_ids = sorted({str(row.get("id") or "") for row in rows or ()
+                      if row.get("id")
+                      and str(row.get("gym_id") or "") == str(gym_id)})
+    if not row_ids:
+        return {"ok": True, "active": 0}
+    reader = getattr(store, "list_rows_by_ids", None)
+    if reader is None:
+        return {"ok": False, "active": 0,
+                "error": "operation_rows_reader_unavailable"}
+    try:
+        current = reader(gym_id, row_ids) or []
+    except Exception as exc:  # noqa: BLE001
+        log(f"event edit reconciliation read failed {type(exc).__name__}")
+        return {"ok": False, "active": 0,
+                "error": "operation_rows_read_failed"}
+    expected = set(row_ids)
+    # Only an absent row or an explicit non-publishing terminal denial/kill is safe
+    # before rolling the event revision back. An approval or publish claim that races
+    # cleanup is human/publisher owned and must keep the new event revision it refers
+    # to; even a held/failed row may be retried or released later.
+    active = [row for row in current
+              if str(row.get("id") or "") in expected
+              and str(row.get("gym_id") or "") == str(gym_id)
+              and _status(row) not in ("denied", "killed")]
+    return {"ok": not active, "active": len(active),
+            **({"error": "operation_rows_still_active"} if active else {})}
 
 
 def _stamp_operation_row_ids(rows, operation_id, log):

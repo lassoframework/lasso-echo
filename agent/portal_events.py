@@ -242,19 +242,26 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
         stage_reason = res.get("reason", "")
         inserted_rows = res.get("_inserted_rows", [])
         if res.get("ok") is False:
+            cleanup_rows = inserted_rows or res.get("_attempted_rows", [])
             compensated = ec.compensate_staged_rows(
-                _store, account_key, inserted_rows)
+                _store, account_key, cleanup_rows)
+            reconciled = ec.confirm_staged_rows_inactive(
+                _store, account_key, cleanup_rows)
             rolled_back = None
-            try:
-                rolled_back = _estore.update_event_if_status(
-                    account_key, event_id, current_status, saved, cur)
-            except Exception:  # noqa: BLE001 - response below remains a retryable failure
-                rolled_back = None
-            if compensated.get("ok") is False:
+            cleanup_ok = (compensated.get("ok") is not False
+                          and reconciled.get("ok") is not False)
+            if cleanup_ok:
+                try:
+                    rolled_back = _estore.update_event_if_status(
+                        account_key, event_id, current_status, saved, cur)
+                except Exception:  # noqa: BLE001 - response remains retryable
+                    rolled_back = None
+            if not cleanup_ok:
                 return 502, {"error": "calendar staging and cleanup failed",
                              "reason": stage_reason,
                              "compensated": compensated.get("denied", 0),
-                             "rolled_back": bool(rolled_back)}
+                             "active": reconciled.get("active", 0),
+                             "rolled_back": False}
             return 502, {"error": "calendar staging failed",
                          "reason": stage_reason,
                          "compensated": compensated.get("denied", 0),
@@ -290,9 +297,27 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
                          "compensated": compensated.get("denied", 0)}
         return 409, {"error": "this promotion changed while it was being edited",
                      "compensated": compensated.get("denied", 0)}
+
+    # Only after the saved event revision is still confirmed current may this edit
+    # retire its old machine-owned rows. Exact ids plus the server-side wipeable CAS
+    # preserve any row concurrently approved, published, denied, or otherwise claimed.
+    remove_key_set = set(remove_keys)
+    superseded_rows = [row for row in old_arc
+                       if (str(row.get("post_date"))[:10],
+                           str(row.get("account") or "").lower(),
+                           str(row.get("format") or "").lower()) in remove_key_set]
+    removed = 0
+    if _store is not None and superseded_rows:
+        superseded = ec.compensate_staged_rows(
+            _store, account_key, superseded_rows,
+            reason=ec.REJECT_EDIT_SUPERSEDED)
+        removed = superseded.get("denied", 0)
+        if superseded.get("ok") is False:
+            return 502, {"error": "superseded event row cleanup failed",
+                         "removed": removed}
     return 200, {"event": _event_row(new_event), "restaged": staged,
                  "held_media": held_media, "reason": stage_reason,
-                 "kept": len(keep), "removed": len(remove_keys)}
+                 "kept": len(keep), "removed": removed}
 
 
 # ---- cancel -------------------------------------------------------------------
