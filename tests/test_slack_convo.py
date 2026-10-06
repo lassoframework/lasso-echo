@@ -253,10 +253,15 @@ class FakeBus:
         return None
 
     def transition_fixer_delivery(self, mid, delivery_status, *, slack_ts=None,
-                                  meta_update=None):
+                                  meta_update=None, expected_intent=None,
+                                  expected_ts=None, attempts=3):
         row = self.message(mid)
         if (not row or row["delivery_status"] != "posting"
-                or not (row.get("attachments") or {}).get("fixer_slack_delivery_intent")):
+                or not (row.get("attachments") or {}).get("fixer_slack_delivery_intent")
+                or (delivery_status == "posted" and (
+                    (row.get("attachments") or {}).get(
+                        "fixer_slack_delivery_intent") != expected_intent
+                    or row.get("slack_ts") != expected_ts))):
             return None
         return self.mark_message(mid, delivery_status, slack_ts=slack_ts,
                                  meta_update=meta_update)
@@ -314,14 +319,13 @@ class FakeBus:
             "fixer_reconcile_next_at": next_at})
 
     def reconcile_held_fixer_delivery(self, mid, proof, *,
-                                      expected_intent=None, expected_ts=None):
+                                      expected_intent, expected_ts):
         row = self.message(mid)
         if (not row or row["delivery_status"] != "held"
                 or not (row.get("attachments") or {}).get("fixer_slack_delivery_uncertain")
-                or (expected_intent is not None
-                    and (row.get("attachments") or {}).get(
-                        "fixer_slack_delivery_intent") != expected_intent)
-                or (expected_ts is not None and row.get("slack_ts") != expected_ts)):
+                or (row.get("attachments") or {}).get(
+                    "fixer_slack_delivery_intent") != expected_intent
+                or row.get("slack_ts") != expected_ts):
             return None
         return self.mark_message(mid, "posted", slack_ts=proof["delivery_readback_ts"],
                                  meta_update=proof)
@@ -3297,7 +3301,8 @@ def test_held_fixer_attachment_cas_retries_without_losing_concurrent_updates(ope
         assert changed["attachments"]["fixer_reconcile_next_at"] == "later"
     elif operation == "reconcile":
         changed = bus.reconcile_held_fixer_delivery(
-            mid, {"delivery_readback_ts": "9.999", "delivery_readback_verified": True})
+            mid, {"delivery_readback_ts": "9.999", "delivery_readback_verified": True},
+            expected_intent={"channel": "C_CLIENT"}, expected_ts="9.999")
         assert changed["delivery_status"] == "posted"
     elif operation == "reserve":
         changed = bus.reserve_uncertain_fixer_alert_retry(mid, None, "later")
@@ -3361,6 +3366,57 @@ def test_fixer_timestamp_cas_retries_after_posting_becomes_held():
     assert stamped["attachments"]["fixer_slack_delivery_uncertain"] is True
 
 
+def test_fixer_posted_transition_db_cas_rejects_concurrent_intent_change():
+    mid = str(uuid.uuid4())
+    intent = {"channel": "C_CLIENT", "body": "done", "sender": "U_ECHO_BOT"}
+    row = {
+        "id": mid, "delivery_status": "posting", "slack_ts": "9.999",
+        "attachments": {"identity": "echo", "fixer_slack_delivery_intent": intent},
+    }
+
+    class _Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class _Http:
+        def __init__(self):
+            self.patch_calls = []
+
+        def get(self, _url, **_kwargs):
+            return _Response([json.loads(json.dumps(row))])
+
+        def patch(self, _url, **kwargs):
+            self.patch_calls.append(kwargs)
+            # A competing consumer replaces the intent after our read. The
+            # database attachment predicate must make this PATCH lose.
+            row["attachments"]["fixer_slack_delivery_intent"] = {
+                **intent, "channel": "C_OTHER"}
+            expected_att = json.loads(kwargs["params"]["attachments"][3:])
+            assert kwargs["params"]["slack_ts"] == "eq.9.999"
+            if expected_att != row["attachments"]:
+                return _Response([])
+            row.update(json.loads(kwargs["data"]))
+            return _Response([json.loads(json.dumps(row))])
+
+    http = _Http()
+    bus = Bus(url="https://example.supabase.co", service_key="service", http=http)
+    changed = bus.transition_fixer_delivery(
+        mid, "posted", slack_ts="9.999",
+        meta_update={"delivery_readback_verified": True},
+        expected_intent=intent, expected_ts="9.999")
+
+    assert changed is None
+    assert len(http.patch_calls) == 1
+    assert row["delivery_status"] == "posting"
+    assert row["attachments"]["fixer_slack_delivery_intent"]["channel"] == "C_OTHER"
+
+
 def test_route_missing_recovery_limits_unique_membership_reads_per_sweep(monkeypatch):
     rows = []
     tickets = {}
@@ -3389,19 +3445,32 @@ def test_route_missing_recovery_limits_unique_membership_reads_per_sweep(monkeyp
         def requeue_route_missing_fixer(self, mid, _at):
             return {"id": mid, "delivery_status": "ready"}
 
-    monkeypatch.setattr(OB, "_pending_fixer_hold_page", lambda *args, **kwargs: rows)
+    page = 0
+
+    def pending(*_args, **kwargs):
+        nonlocal page
+        assert kwargs["limit"] == 5
+        start = page * kwargs["limit"]
+        page += 1
+        return rows[start:start + kwargs["limit"]]
+
+    monkeypatch.setattr(OB, "_pending_fixer_hold_page", pending)
     monkeypatch.setattr(OB, "_customer_fix_reply", lambda *args, **kwargs: False)
     monkeypatch.setattr(OB, "_fixer_grounded_question_answer", lambda *args, **kwargs: True)
     monkeypatch.setattr(OB, "_fresh_fixer_request",
                         lambda _bus, ticket, *_args, **_kwargs: ticket)
     checked = []
-    recovered = OB._recover_route_missing_fixer(
+    first = OB._recover_route_missing_fixer(
+        _Bus(), IDS.get("echo"),
+        lambda channel, _user: checked.append(channel) or True,
+        lambda *_: None)
+    second = OB._recover_route_missing_fixer(
         _Bus(), IDS.get("echo"),
         lambda channel, _user: checked.append(channel) or True,
         lambda *_: None)
 
-    assert recovered == 5
-    assert checked == [f"C_CLIENT_{index}" for index in range(5)]
+    assert (first, second) == (5, 2)
+    assert checked == [f"C_CLIENT_{index}" for index in range(7)]
 
 
 def test_fixer_recomputes_slack_transport_after_conversation_is_bound_during_claim(

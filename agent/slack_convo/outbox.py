@@ -1022,7 +1022,8 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
                     continue
                 posted = bus.transition_fixer_delivery(
                     row["id"], "posted", slack_ts=proof["delivery_readback_ts"],
-                    meta_update=proof)
+                    meta_update=proof, expected_intent=intent,
+                    expected_ts=proof["delivery_readback_ts"])
                 if not posted:
                     current = bus.message(row["id"])
                     if ((current or {}).get("delivery_status") == "held"
@@ -1213,7 +1214,8 @@ def _recover_route_missing_fixer(bus, identity, member_check, log, now=None):
     """
     try:
         rows = _pending_fixer_hold_page(
-            bus, identity, "fixer_slack_route_missing", scan="route_recovery")
+            bus, identity, "fixer_slack_route_missing", limit=5,
+            scan="route_recovery")
     except Exception as exc:  # noqa: BLE001
         log(f"[slack-convo/outbox] FIXER route recovery scan failed: "
             f"{type(exc).__name__}")
@@ -1223,8 +1225,6 @@ def _recover_route_missing_fixer(bus, identity, member_check, log, now=None):
         current = current.replace(tzinfo=timezone.utc)
     recovered = 0
     membership = {}
-    membership_reads = 0
-    membership_read_limit = 5
     for row in rows:
         att = row.get("attachments") or {}
         recipient = att.get("recipient_kind", "client")
@@ -1274,9 +1274,6 @@ def _recover_route_missing_fixer(bus, identity, member_check, log, now=None):
                 if not fresh or fresh.get("slack_channel_id") != channel:
                     continue
             if channel not in membership:
-                if membership_reads >= membership_read_limit:
-                    break
-                membership_reads += 1
                 try:
                     membership[channel] = bool(member_check and member_check(
                         channel, config.APPROVER_SLACK_ID))
@@ -1398,7 +1395,9 @@ def _reconcile_held_fixer(bus, identity, readback, log, summary):
         if not proof:
             continue
         try:
-            posted = bus.reconcile_held_fixer_delivery(row["id"], proof)
+            posted = bus.reconcile_held_fixer_delivery(
+                row["id"], proof, expected_intent=intent,
+                expected_ts=row.get("slack_ts"))
             if not posted or posted.get("delivery_status") != "posted":
                 continue
             ticket = bus.ticket(row["ticket_id"])
@@ -2060,7 +2059,8 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             raise UncertainFixerDelivery(reason)
         try:
             posted = bus.transition_fixer_delivery(
-                row["id"], "posted", slack_ts=ts, meta_update=proof)
+                row["id"], "posted", slack_ts=ts, meta_update=proof,
+                expected_intent=intent, expected_ts=ts)
             if not posted:
                 current = bus.message(row["id"])
                 if ((current or {}).get("delivery_status") == "held"

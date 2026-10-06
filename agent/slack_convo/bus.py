@@ -611,25 +611,47 @@ class Bus:
         return self._patch(_MESSAGES, {"id": f"eq.{message_id}"}, fields)
 
     def transition_fixer_delivery(self, message_id, delivery_status, *,
-                                  slack_ts=None, meta_update=None):
+                                  slack_ts=None, meta_update=None,
+                                  expected_intent=None, expected_ts=None,
+                                  attempts=3):
         """CAS a FIXER Slack row from posting, preserving its delivery intent.
 
         A stale sweeper may quarantine an uncertain post while the original worker
         waits on Slack. Neither worker may overwrite the other's terminal state.
         """
-        row = self.message(message_id)
-        if (not row or row.get("delivery_status") != "posting"
-                or not (row.get("attachments") or {}).get("fixer_slack_delivery_intent")):
+        if delivery_status == "posted" and (
+                not isinstance(expected_intent, dict)
+                or not isinstance(expected_ts, str) or not expected_ts):
             return None
-        fields = {"delivery_status": delivery_status}
-        if slack_ts:
-            fields["slack_ts"] = slack_ts
-        if meta_update:
-            fields["attachments"] = {**(row.get("attachments") or {}), **meta_update}
-        return self._patch(_MESSAGES, {
-            "id": f"eq.{message_id}", "delivery_status": "eq.posting",
-            "attachments->>fixer_slack_delivery_intent": "not.is.null",
-        }, fields)
+        if expected_ts is not None and slack_ts is not None and slack_ts != expected_ts:
+            return None
+        for _ in range(max(1, int(attempts))):
+            row = self.message(message_id)
+            att = (row or {}).get("attachments")
+            snapshot = dict(att or {})
+            if (not row or row.get("delivery_status") != "posting"
+                    or not snapshot.get("fixer_slack_delivery_intent")
+                    or (expected_intent is not None
+                        and snapshot.get("fixer_slack_delivery_intent") != expected_intent)
+                    or (expected_ts is not None and row.get("slack_ts") != expected_ts)):
+                return None
+            fields = {"delivery_status": delivery_status}
+            if slack_ts:
+                fields["slack_ts"] = slack_ts
+            if meta_update:
+                fields["attachments"] = {**snapshot, **meta_update}
+            match = {
+                "id": f"eq.{message_id}", "delivery_status": "eq.posting",
+                "attachments": ("is.null" if att is None else
+                                "eq." + json.dumps(snapshot, separators=(",", ":"),
+                                                   sort_keys=True)),
+            }
+            if expected_ts is not None:
+                match["slack_ts"] = f"eq.{expected_ts}"
+            changed = self._patch(_MESSAGES, match, fields)
+            if changed:
+                return changed
+        return None
 
     def record_fixer_delivery_timestamp(self, message_id, intent, slack_ts, attempts=3):
         """Persist Slack's successful POST timestamp across a stale-sweeper race.
@@ -772,16 +794,15 @@ class Bus:
             updates=lambda _row, _att: {"fixer_reconcile_next_at": next_at})
 
     def reconcile_held_fixer_delivery(self, message_id, proof, *,
-                                      expected_intent=None, expected_ts=None):
+                                      expected_intent, expected_ts):
         """Promote a held uncertain delivery only after exact Slack readback."""
         return self._patch_held_fixer_attachments(
             message_id,
             eligible=lambda _row, att: bool(
                 att.get("fixer_slack_delivery_uncertain")
                 and att.get("fixer_slack_delivery_intent")
-                and (expected_intent is None
-                     or att.get("fixer_slack_delivery_intent") == expected_intent)
-                and (expected_ts is None or _row.get("slack_ts") == expected_ts)),
+                and att.get("fixer_slack_delivery_intent") == expected_intent
+                and _row.get("slack_ts") == expected_ts),
             updates=lambda _row, _att: proof,
             fields={"delivery_status": "posted",
                     "slack_ts": proof["delivery_readback_ts"]})

@@ -244,7 +244,8 @@ class Bus:
             "claimed_at": intent.get("not_before") or intent["claimed_at"]})
 
     def transition_fixer_delivery(self, mid, delivery_status, *, slack_ts=None,
-                                  meta_update=None):
+                                  meta_update=None, expected_intent=None,
+                                  expected_ts=None, attempts=3):
         row = self.message(mid)
         if (not row or row.get("delivery_status") != "posting"
                 or not (row.get("attachments") or {}).get("fixer_slack_delivery_intent")):
