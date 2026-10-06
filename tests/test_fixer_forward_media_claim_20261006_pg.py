@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,152 +38,186 @@ def main():
                 assert result.returncode != 0, 'unexpected SQL success'
             return result.stdout.strip() if ok else result.stderr
 
-        def claim(row, token, ok=True, prefix=''):
-            return sql(prefix + "set role service_role; select public.fixer_claim_forward_media_20261006"
-                       f"('{row}','{token}');", ok)
+        def claim(pair, ok=True):
+            rid, token, evidence = pair
+            return sql("set role service_role; select public.fixer_claim_forward_media_20261006"
+                       f"('{rid}','{token}','{evidence}');", ok)
 
-        def row(tenant, group, url, day='2026-10-10'):
+        def row(tenant, group, url, day='2026-10-10', reservation='2026-10-10', image=None, thumbnail=None):
             rid, token = str(uuid.uuid4()), str(uuid.uuid4())
-            sql("insert into content_calendar(id,gym_id,account,post_date,status,variant_status,"
-                "image_url,source_media_url,visual_group_key,publish_claim_token,publish_reservation_day)"
-                f" values('{rid}','{tenant}','instagram','{day}','publishing','active',"
-                f"'{url}','{url}','{group}','{token}','{day}');")
+            image = image or url
+            thumb = "null" if thumbnail is None else "'" + thumbnail + "'"
+            sql("insert into content_calendar(id,gym_id,post_date,status,variant_status,"
+                "image_url,source_media_url,thumbnail_url,visual_group_key,publish_claim_token,publish_reservation_day)"
+                f" values('{rid}','{tenant}','{day}','publishing','active',"
+                f"'{image}','{url}',{thumb},'{group}','{token}','{reservation}');")
             return rid, token
 
-        def seed(fp=None):
-            tenant = str(uuid.uuid4())
-            group = 'vg_' + uuid.uuid4().hex
-            url = 'https://scratch.example/' + uuid.uuid4().hex
+        def attest(pair, fp, image_fp=None, thumb_fp=None, operation='same_object', ok=True, revision=None):
+            rid, token = pair
+            evidence = str(uuid.uuid4())
+            revision = revision or sql("set role fixer_forward_media_attester_20261006; select "
+                f"fixer_forward_media_attestation_request_20261006('{rid}')->>'revision';")
+            thumb = "null,null" if thumb_fp is None else f"'{thumb_fp}',30"
+            sql("set role fixer_forward_media_attester_20261006; select fixer_attest_forward_media_20261006"
+                f"('{rid}','{revision}','{evidence}','{fp}',10,'{image_fp or fp}',10,{thumb},"
+                f"'{operation}','controlled-runtime-test');", ok)
+            return rid, token, evidence
+
+        def seed(fp=None, day='2026-10-10', tenant=None, group=None, url=None, reservation='2026-10-10'):
+            tenant = tenant or 'gym_' + uuid.uuid4().hex
+            group = group or 'vg_' + uuid.uuid4().hex
+            url = url or 'https://scratch.example/' + uuid.uuid4().hex
             fp = fp or 'md5:' + uuid.uuid4().hex
-            rec = str(uuid.uuid4())
-            sql(f"insert into tenant_alias values('{tenant}','{tenant}',now());"
-                f"insert into visual_group(gym_id,group_key) values('{tenant}','{group}');"
-                "insert into visual_global_object_read_receipt"
-                "(receipt_id,tenant_id,exact_url,fingerprint,byte_length,acquisition_method,evidence_ref,observed_by)"
-                f"values('{rec}','{tenant}','{url}','{fp}',10,'verified_object_read','scratch','test');"
-                "insert into visual_global_object_attestation"
-                "(tenant_id,group_key,exact_url,fingerprint,byte_length,acquisition_method,evidence_ref,read_receipt,attested_by)"
-                f"values('{tenant}','{group}','{url}','{fp}',10,'verified_object_read','scratch','{rec}','test');"
-                "insert into visual_global_scene_object_member(tenant_id,group_key,exact_url,fingerprint,object_role)"
-                f"values('{tenant}','{group}','{url}','{fp}','source'),"
-                f"('{tenant}','{group}','{url}','{fp}','delivered');")
-            return tenant, group, url, fp
+            sql(f"insert into fixer_forward_media_claim_gate_20261006 values('{tenant}',true) on conflict do nothing;")
+            pair = attest(row(tenant,group,url,day,reservation),fp)
+            return pair, tenant, group, url, fp
+
+        def race(pair):
+            rid,token,evidence = pair
+            return subprocess.run(base, input="begin; set role service_role; select "
+                f"fixer_claim_forward_media_20261006('{rid}','{token}','{evidence}');"
+                "select pg_sleep(0.5); commit;", text=True,capture_output=True,timeout=15)
 
         try:
             sql("create role anon; create role authenticated; create role service_role;"
-                "create table content_calendar(id uuid primary key,gym_id text,account text,post_date date,"
+                "create table content_calendar(id uuid primary key,gym_id text,post_date date,"
                 "status text,variant_status text,published_at timestamptz,publish_claim_token uuid,"
                 "publish_reservation_day date,late_post_id text,image_url text,thumbnail_url text,"
-                "source_media_url text,source_media_asset_id text,drive_file_id text,byte_hash text,"
-                "r2_key text,media_not_ready_reason text);"
-                "create table media_asset(id text primary key,gym_id text,content_hash text);"
-                "create function visual_group_row_active(content_calendar) returns boolean language sql as $$select false$$;"
-                "create function visual_group_row_ambiguous(content_calendar) returns boolean language sql as $$select false$$;")
-            for migration in ('DRAFT_visual_group_schema_20261002.sql',
-                              'DRAFT_visual_group_claim_trigger_20261002.sql',
-                              'DRAFT_visual_global_history_20261002.sql',
-                              'DRAFT_fixer_forward_media_claim_20261006.sql'):
-                sql((ROOT / 'migrations' / migration).read_text())
-            tenant, group, url, fp = seed()
-            first = row(tenant, group, url)
-            assert 'OFF' in claim(*first, ok=False)
-            sql(f"insert into fixer_forward_media_claim_gate_20261006 values('{tenant}',true);")
-            assert claim(*first) == 't'
-            assert claim(*first) == 't'
-            sibling = row(tenant, group, url)
-            assert claim(*sibling) == 't'
-            other_date = row(tenant, group, url, '2026-10-11')
-            assert 'another date/group' in claim(*other_date, ok=False)
-            # A newly rendered derivative still consumes the original bytes.
-            delivered_url = 'https://scratch.example/' + uuid.uuid4().hex
-            delivered_fp = 'md5:' + '0' * 32  # sorts before original: exercises rollback after insert
-            read = str(uuid.uuid4())
-            render = str(uuid.uuid4())
-            source_read = sql(f"select read_receipt from visual_global_object_attestation where exact_url='{url}';")
-            sql("insert into visual_global_object_read_receipt"
-                "(receipt_id,tenant_id,exact_url,fingerprint,byte_length,acquisition_method,evidence_ref,observed_by)"
-                f"values('{read}','{tenant}','{delivered_url}','{delivered_fp}',20,'verified_object_read','scratch','test');"
-                "insert into visual_global_object_attestation"
-                "(tenant_id,group_key,exact_url,fingerprint,byte_length,acquisition_method,evidence_ref,read_receipt,attested_by)"
-                f"values('{tenant}','{group}','{delivered_url}','{delivered_fp}',20,'verified_object_read','scratch','{read}','test');"
-                "insert into visual_global_scene_object_member(tenant_id,group_key,exact_url,fingerprint,object_role)"
-                f"values('{tenant}','{group}','{delivered_url}','{delivered_fp}','delivered');"
-                "insert into visual_global_render_receipt"
-                "(receipt_id,tenant_id,source_read_receipt,delivered_read_receipt,source_exact_url,delivered_exact_url,"
-                "source_fingerprint,delivered_fingerprint,operation,evidence_ref,rendered_by)"
-                f"values('{render}','{tenant}','{source_read}','{read}','{url}','{delivered_url}',"
-                f"'{fp}','{delivered_fp}','render','scratch','test');"
-                "insert into visual_global_object_lineage"
-                "(tenant_id,group_key,source_exact_url,delivered_exact_url,source_fingerprint,delivered_fingerprint,render_receipt)"
-                f"values('{tenant}','{group}','{url}','{delivered_url}','{fp}','{delivered_fp}','{render}');")
-            derived = row(tenant,group,url,'2026-10-11')
-            sql(f"update content_calendar set image_url='{delivered_url}' where id='{derived[0]}';")
-            assert 'another date/group' in claim(*derived,ok=False)
-            # Failure must roll back the new rendition byte as well.
-            assert sql(f"select count(*) from fixer_forward_media_use_20261006 where fingerprint='{delivered_fp}';") == '0'
-            derived_sibling = row(tenant,group,url)
-            sql(f"update content_calendar set image_url='{delivered_url}' where id='{derived_sibling[0]}';")
-            assert claim(*derived_sibling) == 't'
-            assert 'ownership' in claim(first[0], str(uuid.uuid4()), ok=False)
+                "media_not_ready_reason text);")
+            # Apply only this self-contained draft. NO #306/#307 dependency.
+            sql((ROOT / 'migrations/DRAFT_fixer_forward_media_claim_20261006.sql').read_text())
+            first, tenant, group, url, fp = seed()
+            sql(f"update fixer_forward_media_claim_gate_20261006 set enabled=false where tenant_id='{tenant}';")
+            assert 'OFF' in claim(first,ok=False)
+            sql(f"update fixer_forward_media_claim_gate_20261006 set enabled=true where tenant_id='{tenant}';")
+            assert claim(first) == 't'
+            assert claim(first) == 't'
+            sibling = attest(row(tenant,group,url),fp)
+            assert claim(sibling) == 't'
+            other = attest(row(tenant,group,url,'2026-10-11'),fp)
+            assert 'another tenant/date/group' in claim(other,ok=False)
+            # Fleet uniqueness, including identical URLs under independent gyms.
+            other_gym, *_ = seed(fp=fp,day='2026-10-11')
+            assert 'another tenant/date/group' in claim(other_gym,ok=False)
+            other_group = attest(row(tenant,'vg_unrelated',url),fp)
+            assert 'another tenant/date/group' in claim(other_group,ok=False)
+            # Catch-up uses today's owned reservation independently of content date.
+            catchup, ct, cg, cu, cf = seed(day='2026-10-01',reservation='2026-10-10')
+            assert claim(catchup) == 't'
+            catch_sibling = attest(row(ct,cg,cu,'2026-10-01','2026-10-11'),cf)
+            assert claim(catch_sibling) == 't'
+            sql(f"update content_calendar set publish_reservation_day='2026-10-12' where id='{catchup[0]}';")
+            assert 'receipt differs' in claim(catchup,ok=False)
+            # Ordinary service credentials cannot forge byte/lineage evidence.
+            revision=sql(f"select fixer_forward_media_attestation_request_20261006('{first[0]}')->>'revision';")
+            assert 'permission denied' in sql("set role service_role; select fixer_attest_forward_media_20261006"
+                f"('{first[0]}','{revision}','{uuid.uuid4()}','{fp}',10,'{fp}',10,null,null,'same_object','forged');",ok=False)
+            assert 'permission denied' in sql("set role service_role; insert into fixer_forward_media_object_read_20261006"
+                f" values('{uuid.uuid4()}','{tenant}','https://scratch.example/forged','{fp}',10,'forged','forged',now());",ok=False)
             assert 'permission denied' in sql("set role authenticated; select fixer_claim_forward_media_20261006"
-                                             f"('{first[0]}','{first[1]}');", ok=False)
-            assert 'permission denied' in sql("set role service_role; insert into fixer_forward_media_claim_gate_20261006"
-                                             f" values('{uuid.uuid4()}',true);", ok=False)
-            assert 'permission denied' in sql("set role service_role; delete from fixer_forward_media_use_20261006;", ok=False)
-            assert 'immutable' in sql("delete from fixer_forward_media_use_20261006;", ok=False)
-            # Unknown source still fails even when the displayed object is attested.
-            unknown = row(tenant, group, url)
+                f"('{first[0]}','{first[1]}','{first[2]}');",ok=False)
+            assert 'permission denied' in sql("set role service_role; update fixer_forward_media_claim_gate_20261006 set enabled=true;",ok=False)
+            assert 'permission denied' in sql("set role fixer_forward_media_attester_20261006; delete from fixer_forward_media_use_20261006;",ok=False)
+            missing = (*row(tenant,group,url),str(uuid.uuid4()))
+            assert 'owner attested' in claim(missing,ok=False)
+            forged = (*row(tenant,group,url),first[2])
+            assert 'owner attested' in claim(forged,ok=False)
+            assert 'ownership' in claim((first[0],str(uuid.uuid4()),first[2]),ok=False)
+            # Evidence is bound to persisted revision and exact outgoing objects.
+            changed = attest(row(tenant,group,url),fp)
+            sql(f"update content_calendar set image_url='https://scratch.example/changed' where id='{changed[0]}';")
+            assert 'owner attested' in claim(changed,ok=False)
+            attest(row(tenant,group,url),fp,ok=False,revision='stale-revision')
+            unknown=row(tenant,group,url)
             sql(f"update content_calendar set source_media_url=null where id='{unknown[0]}';")
-            assert 'owner attested' in claim(*unknown, ok=False)
-            # Persisted token alone cannot repair altered receipt identity.
-            sql(f"update content_calendar set post_date='2026-10-12',publish_reservation_day='2026-10-12' where id='{first[0]}';")
-            assert 'receipt differs' in claim(*first, ok=False)
-            # Cross-tenant byte use is isolated; raw aliases resolve canonically.
-            t2, g2, u2, _ = seed(fp)
-            sql(f"insert into fixer_forward_media_claim_gate_20261006 values('{t2}',true);")
-            assert claim(*row(t2, g2, u2, '2026-10-11')) == 't'
-            sql(f"insert into tenant_alias values('old-gym-key','{tenant}',now());")
-            assert 'another date/group' in claim(*row('old-gym-key',group,url,'2026-10-13'), ok=False)
-            # Same-day unrelated logical group is not a permitted sibling.
-            t3, g3, u3, fp3 = seed()
-            sql(f"insert into fixer_forward_media_claim_gate_20261006 values('{t3}',true);")
-            assert claim(*row(t3,g3,u3)) == 't'
-            g4 = 'vg_' + uuid.uuid4().hex
-            u4 = 'https://scratch.example/' + uuid.uuid4().hex
-            rec4 = str(uuid.uuid4())
-            sql(f"insert into visual_group(gym_id,group_key) values('{t3}','{g4}');"
-                "insert into visual_global_object_read_receipt"
-                "(receipt_id,tenant_id,exact_url,fingerprint,byte_length,acquisition_method,evidence_ref,observed_by)"
-                f"values('{rec4}','{t3}','{u4}','{fp3}',10,'verified_object_read','scratch','test');"
-                "insert into visual_global_object_attestation"
-                "(tenant_id,group_key,exact_url,fingerprint,byte_length,acquisition_method,evidence_ref,read_receipt,attested_by)"
-                f"values('{t3}','{g4}','{u4}','{fp3}',10,'verified_object_read','scratch','{rec4}','test');"
-                "insert into visual_global_scene_object_member(tenant_id,group_key,exact_url,fingerprint,object_role)"
-                f"values('{t3}','{g4}','{u4}','{fp3}','source'),('{t3}','{g4}','{u4}','{fp3}','delivered');")
-            assert 'another date/group' in claim(*row(t3,g4,u4), ok=False)
-            # Deterministic overlap: first txn holds byte occupancy for 1s while
-            # second date races it. Exactly one transaction can consume the byte.
-            tr, gr, ur, _ = seed()
-            sql(f"insert into fixer_forward_media_claim_gate_20261006 values('{tr}',true);")
-            a, b = row(tr,gr,ur), row(tr,gr,ur,'2026-10-11')
-            def race(pair):
-                return subprocess.run(base, input="begin; set role service_role; select "
-                    f"fixer_claim_forward_media_20261006('{pair[0]}','{pair[1]}');"
-                    "select pg_sleep(1); commit;", text=True,capture_output=True,timeout=15)
+            assert 'identity unavailable' in sql(f"select fixer_forward_media_attestation_request_20261006('{unknown[0]}');",ok=False)
+            # Same immutable URL cannot be rebound to different fetched bytes.
+            assert 'changed bytes' in sql("set role fixer_forward_media_attester_20261006; select fixer_attest_forward_media_20261006"
+                f"('{first[0]}','{revision}','{uuid.uuid4()}','md5:{'f'*32}',10,'md5:{'f'*32}',10,null,null,'same_object','test');",ok=False)
+            # Distinct rendition reserves original too; rollback entire hash set.
+            derivative_url='https://scratch.example/' + uuid.uuid4().hex
+            derivative_fp='md5:'+'0'*32
+            derivative=attest(row(tenant,group,url,'2026-10-11',image=derivative_url),fp,
+                image_fp=derivative_fp,operation='render')
+            assert 'another tenant/date/group' in claim(derivative,ok=False)
+            assert sql(f"select count(*) from fixer_forward_media_use_20261006 where fingerprint='{derivative_fp}';") == '0'
+            # Rehosted derivative relabeled as original still reserves its known
+            # original ancestry, even under a new gym and URL.
+            relabeled,*_=seed(fp=derivative_fp)
+            assert 'another tenant/date/group' in claim(relabeled,ok=False)
+            derivative_sibling=attest(row(tenant,group,url,image=derivative_url),fp,
+                image_fp=derivative_fp,operation='render')
+            assert claim(derivative_sibling) == 't'
+            # Thumbnail bytes are required and participate in global authority.
+            poster='https://scratch.example/' + uuid.uuid4().hex
+            thumb_fp='md5:' + uuid.uuid4().hex
+            poster_pair=attest(row(tenant,group,url,image=derivative_url,thumbnail=poster),fp,
+                image_fp=derivative_fp,thumb_fp=thumb_fp,operation='render')
+            assert claim(poster_pair) == 't'
+            poster_reuse,*_=seed(fp=thumb_fp)
+            assert 'another tenant/date/group' in claim(poster_reuse,ok=False)
+            # Missing thumbnail evidence and falsely claimed same-object ancestry hold.
+            attest(row(tenant,group,url,thumbnail=poster),fp,ok=False)
+            attest(row(tenant,group,url,image=derivative_url),fp,image_fp=derivative_fp,ok=False)
+            # Independent concurrent dates: exactly one succeeds.
+            a,rt,rg,ru,rf=seed()
+            b=attest(row(rt,rg,ru,'2026-10-11'),rf)
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                results = list(pool.map(race,(a,b)))
-            assert sum(r.returncode == 0 for r in results) == 1, [r.stderr for r in results]
-            assert sql(f"select count(*) from fixer_forward_media_claim_receipt_20261006 where tenant_id='{tr}';") == '1'
-            # A first forward claim cannot adopt an already delivered row.
-            delivered = row(tenant,group,url)
-            sql(f"update content_calendar set late_post_id='provider-id' where id='{delivered[0]}';")
-            assert 'unsent' in claim(*delivered,ok=False)
-            # Outage is an exception, never a silent allowed decision.
-            sql("alter table fixer_forward_media_use_20261006 rename to temporarily_unavailable;")
-            assert 'does not exist' in claim(*sibling,ok=False)
-            fresh = row(tenant,group,url)
-            assert 'does not exist' in claim(*fresh,ok=False)
-            print('PASS: default OFF, ownership, idempotency, siblings, cross-date/group denial, tenant aliases/isolation, ACL, permanence, unknown source, changed receipt, concurrent single winner, sent-row refusal, ledger outage, original-source render reuse and atomic multi-byte rollback')
+                results=list(pool.map(race,(a,b)))
+            assert sum(x.returncode==0 for x in results)==1,[x.stderr for x in results]
+            # Independent concurrent gyms: exactly one succeeds globally.
+            global_fp='md5:'+uuid.uuid4().hex
+            a,*_=seed(fp=global_fp)
+            b,*_=seed(fp=global_fp)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                results=list(pool.map(race,(a,b)))
+            assert sum(x.returncode==0 for x in results)==1,[x.stderr for x in results]
+            assert sql(f"select count(*) from fixer_forward_media_use_20261006 where fingerprint='{global_fp}';")=='1'
+            # Attester holds an uncommitted new graph edge original -> X.
+            # X's claimant must wait, refresh its snapshot, discover the occupied
+            # original and deny; it cannot escape by claiming before edge commit.
+            origin,ot,og,ou,ofp=seed()
+            assert claim(origin)=='t'
+            target,tt,tg,tu,tfp=seed()
+            edge_row=row(ot,og,ou,image='https://scratch.example/'+uuid.uuid4().hex)
+            edge_id=str(uuid.uuid4())
+            edge_revision=sql(f"select fixer_forward_media_attestation_request_20261006('{edge_row[0]}')->>'revision';")
+            edge_sql=("set application_name='forward_graph_race'; begin; "
+                "set role fixer_forward_media_attester_20261006; select fixer_attest_forward_media_20261006"
+                f"('{edge_row[0]}','{edge_revision}','{edge_id}','{ofp}',10,'{tfp}',10,null,null,'render','race');"
+                "select pg_sleep(1.5); commit;")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                writing=pool.submit(sql,edge_sql)
+                deadline=time.monotonic()+5
+                while sql("select count(*) from pg_stat_activity where application_name='forward_graph_race' "
+                          "and wait_event='PgSleep';")!='1':
+                    assert time.monotonic()<deadline, 'attester did not reach held graph edge'
+                    time.sleep(0.02)
+                denial=claim(target,ok=False)
+                assert 'another tenant/date/group' in denial, denial
+                writing.result(timeout=5)
+            assert sql(f"select count(*) from fixer_forward_media_lineage_20261006 where evidence_id='{edge_id}';")=='1'
+            assert sql(f"select count(*) from fixer_forward_media_use_20261006 where fingerprint='{tfp}';")=='0'
+            # Fixed transaction snapshots cannot bypass post-lock graph refresh.
+            assert 'read committed isolation' in sql("begin isolation level repeatable read; set role service_role; "
+                f"select fixer_claim_forward_media_20261006('{target[0]}','{target[1]}','{target[2]}'); commit;",ok=False)
+            # Deleting content never frees consumed bytes or receipts.
+            sql(f"delete from content_calendar where id='{first[0]}';")
+            assert sql(f"select count(*) from fixer_forward_media_use_20261006 where fingerprint='{fp}';")=='1'
+            assert 'immutable' in sql('delete from fixer_forward_media_use_20261006;',ok=False)
+            assert 'immutable' in sql('truncate fixer_forward_media_use_20261006;',ok=False)
+            # Already-delivered first claims are never adopted into forward history.
+            sent=attest(row(tenant,group,url),fp)
+            sql(f"update content_calendar set late_post_id='provider-id' where id='{sent[0]}';")
+            assert 'unsent' in claim(sent,ok=False)
+            sql('alter table fixer_forward_media_use_20261006 rename to temporarily_unavailable;')
+            assert 'does not exist' in claim(sibling,ok=False)
+            print('PASS: self-contained draft; global cross-gym/cross-date concurrency one-winner; '
+                  'same-group idempotency; catch-up reservation; immutable complete source/image/thumbnail '
+                  'evidence; narrow attester auth; forged/missing/stale evidence hold; deletion permanence; '
+                  'derivative source reuse denial; atomic rollback; default OFF; sent-row/outage hold; '
+                  'attester-vs-claim graph race denial and isolation hold')
         finally:
             subprocess.run(['pg_ctl','-D',str(data),'-m','immediate','-w','stop'],
                            capture_output=True, timeout=60)
