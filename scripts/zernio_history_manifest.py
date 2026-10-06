@@ -14,7 +14,8 @@ import json
 import math
 from pathlib import Path
 import re
-import threading
+import multiprocessing
+import tempfile
 import time
 
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
@@ -166,36 +167,12 @@ def _response_post_id(body):
     return value if isinstance(value, str) and value else None
 
 
-def _call_with_deadline(function, timeout):
-    """Wait at most timeout wall seconds; a timed-out worker is daemonized.
-
-    The capture loop stops after a timeout, so an uninterruptible transport cannot
-    accumulate background requests or delay process exit.
-    """
-    finished = threading.Event()
-    result = {}
-
-    def invoke():
-        try:
-            result["value"] = function()
-        except BaseException as exc:  # relay worker exceptions on the caller thread
-            result["error"] = exc
-        finally:
-            finished.set()
-
-    worker = threading.Thread(target=invoke, name="zernio-history-get", daemon=True)
-    worker.start()
-    if not finished.wait(timeout):
-        raise TimeoutError(f"request exceeded wall deadline ({timeout:g}s)")
-    worker.join()
-    if "error" in result:
-        raise result["error"]
-    return result.get("value")
-
-
 def capture_posts(records, *, ledger: Path, raw_dir: Path, max_items: int,
                   timeout: float, get_json, get_raw=None, now=None):
-    """Capture a bounded unique exact-ID set. get_json(id) must be a GET-only call."""
+    """Capture exact IDs; injected get_json must enforce its GET-only deadline.
+
+    The live CLI supplies _ProcessGet, which kills and reaps requests on timeout.
+    """
     if max_items < 1 or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("max_items and timeout must be positive")
     ledger.parent.mkdir(parents=True, exist_ok=True)
@@ -216,7 +193,7 @@ def capture_posts(records, *, ledger: Path, raw_dir: Path, max_items: int,
     for pid in ids:
         started = time.monotonic()
         try:
-            body = _call_with_deadline(lambda: get_json(pid), timeout)
+            body = get_json(pid)
             elapsed = time.monotonic() - started
             response_id = _response_post_id(body)
             if response_id != pid:
@@ -235,7 +212,7 @@ def capture_posts(records, *, ledger: Path, raw_dir: Path, max_items: int,
         except Exception as exc:  # record bounded failure and allow resume/retry
             record = {"record_type": "capture", "late_post_id": pid,
                       "status": "error", "captured_at": timestamp(),
-                      "error_type": type(exc).__name__,
+                      "error_type": getattr(exc, "error_type", type(exc).__name__),
                       "http_status": getattr(exc, "status", None)}
         with ledger.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
@@ -275,15 +252,82 @@ class _RequestsGet:
         return response
 
 
+def _fetch_post_worker(pid, timeout, output_dir):
+    """Child owns the entire GET; only successful raw bytes or safe metadata leave it."""
+    import contextlib
+    import os
+    root = Path(output_dir)
+    with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        try:
+            from agent import zernio
+            adapter = _RequestsGet(timeout)
+            client = zernio.ZernioClient(http=adapter)
+            client.get_post(pid)
+            (root / "response").write_bytes(adapter.raw)
+            result = {"ok": True}
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            result = {"ok": False, "error_type": type(exc).__name__,
+                      "http_status": status if isinstance(status, int) else None}
+        (root / "result.json").write_text(json.dumps(result), encoding="utf-8")
+
+
+class _ProviderFailure(Exception):
+    def __init__(self, error_type, status):
+        super().__init__("Zernio capture failed")
+        self.error_type = error_type
+        self.status = status
+
+
+class _ProcessGet:
+    """Kill and reap a spawned GET worker before returning a wall deadline failure."""
+    def __init__(self, timeout, worker=_fetch_post_worker):
+        self.timeout = timeout
+        self.worker = worker
+        self.raw = None
+
+    def __call__(self, pid):
+        if not isinstance(pid, str) or not _SAFE_POST_ID.fullmatch(pid):
+            raise ValueError("unsafe exact post ID")
+        self.raw = None
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix="zernio-history-") as output_dir:
+            process = multiprocessing.get_context("spawn").Process(
+                target=self.worker, args=(pid, self.timeout, output_dir))
+            try:
+                process.start()
+                process.join(max(0, self.timeout - (time.monotonic() - started)))
+                if process.is_alive():
+                    # kill closes the child's transport, including a trickling response.
+                    process.kill()
+                    process.join()
+                    raise TimeoutError("Zernio GET exceeded wall deadline")
+                if process.exitcode != 0:
+                    raise _ProviderFailure("WorkerError", None)
+                root = Path(output_dir)
+                result = _load_json(root / "result.json")
+                if not result.get("ok"):
+                    raise _ProviderFailure(result["error_type"], result.get("http_status"))
+                raw_path = root / "response"
+                if raw_path.stat().st_size > MAX_RESPONSE_BYTES:
+                    raise ValueError("Zernio response exceeded 10 MiB capture limit")
+                self.raw = raw_path.read_bytes()
+                return json.loads(self.raw)
+            finally:
+                if process.pid is not None:
+                    if process.is_alive():
+                        process.kill()
+                    process.join()
+                process.close()
+
+
 def _provider_getter(timeout):
-    # Reuse Echo's configured base and GET client, overriding its usual timeout
-    # through an adapter. No POST/PUT/PATCH/DELETE method exists on this adapter.
+    # Validate credentials without a request; the spawned worker owns the GET.
     from agent import zernio
-    adapter = _RequestsGet(timeout)
-    client = zernio.ZernioClient(http=adapter)
-    if not client.api_key:
+    if not zernio.ZernioClient(http=_RequestsGet(timeout)).api_key:
         raise ValueError("ZERNIO_API_KEY is not set")
-    return lambda pid: client.get_post(pid), lambda: adapter.raw
+    getter = _ProcessGet(timeout)
+    return getter, lambda: getter.raw
 
 
 def _hash_file(path):

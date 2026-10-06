@@ -116,29 +116,70 @@ def test_capture_revalidates_ids_at_request_boundary(tmp_path):
     assert result == []
 
 
-def test_capture_enforces_wall_deadline_and_stops_followup_requests(tmp_path):
-    import threading
+def _slow_worker(marker, pid, timeout, output_dir):
+    import time
+    marker = Path(marker)
+    while True:
+        with marker.open("a") as stream:
+            stream.write(pid + "\n")
+        time.sleep(0.01)
+
+
+def _success_worker(pid, timeout, output_dir):
+    root = Path(output_dir)
+    (root / "response").write_bytes(b'{"post": {"_id": "p1"}}')
+    (root / "result.json").write_text('{"ok": true}')
+
+
+def _error_worker(pid, timeout, output_dir):
+    (Path(output_dir) / "result.json").write_text(
+        '{"ok": false, "error_type": "ZernioError", "http_status": 503}')
+
+
+def test_capture_enforces_wall_deadline_and_kills_worker_before_retry(tmp_path):
+    import functools
+    import multiprocessing
     import time
     records = [
         {"record_type": "row", "classification": "exact_post_lookup_candidate", "late_post_id": "p1"},
         {"record_type": "row", "classification": "exact_post_lookup_candidate", "late_post_id": "p2"},
     ]
-    calls = []
-    release = threading.Event()
+    marker = tmp_path / "worker-activity"
+    getter = history._ProcessGet(0.5, worker=functools.partial(_slow_worker, str(marker)))
+    children_before = {child.pid for child in multiprocessing.active_children()}
+    for _ in range(2):
+        started = time.monotonic()
+        result = history.capture_posts(records, ledger=tmp_path / "ledger", raw_dir=tmp_path / "raw",
+                                      max_items=5, timeout=0.5, get_json=getter,
+                                      get_raw=lambda: getter.raw)
+        assert time.monotonic() - started < 1.5
+        assert len(result) == 1 and result[0]["error_type"] == "TimeoutError"
+        assert marker.exists()  # the request worker actually started before being killed
+        frozen = marker.read_bytes()
+        time.sleep(0.05)
+        assert marker.read_bytes() == frozen
+        assert set(marker.read_text().splitlines()) == {"p1"}
+        assert {child.pid for child in multiprocessing.active_children()} == children_before
+        assert getter.raw is None
+    assert history._completed_ids(tmp_path / "ledger", tmp_path / "raw") == set()
+    assert not list((tmp_path / "raw").glob("*"))
 
-    def slow_get(pid):
-        calls.append(pid)
-        release.wait(2)
-        return {"post": {"_id": pid}}
 
-    started = time.monotonic()
-    result = history.capture_posts(records, ledger=tmp_path / "ledger", raw_dir=tmp_path / "raw",
-                                  max_items=5, timeout=0.03, get_json=slow_get)
-    elapsed = time.monotonic() - started
-    release.set()
-    assert elapsed < 0.5
-    assert calls == ["p1"]
-    assert len(result) == 1 and result[0]["error_type"] == "TimeoutError"
+def test_process_get_preserves_raw_bytes_and_safe_error_metadata(tmp_path):
+    getter = history._ProcessGet(3, worker=_success_worker)
+    assert getter("p1") == {"post": {"_id": "p1"}}
+    assert getter.raw == b'{"post": {"_id": "p1"}}'
+    getter.worker = _error_worker
+    row = {"record_type": "row", "classification": "exact_post_lookup_candidate", "late_post_id": "p1"}
+    result = history.capture_posts([row], ledger=tmp_path / "ledger", raw_dir=tmp_path / "raw",
+                                  max_items=1, timeout=3, get_json=getter,
+                                  get_raw=lambda: getter.raw)
+    assert result[0]["error_type"] == "ZernioError"
+    assert result[0]["http_status"] == 503
+    assert getter.raw is None
+    assert not list((tmp_path / "raw").glob("*"))
+    with pytest.raises(ValueError, match="unsafe"):
+        getter("../other")
 
 
 def test_capture_rejects_response_for_different_post_id(tmp_path):
@@ -149,3 +190,49 @@ def test_capture_rejects_response_for_different_post_id(tmp_path):
     assert result[0]["status"] == "error"
     assert result[0]["error_type"] == "ValueError"
     assert not list((tmp_path / "raw").glob("*"))
+
+
+def test_get_adapter_caps_response_and_closes_without_other_http_methods(monkeypatch):
+    import requests
+
+    class Response:
+        closed = False
+
+        def iter_content(self, chunk_size):
+            yield b"x" * history.MAX_RESPONSE_BYTES
+            yield b"x"
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return response
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    adapter = history._RequestsGet(1)
+    with pytest.raises(ValueError, match="10 MiB"):
+        adapter.get("https://synthetic.invalid/v1/posts/p1")
+    assert response.closed and adapter.raw is None
+    assert len(calls) == 1 and calls[0][1]["stream"] is True
+    assert all(not hasattr(adapter, method) for method in ("post", "put", "patch", "delete"))
+
+
+def test_fetch_worker_does_not_save_provider_error_body_or_message(tmp_path, monkeypatch):
+    from agent import zernio
+
+    class Client:
+        def __init__(self, http):
+            pass
+
+        def get_post(self, pid):
+            raise zernio.ZernioError(503, "synthetic credential and error body")
+
+    monkeypatch.setattr(zernio, "ZernioClient", Client)
+    history._fetch_post_worker("p1", 1, str(tmp_path))
+    assert list(tmp_path.iterdir()) == [tmp_path / "result.json"]
+    assert json.loads((tmp_path / "result.json").read_text()) == {
+        "ok": False, "error_type": "ZernioError", "http_status": 503}
