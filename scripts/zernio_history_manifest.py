@@ -11,8 +11,10 @@ from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
+import threading
 import time
 
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
@@ -127,8 +129,10 @@ def _completed_ids(ledger: Path, raw_dir: Path):
         raw_path = row.get("raw_response_path")
         if not isinstance(pid, str) or not isinstance(expected, str) or not isinstance(raw_path, str):
             continue
+        if not _SAFE_POST_ID.fullmatch(pid) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            continue
         candidate = Path(raw_path).resolve()
-        if not candidate.is_relative_to(raw_dir.resolve()):
+        if candidate.parent != raw_dir.resolve() or candidate.name != f"{expected}.json":
             continue
         try:
             if candidate.stat().st_size > MAX_RESPONSE_BYTES:
@@ -142,16 +146,57 @@ def _completed_ids(ledger: Path, raw_dir: Path):
                         break
                     digest.update(chunk)
             if total <= MAX_RESPONSE_BYTES and digest.hexdigest() == expected:
+                body = json.loads(candidate.read_bytes())
+                if _response_post_id(body) != pid:
+                    continue
                 completed.add(pid)
-        except OSError:
+        except (OSError, ValueError, json.JSONDecodeError):
             continue
     return completed
+
+
+def _response_post_id(body):
+    """Read the Zernio get_post envelope ID shape used by existing Echo readers."""
+    if not isinstance(body, dict):
+        return None
+    post = body.get("post")
+    if not isinstance(post, dict):
+        return None
+    value = post.get("_id") or post.get("id")
+    return value if isinstance(value, str) and value else None
+
+
+def _call_with_deadline(function, timeout):
+    """Wait at most timeout wall seconds; a timed-out worker is daemonized.
+
+    The capture loop stops after a timeout, so an uninterruptible transport cannot
+    accumulate background requests or delay process exit.
+    """
+    finished = threading.Event()
+    result = {}
+
+    def invoke():
+        try:
+            result["value"] = function()
+        except BaseException as exc:  # relay worker exceptions on the caller thread
+            result["error"] = exc
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=invoke, name="zernio-history-get", daemon=True)
+    worker.start()
+    if not finished.wait(timeout):
+        raise TimeoutError(f"request exceeded wall deadline ({timeout:g}s)")
+    worker.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 def capture_posts(records, *, ledger: Path, raw_dir: Path, max_items: int,
                   timeout: float, get_json, get_raw=None, now=None):
     """Capture a bounded unique exact-ID set. get_json(id) must be a GET-only call."""
-    if max_items < 1 or timeout <= 0:
+    if max_items < 1 or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("max_items and timeout must be positive")
     ledger.parent.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -159,7 +204,10 @@ def capture_posts(records, *, ledger: Path, raw_dir: Path, max_items: int,
     ids = []
     for row in records:
         pid = row.get("late_post_id")
-        if row.get("record_type") == "row" and row.get("classification") == "exact_post_lookup_candidate" and isinstance(pid, str) and pid not in done and pid not in ids:
+        if (row.get("record_type") == "row" and
+                row.get("classification") == "exact_post_lookup_candidate" and
+                isinstance(pid, str) and _SAFE_POST_ID.fullmatch(pid) and
+                pid not in done and pid not in ids):
             ids.append(pid)
             if len(ids) == max_items:
                 break
@@ -168,10 +216,11 @@ def capture_posts(records, *, ledger: Path, raw_dir: Path, max_items: int,
     for pid in ids:
         started = time.monotonic()
         try:
-            body = get_json(pid)
+            body = _call_with_deadline(lambda: get_json(pid), timeout)
             elapsed = time.monotonic() - started
-            if elapsed > timeout:
-                raise TimeoutError(f"request exceeded timeout ({elapsed:.3f}s)")
+            response_id = _response_post_id(body)
+            if response_id != pid:
+                raise ValueError("Zernio response post ID did not match requested ID")
             raw = get_raw() if get_raw else json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             digest = _sha256(raw)
             raw_path = raw_dir / f"{digest}.json"
@@ -181,6 +230,7 @@ def capture_posts(records, *, ledger: Path, raw_dir: Path, max_items: int,
                       "status": "captured", "captured_at": timestamp(),
                       "elapsed_seconds": round(elapsed, 6), "raw_sha256": digest,
                       "raw_response_path": str(raw_path),
+                      "response_post_id": response_id,
                       "response_hash_basis": "exact_http_response_body" if get_raw else "canonical_json_body"}
         except Exception as exc:  # record bounded failure and allow resume/retry
             record = {"record_type": "capture", "late_post_id": pid,
@@ -190,6 +240,8 @@ def capture_posts(records, *, ledger: Path, raw_dir: Path, max_items: int,
         with ledger.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
         outcomes.append(record)
+        if record.get("error_type") == "TimeoutError":
+            break
     return outcomes
 
 
