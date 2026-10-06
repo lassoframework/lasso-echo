@@ -36,16 +36,33 @@ class _FakeStore:
                 and start_iso <= r.get("post_date", "") <= end_iso
                 and str(r.get("status") or "").lower() != "denied"]
 
+    def rows_in_range_complete(self, gym_id, start_iso, end_iso):
+        return self.rows_in_range(gym_id, start_iso, end_iso)
+
+    def active_rows_on_day_complete(self, gym_id, day):
+        return self.rows_in_range(gym_id, day, day)
+
     def insert_grade(self, record):
         self.grades.append(record)
 
-    def patch_pending_plan(self, gym_id, row_id, *, caption=None, pillar=None):
+    def patch_pending_plan(self, gym_id, row_id, *, caption=None, pillar=None,
+                           expected_row=None, levers=None,
+                           force_caption_visual_hold=False):
         for r in self.rows:
             if r.get("id") == row_id and r.get("gym_id") == gym_id:
                 if str(r.get("status") or "").lower() not in ("pending", "draft", "queued"):
                     return None                    # server-side wipeable guard
+                if expected_row is not None and any(
+                    r.get(k) != expected_row.get(k)
+                    for k in ("caption", "image_url", "created_at", "status", "variant_status")
+                ):
+                    return None
                 if caption is not None:
                     r["caption"] = caption
+                if (expected_row is not None and gym_id == "lasso"
+                        and (force_caption_visual_hold or
+                             (caption is not None and caption != expected_row.get("caption")))):
+                    r["media_not_ready_reason"] = "caption_changed_needs_new_visual"
                 if pillar is not None:
                     r["pillar"] = pillar
                 r["status"] = "pending"
@@ -80,6 +97,8 @@ def _row(i, post_date, caption, *, status="pending", pillar="community",
         "format": fmt,
         "account": account,
         "status": status,
+        "created_at": "2026-08-01T00:00:00Z",
+        "variant_status": "active",
         "image_url": f"https://cdn.example.com/photo_{i}.jpg",
         "media_kind": "photo",
     }
@@ -548,6 +567,12 @@ def test_craft_pass_b2b_gets_mechanics_but_never_the_llm_regen(monkeypatch):
     no repair path at all is what left 116 of LASSO's 121 forward rows flagged
     'no ask' with nothing able to clear them (2026-08-31)."""
     monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    # LASSO's mechanical lane now shares the guarded caption provenance path:
+    # it needs the same durable ledger precondition as a regenerated caption.
+    monkeypatch.setattr("agent.caption_ledger.is_blocked_strict",
+                        lambda *a, **k: False)
+    monkeypatch.setattr("agent.caption_ledger.record_staged_strict",
+                        lambda *a, **k: None)
     cta = "Book a call and we will look at your numbers."
     calls = []
 

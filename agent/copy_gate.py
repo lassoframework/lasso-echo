@@ -161,6 +161,17 @@ def violations(text: str) -> list[str]:
     return v
 
 
+def lasso_violations(text: str) -> list[str]:
+    """LASSO house punctuation on ordinary copy, preserving URLs and handles."""
+    problems = violations(text)
+    plain = _PROTECTED_RE.sub("", str(text))
+    if ":" in plain:
+        problems.append("banned_colon")
+    if ";" in plain:
+        problems.append("banned_semicolon")
+    return problems
+
+
 # Periods in URLs, decimals and common abbreviated names are not sentence ends.
 _CAPTION_SENTENCE_END = re.compile(r"([.!?][\"'”’)]*)[ \t]+(?=\S)")
 _CAPTION_LIST_NUMBER = re.compile(r"\d+\.")

@@ -303,12 +303,66 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
         capacity = resolve_posts_per_day(gym_id, store)
     fmt = (row.get("format") or "feed").strip().lower()
     is_feed = fmt == "feed"
+    row_day = str(row.get("post_date") or "")[:10]
+    if (str(gym_id or "").strip().lower() == "lasso"
+            and fmt in ("feed", "story")
+            and _lasso_immediate_backlog_day(local_claim_day)
+            and _lasso_three_feed_enabled(gym_id, local_claim_day)
+            and (row_day == local_claim_day
+                 or ("2026-10-02" <= row_day <= "2026-10-05"
+                     and row_day < local_claim_day))):
+        # The RPC independently enforces 3 current + 12 backlog rows per
+        # account and format on the actual local publish day (Oct 5-6 only).
+        # Backlog is strictly before the publish day, so Oct 5 is never both.
+        return 15
+    if (str(gym_id or "").strip().lower() == "lasso"
+            and fmt in ("feed", "story")
+            and _lasso_incident_catchup_day(local_claim_day)
+            and _lasso_three_feed_enabled(gym_id, local_claim_day)
+            and str(row.get("post_date") or "")[:10] in
+                {local_claim_day, "2026-10-02", "2026-10-03",
+                 "2026-10-04", "2026-10-05"}):
+        # The RPC independently enforces 3 current + 2 outage rows per account
+        # and format on the actual local publish day. This is not a general 5x.
+        return 5
     # Both the durable cadence and the dated Summit cadence pair each feed
     # with a Story, so their publish capacity must agree with the planner.
     if (fmt in ("feed", "story")
             and _lasso_three_feed_enabled(gym_id, local_claim_day)):
         return max(capacity, 3)
     return capacity if is_feed else min(capacity, 2)
+
+
+def _lasso_immediate_backlog_day(day):
+    return "2026-10-05" <= str(day or "")[:10] <= "2026-10-06"
+
+
+def _lasso_incident_catchup_day(day):
+    return "2026-10-06" <= str(day or "")[:10] <= "2026-10-11"
+
+
+def _client_publish_limits(gym_id, run_date, configured_cap):
+    """Keep LASSO's feed/Story pairs whole without changing client caps."""
+    if (str(gym_id or "").strip().lower() != "lasso"
+            or not _lasso_three_feed_enabled(gym_id, run_date)):
+        return CLIENT_CATCHUP_DAYS, configured_cap
+    if _lasso_immediate_backlog_day(run_date):
+        # Oct 2 remains in the query through Oct 6. The RPC gates the twelve
+        # extra backlog pairs per account, format and actual local day, and
+        # never counts an Oct 5 current-day row as backlog on Oct 5.
+        from datetime import date as _date
+        lookback = (_date.fromisoformat(str(run_date)[:10])
+                    - _date(2026, 10, 2)).days
+        return max(CLIENT_CATCHUP_DAYS, lookback), 50
+    if _lasso_incident_catchup_day(run_date):
+        # Oct 2 remains in the query through Oct 11. The RPC gates the two
+        # extra outage pairs per account, format and actual local day.
+        from datetime import date as _date
+        lookback = (_date.fromisoformat(str(run_date)[:10])
+                    - _date(2026, 10, 2)).days
+        return max(CLIENT_CATCHUP_DAYS, lookback), 20
+    # Three feed and three paired Story posts on each of IG and FB.
+    return CLIENT_CATCHUP_DAYS, 12
 
 
 def _paired_lasso_feed_published(story, store):
@@ -348,6 +402,26 @@ def _paired_lasso_feed_published(story, store):
             and matches[0].get("status") == "published"
             and bool(matches[0].get("published_at"))
             and matches[0].get("late_post_id") is not None)
+
+
+def _paired_lasso_story_prepared(feed, store):
+    """Fail closed unless the DB proves one exact usable Story for this feed."""
+    try:
+        reader = getattr(store, "lasso_paired_story_ready_for_feed")
+        return reader(feed["id"]) is True
+    except Exception:
+        return False
+
+
+# The outgoing source fields a leased paired LASSO feed must still share with
+# the local due_rows snapshot after the owned claim (see publish_due). The
+# claim RPC pins OWNERSHIP, not outgoing content: caption/media patched while
+# pending between the paired-Story proof and the claim would otherwise send
+# content the prepared Story was never bound to.
+_PAIRED_FEED_SOURCE_FIELDS = (
+    "caption", "image_url", "source_media_url", "source_media_asset_id",
+    "thumbnail_url", "account", "format", "post_date", "slot_index",
+    "logical_post_id", "pillar", "scheduled_at", "media_not_ready_reason")
 
 
 def assign_slots(rows):
@@ -1216,6 +1290,29 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         from . import zernio_publisher
         zernio_publish = zernio_publisher.publish
 
+    # A reviewed managed Story unlocks only the exact dated incident feed hold.
+    # This CAS never changes captions, visuals, claims or another hold reason.
+    if (gym_id == "lasso" and config.lasso_three_feed_enabled()
+            and hasattr(store, "_client")):
+        try:
+            from .jobs import lasso_backlog_feed_hold_release
+            for paired_account in ("instagram", "facebook"):
+                lasso_backlog_feed_hold_release.run(
+                    account=paired_account, store=store, today=run_date)
+        except Exception as exc:
+            print(f"[lasso-backlog-feed-release] held: {type(exc).__name__}")
+
+    # Repaired Stories stay held until their exact feed has a real publish
+    # receipt. Release through the database's source-proof RPC before due_rows
+    # filters media-held rows. A failed release never blocks the feed lane.
+    if (gym_id == "lasso" and config.lasso_three_feed_enabled()
+            and hasattr(store, "_client")):
+        try:
+            from .jobs.lasso_daily_paired_stories import release_ready_holds
+            release_ready_holds(store, run_date, catchup_days=catchup_days)
+        except Exception as exc:
+            print(f"[lasso-paired-story-release] held: {type(exc).__name__}")
+
     # catchup_days (client lane): also pick up recent-past rows the client approved
     # AFTER their day passed, so a late approval publishes instead of stranding.
     try:
@@ -1363,6 +1460,26 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         if paired_lasso_story and not _paired_lasso_feed_published(row, store):
             waiting.append(row_id)
             continue
+        paired_lasso_feed = (
+            str(gym_id or "").strip().lower() == "lasso"
+            and (row.get("format") or "feed").strip().lower() == "feed"
+            and row.get("slot_index") in (0, 1, 2)
+            and row_date >= "2026-10-02"
+            and _lasso_three_feed_enabled(gym_id, row_date))
+        if paired_lasso_feed and not _paired_lasso_story_prepared(row, store):
+            # A due feed without its reviewed Story is an actionable stall.
+            # Keep it unclaimed; use the existing persisted threshold/dedupe
+            # so repeated minute ticks produce one operational alert per day.
+            _note_repeat_failure(row_id, gym_id, RuntimeError(
+                "paired Story source proof unavailable; feed remains held"))
+            waiting.append(row_id)
+            continue
+        # The Story artifact binds a source proof over THIS caption. The
+        # cleanup gates below (_strip_or_hold_meta / _format_caption_at_publish)
+        # can legitimately change it, so the proof is re-measured against the
+        # final cleaned row before any claim/network call — but ONLY when the
+        # caption actually moved, so a clean row pays no extra RPC.
+        paired_proven_caption = row.get("caption") if paired_lasso_feed else None
 
         account = _account_for(row, gym_id)
         if account is None:
@@ -1408,6 +1525,24 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             _alert_caption_format_held(row_id, gym_id)
             continue
         row = formatted
+
+        # SOURCE-INTEGRITY HOLD (PR29705 review, lead counterexample). Cleanup
+        # above may have changed the caption AFTER the paired-Story source proof
+        # was measured. The prepared Story was bound to the PRE-cleanup caption,
+        # and _paired_lasso_story_prepared proves by feed ID only -- a second
+        # ID-only proof can return true while the outgoing caption differs from
+        # what the Story was bound to (e.g. the persistence patch failed and the
+        # DB still holds the old text). So a changed caption is ALWAYS held
+        # here, waiting and unclaimed, via the existing repeated-failure note;
+        # the next preparation tick repairs against the persisted cleanup.
+        # Unchanged caption: no second RPC, no behavior change.
+        if (paired_lasso_feed
+                and str(row.get("caption") or "") != str(paired_proven_caption or "")):
+            _note_repeat_failure(row_id, gym_id, RuntimeError(
+                "paired Story source proof invalid after caption cleanup; "
+                "feed remains held"))
+            waiting.append(row_id)
+            continue
 
         # STORY CAPTION MUST BE ON THE MEDIA (Dale, 2026-08-17): a story publishes with
         # an EMPTY body, so its caption lives only on the rendered media. When a client
@@ -1493,6 +1628,44 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # claim. Legacy injected stores return True and use their own rollback
         # behavior; Supabase rollback refuses to run without this token.
         claim_token = won if isinstance(won, str) else None
+
+        # LEASED-ROW SOURCE REVALIDATION (paired LASSO feed, owned string-token
+        # claim only; legacy bool-claim test stores skip this gate entirely).
+        # due_rows is a SNAPSHOT: caption/media can be patched while pending
+        # between the paired-Story proof above and this claim, and the claim
+        # RPC pins ownership, not outgoing content. Re-fetch the leased row and
+        # require the SAME claim token with status 'publishing', field-for-field
+        # equality of the outgoing source with the snapshot, and Story readiness
+        # measured against the LEASED feed row -- all BEFORE any content-ledger
+        # stamp or network call. Anything less rolls back with the owned token
+        # and the existing repeated-failure note; a failed rollback is recovery
+        # work, exactly like the other pre-network blocks.
+        if paired_lasso_feed and claim_token:
+            leased = None
+            try:
+                _get_row = getattr(store, "get_row", None)
+                if callable(_get_row):
+                    leased = _get_row(gym_id, row_id)
+            except Exception:  # noqa: BLE001 - an unreadable lease fails closed
+                leased = None
+            lease_ok = (
+                isinstance(leased, dict)
+                and str(leased.get("publish_claim_token") or "") == str(claim_token)
+                and str(leased.get("status") or "") == "publishing"
+                and all(leased.get(_f) == row.get(_f)
+                        for _f in _PAIRED_FEED_SOURCE_FIELDS))
+            if not lease_ok or not _paired_lasso_story_prepared(leased, store):
+                _note_repeat_failure(row_id, gym_id, RuntimeError(
+                    "leased paired feed changed after the Story source proof; "
+                    "feed remains held"))
+                _reverted = _revert_to_pending(
+                    row_id=row_id, store=store, gym_id=gym_id,
+                    expected_claim_token=claim_token,
+                    reject_reason="leased_feed_source_mismatch")
+                if not _reverted:
+                    recovery_required.append(row_id)
+                failed.append(row_id)
+                continue
 
         # CONTENT IDEMPOTENCY, WRITTEN BEFORE THE NETWORK CALL (2026-09-05 incident).
         #
@@ -2541,12 +2714,14 @@ def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
             # first tick of its post_date). No orphans: a same-day row whose slot has
             # passed is is_due on every later tick, and a PAST-DATE row (catchup_days)
             # is always due — the lane runs every ~1 min, so nothing is stranded.
+            catchup_days, daily_cap = _client_publish_limits(
+                base, run_date, config.client_daily_publish_cap())
             summary = publish_due(run_date, gym_id=base, store=store, notifier=notifier,
                                   now=now, catch_all=False,
                                   approved_only=not autonomous,
                                   zernio_publish=zernio_publish,
-                                  catchup_days=CLIENT_CATCHUP_DAYS,
-                                  daily_cap=config.client_daily_publish_cap())
+                                  catchup_days=catchup_days,
+                                  daily_cap=daily_cap)
             summary["gym"] = base
             summary["autonomous"] = autonomous
             out.append(summary)
