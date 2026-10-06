@@ -802,18 +802,19 @@ class SupabaseCalendarStore:
                     or expected_row["published_at"] is not None
                     or expected_row["late_post_id"] is not None):
                 return None
-            def unchanged(value):
-                if value is None:
-                    return "is.null"
-                escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-                return f'eq."{escaped}"'
+            def unchanged(key, value):
+                encoded = _eq_filter(value)
+                if encoded is None:
+                    raise PortalStoreError(
+                        422, f"image patch CAS blocked: field {key!r} has no safe equality encoding")
+                return encoded
             for key in ("status", "format", "image_url", "caption", "source_media_url"):
-                params[key] = unchanged(expected_row.get(key))
+                params[key] = unchanged(key, expected_row.get(key))
             for key in ("account", "post_date", "visual_group_key", "byte_hash", "r2_key",
                         "source_media_asset_id", "drive_file_id", "variant_status",
                         "scheduled_at", "slot_index", "publish_claim_token", "publish_reservation_day"):
                 if key in expected_row:
-                    params[key] = unchanged(expected_row[key])
+                    params[key] = unchanged(key, expected_row[key])
             params["published_at"] = "is.null"
             params["late_post_id"] = "is.null"
             params["media_not_ready_reason"] = "is.null"
@@ -865,12 +866,11 @@ class SupabaseCalendarStore:
         """Bind preparation to its observed source, slot and publish state."""
         result = dict(params)
         for key in _VISUAL_MEDIA_CAS_COLUMNS:
-            value = current.get(key)
-            if value is None:
-                result[key] = "is.null"
-            else:
-                escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-                result[key] = f'eq."{escaped}"'
+            encoded = _eq_filter(current.get(key))
+            if encoded is None:
+                raise PortalStoreError(
+                    422, f"visual media CAS blocked: field {key!r} has no safe equality encoding")
+            result[key] = encoded
         return result
 
     @staticmethod
