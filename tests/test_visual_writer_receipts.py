@@ -1,5 +1,6 @@
 """Focused fail-closed source/rendition writer contracts."""
 import hashlib
+import os
 import uuid
 
 import pytest
@@ -260,6 +261,96 @@ def test_reburn_download_rejects_external_and_lookalike_hosts(monkeypatch):
         # Dot segments can be normalized by HTTP intermediaries; they are not
         # accepted as exact object paths for this trust boundary.
         assert story_reburn._download(url, lambda message: None) is None
+
+
+def test_reburn_download_accepts_own_bucket_object_with_encoded_space(monkeypatch):
+    """Zanshin's approved Story source uses a valid `%20` object-key segment."""
+    from agent import config
+    url = "https://media.example/zanshinfitness630e22/Zanshin%20Fitness-57.jpg"
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda candidate: b"zanshin-source"
+                        if candidate == url else None)
+
+    path = story_reburn._download(url, lambda message: None)
+
+    try:
+        assert path is not None
+        with open(path, "rb") as source:
+            assert source.read() == b"zanshin-source"
+    finally:
+        if path:
+            os.remove(path)
+
+
+@pytest.mark.parametrize("url", [
+    "https://media.example/zanshinfitness630e22/Zanshin Fitness-57.jpg",
+    "https://media.example/zanshinfitness630e22/Zanshin%09Fitness-57.jpg",
+    "https://media.example/zanshinfitness630e22/Zanshin%0d%0aFitness-57.jpg",
+    "https://media.example/zanshinfitness630e22/Zanshin%7fFitness-57.jpg",
+    "https://media.example/zanshinfitness630e22/%2e%2e/raw.jpg",
+    "https://media.example/zanshinfitness630e22/a%2fb.jpg",
+    "https://media.example/zanshinfitness630e22/a%5cb.jpg",
+    "https://user@media.example/zanshinfitness630e22/raw.jpg",
+    "https://media.example/zanshinfitness630e22/raw.jpg#part",
+    "http://media.example/zanshinfitness630e22/raw.jpg",
+    "https://media.example.evil.test/zanshinfitness630e22/raw.jpg",
+])
+def test_own_media_url_encoded_space_exception_keeps_security_rejections(
+        monkeypatch, url):
+    from agent import config
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+    assert prep._own_media_url(url) is False
+
+
+@pytest.mark.parametrize("format_char", [
+    "\u200c",  # ZERO WIDTH NON-JOINER
+    "\u200d",  # ZERO WIDTH JOINER
+    "\u2060",  # WORD JOINER
+    "\ufeff",  # ZERO WIDTH NO-BREAK SPACE / BOM
+    "\u00ad",  # SOFT HYPHEN
+])
+def test_own_media_url_accepts_safe_format_characters_in_owned_object_names(
+        monkeypatch, format_char):
+    from urllib.parse import quote
+    from agent import config
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+    url = f"https://media.example/zanshinfitness630e22/photo{quote(format_char)}.jpg?version=1"
+
+    assert prep._own_media_url(url) is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://media.example/zanshinfitness630e22/photo%00.jpg",
+    "https://media.example/zanshinfitness630e22/photo%1f.jpg",
+    "https://media.example/zanshinfitness630e22/photo%7f.jpg",
+    "https://media.example/zanshinfitness630e22/%2e%2e/photo.jpg",
+    "https://media.example/zanshinfitness630e22/photo\x01.jpg",
+    "https://media.example/zanshinfitness630e22/photo\ud800.jpg",
+])
+def test_own_media_url_rejects_encoded_controls_and_traversal(monkeypatch, url):
+    from agent import config
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+
+    assert prep._own_media_url(url) is False
+
+
+@pytest.mark.parametrize("format_char", [
+    "\u061c",  # ARABIC LETTER MARK
+    "\u200b",  # ZERO WIDTH SPACE
+    "\u200e",  # LEFT-TO-RIGHT MARK
+    "\u200f",  # RIGHT-TO-LEFT MARK
+    "\u180e",  # MONGOLIAN VOWEL SEPARATOR
+    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",  # bidi embeddings/overrides
+    "\u2066", "\u2067", "\u2068", "\u2069",  # bidi isolates
+    "\u206a", "\u206b", "\u206c", "\u206d", "\u206e", "\u206f",  # deprecated bidi controls
+])
+def test_own_media_url_rejects_bidi_and_unreviewed_format_controls(monkeypatch, format_char):
+    from urllib.parse import quote
+    from agent import config
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+    url = f"https://media.example/zanshinfitness630e22/photo{quote(format_char)}.jpg?version=1"
+
+    assert prep._own_media_url(url) is False
 
 
 def test_query_object_read_disables_redirects_and_caps_stream(monkeypatch):

@@ -21,6 +21,7 @@ import hashlib
 import json
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -1233,16 +1234,24 @@ def test_fixer_request_product_override_is_separate_from_bot_identity():
 # the outbox gates
 # ======================================================================================
 
+def _fresh_slack_test_ts():
+    # Slack ts is Unix seconds. Use a post-time value after the durable intent's
+    # not_before instead of the old "9.999" placeholder from pre-freshness tests.
+    return str(time.time() + 1)
+
+
 def _posted():
     calls = []
 
     def post(channel, text, thread_ts=None, blocks=None):
-        calls.append({"channel": channel, "text": text, "thread_ts": thread_ts, "blocks": blocks})
-        return "9.999"
+        ts = _fresh_slack_test_ts()
+        calls.append({"channel": channel, "text": text, "thread_ts": thread_ts,
+                      "blocks": blocks, "ts": ts})
+        return ts
     def readback(channel, *, thread_ts=None, ts=None, oldest=None):
         matching = [c for c in calls if c["channel"] == channel
                     and c["thread_ts"] == thread_ts]
-        messages = [{"ts": "9.999", "text": c["text"], "user": "U_ECHO_BOT",
+        messages = [{"ts": c["ts"], "text": c["text"], "user": "U_ECHO_BOT",
                      "thread_ts": thread_ts} for c in matching]
         return {"ok": True, "channel": channel, "messages": messages}
     post.readback = readback
@@ -1273,7 +1282,7 @@ def test_portal_provenance_system_alert_routes_to_fixer_once(
     second = OB.run_once(bus, post, identity=IDS.get(row_identity), log=lambda *a: None)
     assert first["posted"] == 1 and second["posted"] == 0
     assert bus.message(row["id"])["delivery_status"] == "posted"
-    assert bus.message(row["id"])["slack_ts"] == "9.999"
+    assert bus.message(row["id"])["slack_ts"] == calls[0]["ts"]
     assert bus.ticket(tid)["bot_identity"] == parent_identity
     assert bus.ticket(tid)["status"] == "hold"
     assert len(calls) == 1 and calls[0]["channel"] == "C_FIXER"
@@ -2187,10 +2196,12 @@ def test_fixer_correction_during_slack_post_keeps_ticket_open(monkeypatch):
     def post(_channel, _body, thread_ts=None, blocks=None):
         bus.record_inbound(ticket_id=tid, author_type="client",
                            body="Correction while Slack delivered the notice")
-        return "9.999"
+        posted_ts.append(_fresh_slack_test_ts())
+        return posted_ts[-1]
+    posted_ts = []
     post.readback = lambda channel, **kw: {
         "ok": True, "channel": channel,
-        "messages": [{"ts": "9.999", "text": f"<@{OB.config.APPROVER_SLACK_ID}> "
+        "messages": [{"ts": posted_ts[-1], "text": f"<@{OB.config.APPROVER_SLACK_ID}> "
                       "The fix is live.", "user": "U_ECHO_BOT", "thread_ts": "1.0"}]}
 
     result = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
@@ -2428,7 +2439,7 @@ def test_grounded_fixer_answer_includes_blake_without_requiring_deploy_proof(
     assert proof["delivery_readback_verified"] is True
     assert proof["delivery_readback_channel"] == "C_CLIENT"
     assert proof["delivery_readback_thread_ts"] == "1.0"
-    assert proof["delivery_readback_ts"] == "9.999"
+    assert proof["delivery_readback_ts"] == calls[0]["ts"]
     assert proof["delivery_readback_sender"] == "U_ECHO_BOT"
     assert proof["delivery_readback_body_sha256"] == hashlib.sha256(
         expected.encode()).hexdigest()
@@ -2517,14 +2528,17 @@ def test_fixer_readback_rejects_distinct_slack_text(intended, observed):
 
 
 def test_fixer_normalized_readback_still_requires_exact_post_timestamp_and_identity():
-    ts = "9.999"
+    not_before = datetime.now(timezone.utc).isoformat()
+    ts = str(datetime.now(timezone.utc).timestamp() + 1)
     intent = {"channel": "C_CLIENT", "thread_ts": "1.0", "sender": "U_ECHO_BOT",
               "body": "Details: https://example.com/fix & done",
-              "not_before": datetime.now(timezone.utc).isoformat()}
+              "not_before": not_before}
     message = {"ts": ts, "text": "Details: <https://example.com/fix> &amp; done",
                "user": "U_ECHO_BOT", "thread_ts": "1.0"}
+    expected_ts = ts
     def readback(channel, *, thread_ts=None, ts=None, oldest=None):
-        assert (channel, thread_ts, ts, oldest) == ("C_CLIENT", "1.0", "9.999", "9.999")
+        assert (channel, thread_ts, ts, oldest) == (
+            "C_CLIENT", "1.0", expected_ts, expected_ts)
         return {"ok": True, "channel": channel, "messages": [message]}
     proof, reason = OB._readback_fixer_message(readback, intent, ts=ts)
     assert not reason and proof["delivery_readback_ts"] == ts
@@ -2540,6 +2554,39 @@ def test_fixer_normalized_readback_still_requires_exact_post_timestamp_and_ident
         intent, ts=ts)[0] is None
 
 
+def test_fixer_readback_rejects_identical_message_older_than_intent():
+    intent = {"channel": "C_CLIENT", "thread_ts": "1.0", "sender": "U_ECHO_BOT",
+              "body": "Details: issue fixed",
+              "not_before": "2026-10-06T12:00:00+00:00"}
+    old = {"ts": "1791287999.000000", "text": intent["body"],
+           "user": intent["sender"], "thread_ts": intent["thread_ts"]}
+    current = {**old, "ts": "1791288000.000000"}
+
+    def readback_for(message):
+        return lambda channel, **kwargs: {
+            "ok": True, "channel": channel, "messages": [message]}
+
+    assert OB._readback_fixer_message(
+        readback_for(old), intent, ts=old["ts"])[0] is None
+    proof, reason = OB._readback_fixer_message(
+        readback_for(current), intent, ts=current["ts"])
+    assert not reason and proof["delivery_readback_ts"] == current["ts"]
+
+
+@pytest.mark.parametrize("bad_ts", ["", "not-a-timestamp", "nan", "inf", "-inf"])
+def test_fixer_readback_rejects_unparseable_observed_timestamp(bad_ts):
+    intent = {"channel": "C_CLIENT", "thread_ts": "1.0", "sender": "U_ECHO_BOT",
+              "body": "Details: issue fixed",
+              "not_before": "2026-10-06T12:00:00+00:00"}
+    message = {"ts": bad_ts, "text": intent["body"],
+               "user": intent["sender"], "thread_ts": intent["thread_ts"]}
+    proof, _ = OB._readback_fixer_message(
+        lambda channel, **kwargs: {"ok": True, "channel": channel,
+                                   "messages": [message]},
+        intent, ts=bad_ts)
+    assert proof is None
+
+
 def test_fixer_normalized_readback_finishes_once_without_resend(monkeypatch):
     _arm_grounded_fixer(monkeypatch)
     bus, tid, row, _ = _grounded_fixer_answer_case()
@@ -2549,7 +2596,7 @@ def test_fixer_normalized_readback_finishes_once_without_resend(monkeypatch):
     post, calls = _posted()
     post.readback = lambda channel, **kwargs: {
         "ok": True, "channel": channel,
-        "messages": [{"ts": "9.999", "text": calls[0]["text"].replace(
+        "messages": [{"ts": calls[0]["ts"], "text": calls[0]["text"].replace(
             "https://example.com/fix", "<https://example.com/fix>"),
             "user": "U_ECHO_BOT", "thread_ts": "1.0"}]}
     first = OB.run_once(bus, post, identity=IDS.get("echo"),
@@ -2699,7 +2746,7 @@ def test_fixer_readback_mismatch_never_posts_or_resolves_and_never_resends(monke
     post, calls = _posted()
     post.readback = lambda channel, **kw: {
         "ok": True, "channel": channel,
-        "messages": [{"ts": "9.999", "text": "wrong body", "user": "U_ECHO_BOT",
+        "messages": [{"ts": calls[0]["ts"], "text": "wrong body", "user": "U_ECHO_BOT",
                       "thread_ts": "1.0"}]}
     first = OB.run_once(bus, post, identity=IDS.get("echo"),
                         member_check=lambda *_: True, log=lambda *_: None)
@@ -2717,7 +2764,7 @@ def test_fixer_readback_mismatch_never_posts_or_resolves_and_never_resends(monke
                for m in bus.msgs)
     post.readback = lambda channel, **kw: {
         "ok": True, "channel": channel,
-        "messages": [{"ts": "9.999", "text": calls[0]["text"],
+        "messages": [{"ts": calls[0]["ts"], "text": calls[0]["text"],
                       "user": "U_ECHO_BOT", "thread_ts": "1.0"}]}
     bus.mark_message(row["id"], "held", meta_update={
         "fixer_reconcile_next_at": (datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -2759,7 +2806,7 @@ def test_fixer_slack_timestamp_survives_concurrent_stale_quarantine_without_rese
 
     delivered = bus.message(row["id"])
     assert delivered["delivery_status"] == "posted"
-    assert delivered["slack_ts"] == "9.999"
+    assert delivered["slack_ts"] == calls[0]["ts"]
     assert delivered["attachments"]["delivery_readback_verified"] is True
     assert summary["posted"] == summary["resolved"] == 1
     assert bus.ticket(tid)["status"] == "resolved"
@@ -2920,7 +2967,7 @@ def test_fixer_crash_before_post_never_claims_identical_other_echo_reply(
 
     def post(channel, text, thread_ts=None, blocks=None):
         sent.append((channel, text))
-        return "9.999"
+        return _fresh_slack_test_ts()
 
     def readback(channel, *, thread_ts=None, ts=None, oldest=None):
         # Another identical Echo reply may fall before OR after this intent.
@@ -2991,7 +3038,7 @@ def test_fixer_uncertain_alert_retries_after_slack_outage(monkeypatch):
         attempts.append((channel, text))
         if len(attempts) == 1:
             raise RuntimeError("Slack outage")
-        return "9.999"
+        return _fresh_slack_test_ts()
 
     start = datetime(2026, 10, 6, 2, 0, tzinfo=timezone.utc)
     OB.run_once(bus, post, identity=IDS.get("echo"), now=start, log=lambda *_: None)
@@ -3168,6 +3215,7 @@ def test_fixer_missing_delivery_config_holds_then_recovers_without_duplicate(
 def test_fixer_held_reconciliation_prioritizes_oldest_due_row_over_new_holds():
     bus = FakeBus()
     due = datetime.now(timezone.utc) - timedelta(minutes=1)
+    due_slack_ts = str(due.timestamp() + 1)
     future = datetime.now(timezone.utc) + timedelta(hours=1)
     intent = {
         "channel": "C_CLIENT", "thread_ts": "1.0", "body": "done",
@@ -3180,7 +3228,7 @@ def test_fixer_held_reconciliation_prioritizes_oldest_due_row_over_new_holds():
         meta={"identity": "echo", "fixer_slack_delivery_uncertain": True,
               "fixer_slack_delivery_intent": intent,
               "fixer_reconcile_next_at": due.isoformat()})
-    bus.mark_message(oldest["id"], "held", slack_ts="1.111")
+    bus.mark_message(oldest["id"], "held", slack_ts=due_slack_ts)
     next(m for m in bus.msgs if m["id"] == oldest["id"])["created_at"] = (
         "2026-01-01T00:00:00+00:00")
     for index in range(250):
@@ -3206,7 +3254,7 @@ def test_fixer_held_reconciliation_prioritizes_oldest_due_row_over_new_holds():
         bus, IDS.get("echo"), readback, lambda *_: None,
         {"posted": 0, "resolved": 0})
 
-    assert reads == ["1.111"]
+    assert reads == [due_slack_ts]
     assert bus.message(oldest["id"])["delivery_status"] == "posted"
     assert all(m["delivery_status"] == "held" for m in bus.msgs
                if m["id"] != oldest["id"])
@@ -3690,10 +3738,12 @@ def test_grounded_fixer_correction_during_post_keeps_newer_request_open(
             monkeypatch.setattr(
                 bus, "messages",
                 lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("read failed")))
-        return "9.999"
+        posted_ts.append(_fresh_slack_test_ts())
+        return posted_ts[-1]
+    posted_ts = []
     post.readback = lambda channel, **kw: {
         "ok": True, "channel": channel,
-        "messages": [{"ts": "9.999", "text": f"<@{OB.config.APPROVER_SLACK_ID}> "
+        "messages": [{"ts": posted_ts[-1], "text": f"<@{OB.config.APPROVER_SLACK_ID}> "
                       "Instagram is connected.", "user": "U_ECHO_BOT", "thread_ts": "1.0"}]}
 
     summary = OB.run_once(
@@ -3701,7 +3751,7 @@ def test_grounded_fixer_correction_during_post_keeps_newer_request_open(
         member_check=lambda _channel, _user: True)
 
     assert bus.message(row["id"])["delivery_status"] == "posted"
-    assert bus.message(row["id"])["slack_ts"] == "9.999"
+    assert bus.message(row["id"])["slack_ts"] == posted_ts[-1]
     assert summary["posted"] == 1
     assert summary["resolved"] == 0
     assert bus.ticket(tid)["status"] == "verification"
@@ -4439,7 +4489,7 @@ def test_posted_row_gets_slack_ts_and_dm_posts_top_level(monkeypatch):
     assert ack_call["thread_ts"] is None, "a DM/group DM continues top level, not threaded"
     ack = [m for m in bus.messages_for(d.ticket_id)
            if m["direction"] == "outbound" and m["attachments"]["kind"] == A.KIND_ACK][0]
-    assert ack["delivery_status"] == "posted" and ack["slack_ts"] == "9.999"
+    assert ack["delivery_status"] == "posted" and ack["slack_ts"] == ack_call["ts"]
 
 
 def test_channel_mention_replies_in_thread(monkeypatch):

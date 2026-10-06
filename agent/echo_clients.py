@@ -80,9 +80,12 @@ The service key is read lazily, never logged, never returned. `http` is injectab
 every path is unit tested offline.
 """
 import hashlib
+import json
 import re
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 
 from . import config
@@ -111,8 +114,18 @@ class ClientSet:
     other_keys: frozenset = frozenset()    # token keys of gyms that are NOT clients
     other_gym_ids: frozenset = frozenset() # portal gym ids that are NOT clients
     markers: dict = field(default_factory=dict)    # gym_id -> frozenset of marker names
+    token_keys_by_gym: dict = field(default_factory=dict)  # issued portal keys, by UUID
+    ambiguous_keys: frozenset = frozenset()  # aliases claimed by multiple gym UUIDs
     error: str = ""
     at: float = 0.0
+    # Raw-ID evidence is kept separately because normalize_key removes _ig/_fb.
+    # Registry repair must never treat a suffixed owner ID as a valid UUID.
+    valid_marker_ids: frozenset = frozenset()
+    invalid_marker_ids: frozenset = frozenset()
+    valid_token_keys_by_gym: dict = field(default_factory=dict)
+    invalid_owner_keys: frozenset = frozenset()
+    valid_gym_row_ids: frozenset = frozenset()
+    invalid_gym_row_ids: frozenset = frozenset()
 
     def is_client(self, ident):
         if not self.ok:
@@ -180,25 +193,34 @@ def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(
     gym_rows        gyms(id, name, slug) for the client ids         -> aliases ONLY
     """
     gym_ids, markers = set(), {}
+    valid_marker_ids, invalid_marker_ids = set(), set()
+
+    def _raw_uuid(value):
+        raw = str(value or "").strip().lower()
+        return raw if _UUID_RE.fullmatch(raw) else ""
 
     def _mark(gid, marker):
+        raw_gid = _raw_uuid(gid)
         gid = normalize_key(gid)
         if not gid:
             return
         gym_ids.add(gid)
         markers.setdefault(gid, set()).add(marker)
+        (valid_marker_ids if raw_gid else invalid_marker_ids).add(gid)
 
     for r in settings_rows or []:
         _mark(r.get("gym_id"), MARKER_SETTINGS)
     intake_aliases = {}
     for r in intake_rows or []:
-        gid = normalize_key(r.get("gym_id"))
-        ck = normalize_key(r.get("client_key"))
+        raw_gid = r.get("gym_id")
+        raw_ck = r.get("client_key")
+        gid = normalize_key(raw_gid)
+        ck = normalize_key(raw_ck)
         if not gid and _UUID_RE.match(ck or ""):
             gid = ck                       # older rows carry the UUID as client_key
         if not gid:
             continue
-        _mark(gid, MARKER_INTAKE)
+        _mark(raw_gid if raw_gid else raw_ck, MARKER_INTAKE)
         for alias in (ck, normalize_key(r.get("echo_account_key"))):
             if alias and not _UUID_RE.match(alias):
                 intake_aliases.setdefault(gid, set()).add(alias)
@@ -215,16 +237,29 @@ def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(
                          "refusing to believe an empty client universe", at=now or time.time())
 
     names, slugs, raw_ids = {}, {}, {}
+    valid_gym_row_ids, invalid_gym_row_ids = set(), set()
     for g in list(gym_rows or []) + list(standalone_rows or []):
         gid = normalize_key(g.get("id"))
         if gid in gym_ids:
             names[gid] = str(g.get("name") or "").strip()
             slugs[gid] = str(g.get("slug") or "").strip().lower()
             raw_ids[gid] = str(g.get("id") or "").strip()
+            if _raw_uuid(g.get("id")):
+                valid_gym_row_ids.add(gid)
+            else:
+                invalid_gym_row_ids.add(gid)
 
     keys, key_to_gym, other, other_ids = set(), {}, set(), set()
+    token_keys_by_gym, valid_token_keys_by_gym = {}, {}
+    invalid_owner_keys, key_claims = set(), {}
+
+    def _claim(alias, gid):
+        if alias and gid:
+            key_claims.setdefault(alias, set()).add(gid)
+
     for gid, aliases in intake_aliases.items():
         for a in aliases:
+            _claim(a, gid)
             keys.add(a)
             key_to_gym.setdefault(a, gid)
     for t in token_rows or []:
@@ -234,7 +269,13 @@ def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(
             other_ids.add(gid)
         if not key:
             continue
+        _claim(key, gid)
+        if not _raw_uuid(t.get("gym_id")):
+            invalid_owner_keys.add(key)
         if gid in gym_ids:
+            token_keys_by_gym.setdefault(gid, set()).add(key)
+            if _raw_uuid(t.get("gym_id")):
+                valid_token_keys_by_gym.setdefault(gid, set()).add(key)
             keys.add(key)
             key_to_gym[key] = gid
         else:
@@ -255,6 +296,7 @@ def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(
         for a in aliases:
             a = normalize_key(a)
             if a:
+                _claim(a, gid)
                 keys.add(a)
                 key_to_gym.setdefault(a, gid)
     # A key both a client and a non-client hold cannot be a non-client marker.
@@ -264,10 +306,50 @@ def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(
                      key_to_gym=key_to_gym, names=names, other_keys=frozenset(other),
                      other_gym_ids=frozenset(other_ids),
                      markers={g: frozenset(m) for g, m in markers.items()},
+                     token_keys_by_gym={g: frozenset(v) for g, v in token_keys_by_gym.items()},
+                     ambiguous_keys=frozenset(a for a, owners in key_claims.items()
+                                              if len(owners) > 1),
+                     valid_marker_ids=frozenset(valid_marker_ids),
+                     invalid_marker_ids=frozenset(invalid_marker_ids),
+                     valid_token_keys_by_gym={g: frozenset(v)
+                                              for g, v in valid_token_keys_by_gym.items()},
+                     invalid_owner_keys=frozenset(invalid_owner_keys),
+                     valid_gym_row_ids=frozenset(valid_gym_row_ids),
+                     invalid_gym_row_ids=frozenset(invalid_gym_row_ids),
                      at=now or time.time())
 
 
 # ---- live reads ------------------------------------------------------------------
+
+class _StdlibResponse:
+    """Small requests-compatible response used by the dependency-free reader."""
+
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        return json.loads(self._body.decode("utf-8"))
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Never forward Supabase service credentials to a redirected origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class _StdlibHTTP:
+    """The production image may omit requests; urllib is always available."""
+
+    @staticmethod
+    def get(url, params=None, headers=None, timeout=None):
+        query = urllib.parse.urlencode(params or {})
+        target = url + (("?" + query) if query else "")
+        request = urllib.request.Request(target, headers=headers or {}, method="GET")
+        opener = urllib.request.build_opener(_NoRedirects())
+        with opener.open(request, timeout=timeout) as response:  # noqa: S310
+            return _StdlibResponse(response.status, response.read())
 
 def _rest_get(http, url, key, path, params):
     """One PostgREST GET. Returns (rows, ok). Never raises."""
@@ -314,8 +396,7 @@ def _load(http=None, now=None):
     if not url or not key:
         return ClientSet(ok=False, error="no Supabase creds", at=stamp)
     if http is None:
-        import requests  # lazy, matches the rest of the repo
-        http = requests
+        http = _StdlibHTTP
     # The four MARKER reads. Any one failing = the universe is unknown = fail closed.
     settings, ok = _read_all(http, url, key, "echo_gym_settings", "gym_id")
     if not ok:

@@ -13,6 +13,7 @@ slack_channel_id as failed; a portal ticket has no Slack channel until a group D
 is opened.
 """
 from datetime import datetime, timezone
+import time
 
 import pytest
 
@@ -385,13 +386,14 @@ def _posts():
     sent = []
 
     def post(channel, text, thread_ts=None, blocks=None):
+        ts = str(time.time() + 1)
         sent.append({"channel": channel, "text": text, "thread_ts": thread_ts,
-                     "blocks": blocks})
-        return "111.1"
+                     "blocks": blocks, "ts": ts})
+        return ts
 
     def readback(channel, *, thread_ts=None, ts=None, oldest=None):
         return {"ok": True, "channel": channel,
-                "messages": [{"ts": "111.1", "text": item["text"],
+                "messages": [{"ts": item["ts"], "text": item["text"],
                               "user": "U_ECHO_BOT", "thread_ts": item["thread_ts"]}
                              for item in sent if item["channel"] == channel
                              and item["thread_ts"] == thread_ts]}

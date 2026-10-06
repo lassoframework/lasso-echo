@@ -353,6 +353,7 @@ def _state_store(monkeypatch, rows):
     monkeypatch.setenv('AGENT_EMPTY_CAPTION_GUARD', 'false')
     monkeypatch.setenv('AGENT_CAPTION_COOLDOWN', 'false')
     monkeypatch.setenv('AGENT_SLOT_DEDUPE', 'false')
+    monkeypatch.setenv('ECHO_CADENCE_2X_ENABLED', 'true')
     http = _StateHTTP(rows)
     store = pcs.SupabaseCalendarStore(url='https://proj.supabase.co', service_key='offline-test', http=http)
     return store, http
@@ -446,12 +447,237 @@ def test_client_apply_data_state_keeps_hold_replaces_ready_and_reports_real_dele
     held = _persisted(account=account, format=fmt, time_slot='evening')
     ready = _persisted(id='ready', post_date='2026-08-14', media_not_ready_reason=None)
     store, http = _state_store(monkeypatch, [held, ready])
-    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 1)
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 2)
     proposals = [dict(held, media_not_ready_reason=None, caption='New held-slot proposal'),
                  dict(ready, caption='New ready-slot caption')]
     result = _apply('eng', proposals, date(2026, 8, 13), 19, store, lambda m: None)
+    if account == 'instagram':
+        # A retained required feed is not a successful cadence apply. Refuse the
+        # whole replacement before delete so cadence_applied cannot advance while
+        # that slot is still held.
+        assert result['ok'] is False
+        assert result['reason'] == 'incomplete cadence preflight'
+        assert result['deleted'] == result['inserted'] == 0
+        assert http.rows == [held, ready]
+        return
     assert result['ok'] is True
     assert result['deleted'] == result['deleted_total'] == result['inserted'] == 1
     assert http.rows[0] == held
     assert len(http.rows) == 2 and http.rows[1]['caption'] == 'New ready-slot caption'
     assert http.rows[1]['id'] != ready['id']
+
+
+def test_client_apply_downstream_feed_filter_fails_before_delete(monkeypatch):
+    from datetime import date
+    from agent.client_month_run import _apply
+    from agent import cadence
+
+    ready = _persisted(id='ready', media_not_ready_reason=None)
+    store, http = _state_store(monkeypatch, [ready])
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 2)
+    monkeypatch.setattr(pcs, '_media_stage_belt', lambda *a, **kw: [])
+
+    result = _apply('eng', [dict(ready, caption='New ready-slot caption')],
+                    date(2026, 8, 13), 19, store, lambda m: None)
+
+    assert result['ok'] is False
+    assert result['reason'] == 'incomplete cadence preflight'
+    assert result['deleted'] == result['inserted'] == 0
+    assert http.rows == [ready]
+
+
+def test_cadence_preflight_dedupes_the_write_normalized_caption(monkeypatch):
+    from agent import caption_ledger
+
+    store, _http = _state_store(monkeypatch, [])
+    monkeypatch.setenv('AGENT_CAPTION_COOLDOWN', 'true')
+    monkeypatch.setattr(
+        caption_ledger, 'is_verbatim_blocked',
+        lambda gym, caption, planned: caption == 'Bring a friend, start today.')
+    proposal = _persisted(
+        media_not_ready_reason=None,
+        caption='Bring a friend; start today.')
+
+    assert store.preflight_cadence_rows('eng', [proposal]) == []
+
+
+def test_cadence_preflight_fb_only_block_keeps_ig_feed_and_paired_story(monkeypatch):
+    from agent import caption_ledger
+
+    store, http = _state_store(monkeypatch, [])
+    monkeypatch.setenv('AGENT_CAPTION_COOLDOWN', 'true')
+    monkeypatch.setattr(
+        caption_ledger, 'is_verbatim_blocked',
+        lambda gym, caption, planned: caption == 'Facebook duplicate')
+    logical_id = '1bd5fe46-fe68-4be2-883d-f67da8929356'
+    common = dict(
+        gym_id='eng', post_date='2026-08-13', slot_index=1,
+        time_slot='evening', logical_post_id=logical_id, status='pending',
+        media_not_ready_reason=None, image_url='https://cdn/new-ready.jpg')
+    planned = [
+        {**common, 'account': 'instagram', 'format': 'feed',
+         'caption': 'Instagram caption\n\n#eng'},
+        {**common, 'account': 'facebook', 'format': 'feed',
+         'caption': 'Facebook duplicate'},
+        {**common, 'account': 'instagram', 'format': 'story',
+         'caption': 'Instagram caption\n\n#eng'},
+    ]
+
+    admitted = store.preflight_cadence_rows(
+        'eng', planned, replace_dates={'2026-08-13'})
+    assert [(row['account'], row['format']) for row in admitted] == [
+        ('instagram', 'feed'), ('instagram', 'story')]
+
+    inserted = store.insert_rows(
+        'eng', admitted, prevalidated_cadence=True,
+        required_feed_slots={('2026-08-13', 1)})
+    assert [(row['account'], row['format']) for row in inserted] == [
+        ('instagram', 'feed'), ('instagram', 'story')]
+    posted = [rows for method, rows in http.calls if method == 'post']
+    assert len(posted) == 1
+    assert [(row['account'], row['format']) for row in posted[0]] == [
+        ('instagram', 'feed'), ('instagram', 'story')]
+
+
+def test_prevalidated_insert_rechecks_human_owned_slot_before_post(monkeypatch):
+    store, http = _state_store(monkeypatch, [])
+    proposal = _persisted(
+        media_not_ready_reason=None,
+        caption='Replacement with different content')
+    monkeypatch.setattr(
+        store, 'locked_slots',
+        lambda _key, _month: {
+            (proposal['post_date'], proposal['account'], proposal['format'])})
+
+    with pytest.raises(pcs.CadencePreconditionError):
+        store.insert_rows(
+            'eng', [proposal], prevalidated_cadence=True,
+            required_feed_slots={(proposal['post_date'], proposal['slot_index'])})
+
+    assert not any(method == 'post' for method, _rows in http.calls)
+
+
+def test_prevalidated_insert_fails_closed_when_live_lock_read_fails(monkeypatch):
+    store, http = _state_store(monkeypatch, [])
+    proposal = _persisted(media_not_ready_reason=None)
+    monkeypatch.setattr(
+        store, 'locked_slots',
+        lambda *_args: (_ for _ in ()).throw(RuntimeError('read failed')))
+
+    with pytest.raises(pcs.CalendarInsertNotStartedError):
+        store.insert_rows(
+            'eng', [proposal], prevalidated_cadence=True,
+            required_feed_slots={(proposal['post_date'], proposal['slot_index'])})
+
+    assert not any(method == 'post' for method, _rows in http.calls)
+
+
+def test_non_prevalidated_insert_does_not_enforce_required_slots(monkeypatch):
+    """The required-slot contract belongs only to the 2x prevalidated lane."""
+    store, http = _state_store(monkeypatch, [])
+    proposal = _persisted(media_not_ready_reason=None)
+    monkeypatch.setattr(pcs, '_stage_belts', lambda *_args: [])
+
+    inserted = store.insert_rows(
+        'eng', [proposal], prevalidated_cadence=False,
+        required_feed_slots={(proposal['post_date'], proposal['slot_index'])})
+
+    assert inserted == []
+    assert not any(method == 'post' for method, _rows in http.calls)
+
+
+def test_prevalidated_insert_keeps_story_hold_recovery(monkeypatch):
+    store, _http = _state_store(monkeypatch, [])
+    proposal = _persisted(
+        format='story', media_not_ready_reason=None,
+        caption='Recovered Story')
+    calls = []
+    monkeypatch.setattr(
+        pcs, '_retry_story_hold_provenance',
+        lambda *_args: calls.append('retry'))
+    monkeypatch.setattr(
+        pcs, '_reconcile_story_media_holds',
+        lambda _store, _key, rows: (rows, calls.append('reconcile') or []))
+
+    inserted = store.insert_rows(
+        'eng', [proposal], prevalidated_cadence=True)
+
+    assert calls == ['retry', 'reconcile']
+    assert len(inserted) == 1 and inserted[0]['format'] == 'story'
+
+
+def test_cadence_preflight_retains_story_needed_for_hold_recovery(monkeypatch):
+    logical_id = '72a73b66-f7c4-4de3-a26f-e5d8d2c20b56'
+    held_story = _persisted(
+        format='story', logical_post_id=logical_id, slot_index=0,
+        time_slot='morning')
+    store, _http = _state_store(monkeypatch, [held_story])
+    common = dict(
+        post_date=held_story['post_date'], slot_index=0, time_slot='morning',
+        logical_post_id=logical_id, status='pending', media_not_ready_reason=None,
+        image_url='https://cdn/new-ready.jpg', caption='Ready replacement')
+    proposals = [
+        {**common, 'account': 'instagram', 'format': 'feed'},
+        {**common, 'account': 'facebook', 'format': 'feed'},
+        {**common, 'account': 'instagram', 'format': 'story'},
+    ]
+
+    admitted = store.preflight_cadence_rows(
+        'eng', proposals, replace_dates={held_story['post_date']})
+
+    assert {(row['account'], row['format']) for row in admitted} == {
+        ('instagram', 'feed'), ('facebook', 'feed'), ('instagram', 'story')}
+
+
+def test_cadence_preflight_runs_horizon_belt_once(monkeypatch):
+    from agent import plan_horizon
+    store, _http = _state_store(monkeypatch, [])
+    proposal = _persisted(media_not_ready_reason=None)
+    calls = []
+
+    def belt(account_key, rows):
+        calls.append((account_key, list(rows)))
+        return list(rows), 0
+
+    monkeypatch.setattr(plan_horizon, 'belt_filter', belt)
+
+    assert store.preflight_cadence_rows('eng', [proposal])
+    assert len(calls) == 1
+
+
+def test_cadence_insert_counts_recovered_story_without_reinserting_it(monkeypatch):
+    """A retained Story UUID recovered in place satisfies its three-row group."""
+    logical_id = 'f8d071c1-02bf-427b-987d-19961b97998e'
+    held_story = _persisted(
+        format='story', image_url=None,
+        media_not_ready_reason='Story media not ready: render failed',
+        created_at='2026-08-01T12:00:00+00:00', slot_index=1,
+        time_slot='evening')
+    store, http = _state_store(monkeypatch, [held_story])
+    common = dict(
+        post_date=held_story['post_date'], slot_index=1, time_slot='evening',
+        logical_post_id=logical_id, status='pending', media_not_ready_reason=None,
+        image_url='https://cdn/new-ready.jpg', caption='Ready replacement')
+    proposals = [
+        {**common, 'account': 'instagram', 'format': 'feed'},
+        {**common, 'account': 'facebook', 'format': 'feed'},
+        {**common, 'account': 'instagram', 'format': 'story'},
+    ]
+
+    def recover(_key, current, proposed, **_kwargs):
+        assert current['id'] == held_story['id']
+        return {**current, 'image_url': proposed['image_url'],
+                'media_not_ready_reason': None}
+
+    monkeypatch.setattr(store, 'recover_story_media_hold', recover)
+
+    inserted = store.insert_rows(
+        'eng', proposals, prevalidated_cadence=True,
+        required_feed_slots={(held_story['post_date'], 1)})
+
+    assert {(row['account'], row['format']) for row in inserted} == {
+        ('instagram', 'feed'), ('facebook', 'feed'), ('instagram', 'story')}
+    posted = [rows for method, rows in http.calls if method == 'post']
+    assert len(posted) == 1
+    assert {(row['account'], row['format']) for row in posted[0]} == {
+        ('instagram', 'feed'), ('facebook', 'feed')}
