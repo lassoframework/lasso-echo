@@ -182,6 +182,16 @@ _CAPTION_CONTEXT_ABBREVIATIONS = frozenset((
     "oct.", "nov.", "dec.", "ave.", "ft.", "no.", "a.m.", "p.m.", "etc."))
 
 
+def captions_presentation_equivalent(left, right) -> bool:
+    """True when two captions carry the same words and punctuation.
+
+    format_caption only inserts blank lines and trims whitespace. A human who
+    approved one form approved the words; the other form is the same stamp.
+    Semicolon-to-comma (or any other character change) is a real edit.
+    """
+    return " ".join(str(left or "").split()) == " ".join(str(right or "").split())
+
+
 def format_caption(text: str, *, reject_ambiguous_lists: bool = False) -> str:
     """Keep every caption sentence on its own paragraph, with one blank line.
 
