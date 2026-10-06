@@ -555,6 +555,36 @@ def test_intake_pass_holds_a_code_fix_behind_the_fixer_tap_same_as_any_other():
     assert not [o for o in bus.outbound if o["kind"] in (A.KIND_ACK, A.KIND_STATUS, A.KIND_TEMPLATE)]
 
 
+def test_portal_code_fix_keeps_portal_product_with_scout_identity():
+    """The bridge bot is Scout, but FIXER must receive the original portal product
+    and ticket identity so the request routes to the portal support lane."""
+    ticket_id = "portal-ticket-original-42"
+    bus = FakeBus([_ticket(id=ticket_id, product="portal",
+                           raw_text="my instagram posting is broken and errors out")])
+    _, _, post = _calls()
+    notices, notice = _notices()
+
+    result = W.intake_pass(bus, open_group_dm=lambda *_: pytest.fail("must remain held"),
+                           post_first_message=post, write_hold_notice=notice,
+                           product="portal", identity_name="scout", **_client_deps())
+
+    assert result == {"processed": 1}
+    assert bus.tickets[ticket_id]["id"] == ticket_id
+    assert bus.tickets[ticket_id]["bot_identity"] == "scout"
+    assert bus.tickets[ticket_id]["product"] == "portal"
+    fixer_rows = [row for row in bus.outbound if row["kind"] == A.KIND_FIXER_REQUEST]
+    assert len(fixer_rows) == 1
+    assert fixer_rows[0]["ticket_id"] == ticket_id
+    assert fixer_rows[0]["delivery_status"] == "held"
+    assert f"ticket {ticket_id} for product portal" in fixer_rows[0]["body"]
+    assert "for product scout" not in fixer_rows[0]["body"]
+    assert fixer_rows[0]["meta"]["identity"] == "scout"
+    assert len(notices) == 1
+    assert notices[0]["tid"] == ticket_id
+    assert notices[0]["ident_name"] == "scout"
+    assert notices[0]["body"] == fixer_rows[0]["body"]
+
+
 # ---- fixed_pass -------------------------------------------------------------------
 
 # ---- D68 (2026-09-06): the fix lane refuses instead of being inert ------------------
