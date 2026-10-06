@@ -75,8 +75,9 @@ def test_stage_belt_drops_paired_story_with_client_edited_caption(monkeypatch):
     assert pcs._stage_belts("eng", payload) == []
 
 
-def test_companion_admission_rejects_ig_when_fb_mirror_is_deduped(monkeypatch):
-    """An IG caption may carry hashtags while the FB mirror's raw copy is blocked."""
+def test_companion_admission_keeps_ig_and_story_when_only_fb_mirror_is_deduped(
+        monkeypatch):
+    """An independent FB refusal cannot erase the valid IG cadence unit."""
     monkeypatch.setattr(pcs.config, "empty_caption_guard_enabled", lambda: True)
     monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: True)
     from agent import caption_ledger
@@ -91,8 +92,44 @@ def test_companion_admission_rejects_ig_when_fb_mirror_is_deduped(monkeypatch):
     filtered = pcs._stage_belts("eng", payload)
 
     assert [(row["account"], row["format"]) for row in filtered] == [
-        ("instagram", "feed")]
+        ("instagram", "feed"), ("instagram", "story")]
+    assert pcs._drop_companions_missing_instagram_feed(payload, filtered) == filtered
+
+
+def test_companion_admission_drops_group_when_instagram_feed_is_blocked(monkeypatch):
+    monkeypatch.setattr(pcs.config, "empty_caption_guard_enabled", lambda: True)
+    monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: True)
+    from agent import caption_ledger
+    monkeypatch.setattr(
+        caption_ledger, "is_verbatim_blocked",
+        lambda gym, caption, planned: caption == "blocked on instagram")
+
+    payload = _companion_rows(
+        "2026-10-19", 1, "blocked on instagram",
+        "50d256db-8dcf-4dbb-81a3-7e564c0843fd")
+    payload[1]["caption"] = "Facebook copy remains independently valid"
+
+    assert pcs._stage_belts("eng", payload) == []
+
+
+def test_companion_admission_drops_feed_and_mirror_when_required_story_is_missing():
+    payload = _companion_rows(
+        "2026-10-19", 1, "valid caption",
+        "eedaa246-e8f0-4b5b-92c3-424729b43668")
+    filtered = [row for row in payload if row["format"] != "story"]
+
     assert pcs._drop_companions_missing_instagram_feed(payload, filtered) == []
+
+
+def test_companion_admission_accepts_story_recovered_in_place():
+    payload = _companion_rows(
+        "2026-10-19", 1, "valid caption",
+        "f119b80e-57bf-4907-92b7-f615944d3a2a")
+    filtered = [row for row in payload if row["format"] != "story"]
+    recovered_story = [row for row in payload if row["format"] == "story"]
+
+    assert pcs._drop_companions_missing_instagram_feed(
+        payload, filtered, satisfied=recovered_story) == filtered
 
 
 def test_human_owned_story_locks_the_day_against_feed_rebuild():

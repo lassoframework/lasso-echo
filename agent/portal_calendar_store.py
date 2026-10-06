@@ -4749,7 +4749,14 @@ def _companion_group_key(row):
 
 
 def _drop_companions_missing_instagram_feed(planned, filtered, *, satisfied=()):
-    """Treat every generated feed/mirror/Story sibling group as an atomic set."""
+    """Keep the Instagram feed and its planned Story coupled.
+
+    Facebook is a best-effort mirror, not a cadence unit.  A Facebook-only belt
+    refusal must not erase a valid Instagram feed (or its paired Story).  The
+    Instagram feed remains the group anchor, while a Story that was planned for
+    that anchor is required either in ``filtered`` or in ``satisfied`` (for an
+    in-place recovered hold).
+    """
     from collections import defaultdict
 
     def _member(row):
@@ -4763,8 +4770,26 @@ def _drop_companions_missing_instagram_feed(planned, filtered, *, satisfied=()):
         planned_members[_companion_group_key(row)].add(_member(row))
     for row in list(filtered or ()) + list(satisfied or ()):
         kept_members[_companion_group_key(row)].add(_member(row))
-    missing = {key for key, members in planned_members.items()
-               if not members.issubset(kept_members.get(key, set()))}
+    instagram_accounts = {"instagram", "ig", ""}
+
+    def _has_instagram_feed(members):
+        return any(fmt == "feed" and account in instagram_accounts
+                   for fmt, account in members)
+
+    def _has_story(members):
+        return any(fmt == "story" for fmt, _account in members)
+
+    missing = set()
+    for key, members in planned_members.items():
+        # Non-Instagram groups are outside this companion contract.
+        if not _has_instagram_feed(members):
+            continue
+        kept = kept_members.get(key, set())
+        if not _has_instagram_feed(kept):
+            missing.add(key)
+            continue
+        if _has_story(members) and not _has_story(kept):
+            missing.add(key)
     if not missing:
         return filtered
     return [row for row in (filtered or ())
@@ -4823,13 +4848,21 @@ def _stage_belts(account_key, payload):
         except Exception:
             pass  # alerting never blocks staging
 
-    # Feed + Facebook mirror + paired Story are one generated companion set.  Decide
-    # feed eligibility first, then remove the Story too if either feed leg is blocked.
+    # Instagram feed + paired Story are the required generated companion set.
+    # Facebook is an independently filtered mirror: losing only that mirror must not
+    # erase a valid Instagram cadence unit. Decide the Instagram feed first, then
+    # remove every sibling only when that primary feed is blocked.
     # Production ENG proved why this must be atomic: the verbatim belt removed the IG
     # and FB feeds for Oct 19/28/29 while their exempt Stories survived, leaving 27 of
     # 30 feed slots and a misleadingly full-looking calendar.
     decisions = []
-    blocked_companions = set()
+    blocked_primary_groups = set()
+
+    def _is_instagram_feed(row):
+        r = row or {}
+        return (str(r.get("format") or "").strip().lower() == "feed"
+                and str(r.get("account") or "").strip().lower()
+                in ("instagram", "ig", ""))
 
     batch_dates_by_hash = {}   # verbatim hash -> set of post_dates staged in THIS batch
     for row in payload:
@@ -4847,7 +4880,8 @@ def _stage_belts(account_key, payload):
                         f"{post_date or 'unknown date'} at stage time (a feed post may "
                         "not ship without real words); the slot refills on the next "
                         "plan pass")
-                    blocked_companions.add(_companion_group_key(row))
+                    if _is_instagram_feed(row):
+                        blocked_primary_groups.add(_companion_group_key(row))
                     decisions.append((row, False))
                     continue
             except Exception:
@@ -4865,7 +4899,8 @@ def _stage_belts(account_key, payload):
                         f"{post_date} at stage time (verbatim duplicate of a caption "
                         f"used within {_ledger.VERBATIM_BLOCK_DAYS} days); the slot "
                         "refills on the next plan pass with a fresh caption")
-                    blocked_companions.add(_companion_group_key(row))
+                    if _is_instagram_feed(row):
+                        blocked_primary_groups.add(_companion_group_key(row))
                     decisions.append((row, False))
                     continue
                 if h:
@@ -4874,8 +4909,7 @@ def _stage_belts(account_key, payload):
                 pass
         decisions.append((row, True))
     return [row for row, allowed in decisions
-            if allowed and not (_is_story(row)
-                                and _companion_group_key(row) in blocked_companions)]
+            if allowed and _companion_group_key(row) not in blocked_primary_groups]
 
 
 # ---- CROSS-DAY MEDIA BELT ------------------------------------------------------

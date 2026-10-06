@@ -501,6 +501,44 @@ def test_cadence_preflight_dedupes_the_write_normalized_caption(monkeypatch):
     assert store.preflight_cadence_rows('eng', [proposal]) == []
 
 
+def test_cadence_preflight_fb_only_block_keeps_ig_feed_and_paired_story(monkeypatch):
+    from agent import caption_ledger
+
+    store, http = _state_store(monkeypatch, [])
+    monkeypatch.setenv('AGENT_CAPTION_COOLDOWN', 'true')
+    monkeypatch.setattr(
+        caption_ledger, 'is_verbatim_blocked',
+        lambda gym, caption, planned: caption == 'Facebook duplicate')
+    logical_id = '1bd5fe46-fe68-4be2-883d-f67da8929356'
+    common = dict(
+        gym_id='eng', post_date='2026-08-13', slot_index=1,
+        time_slot='evening', logical_post_id=logical_id, status='pending',
+        media_not_ready_reason=None, image_url='https://cdn/new-ready.jpg')
+    planned = [
+        {**common, 'account': 'instagram', 'format': 'feed',
+         'caption': 'Instagram caption\n\n#eng'},
+        {**common, 'account': 'facebook', 'format': 'feed',
+         'caption': 'Facebook duplicate'},
+        {**common, 'account': 'instagram', 'format': 'story',
+         'caption': 'Instagram caption\n\n#eng'},
+    ]
+
+    admitted = store.preflight_cadence_rows(
+        'eng', planned, replace_dates={'2026-08-13'})
+    assert [(row['account'], row['format']) for row in admitted] == [
+        ('instagram', 'feed'), ('instagram', 'story')]
+
+    inserted = store.insert_rows(
+        'eng', admitted, prevalidated_cadence=True,
+        required_feed_slots={('2026-08-13', 1)})
+    assert [(row['account'], row['format']) for row in inserted] == [
+        ('instagram', 'feed'), ('instagram', 'story')]
+    posted = [rows for method, rows in http.calls if method == 'post']
+    assert len(posted) == 1
+    assert [(row['account'], row['format']) for row in posted[0]] == [
+        ('instagram', 'feed'), ('instagram', 'story')]
+
+
 def test_prevalidated_insert_rechecks_human_owned_slot_before_post(monkeypatch):
     store, http = _state_store(monkeypatch, [])
     proposal = _persisted(
