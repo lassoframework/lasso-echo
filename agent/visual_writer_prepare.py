@@ -15,6 +15,10 @@ from . import visual_fingerprint as fingerprint
 
 MAX_VISUAL_BYTES = 128 * 1024 * 1024
 _READ_CHUNK = 64 * 1024
+# Explicitly benign filename format characters. Bidi direction marks and other
+# invisible formatting controls stay rejected because they can spoof the name
+# when a URL/object key is displayed, even though they do not change its path.
+_SAFE_MEDIA_FORMAT_CHARS = frozenset("\u200c\u200d\u2060\ufeff\u00ad")
 
 
 class VisualPreparationError(ValueError):
@@ -129,6 +133,18 @@ def _tenant(store, account_key):
         raise VisualPreparationError("calendar key has no canonical visual tenant") from exc
 
 
+def _safe_media_key_segment(part):
+    if part in (".", "..") or "/" in part or "\\" in part:
+        return False
+    for char in part:
+        if char != " " and char.isspace():
+            return False
+        category = unicodedata.category(char)
+        if category.startswith("C") and char not in _SAFE_MEDIA_FORMAT_CHARS:
+            return False
+    return True
+
+
 def _own_media_url(url):
     """Accept only the configured public bucket origin and path, exactly."""
     from . import media_host
@@ -148,17 +164,10 @@ def _own_media_url(url):
         not parsed.fragment and
         parsed.path.startswith(allowed.path.rstrip("/") + "/") and
         len(parsed.path) > len(allowed.path.rstrip("/")) + 1 and
-        all(part not in (".", "..") and "/" not in part and "\\" not in part
-            # Raw whitespace was rejected above.  A decoded ASCII space is
-            # therefore an encoded object-key character (for example %20),
-            # while other whitespace and non-format Unicode category-C chars
-            # remain ineligible. Cf chars are filename data here; Cc controls,
-            # surrogates, private-use and unassigned codepoints fail.
-            and not any((char != " " and char.isspace()) or
-                        (unicodedata.category(char).startswith("C") and
-                         unicodedata.category(char) != "Cf")
-                        for char in part)
-            for part in path_parts)
+        # Raw whitespace was rejected above. A decoded ASCII space is therefore
+        # an encoded object-key character (for example %20); other whitespace,
+        # controls and unreviewed Unicode format characters are ineligible.
+        all(_safe_media_key_segment(part) for part in path_parts)
     )
 
 

@@ -257,8 +257,6 @@ def test_own_media_url_encoded_space_exception_keeps_security_rejections(
 @pytest.mark.parametrize("format_char", [
     "\u200c",  # ZERO WIDTH NON-JOINER
     "\u200d",  # ZERO WIDTH JOINER
-    "\u200e",  # LEFT-TO-RIGHT MARK
-    "\u200f",  # RIGHT-TO-LEFT MARK
     "\u2060",  # WORD JOINER
     "\ufeff",  # ZERO WIDTH NO-BREAK SPACE / BOM
     "\u00ad",  # SOFT HYPHEN
@@ -284,6 +282,25 @@ def test_own_media_url_accepts_safe_format_characters_in_owned_object_names(
 def test_own_media_url_rejects_encoded_controls_and_traversal(monkeypatch, url):
     from agent import config
     monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+
+    assert prep._own_media_url(url) is False
+
+
+@pytest.mark.parametrize("format_char", [
+    "\u061c",  # ARABIC LETTER MARK
+    "\u200b",  # ZERO WIDTH SPACE
+    "\u200e",  # LEFT-TO-RIGHT MARK
+    "\u200f",  # RIGHT-TO-LEFT MARK
+    "\u180e",  # MONGOLIAN VOWEL SEPARATOR
+    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",  # bidi embeddings/overrides
+    "\u2066", "\u2067", "\u2068", "\u2069",  # bidi isolates
+    "\u206a", "\u206b", "\u206c", "\u206d", "\u206e", "\u206f",  # deprecated bidi controls
+])
+def test_own_media_url_rejects_bidi_and_unreviewed_format_controls(monkeypatch, format_char):
+    from urllib.parse import quote
+    from agent import config
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+    url = f"https://media.example/zanshinfitness630e22/photo{quote(format_char)}.jpg?version=1"
 
     assert prep._own_media_url(url) is False
 
