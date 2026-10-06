@@ -15,11 +15,12 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 try:  # direct script and package import
-    from historical_media_evidence import _OversizedFile, _md5_file, _safe_bytes_path
+    from historical_media_evidence import MAX_BYTES, _OversizedFile, _md5_file, _safe_bytes_path
 except ImportError:  # pragma: no cover - package execution path
-    from scripts.historical_media_evidence import _OversizedFile, _md5_file, _safe_bytes_path
+    from scripts.historical_media_evidence import MAX_BYTES, _OversizedFile, _md5_file, _safe_bytes_path
 
 
 def _text(value):
@@ -92,6 +93,63 @@ def _post_id(row):
             None if values else "missing_post_id")
 
 
+def _tenant_slug(tenant):
+    slug = re.sub(r"[^a-z0-9_-]+", "-", str(tenant).lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-_")
+    return slug or "tenant"
+
+
+def _sha1_prefix(path):
+    digest = hashlib.sha1()
+    total = 0
+    with Path(path).open("rb") as stream:
+        while True:
+            chunk = stream.read(min(1024 * 1024, MAX_BYTES - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_BYTES:
+                raise _OversizedFile
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def _delivered_address_matches(reference, gym, path):
+    """Verify local bytes against a strict media-host content-addressed URL."""
+    if not isinstance(reference, dict) or not isinstance(reference.get("value"), str) or not gym:
+        return False
+    value = reference["value"]
+    if not value or value != value.strip() or any(ord(ch) < 32 or ch.isspace() for ch in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if (parsed.scheme not in ("http", "https") or not parsed.netloc or
+            parsed.username or parsed.password or parsed.query or parsed.fragment):
+        return False
+    try:
+        path_text = unquote(parsed.path, errors="strict")
+    except (UnicodeError, ValueError):
+        return False
+    segments = path_text.split("/")
+    if segments and segments[0] == "":
+        segments = segments[1:]
+    if any(not segment or segment in (".", "..") for segment in segments):
+        return False
+    matches = [index for index, segment in enumerate(segments)
+               if segment == "echo" and len(segments) - index == 4]
+    if len(matches) != 1:
+        return False
+    _, tenant_segment, address, filename = segments[matches[0]:]
+    if tenant_segment != _tenant_slug(gym) or not re.fullmatch(r"[0-9a-fA-F]{16}", address) or not filename:
+        return False
+    try:
+        return _sha1_prefix(path) == address.lower()
+    except (OSError, _OversizedFile):
+        return False
+
+
 def _candidate_index(assets):
     """Index explicit source references and asset MD5 hints separately."""
     index = {"asset_id": {}, "source_url": {}, "content_hash": {}}
@@ -148,7 +206,7 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
     refs = Counter(_row_ref(row) for row in rows if isinstance(row, dict) and _row_ref(row))
     output = []
     reason_counts = Counter()
-    malformed_rows = duplicate_rows = delivered_read_count = 0
+    malformed_rows = duplicate_rows = delivered_read_count = delivered_verified_count = 0
 
     for number, row in enumerate(rows, 1):
         if not isinstance(row, dict):
@@ -160,7 +218,8 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
                 "date": None, "provider": None, "delivered_reference": None,
                 "late_post_id": None, "provider_post_id": None,
                 "source_references": [], "delivered_bytes": {"status": "unavailable"},
-                "delivered_bytes_verified": False, "source_lineage_verified": False,
+                "local_bytes_read": False, "delivered_bytes_verified": False,
+                "source_lineage_verified": False,
                 "candidate_matches": {"basis": "delivered_md5_vs_asset_content_hash",
                                       "cardinality": 0, "asset_ids": []},
                 "source_lineage_evidence": {"basis": "explicit_source_reference_only",
@@ -207,6 +266,13 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
                     byte_result = {"status": "unavailable", "reason": "local_bytes_unreadable"}
         if byte_result["status"] != "read":
             unresolved.append(byte_result["reason"])
+        delivered_verified = bool(
+            digest and _delivered_address_matches(delivered_ref, gym, path)
+        )
+        if delivered_verified:
+            delivered_verified_count += 1
+        else:
+            unresolved.append("delivered_object_identity_unverified")
 
         candidates = []
         if gym and digest:
@@ -262,7 +328,8 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
             "provider_post_id": provider_post_id,
             "delivered_reference": delivered_ref, "source_references": source_refs,
             "delivered_bytes": byte_result,
-            "delivered_bytes_verified": byte_result["status"] == "read",
+            "local_bytes_read": byte_result["status"] == "read",
+            "delivered_bytes_verified": delivered_verified,
             "source_lineage_verified": False,
             "candidate_matches": {"basis": "delivered_md5_vs_asset_content_hash",
                                   "cardinality": len(candidates), "asset_ids": candidates},
@@ -281,6 +348,7 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
         "duplicate_row_ref_count": duplicate_rows, "input_asset_count": len(assets),
         "malformed_asset_count": malformed_assets, "duplicate_asset_id_count": duplicate_assets,
         "delivered_bytes_read_count": delivered_read_count,
+        "delivered_bytes_verified_count": delivered_verified_count,
         "unresolved_row_count": sum(bool(r["unresolved_reasons"]) for r in output),
         "unresolved_reason_counts": dict(sorted(reason_counts.items())),
     }

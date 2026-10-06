@@ -44,10 +44,12 @@ def test_manifest_separates_delivered_candidates_from_source_lineage(tmp_path):
     # the Drive source URL was used for this row.
     assert row["source_lineage_evidence"]["asset_ids"] == []
     assert row["source_lineage_evidence"]["status"] == "source_reference_missing"
-    assert row["delivered_bytes_verified"] is True
+    assert row["local_bytes_read"] is True
+    assert row["delivered_bytes_verified"] is False
     assert row["source_lineage_verified"] is False
     assert "source_reference_missing" in row["unresolved_reasons"]
     assert "missing_post_id" in row["unresolved_reasons"]
+    assert "delivered_object_identity_unverified" in row["unresolved_reasons"]
 
 
 def test_manifest_reports_malformed_and_duplicate_rows_and_assets(tmp_path):
@@ -128,7 +130,8 @@ def test_source_id_and_url_are_separate_and_must_match_same_tenant_asset(tmp_pat
     assert matched["source_lineage_verified"] is False
     assert "source_asset_id_url_mismatch" in mismatched["unresolved_reasons"]
     assert mismatched["source_lineage_evidence"]["asset_ids"] == []
-    assert mismatched["delivered_bytes_verified"] is True
+    assert mismatched["local_bytes_read"] is True
+    assert mismatched["delivered_bytes_verified"] is False
     assert mismatched["source_lineage_verified"] is False
 
 
@@ -147,3 +150,34 @@ def test_missing_or_ambiguous_date_and_post_id_are_explicit(tmp_path):
     assert "missing_post_date" in missing["unresolved_reasons"]
     assert missing["provider_post_id"] == "post-2"
     assert "missing_post_id" not in missing["unresolved_reasons"]
+
+
+def test_delivered_verification_requires_matching_media_host_content_address(tmp_path):
+    media_dir = tmp_path / "bytes"
+    media_dir.mkdir()
+    correct = b"correct delivered bytes"
+    wrong = b"different saved bytes"
+    (media_dir / "correct").write_bytes(correct)
+    (media_dir / "wrong").write_bytes(wrong)
+    (media_dir / "legacy").write_bytes(correct)
+    correct_prefix = hashlib.sha1(correct).hexdigest()[:16]
+    wrong_prefix = hashlib.sha1(b"other content").hexdigest()[:16]
+    snapshot = {"rows": [
+        {"id": "correct", "gym_id": "Gym A", "post_date": "2026-08-01",
+         "image_url": f"https://media.example/prefix/echo/gym-a/{correct_prefix}/image.jpg"},
+        {"id": "wrong", "gym_id": "Gym A", "post_date": "2026-08-02",
+         "image_url": f"https://media.example/echo/gym-a/{wrong_prefix}/image.jpg"},
+        {"id": "legacy", "gym_id": "Gym A", "post_date": "2026-08-03",
+         "image_url": "https://media.example/legacy/image.jpg"},
+    ]}
+
+    _, verified, wrong_bytes, legacy = manifest.build_manifest(snapshot, media_dir)
+    assert verified["local_bytes_read"] is True
+    assert verified["delivered_bytes_verified"] is True
+    assert "delivered_object_identity_unverified" not in verified["unresolved_reasons"]
+    assert wrong_bytes["local_bytes_read"] is True
+    assert wrong_bytes["delivered_bytes_verified"] is False
+    assert "delivered_object_identity_unverified" in wrong_bytes["unresolved_reasons"]
+    assert legacy["local_bytes_read"] is True
+    assert legacy["delivered_bytes_verified"] is False
+    assert "delivered_object_identity_unverified" in legacy["unresolved_reasons"]
