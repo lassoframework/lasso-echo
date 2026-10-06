@@ -75,6 +75,41 @@ def test_stage_belt_drops_paired_story_with_client_edited_caption(monkeypatch):
     assert pcs._stage_belts("eng", payload) == []
 
 
+def test_companion_admission_rejects_ig_when_fb_mirror_is_deduped(monkeypatch):
+    """An IG caption may carry hashtags while the FB mirror's raw copy is blocked."""
+    monkeypatch.setattr(pcs.config, "empty_caption_guard_enabled", lambda: True)
+    monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: True)
+    from agent import caption_ledger
+    monkeypatch.setattr(
+        caption_ledger, "is_verbatim_blocked",
+        lambda gym, caption, planned: caption == "raw duplicate caption")
+
+    logical_post_id = "d4e77854-f03c-47dd-a1b0-88617d8bc5e8"
+    payload = _companion_rows(
+        "2026-10-19", 1, "raw duplicate caption", logical_post_id)
+    payload[0]["caption"] = "raw duplicate caption\n\n#eng #fitness"
+    filtered = pcs._stage_belts("eng", payload)
+
+    assert [(row["account"], row["format"]) for row in filtered] == [
+        ("instagram", "feed")]
+    assert pcs._drop_companions_missing_instagram_feed(payload, filtered) == []
+
+
+def test_human_owned_story_locks_the_day_against_feed_rebuild():
+    class _Store:
+        def list_month(self, base_key, month):
+            return [{
+                "post_date": "2026-10-19", "account": "instagram",
+                "format": "story", "status": "approved",
+                "image_url": "https://cdn.example/approved-story.jpg",
+            }]
+
+    locked, _used = cmr._locked_calendar_state(
+        "eng", date(2026, 10, 17), 15, _Store(), lambda _m: None)
+
+    assert "2026-10-19" in locked
+
+
 class _CalendarStore:
     def __init__(self, rows=(), ppd=2):
         self.rows = list(rows)

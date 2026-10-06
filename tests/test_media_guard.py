@@ -146,6 +146,21 @@ def test_surviving_keys_frees_span_wipeables_keeps_the_rest():
     assert {"coach.jpg", "appr.jpg", "pub.jpg"} <= keys
 
 
+def test_surviving_keys_preserves_same_month_wipeable_outside_exact_span():
+    from datetime import date
+    store = _Store([
+        _row("2026-10-16", "before.jpg", "pending"),
+        _row("2026-10-17", "replace.jpg", "pending"),
+        _row("2026-10-31", "replace-later.jpg", "pending"),
+    ])
+
+    keys = media_guard.surviving_keys("gritx", store, date(2026, 10, 17), 15)
+
+    assert "before.jpg" in keys
+    assert "replace.jpg" not in keys
+    assert "replace-later.jpg" not in keys
+
+
 def test_book_state_exact_replacement_dates_keep_out_of_span_wipeables():
     store = _Store([
         _row("2026-10-17", "replace.jpg", "pending"),

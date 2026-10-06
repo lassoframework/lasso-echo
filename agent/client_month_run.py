@@ -148,9 +148,9 @@ _PHOTO_CONSUMING_STATUSES = ("approved", "published", "publishing")
 
 def _locked_calendar_state(base_key, start, days, store, log, library_path=None):
     """(locked_feed_days, used_keys) from the gym's EXISTING human-owned calendar rows
-    across the planned span. locked_feed_days: post_dates whose feed a human already
-    owns (approved/published/denied/killed — anything not machine-wipeable), so the
-    rebuild never plans a competing feed there. used_keys: the media basenames carried
+    across the planned span. locked_feed_days: post_dates where any feed/Story sibling
+    is human-owned (approved/published/denied/killed — anything not machine-wipeable),
+    so a rebuild never separates a retained Story from its feed. used_keys: media carried
     by rows whose photo is truly consumed (approved/published/publishing, any format),
     so a live photo is never re-picked; a denied/killed photo stays available.
     Read-only; a read failure returns empty state (the store-level preserve_and_prune
@@ -173,7 +173,7 @@ def _locked_calendar_state(base_key, start, days, store, log, library_path=None)
             status = str((row or {}).get("status") or "").lower()
             if not status or status in _WIPEABLE_STATUSES:
                 continue
-            if str(row.get("format") or "").lower() == "feed":
+            if str(row.get("format") or "").lower() in ("feed", "story"):
                 locked_days.add(str(row.get("post_date") or "")[:10])
             if status in _PHOTO_CONSUMING_STATUSES:
                 key = _url_basename(row.get("image_url") or "")
@@ -256,7 +256,7 @@ def _surviving_pillar_counts(base_key, start, days, store, log):
 
 
 def _edited_story_captions(base_key, start, days, store, log):
-    """{post_date -> caption} for STORY rows the client edited in the portal but which
+    """{(post_date, slot_index) -> caption} for client-edited STORY rows which
     have NOT been re-rendered yet. Editing a story caption (portal_calendar_store.
     patch_caption) resets the row to 'pending' and updates content_calendar.caption, but
     the burned media still carries the OLD caption. A rebuild would otherwise re-render
@@ -279,24 +279,27 @@ def _edited_story_captions(base_key, start, days, store, log):
         except Exception as exc:  # noqa: BLE001 - never block the build on a read
             log(f"edited-story read failed for {month}: {type(exc).__name__}")
             continue
-        feeds_by_date = {}
-        stories_by_date = {}
+        feeds_by_slot = {}
+        stories_by_slot = {}
         for row in rows:
             fmt = str(row.get("format") or "").lower()
             pd = str(row.get("post_date") or "")[:10]
+            account = str(row.get("account") or "").strip().lower()
+            slot = row.get("slot_index")
             if not pd:
                 continue
-            if fmt == "feed":
-                feeds_by_date.setdefault(pd, row.get("caption") or "")
-            elif fmt == "story":
-                stories_by_date[pd] = row.get("caption") or ""
-        for pd, story_cap in stories_by_date.items():
+            key = (pd, slot)
+            if fmt == "feed" and account in ("instagram", "ig", ""):
+                feeds_by_slot.setdefault(key, row.get("caption") or "")
+            elif fmt == "story" and account in ("instagram", "ig", ""):
+                stories_by_slot[key] = row.get("caption") or ""
+        for key, story_cap in stories_by_slot.items():
             story_cap = (story_cap or "").strip()
-            feed_cap = (feeds_by_date.get(pd) or "").strip()
+            feed_cap = (feeds_by_slot.get(key) or "").strip()
             # An edited story caption is one that differs from the paired feed caption
             # (an unedited paired story is cloned FROM the feed, so it matches).
             if story_cap and story_cap != feed_cap:
-                edited[pd] = story_cap
+                edited[key] = story_cap
     return edited
 
 
@@ -836,10 +839,10 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
     if media_guard.enabled():
         try:
             from datetime import timedelta
-            span_months = {(start + timedelta(days=i)).isoformat()[:7]
-                           for i in range(max(1, days))}
+            span_dates = {(start + timedelta(days=i)).isoformat()[:10]
+                          for i in range(max(1, days))}
             guard_state = media_guard.book_state(base_key, store, start, days, log=log,
-                                                 skip_wipeable_months=span_months,
+                                                 skip_wipeable_dates=span_dates,
                                                  library_path=library_path)
         except Exception as exc:  # noqa: BLE001 - the guard never sinks a fill
             log(f"{base_key}: fallback guard read skipped ({type(exc).__name__})")
@@ -872,7 +875,8 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
             continue
         raw_basename = os.path.basename(feed_path) if feed_path else ""
         media_guard.note_placed(guard_state, raw_basename or key, day_key)
-        story_override = (edited_story_caps or {}).get(str(day_key)[:10])
+        story_override = ((edited_story_caps or {}).get((str(day_key)[:10], None))
+                          or (edited_story_caps or {}).get((str(day_key)[:10], 0)))
         try:
             finished = _finish_feed_with_story(
                 account, feed, library_path, log, day_key=day_key,
@@ -1664,9 +1668,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             # story reuses the feed's creative, never a second photo). All media
             # lanes + the captionless-story guard live in the shared helper so the
             # denied-slot backfill emits IDENTICAL cards. A client-edited story
-            # caption belongs to the day's FIRST (pre-existing) story only.
-            story_caption_override = (edited_story_caps.get(str(day_key)[:10])
-                                      if slot_i == 0 else None)
+            # caption belongs to the exact logical slot it was edited on. A
+            # slotless legacy edit can only map to the first cadence slot.
+            story_caption_override = edited_story_caps.get(
+                (str(day_key)[:10], slot_i))
+            if story_caption_override is None and slot_i == 0:
+                story_caption_override = edited_story_caps.get(
+                    (str(day_key)[:10], None))
             # ACCEPTED: the feed survived every gate and is being placed. Record its
             # photo as served NOW (not at pick time) so rotation reflects only KEPT
             # days — never the picked-then-dropped attempts.

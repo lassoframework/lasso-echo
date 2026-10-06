@@ -270,9 +270,10 @@ def surviving_keys(base_key, store, start, days, *, log=None, library_path=None)
         if start is None:
             return set()
     span_end = start + timedelta(days=max(1, int(days or 1)) - 1)
-    span_months = set(_months_between(start, span_end))
+    span_dates = {start + timedelta(days=offset)
+                  for offset in range(max(1, int(days or 1)))}
     state = book_state(base_key, store, start, days, log=log,
-                       skip_wipeable_months=span_months,
+                       skip_wipeable_dates=span_dates,
                        library_path=library_path)
     win = config.media_repeat_window_days()
     keys = set()

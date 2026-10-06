@@ -3560,7 +3560,17 @@ class SupabaseCalendarStore:
         filtered = _media_stage_belt(
             self, account_key, filtered,
             skip_wipeable_dates=replace_dates)
-        filtered = _preserve_held_slots(self, account_key, filtered)
+        # Held non-Story slots block cadence admission. Story proposals must remain:
+        # insert_rows' reconciliation path needs the new ready Story in order to
+        # recover the retained held UUID rather than leaving the hold stranded.
+        non_story_rows = [row for row in filtered
+                          if str(row.get("format") or "").strip().lower() != "story"]
+        admitted_non_story_ids = {
+            id(row) for row in _preserve_held_slots(
+                self, account_key, non_story_rows)}
+        filtered = [row for row in filtered
+                    if str(row.get("format") or "").strip().lower() == "story"
+                    or id(row) in admitted_non_story_ids]
         filtered = _dedupe_slots(self, account_key, filtered, existing=set())
         return _drop_companions_missing_instagram_feed(planned, filtered)
 
@@ -3719,8 +3729,17 @@ class SupabaseCalendarStore:
                     503, "live human-owned slot read failed before calendar insert") from exc
             payload = _preserve_held_slots(self, account_key, payload)
             payload = _dedupe_slots(self, account_key, payload)
+        # A recovered Story was patched in place under its retained UUID and is
+        # deliberately absent from the POST payload. Count the exact planned
+        # Story slot as satisfied for companion atomicity without re-inserting it.
+        recovered_story_slots = {_story_slot(row) for row in recovered
+                                 if (row or {}).get("format") == "story"}
+        recovered_companions = [
+            row for row in planned_companions
+            if (row or {}).get("format") == "story"
+            and _story_slot(row) in recovered_story_slots]
         payload = _drop_companions_missing_instagram_feed(
-            planned_companions, payload)
+            planned_companions, payload, satisfied=recovered_companions)
         if required_feed_slots is not None:
             required = {tuple(slot) for slot in required_feed_slots}
             actual = _instagram_feed_slots(payload)
@@ -4727,19 +4746,23 @@ def _companion_group_key(row):
             r.get("slot_index"))
 
 
-def _drop_companions_missing_instagram_feed(planned, filtered):
-    """Never stage a mirror or Story after its planned Instagram feed was removed."""
-    def _is_ig_feed(row):
-        r = row or {}
-        return (str(r.get("format") or "").strip().lower() == "feed"
-                and str(r.get("account") or "").strip().lower()
-                in ("instagram", "ig", ""))
+def _drop_companions_missing_instagram_feed(planned, filtered, *, satisfied=()):
+    """Treat every generated feed/mirror/Story sibling group as an atomic set."""
+    from collections import defaultdict
 
-    planned_feeds = {_companion_group_key(row) for row in (planned or ())
-                     if _is_ig_feed(row)}
-    kept_feeds = {_companion_group_key(row) for row in (filtered or ())
-                  if _is_ig_feed(row)}
-    missing = planned_feeds - kept_feeds
+    def _member(row):
+        r = row or {}
+        return (str(r.get("format") or "").strip().lower(),
+                str(r.get("account") or "").strip().lower())
+
+    planned_members = defaultdict(set)
+    kept_members = defaultdict(set)
+    for row in planned or ():
+        planned_members[_companion_group_key(row)].add(_member(row))
+    for row in list(filtered or ()) + list(satisfied or ()):
+        kept_members[_companion_group_key(row)].add(_member(row))
+    missing = {key for key, members in planned_members.items()
+               if not members.issubset(kept_members.get(key, set()))}
     if not missing:
         return filtered
     return [row for row in (filtered or ())

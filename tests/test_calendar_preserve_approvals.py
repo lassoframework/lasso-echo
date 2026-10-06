@@ -552,3 +552,64 @@ def test_prevalidated_insert_keeps_story_hold_recovery(monkeypatch):
 
     assert calls == ['retry', 'reconcile']
     assert len(inserted) == 1 and inserted[0]['format'] == 'story'
+
+
+def test_cadence_preflight_retains_story_needed_for_hold_recovery(monkeypatch):
+    logical_id = '72a73b66-f7c4-4de3-a26f-e5d8d2c20b56'
+    held_story = _persisted(
+        format='story', logical_post_id=logical_id, slot_index=0,
+        time_slot='morning')
+    store, _http = _state_store(monkeypatch, [held_story])
+    common = dict(
+        post_date=held_story['post_date'], slot_index=0, time_slot='morning',
+        logical_post_id=logical_id, status='pending', media_not_ready_reason=None,
+        image_url='https://cdn/new-ready.jpg', caption='Ready replacement')
+    proposals = [
+        {**common, 'account': 'instagram', 'format': 'feed'},
+        {**common, 'account': 'facebook', 'format': 'feed'},
+        {**common, 'account': 'instagram', 'format': 'story'},
+    ]
+
+    admitted = store.preflight_cadence_rows(
+        'eng', proposals, replace_dates={held_story['post_date']})
+
+    assert {(row['account'], row['format']) for row in admitted} == {
+        ('instagram', 'feed'), ('facebook', 'feed'), ('instagram', 'story')}
+
+
+def test_cadence_insert_counts_recovered_story_without_reinserting_it(monkeypatch):
+    """A retained Story UUID recovered in place satisfies its three-row group."""
+    logical_id = 'f8d071c1-02bf-427b-987d-19961b97998e'
+    held_story = _persisted(
+        format='story', image_url=None,
+        media_not_ready_reason='Story media not ready: render failed',
+        created_at='2026-08-01T12:00:00+00:00', slot_index=1,
+        time_slot='evening')
+    store, http = _state_store(monkeypatch, [held_story])
+    common = dict(
+        post_date=held_story['post_date'], slot_index=1, time_slot='evening',
+        logical_post_id=logical_id, status='pending', media_not_ready_reason=None,
+        image_url='https://cdn/new-ready.jpg', caption='Ready replacement')
+    proposals = [
+        {**common, 'account': 'instagram', 'format': 'feed'},
+        {**common, 'account': 'facebook', 'format': 'feed'},
+        {**common, 'account': 'instagram', 'format': 'story'},
+    ]
+
+    def recover(_key, current, proposed, **_kwargs):
+        assert current['id'] == held_story['id']
+        return {**current, 'image_url': proposed['image_url'],
+                'media_not_ready_reason': None}
+
+    monkeypatch.setattr(store, 'recover_story_media_hold', recover)
+
+    inserted = store.insert_rows(
+        'eng', proposals, prevalidated_cadence=True,
+        required_feed_slots={(held_story['post_date'], 1)})
+
+    assert {(row['account'], row['format']) for row in inserted} == {
+        ('instagram', 'feed'), ('facebook', 'feed'), ('instagram', 'story')}
+    posted = [rows for method, rows in http.calls if method == 'post']
+    assert len(posted) == 1
+    assert {(row['account'], row['format']) for row in posted[0]} == {
+        ('instagram', 'feed'), ('facebook', 'feed')}
