@@ -1537,6 +1537,57 @@ class SupabaseCalendarStore:
             return None
         return after
 
+    def reflow_pending_burst_media(self, account_key, current, *, image_url,
+                                   source_media_url, source_media_asset_id,
+                                   first, last, ticket, request_key,
+                                   thumbnail_url=None, render_evidence=None):
+        """Replace only media on one machine-owned Nine7 row using an exact CAS.
+
+        This narrow maintenance write cannot change the slot, copy, approval, hold,
+        or ownership. The caller must have an exact-span write-ahead receipt.
+        """
+        from datetime import date
+        from . import visual_writer_prepare
+        required = _CORE_VISUAL_MEDIA_CAS_COLUMNS + ("id", "gym_id")
+        if (not isinstance(current, dict) or any(key not in current for key in required)
+                or account_key != "crossfitnine7f7dadc"
+                or ticket != "b355c2cf-3b1d-4eec-8b23-282062f662f9"
+                or not isinstance(request_key, str) or len(request_key) < 20
+                or not isinstance(first, str) or not isinstance(last, str)
+                or first > "2026-10-21" or last < "2026-10-26"
+                or (date.fromisoformat(last) - date.fromisoformat(first)).days > 30
+                or not first <= str(current["post_date"])[:10] <= last
+                or current["gym_id"] != account_key
+                or current["status"] not in ("pending", "draft", "queued")
+                or current["variant_status"] != "active"
+                or current["media_not_ready_reason"] is not None
+                or any(current[key] is not None for key in
+                       ("published_at", "late_post_id", "publish_claim_token",
+                        "publish_reservation_day"))
+                or not isinstance(image_url, str) or not image_url.startswith("https://")
+                or source_media_url is not None and
+                (not isinstance(source_media_url, str) or not source_media_url.startswith("https://"))
+                or source_media_asset_id not in (None, "")):
+            return None
+        params = {"id": f"eq.{current['id']}", "gym_id": f"eq.{account_key}"}
+        cas_fields = tuple(key for key in _VISUAL_MEDIA_CAS_COLUMNS if key in current)
+        params.update({key: _eq_filter(current[key]) for key in cas_fields})
+        if any(value is None for value in params.values()):
+            raise PreWriteCASError(422, "burst media CAS has an unsafe field")
+        payload = {"image_url": image_url, "source_media_url": source_media_url,
+                   "source_media_asset_id": None, "thumbnail_url": thumbnail_url}
+        if visual_writer_prepare.enabled():
+            payload = self._prepare_visual_replacement(
+                account_key, current, payload, render_evidence)
+        response = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=payload, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, "burst media reflow CAS failed")
+        return self._visual_media_result(response.json(), account_key, current, payload)
+
     def list_photo_restage_book(self, account_key):
         """Read every retained gym row for a permanent no-repeat operator decision.
 
