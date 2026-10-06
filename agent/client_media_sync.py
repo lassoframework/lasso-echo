@@ -59,8 +59,10 @@ _ig account ("gritx_ig") is the generation/source key; the _fb account is the mi
 import json
 import os
 import subprocess
+import unicodedata
+from collections import defaultdict
 
-from . import config, visual_fingerprint
+from . import burst_spacing, config, visual_fingerprint
 
 # Media extensions we sync (mirror client_month_run._MEDIA_EXTS: the same set that
 # counts as a gym having uploaded usable creative).
@@ -456,6 +458,7 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     os.makedirs(lib_dir, exist_ok=True)
     captions = _read_captions(r2, prefixes, log, keys=listed)
     contexts, consents = _read_context_consent(r2, prefixes, log, keys=listed)   # §8
+    intake_sequences = _read_intake_sequences(r2, prefixes, keys=listed)
 
     synced = 0
     skipped = 0
@@ -465,6 +468,8 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
         target = os.path.join(lib_dir, name)
         # IDEMPOTENT: already in the library -> never re-download.
         if os.path.exists(target):
+            _merge_intake_metadata(
+                lib_dir, name, _intake_sequence_for(intake_sequences, name), log)
             skipped += 1
             if _valid_media_file(target):
                 accepted.append(key)
@@ -489,7 +494,8 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
                        client_context=contexts.get(name, ""),
                        consent=bool(consents.get(name)),
                        source_fingerprint=aliases[0],
-                       source_fingerprint_aliases=aliases[1:])
+                       source_fingerprint_aliases=aliases[1:],
+                       intake_sequence=_intake_sequence_for(intake_sequences, name))
         synced += 1
         if _valid_media_file(target):
             accepted.append(key)
@@ -579,6 +585,15 @@ def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
     lib_dir = _library_dir(base_key, out_dir)
     os.makedirs(lib_dir, exist_ok=True)
 
+    # Hosted objects retain their original upload basename. The intake batch
+    # sidecars are therefore still the trustworthy source for burst metadata,
+    # even when this recovery lane adds a collision-safe hash prefix locally.
+    intake_root = f"intake/{base_key}/"
+    intake_prefixes = [intake_root + suffix for suffix in _MEDIA_PREFIXES]
+    intake_listed = _list_prefixes_once(r2, intake_prefixes, log, base_key)
+    intake_sequences = _read_intake_sequences(
+        r2, intake_prefixes, keys=intake_listed)
+
     recovered = 0
     skipped = 0
     for key in keys:
@@ -596,6 +611,9 @@ def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
         local_name = f"{key_id}_{filename}"
         target = os.path.join(lib_dir, local_name)
         if os.path.exists(target):
+            _merge_intake_metadata(
+                lib_dir, local_name,
+                _intake_sequence_for(intake_sequences, filename), log)
             skipped += 1
             continue
         try:
@@ -620,7 +638,9 @@ def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
         aliases = visual_fingerprint.source_aliases(data)
         _write_sidecar(lib_dir, local_name, key, "", log,
                        source_fingerprint=aliases[0],
-                       source_fingerprint_aliases=aliases[1:])
+                       source_fingerprint_aliases=aliases[1:],
+                       intake_sequence=_intake_sequence_for(
+                           intake_sequences, filename))
         recovered += 1
 
     if recovered or skipped:
@@ -663,9 +683,134 @@ def _read_context_consent(r2, prefixes, log, keys=None):
     return contexts, consents
 
 
+def _read_intake_sequences(r2, prefixes, keys=None):
+    """Build a collision-safe index of trusted upload-batch metadata.
+
+    The portal writes one immutable ``timestamp`` plus the ordered ``filenames``
+    array in each upload sidecar. Persisting those facts into the local sidecar
+    lets the Vision-off picker space camera bursts without inspecting people or
+    image content. Ingest can preserve the stem while converting HEIC to JPG or
+    MOV to MP4, so exact extension matching is insufficient. A normalized-stem
+    fallback is retained only when that stem identifies exactly one source name
+    and one metadata record; collisions return no metadata rather than guessing.
+    """
+    records = defaultdict(list)
+    for prefix in prefixes:
+        prefix_keys = keys.get(prefix) if keys is not None else None
+        if prefix_keys is None:
+            try:
+                prefix_keys = list(r2.list_keys(prefix) or [])
+            except Exception:  # noqa: BLE001
+                continue
+        for key in prefix_keys:
+            if not key.endswith(_UPLOAD_SIDECAR_SUFFIX):
+                continue
+            data = _load_json_cached(r2, key)
+            if not isinstance(data, dict):
+                continue
+            stamp = burst_spacing.normalize_batch_timestamp(data.get("timestamp"))
+            sidecar_stamp = burst_spacing.normalize_batch_timestamp(
+                os.path.basename(key)[:-len(_UPLOAD_SIDECAR_SUFFIX)])
+            filenames = data.get("filenames") or []
+            if (not stamp or stamp != sidecar_stamp
+                    or not isinstance(filenames, list)):
+                continue
+            for position, filename in enumerate(filenames):
+                if position > burst_spacing.MAX_BATCH_POSITION:
+                    break
+                name = os.path.basename(str(filename or ""))
+                if not name.startswith(stamp + "_"):
+                    continue
+                metadata = {
+                    "intake_batch_timestamp": stamp,
+                    "intake_batch_position": position,
+                }
+                parsed = burst_spacing.parse_camera_sequence(name)
+                if parsed:
+                    family, sequence = parsed
+                    metadata["intake_camera_family"] = family
+                    metadata["intake_camera_sequence"] = sequence
+                metadata = burst_spacing.normalize_intake_metadata(metadata)
+                if metadata is None:
+                    continue
+                normalized_name = unicodedata.normalize("NFC", name).casefold()
+                normalized_stem = os.path.splitext(normalized_name)[0]
+                records[normalized_stem].append((normalized_name, metadata))
+
+    by_name = {}
+    by_stem = {}
+    for stem, rows in records.items():
+        names = {name for name, _metadata in rows}
+        metadata_values = {
+            json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+            for _name, metadata in rows
+        }
+        if len(names) != 1 or len(metadata_values) != 1:
+            continue
+        name, metadata = rows[0]
+        by_name[name] = metadata
+        by_stem[stem] = metadata
+    return {"by_name": by_name, "by_stem": by_stem}
+
+
+def _intake_sequence_for(index, media_name):
+    """Resolve exact or conversion-preserved-stem metadata from one safe index."""
+    normalized_name = unicodedata.normalize(
+        "NFC", os.path.basename(str(media_name or ""))).casefold()
+    normalized_stem = os.path.splitext(normalized_name)[0]
+    return ((index or {}).get("by_name", {}).get(normalized_name)
+            or (index or {}).get("by_stem", {}).get(normalized_stem))
+
+
+def _merge_intake_metadata(lib_dir, media_name, intake_sequence, log):
+    """Backfill only missing trusted intake fields on an existing local asset.
+
+    Existing media bytes are never opened or downloaded. Unrelated sidecar
+    values, including moderation, approval, notes and URLs, always win. The
+    bounded intake-owned group is replaced only from the exact trusted manifest.
+    An unreadable sidecar fails closed instead of being replaced.
+    """
+    trusted = burst_spacing.normalize_intake_metadata(intake_sequence)
+    if trusted is None:
+        return False
+    stem = os.path.splitext(media_name)[0]
+    side_path = os.path.join(lib_dir, stem + ".json")
+    existing = {}
+    if os.path.exists(side_path):
+        try:
+            with open(side_path, encoding="utf-8") as fh:
+                existing = json.load(fh)
+        except (OSError, ValueError, TypeError) as exc:
+            log(f"{media_name}: intake metadata backfill skipped: "
+                f"{type(exc).__name__}")
+            return False
+        if not isinstance(existing, dict):
+            log(f"{media_name}: intake metadata backfill skipped: invalid sidecar")
+            return False
+    payload = dict(existing)
+    current = {key: payload[key] for key in burst_spacing.INTAKE_METADATA_FIELDS
+               if key in payload}
+    # The exact current upload manifest is authoritative for intake-owned fields.
+    # Replace the whole bounded group when it is incomplete, corrupt or conflicts;
+    # never preserve a bad half-record and fill only its missing half.
+    if burst_spacing.normalize_intake_metadata(current) != trusted:
+        for key in burst_spacing.INTAKE_METADATA_FIELDS:
+            payload.pop(key, None)
+        payload.update(trusted)
+    if payload == existing:
+        return False
+    try:
+        with open(side_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+    except OSError as exc:
+        log(f"{media_name}: intake metadata backfill failed: {type(exc).__name__}")
+        return False
+    return True
+
+
 def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
                    consent=False, source_fingerprint="",
-                   source_fingerprint_aliases=None):
+                   source_fingerprint_aliases=None, intake_sequence=None):
     """Write the .json sidecar library._load_sidecar reads: public_url makes the
     downloaded photo a portal-ready real-photo card; the gym's own one line about the
     photo goes in the "note" key (the EXACT key library._load_sidecar reads into
@@ -697,6 +842,16 @@ def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
         payload["note"] = caption
     if client_context and not payload.get("client_context"):
         payload["client_context"] = client_context
+    trusted_intake = burst_spacing.normalize_intake_metadata(intake_sequence)
+    if trusted_intake is not None:
+        current_intake = {
+            key: payload[key] for key in burst_spacing.INTAKE_METADATA_FIELDS
+            if key in payload
+        }
+        if burst_spacing.normalize_intake_metadata(current_intake) != trusted_intake:
+            for key in burst_spacing.INTAKE_METADATA_FIELDS:
+                payload.pop(key, None)
+            payload.update(trusted_intake)
     # Stable source-byte identity. SHA-256 is authoritative; weaker/legacy
     # digests survive only in an explicit alias list, never in the authority
     # slot. Unknown source remains absent rather than being inferred from a key.
