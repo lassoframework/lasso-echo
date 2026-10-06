@@ -2344,6 +2344,91 @@ def _arm_grounded_fixer(monkeypatch):
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
 
 
+@pytest.mark.parametrize("intended,observed", [
+    ("Your fix is complete.", "Your fix is complete."),
+    ("Use `https://example.com/fix`", "Use `https://example.com/fix`"),
+    ("Details: https://example.com/fix", "Details: <https://example.com/fix>"),
+    ("Details: https://example.com/fix.", "Details: <https://example.com/fix.>"),
+    ("Details: https://example.com/fix", "Details: <https://example.com/fix|https://example.com/fix>"),
+    ("Details: <https://example.com/fix|View the fix>",
+     "Details: <https://example.com/fix|View the fix>"),
+    ("A & B; 2 < 3 > 1", "A &amp; B; 2 &lt; 3 &gt; 1"),
+    ("A & B https://example.com/fix", "A &amp; B <https://example.com/fix>"),
+    ("Already &amp; escaped", "Already &amp; escaped"),
+    ("&lt;https://example.com/fix|View&gt;", "&lt;https://example.com/fix|View&gt;"),
+])
+def test_fixer_readback_accepts_only_documented_slack_text_forms(intended, observed):
+    assert OB._slack_readback_text_matches(intended, observed)
+
+
+@pytest.mark.parametrize("intended,observed", [
+    ("Details: https://example.com/fix", "Details: <https://evil.example/fix>"),
+    ("Details: https://example.com/fix", "Details: <https://example.com/fix|different label>"),
+    ("https://safe.example/a|https://evil.example",
+     "<https://safe.example/a|https://evil.example>"),
+    ("Details: https://example.com/fix.", "Details: <https://example.com/fix>."),
+    ("Details: https://example.com/fix,", "Details: <https://example.com/fix>,"),
+    ("Use `https://example.com/fix`", "Use `<https://example.com/fix>`"),
+    ("```\nhttps://example.com/fix\n```", "```\n<https://example.com/fix>\n```"),
+    ("Details: <https://example.com/fix|View the fix>",
+     "Details: <https://example.com/fix|Different label>"),
+    ("A & B", "A &amp; C"),
+    ("2 < 3 > 1", "2 &lt; 4 &gt; 1"),
+    ("Already &amp; escaped", "Already &amp;amp; escaped"),
+    ("<@U123> approved", "&lt;@U123&gt; approved"),
+    ("&lt;https://example.com/fix|View&gt;", "&lt;<https://example.com/fix>|View&gt;"),
+    ("Your fix is complete.", "Your fix is complete. Extra sentence."),
+])
+def test_fixer_readback_rejects_distinct_slack_text(intended, observed):
+    assert not OB._slack_readback_text_matches(intended, observed)
+
+
+def test_fixer_normalized_readback_still_requires_exact_post_timestamp_and_identity():
+    ts = "9.999"
+    intent = {"channel": "C_CLIENT", "thread_ts": "1.0", "sender": "U_ECHO_BOT",
+              "body": "Details: https://example.com/fix & done",
+              "not_before": datetime.now(timezone.utc).isoformat()}
+    message = {"ts": ts, "text": "Details: <https://example.com/fix> &amp; done",
+               "user": "U_ECHO_BOT", "thread_ts": "1.0"}
+    def readback(channel, *, thread_ts=None, ts=None, oldest=None):
+        assert (channel, thread_ts, ts, oldest) == ("C_CLIENT", "1.0", "9.999", "9.999")
+        return {"ok": True, "channel": channel, "messages": [message]}
+    proof, reason = OB._readback_fixer_message(readback, intent, ts=ts)
+    assert not reason and proof["delivery_readback_ts"] == ts
+    assert proof["delivery_readback_body_sha256"] == hashlib.sha256(intent["body"].encode()).hexdigest()
+    assert OB._readback_fixer_message(readback, intent)[0] is None
+    for patch in ({"ts": "9.998"}, {"user": "U_OTHER"}, {"thread_ts": "2.0"}):
+        changed = {**message, **patch}
+        assert OB._readback_fixer_message(
+            lambda channel, **kwargs: {"ok": True, "channel": channel, "messages": [changed]},
+            intent, ts=ts)[0] is None
+    assert OB._readback_fixer_message(
+        lambda channel, **kwargs: {"ok": True, "channel": "C_OTHER", "messages": [message]},
+        intent, ts=ts)[0] is None
+
+
+def test_fixer_normalized_readback_finishes_once_without_resend(monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    for message in bus.msgs:
+        if message["id"] == row["id"]:
+            message["body"] = "Instagram is connected. Details: https://example.com/fix"
+    post, calls = _posted()
+    post.readback = lambda channel, **kwargs: {
+        "ok": True, "channel": channel,
+        "messages": [{"ts": "9.999", "text": calls[0]["text"].replace(
+            "https://example.com/fix", "<https://example.com/fix>"),
+            "user": "U_ECHO_BOT", "thread_ts": "1.0"}]}
+    first = OB.run_once(bus, post, identity=IDS.get("echo"),
+                        member_check=lambda *_: True, log=lambda *_: None)
+    second = OB.run_once(bus, post, identity=IDS.get("echo"),
+                         member_check=lambda *_: True, log=lambda *_: None)
+    assert first["resolved"] == 1 and second["resolved"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert bus.ticket(tid)["status"] == "resolved"
+    assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
+
+
 @pytest.mark.parametrize("prepare_number", [1, 2])
 @pytest.mark.parametrize("change", ["correction", "route", "release"])
 def test_fixer_prepare_windows_recheck_current_request_before_client_post(

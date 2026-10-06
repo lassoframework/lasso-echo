@@ -784,8 +784,76 @@ def _fixer_client_row(row):
             and att.get("recipient_kind", "client") not in ("staff", "coach"))
 
 
+# A pipe is mrkdwn's target/label delimiter, never part of an auto-link
+# alternative: wrapping a URL containing it would change the link's meaning.
+_SLACK_URL = re.compile(r"https?://[^\s<>|]+", re.IGNORECASE)
+_SLACK_EXPLICIT_LINK = re.compile(r"<(?:https?://|mailto:|[@!#])[^>\n]+>", re.IGNORECASE)
+_SLACK_ESCAPED_MARKUP = re.compile(
+    r"&lt;(?:https?://|mailto:|[@!#])(?:(?!&gt;)[^\n])*&gt;", re.IGNORECASE)
+_SLACK_ENTITIES = ("&amp;", "&lt;", "&gt;")
+_SLACK_RESERVED = {"&": "&amp;", "<": "&lt;", ">": "&gt;"}
+
+
+def _slack_readback_text_matches(intended, observed):
+    """Match only documented Slack mrkdwn storage forms of the sent bytes.
+
+    This is deliberately one-way: never HTML-unescape or strip link labels
+    from the observed message. A different URL, label, or body must not become
+    delivery proof merely because it renders similarly in the Slack client.
+    """
+    if not isinstance(intended, str) or not isinstance(observed, str):
+        return False
+    if intended == observed:
+        return True
+    # Slack does not auto-format text in inline/fenced code. Parsing every
+    # mrkdwn code boundary is error-prone, so any backtick makes a normalized
+    # (non-exact) readback unverified.
+    if "`" in intended or "`" in observed:
+        return False
+    if len(intended) > 40000 or len(observed) > 80000:
+        return False
+    positions = {0}
+    index = 0
+    while index < len(intended):
+        explicit = (_SLACK_EXPLICIT_LINK.match(intended, index)
+                    or _SLACK_ESCAPED_MARKUP.match(intended, index))
+        if explicit:
+            token = explicit.group()
+            alternatives = (token,)
+        else:
+            url_match = (_SLACK_URL.match(intended, index)
+                         if index == 0 or not (intended[index - 1].isalnum()
+                                                or intended[index - 1] in "<|") else None)
+            if url_match:
+                # Keep terminal punctuation in the target. It may be part of
+                # the URL; guessing Slack's boundary could accept a different
+                # link target as delivery proof.
+                token = url_match.group()
+                if token:
+                    alternatives = (token, f"<{token}>", f"<{token}|{token}>")
+                else:
+                    token = intended[index]
+                    alternatives = (token,)
+            else:
+                entity = next((value for value in _SLACK_ENTITIES
+                               if intended.startswith(value, index)), None)
+                token = entity or intended[index]
+                alternatives = ((token,) if entity or token not in _SLACK_RESERVED
+                                else (token, _SLACK_RESERVED[token]))
+        next_positions = {position + len(candidate)
+                          for position in positions for candidate in alternatives
+                          if observed.startswith(candidate, position)}
+        # Ambiguous/pathological inputs remain unverified rather than making
+        # a potentially expensive fuzzy comparison on a customer message.
+        if not next_positions or len(next_positions) > 64:
+            return False
+        positions = next_positions
+        index += len(token)
+    return len(observed) in positions
+
+
 def _readback_fixer_message(readback, intent, *, ts=None):
-    """Require one exact Echo-authored message in a complete Slack read."""
+    """Require one Echo-authored message at the persisted API-response timestamp."""
     # Text, sender, destination and time cannot tie a Slack message to this
     # particular attempt. A different identical Echo post can satisfy all four.
     # Only a timestamp durably recorded from THIS post response is correlating
@@ -817,7 +885,8 @@ def _readback_fixer_message(readback, intent, *, ts=None):
             continue
         found_ts = str(message.get("ts") or "")
         if (not found_ts or (ts and found_ts != str(ts))
-                or message.get("text") != body or message.get("user") != sender):
+                or not _slack_readback_text_matches(body, message.get("text"))
+                or message.get("user") != sender):
             continue
         observed_thread = message.get("thread_ts")
         if thread_ts:
