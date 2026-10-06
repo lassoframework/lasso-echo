@@ -154,7 +154,7 @@ def row_asset_key(row):
 
 
 def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=(),
-               library_path=None, key_fn=None):
+               skip_wipeable_dates=(), library_path=None, key_fn=None):
     """{media_key: {(iso_date, status), ...}} for every guard-relevant row of the
     gym: forward-book statuses (any date) + PUBLISHED rows near the planned span
     (read back one repeat window before start). Reads via store.list_month
@@ -166,6 +166,9 @@ def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=(
     insert — a WIPEABLE (pending/draft/queued) row inside them will not survive
     the rebuild, so it must not block the very photos it is about to release.
     coach_review rows are NOT wipeable and always count.
+
+    skip_wipeable_dates: exact ISO dates replaced by a span-scoped rebuild. This
+    preserves wipeable rows outside that span even when they share its month.
 
     key_fn: how a row is keyed (default row_media_key, the photo basename). Pass
     row_asset_key to read the same book by Drive asset id; the autofit reframe
@@ -183,6 +186,7 @@ def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=(
     span_end = start + timedelta(days=max(1, int(days or 1)) - 1)
     read_start = start - timedelta(days=win)
     skip = {str(m) for m in (skip_wipeable_months or ())}
+    skip_dates = {str(d)[:10] for d in (skip_wipeable_dates or ())}
     state = {}
     for month in _months_between(read_start, span_end):
         try:
@@ -202,7 +206,10 @@ def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=(
             pd = str(row.get("post_date") or "")[:10]
             if not pd:
                 continue
-            if status in _WIPEABLE and pd[:7] in skip:
+            variant = str(row.get("variant_status") or "active").strip().lower()
+            replaceable = (status in _WIPEABLE and variant == "active"
+                           and row.get("media_not_ready_reason") is None)
+            if replaceable and (pd[:7] in skip or pd in skip_dates):
                 continue                     # this rebuild wipes it; photo is free
             key = key_fn(row)
             if not key:
@@ -263,9 +270,10 @@ def surviving_keys(base_key, store, start, days, *, log=None, library_path=None)
         if start is None:
             return set()
     span_end = start + timedelta(days=max(1, int(days or 1)) - 1)
-    span_months = set(_months_between(start, span_end))
+    span_dates = {start + timedelta(days=offset)
+                  for offset in range(max(1, int(days or 1)))}
     state = book_state(base_key, store, start, days, log=log,
-                       skip_wipeable_months=span_months,
+                       skip_wipeable_dates=span_dates,
                        library_path=library_path)
     win = config.media_repeat_window_days()
     keys = set()

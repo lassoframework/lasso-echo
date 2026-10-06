@@ -146,6 +146,43 @@ def test_surviving_keys_frees_span_wipeables_keeps_the_rest():
     assert {"coach.jpg", "appr.jpg", "pub.jpg"} <= keys
 
 
+def test_surviving_keys_preserves_same_month_wipeable_outside_exact_span():
+    from datetime import date
+    store = _Store([
+        _row("2026-10-16", "before.jpg", "pending"),
+        _row("2026-10-17", "replace.jpg", "pending"),
+        _row("2026-10-31", "replace-later.jpg", "pending"),
+    ])
+
+    keys = media_guard.surviving_keys("gritx", store, date(2026, 10, 17), 15)
+
+    assert "before.jpg" in keys
+    assert "replace.jpg" not in keys
+    assert "replace-later.jpg" not in keys
+
+
+def test_book_state_exact_replacement_dates_keep_out_of_span_wipeables():
+    store = _Store([
+        _row("2026-10-17", "replace.jpg", "pending"),
+        _row("2026-10-18", "outside.jpg", "pending"),
+        _row("2026-10-17", "approved.jpg", "approved"),
+        {**_row("2026-10-17", "held.jpg", "pending"),
+         "media_not_ready_reason": "needs_new_visual"},
+        {**_row("2026-10-17", "candidate.jpg", "pending"),
+         "variant_status": "candidate"},
+    ])
+
+    state = media_guard.book_state(
+        "gritx", store, "2026-10-17", 2,
+        skip_wipeable_dates={"2026-10-17"})
+
+    assert "replace.jpg" not in state
+    assert "outside.jpg" in state
+    assert "approved.jpg" in state
+    assert "held.jpg" in state
+    assert "candidate.jpg" in state
+
+
 def test_surviving_keys_flag_off_is_empty(monkeypatch):
     from datetime import date
     monkeypatch.setenv("AGENT_MEDIA_CROSS_DAY_GUARD", "false")

@@ -139,17 +139,45 @@ def test_edited_story_captions_reads_only_edited_slots():
     class _Store:
         def list_month(self, base_key, month):
             return [
-                {"format": "feed", "post_date": "2026-08-17", "caption": "feed cap A"},
+                {"format": "feed", "account": "instagram", "post_date": "2026-08-17",
+                 "slot_index": 0, "caption": "feed cap A"},
                 {"format": "story", "post_date": "2026-08-17",
+                 "account": "instagram", "slot_index": 0,
                  "caption": "CLIENT edited story caption"},   # edited (differs)
-                {"format": "feed", "post_date": "2026-08-18", "caption": "feed cap B"},
-                {"format": "story", "post_date": "2026-08-18", "caption": "feed cap B"},
+                {"format": "feed", "account": "instagram", "post_date": "2026-08-18",
+                 "slot_index": 1, "caption": "feed cap B"},
+                {"format": "story", "account": "instagram", "post_date": "2026-08-18",
+                 "slot_index": 1, "caption": "feed cap B"},
             ]
 
     from datetime import date
     edited = cmr._edited_story_captions(
         "eng", date(2026, 8, 17), 2, _Store(), lambda m: None)
-    assert edited == {"2026-08-17": "CLIENT edited story caption"}
+    assert edited == {("2026-08-17", 0): "CLIENT edited story caption"}
+
+
+def test_edited_story_captions_keeps_second_slot_edit_on_second_slot():
+    class _Store:
+        def list_month(self, base_key, month):
+            return [
+                {"format": "feed", "account": "instagram", "post_date": "2026-08-17",
+                 "slot_index": 0, "caption": "morning feed"},
+                {"format": "story", "account": "instagram", "post_date": "2026-08-17",
+                 "slot_index": 0, "caption": "morning feed"},
+                {"format": "feed", "account": "facebook", "post_date": "2026-08-17",
+                 "slot_index": 1, "caption": "FB normalized copy"},
+                {"format": "feed", "account": "instagram", "post_date": "2026-08-17",
+                 "slot_index": 1, "caption": "evening feed #gym"},
+                {"format": "story", "account": "instagram", "post_date": "2026-08-17",
+                 "slot_index": 1, "caption": "CLIENT evening edit"},
+            ]
+
+    from datetime import date
+    edited = cmr._edited_story_captions(
+        "eng", date(2026, 8, 17), 1, _Store(), lambda m: None)
+
+    assert edited == {("2026-08-17", 1): "CLIENT evening edit"}
+    assert ("2026-08-17", 0) not in edited
 
 
 def test_maybe_format_story_uses_story_caption_override(monkeypatch):
