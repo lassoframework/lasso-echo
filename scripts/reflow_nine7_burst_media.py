@@ -157,7 +157,9 @@ def plan(store, *, gym, first, last, ticket, request_key, library_path, today=No
         if any(r.get("source_media_asset_id") for r in siblings):
             raise ValueError("Drive identity cannot be permuted by this local-photo operator")
         for row in siblings:
-            if row["format"] not in ("feed", "story"):
+            if (row["account"], row["format"]) not in {
+                    ("instagram", "feed"), ("facebook", "feed"),
+                    ("instagram", "story"), ("googlebusiness", "update")}:
                 raise ValueError("unsupported platform render format")
         groups[day] = sorted(siblings, key=lambda r: str(r["id"]))
         assignment[day] = source
@@ -182,7 +184,7 @@ def plan(store, *, gym, first, last, ticket, request_key, library_path, today=No
            for day, rid in TARGET_ROOTS.items()):
         raise ValueError("exact audited target root missing or changed")
     target_shape = {("instagram", "feed"), ("facebook", "feed"),
-                    ("instagram", "story"), ("googlebusiness", "feed")}
+                    ("instagram", "story"), ("googlebusiness", "update")}
     if any(len(groups[day]) != 4 or
            {(r["account"], r["format"]) for r in groups[day]} != target_shape
            for day in TARGET_ROOTS):

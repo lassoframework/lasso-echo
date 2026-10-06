@@ -19,14 +19,16 @@ def row(day, kind, source, *, status="pending"):
             "variant_status": "active", "account": {
                 "ig": "instagram", "fb": "facebook", "story": "instagram",
                 "gbp": "googlebusiness"}[kind],
-            "format": "story" if kind == "story" else "feed",
+            "format": {"story": "story", "gbp": "update"}.get(kind, "feed"),
             "caption": f"exact caption {kind} {day}",
             "image_url": f"https://cdn/{source}", "source_media_url": f"https://cdn/{source}",
             "source_media_asset_id": None, "thumbnail_url": None,
             "media_not_ready_reason": None, "created_at": "2026-10-01T00:00:00Z",
             "scheduled_at": f"{day}T15:00:00Z", "slot_index": 0,
             "published_at": None, "late_post_id": None, "publish_claim_token": None,
-            "publish_reservation_day": None}
+            "publish_reservation_day": None,
+            "approval_kind": None, "approved_by": None, "approved_at": None,
+            "approval_digest": None}
 
 
 class Calendar:
@@ -126,6 +128,17 @@ def test_missing_coupled_sibling_refuses(monkeypatch, tmp_path):
     calendar.rows.pop("gbp-2026-10-23")
     with pytest.raises(ValueError, match="coupled platform"):
         op.run(**args)
+
+
+@pytest.mark.parametrize("kind,format_value", [("gbp", "feed"), ("fb", "update"),
+                                               ("story", "update"), ("ig", "reel")])
+def test_only_exact_live_platform_formats_are_supported(monkeypatch, tmp_path, kind, format_value):
+    calendar, args = fixture(monkeypatch, tmp_path)
+    rid = op.TARGET_ROOTS["2026-10-23"] if kind == "ig" else f"{kind}-2026-10-23"
+    calendar.rows[rid]["format"] = format_value
+    with pytest.raises(ValueError, match="unsupported platform render format"):
+        op.run(**args)
+    assert not calendar.writes
 
 
 def test_missing_gbp_on_machine_owned_exchange_day_refuses(monkeypatch, tmp_path):
