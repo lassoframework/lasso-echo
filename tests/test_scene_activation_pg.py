@@ -4,6 +4,7 @@ Reuses the scene-history fixture's private Unix-socket cluster and exact schema
 stack. No supplied DSN, remote host, production SQL, or persistent database.
 """
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "migrations"
 SOURCE = MIGRATIONS / "DRAFT_visual_scene_activation_20261005.sql"
+APPROVAL = Path(os.environ.get(
+    "ECHO_APPROVAL_MIGRATION_PATH",
+    MIGRATIONS / "calendar_approval_provenance_20261005.sql"))
 SPEC = importlib.util.spec_from_file_location(
     "scene_history_fixture", ROOT / "tests/test_scene_history_backfill_pg.py")
 history = importlib.util.module_from_spec(SPEC)
@@ -24,10 +28,21 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module", autouse=True)
 def cluster():
+    if not APPROVAL.is_file():
+        pytest.skip("combined PG17 checks require calendar_approval_provenance_20261005.sql")
     start = history.cluster.__wrapped__()
     next(start)
     try:
-        history._sql("alter table public.content_calendar add column format text")
+        history._sql("alter table public.content_calendar "
+                     "add column format text, add column caption text")
+        history._sql("create table public.gyms (id uuid primary key, slug text, name text); "
+                     "create table public.echo_intake_tokens (gym_id uuid, echo_account_key text); "
+                     "create table public.echo_gym_settings (gym_id uuid primary key, "
+                     "autonomous boolean, autonomy_updated_by text)")
+        history._sql(APPROVAL.read_text())
+        premature = history._run(SOURCE.read_text(), check=False)
+        assert premature.returncode != 0
+        assert "scene calendar claim, publish and approval wiring must precede activation" in premature.stderr
         history._sql((MIGRATIONS / "DRAFT_visual_scene_calendar_transaction_20261005.sql").read_text())
         history._sql(SOURCE.read_text())
         yield

@@ -2,6 +2,7 @@
 -- Apply only after DRAFT_visual_group_activation_20261002.sql,
 -- DRAFT_visual_scene_ledger_20261005.sql,
 -- DRAFT_visual_scene_history_backfill_20261005.sql, and
+-- calendar_approval_provenance_20261005.sql, then
 -- DRAFT_visual_scene_calendar_transaction_20261005.sql in a disposable review.
 -- This is the LAST migration in the draft chain. It replaces only the
 -- service-role activation RPC. All settings defaults remain OFF; loading this
@@ -37,11 +38,17 @@ do $$ begin
         and f.prosrc like '%visual_scene_claim_scan%'
         and f.prosrc like '%visual_scene_phash_occupied%')
      or not exists(select 1 from pg_proc f
-       where f.oid=to_regprocedure('public.claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean)')
+       where f.oid=to_regprocedure('public.claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean,boolean)')
          and f.prosrc like '%v_row.publish_claim_token is distinct from v_token%')
      or not exists(select 1 from pg_proc f
-       where f.oid=to_regprocedure('public.approve_calendar_row_if_media_ready(uuid,text)')
-         and f.prosrc like '%variant_status=''active''%') then
+       where f.oid=to_regprocedure('public.approve_calendar_row_if_media_ready(uuid,text,jsonb)')
+         and f.prosrc like '%approval_digest%'
+         and f.prosrc like '%p_expected%')
+     or not exists(select 1 from pg_proc f
+       where f.oid=to_regprocedure('public.claim_calendar_gbp_publish_owned(uuid,text)')
+         and f.prosrc like '%v_row.publish_claim_token is distinct from v_token%')
+     or to_regprocedure('public.claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean)') is not null
+     or to_regprocedure('public.approve_calendar_row_if_media_ready(uuid,text)') is not null then
     raise exception 'scene calendar claim, publish and approval wiring must precede activation'
       using errcode='55000';
   end if;

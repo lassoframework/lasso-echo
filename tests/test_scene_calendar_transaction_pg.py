@@ -25,6 +25,9 @@ _PATH_POSTGRES = shutil.which("postgres")
 BIN = _PG17 if (_PG17 / "postgres").exists() else (
     Path(_PATH_POSTGRES).parent if _PATH_POSTGRES else Path("/nonexistent"))
 DRAFT = ROOT / "migrations/DRAFT_visual_scene_calendar_transaction_20261005.sql"
+APPROVAL = Path(os.environ.get(
+    "ECHO_APPROVAL_MIGRATION_PATH",
+    ROOT / "migrations/calendar_approval_provenance_20261005.sql"))
 
 
 def command(args, **kwargs):
@@ -33,6 +36,8 @@ def command(args, **kwargs):
 
 @pytest.fixture(scope="module", autouse=True)
 def cluster():
+    if not APPROVAL.is_file():
+        pytest.skip("combined PG17 checks require calendar_approval_provenance_20261005.sql")
     available = (BIN / "postgres").exists()
     if available:
         available = "17." in command([str(BIN / "postgres"), "--version"]).stdout
@@ -51,7 +56,13 @@ def cluster():
             ledger.PSQL = str(BIN / "psql")
             ledger.DSN = f"host={base} port=55479 dbname=echo_scene_ledger_test"
             ledger._scratch_stack.__wrapped__()
-            ledger._sql("alter table public.content_calendar add column format text")
+            ledger._sql("alter table public.content_calendar "
+                        "add column format text, add column caption text")
+            ledger._sql("create table public.gyms (id uuid primary key, slug text, name text); "
+                        "create table public.echo_intake_tokens (gym_id uuid, echo_account_key text); "
+                        "create table public.echo_gym_settings (gym_id uuid primary key, "
+                        "autonomous boolean, autonomy_updated_by text)")
+            ledger._sql(APPROVAL.read_text())
             ledger._sql(DRAFT.read_text())
             assert ledger._one("select count(*) from pg_trigger where tgrelid='public.content_calendar'::regclass and not tgisinternal and tgname='content_calendar_visual_group_guard'") == "1"
             yield
@@ -62,6 +73,8 @@ def cluster():
 @pytest.fixture(autouse=True)
 def reset(cluster):
     ledger._isolate_scenarios.__wrapped__()
+    ledger._sql("truncate public.gyms, public.echo_intake_tokens, "
+                "public.echo_gym_settings")
 
 
 def seed(phash="0000000000000000", account="ig", active=True):
@@ -93,6 +106,168 @@ def assert_held(row):
 
 def claim(row, tenant):
     return ledger._one(f"select public.claim_calendar_publish_slot_owned('{row}','{tenant}','2026-10-10','UTC',2,false)")
+
+
+def proof_identity(tenant):
+    ledger._sql(
+        "insert into public.gyms(id,slug,name) "
+        f"values ('{tenant}','combined-test','Combined Test'); "
+        "insert into public.echo_intake_tokens(gym_id,echo_account_key) "
+        f"values ('{tenant}','{tenant}'); "
+        "insert into public.echo_gym_settings(gym_id,autonomous,autonomy_updated_by) "
+        f"values ('{tenant}',false,'test')")
+
+
+def approve_with_card(row, tenant, url, caption=None, account="ig"):
+    caption_sql = "null" if caption is None else f"'{caption}'"
+    return ledger._one(
+        "select count(*) from public.approve_calendar_row_if_media_ready("
+        f"'{row}','{tenant}',jsonb_build_object("
+        f"'caption',{caption_sql},'media_url','{url}',"
+        f"'day_key','2026-10-10','format','feed','platform','{account}'))")
+
+
+def proven_claim(row, tenant):
+    return ledger._one(
+        "select public.claim_calendar_publish_slot_owned("
+        f"'{row}','{tenant}','2026-10-10','UTC',2,true,true)")
+
+
+def stamp(row, tenant, actor):
+    digest = state(row)["approval_digest"]
+    return ledger._one(
+        "select count(*) from public.calendar_stamp_verified_approval("
+        f"'{tenant}','{row}','{actor}','{digest}')")
+
+
+def test_combined_migration_has_one_rpc_signature_each():
+    assert ledger._one(
+        "select count(*) from pg_proc where pronamespace='public'::regnamespace "
+        "and proname='approve_calendar_row_if_media_ready'") == "1"
+    assert ledger._one(
+        "select count(*) from pg_proc where pronamespace='public'::regnamespace "
+        "and proname='claim_calendar_publish_slot_owned'") == "1"
+    assert ledger._one(
+        "select pg_get_function_identity_arguments("
+        "'public.approve_calendar_row_if_media_ready(uuid,text,jsonb)'::regprocedure)"
+    ).count(",") == 2
+    assert ledger._one(
+        "select pg_get_function_identity_arguments("
+        "'public.claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean,boolean)'::regprocedure)"
+    ).count(",") == 6
+
+
+def test_combined_clean_card_approval_proof_and_claim():
+    tenant, group, url, fp, candidate, row = seed()
+    proof_identity(tenant)
+    assert approve_with_card(row, tenant, url) == "1"
+    assert state(row)["approval_kind"] is None
+    assert proven_claim(row, tenant) == ""
+    assert stamp(row, tenant, "") == "0"
+    assert stamp(row, tenant, "clerk_user_1") == "1"
+    token = proven_claim(row, tenant)
+    assert token and state(row)["publish_claim_token"] == token
+    assert state(row)["status"] == "publishing"
+
+
+def test_combined_stale_card_and_stale_creative_refuse():
+    tenant, group, url, fp, candidate, row = seed()
+    proof_identity(tenant)
+    assert approve_with_card(row, tenant, "https://scratch.example/stale.jpg") == "0"
+    assert state(row)["status"] == "pending"
+    assert approve_with_card(row, tenant, url) == "1"
+    assert stamp(row, tenant, "clerk_user_1") == "1"
+    ledger._sql(f"update public.content_calendar set caption='changed after approval' "
+                f"where id='{row}'")
+    assert proven_claim(row, tenant) == ""
+    assert state(row)["publish_claim_token"] is None
+
+
+def test_combined_trigger_hold_refuses_proven_token():
+    tenant, group, url, fp, candidate, row = seed()
+    proof_identity(tenant)
+    assert approve_with_card(row, tenant, url) == "1"
+    assert stamp(row, tenant, "clerk_user_1") == "1"
+    add_conflict()
+    assert proven_claim(row, tenant) == ""
+    assert_held(row)
+    assert len(ledger._holds("open")) == 1
+
+
+def test_combined_gbp_claim_filters_trigger_hold():
+    tenant, group, url, fp, candidate, row = seed(account="googlebusiness")
+    proof_identity(tenant)
+    assert approve_with_card(row, tenant, url, account="googlebusiness") == "1"
+    assert stamp(row, tenant, "clerk_user_1") == "1"
+    assert ledger._one(
+        "select count(*) from public.claim_calendar_gbp_publish_owned("
+        f"'{row}','{tenant}')") == "1"
+    assert state(row)["status"] == "publishing"
+
+    tenant2, group2, url2, fp2, candidate2, row2 = seed(
+        phash=ledger._CODEBOOK[1], account="googlebusiness")
+    proof_identity(tenant2)
+    assert approve_with_card(row2, tenant2, url2, account="googlebusiness") == "1"
+    assert stamp(row2, tenant2, "clerk_user_2") == "1"
+    add_conflict(ledger._near(ledger._CODEBOOK[1], 1))
+    assert ledger._one(
+        "select count(*) from public.claim_calendar_gbp_publish_owned("
+        f"'{row2}','{tenant2}')") == "0"
+    assert_held(row2)
+
+
+@pytest.mark.parametrize("account", ["ig", "googlebusiness"])
+def test_combined_mode_wrapper_returns_only_clean_persisted_claim(account):
+    def wrapped_claim(row, tenant):
+        if account == "googlebusiness":
+            call = (
+                "public.claim_calendar_gbp_publish_with_mode_owned("
+                f"'{row}','{tenant}')")
+        else:
+            call = (
+                "public.claim_calendar_publish_slot_proven_owned("
+                f"'{row}','{tenant}','2026-10-10','UTC',2,true)")
+        result = ledger._one(f"select {call}")
+        return json.loads(result) if result else None
+
+    tenant, group, url, fp, candidate, row = seed(account=account)
+    proof_identity(tenant)
+    assert approve_with_card(row, tenant, url, account=account) == "1"
+    assert stamp(row, tenant, "clerk_user_clean") == "1"
+    clean = wrapped_claim(row, tenant)
+    assert clean is not None
+    assert clean["autonomous_at_claim"] is False
+    assert clean["row"]["id"] == row
+    assert clean["row"]["status"] == "publishing"
+    assert clean["row"]["publish_claim_token"] == state(row)["publish_claim_token"]
+
+    tenant2, group2, url2, fp2, candidate2, row2 = seed(
+        phash=ledger._CODEBOOK[1], account=account)
+    proof_identity(tenant2)
+    assert approve_with_card(row2, tenant2, url2, account=account) == "1"
+    assert stamp(row2, tenant2, "clerk_user_held") == "1"
+    add_conflict(ledger._near(ledger._CODEBOOK[1], 1))
+    assert wrapped_claim(row2, tenant2) is None
+    assert_held(row2)
+    assert len(ledger._holds("open")) == 1
+
+
+def test_combined_legacy_defaulted_calls_and_rollback():
+    tenant, group, url, fp, candidate, row = seed()
+    # The old 2-argument approval and 6-argument claim resolve to the sole
+    # canonical defaulted signatures, with proof still disabled by default.
+    assert ledger._one(
+        f"select count(*) from public.approve_calendar_row_if_media_ready('{row}','{tenant}')"
+    ) == "1"
+    assert claim(row, tenant)
+    tenant2, group2, url2, fp2, candidate2, row2 = seed(phash=ledger._CODEBOOK[1])
+    ledger._sql(
+        "begin; "
+        f"select count(*) from public.approve_calendar_row_if_media_ready('{row2}','{tenant2}'); "
+        f"select public.claim_calendar_publish_slot_owned('{row2}','{tenant2}',"
+        "'2026-10-10','UTC',2,false); rollback")
+    assert state(row2)["status"] == "pending"
+    assert state(row2)["publish_claim_token"] is None
 
 
 def test_clean_claim_and_cas_token():

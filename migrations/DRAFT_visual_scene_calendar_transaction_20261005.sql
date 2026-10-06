@@ -1,18 +1,19 @@
 -- DRAFT / UNAPPLIED / OFF. Transaction wiring only. NEVER APPLY TO PRODUCTION.
 -- Requires the group schema/claim trigger/global history/backfill/activation
--- drafts and DRAFT_visual_scene_ledger_20261005.sql, in their tested order.
+-- drafts, DRAFT_visual_scene_ledger_20261005.sql, and
+-- calendar_approval_provenance_20261005.sql before this migration.
 -- Replaces the ONE existing calendar BEFORE function; installs no second trigger,
 -- flips no setting, performs no backfill, and adds no arming barrier.
 -- Unknown historical scene coverage and the raising backfill stub remain RELEASE
 -- BLOCKERS, alongside cloud Ultra Review and independent acceptance.
 -- GBP and legacy direct UPDATE lanes use this same authoritative BEFORE path.
--- Legacy boolean claim RPCs are not granted new rights; held rows become archived
--- and token-free, so any existing pre-read/direct patch caller MUST inspect the
--- persisted row before sending. A boolean legacy caller alone is not release-safe.
+-- The canonical approval and claim RPCs inspect the trigger's persisted row;
+-- direct patch callers must also inspect it before sending.
 -- Approval of a review hold alone never reactivates a calendar row. An explicit
 -- unsent reactivation is scanned again, with only exact approved-pair exemptions.
 -- Rollback: in scratch only, restore visual_group_guard_trigger from the group
--- claim-trigger draft and the two RPCs from their preceding definitions. Restore
+-- claim-trigger draft and the approval, slot-claim and GBP-claim RPCs from
+-- their preceding definitions. Restore
 -- code inside a transaction and preserve all permanent occupancy/hold evidence.
 -- A transaction rollback removes both scene and exact-byte writes and the row.
 begin;
@@ -219,13 +220,12 @@ $$;
 -- and previously only checked status/published_at/variant_status -- a stale
 -- 'pending' or 'approved' hold row could be claimed and published with no media.
 --
--- This redefinition of publish_capacity_current_day_20260930.sql adds two
--- fail-closed guards to the row selection: image_url must be a non-blank string
--- and media_not_ready_reason must be NULL. Every other guard (owned claim,
--- advisory lock, capacity, format, approved-only) is preserved verbatim.
+-- Compose into approval-provenance's one defaulted seven-argument signature.
+-- Keep its current-autonomy, proof, capacity and format checks intact.
 create or replace function public.claim_calendar_publish_slot_owned(
   p_row_id uuid, p_gym_id text, p_day date, p_timezone text,
-  p_capacity integer, p_approved_only boolean
+  p_capacity integer, p_approved_only boolean,
+  p_require_approval_proof boolean default false
 ) returns uuid
 language plpgsql security definer set search_path = public
 as $$
@@ -233,6 +233,7 @@ declare
   v_row public.content_calendar%rowtype;
   v_used integer;
   v_token uuid;
+  v_enforce_proof boolean;
 begin
   if p_capacity < 1 or p_capacity > 3 or p_day is null or p_timezone is null
       or nullif(btrim(p_gym_id), '') is null then
@@ -243,6 +244,8 @@ begin
   end if;
 
   perform pg_advisory_xact_lock(hashtextextended(p_gym_id, 0));
+  v_enforce_proof := p_require_approval_proof
+                     and not public.calendar_gym_is_autonomous(p_gym_id);
   select * into v_row from public.content_calendar
     where id = p_row_id and gym_id = p_gym_id
       and status in ('pending', 'approved') and published_at is null
@@ -254,8 +257,19 @@ begin
   if not found or (p_approved_only and v_row.status <> 'approved') then
     return null;
   end if;
+  if v_enforce_proof and v_row.status <> 'approved' then
+    return null;
+  end if;
   if p_capacity = 3 and
-      coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed') <> 'feed' then
+      coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed') not in ('feed', 'story') then
+    return null;
+  end if;
+  if v_enforce_proof and
+      (v_row.approval_kind is distinct from 'human'
+       or nullif(btrim(coalesce(v_row.approved_by, '')), '') is null
+       or v_row.approved_at is null
+       or v_row.approval_digest is null
+       or v_row.approval_digest is distinct from public.calendar_approval_digest(v_row)) then
     return null;
   end if;
 
@@ -285,6 +299,12 @@ begin
   if not found or v_row.status is distinct from 'publishing'
       or v_row.variant_status is distinct from 'active'
       or v_row.media_not_ready_reason is not null
+      or nullif(btrim(coalesce(v_row.image_url, '')), '') is null
+      or (v_enforce_proof and
+          (v_row.approval_kind is distinct from 'human'
+           or nullif(btrim(coalesce(v_row.approved_by, '')), '') is null
+           or v_row.approved_at is null
+           or v_row.approval_digest is distinct from public.calendar_approval_digest(v_row)))
       or v_row.publish_claim_token is distinct from v_token
       or v_row.publish_reservation_day is distinct from p_day then
     return null;
@@ -293,36 +313,112 @@ begin
 end;
 $$;
 
-revoke all on function public.claim_calendar_publish_slot_owned(uuid, text, date, text, integer, boolean)
+revoke all on function public.claim_calendar_publish_slot_owned(uuid, text, date, text, integer, boolean, boolean)
   from public, anon, authenticated;
-grant execute on function public.claim_calendar_publish_slot_owned(uuid, text, date, text, integer, boolean)
+grant execute on function public.claim_calendar_publish_slot_owned(uuid, text, date, text, integer, boolean, boolean)
   to service_role;
 
 
 -- Archived content_calendar variants are historical audit records. They may retain
 -- pending status and media for forensics, but they must never be approved or claimed.
--- This migration only tightens the existing approval RPC; it performs no archive.
+-- Compose into approval-provenance's one defaulted three-argument RPC.
 create or replace function public.approve_calendar_row_if_media_ready(
-  p_row_id uuid, p_gym_id text
+  p_row_id uuid, p_gym_id text, p_expected jsonb default null
 ) returns setof public.content_calendar
 language sql security definer set search_path = public
 as $$
-  with persisted as (update public.content_calendar
-     set status = 'approved'
+  with persisted as (update public.content_calendar c
+     set status = 'approved',
+         approval_kind = null,
+         approved_by = null,
+         approved_at = null,
+         approval_digest = public.calendar_approval_digest(c)
    where id = p_row_id and gym_id = p_gym_id
      and status = 'pending' and published_at is null
      and late_post_id is null
      and variant_status = 'active'
      and nullif(btrim(coalesce(image_url, '')), '') is not null
      and media_not_ready_reason is null
+     and (p_expected is null or
+       (c.caption is not distinct from p_expected->>'caption'
+        and c.image_url = p_expected->>'media_url'
+        and c.post_date::text = coalesce(p_expected->>'day_key', '')
+        and coalesce(nullif(lower(btrim(c.format)), ''), 'feed')
+          = coalesce(nullif(lower(btrim(coalesce(p_expected->>'format', ''))), ''), 'feed')
+        and coalesce(nullif(lower(btrim(c.account)), ''), '')
+          = lower(btrim(coalesce(p_expected->>'platform', '')))))
   returning *)
   select * from persisted where status='approved' and variant_status='active'
-    and media_not_ready_reason is null and publish_claim_token is null;
+    and media_not_ready_reason is null and publish_claim_token is null
+    and nullif(btrim(coalesce(image_url, '')), '') is not null
+    and approval_digest is not distinct from public.calendar_approval_digest(persisted);
 $$;
 
-revoke all on function public.approve_calendar_row_if_media_ready(uuid, text)
+revoke all on function public.approve_calendar_row_if_media_ready(uuid, text, jsonb)
   from public, anon, authenticated;
-grant execute on function public.approve_calendar_row_if_media_ready(uuid, text)
+grant execute on function public.approve_calendar_row_if_media_ready(uuid, text, jsonb)
+  to service_role;
+
+-- GBP uses a separate proof-gated claim path in approval-provenance. Its
+-- UPDATE RETURNING is also subject to the scene BEFORE trigger. A held row
+-- must remain committed but cannot be returned as a successful claim.
+create or replace function public.claim_calendar_gbp_publish_owned(
+  p_row_id uuid, p_gym_id text
+) returns setof public.content_calendar
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_row public.content_calendar%rowtype;
+  v_enforce_proof boolean;
+  v_token uuid;
+begin
+  if p_row_id is null or nullif(btrim(coalesce(p_gym_id, '')), '') is null then
+    return;
+  end if;
+  perform pg_advisory_xact_lock(hashtextextended(p_gym_id, 0));
+  v_enforce_proof := not public.calendar_gym_is_autonomous(p_gym_id);
+  select * into v_row from public.content_calendar c
+    where c.id = p_row_id and c.gym_id = p_gym_id
+      and c.account = 'googlebusiness' and c.status = 'approved'
+      and c.variant_status = 'active' and c.published_at is null
+      and c.late_post_id is null and c.publish_claim_token is null
+      and c.media_not_ready_reason is null
+      and nullif(btrim(coalesce(c.image_url, '')), '') is not null
+    for update;
+  if not found then return; end if;
+  if v_enforce_proof and (
+      v_row.approval_kind is distinct from 'human'
+      or nullif(btrim(coalesce(v_row.approved_by, '')), '') is null
+      or v_row.approved_at is null or v_row.approval_digest is null
+      or v_row.approval_digest is distinct from
+         public.calendar_approval_digest(v_row)) then
+    return;
+  end if;
+  v_token := gen_random_uuid();
+  update public.content_calendar c
+    set status = 'publishing', publish_claim_token = v_token
+    where c.id = p_row_id and c.gym_id = p_gym_id
+    returning c.* into v_row;
+  if not found or v_row.status is distinct from 'publishing'
+      or v_row.variant_status is distinct from 'active'
+      or v_row.media_not_ready_reason is not null
+      or nullif(btrim(coalesce(v_row.image_url, '')), '') is null
+      or v_row.publish_claim_token is distinct from v_token
+      or (v_enforce_proof and
+          (v_row.approval_kind is distinct from 'human'
+           or nullif(btrim(coalesce(v_row.approved_by, '')), '') is null
+           or v_row.approved_at is null
+           or v_row.approval_digest is distinct from
+              public.calendar_approval_digest(v_row))) then
+    return;
+  end if;
+  return next v_row;
+end;
+$$;
+
+revoke all on function public.claim_calendar_gbp_publish_owned(uuid, text)
+  from public, anon, authenticated;
+grant execute on function public.claim_calendar_gbp_publish_owned(uuid, text)
   to service_role;
 
 commit;

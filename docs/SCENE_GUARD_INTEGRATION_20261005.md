@@ -9,7 +9,7 @@ This is a code-and-disposable-database milestone on `codex/echo-phash-global-int
 - `agent/visual_writer_prepare.py` adds scene fingerprints and an OFF-default `AGENT_VISUAL_SCENE_CANDIDATE` payload. When the scene guard is explicitly armed, preparation obtains an immutable owner pHash receipt for the exact displayed bytes and calls `visual_scene_register_candidate()`; the payload says `usage_claimed: false` and `counts_as_use: false`, so staging is not use. Local tests cover receipt production and candidate registration. This is not evidence that the owner receipt runtime is provisioned in production.
 - `agent/config.py` supplies tri-state flag readers. Ambiguous values fail closed.
 - `migrations/DRAFT_visual_scene_ledger_20261005.sql` defines candidate staging, permanent occupied-scene evidence, review holds, claim scan/decision/guard and hold resolution. Its `visual_scene_backfill_occupied()` remains a stub that raises `0A000`.
-- `migrations/DRAFT_visual_scene_calendar_transaction_20261005.sql` now replaces the existing `visual_group_guard_trigger()` path so the calendar row, scene decision, review hold, and exact-byte ledger participate in the same transaction. A conflict commits the row as pending/archived with `scene_review_hold`, with claim fields cleared; a clean claim records occupancy in that transaction. The SQL does not arm settings or backfill history. The legacy publish claim RPC alone is not release-safe: callers must verify the persisted row before sending.
+- `migrations/DRAFT_visual_scene_calendar_transaction_20261005.sql` replaces the existing `visual_group_guard_trigger()` path so the calendar row, scene decision, review hold, and exact-byte ledger participate in the same transaction. A conflict commits the row as pending/archived with `scene_review_hold`, with claim fields cleared; a clean claim records occupancy in that transaction. The defaulted slot claim and the dedicated GBP claim inspect the persisted row after the trigger before returning success. Direct patch callers still need a persisted-row check before sending. The SQL does not arm settings or backfill history.
 - Tests include scene classification, selector behavior, writer preparation, scene-ledger PG claim/rollback, and the new transaction PG17 fixture.
 
 ## Exact disposable-PG test order
@@ -22,9 +22,12 @@ The local PostgreSQL 17 transaction fixture builds this draft stack, in this exa
 4. `migrations/DRAFT_visual_group_backfill_20261002.sql`
 5. `migrations/DRAFT_visual_group_activation_20261002.sql`
 6. `migrations/DRAFT_visual_scene_ledger_20261005.sql`
-7. `migrations/DRAFT_visual_scene_calendar_transaction_20261005.sql`
+7. `migrations/DRAFT_visual_scene_history_backfill_20261005.sql`
+8. `migrations/calendar_approval_provenance_20261005.sql` from PR #289
+9. `migrations/DRAFT_visual_scene_calendar_transaction_20261005.sql`
+10. `migrations/DRAFT_visual_scene_activation_20261005.sql`
 
-This is the fixture setup in `tests/test_scene_ledger_claim_pg.py` plus the ledger and transaction SQL applied by `tests/test_scene_calendar_transaction_pg.py`. It tests SQL behavior on a private disposable local PG17 cluster. The activation *draft* is installed in that fixture, but the fixture does not arm a tenant or establish a production migration history. No item in this list has thereby been applied to production.
+The combined disposable PG17 fixtures load the approval migration before the scene transaction and activation migrations. The transaction draft composes into the single defaulted three-argument approval and seven-argument claim signatures and the dedicated GBP claim, preserving the approval snapshot compare, verified actor proof, current autonomy check, scene trigger hold, and persisted-row checks. Tests can use `ECHO_APPROVAL_MIGRATION_PATH` while PR #289 is in a separate worktree; after integration the migration resolves from this repository. The activation draft is installed in the fixture, but no production migration or activation is implied.
 
 The separate rollback fixture tests reverse removal of the scene-ledger draft before any activation. The calendar-transaction SQL header documents scratch-only rollback by restoring the prior group trigger and RPC definitions. Permanent occupancy and review evidence must be preserved after real activation; destructive rollback is not a production recovery plan.
 
