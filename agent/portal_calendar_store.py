@@ -902,9 +902,14 @@ class SupabaseCalendarStore:
                     or evidence.get("delivered_exact_url") != row.get("image_url")):
                 raise visual_writer_prepare.VisualPreparationError(
                     "render evidence does not bind the scoped media replacement")
-        return visual_writer_prepare.prepare(
+        prepared = visual_writer_prepare.prepare(
             self, account_key, row, render_evidence=render_evidence,
             poster_render_evidence=poster_render_evidence)
+        # Preparation may emit/stage advisory evidence internally. It is not a
+        # content_calendar column; retain the original preparation result while
+        # returning only its calendar fields to every INSERT/PATCH caller.
+        return {key: value for key, value in prepared.items()
+                if key != "scene_candidate"}
 
     def _prepare_visual_replacement(self, account_key, current, payload,
                                     render_evidence=None, poster_render_evidence=None):
@@ -3541,7 +3546,8 @@ class SupabaseCalendarStore:
         payload = []
         from .copy_gate import bound_opening_hook, format_caption
         for row in (rows or []):
-            clean = {k: v for k, v in dict(row or {}).items() if k != "id"}
+            clean = {k: v for k, v in dict(row or {}).items()
+                     if k not in ("id", "scene_candidate")}
             if "caption" in clean and clean["caption"] is not None:
                 # Every calendar-building lane converges here. Prompts and individual
                 # generators can miss the hook limit, so enforce the grader's exact
