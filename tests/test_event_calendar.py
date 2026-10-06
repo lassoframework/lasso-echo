@@ -268,6 +268,22 @@ def test_edit_compensation_cannot_overwrite_concurrent_protected_status(
     assert store.row["status"] == protected_status
 
 
+def test_edit_compensation_reports_patch_failure():
+    class _BrokenStore:
+        def deny_wipeable_with_reason(self, *_args):
+            raise RuntimeError("calendar write unavailable")
+
+    result = ec.compensate_staged_rows(
+        _BrokenStore(), "pete",
+        [{"id": "row-1", "gym_id": "pete", "status": "pending"}],
+        logger=lambda *_: None)
+
+    assert result == {
+        "ok": False, "denied": 0, "reason": ec.REJECT_EDIT_CONFLICT,
+        "error": "edit_compensation_incomplete",
+    }
+
+
 def test_ended_uses_event_ended_reason():
     ev = _event()
     arc = _arc_rows(ev)

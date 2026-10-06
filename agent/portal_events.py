@@ -183,13 +183,32 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
 
     # Read the current arc rows to compute what moved.
     old_arc = []
-    if _store is not None and hasattr(_store, "list_event_rows"):
+    if _store is not None:
+        event_reader = getattr(_store, "list_event_rows", None)
+        if event_reader is None:
+            return 502, {"error": "calendar event reader unavailable"}
         try:
-            old_arc = _store.list_event_rows(account_key, event_id) or []
-        except Exception:
-            old_arc = []
+            old_arc = event_reader(account_key, event_id) or []
+        except Exception as exc:  # noqa: BLE001
+            return 502, {"error": f"calendar event read failed: {type(exc).__name__}"}
     restage, keep, remove_keys = ec.retime_arc(old_arc, new_event, today=today,
                                                avatar=avatar)
+
+    # Operation-owned staging must know the complete occupancy before the event
+    # revision is persisted. A failed/partial month read cannot be treated as an empty
+    # calendar: doing so can duplicate pending rows or collide with a protected human
+    # row. stage_arc repeats the reads immediately before insert as a second fence.
+    if _store is not None and restage:
+        month_reader = getattr(_store, "list_month", None)
+        if month_reader is None:
+            return 502, {"error": "calendar occupancy reader unavailable"}
+        months = sorted({str(row.get("post_date") or "")[:7]
+                         for row in restage if row.get("post_date")})
+        try:
+            for month in months:
+                month_reader(account_key, month)
+        except Exception as exc:  # noqa: BLE001
+            return 502, {"error": f"calendar occupancy read failed: {type(exc).__name__}"}
 
     # Persist the event with the new dates + an audit row. This final write is a
     # compare-and-set against the exact status we read. A concurrent cancel/end/status
@@ -222,6 +241,24 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
         held_media = res.get("held_media", 0)
         stage_reason = res.get("reason", "")
         inserted_rows = res.get("_inserted_rows", [])
+        if res.get("ok") is False:
+            compensated = ec.compensate_staged_rows(
+                _store, account_key, inserted_rows)
+            rolled_back = None
+            try:
+                rolled_back = _estore.update_event_if_status(
+                    account_key, event_id, current_status, saved, cur)
+            except Exception:  # noqa: BLE001 - response below remains a retryable failure
+                rolled_back = None
+            if compensated.get("ok") is False:
+                return 502, {"error": "calendar staging and cleanup failed",
+                             "reason": stage_reason,
+                             "compensated": compensated.get("denied", 0),
+                             "rolled_back": bool(rolled_back)}
+            return 502, {"error": "calendar staging failed",
+                         "reason": stage_reason,
+                         "compensated": compensated.get("denied", 0),
+                         "rolled_back": bool(rolled_back)}
 
     # The event CAS and calendar insert are separate PostgREST requests. A cancel or
     # nightly terminal transition can therefore win after the CAS but before/during
@@ -249,7 +286,7 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
         else:
             compensated = {"denied": 0}
         if compensated.get("ok") is False:
-            return 502, {"error": "terminal event calendar sweep failed",
+            return 502, {"error": "event edit cleanup failed",
                          "compensated": compensated.get("denied", 0)}
         return 409, {"error": "this promotion changed while it was being edited",
                      "compensated": compensated.get("denied", 0)}

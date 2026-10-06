@@ -93,6 +93,10 @@ class _CalendarStore:
         self.reads += 1
         return []
 
+    def list_month(self, gym_id, month):
+        self.reads += 1
+        return []
+
 
 @pytest.fixture(autouse=True)
 def _arm(monkeypatch):
@@ -143,4 +147,4 @@ def test_http_edit_keeps_live_promotions_editable(monkeypatch):
     assert captured["json"][1]["event"]["status"] == "live"
     assert events.writes == 1
     assert events.row["starts_on"] == "2026-11-01"
-    assert calendar.reads == 1
+    assert calendar.reads >= 3  # event row plus preflight and pre-insert occupancy reads

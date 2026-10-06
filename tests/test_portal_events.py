@@ -439,6 +439,119 @@ def test_later_same_status_edit_owns_rows_earlier_edit_cannot_compensate(monkeyp
     assert ev.rows[event_id]["offer_text"] == "Winner owns this revision"
 
 
+def test_edit_calendar_event_read_failure_fails_before_event_write(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    before = dict(ev.rows[event_id])
+    cal.list_event_rows = lambda *_args: (_ for _ in ()).throw(
+        RuntimeError("calendar unavailable"))
+
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 502
+    assert response["error"] == "calendar event read failed: RuntimeError"
+    assert ev.rows[event_id] == before
+    assert ev.conditional_update_calls == 0
+
+
+def test_edit_occupancy_read_failure_preserves_protected_row_and_event(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    before = dict(ev.rows[event_id])
+    protected = dict(cal.inserted[0], status="approved")
+    cal.inserted[0] = protected
+    inserted_before = [dict(row) for row in cal.inserted]
+    cal.list_month = lambda *_args: (_ for _ in ()).throw(
+        RuntimeError("occupancy unavailable"))
+
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 502
+    assert response["error"] == "calendar occupancy read failed: RuntimeError"
+    assert ev.rows[event_id] == before
+    assert ev.conditional_update_calls == 0
+    assert cal.inserted == inserted_before
+    assert cal.inserted[0]["status"] == "approved"
+
+
+def test_edit_stage_failure_rolls_back_event_and_audit(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    before = dict(ev.rows[event_id])
+    cal.insert_rows = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("insert unavailable"))
+
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 502
+    assert response["error"] == "calendar staging failed"
+    assert response["rolled_back"] is True
+    assert ev.rows[event_id] == before
+    assert ev.conditional_update_calls == 2
+
+
+def test_losing_edit_compensation_failure_returns_retryable_502(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    initial_ids = {row["id"] for row in cal.inserted}
+    interleaving = {}
+
+    def _winning_edit_then_break_cleanup():
+        interleaving["loser_ids"] = {
+            row["id"] for row in cal.inserted} - initial_ids
+        status, _ = pe.handle_edit_event(
+            "pete", event_id,
+            {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+             "offer_text": "Winner owns this revision", "actor_id": "winner"},
+            store=cal, event_store=ev, today=date(2026, 9, 1))
+        assert status == 200
+        cal.deny_wipeable_with_reason = lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("cleanup unavailable"))
+
+    cal.after_insert = _winning_edit_then_break_cleanup
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "loser"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 502
+    assert response["error"] == "event edit cleanup failed"
+    assert response["compensated"] == 0
+    assert interleaving["loser_ids"]
+    rows = {row["id"]: row for row in cal.inserted}
+    assert all(rows[row_id]["status"] == "pending"
+               for row_id in interleaving["loser_ids"])
+
+
 # ---- cancel --------------------------------------------------------------------
 
 def test_cancel_denies_pending_arc(monkeypatch):

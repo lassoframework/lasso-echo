@@ -368,11 +368,20 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
 
     existing = []
     lister = getattr(store, "list_month", None)
+    if operation_id is not None and lister is None:
+        return {"ok": False, "reason": "calendar occupancy reader unavailable",
+                "staged": 0, "_inserted_rows": []}
     if lister is not None:
         for m in months:
             try:
                 existing.extend(lister(gym_id, m) or [])
             except Exception as exc:  # noqa: BLE001
+                if operation_id is not None:
+                    log(f"stage_arc: list_month {m} failed {type(exc).__name__}; "
+                        "refusing event edit staging")
+                    return {"ok": False,
+                            "reason": "calendar occupancy read failed",
+                            "staged": 0, "_inserted_rows": []}
                 log(f"stage_arc: list_month {m} failed {type(exc).__name__}; treating as empty")
 
     # THE MONTH THE AUDIENCE SEES (Zanshin top-up refusal, 2026-08-31): list_month
@@ -549,6 +558,7 @@ def compensate_staged_rows(store, gym_id, rows, *, reason=REJECT_EDIT_CONFLICT,
     log = logger or (lambda m: print(f"[event-calendar] {m}"))
     denier = getattr(store, "deny_wipeable_with_reason", None)
     denied = 0
+    failed = False
     if denier is None:
         return {"ok": False, "denied": 0, "reason": reason}
     for row in rows or ():
@@ -561,7 +571,9 @@ def compensate_staged_rows(store, gym_id, rows, *, reason=REJECT_EDIT_CONFLICT,
         except Exception as exc:  # noqa: BLE001
             log(f"event edit compensation: deny {row.get('id')} failed "
                 f"{type(exc).__name__}")
-    return {"ok": True, "denied": denied, "reason": reason}
+            failed = True
+    return {"ok": not failed, "denied": denied, "reason": reason,
+            **({"error": "edit_compensation_incomplete"} if failed else {})}
 
 
 def _stamp_operation_row_ids(rows, operation_id, log):
