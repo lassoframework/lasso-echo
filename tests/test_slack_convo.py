@@ -576,6 +576,32 @@ def test_follow_up_attaches_and_retriggers_the_fixer():
     assert "fix it differently" in fixer_rows[-1]["body"]
 
 
+def test_portal_ticket_follow_up_keeps_ticket_product_not_scout_identity():
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {
+        "id": tid, "product": "portal", "source": "website_tab",
+        "client_id": "gym-one", "reporter": "owner@example.com",
+        "raw_text": "the portal is broken", "status": "fixing",
+        "slack_channel_id": "G0MPIM", "slack_thread_ts": "1.001",
+        "slack_user_id": "U_CLIENT", "identity_kind": "client",
+        "bot_identity": "scout", "classification": "code_fix",
+        "request_type": None, "verification_before": None,
+        "verification_after": None, "escalated": False, "lane": "hold",
+        "hold_tier": "routine", "request_version": 1,
+    }
+
+    decision = A.handle_event(
+        _ev("it is still broken after refreshing", ts="1.002"),
+        "G0MPIM:1.002", _deps(bus, identity="scout"),
+    )
+
+    assert decision.classification == C.FOLLOW_UP
+    row = _rows(bus, tid, A.KIND_FIXER_REQUEST)[-1]
+    assert f"ticket {tid} FOLLOW-UP on product portal" in row["body"]
+    assert "FOLLOW-UP on product scout" not in row["body"]
+
+
 @pytest.mark.parametrize("parked", ["approved", "hold", "new"])
 def test_follow_up_never_demotes_an_approved_held_or_ranger_ticket(parked):
     """V-M3: a follow-up on a ticket a human approved (or parked, or a Ranger action awaiting
@@ -686,6 +712,32 @@ def test_code_fix_writes_fixer_request_and_ack_never_an_answer():
     kinds = bus.outbound_kinds(d.ticket_id)
     assert A.KIND_FIXER_REQUEST in kinds and A.KIND_ACK in kinds
     assert A.KIND_ANSWER not in kinds
+
+
+def test_existing_portal_ticket_code_fix_keeps_ticket_product_not_scout_identity():
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {
+        "id": tid, "product": "portal", "source": "website_tab",
+        "client_id": "gym-one", "reporter": "owner@example.com",
+        "raw_text": "prior portal request", "status": "resolved",
+        "slack_channel_id": "G0MPIM", "slack_thread_ts": "1.001",
+        "slack_user_id": "U_CLIENT", "identity_kind": "client",
+        "bot_identity": "scout", "classification": None,
+        "request_type": None, "verification_before": None,
+        "verification_after": None, "escalated": False, "lane": "hold",
+        "hold_tier": None, "request_version": 1,
+    }
+
+    decision = A.handle_event(
+        _ev("the portal login is broken", ts="1.002", thread_ts="1.001"),
+        "G0MPIM:1.002", _deps(bus, identity="scout"),
+    )
+
+    assert decision.classification == C.CODE_FIX
+    row = _rows(bus, tid, A.KIND_FIXER_REQUEST)[-1]
+    assert f"ticket {tid} for product portal" in row["body"]
+    assert "for product scout" not in row["body"]
 
 
 def test_fixer_request_uses_the_prefix_the_existing_worker_watches():

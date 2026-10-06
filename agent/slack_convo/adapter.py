@@ -1402,7 +1402,9 @@ def handle_event(event, event_id, deps):
     if classification == _cls.CODE_FIX:
         deps.bus.set_ticket(tid, classification=_cls.CODE_FIX, status="triage", lane=lane,
                             hold_tier="routine" if lane == "hold" else None)
-        emit(KIND_FIXER_REQUEST, fixer_request_text(ident, tid, text, who, user),
+        emit(KIND_FIXER_REQUEST,
+             fixer_request_text(ident, tid, text, who, user,
+                                product=ticket.get("product")),
              author_type="system")
         if not _is_staffish(who):
             emit(KIND_ACK, ACK_CODE_FIX)
@@ -1555,7 +1557,8 @@ def _follow_up(deps, ident, ticket, who, user, text, surface, emit, out, created
         else:
             deps.bus.set_ticket(tid, status="triage")
             emit(KIND_FIXER_REQUEST, fixer_request_text(ident, tid, text, who, user,
-                                                        follow_up=True),
+                                                        follow_up=True,
+                                                        product=ticket.get("product")),
                  author_type="system")
     else:
         # approved / new (Ranger) / hold / non-code tickets: never demote, always tell a human
