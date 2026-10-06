@@ -222,19 +222,28 @@ def test_edit_404_for_missing_or_cross_gym(monkeypatch):
     assert status == 404
 
 
-@pytest.mark.parametrize("terminal_status", ["cancelled", "ended"])
-def test_edit_refuses_terminal_event_before_calendar_read_or_write(
-        monkeypatch, terminal_status):
+@pytest.mark.parametrize(("stored_status", "case_id"), [
+    ("cancelled", "cancelled"),
+    ("ended", "ended"),
+    (" LIVE ", "whitespace"),
+    ("Scheduled", "case-variant"),
+    ("archived", "unknown"),
+    ("", "empty"),
+    (None, "null"),
+    ({"value": "live"}, "object"),
+])
+def test_edit_refuses_noncanonical_status_before_calendar_read_or_write(
+        monkeypatch, stored_status, case_id):
     monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
     cal, ev = _CalStore(), _EvStore()
     original = {
-        "id": f"e-{terminal_status}", "gym_id": "pete",
+        "id": f"e-{case_id}", "gym_id": "pete",
         "name": "Fall Cohort", "type": "new_offer",
         "starts_on": "2026-10-01", "ends_on": "2026-10-14",
         "tz": "America/New_York", "offer_text": "Reserve a place",
         "link": "", "brief": "", "media_ids": [],
-        "status": terminal_status, "created_by": "owner",
-        "audit": [{"action": terminal_status}],
+        "status": stored_status, "created_by": "owner",
+        "audit": [{"action": "seed"}],
     }
     ev.upsert_event(original)
     writes_before = ev.upsert_calls

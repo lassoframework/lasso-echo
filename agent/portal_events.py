@@ -165,8 +165,9 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     # re-staging an arc after the status job ended it or an owner cancelled it. Keep an
     # explicit allowlist so malformed/future states also fail closed before we inspect
     # calendar rows, persist a merged event, or stage anything.
-    current_status = str(cur.get("status") or "").strip().lower()
-    if current_status not in _EDITABLE_EVENT_STATUSES:
+    current_status = cur.get("status")
+    if (not isinstance(current_status, str)
+            or current_status not in _EDITABLE_EVENT_STATUSES):
         return 409, {"error": "this promotion can no longer be edited"}
 
     merged = dict(cur)

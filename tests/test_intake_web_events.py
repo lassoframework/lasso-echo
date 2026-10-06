@@ -111,10 +111,13 @@ def _post_edit(monkeypatch, status):
     return captured, events, calendar
 
 
-@pytest.mark.parametrize("terminal_status", ["cancelled", "ended"])
-def test_http_edit_propagates_terminal_conflict_without_mutation(
-        monkeypatch, terminal_status):
-    captured, events, calendar = _post_edit(monkeypatch, terminal_status)
+@pytest.mark.parametrize("noncanonical_status", [
+    "cancelled", "ended", " LIVE ", "Scheduled", "archived", "", None,
+    {"value": "live"},
+])
+def test_http_edit_propagates_status_conflict_without_mutation(
+        monkeypatch, noncanonical_status):
+    captured, events, calendar = _post_edit(monkeypatch, noncanonical_status)
 
     assert captured["json"] == (
         409, {"error": "this promotion can no longer be edited"})
