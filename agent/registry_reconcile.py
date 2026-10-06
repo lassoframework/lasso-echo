@@ -128,13 +128,12 @@ def reconcile(*, http=None, clients=None, calendar_rows=None):
                 or not isinstance(base, str) or not _BASE.fullmatch(base)):
             result["error"] = "publisher registry contains missing identity"
             return result
-        gid = echo_clients.normalize_key(raw_gid)
-        if not gid:
-            result["error"] = "publisher registry contains missing identity"
-            return result
+        gid = raw_gid.strip().lower()
         # Existing rows must identify a real portal UUID. A legacy arbitrary
         # string cannot safely prove ownership or participate in uniqueness.
-        # Normalize case before the shared UUID syntax check and duplicate test.
+        # Only trim whitespace and normalize case. normalize_key() would strip
+        # an _ig/_fb suffix before this check and turn an account key into a
+        # seemingly valid gym UUID.
         if not echo_clients._UUID_RE.fullmatch(gid):  # noqa: SLF001
             result["error"] = "publisher registry contains invalid gym_id"
             return result

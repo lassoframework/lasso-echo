@@ -250,11 +250,27 @@ def test_non_uuid_registry_row_blocks_zanshin_registration(monkeypatch, tmp_path
     assert path.read_text() == before
 
 
+@pytest.mark.parametrize("suffix", ["_ig", "_fb"])
+def test_account_suffix_on_valid_uuid_is_not_a_registry_gym_id(monkeypatch,
+                                                                tmp_path, suffix):
+    clients = _clients()
+    path = _registry(monkeypatch, tmp_path, clients)
+    rows = [{"base": "existingclient123", "gym_id": OTHER_CLIENT + suffix}]
+    path.write_text(json.dumps(rows))
+    before = path.read_text()
+    result = registry_reconcile.reconcile(clients=clients,
+                                          calendar_rows=[_calendar()])
+    assert not result["ok"] and result["registered"] == []
+    assert result["error"] == "publisher registry contains invalid gym_id"
+    assert path.read_text() == before
+
+
 def test_uppercase_valid_uuid_is_normalized_for_registry_identity(monkeypatch, tmp_path):
     clients = _clients()
     path = _registry(monkeypatch, tmp_path, clients)
     other = "abcdefff-0000-4000-8000-000000000009"
-    path.write_text(json.dumps([{"base": "existingclient123", "gym_id": other.upper()}]))
+    path.write_text(json.dumps([{"base": "existingclient123",
+                                 "gym_id": f"  {other.upper()}  "}]))
     result = registry_reconcile.reconcile(clients=clients,
                                           calendar_rows=[_calendar()])
     assert result["ok"] and result["registered"] == [BASE]
@@ -266,7 +282,7 @@ def test_uuid_case_variants_cannot_hide_a_duplicate(monkeypatch, tmp_path):
     path = _registry(monkeypatch, tmp_path, clients)
     other = "abcdefff-0000-4000-8000-000000000009"
     rows = [{"base": "existingclient123", "gym_id": other},
-            {"base": "existingclient456", "gym_id": other.upper()}]
+            {"base": "existingclient456", "gym_id": f" {other.upper()} "}]
     path.write_text(json.dumps(rows))
     before = path.read_text()
     result = registry_reconcile.reconcile(clients=clients,
