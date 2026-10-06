@@ -132,6 +132,12 @@ def reconcile(*, http=None, clients=None, calendar_rows=None):
         if not gid:
             result["error"] = "publisher registry contains missing identity"
             return result
+        # Existing rows must identify a real portal UUID. A legacy arbitrary
+        # string cannot safely prove ownership or participate in uniqueness.
+        # Normalize case before the shared UUID syntax check and duplicate test.
+        if not echo_clients._UUID_RE.fullmatch(gid):  # noqa: SLF001
+            result["error"] = "publisher registry contains invalid gym_id"
+            return result
         if base in by_base or gid in by_id:
             result["error"] = "publisher registry contains duplicate identity"
             return result
