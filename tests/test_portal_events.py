@@ -29,16 +29,22 @@ class _CalStore:
         self.existing = existing or []
         self.inserted = []
         self.event_row_reads = 0
+        self.before_insert = None
 
     def list_month(self, gym_id, month):
         return [r for r in self.existing
                 if r.get("gym_id") == gym_id and str(r.get("post_date"))[:7] == month]
 
     def insert_rows(self, gym_id, rows):
+        hook = self.before_insert
+        self.before_insert = None
+        if hook is not None:
+            hook()
         out = []
         for r in rows:
             rr = dict(r)
             rr["gym_id"] = gym_id
+            rr.setdefault("id", f"calendar-{len(self.inserted) + 1}")
             self.inserted.append(rr)
             out.append(rr)
         return out
@@ -336,6 +342,38 @@ def test_concurrent_terminal_transition_wins_edit_compare_and_set(
     assert ev.rows[event_id]["ends_on"] == before["ends_on"]
     assert ev.rows[event_id]["audit"] == before["audit"]
     assert cal.inserted == staged_before, "failed CAS must not restage calendar rows"
+
+
+def test_cancel_after_event_cas_before_calendar_insert_is_compensated(monkeypatch):
+    """A cancellation in the exact post-CAS/pre-insert gap leaves no active rows."""
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+
+    def _cancel_in_gap():
+        status, response = pe.handle_cancel_event(
+            "pete", event_id, {"actor_id": "owner"}, store=cal,
+            event_store=ev)
+        assert status == 200
+        assert response["cancelled"] is True
+
+    cal.before_insert = _cancel_in_gap
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "stale-editor"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 409
+    assert response["compensated"] > 0
+    assert ev.rows[event_id]["status"] == "cancelled"
+    active = [row for row in cal.inserted
+              if row.get("event_id") == event_id
+              and row.get("status") in ("pending", "draft", "queued")]
+    assert active == []
 
 
 # ---- cancel --------------------------------------------------------------------

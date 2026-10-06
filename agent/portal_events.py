@@ -211,12 +211,42 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     staged = 0
     held_media = 0
     stage_reason = ""
+    inserted_rows = []
     if _store is not None and restage:
         res = ec.stage_arc(_store, new_event, restage,
                            profile=_profile_for(account_key))
         staged = res.get("staged", 0)
         held_media = res.get("held_media", 0)
         stage_reason = res.get("reason", "")
+        inserted_rows = res.get("_inserted_rows", [])
+
+    # The event CAS and calendar insert are separate PostgREST requests. A cancel or
+    # nightly terminal transition can therefore win after the CAS but before/during
+    # stage_arc. Re-read after the durable insert and compensate before returning:
+    # terminal state owns every pending event row; another same-status edit invalidates
+    # only the exact rows this call inserted. The counterpart cancel/status paths sweep
+    # after their status write, so every possible ordering ends with zero active rows
+    # for a terminal event. A pre-insert read alone cannot provide that guarantee.
+    try:
+        after_stage = _estore.get_event(account_key, event_id)
+    except Exception as exc:  # noqa: BLE001
+        compensated = (ec.compensate_staged_rows(
+            _store, account_key, inserted_rows) if _store is not None else
+            {"denied": 0})
+        return 502, {"error": f"post-stage verification failed: {type(exc).__name__}",
+                     "compensated": compensated.get("denied", 0)}
+    if after_stage != saved:
+        terminal = (after_stage or {}).get("status")
+        if _store is not None and terminal in ("cancelled", "ended"):
+            compensated = ec.cancel_event(
+                _store, account_key, event_id, ended=terminal == "ended")
+        elif _store is not None:
+            compensated = ec.compensate_staged_rows(
+                _store, account_key, inserted_rows)
+        else:
+            compensated = {"denied": 0}
+        return 409, {"error": "this promotion changed while it was being edited",
+                     "compensated": compensated.get("denied", 0)}
     return 200, {"event": _event_row(new_event), "restaged": staged,
                  "held_media": held_media, "reason": stage_reason,
                  "kept": len(keep), "removed": len(remove_keys)}

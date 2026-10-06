@@ -33,6 +33,7 @@ _WIPEABLE = ("pending", "draft", "queued")
 REJECT_CANCELLED = "event_cancelled"
 REJECT_ENDED = "event_ended"
 REJECT_DEAD_LINK = "event_link_dead"
+REJECT_EDIT_CONFLICT = "event_edit_conflict"
 
 # The A-gate protects an ALREADY-POPULATED month from being broken by an arc insert.
 # Below this many existing rows the calendar is a sparse seed (a brand-new gym or the
@@ -471,6 +472,7 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     if not _stamp_logical_post_ids(to_stage, log):
         return {"ok": False, "reason": "logical post id stamp failed", "staged": 0}
     inserted = 0
+    inserted_rows = []
     inserter = getattr(store, "insert_rows", None)
     if inserter is not None and to_stage:
         # Strip the transient planner-only keys the DB does not carry.
@@ -482,6 +484,7 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
             # inserted row. _attach_media reserves IDs within this call, but stamping
             # before durable confirmation could consume a photo with no calendar row.
             if isinstance(written, (list, tuple)):
+                inserted_rows = [dict(row) for row in written if isinstance(row, dict)]
                 waiting = {}
                 for row in to_stage:
                     ident = _media_write_identity(row, gym_id)
@@ -504,7 +507,39 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
             "held_media": len(held_media),
             "thinned": len(arc_rows) - len(thinned),
             "grade": (grade.total if grade else None),
-            "letter": (grade.letter if grade else None), "months": months}
+            "letter": (grade.letter if grade else None), "months": months,
+            # Internal durability receipt for callers that must compensate an
+            # event transition racing after staging. Production insert_rows returns
+            # exact persisted rows; a count alone is deliberately not treated as
+            # enough identity to undo anything.
+            "_inserted_rows": inserted_rows}
+
+
+def compensate_staged_rows(store, gym_id, rows, *, reason=REJECT_EDIT_CONFLICT,
+                           logger=None):
+    """Deny only the exact newly inserted pending rows from a lost event edit race.
+
+    This is the post-insert half of the edit/cancel serialization fence. It never
+    touches approved or published rows, and every write remains scoped by gym id and
+    the database-returned row id. Callers use ``cancel_event`` instead when the event
+    is terminal, because cancellation/ending owns every still-pending row in the arc.
+    """
+    log = logger or (lambda m: print(f"[event-calendar] {m}"))
+    denier = getattr(store, "deny_with_reason", None)
+    denied = 0
+    if denier is None:
+        return {"ok": False, "denied": 0, "reason": reason}
+    for row in rows or ():
+        if (_status(row) not in _WIPEABLE or not row.get("id")
+                or str(row.get("gym_id") or "") != str(gym_id)):
+            continue
+        try:
+            if denier(gym_id, row["id"], reason):
+                denied += 1
+        except Exception as exc:  # noqa: BLE001
+            log(f"event edit compensation: deny {row.get('id')} failed "
+                f"{type(exc).__name__}")
+    return {"ok": True, "denied": denied, "reason": reason}
 
 
 def backfill_missing_media(store, gym_id, event_id, *, statuses=("pending", "approved"),
