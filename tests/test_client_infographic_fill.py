@@ -543,7 +543,7 @@ def test_photos_rechecked_at_generation_time(monkeypatch):
     calls = {"n": 0}
     real = cif.real_media_depleted
 
-    def _flip(base, *, now=None):
+    def _flip(base, *, now=None, post_date=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return real(base, now=now)   # the top-of-scan check: still depleted
@@ -621,7 +621,7 @@ def test_photo_arriving_after_render_holds_before_insert(monkeypatch):
     _arm_astra(monkeypatch, 200, _astra_body())
     calls = {"n": 0}
 
-    def _flip(base, *, now=None):
+    def _flip(base, *, now=None, post_date=None):
         calls["n"] += 1
         return calls["n"] <= 2  # scan + pre-render pass; pre-insert fails
 

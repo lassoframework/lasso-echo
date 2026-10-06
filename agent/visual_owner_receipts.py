@@ -249,3 +249,54 @@ def produce_same_object(*, tenant, group_key, exact_bytes, evidence, asset_id=No
         except Exception:  # noqa: BLE001
             pass
     return {"read_receipt": str(read_receipt), "render_receipt": None}
+
+
+def default_scene_writer():
+    """Separate owner authority; the scene guard never falls back to service role."""
+    return produce_scene if default_writer() is not None else None
+
+
+def produce_scene(*, tenant, group_key, object_role, exact_url, exact_bytes,
+                  connection_factory=None):
+    """Compute pHash and MD5 from the SAME bounded bytes; no caller hash input.
+
+    Stable owner receipt identity makes byte-identical retries idempotent.
+    This function is used only by the dedicated owner runtime. SQL denies
+    service-role INSERT, UPDATE, DELETE and TRUNCATE on its receipt table.
+    """
+    tenant, group_key, exact_url, fingerprint, _, _, _ = _validate_same_object(
+        tenant, group_key, exact_bytes,
+        {"exact_url": exact_url, "evidence_ref": "owner-scene-exact-bytes",
+         "observed_by": "visual-scene-owner"}, None)
+    if object_role not in ("display", "poster"):
+        raise OwnerReceiptError("scene object role is invalid")
+    from . import visual_scene
+    scene = visual_scene.scene_fingerprint(exact_bytes)
+    if scene is None:
+        raise OwnerReceiptError("owner scene bytes have no decodable pHash")
+    phash = scene.rsplit(":", 1)[-1]
+    import json
+    algorithm = "echo-dct-phash64-v1"
+    receipt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(
+        [tenant, group_key, object_role, exact_url, fingerprint, phash,
+         len(exact_bytes), algorithm], separators=(",", ":"))))
+    connection = connection_factory() if connection_factory else _connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "insert into public.visual_scene_owner_phash_receipt "
+                "(receipt_id,tenant_id,group_key,object_role,exact_url,fingerprint,"
+                "phash,byte_length,algorithm) values (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "on conflict (receipt_id) do nothing",
+                (receipt_id, tenant, group_key, object_role, exact_url, fingerprint,
+                 phash, len(exact_bytes), algorithm))
+        connection.commit()
+    except Exception as exc:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        raise OwnerReceiptError("owner scene receipt transaction failed") from exc
+    finally:
+        connection.close()
+    return {"receipt_id": receipt_id, "phash": phash, "fingerprint": fingerprint}

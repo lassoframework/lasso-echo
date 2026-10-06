@@ -222,9 +222,13 @@ def test_drive_photo_is_cropped_then_stamped_once(monkeypatch):
     monkeypatch.setattr(gym_media_index, "default_store", lambda: Store())
     monkeypatch.setattr(gym_media_index, "needs_rendition", lambda _asset: False)
     monkeypatch.setattr(drive_client, "DriveClient", lambda: Drive())
-    monkeypatch.setattr(gym_media_selector, "pick_media",
-                        lambda gym, kind_preference, **kwargs: asset
-                        if kind_preference == "photo" else None)
+    seen_pick_kwargs = []
+
+    def _pick_media(gym, kind_preference, **kwargs):
+        seen_pick_kwargs.append(kwargs)
+        return asset if kind_preference == "photo" else None
+
+    monkeypatch.setattr(gym_media_selector, "pick_media", _pick_media)
     monkeypatch.setattr(gym_media_selector, "stamp_use",
                         lambda selected, gym, day, **kwargs:
                         stamps.append((selected["id"], gym, day)))
@@ -237,8 +241,12 @@ def test_drive_photo_is_cropped_then_stamped_once(monkeypatch):
     used = set()
     pick = gp._drive_photo_candidate("gymx_ig", "2026-10-03", used)
     assert pick["url"] == "https://r2/gymx_ig/2026-10-03.jpg"
+    assert seen_pick_kwargs[-1]["post_date"] == "2026-10-03"
     assert used == {"drive-photo-1"}
     assert stamps == [], "candidate materialization must not burn the asset"
+
+    gp._drive_photo_candidate("gymx_ig", None, set())
+    assert "post_date" not in seen_pick_kwargs[-1]
 
 
 def test_active_drive_uncertainty_holds_local_gbp_fallback(monkeypatch):

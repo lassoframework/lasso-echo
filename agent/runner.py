@@ -812,7 +812,7 @@ def _client_drive_first_draft(account, day_key, voice, kind_prefs=("photo",)):
         return None
 
 
-def _client_drive_kind_available(account, kind):
+def _client_drive_kind_available(account, kind, day_key=None):
     """True/False for a readable Drive inventory, None when inventory is uncertain."""
     if not (config.gym_drive_stage_enabled()
             and config.gym_drive_connect_active_for(account.key)):
@@ -838,7 +838,8 @@ def _client_drive_kind_available(account, kind):
             def list_sources(self, _base, include_inactive=False):
                 return sources
         return bool(gym_media_selector.pickable(
-            base, kind, store=Snapshot(), strict_claims=True))
+            base, kind, store=Snapshot(), strict_claims=True,
+            **({"post_date": day_key} if day_key else {})))
     except Exception:  # noqa: BLE001 - uncertainty holds lower-priority video
         return None
 
@@ -865,7 +866,7 @@ def _client_local_photo_available(account, day_key, library_path):
 def _client_photo_first_draft(account, day_key, voice, library_path, poster=None):
     """Daily client order: Drive photo, local photo, Drive video, local video."""
     from .client_content import build_client_draft
-    drive_photo = _client_drive_kind_available(account, "photo")
+    drive_photo = _client_drive_kind_available(account, "photo", day_key)
     draft = None
     if drive_photo is True:
         draft = _client_drive_first_draft(
@@ -879,7 +880,7 @@ def _client_photo_first_draft(account, day_key, voice, library_path, poster=None
     # A photo tier that is present, unreadable, or failed materialization holds
     # all videos. Enter video tiers only after both photo inventories are known empty.
     if draft is None and drive_photo is False and local_photo is False:
-        drive_video = _client_drive_kind_available(account, "video")
+        drive_video = _client_drive_kind_available(account, "video", day_key)
         if drive_video is True:
             draft = _client_drive_first_draft(
                 account, day_key, voice, kind_prefs=("video",))

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import unicodedata
 import uuid
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -103,7 +104,8 @@ def _prepare_poster_edge(store, tenant, group, image_url, image_bytes, image_has
         raise VisualPreparationError("poster registration returned conflicting identity")
     return {"role": "poster", "exact_url": poster_url,
             "fingerprint": poster_hash, "byte_length": len(poster),
-            "scene_fingerprint": _scene_fingerprint(poster) if scene_armed else None}
+            "scene_fingerprint": _scene_fingerprint(poster) if scene_armed else None,
+            "exact_bytes": poster}
 
 
 def _rpc(store, name, arguments):
@@ -254,11 +256,10 @@ def _scene_fingerprint(data):
     """Additive, advisory pHash scene evidence ('scene:phash64:<16 hex>') for
     bytes whose exact md5 identity is already verified, or None.
 
-    ADVISORY METADATA ONLY (Astra rejection, see
-    docs/VISUAL_SCENE_GUARD_DRAFT.md): prep-time scene records were rejected as
-    an architecture — prep must not act as an enforcement writer. This helper
-    therefore never gates and never raises: undecodable bytes simply record
-    null evidence alongside the md5 identity, which stays the only authority."""
+    This decoder never gates or raises: undecodable bytes record null
+    evidence alongside exact md5 identity. The separately armed DRAFT durable
+    adapter requires decodable evidence for the actual displayed object; its
+    candidate registration never consumes a scene or records use."""
     try:
         from . import visual_scene
         return visual_scene.scene_fingerprint(data)
@@ -291,7 +292,7 @@ def _candidate_emission_armed():
         return False
 
 
-def _scene_candidate(tenant, group, objects):
+def _scene_candidate(tenant, group, objects, *, force=False):
     """Owner-attested CANDIDATE pHash evidence for the visual_scene_candidate
     staging contract (docs/VISUAL_SCENE_GUARD_DRAFT.md redesign item (a)).
 
@@ -307,14 +308,14 @@ def _scene_candidate(tenant, group, objects):
     did not decode carries phash=None and stageable=False: the phash-NOT-NULL
     staging table can never take it, and null pHash evidence is never treated
     as DISTINCT (unknown fails closed)."""
-    if not _candidate_emission_armed():
+    if not force and not _candidate_emission_armed():
         return None
     entries = []
     for role, url, md5_fp, length, scene_fp in objects:
         bare = None
         if isinstance(scene_fp, str) and scene_fp.startswith("scene:phash64:"):
             digest = scene_fp.rsplit(":", 1)[-1]
-            bare = digest if len(digest) == 16 else None
+            bare = digest if re.fullmatch(r"[0-9a-f]{16}", digest) else None
         entries.append({"role": role, "phash": bare,
                         "scene_fingerprint": scene_fp, "exact_url": url,
                         "fingerprint": md5_fp, "byte_length": length,
@@ -326,6 +327,88 @@ def _scene_candidate(tenant, group, objects):
             "observed_by": "visual_writer_prepare",
             "evidence_ref": "visual_writer_prepare:candidate_scene_evidence",
             "objects": entries}
+
+
+def _scene_guard_armed():
+    """The DRAFT guard is OFF by default; unknown flag values fail closed."""
+    from . import config
+    try:
+        state = config.visual_scene_guard_flag()
+    except Exception as exc:
+        raise VisualPreparationError("scene guard flag could not be verified") from exc
+    if state is None:
+        raise VisualPreparationError("scene guard flag state is ambiguous")
+    return state is True
+
+
+def _prepared_scene_candidate(store, tenant, group, prepared, objects, exact_objects):
+    """Stage only the actual displayed object after owner byte preparation.
+
+    Advisory candidate emission remains independently optional. When the scene
+    guard is explicitly armed, registration is mandatory and the SQL RPC must
+    verify the owner attestation for this exact tenant/group/URL/MD5. It owns
+    atomic retry identity; this adapter sends deterministic evidence so an
+    identical retry returns the same candidate UUID. No registration is use.
+    """
+    armed = _scene_guard_armed()
+    candidate = _scene_candidate(tenant, group, objects, force=armed)
+    if not armed:
+        return candidate
+    poster_url = prepared.get("thumbnail_url")
+    has_poster = isinstance(poster_url, str) and bool(poster_url.strip()) and (
+        poster_url != prepared.get("image_url"))
+    role = "poster" if has_poster else "display"
+    url = poster_url if has_poster else prepared.get("image_url")
+    allowed_roles = ("poster",) if has_poster else ("delivered", "same_object")
+    displayed = [item for item in candidate["objects"]
+                 if item["role"] in allowed_roles and item["exact_url"] == url]
+    if len(displayed) != 1:
+        raise VisualPreparationError("scene candidate has no verified displayed object")
+    entry = displayed[0]
+    if not entry["stageable"]:
+        raise VisualPreparationError("displayed scene candidate has no decodable pHash")
+    if not re.fullmatch(r"md5:[0-9a-f]{32}", str(entry["fingerprint"])):
+        raise VisualPreparationError("displayed scene candidate has no verified MD5")
+    from . import visual_owner_receipts
+    scene_writer = visual_owner_receipts.default_scene_writer()
+    if not callable(scene_writer):
+        raise VisualPreparationError("owner scene receipt producer is unavailable")
+    try:
+        receipt = scene_writer(tenant=tenant, group_key=group, object_role=role,
+                               exact_url=url, exact_bytes=exact_objects[url])
+        receipt_id = str(uuid.UUID(str(receipt["receipt_id"])))
+        if receipt["phash"] != entry["phash"] or receipt["fingerprint"] != entry["fingerprint"]:
+            raise ValueError("owner scene receipt differs from displayed bytes")
+    except Exception as exc:
+        raise VisualPreparationError("owner scene receipt production failed") from exc
+    # Owner receipt IDs are deterministic for the exact byte binding. Keep
+    # timestamps and caller-supplied candidate identity out. Raw source objects
+    # never acquire the SQL display role merely because their pHash decodes.
+    arguments = {
+        "p_tenant": tenant, "p_group_key": group,
+        "p_phash": entry["phash"], "p_exact_url": url,
+        "p_fingerprint": entry["fingerprint"],
+        "p_evidence": {"source": "owner_prepared_exact_object_bytes",
+                       "verified_bytes": entry["fingerprint"],
+                       "byte_length": entry["byte_length"],
+                       "owner_phash_receipt": receipt_id},
+        "p_actor": "visual_writer_prepare", "p_object_role": role,
+    }
+    try:
+        result = _rpc(store, "visual_scene_register_candidate", arguments)
+    except VisualPreparationError:
+        raise
+    except Exception as exc:
+        raise VisualPreparationError("scene candidate registration failed") from exc
+    try:
+        candidate_id = str(uuid.UUID(result))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise VisualPreparationError("scene candidate registration returned invalid UUID") from exc
+    entry["candidate_id"] = candidate_id
+    entry["object_role"] = role
+    candidate["candidate_id"] = candidate_id
+    candidate["object_role"] = role
+    return candidate
 
 
 def _known_group(store, tenant, row, source_url, *, required=True):
@@ -478,7 +561,8 @@ def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url
     if poster is not None:
         objects.append((poster["role"], poster["exact_url"], poster["fingerprint"],
                         poster["byte_length"], poster["scene_fingerprint"]))
-    candidate = _scene_candidate(tenant, group, objects)
+    candidate = _prepared_scene_candidate(store, tenant, group, prepared, objects,
+        {poster["exact_url"]: poster["exact_bytes"]} if poster is not None else {delivered_url: delivered})
     if candidate is not None:
         prepared["scene_candidate"] = candidate
     prepared["visual_group_key"] = group
@@ -493,7 +577,10 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
     The legacy bundle RPC may create an absent scene, but cannot establish byte
     authority. The owner read receipt and source/rendition RPC do that work.
     """
+    guard_armed = _scene_guard_armed()
     if not enabled():
+        if guard_armed:
+            raise VisualPreparationError("scene guard requires owner byte preparation")
         return row
     prepared = dict(row)
     _distinct_poster_url(prepared, poster_render_evidence)
@@ -593,7 +680,8 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
     if poster is not None:
         objects.append((poster["role"], poster["exact_url"], poster["fingerprint"],
                         poster["byte_length"], poster["scene_fingerprint"]))
-    candidate = _scene_candidate(tenant, group, objects)
+    candidate = _prepared_scene_candidate(store, tenant, group, prepared, objects,
+        {poster["exact_url"]: poster["exact_bytes"]} if poster is not None else {url: data})
     if candidate is not None:
         prepared["scene_candidate"] = candidate
     prepared["visual_group_key"] = group
@@ -611,6 +699,8 @@ def prepare_same_object(store, account_key, row_or_url, *, flag_on=None,
     owner receipt checks. Injected callbacks are isolated-test-only.
     """
     actual = enabled()
+    if not actual and _scene_guard_armed():
+        raise VisualPreparationError("scene guard requires owner byte preparation")
     if flag_on is not None and bool(flag_on) is not actual:
         raise VisualPreparationError("writer preparation flag state is ambiguous")
     if isinstance(row_or_url, dict):
@@ -659,7 +749,10 @@ def prepare(store, account_key, row, *, read_bytes=None, render_evidence=None,
     evidence the row fails closed before any lookup, RPC or calendar write.
     Blank posters and posters exactly equal to ``image_url`` need no edge.
     """
+    guard_armed = _scene_guard_armed()
     if not enabled():
+        if guard_armed:
+            raise VisualPreparationError("scene guard requires owner byte preparation")
         return row
     prepared = dict(row)
     _distinct_poster_url(prepared, poster_render_evidence)

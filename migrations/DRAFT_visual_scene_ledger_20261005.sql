@@ -25,6 +25,8 @@
 -- ROLLBACK (before any activation): nothing is applied anywhere; delete the
 -- file. If it were ever applied to a scratch database, drop in this order:
 --   drop function if exists public.visual_scene_backfill_occupied();
+--   drop table if exists public.visual_scene_history_object_binding;
+--   drop table if exists public.visual_scene_history_receipt;
 --   drop function if exists public.visual_scene_hold_resolve(uuid,text,text,jsonb);
 --   drop function if exists public.visual_scene_claim_decide(public.content_calendar,uuid);
 --   drop function if exists public.visual_scene_claim_guard(public.content_calendar,uuid);
@@ -35,6 +37,9 @@
 --   drop function if exists public.visual_scene_register_candidate(text,text,text,text,text,jsonb,text,text);
 --   drop function if exists public.visual_scene_hamming(text,text);
 --   drop trigger if exists visual_scene_occupied_immutable on public.visual_scene_phash_occupied;
+--   drop trigger if exists visual_scene_owner_phash_receipt_immutable on public.visual_scene_owner_phash_receipt;
+--   drop trigger if exists visual_scene_owner_phash_receipt_no_truncate on public.visual_scene_owner_phash_receipt;
+--   drop function if exists public.visual_scene_receipt_no_truncate();
 --   drop trigger if exists visual_scene_candidate_immutable on public.visual_scene_candidate;
 --   drop trigger if exists visual_scene_review_hold_guard on public.visual_scene_review_hold;
 --   drop function if exists public.visual_scene_immutable();
@@ -42,12 +47,13 @@
 --   drop table if exists public.visual_scene_review_hold;
 --   drop table if exists public.visual_scene_phash_occupied;
 --   drop table if exists public.visual_scene_candidate;
+--   drop table if exists public.visual_scene_owner_phash_receipt;
 -- The frozen md5-keyed exact-byte ledger (visual_global_usage, its members and
 -- the visual_global_claim_scene path) is NOT touched by this file and needs no
 -- rollback.
 --
 -- WHAT THIS FILE IMPLEMENTS (the MINIMAL durable subset of the claim-wave
--- redesign — items (a)-(d); item (e) backfill remains a guarded stub):
+-- redesign — items (a)-(e); backfill requires explicit owner receipts):
 --   (a) visual_scene_candidate — prep-time STAGING. A candidate row carries
 --       owner-attested pHash evidence bound to exact verified bytes: it must
 --       reference a visual_global_object_attestation row (same canonical
@@ -60,9 +66,10 @@
 --       by role + exact_url binding and the claim scan rejects (fail closed)
 --       any candidate not bound to the row's delivered object. A candidate
 --       NEVER counts as use and never gates.
---   (b) visual_scene_phash_occupied — a once-used scene is recorded ONLY by
---       the claim path (visual_scene_claim_decide / visual_scene_claim_guard
---       on a clean verdict), inside the caller's claim transaction. Occupancy
+--   (b) visual_scene_phash_occupied — a once-used scene is recorded by
+--       the owner-receipted historical importer or the claim path
+--       (visual_scene_claim_decide / visual_scene_claim_guard on a clean
+--       verdict), inside the caller's transaction. Occupancy
 --       is PERMANENT: the append-only immutability trigger blocks
 --       UPDATE/DELETE, and no function in this file frees an occupied scene
 --       on local release, denial, or swap — mirroring the exact-byte ledger's
@@ -83,9 +90,9 @@
 --       occupied row; there is deliberately NO exact-match pre-filter — a
 --       one-bit-away pHash must be caught). No client-side scan remains a
 --       valid decision path.
---   (e) visual_scene_backfill_occupied is a STUB that RAISES 0A000. Occupied
---       history must be derived from the exact-byte ledger before any
---       activation; shipping the backfill is part of the activation draft.
+--   (e) visual_scene_backfill_occupied imports ONLY immutable owner-reviewed
+--       receipts bound to permanent exact-byte history and source/display
+--       lineage. Missing receipts remain coverage/activation blockers.
 --
 -- POLICY (mirrors the claim-wave draft and agent-side classify bands):
 --   hamming <= 6    near_frame: cross-tenant OR same-tenant-different-date
@@ -156,7 +163,7 @@
 --  3. ROW REACTIVATION. A post-approval safe-reactivation RPC (re-scan +
 --     persisted-identity verification) belongs to the activation draft; it is
 --     deliberately NOT ported here.
---  4. BACKFILL (still 0A000). Occupied history must be derived from the
+--  4. BACKFILL COVERAGE. Occupied history must be derived from the
 --     exact-byte ledger and attested candidates before activation. Unknown or
 --     source-null published history must STAY HELD for review, and the
 --     backfill may never mark a staged candidate as used.
@@ -172,6 +179,28 @@ begin;
 --   'poster'  — the video poster/thumbnail (content_calendar.thumbnail_url),
 --               only when distinct from image_url.
 -- ---------------------------------------------------------------------------
+-- Dedicated owner-only computed pHash receipts. Never writable by service_role.
+-- The owner producer calculates both fingerprints from one exact byte buffer.
+create table if not exists public.visual_scene_owner_phash_receipt (
+  receipt_id uuid primary key,
+  tenant_id text not null,
+  group_key text not null,
+  object_role text not null check (object_role in ('display','poster')),
+  exact_url text not null check (btrim(exact_url) <> ''),
+  fingerprint text not null check (fingerprint ~ '^md5:[0-9a-f]{32}$'),
+  phash char(16) not null check (phash ~ '^[0-9a-f]{16}$'),
+  byte_length bigint not null check (byte_length > 0),
+  algorithm text not null check (algorithm = 'echo-dct-phash64-v1'),
+  created_at timestamptz not null default now(),
+  foreign key (tenant_id, group_key, exact_url, fingerprint)
+    references public.visual_global_object_attestation(tenant_id, group_key, exact_url, fingerprint)
+);
+alter table public.visual_scene_owner_phash_receipt enable row level security;
+revoke all on public.visual_scene_owner_phash_receipt
+  from public, anon, authenticated, service_role;
+-- Provision the separate owner role explicitly during reviewed activation;
+-- this draft grants NO mint privilege to application roles.
+
 create table if not exists public.visual_scene_candidate (
   candidate_id uuid primary key default gen_random_uuid(),
   tenant_id    text        not null,
@@ -195,11 +224,17 @@ create index if not exists visual_scene_candidate_scene_idx
   on public.visual_scene_candidate (tenant_id, group_key);
 create index if not exists visual_scene_candidate_phash_idx
   on public.visual_scene_candidate (phash);
-create index if not exists visual_scene_candidate_object_idx
+-- One candidate per exact delivered object per scene and role. Registration is
+-- IDEMPOTENT on this identity (visual_scene_register_candidate returns the
+-- existing candidate_id for an exact identical retry instead of minting a
+-- fresh UUID) and a conflicting pHash/fingerprint/evidence for the same
+-- identity is refused — the evidence a hold was reviewed against can never be
+-- duplicated or drifted by a retry.
+create unique index if not exists visual_scene_candidate_object_uq
   on public.visual_scene_candidate (tenant_id, group_key, object_role, exact_url);
 
 -- ---------------------------------------------------------------------------
--- (b) Occupied once-used scenes. Written ONLY inside the claim path; PERMANENT
+-- (b) Occupied once-used scenes. Claim path or owner history import; PERMANENT
 -- (append-only, never freed on release/denial/swap). used_date NOT NULL so
 -- the same-tenant cross-date policy always has a date dimension. Same-tenant
 -- same-date same-group siblings are legal, so the PK includes the date and
@@ -220,7 +255,7 @@ create table if not exists public.visual_scene_phash_occupied (
 );
 
 comment on table public.visual_scene_phash_occupied is
-  'DRAFT/UNAPPLIED/OFF: once-used global scene (pHash) evidence, recorded ONLY inside the calendar claim transaction on a clean decision. PERMANENT: append-only, never freed on local release, denial or swap (mirrors the exact-byte ledger). Similarity evidence, never byte identity.';
+  'DRAFT/UNAPPLIED/OFF: once-used global scene (pHash) evidence, recorded inside the calendar claim transaction on a clean decision or from immutable owner-reviewed historical receipts. PERMANENT: append-only, never freed on local release, denial or swap (mirrors the exact-byte ledger). Similarity evidence, never byte identity.';
 
 -- Full-table hamming scans are the design (no selective index is correct for
 -- a one-bit-away match); this index serves inspection and hold forensics.
@@ -338,6 +373,24 @@ begin
 end;
 $$;
 
+drop trigger if exists visual_scene_owner_phash_receipt_immutable on public.visual_scene_owner_phash_receipt;
+create trigger visual_scene_owner_phash_receipt_immutable
+  before update or delete on public.visual_scene_owner_phash_receipt
+  for each row execute function public.visual_scene_immutable();
+create or replace function public.visual_scene_receipt_no_truncate()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  raise exception 'owner scene receipts are immutable' using errcode='23514';
+end;
+$$;
+revoke all on function public.visual_scene_receipt_no_truncate()
+  from public, anon, authenticated, service_role;
+drop trigger if exists visual_scene_owner_phash_receipt_no_truncate on public.visual_scene_owner_phash_receipt;
+create trigger visual_scene_owner_phash_receipt_no_truncate
+  before truncate on public.visual_scene_owner_phash_receipt
+  for each statement execute function public.visual_scene_receipt_no_truncate();
+
+
 drop trigger if exists visual_scene_candidate_immutable on public.visual_scene_candidate;
 create trigger visual_scene_candidate_immutable
   before update or delete on public.visual_scene_candidate
@@ -375,7 +428,9 @@ $$;
 -- visual_global_object_attestation, evidence must carry verified_bytes
 -- matching the attested md5, and object_role declares which delivered object
 -- of the calendar row the candidate binds to. Registration NEVER consumes a
--- scene.
+-- scene and is IDEMPOTENT on (tenant, group, object_role, exact_url): an exact
+-- identical retry returns the existing candidate_id, while a conflicting
+-- pHash/fingerprint/evidence for the same identity is refused.
 -- ---------------------------------------------------------------------------
 create or replace function public.visual_scene_register_candidate(
   p_tenant text, p_group_key text, p_phash text,
@@ -383,6 +438,7 @@ create or replace function public.visual_scene_register_candidate(
   p_object_role text default 'display'
 ) returns uuid language plpgsql security definer set search_path = public as $$
 declare v_tenant text; v_id uuid;
+  v_existing public.visual_scene_candidate%rowtype;
 begin
   v_tenant := public.visual_group_tenant_strict(p_tenant)::text;
   if p_tenant is distinct from v_tenant then
@@ -410,6 +466,43 @@ begin
         and o.exact_url = p_exact_url and o.fingerprint = p_fingerprint) then
     raise exception 'candidate phash is not backed by owner-attested exact bytes'
       using errcode='23514';
+  end if;
+  -- MD5 attestation alone cannot authorize caller-selected scene similarity.
+  -- Validate the immutable owner computation BEFORE the idempotent return.
+  if not exists(select 1 from public.visual_scene_owner_phash_receipt r
+      join public.visual_global_object_attestation o
+        on o.tenant_id=r.tenant_id and o.group_key=r.group_key
+        and o.exact_url=r.exact_url and o.fingerprint=r.fingerprint
+      where r.receipt_id::text = p_evidence->>'owner_phash_receipt'
+        and r.tenant_id=v_tenant and r.group_key=p_group_key
+        and r.object_role=p_object_role and r.exact_url=p_exact_url
+        and r.fingerprint=p_fingerprint and r.phash=p_phash
+        and r.byte_length=o.byte_length
+        and r.algorithm='echo-dct-phash64-v1') then
+    raise exception 'candidate needs matching immutable owner pHash receipt'
+      using errcode='23514';
+  end if;
+  -- IDEMPOTENT REGISTRATION under concurrency: serialize registrations of the
+  -- same delivered-object identity, then either return the EXISTING candidate
+  -- for an exact identical retry (a fresh UUID for the same evidence would
+  -- double-bind the row's delivered object and make
+  -- visual_scene_hold_resolve reject an otherwise valid live row) or refuse a
+  -- conflicting one. The first row's evidence is preserved untouched; the
+  -- candidate table is append-only/immutable.
+  perform pg_advisory_xact_lock(hashtextextended(
+    'visual_scene_candidate', hashtextextended(
+      v_tenant || ':' || p_group_key || ':' || p_object_role || ':' || p_exact_url, 0)));
+  select c.* into v_existing from public.visual_scene_candidate c
+    where c.tenant_id = v_tenant and c.group_key = p_group_key
+      and c.object_role = p_object_role and c.exact_url = p_exact_url;
+  if found then
+    if v_existing.phash <> p_phash
+        or v_existing.fingerprint <> p_fingerprint
+        or v_existing.evidence <> p_evidence then
+      raise exception 'conflicting scene candidate evidence for the same delivered object'
+        using errcode='23514';
+    end if;
+    return v_existing.candidate_id;
   end if;
   insert into public.visual_scene_candidate
     (tenant_id, group_key, object_role, phash, exact_url, fingerprint, evidence, attested_by)
@@ -980,18 +1073,177 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- (e) Backfill stub. Occupied history must be derived from the exact-byte
--- ledger (visual_global_usage / visual_global_usage_member plus attested
--- candidate phashes) BEFORE any activation. Unknown or source-null published
--- history must STAY HELD for review, and the backfill may never mark a staged
--- candidate as used. That derivation is part of the activation draft and must
--- never run ad hoc; the stub fails closed (ACTIVATION BLOCKER 4).
--- ---------------------------------------------------------------------------
+-- (e) Owner-attested historical import. This NEVER discovers history from a
+-- URL, index timestamp, staged candidate, or current calendar state. A separate
+-- owner reviews permanent exact-byte members and mints the immutable receipt
+-- below. Both source and delivered byte buffers need owner pHash computations;
+-- transformed display bytes additionally need immutable render lineage.
+-- Unknown source/date/lineage gets NO receipt and remains a preflight blocker.
+-- Released and orphan members are eligible: local release/deletion cannot free
+-- history. No service role can mint receipts or invoke the importer.
+create table if not exists public.visual_scene_history_receipt (
+  receipt_id uuid primary key,
+  tenant_id text not null,
+  group_key text not null,
+  member_fingerprint text not null,
+  used_date date not null,
+  source_phash_receipt uuid not null references public.visual_scene_owner_phash_receipt(receipt_id),
+  delivered_phash_receipt uuid not null references public.visual_scene_owner_phash_receipt(receipt_id),
+  attested_by text not null check (btrim(attested_by) <> ''),
+  evidence_ref text not null check (btrim(evidence_ref) <> ''),
+  created_at timestamptz not null default now(),
+  foreign key (tenant_id,group_key,member_fingerprint)
+    references public.visual_global_usage_member(tenant_id,group_key,fingerprint),
+  unique (tenant_id,group_key,member_fingerprint,used_date,source_phash_receipt,delivered_phash_receipt)
+);
+alter table public.visual_scene_history_receipt enable row level security;
+revoke all on public.visual_scene_history_receipt from public,anon,authenticated,service_role;
+create trigger visual_scene_history_receipt_immutable before update or delete
+  on public.visual_scene_history_receipt for each row execute function public.visual_scene_immutable();
+create trigger visual_scene_history_receipt_no_truncate before truncate
+  on public.visual_scene_history_receipt for each statement execute function public.visual_scene_receipt_no_truncate();
+
+-- A scene occupancy key deliberately has ONE pHash per tenant/group/date.
+-- Different transformed byte objects can have the SAME pHash. Preserve each
+-- imported object's byte identity here instead of overwriting the first
+-- occupancy fingerprint or losing the other object's permanent coverage.
+-- These immutable bindings are historical evidence, not scene-clearance grants.
+create table if not exists public.visual_scene_history_object_binding (
+  tenant_id text not null,
+  group_key text not null,
+  used_date date not null,
+  phash char(16) not null,
+  fingerprint text not null,
+  exact_url text not null,
+  owner_phash_receipt uuid not null references public.visual_scene_owner_phash_receipt(receipt_id),
+  history_receipt uuid not null references public.visual_scene_history_receipt(receipt_id),
+  primary key (owner_phash_receipt,used_date),
+  foreign key (phash,tenant_id,group_key,used_date)
+    references public.visual_scene_phash_occupied(phash,tenant_id,group_key,used_date),
+  foreign key (tenant_id,group_key,exact_url,fingerprint)
+    references public.visual_global_object_attestation(tenant_id,group_key,exact_url,fingerprint)
+);
+alter table public.visual_scene_history_object_binding enable row level security;
+revoke all on public.visual_scene_history_object_binding from public,anon,authenticated,service_role;
+grant select on public.visual_scene_history_object_binding to service_role;
+create policy visual_scene_history_object_binding_read on public.visual_scene_history_object_binding
+  for select to service_role using (true);
+create trigger visual_scene_history_object_binding_immutable before update or delete
+  on public.visual_scene_history_object_binding for each row execute function public.visual_scene_immutable();
+create trigger visual_scene_history_object_binding_no_truncate before truncate
+  on public.visual_scene_history_object_binding for each statement execute function public.visual_scene_receipt_no_truncate();
+
+-- Import every reviewed receipt under one fleet lock. No partial import survives
+-- a bad receipt or occupancy collision. Exact retries preserve original evidence.
+-- The caller must COMMIT; caller rollback removes all newly imported occupancy.
+-- The activation owner must additionally establish the calendar writer barrier
+-- and rerun full fleet coverage; a returned count NEVER means history cleared.
 create or replace function public.visual_scene_backfill_occupied()
-returns integer language plpgsql security definer set search_path = public as $$
+returns integer language plpgsql security definer
+set search_path = pg_catalog,public,pg_temp as $$
+declare h public.visual_scene_history_receipt%rowtype;
+  m public.visual_global_usage_member%rowtype;
+  s public.visual_scene_owner_phash_receipt%rowtype;
+  d public.visual_scene_owner_phash_receipt%rowtype;
+  r public.visual_scene_owner_phash_receipt%rowtype;
+  n integer:=0; inserted integer;
 begin
-  raise exception 'visual_scene_backfill_occupied is an activation-draft deliverable; occupied history must be derived from the exact-byte ledger before activation (0A000 stub)'
-    using errcode='0A000';
+  perform pg_advisory_xact_lock(hashtextextended('["visual_scene_global"]',0));
+  for h in select * from public.visual_scene_history_receipt order by receipt_id loop
+    select * into m from public.visual_global_usage_member
+      where tenant_id=h.tenant_id and group_key=h.group_key and fingerprint=h.member_fingerprint;
+    select * into s from public.visual_scene_owner_phash_receipt where receipt_id=h.source_phash_receipt;
+    select * into d from public.visual_scene_owner_phash_receipt where receipt_id=h.delivered_phash_receipt;
+    if h.tenant_id is distinct from public.visual_group_tenant_strict(h.tenant_id)::text
+       or m.used_date is distinct from h.used_date
+       or s.tenant_id is distinct from h.tenant_id or d.tenant_id is distinct from h.tenant_id
+       or s.group_key is distinct from h.group_key or d.group_key is distinct from h.group_key
+       or s.fingerprint is distinct from h.member_fingerprint
+       -- BOTH byte objects must already be permanent members and have the
+       -- same global owner/date. An attested staged rendition is NOT history.
+       or exists(select 1 from (values (s.fingerprint),(d.fingerprint)) f(fingerprint)
+          where not exists(select 1 from public.visual_global_usage_member z
+             join public.visual_global_usage u on u.fingerprint=z.fingerprint
+             where z.tenant_id=h.tenant_id and z.group_key=h.group_key
+               and z.fingerprint=f.fingerprint and z.used_date=h.used_date
+               and u.tenant_id=h.tenant_id and u.used_date=h.used_date))
+       or not exists(select 1 from public.visual_global_scene_object_member o
+          where o.tenant_id=h.tenant_id and o.group_key=h.group_key
+            and o.exact_url=s.exact_url and o.fingerprint=s.fingerprint and o.object_role='source')
+       or not exists(select 1 from public.visual_global_scene_object_member o
+          where o.tenant_id=h.tenant_id and o.group_key=h.group_key
+            and o.exact_url=d.exact_url and o.fingerprint=d.fingerprint and o.object_role='delivered')
+       or not ((s.exact_url=d.exact_url and s.fingerprint=d.fingerprint)
+          or exists(select 1 from public.visual_global_object_lineage l
+             join public.visual_global_render_receipt v on v.receipt_id=l.render_receipt
+               and v.tenant_id=l.tenant_id and v.source_exact_url=l.source_exact_url
+               and v.delivered_exact_url=l.delivered_exact_url
+               and v.source_fingerprint=l.source_fingerprint
+               and v.delivered_fingerprint=l.delivered_fingerprint
+             where l.tenant_id=h.tenant_id and l.group_key=h.group_key
+               and l.source_exact_url=s.exact_url and l.source_fingerprint=s.fingerprint
+               and l.delivered_exact_url=d.exact_url and l.delivered_fingerprint=d.fingerprint)) then
+      raise exception 'historical receipt needs canonical permanent member date and owner source/display lineage'
+        using errcode='23514';
+    end if;
+    for r in select * from public.visual_scene_owner_phash_receipt
+      where receipt_id in (s.receipt_id,d.receipt_id) loop
+      if not exists(select 1 from public.visual_global_object_attestation o
+           where o.tenant_id=h.tenant_id and o.group_key=h.group_key
+             and o.exact_url=r.exact_url and o.fingerprint=r.fingerprint
+             and o.byte_length=r.byte_length)
+         or exists(select 1 from public.visual_scene_phash_occupied o
+           where o.tenant_id=h.tenant_id and o.group_key=h.group_key
+             and o.used_date=h.used_date and o.phash=r.phash
+             and o.fingerprint<>r.fingerprint
+             and not (s.phash=d.phash and o.fingerprint in (s.fingerprint,d.fingerprint))
+             -- A previous rendition may be the permanent representative of
+             -- this pHash. Admit another only when immutable bindings and a
+             -- verified render receipt prove the same historical source.
+             and not exists(select 1
+               from public.visual_scene_history_object_binding b
+               join public.visual_scene_history_receipt prior on prior.receipt_id=b.history_receipt
+               join public.visual_scene_owner_phash_receipt ps on ps.receipt_id=prior.source_phash_receipt
+               join public.visual_scene_owner_phash_receipt pd on pd.receipt_id=prior.delivered_phash_receipt
+               join public.visual_global_object_lineage l
+                 on l.tenant_id=b.tenant_id and l.group_key=b.group_key
+                 and l.source_exact_url=ps.exact_url and l.source_fingerprint=ps.fingerprint
+                 and l.delivered_exact_url=pd.exact_url and l.delivered_fingerprint=pd.fingerprint
+               join public.visual_global_render_receipt v on v.receipt_id=l.render_receipt
+                 and v.tenant_id=l.tenant_id and v.source_exact_url=l.source_exact_url
+                 and v.source_fingerprint=l.source_fingerprint
+                 and v.delivered_exact_url=l.delivered_exact_url
+                 and v.delivered_fingerprint=l.delivered_fingerprint
+               where b.tenant_id=h.tenant_id and b.group_key=h.group_key and b.used_date=h.used_date
+                 and b.phash=o.phash and b.fingerprint=o.fingerprint
+                 and b.owner_phash_receipt=pd.receipt_id and b.exact_url=pd.exact_url
+                 and b.fingerprint=pd.fingerprint and b.phash=pd.phash
+                 and ps.tenant_id=h.tenant_id and ps.group_key=h.group_key
+                 and pd.tenant_id=h.tenant_id and pd.group_key=h.group_key
+                 and prior.tenant_id=h.tenant_id and prior.group_key=h.group_key and prior.used_date=h.used_date
+                 and ps.exact_url=s.exact_url and ps.fingerprint=s.fingerprint
+                 and exists(select 1 from public.visual_scene_history_object_binding sb
+                   where sb.owner_phash_receipt=ps.receipt_id and sb.history_receipt=prior.receipt_id
+                     and sb.tenant_id=h.tenant_id and sb.group_key=h.group_key and sb.used_date=h.used_date
+                     and sb.exact_url=ps.exact_url and sb.fingerprint=ps.fingerprint and sb.phash=ps.phash))) then
+        raise exception 'historical byte evidence or occupied identity conflicts' using errcode='23514';
+      end if;
+      insert into public.visual_scene_phash_occupied
+        (phash,tenant_id,group_key,used_date,fingerprint,calendar_row_id,channel,evidence)
+        values(r.phash,h.tenant_id,h.group_key,h.used_date,r.fingerprint,m.calendar_row_id,m.channel,
+          jsonb_build_object('history_receipt',h.receipt_id,'owner_phash_receipt',r.receipt_id,
+            'exact_url',r.exact_url,'member_fingerprint',h.member_fingerprint,
+            'attested_by',h.attested_by,'evidence_ref',h.evidence_ref))
+        on conflict (phash,tenant_id,group_key,used_date) do nothing;
+      get diagnostics inserted=row_count;
+      n:=n+inserted;
+      insert into public.visual_scene_history_object_binding
+        (tenant_id,group_key,used_date,phash,fingerprint,exact_url,owner_phash_receipt,history_receipt)
+        values(h.tenant_id,h.group_key,h.used_date,r.phash,r.fingerprint,r.exact_url,r.receipt_id,h.receipt_id)
+        on conflict (owner_phash_receipt,used_date) do nothing;
+    end loop;
+  end loop;
+  return n;
 end;
 $$;
 

@@ -1861,3 +1861,46 @@ def test_prepared_insert_does_not_retry_typeerror_without_poster_proof(monkeypat
                                               evidence)
     assert len(calls) == 1
     assert calls[0][1]["poster_render_evidence_by_url"] == evidence
+
+
+def test_drive_only_month_stages_photo_eligible_only_on_later_date(monkeypatch, tmp_path):
+    """A zero-local-file build must budget and enter photo prepass for day two,
+    even when the same scene is unavailable on day one/execution day."""
+    from datetime import date
+    from agent import gym_media_selector as selector
+    from agent.drafter import Draft, DraftStatus
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    monkeypatch.setenv("AGENT_PLAN_HORIZON_DAYS", "0")
+    monkeypatch.setattr(selector, "scene_guard_flag", lambda: True)
+    seen = []
+    def pickable(_base, **kwargs):
+        target = kwargs.get("post_date")
+        seen.append(target)
+        return [{"id": "day-two-photo", "kind": "photo"}] if target == "2026-10-11" else []
+    monkeypatch.setattr(selector, "pickable", pickable)
+    monkeypatch.setattr(selector, "pool_kinds", lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("scene-enabled month must not read a date-less pool")))
+    monkeypatch.setattr(cmr, "_clean_draft_for_day", lambda *a, **kw: (None, None))
+    calls = []
+    def append(account, base, start, days, voice, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("kind_prefs") != (cmr._PHOTO_KIND,):
+            return []
+        assert kwargs["max_feed_count"] == 1
+        kwargs["covered_slots"].add(("2026-10-11", 0))
+        return [Draft(draft_id="later-drive", account_key="gritx_ig", platform="instagram",
+                      caption="A grounded gym caption.", hashtags=[], creative_path="/tmp/later.jpg",
+                      creative_public_url="https://cdn.example/later.jpg", day_key="2026-10-11",
+                      scheduled_for="2026-10-11T11:30:00+00:00", status=DraftStatus.PENDING,
+                      source_media_asset_id="day-two-photo")]
+    monkeypatch.setattr(cmr, "append_gym_drive_drafts", append)
+    store = _FakeStore()
+    out = cmr.build_client_month(_account(), "gritx", date(2026, 10, 10), days=2,
+                                 voice=_voice(), library_path=str(tmp_path), store=store,
+                                 banned_words=())
+    assert out["ok"] is True and out["feeds"] == 1 and out["days"] == 1
+    assert calls[0]["kind_prefs"] == (cmr._PHOTO_KIND,)
+    assert "2026-10-11" in seen and None not in seen
+    feeds = [row for row in store.inserted if row["format"] == "feed"]
+    assert feeds and all(str(row["post_date"]) == "2026-10-11" for row in feeds)
