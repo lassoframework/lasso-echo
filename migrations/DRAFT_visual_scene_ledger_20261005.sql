@@ -1196,7 +1196,36 @@ begin
            where o.tenant_id=h.tenant_id and o.group_key=h.group_key
              and o.used_date=h.used_date and o.phash=r.phash
              and o.fingerprint<>r.fingerprint
-             and not (s.phash=d.phash and o.fingerprint in (s.fingerprint,d.fingerprint))) then
+             and not (s.phash=d.phash and o.fingerprint in (s.fingerprint,d.fingerprint))
+             -- A previous rendition may be the permanent representative of
+             -- this pHash. Admit another only when immutable bindings and a
+             -- verified render receipt prove the same historical source.
+             and not exists(select 1
+               from public.visual_scene_history_object_binding b
+               join public.visual_scene_history_receipt prior on prior.receipt_id=b.history_receipt
+               join public.visual_scene_owner_phash_receipt ps on ps.receipt_id=prior.source_phash_receipt
+               join public.visual_scene_owner_phash_receipt pd on pd.receipt_id=prior.delivered_phash_receipt
+               join public.visual_global_object_lineage l
+                 on l.tenant_id=b.tenant_id and l.group_key=b.group_key
+                 and l.source_exact_url=ps.exact_url and l.source_fingerprint=ps.fingerprint
+                 and l.delivered_exact_url=pd.exact_url and l.delivered_fingerprint=pd.fingerprint
+               join public.visual_global_render_receipt v on v.receipt_id=l.render_receipt
+                 and v.tenant_id=l.tenant_id and v.source_exact_url=l.source_exact_url
+                 and v.source_fingerprint=l.source_fingerprint
+                 and v.delivered_exact_url=l.delivered_exact_url
+                 and v.delivered_fingerprint=l.delivered_fingerprint
+               where b.tenant_id=h.tenant_id and b.group_key=h.group_key and b.used_date=h.used_date
+                 and b.phash=o.phash and b.fingerprint=o.fingerprint
+                 and b.owner_phash_receipt=pd.receipt_id and b.exact_url=pd.exact_url
+                 and b.fingerprint=pd.fingerprint and b.phash=pd.phash
+                 and ps.tenant_id=h.tenant_id and ps.group_key=h.group_key
+                 and pd.tenant_id=h.tenant_id and pd.group_key=h.group_key
+                 and prior.tenant_id=h.tenant_id and prior.group_key=h.group_key and prior.used_date=h.used_date
+                 and ps.exact_url=s.exact_url and ps.fingerprint=s.fingerprint
+                 and exists(select 1 from public.visual_scene_history_object_binding sb
+                   where sb.owner_phash_receipt=ps.receipt_id and sb.history_receipt=prior.receipt_id
+                     and sb.tenant_id=h.tenant_id and sb.group_key=h.group_key and sb.used_date=h.used_date
+                     and sb.exact_url=ps.exact_url and sb.fingerprint=ps.fingerprint and sb.phash=ps.phash))) then
         raise exception 'historical byte evidence or occupied identity conflicts' using errcode='23514';
       end if;
       insert into public.visual_scene_phash_occupied

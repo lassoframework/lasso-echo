@@ -104,6 +104,13 @@ def test_caller_rollback_and_conflicting_fingerprint():
 def seed_transformed(phash="ffffffffffffffff", permanent=True, owner=None,
                      member_date="2026-09-01", owner_date="2026-09-01"):
     t,g,f,p = seed_history()
+    _,d,url,candidate = add_rendition(t,g,p,phash,permanent,owner,member_date,owner_date)
+    receipt(t,g,f,p,d)
+    return t,g,f,p,d,url,candidate
+
+
+def add_rendition(t,g,p,phash="0000000000000000",permanent=True,owner=None,
+                  member_date="2026-09-01",owner_date="2026-09-01"):
     url,fp,candidate = _seed_object(t,g,phash)
     d = _one(f"select evidence->>'owner_phash_receipt' from public.visual_scene_candidate where candidate_id='{candidate}'")
     _sql("insert into public.visual_global_render_receipt(tenant_id,source_read_receipt,delivered_read_receipt,"
@@ -117,14 +124,13 @@ def seed_transformed(phash="ffffffffffffffff", permanent=True, owner=None,
          "insert into public.visual_global_object_lineage(tenant_id,group_key,source_exact_url,delivered_exact_url,"
          "source_fingerprint,delivered_fingerprint,render_receipt) "
          f"select tenant_id,'{g}',source_exact_url,delivered_exact_url,source_fingerprint,delivered_fingerprint,receipt_id "
-         "from public.visual_global_render_receipt")
+         f"from public.visual_global_render_receipt where delivered_exact_url='{url}'")
     if permanent:
         _sql("insert into public.visual_global_usage(fingerprint,tenant_id,used_date,state) "
              f"values('{fp}','{owner or t}','{owner_date}','released'); "
              "insert into public.visual_global_usage_member(tenant_id,group_key,fingerprint,used_date,state,calendar_row_id) "
              f"values('{t}','{g}','{fp}','{member_date}','released','{uuid.uuid4()}')")
-    receipt(t,g,f,p,d)
-    return t,g,f,p,d,url,candidate
+    return fp,d,url,candidate
 
 
 def test_verified_transformed_source_and_display_both_import():
@@ -153,6 +159,44 @@ def test_same_phash_different_bytes_preserve_both_and_block_later_reuse():
     assert decision["decision"] == "blocked"
     assert decision["reason"] == "near_frame_conflict"
     assert _occupied_count() == 1
+
+
+def test_common_source_two_renditions_preserve_representative_and_block_reuse():
+    t,g,f,p,d,url,_ = seed_transformed(phash="0000000000000000")
+    df = _one(f"select fingerprint from public.visual_scene_owner_phash_receipt where receipt_id='{d}'")
+    # Force D1 as the representative, preserving its original publication evidence.
+    _sql("insert into public.visual_scene_phash_occupied(phash,tenant_id,group_key,used_date,fingerprint,evidence) "
+         f"values('0000000000000000','{t}','{g}','2026-09-01','{df}',"
+         "'{\"original_publication\":\"D1\"}'::jsonb)")
+    assert _one("select public.visual_scene_backfill_occupied()") == "0"
+    original = _one("select row_to_json(o)::text from public.visual_scene_phash_occupied o")
+    _,d2,url2,candidate2 = add_rendition(t,g,p)
+    receipt(t,g,f,p,d2)
+    assert _one("select public.visual_scene_backfill_occupied()") == "0"
+    assert _one("select public.visual_scene_backfill_occupied()") == "0"
+    assert _occupied_count() == 1
+    assert _one("select row_to_json(o)::text from public.visual_scene_phash_occupied o") == original
+    assert _one("select count(*) from public.visual_scene_history_object_binding") == "3"
+    assert _one("select count(distinct fingerprint) from public.visual_scene_history_object_binding") == "3"
+    decision = json.loads(_one("select public.visual_scene_claim_decide("
+        "jsonb_populate_record(null::public.content_calendar,jsonb_build_object("
+        f"'id','{uuid.uuid4()}','gym_id','{t}','visual_group_key','{g}',"
+        f"'image_url','{url2}','account','ig','post_date','2026-10-10')),'{candidate2}')"))
+    assert decision["decision"] == "blocked"
+    assert decision["reason"] == "near_frame_conflict"
+    assert _occupied_count() == 1
+    # Another verified source in the same owner/group/date cannot borrow D1's binding.
+    source_url,source_fp,_ = _seed_object(t,g,"0000000000000000")
+    source = _one(f"select receipt_id from public.visual_scene_owner_phash_receipt where exact_url='{source_url}'")
+    _sql("insert into public.visual_global_usage(fingerprint,tenant_id,used_date,state) "
+         f"values('{source_fp}','{t}','2026-09-01','released'); "
+         "insert into public.visual_global_usage_member(tenant_id,group_key,fingerprint,used_date,state) "
+         f"values('{t}','{g}','{source_fp}','2026-09-01','released')")
+    _,unrelated,_,_ = add_rendition(t,g,source)
+    receipt(t,g,source_fp,source,unrelated)
+    assert _run("select public.visual_scene_backfill_occupied()",False).returncode
+    assert _one("select row_to_json(o)::text from public.visual_scene_phash_occupied o") == original
+    assert _one("select count(*) from public.visual_scene_history_object_binding") == "3"
 
 
 @pytest.mark.parametrize("kwargs", [
