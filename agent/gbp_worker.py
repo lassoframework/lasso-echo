@@ -56,6 +56,35 @@ def _alert_manual_approval_changed(gym_id, row_id, alert):
               f"{type(exc).__name__}")
 
 
+def _alert_auto_caption_empty(gym_id, row_id, alert):
+    """Alert once per durably held autonomous GBP row whose caption is ONLY
+    [why]/[reason] metadata: the cleaned caption is empty, so the row needs a
+    corrected caption before it can ever send. It is held (never sent) here; the
+    alert asks ops to fix the caption — no client-facing approval required. Same
+    durable-only-or-silent dedup contract as the manual creative-change alert."""
+    if not alert:
+        return
+    try:
+        from . import db
+        key = f"gbp_auto_caption_empty_alerted_{gym_id}_{row_id}"
+        if not db.kv_is_durable():
+            print(f"[gbp] row {row_id}: autonomous empty-caption hold; "
+                  "alert suppressed because KV is not durable")
+            return
+        if db.kv_get(key):
+            return
+        result = alert(
+            f"GBP row {row_id} for {gym_id} is held: its caption contains only "
+            "internal [why]/[reason] metadata, so there is nothing publishable to "
+            "send. Write a real caption for the row; no client approval is needed "
+            "for this correction. The row stays held and no provider payload was "
+            "sent.")
+        if result and not (isinstance(result, dict) and result.get("ok") is False):
+            db.kv_set(key, "1")
+    except Exception as exc:  # alerting must not affect the safe held row
+        print(f"[gbp] row {row_id}: autonomous empty-caption alert failed: "
+              f"{type(exc).__name__}")
+
 # --- row -> payload --------------------------------------------------------
 
 def build_gbp_payload_for_row(row, connection):
@@ -660,6 +689,12 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                                               f"{row.get('id')}: {type(e).__name__}; "
                                               "no send attempted")
                                 else:
+                                    if not cleaned:
+                                        # All-meta caption: nothing publishable to
+                                        # clean to. Keep the hold, never send, and
+                                        # alert ops once (durable-or-silent).
+                                        _alert_auto_caption_empty(
+                                            gym, row.get("id"), alert)
                                     print(f"[gbp] Auto caption cleanup unavailable or "
                                           f"empty for {row.get('id')}; no send attempted")
                         else:

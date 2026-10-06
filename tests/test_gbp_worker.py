@@ -1257,3 +1257,82 @@ def test_proof_photo_drop_sends_exact_claimed_image_and_resolved_destination(mon
     assert client.calls == [(conn["zernio_account_id"], fresh["image_url"])]
     assert out["published"] == 1
     assert fresh["caption"] == "[why] gallery uploads carry no caption"
+
+
+def test_proof_autonomous_all_meta_caption_held_with_one_ops_alert(monkeypatch):
+    """All-meta autonomous caption: claim released back to approved, nothing sent,
+    and ops gets exactly one durable deduped alert asking for a corrected caption."""
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    from agent import db
+    stamps = {}
+    monkeypatch.setattr(db, "kv_is_durable", lambda: True)
+    monkeypatch.setattr(db, "kv_get", lambda key: stamps.get(key))
+    monkeypatch.setattr(db, "kv_set", lambda key, value: stamps.__setitem__(key, value))
+    fresh = _row(id="r1", gym_id="gym", status="publishing",
+                 caption="[why] internal editing rationale only",
+                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111",
+                 autonomous_at_claim=True)
+
+    class AutoEmptyStore(_TokenStore):
+        def claim_publishing(self, row_id, *, gym_id, require_proof):
+            token = fresh["publish_claim_token"]
+            self.tokens[row_id] = token
+            return dict(fresh)
+
+    store = AutoEmptyStore([fresh], {"gym": [_c()]})
+    client = _FakeClient()
+    alerts = []
+
+    def alert(message):
+        alerts.append(message)
+        return {"ok": True}
+
+    for _ in range(2):
+        out = gw.publish_due_gbp(store, client, run_date="2026-09-01",
+                                 draft=False, alert=alert)
+        assert out["held"] == 1 and out["published"] == 0
+
+    assert client.calls == [], "an all-meta caption must never reach the provider"
+    assert store.released == [("r1", "approved"), ("r1", "approved")]
+    assert store.published == [] and store.failed == []
+    assert len(alerts) == 1, "durable KV stamp must dedupe the ops alert"
+    assert "caption contains only internal [why]/[reason] metadata" in alerts[0]
+    assert "Write a real caption" in alerts[0]
+    assert "no client approval is needed" in alerts[0]
+    assert "no provider payload was sent" in alerts[0]
+
+
+def test_proof_autonomous_all_meta_caption_alert_silent_when_kv_not_durable(monkeypatch, capsys):
+    """With non-durable KV the alert is suppressed (printed), not sent — the hold
+    and the no-send guarantee are unaffected."""
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    from agent import db
+    monkeypatch.setattr(db, "kv_is_durable", lambda: False)
+    monkeypatch.setattr(db, "kv_get", lambda key: pytest.fail(
+        "non-durable alert path must not read ephemeral KV"))
+    fresh = _row(id="r1", gym_id="gym", status="publishing",
+                 caption="[reason] internal only",
+                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111",
+                 autonomous_at_claim=True)
+
+    class AutoEmptyStore(_TokenStore):
+        def claim_publishing(self, row_id, *, gym_id, require_proof):
+            token = fresh["publish_claim_token"]
+            self.tokens[row_id] = token
+            return dict(fresh)
+
+    store = AutoEmptyStore([fresh], {"gym": [_c()]})
+    client = _FakeClient()
+    alerts = []
+
+    def alert(message):
+        alerts.append(message)
+        return {"ok": True}
+
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01",
+                             draft=False, alert=alert)
+    assert client.calls == [] and out["held"] == 1
+    assert alerts == [], "non-durable KV must suppress, not send, the ops alert"
+    assert "suppressed because KV is not durable" in capsys.readouterr().out

@@ -269,6 +269,26 @@ def _armed(monkeypatch):
     monkeypatch.setenv("AGENT_PUBLISH_ENABLED", "true")
 
 
+@pytest.mark.parametrize("helper,args", [
+    (cap._alert_meta_reapproval_held, ("r1", "lasso", True)),
+    (cap._alert_meta_autonomous_cleanup_held, ("r2", "lasso")),
+    (cap._alert_caption_format_reapproval, ("r3", "lasso")),
+])
+def test_proof_alerts_are_silent_when_kv_is_not_durable(
+        helper, args, monkeypatch):
+    from agent import db, ops_alerts
+    alerts = []
+    kv_reads = []
+    monkeypatch.setattr(db, "kv_is_durable", lambda: False)
+    monkeypatch.setattr(db, "kv_get", lambda key: kv_reads.append(key))
+    monkeypatch.setattr(ops_alerts, "alert", lambda message: alerts.append(message))
+
+    helper(*args)
+
+    assert alerts == []
+    assert kv_reads == []
+
+
 def test_publish_lane_strips_clean_meta_suffix_and_publishes_body(_armed):
     store = _FakeCalStore([_row("r1", f"{CLEAN_BODY}\n\n{LEAKED_META}")])
     pub = _FakePublisher()

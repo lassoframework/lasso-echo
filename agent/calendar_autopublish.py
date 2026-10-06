@@ -890,6 +890,10 @@ def _alert_meta_reapproval_held(row_id, gym_id, persisted):
     try:
         from . import db, ops_alerts
         key = f"metaleak_reapproval_{gym_id}_{row_id}"
+        if not db.kv_is_durable():
+            print(f"[calendar-autopublish] row {row_id}: meta reapproval alert "
+                  "suppressed because KV is not durable")
+            return
         if db.kv_get(key):
             return
         detail = (
@@ -914,6 +918,10 @@ def _alert_meta_autonomous_cleanup_held(row_id, gym_id):
     try:
         from . import db, ops_alerts
         key = f"metaleak_auto_cleanup_held_{gym_id}_{row_id}"
+        if not db.kv_is_durable():
+            print(f"[calendar-autopublish] row {row_id}: autonomous cleanup alert "
+                  "suppressed because KV is not durable")
+            return
         if db.kv_get(key):
             return
         result = ops_alerts.alert(
@@ -1107,6 +1115,10 @@ def _alert_caption_format_reapproval(row_id, gym_id):
     try:
         from . import db, ops_alerts
         key = f"capformat_reapproval_{gym_id}_{row_id}"
+        if not db.kv_is_durable():
+            print(f"[calendar-autopublish] row {row_id}: caption format reapproval "
+                  "alert suppressed because KV is not durable")
+            return
         if db.kv_get(key):
             return
         _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
