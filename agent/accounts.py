@@ -502,7 +502,7 @@ def _refuse_non_client(base, gym_id, door):
 
 
 def register_gym(base, *, name="", ig_handle="", fb_page="", gym_id=None,
-                 own_submission=False, door="register_gym"):
+                 own_submission=False, door="register_gym", require_absent=False):
     """Persist one client gym to the dynamic registry so its Account records resolve
     without hand-editing accounts.py. Idempotent (a re-register updates in place).
     No-op returning [] when AGENT_DYNAMIC_ACCOUNTS is OFF. Returns the account keys
@@ -539,7 +539,9 @@ def register_gym(base, *, name="", ig_handle="", fb_page="", gym_id=None,
     caller that CAN resolve a gym_id (onboarding_watch.autoregister always can; the
     intake-sweep callers resolve one best-effort via resolve_gym_uuid) MUST pass it. A
     previously-stamped gym_id for this exact base is preserved across a later call that
-    omits it, so re-registration never erases a known-good stamp."""
+    omits it, so re-registration never erases a known-good stamp. A reconciler may
+    pass require_absent=True to refuse even an unstamped row that appeared between
+    its read and this locked write; it must never take over an existing base."""
     global _dynamic_cache
     from . import config
     base = (base or "").strip()
@@ -583,6 +585,22 @@ def register_gym(base, *, name="", ig_handle="", fb_page="", gym_id=None,
             return [f"{existing_base}_ig", f"{existing_base}_fb"]
 
         prior = next((r for r in rows if (r.get("base") or "").strip() == base), None)
+        if require_absent and prior is not None:
+            return []
+        # A base already bound to another portal gym must never be reassigned. The
+        # caller's positive Echo marker proves it is a client, not that this base
+        # belongs to it. Refuse an identity collision inside the write lock so two
+        # concurrent onboarding paths cannot steal each other's account records.
+        prior_gym_id = (str((prior or {}).get("gym_id") or "")).strip()
+        if prior_gym_id and gym_id and prior_gym_id != gym_id:
+            try:
+                from . import ops_alerts
+                ops_alerts.alert(
+                    f"register_gym: refused to reassign '{base}' from gym_id "
+                    f"{prior_gym_id} to {gym_id}. Nothing was written.")
+            except Exception:  # noqa: BLE001 - refusal must not depend on alerting
+                pass
+            return []
         row = {"base": base, "name": (name or base).strip(),
                "ig_handle": (ig_handle or "").strip(),
                "fb_page": (fb_page or "").strip(),

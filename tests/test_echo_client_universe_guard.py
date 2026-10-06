@@ -38,6 +38,7 @@ GATE_SNAPSHOT = "snapshot"     # echo_clients.snapshot(...).is_client(...) also 
 # Every fleet lane / registration door the incident touched (or could have).
 LANES = (
     "onboarding_watch.py",          # roster, autoregister, zero-token sweep
+    "registry_reconcile.py",         # positive-marker registry repair, no publish
     "connect_link_notify.py",       # the DM
     "welcome_queue.py",             # portal welcome scan + prune
     "portal_gyms.py",               # the gyms-table enumerator behind the welcome scan
@@ -302,7 +303,8 @@ def test_every_register_gym_caller_is_a_known_door():
                 own[rel] = bool(isinstance(v, ast.Constant) and v.value is True)
     assert own == {"intake_ingest.py": True,
                    "social_intake_reader.py": True,
-                   "onboarding_watch.py": False}, own
+                   "onboarding_watch.py": False,
+                   "registry_reconcile.py": False}, own
 
 
 def test_dynamic_registry_accounts_are_never_active():
