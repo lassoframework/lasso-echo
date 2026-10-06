@@ -504,6 +504,30 @@ def test_drive_candidates_come_from_the_pickable_pool_minus_the_book():
     assert cands[0]["kind"] == "video" and cands[0]["source"] == "drive"
 
 
+def test_swap_candidates_use_row_date_for_scene_selection_and_omit_missing_date(monkeypatch):
+    from agent import gym_media_selector
+
+    seen = []
+    asset = {"id": "fresh", "gym_id": "zanshin", "kind": "photo",
+             "used_count": 0, "last_used_at": None}
+
+    def pickable(gym, **kwargs):
+        seen.append(kwargs)
+        return [asset]
+
+    monkeypatch.setattr(gym_media_selector, "pickable", pickable)
+    scheduled = _row()
+    msw.candidates_for("zanshin", scheduled, store=_Store(), lib="",
+                       book_state={}, asset_state={}, media_store=object())
+    assert seen[-1]["post_date"] == "2026-09-20"
+
+    undated = dict(scheduled)
+    undated.pop("post_date")
+    msw.candidates_for("zanshin", undated, store=_Store(), lib="",
+                       book_state={}, asset_state={}, media_store=object())
+    assert "post_date" not in seen[-1]
+
+
 def test_drive_cooldown_fallback_never_returns_previously_used_assets():
     from datetime import datetime, timedelta, timezone
     from tests.gym_media_fakes import FakeMediaStore, make_asset

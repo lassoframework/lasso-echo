@@ -308,9 +308,11 @@ def _drive_photo_candidate(account_key, day_key, used_ids):
                 return assets
             def list_sources(self, _base, include_inactive=False):
                 return sources
+        pick_kwargs = {"exclude_ids": tuple(used_ids)}
+        if day_key:
+            pick_kwargs["post_date"] = day_key
         asset = gym_media_selector.pick_media(
-            base, kind_preference="photo", store=Snapshot(),
-            exclude_ids=tuple(used_ids))
+            base, kind_preference="photo", store=Snapshot(), **pick_kwargs)
         if asset is None:
             return None
         with tempfile.TemporaryDirectory(prefix="gbp_drive_") as work:
