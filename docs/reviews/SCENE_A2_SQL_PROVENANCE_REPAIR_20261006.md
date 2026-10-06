@@ -31,6 +31,10 @@ The fixture applies real dated capacity migrations and then authoritative approv
 
 No SQL applied to production. No feature flag enabled. No paid review run. Native parent review is still required for acceptance; this receipt is worker evidence.
 
+## Follow-on status
+
+The separate draft default-OFF scene authority/controlled-disarm milestone is now recorded in `SCENE_A2_DB_AUTHORITY_20261006.md`. The production application barrier and historical backfill blocker remain. The prior 86-check result above records the provenance repair milestone; the follow-on receipt records the expanded run.
+
 ## Smallest next production package
 
 One SQL owner should implement and independently review these coupled requirements before replacing the scratch-only application barrier:

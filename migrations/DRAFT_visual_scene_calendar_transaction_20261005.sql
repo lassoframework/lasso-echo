@@ -5,12 +5,15 @@
 -- after this composition. Requires group schema/claim trigger/global history/backfill/activation
 -- drafts and DRAFT_visual_scene_ledger_20261005.sql, in their tested order.
 -- Replaces the ONE existing calendar BEFORE function; installs no second trigger,
--- flips no setting and performs no backfill. Production scene arming is absent.
+-- flips no setting and performs no backfill. Scene authority must be installed
+-- first; missing/OFF scene settings preserve the existing exact-byte guard.
 -- SCRATCH-ONLY APPLICATION BARRIER: this file refuses any network-connected
 -- session or database except the explicitly named disposable PG17 test DB.
 -- Existing exact-byte activation is NOT a scene activation authority. A reviewed
--- default-OFF database scene barrier, verified historical occupied backfill and
--- rollback are still required before a production replacement may be applied.
+-- historical occupied backfill and activation are required; the separate
+-- DRAFT_visual_scene_activation_authority_20261006.sql supplies DEFAULT OFF.
+-- Verified coverage and production rollback are still required before a
+-- production replacement may be applied.
 -- Unknown historical scene coverage and the raising backfill stub remain RELEASE
 -- BLOCKERS, alongside independent production acceptance.
 -- GBP and legacy direct UPDATE lanes use this same authoritative BEFORE path.
@@ -34,11 +37,14 @@ begin
      or to_regprocedure('public.calendar_approval_digest(public.content_calendar)') is null then
     raise exception 'Apply current calendar approval provenance before scene transaction';
   end if;
+  if to_regprocedure('public.visual_scene_enforcement_on(text)') is null then
+    raise exception 'Apply default-OFF scene authority before scene transaction';
+  end if;
 end;
 $$;
 create or replace function public.visual_group_guard_trigger()
 returns trigger language plpgsql security definer set search_path = public as $$
-declare resolved text; need_claim boolean; finalized boolean; identity_changed boolean; media_changed boolean; old_tenant text; new_tenant text; scene_scan record; scene_blocked boolean := false;
+declare resolved text; need_claim boolean; finalized boolean; identity_changed boolean; media_changed boolean; old_tenant text; new_tenant text; scene_scan record; scene_blocked boolean := false; scene_enforced boolean := false;
 begin
   select null::text o_tenant,null::uuid o_candidate_id,null::char(16) o_phash,
     null::text o_fingerprint,null::text o_exact_url,null::text o_worst_band,
@@ -49,6 +55,7 @@ begin
     end if;
     return old;
   end if;
+  scene_enforced:=public.visual_scene_enforcement_on(new.gym_id);
   if not public.visual_group_enforcement_on(new.gym_id)
      and (tg_op='INSERT' or not public.visual_group_enforcement_on(old.gym_id)) then
     -- Once any tenant is armed, an unarmed writer cannot create history that
@@ -67,6 +74,10 @@ begin
   new_tenant := public.visual_group_tenant_id(new.gym_id)::text;
   if tg_op='UPDATE' then
     old_tenant := public.visual_group_tenant_id(old.gym_id)::text;
+    if old_tenant is distinct from new_tenant and
+       public.visual_scene_enforcement_on(old.gym_id) and not scene_enforced then
+      raise exception 'scene-enforced row cannot move to scene-OFF tenant' using errcode='23514';
+    end if;
     -- An enforced row cannot escape its authority by changing to an unmapped
     -- or unarmed tenant. Resolve/arm the destination before an unsent move.
     if old_tenant is distinct from new_tenant and public.visual_group_enforcement_on(old.gym_id)
@@ -172,7 +183,7 @@ begin
       end if;
       -- A held row can be explicitly reactivated only through a fresh scan.
       -- This does not approve a conflict or erase its durable review evidence.
-      if new.media_not_ready_reason='scene_review_hold' then
+      if scene_enforced and new.media_not_ready_reason='scene_review_hold' then
         new.media_not_ready_reason:=null;
       end if;
       -- BEFORE trigger holds must not allow PR230's claim RPC to return a
@@ -182,7 +193,7 @@ begin
          nullif(btrim(new.image_url),'') is null or new.media_not_ready_reason is not null) then
         raise exception 'visual media not ready for approval, claim or finalize' using errcode='23514';
       end if;
-      if new.visual_group_key is not null and new.post_date is not null
+      if scene_enforced and new.visual_group_key is not null and new.post_date is not null
           and nullif(btrim(new.image_url),'') is not null
           and new.media_not_ready_reason is null then
         select * into scene_scan from public.visual_scene_claim_scan(

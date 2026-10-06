@@ -61,6 +61,13 @@ def cluster():
                          "lasso_immediate_backlog_capacity_20261005.sql",
                          "calendar_approval_provenance_20261005.sql"):
                 ledger._sql((ROOT / "migrations" / name).read_text())
+            authority = ROOT / "migrations/DRAFT_visual_scene_activation_authority_20261006.sql"
+            # Both authority DDL and trigger composition must roll back cleanly.
+            authority_body = authority.read_text().replace("begin;", "", 1).rsplit("commit;", 1)[0]
+            ledger._sql("begin; " + authority_body + "; rollback;")
+            assert ledger._one("select to_regclass('public.gym_visual_scene_guard_settings') is null") == "t"
+            ledger._sql(authority.read_text())
+            assert ledger._one("select count(*) from public.gym_visual_scene_guard_settings") == "0"
             # Rehearse the complete composition under rollback first: every
             # function replacement and obsolete-signature drop must roll back.
             before = ledger._one("select md5(string_agg(proname||prosrc, '' order by oid)) from pg_proc where pronamespace='public'::regnamespace")
@@ -77,10 +84,26 @@ def cluster():
 @pytest.fixture(autouse=True)
 def reset(cluster):
     ledger._isolate_scenarios.__wrapped__()
+    # This expanded module also creates terminal reconciliation/member events
+    # and setting audit history. Clear them only on the disposable test server,
+    # so a published fixture cannot contaminate the next activation scenario.
+    ledger._sql("set session_replication_role=replica; truncate "
+                "public.visual_group_member_event,public.visual_group_reconciliation,"
+                "public.gym_visual_scene_guard_settings,public.visual_scene_disarm_event")
 
 
-def seed(phash="0000000000000000", account="ig", active=True):
+def scratch_scene_on(tenant):
+    # Synthetic ON-state fixture only. The actual arming path is deliberately
+    # absent/refused; tests never fabricate a coverage receipt or call activation.
+    # This server is the private named Unix-socket disposable DB created above.
+    ledger._sql("set session_replication_role=replica; "
+                f"insert into public.gym_visual_scene_guard_settings(gym_id,enforce) values ('{tenant}',true)")
+
+
+def seed(phash="0000000000000000", account="ig", active=True, scene_on=True):
     tenant, group = ledger._seed_tenant()
+    if scene_on:
+        scratch_scene_on(tenant)
     url, fp, candidate = ledger._seed_object(tenant, group, phash)
     row = ledger._one("insert into public.content_calendar(gym_id,account,post_date,status,variant_status,image_url,source_media_url,visual_group_key) values "
         f"('{tenant}','{account}','2026-10-10','pending','{'active' if active else 'archived'}','{url}','{url}','{group}') returning id")
@@ -159,6 +182,7 @@ def test_legacy_direct_patch_and_idempotent_reactivation(account):
 
 def test_unknown_candidate_fails_closed():
     tenant, group = ledger._seed_tenant()
+    scratch_scene_on(tenant)
     url, fp, _ = ledger._seed_object(tenant, group)
     row = ledger._insert_row(tenant, group, url)
     assert_held(row)
@@ -240,6 +264,7 @@ def test_legal_siblings_preserve_raw_tenant_alias():
     ledger._sql(f"insert into public.tenant_alias(alias_key,tenant_id) values ('{tenant}','{tenant}'),('{alias}','{tenant}')")
     ledger._sql(f"insert into public.visual_group(gym_id,group_key) values ('{tenant}','{group}')")
     ledger._sql(f"select public.visual_group_activate_guard('{tenant}','transaction-test')")
+    scratch_scene_on(tenant)
     url, fp, candidate = ledger._seed_object(tenant, group, '0000000000000000')
     row = ledger._insert_row(tenant, group, url)
     sibling = ledger._one("insert into public.content_calendar(gym_id,account,post_date,status,variant_status,image_url,source_media_url,visual_group_key) values "
@@ -413,6 +438,7 @@ def test_current_lasso_story_and_dated_capacity_envelopes(capacity, day, current
     ledger._sql(f"delete from public.tenant_alias where alias_key='lasso'; "
                 f"insert into public.tenant_alias(alias_key,tenant_id) values ('{tenant}','{tenant}'),('lasso','{tenant}')")
     ledger._sql(f"select public.visual_group_activate_guard('{tenant}','capacity-test')")
+    scratch_scene_on(tenant)
     # Distinct days have distinct exact objects/scenes; same-day rows are legal
     # siblings. Capacity is per channel/format, independent of scene identity.
     def rows(post_date, word, number):
@@ -439,6 +465,10 @@ def test_application_barrier_refuses_other_disposable_database():
                           input=DRAFT.read_text(), text=True, capture_output=True, timeout=30)
     try:
         assert done.returncode != 0 and "SCRATCH ONLY" in done.stderr
+        authority=(ROOT / "migrations/DRAFT_visual_scene_activation_authority_20261006.sql").read_text()
+        rejected=subprocess.run([ledger.PSQL,"-X","-q","-v","ON_ERROR_STOP=1","-d",other_dsn],
+                                input=authority,text=True,capture_output=True,timeout=30)
+        assert rejected.returncode != 0 and "SCRATCH ONLY" in rejected.stderr
         check = command([ledger.PSQL,"-X","-qAt","-d",other_dsn,"-c",
                          "select count(*) from pg_proc where pronamespace='public'::regnamespace"])
         assert check.stdout.strip() == "0"
@@ -454,3 +484,160 @@ def test_claim_rebases_authoritative_predicates_without_drift():
     # Only the final mutation/result check is changed. This pins autonomy,
     # manual proof, stale reservations, and all dated capacity predicates.
     assert base.split("  v_token := gen_random_uuid();", 1)[0] == composed.split("  v_token := gen_random_uuid();", 1)[0]
+
+
+def test_scene_authority_missing_row_defaults_off_without_weakening_exact_bytes():
+    tenant, group, url, fp, candidate, row = seed(phash=None, scene_on=False)
+    assert ledger._one(f"select public.visual_scene_enforcement_on('{tenant}')") == "f"
+    assert ledger._one(f"select public.visual_group_enforcement_on('{tenant}')") == "t"
+    assert state(row)["media_not_ready_reason"] is None
+    assert ledger._occupied_count() == 0 and ledger._holds() == []
+    assert ledger._one("select count(*) from public.visual_global_usage") == "1"
+    assert claim(row, tenant)
+    assert ledger._occupied_count() == 0
+    # Exact-byte authority still refuses this same group's different date.
+    denied = ledger._run("insert into public.content_calendar(gym_id,account,post_date,status,variant_status,image_url,source_media_url,visual_group_key) values "
+              f"('{tenant}','ig','2026-10-12','pending','active','{url}','{url}','{group}')",check=False)
+    assert denied.returncode != 0
+    assert ledger._occupied_count() == 0
+
+
+def test_explicit_scene_off_ignores_scene_nearness_and_keeps_proof_gate():
+    tenant, group, url, fp, candidate, row = seed(scene_on=False)
+    ledger._sql(f"insert into public.gym_visual_scene_guard_settings(gym_id) values ('{tenant}')")
+    add_conflict()
+    assert ledger._one(f"select public.visual_scene_enforcement_on('{tenant}')") == "f"
+    assert ledger._one(f"select count(*) from public.approve_calendar_row_if_media_ready('{row}','{tenant}')") == "1"
+    assert ledger._one(f"select public.claim_calendar_publish_slot_proven_owned('{row}','{tenant}','2026-10-10','UTC',2,true)") == ""
+    assert proof_stamp(row, tenant) == "1"
+    assert ledger._one(f"select public.claim_calendar_publish_slot_proven_owned('{row}','{tenant}','2026-10-10','UTC',2,true)")
+    assert state(row)["status"] == "publishing"
+    assert ledger._holds() == []
+    assert ledger._occupied_count() == 1  # only the independently seeded history
+
+
+def test_scene_direct_arming_and_guc_arming_are_refused():
+    tenant, group = ledger._seed_tenant()
+    insert = ledger._run(f"insert into public.gym_visual_scene_guard_settings(gym_id,enforce) values ('{tenant}',true)",check=False)
+    assert insert.returncode != 0 and "verified historical occupied backfill" in insert.stderr
+    ledger._sql(f"insert into public.gym_visual_scene_guard_settings(gym_id) values ('{tenant}')")
+    update = ledger._run(f"set echo.scene_activation='on'; update public.gym_visual_scene_guard_settings set enforce=true where gym_id='{tenant}'",check=False)
+    assert update.returncode != 0 and "verified historical occupied backfill" in update.stderr
+    assert ledger._one(f"select public.visual_scene_enforcement_on('{tenant}')") == "f"
+    assert ledger._run(f"select public.visual_scene_backfill_occupied()",check=False).returncode != 0
+    assert ledger._one("select to_regprocedure('public.visual_scene_activate_guard(text,text)') is null") == "t"
+
+
+def test_scene_settings_and_audit_are_service_read_only():
+    tenant, group = ledger._seed_tenant()
+    for statement in (
+        f"insert into public.gym_visual_scene_guard_settings(gym_id,enforce) values ('{tenant}',true)",
+        f"insert into public.visual_scene_disarm_event(gym_id,actor,reason,was_enforced) values ('{tenant}','forged','forged',true)",
+    ):
+        result=ledger._run("set role service_role; "+statement,check=False)
+        assert result.returncode != 0 and "permission denied" in result.stderr
+    assert ledger._one("select has_function_privilege('authenticated','public.visual_scene_disarm_guard(text,text,text)','EXECUTE')") == "f"
+    assert ledger._one("select has_function_privilege('service_role','public.visual_scene_disarm_guard(text,text,text)','EXECUTE')") == "t"
+
+
+def test_controlled_disarm_rolls_back_or_commits_without_erasing_hold_evidence():
+    tenant, group, url, fp, candidate, row = seed()
+    add_conflict()
+    assert claim(row, tenant) == ""
+    assert_held(row)
+    occupied, holds = ledger._occupied_count(), ledger._holds()
+    before=ledger._one("select count(*) from public.visual_scene_disarm_event")
+    # Raw updates/deletes cannot remove the authority. Nor can invalid reasons.
+    for statement in (
+        f"update public.gym_visual_scene_guard_settings set enforce=false where gym_id='{tenant}'",
+        f"delete from public.gym_visual_scene_guard_settings where gym_id='{tenant}'",
+        f"select public.visual_scene_disarm_guard('{tenant}','reviewer','')",
+    ):
+        assert ledger._run(statement,check=False).returncode != 0
+    ledger._sql(f"begin; select public.visual_scene_disarm_guard('{tenant}','reviewer','rollback rehearsal'); rollback;")
+    assert ledger._one(f"select public.visual_scene_enforcement_on('{tenant}')") == "t"
+    assert ledger._one("select count(*) from public.visual_scene_disarm_event") == before
+    ledger._sql(f"set role service_role; select public.visual_scene_disarm_guard('{tenant}','reviewer','stop scene admission')")
+    assert ledger._one(f"select public.visual_scene_enforcement_on('{tenant}')") == "f"
+    assert ledger._one(f"select public.visual_group_enforcement_on('{tenant}')") == "t"
+    assert ledger._occupied_count()==occupied and ledger._holds()==holds
+    assert_held(row)
+    assert claim(row, tenant) == ""
+    assert ledger._one(f"select actor||':'||reason from public.visual_scene_disarm_event where gym_id='{tenant}'") == "reviewer:stop scene admission"
+    for statement in (
+        f"delete from public.visual_scene_disarm_event where gym_id='{tenant}'",
+        "truncate public.visual_scene_disarm_event",
+        "truncate public.gym_visual_scene_guard_settings",
+    ):
+        assert ledger._run(statement,check=False).returncode != 0
+
+
+def test_scene_authority_alias_and_off_destination_cannot_bypass_on_guard():
+    tenant, group, url, fp, candidate, row = seed(active=False)
+    other, other_group=ledger._seed_tenant()
+    result=ledger._run(f"update public.content_calendar set gym_id='{other}' where id='{row}'",check=False)
+    assert result.returncode != 0 and "scene-OFF tenant" in result.stderr
+    result=ledger._run(f"insert into public.gym_visual_scene_guard_settings(gym_id) values ('unmapped')",check=False)
+    assert result.returncode != 0 and "canonical mapped tenant" in result.stderr
+
+
+@pytest.mark.parametrize("busy_table", ["content_calendar", "gym_visual_scene_guard_settings", "settings_row"])
+def test_scene_disarm_refuses_contended_writer_without_partial_audit(busy_table):
+    tenant, group, url, fp, candidate, row = seed()
+    before=ledger._one("select count(*) from public.visual_scene_disarm_event")
+    marker="scene_disarm_writer_ready"
+    proc=subprocess.Popen([ledger.PSQL,"-X","-q","-A","-t","-v","ON_ERROR_STOP=1","-d",ledger.DSN],
+                          stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    lock=(f"select enforce from public.gym_visual_scene_guard_settings where gym_id='{tenant}' for share"
+          if busy_table=="settings_row" else f"lock table public.{busy_table} in row exclusive mode")
+    proc.stdin.write(f"begin; {lock}; select '{marker}';\n")
+    proc.stdin.flush()
+    try:
+        while marker not in proc.stdout.readline():
+            assert proc.poll() is None
+        result=ledger._run(f"select public.visual_scene_disarm_guard('{tenant}','reviewer','contention test')",check=False)
+        assert result.returncode != 0 and "could not obtain lock" in result.stderr
+        assert ledger._one(f"select public.visual_scene_enforcement_on('{tenant}')") == "t"
+        assert ledger._one("select count(*) from public.visual_scene_disarm_event") == before
+        assert state(row)["status"]=="pending"
+    finally:
+        proc.stdin.write("rollback;\n\\q\n")
+        proc.stdin.flush()
+        proc.wait(timeout=20)
+        assert proc.returncode==0
+
+
+def test_scene_disarm_preserves_published_original_token_and_both_ledgers():
+    tenant, group, url, fp, candidate, row=seed()
+    token=claim(row,tenant)
+    # Synthetic terminal-provider fixture through the real reconciliation RPC;
+    # never loosen finalization or create a real-provider receipt outside scratch.
+    ledger._sql(f"select public.visual_group_reconcile_ambiguous('{tenant}','{row}','confirmed_published','{group}','2026-10-10',"
+                "jsonb_build_object('source','provider_terminal_readback',"
+                f"'gym_id','{tenant}','calendar_row_id','{row}','group_key','{group}',"
+                "'calendar_date','2026-10-10','provider','synthetic-local-test',"
+                "'request_id','synthetic-request','receipt_ref','synthetic-test-only',"
+                "'terminal',true,'will_retry',false,'delivery','delivered','provider_status','published',"
+                f"'provider_post_id','synthetic-post','delivered_url','{url}',"
+                "'checked_at',now(),'published_at',now(),'hold_claims','[]'::jsonb,"
+                "'claims',(select coalesce(jsonb_agg(jsonb_build_object('group_key',s.group_key,"
+                "'attempt_id',s.attempt_id::text,'claim_token',s.original_claim_token::text,"
+                "'provider_post_id',s.original_provider_post_id,'image_url',s.original_image_url) order by s.group_key),'[]'::jsonb) "
+                f"from public.visual_group_usage_sibling s where s.gym_id='{tenant}' and s.calendar_row_id='{row}' and s.ambiguous)),"
+                "'synthetic-test-reviewer')")
+    before=state(row)
+    occupied=ledger._occupied_count()
+    exact=ledger._one("select count(*) from public.visual_global_usage")
+    ledger._sql(f"select public.visual_scene_disarm_guard('{tenant}','reviewer','rollback publish guard')")
+    assert state(row)==before and state(row)["publish_claim_token"]==token
+    assert ledger._occupied_count()==occupied
+    assert ledger._one("select count(*) from public.visual_global_usage")==exact
+    assert ledger._one(f"select public.visual_group_enforcement_on('{tenant}')")=="t"
+
+
+def test_scene_on_refuses_loss_of_exact_byte_authority():
+    tenant, group, url, fp, candidate, row=seed()
+    ledger._sql(f"update public.gym_visual_guard_settings set enforce=false where gym_id='{tenant}'")
+    result=ledger._run(f"update public.content_calendar set caption='another caption' where id='{row}'",check=False)
+    assert result.returncode != 0 and "requires exact-byte authority" in result.stderr
+    assert state(row)["caption"] is None
