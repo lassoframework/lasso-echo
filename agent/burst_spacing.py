@@ -20,7 +20,7 @@ from functools import lru_cache
 from . import config, dam
 
 
-_STAMP_RE = re.compile(r"(?P<stamp>\d{8}T\d{6}Z)_(?P<name>[^/]+)$")
+_STAMP_RE = re.compile(r"^(?P<stamp>\d{8}T\d{6}Z)_(?P<name>[^/]+)$")
 _SEPARATED_CAMERA_SEQUENCE_RE = re.compile(
     r"^(?P<family>[A-Za-z][A-Za-z0-9]{0,11})[_-](?P<sequence>\d{3,8})"
     r"(?:[_-].*)?$",
@@ -90,6 +90,17 @@ def normalize_intake_metadata(values):
     return normalized
 
 
+def _validated_stamped_name(value):
+    """Return ``(canonical_stamp, source_name)`` for a valid stamped basename."""
+    match = _STAMP_RE.search(os.path.basename(str(value or "")))
+    if not match:
+        return None
+    stamp = normalize_batch_timestamp(match.group("stamp"))
+    if stamp is None:
+        return None
+    return stamp, match.group("name")
+
+
 def parse_camera_sequence(value):
     """Return ``(family, sequence)`` from one conservative camera filename.
 
@@ -100,9 +111,9 @@ def parse_camera_sequence(value):
     separated and compact shapes explicit preserves rollover identity.
     """
     name = os.path.basename(str(value or ""))
-    stamped = _STAMP_RE.search(name)
+    stamped = _validated_stamped_name(name)
     if stamped:
-        name = stamped.group("name")
+        _stamp, name = stamped
     stem = os.path.splitext(name)[0]
     for pattern in (_SEPARATED_CAMERA_SEQUENCE_RE,
                     _COMPACT_CAMERA_SEQUENCE_RE):
@@ -143,10 +154,10 @@ def _metadata_cached(path, sidecar_signature):
     )
     source_name = ""
     for raw in source_names:
-        match = _STAMP_RE.search(str(raw or ""))
-        if match:
-            batch = batch or match.group("stamp")
-            source_name = match.group("name")
+        stamped = _validated_stamped_name(raw)
+        if stamped:
+            fallback_batch, source_name = stamped
+            batch = batch or fallback_batch
             break
     if not batch:
         return None

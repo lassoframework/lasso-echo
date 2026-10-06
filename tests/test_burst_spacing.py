@@ -328,3 +328,69 @@ def test_corrupt_member_forces_all_or_nothing_legacy_fallback(tmp_path, monkeypa
 
     assert burst_spacing.choose_spaced_pool(
         photos, photos, {}, "nine7_ig", "2026-10-10") == photos
+
+
+@pytest.mark.parametrize("stamp", [
+    "20260230T120000Z",
+    "20261301T120000Z",
+    "20230229T120000Z",
+    "x20240229T120000Z",
+])
+def test_invalid_filename_fallback_stamps_are_unknown(tmp_path, stamp):
+    path = tmp_path / f"{stamp}_IMG_1001.jpg"
+    path.write_bytes(b"photo")
+    photo = Creative(path=str(path), media_type="image")
+
+    assert burst_spacing.parse_camera_sequence(path.name) is None
+    assert burst_spacing.cohort_map([photo]) == {}
+
+
+def test_invalid_source_key_fallback_stamp_is_unknown(tmp_path):
+    path = tmp_path / "recovered-photo.jpg"
+    path.write_bytes(b"source")
+    from agent import dam
+    dam.write_sidecar(str(path), {
+        "original_key": "intake/nine7/incoming/20260230T120000Z_IMG_1001.jpg",
+    })
+
+    assert burst_spacing.cohort_map([
+        Creative(path=str(path), media_type="image"),
+    ]) == {}
+
+
+def test_valid_leap_day_filename_and_source_key_fallbacks_are_supported(tmp_path):
+    filename_path = tmp_path / "20240229T235959Z_IMG_1001.jpg"
+    filename_path.write_bytes(b"filename")
+    source_path = tmp_path / "recovered-photo.jpg"
+    source_path.write_bytes(b"source")
+    from agent import dam
+    dam.write_sidecar(str(source_path), {
+        "original_key": "intake/nine7/incoming/20240229T120000Z_DSCN0999.jpg",
+    })
+    photos = [
+        Creative(path=str(filename_path), media_type="image"),
+        Creative(path=str(source_path), media_type="image"),
+    ]
+
+    assert burst_spacing.parse_camera_sequence(filename_path.name) == ("img", 1001)
+    cohorts = burst_spacing.cohort_map(photos)
+    assert set(cohorts) == {str(filename_path), str(source_path)}
+    assert cohorts[str(filename_path)].startswith("intake:20240229T235959Z:")
+    assert cohorts[str(source_path)].startswith("intake:20240229T120000Z:")
+
+
+def test_mixed_valid_and_invalid_filename_stamps_preserve_legacy_pool(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BURST_SPACING_GYMS", "nine7")
+    photos = []
+    for name in (
+        "20261001T120000Z_IMG_1001.jpg",
+        "20261002T120000Z_IMG_2001.jpg",
+        "20260230T120000Z_IMG_3001.jpg",
+    ):
+        path = tmp_path / name
+        path.write_bytes(name.encode())
+        photos.append(Creative(path=str(path), media_type="image"))
+
+    assert burst_spacing.choose_spaced_pool(
+        photos, photos, {}, "nine7_ig", "2026-10-10") == photos
