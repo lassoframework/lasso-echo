@@ -1362,6 +1362,30 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         _build_lock.release(base_key, holder=_lock_holder)
 
 
+def _drive_range_pickable(base_key, start, days, covered_days=()):
+    """Distinct Drive assets eligible for at least one open scheduled day.
+
+    Scene OFF retains the original single first-day budget read. With scene ON
+    (or ambiguous, which the selector closes), eligibility can vary by day, so
+    query every open date. This is a ceiling only; each actual pick still checks
+    its own target date and reserves its asset before another slot can use it.
+    """
+    from datetime import timedelta
+    from . import gym_media_selector
+    if gym_media_selector.scene_guard_flag() is False:
+        return gym_media_selector.pickable(base_key, post_date=start.isoformat())
+    eligible = {}
+    for offset in range(days):
+        target = (start + timedelta(days=offset)).isoformat()
+        if target in covered_days:
+            continue
+        for asset in gym_media_selector.pickable(base_key, post_date=target):
+            asset_id = str(asset.get("id") or "").strip()
+            if asset_id:
+                eligible.setdefault(asset_id, asset)
+    return list(eligible.values())
+
+
 def _build_client_month_body(account, base_key, start, days, *, voice, library_path,
                              store, banned_words, log, allow_reshape, media_count,
                              locked_feed_days, used_keys, locked_keys, drafts,
@@ -1400,10 +1424,11 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # gates, so this is a bounded snapshot of the usable Drive budget rather than a
     # broad asset-table count.
     from . import gym_media_selector as _media_selector
-    _drive_budget = (len(_media_selector.pickable(
-                         base_key, post_date=start.isoformat()))
-                     if (config.gym_drive_stage_enabled()
-                         and config.gym_drive_connect_active_for(base_key)) else 0)
+    _drive_armed = (config.gym_drive_stage_enabled()
+                    and config.gym_drive_connect_active_for(base_key))
+    _drive_pool = (_drive_range_pickable(base_key, start, days, locked_feed_days)
+                   if _drive_armed else [])
+    _drive_budget = len(_drive_pool)
     max_feed_days = min(days * slots_per_day,
                         max(0, media_count - _used_in_lib) + _drive_budget)
 
@@ -1490,7 +1515,12 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             "connected Drive pool")
         return feed_count
 
-    _drive_kinds = _media_selector.pool_kinds(base_key) if _drive_armed else set()
+    _drive_kinds = set()
+    if _drive_armed:
+        if _media_selector.scene_guard_flag() is not False:
+            _drive_kinds = {str(asset.get("kind") or "") for asset in _drive_pool}
+        else:
+            _drive_kinds = _media_selector.pool_kinds(base_key)
     if "photo" in _drive_kinds:
         try:
             photo_pre = append_gym_drive_drafts(
@@ -1719,7 +1749,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # VIDEO PRE-PASS: only after the Drive-photo pass and Lane A have consumed every
     # photo slot they can. Restrict this pass to video beats and a video-only currently
     # pickable pool, so a clip cannot outrank any approved Drive or local photo.
-    _drive_kinds = _media_selector.pool_kinds(base_key) if _drive_armed else set()
+    _drive_kinds = set()
+    if _drive_armed:
+        if _media_selector.scene_guard_flag() is not False:
+            _drive_kinds = {str(asset.get("kind") or "") for asset in
+                            _drive_range_pickable(base_key, start, days, covered_days)}
+        else:
+            _drive_kinds = _media_selector.pool_kinds(base_key)
     if "video" in _drive_kinds and "photo" not in _drive_kinds:
         try:
             video_pre = append_gym_drive_drafts(
