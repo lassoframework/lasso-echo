@@ -156,7 +156,9 @@ def test_full_cadence_writes_pending_rows():
                for r in store.rows)
 
 
-def test_gate2_coach_review_status_threads_through():
+def test_legacy_explicit_coach_review_status_cannot_create_new_review_rows():
+    # Legacy callers may still pass the old argument, but new rows always go to
+    # the gym's own pending approval. Historical review rows remain releasable.
     _seed()
     store = _Store()
     out = gd.plan_gbp_dogfood(
@@ -164,7 +166,18 @@ def test_gate2_coach_review_status_threads_through():
         store=store, start=date(2026, 9, 1), initial_status="coach_review",
         caption_fn=_cap, image_fn=_img)
     assert out["ok"] and store.rows
-    assert all(r["status"] == "coach_review" for r in store.rows)
+    assert all(r["status"] == "pending" for r in store.rows)
+
+
+def test_coach_screen_predicates_always_false(monkeypatch):
+    # RETIRED (Blake, 2026-10-06): there is never a coach review on anything. Even with
+    # the legacy env vars explicitly set TRUE, both predicates must report False so
+    # runtime/status cannot imply a coach gate still exists.
+    from agent import config
+    monkeypatch.setenv("AGENT_GBP_COACH_SCREEN", "true")
+    monkeypatch.setenv("AGENT_COACH_SCREEN_FIRST_MONTH", "true")
+    assert config.gbp_coach_screen_enabled() is False
+    assert config.coach_screen_first_month_enabled() is False
 
 
 def test_gate1_unconfirmed_offer_not_written():

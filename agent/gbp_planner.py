@@ -613,10 +613,10 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     GATE 1 offer_confirmed: the OFFER slot is planned ONLY when this is True AND a real
     offer resolves. A gym whose live offer is not confirmed gets NO OFFER post (a wrong
     offer to Google is a failure we cannot eat). Local updates / events / photo drops are
-    unaffected. GATE 2 initial_status: the status every planned row is written with —
-    'pending' (owner-visible) normally, or 'coach_review' (withheld from the owner until a
-    coach screens and releases it) for a gym's first month."""
+    unaffected. The legacy initial_status argument is accepted for call compatibility,
+    but every new row is pending for the gym's own approval; coach review is retired."""
     log = logger or (lambda m: print(f"[gbp-planner] {m}"))
+    initial_status = "pending"
     start = start or date.today()
     caption_fn = caption_fn or (lambda fact: generate_gbp_caption(fact, voice, city))
     facts = list(facts or [])
