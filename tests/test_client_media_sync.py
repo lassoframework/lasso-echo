@@ -167,6 +167,27 @@ def test_sync_downloads_new_media_with_public_url_and_caption():
     assert creatives["20260810T120000Z_photo_00.jpg"].client_note == "day 0 at the gym"
 
 
+def test_sync_persists_ordered_camera_sequence_metadata():
+    names = ["20261001T120000Z_IMG_1001.jpg", "20261001T120000Z_IMG_1002.jpg"]
+    objects = {
+        f"intake/nine7/incoming/{name}": b"\xff\xd8\xffFAKE" + bytes([idx])
+        for idx, name in enumerate(names)
+    }
+    objects["intake/nine7/incoming/20261001T120000Z_upload.json"] = json.dumps({
+        "timestamp": "20261001T120000Z", "filenames": names,
+    }).encode()
+
+    out = cms.sync_uploads("nine7", r2=FakeR2(objects))
+
+    assert out == {"synced": 2, "skipped": 0}
+    side = json.load(open(os.path.join(
+        "content_library", "nine7", "20261001T120000Z_IMG_1002.json")))
+    assert side["intake_batch_timestamp"] == "20261001T120000Z"
+    assert side["intake_batch_position"] == 1
+    assert side["intake_camera_family"] == "img"
+    assert side["intake_camera_sequence"] == 1002
+
+
 def test_sync_is_idempotent_no_redownload():
     r2 = _r2_with_uploads("gritx", n=3)
     cms.sync_uploads("gritx", r2=r2)

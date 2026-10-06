@@ -456,6 +456,7 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     os.makedirs(lib_dir, exist_ok=True)
     captions = _read_captions(r2, prefixes, log, keys=listed)
     contexts, consents = _read_context_consent(r2, prefixes, log, keys=listed)   # §8
+    intake_sequences = _read_intake_sequences(r2, prefixes, keys=listed)
 
     synced = 0
     skipped = 0
@@ -489,7 +490,8 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
                        client_context=contexts.get(name, ""),
                        consent=bool(consents.get(name)),
                        source_fingerprint=aliases[0],
-                       source_fingerprint_aliases=aliases[1:])
+                       source_fingerprint_aliases=aliases[1:],
+                       intake_sequence=intake_sequences.get(name))
         synced += 1
         if _valid_media_file(target):
             accepted.append(key)
@@ -663,9 +665,54 @@ def _read_context_consent(r2, prefixes, log, keys=None):
     return contexts, consents
 
 
+def _read_intake_sequences(r2, prefixes, keys=None):
+    """Trusted upload-batch metadata keyed by stored media basename.
+
+    The portal writes one immutable ``timestamp`` plus the ordered ``filenames``
+    array in each upload sidecar. Persisting those facts into the local sidecar
+    lets the Vision-off picker space camera bursts without inspecting people or
+    image content.
+    """
+    import re
+    result = {}
+    for prefix in prefixes:
+        prefix_keys = keys.get(prefix) if keys is not None else None
+        if prefix_keys is None:
+            try:
+                prefix_keys = list(r2.list_keys(prefix) or [])
+            except Exception:  # noqa: BLE001
+                continue
+        for key in prefix_keys:
+            if not key.endswith(_UPLOAD_SIDECAR_SUFFIX):
+                continue
+            data = _load_json_cached(r2, key)
+            if not isinstance(data, dict):
+                continue
+            stamp = str(data.get("timestamp") or "").strip()
+            filenames = data.get("filenames") or []
+            if not stamp or not isinstance(filenames, list):
+                continue
+            for position, filename in enumerate(filenames):
+                name = os.path.basename(str(filename or ""))
+                if not name:
+                    continue
+                match = re.match(
+                    r"^\d{8}T\d{6}Z_(?P<family>[A-Za-z][A-Za-z0-9]{1,11})"
+                    r"[_-]?(?P<sequence>\d{3,8})(?:[_-].*)?\.[^.]+$", name)
+                metadata = {
+                    "intake_batch_timestamp": stamp,
+                    "intake_batch_position": position,
+                }
+                if match:
+                    metadata["intake_camera_family"] = match.group("family").lower()
+                    metadata["intake_camera_sequence"] = int(match.group("sequence"))
+                result[name] = metadata
+    return result
+
+
 def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
                    consent=False, source_fingerprint="",
-                   source_fingerprint_aliases=None):
+                   source_fingerprint_aliases=None, intake_sequence=None):
     """Write the .json sidecar library._load_sidecar reads: public_url makes the
     downloaded photo a portal-ready real-photo card; the gym's own one line about the
     photo goes in the "note" key (the EXACT key library._load_sidecar reads into
@@ -697,6 +744,8 @@ def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
         payload["note"] = caption
     if client_context and not payload.get("client_context"):
         payload["client_context"] = client_context
+    for key, value in (intake_sequence or {}).items():
+        payload.setdefault(key, value)
     # Stable source-byte identity. SHA-256 is authoritative; weaker/legacy
     # digests survive only in an explicit alias list, never in the authority
     # slot. Unknown source remains absent rather than being inferred from a key.
