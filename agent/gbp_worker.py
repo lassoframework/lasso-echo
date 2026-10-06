@@ -45,8 +45,10 @@ def _alert_manual_approval_changed(gym_id, row_id, alert):
             return
         result = alert(
             f"GBP row {row_id} for {gym_id} was moved back to pending because its "
-            "creative changed after manual approval. Review the current caption and "
-            "image in the portal, then approve it again before publishing.")
+            "creative changed after manual approval. In the portal, remove the internal "
+            "[why]/[reason] block from the caption, review the clean creative, then "
+            "request client approval before publishing. Approving it as-is will keep "
+            "the row held.")
         if result and not (isinstance(result, dict) and result.get("ok") is False):
             db.kv_set(key, "1")
     except Exception as exc:  # alerting must not affect the safe held row

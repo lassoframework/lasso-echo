@@ -1187,7 +1187,10 @@ def test_manual_approval_creative_change_returns_to_pending_and_alerts_once(monk
     assert store.released == [("r1", "pending"), ("r1", "pending")]
     assert len(alerts) == 1
     assert "moved back to pending" in alerts[0]
-    assert "approve it again" in alerts[0]
+    assert "remove the internal [why]/[reason] block" in alerts[0]
+    assert "review the clean creative" in alerts[0]
+    assert "request client approval" in alerts[0]
+    assert "Approving it as-is will keep the row held" in alerts[0]
 
 
 def test_proof_autonomous_caption_metadata_holds_for_automatic_cleanup(monkeypatch):
