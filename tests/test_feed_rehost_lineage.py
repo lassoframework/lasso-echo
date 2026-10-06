@@ -147,10 +147,10 @@ def test_feed_rendition_rehost_attests_real_edge_and_preserves_raw_source(rehost
     assert observations["asset_id"] is None  # asset-a belongs to raw A, not rendition B
     assert [call[0] for call in http.calls][-2:] == ["post", "patch"]
     _, params, payload = http.calls[-1]
-    assert params["status"] == 'eq."approved"'
-    assert params["source_media_url"] == f'eq."{RAW}"'
-    assert params["image_url"] == f'eq."{INPUT}"'
-    assert params["post_date"] == 'eq."2026-10-03"'
+    assert params["status"] == 'eq.approved'
+    assert params["source_media_url"] == f'eq.{RAW}'
+    assert params["image_url"] == f'eq.{INPUT}'
+    assert params["post_date"] == 'eq.2026-10-03'
     assert params["published_at"] == params["late_post_id"] == "is.null"
     assert payload["source_media_url"] == RAW
 
