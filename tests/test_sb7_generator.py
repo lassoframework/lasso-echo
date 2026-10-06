@@ -1,7 +1,7 @@
 """
 StoryBrand SB7 caption generator + the edit-learning feedback loop.
 
-Fully OFFLINE: the Anthropic call (_call_llm_caption) is monkeypatched to a fake
+Fully OFFLINE: the OpenAI call (_call_llm_caption) is monkeypatched to a fake
 that records the prompt it receives, so we can assert what guidance the drafter
 folds in without touching the network.
 

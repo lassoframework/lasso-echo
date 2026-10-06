@@ -104,18 +104,16 @@ def default_fetch_state(ticket, who):
     return facts
 
 
-def default_llm(system, user, *, model=None):
-    import os
+def default_llm(system, user, *, model=None, transport=None):
+    """Call the OpenAI Responses API for one bounded, grounded Slack reply.
+
+    The injectable transport is for offline contract tests. A provider failure raises so
+    the answer lane returns None and the existing escalation path stays in control.
+    """
     from .. import config
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
-    import anthropic
-    client = anthropic.Anthropic(api_key=key)
-    resp = client.messages.create(model=model or config.slack_convo_model(), max_tokens=400,
-                                  system=system, messages=[{"role": "user", "content": user}])
-    parts = [getattr(b, "text", "") for b in (resp.content or [])]
-    return "".join(parts).strip()
+    from .. import openai_text
+    return openai_text.complete(system, user, model=model or config.slack_convo_model(),
+                                max_output_tokens=1000, transport=transport)
 
 
 def _speaker_identity(speaker, fallback):

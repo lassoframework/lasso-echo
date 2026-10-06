@@ -3,9 +3,8 @@ Headless podcast episode source: pull the newest episode video from a Google
 Drive folder that Riverside auto-exports into.
 
 This is the HEADLESS path for the Railway Monday cron. It uses a Google
-service-account key (AGENT_GDRIVE_SA_JSON) via the Google Drive API, NOT the
-claude.ai Google Drive connector (which is interactive-auth and unavailable in a
-headless cron). Set the service account up once with read access to the folder.
+service-account key (AGENT_GDRIVE_SA_JSON) via the Google Drive API. Set the service
+account up once with read access to the folder.
 
 Everything is lazy-imported and fails LOUD with setup instructions when a piece
 is missing, so a misconfigured cron never silently no-ops.

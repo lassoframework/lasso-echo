@@ -205,7 +205,7 @@ def plan_broll_moments(transcript, clip_start, clip_end, llm=None):
     """
     Pick 2-3 B-roll overlay moments for the clip.
     Returns list of {offset (seconds from clip start), text (ALL CAPS), duration}.
-    Uses Claude if llm is provided; falls back to position-based heuristic.
+    Uses the injected model if provided; falls back to a position-based heuristic.
     """
     words = transcript.get("words", [])
     seg_words = [

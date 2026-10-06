@@ -1,3 +1,8 @@
+## Echo OpenAI text runtime (2026-10-06)
+
+- [~] Classifier fallback, grounded answers, SB7 captions, website fact extraction and clipper moment selection use OpenAI Responses with OPENAI_API_KEY and default gpt-6-astra. Stale non-OpenAI model overrides fail closed. Deterministic classification, tenant grounding, billing refusal, claim/citation checks and client send gates remain in place. The final full suite passed 10,726 tests with 268 skips in Echo's existing virtual environment; independent review is pending.
+- [ ] Integration owner must configure the OpenAI key and clear any legacy AGENT_SLACK_CONVO_MODEL, AGENT_SB7_MODEL and AGENT_CLIPPER_MODEL values on live services, then deploy and verify each enabled lane. This branch has not sent a client message or made a live model call.
+
 ## FIXER Slack completion readback (2026-10-06, PR #301)
 
 - [~] Echo's FIXER completion readback now accepts only documented Slack mrkdwn storage forms for the exact intended text: bare HTTP(S) URLs wrapped as links and literal `&`, `<`, `>` encoded as entities. The posted-response timestamp, channel, thread and Echo sender still have to match; unknown or different content remains held without resend. Local targeted checks passed; merge, deployment and live readback remain pending.

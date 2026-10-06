@@ -704,9 +704,9 @@ def _episode_upload(args):
     print()
     print("NEXT STEPS (in Railway env):")
     print("  AGENT_EPISODE_INBOX_ENABLED=true     (inbox watcher, polls every 5 min)")
-    print("  AGENT_CLIPPER_ENABLED=true            (Phase 1: Claude clip selection)")
+    print("  AGENT_CLIPPER_ENABLED=true            (Phase 1: Astra clip selection)")
     print("  AGENT_CLIPPER_RENDER_ENABLED=true     (Phase 2: ffmpeg cut + captions + brand frame)")
-    print("  ANTHROPIC_API_KEY=sk-...              (Claude moment selection)")
+    print("  OPENAI_API_KEY=...                    (Astra moment selection)")
     print("  AGENT_TRANSCRIBE_API_KEY=...          (transcription, OR install faster-whisper)")
     print()
     print("  For RSS podcast cards (release post + infographics):")
@@ -875,7 +875,7 @@ def _config_check():
     # --- 3. Compute undocumented vars ---
     # PORT is Railway-injected; skip it.  Only flag AGENT_* and known external vars.
     known_external = {"META_APP_ID", "META_APP_SECRET", "OPUS_API_KEY",
-                      "ANTHROPIC_API_KEY"}
+                      "OPENAI_API_KEY"}
     skip_vars = {"PORT"}
     undocumented = {}
     for var, fname in sorted(code_vars.items()):
@@ -2745,7 +2745,7 @@ def main(argv=None):
         inbox_status_cli()
     elif cmd == "clip-episode":
         # Native clipper (AGENT_CLIPPER_ENABLED): stage a full episode video, get
-        # word-level transcription, and let Claude pick 4-5 candidate Reel moments.
+        # word-level transcription, and let Astra pick 4-5 candidate Reel moments.
         # Phase 1 is SELECTION only: with no --render it prints the ranked plan and
         # writes/renders nothing (the approval checkpoint before any video work).
         from .clipper import clip_episode_cli
@@ -2753,7 +2753,7 @@ def main(argv=None):
     elif cmd == "video-episode":
         # Video editor (AGENT_VIDEO_EDITOR_ENABLED): the full Option A pipeline —
         # transcribe -> select -> plan b-roll manifest -> render Higgsfield overlays
-        # (Claude-in-the-loop, AGENT_VIDEO_RENDER) -> assemble 9:16 + 1:1, captioned
+        # (injected renderer, AGENT_VIDEO_RENDER) -> assemble 9:16 + 1:1, captioned
         # + caption-free ad -> held review card. Prints the b-roll plan + projected
         # Higgsfield cost. Overlays render only when armed; nothing publishes.
         from .video_editor import video_episode_cli

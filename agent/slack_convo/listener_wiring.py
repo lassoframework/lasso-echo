@@ -218,7 +218,8 @@ def build_classify_llm(identity, *, log=print, factory=None):
     except Exception as e:  # noqa: BLE001 - surfaced as NotWiredError below, never swallowed
         raise NotWiredError(
             f"SLACK_CONVO_{identity.name.upper()}_CLASSIFIER_LLM is on but no classifier LLM "
-            f"could be built ({type(e).__name__}). Set ANTHROPIC_API_KEY or turn the flag "
+            f"could be built ({type(e).__name__}). Set OPENAI_API_KEY and an OpenAI "
+            f"AGENT_SLACK_CONVO_MODEL or turn the flag "
             f"off; refusing to run with the flag on and nothing behind it.") from e
     if llm is None:
         raise NotWiredError(

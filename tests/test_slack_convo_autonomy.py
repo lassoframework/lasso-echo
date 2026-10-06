@@ -28,6 +28,7 @@ Everything runs against the same FakeBus the main suite uses. No network anywher
 """
 import os
 import sys
+import json
 
 import pytest
 
@@ -41,6 +42,90 @@ from agent.slack_convo import listener_wiring as LW  # noqa: E402
 from agent.slack_convo import outbox as OB  # noqa: E402
 
 from tests.test_slack_convo import FakeBus, _deps, _ev, _posted, _who  # noqa: E402
+
+
+def test_slack_answer_uses_openai_responses_without_anthropic(monkeypatch):
+    from agent.slack_convo import answer_lane as AL
+    monkeypatch.setenv("OPENAI_API_KEY", "not-a-real-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("AGENT_SLACK_CONVO_MODEL", raising=False)
+    seen = []
+
+    def fake_transport(url, headers, payload):
+        seen.append((url, headers, payload))
+        return 200, json.dumps({"status": "completed", "output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "content": [
+                {"type": "output_text", "text": "Your post is scheduled."}]}]})
+
+    assert AL.default_llm("Use only facts", "FACTS: scheduled", transport=fake_transport) \
+        == "Your post is scheduled."
+    url, headers, payload = seen[0]
+    assert url == "https://api.openai.com/v1/responses"
+    assert headers == {"Content-Type": "application/json"}
+    assert payload["model"] == "gpt-6-astra"
+    assert payload["instructions"] == "Use only facts"
+    assert payload["input"] == "FACTS: scheduled"
+
+
+def test_slack_answer_http_request_uses_bearer_key_and_timeout(monkeypatch):
+    import urllib.request
+    from agent.slack_convo import answer_lane as AL
+    monkeypatch.setenv("OPENAI_API_KEY", "test-secret-do-not-log")
+    seen = []
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return json.dumps({"status": "completed", "output": [
+                {"type": "message", "content": [
+                    {"type": "output_text", "text": "It is scheduled."}]}]}).encode()
+
+    def fake_urlopen(req, timeout):
+        seen.append((req, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert AL.default_llm("facts only", "FACTS: scheduled") == "It is scheduled."
+    req, timeout = seen[0]
+    assert req.full_url == "https://api.openai.com/v1/responses"
+    assert req.get_header("Authorization") == "Bearer test-secret-do-not-log"
+    assert timeout == 30
+    assert json.loads(req.data)["instructions"] == "facts only"
+
+
+@pytest.mark.parametrize("body", [
+    {"status": "incomplete", "output": [{"type": "message", "content": [
+        {"type": "output_text", "text": "Maybe"}]}]},
+    {"status": "completed", "output": [{"type": "reasoning", "summary": []}]},
+])
+def test_slack_answer_rejects_incomplete_or_missing_provider_text(monkeypatch, body):
+    from agent.slack_convo import answer_lane as AL
+    monkeypatch.setenv("OPENAI_API_KEY", "not-a-real-key")
+    with pytest.raises(RuntimeError, match="no complete text"):
+        AL.default_llm("rules", "facts", transport=lambda *_: (200, json.dumps(body)))
+
+
+def test_slack_answer_rejects_legacy_model_before_provider_call(monkeypatch):
+    from agent.slack_convo import answer_lane as AL
+    monkeypatch.setenv("OPENAI_API_KEY", "not-a-real-key")
+    monkeypatch.setenv("AGENT_SLACK_CONVO_MODEL", "claude-sonnet-5")
+    with pytest.raises(ValueError, match="OpenAI gpt model"):
+        AL.default_llm("rules", "facts", transport=lambda *_: pytest.fail("provider called"))
+
+
+def test_slack_answer_requires_openai_key_even_with_transport(monkeypatch):
+    from agent.slack_convo import answer_lane as AL
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        AL.default_llm("rules", "facts", transport=lambda *_: pytest.fail("provider called"))
 
 
 # =========================================================================================
@@ -180,9 +265,20 @@ def test_no_api_key_with_the_flag_on_refuses_to_boot(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLASSIFIER_LLM", "true")
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "legacy-key-is-not-sufficient")
     assert C.default_classify_llm() is None, "the production factory must fail at BUILD time"
     with pytest.raises(LW.NotWiredError):
+        LW.build_classify_llm(IDS.get("echo"), log=lambda *a: None)
+
+
+def test_stale_claude_model_refuses_to_boot_with_classifier_armed(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLASSIFIER_LLM", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "not-a-real-key")
+    monkeypatch.setenv("AGENT_SLACK_CONVO_MODEL", "claude-sonnet-5")
+    with pytest.raises(LW.NotWiredError, match="OpenAI"):
         LW.build_classify_llm(IDS.get("echo"), log=lambda *a: None)
 
 
@@ -190,7 +286,7 @@ def test_with_a_key_the_production_factory_builds_a_real_callable(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLASSIFIER_LLM", "true")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-a-real-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "not-a-real-key")
     llm = LW.build_classify_llm(IDS.get("echo"), log=lambda *a: None)
     assert callable(llm)
 
@@ -208,7 +304,7 @@ def test_default_classify_llm_never_returns_a_label_outside_the_set(monkeypatch)
     """The model's raw output is filtered, so a chatty or hallucinated response escalates
     rather than mislabelling. No network: default_llm is patched."""
     from agent.slack_convo import answer_lane as AL
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-a-real-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "not-a-real-key")
     monkeypatch.setattr(AL, "default_llm", lambda s, u, model=None: "I think it is a question")
     assert C.default_classify_llm()("anything") is None
     monkeypatch.setattr(AL, "default_llm", lambda s, u, model=None: "code_fix\n")
@@ -1186,7 +1282,7 @@ def test_a_dead_classifier_key_is_loud_not_silent(monkeypatch, capsys):
     every exception by design, which is indistinguishable from a healthy classifier with
     nothing to say -- the D51 flood again."""
     from agent.slack_convo import answer_lane as AL
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-invalid")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-invalid")
 
     def boom(system, user, model=None):
         raise RuntimeError("401 invalid x-api-key")
@@ -1199,7 +1295,7 @@ def test_a_dead_classifier_key_is_loud_not_silent(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "model call failed" in out
     assert "CRITICAL" in out, "a repeatedly dead key must escalate its own log level"
-    assert "ANTHROPIC_API_KEY" in out, "the log must name what to check"
+    assert "OPENAI_API_KEY" in out, "the log must name what to check"
     # and the classifier still fails CLOSED around it
     assert C.classify("anything at all", has_open_ticket=False, identity_product="echo",
                       llm=llm) is None

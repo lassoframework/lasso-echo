@@ -2333,7 +2333,7 @@ def ops_fix_triage_enabled() -> bool:
     Cross-post switch (Blake, 2026-09-02): when a live ops alert (ops_alerts.alert())
     classifies as NEEDS_TRIAGE (agent/ops_triage.py), ALSO post it into the #echosupport
     channel (support_channel_id()) as "OPS-FIX REQUEST: ...", where scout-listener's
-    ops-fix-triage.js relays it to headless Claude Code with real fix-and-ship authority.
+    the FIXER route picks it up for Codex triage and verified repair.
     OFF by default -- #echoclaude keeps receiving every alert exactly as it does today
     either way; this only adds the cross-post. Inert without support_channel_id() set,
     same as the gym support inbox.
@@ -2563,11 +2563,19 @@ def slack_convo_daily_ticket_cap() -> int:
         return 10
 
 
+def _openai_text_model(env_name: str) -> str:
+    """Resolve a text model, rejecting stale provider overrides before any call."""
+    model = (os.environ.get(env_name) or "gpt-6-astra").strip()
+    if not model.startswith("gpt-"):
+        raise ValueError(f"{env_name} must be an OpenAI gpt model")
+    return model
+
+
 def slack_convo_model() -> str:
     """AGENT_SLACK_CONVO_MODEL — the model behind the answer lane and the LLM fallback of
-    the classifier. Client-facing, grounded on live state, so the default is the current
-    Sonnet rather than a small model."""
-    return os.environ.get("AGENT_SLACK_CONVO_MODEL", "claude-sonnet-5")
+    the classifier. Grounded client answers default to the existing Astra Responses model.
+    A stale non-OpenAI override fails closed instead of silently selecting another provider."""
+    return _openai_text_model("AGENT_SLACK_CONVO_MODEL")
 
 
 def slack_convo_open_window_days() -> int:
@@ -2590,10 +2598,8 @@ def fixer_channel_id() -> str:
 
 def ops_fix_channel_id() -> str:
     """AGENT_OPS_FIX_CHANNEL_ID — where a code-fix request card is posted so the FIXER
-    worker picks it up. Ground truth 2026-09-03: the only Claude Code executor that exists
-    is scout-listener's ops-fix-triage.js, which watches #echosupport for messages prefixed
-    'OPS-FIX REQUEST: ' from Echo's own bot. So this defaults to the support channel. When
-    the worker moves (to #fixer, or to a Railway executor), this is one env var."""
+    worker picks it up. The support channel remains the default for Echo's
+    'OPS-FIX REQUEST: ' messages. A different FIXER routing channel is one env var."""
     return (os.environ.get("AGENT_OPS_FIX_CHANNEL_ID", "").strip()
             or support_channel_id())
 
@@ -3178,17 +3184,17 @@ def opus_weekly_cap() -> int:
 
 # ---- Native clipper (episode video -> 4-5 finished vertical Reels, inside Echo) ----
 # Replaces third-party clip platforms. Phase 1 is SELECTION only (episode intake,
-# word-level transcription, Claude moment picking, dry-run plan). Rendering is a
+# word-level transcription, Astra moment picking, dry-run plan). Rendering is a
 # separate Phase 2. Master flag OFF: no intake, no transcription, no LLM call.
 # Secrets (transcription + LLM keys) are read by env var NAME only, never logged.
 CLIPPER_TRANSCRIBE_KEY_ENV = "AGENT_TRANSCRIBE_API_KEY"  # name only, not the value
-CLIPPER_LLM_KEY_ENV = "ANTHROPIC_API_KEY"               # name only, not the value
+CLIPPER_LLM_KEY_ENV = "OPENAI_API_KEY"                  # name only, not the value
 
 
 def clipper_enabled() -> bool:
     """Native clipper master switch. OFF by default = zero behavior change: the CLI
     refuses, nothing is staged, transcribed, or sent to the LLM. ON, an episode
-    video can be staged, transcribed with word-level timestamps, and fed to Claude
+    video can be staged, transcribed with word-level timestamps, and fed to Astra
     for moment selection (Phase 1 stops at the dry-run plan; rendering is Phase 2)."""
     return _truthy(os.environ.get("AGENT_CLIPPER_ENABLED", "false"))
 
@@ -3221,7 +3227,7 @@ def clipper_max_sec() -> float:
 
 
 def clipper_target_count() -> int:
-    """How many candidate moments to ask Claude for (env AGENT_CLIPPER_TARGET_COUNT,
+    """How many candidate moments to ask Astra for (env AGENT_CLIPPER_TARGET_COUNT,
     default 5; the product target is 4-5 finished Reels per episode)."""
     try:
         return max(1, int(os.environ.get("AGENT_CLIPPER_TARGET_COUNT", "5")))
@@ -3230,9 +3236,8 @@ def clipper_target_count() -> int:
 
 
 def clipper_model() -> str:
-    """The Claude model used for moment selection (judgment work), env
-    AGENT_CLIPPER_MODEL, default Opus 4.8."""
-    return os.environ.get("AGENT_CLIPPER_MODEL", "claude-opus-4-8")
+    """OpenAI text model used for moment selection, default gpt-6-astra."""
+    return _openai_text_model("AGENT_CLIPPER_MODEL")
 
 
 def clipper_cache_dir() -> str:
@@ -3265,11 +3270,10 @@ def clipper_broll_enabled() -> bool:
 # AI b-roll overlays rendered by Higgsfield. Three flags, all default OFF, layered:
 #   AGENT_VIDEO_EDITOR_ENABLED  master switch for the video editor pipeline
 #   AGENT_VIDEO_BROLL_ENABLED   plan b-roll beats + composite overlays
-#   AGENT_VIDEO_RENDER          actually CALL Higgsfield (spends real credits)
+#   AGENT_VIDEO_RENDER          allow an injected renderer (spends real credits)
 # When VIDEO_RENDER is OFF the pipeline plans a b-roll manifest and projects cost
-# but renders zero overlays (or uses the text-card fallback). Higgsfield is only
-# reachable through an interactive Claude session (claude.ai MCP), never the
-# headless Railway cron, so the render arm is Claude-in-the-loop by design.
+# but renders zero overlays (or uses the text-card fallback). A separately
+# configured renderer callable and the render flag are both required to spend credits.
 
 
 def video_editor_enabled() -> bool:
@@ -3456,8 +3460,7 @@ def podcast_drive_folder_id() -> str:
 
 def gdrive_service_account_json() -> str:
     """Path to (or inline JSON of) a Google service-account key with read access to
-    the podcast Drive folder, for HEADLESS pulls on Railway (the claude.ai Drive
-    connector is interactive-only and unavailable in cron). Env
+    the podcast Drive folder, for headless pulls on Railway. Env
     AGENT_GDRIVE_SA_JSON."""
     return os.environ.get("AGENT_GDRIVE_SA_JSON", "")
 
@@ -3661,16 +3664,15 @@ SOCIALAPI_ENC_KEY_ENV = "AGENT_SOCIALAPI_ENC_KEY"
 # ---- StoryBrand SB7 caption engine ------------------------------------------
 # When armed, the drafter uses an LLM to write captions using the SB7 framework
 # (problem-first, gym as guide, customer as hero) instead of the verbatim
-# TemplateGenerator. Requires ANTHROPIC_API_KEY. OFF by default.
+# TemplateGenerator. Requires OPENAI_API_KEY. OFF by default.
 def sb7_enabled() -> bool:
     """StoryBrand SB7 caption engine. OFF by default. Set AGENT_SB7_ENABLED=true to arm."""
     return _truthy(os.environ.get("AGENT_SB7_ENABLED", "false"))
 
 
 def sb7_model() -> str:
-    """Claude model for SB7 caption generation (env AGENT_SB7_MODEL).
-    Defaults to Haiku 4.5 for speed and cost."""
-    return os.environ.get("AGENT_SB7_MODEL", "claude-haiku-4-5-20251001")
+    """OpenAI text model for SB7 captions and website intake, default gpt-6-astra."""
+    return _openai_text_model("AGENT_SB7_MODEL")
 
 
 def caption_angle_rotation_enabled() -> bool:

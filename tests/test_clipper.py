@@ -164,7 +164,7 @@ def test_transcribe_rejects_missing_word_timestamps(monkeypatch, tmp_path):
         clipper.transcribe("echo/ep/bad/e.mp4", media_path=str(media), transcriber=_bad)
 
 
-# ---- Part 3: Claude moment selection ------------------------------------------------
+# ---- Part 3: Astra moment selection -------------------------------------------------
 
 # A transcript where every word carries a timestamp, long enough to slice 30-90s.
 def _long_transcript():

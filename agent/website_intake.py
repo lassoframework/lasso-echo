@@ -33,7 +33,7 @@ takes the draft run down. Manual per-gym run:
     python -m agent website-intake --account <base> [--domain x.com] [--force]
 
 Everything is injectable (fetch / llm / alert) so the whole lane is
-unit-testable offline with no network and no Anthropic key.
+    unit-testable offline with no network and no OpenAI key.
 """
 
 import json
@@ -186,23 +186,14 @@ Fewer real facts always beats padding. Omit any category the text does not suppo
 
 
 def _call_llm(system, user):
-    """The SAME Anthropic plumbing drafter._call_llm_caption uses (same env key,
-    same AGENT_SB7_MODEL knob) with a larger max_tokens: a full source bundle
-    (up to ~20 cited facts) does not fit the caption call's 400-token cap.
-    Raises on a missing key/SDK; extract_sources catches and returns {}."""
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
-    try:
-        import anthropic
-    except Exception:
-        raise RuntimeError("anthropic SDK not installed")
-    client = anthropic.Anthropic(api_key=key)
-    resp = client.messages.create(
-        model=config.sb7_model(), max_tokens=2000,
-        system=system, messages=[{"role": "user", "content": user}])
-    parts = getattr(resp, "content", []) or []
-    return "".join(getattr(p, "text", "") or "" for p in parts)
+    """Use the shared OpenAI text client with room for a cited source bundle.
+
+    extract_sources catches provider errors and returns an empty bundle. Its citation,
+    number, tenant and approval checks still decide which facts may be stored.
+    """
+    from . import openai_text
+    return openai_text.complete(system, user, model=config.sb7_model(),
+                                max_output_tokens=4000)
 
 
 def _parse_bundle_json(raw):

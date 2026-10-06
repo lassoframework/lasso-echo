@@ -1,5 +1,9 @@
 # Echo / LASSO Organic System — Canonical Build Spec
 
+Runtime model update (2026-10-06): earlier Claude routing in this original design is
+historical. Echo text calls now use OpenAI Responses under Blake's current operating rule.
+The approval, tenant, source, and no fabrication requirements below remain binding.
+
 This is the full build-out scope for the LASSO organic social system that Echo
 grows into. It is the reference every Claude Code session and agent run should
 read before planning work, alongside `PROGRESS.md` (current state) and

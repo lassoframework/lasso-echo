@@ -31,6 +31,8 @@ before this file existed.
 | AGENT_SLACK_BOT_TOKEN | (unset) | BLAKE | xoxb token. Never logged. |
 | AGENT_SLACK_APP_TOKEN | (unset) | BLAKE | xapp token (Socket Mode). |
 | AGENT_SLACK_CHANNEL_ID | "" | BLAKE | The shared default channel (LASSO client zero). Clients set Account.slack_channel instead. |
+| AGENT_SLACK_CONVO_MODEL | gpt-6-astra | code | OpenAI Responses model for both Slack lanes. An old Claude model override is rejected; remove it or set a supported `gpt-` model during rollout. |
+| SLACK_CONVO_<IDENTITY>_CLASSIFIER_LLM | false | BLAKE | Enables model fallback only after deterministic classification declines. Requires OPENAI_API_KEY and a valid OpenAI model at boot. |
 
 ## Meta / publishing
 
@@ -120,7 +122,7 @@ conventions still reach it; the unprefixed name wins when both are set.
 
 | Var | Default | Owner | Notes |
 |---|---|---|---|
-| OPENAI_API_KEY | (unset) | BLAKE | OpenAI key for the Astra Responses call. Read lazily by name, never stored on an object, never logged. **Absent = boot with `engine=gemini` and ONE warning** (no crash, no silent drop). |
+| OPENAI_API_KEY | (unset) | BLAKE | OpenAI Responses key for Astra images, Slack conversations, SB7 captions, website intake and clipper moment selection. Read by name, never logged. For images, absence boots with `engine=gemini` and one warning. For Slack, classifier flag ON with no key refuses to boot; set the key on each listener service before arming it. Other enabled lanes fail or hold through their existing gates when absent. |
 | IMAGE_ENGINE | astra | code | Primary engine: `astra` (default) or `gemini`. `gemini` skips Astra entirely. Gemini is ALWAYS the last rung when Astra is primary. |
 | ASTRA_BRIEF_MODEL | gpt-6-astra | code | The Responses-API model that reads the creative brief and calls the image tool. |
 | ASTRA_IMAGE_MODEL | gpt-image-2.5-sunburst | code | Sunburst: infographics, carousels, and ANY asset with text overlays. |
@@ -210,7 +212,8 @@ Now the FALLBACK engine. Everything below is unchanged.
 | AGENT_CLIPPER_SCORE_FLOOR / _MIN_SEC / _MAX_SEC / _TARGET_COUNT / _MODEL / _CACHE_DIR | code defaults | code | |
 | AGENT_TRANSCRIBE_API_KEY | (unset) | BLAKE | Or install faster-whisper. |
 | AGENT_WHISPER_MODEL | code default | code | |
-| ANTHROPIC_API_KEY | (unset) | BLAKE | Clipper moment selection. |
+| AGENT_CLIPPER_MODEL | gpt-6-astra | code | OpenAI model for clipper moment selection. A stale non-OpenAI override fails closed. |
+| AGENT_SB7_MODEL | gpt-6-astra | code | OpenAI model for SB7 captions and website fact extraction. A stale non-OpenAI override fails closed. |
 | AGENT_EPISODE_INBOX_ENABLED / _PREFIX / _TENANT / _POLL_MINUTES | false / code / lasso_episodes / 5 | BLAKE | Riverside drop watcher. |
 | AGENT_EPISODE_NUDGE_TIME / _WINDOW_DAYS | 09:00 / 2 | code | Monday nudge. |
 | AGENT_OPUS_ENABLED / AGENT_OPUS_POLL_ENABLED / AGENT_OPUS_FACTORY_ENABLED | false | BLAKE | Legacy Opus lanes. |

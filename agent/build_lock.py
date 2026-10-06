@@ -47,9 +47,9 @@ build_client_month call. Auditing that number turned up:
     agent/gym_media_index.py RENDITION_TIMEOUT_SEC = 180 (per clip) --
     8 x 180s = 1440s = 24 minutes of transcoding budget ALONE, already past
     15 minutes.
-  * On top of that, agent/drafter.py's SB7 caption generation calls Claude
-    (agent/drafter.py _call_llm_caption, no per-call timeout override, so it
-    inherits the anthropic SDK's default ~600s request timeout) up to FOUR
+  * On top of that, agent/drafter.py's SB7 caption generation calls a text model
+    (agent/drafter.py _call_llm_caption, currently bounded by a 30s OpenAI
+    Responses request) up to FOUR
     times per caption (initial compose + up to three conditional retries:
     opening-collision, dropped-name, figure-gate -- agent/drafter.py
     build(), lines ~941-994), for up to 31 days x 2 cadence slots
@@ -64,9 +64,8 @@ build_client_month call. Auditing that number turned up:
     numbers above.
   A precise "worst legitimate runtime" number is therefore NOT knowable from
   a static read of the code: it depends on how many of those paths run slow-
-  but-successful in the same build, and at least two of them (the Claude and
-  Gemini calls) have no explicit timeout in this codebase at all, only
-  whatever the SDK defaults to. Picking a bigger static number just moves the
+  but-successful in the same build. The text model has a 30s request timeout;
+  Gemini calls still depend on the SDK default. Picking a bigger static number moves the
   goalpost to the next unaudited slow step (a new rendition budget, a new
   vision pass, a longer caption loop) with the exact same failure mode.
 
