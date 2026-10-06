@@ -91,7 +91,7 @@ def test_uncertain_local_global_ledger_holds_daily_video_tier(monkeypatch, tmp_p
                             selector.GlobalLedgerUnavailable("unreadable")))
     checks = []
 
-    def _drive(_account, kind):
+    def _drive(_account, kind, day_key=None):
         checks.append(kind)
         return False if kind == "photo" else pytest.fail("video tier must hold")
 

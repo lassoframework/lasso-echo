@@ -88,7 +88,7 @@ def _with_review_mark(category):
 _ARCHETYPES = ("flow", "split", "hero", "path", "headline")
 
 
-def real_media_depleted(base, *, now=None):
+def real_media_depleted(base, *, now=None, post_date=None):
     """Return True only when Echo can confirm this gym has no usable real media.
 
     A calendar gap is deliberately not evidence of depletion: a gym may have uploads
@@ -216,7 +216,8 @@ def real_media_depleted(base, *, now=None):
                     and parsed_now.tzinfo is None):
                 parsed_now = parsed_now.replace(tzinfo=_tz.utc)
         drive = gym_media_selector.pickable(
-            base, store=Snapshot(), now=parsed_now, strict_claims=True)
+            base, store=Snapshot(), now=parsed_now, strict_claims=True,
+            **({"post_date": post_date} if post_date else {}))
         from .media_bridge import observe_drive_inventory
         observe_drive_inventory(base, [a.get("id") for a in drive])
         return not local and not drive
@@ -415,7 +416,7 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         # Re-verify BOTH right before this card is drawn so a photo that
         # landed (or a row another lane inserted) between the scan and now
         # always wins over an infographic.
-        if not real_media_depleted(base, now=now):
+        if not real_media_depleted(base, now=now, post_date=day):
             log(f"{base}: usable approved photos available at generation "
                 "time; holding infographic fill (photos first)")
             break
@@ -527,9 +528,11 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
     # final best-effort guard; its check-to-insert interval remains necessarily
     # subject to a concurrent writer and must stay fail-closed at the store
     # boundary when that capability is added.
-    if not real_media_depleted(base, now=now):
+    drafts = [draft for draft in drafts
+              if real_media_depleted(base, now=now, post_date=draft.day_key)]
+    if not drafts:
         log(f"{base}: usable approved photos available before insert; holding "
-            "all infographic drafts")
+            "infographic drafts")
         return {"ok": True, "filled": 0, "gaps": len(gaps),
                 "reason": "usable media available before insert"}
     insertable_days = set(_empty_upcoming_days(
