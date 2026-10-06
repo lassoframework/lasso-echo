@@ -320,6 +320,10 @@ class PortalStoreError(Exception):
         super().__init__(f"supabase {status}: {detail}")
 
 
+class PreWriteCASError(PortalStoreError):
+    """CAS encoding refused before the calendar PATCH was attempted."""
+
+
 _UUID_RE = _re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -802,18 +806,19 @@ class SupabaseCalendarStore:
                     or expected_row["published_at"] is not None
                     or expected_row["late_post_id"] is not None):
                 return None
-            def unchanged(value):
-                if value is None:
-                    return "is.null"
-                escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-                return f'eq."{escaped}"'
+            def unchanged(key, value):
+                encoded = _eq_filter(value)
+                if encoded is None:
+                    raise PortalStoreError(
+                        422, f"image patch CAS blocked: field {key!r} has no safe equality encoding")
+                return encoded
             for key in ("status", "format", "image_url", "caption", "source_media_url"):
-                params[key] = unchanged(expected_row.get(key))
+                params[key] = unchanged(key, expected_row.get(key))
             for key in ("account", "post_date", "visual_group_key", "byte_hash", "r2_key",
                         "source_media_asset_id", "drive_file_id", "variant_status",
                         "scheduled_at", "slot_index", "publish_claim_token", "publish_reservation_day"):
                 if key in expected_row:
-                    params[key] = unchanged(expected_row[key])
+                    params[key] = unchanged(key, expected_row[key])
             params["published_at"] = "is.null"
             params["late_post_id"] = "is.null"
             params["media_not_ready_reason"] = "is.null"
@@ -865,12 +870,11 @@ class SupabaseCalendarStore:
         """Bind preparation to its observed source, slot and publish state."""
         result = dict(params)
         for key in _VISUAL_MEDIA_CAS_COLUMNS:
-            value = current.get(key)
-            if value is None:
-                result[key] = "is.null"
-            else:
-                escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-                result[key] = f'eq."{escaped}"'
+            encoded = _eq_filter(current.get(key))
+            if encoded is None:
+                raise PreWriteCASError(
+                    422, f"visual media CAS blocked: field {key!r} has no safe equality encoding")
+            result[key] = encoded
         return result
 
     @staticmethod
@@ -898,9 +902,14 @@ class SupabaseCalendarStore:
                     or evidence.get("delivered_exact_url") != row.get("image_url")):
                 raise visual_writer_prepare.VisualPreparationError(
                     "render evidence does not bind the scoped media replacement")
-        return visual_writer_prepare.prepare(
+        prepared = visual_writer_prepare.prepare(
             self, account_key, row, render_evidence=render_evidence,
             poster_render_evidence=poster_render_evidence)
+        # Preparation may emit/stage advisory evidence internally. It is not a
+        # content_calendar column; retain the original preparation result while
+        # returning only its calendar fields to every INSERT/PATCH caller.
+        return {key: value for key, value in prepared.items()
+                if key != "scene_candidate"}
 
     def _prepare_visual_replacement(self, account_key, current, payload,
                                     render_evidence=None, poster_render_evidence=None):
@@ -3537,7 +3546,8 @@ class SupabaseCalendarStore:
         payload = []
         from .copy_gate import bound_opening_hook, format_caption
         for row in (rows or []):
-            clean = {k: v for k, v in dict(row or {}).items() if k != "id"}
+            clean = {k: v for k, v in dict(row or {}).items()
+                     if k not in ("id", "scene_candidate")}
             if "caption" in clean and clean["caption"] is not None:
                 # Every calendar-building lane converges here. Prompts and individual
                 # generators can miss the hook limit, so enforce the grader's exact

@@ -46,7 +46,8 @@ def _distinct_poster_url(row, poster_render_evidence):
 
 
 def _prepare_poster_edge(store, tenant, group, image_url, image_bytes, image_hash,
-                         poster_url, poster_render_evidence, reader, receipt_writer):
+                         poster_url, poster_render_evidence, reader, receipt_writer,
+                         scene_armed=False):
     """Attest the poster as a second owner render edge image -> thumbnail.
 
     The selected image is this edge's source and the poster its delivered
@@ -98,7 +99,8 @@ def _prepare_poster_edge(store, tenant, group, image_url, image_bytes, image_has
         raise VisualPreparationError("poster registration returned conflicting identity")
     return {"role": "poster", "exact_url": poster_url,
             "fingerprint": poster_hash, "byte_length": len(poster),
-            "scene_fingerprint": _scene_fingerprint(poster), "exact_bytes": poster}
+            "scene_fingerprint": _scene_fingerprint(poster) if scene_armed else None,
+            "exact_bytes": poster}
 
 
 def _rpc(store, name, arguments):
@@ -152,7 +154,11 @@ def _own_media_url(url):
         parsed.path.startswith(allowed.path.rstrip("/") + "/") and
         len(parsed.path) > len(allowed.path.rstrip("/")) + 1 and
         all(part not in (".", "..") and "/" not in part and "\\" not in part
-            and not any(char.isspace() or ord(char) < 32 for char in part)
+            # Our host percent-encodes ordinary filename spaces. Raw URL
+            # whitespace is rejected above; decoded separators and controls
+            # remain ineligible even when percent-encoded.
+            and not any((char.isspace() and char != " ") or ord(char) < 32
+                        or 127 <= ord(char) <= 159 for char in part)
             for part in path_parts)
     )
 
@@ -245,6 +251,16 @@ def _scene_fingerprint(data):
         return visual_scene.scene_fingerprint(data)
     except Exception:  # noqa: BLE001 - no scene evidence is not byte evidence
         return None
+
+
+def _scene_evidence_armed():
+    """Read both OFF-default scene switches before doing any pHash work."""
+    try:
+        from . import config
+        return (config.visual_scene_candidate_flag() is not False or
+                config.visual_scene_guard_flag() is not False)
+    except Exception:  # noqa: BLE001 - config read failure means no new metadata
+        return False
 
 
 def _candidate_emission_armed():
@@ -402,7 +418,8 @@ def _known_group(store, tenant, row, source_url, *, required=True):
     return group
 
 
-def _register_raw_source(store, tenant, prepared, source_url, source, asset):
+def _register_raw_source(store, tenant, prepared, source_url, source, asset,
+                         scene_fp=None, scene_armed=False):
     """Bind the observed raw object before any rendition receipt consumes it."""
     if not _own_media_url(source_url):
         raise VisualPreparationError("raw source URL is outside the configured media host")
@@ -419,14 +436,15 @@ def _register_raw_source(store, tenant, prepared, source_url, source, asset):
         if not asset or str(drive_id) != str(asset_id):
             raise VisualPreparationError("Drive ID has no matching tenant asset")
         aliases.append(("drive_id", str(drive_id)))
-    scene_fp = _scene_fingerprint(source)
+    evidence = {"source": "raw_object_bytes", "verified_bytes": source_hash,
+                "delivered_url": source_url}
+    if scene_armed:
+        evidence["scene_fingerprint"] = scene_fp
     result = _rpc(store, "visual_global_prepare_bundle", {
         "p_tenant": tenant,
         "p_aliases": [{"alias_kind": kind, "alias_value": value} for kind, value in aliases],
         "p_fingerprint": source_hash,
-        "p_evidence": {"source": "raw_object_bytes", "verified_bytes": source_hash,
-                       "scene_fingerprint": scene_fp,
-                       "delivered_url": source_url},
+        "p_evidence": evidence,
         "p_actor": "visual_writer_prepare",
         "p_asset_id": str(asset_id) if asset else None,
     })
@@ -479,8 +497,12 @@ def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url
     if not callable(receipt_writer):
         raise VisualPreparationError("owner receipt producer is unavailable for source/rendition")
     group = _known_group(store, tenant, prepared, source_url, required=False)
+    scene_armed = _scene_evidence_armed()
+    source_scene = _scene_fingerprint(source) if scene_armed else None
+    delivered_scene = _scene_fingerprint(delivered) if scene_armed else None
     if group is None:
-        registered = _register_raw_source(store, tenant, prepared, source_url, source, asset)
+        registered = _register_raw_source(store, tenant, prepared, source_url, source, asset,
+                                          scene_fp=source_scene, scene_armed=scene_armed)
         group = _known_group(store, tenant, prepared, source_url)
         if group != registered:
             raise VisualPreparationError("raw source registration returned conflicting group")
@@ -519,11 +541,9 @@ def _prepare_source_rendition(store, tenant, prepared, source_url, delivered_url
         # Second owner-attested render edge: selected image -> poster object.
         poster = _prepare_poster_edge(store, tenant, group, delivered_url, delivered,
                                       delivered_hash, poster_url, poster_render_evidence,
-                                      reader, receipt_writer)
-    objects = [("source", source_url, source_hash, len(source),
-                _scene_fingerprint(source)),
-               ("delivered", delivered_url, delivered_hash, len(delivered),
-                _scene_fingerprint(delivered))]
+                                      reader, receipt_writer, scene_armed=scene_armed)
+    objects = [("source", source_url, source_hash, len(source), source_scene),
+               ("delivered", delivered_url, delivered_hash, len(delivered), delivered_scene)]
     if poster is not None:
         objects.append((poster["role"], poster["exact_url"], poster["fingerprint"],
                         poster["byte_length"], poster["scene_fingerprint"]))
@@ -593,20 +613,23 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
     if supplied_hash and supplied_hash != "derived:" + digest:
         raise VisualPreparationError("row byte_hash does not match exact bytes")
 
+    scene_armed = _scene_evidence_armed()
+    scene_fp = _scene_fingerprint(data) if scene_armed else None
     group = _known_group(store, tenant, prepared, url, required=False)
     if group is None:
-        registered = _register_raw_source(store, tenant, prepared, url, data, asset)
+        registered = _register_raw_source(store, tenant, prepared, url, data, asset,
+                                          scene_fp=scene_fp, scene_armed=scene_armed)
         group = _known_group(store, tenant, prepared, url)
         if group != registered:
             raise VisualPreparationError("raw source registration returned conflicting group")
     if not isinstance(group, str) or not group.startswith("vg_"):
         raise VisualPreparationError("same-object source has no unambiguous registered group")
 
-    scene_fp = _scene_fingerprint(data)
     evidence = {"exact_url": url, "fingerprint": digest, "byte_length": len(data),
-                "scene_fingerprint": scene_fp,
                 "evidence_ref": "visual_writer_prepare:same_object_exact_read",
                 "observed_by": "visual_writer_prepare"}
+    if scene_armed:
+        evidence["scene_fingerprint"] = scene_fp
     try:
         receipts = receipt_writer(tenant=tenant, group_key=group, exact_bytes=data,
                                   evidence=evidence, asset_id=str(asset_id) if asset else None)
@@ -637,7 +660,8 @@ def _prepare_same_object_row(store, account_key, row, *, read_bytes=None, receip
         # configured source/rendition owner writer for image -> thumbnail.
         poster = _prepare_poster_edge(store, tenant, group, url, data, digest,
                                       poster_url, poster_render_evidence,
-                                      read_bytes or _bytes_for_url, None)
+                                      read_bytes or _bytes_for_url, None,
+                                      scene_armed=scene_armed)
     objects = [("same_object", url, digest, len(data), scene_fp)]
     if poster is not None:
         objects.append((poster["role"], poster["exact_url"], poster["fingerprint"],
