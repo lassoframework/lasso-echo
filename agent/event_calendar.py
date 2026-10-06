@@ -339,7 +339,8 @@ def sweep_arc_rows(arc_rows, reason):
 # ---------------------------------------------------------------------------
 
 def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
-              media_picker=None, media_host_fn=None, gate="hard"):
+              media_picker=None, media_host_fn=None, gate="hard",
+              operation_id=None):
     """Insert `arc_rows` into the gym's live month plan through `store`, re-grade, and
     stage the kept rows as 'pending'. Returns a summary dict. Never publishes.
 
@@ -419,6 +420,11 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     # Stage only the NEW arc rows (existing rows already live). Recap rows that are
     # blocked (no media yet) are held out of staging until media arrives.
     to_stage = [r for r in thinned if not r.get("recap_blocked")]
+    operation_row_ids = set()
+    if operation_id is not None:
+        operation_row_ids = _stamp_operation_row_ids(to_stage, operation_id, log)
+        if operation_row_ids is None:
+            return {"ok": False, "reason": "invalid staging operation", "staged": 0}
     # RE-STAGE GUARD: stage_arc only ever ADDS, so staging an arc that is already on the
     # calendar duplicated every one of its days. Hit live on 2026-08-30 re-staging
     # Pete/Zanshin's Back to School promo: four dates came back twice, including three
@@ -441,6 +447,11 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     denied_count = {}
     for r in existing:
         if str(r.get("event_id") or "") != str(event.id):
+            continue
+        # An edit operation owns only its deterministic row UUIDs. Rows inserted by
+        # another edit may still be compensated by that loser, so they cannot satisfy
+        # this operation's occupancy check or the winner could adopt disappearing rows.
+        if operation_id is not None and str(r.get("id") or "") not in operation_row_ids:
             continue
         slot = (str(r.get("post_date"))[:10],
                 str(r.get("account") or "").lower(),
@@ -478,7 +489,10 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
         # Strip the transient planner-only keys the DB does not carry.
         payload = [_db_row(r) for r in to_stage]
         try:
-            written = inserter(gym_id, payload) or []
+            if operation_id is None:
+                written = inserter(gym_id, payload) or []
+            else:
+                written = inserter(gym_id, payload, preserve_ids=True) or []
             inserted = len(written) if not isinstance(written, int) else written
             # A Drive asset is globally burned only after the store returns the exact
             # inserted row. _attach_media reserves IDs within this call, but stamping
@@ -525,7 +539,7 @@ def compensate_staged_rows(store, gym_id, rows, *, reason=REJECT_EDIT_CONFLICT,
     is terminal, because cancellation/ending owns every still-pending row in the arc.
     """
     log = logger or (lambda m: print(f"[event-calendar] {m}"))
-    denier = getattr(store, "deny_with_reason", None)
+    denier = getattr(store, "deny_wipeable_with_reason", None)
     denied = 0
     if denier is None:
         return {"ok": False, "denied": 0, "reason": reason}
@@ -540,6 +554,30 @@ def compensate_staged_rows(store, gym_id, rows, *, reason=REJECT_EDIT_CONFLICT,
             log(f"event edit compensation: deny {row.get('id')} failed "
                 f"{type(exc).__name__}")
     return {"ok": True, "denied": denied, "reason": reason}
+
+
+def _stamp_operation_row_ids(rows, operation_id, log):
+    """Stamp deterministic UUIDs owned by one event-edit staging operation."""
+    import uuid
+
+    try:
+        namespace = uuid.UUID(str(operation_id))
+    except (AttributeError, TypeError, ValueError):
+        log("event edit staging: refusing invalid operation UUID")
+        return None
+    owned = set()
+    for index, row in enumerate(rows):
+        identity = "|".join((
+            str(index), str(row.get("event_id") or ""),
+            str(row.get("post_date") or "")[:10],
+            str(row.get("account") or "").lower(),
+            str(row.get("format") or "").lower(),
+            str(row.get("arc_kind") or ""),
+        ))
+        row_id = str(uuid.uuid5(namespace, identity))
+        row["id"] = row_id
+        owned.add(row_id)
+    return owned
 
 
 def backfill_missing_media(store, gym_id, event_id, *, statuses=("pending", "approved"),

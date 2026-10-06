@@ -230,6 +230,34 @@ def test_cancel_flips_pending_arc_rows_denied():
                for i in range(1, len(arc)))
 
 
+@pytest.mark.parametrize("protected_status", [
+    "approved", "publishing", "published", "denied", "killed", "failed", "held",
+])
+def test_edit_compensation_cannot_overwrite_concurrent_protected_status(
+        protected_status):
+    class _RaceStore:
+        def __init__(self):
+            self.row = {"id": "row-1", "gym_id": "pete", "status": protected_status}
+
+        def deny_with_reason(self, *_args):
+            raise AssertionError("generic denier is unsafe for compensation")
+
+        def deny_wipeable_with_reason(self, gym_id, row_id, reason):
+            if (self.row["gym_id"] == gym_id and self.row["id"] == row_id
+                    and self.row["status"] in ("pending", "draft", "queued")):
+                self.row.update(status="denied", reject_reason=reason)
+                return dict(self.row)
+            return None
+
+    store = _RaceStore()
+    stale_insert_receipt = {"id": "row-1", "gym_id": "pete", "status": "pending"}
+
+    result = ec.compensate_staged_rows(store, "pete", [stale_insert_receipt])
+
+    assert result["denied"] == 0
+    assert store.row["status"] == protected_status
+
+
 def test_ended_uses_event_ended_reason():
     ev = _event()
     arc = _arc_rows(ev)

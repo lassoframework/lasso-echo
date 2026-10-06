@@ -75,7 +75,7 @@ class _CalendarStore:
                 if row.get("gym_id") == gym_id
                 and str(row.get("post_date"))[:7] == month]
 
-    def insert_rows(self, gym_id, rows):
+    def insert_rows(self, gym_id, rows, *, preserve_ids=False):
         stored = [dict(row, gym_id=gym_id) for row in rows]
         self.inserted.extend(stored)
         return stored

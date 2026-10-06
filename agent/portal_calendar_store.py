@@ -4035,6 +4035,37 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def deny_wipeable_with_reason(self, account_key, row_id, reject_reason):
+        """Compensate one machine-owned row only while it remains wipeable.
+
+        The status predicate is part of the PATCH, so an approval, publish claim,
+        publication, denial, kill, failure, or hold that wins after the caller's read
+        cannot be overwritten by cleanup from a stale event edit.
+        """
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+            "status": f"in.({','.join(_WIPEABLE_STATUSES)})",
+        }
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"status": "denied", "reject_reason": reject_reason},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if (str(row.get("id")) == str(row_id)
+                    and str(row.get("gym_id")) == str(account_key)
+                    and row.get("status") == "denied"):
+                return row
+        return None
+
     def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None,
                            levers=None, expected_row=None,
                            force_caption_visual_hold=False,

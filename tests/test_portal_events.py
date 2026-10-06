@@ -30,12 +30,15 @@ class _CalStore:
         self.inserted = []
         self.event_row_reads = 0
         self.before_insert = None
+        self.after_insert = None
+        self.preserve_id_calls = []
 
     def list_month(self, gym_id, month):
         return [r for r in self.existing
                 if r.get("gym_id") == gym_id and str(r.get("post_date"))[:7] == month]
 
-    def insert_rows(self, gym_id, rows):
+    def insert_rows(self, gym_id, rows, *, preserve_ids=False):
+        self.preserve_id_calls.append(preserve_ids)
         hook = self.before_insert
         self.before_insert = None
         if hook is not None:
@@ -47,6 +50,10 @@ class _CalStore:
             rr.setdefault("id", f"calendar-{len(self.inserted) + 1}")
             self.inserted.append(rr)
             out.append(rr)
+        hook = self.after_insert
+        self.after_insert = None
+        if hook is not None:
+            hook()
         return out
 
     def list_event_rows(self, gym_id, event_id):
@@ -57,6 +64,15 @@ class _CalStore:
     def deny_with_reason(self, gym_id, row_id, reason):
         for r in self.inserted:
             if r.get("id") == row_id and r.get("gym_id") == gym_id:
+                r["status"] = "denied"
+                r["reject_reason"] = reason
+                return r
+        return None
+
+    def deny_wipeable_with_reason(self, gym_id, row_id, reason):
+        for r in self.inserted:
+            if (r.get("id") == row_id and r.get("gym_id") == gym_id
+                    and r.get("status") in ("pending", "draft", "queued")):
                 r["status"] = "denied"
                 r["reject_reason"] = reason
                 return r
@@ -374,6 +390,53 @@ def test_cancel_after_event_cas_before_calendar_insert_is_compensated(monkeypatc
               if row.get("event_id") == event_id
               and row.get("status") in ("pending", "draft", "queued")]
     assert active == []
+
+
+def test_later_same_status_edit_owns_rows_earlier_edit_cannot_compensate(monkeypatch):
+    """A winner must insert its own rows rather than adopt a loser's receipts."""
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    initial_ids = {row["id"] for row in cal.inserted}
+    interleaving = {}
+
+    def _winning_edit_after_loser_insert():
+        loser_ids = {row["id"] for row in cal.inserted} - initial_ids
+        interleaving["loser_ids"] = loser_ids
+        status, response = pe.handle_edit_event(
+            "pete", event_id,
+            {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+             "offer_text": "Winner owns this revision", "actor_id": "winner"},
+            store=cal, event_store=ev, today=date(2026, 9, 1))
+        interleaving["status"] = status
+        interleaving["response"] = response
+        interleaving["winner_ids"] = (
+            {row["id"] for row in cal.inserted} - initial_ids - loser_ids)
+
+    cal.after_insert = _winning_edit_after_loser_insert
+    losing_status, losing_response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "loser"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert interleaving["status"] == 200
+    assert interleaving["response"]["restaged"] > 0
+    assert losing_status == 409
+    assert losing_response["compensated"] == len(interleaving["loser_ids"])
+    assert interleaving["loser_ids"]
+    assert interleaving["winner_ids"]
+    assert cal.preserve_id_calls[-2:] == [True, True]
+    assert interleaving["loser_ids"].isdisjoint(interleaving["winner_ids"])
+    rows = {row["id"]: row for row in cal.inserted}
+    assert all(rows[row_id]["status"] == "denied"
+               for row_id in interleaving["loser_ids"])
+    assert all(rows[row_id]["status"] == "pending"
+               for row_id in interleaving["winner_ids"])
+    assert ev.rows[event_id]["offer_text"] == "Winner owns this revision"
 
 
 # ---- cancel --------------------------------------------------------------------

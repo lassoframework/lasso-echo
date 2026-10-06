@@ -213,8 +213,11 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     stage_reason = ""
     inserted_rows = []
     if _store is not None and restage:
+        import uuid
+        staging_operation_id = str(uuid.uuid4())
         res = ec.stage_arc(_store, new_event, restage,
-                           profile=_profile_for(account_key))
+                           profile=_profile_for(account_key),
+                           operation_id=staging_operation_id)
         staged = res.get("staged", 0)
         held_media = res.get("held_media", 0)
         stage_reason = res.get("reason", "")
