@@ -40,6 +40,7 @@ def _armed(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO_BOT")
     yield
 
 
@@ -235,6 +236,42 @@ class Bus:
                 return dict(m)
         return None
 
+    def prepare_fixer_delivery(self, mid, intent):
+        if (self.message(mid) or {}).get("delivery_status") != "posting":
+            return None
+        return self.mark_message(mid, "posting", meta_update={
+            "fixer_slack_delivery_intent": intent,
+            "claimed_at": intent.get("not_before") or intent["claimed_at"]})
+
+    def transition_fixer_delivery(self, mid, delivery_status, *, slack_ts=None,
+                                  meta_update=None):
+        row = self.message(mid)
+        if (not row or row.get("delivery_status") != "posting"
+                or not (row.get("attachments") or {}).get("fixer_slack_delivery_intent")):
+            return None
+        return self.mark_message(mid, delivery_status, slack_ts=slack_ts,
+                                 meta_update=meta_update)
+
+    def pending_fixer_finalization(self, identity, limit=100):
+        return [dict(m) for m in self.msgs
+                if m.get("delivery_status") == "posted"
+                and (m.get("attachments") or {}).get("identity") == identity
+                and (m.get("attachments") or {}).get("fixer_slack_delivery_intent")
+                and not (m.get("attachments") or {}).get("fixer_delivery_finalized_at")][:limit]
+
+    def fixer_receipt_exists(self, mid):
+        return any((m.get("attachments") or {}).get("receipt_for") == mid
+                   for m in self.msgs)
+
+    def finalize_fixer_delivery(self, mid, reason):
+        row = self.message(mid)
+        if (not row or row.get("delivery_status") != "posted"
+                or not (row.get("attachments") or {}).get("delivery_readback_verified")):
+            return None
+        return self.mark_message(mid, "posted", meta_update={
+            "fixer_delivery_finalized_at": datetime.now(timezone.utc).isoformat(),
+            "fixer_delivery_finalized_reason": reason})
+
     # helpers for assertions
     def outbound_kinds(self, tid=None):
         return [(m["attachments"].get("kind"), m["delivery_status"])
@@ -341,8 +378,18 @@ def _posts():
     sent = []
 
     def post(channel, text, thread_ts=None, blocks=None):
-        sent.append({"channel": channel, "text": text, "blocks": blocks})
+        sent.append({"channel": channel, "text": text, "thread_ts": thread_ts,
+                     "blocks": blocks})
         return "111.1"
+
+    def readback(channel, *, thread_ts=None, ts=None, oldest=None):
+        return {"ok": True, "channel": channel,
+                "messages": [{"ts": "111.1", "text": item["text"],
+                              "user": "U_ECHO_BOT", "thread_ts": item["thread_ts"]}
+                             for item in sent if item["channel"] == channel
+                             and item["thread_ts"] == thread_ts]}
+
+    post.readback = readback
 
     return sent, post
 
@@ -594,6 +641,9 @@ def test_verified_fix_notice_names_blake_in_group_dm():
                 member_check=lambda channel, user: channel == "G_CLIENT" and bool(user))
     assert len(sent) == 1, bus.outbound_kinds()
     assert f"<@{OB.config.APPROVER_SLACK_ID}>" in sent[0]["text"]
+    notice = bus.of_kind(A.KIND_STATUS)[0]
+    assert notice["attachments"]["delivery_readback_verified"] is True
+    assert notice["attachments"]["delivery_readback_channel"] == "G_CLIENT"
     assert bus.ticket("t-1")["status"] == "resolved"
 
 

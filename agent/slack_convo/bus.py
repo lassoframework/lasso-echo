@@ -586,6 +586,138 @@ class Bus:
             fields["attachments"] = att
         return self._patch(_MESSAGES, {"id": f"eq.{message_id}"}, fields)
 
+    def transition_fixer_delivery(self, message_id, delivery_status, *,
+                                  slack_ts=None, meta_update=None):
+        """CAS a FIXER Slack row from posting, preserving its delivery intent.
+
+        A stale sweeper may quarantine an uncertain post while the original worker
+        waits on Slack. Neither worker may overwrite the other's terminal state.
+        """
+        row = self.message(message_id)
+        if (not row or row.get("delivery_status") != "posting"
+                or not (row.get("attachments") or {}).get("fixer_slack_delivery_intent")):
+            return None
+        fields = {"delivery_status": delivery_status}
+        if slack_ts:
+            fields["slack_ts"] = slack_ts
+        if meta_update:
+            fields["attachments"] = {**(row.get("attachments") or {}), **meta_update}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.posting",
+            "attachments->>fixer_slack_delivery_intent": "not.is.null",
+        }, fields)
+
+    def prepare_fixer_delivery(self, message_id, intent):
+        """Persist exact delivery intent only while this worker still owns posting."""
+        row = self.message(message_id)
+        if not row or row.get("delivery_status") != "posting":
+            return None
+        att = {**(row.get("attachments") or {}),
+               "fixer_slack_delivery_intent": intent,
+               "claimed_at": intent.get("not_before") or intent["claimed_at"]}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.posting",
+        }, {"attachments": att})
+
+    def hold_uncertain_fixer_delivery(self, message_id, reason):
+        """Quarantine an uncertain client post; never put it back in ready."""
+        row = self.message(message_id)
+        if not row or row.get("delivery_status") != "posting":
+            return row
+        att = {**(row.get("attachments") or {}),
+               "fixer_slack_delivery_uncertain": True,
+               "held_why": str(reason)[:300]}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.posting",
+        }, {"delivery_status": "held", "attachments": att})
+
+    def pending_held_fixer_delivery(self, identity, limit=200):
+        return self._get(_MESSAGES, {
+            "direction": "eq.outbound", "delivery_status": "eq.held",
+            "attachments->>identity": f"eq.{identity}",
+            "attachments->>fixer_slack_delivery_uncertain": "eq.true",
+            "attachments->>fixer_slack_delivery_intent": "not.is.null",
+            "select": "*", "order": "created_at.desc", "limit": str(int(limit)),
+        })
+
+    def defer_held_fixer_reconcile(self, message_id, next_at):
+        row = self.message(message_id)
+        if (not row or row.get("delivery_status") != "held"
+                or not (row.get("attachments") or {}).get("fixer_slack_delivery_uncertain")):
+            return None
+        att = {**(row.get("attachments") or {}),
+               "fixer_reconcile_next_at": next_at}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.held",
+            "attachments->>fixer_slack_delivery_uncertain": "eq.true",
+        }, {"attachments": att})
+
+    def reconcile_held_fixer_delivery(self, message_id, proof):
+        """Promote a held uncertain delivery only after exact Slack readback."""
+        row = self.message(message_id)
+        if (not row or row.get("delivery_status") != "held"
+                or not (row.get("attachments") or {}).get("fixer_slack_delivery_uncertain")
+                or not (row.get("attachments") or {}).get("fixer_slack_delivery_intent")):
+            return None
+        att = {**(row.get("attachments") or {}), **proof}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.held",
+            "attachments->>fixer_slack_delivery_uncertain": "eq.true",
+        }, {"delivery_status": "posted", "slack_ts": proof["delivery_readback_ts"],
+            "attachments": att})
+
+    def uncertain_fixer_alert_status(self, message_id):
+        """Posted is proof of an alert; failed notices remain retryable."""
+        rows = self._get(_MESSAGES, {
+            "attachments->>fixer_uncertain_row_id": f"eq.{message_id}",
+            "select": "delivery_status", "order": "created_at.desc", "limit": "100",
+        })
+        states = {r.get("delivery_status") for r in rows}
+        if "posted" in states:
+            return "posted"
+        if states & {"ready", "posting"}:
+            return "pending"
+        return "failed" if states else None
+
+    def mark_uncertain_fixer_alerted(self, message_id):
+        row = self.message(message_id)
+        if not row or row.get("delivery_status") != "held":
+            return None
+        att = {**(row.get("attachments") or {}), "fixer_staff_alerted": True}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.held",
+        }, {"attachments": att})
+
+    def pending_fixer_finalization(self, identity, limit=100):
+        """Verified Slack posts whose ticket close may have been interrupted."""
+        return self._get(_MESSAGES, {
+            "direction": "eq.outbound", "delivery_status": "eq.posted",
+            "attachments->>identity": f"eq.{identity}",
+            "attachments->>fixer_slack_delivery_intent": "not.is.null",
+            "attachments->>fixer_delivery_finalized_at": "is.null",
+            "select": "*", "order": "created_at.desc", "limit": str(int(limit)),
+        })
+
+    def fixer_receipt_exists(self, message_id):
+        rows = self._get(_MESSAGES, {
+            "attachments->>receipt_for": f"eq.{message_id}",
+            "select": "id", "limit": "1",
+        })
+        return bool(rows)
+
+    def finalize_fixer_delivery(self, message_id, reason):
+        row = self.message(message_id)
+        if (not row or row.get("delivery_status") != "posted"
+                or not (row.get("attachments") or {}).get("delivery_readback_verified")):
+            return None
+        att = {**(row.get("attachments") or {}),
+               "fixer_delivery_finalized_at": datetime.now(timezone.utc).isoformat(),
+               "fixer_delivery_finalized_reason": reason}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.posted",
+            "attachments->>delivery_readback_verified": "eq.true",
+        }, {"attachments": att})
+
     def hold_uncertain_outreach(self, message_id):
         """Preserve a committed posted receipt; quarantine only an unposted outreach row."""
         row = self.message(message_id)

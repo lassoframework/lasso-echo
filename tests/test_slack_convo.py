@@ -238,6 +238,84 @@ class FakeBus:
                 return dict(m)
         return None
 
+    def transition_fixer_delivery(self, mid, delivery_status, *, slack_ts=None,
+                                  meta_update=None):
+        row = self.message(mid)
+        if (not row or row["delivery_status"] != "posting"
+                or not (row.get("attachments") or {}).get("fixer_slack_delivery_intent")):
+            return None
+        return self.mark_message(mid, delivery_status, slack_ts=slack_ts,
+                                 meta_update=meta_update)
+
+    def prepare_fixer_delivery(self, mid, intent):
+        if (self.message(mid) or {}).get("delivery_status") != "posting":
+            return None
+        return self.mark_message(mid, "posting", meta_update={
+            "fixer_slack_delivery_intent": intent,
+            "claimed_at": intent.get("not_before") or intent["claimed_at"]})
+
+    def hold_uncertain_fixer_delivery(self, mid, reason):
+        row = self.message(mid)
+        if not row or row["delivery_status"] != "posting":
+            return row
+        return self.mark_message(mid, "held", meta_update={
+            "fixer_slack_delivery_uncertain": True, "held_why": reason})
+
+    def pending_held_fixer_delivery(self, identity, limit=200):
+        return [dict(m) for m in self.msgs
+                if m["delivery_status"] == "held"
+                and (m.get("attachments") or {}).get("identity") == identity
+                and (m.get("attachments") or {}).get("fixer_slack_delivery_uncertain")
+                and (m.get("attachments") or {}).get("fixer_slack_delivery_intent")][:limit]
+
+    def defer_held_fixer_reconcile(self, mid, next_at):
+        if (self.message(mid) or {}).get("delivery_status") != "held":
+            return None
+        return self.mark_message(mid, "held", meta_update={
+            "fixer_reconcile_next_at": next_at})
+
+    def reconcile_held_fixer_delivery(self, mid, proof):
+        row = self.message(mid)
+        if (not row or row["delivery_status"] != "held"
+                or not (row.get("attachments") or {}).get("fixer_slack_delivery_uncertain")):
+            return None
+        return self.mark_message(mid, "posted", slack_ts=proof["delivery_readback_ts"],
+                                 meta_update=proof)
+
+    def uncertain_fixer_alert_status(self, mid):
+        states = {m["delivery_status"] for m in self.msgs
+                  if (m.get("attachments") or {}).get("fixer_uncertain_row_id") == mid}
+        if "posted" in states:
+            return "posted"
+        if states & {"ready", "posting"}:
+            return "pending"
+        return "failed" if states else None
+
+    def mark_uncertain_fixer_alerted(self, mid):
+        if (self.message(mid) or {}).get("delivery_status") != "held":
+            return None
+        return self.mark_message(mid, "held", meta_update={"fixer_staff_alerted": True})
+
+    def pending_fixer_finalization(self, identity, limit=100):
+        return [dict(m) for m in self.msgs
+                if m["delivery_status"] == "posted"
+                and (m.get("attachments") or {}).get("identity") == identity
+                and (m.get("attachments") or {}).get("fixer_slack_delivery_intent")
+                and not (m.get("attachments") or {}).get("fixer_delivery_finalized_at")][:limit]
+
+    def fixer_receipt_exists(self, mid):
+        return any((m.get("attachments") or {}).get("receipt_for") == mid
+                   for m in self.msgs)
+
+    def finalize_fixer_delivery(self, mid, reason):
+        row = self.message(mid)
+        if (not row or row["delivery_status"] != "posted"
+                or not (row.get("attachments") or {}).get("delivery_readback_verified")):
+            return None
+        return self.mark_message(mid, "posted", meta_update={
+            "fixer_delivery_finalized_at": self._ts(),
+            "fixer_delivery_finalized_reason": reason})
+
     def hold_uncertain_outreach(self, mid):
         row = self.message(mid)
         if not row or row["delivery_status"] == "posted":
@@ -918,6 +996,13 @@ def _posted():
     def post(channel, text, thread_ts=None, blocks=None):
         calls.append({"channel": channel, "text": text, "thread_ts": thread_ts, "blocks": blocks})
         return "9.999"
+    def readback(channel, *, thread_ts=None, ts=None, oldest=None):
+        matching = [c for c in calls if c["channel"] == channel
+                    and c["thread_ts"] == thread_ts]
+        messages = [{"ts": "9.999", "text": c["text"], "user": "U_ECHO_BOT",
+                     "thread_ts": thread_ts} for c in matching]
+        return {"ok": True, "channel": channel, "messages": messages}
+    post.readback = readback
     return post, calls
 
 
@@ -1860,6 +1945,10 @@ def test_fixer_correction_during_slack_post_keeps_ticket_open(monkeypatch):
         bus.record_inbound(ticket_id=tid, author_type="client",
                            body="Correction while Slack delivered the notice")
         return "9.999"
+    post.readback = lambda channel, **kw: {
+        "ok": True, "channel": channel,
+        "messages": [{"ts": "9.999", "text": f"<@{OB.config.APPROVER_SLACK_ID}> "
+                      "The fix is live.", "user": "U_ECHO_BOT", "thread_ts": "1.0"}]}
 
     result = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None,
                          member_check=lambda channel, user: True)
@@ -2092,6 +2181,14 @@ def test_grounded_fixer_answer_includes_blake_without_requiring_deploy_proof(
     expected = f"<@{OB.config.APPROVER_SLACK_ID}> Instagram is connected."
     assert bus.message(row["id"])["delivery_status"] == "posted"
     assert bus.message(row["id"])["body"] == expected
+    proof = bus.message(row["id"])["attachments"]
+    assert proof["delivery_readback_verified"] is True
+    assert proof["delivery_readback_channel"] == "C_CLIENT"
+    assert proof["delivery_readback_thread_ts"] == "1.0"
+    assert proof["delivery_readback_ts"] == "9.999"
+    assert proof["delivery_readback_sender"] == "U_ECHO_BOT"
+    assert proof["delivery_readback_body_sha256"] == hashlib.sha256(
+        expected.encode()).hexdigest()
     assert summary["resolved"] == 1
     assert [call["text"] for call in calls if call["channel"] == "C_CLIENT"] == [expected]
 
@@ -2116,6 +2213,265 @@ def _grounded_fixer_answer_case():
               "request_key": request_key,
               "request_version": bus.ticket(tid)["request_version"]})
     return bus, tid, row, request_key
+
+
+def _arm_grounded_fixer(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+
+
+@pytest.mark.parametrize("prepare_number", [1, 2])
+@pytest.mark.parametrize("change", ["correction", "route", "release"])
+def test_fixer_prepare_windows_recheck_current_request_before_client_post(
+        monkeypatch, prepare_number, change):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    original_prepare = bus.prepare_fixer_delivery
+    preparations = 0
+
+    def prepare(mid, intent):
+        nonlocal preparations
+        result = original_prepare(mid, intent)
+        preparations += 1
+        if preparations == prepare_number:
+            if change == "correction":
+                bus.record_inbound(ticket_id=tid, author_type="client",
+                                   body="Correction: that answer was for the old request")
+            elif change == "route":
+                bus.set_ticket(tid, slack_channel_id="C_NEW_CLIENT_THREAD")
+            else:
+                monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "false")
+        return result
+
+    monkeypatch.setattr(bus, "prepare_fixer_delivery", prepare)
+    post, calls = _posted()
+    summary = OB.run_once(bus, post, identity=IDS.get("echo"),
+                          member_check=lambda *_: True, log=lambda *_: None)
+    assert preparations == 2
+    assert summary["resolved"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "suppressed"
+    assert bus.ticket(tid)["status"] == "verification"
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
+
+
+def test_fixer_readback_mismatch_never_posts_or_resolves_and_never_resends(monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    post, calls = _posted()
+    post.readback = lambda channel, **kw: {
+        "ok": True, "channel": channel,
+        "messages": [{"ts": "9.999", "text": "wrong body", "user": "U_ECHO_BOT",
+                      "thread_ts": "1.0"}]}
+    first = OB.run_once(bus, post, identity=IDS.get("echo"),
+                        member_check=lambda *_: True, log=lambda *_: None)
+    assert first["posted"] == first["resolved"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "posting"
+    stale = datetime.now(timezone.utc) - timedelta(seconds=OB.CLAIM_TIMEOUT_SECONDS + 30)
+    bus.mark_message(row["id"], "posting", meta_update={"claimed_at": stale.isoformat()})
+    second = OB.run_once(bus, post, identity=IDS.get("echo"),
+                         member_check=lambda *_: True, log=lambda *_: None)
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    assert bus.ticket(tid)["status"] == "verification"
+    assert len([c for c in calls if c["channel"] == "C_CLIENT"]) == 1
+    assert second["reclaimed"] == 1
+    assert any((m.get("attachments") or {}).get("fixer_uncertain_row_id") == row["id"]
+               for m in bus.msgs)
+    post.readback = lambda channel, **kw: {
+        "ok": True, "channel": channel,
+        "messages": [{"ts": "9.999", "text": calls[0]["text"],
+                      "user": "U_ECHO_BOT", "thread_ts": "1.0"}]}
+    bus.mark_message(row["id"], "held", meta_update={
+        "fixer_reconcile_next_at": (datetime.now(timezone.utc) - timedelta(seconds=1)
+                                     ).isoformat()})
+    third = OB.run_once(bus, post, identity=IDS.get("echo"),
+                        member_check=lambda *_: True, log=lambda *_: None)
+    assert third["resolved"] == 1
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert bus.ticket(tid)["status"] == "resolved"
+    assert len([c for c in calls if c["channel"] == "C_CLIENT"]) == 1
+
+
+def test_fixer_crash_before_timestamp_persistence_holds_without_second_post(monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    sent = []
+    slack_ts = []
+
+    def post(channel, text, thread_ts=None, blocks=None):
+        sent.append((channel, text, thread_ts))
+        if channel == "C_CLIENT":
+            slack_ts.append(f"{datetime.now(timezone.utc).timestamp():.6f}")
+            raise SystemExit("process died after Slack accepted")
+        return "8.888"
+
+    def readback(channel, *, thread_ts=None, ts=None, oldest=None):
+        return {"ok": True, "channel": channel, "messages": [
+            {"ts": slack_ts[0], "text": sent[0][1], "user": "U_ECHO_BOT",
+             "thread_ts": sent[0][2]}]}
+
+    with pytest.raises(SystemExit):
+        OB.run_once(bus, post, identity=IDS.get("echo"), readback=readback,
+                    member_check=lambda *_: True, log=lambda *_: None)
+    assert bus.message(row["id"])["delivery_status"] == "posting"
+    assert bus.message(row["id"])["slack_ts"] is None
+    stale = datetime.now(timezone.utc) - timedelta(seconds=OB.CLAIM_TIMEOUT_SECONDS + 30)
+    intent = dict(bus.message(row["id"])["attachments"]["fixer_slack_delivery_intent"])
+    intent["claimed_at"] = stale.isoformat()
+    bus.mark_message(row["id"], "posting", meta_update={
+        "claimed_at": stale.isoformat(), "fixer_slack_delivery_intent": intent})
+    recovered = OB.run_once(bus, post, identity=IDS.get("echo"), readback=readback,
+                            member_check=lambda *_: True, log=lambda *_: None)
+    assert recovered["reclaimed"] == 1
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    assert bus.message(row["id"])["slack_ts"] is None
+    assert bus.message(row["id"])["attachments"]["fixer_slack_delivery_uncertain"] is True
+    assert bus.ticket(tid)["status"] == "verification"
+    assert len([call for call in sent if call[0] == "C_CLIENT"]) == 1
+
+
+@pytest.mark.parametrize("offset_seconds", [-10, 10])
+def test_fixer_crash_before_post_never_claims_identical_other_echo_reply(
+        monkeypatch, offset_seconds):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, key = _grounded_fixer_answer_case()
+    claimed = datetime.now(timezone.utc) - timedelta(minutes=3)
+    other_ts = f"{(claimed + timedelta(seconds=offset_seconds)).timestamp():.6f}"
+    body = f"<@{OB.config.APPROVER_SLACK_ID}> Instagram is connected."
+    bus.claim_message(row["id"])
+    bus.set_message_body_if_posting(row["id"], body)
+    intent = {"channel": "C_CLIENT", "thread_ts": "1.0", "body": body,
+              "sender": "U_ECHO_BOT", "claimed_at": claimed.isoformat(),
+              "not_before": (claimed + timedelta(seconds=1)).isoformat(),
+              "request_key": key, "request_version": bus.ticket(tid)["request_version"]}
+    bus.prepare_fixer_delivery(row["id"], intent)
+    sent = []
+
+    def post(channel, text, thread_ts=None, blocks=None):
+        sent.append((channel, text))
+        return "9.999"
+
+    def readback(channel, *, thread_ts=None, ts=None, oldest=None):
+        # Another identical Echo reply may fall before OR after this intent.
+        # Neither proves post() ran for this row when no ts was persisted.
+        return {"ok": True, "channel": channel,
+                "messages": [{"ts": other_ts, "text": body, "user": "U_ECHO_BOT",
+                              "thread_ts": "1.0"}]}
+
+    summary = OB.run_once(bus, post, identity=IDS.get("echo"), readback=readback,
+                          member_check=lambda *_: True, log=lambda *_: None)
+    assert summary["resolved"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    assert bus.ticket(tid)["status"] == "verification"
+    assert not any(channel == "C_CLIENT" for channel, _ in sent)
+    assert OB.release_held(bus, row["id"], approved_by="U_BLAKE",
+                           identity=IDS.get("echo"), log=lambda *_: None) is False
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    # Even a manual ready edit cannot bypass the prior-attempt guard.
+    bus.mark_message(row["id"], "ready")
+    OB.run_once(bus, post, identity=IDS.get("echo"), readback=readback,
+                member_check=lambda *_: True, log=lambda *_: None)
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    assert not any(channel == "C_CLIENT" for channel, _ in sent)
+
+
+def test_fixer_uncertain_alert_retries_after_slack_outage(monkeypatch):
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {"id": tid, "status": "verification",
+                        "bot_identity": "echo", "slack_channel_id": "C_CLIENT"}
+    row = bus.record_outbound(
+        ticket_id=tid, author_type="echo", body="Completion awaiting reconciliation",
+        delivery_status="held", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "fixer": True, "recipient_kind": "client",
+              "fixer_slack_delivery_uncertain": True,
+              "held_why": "Slack outcome unknown"})
+    attempts = []
+
+    def post(channel, text, thread_ts=None, blocks=None):
+        attempts.append((channel, text))
+        if len(attempts) == 1:
+            raise RuntimeError("Slack outage")
+        return "9.999"
+
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *_: None)
+    alerts = [m for m in bus.msgs
+              if (m.get("attachments") or {}).get("fixer_uncertain_row_id") == row["id"]]
+    assert len(alerts) == 1 and alerts[0]["delivery_status"] == "failed"
+    assert not bus.message(row["id"])["attachments"].get("fixer_staff_alerted")
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *_: None)
+    alerts = [m for m in bus.msgs
+              if (m.get("attachments") or {}).get("fixer_uncertain_row_id") == row["id"]]
+    assert len(alerts) == 2
+    assert alerts[1]["delivery_status"] == "posted"
+    assert not bus.message(row["id"])["attachments"].get("fixer_staff_alerted")
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *_: None)
+    assert bus.message(row["id"])["attachments"]["fixer_staff_alerted"] is True
+    assert [channel for channel, _ in attempts] == ["C_FIXER", "C_FIXER"]
+
+
+def test_fixer_missing_readback_holds_before_slack_post(monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    sent = []
+
+    def post(*args, **kwargs):
+        sent.append(args)
+        return "9.999"
+
+    OB.run_once(bus, post, identity=IDS.get("echo"),
+                member_check=lambda *_: True, log=lambda *_: None)
+    assert not sent
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    assert bus.ticket(tid)["status"] == "verification"
+
+
+def test_fixer_portal_only_completion_stays_held_until_slack_route_exists(monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    bus.tickets[tid].update({"source": "portal_form", "client_id": "gym-one",
+                             "slack_channel_id": None, "slack_thread_ts": None})
+    post, calls = _posted()
+    summary = OB.run_once(bus, post, identity=IDS.get("echo"),
+                          member_check=lambda *_: True, log=lambda *_: None)
+    assert summary["posted"] == summary["resolved"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    assert bus.message(row["id"])["attachments"]["fixer_slack_route_missing"] is True
+    assert bus.ticket(tid)["status"] == "verification"
+    assert not any(call["channel"] == "C_CLIENT" for call in calls)
+
+
+def test_verified_fixer_post_retries_ticket_close_without_reposting(monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    post, calls = _posted()
+    real_resolve = bus.resolve_current_delivery
+    attempts = 0
+
+    def intermittent_resolve(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("database unavailable after Slack readback")
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(bus, "resolve_current_delivery", intermittent_resolve)
+    first = OB.run_once(bus, post, identity=IDS.get("echo"),
+                        member_check=lambda *_: True, log=lambda *_: None)
+    assert first["posted"] == 1 and first["resolved"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert bus.ticket(tid)["status"] == "verification"
+    second = OB.run_once(bus, post, identity=IDS.get("echo"),
+                         member_check=lambda *_: True, log=lambda *_: None)
+    assert second["resolved"] == 1
+    assert bus.ticket(tid)["status"] == "resolved"
+    assert bus.message(row["id"])["attachments"]["fixer_delivery_finalized_reason"] == (
+        "resolved_after_verified_slack")
+    assert len([c for c in calls if c["channel"] == "C_CLIENT"]) == 1
 
 
 @pytest.mark.parametrize("defect", [
@@ -2253,6 +2609,10 @@ def test_grounded_fixer_correction_during_post_keeps_newer_request_open(
                 bus, "messages",
                 lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("read failed")))
         return "9.999"
+    post.readback = lambda channel, **kw: {
+        "ok": True, "channel": channel,
+        "messages": [{"ts": "9.999", "text": f"<@{OB.config.APPROVER_SLACK_ID}> "
+                      "Instagram is connected.", "user": "U_ECHO_BOT", "thread_ts": "1.0"}]}
 
     summary = OB.run_once(
         bus, post, identity=IDS.get("echo"), log=lambda *_: None,
