@@ -31,7 +31,7 @@ before this file existed.
 | AGENT_SLACK_BOT_TOKEN | (unset) | BLAKE | xoxb token. Never logged. |
 | AGENT_SLACK_APP_TOKEN | (unset) | BLAKE | xapp token (Socket Mode). |
 | AGENT_SLACK_CHANNEL_ID | "" | BLAKE | The shared default channel (LASSO client zero). Clients set Account.slack_channel instead. |
-| AGENT_SLACK_CONVO_MODEL | gpt-6-astra | code | OpenAI Responses model for both Slack lanes. An old Claude model override is rejected; remove it or set a supported `gpt-` model during rollout. |
+| AGENT_SLACK_CONVO_MODEL | gpt-6-astra | code | OpenAI Responses text model for grounded Slack answers and optional classifier. Boot fails closed if the lane is enabled without `OPENAI_API_KEY` or with an unapproved model. Allowed models: `gpt-6-astra`, `gpt-6-luna`. |
 | SLACK_CONVO_<IDENTITY>_CLASSIFIER_LLM | false | BLAKE | Enables model fallback only after deterministic classification declines. Requires OPENAI_API_KEY and a valid OpenAI model at boot. |
 
 ## Meta / publishing
@@ -212,8 +212,8 @@ Now the FALLBACK engine. Everything below is unchanged.
 | AGENT_CLIPPER_SCORE_FLOOR / _MIN_SEC / _MAX_SEC / _TARGET_COUNT / _MODEL / _CACHE_DIR | code defaults | code | |
 | AGENT_TRANSCRIBE_API_KEY | (unset) | BLAKE | Or install faster-whisper. |
 | AGENT_WHISPER_MODEL | code default | code | |
-| AGENT_CLIPPER_MODEL | gpt-6-astra | code | OpenAI model for clipper moment selection. A stale non-OpenAI override fails closed. |
-| AGENT_SB7_MODEL | gpt-6-astra | code | OpenAI model for SB7 captions and website fact extraction. A stale non-OpenAI override fails closed. |
+| AGENT_CLIPPER_MODEL | gpt-6-astra | code | OpenAI text model for clipper, video editor and podcast moment selection. Enabled lanes fail boot without `OPENAI_API_KEY` or an allowed text model (`gpt-6-astra`, `gpt-6-luna`). |
+| AGENT_SB7_MODEL | gpt-6-astra | code | OpenAI text model for SB7, auto-reel and GBP captions plus website fact extraction. Enabled lanes fail boot without `OPENAI_API_KEY` or an allowed text model (`gpt-6-astra`, `gpt-6-luna`). |
 | AGENT_EPISODE_INBOX_ENABLED / _PREFIX / _TENANT / _POLL_MINUTES | false / code / lasso_episodes / 5 | BLAKE | Riverside drop watcher. |
 | AGENT_EPISODE_NUDGE_TIME / _WINDOW_DAYS | 09:00 / 2 | code | Monday nudge. |
 | AGENT_OPUS_ENABLED / AGENT_OPUS_POLL_ENABLED / AGENT_OPUS_FACTORY_ENABLED | false | BLAKE | Legacy Opus lanes. |

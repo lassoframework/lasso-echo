@@ -1656,6 +1656,8 @@ def main(argv=None):
     elif cmd == "fabrication-scan":
         _fabrication_scan(argv[1:])
     elif cmd == "listen":
+        from .openai_text import startup_preflight
+        startup_preflight()
         if os.environ.get("AGENT_SUMMIT_QUEUE_ON_START", "").lower() in ("1", "true"):
             print("[startup] AGENT_SUMMIT_QUEUE_ON_START detected — loading summit queue…",
                   flush=True)

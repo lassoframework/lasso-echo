@@ -117,7 +117,7 @@ def test_slack_answer_rejects_legacy_model_before_provider_call(monkeypatch):
     from agent.slack_convo import answer_lane as AL
     monkeypatch.setenv("OPENAI_API_KEY", "not-a-real-key")
     monkeypatch.setenv("AGENT_SLACK_CONVO_MODEL", "claude-sonnet-5")
-    with pytest.raises(ValueError, match="OpenAI gpt model"):
+    with pytest.raises(ValueError, match="supported OpenAI text model"):
         AL.default_llm("rules", "facts", transport=lambda *_: pytest.fail("provider called"))
 
 

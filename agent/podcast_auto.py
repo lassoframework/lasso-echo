@@ -39,6 +39,9 @@ def run(source=None, render=False, account_key=None, client=None, poster=None,
               flush=True)
         return None
 
+    from .openai_text import startup_preflight
+    startup_preflight()
+
     from . import video_editor, media_host, clipper
 
     # Accounts the clips cross-post to (e.g. lasso_ig + lasso_fb). One clip drafts

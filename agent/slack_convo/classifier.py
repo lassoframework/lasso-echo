@@ -261,8 +261,8 @@ def default_classify_llm(model=None):
         return None
     from .. import config
     selected_model = model or config.slack_convo_model()
-    if not selected_model.startswith("gpt-"):
-        raise ValueError("Slack classifier model must be an OpenAI gpt model")
+    from ..openai_text import validate_model
+    validate_model(selected_model)
 
     # Finding 4 (2026-09-05 audit 3): a PRESENT BUT INVALID key (revoked, typo'd, wrong
     # project) builds fine and cannot be detected without a network call, so the boot

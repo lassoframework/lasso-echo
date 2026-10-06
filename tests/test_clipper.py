@@ -31,6 +31,7 @@ class _FakeClient:
 
 def _arm(monkeypatch):
     monkeypatch.setenv("AGENT_CLIPPER_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
     monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
     # S3_PUBLIC_BASE_URL is a module constant captured at import; set it directly.
     monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://cdn.echo.test")

@@ -2565,10 +2565,13 @@ def slack_convo_daily_ticket_cap() -> int:
 
 def _openai_text_model(env_name: str) -> str:
     """Resolve a text model, rejecting stale provider overrides before any call."""
-    model = (os.environ.get(env_name) or "gpt-6-astra").strip()
-    if not model.startswith("gpt-"):
-        raise ValueError(f"{env_name} must be an OpenAI gpt model")
-    return model
+    from .openai_text import validate_model
+    configured = os.environ.get(env_name)
+    model = "gpt-6-astra" if configured is None else configured.strip()
+    try:
+        return validate_model(model)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be a supported OpenAI text model") from exc
 
 
 def slack_convo_model() -> str:

@@ -1711,6 +1711,9 @@ def edit_episode(source, render=False, client=None, transcriber=None, llm=None,
               flush=True)
         return None
 
+    from .openai_text import startup_preflight
+    startup_preflight()
+
     aspects = aspects or config.video_aspects()
 
     staged = clipper.stage_episode(source, client=client)

@@ -6,7 +6,20 @@ from pathlib import Path
 
 import pytest
 
-from agent import clipper, config, drafter, openai_text, website_intake
+from agent import clipper, config, drafter, openai_text, podcast_auto, video_editor, website_intake
+
+
+@pytest.fixture
+def no_text_lanes(monkeypatch):
+    for name in ("SLACK_CONVO_ENABLED", "SLACK_CONVO_ECHO_ENABLED", "AGENT_SB7_ENABLED",
+                 "AGENT_WEBSITE_AUTO_INTAKE", "AGENT_CLIPPER_ENABLED",
+                 "AGENT_AUTO_REELS_ENABLED", "AGENT_GBP_MIRROR", "AGENT_GBP_MONTH_SWEEP",
+                 "AGENT_VIDEO_EDITOR_ENABLED", "AGENT_PODCAST_AUTO_ENABLED"):
+        monkeypatch.setenv(name, "false")
+    monkeypatch.setenv("AGENT_GBP_MIRROR_GYMS", "")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLASSIFIER_LLM", "false")
+    for model_env in ("AGENT_SLACK_CONVO_MODEL", "AGENT_SB7_MODEL", "AGENT_CLIPPER_MODEL"):
+        monkeypatch.delenv(model_env, raising=False)
 
 
 def _response(text="Grounded answer.", status="completed"):
@@ -51,7 +64,7 @@ def test_missing_openai_key_and_old_model_do_not_call_provider(monkeypatch):
                              max_output_tokens=1000,
                              transport=lambda *_: pytest.fail("provider called"))
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    with pytest.raises(ValueError, match="OpenAI gpt model"):
+    with pytest.raises(ValueError, match="supported OpenAI text model"):
         openai_text.complete("system", "user", model="claude-sonnet-5",
                              max_output_tokens=1000,
                              transport=lambda *_: pytest.fail("provider called"))
@@ -85,8 +98,103 @@ def test_caption_website_and_clipper_use_shared_openai_client(monkeypatch):
 ])
 def test_stale_model_overrides_are_rejected(monkeypatch, env_name, model_reader):
     monkeypatch.setenv(env_name, "claude-sonnet-5")
-    with pytest.raises(ValueError, match="OpenAI gpt model"):
+    with pytest.raises(ValueError, match="supported OpenAI text model"):
         model_reader()
+
+
+@pytest.mark.parametrize("model", ["gpt-image-2.5-sunburst", "gpt-bogus", "gpt-6-astra-bogus"])
+def test_non_text_or_unknown_models_never_reach_provider(monkeypatch, model):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    with pytest.raises(ValueError, match="supported OpenAI text model"):
+        openai_text.complete("system", "user", model=model, max_output_tokens=1000,
+                             transport=lambda *_: pytest.fail("provider called"))
+
+
+@pytest.mark.parametrize("model", sorted(openai_text.ALLOWED_TEXT_MODELS))
+def test_supported_text_models_pass_local_validation(model):
+    assert openai_text.validate_model(model) == model
+
+
+_ARMED_LANES = [
+    ("slack", "SLACK_CONVO_ENABLED", "SLACK_CONVO_ECHO_ENABLED", "AGENT_SLACK_CONVO_MODEL"),
+    ("sb7", "AGENT_SB7_ENABLED", None, "AGENT_SB7_MODEL"),
+    ("website", "AGENT_WEBSITE_AUTO_INTAKE", None, "AGENT_SB7_MODEL"),
+    ("clipper", "AGENT_CLIPPER_ENABLED", None, "AGENT_CLIPPER_MODEL"),
+    ("auto_reels", "AGENT_AUTO_REELS_ENABLED", None, "AGENT_SB7_MODEL"),
+    ("gbp_mirror", "AGENT_GBP_MIRROR", None, "AGENT_SB7_MODEL"),
+    ("gbp_month_sweep", "AGENT_GBP_MONTH_SWEEP", None, "AGENT_SB7_MODEL"),
+    ("video_editor", "AGENT_VIDEO_EDITOR_ENABLED", None, "AGENT_CLIPPER_MODEL"),
+    ("podcast_auto", "AGENT_PODCAST_AUTO_ENABLED", None, "AGENT_CLIPPER_MODEL"),
+]
+
+
+@pytest.mark.parametrize("lane,flag,extra_flag,model_env", _ARMED_LANES)
+@pytest.mark.parametrize("problem", ["missing_key", "stale_model", "image_model", "bogus_model"])
+def test_every_armed_lane_fails_preflight_with_classifier_off(
+        monkeypatch, no_text_lanes, lane, flag, extra_flag, model_env, problem):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv(flag, "true")
+    if extra_flag:
+        monkeypatch.setenv(extra_flag, "true")
+    if problem == "missing_key":
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        expected = "OPENAI_API_KEY"
+    else:
+        monkeypatch.setenv(model_env, {
+            "stale_model": "claude-sonnet-5",
+            "image_model": "gpt-image-2.5-sunburst",
+            "bogus_model": "gpt-bogus",
+        }[problem])
+        expected = model_env
+    with pytest.raises(RuntimeError, match=expected):
+        openai_text.startup_preflight()
+
+
+def test_listener_and_daily_worker_fail_before_side_effects(monkeypatch, no_text_lanes):
+    from agent import listener, opus_ingest, runner
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLASSIFIER_LLM", "false")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(opus_ingest, "validated_project_ids",
+                        lambda: pytest.fail("listener started after failed preflight"))
+    monkeypatch.setattr(runner, "_trust_startup_warning",
+                        lambda: pytest.fail("daily worker started after failed preflight"))
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        listener.run_listener()
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "false")
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        runner.run_daily()
+
+
+def test_manual_text_entrypoints_fail_before_staging_or_fetch(monkeypatch, no_text_lanes):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("AGENT_CLIPPER_ENABLED", "true")
+    monkeypatch.setattr(clipper, "stage_episode",
+                        lambda *_args, **_kwargs: pytest.fail("episode staged"))
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        clipper.clip_episode("episode.mp4")
+    monkeypatch.setenv("AGENT_CLIPPER_ENABLED", "false")
+    monkeypatch.setenv("AGENT_WEBSITE_AUTO_INTAKE", "true")
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        website_intake.run(bases=["test"], fetch=lambda *_: pytest.fail("website fetched"))
+    monkeypatch.setenv("AGENT_WEBSITE_AUTO_INTAKE", "false")
+    monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        video_editor.edit_episode("episode.mp4", llm=lambda *_: "offline")
+    monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "false")
+    monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        podcast_auto.run(source="episode.mp4", llm=lambda *_: "offline")
+
+
+def test_explicit_empty_model_override_fails_closed(monkeypatch, no_text_lanes):
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("AGENT_SB7_MODEL", " ")
+    with pytest.raises(RuntimeError, match="AGENT_SB7_MODEL"):
+        openai_text.startup_preflight()
 
 
 def test_clipper_preserves_missing_key_error_type(monkeypatch):

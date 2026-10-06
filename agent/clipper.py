@@ -630,6 +630,9 @@ def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
         print("clip-episode: OFF (set AGENT_CLIPPER_ENABLED=true). Nothing done.")
         return None
 
+    from .openai_text import startup_preflight
+    startup_preflight()
+
     staged = stage_episode(source, tenant, client=client)
     print(f"clip-episode: staged episode -> {staged['r2_key']} "
           f"({'uploaded' if staged['staged'] else 'already in R2'})", flush=True)

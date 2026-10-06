@@ -513,6 +513,8 @@ def run(bases=None, websites=None, fetch=None, llm=None, alert=None):
     a caller that holds that mapping passes it in)."""
     if not config.website_auto_intake_enabled():
         return {"ok": False, "reason": "AGENT_WEBSITE_AUTO_INTAKE off"}
+    from .openai_text import startup_preflight
+    startup_preflight()
     if bases is None:
         from .calendar_autopublish import client_gym_bases
         bases = client_gym_bases()
