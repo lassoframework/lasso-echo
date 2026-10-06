@@ -151,7 +151,11 @@ def _own_media_url(url):
         parsed.path.startswith(allowed.path.rstrip("/") + "/") and
         len(parsed.path) > len(allowed.path.rstrip("/")) + 1 and
         all(part not in (".", "..") and "/" not in part and "\\" not in part
-            and not any(char.isspace() or ord(char) < 32 for char in part)
+            # Our host percent-encodes ordinary filename spaces. Raw URL
+            # whitespace is rejected above; decoded separators and controls
+            # remain ineligible even when percent-encoded.
+            and not any((char.isspace() and char != " ") or ord(char) < 32
+                        or 127 <= ord(char) <= 159 for char in part)
             for part in path_parts)
     )
 
