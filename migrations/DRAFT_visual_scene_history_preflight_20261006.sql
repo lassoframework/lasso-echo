@@ -46,6 +46,59 @@ with rows as materialized (
   left join public.visual_scene_candidate k on k.tenant_id=r.tenant
     and k.group_key=r.resolved_group and k.object_role=d.object_role
     and k.exact_url=d.exact_url
+), history_bound as materialized (
+  -- A secondary byte identity sharing an occupied pHash is covered only by
+  -- the immutable importer binding and its complete reviewed source/display
+  -- chain. A binding-shaped row or a candidate alone proves no historical use.
+  select b.* from public.visual_scene_history_object_binding b
+  join public.visual_scene_phash_occupied o
+    on o.tenant_id=b.tenant_id and o.group_key=b.group_key
+      and o.used_date=b.used_date and o.phash=b.phash
+  join public.visual_scene_history_receipt h on h.receipt_id=b.history_receipt
+    and h.tenant_id=b.tenant_id and h.group_key=b.group_key and h.used_date=b.used_date
+  join public.visual_scene_owner_phash_receipt p on p.receipt_id=b.owner_phash_receipt
+    and p.receipt_id in (h.source_phash_receipt,h.delivered_phash_receipt)
+    and p.tenant_id=b.tenant_id and p.group_key=b.group_key
+    and p.exact_url=b.exact_url and p.fingerprint=b.fingerprint and p.phash=b.phash
+    and p.algorithm='echo-dct-phash64-v1'
+  join public.visual_global_object_attestation a on a.tenant_id=p.tenant_id
+    and a.group_key=p.group_key and a.exact_url=p.exact_url
+    and a.fingerprint=p.fingerprint and a.byte_length=p.byte_length
+  join public.visual_scene_owner_phash_receipt s on s.receipt_id=h.source_phash_receipt
+    and s.tenant_id=h.tenant_id and s.group_key=h.group_key
+    and s.fingerprint=h.member_fingerprint
+  join public.visual_scene_owner_phash_receipt d on d.receipt_id=h.delivered_phash_receipt
+    and d.tenant_id=h.tenant_id and d.group_key=h.group_key
+  join public.visual_global_object_attestation sa on sa.tenant_id=s.tenant_id
+    and sa.group_key=s.group_key and sa.exact_url=s.exact_url
+    and sa.fingerprint=s.fingerprint and sa.byte_length=s.byte_length
+  join public.visual_global_object_attestation da on da.tenant_id=d.tenant_id
+    and da.group_key=d.group_key and da.exact_url=d.exact_url
+    and da.fingerprint=d.fingerprint and da.byte_length=d.byte_length
+  where s.algorithm='echo-dct-phash64-v1' and d.algorithm='echo-dct-phash64-v1'
+    and h.tenant_id=public.visual_group_tenant_id(h.tenant_id)::text
+    and not exists(select 1 from (values(s.fingerprint),(d.fingerprint)) f(fingerprint)
+      where not exists(select 1 from public.visual_global_usage_member m
+        join public.visual_global_usage u on u.fingerprint=m.fingerprint
+        where m.tenant_id=h.tenant_id and m.group_key=h.group_key
+          and m.fingerprint=f.fingerprint and m.used_date=h.used_date
+          and u.tenant_id=h.tenant_id and u.used_date=h.used_date))
+    and exists(select 1 from public.visual_global_scene_object_member m
+      where m.tenant_id=h.tenant_id and m.group_key=h.group_key
+        and m.exact_url=s.exact_url and m.fingerprint=s.fingerprint and m.object_role='source')
+    and exists(select 1 from public.visual_global_scene_object_member m
+      where m.tenant_id=h.tenant_id and m.group_key=h.group_key
+        and m.exact_url=d.exact_url and m.fingerprint=d.fingerprint and m.object_role='delivered')
+    and ((s.exact_url=d.exact_url and s.fingerprint=d.fingerprint)
+      or exists(select 1 from public.visual_global_object_lineage l
+        join public.visual_global_render_receipt r on r.receipt_id=l.render_receipt
+          and r.tenant_id=l.tenant_id and r.source_exact_url=l.source_exact_url
+          and r.delivered_exact_url=l.delivered_exact_url
+          and r.source_fingerprint=l.source_fingerprint
+          and r.delivered_fingerprint=l.delivered_fingerprint
+        where l.tenant_id=h.tenant_id and l.group_key=h.group_key
+          and l.source_exact_url=s.exact_url and l.source_fingerprint=s.fingerprint
+          and l.delivered_exact_url=d.exact_url and l.delivered_fingerprint=d.fingerprint))
 ), issues as (
   select 'calendar'::text as scope, c.calendar_row_id::text as identity,
     c.issue as reason from public.visual_global_coverage() c where c.issue<>'ready'
@@ -82,6 +135,11 @@ with rows as materialized (
       select 1 from public.visual_scene_phash_occupied o
       where o.tenant_id=b.tenant and o.group_key=b.resolved_group
         and o.used_date=b.post_date and o.fingerprint=b.fingerprint and o.phash=b.phash)
+      and not exists(select 1 from history_bound h
+        where h.tenant_id=b.tenant and h.group_key=b.resolved_group
+          and h.used_date=b.post_date and h.fingerprint=b.fingerprint
+          and h.phash=b.phash and h.exact_url=b.exact_url
+          and h.owner_phash_receipt::text=b.evidence->>'owner_phash_receipt')
   union all
   -- Conservatively require each permanent exact-byte member to retain matching
   -- owner-computed scene occupancy. A source-only member without verified
@@ -103,6 +161,9 @@ with rows as materialized (
       where o.tenant_id=m.tenant_id and o.group_key=m.group_key
         and o.fingerprint=m.fingerprint and o.used_date=m.used_date
         and p.byte_length=a.byte_length and p.algorithm='echo-dct-phash64-v1')
+      and not exists(select 1 from history_bound h
+        where h.tenant_id=m.tenant_id and h.group_key=m.group_key
+          and h.fingerprint=m.fingerprint and h.used_date=m.used_date)
   union all
   -- Full pair scan uses the same <=6 near-frame / 7..30 uncertain bands as
   -- admission. Only exact tenant/group/date siblings are exempt. Approved

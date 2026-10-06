@@ -19,7 +19,8 @@ public/anon/authenticated/service_role by design; the owner is unaffected),
 proving: tenant-scoped occupancy recording on clean claims, legal same-scene
 siblings, near_frame/uncertain blocking with durable idempotent holds, the
 approval-scoped exemption, fail-closed unbound candidates, the raising guard
-writing no holds, append-only immutability, and the 0A000 backfill stub.
+writing no holds, append-only immutability, and zero import without reviewed
+historical receipts.
 
 Scenario pHashes come from a deterministic Walsh-Hadamard codebook: word_i
 (i in 0..15) has bit j (j in 0..63) = parity(i & j), so every distinct pair is
@@ -519,10 +520,14 @@ def test_holds_are_permanent_and_open_holds_cannot_be_edited():
     assert len(_holds("open")) == 1
 
 
-def test_backfill_stub_fails_closed():
-    bad = _run("select public.visual_scene_backfill_occupied()", check=False)
-    assert bad.returncode != 0
-    assert "0A000" in bad.stderr or "activation-draft deliverable" in bad.stderr
+def test_backfill_without_reviewed_receipts_imports_nothing():
+    tenant, group = _seed_tenant()
+    url, _, _ = _seed_object(tenant, group, _CODEBOOK[0])
+    _insert_row(tenant, group, url)
+    assert _one("select count(*) from public.visual_scene_history_receipt") == "0"
+    assert _one("select public.visual_scene_backfill_occupied()") == "0"
+    assert _occupied_count() == 0
+    assert _one("select count(*) from public.visual_scene_history_object_binding") == "0"
 
 
 def test_hold_resolve_validates_inputs_and_missing_hold():

@@ -124,7 +124,8 @@ def test_temporary_relations_cannot_shadow_privileged_history():
     tenant, group, url, fp, candidate, row = txn.seed(scene_on=False)
     baseline = report()
     tables = ("content_calendar", "visual_scene_candidate", "visual_scene_owner_phash_receipt",
-              "visual_scene_phash_occupied", "visual_scene_review_hold", "visual_global_usage",
+              "visual_scene_phash_occupied", "visual_scene_review_hold", "visual_scene_history_object_binding",
+              "visual_scene_history_receipt", "visual_global_usage",
               "visual_global_usage_member", "visual_global_object_attestation", "tenant_alias")
     setup = "; ".join(f"create temp table {table} (like public.{table}); grant select on pg_temp.{table} to service_role"
                       for table in tables)
@@ -227,3 +228,123 @@ def test_wrong_database_application_rolls_back():
     body = DRAFT.read_text().replace("echo_scene_ledger_test", "not_this_database")
     result = ledger._run(body, check=False)
     assert result.returncode and "SCRATCH ONLY" in result.stderr
+
+
+def seed_equal_phash_history(display_phash="0000000000000000"):
+    """Two permanent byte objects, reviewed render lineage, one scene key."""
+    tenant, group, source_url, source_fp, source_candidate, row = txn.seed(scene_on=False)
+    display_url, display_fp, display_candidate = ledger._seed_object(tenant, group, display_phash)
+    source = ledger._one(f"select evidence->>'owner_phash_receipt' from public.visual_scene_candidate where candidate_id='{source_candidate}'")
+    display = ledger._one(f"select evidence->>'owner_phash_receipt' from public.visual_scene_candidate where candidate_id='{display_candidate}'")
+    ledger._sql("insert into public.visual_global_render_receipt(tenant_id,source_read_receipt,delivered_read_receipt,"
+                "source_exact_url,delivered_exact_url,source_fingerprint,delivered_fingerprint,operation,evidence_ref,rendered_by) "
+                "select s.tenant_id,sa.read_receipt,da.read_receipt,s.exact_url,d.exact_url,s.fingerprint,d.fingerprint,"
+                "'render','scratch-render','history-owner' from public.visual_scene_owner_phash_receipt s "
+                "join public.visual_global_object_attestation sa on sa.exact_url=s.exact_url "
+                "cross join public.visual_scene_owner_phash_receipt d "
+                "join public.visual_global_object_attestation da on da.exact_url=d.exact_url "
+                f"where s.receipt_id='{source}' and d.receipt_id='{display}'; "
+                "insert into public.visual_global_object_lineage(tenant_id,group_key,source_exact_url,delivered_exact_url,"
+                "source_fingerprint,delivered_fingerprint,render_receipt) "
+                f"select tenant_id,'{group}',source_exact_url,delivered_exact_url,source_fingerprint,delivered_fingerprint,receipt_id "
+                "from public.visual_global_render_receipt; "
+                "insert into public.visual_global_usage(fingerprint,tenant_id,used_date,state) "
+                f"values('{display_fp}','{tenant}','2026-10-10','reserved'); "
+                "insert into public.visual_global_usage_member(tenant_id,group_key,fingerprint,used_date,state,calendar_row_id) "
+                f"values('{tenant}','{group}','{display_fp}','2026-10-10','reserved','{row}'); "
+                "insert into public.visual_scene_history_receipt(receipt_id,tenant_id,group_key,member_fingerprint,used_date,"
+                "source_phash_receipt,delivered_phash_receipt,attested_by,evidence_ref) values "
+                f"(gen_random_uuid(),'{tenant}','{group}','{source_fp}','2026-10-10','{source}','{display}',"
+                "'history-owner','verified-publication-export'); "
+                "set session_replication_role=replica; "
+                f"update public.content_calendar set image_url='{display_url}' where id='{row}'")
+    assert ledger._one("select public.visual_scene_backfill_occupied()") == ("1" if display_phash == "0000000000000000" else "2")
+    return tenant, group, source_fp, display_fp, row
+
+
+def test_equal_phash_distinct_bytes_have_complete_immutable_history_coverage():
+    seed_equal_phash_history()
+    assert ledger._occupied_count() == 1
+    assert ledger._one("select count(distinct fingerprint) from public.visual_scene_history_object_binding") == "2"
+    result = report()
+    assert result["coverage_complete"] and result["issues"] == []
+    assert not result["clearance_authorized"] and not result["activation_available"]
+
+
+@pytest.mark.parametrize("corruption", ["missing", "receipt", "url", "phash", "tenant", "date"])
+def test_equal_phash_missing_or_forged_binding_does_not_clear_history(corruption):
+    tenant, group, source_fp, display_fp, row = seed_equal_phash_history()
+    # Select the non-representative byte object deterministically: receipt UUID
+    # ordering may make either source or display the occupied representative.
+    fp = ledger._one("select b.fingerprint from public.visual_scene_history_object_binding b "
+                     "join public.visual_scene_phash_occupied o using(tenant_id,group_key,used_date,phash) "
+                     "where b.fingerprint<>o.fingerprint")
+    updates = {
+        "receipt": "owner_phash_receipt=gen_random_uuid()",
+        "url": "exact_url='https://scratch.example/forged.jpg'",
+        "phash": "phash='ffffffffffffffff'",
+        "tenant": "tenant_id='00000000-0000-0000-0000-000000000001'",
+        "date": "used_date='2026-10-11'",
+    }
+    statement = ("delete from public.visual_scene_history_object_binding" if corruption == "missing"
+                 else "update public.visual_scene_history_object_binding set " + updates[corruption])
+    ledger._sql("set session_replication_role=replica; " + statement + f" where fingerprint='{fp}'")
+    result = report()
+    assert "permanent_member_scene_coverage_missing" in reasons(result)
+    assert not result["coverage_complete"]
+    if fp == display_fp:
+        assert "displayed_scene_occupancy_missing" in reasons(result)
+
+
+@pytest.mark.parametrize("corruption", ["source", "date", "orphan", "lineage", "owner"])
+def test_valid_binding_preserves_other_historical_blockers(corruption):
+    tenant, group, source_fp, display_fp, row = seed_equal_phash_history()
+    changes = {
+        "source": f"update public.content_calendar set source_media_url=null where id='{row}'",
+        "date": f"update public.content_calendar set post_date=null,status='published' where id='{row}'",
+        "orphan": f"delete from public.content_calendar where id='{row}'; "
+                  "delete from public.visual_scene_history_object_binding where fingerprint in "
+                  "(select b.fingerprint from public.visual_scene_history_object_binding b "
+                  "join public.visual_scene_phash_occupied o using(tenant_id,group_key,used_date,phash) "
+                  "where b.fingerprint<>o.fingerprint)",
+        "lineage": "delete from public.visual_global_object_lineage",
+        "owner": f"update public.visual_global_usage set tenant_id='00000000-0000-0000-0000-000000000001' where fingerprint='{display_fp}'",
+    }
+    ledger._sql("set session_replication_role=replica; " + changes[corruption])
+    result = report()
+    if corruption in ("source", "date"):
+        assert ("historical_source_review_required" if corruption == "source" else "scene_usage_date_unknown") in reasons(result)
+    assert not result["coverage_complete"]
+
+
+def test_multiple_lineage_proven_renditions_share_scene_without_losing_coverage():
+    tenant, group, source_fp, display_fp, row = seed_equal_phash_history('ffffffffffffffff')
+    url, third_fp, candidate = ledger._seed_object(tenant, group, 'ffffffffffffffff')
+    ledger._sql("insert into public.visual_global_render_receipt(tenant_id,source_read_receipt,delivered_read_receipt,"
+                "source_exact_url,delivered_exact_url,source_fingerprint,delivered_fingerprint,operation,evidence_ref,rendered_by) "
+                "select h.tenant_id,sa.read_receipt,da.read_receipt,s.exact_url,d.exact_url,s.fingerprint,d.fingerprint,"
+                "'render','third-rendition','history-owner' from public.visual_scene_history_receipt h "
+                "join public.visual_scene_owner_phash_receipt s on s.receipt_id=h.source_phash_receipt "
+                "join public.visual_global_object_attestation sa on sa.exact_url=s.exact_url "
+                "cross join public.visual_scene_owner_phash_receipt d "
+                "join public.visual_global_object_attestation da on da.exact_url=d.exact_url "
+                f"where h.member_fingerprint='{source_fp}' and d.exact_url='{url}'; "
+                "insert into public.visual_global_object_lineage(tenant_id,group_key,source_exact_url,delivered_exact_url,"
+                "source_fingerprint,delivered_fingerprint,render_receipt) "
+                f"select tenant_id,'{group}',source_exact_url,delivered_exact_url,source_fingerprint,delivered_fingerprint,receipt_id "
+                f"from public.visual_global_render_receipt where delivered_fingerprint='{third_fp}'; "
+                "insert into public.visual_global_usage(fingerprint,tenant_id,used_date,state) "
+                f"values('{third_fp}','{tenant}','2026-10-10','reserved'); "
+                "insert into public.visual_global_usage_member(tenant_id,group_key,fingerprint,used_date,state,calendar_row_id) "
+                f"values('{tenant}','{group}','{third_fp}','2026-10-10','reserved','{row}'); "
+                "insert into public.visual_scene_history_receipt(receipt_id,tenant_id,group_key,member_fingerprint,used_date,"
+                "source_phash_receipt,delivered_phash_receipt,attested_by,evidence_ref) "
+                "select gen_random_uuid(),h.tenant_id,h.group_key,h.member_fingerprint,h.used_date,h.source_phash_receipt,"
+                "d.receipt_id,'history-owner','third-rendition' from public.visual_scene_history_receipt h "
+                "cross join public.visual_scene_owner_phash_receipt d "
+                f"where h.member_fingerprint='{source_fp}' and d.exact_url='{url}'")
+    assert ledger._one('select public.visual_scene_backfill_occupied()') == '0'
+    assert ledger._occupied_count() == 2
+    assert ledger._one('select count(distinct fingerprint) from public.visual_scene_history_object_binding') == '3'
+    result = report()
+    assert result['coverage_complete'], result['issues']
