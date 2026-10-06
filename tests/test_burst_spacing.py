@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -174,3 +175,110 @@ def test_cross_cohort_dupe_group_history_is_conservative(tmp_path, monkeypatch):
         "nine7_ig", "2026-10-10")
 
     assert chosen == [third]
+
+
+def test_preexisting_library_backfill_activates_complete_cohort_spacing(
+        tmp_path, monkeypatch):
+    from agent import client_media_sync as cms
+
+    monkeypatch.setenv("AGENT_BURST_SPACING_GYMS", "nine7")
+    names = [
+        "20261001T120000Z_IMG_1001.jpg",
+        "20261001T120000Z_IMG_1002.jpg",
+        "20261002T120000Z_IMG_2001.jpg",
+        "20261002T120000Z_IMG_2002.jpg",
+    ]
+    objects = {
+        f"intake/nine7/incoming/{name}": b"remote" for name in names
+    }
+    for stamp in ("20261001T120000Z", "20261002T120000Z"):
+        batch_names = [name for name in names if name.startswith(stamp)]
+        objects[f"intake/nine7/incoming/{stamp}_upload.json"] = json.dumps({
+            "timestamp": stamp, "filenames": batch_names,
+        }).encode()
+
+    class R2:
+        def __init__(self):
+            self.got = []
+
+        def list_keys(self, prefix):
+            return [key for key in objects if key.startswith(prefix)]
+
+        def get_bytes(self, key):
+            self.got.append(key)
+            return objects[key]
+
+    r2 = R2()
+    for name in names:
+        (tmp_path / name).write_bytes(b"already-local")
+
+    assert cms.sync_uploads("nine7", r2=r2, out_dir=str(tmp_path)) == {
+        "synced": 0, "skipped": 4,
+    }
+    assert not [key for key in r2.got if key.endswith(".jpg")]
+    creatives = [Creative(path=str(tmp_path / name), media_type="image")
+                 for name in names]
+    cohorts = burst_spacing.cohort_map(creatives)
+    assert len(cohorts) == 4
+    assert len(set(cohorts.values())) == 2
+    spaced = burst_spacing.choose_spaced_pool(
+        creatives, creatives, {}, "nine7_ig", "2026-10-10")
+    assert 0 < len(spaced) < len(creatives)
+
+
+def test_unchanged_cohort_map_is_cached_and_invalidates_on_sidecar_edit(
+        tmp_path, monkeypatch):
+    photo = _photo(tmp_path, "20261001T120000Z", 1001)
+    from agent import dam
+    real_read = dam.read_sidecar
+    reads = []
+
+    def counted(path):
+        reads.append(path)
+        return real_read(path)
+
+    monkeypatch.setattr(dam, "read_sidecar", counted)
+    first = burst_spacing.cohort_map([photo])
+    hits_before = burst_spacing._cohort_items.cache_info().hits
+    second = burst_spacing.cohort_map([photo])
+    assert first == second
+    assert reads == [photo.path]
+    assert burst_spacing._cohort_items.cache_info().hits == hits_before + 1
+
+    with open(dam.sidecar_path(photo.path), "w", encoding="utf-8") as fh:
+        json.dump({"intake_batch_position": 7,
+                   "cache_invalidator": "different-size"}, fh)
+    assert burst_spacing.cohort_map([photo]) == first
+    assert reads == [photo.path, photo.path]
+
+
+def test_batch_position_is_deterministic_within_selected_cohort(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BURST_SPACING_GYMS", "nine7")
+    first_path = tmp_path / "20261001T120000Z_IMG_1001_z.jpg"
+    second_path = tmp_path / "20261001T120000Z_IMG_1001_a.jpg"
+    other_path = tmp_path / "20261002T120000Z_IMG_2001.jpg"
+    photos = [
+        Creative(path=str(first_path), media_type="image"),
+        Creative(path=str(second_path), media_type="image"),
+        Creative(path=str(other_path), media_type="image"),
+    ]
+    from agent import dam
+    for path in (first_path, second_path, other_path):
+        path.write_bytes(b"photo")
+    common = {"intake_batch_timestamp": "20261001T120000Z",
+              "intake_camera_family": "img", "intake_camera_sequence": 1001}
+    dam.write_sidecar(str(first_path), {**common, "intake_batch_position": 0})
+    dam.write_sidecar(str(second_path), {**common, "intake_batch_position": 1})
+    dam.write_sidecar(str(other_path), {
+        "intake_batch_timestamp": "20261002T120000Z",
+        "intake_batch_position": 0,
+        "intake_camera_family": "img", "intake_camera_sequence": 2001,
+    })
+
+    served = {"nine7_ig": [{
+        "key": dam.rotation_key(str(other_path)), "date": "2026-10-09",
+    }]}
+    chosen = burst_spacing.choose_spaced_pool(
+        photos, photos, served, "nine7_ig", "2026-10-10")
+
+    assert chosen[:2] == photos[:2]

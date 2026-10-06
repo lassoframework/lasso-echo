@@ -468,6 +468,8 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
         target = os.path.join(lib_dir, name)
         # IDEMPOTENT: already in the library -> never re-download.
         if os.path.exists(target):
+            _merge_intake_metadata(
+                lib_dir, name, _intake_sequence_for(intake_sequences, name), log)
             skipped += 1
             if _valid_media_file(target):
                 accepted.append(key)
@@ -583,6 +585,15 @@ def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
     lib_dir = _library_dir(base_key, out_dir)
     os.makedirs(lib_dir, exist_ok=True)
 
+    # Hosted objects retain their original upload basename. The intake batch
+    # sidecars are therefore still the trustworthy source for burst metadata,
+    # even when this recovery lane adds a collision-safe hash prefix locally.
+    intake_root = f"intake/{base_key}/"
+    intake_prefixes = [intake_root + suffix for suffix in _MEDIA_PREFIXES]
+    intake_listed = _list_prefixes_once(r2, intake_prefixes, log, base_key)
+    intake_sequences = _read_intake_sequences(
+        r2, intake_prefixes, keys=intake_listed)
+
     recovered = 0
     skipped = 0
     for key in keys:
@@ -600,6 +611,9 @@ def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
         local_name = f"{key_id}_{filename}"
         target = os.path.join(lib_dir, local_name)
         if os.path.exists(target):
+            _merge_intake_metadata(
+                lib_dir, local_name,
+                _intake_sequence_for(intake_sequences, filename), log)
             skipped += 1
             continue
         try:
@@ -624,7 +638,9 @@ def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
         aliases = visual_fingerprint.source_aliases(data)
         _write_sidecar(lib_dir, local_name, key, "", log,
                        source_fingerprint=aliases[0],
-                       source_fingerprint_aliases=aliases[1:])
+                       source_fingerprint_aliases=aliases[1:],
+                       intake_sequence=_intake_sequence_for(
+                           intake_sequences, filename))
         recovered += 1
 
     if recovered or skipped:
@@ -736,6 +752,44 @@ def _intake_sequence_for(index, media_name):
     normalized_stem = os.path.splitext(normalized_name)[0]
     return ((index or {}).get("by_name", {}).get(normalized_name)
             or (index or {}).get("by_stem", {}).get(normalized_stem))
+
+
+def _merge_intake_metadata(lib_dir, media_name, intake_sequence, log):
+    """Backfill only missing trusted intake fields on an existing local asset.
+
+    Existing media bytes are never opened or downloaded. Existing sidecar
+    values, including moderation, approval, notes, URLs and prior intake facts,
+    always win. An unreadable sidecar fails closed instead of being replaced.
+    """
+    if not intake_sequence:
+        return False
+    stem = os.path.splitext(media_name)[0]
+    side_path = os.path.join(lib_dir, stem + ".json")
+    existing = {}
+    if os.path.exists(side_path):
+        try:
+            with open(side_path, encoding="utf-8") as fh:
+                existing = json.load(fh)
+        except (OSError, ValueError, TypeError) as exc:
+            log(f"{media_name}: intake metadata backfill skipped: "
+                f"{type(exc).__name__}")
+            return False
+        if not isinstance(existing, dict):
+            log(f"{media_name}: intake metadata backfill skipped: invalid sidecar")
+            return False
+    payload = dict(existing)
+    for key, value in intake_sequence.items():
+        if key.startswith("intake_"):
+            payload.setdefault(key, value)
+    if payload == existing:
+        return False
+    try:
+        with open(side_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+    except OSError as exc:
+        log(f"{media_name}: intake metadata backfill failed: {type(exc).__name__}")
+        return False
+    return True
 
 
 def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",

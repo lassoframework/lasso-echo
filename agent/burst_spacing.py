@@ -14,6 +14,7 @@ library fallback.
 import os
 import re
 from collections import defaultdict
+from functools import lru_cache
 
 from . import config, dam
 
@@ -54,16 +55,31 @@ def parse_camera_sequence(value):
     return None
 
 
-def _metadata(path):
+def _sidecar_signature(path):
+    """Cheap cache invalidator for one asset's cohort metadata."""
+    try:
+        stat = os.stat(dam.sidecar_path(path))
+        return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=4096)
+def _metadata_cached(path, sidecar_signature):
     """Return an intake batch plus conservative camera sequence metadata."""
     side = dam.read_sidecar(path)
     batch = str(side.get("intake_batch_timestamp") or "").strip()
     family = str(side.get("intake_camera_family") or "").strip().lower()
     sequence = side.get("intake_camera_sequence")
+    position = side.get("intake_batch_position")
     try:
         sequence = int(sequence) if sequence is not None else None
     except (TypeError, ValueError):
         sequence = None
+    try:
+        position = int(position) if position is not None else None
+    except (TypeError, ValueError):
+        position = None
 
     source_names = (
         side.get("original_key"), side.get("current_key"),
@@ -86,21 +102,39 @@ def _metadata(path):
             family = family or parsed_family
             if sequence is None:
                 sequence = parsed_sequence
-    return batch, family, sequence
+    return batch, family, sequence, position
 
 
-def cohort_map(creatives):
-    """Map creative path to a stable burst cohort, omitting unknown assets."""
+def _metadata(path):
+    return _metadata_cached(path, _sidecar_signature(path))
+
+
+def intake_order_key(path):
+    """Stable within-cohort order, preferring the portal's upload order."""
+    metadata = _metadata(path)
+    if metadata is None:
+        return (1, 0, 1, 0, os.path.basename(path).casefold())
+    _batch, _family, sequence, position = metadata
+    return (
+        position is None, position or 0,
+        sequence is None, sequence or 0,
+        os.path.basename(path).casefold(),
+    )
+
+
+@lru_cache(maxsize=128)
+def _cohort_items(signature):
+    """Compute immutable cohort pairs once per unchanged library snapshot."""
     grouped = defaultdict(list)
     result = {}
-    for creative in creatives:
-        if getattr(creative, "media_type", "") != "image":
+    for media_type, path, sidecar_state in signature:
+        if media_type != "image":
             continue
-        meta = _metadata(creative.path)
+        meta = _metadata_cached(path, sidecar_state)
         if meta is None:
             continue
-        batch, family, sequence = meta
-        grouped[(batch, family)].append((sequence, creative.path))
+        batch, family, sequence, _position = meta
+        grouped[(batch, family)].append((sequence, path))
 
     for (batch, family), rows in grouped.items():
         sequenced = sorted((seq, path) for seq, path in rows if seq is not None)
@@ -119,7 +153,21 @@ def cohort_map(creatives):
             prior = sequence
         batch_key = f"intake:{batch}:{family or 'batch'}:unknown"
         result.update({path: batch_key for path in unsequenced})
-    return result
+    return tuple(sorted(result.items()))
+
+
+def cohort_map(creatives):
+    """Map creative path to a stable burst cohort, omitting unknown assets.
+
+    The signature stats sidecars but does not reread them. Repeated picks from an
+    unchanged month-build library reuse both parsed metadata and cohort grouping.
+    """
+    signature = tuple(
+        (getattr(creative, "media_type", ""), creative.path,
+         _sidecar_signature(creative.path))
+        for creative in creatives
+    )
+    return dict(_cohort_items(signature))
 
 
 def choose_spaced_pool(pool, catalog, served, account_key, day_key):
@@ -174,4 +222,5 @@ def choose_spaced_pool(pool, catalog, served, account_key, day_key):
     from .client_content import _day_ordinal
     chosen = candidates[_day_ordinal(day_key) % len(candidates)]
     spaced = [creative for creative in pool if cohorts.get(creative.path) == chosen]
+    spaced.sort(key=lambda creative: intake_order_key(creative.path))
     return spaced or pool
