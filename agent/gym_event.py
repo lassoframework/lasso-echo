@@ -45,6 +45,12 @@ EVENT_TYPES = (
     "holiday_sale", "new_offer", "party",
 )
 
+# Canonical event lifecycle tokens. Portal edits are permitted only while an event
+# is in one of these exact active states; terminal and unknown states fail closed.
+EDITABLE_EVENT_STATUSES = frozenset(("draft", "scheduled", "live"))
+TERMINAL_EVENT_STATUSES = frozenset(("ended", "cancelled"))
+EVENT_STATUSES = EDITABLE_EVENT_STATUSES | TERMINAL_EVENT_STATUSES
+
 # Arc category: event posts ride the calendar as 'offer'/'event'. They DISPLACE
 # doctrine/education slots first (event_calendar), never other proof/offer posts.
 ARC_CATEGORY = "offer"
@@ -126,7 +132,7 @@ class GymEvent:
             ZoneInfo(self.tz)
         except Exception:
             raise ValueError(f"gym_event.tz {self.tz!r} is not a valid IANA timezone")
-        if self.status not in ("draft", "scheduled", "live", "ended", "cancelled"):
+        if self.status not in EVENT_STATUSES:
             raise ValueError(f"gym_event.status {self.status!r} is invalid")
 
     @property

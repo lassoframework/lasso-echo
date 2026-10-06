@@ -74,6 +74,14 @@ class _EventStore:
         self.row = dict(row)
         return dict(self.row)
 
+    def update_event_if_status(self, gym_id, event_id, expected_status, row):
+        if (gym_id != self.row["gym_id"] or event_id != self.row["id"]
+                or self.row.get("status") != expected_status):
+            return None
+        self.writes += 1
+        self.row = dict(row)
+        return dict(self.row)
+
 
 class _CalendarStore:
     def __init__(self):

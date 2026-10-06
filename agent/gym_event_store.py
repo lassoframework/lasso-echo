@@ -90,6 +90,41 @@ class SupabaseGymEventStore:
                 return row
         return None
 
+    def update_event_if_status(self, gym_id, event_id, expected_status, row):
+        """Atomically replace one gym-scoped event only while its stored status is
+        exactly ``expected_status``. Returns the updated row, or None when the event
+        disappeared or its status changed before this write.
+
+        This is the edit path's compare-and-set fence: a concurrent cancel or nightly
+        transition must win instead of a stale edit upsert resurrecting the event.
+        """
+        payload = dict(row or {})
+        if (not gym_id or not event_id or not expected_status
+                or str(payload.get("id")) != str(event_id)
+                or str(payload.get("gym_id")) != str(gym_id)):
+            raise GymEventStoreError(400, "conditional gym_event update identity mismatch")
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={
+                "id": f"eq.{event_id}",
+                "gym_id": f"eq.{gym_id}",
+                "status": f"eq.{expected_status}",
+            },
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise GymEventStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for stored in (r.json() or []):
+            if (str(stored.get("id")) == str(event_id)
+                    and str(stored.get("gym_id")) == str(gym_id)):
+                return stored
+        return None
+
     # ---- reads -------------------------------------------------------------
     def get_event(self, gym_id, event_id):
         """One event by id AND gym_id, or None. Cross-gym id -> None (never revealed)."""

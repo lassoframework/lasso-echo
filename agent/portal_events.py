@@ -24,9 +24,6 @@ from datetime import date
 from . import config, gym_event as ge, event_calendar as ec, event_engine as ee
 
 
-_EDITABLE_EVENT_STATUSES = frozenset(("draft", "scheduled", "live"))
-
-
 def _flag_off():
     """A disabled gym / feature is a 404, indistinguishable from an unknown route."""
     return 404, {"error": "not found"}
@@ -167,7 +164,7 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     # calendar rows, persist a merged event, or stage anything.
     current_status = cur.get("status")
     if (not isinstance(current_status, str)
-            or current_status not in _EDITABLE_EVENT_STATUSES):
+            or current_status not in ge.EDITABLE_EVENT_STATUSES):
         return 409, {"error": "this promotion can no longer be edited"}
 
     merged = dict(cur)
@@ -190,14 +187,21 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     restage, keep, remove_keys = ec.retime_arc(old_arc, new_event, today=today,
                                                avatar=avatar)
 
-    # Persist the event with the new dates + an audit row.
+    # Persist the event with the new dates + an audit row. This final write is a
+    # compare-and-set against the exact status we read. A concurrent cancel/end/status
+    # transition therefore wins and cannot be overwritten by this stale merged row.
+    # retime_arc above is pure; calendar staging remains strictly after this fence.
     audit = list(cur.get("audit") or [])
     audit.append({"action": "edit", "actor": str((body or {}).get("actor_id") or ""),
                   "at": _now_iso()})
     try:
-        _estore.upsert_event({**_event_row(new_event), "audit": audit})
+        saved = _estore.update_event_if_status(
+            account_key, event_id, current_status,
+            {**_event_row(new_event), "audit": audit})
     except Exception as exc:  # noqa: BLE001
         return 502, {"error": f"save failed: {type(exc).__name__}"}
+    if saved is None:
+        return 409, {"error": "this promotion can no longer be edited"}
 
     # Stage only the changed rows (pending); approved unaffected rows are left as-is.
     staged = 0

@@ -61,6 +61,8 @@ class _EvStore:
     def __init__(self):
         self.rows = {}
         self.upsert_calls = 0
+        self.conditional_update_calls = 0
+        self.before_conditional_update = None
 
     def upsert_event(self, row):
         self.upsert_calls += 1
@@ -70,6 +72,17 @@ class _EvStore:
     def get_event(self, gym_id, event_id):
         r = self.rows.get(event_id)
         return dict(r) if r and r.get("gym_id") == gym_id else None
+
+    def update_event_if_status(self, gym_id, event_id, expected_status, row):
+        self.conditional_update_calls += 1
+        if self.before_conditional_update is not None:
+            self.before_conditional_update(self, gym_id, event_id)
+        current = self.rows.get(event_id)
+        if (not current or current.get("gym_id") != gym_id
+                or current.get("status") != expected_status):
+            return None
+        self.rows[event_id] = dict(row)
+        return dict(self.rows[event_id])
 
     def list_events(self, gym_id, statuses=None):
         return [dict(r) for r in self.rows.values() if r.get("gym_id") == gym_id]
@@ -288,6 +301,39 @@ def test_edit_preserves_supported_active_statuses(monkeypatch, editable_status):
     assert ev.rows[event["id"]]["starts_on"] == "2026-10-03"
     assert ev.rows[event["id"]]["ends_on"] == "2026-10-16"
     assert any(a["action"] == "edit" for a in ev.rows[event["id"]]["audit"])
+
+
+@pytest.mark.parametrize("terminal_status", ["cancelled", "ended"])
+def test_concurrent_terminal_transition_wins_edit_compare_and_set(
+        monkeypatch, terminal_status):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    before = dict(ev.rows[event_id])
+    staged_before = [dict(row) for row in cal.inserted]
+
+    def _terminal_transition(store, gym_id, eid):
+        assert gym_id == "pete" and eid == event_id
+        store.rows[eid]["status"] = terminal_status
+
+    ev.before_conditional_update = _terminal_transition
+    status, resp = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "stale-editor"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 409
+    assert resp == {"error": "this promotion can no longer be edited"}
+    assert ev.conditional_update_calls == 1
+    assert ev.rows[event_id]["status"] == terminal_status
+    assert ev.rows[event_id]["starts_on"] == before["starts_on"]
+    assert ev.rows[event_id]["ends_on"] == before["ends_on"]
+    assert ev.rows[event_id]["audit"] == before["audit"]
+    assert cal.inserted == staged_before, "failed CAS must not restage calendar rows"
 
 
 # ---- cancel --------------------------------------------------------------------
