@@ -3,7 +3,7 @@
 No supplied DSN is accepted. CI without PG17 skips these optional integration
 checks; a release requires a separate recorded PG17 run. Existing scene-ledger
 fixture helpers are reused for exact-byte attestation setup. Every server is
-stopped on exit. Historical coverage and cloud review remain release gates.
+stopped on exit. Historical coverage and production activation remain release gates.
 """
 import importlib.util
 import json
@@ -51,7 +51,22 @@ def cluster():
             ledger.PSQL = str(BIN / "psql")
             ledger.DSN = f"host={base} port=55479 dbname=echo_scene_ledger_test"
             ledger._scratch_stack.__wrapped__()
-            ledger._sql("alter table public.content_calendar add column format text")
+            ledger._sql("alter table public.content_calendar add column format text, add column caption text, add column scheduled_at timestamptz")
+            ledger._sql("create table public.gyms(id uuid primary key, slug text, name text); "
+                        "create table public.echo_intake_tokens(gym_id uuid, echo_account_key text); "
+                        "create table public.echo_gym_settings(gym_id uuid primary key, autonomous boolean)")
+            # Production order: dated capacity patches, authoritative provenance,
+            # THEN scene composition. Do not test against obsolete RPC stubs.
+            for name in ("lasso_bounded_catchup_capacity_20261005.sql",
+                         "lasso_immediate_backlog_capacity_20261005.sql",
+                         "calendar_approval_provenance_20261005.sql"):
+                ledger._sql((ROOT / "migrations" / name).read_text())
+            # Rehearse the complete composition under rollback first: every
+            # function replacement and obsolete-signature drop must roll back.
+            before = ledger._one("select md5(string_agg(proname||prosrc, '' order by oid)) from pg_proc where pronamespace='public'::regnamespace")
+            draft_body = DRAFT.read_text().replace("begin;", "", 1).rsplit("commit;", 1)[0]
+            ledger._sql("begin; " + draft_body + "; rollback;")
+            assert ledger._one("select md5(string_agg(proname||prosrc, '' order by oid)) from pg_proc where pronamespace='public'::regnamespace") == before
             ledger._sql(DRAFT.read_text())
             assert ledger._one("select count(*) from pg_trigger where tgrelid='public.content_calendar'::regclass and not tgisinternal and tgname='content_calendar_visual_group_guard'") == "1"
             yield
@@ -89,6 +104,8 @@ def assert_held(row):
     assert (current["status"], current["variant_status"], current["media_not_ready_reason"]) == ("pending", "archived", "scene_review_hold")
     assert current["publish_claim_token"] is None
     assert current["publish_reservation_day"] is None
+    assert all(current[key] is None for key in
+               ("approval_kind", "approved_by", "approved_at", "approval_digest"))
 
 
 def claim(row, tenant):
@@ -303,3 +320,137 @@ def test_review_approval_requires_fresh_reactivation_and_new_conflict_reholds():
     assert_held(row)
     assert len(ledger._holds("approved")) == 1
     assert len(ledger._holds("open")) == 1
+
+
+def proof_stamp(row, tenant):
+    ledger._sql(f"insert into public.gyms values ('{tenant}','scene-proof','Scene proof') on conflict do nothing; "
+                f"insert into public.echo_intake_tokens values ('{tenant}','{tenant}') on conflict do nothing; "
+                f"insert into public.echo_gym_settings values ('{tenant}',false) on conflict do nothing")
+    digest = state(row)["approval_digest"]
+    return ledger._one(f"select count(*) from public.calendar_stamp_verified_approval('{tenant}','{row}','clerk-test','{digest}')")
+
+
+def test_defaulted_rpc_signatures_are_single_and_acl_preserved():
+    for name, count in (("claim_calendar_publish_slot_owned", 7),
+                        ("approve_calendar_row_if_media_ready", 3)):
+        assert ledger._one(f"select count(*) from pg_proc where pronamespace='public'::regnamespace and proname='{name}'") == "1"
+        assert ledger._one(f"select pronargs||':'||pronargdefaults from pg_proc where pronamespace='public'::regnamespace and proname='{name}'") == f"{count}:1"
+    assert ledger._one("select has_function_privilege('service_role','public.claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean,boolean)','EXECUTE')") == "t"
+    assert ledger._one("select has_function_privilege('authenticated','public.claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean,boolean)','EXECUTE')") == "f"
+
+
+def test_expected_card_proof_reset_and_manual_digest_are_preserved():
+    tenant, group, url, fp, candidate, row = seed()
+    ledger._sql(f"update public.content_calendar set caption='Visible caption' where id='{row}'")
+    expected = dict(caption="stale", media_url=url, day_key="2026-10-10", format="feed", platform="ig")
+    def approve():
+        return ledger._one(f"select count(*) from public.approve_calendar_row_if_media_ready('{row}','{tenant}','{json.dumps(expected)}'::jsonb)")
+    assert approve() == "0" and state(row)["status"] == "pending"
+    expected["caption"] = "Visible caption"
+    ledger._sql(f"update public.content_calendar set approval_kind='automatic',approved_by='old',approved_at=now(),approval_digest='old' where id='{row}'")
+    assert approve() == "1"
+    current = state(row)
+    assert all(current[key] is None for key in ("approval_kind", "approved_by", "approved_at"))
+    assert current["approval_digest"] == ledger._one(f"select public.calendar_approval_digest(c) from public.content_calendar c where id='{row}'")
+    assert ledger._one(f"select public.claim_calendar_publish_slot_owned('{row}','{tenant}','2026-10-10','UTC',2,true,true)") == ""
+    assert proof_stamp(row, tenant) == "1"
+    ledger._sql(f"update public.content_calendar set caption='Changed after review' where id='{row}'")
+    assert ledger._one(f"select public.claim_calendar_publish_slot_proven_owned('{row}','{tenant}','2026-10-10','UTC',2,true)") == ""
+    assert state(row)["status"] == "approved"
+
+
+def test_manual_proven_claim_commits_hold_without_snapshot_or_proof():
+    tenant, group, url, fp, candidate, row = seed()
+    assert ledger._one(f"select count(*) from public.approve_calendar_row_if_media_ready('{row}','{tenant}')") == "1"
+    assert proof_stamp(row, tenant) == "1"
+    add_conflict()
+    assert ledger._one(f"select public.claim_calendar_publish_slot_proven_owned('{row}','{tenant}','2026-10-10','UTC',2,true)") == ""
+    assert_held(row)
+    assert len(ledger._holds("open")) == 1
+
+
+def test_proof_stamp_filters_new_scene_hold():
+    tenant, group, url, fp, candidate, row = seed()
+    assert ledger._one(f"select count(*) from public.approve_calendar_row_if_media_ready('{row}','{tenant}')") == "1"
+    add_conflict()
+    assert proof_stamp(row, tenant) == "0"
+    assert_held(row)
+    assert len(ledger._holds("open")) == 1
+
+
+def test_gbp_claim_commits_hold_and_returns_no_mode_snapshot():
+    tenant, group, url, fp, candidate, row = seed(account="googlebusiness")
+    assert ledger._one(f"select count(*) from public.approve_calendar_row_if_media_ready('{row}','{tenant}')") == "1"
+    assert proof_stamp(row, tenant) == "1"
+    add_conflict()
+    assert ledger._one(f"select public.claim_calendar_gbp_publish_with_mode_owned('{row}','{tenant}')") == ""
+    assert_held(row)
+    assert len(ledger._holds("open")) == 1
+
+
+def test_stale_reservations_and_null_proof_argument_remain_rejected():
+    tenant, group, url, fp, candidate, row = seed()
+    assert ledger._one(f"select public.claim_calendar_publish_slot_owned('{row}','{tenant}','2026-10-10','UTC',2,false,null)") == ""
+    ledger._sql(f"set session_replication_role=replica; update public.content_calendar set publish_reservation_day='2026-10-09' where id='{row}'")
+    assert claim(row, tenant) == ""
+    assert state(row)["status"] == "pending"
+
+
+def test_prerequisite_failure_and_composition_rollback():
+    # The migration must not fabricate older RPCs when provenance is absent.
+    before = ledger._one("select md5(prosrc) from pg_proc where oid='public.visual_group_guard_trigger()'::regprocedure")
+    body = DRAFT.read_text().replace("begin;", "", 1).rsplit("commit;", 1)[0]
+    result = ledger._run("begin; drop function public.approve_calendar_row_if_media_ready(uuid,text,jsonb); " + body, check=False)
+    assert result.returncode != 0 and "Apply current calendar approval provenance" in result.stderr
+    assert ledger._one("select md5(prosrc) from pg_proc where oid='public.visual_group_guard_trigger()'::regprocedure") == before
+    ledger._sql("begin; " + body + "; rollback;")
+    assert ledger._one("select md5(prosrc) from pg_proc where oid='public.visual_group_guard_trigger()'::regprocedure") == before
+
+
+@pytest.mark.parametrize("capacity,day,current_limit,backlog_limit", [(3,"2026-10-10",3,0),(5,"2026-10-10",3,2),(15,"2026-10-06",3,12)])
+def test_current_lasso_story_and_dated_capacity_envelopes(capacity, day, current_limit, backlog_limit):
+    tenant = str(uuid.uuid4())
+    ledger._sql(f"delete from public.tenant_alias where alias_key='lasso'; "
+                f"insert into public.tenant_alias(alias_key,tenant_id) values ('{tenant}','{tenant}'),('lasso','{tenant}')")
+    ledger._sql(f"select public.visual_group_activate_guard('{tenant}','capacity-test')")
+    # Distinct days have distinct exact objects/scenes; same-day rows are legal
+    # siblings. Capacity is per channel/format, independent of scene identity.
+    def rows(post_date, word, number):
+        group = 'capacity_' + post_date
+        ledger._sql(f"insert into public.visual_group(gym_id,group_key) values ('{tenant}','{group}')")
+        url, fp, candidate = ledger._seed_object(tenant, group, ledger._word(word))
+        return [ledger._one("insert into public.content_calendar(gym_id,account,format,post_date,status,variant_status,image_url,source_media_url,visual_group_key) values "
+                f"('lasso','ig','story','{post_date}','pending','active','{url}','{url}','{group}') returning id") for _ in range(number)]
+    def take(row):
+        return ledger._one(f"select public.claim_calendar_publish_slot_owned('{row}','lasso','{day}','America/New_York',{capacity},false)")
+    current = rows(day, 3, current_limit+1)
+    assert all(take(row) for row in current[:current_limit])
+    assert take(current[-1]) == ""
+    if backlog_limit:
+        older = rows("2026-10-02", 5, backlog_limit+1)
+        assert all(take(row) for row in older[:backlog_limit])
+        assert take(older[-1]) == ""
+
+
+def test_application_barrier_refuses_other_disposable_database():
+    ledger._sql("create database echo_scene_forbidden_test")
+    other_dsn = ledger.DSN.replace("dbname=echo_scene_ledger_test", "dbname=echo_scene_forbidden_test")
+    done = subprocess.run([ledger.PSQL,"-X","-q","-v","ON_ERROR_STOP=1","-d",other_dsn],
+                          input=DRAFT.read_text(), text=True, capture_output=True, timeout=30)
+    try:
+        assert done.returncode != 0 and "SCRATCH ONLY" in done.stderr
+        check = command([ledger.PSQL,"-X","-qAt","-d",other_dsn,"-c",
+                         "select count(*) from pg_proc where pronamespace='public'::regnamespace"])
+        assert check.stdout.strip() == "0"
+    finally:
+        ledger._sql("drop database echo_scene_forbidden_test")
+
+
+def test_claim_rebases_authoritative_predicates_without_drift():
+    authoritative = (ROOT / "migrations/calendar_approval_provenance_20261005.sql").read_text()
+    marker = "create or replace function public.claim_calendar_publish_slot_owned("
+    base = authoritative[authoritative.index(marker):].split("\n$$;", 1)[0]
+    composed = DRAFT.read_text()[DRAFT.read_text().index(marker):].split("\n$$;", 1)[0]
+    # Only the final mutation/result check is changed. This pins autonomy,
+    # manual proof, stale reservations, and all dated capacity predicates.
+    assert base.split("  v_token := gen_random_uuid();", 1)[0] == composed.split("  v_token := gen_random_uuid();", 1)[0]
