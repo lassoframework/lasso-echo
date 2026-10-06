@@ -248,6 +248,9 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
                 _store, account_key, inserted_rows)
         else:
             compensated = {"denied": 0}
+        if compensated.get("ok") is False:
+            return 502, {"error": "terminal event calendar sweep failed",
+                         "compensated": compensated.get("denied", 0)}
         return 409, {"error": "this promotion changed while it was being edited",
                      "compensated": compensated.get("denied", 0)}
     return 200, {"event": _event_row(new_event), "restaged": staged,
@@ -285,6 +288,9 @@ def handle_cancel_event(account_key, event_id, body=None, *, store=None,
     if _store is not None:
         res = ec.cancel_event(_store, account_key, event_id, ended=False)
         denied = res.get("denied", 0)
+        if res.get("ok") is False:
+            return 502, {"error": "event cancelled but calendar sweep failed",
+                         "cancelled": True, "denied": denied}
     return 200, {"cancelled": True, "denied": denied}
 
 

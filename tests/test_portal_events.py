@@ -458,6 +458,24 @@ def test_cancel_denies_pending_arc(monkeypatch):
     assert any(a["action"] == "cancel" for a in ev.rows[eid]["audit"])
 
 
+def test_cancel_calendar_read_failure_is_not_reported_as_success(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event("pete", _form(media_ids=["m1"]),
+                           store=cal, event_store=ev, today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    cal.list_event_rows = lambda *_args: (_ for _ in ()).throw(
+        RuntimeError("calendar unavailable"))
+
+    status, response = pe.handle_cancel_event(
+        "pete", event_id, {"actor_id": "owner"}, store=cal, event_store=ev)
+
+    assert status == 502
+    assert response["cancelled"] is True
+    assert response["error"] == "event cancelled but calendar sweep failed"
+    assert ev.rows[event_id]["status"] == "cancelled"
+
+
 # ---- recur ---------------------------------------------------------------------
 
 def test_recur_clones_with_blank_dates(monkeypatch):

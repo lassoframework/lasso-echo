@@ -448,15 +448,23 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     for r in existing:
         if str(r.get("event_id") or "") != str(event.id):
             continue
+        status = _status(r)
         # An edit operation owns only its deterministic row UUIDs. Rows inserted by
         # another edit may still be compensated by that loser, so they cannot satisfy
         # this operation's occupancy check or the winner could adopt disappearing rows.
+        # Only machine-wipeable rows can disappear that way. Human/publisher/terminal
+        # states remain permanent occupancy and must still block a duplicate slot.
         if operation_id is not None and str(r.get("id") or "") not in operation_row_ids:
+            if status in _WIPEABLE:
+                continue
+            already.add((str(r.get("post_date"))[:10],
+                         str(r.get("account") or "").lower(),
+                         str(r.get("format") or "").lower()))
             continue
         slot = (str(r.get("post_date"))[:10],
                 str(r.get("account") or "").lower(),
                 str(r.get("format") or "").lower())
-        if _status(r) == "denied":
+        if status == "denied":
             denied_count[slot] = denied_count.get(slot, 0) + 1
         else:
             already.add(slot)
@@ -831,29 +839,37 @@ def cancel_event(store, gym_id, event_id, *, ended=False, logger=None):
     Returns a summary. Reason is event_ended when `ended` else event_cancelled."""
     log = logger or (lambda m: print(f"[event-calendar] {m}"))
     reason = REJECT_ENDED if ended else REJECT_CANCELLED
-    rows = _event_rows(store, gym_id, event_id)
-    denier = getattr(store, "deny_with_reason", None)
+    try:
+        rows = _event_rows(store, gym_id, event_id)
+    except Exception as exc:  # noqa: BLE001 - never claim a terminal sweep we could not read
+        log(f"cancel_event: event row read failed {type(exc).__name__}")
+        return {"ok": False, "denied": 0, "reason": reason,
+                "error": "event_rows_unavailable"}
+    denier = getattr(store, "deny_wipeable_with_reason", None)
     denied = 0
+    failed = False
     for row in rows:
-        if _status(row) in _WIPEABLE and row.get("id") and denier is not None:
+        if _status(row) in _WIPEABLE and row.get("id"):
+            if denier is None:
+                failed = True
+                continue
             try:
                 if denier(gym_id, row["id"], reason):
                     denied += 1
             except Exception as exc:  # noqa: BLE001
                 log(f"cancel_event: deny {row.get('id')} failed {type(exc).__name__}")
-    return {"ok": True, "denied": denied, "reason": reason}
+                failed = True
+    return {"ok": not failed, "denied": denied, "reason": reason,
+            **({"error": "terminal_sweep_incomplete"} if failed else {})}
 
 
 def _event_rows(store, gym_id, event_id):
     """Every content_calendar row carrying this event_id for the gym. Uses the store's
     event-scoped reader when present, else filters a month read. Gym-scoped."""
     getter = getattr(store, "list_event_rows", None)
-    if getter is not None:
-        try:
-            return getter(gym_id, event_id) or []
-        except Exception:
-            return []
-    return []
+    if getter is None:
+        raise RuntimeError("event-scoped calendar reader unavailable")
+    return getter(gym_id, event_id) or []
 
 
 def guard_publish(store, event, row, *, http=None, today=None, logger=None):
