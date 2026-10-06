@@ -290,12 +290,29 @@ class FakeBus:
         return self.mark_message(mid, "held", meta_update={
             "fixer_slack_delivery_uncertain": True, "held_why": reason})
 
-    def pending_held_fixer_delivery(self, identity, limit=200):
-        return [dict(m) for m in self.msgs
+    def hold_fixer_config_missing(self, mid, reason):
+        row = self.message(mid)
+        att = (row or {}).get("attachments") or {}
+        if (not row or row.get("delivery_status") != "posting"
+                or att.get("fixer_slack_delivery_intent") is not None
+                or att.get("fixer_slack_delivery_uncertain")
+                or row.get("slack_ts")):
+            return None
+        return self.mark_message(mid, "held", meta_update={
+            "fixer_slack_config_missing": True, "held_why": reason})
+
+    def pending_held_fixer_delivery(self, identity, limit=200, after=None):
+        rows = [m for m in self.msgs
                 if m["delivery_status"] == "held"
                 and (m.get("attachments") or {}).get("identity") == identity
                 and (m.get("attachments") or {}).get("fixer_slack_delivery_uncertain")
-                and (m.get("attachments") or {}).get("fixer_slack_delivery_intent")][:limit]
+                and (m.get("attachments") or {}).get("fixer_slack_delivery_intent")]
+        rows.sort(key=lambda m: (m.get("created_at") or "", m["id"]))
+        if after:
+            bound = (after.get("created_at") or "", after.get("id") or "")
+            rows = [m for m in rows
+                    if (m.get("created_at") or "", m["id"]) > bound]
+        return [dict(m) for m in rows[:limit]]
 
     def requeue_route_missing_fixer(self, mid, recovered_at):
         row = self.message(mid)
@@ -309,6 +326,21 @@ class FakeBus:
         return self.mark_message(mid, "ready", meta_update={
             "fixer_slack_route_missing": False,
             "fixer_slack_route_recovered_at": recovered_at,
+            "claimed_at": recovered_at,
+        })
+
+    def requeue_config_missing_fixer(self, mid, recovered_at):
+        row = self.message(mid)
+        att = (row or {}).get("attachments") or {}
+        if (not row or row.get("delivery_status") != "held"
+                or att.get("fixer_slack_config_missing") is not True
+                or att.get("fixer_slack_delivery_intent") is not None
+                or att.get("fixer_slack_delivery_uncertain")
+                or row.get("slack_ts")):
+            return None
+        return self.mark_message(mid, "ready", meta_update={
+            "fixer_slack_config_missing": False,
+            "fixer_slack_config_recovered_at": recovered_at,
             "claimed_at": recovered_at,
         })
 
@@ -2849,20 +2881,93 @@ def test_fixer_marker_pages_advance_without_cross_consumer_starvation():
     assert len(recovery_one) == len(recovery_two) == 200
 
 
-def test_fixer_missing_readback_holds_before_slack_post(monkeypatch):
+@pytest.mark.parametrize("missing", ["bot_user_id", "readback"])
+def test_fixer_missing_delivery_config_holds_then_recovers_without_duplicate(
+        monkeypatch, missing):
     _arm_grounded_fixer(monkeypatch)
     bus, tid, row, _ = _grounded_fixer_answer_case()
-    sent = []
+    post, calls = _posted()
+    valid_readback = post.readback
+    if missing == "bot_user_id":
+        monkeypatch.delenv("AGENT_SLACK_BOT_USER_ID")
+    else:
+        del post.readback
 
-    def post(*args, **kwargs):
-        sent.append(args)
-        return "9.999"
-
-    OB.run_once(bus, post, identity=IDS.get("echo"),
-                member_check=lambda *_: True, log=lambda *_: None)
-    assert not sent
-    assert bus.message(row["id"])["delivery_status"] == "held"
+    first = OB.run_once(bus, post, identity=IDS.get("echo"),
+                        member_check=lambda *_: True, log=lambda *_: None)
+    held = bus.message(row["id"])
+    assert first["held"] == 1 and first["posted"] == first["resolved"] == 0
+    assert not calls
+    assert held["delivery_status"] == "held"
+    assert held["attachments"]["fixer_slack_config_missing"] is True
+    assert held["attachments"].get("fixer_slack_delivery_uncertain") is not True
+    assert held["attachments"].get("fixer_slack_delivery_intent") is None
+    assert held.get("slack_ts") is None
     assert bus.ticket(tid)["status"] == "verification"
+    assert not any((m.get("attachments") or {}).get("fixer_uncertain_row_id") == row["id"]
+                   for m in bus.msgs)
+
+    monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO_BOT")
+    post.readback = valid_readback
+    second = OB.run_once(bus, post, identity=IDS.get("echo"),
+                         member_check=lambda *_: True, log=lambda *_: None)
+    third = OB.run_once(bus, post, identity=IDS.get("echo"),
+                        member_check=lambda *_: True, log=lambda *_: None)
+    delivered = bus.message(row["id"])
+    assert second["reclaimed"] == second["posted"] == second["resolved"] == 1
+    assert third["resolved"] == 0
+    assert delivered["delivery_status"] == "posted"
+    assert delivered["attachments"]["fixer_slack_config_missing"] is False
+    assert delivered["attachments"]["delivery_readback_verified"] is True
+    assert bus.ticket(tid)["status"] == "resolved"
+    assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
+
+
+def test_fixer_held_reconciliation_prioritizes_oldest_due_row_over_new_holds():
+    bus = FakeBus()
+    due = datetime.now(timezone.utc) - timedelta(minutes=1)
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    intent = {
+        "channel": "C_CLIENT", "thread_ts": "1.0", "body": "done",
+        "sender": "U_ECHO_BOT", "not_before": due.isoformat(),
+        "request_key": "request", "request_version": 1,
+    }
+    oldest = bus.record_outbound(
+        ticket_id="missing-ticket", author_type="echo", body="done",
+        delivery_status="held", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "fixer_slack_delivery_uncertain": True,
+              "fixer_slack_delivery_intent": intent,
+              "fixer_reconcile_next_at": due.isoformat()})
+    bus.mark_message(oldest["id"], "held", slack_ts="1.111")
+    next(m for m in bus.msgs if m["id"] == oldest["id"])["created_at"] = (
+        "2026-01-01T00:00:00+00:00")
+    for index in range(250):
+        newer = bus.record_outbound(
+            ticket_id="missing-ticket", author_type="echo", body=f"newer {index}",
+            delivery_status="held", kind=A.KIND_STATUS,
+            meta={"identity": "echo", "fixer_slack_delivery_uncertain": True,
+                  "fixer_slack_delivery_intent": {**intent, "body": f"newer {index}"},
+                  "fixer_reconcile_next_at": future.isoformat()})
+        bus.mark_message(newer["id"], "held", slack_ts=f"2.{index:03d}")
+        next(m for m in bus.msgs if m["id"] == newer["id"])["created_at"] = (
+            f"2026-02-{1 + index // 28:02d}T00:00:{index % 60:02d}+00:00")
+
+    reads = []
+
+    def readback(channel, **kwargs):
+        reads.append(kwargs["ts"])
+        return {"ok": True, "channel": channel,
+                "messages": [{"ts": kwargs["ts"], "text": "done",
+                              "user": "U_ECHO_BOT", "thread_ts": "1.0"}]}
+
+    OB._reconcile_held_fixer(
+        bus, IDS.get("echo"), readback, lambda *_: None,
+        {"posted": 0, "resolved": 0})
+
+    assert reads == ["1.111"]
+    assert bus.message(oldest["id"])["delivery_status"] == "posted"
+    assert all(m["delivery_status"] == "held" for m in bus.msgs
+               if m["id"] != oldest["id"])
 
 
 def test_fixer_portal_only_completion_stays_held_until_slack_route_exists(monkeypatch):

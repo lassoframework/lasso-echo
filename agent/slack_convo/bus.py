@@ -580,7 +580,8 @@ class Bus:
         starving delivery reconciliation while keeping each sweep bounded.
         """
         if marker not in {"fixer_slack_delivery_uncertain",
-                          "fixer_slack_route_missing"}:
+                          "fixer_slack_route_missing",
+                          "fixer_slack_config_missing"}:
             raise BusError(400, "invalid FIXER hold marker")
         params = {
             "direction": "eq.outbound", "delivery_status": "eq.held",
@@ -714,14 +715,43 @@ class Bus:
             "id": f"eq.{message_id}", "delivery_status": "eq.posting",
         }, {"delivery_status": "held", "attachments": att})
 
-    def pending_held_fixer_delivery(self, identity, limit=200):
-        return self._get(_MESSAGES, {
+    def hold_fixer_config_missing(self, message_id, reason):
+        """Hold a deterministic pre-POST configuration failure for safe retry."""
+        row = self.message(message_id)
+        raw_att = (row or {}).get("attachments")
+        att = dict(raw_att or {})
+        if (not row or row.get("delivery_status") != "posting"
+                or att.get("fixer_slack_delivery_intent") is not None
+                or att.get("fixer_slack_delivery_uncertain")
+                or row.get("slack_ts")):
+            return None
+        next_att = {**att,
+                    "fixer_slack_config_missing": True,
+                    "held_why": str(reason)[:300]}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.posting",
+            "slack_ts": "is.null",
+            "attachments": ("is.null" if raw_att is None else
+                            "eq." + json.dumps(att, separators=(",", ":"),
+                                               sort_keys=True)),
+        }, {"delivery_status": "held", "attachments": next_att})
+
+    def pending_held_fixer_delivery(self, identity, limit=200, after=None):
+        params = {
             "direction": "eq.outbound", "delivery_status": "eq.held",
             "attachments->>identity": f"eq.{identity}",
             "attachments->>fixer_slack_delivery_uncertain": "eq.true",
             "attachments->>fixer_slack_delivery_intent": "not.is.null",
-            "select": "*", "order": "created_at.desc", "limit": str(int(limit)),
-        })
+            "select": "*", "order": "created_at.asc,id.asc",
+            "limit": str(int(limit)),
+        }
+        if after:
+            ts = str(after.get("created_at") or "").replace('"', "")
+            mid = str(after.get("id") or "").replace('"', "")
+            if ts and mid:
+                params["or"] = (f'(created_at.gt."{ts}",'
+                                f'and(created_at.eq."{ts}",id.gt."{mid}"))')
+        return self._get(_MESSAGES, params)
 
     def _patch_held_fixer_attachments(self, message_id, *, eligible, updates,
                                       fields=None, match_update=None, attempts=3):
@@ -788,6 +818,24 @@ class Bus:
             "attachments->>fixer_slack_delivery_intent": "is.null",
             "attachments->>fixer_slack_delivery_uncertain": "is.null",
         }, {"delivery_status": "ready", "attachments": next_att})
+
+    def requeue_config_missing_fixer(self, message_id, recovered_at):
+        """CAS one never-attempted configuration hold back to ready."""
+        return self._patch_held_fixer_attachments(
+            message_id,
+            eligible=lambda row, att: (
+                att.get("fixer_slack_config_missing") is True
+                and att.get("fixer_slack_delivery_intent") is None
+                and not att.get("fixer_slack_delivery_uncertain")
+                and not row.get("slack_ts")),
+            updates=lambda _row, att: {
+                "fixer_slack_config_missing": False,
+                "fixer_slack_config_recovered_at": recovered_at,
+                "claimed_at": recovered_at,
+            },
+            fields={"delivery_status": "ready"},
+            match_update=lambda _row, _att: {"slack_ts": "is.null"},
+        )
 
     def defer_held_fixer_reconcile(self, message_id, next_at):
         return self._patch_held_fixer_attachments(

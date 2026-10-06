@@ -1298,6 +1298,40 @@ def _recover_route_missing_fixer(bus, identity, member_check, log, now=None):
     return recovered
 
 
+def _recover_config_missing_fixer(bus, identity, readback, log, now=None):
+    """Requeue never-attempted rows after required Slack proof config returns."""
+    if not identity.bot_user_id() or not callable(readback):
+        return 0
+    try:
+        rows = _pending_fixer_hold_page(
+            bus, identity, "fixer_slack_config_missing", limit=5,
+            scan="config_recovery")
+    except Exception as exc:  # noqa: BLE001
+        log(f"[slack-convo/outbox] FIXER config recovery scan failed: "
+            f"{type(exc).__name__}")
+        return 0
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    recovered = 0
+    for row in rows:
+        att = row.get("attachments") or {}
+        if (att.get("fixer_slack_config_missing") is not True
+                or att.get("fixer_slack_delivery_intent") is not None
+                or att.get("fixer_slack_delivery_uncertain")
+                or row.get("slack_ts")):
+            continue
+        try:
+            requeued = bus.requeue_config_missing_fixer(
+                row["id"], current.astimezone(timezone.utc).isoformat())
+            if requeued and requeued.get("delivery_status") == "ready":
+                recovered += 1
+        except Exception as exc:  # noqa: BLE001 - held row remains safe
+            log(f"[slack-convo/outbox] FIXER config recovery failed "
+                f"row={row.get('id')}: {type(exc).__name__}")
+    return recovered
+
+
 def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
     """Idempotently finish the ticket step after verified Slack delivery."""
     att = row.get("attachments") or {}
@@ -1363,7 +1397,28 @@ def _reconcile_posted_fixer(bus, identity, log, summary):
 def _reconcile_held_fixer(bus, identity, readback, log, summary):
     """Recover a late Slack success without ever sending the client row again."""
     try:
-        rows = bus.pending_held_fixer_delivery(identity.name, limit=200)
+        reader = bus.pending_held_fixer_delivery
+        cursors = getattr(bus, "_fixer_held_reconcile_cursors", None)
+        if not isinstance(cursors, dict):
+            cursors = {}
+            setattr(bus, "_fixer_held_reconcile_cursors", cursors)
+        after = cursors.get(identity.name)
+        try:
+            rows = reader(identity.name, limit=200, after=after)
+        except TypeError:  # compatibility for bounded legacy/test adapters
+            rows = reader(identity.name, limit=200)
+        if not rows and after:
+            cursors.pop(identity.name, None)
+            try:
+                rows = reader(identity.name, limit=200, after=None)
+            except TypeError:
+                rows = reader(identity.name, limit=200)
+        if rows:
+            last = rows[-1]
+            cursors[identity.name] = {
+                "created_at": last.get("created_at"), "id": last.get("id")}
+            if len(rows) < 200:
+                cursors.pop(identity.name, None)
     except Exception as exc:  # noqa: BLE001
         log(f"[slack-convo/outbox] FIXER held reconciliation scan failed: "
             f"{type(exc).__name__}")
@@ -1446,6 +1501,8 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
     _reconcile_held_fixer(bus, identity, readback, log, summary)
     summary["reclaimed"] += _recover_route_missing_fixer(
         bus, identity, member_check, log, now=now)
+    summary["reclaimed"] += _recover_config_missing_fixer(
+        bus, identity, readback, log, now=now)
     _report_uncertain_fixer(bus, identity, log, now=now)
     _reconcile_posted_fixer(bus, identity, log, summary)
     try:
@@ -1958,7 +2015,14 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     if fixer_customer_slack:
         sender = identity.bot_user_id()
         if not sender or not callable(readback):
-            raise UncertainFixerDelivery("Echo bot identity or Slack readback unavailable")
+            reason = "Echo bot identity or Slack readback unavailable before Slack POST"
+            held = bus.hold_fixer_config_missing(row["id"], reason)
+            if held and held.get("delivery_status") == "held":
+                log(f"[slack-convo/outbox] FIXER delivery held before Slack POST "
+                    f"row={row.get('id')}: {reason}")
+                summary["held"] += 1
+                return
+            raise RuntimeError("FIXER pre-POST configuration hold was not persisted")
         intent = {
             "channel": channel, "thread_ts": thread_ts, "body": sent_body,
             "sender": sender, "claimed_at": datetime.now(timezone.utc).isoformat(),
