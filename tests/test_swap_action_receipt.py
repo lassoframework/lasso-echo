@@ -516,7 +516,7 @@ def _wire_legacy_original_proof(monkeypatch):
     # These three cases isolate action-ID route selection. Real original-byte
     # verification and refusal are tested in test_ordinary_swap_proof.
     monkeypatch.setattr(media_guard, "swap_original_identity",
-                        lambda account, row, store, *, pick=None:
+                        lambda account, row, store, *, pick=None, byte_cache=None:
                         {"sha256": "b" * 64 if pick else "a" * 64,
                          "source_asset_id": "asset-1" if pick else "asset-0",
                          "source_url": (pick or row).get("source_media_url")})

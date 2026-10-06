@@ -40,7 +40,7 @@ def _enable(monkeypatch):
                         lambda: True)
     # This suite owns forwarding of render/poster evidence. Original-byte and
     # tenant identity are covered with real bytes in test_ordinary_swap_proof.
-    def original_identity(account, row, store, *, pick=None):
+    def original_identity(account, row, store, *, pick=None, byte_cache=None):
         if pick and pick.get("source_media_url") != pick.get("image_url") and not pick.get("render_evidence"):
             raise ValueError("render lineage missing")
         return {"sha256": "b" * 64 if pick else "a" * 64,
