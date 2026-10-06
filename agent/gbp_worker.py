@@ -25,6 +25,35 @@ from . import config, gbp
 RECONCILE_HOURS = 48          # §7.2: poll hourly for the first 48h after publish
 
 
+def _alert_manual_approval_changed(gym_id, row_id, alert):
+    """Alert once per durably held manual GBP row; never let alerting affect safety.
+
+    An ephemeral KV stamp disappears on worker restart and would allow this hold to
+    storm, so only durable stores may send. Stamp after confirmed delivery so failures
+    can retry on a later tick.
+    """
+    if not alert:
+        return
+    try:
+        from . import db
+        key = f"gbp_approval_creative_change_alerted_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        if not db.kv_is_durable():
+            print(f"[gbp] row {row_id}: manual approval creative changed; "
+                  "alert suppressed because KV is not durable")
+            return
+        result = alert(
+            f"GBP row {row_id} for {gym_id} was moved back to pending because its "
+            "creative changed after manual approval. Review the current caption and "
+            "image in the portal, then approve it again before publishing.")
+        if result and not (isinstance(result, dict) and result.get("ok") is False):
+            db.kv_set(key, "1")
+    except Exception as exc:  # alerting must not affect the safe held row
+        print(f"[gbp] row {row_id}: manual approval change alert failed: "
+              f"{type(exc).__name__}")
+
+
 # --- row -> payload --------------------------------------------------------
 
 def build_gbp_payload_for_row(row, connection):
@@ -594,12 +623,16 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                     # 'publishing'. No provider attempt was made, so the token clears.
                     try:
                         release = getattr(store, "release_publishing_claim", None)
+                        release_status = ("pending" if res.get("held") ==
+                                          "approval_creative_change" else "approved")
                         if claim_token is not None and release is not None:
                             released = release(row.get("id"), claim_token,
-                                               "approved")
+                                               release_status)
                             if released is None:
                                 print(f"[gbp] WARNING: claim release matched no row "
                                       f"for {row.get('id')}; claim changed elsewhere")
+                            elif res.get("held") == "approval_creative_change":
+                                _alert_manual_approval_changed(gym, row.get("id"), alert)
                             elif (res.get("held") == "automatic_caption_cleanup"
                                   and row.get("autonomous_at_claim") is True):
                                 # The provider payload must exactly match the claimed
@@ -628,7 +661,9 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                                     print(f"[gbp] Auto caption cleanup unavailable or "
                                           f"empty for {row.get('id')}; no send attempted")
                         else:
-                            store.mark_status(row.get("id"), "approved")
+                            store.mark_status(row.get("id"), release_status)
+                            if res.get("held") == "approval_creative_change":
+                                _alert_manual_approval_changed(gym, row.get("id"), alert)
                     except Exception as e:  # noqa: BLE001
                         print(f"[gbp] WARNING: claim release failed for "
                               f"{row.get('id')}: {type(e).__name__}")

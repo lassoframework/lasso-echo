@@ -1145,9 +1145,49 @@ def test_proof_claimed_caption_metadata_holds_and_releases_without_send(monkeypa
     client = _FakeClient()
     out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
     assert client.calls == [] and out["held"] == 1
-    assert store.released == [("r1", "approved")]
+    assert store.released == [("r1", "pending")]
     assert store.published == [] and store.failed == []
     assert fresh["caption"].endswith("[why] internal editing rationale")
+
+
+def test_manual_approval_creative_change_returns_to_pending_and_alerts_once(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    from agent import db
+    stamps = {}
+    monkeypatch.setattr(db, "kv_is_durable", lambda: True)
+    monkeypatch.setattr(db, "kv_get", lambda key: stamps.get(key))
+    monkeypatch.setattr(db, "kv_set", lambda key, value: stamps.__setitem__(key, value))
+    fresh = _row(id="r1", gym_id="gym", status="publishing",
+                 caption=_GOOD_CAPTION + "\n[why] edited after approval",
+                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111",
+                 autonomous_at_claim=False)
+
+    class ManualApprovalStore(_TokenStore):
+        def claim_publishing(self, row_id, *, gym_id, require_proof):
+            assert gym_id == "gym" and require_proof is True
+            token = fresh["publish_claim_token"]
+            self.tokens[row_id] = token
+            return dict(fresh)
+
+    store = ManualApprovalStore([fresh], {"gym": [_c()]})
+    client = _FakeClient()
+    alerts = []
+
+    def alert(message):
+        alerts.append(message)
+        return {"ok": True}
+
+    for _ in range(2):
+        out = gw.publish_due_gbp(store, client, run_date="2026-09-01",
+                                 draft=False, alert=alert)
+        assert out["held"] == 1 and out["published"] == 0
+
+    assert client.calls == []
+    assert store.released == [("r1", "pending"), ("r1", "pending")]
+    assert len(alerts) == 1
+    assert "moved back to pending" in alerts[0]
+    assert "approve it again" in alerts[0]
 
 
 def test_proof_autonomous_caption_metadata_holds_for_automatic_cleanup(monkeypatch):
