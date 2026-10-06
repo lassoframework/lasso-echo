@@ -291,6 +291,26 @@ class FakeBus:
             return "pending"
         return "failed" if states else None
 
+    def rearm_uncertain_fixer_alert(self, mid):
+        rows = [m for m in reversed(self.msgs)
+                if (m.get("attachments") or {}).get("fixer_uncertain_row_id") == mid]
+        if any(m["delivery_status"] in {"posted", "ready", "posting"} for m in rows):
+            return None
+        alert = next((m for m in rows
+                      if m["delivery_status"] in {"failed", "suppressed"}), None)
+        if not alert:
+            return None
+        alert["delivery_status"] = "ready"
+        return dict(alert)
+
+    def reserve_uncertain_fixer_alert_retry(self, mid, expected_at, next_at):
+        row = self.message(mid)
+        if (not row or row.get("delivery_status") != "held"
+                or (row.get("attachments") or {}).get("fixer_alert_retry_after") != expected_at):
+            return None
+        return self.mark_message(mid, "held", meta_update={
+            "fixer_alert_retry_after": next_at})
+
     def mark_uncertain_fixer_alerted(self, mid):
         if (self.message(mid) or {}).get("delivery_status") != "held":
             return None
@@ -2398,18 +2418,48 @@ def test_fixer_uncertain_alert_retries_after_slack_outage(monkeypatch):
             raise RuntimeError("Slack outage")
         return "9.999"
 
-    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *_: None)
+    start = datetime(2026, 10, 6, 2, 0, tzinfo=timezone.utc)
+    OB.run_once(bus, post, identity=IDS.get("echo"), now=start, log=lambda *_: None)
     alerts = [m for m in bus.msgs
               if (m.get("attachments") or {}).get("fixer_uncertain_row_id") == row["id"]]
     assert len(alerts) == 1 and alerts[0]["delivery_status"] == "failed"
     assert not bus.message(row["id"])["attachments"].get("fixer_staff_alerted")
-    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *_: None)
+    # The first failed attempt establishes a durable retry time without
+    # creating or immediately rearming another alert row.
+    OB.run_once(bus, post, identity=IDS.get("echo"), now=start + timedelta(seconds=5),
+                log=lambda *_: None)
     alerts = [m for m in bus.msgs
               if (m.get("attachments") or {}).get("fixer_uncertain_row_id") == row["id"]]
-    assert len(alerts) == 2
-    assert alerts[1]["delivery_status"] == "posted"
+    assert len(alerts) == 1 and alerts[0]["delivery_status"] == "failed"
+    for seconds in (10, 60, 299):
+        OB.run_once(bus, post, identity=IDS.get("echo"),
+                    now=start + timedelta(seconds=seconds), log=lambda *_: None)
+    assert len([m for m in bus.msgs
+                if (m.get("attachments") or {}).get("fixer_uncertain_row_id") == row["id"]]) == 1
+    assert len(attempts) == 1
+    # Simulate another sweep winning the expired-deadline CAS. This sweep must
+    # not rearm even if the winning process has not yet done so.
+    reserve = bus.reserve_uncertain_fixer_alert_retry
+
+    def lose_reservation(mid, expected_at, next_at):
+        reserve(mid, expected_at, next_at)
+        return None
+
+    bus.reserve_uncertain_fixer_alert_retry = lose_reservation
+    OB.run_once(bus, post, identity=IDS.get("echo"), now=start + timedelta(seconds=305),
+                log=lambda *_: None)
+    assert len(attempts) == 1
+    assert alerts[0]["delivery_status"] == "failed"
+    bus.reserve_uncertain_fixer_alert_retry = reserve
+    OB.run_once(bus, post, identity=IDS.get("echo"), now=start + timedelta(seconds=610),
+                log=lambda *_: None)
+    alerts = [m for m in bus.msgs
+              if (m.get("attachments") or {}).get("fixer_uncertain_row_id") == row["id"]]
+    assert len(alerts) == 1
+    assert alerts[0]["delivery_status"] == "posted"
     assert not bus.message(row["id"])["attachments"].get("fixer_staff_alerted")
-    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *_: None)
+    OB.run_once(bus, post, identity=IDS.get("echo"), now=start + timedelta(seconds=615),
+                log=lambda *_: None)
     assert bus.message(row["id"])["attachments"]["fixer_staff_alerted"] is True
     assert [channel for channel, _ in attempts] == ["C_FIXER", "C_FIXER"]
 

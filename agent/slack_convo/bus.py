@@ -679,6 +679,39 @@ class Bus:
             return "pending"
         return "failed" if states else None
 
+    def rearm_uncertain_fixer_alert(self, message_id):
+        """Retry the newest failed staff alert in place; never mint alert rows forever."""
+        rows = self._get(_MESSAGES, {
+            "attachments->>fixer_uncertain_row_id": f"eq.{message_id}",
+            "select": "*", "order": "created_at.desc", "limit": "100",
+        })
+        if any(r.get("delivery_status") == "posted" for r in rows):
+            return None
+        if any(r.get("delivery_status") in {"ready", "posting"} for r in rows):
+            return None
+        alert = next((r for r in rows
+                      if r.get("delivery_status") in {"failed", "suppressed"}), None)
+        if not alert:
+            return None
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{alert['id']}",
+            "delivery_status": f"eq.{alert['delivery_status']}",
+        }, {"delivery_status": "ready"})
+
+    def reserve_uncertain_fixer_alert_retry(self, message_id, expected_at, next_at):
+        """CAS the held row's retry deadline before an alert can be rearmed."""
+        row = self.message(message_id)
+        if not row or row.get("delivery_status") != "held":
+            return None
+        att = {**(row.get("attachments") or {}),
+               "fixer_alert_retry_after": next_at}
+        match = {
+            "id": f"eq.{message_id}", "delivery_status": "eq.held",
+            "attachments->>fixer_alert_retry_after": (
+                "is.null" if expected_at is None else f"eq.{expected_at}"),
+        }
+        return self._patch(_MESSAGES, match, {"attachments": att})
+
     def mark_uncertain_fixer_alerted(self, message_id):
         row = self.message(message_id)
         if not row or row.get("delivery_status") != "held":

@@ -86,6 +86,7 @@ RELEASE_ACTION_ID = "slack_convo_release"
 RESOLVE_ACTION_ID = "slack_convo_resolve"
 _REENTRY_PREFIX = "OPS-FIX REQUEST"
 _BLOCK_TEXT_CHARS = 2900
+FIXER_ALERT_RETRY_DELAY = timedelta(minutes=5)
 
 # D48 (Blake, 2026-09-05): a ticket the person submitted IN THE PORTAL has a second, real
 # delivery surface that is not Slack -- the /my/support/[ticketId] thread they submitted it
@@ -972,7 +973,7 @@ def _report_uncertain_outreach(bus, identity, log):
                 f"row={row['id']}: {type(e).__name__}")
 
 
-def _report_uncertain_fixer(bus, identity, log):
+def _report_uncertain_fixer(bus, identity, log, now=None):
     """Raise one internal card for a held client completion needing reconciliation."""
     try:
         rows = bus.outbox("held", limit=200, identity=identity.name)
@@ -991,8 +992,30 @@ def _report_uncertain_fixer(bus, identity, log):
                 continue
             if state == "pending":
                 continue
-            # No attempt, or every attempt failed. Queue a new notice; never
-            # mark the client row alerted merely because INSERT succeeded.
+            current = now or datetime.now(timezone.utc)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            retry_raw = att.get("fixer_alert_retry_after")
+            retry_at = _parse_ts(retry_raw)
+            next_at = (current + FIXER_ALERT_RETRY_DELAY).isoformat()
+            if state == "failed":
+                if retry_at is None:
+                    bus.reserve_uncertain_fixer_alert_retry(row["id"], None, next_at)
+                    continue
+                if current < retry_at:
+                    continue
+                # Reserve the next retry window first. If this process crashes,
+                # another sweep waits; only the CAS winner may rearm the alert.
+                reserved = bus.reserve_uncertain_fixer_alert_retry(
+                    row["id"], retry_raw, next_at)
+                if not reserved:
+                    continue
+                rearmed = bus.rearm_uncertain_fixer_alert(row["id"])
+                if not rearmed or rearmed.get("delivery_status") != "ready":
+                    continue
+                continue
+            # The first notice is one row. A failed attempt is rearmed in place
+            # above after a durable backoff; it never creates an alert storm.
             bus.record_outbound(
                 ticket_id=row["ticket_id"], author_type="system",
                 body=(f"FIXER client completion needs delivery reconciliation. "
@@ -1150,7 +1173,7 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
                                                    readback=readback)
     _report_uncertain_outreach(bus, identity, log)
     _reconcile_held_fixer(bus, identity, readback, log, summary)
-    _report_uncertain_fixer(bus, identity, log)
+    _report_uncertain_fixer(bus, identity, log, now=now)
     _reconcile_posted_fixer(bus, identity, log, summary)
     try:
         rows = bus.outbox("ready", limit=limit, identity=identity.name)
