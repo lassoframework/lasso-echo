@@ -1011,7 +1011,7 @@ class SupabaseCalendarStore:
     def swap_media(self, account_key, row_id, image_url,
                    source_media_url=_SOURCE_MEDIA_UNSET,
                    extra_fields=None, *, render_evidence=None,
-                   poster_render_evidence=None):
+                   poster_render_evidence=None, expected_row=None):
         """CROSS-DAY MEDIA GUARD sweep (Blake, 2026-08-31): re-point a WAITING row's
         media to a fresh photo because its current photo already sits on another day
         of the gym's book. STATUS-GUARDED SERVER-SIDE: the PATCH itself is filtered to
@@ -1028,12 +1028,19 @@ class SupabaseCalendarStore:
         and source_media_asset_id (the Drive asset now on the row; None clears it when
         a Drive row becomes a local-library row, so the hide / removed-from-Drive
         sweeps stop tracking an asset the row no longer carries). Any other key is
-        ignored: this method never becomes a general row editor."""
+        ignored: this method never becomes a general row editor.
+
+        Ordinary self-service supplies expected_row from the clicked snapshot.
+        Its CAS runs regardless of global visual preparation; it preserves the
+        existing hold and pins caption, approval, claim and schedule state.
+        Completion still requires an independent readback by the handler."""
         if not (image_url or "").strip():
             return None
         # This is a real replacement, so release any earlier needs-media hold in
         # the same pending / coach_review-scoped write. Status itself is unchanged.
-        payload = {"image_url": image_url, "media_not_ready_reason": None}
+        payload = {"image_url": image_url}
+        if expected_row is None:
+            payload["media_not_ready_reason"] = None
         if source_media_url is not _SOURCE_MEDIA_UNSET:
             payload["source_media_url"] = source_media_url
         for col in _SWAP_EXTRA_COLUMNS:
@@ -1044,17 +1051,36 @@ class SupabaseCalendarStore:
         current = None
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
                   "status": "in.(pending,coach_review)"}
-        if prepared_write:
-            current = self.get_row(account_key, row_id)
+        if prepared_write or expected_row is not None:
+            current = dict(expected_row) if expected_row is not None else self.get_row(account_key, row_id)
             if (current is None or str(current.get("gym_id")) != str(account_key)
                     or str(current.get("id")) != str(row_id)
                     or current.get("status") not in ("pending", "coach_review")
                     or any(current.get(key) is not None for key in
                            ("published_at", "late_post_id", "publish_claim_token"))):
                 return None
-            payload = self._prepare_visual_replacement(
-                account_key, current, payload, render_evidence, poster_render_evidence)
-            params = self._visual_media_cas(current, params)
+            if prepared_write:
+                payload = self._prepare_visual_replacement(
+                    account_key, current, payload, render_evidence, poster_render_evidence)
+            if expected_row is not None:
+                if not prepared_write:
+                    # Optional scene columns describe the replaced object. Never
+                    # retain that object's aliases on the new original.
+                    for field in _DRAFT_SCENE_CAS_COLUMNS:
+                        if field in current:
+                            payload[field] = None
+                required = ("id", "gym_id", *_CORE_VISUAL_MEDIA_CAS_COLUMNS)
+                if any(key not in current for key in required):
+                    raise PreWriteCASError(422, "swap snapshot incomplete")
+                for key in (*_VISUAL_MEDIA_CAS_COLUMNS, "variant_of", "approval_kind", "approved_by", "approved_at", "approval_digest"):
+                    if key not in current:
+                        continue
+                    encoded = _eq_filter(current[key])
+                    if encoded is None:
+                        raise PreWriteCASError(422, "swap snapshot cannot be encoded")
+                    params[key] = encoded
+            else:
+                params = self._visual_media_cas(current, params)
         r = self._client().patch(
             self._rest(_TABLE), params=params,
             headers=self._headers({"Content-Type": "application/json",
@@ -1063,7 +1089,7 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
-        if prepared_write:
+        if prepared_write or expected_row is not None:
             return self._visual_media_result(rows, account_key, current, payload)
         for row in rows:
             if str(row.get("gym_id")) == str(account_key):

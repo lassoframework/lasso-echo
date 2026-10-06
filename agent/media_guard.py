@@ -386,3 +386,90 @@ def find_cross_day_repeats(rows, *, repeat_window_days=None):
         if len(by_date) > 1 and forward_dates:
             out[key] = by_date
     return out
+
+
+def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=None,
+                           library_path=None):
+    """Resolve an original from tenant asset bytes or an exact local source.
+
+    URL inequality and hashes of rendered cards do not prove a new photo.
+    Missing original lineage is an error, never a guessed raw-photo identity.
+    For legacy rendered cards the persisted source link is accepted only after
+    tenant asset/source ownership or exact local bytes establish the original,
+    and supplied object metadata agrees. This is bounded original-source
+    identity, not a historical owner-render receipt. The scene ledger stays OFF.
+    This routine reads only; it does not activate the scene ledger.
+    """
+    import hashlib
+    from . import visual_writer_prepare as vp, visual_fingerprint as vf
+    reader = read_bytes or vp._bytes_for_url
+    source = (pick or row).get("source_media_url")
+    delivered = (pick or row).get("image_url")
+    if not source or not delivered:
+        raise ValueError("original lineage missing")
+    raw = vp._exact_bytes(source, reader, "swap original")
+    digest = hashlib.sha256(raw).hexdigest()
+    asset_id = (pick or row).get("source_media_asset_id")
+    if asset_id:
+        response = store._client().get(store._rest("media_asset"),
+            params={"select": "id,gym_id,source_id,content_hash", "id": f"eq.{asset_id}",
+                    "gym_id": f"eq.{account_key}", "limit": "2"},
+            headers=store._headers(), timeout=30)
+        assets = response.json() if response.status_code < 400 else None
+        if (not isinstance(assets, list) or len(assets) != 1
+                or str(assets[0].get("id")) != str(asset_id)
+                or str(assets[0].get("gym_id")) != str(account_key)):
+            raise ValueError("original asset tenant mismatch")
+        asset = assets[0]
+        if not asset.get("source_id"):
+            raise ValueError("original asset source missing")
+        response = store._client().get(store._rest("media_source"),
+            params={"select": "id,gym_id", "id": f"eq.{asset['source_id']}",
+                    "gym_id": f"eq.{account_key}", "limit": "2"},
+            headers=store._headers(), timeout=30)
+        sources = response.json() if response.status_code < 400 else None
+        if (not isinstance(sources, list) or len(sources) != 1
+                or str(sources[0].get("id")) != str(asset["source_id"])
+                or str(sources[0].get("gym_id")) != str(account_key)):
+            raise ValueError("original asset source tenant mismatch")
+        if (pick or row).get("drive_file_id") not in (None, "", asset_id):
+            raise ValueError("contradictory Drive identity")
+        if not vf.attest_drive(asset.get("content_hash"), raw):
+            raise ValueError("original asset bytes mismatch")
+    elif pick is not None:
+        if pick.get("original_sha256") != digest:
+            raise ValueError("candidate original bytes unproved")
+    else:
+        lib = library_path
+        if lib is None:
+            from . import media_swap
+            lib = media_swap.library_path_for(account_key)
+        key = media_key(source)
+        keys = library_keys(lib) if lib else set()
+        if key not in keys:
+            raise ValueError("current original lineage missing")
+        with open(os.path.join(lib, key), "rb") as fh:
+            if fh.read() != raw:
+                raise ValueError("current local original bytes mismatch")
+    if pick is None and row.get("byte_hash"):
+        delivered_bytes = raw if source == delivered else vp._exact_bytes(delivered, reader, "current rendered")
+        alias = vf.normalize_any(row["byte_hash"])
+        if alias not in vf.source_aliases(delivered_bytes) + vf.derived_aliases(delivered_bytes):
+            raise ValueError("current delivered byte identity conflicts")
+    if pick is None and row.get("r2_key"):
+        from . import media_host
+        if media_host._key_from_public_url(delivered) != row["r2_key"]:
+            raise ValueError("current object key conflicts")
+    if pick is not None and source != delivered:
+        evidence = pick.get("render_evidence")
+        rendered = vp._exact_bytes(delivered, reader, "swap rendered")
+        expected = {"source_exact_url": source, "delivered_exact_url": delivered,
+                    "source_fingerprint": vp._md5(raw),
+                    "delivered_fingerprint": vp._md5(rendered),
+                    "source_byte_length": len(raw), "delivered_byte_length": len(rendered)}
+        if (not isinstance(evidence, dict)
+                or any(evidence.get(k) != v for k, v in expected.items())
+                or evidence.get("operation") not in ("render", "reburn", "rehost")):
+            raise ValueError("candidate render lineage missing")
+    return {"sha256": digest, "source_asset_id": asset_id or None,
+            "source_url": source}

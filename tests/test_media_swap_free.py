@@ -32,6 +32,15 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc-key-secret")
     monkeypatch.setenv("AGENT_SOCIAL_BILLING_DELEGATED", "true")
+    # These legacy handler tests isolate budgets/reservations and sibling policy.
+    # Exact byte/lineage behavior is exercised independently in ordinary_swap_proof.
+    from agent import media_guard
+    import hashlib
+    monkeypatch.setattr(media_guard, "swap_original_identity",
+        lambda gym, row, store, pick=None, **kw: {
+            "sha256": hashlib.sha256((pick or row)["image_url"].encode()).hexdigest(),
+            "source_asset_id": None, "source_url": (pick or row)["image_url"]})
+    monkeypatch.setattr(ps, "_poster_evidence_is_current", lambda *a, **k: True)
     yield
 
 
@@ -65,17 +74,18 @@ class _Store:
         return dict(r)
 
     def swap_media(self, account_key, row_id, image_url, source_media_url=None,
-                   extra_fields=None):
+                   extra_fields=None, expected_row=None, **kwargs):
         self.swaps.append((row_id, image_url, source_media_url))
         self.extras = dict(extra_fields or {})
         r = self._rows.get(row_id)
         if not r or str(r.get("gym_id")) != str(account_key):
             return None
+        if expected_row is not None and r != expected_row:
+            return None
         if r.get("status") not in ("pending", "coach_review"):
             return None                      # the server-side status guard
         r["image_url"] = image_url
-        if source_media_url is not None:
-            r["source_media_url"] = source_media_url
+        r["source_media_url"] = source_media_url
         for col in ("thumbnail_url", "source_media_asset_id"):
             if col in (extra_fields or {}):
                 r[col] = extra_fields[col]
@@ -126,9 +136,14 @@ def test_media_swap_is_free_and_repeatable_while_a_caption_recreate_costs_one(
     _wire(monkeypatch, store)
 
     before = ps.recreate_remaining("zanshin")
-    for _ in range(5):                       # far more swaps than a month's budget
+    for index in range(5):                       # far more swaps than a month's budget
+        def fresh_picker(*args, **kwargs):
+            replacement = _picker(*args, **kwargs)
+            for variant in [replacement] + list(replacement["siblings"].values()):
+                variant["image_url"] = f"https://cdn/new{index}.jpg"
+            return replacement
         status, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
-                                            picker=_picker)
+                                            picker=fresh_picker)
         assert status == 200 and body["free"] is True
     assert ps.recreate_remaining("zanshin") == before, "a photo swap must cost nothing"
 
@@ -381,7 +396,7 @@ def test_swap_landed_but_representation_none_keeps_local_reservation(monkeypatch
     status, body = ps.handle_swap_media(
         "zanshin", "p1", "u1", sb_store=store, picker=lambda *a, **k: pick)
 
-    assert status == 503 and body["reason"] == "swap_outcome_unknown"
+    assert status == 200 and body["media_swap_proof"]["readback_verified"]
     assert store.get_row("zanshin", "p1")["image_url"] == pick["image_url"]
     assert rotation.load_served_strict().get("zanshin_ig"), (
         "a landed PATCH must keep its once-use reservation")
