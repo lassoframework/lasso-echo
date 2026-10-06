@@ -386,3 +386,158 @@ def find_cross_day_repeats(rows, *, repeat_window_days=None):
         if len(by_date) > 1 and forward_dates:
             out[key] = by_date
     return out
+
+
+def _legacy_feed_original(library_path, rendered_key, delivered_bytes):
+    """Locate a local source, then prove its render against the served bytes.
+
+    The legacy hash-prefix name is a lookup hint only. Neither the name nor a
+    cached derivative attests lineage: reproduce the render from frozen raw
+    bytes and compare the entire output. Nothing writes into the gym library.
+    """
+    import hashlib
+    import tempfile
+    from . import feed_image, visual_writer_prepare as vp
+
+    raw_key = reframe_map(library_path, {rendered_key}).get(rendered_key)
+    matches = [key for key in library_keys(library_path)
+               if f"{_library_hash(os.path.join(library_path, key))}{_REFRAME_SUFFIX}"
+               == rendered_key]
+    if raw_key is None or matches != [raw_key]:
+        raise ValueError("current reframe original ambiguous or missing")
+    with open(os.path.join(library_path, raw_key), "rb") as fh:
+        original = fh.read(vp.MAX_VISUAL_BYTES + 1)
+    if (not original or len(original) > vp.MAX_VISUAL_BYTES
+            or f"{hashlib.sha256(original).hexdigest()[:12]}{_REFRAME_SUFFIX}" != rendered_key):
+        raise ValueError("current reframe original bytes mismatch")
+    with tempfile.TemporaryDirectory(prefix="echo-swap-original-") as work:
+        source_path = os.path.join(work, raw_key)
+        with open(source_path, "wb") as fh:
+            fh.write(original)
+        output = os.path.join(work, "verified-feed.jpg")
+        feed_image.build_feed_image(source_path, output)
+        with open(output, "rb") as fh:
+            if fh.read(vp.MAX_VISUAL_BYTES + 1) != delivered_bytes:
+                raise ValueError("current reframe render bytes mismatch")
+    return os.path.join(library_path, raw_key), original
+
+
+def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=None,
+                           library_path=None, byte_cache=None):
+    """Resolve an original from tenant asset bytes or an exact local source.
+
+    URL inequality and hashes of rendered cards do not prove a new photo.
+    Legacy URL-only originals require exact tenant library bytes; missing or
+    contradictory evidence is an error, never a guessed raw-photo identity.
+    For legacy rendered cards the persisted source link is accepted only after
+    tenant asset/source ownership or exact local bytes establish the original,
+    and supplied object metadata agrees. This is bounded original-source
+    identity, not a historical owner-render receipt. The scene ledger stays OFF.
+    This routine reads only; it does not activate the scene ledger.
+    """
+    import hashlib
+    from . import visual_writer_prepare as vp, visual_fingerprint as vf
+    reader = read_bytes or vp._bytes_for_url
+    if byte_cache is not None:
+        uncached_reader = reader
+
+        def reader(url):
+            # Request-scoped, exact URL only. Never memoize a failed fetch.
+            if url not in byte_cache:
+                raw = uncached_reader(url)
+                if isinstance(raw, bytes) and 0 < len(raw) <= vp.MAX_VISUAL_BYTES:
+                    byte_cache[url] = raw
+                return raw
+            return byte_cache[url]
+
+    target = pick or row
+    source = target.get("source_media_url")
+    delivered = target.get("image_url")
+    asset_id = target.get("source_media_asset_id")
+    if not delivered:
+        raise ValueError("original lineage missing")
+    if not source:
+        # Some existing Drive-backed cards store only the asset ID and its
+        # hosted original in image_url. Prove those exact bytes against the
+        # tenant-owned asset below; a transformed card will fail that check.
+        if pick is None:
+            # URL-only legacy rows can name a raw library original. The asset
+            # attestation or exact tenant-local comparison below must prove it;
+            # a basename or a rendered object's hash alone never does.
+            source = delivered
+        else:
+            raise ValueError("original lineage missing")
+    raw = vp._exact_bytes(source, reader, "swap original")
+    digest = hashlib.sha256(raw).hexdigest()
+    if asset_id:
+        response = store._client().get(store._rest("media_asset"),
+            params={"select": "id,gym_id,source_id,content_hash", "id": f"eq.{asset_id}",
+                    "gym_id": f"eq.{account_key}", "limit": "2"},
+            headers=store._headers(), timeout=30)
+        assets = response.json() if response.status_code < 400 else None
+        if (not isinstance(assets, list) or len(assets) != 1
+                or str(assets[0].get("id")) != str(asset_id)
+                or str(assets[0].get("gym_id")) != str(account_key)):
+            raise ValueError("original asset tenant mismatch")
+        asset = assets[0]
+        if not asset.get("source_id"):
+            raise ValueError("original asset source missing")
+        response = store._client().get(store._rest("media_source"),
+            params={"select": "id,gym_id", "id": f"eq.{asset['source_id']}",
+                    "gym_id": f"eq.{account_key}", "limit": "2"},
+            headers=store._headers(), timeout=30)
+        sources = response.json() if response.status_code < 400 else None
+        if (not isinstance(sources, list) or len(sources) != 1
+                or str(sources[0].get("id")) != str(asset["source_id"])
+                or str(sources[0].get("gym_id")) != str(account_key)):
+            raise ValueError("original asset source tenant mismatch")
+        # Persisted rows have the legacy Drive alias. Picker lineage instead
+        # binds source_media_asset_id to the tenant asset and exact bytes above.
+        if pick is None and row.get("drive_file_id") not in (None, "", asset_id):
+            raise ValueError("contradictory Drive identity")
+        if not vf.attest_drive(asset.get("content_hash"), raw):
+            raise ValueError("original asset bytes mismatch")
+    elif pick is not None:
+        if pick.get("original_sha256") != digest:
+            raise ValueError("candidate original bytes unproved")
+    else:
+        lib = library_path
+        if lib is None:
+            from . import media_swap
+            lib = media_swap.library_path_for(account_key)
+        key = media_key(source)
+        keys = library_keys(lib) if lib else set()
+        if key not in keys:
+            if (lib and not row.get("source_media_url")
+                    and not row.get("drive_file_id")
+                    and row.get("format") == "feed" and key.endswith(_REFRAME_SUFFIX)):
+                source, raw = _legacy_feed_original(lib, key, raw)
+                digest = hashlib.sha256(raw).hexdigest()
+            else:
+                raise ValueError("current original lineage missing")
+        else:
+            with open(os.path.join(lib, key), "rb") as fh:
+                if fh.read() != raw:
+                    raise ValueError("current local original bytes mismatch")
+    if pick is None and row.get("byte_hash"):
+        delivered_bytes = raw if source == delivered else vp._exact_bytes(delivered, reader, "current rendered")
+        alias = vf.normalize_any(row["byte_hash"])
+        if alias not in vf.source_aliases(delivered_bytes) + vf.derived_aliases(delivered_bytes):
+            raise ValueError("current delivered byte identity conflicts")
+    if pick is None and row.get("r2_key"):
+        from . import media_host
+        if media_host._key_from_public_url(delivered) != row["r2_key"]:
+            raise ValueError("current object key conflicts")
+    if pick is not None and source != delivered:
+        evidence = pick.get("render_evidence")
+        rendered = vp._exact_bytes(delivered, reader, "swap rendered")
+        expected = {"source_exact_url": source, "delivered_exact_url": delivered,
+                    "source_fingerprint": vp._md5(raw),
+                    "delivered_fingerprint": vp._md5(rendered),
+                    "source_byte_length": len(raw), "delivered_byte_length": len(rendered)}
+        if (not isinstance(evidence, dict)
+                or any(evidence.get(k) != v for k, v in expected.items())
+                or evidence.get("operation") not in ("render", "reburn", "rehost")):
+            raise ValueError("candidate render lineage missing")
+    return {"sha256": digest, "source_asset_id": asset_id or None,
+            "source_url": source}

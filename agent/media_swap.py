@@ -526,7 +526,7 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                      asset_state=None, candidates_fn=None, materialize_fn=None,
                      host_fn=None, feed_fn=None, reburn_fn=None, poster_fn=None,
                      media_store=None, drive=None, now=None, log=None,
-                     siblings=(), clock=None):
+                     siblings=(), clock=None, require_original_proof=False):
     """A genuinely fresh creative for ONE waiting row (and the same creative shaped for
     its same-date siblings, see `siblings`).
 
@@ -605,7 +605,7 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                 prep_failures += 1
                 continue
             path = mat["path"]
-            if (_visual_writer_enabled() and cand["source"] == "drive"
+            if ((_visual_writer_enabled() or require_original_proof) and cand["source"] == "drive"
                     and mat.get("hosted")):
                 # ensure_rendition only returns (URL, newly_converted). A cached
                 # HEIC/HEVC rendition has no source URL or render receipt here.
@@ -643,7 +643,7 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
             poster_render_evidence = None
             try:
                 if cand["kind"] == "video":
-                    if _visual_writer_enabled():
+                    if _visual_writer_enabled() or require_original_proof:
                         # Stories do not use a thumbnail: _finish clears it and
                         # either reburns the story media or keeps the hosted video.
                         # Do not reject an otherwise usable story-only swap over an
@@ -670,7 +670,7 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                 out = _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant,
                               poster=poster, poster_render_evidence=poster_render_evidence,
                               feed_fn=feed_fn, reburn_fn=reburn_fn, log=say,
-                              deadline=deadline)
+                              deadline=deadline, require_original_proof=require_original_proof)
                 if not out.get("ok"):
                     return out
                 # ALL OR NOTHING (audit 3c residual): every sibling variant is computed
@@ -683,7 +683,8 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                     var = _finish(base_key, sib, sfmt, cand, path, hosted, lib, work,
                                   tenant, poster=poster,
                                   poster_render_evidence=poster_render_evidence, feed_fn=feed_fn,
-                                  reburn_fn=reburn_fn, log=say, deadline=deadline)
+                                  reburn_fn=reburn_fn, log=say, deadline=deadline,
+                                  require_original_proof=require_original_proof)
                     if not var.get("ok"):
                         return {"ok": False,
                                 "reason": var.get("reason") or REASON_STORY_REBURN,
@@ -703,7 +704,8 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
 
 
 def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster,
-            poster_render_evidence=None, feed_fn, reburn_fn, log, deadline=None):
+            poster_render_evidence=None, feed_fn, reburn_fn, log, deadline=None,
+            require_original_proof=False):
     """Shape the hosted replacement for the row's format: a story is re-burned with
     its caption (still card or 9:16 story video), a video feed ships the hosted video,
     a photo feed gets the autofit reframe. A failed story re-burn is a hard stop
@@ -718,6 +720,10 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
     # in the writer side channel rather than the calendar row payload.
     if video and fmt != "story" and poster_render_evidence is not None:
         base["poster_render_evidence"] = _evidence_dict(poster_render_evidence)
+    if require_original_proof:
+        import hashlib
+        with open(path, "rb") as original:
+            base["original_sha256"] = hashlib.sha256(original.read()).hexdigest()
     raw_source = hosted
     if fmt == "story":
         # A story publishes empty-body, so its caption lives ON the media. Swapping
@@ -726,7 +732,7 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
         if config.story_format_enabled():
             if deadline is not None:
                 deadline.check(f"story burn for row {row.get('id')}")
-            if _visual_writer_enabled():
+            if (_visual_writer_enabled() or require_original_proof):
                 if video:
                     burned, evidence = _reburn_story_video_with_evidence(
                         base_key, row, path, lib, hosted, deadline=deadline)
@@ -746,7 +752,7 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
         if evidence is not None:
             out["render_evidence"] = _evidence_dict(evidence)
             out["source_media_url"] = raw_source
-        elif _visual_writer_enabled():
+        elif (_visual_writer_enabled() or require_original_proof):
             # Even an unburned Story points at its exact raw object.
             out["source_media_url"] = raw_source
         return out
@@ -754,7 +760,7 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
     if video:
         # A video feed ships the hosted video itself (autofit is a still-photo lane).
         return {"ok": True, "image_url": hosted,
-                "source_media_url": hosted if _visual_writer_enabled() else None, **base}
+                "source_media_url": hosted if (_visual_writer_enabled() or require_original_proof) else None, **base}
 
     # FEED AUTOFIT PARITY: the original shipped through the square reframe, so the
     # replacement gets it too. Any failure keeps the raw hosted photo (never a drop).
@@ -774,14 +780,14 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
                 reframed = media_host.host_media(asset, tenant)
                 if reframed:
                     target = reframed
-                    if _visual_writer_enabled():
+                    if (_visual_writer_enabled() or require_original_proof):
                         with open(asset, "rb") as rendered:
                             feed_rendered_bytes = rendered.read()
         except Exception:  # noqa: BLE001 - the raw hosted photo is a correct answer
             pass
     out = {"ok": True, "image_url": target,
-           "source_media_url": hosted if _visual_writer_enabled() else None, **base}
-    if target != hosted and _visual_writer_enabled():
+           "source_media_url": hosted if (_visual_writer_enabled() or require_original_proof) else None, **base}
+    if target != hosted and (_visual_writer_enabled() or require_original_proof):
         evidence = _feed_render_evidence(path, hosted, target,
                                          rendered_bytes=feed_rendered_bytes,
                                          deadline=deadline)
@@ -789,7 +795,7 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
             return {"ok": False, "reason": REASON_ASSET_PREP}
         out["render_evidence"] = evidence
         out["source_media_url"] = hosted
-    elif _visual_writer_enabled():
+    elif (_visual_writer_enabled() or require_original_proof):
         out["source_media_url"] = hosted
     return out
 
