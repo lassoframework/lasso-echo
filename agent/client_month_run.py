@@ -1400,7 +1400,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # gates, so this is a bounded snapshot of the usable Drive budget rather than a
     # broad asset-table count.
     from . import gym_media_selector as _media_selector
-    _drive_budget = (len(_media_selector.pickable(base_key))
+    _drive_budget = (len(_media_selector.pickable(
+                         base_key, post_date=start.isoformat()))
                      if (config.gym_drive_stage_enabled()
                          and config.gym_drive_connect_active_for(base_key)) else 0)
     max_feed_days = min(days * slots_per_day,

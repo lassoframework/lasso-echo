@@ -329,7 +329,7 @@ def test_daily_transient_drive_photo_failure_holds_all_videos(monkeypatch):
     account = SimpleNamespace(key="gymx_ig")
     kinds = []
     monkeypatch.setattr(runner, "_client_drive_kind_available",
-                        lambda _account, kind: True)
+                        lambda _account, kind, day_key=None: True)
     monkeypatch.setattr(runner, "_client_drive_first_draft",
                         lambda *a, **k: kinds.append(k["kind_prefs"]) or None)
     monkeypatch.setattr(runner, "_client_local_photo_available",
@@ -348,7 +348,7 @@ def test_daily_order_reaches_drive_video_only_after_both_photo_tiers_empty(monke
     checks = []
     expected = object()
 
-    def _available(_account, kind):
+    def _available(_account, kind, day_key=None):
         checks.append(kind)
         return kind == "video"
 

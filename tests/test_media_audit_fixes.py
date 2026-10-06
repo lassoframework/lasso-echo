@@ -161,6 +161,12 @@ def test_partial_pool_fills_every_day_three_drive_then_spaced_repeats(monkeypatc
     UNCOVERED exactly as they would have before the PR."""
     _sources()
     _stale_ledger(monkeypatch)
+    pickable_calls = []
+    real_pickable = sel.pickable
+    def _track_pickable(*args, **kwargs):
+        pickable_calls.append(kwargs.copy())
+        return real_pickable(*args, **kwargs)
+    monkeypatch.setattr(sel, "pickable", _track_pickable)
     store = FakeMediaStore(assets=[make_asset(f"a{i}", gym_id="gritx", title=f"t{i}.jpg")
                                    for i in range(3)])
     _arm(monkeypatch, store, FakeDrive())
@@ -177,6 +183,7 @@ def test_partial_pool_fills_every_day_three_drive_then_spaced_repeats(monkeypatc
     assert len({r["post_date"] for r in feeds}) == 8
     assert not any(mt.is_video_url(r["image_url"]) for r in feeds)
     assert len({r["image_url"] for r in repeats}) == 5
+    assert any(call.get("post_date") == "2026-08-01" for call in pickable_calls)
 
 
 def test_two_photos_one_drive_asset_counts_all_distinct_media(monkeypatch, tmp_path):
