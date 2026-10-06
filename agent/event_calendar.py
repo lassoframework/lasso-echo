@@ -627,7 +627,7 @@ def _attach_media(gym_id, rows, log, *, picker=None, host=None):
             f"holding {len(need)} image-less row(s)")
         return [r for r in rows if r not in need], list(need)
 
-    picker = picker or (lambda exclude: _sel.pick_media(gym_id, exclude_ids=exclude))
+    use_default_picker = picker is None
     kept, held, used = [], [], []
     for row in rows:
         if (row.get("image_url") or "").strip():
@@ -635,7 +635,16 @@ def _attach_media(gym_id, rows, log, *, picker=None, host=None):
             continue
         asset = None
         try:
-            asset = picker(tuple(used))
+            if use_default_picker:
+                # The scheduled row date is the selector's scene context. Keep
+                # missing dates compatible with the selector's legacy behavior.
+                pick_kwargs = {"exclude_ids": tuple(used)}
+                if row.get("post_date"):
+                    pick_kwargs["post_date"] = row["post_date"]
+                asset = _sel.pick_media(gym_id, **pick_kwargs)
+            else:
+                # Injected picker callables retain their established API.
+                asset = picker(tuple(used))
         except Exception as exc:  # noqa: BLE001
             log(f"event media: pick failed ({type(exc).__name__})")
         if not asset:

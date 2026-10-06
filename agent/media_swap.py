@@ -244,7 +244,7 @@ def local_candidates(base_key, lib, post_date, blocked_keys, *, allow_recent=Fal
 
 
 def drive_candidates(base_key, blocked_ids, *, media_store=None, now=None,
-                     allow_cooling=False):
+                     allow_cooling=False, post_date=None):
     """The gym's Drive-pool assets a swap may use: gym_media_selector.pickable (eligible,
     not hidden, outside the 90-day cooldown, not used this month), minus everything
     already on the book. Never raises; an unarmed store is an empty list."""
@@ -254,6 +254,8 @@ def drive_candidates(base_key, blocked_ids, *, media_store=None, now=None,
         kwargs = {"store": media_store, "exclude_ids": tuple(blocked_ids)}
         if not allow_cooling:
             kwargs["now"] = now
+            if post_date:
+                kwargs["post_date"] = post_date
         assets = picker(base_key, **kwargs)
     except Exception:  # noqa: BLE001
         return []
@@ -351,7 +353,8 @@ def candidates_for(base_key, row, *, store, lib, book_state=None, asset_state=No
     if current_asset:
         blocked_ids.add(current_asset)
     cands = local_candidates(base_key, lib, pd, blocked_keys)
-    cands += drive_candidates(base_key, blocked_ids, media_store=media_store, now=now)
+    cands += drive_candidates(base_key, blocked_ids, media_store=media_store, now=now,
+                              post_date=pd or None)
     if not cands:
         # A user-requested swap must not deadlock a small library merely because
         # every otherwise-safe asset is inside the generic 30/90-day rotation
@@ -363,7 +366,7 @@ def candidates_for(base_key, row, *, store, lib, book_state=None, asset_state=No
             cands = local_candidates(base_key, lib, pd, blocked_keys,
                                      allow_recent=True)
             cands += drive_candidates(base_key, blocked_ids, media_store=media_store,
-                                      now=now, allow_cooling=True)
+                                      now=now, allow_cooling=True, post_date=pd or None)
             for cand in cands:
                 cand["reuse_fallback"] = True
             if cands:

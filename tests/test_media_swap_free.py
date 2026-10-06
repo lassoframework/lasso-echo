@@ -523,6 +523,30 @@ def test_drive_candidates_come_from_the_pickable_pool_minus_the_book():
     assert cands[0]["kind"] == "video" and cands[0]["source"] == "drive"
 
 
+def test_swap_candidates_use_row_date_for_scene_selection_and_omit_missing_date(monkeypatch):
+    from agent import gym_media_selector
+
+    seen = []
+    asset = {"id": "fresh", "gym_id": "zanshin", "kind": "photo",
+             "used_count": 0, "last_used_at": None}
+
+    def pickable(gym, **kwargs):
+        seen.append(kwargs)
+        return [asset]
+
+    monkeypatch.setattr(gym_media_selector, "pickable", pickable)
+    scheduled = _row()
+    msw.candidates_for("zanshin", scheduled, store=_Store(), lib="",
+                       book_state={}, asset_state={}, media_store=object())
+    assert seen[-1]["post_date"] == "2026-09-20"
+
+    undated = dict(scheduled)
+    undated.pop("post_date")
+    msw.candidates_for("zanshin", undated, store=_Store(), lib="",
+                       book_state={}, asset_state={}, media_store=object())
+    assert "post_date" not in seen[-1]
+
+
 def test_drive_cooldown_fallback_never_returns_previously_used_assets():
     from datetime import datetime, timedelta, timezone
     from tests.gym_media_fakes import FakeMediaStore, make_asset
@@ -537,6 +561,55 @@ def test_drive_cooldown_fallback_never_returns_previously_used_assets():
     assert msw.drive_candidates("zanshin", set(), media_store=store, now=now) == []
     assert msw.drive_candidates("zanshin", set(), media_store=store, now=now,
                                 allow_cooling=True) == []
+
+
+@pytest.mark.parametrize("flag", ["true", "ambiguous"])
+@pytest.mark.parametrize("operational", [False, True])
+def test_drive_cooling_fallback_closes_when_scene_guard_is_armed(
+        monkeypatch, flag, operational):
+    from agent import gym_media_selector as selector
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+
+    monkeypatch.setenv(selector.SCENE_GUARD_FLAG_ENV, flag)
+    monkeypatch.setattr(selector, "SCENE_GUARD_OPERATIONAL", operational)
+    store = FakeMediaStore(assets=[make_asset("fresh", gym_id="pierce")])
+
+    assert selector.cooldown_fallback("pierce", store=store) == []
+    assert msw.drive_candidates("pierce", set(), media_store=store,
+                                allow_cooling=True, post_date="2026-09-20") == []
+
+
+def test_drive_cooling_fallback_cannot_bypass_cross_date_scene_hold(monkeypatch):
+    from datetime import datetime, timezone
+    from agent import gym_media_selector as selector
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+
+    monkeypatch.setenv(selector.SCENE_GUARD_FLAG_ENV, "true")
+    monkeypatch.setattr(selector, "SCENE_GUARD_OPERATIONAL", True)
+    scene = "scene:phash64:" + "0" * 16
+    monkeypatch.setattr(selector, "_scene_fingerprint_for",
+                        lambda *args: scene)
+    monkeypatch.setattr(selector, "cross_tenant_scene_phashes",
+                        lambda *args, **kwargs: (
+                            "own-tenant", {scene: {"own-tenant": {"2026-09-19"}}}))
+    store = FakeMediaStore(assets=[make_asset("fresh-near-frame", gym_id="pierce")])
+    now = datetime(2026, 9, 19, tzinfo=timezone.utc)
+
+    # Execution day matches the earlier scene; the scheduled slot does not.
+    assert [c["key"] for c in msw.drive_candidates(
+        "pierce", set(), media_store=store, now=now, post_date="2026-09-19"
+    )] == ["fresh-near-frame"]
+    assert msw.drive_candidates("pierce", set(), media_store=store,
+                                now=now, post_date="2026-09-20") == []
+    assert msw.drive_candidates("pierce", set(), media_store=store, now=now,
+                                allow_cooling=True, post_date="2026-09-20") == []
+
+    # OFF preserves the original explicit unused-asset fallback.
+    monkeypatch.setenv(selector.SCENE_GUARD_FLAG_ENV, "false")
+    assert [c["key"] for c in msw.drive_candidates(
+        "pierce", set(), media_store=store, now=now,
+        allow_cooling=True, post_date="2026-09-20"
+    )] == ["fresh-near-frame"]
 
 
 def test_swift_river_swap_does_not_reuse_previously_staged_drive_media():

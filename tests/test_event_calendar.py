@@ -371,6 +371,32 @@ def test_attach_media_gives_rows_a_photo_and_stamps_the_asset(monkeypatch):
         "https://drive.test/raw/a1", "https://drive.test/raw/a2"]
 
 
+def test_attach_media_default_picker_uses_each_rows_scheduled_date(monkeypatch):
+    from agent import gym_media_selector as selector
+
+    calls = []
+    dates = ["2026-10-03", None]
+
+    def pick_media(gym_id, **kwargs):
+        calls.append((gym_id, kwargs))
+        asset_id = f"asset-{len(calls)}"
+        return {"id": asset_id, "gym_id": gym_id, "source_id": "src1"}
+
+    monkeypatch.setattr(selector, "pick_media", pick_media)
+    monkeypatch.setattr(selector, "asset_source_ok", lambda asset, gym_id: True)
+    rows = [{"post_date": dates[0]}, {}]
+
+    kept, held = ec._attach_media(
+        "gym-a", rows, lambda message: None,
+        host=lambda asset, gym_id, drive: f"https://cdn.test/{asset['id']}.jpg")
+
+    assert not held
+    assert calls[0][1]["post_date"] == dates[0]
+    assert "post_date" not in calls[1][1]
+    assert calls[1][1]["exclude_ids"] == ("asset-1",)
+    assert len(kept) == 2
+
+
 def test_attach_media_does_not_claim_hosted_rendition_as_raw_source(monkeypatch):
     from agent import event_calendar as ec
     _arm_source_guard(monkeypatch, "g")

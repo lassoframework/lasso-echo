@@ -172,7 +172,7 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
     if kind_prefs is None:
         kind_prefs = kinds_for_slot(
             _sel.pool_kinds(gym_base, store=store, now=now,
-                            exclude_ids=tuple(caller_excludes)),
+                            exclude_ids=tuple(caller_excludes), post_date=day_key),
             day_key, slot_index)
     else:
         kind_prefs = [k for k in kind_prefs if k in (_idx.KIND_PHOTO, _idx.KIND_VIDEO)]
@@ -187,11 +187,11 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
         # left for the nightly pre-render pass and the slot moves on to photos.
         if kind_pref == _idx.KIND_VIDEO and rendition_budget.spent:
             cands = [c for c in _sel.pickable(gym_base, kind_pref, store=store, now=now,
-                                              exclude_ids=excl)
+                                              exclude_ids=excl, post_date=day_key)
                      if c.get("rendition_url")]
             return cands[0] if cands else None
         return _sel.pick_media(gym_base, kind_preference=kind_pref, store=store,
-                               now=now, exclude_ids=excl)
+                               now=now, exclude_ids=excl, post_date=day_key)
 
     tried = []
     for _attempt in range(_MAX_ASSET_ATTEMPTS):

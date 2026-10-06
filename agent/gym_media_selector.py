@@ -994,7 +994,13 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
 
     Month planning and automatic publishing never call this helper. An asset
     previously staged, or a same-byte re-upload of one, stays unavailable.
+
+    This lane has no scheduled-date scene evidence. An armed or ambiguous
+    scene guard therefore closes it, including when the guard is operational;
+    only the date-aware normal selector can offer scene-checked candidates.
     """
+    if scene_guard_flag() is not False:
+        return []
     base = base_gym_key(gym_id)
     from .media_reuse_policy import reuse_months
     if reuse_months(base):
