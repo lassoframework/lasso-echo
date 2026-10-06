@@ -221,7 +221,8 @@ $$;
 -- 'pending' or 'approved' hold row could be claimed and published with no media.
 --
 -- Compose into approval-provenance's one defaulted seven-argument signature.
--- Keep its current-autonomy, proof, capacity and format checks intact.
+-- Keep its current-autonomy, proof, dated catchup capacity and format checks
+-- intact; only the post-UPDATE scene-trigger result is added below.
 create or replace function public.claim_calendar_publish_slot_owned(
   p_row_id uuid, p_gym_id text, p_day date, p_timezone text,
   p_capacity integer, p_approved_only boolean,
@@ -232,14 +233,31 @@ as $$
 declare
   v_row public.content_calendar%rowtype;
   v_used integer;
+  v_current_used integer;
+  v_backlog_used integer;
   v_token uuid;
   v_enforce_proof boolean;
 begin
-  if p_capacity < 1 or p_capacity > 3 or p_day is null or p_timezone is null
+  if p_capacity is null or p_approved_only is null
+      or p_require_approval_proof is null
+      or p_capacity < 1 or (p_capacity > 3 and p_capacity not in (5, 15))
+      or p_day is null or p_timezone is null
       or nullif(btrim(p_gym_id), '') is null then
     return null;
   end if;
   if p_capacity = 3 and p_gym_id <> 'lasso' then
+    return null;
+  end if;
+  if p_capacity = 5 and not (
+      p_gym_id = 'lasso'
+      and p_day between date '2026-10-07' and date '2026-10-11'
+      and p_timezone = 'America/New_York') then
+    return null;
+  end if;
+  if p_capacity = 15 and not (
+      p_gym_id = 'lasso'
+      and p_day between date '2026-10-05' and date '2026-10-06'
+      and p_timezone = 'America/New_York') then
     return null;
   end if;
 
@@ -257,11 +275,31 @@ begin
   if not found or (p_approved_only and v_row.status <> 'approved') then
     return null;
   end if;
+  if v_row.publish_claim_token is not null
+      or v_row.publish_reservation_day is not null then
+    return null;
+  end if;
   if v_enforce_proof and v_row.status <> 'approved' then
     return null;
   end if;
-  if p_capacity = 3 and
+  if p_capacity in (5, 15) and
+      (v_row.post_date is null
+       or nullif(btrim(coalesce(v_row.account, '')), '') is null) then
+    return null;
+  end if;
+  if p_capacity in (3, 5, 15) and
       coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed') not in ('feed', 'story') then
+    return null;
+  end if;
+  if p_capacity = 5 and not (
+      v_row.post_date = p_day
+      or v_row.post_date between date '2026-10-02' and date '2026-10-05') then
+    return null;
+  end if;
+  if p_capacity = 15 and not (
+      v_row.post_date = p_day
+      or (v_row.post_date between date '2026-10-02' and date '2026-10-05'
+          and v_row.post_date < p_day)) then
     return null;
   end if;
   if v_enforce_proof and
@@ -286,6 +324,55 @@ begin
                     (published_at at time zone p_timezone)::date = p_day))));
   if v_used >= p_capacity then
     return null;
+  end if;
+
+  if p_capacity = 5 then
+    -- Three current-day slots plus two outage slots on October 7-11.
+    -- The tenant advisory lock serializes both class counts.
+    select count(*) filter (where post_date = p_day),
+           count(*) filter (where post_date between date '2026-10-02'
+                                            and date '2026-10-05')
+      into v_current_used, v_backlog_used
+      from public.content_calendar
+      where gym_id = p_gym_id
+        and lower(btrim(coalesce(account, ''))) =
+            lower(btrim(coalesce(v_row.account, '')))
+        and coalesce(nullif(lower(btrim(format)), ''), 'feed') =
+            coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed')
+        and ((status = 'publishing' and publish_reservation_day = p_day)
+             or (status = 'published' and
+                 (publish_reservation_day = p_day
+                  or (published_at is not null and
+                      (published_at at time zone p_timezone)::date = p_day))));
+    if (v_row.post_date = p_day and v_current_used >= 3)
+        or (v_row.post_date <> p_day and v_backlog_used >= 2) then
+      return null;
+    end if;
+  end if;
+
+  if p_capacity = 15 then
+    -- Three current-day slots plus twelve older-backlog slots on October 5-6.
+    -- A post dated October 5 is current on the fifth, backlog on the sixth.
+    select count(*) filter (where post_date = p_day),
+           count(*) filter (where post_date between date '2026-10-02'
+                                            and date '2026-10-05'
+                                and post_date < p_day)
+      into v_current_used, v_backlog_used
+      from public.content_calendar
+      where gym_id = p_gym_id
+        and lower(btrim(coalesce(account, ''))) =
+            lower(btrim(coalesce(v_row.account, '')))
+        and coalesce(nullif(lower(btrim(format)), ''), 'feed') =
+            coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed')
+        and ((status = 'publishing' and publish_reservation_day = p_day)
+             or (status = 'published' and
+                 (publish_reservation_day = p_day
+                  or (published_at is not null and
+                      (published_at at time zone p_timezone)::date = p_day))));
+    if (v_row.post_date = p_day and v_current_used >= 3)
+        or (v_row.post_date < p_day and v_backlog_used >= 12) then
+      return null;
+    end if;
   end if;
 
   v_token := gen_random_uuid();

@@ -28,6 +28,8 @@ DRAFT = ROOT / "migrations/DRAFT_visual_scene_calendar_transaction_20261005.sql"
 APPROVAL = Path(os.environ.get(
     "ECHO_APPROVAL_MIGRATION_PATH",
     ROOT / "migrations/calendar_approval_provenance_20261005.sql"))
+CATCHUP = APPROVAL.with_name("lasso_bounded_catchup_capacity_20261005.sql")
+IMMEDIATE = APPROVAL.with_name("lasso_immediate_backlog_capacity_20261005.sql")
 
 
 def command(args, **kwargs):
@@ -36,8 +38,8 @@ def command(args, **kwargs):
 
 @pytest.fixture(scope="module", autouse=True)
 def cluster():
-    if not APPROVAL.is_file():
-        pytest.skip("combined PG17 checks require calendar_approval_provenance_20261005.sql")
+    if not all(path.is_file() for path in (APPROVAL, CATCHUP, IMMEDIATE)):
+        pytest.skip("combined PG17 checks require current catchup and approval migrations")
     available = (BIN / "postgres").exists()
     if available:
         available = "17." in command([str(BIN / "postgres"), "--version"]).stdout
@@ -66,6 +68,10 @@ def cluster():
                         "create table public.echo_intake_tokens (gym_id uuid, echo_account_key text); "
                         "create table public.echo_gym_settings (gym_id uuid primary key, "
                         "autonomous boolean, autonomy_updated_by text)")
+            # Match deployment order: current main catchup, immediate drain,
+            # then #289 approval proof, then #290 scene transaction.
+            ledger._sql(CATCHUP.read_text())
+            ledger._sql(IMMEDIATE.read_text())
             ledger._sql(APPROVAL.read_text())
             ledger._sql(DRAFT.read_text())
             assert ledger._one("select count(*) from pg_trigger where tgrelid='public.content_calendar'::regclass and not tgisinternal and tgname='content_calendar_visual_group_guard'") == "1"
@@ -87,6 +93,50 @@ def seed(phash="0000000000000000", account="ig", active=True):
     row = ledger._one("insert into public.content_calendar(gym_id,account,post_date,status,variant_status,image_url,source_media_url,visual_group_key) values "
         f"('{tenant}','{account}','2026-10-10','pending','{'active' if active else 'archived'}','{url}','{url}','{group}') returning id")
     return tenant, group, url, fp, candidate, row
+
+
+def seed_lasso(post_date="2026-10-02"):
+    tenant, group = str(uuid.uuid4()), "vg_" + uuid.uuid4().hex[:12]
+    # Register both raw keys BEFORE activation; the armed alias guard rightly
+    # rejects adding an account key without new coverage evidence afterward.
+    ledger._sql("insert into public.tenant_alias(alias_key,tenant_id) values "
+                f"('{tenant}','{tenant}'),('lasso','{tenant}'); "
+                "insert into public.visual_group(gym_id,group_key) "
+                f"values ('{tenant}','{group}')")
+    ledger._sql(f"select public.visual_group_activate_guard('{tenant}', 'scene-catchup-test')")
+    url, fp, candidate = ledger._seed_object(tenant, group, "0000000000000000")
+    row = ledger._one(
+        "insert into public.content_calendar(gym_id,account,format,post_date,"
+        "status,variant_status,image_url,source_media_url,visual_group_key) values "
+        f"('lasso','ig','feed','{post_date}','pending','active',"
+        f"'{url}','{url}','{group}') returning id")
+    ledger._sql("insert into public.gyms(id,slug,name) "
+                f"values ('{tenant}','lasso','LASSO'); "
+                "insert into public.echo_intake_tokens(gym_id,echo_account_key) "
+                f"values ('{tenant}','lasso'); "
+                "insert into public.echo_gym_settings(gym_id,autonomous,autonomy_updated_by) "
+                f"values ('{tenant}',false,'test')")
+    return tenant, group, url, row
+
+
+def lasso_claim(row, day, capacity, proof=False, six_args=False):
+    suffix = "" if six_args else f",{'true' if proof else 'false'}"
+    return ledger._one(
+        "select public.claim_calendar_publish_slot_owned("
+        f"'{row}','lasso','{day}','America/New_York',{capacity},false{suffix})")
+
+
+def existing_reservations(day, post_date, count):
+    # Model already reserved rows without running the scene guard on synthetic
+    # historical fixtures. Only the claim under test runs through that guard.
+    ledger._sql(
+        "set session_replication_role=replica; "
+        "insert into public.content_calendar(id,gym_id,account,format,post_date,"
+        "status,variant_status,publish_reservation_day) "
+        "select gen_random_uuid(),'lasso','ig','feed',"
+        f"date '{post_date}','publishing','archived',date '{day}' "
+        f"from generate_series(1,{count}); "
+        "set session_replication_role=origin")
 
 
 def add_conflict(phash="0000000000000001"):
@@ -175,6 +225,96 @@ def test_combined_migration_has_one_rpc_signature_each():
         "select pg_get_function_identity_arguments("
         "'public.claim_calendar_publish_slot_owned(uuid,text,date,text,integer,boolean,boolean)'::regprocedure)"
     ).count(",") == 6
+    assert ledger._one(
+        "select count(*) from pg_proc where pronamespace='public'::regnamespace "
+        "and proname='claim_calendar_publish_slot_owned' "
+        "and pronargs=7 and pronargdefaults=1") == "1"
+
+
+@pytest.mark.parametrize("capacity,day", [(15, "2026-10-05"), (5, "2026-10-07")])
+def test_ordered_scene_claim_keeps_dated_capacity_and_defaulted_six_args(capacity, day):
+    tenant, group, url, row = seed_lasso()
+    token = lasso_claim(row, day, capacity, six_args=True)
+    assert token and state(row)["publish_claim_token"] == token
+    assert state(row)["publish_reservation_day"] == day
+
+
+@pytest.mark.parametrize("capacity,day", [(15, "2026-10-05"), (5, "2026-10-07")])
+def test_ordered_scene_claim_keeps_manual_proof_gate(capacity, day):
+    tenant, group, url, row = seed_lasso()
+    assert ledger._one(
+        "select count(*) from public.approve_calendar_row_if_media_ready("
+        f"'{row}','lasso')") == "1"
+    assert lasso_claim(row, day, capacity, proof=True) == ""
+    assert stamp(row, tenant, "clerk_lasso") == "1"
+    assert lasso_claim(row, day, capacity, proof=True)
+
+
+@pytest.mark.parametrize("capacity,day,candidate_date,used_date,used_count,allowed", [
+    (15, "2026-10-05", "2026-10-05", "2026-10-05", 3, False),
+    (15, "2026-10-05", "2026-10-02", "2026-10-02", 12, False),
+    (15, "2026-10-05", "2026-10-02", "2026-10-05", 3, True),
+    (15, "2026-10-05", "2026-10-05", "2026-10-02", 12, True),
+    (5, "2026-10-07", "2026-10-07", "2026-10-07", 3, False),
+    (5, "2026-10-07", "2026-10-02", "2026-10-02", 2, False),
+    (5, "2026-10-07", "2026-10-02", "2026-10-07", 3, True),
+    (5, "2026-10-07", "2026-10-07", "2026-10-02", 2, True),
+])
+def test_ordered_scene_claim_keeps_current_and_backlog_class_ceilings(
+        capacity, day, candidate_date, used_date, used_count, allowed):
+    tenant, group, url, row = seed_lasso(candidate_date)
+    existing_reservations(day, used_date, used_count)
+    token = lasso_claim(row, day, capacity, six_args=True)
+    assert bool(token) is allowed
+    assert (state(row)["status"] == "publishing") is allowed
+
+
+@pytest.mark.parametrize("capacity,day", [(15, "2026-10-05"), (5, "2026-10-07")])
+def test_ordered_scene_claim_keeps_null_and_stale_reservation_guards(capacity, day):
+    tenant, group, url, row = seed_lasso()
+    for nullable_arg in ("null,false,false", f"{capacity},null,false",
+                         f"{capacity},false,null"):
+        assert ledger._one(
+            "select public.claim_calendar_publish_slot_owned("
+            f"'{row}','lasso','{day}','America/New_York',{nullable_arg})") == ""
+    assert ledger._one(
+        "select public.claim_calendar_publish_slot_owned("
+        f"'{row}','lasso',null,'America/New_York',{capacity},false,false)") == ""
+    assert ledger._one(
+        "select public.claim_calendar_publish_slot_owned("
+        f"'{row}','lasso','{day}',null,{capacity},false,false)") == ""
+    assert ledger._one(
+        "select count(*) from public.approve_calendar_row_if_media_ready("
+        f"'{row}','lasso')") == "1"
+    assert stamp(row, tenant, "clerk_lasso") == "1"
+    ledger._sql("set session_replication_role=replica; "
+                "update public.content_calendar set publish_claim_token=gen_random_uuid() "
+                f"where id='{row}'; set session_replication_role=origin")
+    for proof in (False, True):
+        assert lasso_claim(row, day, capacity, proof=proof) == ""
+    ledger._sql("set session_replication_role=replica; "
+                "update public.content_calendar set publish_claim_token=null,"
+                "publish_reservation_day='2026-10-04' "
+                f"where id='{row}'; set session_replication_role=origin")
+    for proof in (False, True):
+        assert lasso_claim(row, day, capacity, proof=proof) == ""
+
+
+@pytest.mark.parametrize("capacity,day,proof", [
+    (15, "2026-10-05", False), (15, "2026-10-05", True),
+    (5, "2026-10-07", False), (5, "2026-10-07", True),
+])
+def test_ordered_scene_claim_rejects_repeat_scene_even_with_catchup_capacity(
+        capacity, day, proof):
+    tenant, group, url, row = seed_lasso()
+    if proof:
+        assert ledger._one(
+            "select count(*) from public.approve_calendar_row_if_media_ready("
+            f"'{row}','lasso')") == "1"
+        assert stamp(row, tenant, "clerk_lasso") == "1"
+    add_conflict()
+    assert lasso_claim(row, day, capacity, proof=proof, six_args=not proof) == ""
+    assert_held(row)
 
 
 def test_combined_clean_card_approval_proof_and_claim():
