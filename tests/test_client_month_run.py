@@ -351,7 +351,7 @@ def test_drive_provenance_hold_excludes_rendition_for_next_day(monkeypatch, tmp_
     assert any(d.draft_id == "good" for d in drafts)
 
 
-# ---- 3b. GATE 2 coach-screens-first-month (FB/IG client month) -------------------
+# ---- 3b. First-month FB/IG client month lands pending (no coach_review) ----------
 
 class _StoreWithHistory(_FakeStore):
     """A store that reports whether the gym already has owner-visible rows (the real
@@ -364,7 +364,7 @@ class _StoreWithHistory(_FakeStore):
         return self._has_visible
 
 
-def test_gate2_first_month_withheld_as_coach_review(tmp_path):
+def test_gate2_first_month_lands_pending_for_owner(tmp_path):
     _stock_clean("gritx_ig")
     lib = _lib(tmp_path, n=6)
     store = _StoreWithHistory(has_visible=False)   # brand-new gym, no prior rows
@@ -372,8 +372,9 @@ def test_gate2_first_month_withheld_as_coach_review(tmp_path):
         _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
         library_path=lib, store=store, banned_words=())
     assert out["ok"] is True and store.inserted
-    assert all(r["status"] == "coach_review" for r in store.inserted), \
-        "a gym's first month must be withheld from the owner until a coach releases it"
+    assert all(r["status"] == "pending" for r in store.inserted), \
+        "Blake 2026-10-06: no new row is ever coach_review — the client approves " \
+        "first-month drafts directly"
 
 
 def test_gate2_established_gym_grandfathered_pending(tmp_path):
