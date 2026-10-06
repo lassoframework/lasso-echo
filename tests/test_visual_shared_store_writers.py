@@ -120,9 +120,11 @@ class HTTP:
         if self.patch_race:
             self.current.update(self.patch_race)
         for key in pcs._VISUAL_MEDIA_CAS_COLUMNS:
-            if key not in params or not (params[key] == "is.null" or params[key].startswith('eq."')):
+            if key not in params:
                 continue
-            expected = None if params[key] == "is.null" else params[key][4:-1].replace('\\"', '"').replace('\\\\', '\\')
+            if params[key] != "is.null" and not params[key].startswith("eq."):
+                continue
+            expected = None if params[key] == "is.null" else params[key][3:]
             actual = self.current.get(key)
             if (None if actual is None else str(actual)) != expected:
                 return Response([])
@@ -285,9 +287,9 @@ def test_prepared_patch_refuses_concurrent_identity_or_release_change(armed, bou
     assert http.current["image_url"] != FINAL
     patch = next(call for call in http.calls if call[0] == "patch")
     assert patch[2]["gym_id"] == "eq.gym"
-    assert patch[2]["image_url"] == 'eq.""'
+    assert patch[2]["image_url"] == 'eq.'
     assert patch[2]["source_media_url"] == "is.null"
-    assert patch[2]["post_date"] == 'eq."2026-10-03"'
+    assert patch[2]["post_date"] == 'eq.2026-10-03'
     assert patch[2]["publish_claim_token"] == "is.null"
 
 
@@ -379,10 +381,10 @@ def test_operator_replacements_prepare_claims_and_use_full_visual_cas(armed, wri
     assert armed[0]["delivered_bytes"] == DATA[FINAL]
     patch = next(call for call in http.calls if call[0] == "patch")
     assert set(pcs._VISUAL_MEDIA_CAS_COLUMNS).issubset(patch[2])
-    assert patch[2]["caption"] == 'eq."Approved copy stays fixed"'
+    assert patch[2]["caption"] == 'eq.Approved copy stays fixed'
     assert patch[2]["media_not_ready_reason"] == (
-        'eq."Photo-first hold: unverified infographic placeholder; approved gym photo required"'
-        if writer is replace_held_infographic else 'eq."operator hold"')
+        'eq.Photo-first hold: unverified infographic placeholder; approved gym photo required'
+        if writer is replace_held_infographic else 'eq.operator hold')
 
 
 @pytest.mark.parametrize("writer,row_builder", [
@@ -486,10 +488,10 @@ def test_held_release_cas_refuses_lineage_race_after_script_read(armed, field):
     http = HTTP(current=dict(staged), patch_race={field: "concurrent"})
     assert store(http).restage_held_media(KEY, staged, release=True) is None
     patch = next(call for call in http.calls if call[0] == "patch")
-    assert patch[2]["visual_group_key"] == 'eq."vg_scene"'
-    assert patch[2]["byte_hash"] == 'eq."derived:md5:verified"'
-    assert patch[2]["caption"] == 'eq."Approved copy stays fixed"'
-    assert patch[2]["media_not_ready_reason"] == 'eq."operator hold"'
+    assert patch[2]["visual_group_key"] == 'eq.vg_scene'
+    assert patch[2]["byte_hash"] == 'eq.derived:md5:verified'
+    assert patch[2]["caption"] == 'eq.Approved copy stays fixed'
+    assert patch[2]["media_not_ready_reason"] == 'eq.operator hold'
     assert patch[3] == {"media_not_ready_reason": None}
     assert http.current["media_not_ready_reason"] == "operator hold"
 
@@ -619,7 +621,7 @@ def test_swap_cannot_overwrite_thumbnail_changed_during_preparation(armed):
     assert http.current["thumbnail_url"] == concurrent_thumbnail
     assert http.current["image_url"] != FINAL
     patch = next(call for call in http.calls if call[0] == "patch")
-    assert patch[2]["thumbnail_url"] == f'eq."{FINAL}"'
+    assert patch[2]["thumbnail_url"] == f'eq.{FINAL}'
 
 
 def test_swap_checks_unchanged_thumbnail_in_persisted_result(armed):
