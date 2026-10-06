@@ -946,10 +946,12 @@ def _strip_or_hold_meta(row, gym_id, store, *, autonomous_lane=False):
     this class of leak must never be publishable under any flag combination.
 
     With durable approval proof armed, stripping changes digest-bound creative. The
-    cleaned caption is therefore persisted through patch_caption (which resets the
-    row to pending) and the row is held for fresh human approval. A missing/failed
-    patch also holds. With proof disabled, the legacy status-preserving self-heal is
-    retained. An all-meta caption returns None for the existing rewrite hold."""
+    cleaned caption is therefore persisted through the current-mode Manual RPC,
+    which checks the exact status and caption, clears proof, and resets the row to
+    pending. The row is held for fresh human approval even when the patch succeeds.
+    A missing, stale, or failed patch also holds. With proof disabled, the
+    legacy status-preserving self-heal is retained. An all-meta caption
+    returns None for the existing rewrite hold."""
     from . import post_quality
     body, meta = post_quality.split_meta_suffix(row.get("caption") or "")
     if not meta:
@@ -979,10 +981,11 @@ def _strip_or_hold_meta(row, gym_id, store, *, autonomous_lane=False):
             return _META_REAPPROVAL_REQUIRED
         persisted = False
         try:
-            patcher = getattr(store, "patch_caption", None)
+            patcher = getattr(store, "patch_caption_manual_format", None)
             if callable(patcher):
                 persisted = patcher(row.get("gym_id") or gym_id,
-                                    row.get("id"), body) is not None
+                                    row.get("id"), row.get("status"),
+                                    row.get("caption"), body) is not None
         except Exception as e:  # noqa: BLE001 - the hold remains fail closed
             print(f"[calendar-autopublish] proof meta-strip caption patch failed for "
                   f"{row.get('id')}: {type(e).__name__}: {e}")

@@ -85,7 +85,43 @@ def _alert_auto_caption_empty(gym_id, row_id, alert):
         print(f"[gbp] row {row_id}: autonomous empty-caption alert failed: "
               f"{type(exc).__name__}")
 
+def _alert_proof_claim_exception(gym_id, row_id, detail, alert):
+    """Alert once per proof-mode claim exception; never let alerting affect safety.
+
+    The server-side claim may already have committed status=publishing and a
+    publish_claim_token before the claim call (or the post-claim validation of
+    the returned row) raised. That leaves a stranded row whose ownership is
+    unknown: it must never be released, retried, or re-sent from here — ops
+    must inspect and reconcile it against the provider. Durable-only-or-silent
+    dedup contract as the other ops alerts: an ephemeral KV stamp would let the
+    alert storm after a restart, so non-durable KV suppresses the send."""
+    if not alert:
+        return
+    try:
+        from . import db
+        key = f"gbp_proof_claim_exception_alerted_{gym_id}_{row_id}"
+        if not db.kv_is_durable():
+            print(f"[gbp] row {row_id}: proof-mode claim exception ({detail}); "
+                  "alert suppressed because KV is not durable")
+            return
+        if db.kv_get(key):
+            return
+        result = alert(
+            f"GBP row {row_id} for {gym_id}: the approval-proof publishing claim "
+            f"raised ({detail}) after the claim may have committed "
+            "status=publishing with a publish_claim_token. The row is stranded "
+            "with unknown ownership: inspect it and reconcile against the "
+            "provider before any further action. Do NOT release the token, "
+            "retry the publish, or re-approve the row from automation — the "
+            "claim was retained and no provider call was made by this run.")
+        if result and not (isinstance(result, dict) and result.get("ok") is False):
+            db.kv_set(key, "1")
+    except Exception as exc:  # alerting must not affect the safe held row
+        print(f"[gbp] row {row_id}: proof claim exception alert failed: "
+              f"{type(exc).__name__}")
+
 # --- row -> payload --------------------------------------------------------
+
 
 def build_gbp_payload_for_row(row, connection):
     """Assemble the Zernio POST body for an approved GBP `content_calendar` row using
@@ -578,6 +614,13 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                 except Exception as e:  # noqa: BLE001
                     print(f"[gbp] claim failed for row {row.get('id')}: "
                           f"{type(e).__name__}; skipping this tick")
+                    if require_proof:
+                        # The server-side claim may have committed
+                        # status=publishing/token before raising: alert ops to
+                        # inspect/reconcile. Never release or retry a token
+                        # whose ownership is unknown, and never send.
+                        _alert_proof_claim_exception(
+                            gym, row.get("id"), type(e).__name__, alert)
                     continue
                 if not claimed:
                     continue                      # someone else owns it: skip
@@ -596,6 +639,13 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                             or not claimed_token
                             or type(claimed.get("autonomous_at_claim")) is not bool):
                         held += 1
+                        # The claim succeeded but the returned row fails proof
+                        # validation — the same stranded-claim ambiguity as a
+                        # raising claim: alert ops to inspect/reconcile. The
+                        # token is never released or retried here.
+                        _alert_proof_claim_exception(
+                            gym, row.get("id"), "post-claim validation failed",
+                            alert)
                         continue
                     row = claimed
                     claim_token = claimed_token

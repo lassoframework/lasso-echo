@@ -1336,3 +1336,141 @@ def test_proof_autonomous_all_meta_caption_alert_silent_when_kv_not_durable(monk
     assert client.calls == [] and out["held"] == 1
     assert alerts == [], "non-durable KV must suppress, not send, the ops alert"
     assert "suppressed because KV is not durable" in capsys.readouterr().out
+
+
+# ---- proof-mode claim exception ops alert (Ultra Review 666a6e4) -------------
+
+def _proof_kv(monkeypatch, durable=True):
+    from agent import db
+    stamps = {}
+    monkeypatch.setattr(db, "kv_is_durable", lambda: durable)
+    if durable:
+        monkeypatch.setattr(db, "kv_get", lambda key: stamps.get(key))
+        monkeypatch.setattr(db, "kv_set",
+                            lambda key, value: stamps.__setitem__(key, value))
+    else:
+        monkeypatch.setattr(db, "kv_get", lambda key: pytest.fail(
+            "non-durable alert path must not read ephemeral KV"))
+    return stamps
+
+
+class _RaisingClaimStore(_TokenStore):
+    """The server-side claim commits the token, THEN raises — the stranded-row
+    case: status=publishing/token exist but ownership is unknown."""
+    def __init__(self, rows, conns, exc):
+        super().__init__(rows, conns)
+        self._exc = exc
+
+    def claim_publishing(self, row_id, *, gym_id, require_proof):
+        import uuid as _u
+        self.claims.append(row_id)
+        self.tokens[row_id] = str(_u.uuid4())   # committed before the raise
+        raise self._exc
+
+
+def test_proof_claim_exception_alerts_once_sends_nothing_keeps_token(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    _proof_kv(monkeypatch, durable=True)
+    row = dict(_row(), id="r1", gym_id="gym")
+    store = _RaisingClaimStore([row], {"gym": [_c()]}, RuntimeError("claim rpc boom"))
+    client = _FakeClient()
+    alerts = []
+
+    def alert(message):
+        alerts.append(message)
+        return {"ok": True}
+
+    for _ in range(2):
+        out = gw.publish_due_gbp(store, client, run_date="2026-09-01",
+                                 draft=False, alert=alert)
+        assert out["published"] == 0 and out["failed"] == 0
+
+    assert client.calls == [], "a raising claim must never reach the provider"
+    assert store.released == [] and store.failed == [] and store.published == []
+    assert store.tokens.get("r1"), "the possibly-committed token is left untouched"
+    assert len(alerts) == 1, "durable KV stamp must dedupe the ops alert"
+    assert "r1" in alerts[0] and "gym" in alerts[0]
+    assert "inspect" in alerts[0] and "reconcile" in alerts[0]
+    assert "no provider call was made" in alerts[0]
+
+
+def test_proof_claim_exception_alert_suppressed_when_kv_not_durable(monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    _proof_kv(monkeypatch, durable=False)
+    row = dict(_row(), id="r1", gym_id="gym")
+    store = _RaisingClaimStore([row], {"gym": [_c()]}, RuntimeError("claim rpc boom"))
+    client = _FakeClient()
+    alerts = []
+
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01",
+                             draft=False, alert=alerts.append)
+    assert client.calls == [] and out["published"] == 0
+    assert alerts == [], "non-durable KV must suppress, not send, the ops alert"
+    assert "suppressed because KV is not durable" in capsys.readouterr().out
+    assert store.tokens.get("r1") and store.released == []
+
+
+def test_proof_claim_alert_failure_does_not_abort_other_rows(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    _proof_kv(monkeypatch, durable=True)
+    rows = [dict(_row(), id=rid, gym_id="gym") for rid in ("r1", "r2")]
+    store = _RaisingClaimStore(rows, {"gym": [_c()]}, RuntimeError("claim rpc boom"))
+    client = _FakeClient()
+
+    def broken_alert(message):
+        raise RuntimeError("ops transport unavailable")
+
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01",
+                             draft=False, alert=broken_alert)
+    assert store.claims == ["r1", "r2"]
+    assert client.calls == [] and out["published"] == 0
+    assert store.released == []
+
+
+def test_proof_claim_validation_anomaly_alerts_and_sends_nothing(monkeypatch):
+    """Claim succeeds but returns a row failing proof validation (wrong gym):
+    same stranded-claim ambiguity — alert ops, keep the token, no provider
+    call, no release."""
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    _proof_kv(monkeypatch, durable=True)
+    row = dict(_row(), id="r1", gym_id="gym")
+    fresh = dict(row, status="publishing", gym_id="someone_else",
+                 publish_claim_token="aaaaaaaa-2222-4222-8222-222222222222",
+                 autonomous_at_claim=True)
+
+    class WrongGymStore(_TokenStore):
+        def claim_publishing(self, row_id, *, gym_id, require_proof):
+            self.tokens[row_id] = fresh["publish_claim_token"]
+            return dict(fresh)
+
+    store = WrongGymStore([row], {"gym": [_c()]})
+    client = _FakeClient()
+    alerts = []
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01",
+                             draft=False, alert=alerts.append)
+    assert out["held"] == 1 and out["published"] == 0
+    assert client.calls == [], "an invalid claimed row must never be sent"
+    assert store.released == [] and store.published == [] and store.failed == []
+    assert store.tokens.get("r1"), "token ownership unknown — left in place"
+    assert len(alerts) == 1
+    assert "post-claim validation failed" in alerts[0]
+    assert "inspect" in alerts[0] and "reconcile" in alerts[0]
+
+
+def test_flag_off_claim_exception_stays_silent_and_sends_nothing(monkeypatch):
+    """Flag-off behavior is unchanged: a raising legacy claim only prints and
+    skips; no ops alert fires."""
+    monkeypatch.delenv("AGENT_APPROVAL_PROOF", raising=False)
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    row = dict(_row(), id="r1", gym_id="gym")
+    store = _RaisingClaimStore([row], {"gym": [_c()]}, RuntimeError("claim rpc boom"))
+    client = _FakeClient()
+    alerts = []
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01",
+                             draft=False, alert=alerts.append)
+    assert client.calls == [] and alerts == []
+    assert out["published"] == 0 and out["failed"] == 0
