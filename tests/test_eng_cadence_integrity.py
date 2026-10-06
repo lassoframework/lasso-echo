@@ -96,6 +96,22 @@ def test_companion_admission_keeps_ig_and_story_when_only_fb_mirror_is_deduped(
     assert pcs._drop_companions_missing_instagram_feed(payload, filtered) == filtered
 
 
+def test_companion_admission_keeps_ig_and_story_when_only_fb_mirror_is_empty(
+        monkeypatch):
+    monkeypatch.setattr(pcs.config, "empty_caption_guard_enabled", lambda: True)
+    monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: False)
+
+    payload = _companion_rows(
+        "2026-10-19", 1, "Instagram caption",
+        "4e620979-0a11-427b-ab13-ecc8f251521f")
+    payload[1]["caption"] = ""
+
+    filtered = pcs._stage_belts("eng", payload)
+    assert [(row["account"], row["format"]) for row in filtered] == [
+        ("instagram", "feed"), ("instagram", "story")]
+    assert pcs._drop_companions_missing_instagram_feed(payload, filtered) == filtered
+
+
 def test_companion_admission_drops_group_when_instagram_feed_is_blocked(monkeypatch):
     monkeypatch.setattr(pcs.config, "empty_caption_guard_enabled", lambda: True)
     monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: True)
