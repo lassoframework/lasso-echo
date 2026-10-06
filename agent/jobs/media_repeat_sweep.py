@@ -42,7 +42,7 @@ import sys
 from datetime import date, timedelta
 
 from agent import config, media_guard
-from agent.portal_calendar_store import SupabaseCalendarStore
+from agent.portal_calendar_store import PreWriteCASError, SupabaseCalendarStore
 
 FIXABLE = ("pending", "coach_review")
 UNTOUCHABLE = ("published", "publishing")
@@ -255,6 +255,10 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
             if var.get("poster_render_evidence") is not None:
                 write_args["poster_render_evidence"] = var["poster_render_evidence"]
             done = store.swap_media(base, rid, var["image_url"], **write_args)
+        except PreWriteCASError as exc:
+            _log(f"{base}: swap_media refused before write for {rid} ({type(exc).__name__})")
+            done = None
+            continue
         except Exception as exc:  # noqa: BLE001 - one row never undoes the others
             _log(f"{base}: swap_media failed for {rid} ({type(exc).__name__})")
             write_outcome_unknown = True
@@ -940,6 +944,9 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                     write_args["render_evidence"] = evidence
                 try:
                     done = store.swap_media(base, rid, target_url, **write_args)
+                except PreWriteCASError as exc:
+                    _log(f"{base}: local swap refused before write for {rid} ({type(exc).__name__})")
+                    continue
                 except Exception as exc:  # noqa: BLE001 - remote outcome may be unknown
                     _log(f"{base}: local swap failed for {rid} ({type(exc).__name__})")
                     write_outcome_unknown = True
