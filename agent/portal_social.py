@@ -2207,10 +2207,12 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                        book_rows=_month_rows_for(sb_store, account_key, row),
                        swapped_ids=swapped)
     except Exception as exc:
-        # Before the remote call starts, nothing can have landed and the exact
-        # reservation is safe to release. Once it starts, an exception is an
-        # UNKNOWN outcome: retain fail closed because the row may have changed.
-        if pick is not None and not local_landed and not primary_write_started:
+        # A typed CAS encoding refusal occurs before the calendar PATCH, so the
+        # exact reservation is safe to release. Other exceptions after the
+        # remote call starts have UNKNOWN outcome and retain the reservation.
+        if (pick is not None and not local_landed
+                and (not primary_write_started
+                     or isinstance(exc, _pcs.PreWriteCASError))):
             _ms.release_local_pick(pick)
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}

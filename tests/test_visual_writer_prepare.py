@@ -509,8 +509,6 @@ class _CASHTTP:
     def _matches(actual, predicate):
         if predicate == "is.null":
             return actual is None
-        if predicate.startswith('eq."') and predicate.endswith('"'):
-            return str(actual) == predicate[4:-1]
         if predicate.startswith("eq."):
             return str(actual) == predicate[3:]
         if predicate.startswith("in.("):
@@ -519,7 +517,12 @@ class _CASHTTP:
 
     def patch(self, url, *, params, headers, json, timeout):
         self.row.update(self.concurrent)
-        self.params = dict(params)
+        import requests
+        from urllib.parse import parse_qsl, urlsplit
+        wire = requests.Request("PATCH", url, params=params).prepare().url
+        decoded = dict(parse_qsl(urlsplit(wire).query))
+        assert decoded == params
+        self.params = decoded
         if not all(self._matches(self.row.get(key), value)
                    for key, value in params.items() if key not in ("id", "gym_id")):
             return Response([])
@@ -533,12 +536,13 @@ def _prepared_payload(_account_key, _row_id, payload, *, current=None,
             "byte_hash": "derived:md5:" + "b" * 32}
 
 
-def test_guarded_image_patch_refuses_concurrent_same_status_slot_swap(monkeypatch):
+@pytest.mark.parametrize("slot_index", [0, 1, None])
+def test_guarded_image_patch_refuses_concurrent_same_status_slot_swap(monkeypatch, slot_index):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
     current = {"id": "row-1", "gym_id": "old-key", "status": "pending",
                "format": "story", "image_url": "https://media.example/old.jpg",
                "source_media_url": "https://media.example/raw.jpg", "caption": "new",
-               "slot_index": None, "thumbnail_url": "https://media.example/thumb-old.jpg",
+               "slot_index": slot_index, "thumbnail_url": "https://media.example/thumb-old.jpg",
                "visual_group_key": "vg_old", "byte_hash": "derived:md5:" + "a" * 32}
     http = _CASHTTP(current, {"slot_index": 2,
                               "thumbnail_url": "https://media.example/thumb-new.jpg",
@@ -550,17 +554,18 @@ def test_guarded_image_patch_refuses_concurrent_same_status_slot_swap(monkeypatc
                                     "https://media.example/reburn.jpg") is None
     assert http.row["image_url"] == current["image_url"]
     assert http.row["visual_group_key"] == "vg_concurrent"
-    assert http.params["slot_index"] == "is.null"
-    assert http.params["thumbnail_url"] == 'eq."https://media.example/thumb-old.jpg"'
-    assert http.params["visual_group_key"] == 'eq."vg_old"'
+    assert http.params["slot_index"] == ("is.null" if slot_index is None else f"eq.{slot_index}")
+    assert http.params["thumbnail_url"] == "eq.https://media.example/thumb-old.jpg"
+    assert http.params["visual_group_key"] == "eq.vg_old"
 
 
-def test_guarded_image_patch_succeeds_when_observed_visual_row_is_unchanged(monkeypatch):
+@pytest.mark.parametrize("slot_index", [0, 1, None])
+def test_guarded_image_patch_succeeds_when_observed_visual_row_is_unchanged(monkeypatch, slot_index):
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
     current = {"id": "row-1", "gym_id": "old-key", "status": "pending",
                "format": "story", "image_url": "https://media.example/old.jpg",
                "source_media_url": "https://media.example/raw.jpg", "caption": "new",
-               "slot_index": None, "visual_group_key": "vg_old",
+               "slot_index": slot_index, "visual_group_key": "vg_old",
                "byte_hash": "derived:md5:" + "a" * 32}
     http = _CASHTTP(current)
     calendar = store(http)
@@ -571,6 +576,7 @@ def test_guarded_image_patch_succeeds_when_observed_visual_row_is_unchanged(monk
     assert saved["image_url"] == "https://media.example/reburn.jpg"
     assert saved["visual_group_key"] == "vg_prepared"
     assert saved["caption"] == "new"
+    assert http.params["slot_index"] == ("is.null" if slot_index is None else f"eq.{slot_index}")
 
 
 def test_guarded_image_patch_without_expected_row_preserves_status_allowlist(monkeypatch):
@@ -682,3 +688,28 @@ def test_bundle_response_conflict_or_failure_aborts_preparation(monkeypatch):
             prep.prepare(store(http), "old-key", {"image_url": URL, "source_media_url": URL})
         assert len([c for c in http.calls if c[1] == "visual_global_prepare_bundle"]) == 1
         assert not any(c[1] == "visual_global_prepare_source_rendition" for c in http.calls)
+
+
+@pytest.mark.parametrize("visual_guard", [False, True])
+@pytest.mark.parametrize("unsafe", ["caption\\with-backslash", {"malformed": "caption"}])
+def test_image_patch_cas_unsupported_value_fails_before_write(monkeypatch, visual_guard, unsafe):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1" if visual_guard else "0")
+    current = {"id": "row-1", "gym_id": "old-key", "status": "approved",
+               "format": "story", "account": "instagram", "post_date": "2026-10-04",
+               "image_url": "https://media.example/old.jpg",
+               "source_media_url": "https://media.example/raw.jpg", "caption": unsafe,
+               "slot_index": 0, "published_at": None, "late_post_id": None}
+    http = _CASHTTP(current)
+    calendar = store(http)
+    with pytest.raises(pcs.PortalStoreError, match="CAS blocked"):
+        calendar.patch_image_url("old-key", "row-1", "https://media.example/new.jpg",
+                                 expected_row=current)
+    assert http.params is None
+    assert http.row == current
+
+
+@pytest.mark.parametrize("unsafe", ["key\\with-backslash", {"malformed": "key"}])
+def test_visual_media_cas_unsupported_value_keeps_predicates_and_fails_closed(unsafe):
+    with pytest.raises(pcs.PreWriteCASError, match="visual media CAS blocked"):
+        pcs.SupabaseCalendarStore._visual_media_cas(
+            {"r2_key": unsafe, "slot_index": 0}, {"id": "eq.row-1", "gym_id": "eq.old-key"})
