@@ -8,6 +8,7 @@ the real predicate over fake readings. No network.
 import os
 import sys
 import time
+import urllib.parse
 
 import pytest
 
@@ -176,6 +177,78 @@ def test_live_load_reads_the_marker_tables_and_only_client_gyms(creds, real_echo
     # the alias gyms read is scoped to the client ids; the fleet's rows are never pulled
     assert alias_params["id"].startswith("in.(") and BOOM not in alias_params["id"]
     assert s.markers[TOUGH] == {ec.MARKER_SETTINGS} and s.markers[LOCAL] == {ec.MARKER_SETTINGS}
+
+
+def test_default_live_reader_uses_dependency_free_http(creds, real_echo_clients, monkeypatch):
+    calls = []
+
+    class _RawResponse:
+        status = 200
+
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        parsed = urllib.parse.urlsplit(request.full_url)
+        table = parsed.path.rsplit("/rest/v1/", 1)[1]
+        params = dict(urllib.parse.parse_qsl(parsed.query))
+        calls.append((table, params, dict(request.header_items()), timeout))
+        rows = list(_tables().get(table, []))
+        if table == "gyms" and params.get("plan", "").startswith("eq."):
+            rows = [row for row in rows if row.get("plan") == params["plan"][3:]]
+        if table == "gyms" and params.get("id", "").startswith("in.("):
+            wanted = set(params["id"][4:-1].split(","))
+            rows = [row for row in rows if row.get("id") in wanted]
+        return _RawResponse(__import__("json").dumps(rows).encode("utf-8"))
+
+    class _Opener:
+        open = staticmethod(fake_urlopen)
+
+    monkeypatch.setattr(ec.urllib.request, "build_opener", lambda *_handlers: _Opener())
+    result = ec._load()
+
+    assert result.ok and result.gym_ids == {TOUGH, LOCAL}
+    assert [table for table, *_ in calls] == [
+        "echo_gym_settings", "echo_social_intake", "gym_products", "gyms",
+        "echo_intake_tokens", "gyms",
+    ]
+    assert all(timeout == ec._READ_TIMEOUT for *_, timeout in calls)
+    assert all("Authorization" in headers for _, _, headers, _ in calls)
+
+
+def test_default_live_reader_refuses_redirects_with_service_headers(
+        creds, real_echo_clients, monkeypatch):
+    opened = []
+
+    class _RedirectingOpener:
+        def __init__(self, handler):
+            self.handler = handler
+
+        def open(self, request, timeout=None):
+            opened.append(request.full_url)
+            redirected = self.handler.redirect_request(
+                request, None, 302, "Found", {}, "https://attacker.invalid/collect")
+            assert redirected is None
+            raise RuntimeError("redirect refused")
+
+    monkeypatch.setattr(
+        ec.urllib.request, "build_opener",
+        lambda handler: _RedirectingOpener(handler),
+    )
+
+    result = ec._load()
+
+    assert not result.ok and result.error == "echo_gym_settings unreadable"
+    assert len(opened) == 1
 
 
 @pytest.mark.parametrize("broken", ["echo_social_intake", "gym_products"])

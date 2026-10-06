@@ -80,9 +80,12 @@ The service key is read lazily, never logged, never returned. `http` is injectab
 every path is unit tested offline.
 """
 import hashlib
+import json
 import re
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 
 from . import config
@@ -318,6 +321,36 @@ def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(
 
 # ---- live reads ------------------------------------------------------------------
 
+class _StdlibResponse:
+    """Small requests-compatible response used by the dependency-free reader."""
+
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        return json.loads(self._body.decode("utf-8"))
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Never forward Supabase service credentials to a redirected origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class _StdlibHTTP:
+    """The production image may omit requests; urllib is always available."""
+
+    @staticmethod
+    def get(url, params=None, headers=None, timeout=None):
+        query = urllib.parse.urlencode(params or {})
+        target = url + (("?" + query) if query else "")
+        request = urllib.request.Request(target, headers=headers or {}, method="GET")
+        opener = urllib.request.build_opener(_NoRedirects())
+        with opener.open(request, timeout=timeout) as response:  # noqa: S310
+            return _StdlibResponse(response.status, response.read())
+
 def _rest_get(http, url, key, path, params):
     """One PostgREST GET. Returns (rows, ok). Never raises."""
     try:
@@ -363,8 +396,7 @@ def _load(http=None, now=None):
     if not url or not key:
         return ClientSet(ok=False, error="no Supabase creds", at=stamp)
     if http is None:
-        import requests  # lazy, matches the rest of the repo
-        http = requests
+        http = _StdlibHTTP
     # The four MARKER reads. Any one failing = the universe is unknown = fail closed.
     settings, ok = _read_all(http, url, key, "echo_gym_settings", "gym_id")
     if not ok:
