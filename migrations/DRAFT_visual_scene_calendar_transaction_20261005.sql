@@ -346,7 +346,11 @@ as $$
         and coalesce(nullif(lower(btrim(c.format)), ''), 'feed')
           = coalesce(nullif(lower(btrim(coalesce(p_expected->>'format', ''))), ''), 'feed')
         and coalesce(nullif(lower(btrim(c.account)), ''), '')
-          = lower(btrim(coalesce(p_expected->>'platform', '')))))
+          = lower(btrim(coalesce(p_expected->>'platform', '')))
+        -- Compose approval-provenance's exact raw GBP card compare. Without
+        -- this predicate, the later scene migration would overwrite its CAS.
+        and (lower(btrim(c.account)) <> 'googlebusiness'
+             or public.calendar_gbp_approval_snapshot(c) = p_expected->'gbp_proof')))
   returning *)
   select * from persisted where status='approved' and variant_status='active'
     and media_not_ready_reason is null and publish_claim_token is null

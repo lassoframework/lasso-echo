@@ -57,7 +57,11 @@ def cluster():
             ledger.DSN = f"host={base} port=55479 dbname=echo_scene_ledger_test"
             ledger._scratch_stack.__wrapped__()
             ledger._sql("alter table public.content_calendar "
-                        "add column format text, add column caption text")
+                        "add column format text, add column caption text, "
+                        "add column pillar text, add column gbp_topic_type text, "
+                        "add column gbp_cta_type text, add column gbp_cta_url text, "
+                        "add column gbp_event jsonb, add column gbp_offer jsonb, "
+                        "add column gbp_location_id text")
             ledger._sql("create table public.gyms (id uuid primary key, slug text, name text); "
                         "create table public.echo_intake_tokens (gym_id uuid, echo_account_key text); "
                         "create table public.echo_gym_settings (gym_id uuid primary key, "
@@ -118,13 +122,29 @@ def proof_identity(tenant):
         f"values ('{tenant}',false,'test')")
 
 
-def approve_with_card(row, tenant, url, caption=None, account="ig"):
+def visible_card(row, tenant, url, caption=None, account="ig"):
     caption_sql = "null" if caption is None else f"'{caption}'"
     return ledger._one(
-        "select count(*) from public.approve_calendar_row_if_media_ready("
-        f"'{row}','{tenant}',jsonb_build_object("
+        "select jsonb_build_object("
         f"'caption',{caption_sql},'media_url','{url}',"
-        f"'day_key','2026-10-10','format','feed','platform','{account}'))")
+        f"'day_key','2026-10-10','format',"
+        "coalesce(nullif(lower(btrim(c.format)),''),'feed'),"
+        f"'platform','{account}'"
+        + (",'gbp_proof',public.calendar_gbp_approval_snapshot(c)"
+           if account == "googlebusiness" else "")
+        + f") from public.content_calendar c where c.id='{row}'")
+
+
+def approve_with_snapshot(row, tenant, snapshot):
+    safe = snapshot.replace("'", "''")
+    return ledger._one(
+        "select count(*) from public.approve_calendar_row_if_media_ready("
+        f"'{row}','{tenant}','{safe}'::jsonb)")
+
+
+def approve_with_card(row, tenant, url, caption=None, account="ig"):
+    return approve_with_snapshot(
+        row, tenant, visible_card(row, tenant, url, caption, account))
 
 
 def proven_claim(row, tenant):
@@ -181,6 +201,37 @@ def test_combined_stale_card_and_stale_creative_refuse():
                 f"where id='{row}'")
     assert proven_claim(row, tenant) == ""
     assert state(row)["publish_claim_token"] is None
+
+
+@pytest.mark.parametrize("changed_field,new_value", [
+    ("gbp_cta_url", "'https://book.new'"),
+    ("gbp_offer", "'{\"couponCode\":\"NEW\",\"termsConditions\":\"Changed\"}'::jsonb"),
+    ("gbp_location_id", "'place-new'"),
+])
+def test_ordered_scene_approval_preserves_raw_gbp_card_cas(changed_field, new_value):
+    tenant, group, url, fp, candidate, row = seed(account="googlebusiness")
+    proof_identity(tenant)
+    ledger._sql(
+        "update public.content_calendar set format='offer',pillar='offer',"
+        "gbp_topic_type='OFFER',gbp_cta_type='BOOK',"
+        "gbp_cta_url='https://book.old',gbp_location_id='place-old',"
+        "gbp_offer='{\"couponCode\":\"OLD\",\"termsConditions\":\"Original\"}'::jsonb "
+        f"where id='{row}'")
+    before = visible_card(row, tenant, url, account="googlebusiness")
+    proof = json.loads(before)["gbp_proof"]
+    assert proof["gbp_cta_url"] == "https://book.old"
+    assert proof["gbp_offer"]["termsConditions"] == "Original"
+    assert proof["gbp_location_id"] == "place-old"
+    # The scene migration is applied AFTER approval provenance in this cluster.
+    # A stale structured field must match zero rows in its composed approval RPC.
+    ledger._sql(f"update public.content_calendar set {changed_field}={new_value} where id='{row}'")
+    assert approve_with_snapshot(row, tenant, before) == "0"
+    assert state(row)["status"] == "pending"
+    assert state(row)["approval_digest"] is None
+    # A fresh card with the exact current raw JSON remains approvable.
+    after = visible_card(row, tenant, url, account="googlebusiness")
+    assert approve_with_snapshot(row, tenant, after) == "1"
+    assert state(row)["approval_digest"]
 
 
 def test_combined_trigger_hold_refuses_proven_token():
