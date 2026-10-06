@@ -692,6 +692,30 @@ def _daily_scheduler(store):
                 # AGENT_ZERNIO_PUBLISH (a no-op unless armed); one gym never blocks another.
                 calendar_autopublish.publish_client_gyms(
                     _local_today, notifier=ops_alerts._default_poster())
+                # Registry repair runs AFTER this tick's publisher. A positive
+                # Echo marker plus one unambiguous calendar/issued key may make a
+                # missing client visible on the NEXT tick; repair itself never
+                # publishes, sends a connect link, or approves a row.
+                if config.dynamic_accounts_enabled():
+                    try:
+                        import time as _time
+                        from . import db as _db, registry_reconcile as _rr
+                        _reg_ts = float(_db.kv_get("echo_registry_reconcile_ts") or 0)
+                        if _time.time() - _reg_ts > 3600:
+                            _db.kv_set("echo_registry_reconcile_ts", str(_time.time()))
+                            _reg_result = _rr.reconcile()
+                            if _reg_result["registered"]:
+                                print("[registry-reconcile] registered "
+                                      + ", ".join(_reg_result["registered"]))
+                            if _reg_result["held"]:
+                                print("[registry-reconcile] held "
+                                      + repr(_reg_result["held"]))
+                            if not _reg_result["ok"]:
+                                print("[registry-reconcile] held: "
+                                      + _reg_result["error"])
+                    except Exception as _reg_exc:
+                        print(f"[registry-reconcile] skipped: "
+                              f"{type(_reg_exc).__name__}: {_reg_exc}")
                 # Zernio profile re-link (hourly): a gym that connects Zernio mid-day
                 # gets its profile_id populated here so approved posts can publish
                 # the same day instead of waiting until the next morning's daily draw.
