@@ -37,6 +37,7 @@ Both passes are pure given their injected dependencies -- no import of a live Sl
 client or the live bus at module scope, so they are fully unit-testable offline.
 """
 import json
+from .slack_convo.bus import current_notice_blocked
 import os
 import re
 import time
@@ -256,6 +257,8 @@ def _delivery_snapshot(bus, original, *, status, classification, identity_name, 
 
 def _resolve_delivered(bus, snapshot, result, *, log):
     """Close only a confirmed posted completion for the original request cycle."""
+    if current_notice_blocked(bus, snapshot):
+        return False
     current_notice = bool(getattr(result, "notice_id", "") and
                           getattr(result, "attempt_token", ""))
     resolver = getattr(bus, ("resolve_current_notice" if current_notice else

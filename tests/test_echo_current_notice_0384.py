@@ -336,6 +336,7 @@ def test_held_route_receipt_outage_keeps_posted_notice_for_finalization():
 
 
 def test_known_route_reserves_id_and_token_before_insert(monkeypatch):
+    monkeypatch.setenv("AGENT_FIXER_CURRENT_NOTICE_0384", "true")
     ticket = NoticeBus().current
     ticket.update(slack_channel_id="G_CLIENT", slack_thread_ts="45.67")
     bus = Bus(url="https://example.test", service_key="test")
@@ -516,3 +517,106 @@ def test_expired_token_claim_before_intent_is_suppressed_not_requeued():
         now=datetime.now(timezone.utc), summary=summary) == 1
     assert bus.events == ["suppressed", "alert"]
     assert summary["suppressed"] == 1
+
+
+def test_pre0384_blocks_rpc_transport_and_legacy_resolution(monkeypatch):
+    import pytest
+    from agent.slack_convo.bus import BusError
+    monkeypatch.delenv("AGENT_FIXER_CURRENT_NOTICE_0384", raising=False)
+    bus = Bus(url="https://example.test", service_key="test")
+    ticket = NoticeBus().current
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(bus, "_client", lambda: pytest.fail("RPC transport forbidden"))
+    for call in (
+        lambda: bus.begin_current_notice(ticket, TICKET_ID),
+        lambda: bus.begin_current_notice(ticket, TICKET_ID, unrouted=True),
+        lambda: bus.bind_current_notice_route(TICKET_ID, 3, TICKET_ID, NOTICE_TOKEN, "G", "1"),
+        lambda: bus.resolve_current_notice(ticket, TICKET_ID, NOTICE_TOKEN, "posted"),
+        lambda: bus.resolve_current_delivery(TICKET_ID, 3, "verification", "answerable_question",
+                                            "echo", "gym-1", "echo", "U_CLIENT", "G", "1"),
+    ):
+        with pytest.raises(BusError, match="disabled before verified 0384"):
+            call()
+
+
+def test_pre0384_blocks_completion_insert_but_preserves_intake(monkeypatch):
+    import pytest
+    from agent.slack_convo.bus import BusError
+    monkeypatch.delenv("AGENT_FIXER_CURRENT_NOTICE_0384", raising=False)
+    bus = Bus(url="https://example.test", service_key="test")
+    ticket = NoticeBus().current
+    rows = []
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(bus, "_insert", lambda table, row: (rows.append((table, row)) or row, False))
+    for kind, meta, mid in (("answer", {}, None), ("status", {"resolve_notice": True}, TICKET_ID)):
+        with pytest.raises(BusError, match="disabled before verified 0384"):
+            bus.record_outbound(ticket_id=TICKET_ID, author_type="echo", body="Done",
+                                delivery_status="ready", kind=kind, meta=meta, message_id=mid)
+    assert rows == []
+    bus.record_inbound(ticket_id=TICKET_ID, slack_event_id="E_SAFE", slack_ts="1",
+                       author_type="human", author_id="U_CLIENT", body="Please help")
+    bus.record_outbound(ticket_id=TICKET_ID, author_type="echo", body="Request received",
+                        delivery_status="ready", kind="ack")
+    bus.record_outbound(ticket_id=TICKET_ID, author_type="system", body="Needs review",
+                        delivery_status="ready", kind="escalation")
+    assert len(rows) == 3
+
+
+def test_pre0384_direct_outreach_never_opens_or_posts(monkeypatch):
+    import pytest
+    monkeypatch.delenv("AGENT_FIXER_CURRENT_NOTICE_0384", raising=False)
+    bus = Bus(url="https://example.test", service_key="test")
+    blocked = lambda *_a, **_kw: pytest.fail("completion effect forbidden")
+    result = outreach._send(
+        NoticeBus().current, SimpleNamespace(slack_user_id="U_CLIENT", kind="client"),
+        SimpleNamespace(name="echo"), open_group_dm=blocked,
+        post_first_message=blocked, record_outbound=blocked, completion=True,
+        current_notice_bus=bus)
+    assert result.reason == "current_notice_0384_disabled"
+    assert not result.delivered and not result.completion_posted
+
+
+def test_pre0384_old_queued_and_posted_notices_never_send_or_resolve(monkeypatch):
+    import pytest
+    monkeypatch.delenv("AGENT_FIXER_CURRENT_NOTICE_0384", raising=False)
+    bus = Bus(url="https://example.test", service_key="test")
+    ticket = NoticeBus().current
+    blocked = lambda *_a, **_kw: pytest.fail("legacy notice effect forbidden")
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(bus, "mark_message", blocked)
+    monkeypatch.setattr(bus, "set_ticket", blocked)
+    monkeypatch.setattr(bus, "_client", blocked)
+    summary = {"skipped": 0, "resolved": 0}
+    for kind, meta in (("answer", {}), ("status", {"resolve_notice": True, "fixer": True})):
+        row = {"id": TICKET_ID, "ticket_id": TICKET_ID, "delivery_status": "ready",
+               "body": "Older completion", "attachments": {"kind": kind, **meta}}
+        outbox._dispatch_one(bus, blocked, row, identity=SimpleNamespace(name="echo"),
+                             log=lambda _msg: None, summary=summary)
+        outbox._resolve_on_answer(bus, ticket, row, kind, summary, att=meta)
+        outbox._finalize_fixer_post(bus, ticket, {**row, "delivery_status": "posted"},
+                                   SimpleNamespace(name="echo"), lambda _msg: None, summary)
+    assert summary == {"skipped": 2, "resolved": 0}
+    assert outbox.resolve_and_notify(bus, TICKET_ID, approved_by="U_OPERATOR",
+                                     identity=SimpleNamespace(name="echo"), log=lambda _msg: None) is False
+    result = SimpleNamespace(completion_posted=True, ticket_stamped=True,
+                             channel_id="G", posted_ts="1", notice_id="", attempt_token="")
+    assert worker._resolve_delivered(bus, ticket, result, log=lambda _msg: None) is False
+
+
+def test_0384_rpc_requires_explicit_true_enablement(monkeypatch):
+    import json
+    import pytest
+    from agent.slack_convo.bus import BusError
+    posts = []
+    response = SimpleNamespace(status_code=200, json=lambda: NOTICE_TOKEN)
+    http = SimpleNamespace(post=lambda *a, **kw: posts.append((a, kw)) or response)
+    bus = Bus(url="https://example.test", service_key="test", http=http)
+    for value in ("", "false", "1", "yes"):
+        monkeypatch.setenv("AGENT_FIXER_CURRENT_NOTICE_0384", value)
+        with pytest.raises(BusError):
+            bus.begin_current_notice(NoticeBus().current, TICKET_ID)
+    assert posts == []
+    monkeypatch.setenv("AGENT_FIXER_CURRENT_NOTICE_0384", "true")
+    assert bus.begin_current_notice(NoticeBus().current, TICKET_ID) == NOTICE_TOKEN
+    assert len(posts) == 1
+    assert json.loads(posts[0][1]["data"])["p_notice_message_id"] == TICKET_ID

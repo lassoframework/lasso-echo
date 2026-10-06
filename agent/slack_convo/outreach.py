@@ -37,6 +37,7 @@ REFUSAL PATHS (Blake's own words, restated as hard gates -- both have tests):
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import uuid
+from .bus import current_notice_blocked
 
 from . import identity_gate as _ig
 from .adapter import _slack_escape, KIND_OUTREACH_REQUEST
@@ -303,6 +304,9 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
     else:
         text = (_slack_escape(message_text) if message_text is not None
                else first_message_text(ticket, ident))
+
+    if completion and current_notice_blocked(current_notice_bus, ticket):
+        return OutreachResult(opened=False, reason="current_notice_0384_disabled")
 
     opened = open_group_dm([BLAKE_SLACK_USER_ID, who.slack_user_id])
     if not opened or not opened.get("ok") or not opened.get("channel_id"):

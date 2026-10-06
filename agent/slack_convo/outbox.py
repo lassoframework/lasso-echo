@@ -70,6 +70,7 @@ HARDENING (2026-09-03 re-audit wave 2):
 """
 from datetime import datetime, timedelta, timezone
 import hashlib
+from .bus import current_notice_blocked
 import math
 import json
 import re
@@ -1500,6 +1501,8 @@ def _recover_config_missing_fixer(bus, identity, readback, log, now=None):
 
 def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
     """Idempotently finish the ticket step after verified Slack delivery."""
+    if current_notice_blocked(bus, ticket):
+        return
     att = row.get("attachments") or {}
     intent = att.get("fixer_slack_delivery_intent") or {}
     if (row.get("delivery_status") != "posted"
@@ -1876,6 +1879,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     if not ticket:
         _suppress(bus, row, None, identity, "parent ticket missing", log, summary,
                   escalate=False)
+        return
+    if (current_notice_blocked(bus, ticket)
+            and (kind == _a.KIND_ANSWER or kind == _a.KIND_STATUS
+                 and att.get("resolve_notice") is True)):
+        log(f"[slack-convo/outbox] completion paused before 0384 row={row['id']}")
+        summary["skipped"] += 1
         return
     # only rows for THIS identity; another identity's loop owns the rest
     row_ident = att.get("identity") or ""
@@ -2553,6 +2562,8 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
     Two rows close a ticket: the ANSWER that answered it, and the resolve NOTICE a human
     tapped (MINOR 5, audit 7 -- resolve_and_notify used to stamp the ticket itself, before
     delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
+    if current_notice_blocked(bus, ticket):
+        return
     meta = att or {}
     fixer = bool(meta.get("fixer"))
     should_resolve = (
@@ -2688,6 +2699,9 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
             f"{ticket.get('bot_identity') or '?'} not {identity.name}")
         return False
     if ticket.get("status") == "resolved":
+        return False
+    if current_notice_blocked(bus, ticket):
+        log(f"[slack-convo/outbox] resolve paused before 0384 ticket={ticket_id}")
         return False
     customer_fix = _customer_fix_reply(ticket, {})
     if (callable(getattr(bus, "begin_current_notice", None))
