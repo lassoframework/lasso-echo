@@ -927,6 +927,7 @@ def _alert_meta_autonomous_cleanup_held(row_id, gym_id):
 
 
 _META_REAPPROVAL_REQUIRED = object()
+_CAPTION_REAPPROVAL_REQUIRED = object()
 
 
 def _strip_or_hold_meta(row, gym_id, store, *, autonomous_lane=False):
@@ -1036,8 +1037,10 @@ def _format_caption_at_publish(row, gym_id, store):
 
     Approved rows and media-held rows are excluded from the bulk correction,
     but may later reach this lane with old sentence spacing. Format the exact
-    caption sent to the network and best-effort persist it without resetting
-    approval. Story text may be burned into media, so a Story with a semicolon
+    caption sent to the network. With approval proof enabled, persist through a
+    current-mode guarded RPC: a Manual edit invalidates proof and returns the
+    row to pending review; an Auto edit clears stale proof while preserving its
+    autonomous path. Story text may be burned into media, so a Story with a semicolon
     holds for correction rather than silently changing its saved caption.
     A protected URL containing a semicolon also holds instead of being damaged.
     Ambiguous inline numbered lists wait for items to be placed on separate
@@ -1057,12 +1060,38 @@ def _format_caption_at_publish(row, gym_id, store):
         return row
     patched = None
     try:
-        patcher = getattr(store, "patch_caption_preserve_status", None)
-        if patcher is not None:
-            patched = patcher(row.get("gym_id") or gym_id, row.get("id"), clean)
+        row_gym_id = row.get("gym_id") or gym_id
+        if config.approval_proof_enabled():
+            manual_patcher = getattr(store, "patch_caption_manual_format", None)
+            if callable(manual_patcher):
+                patched = manual_patcher(
+                    row_gym_id, row.get("id"), row.get("status"), caption, clean)
+            if patched is not None:
+                # Manual approval is for the exact caption. The current-mode
+                # CAS clears its proof and demotes approved -> pending; make
+                # the owner review the formatted wording on a later tick.
+                if row.get("status") == "approved":
+                    _alert_caption_format_reapproval(row.get("id"), gym_id)
+                    return _CAPTION_REAPPROVAL_REQUIRED
+                return patched
+            # A null Manual result may mean Auto, but can also mean a stale
+            # row or unresolved mode. The autonomous RPC repeats both the mode
+            # and exact-caption CAS, so only a confirmed Auto update may send.
+            auto_patcher = getattr(store, "patch_caption_autonomous_clean", None)
+            if callable(auto_patcher):
+                patched = auto_patcher(row_gym_id, row.get("id"),
+                                       row.get("status"), caption, clean)
+            if patched is None:
+                return None
+        else:
+            patcher = getattr(store, "patch_caption_preserve_status", None)
+            if patcher is not None:
+                patched = patcher(row_gym_id, row.get("id"), clean)
     except Exception as e:  # noqa: BLE001 - persistence is best effort here
         print(f"[calendar-autopublish] caption format patch failed for "
               f"{row.get('id')}: {type(e).__name__}: {e}")
+        if config.approval_proof_enabled():
+            return None
     row = dict(patched or row)
     row["caption"] = clean  # what we SEND is clean even when the patch failed
     if ";" in caption:
@@ -1071,6 +1100,21 @@ def _format_caption_at_publish(row, gym_id, store):
         print(f"[calendar-autopublish] formatted legacy caption spacing for "
               f"{gym_id}/{row.get('id')}; awaiting remaining publish checks")
     return row
+
+
+def _alert_caption_format_reapproval(row_id, gym_id):
+    """Tell ops that formatting invalidated a Manual approval and needs review."""
+    try:
+        from . import db, ops_alerts
+        key = f"capformat_reapproval_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
+            f"{gym_id}: row {row_id} was returned to pending review because "
+            "publish-time caption formatting changed the approved text. Review "
+            "and approve the formatted caption before it can publish."))
+    except Exception:
+        pass
 
 
 def _planned_mentions(caption, gym_id, category):
@@ -1594,6 +1638,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # rows that the safe pending-row backfill intentionally left alone.
         # Story rows with semicolons and unformattable URLs hold with an alert.
         formatted = _format_caption_at_publish(row, gym_id, store)
+        if formatted is _CAPTION_REAPPROVAL_REQUIRED:
+            waiting.append(row_id)
+            continue
         if formatted is None:
             waiting.append(row_id)
             _alert_caption_format_held(row_id, gym_id)

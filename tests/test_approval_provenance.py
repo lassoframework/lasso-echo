@@ -188,6 +188,21 @@ class _ProofStore:
                    approved_at=None, approval_digest=None)
         return dict(row)
 
+    def patch_caption_manual_format(self, gym_id, row_id, expected_status,
+                                    expected_caption, clean_caption):
+        row = self.rows.get(row_id)
+        if (self.autonomy.get(gym_id) is not False or not row
+                or row.get("status") != expected_status
+                or row.get("caption") != expected_caption
+                or row.get("published_at") or row.get("late_post_id")
+                or row.get("publish_claim_token")):
+            return None
+        row.update(caption=clean_caption, approval_kind=None, approved_by=None,
+                   approved_at=None, approval_digest=None)
+        if expected_status == "approved":
+            row["status"] = "pending"
+        return dict(row)
+
     def mark_published(self, row_id, media_id, published_at=None, **kw):
         row = self.rows[row_id]
         if row.get("status") != "publishing":
@@ -402,6 +417,29 @@ def test_claim_slot_sends_proof_param_only_when_required(monkeypatch):
     assert claimed["autonomous_at_claim"] is False
 
 
+def test_manual_caption_format_uses_exact_cas_rpc_and_requires_pending_result(
+        monkeypatch):
+    row = {"id": "r1", "gym_id": "gymx", "status": "pending",
+           "caption": "clean caption"}
+    http = _FakeHTTP(_Resp(200, [row]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    patched = pcs.SupabaseCalendarStore().patch_caption_manual_format(
+        "gymx", "r1", "approved", "raw caption", "clean caption")
+    url, payload = http.calls[0]
+    assert url.endswith("/rpc/calendar_patch_caption_manual_format")
+    assert payload == {
+        "p_row_id": "r1", "p_gym_id": "gymx",
+        "p_expected_status": "approved",
+        "p_expected_caption": "raw caption",
+        "p_clean_caption": "clean caption",
+    }
+    assert patched == row
+
+    http._post_resp = _Resp(200, [{**row, "status": "approved"}])
+    assert pcs.SupabaseCalendarStore().patch_caption_manual_format(
+        "gymx", "r1", "approved", "raw caption", "clean caption") is None
+
+
 # ---- Manual lane, armed -----------------------------------------------------
 
 def test_armed_manual_lane_publishes_only_fresh_human_proved_rows(proof_armed):
@@ -546,6 +584,47 @@ def test_gated_autonomous_meta_cleanup_persists_then_sends_clean_body(proof_arme
     assert summary["published"] == ["auto-meta"]
     assert sent == ["Ready to train."]
     assert store.rows["auto-meta"]["caption"] == "Ready to train."
+
+
+def test_manual_caption_spacing_format_invalidates_proof_and_waits_for_review(
+        proof_armed, monkeypatch):
+    row = human_prove(_row(
+        "manual-spacing", caption="Move well today. Build strength tomorrow."))
+    store = _ProofStore([row], autonomy={"lasso": False})
+    pub = _FakePublisher()
+    monkeypatch.setattr(cap, "_alert_caption_format_reapproval", lambda *a: None)
+
+    summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
+                              publisher=pub, now=LATE_NOW, approved_only=True)
+
+    current = store.rows["manual-spacing"]
+    assert summary["published"] == []
+    assert summary["waiting"] == ["manual-spacing"]
+    assert pub.calls == []
+    assert store.claim_calls == []
+    assert current["caption"] == "Move well today.\n\nBuild strength tomorrow."
+    assert current["status"] == "pending"
+    assert current["approval_kind"] is None
+    assert current["approved_by"] is None
+    assert current["approved_at"] is None
+    assert current["approval_digest"] is None
+
+
+def test_autonomous_caption_spacing_cleanup_keeps_autonomous_publish_path(
+        proof_armed):
+    row = human_prove(_row(
+        "auto-spacing", caption="Move well today. Build strength tomorrow."))
+    store = _ProofStore([row], autonomy={"lasso": True})
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
+                              publisher=pub, now=LATE_NOW, approved_only=False)
+
+    assert summary["published"] == ["auto-spacing"]
+    assert pub.calls
+    assert store.rows["auto-spacing"]["caption"] == \
+        "Move well today.\n\nBuild strength tomorrow."
+    assert store.rows["auto-spacing"]["status"] == "published"
 
 
 def test_gated_auto_to_manual_before_meta_cleanup_holds(proof_armed):

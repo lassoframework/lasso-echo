@@ -456,7 +456,8 @@ grant execute on function public.calendar_gym_is_autonomous(text)
   to service_role;
 
 -- Atomic claim with an OPTIONAL proof gate. p_require_approval_proof defaults
--- FALSE, preserving byte-for-byte current behavior for every caller. When TRUE
+-- FALSE, preserving the current owned claim's dated catchup envelopes and
+-- NULL/stale-reservation guards for every caller. When TRUE
 -- the claim re-reads the gym's CURRENT autonomy from the DB in this same
 -- transaction: a definitively-autonomous gym keeps today's behavior exactly;
 -- any other gym (Manual, or unresolved) must carry a fresh human proof whose
@@ -475,14 +476,31 @@ as $$
 declare
   v_row public.content_calendar%rowtype;
   v_used integer;
+  v_current_used integer;
+  v_backlog_used integer;
   v_token uuid;
   v_enforce_proof boolean;
 begin
-  if p_capacity < 1 or p_capacity > 3 or p_day is null or p_timezone is null
+  if p_capacity is null or p_approved_only is null
+      or p_require_approval_proof is null
+      or p_capacity < 1 or (p_capacity > 3 and p_capacity not in (5, 15))
+      or p_day is null or p_timezone is null
       or nullif(btrim(p_gym_id), '') is null then
     return null;
   end if;
   if p_capacity = 3 and p_gym_id <> 'lasso' then
+    return null;
+  end if;
+  if p_capacity = 5 and not (
+      p_gym_id = 'lasso'
+      and p_day between date '2026-10-07' and date '2026-10-11'
+      and p_timezone = 'America/New_York') then
+    return null;
+  end if;
+  if p_capacity = 15 and not (
+      p_gym_id = 'lasso'
+      and p_day between date '2026-10-05' and date '2026-10-06'
+      and p_timezone = 'America/New_York') then
     return null;
   end if;
 
@@ -508,13 +526,35 @@ begin
   if not found or (p_approved_only and v_row.status <> 'approved') then
     return null;
   end if;
+  -- Never reclaim a pending/approved row with an unresolved claim token or
+  -- reservation day. This guard applies at every capacity and proof setting.
+  if v_row.publish_claim_token is not null
+      or v_row.publish_reservation_day is not null then
+    return null;
+  end if;
   -- A gym the DB says is Manual right now may only publish APPROVED rows,
   -- even if the worker's stale snapshot ran the autonomous lane.
   if v_enforce_proof and v_row.status <> 'approved' then
     return null;
   end if;
-  if p_capacity = 3 and
+  if p_capacity in (5, 15) and
+      (v_row.post_date is null
+       or nullif(btrim(coalesce(v_row.account, '')), '') is null) then
+    return null;
+  end if;
+  if p_capacity in (3, 5, 15) and
       coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed') not in ('feed', 'story') then
+    return null;
+  end if;
+  if p_capacity = 5 and not (
+      v_row.post_date = p_day
+      or v_row.post_date between date '2026-10-02' and date '2026-10-05') then
+    return null;
+  end if;
+  if p_capacity = 15 and not (
+      v_row.post_date = p_day
+      or (v_row.post_date between date '2026-10-02' and date '2026-10-05'
+          and v_row.post_date < p_day)) then
     return null;
   end if;
 
@@ -549,6 +589,55 @@ begin
                     (published_at at time zone p_timezone)::date = p_day))));
   if v_used >= p_capacity then
     return null;
+  end if;
+
+  if p_capacity = 5 then
+    -- Three current-day slots plus two outage slots on October 7-11.
+    -- The tenant advisory lock serializes both class counts.
+    select count(*) filter (where post_date = p_day),
+           count(*) filter (where post_date between date '2026-10-02'
+                                            and date '2026-10-05')
+      into v_current_used, v_backlog_used
+      from public.content_calendar
+      where gym_id = p_gym_id
+        and lower(btrim(coalesce(account, ''))) =
+            lower(btrim(coalesce(v_row.account, '')))
+        and coalesce(nullif(lower(btrim(format)), ''), 'feed') =
+            coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed')
+        and ((status = 'publishing' and publish_reservation_day = p_day)
+             or (status = 'published' and
+                 (publish_reservation_day = p_day
+                  or (published_at is not null and
+                      (published_at at time zone p_timezone)::date = p_day))));
+    if (v_row.post_date = p_day and v_current_used >= 3)
+        or (v_row.post_date <> p_day and v_backlog_used >= 2) then
+      return null;
+    end if;
+  end if;
+
+  if p_capacity = 15 then
+    -- Three current-day slots plus twelve older-backlog slots on October 5-6.
+    -- A post dated October 5 is current on the fifth, backlog on the sixth.
+    select count(*) filter (where post_date = p_day),
+           count(*) filter (where post_date between date '2026-10-02'
+                                            and date '2026-10-05'
+                                and post_date < p_day)
+      into v_current_used, v_backlog_used
+      from public.content_calendar
+      where gym_id = p_gym_id
+        and lower(btrim(coalesce(account, ''))) =
+            lower(btrim(coalesce(v_row.account, '')))
+        and coalesce(nullif(lower(btrim(format)), ''), 'feed') =
+            coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed')
+        and ((status = 'publishing' and publish_reservation_day = p_day)
+             or (status = 'published' and
+                 (publish_reservation_day = p_day
+                  or (published_at is not null and
+                      (published_at at time zone p_timezone)::date = p_day))));
+    if (v_row.post_date = p_day and v_current_used >= 3)
+        or (v_row.post_date < p_day and v_backlog_used >= 12) then
+      return null;
+    end if;
   end if;
 
   v_token := gen_random_uuid();
@@ -636,6 +725,73 @@ revoke all on function public.calendar_patch_caption_autonomous_clean(
   uuid, text, text, text, text)
   from public, anon, authenticated;
 grant execute on function public.calendar_patch_caption_autonomous_clean(
+  uuid, text, text, text, text)
+  to service_role;
+
+-- A formatter may discover a changed caption after a client has approved it.
+-- Resolve Manual mode NOW, with the same tenant/settings locks as a claim.
+-- A bare FALSE from calendar_gym_is_autonomous is insufficient here because
+-- missing/ambiguous tenant state also returns FALSE; only one clean mapping
+-- and an explicit autonomous=FALSE setting may demote an approved row.
+create or replace function public.calendar_patch_caption_manual_format(
+  p_row_id uuid, p_gym_id text, p_expected_status text,
+  p_expected_caption text, p_clean_caption text
+) returns setof public.content_calendar
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_gym_count integer;
+  v_gym_uuid uuid;
+  v_settings_count integer;
+  v_autonomous boolean;
+begin
+  if p_row_id is null or nullif(btrim(coalesce(p_gym_id, '')), '') is null
+      or p_expected_status not in ('pending', 'approved')
+      or p_clean_caption is null
+      or p_clean_caption is not distinct from p_expected_caption then
+    return;
+  end if;
+  perform pg_advisory_xact_lock(hashtextextended(p_gym_id, 0));
+  select count(*), min(g.id::text)::uuid into v_gym_count, v_gym_uuid
+    from public.gyms g
+    join public.echo_intake_tokens t on t.gym_id = g.id
+   where t.echo_account_key = p_gym_id
+     and lower(coalesce(g.slug, '')) not like '%archived%'
+     and lower(coalesce(g.slug, '')) not like '%-dup%'
+     and lower(coalesce(g.name, '')) not like '%archived%'
+     and lower(coalesce(g.name, '')) not like '%do not use%';
+  if v_gym_count is distinct from 1 then return; end if;
+  perform 1 from public.echo_intake_tokens t
+   where t.gym_id = v_gym_uuid and t.echo_account_key = p_gym_id
+   for share;
+  if not found then return; end if;
+  select count(*) into v_settings_count from public.echo_gym_settings s
+   where s.gym_id = v_gym_uuid;
+  if v_settings_count is distinct from 1 then return; end if;
+  select s.autonomous into v_autonomous from public.echo_gym_settings s
+   where s.gym_id = v_gym_uuid for share;
+  if v_autonomous is distinct from false then return; end if;
+
+  -- UPDATE is the row lock and CAS. Any claim, approval or caption edit that
+  -- wins first changes these predicates. A changed Manual approval must be
+  -- reviewed again, including rows previously approved in Automatic mode.
+  return query update public.content_calendar c
+     set caption = p_clean_caption, status = 'pending',
+         approval_kind = null, approved_by = null,
+         approved_at = null, approval_digest = null
+   where c.id = p_row_id and c.gym_id = p_gym_id
+     and c.status = p_expected_status
+     and c.caption is not distinct from p_expected_caption
+     and c.variant_status = 'active' and c.published_at is null
+     and c.late_post_id is null and c.publish_claim_token is null
+     and c.publish_reservation_day is null
+   returning c.*;
+end;
+$$;
+revoke all on function public.calendar_patch_caption_manual_format(
+  uuid, text, text, text, text)
+  from public, anon, authenticated;
+grant execute on function public.calendar_patch_caption_manual_format(
   uuid, text, text, text, text)
   to service_role;
 

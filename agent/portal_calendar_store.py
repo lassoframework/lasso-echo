@@ -2386,6 +2386,35 @@ class SupabaseCalendarStore:
             and rows[0].get("gym_id") == gym_id \
             and rows[0].get("caption") == clean_caption else None
 
+    def patch_caption_manual_format(self, gym_id, row_id, expected_status,
+                                    expected_caption, clean_caption):
+        """Format a due caption only while the gym is currently Manual.
+
+        The RPC locks current gym mode and exact row state, clears approval
+        provenance, and demotes approved rows to pending. This ensures a
+        publish-boundary wording change cannot keep stale human approval.
+        A null result means the row/mode did not match and must be rechecked
+        through the separate Auto-only cleanup RPC or held.
+        """
+        payload = {"p_row_id": row_id, "p_gym_id": gym_id,
+                   "p_expected_status": expected_status,
+                   "p_expected_caption": expected_caption,
+                   "p_clean_caption": clean_caption}
+        r = self._client().post(
+            self._rest("rpc/calendar_patch_caption_manual_format"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json=payload, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise PortalStoreError(502, "manual caption formatting returned invalid rows")
+        return rows[0] if rows and isinstance(rows[0], dict) \
+            and str(rows[0].get("id")) == str(row_id) \
+            and rows[0].get("gym_id") == gym_id \
+            and rows[0].get("caption") == clean_caption \
+            and rows[0].get("status") == "pending" else None
+
     def patch_post_date(self, row_id, new_post_date):
         """RE-DATE one waiting row (expired-row self-heal, Blake 2026-08-31: no human
         should have to re-date dead posts). Moves post_date forward and CLEARS

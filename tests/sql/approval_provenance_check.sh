@@ -1,8 +1,9 @@
 #!/bin/bash
 # Disposable-Postgres check for migrations/calendar_approval_provenance_20261005.sql.
 # Spins up a throwaway cluster in $TMPDIR, builds a MINIMAL schema (only the
-# columns the migration's functions touch), applies the DRAFT migration, and
-# asserts the proof-gate contract. Destroys the cluster on exit. No live data.
+# columns the migrations' functions touch), applies the current main catchup
+# migrations BEFORE approval provenance, and asserts the composed claim and
+# proof-gate contract. Destroys the cluster on exit. No live data.
 # NOTE: needs an environment that permits Postgres shared memory (shmget) —
 # run it OUTSIDE the Codex sandbox (e.g. a maintainer shell with
 # PATH=/opt/homebrew/opt/postgresql@17/bin:$PATH).
@@ -38,6 +39,8 @@ create table content_calendar (
 SQL
 
 psql -h "$SOCK" -p 55444 -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
+  -f "$ROOT/migrations/lasso_bounded_catchup_capacity_20261005.sql" \
+  -f "$ROOT/migrations/lasso_immediate_backlog_capacity_20261005.sql" \
   -f "$ROOT/migrations/calendar_approval_provenance_20261005.sql"
 
 PASS=0; FAIL=0
@@ -169,9 +172,40 @@ q "update content_calendar set caption='clean body [why] rationale' where id='aa
 check "Auto cleanup uses exact caption CAS" "0" "$(q "select count(*) from calendar_patch_caption_autonomous_clean('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa13','$SWIFT','pending','stale caption','clean body')")"
 check "Auto cleanup persists clean caption" "1" "$(q "select count(*) from calendar_patch_caption_autonomous_clean('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa13','$SWIFT','pending','clean body [why] rationale','clean body')")"
 check "Auto cleanup clears proof" "t" "$(q "select approval_kind is null and approval_digest is null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa13'")"
+check "Manual formatter refuses current Auto mode" "0" "$(q "select count(*) from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa13','$SWIFT','pending','clean body','new body')")"
 q "update echo_gym_settings set autonomous=false where gym_id='$GYM_UUID'"
 mkrow 14 pending
 check "Manual flip blocks autonomous cleanup" "0" "$(q "select count(*) from calendar_patch_caption_autonomous_clean('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa14','$SWIFT','pending','caption 14','clean body')")"
+
+# The formatter may change copy only under definitive current Manual mode.
+# An approved row must return to pending and lose all old human proof; pending
+# rows remain pending. The exact caption/status CAS prevents a stale formatter
+# from overwriting another edit or resurrecting an old approval.
+mkrow 15 pending
+q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa15','$SWIFT')" >/dev/null
+D15="$(DIGEST_OF 15)"
+check "formatter fixture has human proof" "1" "$(q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa15','clerk-editor','$D15')")"
+check "Manual formatted approved row demotes" "1" "$(q "select count(*) from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa15','$SWIFT','approved','caption 15','clean caption 15')")"
+check "formatted row is pending with new caption" "pending|clean caption 15" "$(q "select status || '|' || caption from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa15'")"
+check "formatted row clears all proof" "t" "$(q "select approval_kind is null and approved_by is null and approved_at is null and approval_digest is null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa15'")"
+check "Manual formatter stale caption CAS rejects" "0" "$(q "select count(*) from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa15','$SWIFT','pending','caption 15','second edit')")"
+check "Manual formatter stale status CAS rejects" "0" "$(q "select count(*) from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa15','$SWIFT','approved','clean caption 15','second edit')")"
+mkrow 16 pending
+check "Manual formatted pending row remains pending" "pending" "$(q "select status from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa16','$SWIFT','pending','caption 16','clean caption 16')")"
+check "Manual formatter wrong gym rejects" "0" "$(q "select count(*) from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa16','othergym999999','pending','clean caption 16','wrong gym')")"
+
+mkrow 17 approved
+q "update content_calendar set publish_claim_token='33333333-3333-3333-3333-333333333333' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa17'"
+check "Manual formatter rejects claimed token" "0" "$(q "select count(*) from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa17','$SWIFT','approved','caption 17','changed')")"
+mkrow 18 approved
+q "update content_calendar set publish_reservation_day='2026-08-10' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa18'"
+check "Manual formatter rejects reserved row" "0" "$(q "select count(*) from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa18','$SWIFT','approved','caption 18','changed')")"
+mkrow 19 approved
+q "update content_calendar set published_at=now() where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa19'"
+check "Manual formatter rejects published row" "0" "$(q "select count(*) from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa19','$SWIFT','approved','caption 19','changed')")"
+mkrow 97 approved
+q "update content_calendar set variant_status='archived' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa97'"
+check "Manual formatter rejects inactive row" "0" "$(q "select count(*) from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa97','$SWIFT','approved','caption 97','changed')")"
 
 # A plausible six-hex suffix is not an account mapping.
 q "update echo_gym_settings set autonomous=true where gym_id='$GYM_UUID'"
@@ -181,6 +215,7 @@ check "arbitrary suffix cannot inherit autonomy" "" "$(q "select claim_calendar_
 q "select count(*) from approve_calendar_row_if_media_ready('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa11','swiftrivercrossfitabcdef')" >/dev/null
 D11="$(DIGEST_OF 11)"
 check "arbitrary suffix cannot receive human stamp" "0" "$(q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa11','clerk-user-1','$D11')")"
+check "Manual formatter rejects unresolved gym" "0" "$(q "select count(*) from calendar_patch_caption_manual_format('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa11','swiftrivercrossfitabcdef','approved','caption 11','changed')")"
 if q "insert into echo_intake_tokens values ('$OTHER_GYM','$SWIFT')" >/dev/null 2>&1; then
   check "duplicate account key rejected" "rejected" "inserted"
 else
@@ -424,6 +459,74 @@ check "capacity-three LASSO Story claim succeeds with proof flag off" "1" "$(q "
 q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
    values ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb02','lasso','approved','active','https://cdn/reel.jpg','instagram','reel','2026-08-10','unsupported')"
 check "capacity-three LASSO unsupported format is rejected" "" "$(q "select claim_calendar_publish_slot_owned('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbb02','lasso','2026-08-10','America/New_York',3,true,false)")"
+
+# Main migration order: bounded catchup -> immediate backlog -> approval.
+# The final defaulted seven-argument function is the sole RPC signature.
+check "owned claim has no ambiguous six-argument overload" "1" "$(q "select count(*) from pg_proc where pronamespace='public'::regnamespace and proname='claim_calendar_publish_slot_owned' and pronargs=7 and pronargdefaults=1")"
+check "owned claim six-argument signature was dropped" "0" "$(q "select count(*) from pg_proc where pronamespace='public'::regnamespace and proname='claim_calendar_publish_slot_owned' and pronargs=6")"
+
+LASSO_GYM_UUID="22222222-2222-2222-2222-222222222222"
+q "insert into gyms values ('$LASSO_GYM_UUID','lasso','LASSO')"
+q "insert into echo_intake_tokens values ('$LASSO_GYM_UUID','lasso')"
+q "insert into echo_gym_settings values ('$LASSO_GYM_UUID',false,'test')"
+CATCHUP_ROW() { # suffix, post_date, optional claim token, optional reservation day
+  q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption,publish_claim_token,publish_reservation_day)
+     values ('dddddddd-dddd-dddd-dddd-dddddddddd$1','lasso','approved','active','https://cdn/catchup-$1.jpg','instagram','feed',$2,'catchup $1',$3,$4)"
+}
+CATCHUP_CLAIM() { # suffix, day, capacity, proof flag, approved_only (default true)
+  q "select claim_calendar_publish_slot_owned('dddddddd-dddd-dddd-dddd-dddddddddd$1','lasso',$2,'America/New_York',$3,${5:-true},$4)"
+}
+
+CATCHUP_ROW 01 "'2026-10-02'" null null
+check "Oct 5 immediate backlog capacity 15 flag off" "1" "$([ -n "$(CATCHUP_CLAIM 01 "'2026-10-05'" 15 false)" ] && echo 1 || echo 0)"
+CATCHUP_ROW 02 "'2026-10-05'" null null
+check "Oct 6 immediate backlog capacity 15 flag off" "1" "$([ -n "$(CATCHUP_CLAIM 02 "'2026-10-06'" 15 false)" ] && echo 1 || echo 0)"
+CATCHUP_ROW 03 "'2026-10-03'" null null
+check "Oct 7 residual backlog capacity 5 flag off" "1" "$([ -n "$(CATCHUP_CLAIM 03 "'2026-10-07'" 5 false)" ] && echo 1 || echo 0)"
+CATCHUP_ROW 13 "'2026-10-04'" null null
+check "legacy six-argument call defaults proof OFF at capacity 15" "1" "$([ -n "$(q "select claim_calendar_publish_slot_owned('dddddddd-dddd-dddd-dddd-dddddddddd13','lasso','2026-10-06','America/New_York',15,true)")" ] && echo 1 || echo 0)"
+CATCHUP_ROW 04 "'2026-10-02'" null null
+check "capacity 15 outside Oct 5-6 rejects" "" "$(CATCHUP_CLAIM 04 "'2026-10-07'" 15 false)"
+check "capacity 5 before Oct 7 rejects" "" "$(CATCHUP_CLAIM 04 "'2026-10-06'" 5 false)"
+check "null capacity rejects" "" "$(CATCHUP_CLAIM 04 "'2026-10-05'" null false)"
+check "null approved_only rejects" "" "$(CATCHUP_CLAIM 04 "'2026-10-05'" 15 false null)"
+check "null day rejects" "" "$(CATCHUP_CLAIM 04 null 15 false)"
+check "null proof flag rejects" "" "$(CATCHUP_CLAIM 04 "'2026-10-05'" 15 null)"
+
+CATCHUP_ROW 05 "'2026-10-02'" null null
+check "Manual bare approved capacity 15 proof ON held" "" "$(CATCHUP_CLAIM 05 "'2026-10-05'" 15 true)"
+CATCHUP_ROW 06 "'2026-10-03'" null null
+check "Manual bare approved capacity 5 proof ON held" "" "$(CATCHUP_CLAIM 06 "'2026-10-07'" 5 true)"
+
+# Give these test rows current human proof so their refusal isolates the
+# inherited stale-token/reservation guards rather than the proof gate.
+CATCHUP_ROW 07 "'2026-10-02'" "'33333333-3333-3333-3333-333333333333'::uuid" null
+CATCHUP_ROW 08 "'2026-10-02'" null "'2026-10-04'"
+for ID in 07 08; do
+  q "update content_calendar set approval_digest=calendar_approval_digest(content_calendar.*) where id='dddddddd-dddd-dddd-dddd-dddddddddd$ID'"
+  D="$(q "select approval_digest from content_calendar where id='dddddddd-dddd-dddd-dddd-dddddddddd$ID'")"
+  check "catchup $ID human proof stamps" "1" "$(q "select count(*) from calendar_stamp_verified_approval('$LASSO_GYM_UUID','dddddddd-dddd-dddd-dddd-dddddddddd$ID','clerk-catchup','$D')")"
+done
+for ID in 09 10; do
+  if [ "$ID" = 09 ]; then CATCHUP_ROW "$ID" "'2026-10-03'" null null
+  else CATCHUP_ROW "$ID" "'2026-10-04'" null null; fi
+  q "update content_calendar set approval_digest=calendar_approval_digest(content_calendar.*) where id='dddddddd-dddd-dddd-dddd-dddddddddd$ID'"
+  D="$(q "select approval_digest from content_calendar where id='dddddddd-dddd-dddd-dddd-dddddddddd$ID'")"
+  check "catchup $ID fresh human proof stamps" "1" "$(q "select count(*) from calendar_stamp_verified_approval('$LASSO_GYM_UUID','dddddddd-dddd-dddd-dddd-dddddddddd$ID','clerk-catchup','$D')")"
+done
+check "Manual fresh human proof capacity 15 claims" "1" "$([ -n "$(CATCHUP_CLAIM 09 "'2026-10-05'" 15 true)" ] && echo 1 || echo 0)"
+check "Manual fresh human proof capacity 5 claims" "1" "$([ -n "$(CATCHUP_CLAIM 10 "'2026-10-07'" 5 true)" ] && echo 1 || echo 0)"
+for PROOF in false true; do
+  check "preexisting token held with proof $PROOF" "" "$(CATCHUP_CLAIM 07 "'2026-10-05'" 15 "$PROOF")"
+  check "preexisting reservation held with proof $PROOF" "" "$(CATCHUP_CLAIM 08 "'2026-10-07'" 5 "$PROOF")"
+done
+check "preexisting token remains unclaimed" "approved" "$(q "select status from content_calendar where id='dddddddd-dddd-dddd-dddd-dddddddddd07'")"
+check "preexisting reservation remains unchanged" "2026-10-04" "$(q "select publish_reservation_day from content_calendar where id='dddddddd-dddd-dddd-dddd-dddddddddd08'")"
+CATCHUP_ROW 11 null null null
+check "capacity 15 null post_date held" "" "$(CATCHUP_CLAIM 11 "'2026-10-05'" 15 false)"
+CATCHUP_ROW 12 "'2026-10-02'" null null
+q "update content_calendar set account=null where id='dddddddd-dddd-dddd-dddd-dddddddddd12'"
+check "capacity 15 null account held" "" "$(CATCHUP_CLAIM 12 "'2026-10-05'" 15 false)"
 
 
 # GBP uses a guarded claim with a returned creative, independent of IG/FB capacity.
