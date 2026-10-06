@@ -2517,14 +2517,17 @@ def test_fixer_readback_rejects_distinct_slack_text(intended, observed):
 
 
 def test_fixer_normalized_readback_still_requires_exact_post_timestamp_and_identity():
-    ts = "9.999"
+    not_before = datetime.now(timezone.utc).isoformat()
+    ts = str(datetime.now(timezone.utc).timestamp() + 1)
     intent = {"channel": "C_CLIENT", "thread_ts": "1.0", "sender": "U_ECHO_BOT",
               "body": "Details: https://example.com/fix & done",
-              "not_before": datetime.now(timezone.utc).isoformat()}
+              "not_before": not_before}
     message = {"ts": ts, "text": "Details: <https://example.com/fix> &amp; done",
                "user": "U_ECHO_BOT", "thread_ts": "1.0"}
+    expected_ts = ts
     def readback(channel, *, thread_ts=None, ts=None, oldest=None):
-        assert (channel, thread_ts, ts, oldest) == ("C_CLIENT", "1.0", "9.999", "9.999")
+        assert (channel, thread_ts, ts, oldest) == (
+            "C_CLIENT", "1.0", expected_ts, expected_ts)
         return {"ok": True, "channel": channel, "messages": [message]}
     proof, reason = OB._readback_fixer_message(readback, intent, ts=ts)
     assert not reason and proof["delivery_readback_ts"] == ts
@@ -2538,6 +2541,39 @@ def test_fixer_normalized_readback_still_requires_exact_post_timestamp_and_ident
     assert OB._readback_fixer_message(
         lambda channel, **kwargs: {"ok": True, "channel": "C_OTHER", "messages": [message]},
         intent, ts=ts)[0] is None
+
+
+def test_fixer_readback_rejects_identical_message_older_than_intent():
+    intent = {"channel": "C_CLIENT", "thread_ts": "1.0", "sender": "U_ECHO_BOT",
+              "body": "Details: issue fixed",
+              "not_before": "2026-10-06T12:00:00+00:00"}
+    old = {"ts": "1791287999.000000", "text": intent["body"],
+           "user": intent["sender"], "thread_ts": intent["thread_ts"]}
+    current = {**old, "ts": "1791288000.000000"}
+
+    def readback_for(message):
+        return lambda channel, **kwargs: {
+            "ok": True, "channel": channel, "messages": [message]}
+
+    assert OB._readback_fixer_message(
+        readback_for(old), intent, ts=old["ts"])[0] is None
+    proof, reason = OB._readback_fixer_message(
+        readback_for(current), intent, ts=current["ts"])
+    assert not reason and proof["delivery_readback_ts"] == current["ts"]
+
+
+@pytest.mark.parametrize("bad_ts", ["", "not-a-timestamp", "nan", "inf", "-inf"])
+def test_fixer_readback_rejects_unparseable_observed_timestamp(bad_ts):
+    intent = {"channel": "C_CLIENT", "thread_ts": "1.0", "sender": "U_ECHO_BOT",
+              "body": "Details: issue fixed",
+              "not_before": "2026-10-06T12:00:00+00:00"}
+    message = {"ts": bad_ts, "text": intent["body"],
+               "user": intent["sender"], "thread_ts": intent["thread_ts"]}
+    proof, _ = OB._readback_fixer_message(
+        lambda channel, **kwargs: {"ok": True, "channel": channel,
+                                   "messages": [message]},
+        intent, ts=bad_ts)
+    assert proof is None
 
 
 def test_fixer_normalized_readback_finishes_once_without_resend(monkeypatch):
