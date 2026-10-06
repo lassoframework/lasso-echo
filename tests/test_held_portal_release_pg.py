@@ -38,7 +38,7 @@ def main(portal):
               create role service_role nologin bypassrls;
               create schema auth;
               create function auth.jwt() returns jsonb language sql stable
-                as $$ select '{}'::jsonb $$;
+                as $$ select '{"sub":"fixture-client"}'::jsonb $$;
               create table public.app_users(id uuid primary key, clerk_user_id text);
               create table public.gym_assignments(gym_id uuid, app_user_id uuid);
               create table public.support_tickets(
@@ -64,10 +64,19 @@ def main(portal):
               grant usage on schema public to service_role;
               grant select,insert,update on public.support_messages to service_role;
               grant select on public.support_tickets to service_role;
+              grant usage on schema public,auth to authenticated;
+              grant select on public.support_messages,public.support_tickets,
+                public.app_users,public.gym_assignments to authenticated;
+              create policy fixture_client_tickets on public.support_tickets
+                for select to authenticated using (
+                  client_id in (select ga.gym_id::text from public.gym_assignments ga
+                    join public.app_users u on u.id=ga.app_user_id
+                    where u.clerk_user_id=auth.jwt()->>'sub'));
             ''')
             for name in ('0381_fixer_client_resolution_delivery_guard.sql',
                          '0382_fixer_delivery_resolution_predecessor.sql',
-                         '0383_fixer_held_delivery_release.sql'):
+                         '0383_fixer_held_delivery_release.sql',
+                         '0310_support_messages_client_visibility.sql'):
                 run(psql + ['-f', str(portal / 'supabase/migrations' / name)])
             fixture = Path(__file__).with_name('held_portal_release.verify.sql')
             run(psql + ['-f', str(fixture)])
