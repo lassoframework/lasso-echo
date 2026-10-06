@@ -149,6 +149,7 @@ def _armed(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     monkeypatch.setenv("AGENT_PORTAL_ECHO_TICKETS_ENABLED", "true")
+    monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO_BOT")
 
 
 # Classified answerable_question by the deterministic rules, and carrying a third party.
@@ -300,6 +301,8 @@ def test_outbox_delivers_grounded_fixer_answer_without_inventing_a_code_release(
                     member_check=lambda channel, user: True,
                     log=lambda *a: None)
     assert bus.message(mid)["delivery_status"] == "posted"
+    assert bus.message(mid)["attachments"]["delivery_readback_verified"] is True
+    assert bus.message(mid)["attachments"]["delivery_readback_channel"] == "G0MPIM"
     assert s["posted"] == 1 and s["suppressed"] == 0
     assert any(c["channel"] == "G0MPIM" for c in calls)
     assert any(f"<@{config.APPROVER_SLACK_ID}>" in c["text"] for c in calls)
@@ -514,6 +517,7 @@ def test_outbox_fixer_promise_waits_for_deployed_fix(monkeypatch):
                 member_check=lambda channel, user: True,
                 log=lambda *a: None)
     assert bus2.message(mid2)["delivery_status"] == "posted"
+    assert bus2.message(mid2)["attachments"]["delivery_readback_sender"] == "U_ECHO_BOT"
     assert any(f"<@{config.APPROVER_SLACK_ID}>" in c["text"] for c in calls)
     assert bus2.tickets[tid2]["status"] == "resolved"
 

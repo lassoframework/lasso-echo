@@ -62,6 +62,45 @@ def test_update_card_swallows_transport_error():
     assert resp.get("ok") is False
 
 
+def test_slack_readback_uses_exact_thread_boundary_and_requires_complete_pages():
+    calls = []
+
+    class Resp:
+        status_code = 200
+        headers = {}
+
+        def __init__(self, body):
+            self.body = body
+
+        def json(self):
+            return self.body
+
+    class Http:
+        def get(self, url, **kw):
+            calls.append((url, kw["params"]))
+            if len(calls) == 1:
+                return Resp({"ok": True, "messages": [{"ts": "2.0"}],
+                             "has_more": True,
+                             "response_metadata": {"next_cursor": "next"}})
+            return Resp({"ok": True, "messages": [{"ts": "3.0"}],
+                         "has_more": False,
+                         "response_metadata": {"next_cursor": ""}})
+
+    poster = SlackPoster(http=Http(), token="xoxb-test")
+    found = poster.read_conversation_messages(
+        "C_CLIENT", thread_ts="1.0", oldest="1.5")
+    assert found == {"ok": True, "channel": "C_CLIENT",
+                     "messages": [{"ts": "2.0"}, {"ts": "3.0"}]}
+    assert calls[0][0].endswith("/conversations.replies")
+    assert calls[0][1]["channel"] == "C_CLIENT"
+    assert calls[0][1]["ts"] == "1.0"
+    assert calls[0][1]["oldest"] == "1.5"
+    assert calls[1][1]["cursor"] == "next"
+    calls.clear()
+    assert poster.read_conversation_messages(
+        "C_CLIENT", ts="3.0", max_pages=1)["ok"] is False
+
+
 def test_stdlib_adapter_constructs_and_posts():
     """_requests() returns a stdlib urllib adapter with no external deps.
     Verify it instantiates cleanly and provides the .post() interface — the

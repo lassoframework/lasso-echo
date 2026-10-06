@@ -1,3 +1,8 @@
+## FIXER Slack completion readback (2026-10-06, PR #301)
+
+- [~] Echo's FIXER completion readback now accepts only documented Slack mrkdwn storage forms for the exact intended text: bare HTTP(S) URLs wrapped as links and literal `&`, `<`, `>` encoded as entities. The posted-response timestamp, channel, thread and Echo sender still have to match; unknown or different content remains held without resend. Local targeted checks passed; merge, deployment and live readback remain pending.
+- [ ] Fresh exact-head Ultra Review and release verification remain with the integration owner.
+
 ## Exact delivered-media repeat hold (2026-10-04)
 
 - [~] The nightly repeat sweep has a default-OFF `AGENT_MEDIA_REPEAT_SWEEP_HOLD` lane. After its existing replacement attempt, a complete tenant-scoped reread finds identical delivered image URLs on different dates across Instagram, Facebook and Google Business. A strict before-image CAS adds only `media_not_ready_reason` to future non-owner pending or approved rows. Same-day siblings and published, claimed, scheduled or changed rows stay untouched.
