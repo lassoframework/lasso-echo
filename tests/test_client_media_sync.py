@@ -268,7 +268,12 @@ def test_sync_backfills_existing_media_burst_metadata_without_redownload_or_clob
     side_path = os.path.join(lib, "20261001T120000Z_IMG_1001.json")
     with open(side_path, "w", encoding="utf-8") as fh:
         json.dump({"approved": True, "moderation": "clean", "note": "keep me",
-                   "custom_review_field": {"owner": "Blake"}}, fh)
+                   "custom_review_field": {"owner": "Blake"},
+                   # A corrupt half-record must be replaced as one trusted group,
+                   # never preserved and combined with the missing sequence.
+                   "intake_batch_timestamp": "not-a-date",
+                   "intake_batch_position": "0",
+                   "intake_camera_family": "arbitrary family!"}, fh)
 
     out = cms.sync_uploads("nine7", r2=r2)
 
@@ -286,6 +291,23 @@ def test_sync_backfills_existing_media_burst_metadata_without_redownload_or_clob
     before = dict(side)
     cms.sync_uploads("nine7", r2=r2)
     assert json.load(open(side_path)) == before
+
+
+def test_sync_rejects_non_date_manifest_metadata_for_existing_media():
+    name = "20261001T120000Z_IMG_1001.jpg"
+    r2 = FakeR2({
+        f"intake/nine7/incoming/{name}": b"remote",
+        "intake/nine7/incoming/20261001T120000Z_upload.json": json.dumps({
+            "timestamp": "20260230T120000Z", "filenames": [name],
+        }).encode(),
+    })
+    lib = os.path.join("content_library", "nine7")
+    os.makedirs(lib, exist_ok=True)
+    open(os.path.join(lib, name), "wb").write(b"existing")
+
+    assert cms.sync_uploads("nine7", r2=r2) == {"synced": 0, "skipped": 1}
+    assert not os.path.exists(os.path.join(
+        lib, "20261001T120000Z_IMG_1001.json"))
 
 
 def test_sync_ignores_non_media_and_sidecars():
@@ -566,7 +588,10 @@ def test_sync_hosted_media_backfills_existing_local_metadata_without_redownload(
     side_path = os.path.join(lib, os.path.splitext(local_name)[0] + ".json")
     with open(side_path, "w", encoding="utf-8") as fh:
         json.dump({"public_url": "https://keep.example/photo.jpg",
-                   "approved": True, "review": "human-note"}, fh)
+                   "approved": True, "review": "human-note",
+                   "intake_batch_timestamp": "20261001T120000Z",
+                   "intake_batch_position": -1,
+                   "intake_camera_sequence": "999"}, fh)
 
     out = cms.sync_hosted_media("nine7", r2=r2)
 
@@ -579,6 +604,27 @@ def test_sync_hosted_media_backfills_existing_local_metadata_without_redownload(
         "dscn", 999)
     assert side["public_url"] == "https://keep.example/photo.jpg"
     assert side["approved"] is True and side["review"] == "human-note"
+
+
+def test_sync_hosted_media_rejects_invalid_manifest_metadata():
+    filename = "20261001T120000Z_DSCN0999.jpg"
+    hosted_key = f"echo/nine7/1111222233334444/{filename}"
+    r2 = FakeR2({
+        hosted_key: b"hosted",
+        "intake/nine7/incoming/20261001T120000Z_upload.json": json.dumps({
+            "timestamp": "not-a-date", "filenames": [filename],
+        }).encode(),
+    })
+    lib = os.path.join("content_library", "nine7")
+    os.makedirs(lib, exist_ok=True)
+    local_name = f"1111222233334444_{filename}"
+    open(os.path.join(lib, local_name), "wb").write(b"existing")
+
+    assert cms.sync_hosted_media("nine7", r2=r2) == {
+        "recovered": 0, "skipped": 1,
+    }
+    assert not os.path.exists(os.path.join(
+        lib, os.path.splitext(local_name)[0] + ".json"))
 
 
 def test_sync_hosted_media_disambiguates_same_basename_across_shoots():

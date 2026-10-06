@@ -708,13 +708,18 @@ def _read_intake_sequences(r2, prefixes, keys=None):
             data = _load_json_cached(r2, key)
             if not isinstance(data, dict):
                 continue
-            stamp = str(data.get("timestamp") or "").strip()
+            stamp = burst_spacing.normalize_batch_timestamp(data.get("timestamp"))
+            sidecar_stamp = burst_spacing.normalize_batch_timestamp(
+                os.path.basename(key)[:-len(_UPLOAD_SIDECAR_SUFFIX)])
             filenames = data.get("filenames") or []
-            if not stamp or not isinstance(filenames, list):
+            if (not stamp or stamp != sidecar_stamp
+                    or not isinstance(filenames, list)):
                 continue
             for position, filename in enumerate(filenames):
+                if position > burst_spacing.MAX_BATCH_POSITION:
+                    break
                 name = os.path.basename(str(filename or ""))
-                if not name:
+                if not name.startswith(stamp + "_"):
                     continue
                 metadata = {
                     "intake_batch_timestamp": stamp,
@@ -725,6 +730,9 @@ def _read_intake_sequences(r2, prefixes, keys=None):
                     family, sequence = parsed
                     metadata["intake_camera_family"] = family
                     metadata["intake_camera_sequence"] = sequence
+                metadata = burst_spacing.normalize_intake_metadata(metadata)
+                if metadata is None:
+                    continue
                 normalized_name = unicodedata.normalize("NFC", name).casefold()
                 normalized_stem = os.path.splitext(normalized_name)[0]
                 records[normalized_stem].append((normalized_name, metadata))
@@ -757,11 +765,13 @@ def _intake_sequence_for(index, media_name):
 def _merge_intake_metadata(lib_dir, media_name, intake_sequence, log):
     """Backfill only missing trusted intake fields on an existing local asset.
 
-    Existing media bytes are never opened or downloaded. Existing sidecar
-    values, including moderation, approval, notes, URLs and prior intake facts,
-    always win. An unreadable sidecar fails closed instead of being replaced.
+    Existing media bytes are never opened or downloaded. Unrelated sidecar
+    values, including moderation, approval, notes and URLs, always win. The
+    bounded intake-owned group is replaced only from the exact trusted manifest.
+    An unreadable sidecar fails closed instead of being replaced.
     """
-    if not intake_sequence:
+    trusted = burst_spacing.normalize_intake_metadata(intake_sequence)
+    if trusted is None:
         return False
     stem = os.path.splitext(media_name)[0]
     side_path = os.path.join(lib_dir, stem + ".json")
@@ -778,9 +788,15 @@ def _merge_intake_metadata(lib_dir, media_name, intake_sequence, log):
             log(f"{media_name}: intake metadata backfill skipped: invalid sidecar")
             return False
     payload = dict(existing)
-    for key, value in intake_sequence.items():
-        if key.startswith("intake_"):
-            payload.setdefault(key, value)
+    current = {key: payload[key] for key in burst_spacing.INTAKE_METADATA_FIELDS
+               if key in payload}
+    # The exact current upload manifest is authoritative for intake-owned fields.
+    # Replace the whole bounded group when it is incomplete, corrupt or conflicts;
+    # never preserve a bad half-record and fill only its missing half.
+    if burst_spacing.normalize_intake_metadata(current) != trusted:
+        for key in burst_spacing.INTAKE_METADATA_FIELDS:
+            payload.pop(key, None)
+        payload.update(trusted)
     if payload == existing:
         return False
     try:
@@ -826,8 +842,16 @@ def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
         payload["note"] = caption
     if client_context and not payload.get("client_context"):
         payload["client_context"] = client_context
-    for key, value in (intake_sequence or {}).items():
-        payload.setdefault(key, value)
+    trusted_intake = burst_spacing.normalize_intake_metadata(intake_sequence)
+    if trusted_intake is not None:
+        current_intake = {
+            key: payload[key] for key in burst_spacing.INTAKE_METADATA_FIELDS
+            if key in payload
+        }
+        if burst_spacing.normalize_intake_metadata(current_intake) != trusted_intake:
+            for key in burst_spacing.INTAKE_METADATA_FIELDS:
+                payload.pop(key, None)
+            payload.update(trusted_intake)
     # Stable source-byte identity. SHA-256 is authoritative; weaker/legacy
     # digests survive only in an explicit alias list, never in the authority
     # slot. Unknown source remains absent rather than being inferred from a key.

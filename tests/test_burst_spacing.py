@@ -2,6 +2,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import burst_spacing  # noqa: E402
@@ -248,7 +250,7 @@ def test_unchanged_cohort_map_is_cached_and_invalidates_on_sidecar_edit(
     with open(dam.sidecar_path(photo.path), "w", encoding="utf-8") as fh:
         json.dump({"intake_batch_position": 7,
                    "cache_invalidator": "different-size"}, fh)
-    assert burst_spacing.cohort_map([photo]) == first
+    assert burst_spacing.cohort_map([photo]) == {}
     assert reads == [photo.path, photo.path]
 
 
@@ -282,3 +284,47 @@ def test_batch_position_is_deterministic_within_selected_cohort(tmp_path, monkey
         photos, photos, served, "nine7_ig", "2026-10-10")
 
     assert chosen[:2] == photos[:2]
+
+
+@pytest.mark.parametrize("updates", [
+    {"intake_batch_timestamp": "20261301T120000Z"},
+    {"intake_camera_family": "people!"},
+    {"intake_camera_sequence": -1},
+    {"intake_camera_sequence": "1001"},
+    {"intake_camera_sequence": 100_000_000},
+    {"intake_batch_position": -1},
+    {"intake_batch_position": "0"},
+    {"intake_batch_position": burst_spacing.MAX_BATCH_POSITION + 1},
+])
+def test_corrupt_intake_metadata_is_unknown(tmp_path, updates):
+    photo = _photo(tmp_path, "20261001T120000Z", 1001)
+    from agent import dam
+    metadata = {
+        "intake_batch_timestamp": "20261001T120000Z",
+        "intake_batch_position": 0,
+        "intake_camera_family": "img",
+        "intake_camera_sequence": 1001,
+        **updates,
+    }
+    dam.write_sidecar(photo.path, metadata)
+
+    assert burst_spacing.cohort_map([photo]) == {}
+
+
+def test_corrupt_member_forces_all_or_nothing_legacy_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BURST_SPACING_GYMS", "nine7")
+    photos = [
+        _photo(tmp_path, "20261001T120000Z", 1001),
+        _photo(tmp_path, "20261002T120000Z", 2001),
+        _photo(tmp_path, "20261003T120000Z", 3001),
+    ]
+    from agent import dam
+    dam.write_sidecar(photos[-1].path, {
+        "intake_batch_timestamp": "not-a-date",
+        "intake_batch_position": 0,
+        "intake_camera_family": "img",
+        "intake_camera_sequence": 3001,
+    })
+
+    assert burst_spacing.choose_spaced_pool(
+        photos, photos, {}, "nine7_ig", "2026-10-10") == photos

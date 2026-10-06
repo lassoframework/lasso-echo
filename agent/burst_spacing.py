@@ -14,6 +14,7 @@ library fallback.
 import os
 import re
 from collections import defaultdict
+from datetime import datetime
 from functools import lru_cache
 
 from . import config, dam
@@ -31,6 +32,62 @@ _COMPACT_CAMERA_SEQUENCE_RE = re.compile(
     re.IGNORECASE,
 )
 _MAX_SEQUENCE_GAP = 4
+_MAX_CAMERA_SEQUENCE = 99_999_999
+MAX_BATCH_POSITION = 1_000_000
+_CAMERA_FAMILY_RE = re.compile(r"[a-z][a-z0-9]{0,11}\Z")
+INTAKE_METADATA_FIELDS = (
+    "intake_batch_timestamp", "intake_batch_position",
+    "intake_camera_family", "intake_camera_sequence",
+)
+
+
+def normalize_batch_timestamp(value):
+    """Return the canonical portal timestamp, or ``None`` when it is not real."""
+    if not isinstance(value, str):
+        return None
+    stamp = value.strip()
+    if not re.fullmatch(r"\d{8}T\d{6}Z", stamp):
+        return None
+    try:
+        parsed = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ")
+    except ValueError:
+        return None
+    return parsed.strftime("%Y%m%dT%H%M%SZ")
+
+
+def normalize_intake_metadata(values):
+    """Validate one complete persisted intake-metadata record.
+
+    Batch timestamp and upload position are mandatory. Camera family/sequence
+    are optional as a pair, but a partial or malformed pair invalidates the
+    whole record so corrupt fields cannot be combined with filename fallback.
+    """
+    if not isinstance(values, dict):
+        return None
+    batch = normalize_batch_timestamp(values.get("intake_batch_timestamp"))
+    position = values.get("intake_batch_position")
+    if (batch is None or type(position) is not int
+            or not 0 <= position <= MAX_BATCH_POSITION):
+        return None
+    family_present = "intake_camera_family" in values
+    sequence_present = "intake_camera_sequence" in values
+    if family_present != sequence_present:
+        return None
+    normalized = {
+        "intake_batch_timestamp": batch,
+        "intake_batch_position": position,
+    }
+    if family_present:
+        family = values.get("intake_camera_family")
+        sequence = values.get("intake_camera_sequence")
+        if (not isinstance(family, str) or family != family.strip().lower()
+                or not _CAMERA_FAMILY_RE.fullmatch(family)
+                or type(sequence) is not int
+                or not 0 <= sequence <= _MAX_CAMERA_SEQUENCE):
+            return None
+        normalized["intake_camera_family"] = family
+        normalized["intake_camera_sequence"] = sequence
+    return normalized
 
 
 def parse_camera_sequence(value):
@@ -68,18 +125,17 @@ def _sidecar_signature(path):
 def _metadata_cached(path, sidecar_signature):
     """Return an intake batch plus conservative camera sequence metadata."""
     side = dam.read_sidecar(path)
-    batch = str(side.get("intake_batch_timestamp") or "").strip()
-    family = str(side.get("intake_camera_family") or "").strip().lower()
-    sequence = side.get("intake_camera_sequence")
-    position = side.get("intake_batch_position")
-    try:
-        sequence = int(sequence) if sequence is not None else None
-    except (TypeError, ValueError):
-        sequence = None
-    try:
-        position = int(position) if position is not None else None
-    except (TypeError, ValueError):
-        position = None
+    has_intake_metadata = any(key in side for key in INTAKE_METADATA_FIELDS)
+    if has_intake_metadata:
+        trusted = normalize_intake_metadata(side)
+        if trusted is None:
+            return None
+        batch = trusted["intake_batch_timestamp"]
+        position = trusted["intake_batch_position"]
+        family = trusted.get("intake_camera_family", "")
+        sequence = trusted.get("intake_camera_sequence")
+    else:
+        batch, family, sequence, position = "", "", None, None
 
     source_names = (
         side.get("original_key"), side.get("current_key"),
