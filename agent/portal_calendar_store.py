@@ -2339,8 +2339,11 @@ class SupabaseCalendarStore:
                 raise PortalStoreError(502, "calendar claim returned invalid locked creative")
             claimed = token["row"]
             required = ("id", "gym_id", "status", "publish_claim_token",
-                        "account", "format", "post_date", "caption", "image_url",
-                        "source_media_asset_id", "source_media_url")
+                        "account", "format", "post_date", "caption", "image_url")
+            # These fields are optional in supported legacy schemas; to_jsonb
+            # omits them when the underlying columns do not exist.
+            claimed.setdefault("source_media_asset_id", None)
+            claimed.setdefault("source_media_url", None)
             if (any(k not in claimed for k in required)
                     or str(claimed["id"]) != str(row_id)
                     or claimed["gym_id"] != gym_id
