@@ -93,3 +93,27 @@ def test_legacy_picker_spaces_bursts_with_vision_disabled(tmp_path, monkeypatch)
     assert first is not None and second is not None
     assert os.path.basename(first.path).split("_IMG_")[0] != (
         os.path.basename(second.path).split("_IMG_")[0])
+
+
+def test_real_picker_preserves_unknown_asset_in_mixed_cohort_library(
+        tmp_path, monkeypatch):
+    _photo(tmp_path, "20261001T120000Z", 1001)
+    _photo(tmp_path, "20261002T120000Z", 2001)
+    legacy = tmp_path / "000_legacy_team.jpg"
+    legacy.write_bytes(b"legacy-photo")
+    served = {"nine7_ig": []}
+    monkeypatch.setattr(config, "vision_enabled_for", lambda _account: False)
+    monkeypatch.setattr(rotation, "load_served_strict", lambda: served)
+    monkeypatch.setattr(rotation, "load_served", lambda: served)
+    monkeypatch.setattr(
+        rotation, "globally_available_local_paths",
+        lambda _account, paths: set(paths),
+    )
+    from agent import media_bridge
+    monkeypatch.setattr(media_bridge, "enabled", lambda: False)
+
+    picked = client_content.pick_image(
+        "nine7_ig", "2026-10-10", str(tmp_path), prefer_photos=True)
+
+    assert picked is not None
+    assert picked.path == str(legacy)

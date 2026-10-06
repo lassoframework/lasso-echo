@@ -106,6 +106,11 @@ def choose_spaced_pool(pool, catalog, served, account_key, day_key):
     if len(pool) < 2 or any(getattr(c, "media_type", "") != "image" for c in pool):
         return pool
     cohorts = cohort_map(catalog)
+    # Fail open to the legacy picker when even one eligible candidate cannot be
+    # placed in a trustworthy intake cohort. Filtering only the known paths would
+    # silently starve legacy media in an otherwise cohort-rich mixed library.
+    if any(c.path not in cohorts for c in pool):
+        return pool
     available = sorted({cohorts.get(c.path) for c in pool if cohorts.get(c.path)})
     if len(available) < 2:
         return pool
