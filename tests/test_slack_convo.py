@@ -229,8 +229,8 @@ class FakeBus:
                         "claimed_at": claimed_at,
                         "fixer_slack_delivery_protocol": protocol,
                     }
-                    return True
-        return False
+                    return dict(m)
+        return None
 
     def requeue_unattempted_fixer_delivery(self, mid, protocol, recovered_at):
         with self._atomic_lock:
@@ -308,12 +308,19 @@ class FakeBus:
             return None
         return self.mark_message(mid, row["delivery_status"], slack_ts=slack_ts)
 
-    def prepare_fixer_delivery(self, mid, intent):
-        if (self.message(mid) or {}).get("delivery_status") != "posting":
-            return None
-        return self.mark_message(mid, "posting", meta_update={
-            "fixer_slack_delivery_intent": intent,
-            "claimed_at": intent.get("not_before") or intent["claimed_at"]})
+    def prepare_fixer_delivery(self, mid, intent, *, expected_attachments):
+        with self._atomic_lock:
+            row = next((m for m in self.msgs if m["id"] == mid), None)
+            if (not row or row.get("delivery_status") != "posting"
+                    or row.get("slack_ts") is not None
+                    or (row.get("attachments") or {}) != expected_attachments):
+                return None
+            row["attachments"] = {
+                **expected_attachments,
+                "fixer_slack_delivery_intent": dict(intent),
+                "claimed_at": intent.get("not_before") or intent["claimed_at"],
+            }
+            return dict(row)
 
     def hold_uncertain_fixer_delivery(self, mid, reason):
         row = self.message(mid)
@@ -2564,9 +2571,10 @@ def test_fixer_prepare_windows_recheck_current_request_before_client_post(
     original_prepare = bus.prepare_fixer_delivery
     preparations = 0
 
-    def prepare(mid, intent):
+    def prepare(mid, intent, *, expected_attachments):
         nonlocal preparations
-        result = original_prepare(mid, intent)
+        result = original_prepare(
+            mid, intent, expected_attachments=expected_attachments)
         preparations += 1
         if preparations == prepare_number:
             if change == "correction":
@@ -2587,6 +2595,102 @@ def test_fixer_prepare_windows_recheck_current_request_before_client_post(
     assert bus.message(row["id"])["delivery_status"] == "suppressed"
     assert bus.ticket(tid)["status"] == "verification"
     assert not any(call["channel"] == "C_CLIENT" for call in calls)
+
+
+def test_fixer_prepare_cas_accepts_same_claimant_and_rejects_attachment_mutation(
+        monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, _tid, row, request_key = _grounded_fixer_answer_case()
+    claimed = OB._claim(bus, row, lambda *_: None)
+    assert claimed["delivery_status"] == "posting"
+    claim_att = dict(claimed["attachments"])
+    assert claim_att["fixer_slack_delivery_protocol"] == OB.FIXER_DELIVERY_PROTOCOL
+    assert claim_att["claimed_at"]
+    intent = {
+        "channel": "C_CLIENT", "thread_ts": "1.0", "body": "body",
+        "sender": "U_ECHO_BOT", "claimed_at": datetime.now(timezone.utc).isoformat(),
+        "request_key": request_key, "request_version": 1,
+    }
+
+    prepared = bus.prepare_fixer_delivery(
+        row["id"], intent, expected_attachments=claim_att)
+    assert prepared["attachments"]["fixer_slack_delivery_intent"] == intent
+
+    bus2, _tid2, row2, request_key2 = _grounded_fixer_answer_case()
+    claimed2 = OB._claim(bus2, row2, lambda *_: None)
+    bus2.mark_message(row2["id"], "posting", meta_update={"concurrent_edit": True})
+    intent2 = {**intent, "request_key": request_key2}
+    assert bus2.prepare_fixer_delivery(
+        row2["id"], intent2,
+        expected_attachments=claimed2["attachments"]) is None
+    current = bus2.message(row2["id"])
+    assert current["attachments"]["concurrent_edit"] is True
+    assert current["attachments"].get("fixer_slack_delivery_intent") is None
+
+
+def test_production_fixer_prepare_matches_exact_claim_snapshot(monkeypatch):
+    bus = Bus(url="https://db.example", service_key="test")
+    expected = {
+        "identity": "echo", "fixer": True,
+        "fixer_slack_delivery_protocol": OB.FIXER_DELIVERY_PROTOCOL,
+        "claimed_at": "2026-10-06T12:00:00+00:00",
+    }
+    intent = {
+        "channel": "C_CLIENT", "thread_ts": "1.0", "body": "body",
+        "sender": "U_ECHO_BOT", "claimed_at": "2026-10-06T12:00:01+00:00",
+    }
+    observed = {}
+
+    def patch(table, match, fields):
+        observed.update(table=table, match=match, fields=fields)
+        return {"delivery_status": "posting", **fields}
+
+    monkeypatch.setattr(bus, "_patch", patch)
+    bus.prepare_fixer_delivery(
+        "message-id", intent, expected_attachments=expected)
+
+    assert observed["match"]["delivery_status"] == "eq.posting"
+    assert observed["match"]["slack_ts"] == "is.null"
+    assert json.loads(observed["match"]["attachments"][3:]) == expected
+    assert observed["fields"]["attachments"]["fixer_slack_delivery_intent"] == intent
+
+
+def test_stale_fixer_claimant_cannot_overwrite_reclaimer_intent_or_duplicate_post(
+        monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _request_key = _grounded_fixer_answer_case()
+    post, calls = _posted()
+    original_prepare = bus.prepare_fixer_delivery
+    raced = False
+    worker_b = None
+
+    def prepare(mid, intent, *, expected_attachments):
+        nonlocal raced, worker_b
+        if not raced:
+            raced = True
+            future = (datetime.now(timezone.utc)
+                      + timedelta(seconds=OB.CLAIM_TIMEOUT_SECONDS + 5))
+            worker_b = OB.run_once(
+                bus, post, identity=IDS.get("echo"), now=future,
+                member_check=lambda *_: True, log=lambda *_: None)
+        return original_prepare(
+            mid, intent, expected_attachments=expected_attachments)
+
+    monkeypatch.setattr(bus, "prepare_fixer_delivery", prepare)
+    worker_a = OB.run_once(
+        bus, post, identity=IDS.get("echo"),
+        member_check=lambda *_: True, log=lambda *_: None)
+
+    delivered = bus.message(row["id"])
+    assert worker_b["reclaimed"] == 1
+    assert worker_b["requeued_ready"] == 1
+    assert worker_b["quarantined_held"] == worker_b["reconciled_posted"] == 0
+    assert worker_b["posted"] == worker_b["resolved"] == 1
+    assert worker_a["posted"] == worker_a["resolved"] == 0
+    assert delivered["delivery_status"] == "posted"
+    assert delivered["attachments"]["delivery_readback_verified"] is True
+    assert bus.ticket(tid)["status"] == "resolved"
+    assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
 
 
 def test_fixer_readback_mismatch_never_posts_or_resolves_and_never_resends(monkeypatch):
@@ -2728,7 +2832,7 @@ def test_modern_fixer_crash_after_claim_before_intent_requeues_once_and_delivers
         monkeypatch):
     _arm_grounded_fixer(monkeypatch)
     bus, tid, row, _ = _grounded_fixer_answer_case()
-    assert OB._claim(bus, row, lambda *_: None) is True
+    assert OB._claim(bus, row, lambda *_: None)
     claimed = bus.message(row["id"])
     assert claimed["attachments"]["fixer_slack_delivery_protocol"] == (
         OB.FIXER_DELIVERY_PROTOCOL)
@@ -2808,7 +2912,10 @@ def test_fixer_crash_before_post_never_claims_identical_other_echo_reply(
               "sender": "U_ECHO_BOT", "claimed_at": claimed.isoformat(),
               "not_before": (claimed + timedelta(seconds=1)).isoformat(),
               "request_key": key, "request_version": bus.ticket(tid)["request_version"]}
-    bus.prepare_fixer_delivery(row["id"], intent)
+    claimed_row = bus.message(row["id"])
+    bus.prepare_fixer_delivery(
+        row["id"], intent,
+        expected_attachments=claimed_row["attachments"])
     sent = []
 
     def post(channel, text, thread_ts=None, blocks=None):

@@ -559,7 +559,7 @@ class Bus:
                             "eq." + json.dumps(snapshot, separators=(",", ":"),
                                                sort_keys=True)),
         }, {"delivery_status": "posting", "attachments": next_att})
-        return bool(changed)
+        return changed
 
     def requeue_unattempted_fixer_delivery(self, message_id, protocol, recovered_at):
         """CAS a stale modern pre-intent claim back to ready; Slack was not called."""
@@ -738,16 +738,18 @@ class Bus:
                 return changed
         return None
 
-    def prepare_fixer_delivery(self, message_id, intent):
-        """Persist exact delivery intent only while this worker still owns posting."""
-        row = self.message(message_id)
-        if not row or row.get("delivery_status") != "posting":
+    def prepare_fixer_delivery(self, message_id, intent, *, expected_attachments):
+        """Persist intent only while the exact claimant snapshot still owns posting."""
+        if not isinstance(expected_attachments, dict):
             return None
-        att = {**(row.get("attachments") or {}),
-               "fixer_slack_delivery_intent": intent,
+        snapshot = dict(expected_attachments)
+        att = {**snapshot, "fixer_slack_delivery_intent": intent,
                "claimed_at": intent.get("not_before") or intent["claimed_at"]}
         return self._patch(_MESSAGES, {
             "id": f"eq.{message_id}", "delivery_status": "eq.posting",
+            "slack_ts": "is.null",
+            "attachments": "eq." + json.dumps(
+                snapshot, separators=(",", ":"), sort_keys=True),
         }, {"attachments": att})
 
     def hold_uncertain_fixer_delivery(self, message_id, reason):

@@ -977,18 +977,31 @@ def _claim(bus, row, log):
         else:
             claimed = bus.claim_message(row["id"])
         if not claimed:
-            return False
+            return None
     except AttributeError:
         return True  # a bus without claim support (older fakes): best effort, no CAS
     except Exception as e:  # noqa: BLE001
         log(f"[slack-convo/outbox] claim failed for row {row['id']}: {type(e).__name__}")
-        return False
+        return None
     if not (_fixer_client_row(row) and callable(modern_claim)):
         try:
             bus.mark_message(row["id"], "posting", meta_update={"claimed_at": claimed_at})
         except Exception:  # noqa: BLE001 - legacy/non-FIXER best-effort stamp
             pass
-    return True
+    if isinstance(claimed, dict):
+        return claimed
+    try:
+        current = bus.message(row["id"])
+    except Exception:  # noqa: BLE001 - compatibility adapters may not expose message()
+        return True
+    if _fixer_client_row(row) and callable(modern_claim):
+        current_att = (current or {}).get("attachments") or {}
+        if (not current or current.get("delivery_status") != "posting"
+                or current_att.get("fixer_slack_delivery_protocol")
+                != FIXER_DELIVERY_PROTOCOL
+                or current_att.get("claimed_at") != claimed_at):
+            return None
+    return current or True
 
 
 def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=None):
@@ -1013,6 +1026,11 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
     except Exception:  # noqa: BLE001
         return 0
     n = 0
+
+    def count(outcome):
+        if isinstance(summary, dict):
+            summary[outcome] = int(summary.get(outcome) or 0) + 1
+
     for row in stuck:
         if _age_seconds(row, now) < CLAIM_TIMEOUT_SECONDS:
             continue  # plausibly still in flight; do not steal it
@@ -1029,16 +1047,22 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
                                 row["id"], FIXER_DELIVERY_PROTOCOL, recovered_at)
                             if reset and reset.get("delivery_status") == "ready":
                                 n += 1
+                                count("requeued_ready")
                             continue
-                    n += int(_quarantine_fixer(
+                    quarantined = _quarantine_fixer(
                         bus, row["id"], "legacy FIXER posting has no durable Slack intent; "
-                        "check the client conversation before any resend", log))
+                        "check the client conversation before any resend", log)
+                    n += int(quarantined)
+                    if quarantined:
+                        count("quarantined_held")
                     continue
                 proof, reason = _readback_fixer_message(
                     readback, intent, ts=row.get("slack_ts") or None)
                 if not proof:
-                    n += int(_quarantine_fixer(
-                        bus, row["id"], reason, log))
+                    quarantined = _quarantine_fixer(bus, row["id"], reason, log)
+                    n += int(quarantined)
+                    if quarantined:
+                        count("quarantined_held")
                     continue
                 posted = bus.transition_fixer_delivery(
                     row["id"], "posted", slack_ts=proof["delivery_readback_ts"],
@@ -1057,6 +1081,7 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
                                       "Slack readback succeeded but database commit failed", log)
                     continue
                 n += 1
+                count("reconciled_posted")
                 ticket = bus.ticket(row["ticket_id"])
                 if ticket:
                     _finalize_fixer_post(bus, ticket, posted, identity, log,
@@ -1075,9 +1100,11 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
                 observed = quarantine(row["id"])
                 if observed and observed.get("delivery_status") == "held":
                     n += 1
+                    count("quarantined_held")
                 continue
             bus.mark_message(row["id"], "ready", meta_update={"reclaimed_stale_posting": True})
             n += 1
+            count("requeued_ready")
         except Exception:  # noqa: BLE001
             pass
     return n
@@ -1516,7 +1543,8 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
     post(channel, text, thread_ts=None, blocks=None) -> slack ts.
     Returns a summary dict. Never raises out of the loop."""
     summary = {"posted": 0, "held": 0, "suppressed": 0, "failed": 0, "skipped": 0,
-               "resolved": 0, "reclaimed": 0}
+               "resolved": 0, "reclaimed": 0, "requeued_ready": 0,
+               "quarantined_held": 0, "reconciled_posted": 0}
     readback = readback or getattr(post, "readback", None)
     member_check = member_check or (lambda channel, user: _blake_is_member(
         identity, channel, user))
@@ -1524,10 +1552,14 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
         bus, identity, log, now=now, readback=readback, summary=summary)
     _report_uncertain_outreach(bus, identity, log)
     _reconcile_held_fixer(bus, identity, readback, log, summary)
-    summary["reclaimed"] += _recover_route_missing_fixer(
+    route_requeued = _recover_route_missing_fixer(
         bus, identity, member_check, log, now=now)
-    summary["reclaimed"] += _recover_config_missing_fixer(
+    summary["reclaimed"] += route_requeued
+    summary["requeued_ready"] += route_requeued
+    config_requeued = _recover_config_missing_fixer(
         bus, identity, readback, log, now=now)
+    summary["reclaimed"] += config_requeued
+    summary["requeued_ready"] += config_requeued
     _report_uncertain_fixer(bus, identity, log, now=now)
     _reconcile_posted_fixer(bus, identity, log, summary)
     try:
@@ -1914,7 +1946,8 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             surface=att.get("surface") or "", why="flag off at post time")
         return
     # 6. claim, immediately before posting
-    if not _claim(bus, row, log):
+    claim_state = _claim(bus, row, log)
+    if not claim_state:
         summary["skipped"] += 1
         return
     if portal_progress:
@@ -2038,6 +2071,17 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             return
         ticket = fresh
     if fixer_customer_slack:
+        expected_claim_attachments = (
+            dict((claim_state.get("attachments") or {}))
+            if isinstance(claim_state, dict) else None)
+        if expected_claim_attachments is None:
+            try:
+                claimed_row = bus.message(row["id"])
+            except Exception as exc:  # noqa: BLE001
+                raise UncertainFixerDelivery(
+                    f"FIXER claimant snapshot unavailable: {type(exc).__name__}") from exc
+            expected_claim_attachments = dict(
+                (claimed_row or {}).get("attachments") or {})
         sender = identity.bot_user_id()
         if not sender or not callable(readback):
             reason = "Echo bot identity or Slack readback unavailable before Slack POST"
@@ -2054,7 +2098,9 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             "request_key": att.get("request_key"),
             "request_version": att.get("request_version"),
         }
-        prepared = bus.prepare_fixer_delivery(row["id"], intent)
+        prepared = bus.prepare_fixer_delivery(
+            row["id"], intent,
+            expected_attachments=expected_claim_attachments)
         if (not prepared or prepared.get("delivery_status") != "posting"
                 or (prepared.get("attachments") or {}).get("fixer_slack_delivery_intent")
                 != intent):
@@ -2062,7 +2108,9 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         # This timestamp follows the first committed intent. Persist it before
         # post() so crash recovery cannot match an identical pre-intent message.
         intent["not_before"] = datetime.now(timezone.utc).isoformat()
-        prepared = bus.prepare_fixer_delivery(row["id"], intent)
+        prepared = bus.prepare_fixer_delivery(
+            row["id"], intent,
+            expected_attachments=dict(prepared.get("attachments") or {}))
         if (not prepared or prepared.get("delivery_status") != "posting"
                 or (prepared.get("attachments") or {}).get("fixer_slack_delivery_intent")
                 != intent):

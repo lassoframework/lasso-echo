@@ -236,8 +236,10 @@ class Bus:
                 return dict(m)
         return None
 
-    def prepare_fixer_delivery(self, mid, intent):
-        if (self.message(mid) or {}).get("delivery_status") != "posting":
+    def prepare_fixer_delivery(self, mid, intent, *, expected_attachments):
+        row = self.message(mid)
+        if (not row or row.get("delivery_status") != "posting"
+                or (row.get("attachments") or {}) != expected_attachments):
             return None
         return self.mark_message(mid, "posting", meta_update={
             "fixer_slack_delivery_intent": intent,
