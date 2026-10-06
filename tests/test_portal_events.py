@@ -73,13 +73,15 @@ class _EvStore:
         r = self.rows.get(event_id)
         return dict(r) if r and r.get("gym_id") == gym_id else None
 
-    def update_event_if_status(self, gym_id, event_id, expected_status, row):
+    def update_event_if_status(self, gym_id, event_id, expected_status,
+                               expected_row, row):
         self.conditional_update_calls += 1
         if self.before_conditional_update is not None:
             self.before_conditional_update(self, gym_id, event_id)
         current = self.rows.get(event_id)
         if (not current or current.get("gym_id") != gym_id
-                or current.get("status") != expected_status):
+                or current.get("status") != expected_status
+                or current != expected_row):
             return None
         self.rows[event_id] = dict(row)
         return dict(self.rows[event_id])

@@ -24,6 +24,10 @@ from datetime import date
 from . import config, gym_event as ge, event_calendar as ec, event_engine as ee
 
 
+def _edit_conflict():
+    return 409, {"error": "this promotion can no longer be edited"}
+
+
 def _flag_off():
     """A disabled gym / feature is a 404, indistinguishable from an unknown route."""
     return 404, {"error": "not found"}
@@ -165,7 +169,7 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     current_status = cur.get("status")
     if (not isinstance(current_status, str)
             or current_status not in ge.EDITABLE_EVENT_STATUSES):
-        return 409, {"error": "this promotion can no longer be edited"}
+        return _edit_conflict()
 
     merged = dict(cur)
     for k in ("name", "type", "starts_on", "ends_on", "tz", "offer_text",
@@ -196,12 +200,12 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
                   "at": _now_iso()})
     try:
         saved = _estore.update_event_if_status(
-            account_key, event_id, current_status,
+            account_key, event_id, current_status, cur,
             {**_event_row(new_event), "audit": audit})
     except Exception as exc:  # noqa: BLE001
         return 502, {"error": f"save failed: {type(exc).__name__}"}
     if saved is None:
-        return 409, {"error": "this promotion can no longer be edited"}
+        return _edit_conflict()
 
     # Stage only the changed rows (pending); approved unaffected rows are left as-is.
     staged = 0
