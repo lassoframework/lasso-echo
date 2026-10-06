@@ -187,6 +187,25 @@ def test_current_drive_original_reads_existing_asset_source_without_scene_ledger
     assert identity["sha256"] == hashlib.sha256(b"old original").hexdigest()
 
 
+def test_existing_drive_card_with_asset_id_and_exact_original_but_no_source_url(enabled):
+    current = row()
+    current.update(source_media_asset_id="asset-old", source_media_url=None)
+    identity = media_guard.swap_original_identity("gym", current, asset_store())
+    assert identity["sha256"] == hashlib.sha256(b"old original").hexdigest()
+    assert identity["source_url"] == current["image_url"]
+    assert identity["source_asset_id"] == "asset-old"
+
+
+def test_existing_drive_card_without_source_url_requires_exact_asset_bytes(enabled):
+    current = row()
+    current.update(source_media_asset_id="asset-old", source_media_url=None)
+    with pytest.raises(ValueError, match="original asset bytes mismatch"):
+        media_guard.swap_original_identity("gym", current, asset_store(content=b"different original"))
+    current["source_media_asset_id"] = None
+    with pytest.raises(ValueError, match="original lineage missing"):
+        media_guard.swap_original_identity("gym", current, asset_store())
+
+
 def test_video_proof_binds_actual_media_and_keeps_poster_display(enabled, monkeypatch, tmp_path):
     lib = tmp_path / "video-library"
     lib.mkdir()

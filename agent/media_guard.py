@@ -403,13 +403,22 @@ def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=Non
     import hashlib
     from . import visual_writer_prepare as vp, visual_fingerprint as vf
     reader = read_bytes or vp._bytes_for_url
-    source = (pick or row).get("source_media_url")
-    delivered = (pick or row).get("image_url")
-    if not source or not delivered:
+    target = pick or row
+    source = target.get("source_media_url")
+    delivered = target.get("image_url")
+    asset_id = target.get("source_media_asset_id")
+    if not delivered:
         raise ValueError("original lineage missing")
+    if not source:
+        # Some existing Drive-backed cards store only the asset ID and its
+        # hosted original in image_url. Prove those exact bytes against the
+        # tenant-owned asset below; a transformed card will fail that check.
+        if pick is None and asset_id:
+            source = delivered
+        else:
+            raise ValueError("original lineage missing")
     raw = vp._exact_bytes(source, reader, "swap original")
     digest = hashlib.sha256(raw).hexdigest()
-    asset_id = (pick or row).get("source_media_asset_id")
     if asset_id:
         response = store._client().get(store._rest("media_asset"),
             params={"select": "id,gym_id,source_id,content_hash", "id": f"eq.{asset_id}",
