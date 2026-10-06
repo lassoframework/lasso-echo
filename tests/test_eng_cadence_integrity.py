@@ -188,6 +188,91 @@ def test_apply_fails_closed_when_october_target_lands_27_of_30(monkeypatch):
     assert store.inserted == []
 
 
+def test_apply_one_x_tolerates_ordinary_stage_drop(monkeypatch):
+    """Legacy 1x builds keep their partial-stage retry behavior."""
+    monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "false")
+    from agent import cadence
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda *a, **kw: 1)
+
+    class _OneXDropStore(_CalendarStore):
+        def __init__(self):
+            super().__init__()
+            self.required = "unset"
+
+        def insert_rows(self, base_key, incoming, *, required_feed_slots=None,
+                        prevalidated_cadence=False):
+            self.required = required_feed_slots
+            kept = list(incoming[:1])
+            self.inserted.extend(kept)
+            return kept
+
+    rows = [
+        _companion_rows("2026-10-19", 0, "first caption")[0],
+        _companion_rows("2026-10-20", 0, "second caption")[0],
+    ]
+    store = _OneXDropStore()
+
+    result = cmr._apply(
+        "eng", rows, date(2026, 10, 19), 2, store, lambda _msg: None,
+        allow_reshape=True)
+
+    assert result["ok"] is True
+    assert result["inserted"] == 1
+    assert store.required is None
+
+
+def test_apply_two_x_keeps_required_slot_check_strict(monkeypatch):
+    monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
+    from agent import cadence
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda *a, **kw: 2)
+
+    class _TwoXDropStore(_CalendarStore):
+        def __init__(self):
+            super().__init__()
+            self.required = None
+
+        def preflight_cadence_rows(self, base_key, incoming, *, replace_dates=()):
+            return list(incoming)
+
+        def insert_rows(self, base_key, incoming, *, required_feed_slots=None,
+                        prevalidated_cadence=False):
+            self.required = set(required_feed_slots or ())
+            return [row for row in incoming if row.get("slot_index") == 0]
+
+    rows = (_companion_rows("2026-10-19", 0, "morning")
+            + _companion_rows("2026-10-19", 1, "evening"))
+    store = _TwoXDropStore()
+
+    result = cmr._apply(
+        "eng", rows, date(2026, 10, 19), 1, store, lambda _msg: None,
+        allow_reshape=True)
+
+    assert store.required == {("2026-10-19", 0), ("2026-10-19", 1)}
+    assert result["ok"] is False
+    assert result["reason"] == "incomplete cadence staging"
+
+
+def test_apply_two_x_fails_closed_when_locked_slot_read_fails(monkeypatch):
+    from agent import cadence
+    monkeypatch.setattr(cadence, "resolve_posts_per_day", lambda *a, **kw: 2)
+
+    class _UnreadableLockedStore(_CalendarStore):
+        def list_month(self, base_key, month):
+            raise RuntimeError("locked rows unavailable")
+
+    store = _UnreadableLockedStore()
+    rows = _companion_rows("2026-10-20", 0, "new caption")
+
+    result = cmr._apply(
+        "eng", rows, date(2026, 10, 19), 2, store, lambda _msg: None,
+        locked_days={"2026-10-19"}, allow_reshape=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "locked feed slot count unavailable"
+    assert store.deleted == []
+    assert store.inserted == []
+
+
 def test_apply_restores_deleted_book_when_live_cadence_gate_changes(monkeypatch):
     from agent.portal_calendar_store import CadencePreconditionError
 

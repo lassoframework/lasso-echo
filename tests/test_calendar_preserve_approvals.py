@@ -534,6 +534,20 @@ def test_prevalidated_insert_fails_closed_when_live_lock_read_fails(monkeypatch)
     assert not any(method == 'post' for method, _rows in http.calls)
 
 
+def test_non_prevalidated_insert_does_not_enforce_required_slots(monkeypatch):
+    """The required-slot contract belongs only to the 2x prevalidated lane."""
+    store, http = _state_store(monkeypatch, [])
+    proposal = _persisted(media_not_ready_reason=None)
+    monkeypatch.setattr(pcs, '_stage_belts', lambda *_args: [])
+
+    inserted = store.insert_rows(
+        'eng', [proposal], prevalidated_cadence=False,
+        required_feed_slots={(proposal['post_date'], proposal['slot_index'])})
+
+    assert inserted == []
+    assert not any(method == 'post' for method, _rows in http.calls)
+
+
 def test_prevalidated_insert_keeps_story_hold_recovery(monkeypatch):
     store, _http = _state_store(monkeypatch, [])
     proposal = _persisted(
@@ -575,6 +589,22 @@ def test_cadence_preflight_retains_story_needed_for_hold_recovery(monkeypatch):
 
     assert {(row['account'], row['format']) for row in admitted} == {
         ('instagram', 'feed'), ('facebook', 'feed'), ('instagram', 'story')}
+
+
+def test_cadence_preflight_runs_horizon_belt_once(monkeypatch):
+    from agent import plan_horizon
+    store, _http = _state_store(monkeypatch, [])
+    proposal = _persisted(media_not_ready_reason=None)
+    calls = []
+
+    def belt(account_key, rows):
+        calls.append((account_key, list(rows)))
+        return list(rows), 0
+
+    monkeypatch.setattr(plan_horizon, 'belt_filter', belt)
+
+    assert store.preflight_cadence_rows('eng', [proposal])
+    assert len(calls) == 1
 
 
 def test_cadence_insert_counts_recovered_story_without_reinserting_it(monkeypatch):

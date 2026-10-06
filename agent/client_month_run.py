@@ -2795,6 +2795,7 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             str(d)[:10] for d in (locked_days or ())
             if locked_span_first <= str(d)[:10] < locked_span_after}
         locked_feed_slots = set()
+        locked_feed_slots_known = not locked_in_span
         list_month = getattr(store, "list_month", None)
         if callable(list_month) and locked_in_span:
             try:
@@ -2811,9 +2812,21 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                 locked_feed_slots = {
                     slot for slot in locked_feed_slots
                     if slot[0] in locked_in_span}
-            except Exception:  # noqa: BLE001 - preserve the old fail-open fallback
-                locked_feed_slots = {(day, None) for day in locked_in_span}
+                locked_feed_slots_known = True
+            except Exception:  # noqa: BLE001 - handled by cadence-aware guard below
+                locked_feed_slots_known = False
         else:
+            locked_feed_slots_known = not locked_in_span
+        if not locked_feed_slots_known:
+            if int(_slot_capacity or 1) > 1:
+                log(f"{base_key}: locked feed slot count unavailable for a "
+                    "multi-slot cadence; keeping the existing calendar")
+                return {"ok": False,
+                        "reason": "locked feed slot count unavailable",
+                        "incomplete_cadence": True,
+                        "upserted": 0, "inserted": 0, "deleted": 0,
+                        "months": months}
+            # One post/day has exactly one logical feed slot per locked day.
             locked_feed_slots = {(day, None) for day in locked_in_span}
         post_merge_feeds = new_feeds + len(locked_feed_slots)
         try:
@@ -2879,7 +2892,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                 insert_rows, base_key, store_rows,
                 poster_render_evidence_by_url,
                 render_evidence_by_url=render_evidence_by_url,
-                required_feed_slots=new_feed_slots,
+                required_feed_slots=(new_feed_slots
+                                     if cadence_prevalidated else None),
                 prevalidated_cadence=cadence_prevalidated) or []
             inserted += len(inserted_rows)
             inserted_feed_slots = _instagram_feed_slots(inserted_rows)
@@ -2888,7 +2902,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             # shortfall means a stage-time belt dropped required cadence.
             expected_feed_count = len(new_feed_slots)
             actual_feed_count = len(inserted_feed_slots)
-            if actual_feed_count < expected_feed_count:
+            if (cadence_prevalidated
+                    and actual_feed_count < expected_feed_count):
                 log(f"{base_key}: cadence staging incomplete: inserted "
                     f"{actual_feed_count}/{expected_feed_count} Instagram "
                     "feed slots; cadence remains pending and the scan will retry")

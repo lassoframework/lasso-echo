@@ -3539,7 +3539,7 @@ class SupabaseCalendarStore:
         no deterministic filter can first run after the delete.
         """
         planned = [dict(row or {}, gym_id=account_key) for row in (rows or ())]
-        normalized = []
+        normalized_pairs = []
         from .copy_gate import bound_opening_hook, format_caption
         for row in planned:
             clean = dict(row)
@@ -3552,10 +3552,12 @@ class SupabaseCalendarStore:
                 # feed on hold cannot certify cadence, so leave it out and let
                 # the companion/required-slot checks refuse the rebuild.
                 continue
-            normalized.append(clean)
+            normalized_pairs.append((row, clean))
         from .plan_horizon import belt_filter as _horizon_belt
         planned, _ = _horizon_belt(account_key, planned)
-        filtered, _ = _horizon_belt(account_key, normalized)
+        admitted_planned_ids = {id(row) for row in planned}
+        filtered = [clean for original, clean in normalized_pairs
+                    if id(original) in admitted_planned_ids]
         filtered = _stage_belts(account_key, filtered)
         filtered = _media_stage_belt(
             self, account_key, filtered,
@@ -3740,7 +3742,7 @@ class SupabaseCalendarStore:
             and _story_slot(row) in recovered_story_slots]
         payload = _drop_companions_missing_instagram_feed(
             planned_companions, payload, satisfied=recovered_companions)
-        if required_feed_slots is not None:
+        if prevalidated_cadence and required_feed_slots is not None:
             required = {tuple(slot) for slot in required_feed_slots}
             actual = _instagram_feed_slots(payload)
             if not required.issubset(actual):
