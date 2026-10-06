@@ -248,24 +248,13 @@ def run(portal_gym_key="lasso", *, city=None, cta_url=None, days=30, now=None,
 
     # GATE 1: OFFER only for a gym whose live offer a human has confirmed (default: none).
     offer_confirmed = base in config.gbp_offer_confirmed_gyms()
-    # GATE 2: a CLIENT gym's FIRST GBP month is withheld in 'coach_review' until a coach
-    # releases it. First month == the gym has NO prior googlebusiness rows at all.
-    # LASSO (base 'lasso') is EXEMPT BY DESIGN: it is the dogfood account, Blake is both
-    # owner and coach, and approving the raw month IS the client-experience test. Client
-    # gyms always get GATE 2; the dogfood skips it deliberately, not by accident.
-    is_dogfood = base == "lasso"
-    is_first_month = True
-    try:
-        is_first_month = not store.any_gbp_rows(portal_gym_key)
-    except Exception:  # noqa: BLE001
-        is_first_month = True
-    initial_status = "coach_review" if (config.gbp_coach_screen_enabled()
-                                        and is_first_month and not is_dogfood) else "pending"
-    if initial_status == "coach_review":
-        log(f"{portal_gym_key}: first GBP month -> written as 'coach_review' "
-            "(withheld from owner until a coach releases it; GATE 2)")
-    elif is_dogfood:
-        log(f"{portal_gym_key}: dogfood account -> GATE 2 skipped by design "
+    # RETIRED GATE 2 (Blake, 2026-10-06): new GBP drafts ALWAYS land in 'pending' for
+    # owner approval — there is never a coach review on anything. Historical coach_review
+    # rows are still handled below (release() can still flip them to 'pending').
+    # The planner also normalizes legacy caller-supplied status to pending.
+    initial_status = "pending"
+    if base == "lasso":
+        log(f"{portal_gym_key}: dogfood account -> drafts land 'pending' "
             "(owner==coach; approving raw IS the test)")
 
     facts = None
