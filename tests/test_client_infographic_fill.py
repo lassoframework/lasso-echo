@@ -577,6 +577,26 @@ def test_pending_client_photo_blocks_last_resort_infographic(monkeypatch):
     assert cif.real_media_depleted("gymx") is False
 
 
+def test_clean_pending_review_photo_blocks_last_resort_infographic(monkeypatch):
+    """A legacy/inconsistent clean+pending_review Drive photo is known supply."""
+    from agent import gym_media_index
+
+    class MediaStore:
+        def available(self):
+            return True
+
+        def list_assets(self, gym):
+            return [{"id": "photo-1", "gym_id": gym, "kind": "photo",
+                     "eligible": True, "excluded_by_coach": False,
+                     "review_status": "pending_review",
+                     "moderation_status": "clean", "content_hash": "hash"}]
+
+    monkeypatch.setattr(config, "gym_drive_stage_enabled", lambda: True)
+    monkeypatch.setattr(config, "gym_drive_connect_active_for", lambda base: True)
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: MediaStore())
+    assert cif.real_media_depleted("gymx") is False
+
+
 def test_gym_astra_brief_never_inherits_lasso_color_or_footer(monkeypatch):
     from agent import astra_prompt
 
