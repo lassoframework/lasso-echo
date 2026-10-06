@@ -393,7 +393,8 @@ def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=Non
     """Resolve an original from tenant asset bytes or an exact local source.
 
     URL inequality and hashes of rendered cards do not prove a new photo.
-    Missing original lineage is an error, never a guessed raw-photo identity.
+    Legacy URL-only originals require exact tenant library bytes; missing or
+    contradictory evidence is an error, never a guessed raw-photo identity.
     For legacy rendered cards the persisted source link is accepted only after
     tenant asset/source ownership or exact local bytes establish the original,
     and supplied object metadata agrees. This is bounded original-source
@@ -425,7 +426,10 @@ def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=Non
         # Some existing Drive-backed cards store only the asset ID and its
         # hosted original in image_url. Prove those exact bytes against the
         # tenant-owned asset below; a transformed card will fail that check.
-        if pick is None and asset_id:
+        if pick is None:
+            # URL-only legacy rows can name a raw library original. The asset
+            # attestation or exact tenant-local comparison below must prove it;
+            # a basename or a rendered object's hash alone never does.
             source = delivered
         else:
             raise ValueError("original lineage missing")

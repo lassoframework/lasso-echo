@@ -201,9 +201,126 @@ def test_existing_drive_card_without_source_url_requires_exact_asset_bytes(enabl
     current.update(source_media_asset_id="asset-old", source_media_url=None)
     with pytest.raises(ValueError, match="original asset bytes mismatch"):
         media_guard.swap_original_identity("gym", current, asset_store(content=b"different original"))
-    current["source_media_asset_id"] = None
-    with pytest.raises(ValueError, match="original lineage missing"):
+
+
+@pytest.mark.parametrize("missing_columns", [False, True])
+def test_url_only_legacy_raw_original_can_swap_with_exact_tenant_library_bytes(enabled, missing_columns):
+    current = row()
+    for field in ("source_media_url", "source_media_asset_id"):
+        if missing_columns:
+            current.pop(field)
+        else:
+            current[field] = None
+    code, body = run(Store(current))
+    assert code == 200 and body["media_swap_proof"]["readback_verified"]
+    assert body["media_swap_proof"]["old_original_sha256"] == hashlib.sha256(b"old original").hexdigest()
+
+
+@pytest.mark.parametrize("delivered", ["https://cdn/legacy-card.jpg", "https://cdn/new.jpg"])
+def test_url_only_legacy_unknown_rendered_object_still_refuses(enabled, monkeypatch, delivered):
+    current = row()
+    current.update(source_media_url=None, source_media_asset_id=None, image_url=delivered)
+    monkeypatch.setattr(vp, "_bytes_for_url", lambda *a: b"unproved rendered pixels")
+    store = Store(current)
+    code, body = run(store)
+    assert code == 409 and body["reason"] == "media_evidence_unavailable"
+    assert not store.calls and "media_swap_proof" not in body
+
+
+def test_url_only_legacy_basename_requires_byte_equality(enabled, monkeypatch):
+    current = row()
+    current.update(source_media_url=None, source_media_asset_id=None)
+    monkeypatch.setattr(vp, "_bytes_for_url", lambda *a: b"different pixels at same basename")
+    with pytest.raises(ValueError, match="current local original bytes mismatch"):
         media_guard.swap_original_identity("gym", current, asset_store())
+
+
+def test_server_updated_at_does_not_override_preserved_fields(enabled):
+    before = {**row(), "updated_at": "2026-10-06T00:00:00Z"}
+    store = Store(before, readback=lambda r: r.update(updated_at="2026-10-06T01:00:00Z"))
+    original_swap = store.swap_media
+    def swap(*args, **kwargs):
+        result = original_swap(*args, **kwargs)
+        store.row["updated_at"] = "2026-10-06T00:30:00Z"
+        result["updated_at"] = store.row["updated_at"]
+        return result
+    store.swap_media = swap
+    code, body = run(store)
+    assert code == 200 and body["media_swap_proof"]["invariants_preserved"]
+    assert store.row["caption"] == before["caption"]
+    assert store.row["media_not_ready_reason"] == before["media_not_ready_reason"]
+
+
+@pytest.mark.parametrize("failure_count,expected_code", [(1, 200), (2, 503)])
+def test_primary_get_outage_keeps_sibling_work_without_replaying_patch(
+        enabled, monkeypatch, failure_count, expected_code):
+    before = row()
+    sibling = {**before, "id": "sibling", "account": "facebook"}
+    snapshots = {"post": deepcopy(before), "sibling": deepcopy(sibling)}
+    writes, reads, released, settled = [], [], [], []
+    failures = [failure_count]
+    def get(gym, rid):
+        reads.append(rid)
+        if writes and rid == "post" and failures[0]:
+            failures[0] -= 1
+            raise OSError("transient independent GET failure")
+        return deepcopy(snapshots[rid])
+    def swap(gym, rid, image, **kwargs):
+        writes.append(rid)
+        assert snapshots[rid] == kwargs["expected_row"]
+        snapshots[rid].update(image_url=image, source_media_url=kwargs["source_media_url"],
+                              **kwargs["extra_fields"])
+        return deepcopy(snapshots[rid])
+    store = SimpleNamespace(get_row=get, swap_media=swap,
+        list_month=lambda *a: [deepcopy(r) for r in snapshots.values()])
+    monkeypatch.setattr(media_swap, "sibling_rows", lambda *a, **k: [deepcopy(sibling)])
+    monkeypatch.setattr(media_swap, "release_local_pick", lambda *a: released.append(True))
+    monkeypatch.setattr(media_swap, "after_swap", lambda *a, **k: settled.append(True))
+    replacement = pick()
+    replacement["siblings"] = {"sibling": pick()}
+    code, body = run(store, replacement)
+    assert code == expected_code
+    assert writes == ["post", "sibling"]
+    assert reads == ["post", "post", "post", "sibling"]
+    assert body["siblings_swapped"] == ["sibling"] and body["siblings_left"] == []
+    assert not released
+    if expected_code == 200:
+        assert body["media_swap_proof"]["readback_verified"] and settled == [True]
+    else:
+        assert not body["ok"] and body["reason"] == "swap_outcome_unknown"
+        assert "media_swap_proof" not in body and not settled
+    for snapshot in snapshots.values():
+        assert snapshot["caption"] == before["caption"]
+        assert snapshot["media_not_ready_reason"] == before["media_not_ready_reason"]
+
+
+@pytest.mark.parametrize("patch_result", ["missing", "wrong_tenant", "wrong_id", "caption_drift", "missing_approval"])
+def test_unproved_primary_patch_never_moves_siblings_on_get_outage(enabled, monkeypatch, patch_result):
+    before = row()
+    sibling = {**before, "id": "sibling", "account": "facebook"}
+    store = Store(before)
+    monkeypatch.setattr(media_swap, "sibling_rows", lambda *a, **k: [deepcopy(sibling)])
+    original_swap = store.swap_media
+    def swap(*args, **kwargs):
+        result = original_swap(*args, **kwargs)
+        if patch_result == "missing":
+            return None
+        if patch_result == "missing_approval":
+            result.pop("approved_by")
+        else:
+            field = {"wrong_tenant": "gym_id", "wrong_id": "id", "caption_drift": "caption"}[patch_result]
+            result[field] = "other"
+        return result
+    def get(*args):
+        if store.calls:
+            raise OSError("independent GET unavailable")
+        return deepcopy(store.row)
+    store.swap_media, store.get_row = swap, get
+    replacement = pick()
+    replacement["siblings"] = {"sibling": pick()}
+    code, body = run(store, replacement)
+    assert code == 503 and body["reason"] == "swap_outcome_unknown"
+    assert len(store.calls) == 1 and "media_swap_proof" not in body
 
 
 def test_video_proof_binds_actual_media_and_keeps_poster_display(enabled, monkeypatch, tmp_path):

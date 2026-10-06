@@ -2152,13 +2152,22 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
         # frame (or a cleared poster when a video row becomes a photo) and the Drive
         # asset id now on the row (or None when it left the Drive pool).
         primary_write_started = True
-        updated = sb_store.swap_media(account_key, draft_id, pick["image_url"],
-                                      **write_args)
+        patch_result = sb_store.swap_media(account_key, draft_id, pick["image_url"],
+                                           **write_args)
+        primary_readback_unknown = False
         try:
-            updated = (_verified_swap_readback(sb_store, account_key, row, pick, updated)
-                       if updated is not None else None)
+            updated = (_verified_swap_readback(sb_store, account_key, row, pick, patch_result)
+                       if patch_result is not None else None)
         except Exception:
             updated = None
+            # A fully validated PATCH proves this request wrote the primary,
+            # even while its independent GET cannot certify completion. Carry
+            # its siblings forward once, retaining the reservation and unknown
+            # response; never replay the primary PATCH or infer our write from
+            # a matching mutable row after a missing/mismatched PATCH result.
+            if _swap_row_matches(account_key, row, pick, patch_result):
+                primary_readback_unknown = True
+                updated = patch_result
         if updated is None:
             # Prepared writes can land the PATCH and still return None when the
             # representation fails validation. Only a fresh, tenant-scoped row
@@ -2185,10 +2194,9 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                          "error": "Photo swap outcome could not be verified.",
                          "reason": "swap_outcome_unknown",
                          "recreate_budget": _budget_state(account_key)}
-        # Exact-ID readback binds the saved source URL, asset and render fields
-        # to the candidate whose exact bytes were proved before the PATCH. A
-        # redundant network fetch here cannot strengthen that row proof and can
-        # strand siblings after a committed primary swap during a transient outage.
+        # The validated PATCH establishes that this request landed. Success
+        # still requires its independent exact-ID readback; a persistent GET
+        # outage completes bounded sibling work but remains outcome unknown.
         local_landed = True
         # Same-post siblings, one operation, the SAME per-row server-side status guard
         # (a sibling approved between the read and this write matches nothing and is
@@ -2232,6 +2240,14 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
         # asset now on the row cools down, and the one it replaced returns to the pool
         # ONLY when no remaining row on the book still carries it. A failed re-read
         # is None = unknown = leave it stamped (never [] = "nothing carries it").
+        if primary_readback_unknown:
+            return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": "Photo swap outcome could not be verified.",
+                         "reason": "swap_outcome_unknown",
+                         "siblings_swapped": [s for s in swapped if s != draft_id],
+                         "siblings_left": left,
+                         "sibling_results": sibling_results,
+                         "recreate_budget": _budget_state(account_key)}
         _ms.after_swap(account_key, row, pick,
                        book_rows=_month_rows_for(sb_store, account_key, row),
                        swapped_ids=swapped)
@@ -2291,7 +2307,13 @@ def _verified_swap_readback(store, account_key, before, pick, patch_result):
     """An independent exact-ID GET is the completion boundary, never PATCH output."""
     if not _swap_row_matches(account_key, before, pick, patch_result):
         return None
-    fresh = store.get_row(account_key, before["id"])
+    try:
+        fresh = store.get_row(account_key, before["id"])
+    except Exception:
+        # One bounded read retry resolves a transient GET failure after a
+        # committed PATCH. It never retries the mutation. Persistent outages
+        # propagate so the caller retains an unknown completion outcome.
+        fresh = store.get_row(account_key, before["id"])
     if not _swap_row_matches(account_key, before, pick, fresh):
         return None
     # Preparation may replace scene identities in the validated PATCH result.
@@ -2321,9 +2343,11 @@ def _swap_row_matches(account_key, before, pick, fresh):
                 expected[field] = None
     changed = set(expected)
     for key, value in before.items():
-        if key not in changed and fresh.get(key) != value:
+        if (key not in changed and key != "updated_at"
+                and (key not in fresh or fresh[key] != value)):
             # Global preparation can attach identity evidence; every other field,
             # including approval, hold, caption, schedule and claim, stays exact.
+            # updated_at is advanced by the database for this same mutation.
             if not prepared_write or key not in _pcs._DRAFT_SCENE_CAS_COLUMNS:
                 return None
     if any(key not in fresh or fresh[key] != value for key, value in expected.items()):
