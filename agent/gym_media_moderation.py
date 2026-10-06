@@ -133,6 +133,15 @@ def _md5_hex(path):
     return h.hexdigest()
 
 
+def _sha256_hex(path):
+    """SHA-256 of the same downloaded bytes whose Drive MD5 was verified."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _sample_video_frames(path, *, count=VIDEO_SAMPLE_COUNT,
                          timeout=VIDEO_SAMPLE_TIMEOUT_SEC):
     """Return bounded representative JPEG frames from one video.
@@ -173,12 +182,13 @@ def _sample_video_frames(path, *, count=VIDEO_SAMPLE_COUNT,
     return frames
 
 
-def build_evidence(provider, verdict, asset, people_detected, observed_at):
+def build_evidence(provider, verdict, asset, people_detected, observed_at,
+                   *, sha256=None):
     """The moderation_json payload, shaped to EXACTLY what
     gym_media_selector._clean_moderation_evidence validates, plus the provider
     string: verdict, provider, content_hash, asset_id, gym_id, people_detected
     (identity-equal to the row's people_detected), observed_at (ISO with tz)."""
-    return {
+    evidence = {
         "provider": provider,
         "verdict": verdict,
         "content_hash": asset["content_hash"],
@@ -187,11 +197,15 @@ def build_evidence(provider, verdict, asset, people_detected, observed_at):
         "people_detected": people_detected,
         "observed_at": observed_at,
     }
+    if sha256:
+        evidence["sha256"] = sha256
+    return evidence
 
 
-def _outcome_fields(verdict, people, provider, asset, observed_at):
+def _outcome_fields(verdict, people, provider, asset, observed_at, *, sha256=None):
     """Map a parsed verdict to one atomic evidence and approval update."""
-    evidence = build_evidence(provider, verdict, asset, people, observed_at)
+    evidence = build_evidence(provider, verdict, asset, people, observed_at,
+                              sha256=sha256)
     fields = {"moderation_json": evidence,
               "people_detected": people if isinstance(people, bool) else None}
     if verdict == "clean":
@@ -259,6 +273,7 @@ def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None,
             return _fail(asset_id, gym_id,
                          "hash drift: downloaded bytes no longer match the "
                          "indexed content_hash — evidence refused")
+        raw_sha256 = _sha256_hex(tmp_path)
         if kind == _idx.KIND_VIDEO:
             sampler = video_sampler or _sample_video_frames
             frames = sampler(tmp_path)
@@ -303,7 +318,8 @@ def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None,
     provider = f"gemini:{config.OCR_MODEL}"
     if kind == _idx.KIND_VIDEO:
         provider += f":video-frames-{len(parsed_scans)}"
-    fields = _outcome_fields(verdict, people, provider, asset, now_iso)
+    fields = _outcome_fields(verdict, people, provider, asset, now_iso,
+                             sha256=raw_sha256)
     try:
         store.update_moderation_asset(
             gym_id, asset_id, fields, expected_content_hash=content_hash)
@@ -319,3 +335,72 @@ def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None,
             "people_detected": fields["people_detected"],
             "verdict": verdict,
             "evidence": fields["moderation_json"]}
+
+
+def backfill_asset_sha256(gym_id, asset_id, *, store, drive, apply=False):
+    """Add raw-byte SHA-256 evidence to ONE already-approved clean asset.
+
+    The existing evidence and review must be bound to the current Drive MD5.
+    Exact Drive bytes are then downloaded, rechecked against that MD5 and hashed.
+    ``apply`` uses a tenant/hash/status/evidence CAS; dry-run performs every read
+    and byte check but writes nothing. No review or moderation state is changed.
+    """
+    import re
+    from . import gym_media_selector
+
+    gym_id = str(gym_id or "").strip()
+    asset_id = str(asset_id or "").strip()
+    asset = store.get_asset(asset_id)
+    if not asset:
+        return _fail(asset_id, gym_id, "asset not found")
+    if str(asset.get("gym_id") or "") != gym_id:
+        return _fail(asset_id, gym_id, "asset belongs to another gym")
+    content_hash = str(asset.get("content_hash") or "").strip()
+    evidence = asset.get("moderation_json")
+    if (asset.get("review_status") != "approved"
+            or asset.get("review_content_hash") != content_hash
+            or not gym_media_selector._clean_moderation_evidence(asset)):
+        return _fail(asset_id, gym_id,
+                     "asset lacks clean hash-bound approval evidence")
+    prior_sha = evidence.get("sha256")
+    if prior_sha is not None:
+        if not isinstance(prior_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", prior_sha):
+            return _fail(asset_id, gym_id, "existing sha256 evidence is malformed")
+        return {"ok": True, "asset_id": asset_id, "gym_id": gym_id,
+                "sha256": prior_sha, "changed": False, "dry_run": not apply}
+
+    tmp_dir = tempfile.mkdtemp(prefix="gymsha_")
+    suffix = Path(str(asset.get("title") or "")).suffix or ".bin"
+    tmp_path = Path(tmp_dir) / f"identity{suffix}"
+    try:
+        drive.download(asset_id, tmp_path)
+        if _md5_hex(tmp_path) != content_hash:
+            return _fail(asset_id, gym_id,
+                         "hash drift: downloaded bytes no longer match the "
+                         "indexed content_hash — evidence refused")
+        raw_sha256 = _sha256_hex(tmp_path)
+    except Exception as exc:  # noqa: BLE001 - an uncertain identity fails closed
+        return _fail(asset_id, gym_id,
+                     f"download/hash failed: {type(exc).__name__}")
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+            Path(tmp_dir).rmdir()
+        except OSError:
+            pass
+
+    updated_evidence = dict(evidence)
+    updated_evidence["sha256"] = raw_sha256
+    if apply:
+        try:
+            store.update_moderation_sha256(
+                gym_id, asset_id, updated_evidence,
+                expected_content_hash=content_hash,
+                expected_moderation_json=evidence)
+        except MediaStoreError as exc:
+            if getattr(exc, "status", None) == 409:
+                return _fail(asset_id, gym_id,
+                             "asset changed during sha256 backfill (conflict) — no write")
+            raise
+    return {"ok": True, "asset_id": asset_id, "gym_id": gym_id,
+            "sha256": raw_sha256, "changed": bool(apply), "dry_run": not apply}

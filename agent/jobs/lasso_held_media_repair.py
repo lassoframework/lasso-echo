@@ -3,6 +3,12 @@
 The caption is the generation source. A reviewed artifact is required before an
 exact-row compare-and-swap can replace the repeated image and clear its hold.
 This job never claims or publishes a calendar row.
+
+Managed Stories are out of scope here: a generic swap would regenerate from
+the Story id and clear the hold without binding the managed registry, so the
+publish guard could never pass. Held Stories are repaired only by the daily
+paired Story job, which generates from the exact paired feed id/caption and
+routes through the guarded repair RPC.
 """
 
 from __future__ import annotations
@@ -12,16 +18,23 @@ import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from agent import config, infographic_evidence, variant_regen, visual_writer_prepare
+from agent import (calendar_autopublish, config, feed_image,
+                   infographic_evidence, variant_regen, visual_writer_prepare)
 from agent.infographic_artifacts import ArtifactStore
 from agent.portal_calendar_store import SupabaseCalendarStore
 
 HOLD_REASON = "cross_date_media_repeat_needs_new_visual"
+CAPTION_HOLD_REASON = "caption_changed_needs_new_visual"
 GYM = "lasso"
 ACCOUNTS = {"instagram": "lasso_ig", "facebook": "lasso_fb"}
 ACCOUNT = "lasso_ig"
 MAX_PER_DAY = 3
 HORIZON_DAYS = 1
+# Kept for the runner's recovery-window detection; this job no longer gates
+# past coverage on fixed dates (see run()).
+INCIDENT_RECOVERY_FIRST = "2026-10-06"
+INCIDENT_RECOVERY_LAST = "2026-10-11"
+MAX_PAST_PER_RUN = 2
 _CAS_COLUMNS = (
     "id", "gym_id", "status", "variant_status", "account", "format",
     "post_date", "caption", "image_url", "source_media_url",
@@ -47,16 +60,19 @@ def _row_account_key(row):
 
 
 def _eligible(row, first, last, account_key=ACCOUNT):
+    fmt = str((row or {}).get("format") or "").lower()
+    reason = (row or {}).get("media_not_ready_reason")
     return (isinstance(row, dict)
             and all(key in row for key in _CAS_COLUMNS)
             and row["gym_id"] == GYM
             and row["status"] == "pending"
             and row["variant_status"] == "active"
             and _row_account_key(row) == account_key
-            and str(row["format"] or "").lower() == "feed"
+            and fmt == "feed"
             and first <= str(row["post_date"] or "")[:10] <= last
-            and row["media_not_ready_reason"] == HOLD_REASON
-            and isinstance(row["caption"], str) and bool(row["caption"].strip())
+            and reason in (HOLD_REASON, CAPTION_HOLD_REASON)
+            and isinstance(row["caption"], str)
+            and bool(row["caption"].strip())
             and isinstance(row["image_url"], str) and bool(row["image_url"].strip())
             and row["published_at"] is None and row["late_post_id"] is None
             and row["publish_claim_token"] is None
@@ -74,26 +90,106 @@ def _eq(value):
     return f"eq.{value}"
 
 
+FEED_ASPECTS = ("4:5", "1:1", "1.91:1")
+
+
+def _feed_format_evidence(evidence):
+    """True only when reviewed evidence is usable as FEED artwork.
+
+    Feed and Story artifacts now share the exact feed id/caption source
+    identity in one tenant, so the most recent PASS artifact can be a 9:16
+    Story render. Only supported feed aspects (an unstamped legacy feed
+    review, or a stamped 4:5/1:1/1.91:1 within the platform's feed ratio
+    band) may be reused. A present but unreadable dimension claim is an
+    error, never a silent miss: reusing or regenerating from a malformed
+    record could bill twice or bind Story media to a feed row.
+    """
+    aspect = evidence.get("aspect")
+    if aspect not in (None, "") and aspect not in FEED_ASPECTS:
+        return False
+    measured = evidence.get("verified_dimensions")
+    if measured is None:
+        return True
+    if not isinstance(measured, dict):
+        raise RuntimeError("reviewed artifact lookup malformed")
+    width, height = measured.get("width"), measured.get("height")
+    if (type(width) is not int or type(height) is not int
+            or width <= 0 or height <= 0):
+        raise RuntimeError("reviewed artifact lookup malformed")
+    ratio = width / height
+    return feed_image.MIN_RATIO <= ratio <= feed_image.MAX_RATIO
+
+
+ARTIFACT_LOOKUP_PAGE = 50
+ARTIFACT_LOOKUP_MAX_PAGES = 4
+
+
+def _reviewed_artifact_rows(store, source_id, source_hash, account_key):
+    """Read EVERY artifact under one shared feed/caption tenant key.
+
+    Feed and Story renders share this key, so any fixed small window can hide
+    a valid older feed artifact behind newer 9:16 Story renders. Pagination
+    is a deterministic immutable keyset: rows are ordered by image_url
+    ascending (immutable, part of the (tenant, image_url) primary key) with a
+    strict `gt` cursor on the last seen image_url (both evaluated by the
+    database's own ICU collation, never by Python string order), so
+    timestamp ties and concurrent Story inserts between page reads can
+    neither duplicate nor skip a row. Validation is collation-agnostic: no
+    URL may repeat anywhere in the scan and every record needs a non-empty
+    string URL; a duplicate (any repeating or non-advancing page resurfaces
+    an already seen URL), a malformed record, a read error, an overlong
+    page or the hard page bound fails closed rather than silently
+    truncating into a paid duplicate render. A short page is completion,
+    not failure.
+    """
+    rows = []
+    seen = set()
+    cursor = None
+    for _ in range(ARTIFACT_LOOKUP_MAX_PAGES):
+        params = {"tenant": f"eq.{account_key}",
+                  "source_identity->>source_id": _eq(source_id),
+                  "source_identity->>source_hash": _eq(source_hash),
+                  "select": "image_url,evidence,source_identity",
+                  "order": "image_url.asc",
+                  "limit": str(ARTIFACT_LOOKUP_PAGE)}
+        if cursor is not None:
+            params["image_url"] = f"gt.{cursor}"
+        response = store._client().get(
+            store._rest("echo_infographic_artifacts"), params=params,
+            headers=store._headers(), timeout=30)
+        if response.status_code >= 400:
+            raise RuntimeError("reviewed artifact lookup failed")
+        batch = response.json()
+        if not isinstance(batch, list) or len(batch) > ARTIFACT_LOOKUP_PAGE:
+            raise RuntimeError("reviewed artifact lookup incomplete")
+        # Progress and duplicate validation must be collation-agnostic: the
+        # database sorts image_url under its ICU locale, which legitimately
+        # differs from Python string order. Only checks that hold under ANY
+        # server comparator are safe: no URL may repeat anywhere in the scan
+        # (a repeating or non-advancing page always resurfaces an already
+        # seen URL), and every record must carry a non-empty string URL.
+        for row in batch:
+            if (not isinstance(row, dict)
+                    or not isinstance(row.get("image_url"), str)
+                    or not row["image_url"]):
+                raise RuntimeError("reviewed artifact lookup malformed")
+            if row["image_url"] in seen:
+                raise RuntimeError("reviewed artifact lookup cursor did not advance")
+            seen.add(row["image_url"])
+        rows.extend(batch)
+        if len(batch) < ARTIFACT_LOOKUP_PAGE:
+            return rows
+        cursor = batch[-1]["image_url"]
+    raise RuntimeError("reviewed artifact lookup exceeded bound")
+
+
 def _reviewed_artifact_record(store, source_id, source_hash, account_key=ACCOUNT):
-    """Reuse a persisted reviewed image before any new paid generation.
+    """Reuse a persisted reviewed FEED image before any new paid generation.
 
     A failed or incomplete lookup is an error, not a cache miss: generating in
     that state could bill repeatedly for the same row after a process restart.
     """
-    response = store._client().get(
-        store._rest("echo_infographic_artifacts"),
-        params={"tenant": f"eq.{account_key}",
-                "source_identity->>source_id": _eq(source_id),
-                "source_identity->>source_hash": _eq(source_hash),
-                "select": "image_url,evidence,source_identity",
-                "order": "created_at.desc", "limit": "2"},
-        headers=store._headers(), timeout=30)
-    if response.status_code >= 400:
-        raise RuntimeError("reviewed artifact lookup failed")
-    rows = response.json()
-    if not isinstance(rows, list) or len(rows) > 2:
-        raise RuntimeError("reviewed artifact lookup incomplete")
-    for row in rows:
+    for row in _reviewed_artifact_rows(store, source_id, source_hash, account_key):
         if not isinstance(row, dict):
             raise RuntimeError("reviewed artifact lookup malformed")
         evidence = row.get("evidence") or {}
@@ -106,7 +202,8 @@ def _reviewed_artifact_record(store, source_id, source_hash, account_key=ACCOUNT
                 and evidence.get("brief_model") == "gpt-6-astra"
                 and evidence.get("grade_status") == "PASS"
                 and evidence.get("image_sha256")
-                and evidence.get("review_response_id")):
+                and evidence.get("review_response_id")
+                and _feed_format_evidence(evidence)):
             return row
     return None
 
@@ -225,6 +322,9 @@ def _replace_exact(store, current, new_url, account_key=ACCOUNT):
         return None
     if not isinstance(new_url, str) or not new_url.startswith("https://"):
         return None
+    if (current["media_not_ready_reason"] == CAPTION_HOLD_REASON
+            and new_url == current["image_url"]):
+        return None  # a caption change needs a genuinely new reviewed visual
     params = {key: _eq(current[key]) for key in _CAS_COLUMNS}
     payload = {"image_url": new_url, "source_media_url": new_url,
                "source_media_asset_id": None,
@@ -254,8 +354,19 @@ def _replace_exact(store, current, new_url, account_key=ACCOUNT):
 
 
 def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
-        host_fn=None, max_per_day=MAX_PER_DAY, account_key=ACCOUNT):
-    """Repair at most three held feed visuals per date in this run."""
+        host_fn=None, max_per_day=MAX_PER_DAY, account_key=ACCOUNT,
+        include_incident_backlog=False):
+    """Repair the current runway plus held rows inside the publisher catchup.
+
+    Past coverage follows the publisher's dynamic catchup window
+    (``_client_publish_limits``), not fixed outage dates: an Oct 7 hold is
+    still repaired on an Oct 8 retry, and rows that age out of the publisher
+    window age out here too. Past-day paid attempts stay capped at
+    MAX_PAST_PER_RUN per run, and only the two feed media holds are ever
+    cleared. ``include_incident_backlog`` is accepted for the deployed
+    runner's recovery-window call and no longer changes coverage. No row is
+    published by this job.
+    """
     summary = {"ok": False, "attempted": 0, "generated": 0, "reused": 0,
                "repaired": 0, "skipped": 0, "errors": 0}
     if not (account_key in ACCOUNTS.values()
@@ -268,7 +379,17 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         summary["reason"] = "invalid repair cap"
         return summary
     day = _local_day(now)
-    first, last = day.isoformat(), (day + timedelta(days=HORIZON_DAYS)).isoformat()
+    today = day.isoformat()
+    try:
+        catchup_days, _ = calendar_autopublish._client_publish_limits(
+            GYM, today, config.client_daily_publish_cap())
+    except Exception:
+        catchup_days = None
+    if type(catchup_days) is not int or catchup_days < 0:
+        summary["reason"] = "publisher catchup window unavailable"
+        return summary
+    first = (day - timedelta(days=catchup_days)).isoformat()
+    last = (day + timedelta(days=HORIZON_DAYS)).isoformat()
     store = store or SupabaseCalendarStore()
     artifact_store = artifact_store or ArtifactStore()
     if not artifact_store.available:
@@ -284,12 +405,21 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
         return summary
     summary["ok"] = True
     rows = sorted((row for row in rows if _eligible(row, first, last, account_key)),
-                  key=lambda row: (row["post_date"], row.get("slot_index") or 0,
-                                   str(row["id"])))
-    per_day = {first: 0, last: 0}
+                  key=lambda row: (str(row["post_date"])[:10] < today,
+                                   row["post_date"],
+                                   0 if row["format"] == "feed" else 1,
+                                   row.get("slot_index") or 0, str(row["id"])))
+    per_day = {}
+    backlog_attempted = 0
     for row in rows:
         row_day = str(row["post_date"])[:10]
-        if per_day[row_day] >= max_per_day:
+        past_day = row_day < today
+        if past_day and backlog_attempted >= MAX_PAST_PER_RUN:
+            summary["skipped"] += 1
+            continue
+        kind = str(row["format"]).lower()
+        count_key = (row_day, kind)
+        if per_day.get(count_key, 0) >= max_per_day:
             summary["skipped"] += 1
             continue
         source_id = f"content_calendar:{row['id']}:caption"
@@ -305,13 +435,15 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
                 summary["skipped"] += 1
                 continue
             summary["attempted"] += 1
-            per_day[row_day] += 1
+            if past_day:
+                backlog_attempted += 1
+            per_day[count_key] = per_day.get(count_key, 0) + 1
             fresh = store.get_row(GYM, row["id"])
             if not _same_row(row, fresh):
                 summary["skipped"] += 1
                 continue
             url = None
-            if account_key == ACCOUNTS["facebook"]:
+            if kind == "feed" and account_key == ACCOUNTS["facebook"]:
                 url, mirror_found = _reuse_ig_for_fb(store, row)
                 if mirror_found and not url:
                     summary["skipped"] += 1
@@ -329,6 +461,12 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
                     continue
                 url = result["image_url"]
                 summary["generated"] += 1
+            if row["media_not_ready_reason"] == CAPTION_HOLD_REASON:
+                reviewed = _reviewed_artifact_record(
+                    store, source_id, source_hash, account_key)
+                if not reviewed or reviewed["image_url"] != url:
+                    summary["errors"] += 1
+                    continue
             fresh = store.get_row(GYM, row["id"])
             if not _same_row(row, fresh):
                 summary["skipped"] += 1

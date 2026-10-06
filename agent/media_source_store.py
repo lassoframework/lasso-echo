@@ -15,6 +15,9 @@ gates, so a single missing filter cannot leak another gym's media.
 """
 from __future__ import annotations
 
+import json
+import re
+
 from . import config
 
 _SOURCE_TABLE = "media_source"
@@ -327,6 +330,49 @@ class SupabaseMediaStore:
             raise MediaStoreError(r.status_code, self._scrubbed(r))
         if len(r.json() or []) != 1:
             raise MediaStoreError(409, "asset changed during moderation")
+        return True
+
+    def update_moderation_sha256(self, gym_id, asset_id, evidence, *,
+                                 expected_content_hash,
+                                 expected_moderation_json):
+        """CAS one derived SHA-256 into existing clean moderation evidence.
+
+        This intentionally updates only ``moderation_json``. The row must remain
+        clean, approved and review-bound to the same Drive MD5, and the complete
+        prior JSON is part of the compare-and-swap so concurrent evidence edits
+        cannot be overwritten.
+        """
+        if not gym_id or not asset_id or not expected_content_hash:
+            raise MediaStoreError(400, "sha256 backfill requires tenant, asset and hash")
+        if not isinstance(expected_moderation_json, dict) or not isinstance(evidence, dict):
+            raise MediaStoreError(400, "sha256 backfill requires evidence objects")
+        raw_sha = evidence.get("sha256")
+        if (not isinstance(raw_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", raw_sha)
+                or {k: v for k, v in evidence.items() if k != "sha256"}
+                   != expected_moderation_json
+                or expected_moderation_json.get("verdict") != "clean"
+                or expected_moderation_json.get("content_hash") != expected_content_hash
+                or expected_moderation_json.get("asset_id") != asset_id
+                or expected_moderation_json.get("gym_id") != gym_id):
+            raise MediaStoreError(400, "invalid sha256 moderation evidence")
+        params = {
+            "id": f"eq.{asset_id}", "gym_id": f"eq.{gym_id}",
+            "content_hash": f"eq.{expected_content_hash}",
+            "review_content_hash": f"eq.{expected_content_hash}",
+            "review_status": "eq.approved", "moderation_status": "eq.clean",
+            "moderation_json": "eq." + json.dumps(
+                expected_moderation_json, sort_keys=True, separators=(",", ":")),
+        }
+        r = self._client().patch(
+            self._rest(_ASSET_TABLE), params=params,
+            json={"moderation_json": evidence},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}), timeout=30)
+        if r.status_code >= 400:
+            raise MediaStoreError(r.status_code, self._scrubbed(r))
+        if len(r.json() or []) != 1:
+            raise MediaStoreError(409, "asset changed during sha256 backfill")
         return True
 
 

@@ -161,8 +161,20 @@ def violations(text: str) -> list[str]:
     return v
 
 
+def lasso_violations(text: str) -> list[str]:
+    """LASSO house punctuation on ordinary copy, preserving URLs and handles."""
+    problems = violations(text)
+    plain = _PROTECTED_RE.sub("", str(text))
+    if ":" in plain:
+        problems.append("banned_colon")
+    if ";" in plain:
+        problems.append("banned_semicolon")
+    return problems
+
+
 # Periods in URLs, decimals and common abbreviated names are not sentence ends.
 _CAPTION_SENTENCE_END = re.compile(r"([.!?][\"'”’)]*)[ \t]+(?=\S)")
+_CAPTION_LIST_NUMBER = re.compile(r"\d+\.")
 _CAPTION_ABBREVIATIONS = frozenset(("mr.", "mrs.", "ms.", "dr.", "prof.",
                                     "st.", "vs.", "e.g.", "i.e."))
 _CAPTION_CONTEXT_ABBREVIATIONS = frozenset((
@@ -170,12 +182,15 @@ _CAPTION_CONTEXT_ABBREVIATIONS = frozenset((
     "oct.", "nov.", "dec.", "ave.", "ft.", "no.", "a.m.", "p.m.", "etc."))
 
 
-def format_caption(text: str) -> str:
+def format_caption(text: str, *, reject_ambiguous_lists: bool = False) -> str:
     """Keep every caption sentence on its own paragraph, with one blank line.
 
     This is a presentation rule for generated and edited calendar copy. It leaves
     the words and punctuation intact, and is idempotent so repeated staging cannot
     add extra blank lines. Hashtag and URL lines are kept as standalone blocks.
+    At publication, reject ambiguous inline ordinals: a quantity ending a
+    sentence can look exactly like the next list marker. Explicit list items
+    on separate lines remain safe. Draft callers retain their existing behavior.
     """
     source = str(text or "")
     chunks, last = [], 0
@@ -196,17 +211,30 @@ def format_caption(text: str) -> str:
             blocks.append(line)
             continue
         start = 0
+        next_list_number = None
         for match in _CAPTION_SENTENCE_END.finditer(line):
             part = line[start:match.end(1)].strip()
             last_word = part.split()[-1].lower() if part.split() else ""
             if last_word in _CAPTION_ABBREVIATIONS:
                 continue
             next_text = line[match.end():].lstrip()
+            if _CAPTION_LIST_NUMBER.fullmatch(last_word):
+                prefix = line[start:match.start() - len(last_word[:-1])].strip()
+                number = int(last_word[:-1])
+                if (reject_ambiguous_lists and next_list_number is not None
+                        and prefix and not prefix.endswith(":")):
+                    raise ValueError("ambiguous numbered list: put each item on its own line")
+                if number == next_list_number or not prefix or prefix.endswith(":"):
+                    next_list_number = number + 1
+                    continue
+            if last_word.rstrip("\"'”’)]").endswith("..."):
+                continue
             if (last_word in _CAPTION_CONTEXT_ABBREVIATIONS and next_text
                     and (next_text[0].islower() or next_text[0].isdigit())):
                 continue
             blocks.append(part)
             start = match.end()
+            next_list_number = None
         tail = line[start:].strip()
         if tail:
             blocks.append(tail)
