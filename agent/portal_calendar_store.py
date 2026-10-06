@@ -132,6 +132,73 @@ def _eq_filter(value):
     return f"eq.{value}"
 
 
+def _paired_story_hold_source_link(expected_row, feed):
+    """True when `expected_row` is an unclaimed pending active LASSO Story and
+    `feed` identifies its exact source feed row.
+
+    A pending Story holding 'paired_feed_not_ready' is waiting on its paired
+    feed's visual, so a caption-driven visual hold on it is legitimate — but
+    ONLY through an exact CAS whose caller proves the story/feed linkage with
+    the same identity the pairing lanes use (gym, account, post_date,
+    slot_index, logical_post_id). Anything less fails closed: the hold reason
+    stays in the rejected set and patch_pending_plan returns None.
+    """
+    if not isinstance(feed, dict):
+        return False
+    if (str(expected_row.get("format") or "").lower() != "story"
+            or expected_row.get("status") != "pending"
+            or expected_row.get("variant_status") != "active"
+            or expected_row.get("published_at") is not None
+            or expected_row.get("late_post_id") is not None
+            or expected_row.get("publish_claim_token") is not None):
+        return False
+    if (str(feed.get("format") or "").lower() != "feed"
+            or str(feed.get("gym_id") or "") != str(expected_row.get("gym_id") or "")
+            or str(feed.get("post_date") or "")[:10]
+            != str(expected_row.get("post_date") or "")[:10]):
+        return False
+    return all(feed.get(column) == expected_row.get(column)
+               for column in ("account", "slot_index", "logical_post_id"))
+
+
+_PREPARED_BACKLOG_HOLD = "prepared_backlog_waiting_for_story_and_capacity"
+
+
+def _prepared_backlog_caption_hold_transition_ok(expected_row):
+    """Narrow gate for the Oct 2-5 2026 prepared-backlog caption swap.
+
+    Four LASSO feeds hold 'prepared_backlog_waiting_for_story_and_capacity'
+    while waiting on reviewed Story media and capacity; their approved copy
+    apply must move them to 'caption_changed_needs_new_visual' atomically with
+    the new caption CAS. True ONLY for a canonical owned LASSO FEED: gym
+    lasso, IG/FB account, post_date inside the incident window and not future
+    dated, slot 0-2, pending/active, and completely unclaimed (no claim token,
+    no late post id, no publish receipt). The exact-row CAS pins every one of
+    these server-side; this check decides whether the hold may TRANSITION
+    (never clear) at all. Stories, other tenants, foreign holds and stale
+    snapshots fail closed.
+    """
+    from datetime import date as _date
+    day = str(expected_row.get("post_date") or "")[:10]
+    try:
+        d = _date.fromisoformat(day)
+    except ValueError:
+        return False
+    return (
+        str(expected_row.get("gym_id") or "") == "lasso"
+        and str(expected_row.get("account") or "").strip().lower()
+        in ("instagram", "facebook")
+        and _date(2026, 10, 2) <= d <= _date(2026, 10, 5)
+        and d <= _date.today()
+        and expected_row.get("slot_index") in (0, 1, 2)
+        and str(expected_row.get("format") or "").lower() == "feed"
+        and expected_row.get("status") == "pending"
+        and expected_row.get("variant_status") == "active"
+        and expected_row.get("publish_claim_token") is None
+        and expected_row.get("late_post_id") is None
+        and expected_row.get("published_at") is None)
+
+
 def _slot_key(row):
     """The (post_date, account, format) a row occupies, normalized. Two rows with the
     same slot key are the same calendar cell (a rebuild must not create a second one).
@@ -318,6 +385,54 @@ class SupabaseCalendarStore:
 
     def _rest(self, path):
         return f"{self._url}/rest/v1/{path}"
+
+    def managed_lasso_paired_story_ids(self, story_ids):
+        """Read exact Story IDs protected by the paired-feed registry.
+
+        A failed or partial read raises; calendar reconciliation must then keep
+        every retained LASSO Story instead of overwriting an unknown managed
+        row with a planner rerender.
+        """
+        from uuid import UUID
+        if not isinstance(story_ids, (list, tuple, set)) or len(story_ids) > 1000:
+            raise ValueError("invalid managed Story lookup size")
+        ids = sorted({str(UUID(str(value))) for value in story_ids})
+        found = set()
+        for start in range(0, len(ids), 100):
+            group = ids[start:start + 100]
+            response = self._client().get(
+                self._rest("lasso_managed_paired_stories"),
+                params={"story_id": "in.(" + ",".join(group) + ")",
+                        "select": "story_id,feed_id", "limit": str(len(group) + 1)},
+                headers=self._headers(), timeout=30)
+            if response.status_code >= 400:
+                raise RuntimeError("managed LASSO Story registry read failed")
+            rows = response.json()
+            if not isinstance(rows, list) or len(rows) > len(group):
+                raise RuntimeError("managed LASSO Story registry read incomplete")
+            for row in rows:
+                if (not isinstance(row, dict)
+                        or str(row.get("story_id")) not in group
+                        or not row.get("feed_id")
+                        or row["story_id"] in found):
+                    raise RuntimeError("managed LASSO Story registry response malformed")
+                found.add(row["story_id"])
+        return found
+
+    def lasso_paired_story_ready_for_feed(self, feed_id):
+        """Database source proof immediately before claiming a LASSO feed."""
+        from uuid import UUID
+        canonical = str(UUID(str(feed_id)))
+        response = self._client().post(
+            self._rest("rpc/lasso_paired_story_ready_for_feed"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"p_feed_id": canonical}, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError("LASSO paired Story preflight unavailable")
+        ready = response.json()
+        if type(ready) is not bool:
+            raise RuntimeError("LASSO paired Story preflight malformed")
+        return ready
 
     # ---- read ---------------------------------------------------------------
     def list_month(self, account_key, month):
@@ -1526,6 +1641,34 @@ class SupabaseCalendarStore:
                or not first <= str(row.get("post_date") or "")[:10] <= last
                for row in rows):
             raise ValueError("pending media read scope mismatch")
+        return rows
+
+    def active_rows_on_day_complete(self, account_key, day):
+        """Exact-count read of every active status for a caption/Story swap.
+
+        The general forward-book read omits draft and queued rows. A stale
+        paired Story in either state must still receive a media hold before
+        its feed caption changes.
+        """
+        response = self._client().get(
+            self._rest(_TABLE),
+            params={"gym_id": f"eq.{account_key}", "post_date": f"eq.{day}",
+                    "variant_status": "eq.active", "select": "*",
+                    "limit": "1000", "order": "id"},
+            headers=self._headers({"Prefer": "count=exact"}), timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code,
+                                   _scrub((response.text or "")[:200]))
+        rows = response.json()
+        total = (getattr(response, "headers", {}) or {}).get(
+            "Content-Range", "").rsplit("/", 1)[-1]
+        if (not isinstance(rows, list) or not total.isdigit()
+                or int(total) != len(rows)
+                or any(not isinstance(row, dict)
+                       or row.get("gym_id") != account_key
+                       or str(row.get("post_date") or "")[:10] != day
+                       or row.get("variant_status") != "active" for row in rows)):
+            raise ValueError("paired Story read incomplete")
         return rows
 
     # ---- variant pairing (0318): v2 creative candidates -----------------------
@@ -3492,7 +3635,9 @@ class SupabaseCalendarStore:
         return None
 
     def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None,
-                           levers=None):
+                           levers=None, expected_row=None,
+                           force_caption_visual_hold=False,
+                           caption_hold_source_feed=None):
         """PATCH a WIPEABLE row's caption and/or pillar (the grade self-fix lane,
         AGENT_GRADE_SELF_FIX), filtered by id AND gym_id AND a server-side
         status IN (pending,draft,queued) guard, so a human-owned row (approved /
@@ -3515,6 +3660,15 @@ class SupabaseCalendarStore:
         learner reads: metrics_sync copies these columns onto post_metrics and
         monthly_retro compares on them. A caller that changes the caption must
         pass the re-stamped levers so the label keeps telling the truth.
+
+        `caption_hold_source_feed` is the paired feed row dict, accepted only
+        alongside `force_caption_visual_hold` on a LASSO Story whose current
+        hold is 'paired_feed_not_ready' (a normal Story waiting on its feed's
+        visual). Without that source link the widened hold stays refused.
+        One further transition is allowed for a canonical owned Oct 2-5 2026
+        LASSO feed: 'prepared_backlog_waiting_for_story_and_capacity' moves to
+        'caption_changed_needs_new_visual' atomically with the new caption
+        (_prepared_backlog_caption_hold_transition_ok; never a clear).
         """
         fields = {}
         if caption is not None:
@@ -3525,6 +3679,55 @@ class SupabaseCalendarStore:
         for key, value in (levers or {}).items():
             if key in _LEVER_COLUMNS and value is not None:
                 fields[key] = value
+        caption_visual_hold = (
+            account_key == "lasso" and expected_row is not None
+            # PR29705 review: the caption visual hold belongs to the autonomous
+            # LASSO lane. With AGENT_LASSO_3X_ENABLED OFF this PATCH keeps the
+            # old mechanical CAS behavior and sets NO new hold; every condition
+            # below (and the paired-Story source guard) is unchanged when ON.
+            and config.lasso_three_feed_enabled()
+            and ((caption is not None and caption != expected_row.get("caption"))
+                 or force_caption_visual_hold))
+        if (expected_row is not None
+                and expected_row.get("media_not_ready_reason")
+                == _PREPARED_BACKLOG_HOLD
+                and ((caption is not None
+                      and caption != expected_row.get("caption"))
+                     or force_caption_visual_hold)):
+            # The prepared-backlog hold may only ever TRANSITION (never be
+            # cleared, never be left behind by a caption change), and only
+            # through the gated autonomous path. Flag OFF, a non-canonical row,
+            # a claimed/receipt row or a stale snapshot all fail CLOSED here --
+            # before any write -- so the copy apply can never partially reserve.
+            if not (caption_visual_hold
+                    and _prepared_backlog_caption_hold_transition_ok(expected_row)):
+                return None
+        if caption_visual_hold:
+            hold_reason = expected_row.get("media_not_ready_reason")
+            if hold_reason == "paired_feed_not_ready":
+                # The ONLY widened case: an exact, unclaimed, pending, active
+                # LASSO Story CAS whose caller names the paired source feed
+                # (_paired_story_hold_source_link). The CAS params below already
+                # pin status/variant/claim columns server-side, so the link
+                # check is what keeps this from broadening to unrelated holds.
+                if not (force_caption_visual_hold
+                        and _paired_story_hold_source_link(
+                            expected_row, caption_hold_source_feed)):
+                    return None
+            elif hold_reason == _PREPARED_BACKLOG_HOLD:
+                # The Oct 2-5 prepared-backlog copy apply: the hold TRANSITIONS
+                # to caption_changed_needs_new_visual atomically with the new
+                # caption, only for the canonical owned LASSO feed the gate
+                # proves. The old hold is never CLEARED here -- the CAS params
+                # below pin it server-side and the payload replaces it.
+                if not _prepared_backlog_caption_hold_transition_ok(expected_row):
+                    return None
+            elif hold_reason not in (None, "caption_changed_needs_new_visual",
+                                     "cross_date_media_repeat_needs_new_visual"):
+                return None
+            # Set in the SAME PostgREST PATCH as the new caption. The old image
+            # is never publishable even if the runner sees this row immediately.
+            fields["media_not_ready_reason"] = "caption_changed_needs_new_visual"
         if not fields:
             return None
         fields["status"] = "pending"
@@ -3533,6 +3736,29 @@ class SupabaseCalendarStore:
             "gym_id": f"eq.{account_key}",
             "status": f"in.({','.join(_WIPEABLE_STATUSES)})",
         }
+        if expected_row is not None:
+            # Autonomous caption repair must target the exact active generation.
+            # A late publisher, visual swap, or concurrent rewrite makes the
+            # compare-and-swap return zero rows instead of clobbering its work.
+            if (str(expected_row.get("id")) != str(row_id)
+                    or str(expected_row.get("gym_id")) != str(account_key)
+                    or expected_row.get("status") not in _WIPEABLE_STATUSES
+                    or expected_row.get("variant_status") != "active"
+                    or not expected_row.get("created_at")):
+                return None
+            for column in ("post_date", "account", "format", "slot_index",
+                           "logical_post_id", "created_at", "caption", "image_url",
+                           "source_media_url", "thumbnail_url",
+                           "media_not_ready_reason", "source_media_asset_id",
+                           "published_at", "late_post_id", "publish_claim_token",
+                           "publish_reservation_day", "scheduled_at"):
+                value = expected_row.get(column)
+                encoded = _eq_filter(value)
+                if encoded is None:
+                    return None
+                params[column] = encoded
+            params["status"] = f"eq.{expected_row['status']}"
+            params["variant_status"] = "eq.active"
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -3546,7 +3772,15 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         for row in (r.json() or []):
-            if str(row.get("gym_id")) == str(account_key):
+            if (str(row.get("gym_id")) == str(account_key)
+                    and (expected_row is None or (
+                        str(row.get("id")) == str(row_id)
+                        and ("caption" not in fields or
+                             row.get("caption") == fields["caption"])
+                        and (not caption_visual_hold or
+                             row.get("media_not_ready_reason") ==
+                             "caption_changed_needs_new_visual")
+                        and row.get("status") == "pending"))):
                 return row
         return None
 
@@ -3629,11 +3863,15 @@ class SupabaseCalendarStore:
     _REPEAT_HOLD_PAGE_SIZE = 500
     _REPEAT_HOLD_MAX_PAGES = 100        # 50k rows: a hard tripwire, far past any real book
 
-    def rows_in_range_complete(self, account_key, start_iso, end_iso):
+    def rows_in_range_complete(self, account_key, start_iso, end_iso, *,
+                               all_statuses=False):
         """Complete tenant-scoped read of active rows in a date range.
 
         Unlike rows_in_range, this read does not cap at 1000 rows. Id-cursor
-        pagination covers active statuses and the requested date range. Every page is
+        pagination covers active variants and the requested date range. By
+        default it includes forward-book statuses only; all_statuses=True is
+        for additive LASSO refill, where draft and queued rows own slots too.
+        Every page is
         validated; ANY error, malformed row, out-of-scope row, duplicate or
         non-ascending id, or a runaway page count fails the ENTIRE read --
         never a partial result."""
@@ -3643,13 +3881,14 @@ class SupabaseCalendarStore:
         for _ in range(self._REPEAT_HOLD_MAX_PAGES):
             params = {
                 "gym_id": f"eq.{account_key}",
-                "status": "in.(pending,approved,publishing,published,coach_review)",
                 "variant_status": "eq.active",
                 "post_date": f"gte.{start_iso}",
                 "and": f"(post_date.lte.{end_iso})",
                 "order": "id",
                 "limit": str(self._REPEAT_HOLD_PAGE_SIZE),
             }
+            if not all_statuses:
+                params["status"] = "in.(pending,approved,publishing,published,coach_review)"
             if last_id is not None:
                 params["id"] = f"gt.{last_id}"
             r = self._client().get(
@@ -3969,6 +4208,19 @@ def _reconcile_story_media_holds(store, calendar_gym_key, proposed):
     retained = [row for row in existing if isinstance(row, dict) and row.get("format") == "story"
                 and row.get("gym_id") == calendar_gym_key
                 and row.get("variant_status") == "active"]
+    protected_ids = set()
+    if calendar_gym_key == "lasso":
+        pending_ids = [row["id"] for row in retained if row.get("status") == "pending"]
+        try:
+            reader = getattr(store, "managed_lasso_paired_story_ids")
+            protected_ids = reader(pending_ids)
+            if (not isinstance(protected_ids, set)
+                    or not protected_ids.issubset(set(pending_ids))):
+                raise ValueError("managed Story registry returned invalid IDs")
+        except Exception as exc:
+            print(f"[calendar] LASSO Story registry unconfirmed: {type(exc).__name__}; "
+                  "retained pending rows protected")
+            protected_ids = set(pending_ids)
     output, recovered = [], []
     for row in proposed:
         if row.get("format") == "story" and sum(_story_slot(r) == _story_slot(row) for r in stories) != 1:
@@ -3985,6 +4237,11 @@ def _reconcile_story_media_holds(store, calendar_gym_key, proposed):
         if targets[0].get("status") != "pending":
             # The planner never creates a sibling over a human/publisher row,
             # even with the optional content-dedupe belt disabled.
+            continue
+        if targets[0]["id"] in protected_ids:
+            # This exact Story/feed pair was independently reviewed and staged
+            # through the guarded RPC. A later planner rerender may not replace
+            # its image or clear its feed hold, even if the hold already lifted.
             continue
         if _is_story_media_hold(row):
             # Same failed slot: keep its source generation and retry seed, even

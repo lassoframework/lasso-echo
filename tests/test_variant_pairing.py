@@ -584,6 +584,7 @@ def test_lasso_story_variant_keeps_caption_and_story_canvas(monkeypatch):
     from agent import infographic_artifacts
     monkeypatch.setattr(infographic_artifacts.ArtifactStore, "save",
         lambda *args, **kwargs: {})
+    monkeypatch.setattr(vr, "_attest_reviewed_story_dimensions", lambda path: True)
     seen = {}
 
     def fake_generate(headline, facts, **kwargs):

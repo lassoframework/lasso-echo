@@ -970,6 +970,73 @@ def _unused_client_photo_available(account, path, day_key):
         return True
 
 
+def _lasso_held_media_and_story_preparation(scheduled_for):
+    """Repair held LASSO visuals, then stage source-bound paired Stories.
+
+    Runs AFTER every calendar-mutating job in run_daily (drafting, refills,
+    grade_sweep remediation, sweeps) and immediately before the final calendar
+    publish block, exactly once per draw. A Story artifact binds the feed
+    caption present at staging time (source_hash over feed["caption"]), so
+    staging here — after grade_fix caption remediation — means tonight's pairs
+    bind the FINAL caption instead of stranding on a pre-remediation one until
+    the next nightly draw. Held-feed repair stays strictly BEFORE Story
+    preparation so a repaired visual exists before its Story is staged. Both
+    jobs keep their existing flags, bounds, both-accounts coverage, and the
+    dynamic _client_publish_limits lookback; neither can publish.
+    """
+    # Prepare today's and tomorrow's held LASSO visuals. Tomorrow matters
+    # because the draw runs after the first local feed slot. During the dated
+    # October incident window, include at most two older held rows per account
+    # and run, after the current runway. This job only replaces media on an
+    # exact pending held row; it cannot post.
+    if config.lasso_three_feed_enabled():
+        try:
+            from .jobs import lasso_held_media_repair
+            repair_day = lasso_held_media_repair._local_day(scheduled_for).isoformat()
+            incident_recovery = (
+                lasso_held_media_repair.INCIDENT_RECOVERY_FIRST <= repair_day
+                <= lasso_held_media_repair.INCIDENT_RECOVERY_LAST)
+            for account_key in ("lasso_ig", "lasso_fb"):
+                try:
+                    repair_args = {"now": scheduled_for, "account_key": account_key}
+                    if incident_recovery:
+                        repair_args["include_incident_backlog"] = True
+                    repair = lasso_held_media_repair.run(**repair_args)
+                    if repair.get("ok"):
+                        print(f"[lasso-held-media] {account_key} "
+                              f"attempted={repair['attempted']} generated={repair['generated']} "
+                              f"reused={repair['reused']} repaired={repair['repaired']} "
+                              f"skipped={repair['skipped']} errors={repair['errors']}")
+                    else:
+                        print(f"[lasso-held-media] {account_key} held: "
+                              f"{repair.get('reason', 'unavailable')}")
+                except Exception as exc:
+                    print(f"[lasso-held-media] {account_key} failed: {type(exc).__name__}")
+        except Exception as exc:
+            print(f"[lasso-held-media] failed: {type(exc).__name__}")
+
+    # Stage up to three genuinely reviewed, source-bound 9:16 Stories per
+    # account for today and tomorrow. The job skips occupied slots, leases paid
+    # generation, and uses the guarded insert-only RPC. It cannot publish.
+    if config.lasso_three_feed_enabled() and config.calendar_autopublish_enabled():
+        try:
+            from .jobs import lasso_daily_paired_stories, lasso_held_media_repair
+            from .calendar_autopublish import _client_publish_limits
+            pairing_day = lasso_held_media_repair._local_day(scheduled_for).isoformat()
+            pairing_lookback, _ = _client_publish_limits(
+                "lasso", pairing_day, config.client_daily_publish_cap())
+            for account in ("instagram", "facebook"):
+                result = lasso_daily_paired_stories.run(
+                    now=scheduled_for, account=account, catchup_days=pairing_lookback)
+                print(f"[lasso-paired-stories] {account} "
+                      f"staged={result['staged']} generated={result['generated']} "
+                      f"reused={result['reused']} occupied={result['occupied']} "
+                      f"blocked={result['blocked']} "
+                      f"reason={result.get('reason', 'ok')}")
+        except Exception as exc:
+            print(f"[lasso-paired-stories] failed: {type(exc).__name__}")
+
+
 def run_daily(poster=None, voice_path=None, library_path=None,
               scheduled_for=None, accounts=None, store=None):
     """
@@ -990,34 +1057,24 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         # agent disarmed. say nothing publicly; just report state to the caller.
         return {"status": "disabled", "drafts": []}
 
-    # Prepare today's and tomorrow's held LASSO feed visuals before drafting or
-    # the calendar publish sweep. Tomorrow's runway matters because the daily
-    # draw may run after the first local feed slot. This job only replaces media
-    # on an exact pending held row; it cannot claim or publish a post.
-    if config.lasso_three_feed_enabled():
-        try:
-            from .jobs import lasso_held_media_repair
-            for account_key in ("lasso_ig", "lasso_fb"):
-                try:
-                    repair = lasso_held_media_repair.run(now=scheduled_for,
-                                                         account_key=account_key)
-                    if repair.get("ok"):
-                        print(f"[lasso-held-media] {account_key} "
-                              f"attempted={repair['attempted']} generated={repair['generated']} "
-                              f"reused={repair['reused']} repaired={repair['repaired']} "
-                              f"skipped={repair['skipped']} errors={repair['errors']}")
-                    else:
-                        print(f"[lasso-held-media] {account_key} held: "
-                              f"{repair.get('reason', 'unavailable')}")
-                except Exception as exc:
-                    print(f"[lasso-held-media] {account_key} failed: {type(exc).__name__}")
-        except Exception as exc:
-            print(f"[lasso-held-media] failed: {type(exc).__name__}")
+    # NOTE: the LASSO held-media repair + paired-Story preparation sequence
+    # runs at the END of this draw (see _lasso_held_media_and_story_preparation,
+    # invoked immediately before the calendar publish block below), AFTER every
+    # calendar-mutating job, so Stories bind post-remediation captions tonight
+    # instead of stranding a held feed until the next nightly draw.
 
     poster = poster or SlackPoster()
     voice = load_voice(voice_path or config.VOICE_DOC_PATH)
 
     if voice is None:
+        # A missing voice blocks DRAFTING, not the autonomous LASSO preparation
+        # lane: held feeds and paired Stories for already-staged rows still
+        # prepare tonight (the job cannot publish). Gated on the same switch as
+        # the end-of-draw call — flag OFF stays the intentional fail-closed
+        # no-op. The normal branch keeps its single call AFTER every calendar
+        # mutation (post-grade ordering), exactly once per draw either way.
+        if config.lasso_three_feed_enabled():
+            _lasso_held_media_and_story_preparation(scheduled_for)
         poster.post_notice(":warning: Brand voice doc missing or empty. "
                            "Drafting nothing until it's in place.")
         return {"status": "no_voice", "drafts": []}
@@ -2108,6 +2165,16 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 print(f"[real-mirror] {account.key}: {type(e).__name__}: {e}")
                 ops_alerts.alert(f"real-calendar mirror failed for {account.key}: "
                                  f"{type(e).__name__}: {e}. The draft run is unaffected.")
+
+    # LASSO HELD-MEDIA REPAIR + PAIRED-STORY PREPARATION: this is the LAST
+    # calendar-mutation-adjacent step before publishing. It runs AFTER every
+    # calendar-mutating job in this draw (drafting, refills, grade_sweep's
+    # grade_fix caption remediation, every sweep above) so each staged Story
+    # binds the FINAL feed caption tonight; run earlier, a caption repaired by
+    # grade_sweep strands its pre-remediation Story behind the exact
+    # caption-equality proof until the next nightly draw. Held-feed repair runs
+    # first, Story preparation second, exactly once per draw.
+    _lasso_held_media_and_story_preparation(scheduled_for)
 
     # CALENDAR AUTO-PUBLISHER (AGENT_CALENDAR_AUTOPUBLISH, OFF by default; ALSO needs
     # AGENT_PUBLISH_ENABLED). publish_due() self-guards on BOTH flags, so an unguarded

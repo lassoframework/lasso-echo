@@ -80,3 +80,72 @@ def test_story_claim_migration_only_widens_lasso_format_guard():
         f"{guard} not in ('feed', 'story')",
         f"{guard} <> 'feed'")
     assert widened == claim_body(previous)
+
+
+def test_immediate_backlog_window_gives_stories_fifteen_on_oct5_and_oct6(
+        monkeypatch):
+    monkeypatch.setattr(cadence, "resolve_posts_per_day",
+                        lambda gym_id, store, day=None: 3)
+    monkeypatch.setattr(cap.config, "lasso_three_feed_enabled", lambda: True)
+    monkeypatch.setattr(cap.config, "lasso_summit_daily_enabled",
+                        lambda day: False)
+    # A durable three-feed Story pair joining the immediate drain gets the
+    # same 15-row envelope as its feed (3 current + 12 strict backlog).
+    story = {"format": "story", "post_date": "2026-10-05"}
+    assert cap._publish_capacity("lasso", story, object(), "2026-10-05") == 15
+    assert cap._publish_capacity("lasso", story, object(), "2026-10-06") == 15
+    assert cap._publish_capacity(
+        "lasso", {**story, "post_date": "2026-10-02"}, object(),
+        "2026-10-06") == 15
+    # Outside the two immediate days the durable Story capacity is unchanged.
+    assert cap._publish_capacity("lasso", story, object(), "2026-10-12") == 3
+    # Another tenant's Story is never enlarged.
+    assert cap._publish_capacity("client-gym", story, object(),
+                                 "2026-10-05") == 2
+
+
+def test_immediate_capacity_migration_preserves_owned_claim_guards():
+    root = Path(__file__).resolve().parents[1] / "migrations"
+    sql = (root / "lasso_immediate_backlog_capacity_20261005.sql") \
+        .read_text().lower()
+    # Only LASSO, only Oct 5-6, only America/New_York may use capacity 15.
+    assert "p_capacity = 15 and not (" in sql
+    assert "p_day between date '2026-10-05' and date '2026-10-06'" in sql
+    assert "p_timezone = 'america/new_york'" in sql
+    # NULL-safe capacity, approved_only, day and timezone validation.
+    assert "p_capacity is null or p_approved_only is null" in sql
+    assert "p_day is null or p_timezone is null" in sql
+    # Backlog is sourced from Oct 2-5 strictly before the publish day, so an
+    # Oct 5 current-day row is never double counted as backlog.
+    assert ("v_row.post_date between date '2026-10-02' and date '2026-10-05'\n"
+            "          and v_row.post_date < p_day" in sql)
+    assert "and post_date < p_day)" in sql
+    assert "v_current_used >= 3" in sql
+    assert "v_backlog_used >= 12" in sql
+    # The residual Oct 7-11 two-extra mode is retained, narrowed off Oct 5-6.
+    assert "p_day between date '2026-10-07' and date '2026-10-11'" in sql
+    assert "v_backlog_used >= 2" in sql
+    # Stale/queued claim state and NULL-comparison rows fail closed.
+    assert "v_row.publish_claim_token is not null" in sql
+    assert "v_row.publish_reservation_day is not null" in sql
+    assert "v_row.post_date is null" in sql
+    assert "nullif(btrim(coalesce(v_row.account, '')), '') is null" in sql
+    # Every pre-existing owned-claim guarantee is preserved verbatim.
+    for fragment in (
+        "id = p_row_id and gym_id = p_gym_id",
+        "status in ('pending', 'approved')",
+        "published_at is null",
+        "late_post_id is null",
+        "variant_status = 'active'",
+        "nullif(btrim(coalesce(image_url, '')), '') is not null",
+        "media_not_ready_reason is null",
+        "p_approved_only and v_row.status <> 'approved'",
+        "for update",
+        "pg_advisory_xact_lock(hashtextextended(p_gym_id, 0))",
+        "(published_at at time zone p_timezone)::date = p_day",
+        "status = 'publishing' and publish_reservation_day = p_day",
+        "publish_claim_token = v_token",
+        "p_capacity = 3 and p_gym_id <> 'lasso'",
+        "to service_role",
+    ):
+        assert fragment in sql
