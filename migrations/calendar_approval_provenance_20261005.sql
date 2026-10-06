@@ -208,7 +208,9 @@ grant execute on function public.approve_calendar_row_if_media_ready(uuid, text,
 
 -- A failed portal proof stamp leaves an approved but unproved row. A fresh
 -- review tap may recover its digest only when the exact current card still
--- matches, the row is unproved, and no publish-relevant field has changed.
+-- matches, the row is unproved, and any stored digest still matches the row.
+-- Legacy approved rows with NULL digest receive a digest of the locked current
+-- row only after that same exact-card comparison; no actor is minted here.
 -- This RPC never stamps a human actor; the portal still calls the separate
 -- service-role stamp with its authenticated Clerk identity.
 create or replace function public.calendar_recover_unproved_approval(
@@ -230,8 +232,8 @@ begin
       or v_row.approved_at is not null
       or v_row.media_not_ready_reason is not null
       or nullif(btrim(coalesce(v_row.image_url, '')), '') is null
-      or v_row.approval_digest is null
-      or v_row.approval_digest is distinct from public.calendar_approval_digest(v_row)
+      or (v_row.approval_digest is not null and
+          v_row.approval_digest is distinct from public.calendar_approval_digest(v_row))
       or v_row.caption is distinct from p_expected->>'caption'
       or v_row.image_url is distinct from p_expected->>'media_url'
       or v_row.post_date::text is distinct from p_expected->>'day_key'
@@ -241,7 +243,15 @@ begin
          is distinct from lower(btrim(coalesce(p_expected->>'platform', ''))) then
     return;
   end if;
-  return next v_row;
+  if v_row.approval_digest is null then
+    return query
+      update public.content_calendar c
+         set approval_digest = public.calendar_approval_digest(c)
+       where c.id = p_row_id
+      returning c.*;
+  else
+    return next v_row;
+  end if;
 end;
 $$;
 revoke all on function public.calendar_recover_unproved_approval(uuid, text, jsonb)

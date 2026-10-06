@@ -109,6 +109,80 @@ def test_approved_unproved_retry_requires_atomic_recovery(monkeypatch):
     assert status == 409 and body["error"] == "review_refresh_required"
 
 
+def test_capture_only_recovers_legacy_approved_row_without_actor(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_CAPTURE", "true")
+    monkeypatch.delenv("AGENT_APPROVAL_PROOF", raising=False)
+    assert config.approval_capture_enabled() is True
+    assert config.approval_proof_enabled() is False
+
+    class _LegacyStore:
+        row = {**_full_row(), "status": "approved", "approval_digest": None,
+               "approval_kind": None, "approved_by": None, "approved_at": None}
+
+        def recover_unproved_approval(self, gym, row_id, expected):
+            assert expected == _snapshot()
+            return {**self.row, "approval_digest": "legacy-digest"}
+
+    status, body = _run(monkeypatch, _LegacyStore(), _snapshot())
+    assert status == 200
+    assert body["approval_state"] == "approved_unproved_retry"
+    assert body["approval_digest"] == "legacy-digest"
+    assert body["idempotent"] is True
+
+
+def test_capture_only_requires_snapshot_and_rejects_stale_pending_card(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_CAPTURE", "true")
+    monkeypatch.delenv("AGENT_APPROVAL_PROOF", raising=False)
+    sb = _SB(_full_row())
+    status, body = _run(monkeypatch, sb)
+    assert status == 409 and body["error"] == "review_refresh_required"
+    assert sb.calls == []
+
+    status, body = _run(monkeypatch, sb, _snapshot(caption="stale"))
+    assert status == 409 and body["error"] == "review_refresh_required"
+    assert sb.calls == [_snapshot(caption="stale")]
+
+    status, body = _run(monkeypatch, sb, _snapshot())
+    assert status == 200 and body["approval_digest"] == "digest-abc"
+
+
+@pytest.mark.parametrize("flag", ["AGENT_APPROVAL_CAPTURE", "AGENT_APPROVAL_PROOF"])
+def test_guarded_approve_never_falls_back_to_generic_status_write(monkeypatch, flag):
+    monkeypatch.delenv("AGENT_APPROVAL_CAPTURE", raising=False)
+    monkeypatch.delenv("AGENT_APPROVAL_PROOF", raising=False)
+    monkeypatch.setenv(flag, "true")
+
+    class _LegacyStore:
+        row = _full_row()
+        writes = 0
+
+        def set_status(self, *args):
+            self.writes += 1
+            return {**self.row, "status": "approved"}
+
+    sb = _LegacyStore()
+    status, body = _run(monkeypatch, sb, _snapshot())
+    assert status == 409 and body["error"] == "review_refresh_required"
+    assert "approval_digest" not in body
+    assert sb.writes == 0
+
+
+def test_capture_only_recovery_failure_does_not_return_digest(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_CAPTURE", "true")
+    monkeypatch.delenv("AGENT_APPROVAL_PROOF", raising=False)
+
+    class _ProvedStore:
+        row = {**_full_row(), "status": "approved", "approval_digest": "old",
+               "approval_kind": "human", "approved_by": "clerk-user"}
+
+        def recover_unproved_approval(self, *args):
+            return None
+
+    status, body = _run(monkeypatch, _ProvedStore(), _snapshot())
+    assert status == 409 and body["error"] == "review_refresh_required"
+    assert "approval_digest" not in body
+
+
 def test_generic_approved_replay_cannot_mint_recovery_digest(monkeypatch):
     monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
 
@@ -127,7 +201,9 @@ def test_generic_approved_replay_cannot_mint_recovery_digest(monkeypatch):
 
 def test_flag_off_ignores_snapshot_and_keeps_legacy_wire(monkeypatch):
     monkeypatch.delenv("AGENT_APPROVAL_PROOF", raising=False)
+    monkeypatch.delenv("AGENT_APPROVAL_CAPTURE", raising=False)
     assert config.approval_proof_enabled() is False
+    assert config.approval_capture_enabled() is False
     sb = _SB(_pending_row())
     # A snapshot that WOULD mismatch is completely ignored when OFF.
     status, resp = _run(monkeypatch, sb, expected_creative=_snapshot(
@@ -282,15 +358,18 @@ def test_flag_on_case_insensitive_format_and_platform(monkeypatch):
     assert status == 200
 
 
-def test_legacy_approve_proof_keeps_legacy_access_gates(monkeypatch):
-    """The proof flag adds a snapshot guard, never the Part-B product gate.
+@pytest.mark.parametrize("flag", ["AGENT_APPROVAL_PROOF", "AGENT_APPROVAL_CAPTURE"])
+def test_legacy_approve_guard_keeps_legacy_access_gates(monkeypatch, flag):
+    """Either flag adds a snapshot guard, never the Part-B product gate.
 
     The legacy route is already behind portal-approval token handling.  Calling
     the common Supabase approval handler must retain its row ownership and
     proof checks while skipping only the portal-social feature and billing
     gates that legacy customers do not have.
     """
-    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.delenv("AGENT_APPROVAL_PROOF", raising=False)
+    monkeypatch.delenv("AGENT_APPROVAL_CAPTURE", raising=False)
+    monkeypatch.setenv(flag, "true")
     monkeypatch.setattr(portal_routes.config, "portal_approvals_enabled",
                         lambda: True)
     monkeypatch.setattr(portal_routes.config, "portal_calendar_supabase_enabled",
@@ -325,6 +404,12 @@ def test_legacy_approve_proof_keeps_legacy_access_gates(monkeypatch):
     assert body["approval_digest"] == "digest-abc"
     assert calls["loaded"] == ("gymx", "r1")
     assert calls["approved"] == ("gymx", "r1", _snapshot())
+
+    calls.clear()
+    status, body = portal_routes.handle_portal_action(
+        "approve", "gymx", "r1", "legacy-actor", expected_creative=None)
+    assert status == 409 and body["error"] == "review_refresh_required"
+    assert calls == {"loaded": ("gymx", "r1")}
 
 
 def test_flag_on_row_changed_under_tap_fails_closed(monkeypatch):

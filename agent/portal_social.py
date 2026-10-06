@@ -930,7 +930,7 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store,
         # an already PUBLISHED row is also a clean no-op (the approval already ran its
         # course), never a status rewrite back to 'approved'.
         if (row.get("status") or "") == _pcs.action_status("approve"):
-            if config.approval_proof_enabled():
+            if config.approval_capture_enabled() or config.approval_proof_enabled():
                 expected, why = _validate_expected_creative(expected_creative)
                 if expected is None:
                     return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
@@ -999,21 +999,26 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store,
         # with an authenticated Clerk actor and this response's
         # approval_digest (docs/ECHO_VERIFIED_APPROVAL_PROOF_CONTRACT.md).
         # VISIBLE-CARD SNAPSHOT GATE (Echo half of the portal
-        # ECHO_VERIFIED_APPROVAL_PROOF contract, 2026-10-05): only when
-        # AGENT_APPROVAL_PROOF is ON does Echo require the portal's
+        # ECHO_VERIFIED_APPROVAL_PROOF contract, 2026-10-05): when
+        # AGENT_APPROVAL_CAPTURE or AGENT_APPROVAL_PROOF is ON, Echo requires the portal's
         # expected_creative snapshot. Absent/malformed snapshot, or a compare
         # mismatch inside the atomic RPC, is a 409 review_refresh_required:
         # no status change, no digest. Flag OFF ignores the body field
         # entirely and keeps the legacy wire + error shape.
-        _proof = config.approval_proof_enabled()
+        _capture = config.approval_capture_enabled() or config.approval_proof_enabled()
         _expected = None
-        if _proof:
+        if _capture:
             _expected, _why = _validate_expected_creative(expected_creative)
             if _expected is None:
                 return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
                              "error": "review_refresh_required",
                              "detail": _why}
         approve_ready = getattr(sb_store, "approve_ready", None)
+        if _capture and not callable(approve_ready):
+            # The generic status setter has no locked snapshot compare or
+            # digest write. Capture/enforcement must never use that path.
+            return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                         "error": "review_refresh_required"}
         if callable(approve_ready):
             updated = (approve_ready(account_key, draft_id)
                        if _expected is None
@@ -1023,7 +1028,7 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store,
             updated = sb_store.set_status(account_key, draft_id,
                                           _pcs.action_status("approve"))
         if updated is None:
-            if _proof:
+            if _capture:
                 # Stale snapshot OR the row changed under the tap: the card
                 # the human saw is no longer the locked row. Fail closed into
                 # fresh review; the digest is NOT stamped.
@@ -2561,8 +2566,8 @@ def handle_approve(account_key, draft_id, actor_id, store=None, reader=None,
     portal_approvals.approve, which runs the same gated publish Slack uses.
 
     expected_creative (optional): the portal's visible-card snapshot, required
-    and compared ONLY when AGENT_APPROVAL_PROOF is ON; ignored (legacy) when
-    OFF."""
+    and compared when AGENT_APPROVAL_CAPTURE or AGENT_APPROVAL_PROOF is ON;
+    ignored (legacy) when both are OFF."""
     if config.portal_calendar_supabase_enabled():
         return _handle_approve_supabase(account_key, draft_id, actor_id, reader,
                                         sb_store or _pcs.SupabaseCalendarStore(),

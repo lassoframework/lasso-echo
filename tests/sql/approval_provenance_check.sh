@@ -278,6 +278,30 @@ D36="$(DIGEST_OF 36)"
 q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa36','clerk-user-1','$D36')" >/dev/null
 check "proved approval cannot recover" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa36','$SWIFT','$(SNAP 36)'::jsonb)")"
 
+# Existing approved Manual rows predate digest capture. A fresh exact-card
+# tap fills only the digest; the authenticated portal stamps the actor later.
+mkrow 39 approved
+check "legacy approved requires exact card" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa39','$SWIFT','$(SNAP 35)'::jsonb)")"
+check "stale legacy tap leaves digest null" "t" "$(q "select approval_digest is null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa39'")"
+check "legacy approved recovers digest" "1" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa39','$SWIFT','$(SNAP 39)'::jsonb)")"
+check "legacy digest matches locked row" "t" "$(q "select approval_digest = calendar_approval_digest(content_calendar.*) from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa39'")"
+check "legacy recovery did not mint actor" "t" "$(q "select approval_kind is null and approved_by is null and approved_at is null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa39'")"
+check "recovered legacy row still held at Manual claim" "" "$(CLAIM 39)"
+D39="$(DIGEST_OF 39)"
+check "portal can stamp recovered legacy row" "1" "$(q "select count(*) from calendar_stamp_verified_approval('$GYM_UUID','aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa39','clerk-user-39','$D39')")"
+check "proved legacy row cannot recover again" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa39','$SWIFT','$(SNAP 39)'::jsonb)")"
+
+mkrow 40 approved
+check "wrong gym cannot capture legacy digest" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa40','othergym999999','$(SNAP 40)'::jsonb)")"
+check "wrong gym left legacy digest null" "t" "$(q "select approval_digest is null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa40'")"
+q "update content_calendar set media_not_ready_reason='hold' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa40'"
+check "media hold cannot capture legacy digest" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa40','$SWIFT','$(SNAP 40)'::jsonb)")"
+
+mkrow 41 approved
+q "update content_calendar set approval_digest='old-digest' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa41'"
+check "mismatched stored digest cannot recover" "0" "$(q "select count(*) from calendar_recover_unproved_approval('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa41','$SWIFT','$(SNAP 41)'::jsonb)")"
+check "mismatched stored digest was preserved" "old-digest" "$(DIGEST_OF 41)"
+
 # Keep the resolver's settings-row lock open across a transaction. A mode
 # update must wait for that claim-side transaction, never pass it mid-claim.
 cat >"$WORK/lock-holder.sql" <<SQL

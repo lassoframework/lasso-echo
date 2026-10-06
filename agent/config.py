@@ -697,6 +697,16 @@ def approval_proof_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_APPROVAL_PROOF", "false"))
 
 
+def approval_capture_enabled() -> bool:
+    """Capture exact-card approval digests without enforcing them at publish.
+
+    OFF by default. When ON, Echo requires the portal's visible-card snapshot
+    on approval and recovery taps. AGENT_APPROVAL_PROOF independently controls
+    the publisher's proof requirement.
+    """
+    return _truthy(os.environ.get("AGENT_APPROVAL_CAPTURE", "false"))
+
+
 def real_month_plan_enabled() -> bool:
     """
     REAL month planner switch. OFF by default = zero behavior change: the planner is
