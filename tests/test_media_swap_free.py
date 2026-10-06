@@ -387,6 +387,25 @@ def test_swap_landed_but_representation_none_keeps_local_reservation(monkeypatch
         "a landed PATCH must keep its once-use reservation")
 
 
+def test_prewrite_cas_refusal_releases_exact_local_reservation(monkeypatch, tmp_path):
+    from agent import portal_calendar_store, rotation
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    store = _Store([_row("p1")])
+    pick = dict(_picker("zanshin", _row("p1")), path=str(tmp_path / "new.jpg"))
+
+    def cas_refused(*args, **kwargs):
+        raise portal_calendar_store.PreWriteCASError(
+            422, "visual media CAS blocked: field 'caption' has no safe equality encoding")
+
+    store.swap_media = cas_refused
+    status, body = ps.handle_swap_media(
+        "zanshin", "p1", "u1", sb_store=store, picker=lambda *a, **k: pick)
+
+    assert status == 500 and body["error"].endswith("PreWriteCASError")
+    assert store.get_row("zanshin", "p1")["image_url"] == "https://cdn/old.jpg"
+    assert rotation.load_served_strict().get("zanshin_ig", []) == []
+
+
 def test_unknown_remote_swap_outcome_retains_local_reservation(monkeypatch, tmp_path):
     from agent import rotation
     monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")

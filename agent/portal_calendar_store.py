@@ -320,6 +320,10 @@ class PortalStoreError(Exception):
         super().__init__(f"supabase {status}: {detail}")
 
 
+class PreWriteCASError(PortalStoreError):
+    """CAS encoding refused before the calendar PATCH was attempted."""
+
+
 _UUID_RE = _re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -868,7 +872,7 @@ class SupabaseCalendarStore:
         for key in _VISUAL_MEDIA_CAS_COLUMNS:
             encoded = _eq_filter(current.get(key))
             if encoded is None:
-                raise PortalStoreError(
+                raise PreWriteCASError(
                     422, f"visual media CAS blocked: field {key!r} has no safe equality encoding")
             result[key] = encoded
         return result

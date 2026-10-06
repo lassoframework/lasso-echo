@@ -710,6 +710,6 @@ def test_image_patch_cas_unsupported_value_fails_before_write(monkeypatch, visua
 
 @pytest.mark.parametrize("unsafe", ["key\\with-backslash", {"malformed": "key"}])
 def test_visual_media_cas_unsupported_value_keeps_predicates_and_fails_closed(unsafe):
-    with pytest.raises(pcs.PortalStoreError, match="visual media CAS blocked"):
+    with pytest.raises(pcs.PreWriteCASError, match="visual media CAS blocked"):
         pcs.SupabaseCalendarStore._visual_media_cas(
             {"r2_key": unsafe, "slot_index": 0}, {"id": "eq.row-1", "gym_id": "eq.old-key"})
