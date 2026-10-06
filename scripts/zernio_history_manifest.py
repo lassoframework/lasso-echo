@@ -166,6 +166,23 @@ def _response_post_id(body):
     value = post.get("_id") or post.get("id")
     return value if isinstance(value, str) and value else None
 
+def _terminal_provider_ids(ledger: Path):
+    """Only the latest exact-ID provider HTTP400 receipt prevents automatic retry.
+
+    A later capture or retryable failure supersedes the terminal receipt. Do
+    not infer permanent failures from ID format or unrelated transport errors.
+    """
+    latest = {}
+    if ledger.exists():
+        for row in _read_jsonl(ledger):
+            pid = row.get("late_post_id")
+            if (row.get("record_type") == "capture" and isinstance(pid, str)
+                    and _SAFE_POST_ID.fullmatch(pid)):
+                latest[pid] = row
+    return {pid for pid, row in latest.items()
+            if row.get("status") == "error" and row.get("error_type") == "ZernioError"
+            and row.get("http_status") == 400}
+
 
 def capture_posts(records, *, ledger: Path, raw_dir: Path, max_items: int,
                   timeout: float, get_json, get_raw=None, now=None):
@@ -178,13 +195,14 @@ def capture_posts(records, *, ledger: Path, raw_dir: Path, max_items: int,
     ledger.parent.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
     done = _completed_ids(ledger, raw_dir)
+    terminal = _terminal_provider_ids(ledger)
     ids = []
     for row in records:
         pid = row.get("late_post_id")
         if (row.get("record_type") == "row" and
                 row.get("classification") == "exact_post_lookup_candidate" and
                 isinstance(pid, str) and _SAFE_POST_ID.fullmatch(pid) and
-                pid not in done and pid not in ids):
+                pid not in done and pid not in terminal and pid not in ids):
             ids.append(pid)
             if len(ids) == max_items:
                 break

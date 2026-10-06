@@ -370,3 +370,54 @@ def test_normalize_rejects_conflicting_provider_id_fields(tmp_path):
     rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path, post=post, rows=rows)
     receipt = history.normalize_deliveries(rows, ledger=ledger, raw_dir=raw_dir)[1]
     assert receipt["unresolved_reason"] == "ambiguous_provider_post_id"
+
+
+@pytest.mark.parametrize("error_type,http_status,skipped", [
+    ("ZernioError", 400, True), ("ZernioError", 429, False),
+    ("ZernioError", 503, False), ("TimeoutError", None, False),
+    ("ValueError", 400, False),
+])
+def test_capture_skips_only_explicit_terminal_provider_400(tmp_path, error_type, http_status, skipped):
+    pid = "18556022872077029"
+    row = {"record_type": "row", "classification": "exact_post_lookup_candidate", "late_post_id": pid}
+    ledger, raw_dir = tmp_path / "ledger", tmp_path / "raw"
+    failure = {"record_type": "capture", "late_post_id": pid, "status": "error",
+               "error_type": error_type, "http_status": http_status}
+    before = json.dumps(failure) + "\n"
+    ledger.write_text(before)
+    calls = []
+    def get_json(requested):
+        calls.append(requested)
+        return {"post": {"_id": requested}}
+    result = history.capture_posts([row], ledger=ledger, raw_dir=raw_dir,
+                                   max_items=1, timeout=1, get_json=get_json)
+    assert calls == ([] if skipped else [pid])
+    assert len(result) == (0 if skipped else 1)
+    assert ledger.read_text().startswith(before)
+    if skipped:
+        assert ledger.read_text() == before
+
+
+def test_later_capture_supersedes_terminal_400_and_revalidates_bytes(tmp_path):
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path)
+    failure = {"record_type": "capture", "late_post_id": "p1", "status": "error",
+               "error_type": "ZernioError", "http_status": 400}
+    ledger.write_text(json.dumps(failure) + "\n" + ledger.read_text())
+    assert history._terminal_provider_ids(ledger) == set()
+    calls = []
+    getter = lambda pid: calls.append(pid) or {"post": {"_id": pid}}
+    assert history.capture_posts(rows, ledger=ledger, raw_dir=raw_dir,
+                                 max_items=1, timeout=1, get_json=getter) == []
+    path.write_bytes(b"tampered")
+    history.capture_posts(rows, ledger=ledger, raw_dir=raw_dir,
+                          max_items=1, timeout=1, get_json=getter)
+    assert calls == ["p1"]
+
+
+def test_later_retryable_failure_supersedes_terminal_400(tmp_path):
+    ledger = tmp_path / "ledger"
+    failure = {"record_type": "capture", "late_post_id": "p1", "status": "error",
+               "error_type": "ZernioError", "http_status": 400}
+    retryable = {**failure, "http_status": 429}
+    ledger.write_text(json.dumps(failure) + "\n" + json.dumps(retryable) + "\n")
+    assert history._terminal_provider_ids(ledger) == set()
