@@ -280,8 +280,8 @@ def dedupe_key(event):
 # ---- registration ---------------------------------------------------------------------
 
 class ConvoWiring:
-    def __init__(self, app, identity, deps, *, post=None, open_group_dm=None,
-                 post_first_message=None, log=print):
+    def __init__(self, app, identity, deps, *, post=None, readback=None,
+                 open_group_dm=None, post_first_message=None, log=print):
         self.app = app
         self.identity = identity
         self.deps = deps
@@ -292,6 +292,7 @@ class ConvoWiring:
         self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EVENTS,
                                         thread_name_prefix=f"slack-convo-{identity.name}")
         self._post = post or self._default_post()
+        self._readback = readback or self._default_readback
         # Injectable, like `post` above, so a test can supply fakes without a real Slack
         # client; built lazily off the identity's own bot token (never Blake's, never a
         # different identity's) only if the outreach-release path is actually exercised.
@@ -336,6 +337,10 @@ class ConvoWiring:
             token = self.identity.env(self.identity.bot_token_env)
             self.__poster = SlackPoster(token=token)
         return self.__poster
+
+    def _default_readback(self, channel, *, thread_ts=None, ts=None, oldest=None):
+        return self._poster().read_conversation_messages(
+            channel, thread_ts=thread_ts, ts=ts, oldest=oldest)
 
     # -- inbound --
     def _process(self, event, raw_event_id):
@@ -489,7 +494,7 @@ class ConvoWiring:
             try:
                 if self.deps.identity_enabled():
                     s = _outbox.run_once(self.deps.bus, self._post, identity=self.identity,
-                                         log=self.log)
+                                         log=self.log, readback=self._readback)
                     for k, v in s.items():
                         if v:
                             self.counts[f"outbox:{k}"] += v
