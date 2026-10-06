@@ -389,7 +389,7 @@ def find_cross_day_repeats(rows, *, repeat_window_days=None):
 
 
 def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=None,
-                           library_path=None):
+                           library_path=None, byte_cache=None):
     """Resolve an original from tenant asset bytes or an exact local source.
 
     URL inequality and hashes of rendered cards do not prove a new photo.
@@ -403,6 +403,18 @@ def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=Non
     import hashlib
     from . import visual_writer_prepare as vp, visual_fingerprint as vf
     reader = read_bytes or vp._bytes_for_url
+    if byte_cache is not None:
+        uncached_reader = reader
+
+        def reader(url):
+            # Request-scoped, exact URL only. Never memoize a failed fetch.
+            if url not in byte_cache:
+                raw = uncached_reader(url)
+                if isinstance(raw, bytes) and 0 < len(raw) <= vp.MAX_VISUAL_BYTES:
+                    byte_cache[url] = raw
+                return raw
+            return byte_cache[url]
+
     target = pick or row
     source = target.get("source_media_url")
     delivered = target.get("image_url")
@@ -441,7 +453,9 @@ def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=Non
                 or str(sources[0].get("id")) != str(asset["source_id"])
                 or str(sources[0].get("gym_id")) != str(account_key)):
             raise ValueError("original asset source tenant mismatch")
-        if (pick or row).get("drive_file_id") not in (None, "", asset_id):
+        # Persisted rows have the legacy Drive alias. Picker lineage instead
+        # binds source_media_asset_id to the tenant asset and exact bytes above.
+        if pick is None and row.get("drive_file_id") not in (None, "", asset_id):
             raise ValueError("contradictory Drive identity")
         if not vf.attest_drive(asset.get("content_hash"), raw):
             raise ValueError("original asset bytes mismatch")

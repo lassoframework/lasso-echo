@@ -195,7 +195,7 @@ def test_portal_rejects_mismatched_poster_before_reservation(monkeypatch, mismat
     # Original-source identity is covered by test_ordinary_swap_proof; isolate
     # the poster evidence gate so each malformed poster variant reaches it.
     monkeypatch.setattr(media_guard, "swap_original_identity",
-                        lambda account, row, store, *, pick=None:
+                        lambda account, row, store, *, pick=None, byte_cache=None:
                         {"sha256": "b" * 64 if pick else "a" * 64,
                          "source_asset_id": None,
                          "source_url": (pick or row).get("source_media_url")})
