@@ -2,6 +2,7 @@
 
 Uses the existing local-only stack fixture. No activation or production writes.
 """
+import json
 import uuid
 import pytest
 from test_scene_ledger_claim_pg import (
@@ -12,18 +13,18 @@ from test_scene_ledger_claim_pg import (
 pytestmark = pytest.mark.skipif(not DSN or not PSQL, reason="disposable local PG required")
 
 
-def seed_history(state="released", date="2026-09-01", ambiguous=False):
+def seed_history(state="released", date="2026-09-01", ambiguous=False, owner=None):
     tenant, group = str(uuid.uuid4()), "vg_" + uuid.uuid4().hex[:12]
     _sql(f"insert into public.tenant_alias(alias_key,tenant_id) values('{tenant}','{tenant}'); "
          f"insert into public.visual_group(gym_id,group_key) values('{tenant}','{group}')")
     url, fp, _ = _seed_object(tenant, group, "0000000000000000")
-    owner = _one(f"select receipt_id from public.visual_scene_owner_phash_receipt where exact_url='{url}'")
+    phash_receipt = _one(f"select receipt_id from public.visual_scene_owner_phash_receipt where exact_url='{url}'")
     day = "null" if date is None else f"'{date}'"
     _sql("insert into public.visual_global_usage(fingerprint,tenant_id,used_date,state,ambiguous) "
-         f"values('{fp}','{tenant}',{day},'{state}',{str(ambiguous).lower()}); "
+         f"values('{fp}','{owner or tenant}',{day},'{state}',{str(ambiguous).lower()}); "
          "insert into public.visual_global_usage_member(tenant_id,group_key,fingerprint,used_date,state,ambiguous,calendar_row_id) "
          f"values('{tenant}','{group}','{fp}',{day},'{state}',{str(ambiguous).lower()},'{uuid.uuid4()}')")
-    return tenant, group, fp, owner
+    return tenant, group, fp, phash_receipt
 
 
 def receipt(tenant, group, fp, source, delivered=None, day="2026-09-01"):
@@ -69,7 +70,11 @@ def test_cross_tenant_receipt_fails_and_rolls_back_whole_import():
 
 def test_transformed_display_requires_lineage():
     t,g,f,p = seed_history()
-    _,_,candidate = _seed_object(t,g,"ffffffffffffffff")
+    _,df,candidate = _seed_object(t,g,"ffffffffffffffff")
+    _sql("insert into public.visual_global_usage(fingerprint,tenant_id,used_date,state) "
+         f"values('{df}','{t}','2026-09-01','released'); "
+         "insert into public.visual_global_usage_member(tenant_id,group_key,fingerprint,used_date,state) "
+         f"values('{t}','{g}','{df}','2026-09-01','released')")
     display = _one(f"select evidence->>'owner_phash_receipt' from public.visual_scene_candidate where candidate_id='{candidate}'")
     receipt(t,g,f,p,display)
     assert _run("select public.visual_scene_backfill_occupied()",False).returncode
@@ -96,9 +101,10 @@ def test_caller_rollback_and_conflicting_fingerprint():
     assert _occupied_count() == 1
 
 
-def test_verified_transformed_source_and_display_both_import():
+def seed_transformed(phash="ffffffffffffffff", permanent=True, owner=None,
+                     member_date="2026-09-01", owner_date="2026-09-01"):
     t,g,f,p = seed_history()
-    _,_,candidate = _seed_object(t,g,"ffffffffffffffff")
+    url,fp,candidate = _seed_object(t,g,phash)
     d = _one(f"select evidence->>'owner_phash_receipt' from public.visual_scene_candidate where candidate_id='{candidate}'")
     _sql("insert into public.visual_global_render_receipt(tenant_id,source_read_receipt,delivered_read_receipt,"
          "source_exact_url,delivered_exact_url,source_fingerprint,delivered_fingerprint,operation,evidence_ref,rendered_by) "
@@ -112,11 +118,65 @@ def test_verified_transformed_source_and_display_both_import():
          "source_fingerprint,delivered_fingerprint,render_receipt) "
          f"select tenant_id,'{g}',source_exact_url,delivered_exact_url,source_fingerprint,delivered_fingerprint,receipt_id "
          "from public.visual_global_render_receipt")
+    if permanent:
+        _sql("insert into public.visual_global_usage(fingerprint,tenant_id,used_date,state) "
+             f"values('{fp}','{owner or t}','{owner_date}','released'); "
+             "insert into public.visual_global_usage_member(tenant_id,group_key,fingerprint,used_date,state,calendar_row_id) "
+             f"values('{t}','{g}','{fp}','{member_date}','released','{uuid.uuid4()}')")
     receipt(t,g,f,p,d)
+    return t,g,f,p,d,url,candidate
+
+
+def test_verified_transformed_source_and_display_both_import():
+    seed_transformed()
     assert _one("select public.visual_scene_backfill_occupied()") == "2"
     assert _one("select public.visual_scene_backfill_occupied()") == "0"
     assert _occupied_count() == 2
+    assert _one("select count(*) from public.visual_scene_history_object_binding") == "2"
+
+
+def test_same_phash_different_bytes_preserve_both_and_block_later_reuse():
+    t,g,f,p,d,url,candidate = seed_transformed(phash="0000000000000000")
+    assert _one("select public.visual_scene_backfill_occupied()") == "1"
+    assert _one("select public.visual_scene_backfill_occupied()") == "0"
+    assert _occupied_count() == 1
+    assert _one("select count(distinct fingerprint) from public.visual_scene_history_object_binding") == "2"
+    assert _run("delete from public.visual_scene_history_object_binding",False).returncode
+    assert _run("update public.visual_scene_history_object_binding set fingerprint='md5:11111111111111111111111111111111'",False).returncode
+    assert _run("truncate public.visual_scene_history_object_binding",False).returncode
+    # Exercise the internal scene gate on a typed synthetic row, without
+    # activating the exact-byte calendar BEFORE path on this scratch stack.
+    decision = json.loads(_one("select public.visual_scene_claim_decide("
+        "jsonb_populate_record(null::public.content_calendar,jsonb_build_object("
+        f"'id','{uuid.uuid4()}','gym_id','{t}','visual_group_key','{g}',"
+        f"'image_url','{url}','account','ig','post_date','2026-10-10')),'{candidate}')"))
+    assert decision["decision"] == "blocked"
+    assert decision["reason"] == "near_frame_conflict"
+    assert _occupied_count() == 1
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"permanent": False},
+    {"owner": "00000000-0000-0000-0000-000000000001"},
+    {"member_date": "2026-09-02"},
+    {"owner_date": "2026-09-02"},
+])
+def test_missing_or_conflicting_display_permanence_is_atomic(kwargs):
+    t,g,f,p = seed_history()
+    receipt(t,g,f,p)
+    seed_transformed(**kwargs)
+    assert _run("select public.visual_scene_backfill_occupied()",False).returncode
+    assert _occupied_count() == 0
+    assert _one("select count(*) from public.visual_scene_history_object_binding") == "0"
+
 
 
 def test_disposable_server_is_pg17():
     assert 170000 <= int(_one("show server_version_num")) < 180000
+
+
+def test_source_global_foreign_owner_is_rejected():
+    t,g,f,p = seed_history(owner="00000000-0000-0000-0000-000000000001")
+    receipt(t,g,f,p)
+    assert _run("select public.visual_scene_backfill_occupied()",False).returncode
+    assert _occupied_count() == 0

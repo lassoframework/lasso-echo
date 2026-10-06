@@ -25,6 +25,7 @@
 -- ROLLBACK (before any activation): nothing is applied anywhere; delete the
 -- file. If it were ever applied to a scratch database, drop in this order:
 --   drop function if exists public.visual_scene_backfill_occupied();
+--   drop table if exists public.visual_scene_history_object_binding;
 --   drop table if exists public.visual_scene_history_receipt;
 --   drop function if exists public.visual_scene_hold_resolve(uuid,text,text,jsonb);
 --   drop function if exists public.visual_scene_claim_decide(public.content_calendar,uuid);
@@ -1102,6 +1103,36 @@ create trigger visual_scene_history_receipt_immutable before update or delete
 create trigger visual_scene_history_receipt_no_truncate before truncate
   on public.visual_scene_history_receipt for each statement execute function public.visual_scene_receipt_no_truncate();
 
+-- A scene occupancy key deliberately has ONE pHash per tenant/group/date.
+-- Different transformed byte objects can have the SAME pHash. Preserve each
+-- imported object's byte identity here instead of overwriting the first
+-- occupancy fingerprint or losing the other object's permanent coverage.
+-- These immutable bindings are historical evidence, not scene-clearance grants.
+create table if not exists public.visual_scene_history_object_binding (
+  tenant_id text not null,
+  group_key text not null,
+  used_date date not null,
+  phash char(16) not null,
+  fingerprint text not null,
+  exact_url text not null,
+  owner_phash_receipt uuid not null references public.visual_scene_owner_phash_receipt(receipt_id),
+  history_receipt uuid not null references public.visual_scene_history_receipt(receipt_id),
+  primary key (owner_phash_receipt,used_date),
+  foreign key (phash,tenant_id,group_key,used_date)
+    references public.visual_scene_phash_occupied(phash,tenant_id,group_key,used_date),
+  foreign key (tenant_id,group_key,exact_url,fingerprint)
+    references public.visual_global_object_attestation(tenant_id,group_key,exact_url,fingerprint)
+);
+alter table public.visual_scene_history_object_binding enable row level security;
+revoke all on public.visual_scene_history_object_binding from public,anon,authenticated,service_role;
+grant select on public.visual_scene_history_object_binding to service_role;
+create policy visual_scene_history_object_binding_read on public.visual_scene_history_object_binding
+  for select to service_role using (true);
+create trigger visual_scene_history_object_binding_immutable before update or delete
+  on public.visual_scene_history_object_binding for each row execute function public.visual_scene_immutable();
+create trigger visual_scene_history_object_binding_no_truncate before truncate
+  on public.visual_scene_history_object_binding for each statement execute function public.visual_scene_receipt_no_truncate();
+
 -- Import every reviewed receipt under one fleet lock. No partial import survives
 -- a bad receipt or occupancy collision. Exact retries preserve original evidence.
 -- The caller must COMMIT; caller rollback removes all newly imported occupancy.
@@ -1128,6 +1159,14 @@ begin
        or s.tenant_id is distinct from h.tenant_id or d.tenant_id is distinct from h.tenant_id
        or s.group_key is distinct from h.group_key or d.group_key is distinct from h.group_key
        or s.fingerprint is distinct from h.member_fingerprint
+       -- BOTH byte objects must already be permanent members and have the
+       -- same global owner/date. An attested staged rendition is NOT history.
+       or exists(select 1 from (values (s.fingerprint),(d.fingerprint)) f(fingerprint)
+          where not exists(select 1 from public.visual_global_usage_member z
+             join public.visual_global_usage u on u.fingerprint=z.fingerprint
+             where z.tenant_id=h.tenant_id and z.group_key=h.group_key
+               and z.fingerprint=f.fingerprint and z.used_date=h.used_date
+               and u.tenant_id=h.tenant_id and u.used_date=h.used_date))
        or not exists(select 1 from public.visual_global_scene_object_member o
           where o.tenant_id=h.tenant_id and o.group_key=h.group_key
             and o.exact_url=s.exact_url and o.fingerprint=s.fingerprint and o.object_role='source')
@@ -1156,7 +1195,8 @@ begin
          or exists(select 1 from public.visual_scene_phash_occupied o
            where o.tenant_id=h.tenant_id and o.group_key=h.group_key
              and o.used_date=h.used_date and o.phash=r.phash
-             and o.fingerprint<>r.fingerprint) then
+             and o.fingerprint<>r.fingerprint
+             and not (s.phash=d.phash and o.fingerprint in (s.fingerprint,d.fingerprint))) then
         raise exception 'historical byte evidence or occupied identity conflicts' using errcode='23514';
       end if;
       insert into public.visual_scene_phash_occupied
@@ -1168,6 +1208,10 @@ begin
         on conflict (phash,tenant_id,group_key,used_date) do nothing;
       get diagnostics inserted=row_count;
       n:=n+inserted;
+      insert into public.visual_scene_history_object_binding
+        (tenant_id,group_key,used_date,phash,fingerprint,exact_url,owner_phash_receipt,history_receipt)
+        values(h.tenant_id,h.group_key,h.used_date,r.phash,r.fingerprint,r.exact_url,r.receipt_id,h.receipt_id)
+        on conflict (owner_phash_receipt,used_date) do nothing;
     end loop;
   end loop;
   return n;
