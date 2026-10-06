@@ -573,6 +573,30 @@ class Bus:
             params["or"] = f"(attachments->>identity.eq.{identity},attachments->>identity.is.null)"
         return self._get(_MESSAGES, params)
 
+    def pending_fixer_holds(self, identity, marker, limit=200, after=None):
+        """One keyset page of held FIXER rows carrying an exact recovery marker.
+
+        Marker-specific paging prevents unrelated trust-ladder holds from
+        starving delivery reconciliation while keeping each sweep bounded.
+        """
+        if marker not in {"fixer_slack_delivery_uncertain",
+                          "fixer_slack_route_missing"}:
+            raise BusError(400, "invalid FIXER hold marker")
+        params = {
+            "direction": "eq.outbound", "delivery_status": "eq.held",
+            "attachments->>identity": f"eq.{identity}",
+            f"attachments->>{marker}": "eq.true",
+            "select": "*", "order": "created_at.asc,id.asc",
+            "limit": str(int(limit)),
+        }
+        if after:
+            ts = str(after.get("created_at") or "").replace('"', "")
+            mid = str(after.get("id") or "").replace('"', "")
+            if ts and mid:
+                params["or"] = (f'(created_at.gt."{ts}",'
+                                f'and(created_at.eq."{ts}",id.gt."{mid}"))')
+        return self._get(_MESSAGES, params)
+
     def mark_message(self, message_id, delivery_status, slack_ts=None, meta_update=None):
         """Move a row between delivery states. `meta_update` merges keys into attachments
         (read-merge-write; jsonb PATCH replaces the whole value otherwise)."""
@@ -639,6 +663,39 @@ class Bus:
             "attachments->>fixer_slack_delivery_intent": "not.is.null",
             "select": "*", "order": "created_at.desc", "limit": str(int(limit)),
         })
+
+    def requeue_route_missing_fixer(self, message_id, recovered_at):
+        """CAS one never-attempted route hold back to ready.
+
+        A route hold is safe to retry only while it has no durable intent, no
+        uncertainty marker and no Slack timestamp.  The caller revalidates the
+        current ticket and route immediately before this CAS; normal dispatch
+        repeats every gate after the transition and before POST.
+        """
+        row = self.message(message_id)
+        att = (row or {}).get("attachments") or {}
+        if (not row or row.get("delivery_status") != "held"
+                or att.get("fixer_slack_route_missing") is not True
+                or att.get("fixer_slack_delivery_intent") is not None
+                or att.get("fixer_slack_delivery_uncertain")
+                or row.get("slack_ts")):
+            return None
+        next_att = {
+            **att,
+            "fixer_slack_route_missing": False,
+            "fixer_slack_route_recovered_at": recovered_at,
+            # Freshness starts at the recovery boundary, not when the portal-only
+            # completion was first written (which may have been days earlier).
+            "claimed_at": recovered_at,
+        }
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}",
+            "delivery_status": "eq.held",
+            "slack_ts": "is.null",
+            "attachments->>fixer_slack_route_missing": "eq.true",
+            "attachments->>fixer_slack_delivery_intent": "is.null",
+            "attachments->>fixer_slack_delivery_uncertain": "is.null",
+        }, {"delivery_status": "ready", "attachments": next_att})
 
     def defer_held_fixer_reconcile(self, message_id, next_at):
         row = self.message(message_id)

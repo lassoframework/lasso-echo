@@ -1,5 +1,7 @@
 """Portal progress updates stay in the original ticket and never route to Slack."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from agent.slack_convo import adapter as A
@@ -109,6 +111,21 @@ def test_human_released_current_progress_reaches_portal_without_arming(monkeypat
     assert posted["attachments"]["delivered_via"] == "portal_thread"
     assert all(channel != "G_CLIENT" for channel, _ in calls)
     assert bus.ticket("t-1")["status"] == "merged"
+
+
+def test_stale_portal_progress_claim_is_retried_not_quarantined_as_uncertain_fixer():
+    bus, row = _progress_bus()
+    assert bus.claim_message(row["id"])
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    bus.mark_message(row["id"], "posting", meta_update={"claimed_at": stale})
+
+    result, calls = _dispatch(bus)
+    posted = bus.message(row["id"])
+    assert result["reclaimed"] == 1
+    assert posted["delivery_status"] == "posted"
+    assert posted["attachments"]["delivered_via"] == "portal_thread"
+    assert not posted["attachments"].get("fixer_slack_delivery_uncertain")
+    assert calls == []
 
 
 def test_progress_marker_on_an_internal_kind_is_suppressed_before_internal_post():
