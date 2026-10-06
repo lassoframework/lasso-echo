@@ -111,6 +111,8 @@ class ClientSet:
     other_keys: frozenset = frozenset()    # token keys of gyms that are NOT clients
     other_gym_ids: frozenset = frozenset() # portal gym ids that are NOT clients
     markers: dict = field(default_factory=dict)    # gym_id -> frozenset of marker names
+    token_keys_by_gym: dict = field(default_factory=dict)  # issued portal keys, by UUID
+    ambiguous_keys: frozenset = frozenset()  # aliases claimed by multiple gym UUIDs
     error: str = ""
     at: float = 0.0
 
@@ -223,8 +225,15 @@ def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(
             raw_ids[gid] = str(g.get("id") or "").strip()
 
     keys, key_to_gym, other, other_ids = set(), {}, set(), set()
+    token_keys_by_gym, key_claims = {}, {}
+
+    def _claim(alias, gid):
+        if alias and gid:
+            key_claims.setdefault(alias, set()).add(gid)
+
     for gid, aliases in intake_aliases.items():
         for a in aliases:
+            _claim(a, gid)
             keys.add(a)
             key_to_gym.setdefault(a, gid)
     for t in token_rows or []:
@@ -234,7 +243,9 @@ def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(
             other_ids.add(gid)
         if not key:
             continue
+        _claim(key, gid)
         if gid in gym_ids:
+            token_keys_by_gym.setdefault(gid, set()).add(key)
             keys.add(key)
             key_to_gym[key] = gid
         else:
@@ -255,6 +266,7 @@ def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(
         for a in aliases:
             a = normalize_key(a)
             if a:
+                _claim(a, gid)
                 keys.add(a)
                 key_to_gym.setdefault(a, gid)
     # A key both a client and a non-client hold cannot be a non-client marker.
@@ -264,6 +276,9 @@ def build(settings_rows, token_rows, gym_rows, *, intake_rows=(), product_rows=(
                      key_to_gym=key_to_gym, names=names, other_keys=frozenset(other),
                      other_gym_ids=frozenset(other_ids),
                      markers={g: frozenset(m) for g, m in markers.items()},
+                     token_keys_by_gym={g: frozenset(v) for g, v in token_keys_by_gym.items()},
+                     ambiguous_keys=frozenset(a for a, owners in key_claims.items()
+                                              if len(owners) > 1),
                      at=now or time.time())
 
 
