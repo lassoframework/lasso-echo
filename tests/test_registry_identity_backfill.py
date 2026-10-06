@@ -93,6 +93,70 @@ def test_nine_known_legacy_rows_in_thirteen_row_registry_plan_together(tmp_path)
     assert path.read_bytes() == raw
 
 
+def test_bare_name_alias_cannot_backfill_when_ads_only_gym_shares_name(tmp_path):
+    path = tmp_path / "gym_accounts.json"
+    raw = b'[{"base":"piercefitness"}]'
+    path.write_bytes(raw)
+    clients = echo_clients.build(
+        [{"gym_id": PIERCE}],
+        [{"gym_id": PIERCE, "echo_account_key": "pierceissued"},
+         {"gym_id": ADS, "echo_account_key": "adsonlyissued"}],
+        [{"id": PIERCE, "name": "Pierce Fitness", "slug": "piercefitness"},
+         {"id": ADS, "name": "Pierce Fitness", "slug": "piercefitness"}],
+        now=time.time())
+    assert clients.key_to_gym["piercefitness"] == PIERCE
+    assert clients.token_keys_by_gym[PIERCE] == frozenset({"pierceissued"})
+    with pytest.raises(backfill.BackfillBlocked, match="unique Echo owner"):
+        _run(path, clients)
+    assert path.read_bytes() == raw
+
+
+def test_exact_raw_uuid_derived_key_can_backfill_without_issued_key(tmp_path):
+    path = tmp_path / "gym_accounts.json"
+    gid = "30b5b200-aaaa-4000-8000-000000000004"
+    base = "crossfitreverb30b5b2"
+    raw = ('[{"base":"' + base + '"}]').encode()
+    path.write_bytes(raw)
+    clients = echo_clients.build(
+        [{"gym_id": gid}], [],
+        [{"id": gid, "name": "CrossFit Reverb", "slug": "crossfit-reverb"}],
+        now=time.time())
+    assert base == echo_clients._portal_key(gid, "CrossFit Reverb")
+    assert _run(path, clients)["plan"].mappings[0]["gym_id"] == gid
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize("bad_source", ["marker", "issued_owner", "gym_row"])
+def test_suffix_on_raw_authoritative_uuid_never_becomes_identity(tmp_path, bad_source):
+    path = tmp_path / "gym_accounts.json"
+    raw = b'[{"base":"piercefitness"}]'
+    path.write_bytes(raw)
+    clients = echo_clients.build(
+        [{"gym_id": PIERCE + "_ig" if bad_source == "marker" else PIERCE}],
+        [{"gym_id": PIERCE + "_ig" if bad_source == "issued_owner" else PIERCE,
+          "echo_account_key": "piercefitness"}],
+        [{"id": PIERCE + "_ig" if bad_source == "gym_row" else PIERCE,
+          "name": "Pierce Fitness", "slug": "piercefitness"}], now=time.time())
+    with pytest.raises(backfill.BackfillBlocked, match="unique Echo owner"):
+        _run(path, clients)
+    assert path.read_bytes() == raw
+
+
+def test_symlink_registry_target_is_rejected_before_read_or_write(tmp_path):
+    actual = tmp_path / "actual.json"
+    raw = b'[{"base":"piercefitness"}]'
+    actual.write_bytes(raw)
+    link = tmp_path / "gym_accounts.json"
+    link.symlink_to(actual)
+    with pytest.raises(backfill.BackfillBlocked, match="not a regular file"):
+        _run(link, _clients())
+    plan = backfill.build_plan(raw, _clients())
+    with pytest.raises(backfill.BackfillBlocked, match="not a regular file"):
+        _run(link, _clients(), apply=True, **_expectations(plan))
+    assert actual.read_bytes() == raw
+    assert not list(tmp_path.glob("*.backup"))
+
+
 def test_apply_is_guarded_backed_up_receipted_and_idempotent(tmp_path, monkeypatch):
     path = tmp_path / "gym_accounts.json"
     original = b'[{"base":"piercefitness","name":"Pierce"}]\n'
@@ -146,6 +210,66 @@ def test_failed_post_write_readback_keeps_backup_and_prepared_receipt(tmp_path,
     receipt = json.loads(receipts[0].read_text())
     assert receipt["status"] == "prepared"
     assert receipt["original_sha256"] == backfill._sha(raw)
+
+
+@pytest.mark.parametrize("fail_after_replace", [False, True])
+def test_failed_applied_receipt_write_is_safely_finalized_on_retry(
+        tmp_path, monkeypatch, fail_after_replace):
+    path = tmp_path / "gym_accounts.json"
+    raw = b'[{"base":"piercefitness"}]'
+    path.write_bytes(raw)
+    clients = _clients()
+    plan = _run(path, clients)["plan"]
+    real_write = backfill._write_new
+    failed = {"once": False}
+
+    def fail_receipt(target, data, mode):
+        if str(target).endswith(".receipt.json") and not failed["once"]:
+            failed["once"] = True
+            if fail_after_replace:
+                real_write(target, data, mode)
+            raise OSError("simulated receipt write failure")
+        return real_write(target, data, mode)
+
+    monkeypatch.setattr(backfill, "_write_new", fail_receipt)
+    with pytest.raises(backfill.BackfillBlocked, match="registry I/O failed"):
+        _run(path, clients, apply=True, **_expectations(plan))
+    assert path.read_bytes() == plan.new_bytes
+    assert failed["once"]
+    monkeypatch.setattr(backfill, "_write_new", real_write)
+    recovered = _run(path, clients, apply=True, **_expectations(plan))
+    receipt = json.loads((tmp_path / recovered["receipt"].split("/")[-1]).read_text())
+    assert receipt["status"] == "applied"
+    assert receipt["readback_sha256"] == plan.new_sha256
+    assert recovered["status"] == ("already_applied" if fail_after_replace else "recovered")
+    assert len(list(tmp_path.glob("*.backup"))) == 1
+    assert _run(path, clients, apply=True, **_expectations(plan))["status"] == "already_applied"
+
+
+def test_recovery_refuses_tampered_prepared_receipt(tmp_path, monkeypatch):
+    path = tmp_path / "gym_accounts.json"
+    path.write_bytes(b'[{"base":"piercefitness"}]')
+    clients = _clients()
+    plan = _run(path, clients)["plan"]
+    real_write = backfill._write_new
+
+    def fail_receipt(target, data, mode):
+        if str(target).endswith(".receipt.json"):
+            raise OSError("simulated receipt failure")
+        return real_write(target, data, mode)
+
+    monkeypatch.setattr(backfill, "_write_new", fail_receipt)
+    with pytest.raises(backfill.BackfillBlocked):
+        _run(path, clients, apply=True, **_expectations(plan))
+    monkeypatch.setattr(backfill, "_write_new", real_write)
+    receipt_path = next(tmp_path.glob("*.receipt.json"))
+    receipt = json.loads(receipt_path.read_text())
+    receipt["mappings"][0]["gym_id"] = ADS
+    receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(backfill.BackfillBlocked, match="receipt disagrees"):
+        _run(path, clients, apply=True, **_expectations(plan))
+    assert path.read_bytes() == plan.new_bytes
+    assert json.loads(receipt_path.read_text())["status"] == "prepared"
 
 
 @pytest.mark.parametrize("raw", [
