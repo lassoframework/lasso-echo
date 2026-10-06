@@ -1671,6 +1671,34 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None,
     from . import lever_stamp as _levers
     _levers.apply_learning_stamps(account_key, rows)
 
+    # SOURCE LINEAGE SCHEMA GATE (ECHO_SOURCE_MEDIA_CONTENT_HASH_ENABLED, default
+    # OFF). to_calendar_rows -> _real_row only emits source_media_content_hash when
+    # the feature is ON, so a hash-carrying row proves the feature is armed. Prove
+    # the destination column is queryable BEFORE any delete; an
+    # unreadable/missing-column schema must never erase a previously staged month.
+    try:
+        _hash_enabled = bool(config.source_media_content_hash_enabled())
+    except AttributeError:
+        _hash_enabled = False
+    if _hash_enabled and any(str(r.get("source_media_content_hash") or "").strip()
+                             for r in rows):
+        ready = getattr(sb_store, "source_media_content_hash_schema_ready", None)
+        try:
+            schema_ready = ready() if ready is not None else None
+        except Exception:
+            schema_ready = None
+        if schema_ready is not True:
+            return {"ok": False,
+                    "reason": "source_media_content_hash column is not confirmed "
+                              "ready; refusing month deletion (fail closed)",
+                    "upserted": 0, "deleted": 0}
+    if not _hash_enabled:
+        # Belt and braces (to_calendar_rows already gates emission): a flag-OFF
+        # insert never carries the column, so a pre-migration schema sees the
+        # exact row shape it saw before the feature existed.
+        for r in rows:
+            r.pop("source_media_content_hash", None)
+
     # Reconcile the FULL planned span plus every month a real row lands in: DELETE all of
     # the gym's rows there first (demo and prior real), so a re-run is idempotent.
     months = _months_in_span(rows, extra_months=span_months)

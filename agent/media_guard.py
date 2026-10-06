@@ -3,7 +3,7 @@ media_guard.py — ONE PHOTO, ONE DAY: the shared cross-day media guard.
 
 THE RULE (Blake, 2026-08-31, after a client saw the same photo across different
 weeks of their calendar): one photo must never appear on MULTIPLE DIFFERENT DAYS
-of a gym's forward book — its pending / approved / publishing / coach_review
+of a gym's forward book — its pending / approved / publishing / protected legacy
 content_calendar rows — and must not be planned within the trailing repeat
 window of a day it was PUBLISHED on. Same-DATE siblings (the FB mirror of a
 feed, its paired story) are ONE post and legitimately share the photo: a row on
@@ -34,8 +34,8 @@ from datetime import date, timedelta
 
 from . import config
 
-# Statuses that make a row part of the gym's live forward book: content a client
-# can see (or has approved / is being published) that a NEW pick must not repeat.
+# Statuses that make a row part of the gym's protected forward book. The retired
+# status remains protected as an anomaly so its media cannot be silently reused.
 FORWARD_STATUSES = ("pending", "approved", "publishing", "coach_review")
 
 # Rebuild-wipeable statuses (mirrors portal_calendar_store._WIPEABLE_STATUSES):
@@ -165,7 +165,7 @@ def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=(
     skip_wipeable_months: 'YYYY-MM' months a rebuild is about to delete-then-
     insert — a WIPEABLE (pending/draft/queued) row inside them will not survive
     the rebuild, so it must not block the very photos it is about to release.
-    coach_review rows are NOT wipeable and always count.
+    Retired coach_review rows are NOT wipeable and always count.
 
     key_fn: how a row is keyed (default row_media_key, the photo basename). Pass
     row_asset_key to read the same book by Drive asset id; the autofit reframe
@@ -254,7 +254,7 @@ def surviving_keys(base_key, store, start, days, *, log=None, library_path=None)
     still be on the gym's book AFTER the rebuild's delete-then-insert — so the
     rebuild must not re-place any of them on a (different) day. Wipeable rows
     inside the span months are excluded (the rebuild replaces them); everything
-    else (approved / publishing / coach_review anywhere, published within the
+    else (approved / publishing / retired coach_review rows anywhere, published within the
     trailing window, wipeable rows OUTSIDE the span) blocks. Flag off => empty."""
     if not enabled():
         return set()

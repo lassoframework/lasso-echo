@@ -156,15 +156,25 @@ def test_full_cadence_writes_pending_rows():
                for r in store.rows)
 
 
-def test_gate2_coach_review_status_threads_through():
+def test_retired_coach_review_status_cannot_be_written():
     _seed()
     store = _Store()
     out = gd.plan_gbp_dogfood(
         "lasso", "lasso_ig", voice=_voice(), library_path="/x", city="Carmel",
         store=store, start=date(2026, 9, 1), initial_status="coach_review",
         caption_fn=_cap, image_fn=_img)
-    assert out["ok"] and store.rows
-    assert all(r["status"] == "coach_review" for r in store.rows)
+    assert not out["ok"] and out["reason"] == "unsupported initial status"
+    assert not store.rows
+
+
+def test_retired_coach_review_release_entrypoint_is_absent():
+    assert not hasattr(gd, "release")
+
+
+def test_retired_release_command_cannot_become_a_gym_run(monkeypatch):
+    monkeypatch.setattr(gd, "run", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("retired release command must not run")))
+    assert gd.main(["release", "lasso"]) == 2
 
 
 def test_gate1_unconfirmed_offer_not_written():

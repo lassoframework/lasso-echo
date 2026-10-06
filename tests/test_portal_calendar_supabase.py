@@ -621,7 +621,7 @@ def test_patch_media_recovers_held_row_with_image_and_asset(monkeypatch):
     assert method == "patch"
     assert params["id"] == "eq.id-m"
     assert params["gym_id"] == "eq.zanshinfitness630e22"
-    assert params["status"] == "in.(pending,coach_review)"
+    assert params["status"] == "eq.pending"
     assert params["or"] == "(image_url.is.null,image_url.eq.)"
     assert payload == {"image_url": "https://cdn.test/a1.jpg",
                        "source_media_asset_id": "asset-1",
@@ -655,7 +655,7 @@ def test_patch_media_race_loses_when_another_worker_attaches_media(monkeypatch):
     method, _url, params, _headers, payload = http.calls[1]
     assert method == "patch"
     assert params["or"] == "(image_url.is.null,image_url.eq.)"
-    assert params["status"] == "in.(pending,coach_review)"
+    assert params["status"] == "eq.pending"
     assert payload["image_url"] == "https://cdn.test/a1.jpg"
 
 
@@ -887,16 +887,16 @@ def test_delete_month_ignores_foreign_gym_rows_in_response(monkeypatch):
     assert store.delete_month("lasso", "2026-08") == 1
 
 
-# ---- GATE 2 store helpers: first-month signal + coach release -----------------
+# ---- Legacy visibility signal ------------------------------------------------
 
-def test_has_owner_visible_rows_true_when_non_coach_review_exists():
+def test_has_owner_visible_rows_true_when_any_calendar_row_exists():
     http = _FakeHTTP(get_resp=_Resp(200, [{"id": "x"}]))
     store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
                                       service_key="svc", http=http)
     assert store.has_owner_visible_rows("gritx") is True
     _, _, params, _ = http.calls[-1]
     assert params["gym_id"] == "eq.gritx"
-    assert params["status"] == "neq.coach_review"   # coach_review rows don't count
+    assert "status" not in params
 
 
 def test_has_owner_visible_rows_false_when_empty():
@@ -906,18 +906,8 @@ def test_has_owner_visible_rows_false_when_empty():
     assert store.has_owner_visible_rows("gritx") is False
 
 
-def test_release_coach_review_flips_all_platforms_to_pending():
-    released = [{"id": "1", "account": "instagram"}, {"id": "2", "account": "facebook"}]
-    http = _FakeHTTP(patch_resp=_Resp(200, released))
-    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
-                                      service_key="svc", http=http)
-    out = store.release_coach_review("gritx")
-    assert len(out) == 2
-    _, _, params, _, body = http.calls[-1]
-    assert params["gym_id"] == "eq.gritx"
-    assert params["status"] == "eq.coach_review"     # only withheld rows
-    assert "account" not in params                    # every platform, one shot
-    assert body == {"status": "pending"}
+def test_legacy_coach_review_release_mutator_is_absent():
+    assert not hasattr(pcs.SupabaseCalendarStore, "release_coach_review")
 
 
 # ---- G2 requeue: failed-row recovery + words-changed routing ------------------
@@ -1270,7 +1260,7 @@ def test_swap_media_is_status_guarded_to_waiting_rows(monkeypatch):
         "gritx", "id-m", "https://cdn/new.jpg", source_media_url="https://cdn/raw.jpg")
     assert out is not None
     _m, _u, params, _h, payload = http.calls[0]
-    assert params["status"] == "in.(pending,coach_review)"
+    assert params["status"] == "eq.pending"
     assert params["id"] == "eq.id-m" and params["gym_id"] == "eq.gritx"
     assert payload == {"image_url": "https://cdn/new.jpg",
                        "source_media_url": "https://cdn/raw.jpg",

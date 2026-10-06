@@ -1437,6 +1437,16 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 _applied = not (built.get("noop_shrink") or built.get("noop_empty"))
                 if not _applied:
                     reason = "noop_empty" if built.get("noop_empty") else "noop_shrink"
+                    # A Drive-only gym is allowed past the local-media short-circuit
+                    # so build_client_month can try its connected Drive pool. If that
+                    # attempt produces no rows, give the existing Astra fallback the
+                    # same scan pass. fill_gaps rechecks the authoritative, approved
+                    # media inventory and its own palette/source/day gates before any
+                    # render or insert; an unreadable or still-syncing Drive pool stays
+                    # held there. Do not run this for local-media gyms or weekly windows.
+                    if (reason == "noop_empty" and media_count <= 0
+                            and drive_lane_may_cover and not weekly_pierce):
+                        _maybe_infographic_fill(base, account, store, log)
                     results.append({"base": base, "status": "not_built",
                                     "reason": reason,
                                     "synced": sync.get("synced", 0),
@@ -1481,6 +1491,13 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             else:
                 if built.get("awaiting_media"):
                     awaiting += 1
+                    # The connected Drive writer has now had its chance. On a
+                    # Drive-only first build, let the existing self-gated fallback
+                    # fill eligible empty days in this same pass if the authoritative
+                    # inventory proves no real media remains.
+                    if (media_count <= 0 and drive_lane_may_cover
+                            and not weekly_pierce):
+                        _maybe_infographic_fill(base, account, store, log)
                 results.append({"base": base,
                                 "status": "not_built",
                                 "reason": built.get("reason"),

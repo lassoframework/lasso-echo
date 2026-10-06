@@ -288,9 +288,8 @@ def test_approve_sets_status_approved(monkeypatch):
     assert store.patches == [("id-1", "approved")]
 
 
-def test_gate2_coach_review_rows_withheld_from_owner(monkeypatch):
-    # GATE 2: a first-month 'coach_review' post is invisible in the owner /social view
-    # until a coach releases it; a sibling 'pending' post shows normally.
+def test_legacy_status_rows_remain_private_from_owner(monkeypatch):
+    # A retired coach_review row stays private; a normal pending sibling shows normally.
     store = _FakeStore([
         _row("vis-1", post_date="2026-08-05", status="pending"),
         _row("hidden-1", post_date="2026-08-08", status="coach_review"),
@@ -299,16 +298,16 @@ def test_gate2_coach_review_rows_withheld_from_owner(monkeypatch):
     status, body = ps.handle_social("lasso", "2026-08")
     assert status == 200
     ids = {p["id"] for p in body["posts"]}
-    assert ids == {"vis-1"}, "coach_review rows must not reach the owner view"
+    assert ids == {"vis-1"}, "retired coach_review rows must stay private"
 
 
-def test_gate2_approve_rejects_coach_review_row(monkeypatch):
-    # even if a withheld row's id leaks, the owner cannot approve it
+def test_approve_rejects_unsupported_legacy_status(monkeypatch):
+    # a retired coach_review row cannot be approved even if its id leaks
     store = _FakeStore([_row("id-1", status="coach_review")])
     status, body = ps.handle_approve("lasso", "id-1", "U_owner", sb_store=store)
     assert status == 409 and body["ok"] is False
-    assert "coach review" in body["error"].lower()
-    assert store.patches == [], "a coach_review row must never be flipped to approved"
+    assert "status" in body["error"].lower() and "coach" not in body["error"].lower()
+    assert store.patches == [], "a retired coach_review row must never be flipped to approved"
 
 
 def test_approve_idempotent_on_already_approved(monkeypatch):

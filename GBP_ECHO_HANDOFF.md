@@ -49,10 +49,11 @@ belt-and-suspenders, but the planner is the real gate). **Until this is wired, k
 per gym.** STANDARD updates, EVENT, and photo drops run day one. Blake: "a wrong offer in front of
 Google strangers is the one failure we cannot eat."
 
-### 2. Coach screens the first month before the owner sees it
-`GBP_BUILD_SPEC` §11 rollout; mirror the FB/IG onboarding pattern. The first planned month per gym is
-coach-screened before it surfaces to the owner. The portal shows whatever Echo surfaces via
-`fetchSocialMonth`, so Echo withholds month-1 from the client feed until a coach releases it.
+### 2. First month enters the owner's normal approval flow
+Blake retired the older §11 coach-review gate. New first-month rows enter `pending`
+and appear in the owner's normal approval flow through `fetchSocialMonth`. No coach
+release step or `coach_review` status may be created for new rows. Historical rows
+in that retired status remain hidden until individually reconciled.
 
 ---
 

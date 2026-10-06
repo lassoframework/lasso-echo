@@ -837,7 +837,7 @@ def _swap_media_candidates_readiness(gym_key, row_id, deps, *, now=None):
         if (not isinstance(row, dict) or row.get("id") != row_id
                 or row.get("gym_id") != gym_key):
             return 503, {"error": "calendar_store_unavailable"}
-        if str(row.get("status") or "").strip().lower() not in ("pending", "coach_review"):
+        if str(row.get("status") or "").strip().lower() != "pending":
             return 409, {"error": "row_not_swappable", "gym_key": gym_key, "row_id": row_id}
         try:
             post_date = date.fromisoformat(str(row.get("post_date") or "")[:10])
@@ -1348,12 +1348,12 @@ def _derive_swap_sibling_ids(store, gym_key, rid):
         if str(r.get("gym_id") or "") != gym_key:
             raise _ReadbackUnavailable("sibling derivation read crossed the tenant scope")
     from . import media_swap as _ms
-    # portal_social moves only pending / coach_review siblings.  Approved and
+    # portal_social moves only pending siblings. Approved and
     # live siblings are intentionally left in place, so including them in the
     # expected set would turn a correct, protected swap into a false failure.
     siblings = [s for s in _ms.sibling_rows(
         row, rows, lib=_ms.library_path_for(gym_key))
-        if str(s.get("status") or "").lower() in ("pending", "coach_review")]
+        if str(s.get("status") or "").lower() == "pending"]
     out = set()
     for s in siblings:
         sid = str(s.get("id") or "")
@@ -1484,7 +1484,7 @@ def _run_swap_media(ctx):
                 and before_image != after_image
                 and isinstance(before_caption, str)
                 and after_caption == before_caption
-                and confirmed.get("status") in ("pending", "coach_review")
+                and confirmed.get("status") == "pending"
                 and isinstance(asset_id, str) and bool(asset_id)
                 and asset_id != (before_row.get("source_media_asset_id") or "")):
             digest = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()

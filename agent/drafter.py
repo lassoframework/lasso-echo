@@ -112,6 +112,9 @@ class Draft:
     # mirror's delete/reinsert cycle keeps one immutable identity per draft. Empty
     # until stamped; never inferred from date/photo/caption.
     logical_post_id: str = ""
+    # Original Drive bytes identity (md5Checksum from media_asset.content_hash).
+    # It is independent of source_media_url and the delivered rendition URL.
+    source_media_content_hash: str = ""
 
 
 def _make_id(account_key, creative_path, scheduled_for):

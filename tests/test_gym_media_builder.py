@@ -225,7 +225,8 @@ def test_heic_photo_stages_via_rendition(monkeypatch, tmp_path):
         store=store, drive=drive, library_dir=str(tmp_path))
     assert draft is not None and draft.status == DraftStatus.PENDING
     assert draft.creative_public_url == "https://cdn.fake/rend.jpg"
-    assert not getattr(draft, "source_media_url", "")
+    assert draft.source_media_url == "https://cdn.fake/served.jpg"
+    assert draft.source_media_url != draft.creative_public_url
 
 
 def test_unprobed_video_never_stages(monkeypatch, tmp_path):
@@ -254,7 +255,7 @@ def test_tenant_assertion_blocks_cross_gym(monkeypatch, tmp_path):
     foreign = make_asset("x", gym_id="other_gym", kind="photo")
     monkeypatch.setattr("agent.gym_media_selector.pick_media",
                         lambda gym_id, kind_preference=None, store=None, now=None,
-                        exclude_ids=(): foreign if "x" not in exclude_ids else None)
+                        exclude_ids=(), post_date=None: foreign if "x" not in exclude_ids else None)
     store = FakeMediaStore()
     drive = FakeDrive(blobs={"x": b"jpg"})
     draft = builder.build_gym_media_draft(

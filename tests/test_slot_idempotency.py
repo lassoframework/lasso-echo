@@ -183,9 +183,9 @@ def test_two_rows_of_the_same_event_are_both_kept(monkeypatch):
 
 # ---- AUD-103: the live set must match what the reader can actually return ---------------
 
-def test_a_coach_review_slot_is_treated_as_taken(monkeypatch):
-    """rows_in_range returns coach_review, but it was missing from the live set, so a
-    coach-review slot read as FREE and a re-plan stacked a second row on top of it."""
+def test_an_unsupported_legacy_slot_is_treated_as_taken(monkeypatch):
+    """rows_in_range returns a retired coach_review row, which stays occupied so a
+    unsupported slot must stay occupied to prevent a duplicate plan."""
     _armed(monkeypatch)
     live = [_row(status="coach_review")]
     assert pcs._dedupe_slots(_Store(live), "eng", [_row()]) == []
@@ -193,7 +193,7 @@ def test_a_coach_review_slot_is_treated_as_taken(monkeypatch):
 
 def test_the_live_set_matches_the_readers_own_allowlist():
     """Dead entries in this set are silent under-blocking. 'draft' was listed here while
-    rows_in_range can never return it; 'coach_review' was returned and not listed."""
+    the reader may return retired coach_review rows; they must remain occupied."""
     import inspect
     src = inspect.getsource(pcs.SupabaseCalendarStore.rows_in_range)
     allow = src.split("status\": \"in.(")[1].split(")")[0]

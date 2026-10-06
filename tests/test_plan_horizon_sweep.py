@@ -69,7 +69,7 @@ def test_selector_retires_only_beyond_horizon_pending():
 
 
 @pytest.mark.parametrize("status", ["approved", "publishing", "published",
-                                    "denied", "killed", "failed"])
+                                    "denied", "killed", "failed", "coach_review"])
 def test_selector_never_retires_a_human_owned_or_live_row(status):
     """THE rail: the sweep may not delete a post someone approved, a post that is
     going out, a post that went out, or a decision someone already made."""

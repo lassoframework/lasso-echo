@@ -34,12 +34,18 @@ def _to_dict(d: Draft):
         # This is raw-source provenance, not a fallback for the delivered URL.
         # Keep an absent legacy value empty rather than inventing one.
         "source_media_url": d.source_media_url,
+        # Original Drive byte identity; never inferred from the delivered URL.
+        "source_media_content_hash": getattr(d, "source_media_content_hash", "") or "",
         # A video poster and its immutable render proof must survive the store
         # round trip before real_calendar_mirror builds the prepared-writer side
         # channel.  The proof remains draft JSON only; it is never a calendar
         # column.
         "thumbnail_url": getattr(d, "thumbnail_url", ""),
         "poster_render_evidence": getattr(d, "poster_render_evidence", {}),
+        # Drive/photo rendition proof survives PendingStore so the real calendar
+        # mirror can send it through the prepared writer side channel. Draft JSON
+        # only; never a content_calendar field.
+        "render_evidence": getattr(d, "render_evidence", {}),
         "scheduled_for": d.scheduled_for,
         "status": d.status.value,
         "blocked_reason": d.blocked_reason,
@@ -130,6 +136,7 @@ def _from_dict(r):
         day_key=r.get("day_key", ""),
         draft_type=r.get("draft_type", ""),
         logical_post_id=r.get("logical_post_id", "") or "",
+        source_media_content_hash=r.get("source_media_content_hash", "") or "",
         slack_channel=r.get("slack_channel", ""),
         slack_ts=r.get("slack_ts", ""),
         needs_media=bool(r.get("needs_media", False)),
@@ -147,6 +154,9 @@ def _from_dict(r):
     poster_evidence = r.get("poster_render_evidence", {})
     if isinstance(poster_evidence, dict) and poster_evidence:
         draft.poster_render_evidence = poster_evidence
+    render_evidence = r.get("render_evidence", {})
+    if isinstance(render_evidence, dict) and render_evidence:
+        draft.render_evidence = render_evidence
     return draft
 
 

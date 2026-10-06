@@ -248,25 +248,9 @@ def run(portal_gym_key="lasso", *, city=None, cta_url=None, days=30, now=None,
 
     # GATE 1: OFFER only for a gym whose live offer a human has confirmed (default: none).
     offer_confirmed = base in config.gbp_offer_confirmed_gyms()
-    # GATE 2: a CLIENT gym's FIRST GBP month is withheld in 'coach_review' until a coach
-    # releases it. First month == the gym has NO prior googlebusiness rows at all.
-    # LASSO (base 'lasso') is EXEMPT BY DESIGN: it is the dogfood account, Blake is both
-    # owner and coach, and approving the raw month IS the client-experience test. Client
-    # gyms always get GATE 2; the dogfood skips it deliberately, not by accident.
-    is_dogfood = base == "lasso"
-    is_first_month = True
-    try:
-        is_first_month = not store.any_gbp_rows(portal_gym_key)
-    except Exception:  # noqa: BLE001
-        is_first_month = True
-    initial_status = "coach_review" if (config.gbp_coach_screen_enabled()
-                                        and is_first_month and not is_dogfood) else "pending"
-    if initial_status == "coach_review":
-        log(f"{portal_gym_key}: first GBP month -> written as 'coach_review' "
-            "(withheld from owner until a coach releases it; GATE 2)")
-    elif is_dogfood:
-        log(f"{portal_gym_key}: dogfood account -> GATE 2 skipped by design "
-            "(owner==coach; approving raw IS the test)")
+    # Every gym's new Google post is owner-visible for its normal approval flow.
+    # New rows always follow the normal owner approval flow.
+    initial_status = "pending"
 
     facts = None
     if base == "lasso":
@@ -290,39 +274,17 @@ def run(portal_gym_key="lasso", *, city=None, cta_url=None, days=30, now=None,
         connection_status=conn_status, logger=log)
 
 
-def release(portal_gym_key, *, logger=None):
-    """GATE 2 coach release: after a coach screens a gym's withheld first month, flip its
-    'coach_review' rows to 'pending' so the owner can see and approve them. Releases the
-    gym's WHOLE first month across EVERY platform (GBP + FB/IG) in one shot — the coach
-    walks the owner through their first approvals once, per the SOP."""
-    log = logger or (lambda m: print(f"[gbp-dogfood] {m}"))
-    from .portal_calendar_store import SupabaseCalendarStore
-    store = SupabaseCalendarStore()
-    if not (getattr(store, "_url", "") and getattr(store, "_key", "")):
-        return {"ok": False, "reason": "portal store unavailable", "released": 0}
-    released = store.release_coach_review(portal_gym_key)
-    log(f"{portal_gym_key}: released {len(released)} coach_review rows -> pending "
-        "(all platforms)")
-    return {"ok": True, "released": len(released)}
-
-
 def main(argv=None):
     argv = list(argv if argv is not None else sys.argv[1:])
-    # coach release: `python3 -m agent.gbp_dogfood release <gym>`
     if argv and argv[0] == "release":
-        if len(argv) < 2:
-            print("usage: python3 -m agent.gbp_dogfood release <portal_gym_key>")
-            return 2
-        res = release(argv[1])
-        print(f"[gbp-dogfood] result: {res}")
-        return 0 if res.get("ok") else 1
+        print("Unsupported command.")
+        return 2
     gym = argv[0] if argv else "lasso"
     # city passed as 2nd arg (real); LASSO's is Carmel.
     city = argv[1] if len(argv) > 1 else ("Carmel" if gym == "lasso" else None)
     cta_url = argv[2] if len(argv) > 2 else None    # optional LEARN_MORE target override
     if not city:
         print("usage: python3 -m agent.gbp_dogfood <portal_gym_key> <city> [cta_url]")
-        print("       python3 -m agent.gbp_dogfood release <portal_gym_key>")
         return 2
     res = run(gym, city=city, cta_url=cta_url)
     print(f"[gbp-dogfood] result: {res}")

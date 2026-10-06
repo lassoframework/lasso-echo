@@ -1876,12 +1876,8 @@ def gbp_mirror_active_for(gym_id) -> bool:
 
 
 def gbp_coach_screen_enabled() -> bool:
-    """GATE 2 (coach-screens-first-month): when ON (the DEFAULT), a gym's FIRST GBP month
-    is written in the withheld 'coach_review' status so the OWNER never sees or approves it
-    until a coach screens and releases it. Set AGENT_GBP_COACH_SCREEN=false only to bypass
-    the screen (e.g. a gym a coach has already vetted). The owner /social read hides
-    coach_review rows; the release flips them to 'pending'."""
-    return _truthy(os.environ.get("AGENT_GBP_COACH_SCREEN", "true"))
+    """Retired: new Google posts use the normal owner approval flow."""
+    return False
 
 
 def story_source_media_enabled() -> bool:
@@ -1905,14 +1901,8 @@ def gbp_publish_window_enabled() -> bool:
 
 
 def coach_screen_first_month_enabled() -> bool:
-    """GATE 2 for the FB/IG CLIENT month (Blake, 2026-08-17): coach screens every gym's
-    FIRST month on EVERY platform before the owner sees it — the coach SOP (walk the owner
-    through their first approvals) now enforced in software. When ON (the DEFAULT), a
-    CLIENT gym's first FB/IG month is written 'coach_review' (withheld) until released.
-    Gyms with a month already in flight are grandfathered (they already have owner-visible
-    rows, so they are not first-month). Set AGENT_COACH_SCREEN_FIRST_MONTH=false to bypass.
-    LASSO's own dogfood account is exempt (it is not a client gym)."""
-    return _truthy(os.environ.get("AGENT_COACH_SCREEN_FIRST_MONTH", "true"))
+    """Retired: new client posts use the normal owner approval flow."""
+    return False
 
 
 def welcome_digest_enabled() -> bool:
@@ -4752,3 +4742,49 @@ def logical_post_id_enabled() -> bool:
     accepts caller-provided IDs and the migration is unchanged either way.
     """
     return _truthy(os.environ.get("ECHO_LOGICAL_POST_ID_ENABLED", "false"))
+
+
+def visual_scene_guard_enabled() -> bool:
+    """AGENT_VISUAL_SCENE_GUARD, default OFF. New capability (the global
+    cross-tenant pHash scene-similarity guard in agent/visual_scene.py) ships
+    off by default, same house rule as every other new capability in this
+    file: with the flag unset, behavior is byte-for-byte unchanged."""
+    return _truthy(os.environ.get("AGENT_VISUAL_SCENE_GUARD", "false"))
+
+
+def visual_scene_guard_flag():
+    """Tri-state read of AGENT_VISUAL_SCENE_GUARD: True (on), False (off or
+    unset), None (ambiguous value — fail closed). Mirrors the stricter
+    global_ledger_flag pattern in agent/gym_media_selector.py: anything
+    outside the explicit truthy/off sets is not a silent default."""
+    raw = (os.environ.get("AGENT_VISUAL_SCENE_GUARD", "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    return None
+
+
+def visual_scene_candidate_flag():
+    """Tri-state read of AGENT_VISUAL_SCENE_CANDIDATE, OFF by default.
+
+    Gates ONLY the emission of owner-attested CANDIDATE pHash scene evidence
+    (the ``visual_scene_candidate`` staging contract) by
+    agent/visual_writer_prepare.py. The evidence is advisory staging metadata:
+    it never counts as use, never excludes other candidates, and arming this
+    flag arms NO enforcement — the guard stays non-operational regardless
+    (SCENE_GUARD_OPERATIONAL=False).
+
+    Mirrors visual_scene_guard_flag exactly: True (explicitly on), False (off
+    or unset — byte-for-byte today's behavior, no candidate payload), None
+    (ambiguous value — counts as ARMED fail-closed, never a silent default)."""
+    raw = (os.environ.get("AGENT_VISUAL_SCENE_CANDIDATE", "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    return None
+
+def source_media_content_hash_enabled() -> bool:
+    """Emit original Drive byte hashes to content_calendar only after migration."""
+    return _truthy(os.environ.get("ECHO_SOURCE_MEDIA_CONTENT_HASH_ENABLED", "false"))

@@ -289,7 +289,7 @@ The additive media fields are read-only status signals from the Echo backend:
   set has no calendar rows. That signal set includes rows that may not render
   as visible cards, such as denied or removed rows, so a month can have no
   visible cards and still report `false`. It is also `false` for a calendar
-  held for coach review. It does not publish, create content, or mutate the
+  containing retired coach_review rows that remain hidden. It does not publish, create content, or mutate the
   calendar.
 - `upload_url` is the per-gym tokenized upload link when the media signal is
   active, otherwise an empty string. It is never a public or cross-gym link.

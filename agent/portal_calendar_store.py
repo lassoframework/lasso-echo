@@ -27,6 +27,7 @@ the row exists and never issues a write that could touch it.
 """
 
 import calendar as _calendar
+import os as _os
 import re as _re
 import time as _time
 
@@ -467,6 +468,18 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def source_media_content_hash_schema_ready(self):
+        """Return True only when PostgREST proves the lineage column is selectable."""
+        r = self._client().get(
+            self._rest(_TABLE), params={"select": "source_media_content_hash", "limit": "0"},
+            headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            return False
+        try:
+            return isinstance(r.json(), list)
+        except Exception:
+            return False
+
     def list_media_publish_history(self, account_key, since):
         """Complete cross-platform send history for a strict reuse decision.
 
@@ -533,11 +546,8 @@ class SupabaseCalendarStore:
         return r.json() or []
 
     def has_owner_visible_rows(self, account_key):
-        """GATE 2 (coach-screens-first-month): True if the gym has EVER had an owner-visible
-        content_calendar row (any status EXCEPT 'coach_review', any account, any date). A
-        gym with none is in its FIRST, not-yet-released month; a gym with any is established
-        and grandfathered (never re-withheld on a rebuild)."""
-        params = {"gym_id": f"eq.{account_key}", "status": "neq.coach_review",
+        """True if the gym has any normal, owner-visible active calendar row."""
+        params = {"gym_id": f"eq.{account_key}",
                   # 0318: a 'candidate' row (an unchosen Astra v2, never itself
                   # owner-visible in the review sense this gate cares about)
                   # must not count as "the gym already has a released month".
@@ -548,20 +558,6 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return bool(r.json() or [])
-
-    def release_coach_review(self, account_key):
-        """GATE 2 coach release: flip ALL of this gym's withheld 'coach_review' rows (every
-        account/platform) to 'pending' in one PATCH, so the owner can see and approve their
-        first month after the coach walks them through it. Returns the released rows."""
-        r = self._client().patch(
-            self._rest(_TABLE),
-            params={"gym_id": f"eq.{account_key}", "status": "eq.coach_review"},
-            headers=self._headers({"Content-Type": "application/json",
-                                   "Prefer": "return=representation"}),
-            json={"status": "pending"}, timeout=30)
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        return r.json() or []
 
     def get_row(self, account_key, row_id):
         """
@@ -668,6 +664,9 @@ class SupabaseCalendarStore:
             # invent an A -> C render receipt or discard A to pass preparation.
             patch["source_media_url"] = current.get("source_media_url") or current["image_url"]
             patch["r2_key"] = None
+            # The patch retains the ORIGINAL source (or, when none was recorded,
+            # the evidence-bound old image itself), so the Drive content hash
+            # stays valid here; the clearing loops below cover source changes.
             candidate = dict(current)
             candidate.update(patch)
             candidate["source_media_url"] = current["image_url"]
@@ -677,9 +676,9 @@ class SupabaseCalendarStore:
                 # The asset/Drive identity attests A, not input rendition B.
                 candidate["source_media_asset_id"] = None
                 candidate["drive_file_id"] = None
-            prepared = visual_writer_prepare.prepare(
+            prepared = self._calendar_visual_payload(visual_writer_prepare.prepare(
                 self, account_key, candidate, render_evidence=render_evidence,
-                poster_render_evidence=poster_render_evidence)
+                poster_render_evidence=poster_render_evidence))
             if (current.get("visual_group_key")
                     and prepared["visual_group_key"] != current["visual_group_key"]):
                 raise visual_writer_prepare.VisualPreparationError(
@@ -701,19 +700,31 @@ class SupabaseCalendarStore:
                     "render evidence does not bind the scoped story replacement")
         # A replacement must not carry a stale source identity from the old
         # image. Callers that know the replacement asset supply it explicitly.
-        for field in ("source_media_url", "source_media_asset_id", "drive_file_id", "byte_hash", "r2_key"):
+        for field in ("source_media_url", "source_media_asset_id", "drive_file_id",
+                      "byte_hash", "r2_key", "source_media_content_hash"):
             if (field == "source_media_url" and is_story
-                    and (current.get(field) == patch.get("image_url")
+                    and (current.get("source_media_url") == patch.get("image_url")
                          or render_evidence is not None)):
+                continue
+            if (field == "source_media_content_hash" and is_story
+                    and bool(current.get("source_media_asset_id"))
+                    and patch.get("source_media_asset_id",
+                                  current.get("source_media_asset_id"))
+                    == current.get("source_media_asset_id")
+                    and (current.get("source_media_url") == patch.get("image_url")
+                         or render_evidence is not None)):
+                # Story raw source (and therefore its Drive byte identity) is
+                # retained: same-source render evidence proves retention only
+                # while the Drive asset identity also remains unchanged.
                 continue
             if field not in patch and current.get(field):
                 patch[field] = None
         candidate = dict(current)
         candidate.update(patch)
         candidate.pop("visual_group_key", None)
-        prepared = visual_writer_prepare.prepare(
+        prepared = self._calendar_visual_payload(visual_writer_prepare.prepare(
             self, account_key, candidate, render_evidence=render_evidence,
-            poster_render_evidence=poster_render_evidence)
+            poster_render_evidence=poster_render_evidence))
         patch["visual_group_key"] = prepared["visual_group_key"]
         patch["byte_hash"] = prepared["byte_hash"]
         return patch
@@ -736,11 +747,11 @@ class SupabaseCalendarStore:
             if (not isinstance(current, dict)
                     or str(current.get("id")) != str(row_id)
                     or str(current.get("gym_id")) != str(account_key)
-                    or current.get("status") not in ("pending", "coach_review")):
+                    or current.get("status") != "pending"):
                 return None
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"}
         if expected_row is None:
-            params["status"] = "in.(pending,coach_review)"
+            params["status"] = "eq.pending"
         else:
             required = ("id", "gym_id", "status", "format", "image_url",
                         "caption", "source_media_url", "published_at", "late_post_id",
@@ -853,9 +864,22 @@ class SupabaseCalendarStore:
                     or evidence.get("delivered_exact_url") != row.get("image_url")):
                 raise visual_writer_prepare.VisualPreparationError(
                     "render evidence does not bind the scoped media replacement")
-        return visual_writer_prepare.prepare(
+        prepared = visual_writer_prepare.prepare(
             self, account_key, row, render_evidence=render_evidence,
             poster_render_evidence=poster_render_evidence)
+        return self._calendar_visual_payload(prepared)
+
+    @staticmethod
+    def _calendar_visual_payload(prepared):
+        """Keep durable preparation receipts out of content_calendar writes.
+
+        ``scene_candidate`` is registered through its owner-only RPC during
+        preparation. It is transport metadata rather than a content_calendar
+        column, so forwarding it to PostgREST would reject an otherwise valid
+        prepared insert or patch.
+        """
+        return {key: value for key, value in prepared.items()
+                if key != "scene_candidate"}
 
     def _prepare_visual_replacement(self, account_key, current, payload,
                                     render_evidence=None, poster_render_evidence=None):
@@ -867,7 +891,16 @@ class SupabaseCalendarStore:
                 and current.get("source_media_url") != current.get("image_url")):
             raise visual_writer_prepare.VisualPreparationError(
                 "replacement requires an explicit source; existing raw source cannot be discarded")
-        for field in ("source_media_url", "source_media_asset_id", "drive_file_id", "byte_hash", "r2_key"):
+        new_source = patch.get("source_media_url")
+        same_source = bool(new_source) and new_source == current.get("source_media_url")
+        new_asset_id = patch.get("source_media_asset_id", current.get("source_media_asset_id"))
+        same_asset = bool(new_asset_id) and new_asset_id == current.get("source_media_asset_id")
+        for field in ("source_media_url", "source_media_asset_id", "drive_file_id",
+                      "byte_hash", "r2_key", "source_media_content_hash"):
+            if field == "source_media_content_hash" and same_source and same_asset:
+                # Source unchanged (e.g. a no-image backfill retaining its raw
+                # source): the old Drive byte identity still proves origin.
+                continue
             if field not in patch and current.get(field):
                 patch[field] = None
         candidate = {**current, **patch}
@@ -897,9 +930,7 @@ class SupabaseCalendarStore:
             return None  # already has a real image; never overwrite
         if not (image_url or "").strip():
             return None
-        # A real replacement resolves the explicit hold in the SAME scoped write.
-        # Do not change status: it remains pending / coach_review and must pass the
-        # ordinary approval gate before it can publish.
+        # A real replacement resolves the explicit media hold in the SAME scoped write.
         payload = {"image_url": image_url, "media_not_ready_reason": None}
         if source_media_asset_id:
             payload["source_media_asset_id"] = source_media_asset_id
@@ -908,7 +939,7 @@ class SupabaseCalendarStore:
         if prepared_write:
             if (str(current.get("gym_id")) != str(account_key)
                     or str(current.get("id")) != str(row_id)
-                    or current.get("status") not in ("pending", "coach_review")
+                    or current.get("status") != "pending"
                     or any(current.get(key) is not None for key in
                            ("published_at", "late_post_id", "publish_claim_token"))):
                 return None
@@ -927,7 +958,7 @@ class SupabaseCalendarStore:
         # media after the prefetch but before this write. PostgREST's OR predicate
         # permits only a still-null or still-empty image_url to be recovered.
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
-                  "status": "in.(pending,coach_review)",
+                  "status": "eq.pending",
                   "or": "(image_url.is.null,image_url.eq.)"}
         if prepared_write:
             params = self._visual_media_cas(current, params)
@@ -953,7 +984,7 @@ class SupabaseCalendarStore:
         """CROSS-DAY MEDIA GUARD sweep (Blake, 2026-08-31): re-point a WAITING row's
         media to a fresh photo because its current photo already sits on another day
         of the gym's book. STATUS-GUARDED SERVER-SIDE: the PATCH itself is filtered to
-        status in (pending, coach_review), so an approved / publishing / published row
+        status in (pending or a retired coach_review state), so an approved / publishing / published row
         can NEVER be swapped through this method — the gym's approval and anything
         live keep exactly the pixels they had. Caption, status and date are untouched.
         source_media_url (when given) is updated too, so a later edited-caption story
@@ -970,7 +1001,7 @@ class SupabaseCalendarStore:
         if not (image_url or "").strip():
             return None
         # This is a real replacement, so release any earlier needs-media hold in
-        # the same pending / coach_review-scoped write. Status itself is unchanged.
+        # the same pending-scoped write. Status itself is unchanged.
         payload = {"image_url": image_url, "media_not_ready_reason": None}
         if source_media_url is not _SOURCE_MEDIA_UNSET:
             payload["source_media_url"] = source_media_url
@@ -981,12 +1012,12 @@ class SupabaseCalendarStore:
         prepared_write = visual_writer_prepare.enabled()
         current = None
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
-                  "status": "in.(pending,coach_review)"}
+                  "status": "eq.pending"}
         if prepared_write:
             current = self.get_row(account_key, row_id)
             if (current is None or str(current.get("gym_id")) != str(account_key)
                     or str(current.get("id")) != str(row_id)
-                    or current.get("status") not in ("pending", "coach_review")
+                    or current.get("status") != "pending"
                     or any(current.get(key) is not None for key in
                            ("published_at", "late_post_id", "publish_claim_token"))):
                 return None
@@ -3507,6 +3538,173 @@ class SupabaseCalendarStore:
             return None
         return rows[0]
 
+    def atomic_month_replace_enabled(self):
+        """Draft cutover switch. The SQL migration must be applied before arming."""
+        return _os.environ.get("ECHO_ATOMIC_MONTH_REPLACE_DRAFT", "").lower() in (
+            "1", "true", "yes")
+
+    def replace_months_atomic(self, account_key, months, rows, *, preserve_dates=(),
+                              render_evidence_by_url=None,
+                              poster_render_evidence_by_url=None,
+                              on_write_start=None):
+        """Replace active machine rows in one database transaction with month CAS.
+
+        Every preparation step and read happens before the RPC. A failed RPC can
+        have an unknown outcome, but its database effects cannot be half applied.
+        The draft path refuses batches changed by a stage belt; that is safer than
+        deleting a full month for a shortened prepared batch.
+        """
+        if not self.atomic_month_replace_enabled():
+            raise PortalStoreError(503, "atomic month replacement is not armed")
+        months = sorted(set(months or ()))
+        if not months or not rows:
+            raise ValueError("atomic month replacement requires months and rows")
+        import datetime as _dt
+        for month in months:
+            if (not isinstance(month, str) or len(month) != 7
+                    or _dt.date.fromisoformat(month + "-01").strftime("%Y-%m") != month):
+                raise ValueError("invalid replacement month")
+
+        expected = []
+        protected_story_ids = []
+        month_rows = {}
+        for month in months:
+            current = self.list_month(account_key, month)
+            if not isinstance(current, list) or len(current) >= 1000:
+                raise PortalStoreError(503, "month read may be partial")
+            month_rows[month] = current
+            first = month + "-01"
+            last = f"{month}-{_calendar.monthrange(int(month[:4]), int(month[5:]))[1]:02d}"
+            try:
+                _record_confirmed_story_holds(account_key, current)
+                incidents = _story_incident_targets(self, account_key, first, last)
+                from .fixer_business_seed import validate_story_created_at
+                protected_story_ids.extend(
+                    str(r["id"]) for r in current
+                    if r.get("format") == "story" and
+                    (_is_story_media_hold(r) or
+                     (r.get("id"), validate_story_created_at(r.get("created_at")))
+                     in incidents))
+            except Exception:
+                # Match delete_month's read-failure posture: retain every Story.
+                protected_story_ids.extend(
+                    str(r["id"]) for r in current if r.get("format") == "story")
+            expected.extend({
+                "id": str(r["id"]), "status": r.get("status"),
+                "variant_status": r.get("variant_status"),
+                "media_not_ready_reason": r.get("media_not_ready_reason"),
+                "post_date": str(r.get("post_date") or "")[:10],
+                "account": r.get("account"), "format": r.get("format"),
+                "caption": r.get("caption"), "image_url": r.get("image_url"),
+                "thumbnail_url": r.get("thumbnail_url"),
+                "source_media_url": r.get("source_media_url"),
+            } for r in current)
+
+        from .copy_gate import bound_opening_hook
+        payload = []
+        for row in rows:
+            clean = {k: v for k, v in dict(row).items() if k != "id"}
+            clean["gym_id"] = account_key
+            if clean.get("post_date", "")[:7] not in months:
+                raise ValueError("row outside replacement months")
+            if clean.get("caption") is not None:
+                clean["caption"] = bound_opening_hook(clean["caption"])
+            if clean.get("logical_post_id") is not None:
+                import uuid as _uuid
+                clean["logical_post_id"] = str(_uuid.UUID(str(clean["logical_post_id"])))
+            payload.append(clean)
+        from .plan_horizon import belt_filter as _horizon_belt
+        payload, _ = _horizon_belt(account_key, payload)
+        payload = _stage_belts(account_key, payload)
+        if len(payload) != len(rows):
+            raise PortalStoreError(409, "stage belt changed atomic month batch")
+
+        keep_dates = {str(d)[:10] for d in preserve_dates}
+        protect_ids = set(protected_story_ids)
+
+        def survives(current):
+            if str(current.get("post_date") or "")[:10] in keep_dates:
+                return True
+            if current.get("format") == "story" and str(current.get("id")) in protect_ids:
+                return True
+            status = str(current.get("status") or "").lower()
+            return (status not in _WIPEABLE_STATUSES and bool(status)) or (
+                current.get("media_not_ready_reason") is not None)
+
+        class _ReplacementView:
+            def __init__(self, source):
+                self.source = source
+                self.failed = False
+
+            def list_month(self, gym, month):
+                try:
+                    current = (month_rows[month] if month in month_rows
+                               else self.source.list_month(gym, month))
+                except Exception:
+                    self.failed = True
+                    raise
+                return [r for r in current if month not in month_rows or survives(r)]
+
+        view = _ReplacementView(self)
+        media_payload = _media_stage_belt(view, account_key, payload)
+        if view.failed or len(media_payload) != len(payload):
+            raise PortalStoreError(409, "media belt changed atomic month batch")
+        live = {"pending", "approved", "publishing", "published", "coach_review"}
+        survivor_slots = {
+            key for current in month_rows.values() for row in current
+            if survives(row) and str(row.get("status") or "").lower() in live
+            for key in [_dedupe_slot_key(row)] if key is not None
+        }
+        deduped = _dedupe_slots(self, account_key, payload, existing=survivor_slots)
+        if len(deduped) != len(payload):
+            raise PortalStoreError(409, "slot belt changed atomic month batch")
+        from . import visual_writer_prepare
+        prepared_write = visual_writer_prepare.enabled()
+        if prepared_write:
+            payload = [self._prepare_visual_row(
+                account_key, row,
+                render_evidence=(render_evidence_by_url or {}).get(row.get("image_url")),
+                poster_render_evidence=(poster_render_evidence_by_url or {}).get(
+                    (row.get("image_url"), row.get("thumbnail_url"))))
+                for row in payload]
+        # Keep the batch homogeneous, as insert_rows does for PostgREST.
+        all_keys = set().union(*(r.keys() for r in payload))
+        payload = [{k: r.get(k) for k in all_keys} for r in payload]
+        client = self._client()
+        url = self._rest("rpc/echo_replace_calendar_months_atomic_draft")
+        headers = self._headers({"Content-Type": "application/json"})
+        request_body = {"p_gym_id": account_key, "p_months": months,
+                        "p_expected": sorted(expected, key=lambda r: r["id"]),
+                        "p_rows": payload,
+                        "p_preserve_dates": sorted({str(d)[:10] for d in preserve_dates}),
+                        "p_protected_story_ids": sorted(set(protected_story_ids))}
+        if on_write_start is not None:
+            on_write_start()
+        response = client.post(url, headers=headers, json=request_body, timeout=60)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code,
+                                   _scrub((response.text or "")[:200]))
+        result = response.json()
+        if not isinstance(result, dict):
+            raise PortalStoreError(502, "atomic month receipt missing")
+        inserted = result.get("rows")
+        if (not isinstance(inserted, list) or len(inserted) != len(payload)
+                or result.get("inserted") != len(payload)
+                or not isinstance(result.get("deleted"), int)
+                or any(not isinstance(r, dict) or r.get("gym_id") != account_key
+                       or not r.get("id") for r in inserted)):
+            raise PortalStoreError(502, "atomic month receipt unverified")
+        if prepared_write:
+            unmatched = list(payload)
+            for row in inserted:
+                matches = [candidate for candidate in unmatched
+                           if all(key in row and row[key] == value
+                                  for key, value in candidate.items())]
+                if not matches:
+                    raise PortalStoreError(502, "atomic visual receipt unverified")
+                unmatched.remove(matches[0])
+        return result
+
     def delete_month(self, account_key, month, *, preserve_human=True,
                      preserve_dates=()):
         """DELETE content_calendar rows for account_key whose post_date falls inside the
@@ -4324,9 +4522,8 @@ def _live_slots_for(store, account_key, dates):
         return None
     # EXACTLY the statuses rows_in_range can return (its own positive allowlist at the
     # top of this file). "draft" was dead code here -- that reader never returns it -- and
-    # "coach_review" WAS being returned while missing from this set, so a coach-review slot
-    # read as free and a re-plan stacked on top of it. 105 forward draft rows and every
-    # coach_review row were invisible to this pass.
+    # Retired coach_review rows still occupy their slots; do not silently stack
+    # new content on top of that retired row.
     live = {"pending", "approved", "publishing", "published", "coach_review"}
     out = set()
     for r in (rows or []):

@@ -23,7 +23,7 @@ def client_visible(rows):
     """Return rows that may appear on a gym owner's calendar.
 
     The escape hatch restores the historical rejected-row payload while keeping
-    coach-screened rows private until a coach releases them.
+    any legacy coach_review rows private. New rows never enter that retired state.
     """
     hidden = CLIENT_HIDDEN_STATUSES
     if config.portal_show_rejected():

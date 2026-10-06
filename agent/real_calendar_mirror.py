@@ -226,6 +226,26 @@ def _real_row(account_key, draft, caption=None):
     src_asset = getattr(draft, "source_media_asset_id", "") or ""
     if src_asset:
         row["source_media_asset_id"] = src_asset
+    # gym_media_drive ORIGINAL-SOURCE LINEAGE (2026-10-05): the Drive md5Checksum
+    # the asset was indexed under, carried separately from source_media_url /
+    # image_url. Those are delivery addresses (a hosted-original URL or a
+    # transformed rendition URL); this is the original-byte identity, so a
+    # rendition-backed row proves WHICH Drive bytes it came from. Stamped ONLY
+    # when present (the column exists after the
+    # DRAFT_content_calendar_source_media_content_hash migration is applied);
+    # omitted otherwise so a pre-migration insert never carries an unknown column.
+    # EMISSION IS FLAG-GATED (ECHO_SOURCE_MEDIA_CONTENT_HASH_ENABLED, default OFF):
+    # direct callers (client_month_run._row_from_draft, real_month_planner
+    # to_calendar_rows) insert this row after a month delete, so emitting an
+    # unknown pre-migration column while the feature is OFF could cost the month.
+    try:
+        _hash_enabled = bool(config.source_media_content_hash_enabled())
+    except AttributeError:
+        _hash_enabled = False
+    src_hash = (str(getattr(draft, "source_media_content_hash", "") or "").strip()
+                if _hash_enabled else "")
+    if src_hash:
+        row["source_media_content_hash"] = src_hash
     # Planned cadence: a draft carries its slot ordinal so publish-time slot times
     # are deterministic. Ordinals 0/1 are the regular AM/PM feeds; LASSO's guarded,
     # dated Summit runway may add ordinal 2. Preserve the planner's ordinal exactly.
@@ -278,7 +298,8 @@ def _draft_eligible(draft):
     return True
 
 
-def collect_real_drafts(account_key, store, poster_evidence_out=None):
+def collect_real_drafts(account_key, store, poster_evidence_out=None,
+                        render_evidence_out=None):
     """The gym's REAL drafts as content_calendar row dicts.
 
     Included: a draft for THIS account that carries a real hosted creative URL or an
@@ -299,6 +320,10 @@ def collect_real_drafts(account_key, store, poster_evidence_out=None):
     mirror_to_supabase forwards the dict to insert_rows(poster_render_evidence_by_url=...)
     so the guarded calendar writer can bind each video row's distinct thumbnail to a
     byte-bound rendition receipt.
+
+    render_evidence_out: optional URL-keyed side channel from draft-owned rendition
+    evidence. Evidence is accepted only when its exact delivered URL matches the row
+    creative URL; conflicting claims for one URL are omitted.
     """
     if not account_key or store is None:
         return []
@@ -317,6 +342,20 @@ def collect_real_drafts(account_key, store, poster_evidence_out=None):
             thumb = row.get("thumbnail_url") or ""
             if image and thumb:
                 poster_evidence_out[(image, thumb)] = poster_evidence
+        render_evidence = getattr(draft, "render_evidence", None)
+        delivered = row.get("image_url") or ""
+        if (isinstance(render_evidence, dict) and isinstance(delivered, str) and delivered
+                and render_evidence.get("delivered_exact_url") == delivered
+                and render_evidence_out is not None):
+            if delivered in render_evidence_out:
+                if render_evidence_out[delivered] != render_evidence:
+                    render_evidence_out[delivered] = None
+            else:
+                render_evidence_out[delivered] = render_evidence
+    if render_evidence_out is not None:
+        for url in [url for url, evidence in render_evidence_out.items()
+                    if not isinstance(evidence, dict)]:
+            render_evidence_out.pop(url, None)
     return rows
 
 
@@ -400,17 +439,55 @@ def mirror_to_supabase(account_key, store, sb_store):
         # Stamped durably; collect_real_drafts below re-lists the store, so the
         # rehydrated drafts carry the persisted ids (never same-object stash).
 
+    # Source lineage schema gate. The feature remains OFF unless deliberately
+    # enabled. When enabled, prove the destination column is queryable before the
+    # month delete/insert transaction begins; an unreadable/missing-column schema
+    # must never erase a previously mirrored month.
+    try:
+        hash_enabled = bool(config.source_media_content_hash_enabled())
+    except AttributeError:
+        hash_enabled = False
+    if hash_enabled:
+        lister = getattr(store, "list_for_account", None)
+        candidates = [d for d in (lister(account_key) or []) if _draft_eligible(d)] if lister else []
+        has_hash = any(str(getattr(d, "source_media_content_hash", "") or "").strip()
+                       for d in candidates)
+        if has_hash:
+            ready = getattr(sb_store, "source_media_content_hash_schema_ready", None)
+            if ready is None:
+                raise ValueError(
+                    "source_media_content_hash flag ON but calendar store cannot "
+                    "prove schema readiness; refusing month deletion (fail closed)")
+            try:
+                schema_ready = ready()
+            except Exception as exc:
+                raise ValueError(
+                    "source_media_content_hash schema readiness check failed; "
+                    "refusing month deletion (fail closed)") from exc
+            if schema_ready is not True:
+                raise ValueError(
+                    "source_media_content_hash column is not confirmed ready; "
+                    "refusing month deletion (fail closed)")
+
     # Real rows, gym-forced, with any stray id stripped (belt and braces; _real_row no
     # longer emits one). A real gym never carries a demo id, so a demo-id row is dropped.
     poster_evidence_by_url = {}
+    render_evidence_by_url = {}
     real_rows = []
+    try:
+        hash_enabled = bool(config.source_media_content_hash_enabled())
+    except AttributeError:
+        hash_enabled = False
     for row in collect_real_drafts(
             account_key, store,
-            poster_evidence_out=poster_evidence_by_url):
+            poster_evidence_out=poster_evidence_by_url,
+            render_evidence_out=render_evidence_by_url):
         if (_demo.is_demo_draft_id(row.get("id"))
                 or str(row.get("gym_id")) != str(account_key)):
             continue
         row = {k: v for k, v in row.items() if k != "id"}
+        if not hash_enabled:
+            row.pop("source_media_content_hash", None)
         # Fail closed BEFORE any delete or insert: a logical_post_id reaching
         # insert_rows must be a valid UUID; an invalid one aborts the whole mirror
         # with ValueError (never a silent strip + identity-less delete/reinsert).
@@ -432,30 +509,68 @@ def mirror_to_supabase(account_key, store, sb_store):
 
     deleted = 0
     inserted = 0
+    atomic_started = False
     try:
         # PRESERVE APPROVALS: never overwrite a slot a human already approved/published.
         from .portal_calendar_store import preserve_and_prune
         real_rows, _locked = preserve_and_prune(sb_store, account_key, months, real_rows)
-        delete_month = getattr(sb_store, "delete_month", None)
-        for month in months:
-            if delete_month is not None:
-                deleted += delete_month(account_key, month) or 0
-        insert_rows = getattr(sb_store, "insert_rows", None)
-        if insert_rows is not None and real_rows:
-            from . import visual_writer_prepare
-            if poster_evidence_by_url and visual_writer_prepare.enabled():
-                # Poster proof is a side channel, never a row column: the store binds
-                # each (image_url, thumbnail_url) pair to its rendition receipt at the
-                # prepared-writer boundary. A TypeError can happen after an internal
-                # write, so it must fail the mirror rather than retrying without proof.
-                inserted += len(insert_rows(
-                    account_key, real_rows,
-                    poster_render_evidence_by_url=poster_evidence_by_url) or [])
-            else:
-                inserted += len(insert_rows(account_key, real_rows) or [])
+        from . import visual_writer_prepare
+        if visual_writer_prepare.enabled():
+            missing_render_proof = []
+            for row in real_rows:
+                source_url = row.get("source_media_url")
+                delivered_url = row.get("image_url")
+                if not source_url or source_url == delivered_url:
+                    continue
+                evidence = render_evidence_by_url.get(delivered_url)
+                if (not isinstance(evidence, dict)
+                        or evidence.get("source_exact_url") != source_url
+                        or evidence.get("delivered_exact_url") != delivered_url):
+                    missing_render_proof.append(delivered_url)
+            if missing_render_proof:
+                return {"ok": False,
+                        "reason": "transformed visual row lacks exact source and "
+                                  "delivered render evidence; aborted before month deletion",
+                        "missing_render_evidence_urls": sorted(set(missing_render_proof)),
+                        "upserted": 0, "inserted": 0, "deleted": 0}
+        atomic_enabled = getattr(sb_store, "atomic_month_replace_enabled", None)
+        if callable(atomic_enabled) and atomic_enabled():
+            if not months or not real_rows:
+                return {"ok": True, "upserted": 0, "inserted": 0,
+                        "deleted": 0, "months": months, "noop_empty": True}
+            replace = getattr(sb_store, "replace_months_atomic", None)
+            if not callable(replace):
+                raise RuntimeError("atomic month replacement method unavailable")
+            atomic_started = True
+            receipt = replace(
+                account_key, months, real_rows,
+                poster_render_evidence_by_url=poster_evidence_by_url,
+                render_evidence_by_url=render_evidence_by_url)
+            deleted = receipt["deleted"]
+            inserted = receipt["inserted"]
+        else:
+            delete_month = getattr(sb_store, "delete_month", None)
+            for month in months:
+                if delete_month is not None:
+                    deleted += delete_month(account_key, month) or 0
+            insert_rows = getattr(sb_store, "insert_rows", None)
+            if insert_rows is not None and real_rows:
+                if ((poster_evidence_by_url or render_evidence_by_url)
+                        and visual_writer_prepare.enabled()):
+                    # A TypeError can happen after an internal write; never retry
+                    # without the side-channel evidence.
+                    kwargs = {}
+                    if poster_evidence_by_url:
+                        kwargs["poster_render_evidence_by_url"] = poster_evidence_by_url
+                    if render_evidence_by_url:
+                        kwargs["render_evidence_by_url"] = render_evidence_by_url
+                    inserted += len(insert_rows(account_key, real_rows, **kwargs) or [])
+                else:
+                    inserted += len(insert_rows(account_key, real_rows) or [])
     except Exception as exc:
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
-                "upserted": inserted, "deleted": deleted}
+                "upserted": inserted, "deleted": deleted,
+                "atomic_outcome_unknown": atomic_started}
 
     return {"ok": True, "upserted": inserted, "inserted": inserted,
             "deleted": deleted, "months": months}

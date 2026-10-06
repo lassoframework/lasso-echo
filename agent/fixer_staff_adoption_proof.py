@@ -305,7 +305,7 @@ def handle(raw_body, *, read=None, http_get=None, receipt_read=None):
         if not isinstance(rows, list) or len(rows) != 1:
             return 409, {"error": "swap_readback_mismatch"}
         row = rows[0]; digest = lambda value: hashlib.sha256(str(value).encode()).hexdigest()
-        if (row.get("status") not in ("pending", "coach_review") or digest(row.get("caption")) != pointer["caption_sha256"]
+        if (row.get("status") != "pending" or digest(row.get("caption")) != pointer["caption_sha256"]
                 or digest(row.get("image_url")) != proof.get("after_image_sha256")
                 or row.get("source_media_asset_id") != proof.get("after_asset_id")
                 or not isinstance(row.get("source_media_asset_id"), str)):

@@ -439,7 +439,7 @@ def test_patch_media_recovers_hold_without_auto_approval():
     assert row == recovered
     patch = [call for call in http.calls if call[0] == "patch"][0]
     assert patch[1]["gym_id"] == "eq.lasso_ig"
-    assert patch[1]["status"] == "in.(pending,coach_review)"
+    assert patch[1]["status"] == "eq.pending"
     assert patch[2] == {"image_url": recovered["image_url"],
                         "media_not_ready_reason": None}
     assert row["status"] == "pending"  # media recovery never approves the row

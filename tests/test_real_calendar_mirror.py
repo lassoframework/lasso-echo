@@ -324,17 +324,22 @@ class _EvidenceSB:
 
     def __init__(self):
         self.poster_evidence_by_url = None
+        self.render_evidence_by_url = None
         self.inserted = []
+        self.deleted = []
 
     def list_month(self, account_key, month):
         return []
 
-    def insert_rows(self, account_key, rows, *, poster_render_evidence_by_url=None):
+    def insert_rows(self, account_key, rows, *, poster_render_evidence_by_url=None,
+                    render_evidence_by_url=None):
         self.poster_evidence_by_url = poster_render_evidence_by_url
+        self.render_evidence_by_url = render_evidence_by_url
         self.inserted.extend(rows or [])
         return rows
 
     def delete_month(self, account_key, month):
+        self.deleted.append((account_key, month))
         return 0
 
 
@@ -381,6 +386,59 @@ def test_prepared_mirror_forwards_poster_proof_after_real_store_round_trip(
         draft.poster_render_evidence}
     assert sb.inserted[0]["thumbnail_url"] == draft.thumbnail_url
     assert "poster_render_evidence" not in sb.inserted[0]
+
+
+def test_prepared_mirror_forwards_drive_render_proof_after_store_round_trip(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    pending = PendingStore(str(tmp_path / "render-mirror.db"))
+    draft = _draft("render-1", url="https://cdn/rendered.jpg")
+    draft.render_evidence = {
+        "operation": "render", "source_exact_url": "https://cdn/source.jpg",
+        "delivered_exact_url": draft.creative_public_url,
+        "source_fingerprint": "source-fp", "delivered_fingerprint": "delivered-fp"}
+    pending.put(draft)
+
+    sb = _EvidenceSB()
+    out = rcm.mirror_to_supabase("northside_ig", pending, sb)
+
+    assert out["ok"] is True and out["inserted"] == 1
+    assert sb.render_evidence_by_url == {draft.creative_public_url: draft.render_evidence}
+    assert "render_evidence" not in sb.inserted[0]
+
+
+def test_collect_real_drafts_omits_mismatched_or_conflicting_render_proof():
+    one = _draft("render-a", url="https://cdn/shared.jpg")
+    one.render_evidence = {"delivered_exact_url": "https://cdn/shared.jpg", "source": "a"}
+    two = _draft("render-b", url="https://cdn/shared.jpg")
+    two.render_evidence = {"delivered_exact_url": "https://cdn/shared.jpg", "source": "b"}
+    mismatch = _draft("render-c", url="https://cdn/other.jpg")
+    mismatch.render_evidence = {"delivered_exact_url": "https://cdn/shared.jpg", "source": "c"}
+    evidence = {}
+    rows = rcm.collect_real_drafts(
+        "northside_ig", _EvidenceStore([one, two, mismatch]),
+        render_evidence_out=evidence)
+    assert len(rows) == 3
+    assert evidence == {}
+
+
+@pytest.mark.parametrize("proof", [None, {
+    "operation": "render", "source_exact_url": "https://cdn/wrong-source.jpg",
+    "delivered_exact_url": "https://cdn/rendered.jpg"}])
+def test_mirror_refuses_transformed_row_without_exact_source_proof_before_delete(
+        monkeypatch, proof):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    draft = _draft("render-preflight", url="https://cdn/rendered.jpg")
+    draft.source_media_url = "https://cdn/source.jpg"
+    if proof is not None:
+        draft.render_evidence = proof
+    sb = _EvidenceSB()
+
+    out = rcm.mirror_to_supabase("northside_ig", _EvidenceStore([draft]), sb)
+
+    assert out["ok"] is False
+    assert "aborted before month deletion" in out["reason"]
+    assert sb.deleted == [] and sb.inserted == []
 
 
 def test_flag_off_mirror_keeps_plain_insert(monkeypatch):

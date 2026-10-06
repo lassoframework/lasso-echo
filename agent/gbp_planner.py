@@ -483,9 +483,8 @@ def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
          event=None, offer=None, gbp_location_id=None, fmt="update",
          status="pending", source_media_url=None, source_media_asset_id=None):
     """One content_calendar GBP row dict (no id; DB mints it). account is the literal
-    'googlebusiness'; gym_id is the portal_gym_key canonical join. status is 'pending'
-    (owner-visible) normally, or 'coach_review' (withheld from the owner) for a gym's
-    first month under GATE 2."""
+    'googlebusiness'; gym_id is the portal_gym_key canonical join. New rows use 'pending'
+    for the owner's normal approval flow."""
     row = {
         "gym_id": portal_gym_key,
         "account": gbp.PLATFORM,             # 'googlebusiness'
@@ -613,10 +612,10 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     GATE 1 offer_confirmed: the OFFER slot is planned ONLY when this is True AND a real
     offer resolves. A gym whose live offer is not confirmed gets NO OFFER post (a wrong
     offer to Google is a failure we cannot eat). Local updates / events / photo drops are
-    unaffected. GATE 2 initial_status: the status every planned row is written with —
-    'pending' (owner-visible) normally, or 'coach_review' (withheld from the owner until a
-    coach screens and releases it) for a gym's first month."""
+    unaffected. New rows must be pending for the normal owner approval flow."""
     log = logger or (lambda m: print(f"[gbp-planner] {m}"))
+    if initial_status != "pending":
+        return {"ok": False, "reason": "unsupported initial status", "planned": 0}
     start = start or date.today()
     caption_fn = caption_fn or (lambda fact: generate_gbp_caption(fact, voice, city))
     facts = list(facts or [])

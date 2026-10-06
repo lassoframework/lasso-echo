@@ -175,14 +175,18 @@ def real_media_depleted(base, *, now=None):
         assets = media_store.list_assets(base)
         # An indexed client photo awaiting the normal hash-bound moderation is
         # supply waiting for Echo, not evidence that the gym has no photos.
-        # Hold the infographic while the moderation worker catches up. A known
-        # rejected or coach-hidden asset cannot block the last-resort lane.
+        # Hold the infographic while the moderation worker catches up. A legacy
+        # pending_review photo already marked clean by auto-moderation is also
+        # known supply -- the review step has not cleared it, but it must not
+        # unlock Astra fallback. A known rejected or coach-hidden asset cannot
+        # block the last-resort lane.
         if any(str(a.get("gym_id") or "") == base
                and a.get("kind") == "photo"
                and a.get("eligible") is not False
                and not a.get("excluded_by_coach")
                and a.get("review_status") == "pending_review"
-               and a.get("moderation_status") == "pending"
+               and str(a.get("moderation_status") or "").lower()
+                   in ("pending", "clean")
                and a.get("content_hash") for a in assets):
             return False
         class Snapshot:

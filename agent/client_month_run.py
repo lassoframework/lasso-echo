@@ -183,7 +183,7 @@ def _locked_calendar_state(base_key, start, days, store, log, library_path=None)
     # CROSS-DAY MEDIA GUARD (Blake, 2026-08-31: a client saw the same photo across
     # different weeks): also exclude every photo that will SURVIVE this rebuild on
     # the gym's book — published within the trailing repeat window (the span-months
-    # read above missed last month's publishes), coach_review rows (NOT wipeable, so
+    # read above missed last month's publishes), retired coach_review rows (NOT wipeable, so
     # they survive the delete), and wipeable rows OUTSIDE the span months. Wipeable
     # rows INSIDE the span are about to be replaced, so their photos stay free —
     # excluding them would starve the very rebuild that releases them. Read failure
@@ -676,22 +676,6 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
     return out
 
 
-def _is_first_month(base_key, store, log):
-    """GATE 2: True when this gym has NO owner-visible content_calendar row yet (its first,
-    not-yet-released month). A store without has_owner_visible_rows (test fakes, legacy) is
-    treated as ESTABLISHED (returns False) so the gate only ever engages against the real
-    Supabase store — nothing withheld by accident."""
-    checker = getattr(store, "has_owner_visible_rows", None)
-    if not callable(checker):
-        return False
-    try:
-        return not checker(base_key)
-    except Exception as exc:  # noqa: BLE001 - a check failure must never withhold blindly
-        log(f"{base_key}: first-month check failed ({type(exc).__name__}); treating as "
-            "established (not withheld)")
-        return False
-
-
 # The gym-drive lane fills these people-forward slots (spec §7). Kept in the order
 # a month rotates through them so consecutive Drive days do not repeat one pillar.
 _GYM_DRIVE_PILLARS = ("faces", "community", "results")
@@ -950,7 +934,7 @@ def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, 
 def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                             covered_days, drive=None, store=None,
                             library_path="", slots_per_day=1, banned_words=(),
-                            rendition_budget=None, covered_slots=None,
+                            rendition_budget=None, photo_rendition_budget=None, covered_slots=None,
                             video_beats_only=False, kind_prefs=None,
                             day_captions_seed=None, failed_assets=None,
                             max_feed_count=None):
@@ -1044,6 +1028,7 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                 draft = gym_media_builder.build_gym_media_draft(
                     account, day_key, pillar, voice, source, store=store, drive=drive,
                     slot_index=slot_i, rendition_budget=rendition_budget,
+                    photo_rendition_budget=photo_rendition_budget,
                     kind_prefs=kind_prefs, exclude_ids=tuple(sorted(failed)))
             except Exception as e:  # noqa: BLE001 - the lane never sinks the month
                 log(f"[gym-drive] builder failed for {base_key} {day_key}: "
@@ -1405,6 +1390,11 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                          and config.gym_drive_connect_active_for(base_key)) else 0)
     max_feed_days = min(days * slots_per_day,
                         max(0, media_count - _used_in_lib) + _drive_budget)
+    # One bounded HEIC proof conversion per potential photo feed.  This is kept
+    # independent from the expensive video transcode cap, so cached HEIC evidence
+    # refreshes cannot starve the photo lane and trigger an inappropriate fallback.
+    from . import gym_media_index as _photo_gmi
+    photo_rendition_budget = _photo_gmi.RenditionBudget(max_feed_days)
 
     # `drafts` is the caller's list (build_client_month's try/finally reads it back to
     # roll unlanded Drive picks out of the pool); never rebound here.
@@ -1496,7 +1486,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 account, base_key, start, days, voice, log=log,
                 covered_days=locked_feed_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
-                rendition_budget=rendition_budget, covered_slots=covered_slots,
+                rendition_budget=rendition_budget, photo_rendition_budget=photo_rendition_budget,
+                covered_slots=covered_slots,
                 kind_prefs=(_PHOTO_KIND,), max_feed_count=max_feed_days)
             drive_photo_feeds = _record_drive_prepass(photo_pre, "Drive photo")
         except InvalidLogicalPostIdentity:
@@ -1727,7 +1718,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 # genuinely open PM slot after a local or Drive-photo AM post.
                 covered_days=locked_feed_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
-                rendition_budget=rendition_budget, covered_slots=covered_slots,
+                rendition_budget=rendition_budget, photo_rendition_budget=photo_rendition_budget,
+                covered_slots=covered_slots,
                 video_beats_only=True, kind_prefs=(_VIDEO_KIND,),
                 day_captions_seed=pre_captions,
                 max_feed_count=max(0, max_feed_days - drive_photo_feeds - built_feeds))
@@ -1738,7 +1730,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             log(f"{base_key}: video pre-pass skipped ({type(e).__name__}: {e})")
 
     # §4 weak_match: no image cleared the content-score floor for these slots — the best
-    # available was planned and must reach the coach (never silent). One summary staff alert
+    # available was planned and must reach ops (never silent). One summary staff alert
     # per build, not per day.
     weak = sum(1 for d in drafts if getattr(d, "weak_match", False))
     if weak:
@@ -1749,7 +1741,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                              "fresher material for those pillars")
         except Exception:  # noqa: BLE001
             pass
-        log(f"{base_key}: {weak} weak_match pick(s) flagged for the coach")
+        log(f"{base_key}: {weak} weak_match pick(s) flagged for ops media alert")
 
     # Days the UPLOADED library covered (Lane A only, locked days excluded): the
     # small-library digest compares the library against these + the fallback fills,
@@ -1773,7 +1765,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 # a day with one Lane-A feed here used to skip its open second slot.
                 covered_days=locked_feed_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
-                rendition_budget=rendition_budget, covered_slots=covered_slots,
+                rendition_budget=rendition_budget, photo_rendition_budget=photo_rendition_budget,
+                covered_slots=covered_slots,
                 day_captions_seed=pre_captions,
                 max_feed_count=max(0, max_feed_days - sum(
                     1 for d in drafts if not getattr(d, "is_story", False))))
@@ -1848,25 +1841,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 "approved CTA that reads as a single ask (never an invented one)")
 
     rows = _to_rows(base_key, drafts)
-    # GATE 2 (coach-screens-first-month, Blake 2026-08-17): a CLIENT gym's FIRST month on
-    # every platform is WITHHELD from the owner ('coach_review') until a coach screens and
-    # releases it — the coach SOP enforced in software. Established gyms (any owner-visible
-    # row already) are grandfathered, never re-withheld on a rebuild. LASSO's own account is
-    # exempt (not a client gym). Safe default: a store lacking the signal is treated as
-    # established (no withhold), so nothing changes for it.
-    if (config.coach_screen_first_month_enabled() and base_key != "lasso"
-            and _is_first_month(base_key, store, log)):
-        for r in rows:
-            r["status"] = "coach_review"
-        log(f"{base_key}: FIRST month -> written 'coach_review' (withheld from owner "
-            "until a coach releases it; GATE 2)")
+    # All new calendar rows remain pending for the owner's normal approval path.
     # GOOGLE BUSINESS MIRROR (AGENT_GBP_MIRROR, default OFF; Blake 2026-09-02: "anytime
     # you post to ig, fb or whatever goes to google as well"). The same build-time
     # cross-post the Facebook leg does, with the two things a Google post cannot share
     # with an Instagram post done properly: a 1200x900 crop hosted BEFORE approval, and a
     # Google-native caption that must clear the A+ gate or the row is skipped. Appended
-    # AFTER the GATE 2 loop on purpose: a GBP row is never 'coach_review' (Blake ruled it
-    # out for Google), it is always the owner's own 'pending' tap. See agent/gbp_mirror.py.
+    # GBP rows also enter the owner's standard pending approval path. See agent/gbp_mirror.py.
     from . import gbp_mirror as _gbp_mirror
     # NOTE: no store= is passed. `store` here is the calendar store; the mirror needs a
     # GbpStore (connection posture + the CTA link live only there) and builds its own.
@@ -1885,7 +1866,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                         locked_days=locked_feed_days, allow_reshape=allow_reshape,
                         poster_render_evidence_by_url=_poster_render_evidence_by_url(
                             drafts),
-                        render_evidence_by_url=_gbp_render_evidence or None)
+                        render_evidence_by_url=_merge_render_evidence_by_url(
+                            _render_evidence_by_url(drafts), _gbp_render_evidence) or None)
     except Exception:
         # _apply catches remote write failures and returns their unknown-outcome
         # flag. An exception escaping its contract is a prewrite planning failure.
@@ -2087,6 +2069,49 @@ def _poster_render_evidence_by_url(drafts):
         thumb = (getattr(draft, "thumbnail_url", "") or "").strip()
         if image and thumb:
             out[(image, thumb)] = evidence
+    return out
+
+
+def _render_evidence_by_url(drafts):
+    """Build the prepared-writer side channel from draft-owned rendition proof.
+
+    The key is the exact delivered creative URL. Reject mismatched or malformed
+    evidence here; the prepared writer independently checks the bytes. If multiple
+    drafts claim one URL with different evidence, omit that URL rather than letting
+    one row's lineage attest another row's creative.
+    """
+    out = {}
+    conflicted = set()
+    for draft in drafts or ():
+        evidence = getattr(draft, "render_evidence", None)
+        url = getattr(draft, "creative_public_url", "") or ""
+        if (not isinstance(url, str) or not url or not isinstance(evidence, dict)
+                or evidence.get("delivered_exact_url") != url):
+            continue
+        if url in out and out[url] != evidence:
+            conflicted.add(url)
+        else:
+            out[url] = evidence
+    for url in conflicted:
+        out.pop(url, None)
+    return out
+
+
+def _merge_render_evidence_by_url(*maps):
+    """Merge URL keyed proof maps without choosing between conflicting claims."""
+    out = {}
+    conflicted = set()
+    for mapping in maps:
+        for url, evidence in (mapping or {}).items():
+            if (not isinstance(url, str) or not url or not isinstance(evidence, dict)
+                    or evidence.get("delivered_exact_url") != url):
+                continue
+            if url in out and out[url] != evidence:
+                conflicted.add(url)
+            else:
+                out[url] = evidence
+    for url in conflicted:
+        out.pop(url, None)
     return out
 
 
@@ -2389,6 +2414,12 @@ def _story_from_feed(feed):
             story.poster_render_evidence = poster_evidence
         except Exception:  # noqa: BLE001 - a frozen/edge draft never blocks the build
             pass
+    render_evidence = getattr(feed, "render_evidence", None)
+    if render_evidence:
+        try:
+            story.render_evidence = render_evidence
+        except Exception:  # noqa: BLE001 - preserve fail-closed writer behavior
+            pass
     return story
 
 
@@ -2550,6 +2581,58 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     months = sorted(span)
     clean_rows = [{k: v for k, v in r.items() if k != "id"}
                   for r in rows if str(r.get("gym_id")) == str(base_key)]
+    # A distinct delivered object cannot be recreated by the prepared writer without
+    # draft-owned render proof. Check before month deletion so a missing or collided
+    # sidechannel never erases the currently staged calendar. Later byte/readback
+    # failures remain writer failures and are not made atomic by this preflight.
+    if _visual_writer_guard_enabled():
+        evidence_by_url = render_evidence_by_url or {}
+        missing_render_proof = []
+        for row in clean_rows:
+            source_url = row.get("source_media_url")
+            delivered_url = row.get("image_url")
+            if not source_url or source_url == delivered_url:
+                continue
+            evidence = evidence_by_url.get(delivered_url)
+            if (not isinstance(evidence, dict)
+                    or evidence.get("delivered_exact_url") != delivered_url
+                    or evidence.get("source_exact_url") != source_url):
+                missing_render_proof.append(delivered_url)
+        if missing_render_proof:
+            return {"ok": False,
+                    "reason": "transformed visual row lacks exact render evidence; "
+                              "aborted before month deletion",
+                    "missing_render_evidence_urls": sorted(set(missing_render_proof)),
+                    "upserted": 0, "inserted": 0, "deleted": 0,
+                    "months": sorted({r.get("post_date", "")[:7]
+                                      for r in clean_rows if r.get("post_date")})}
+    # SOURCE LINEAGE SCHEMA GATE (ECHO_SOURCE_MEDIA_CONTENT_HASH_ENABLED, default
+    # OFF). _real_row only emits source_media_content_hash when the feature is ON,
+    # so a hash-carrying row proves the feature is armed. Prove the destination
+    # column is queryable BEFORE any delete; an unreadable/missing-column schema
+    # must never erase a previously staged month. Fail closed with zero writes.
+    try:
+        _hash_enabled = bool(config.source_media_content_hash_enabled())
+    except AttributeError:
+        _hash_enabled = False
+    if _hash_enabled and any(str(r.get("source_media_content_hash") or "").strip()
+                             for r in clean_rows):
+        ready = getattr(store, "source_media_content_hash_schema_ready", None)
+        try:
+            schema_ready = ready() if ready is not None else None
+        except Exception:
+            schema_ready = None
+        if schema_ready is not True:
+            return {"ok": False,
+                    "reason": "source_media_content_hash column is not confirmed "
+                              "ready; refusing month deletion (fail closed)",
+                    "upserted": 0, "inserted": 0, "deleted": 0}
+    if not _hash_enabled:
+        # Belt and braces (the mapper already gates emission): a flag-OFF insert
+        # never carries the column, so a pre-migration schema sees the exact row
+        # shape it saw before the feature existed.
+        for r in clean_rows:
+            r.pop("source_media_content_hash", None)
     # WAVE 7 LEVER STAMPING (audit item 1, 2026-08-31; behind AGENT_LEARNING_LOOP).
     # This is the CLIENT month build — the lane that stages almost every row Echo
     # owns — and it never stamped a lever. The stamping lived only in LASSO's
@@ -2748,25 +2831,44 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         delete_preserve = _out_of_span_preserve_dates(
             months, span_first, span_last, preserve_dates=locked_days)
         bounded_delete_read = callable(getattr(store, "list_month", None))
-        delete_month = getattr(store, "delete_month", None)
-        for month in months:
-            if delete_month is not None:
-                try:
-                    deleted += delete_month(base_key, month,
-                                            preserve_dates=delete_preserve) or 0
-                except TypeError:      # older store/test fakes without the kwarg
-                    if bounded_delete_read:
-                        raise RuntimeError("bounded store cannot preserve dates")
-                    deleted += delete_month(base_key, month) or 0
-        insert_rows = getattr(store, "insert_rows", None)
-        if insert_rows is not None and clean_rows:
-            store_rows = [{k: v for k, v in r.items()
-                           if k != "_served_reservation_id"} for r in clean_rows]
-            insert_started = True
-            inserted += len(_insert_rows_with_poster_evidence(
-                insert_rows, base_key, store_rows,
-                poster_render_evidence_by_url,
-                render_evidence_by_url=render_evidence_by_url) or [])
+        store_rows = [{k: v for k, v in r.items()
+                       if k != "_served_reservation_id"} for r in clean_rows]
+        atomic_enabled = getattr(store, "atomic_month_replace_enabled", None)
+        if callable(atomic_enabled) and atomic_enabled():
+            replace = getattr(store, "replace_months_atomic", None)
+            if not callable(replace):
+                raise RuntimeError("atomic month replacement method unavailable")
+            # The store signals immediately before RPC dispatch. Its validation
+            # and reads happen first, so those failures have a known no-write outcome.
+            def mark_write_start():
+                nonlocal insert_started
+                insert_started = True
+
+            receipt = replace(
+                base_key, months, store_rows, preserve_dates=delete_preserve,
+                poster_render_evidence_by_url=poster_render_evidence_by_url,
+                render_evidence_by_url=render_evidence_by_url,
+                on_write_start=mark_write_start)
+            deleted = receipt["deleted"]
+            inserted = receipt["inserted"]
+        else:
+            delete_month = getattr(store, "delete_month", None)
+            for month in months:
+                if delete_month is not None:
+                    try:
+                        deleted += delete_month(base_key, month,
+                                                preserve_dates=delete_preserve) or 0
+                    except TypeError:      # older store/test fakes without the kwarg
+                        if bounded_delete_read:
+                            raise RuntimeError("bounded store cannot preserve dates")
+                        deleted += delete_month(base_key, month) or 0
+            insert_rows = getattr(store, "insert_rows", None)
+            if insert_rows is not None and clean_rows:
+                insert_started = True
+                inserted += len(_insert_rows_with_poster_evidence(
+                    insert_rows, base_key, store_rows,
+                    poster_render_evidence_by_url,
+                    render_evidence_by_url=render_evidence_by_url) or [])
     except Exception as exc:  # noqa: BLE001
         log(f"store write failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
@@ -3159,11 +3261,6 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
 
     try:
         rows = _to_rows(base_key, drafts)
-        # GATE 2 safety: withhold a first-month replacement exactly as its month would be.
-        if (config.coach_screen_first_month_enabled() and base_key != "lasso"
-                and _is_first_month(base_key, store, log)):
-            for r in rows:
-                r["status"] = "coach_review"
         from . import gbp_mirror as _gbp_mirror
         rows.extend(_gbp_mirror.rows_for(base_key, drafts, library_path=library_path,
                                          logger=log))
@@ -3189,7 +3286,8 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
             _reservation_state["insert_started"] = True
         inserted_rows = _insert_rows_with_poster_evidence(
             insert_rows, base_key, store_rows,
-            _poster_render_evidence_by_url(drafts)) or []
+            _poster_render_evidence_by_url(drafts),
+            render_evidence_by_url=_render_evidence_by_url(drafts)) or []
         inserted = len(inserted_rows)
     except Exception as exc:  # noqa: BLE001
         # The insert request may have reached the remote store before the exception;

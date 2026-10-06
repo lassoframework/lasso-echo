@@ -40,7 +40,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from . import gym_media_index as _idx
 
@@ -204,6 +204,277 @@ def cross_client_used_fingerprints(base, fingerprints, *, http=None):
             # counters cannot establish that the exact bytes are safe to reuse.
             used.add(row["fingerprint"])
     return used
+
+
+# DRAFT SCENE GUARD (near-duplicate pHash belt, layered on PR235, 2026-10-03):
+# when AGENT_VISUAL_SCENE_GUARD is explicitly enabled, usable photos are
+# classified by scene fingerprint against scene hashes the integrated DRAFT
+# visual_scene_phash_occupied table shows used by OTHER canonical tenants. A
+# cross-tenant NEAR_FRAME (hamming <= 6) excludes the photo like exact-byte
+# cross-tenant use; a SCENE_CANDIDATE (7..30, same or cross tenant) is held for
+# manual review ('scene_review_hold') — never auto-approved, never silently
+# excluded, and never written as a scene link from pHash inference. The flag is
+# tri-state via agent.config.visual_scene_guard_flag(): an ambiguous value
+# fails closed exactly like the global-ledger gate. Default OFF = byte-for-byte
+# legacy behavior. Read-only; this gate never mutates ledger state.
+SCENE_GUARD_FLAG_ENV = "AGENT_VISUAL_SCENE_GUARD"
+SCENE_REVIEW_HOLD = "scene_review_hold"
+
+# ASTRA REJECTION (see docs/VISUAL_SCENE_GUARD_DRAFT.md): the prep-time scene
+# writer architecture was rejected — prep-time records mark UNUSED candidates
+# as used, are not atomic with the real visual_global_usage claim, and race
+# across gyms. The scene ledger therefore currently has NO legitimate writer,
+# so an ARMED guard must fail closed as not-yet-operational rather than read a
+# table that can only be empty or backfilled. All read machinery below (full
+# scan, ordering proofs, classify_scene_all policy, cross-date holds) is kept
+# intact for the redesign but is unreachable until this flips to True.
+SCENE_GUARD_OPERATIONAL = False
+_SCENE_PHASH_RE = re.compile(r"scene:phash64:[0-9a-f]{16}")
+# The DRAFT table stores the BARE 16-hex hash (visual_scene_record_use strips
+# the namespace before insert); the reader namespaces it again in memory.
+_SCENE_BARE_RE = re.compile(r"[0-9a-f]{16}")
+_SCENE_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Deterministic scan order covering the full primary key of the integrated
+# visual_scene_phash_occupied schema — (phash, tenant_id, group_key, used_date)
+# — so page boundaries are stable snapshot boundaries. Omitting used_date from
+# the pinned order leaves same-(phash, tenant, group) rows at arbitrary relative
+# positions, and a page boundary could split them non-deterministically.
+_SCENE_SCAN_ORDER = "phash.asc,tenant_id.asc,group_key.asc,used_date.asc"
+_SCENE_SCAN_SELECT = "phash,tenant_id,group_key,used_date"
+
+
+class SceneLedgerUnavailable(RuntimeError):
+    """The DRAFT scene ledger could not prove a photo's cross-tenant scene status."""
+
+
+def scene_guard_flag():
+    """Tri-state read of AGENT_VISUAL_SCENE_GUARD: True (on), False (off or
+    unset), None (ambiguous value — fail closed). Delegates to
+    agent.config.visual_scene_guard_flag() when the sibling config has landed;
+    until then the env is parsed here with identical semantics so an ambiguous
+    value is never a silent default."""
+    from . import config
+    tri = getattr(config, "visual_scene_guard_flag", None)
+    if callable(tri):
+        value = tri()
+        return value if value in (True, False, None) else None
+    raw = (os.environ.get(SCENE_GUARD_FLAG_ENV, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _complete_scene_read(http, url, params, headers, *, maximum=100):
+    """One exact, bounded visual_scene_phash_occupied read, proven complete.
+
+    Mirrors _complete_ledger_read but raises SceneLedgerUnavailable: the scene
+    table is DRAFT-only, so a missing table (404) or any unreadable response
+    must surface as unavailability, never as 'no known scenes'."""
+    page_headers = dict(headers)
+    page_headers.update({"Prefer": "count=exact", "Range-Unit": "items",
+                         "Range": "0-99"})
+    try:
+        response = http.get(url, params=params, headers=page_headers, timeout=30)
+    except Exception as exc:  # noqa: BLE001 - an incomplete scene ledger is unsafe
+        raise SceneLedgerUnavailable("scene ledger read failed") from exc
+    if not 200 <= response.status_code < 300:
+        raise SceneLedgerUnavailable(
+            f"scene ledger read failed ({response.status_code})")
+    try:
+        rows = response.json()
+    except Exception as exc:  # noqa: BLE001
+        raise SceneLedgerUnavailable("scene ledger read was malformed") from exc
+    if not isinstance(rows, list):
+        raise SceneLedgerUnavailable("scene ledger page was malformed")
+    response_headers = getattr(response, "headers", {}) or {}
+    content_range = (response_headers.get("Content-Range")
+                     or response_headers.get("content-range") or "")
+    match = re.fullmatch(r"(\*|\d+-\d+)/(\d+)", str(content_range))
+    if not match:
+        raise SceneLedgerUnavailable("scene ledger did not prove page completeness")
+    span, total_text = match.groups()
+    total = int(total_text)
+    if total > maximum or len(rows) != total:
+        raise SceneLedgerUnavailable("scene ledger page was incomplete")
+    if total == 0:
+        if span != "*":
+            raise SceneLedgerUnavailable("scene ledger page was incomplete")
+    elif span != f"0-{total - 1}":
+        raise SceneLedgerUnavailable("scene ledger page was incomplete")
+    return rows
+
+
+def _scene_page(http, url, headers, offset, *, size=100):
+    """One page of the full visual_scene_phash_occupied scan, (rows, total), proven
+    consistent: the query pins a deterministic order over the FULL primary key
+    (phash, tenant_id, group_key, used_date) so page boundaries are stable, the span must
+    start exactly at `offset`, the row count must match the span, and `total`
+    is returned so the caller can detect the table changing mid-scan. Any
+    deviation raises SceneLedgerUnavailable."""
+    page_headers = dict(headers)
+    page_headers.update({"Prefer": "count=exact", "Range-Unit": "items",
+                         "Range": f"{offset}-{offset + size - 1}"})
+    try:
+        response = http.get(url,
+                            params={"select": _SCENE_SCAN_SELECT,
+                                    "order": _SCENE_SCAN_ORDER},
+                            headers=page_headers, timeout=30)
+    except Exception as exc:  # noqa: BLE001 - an incomplete scene ledger is unsafe
+        raise SceneLedgerUnavailable("scene ledger read failed") from exc
+    if not 200 <= response.status_code < 300:
+        raise SceneLedgerUnavailable(
+            f"scene ledger read failed ({response.status_code})")
+    try:
+        rows = response.json()
+    except Exception as exc:  # noqa: BLE001
+        raise SceneLedgerUnavailable("scene ledger read was malformed") from exc
+    if not isinstance(rows, list):
+        raise SceneLedgerUnavailable("scene ledger page was malformed")
+    response_headers = getattr(response, "headers", {}) or {}
+    content_range = (response_headers.get("Content-Range")
+                     or response_headers.get("content-range") or "")
+    match = re.fullmatch(r"(\*|\d+-\d+)/(\d+)", str(content_range))
+    if not match:
+        raise SceneLedgerUnavailable("scene ledger did not prove page completeness")
+    span, total_text = match.groups()
+    total = int(total_text)
+    if total == 0:
+        if span != "*" or rows:
+            raise SceneLedgerUnavailable("scene ledger page was incomplete")
+        return [], 0
+    if not rows or span != f"{offset}-{offset + len(rows) - 1}" \
+            or offset + len(rows) > total:
+        raise SceneLedgerUnavailable("scene ledger page was incomplete")
+    return rows, total
+
+
+def _scene_row_date(row):
+    """The row's used_date as strict YYYY-MM-DD text; anything else raises."""
+    raw = str(row.get("used_date") or "").strip()
+    if not _SCENE_DATE_RE.fullmatch(raw):
+        raise SceneLedgerUnavailable(
+            "visual scene ledger returned an unreadable row")
+    try:
+        date.fromisoformat(raw)
+    except ValueError as exc:
+        raise SceneLedgerUnavailable(
+            "visual scene ledger returned an unreadable row") from exc
+    return raw
+
+
+def cross_tenant_scene_phashes(base, *, http=None):
+    """(own_tenant, {namespaced scene phash: {tenant_id: {used_date, ...}}}) for
+    EVERY scene hash the integrated DRAFT visual_scene_phash_occupied table
+    shows used by any canonical tenant.
+
+    The scan is deliberately unfiltered: a near-duplicate almost never shares
+    the exact hash (that is the exact-byte ledger's job), so the guard must
+    read the whole table and compute hamming distances locally. Pages are
+    pinned to a deterministic full-primary-key order so their boundaries are
+    stable, each page's Content-Range proves its span and completeness, and the
+    table total may not change mid-scan. Read-only PostgREST against the DRAFT
+    scene table plus the same tenant_alias mapping the exact-byte ledger gate
+    requires. FAILS CLOSED: missing creds, a failed/malformed/incomplete read,
+    a missing/failed ordering, a table that changes mid-scan, an unmapped
+    tenant, or a row without a bare 16-hex phash, a tenant UUID, a non-empty
+    group_key and a strict used_date raises SceneLedgerUnavailable — the caller
+    must not treat uncertainty as 'distinct'."""
+    from . import config
+    base = str(base or "").strip()
+    if not base:
+        return None, {}
+    url = (config.supabase_url() or "").rstrip("/")
+    key = config.supabase_service_key()
+    if not url or not key:
+        raise SceneLedgerUnavailable("scene ledger credentials are not configured")
+    if http is None:
+        import requests  # lazy, matches the repo pattern
+        http = requests
+    headers = {"apikey": key, "Authorization": f"Bearer {key}",
+               "Accept": "application/json"}
+    rows = _complete_scene_read(
+        http, f"{url}/rest/v1/tenant_alias",
+        {"select": "alias_key,tenant_id", "alias_key": f"eq.{base}"}, headers)
+    if len(rows) != 1 or not isinstance(rows[0], dict) \
+            or rows[0].get("alias_key") != base:
+        raise SceneLedgerUnavailable(
+            f"{base} has no canonical visual tenant mapping")
+    try:
+        own_tenant = str(uuid.UUID(str(rows[0].get("tenant_id"))))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise SceneLedgerUnavailable(
+            f"{base} has no canonical visual tenant mapping") from exc
+    known = {}
+    scene_url = f"{url}/rest/v1/visual_scene_phash_occupied"
+    offset = 0
+    total = None
+    prev_key = None
+    while total is None or offset < total:
+        rows, page_total = _scene_page(http, scene_url, headers, offset)
+        if total is not None and page_total != total:
+            # The table changed mid-scan: no page set is provably complete.
+            raise SceneLedgerUnavailable("scene ledger changed during the scan")
+        total = page_total
+        if total == 0:
+            break
+        for row in rows:
+            if not isinstance(row, dict) \
+                    or not _SCENE_BARE_RE.fullmatch(str(row.get("phash") or "")) \
+                    or not str(row.get("group_key") or "").strip():
+                raise SceneLedgerUnavailable(
+                    "visual scene ledger returned an unreadable row")
+            try:
+                tenant = str(uuid.UUID(str(row.get("tenant_id"))))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise SceneLedgerUnavailable(
+                    "visual scene ledger returned an unreadable row") from exc
+            used_date = _scene_row_date(row)
+            # The pinned full-PK order must actually hold row over row (across
+            # page boundaries too); an unordered page proves the server did not
+            # honor the snapshot the spans were checked against.
+            order_key = (str(row["phash"]), str(row["tenant_id"]),
+                         str(row["group_key"]), used_date)
+            if prev_key is not None and order_key < prev_key:
+                raise SceneLedgerUnavailable(
+                    "scene ledger did not honor deterministic ordering")
+            prev_key = order_key
+            known.setdefault(f"scene:phash64:{row['phash']}", {}) \
+                 .setdefault(tenant, set()).add(used_date)
+        offset += len(rows)
+    return own_tenant, known
+
+
+def _scene_fingerprint_for(asset, scene_module, read_bytes):
+    """The scene fingerprint for one usable photo's bytes, or ''.
+
+    Bytes come from the injectable reader (tests / callers holding the exact
+    object) or, by default, the asset's own hosted rendition object read
+    through the writer-prep byte verifier. No readable bytes is a compute
+    failure, not evidence of a distinct scene."""
+    data = None
+    if read_bytes is not None:
+        try:
+            data = read_bytes(asset)
+        except Exception:  # noqa: BLE001 - unreadable bytes are no evidence
+            data = None
+    else:
+        rendition = str(asset.get("rendition_url") or "").strip()
+        if rendition:
+            from . import visual_writer_prepare
+            try:
+                data = visual_writer_prepare._bytes_for_url(rendition)
+            except Exception:  # noqa: BLE001
+                data = None
+    if not isinstance(data, bytes) or not data:
+        return ""
+    try:
+        return scene_module.scene_fingerprint(data) or ""
+    except Exception:  # noqa: BLE001 - a decode failure is no evidence
+        return ""
+
+
 _POOL_EMPTY_STAMP = "pool_empty:{}"          # per gym
 _USE_KEY = "gym_media_use:{}:{}"             # gym base key, post_date
 
@@ -417,8 +688,31 @@ def _claimed_hashes(assets, claimed_ids, base):
     return hashes | canonical
 
 
+def _scene_target_date(post_date, now):
+    """The scene guard's target date as strict YYYY-MM-DD text, or None.
+
+    The SCHEDULED post_date wins when the caller supplies one (the sibling
+    decision is about the day the post goes out, not the day the build ran);
+    otherwise the pick date (`now`) is the only target date that exists here.
+    None means the date is unknowable: fail closed upstream."""
+    value = post_date if post_date is not None else now
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    raw = str(value or "").strip()
+    if _SCENE_DATE_RE.fullmatch(raw):
+        try:
+            date.fromisoformat(raw)
+        except ValueError:
+            return None
+        return raw
+    return None
+
+
 def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=(),
-             strict_claims=False, ledger_http=None):
+             strict_claims=False, ledger_http=None, scene_read_bytes=None,
+             post_date=None):
     """Every asset pick_media could hand out RIGHT NOW for this gym, in pick order
     (used_count ASC, last_used_at ASC NULLS FIRST, id tiebreak). [] when the pool is
     empty, the store is down, or the read fails. NEVER alerts: this is the read the
@@ -430,7 +724,17 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
     distinguish uncertainty from a proven empty pool. With the DRAFT global
     visual ledger flag ON (see global_ledger_flag), globally previously-used
     photos are excluded and any ledger uncertainty fails closed the same way;
-    ledger_http injects the ledger's HTTP client for tests."""
+    ledger_http injects the ledger's HTTP client for tests. With the DRAFT
+    scene guard flag ON (see scene_guard_flag), cross-tenant near-frame photos
+    are excluded, scene-candidate photos are held for manual review
+    ('scene_review_hold'), and any scene uncertainty fails closed the same way;
+    scene_read_bytes injects the scene byte reader for tests. `post_date` is the
+    SCHEDULED target date of the slot being filled (date/datetime/'YYYY-MM-DD'):
+    the same-tenant sibling decision is made against THAT date, never the
+    execution clock — two slots scheduled for the same day are legal siblings
+    even when the build runs around midnight, and a slot for another day never
+    rides on today's sibling allowance. An unparseable post_date fails closed
+    like any other scene uncertainty."""
     base = base_gym_key(gym_id)
     store = store or _idx.default_store()
     if not store.available():
@@ -508,6 +812,121 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
                   f"{type(e).__name__}")
             return []
 
+    # DRAFT SCENE GUARD (near-duplicate belt on PR235): with the flag ON, a
+    # usable photo whose scene is a cross-tenant NEAR_FRAME leaves the pickable
+    # set like exact-byte cross-tenant use; a SCENE_CANDIDATE is held for
+    # manual review ('scene_review_hold') — visible, never auto-approved,
+    # never silently excluded, and never written as a scene link. An ambiguous
+    # flag value or ANY scene uncertainty (no usable bytes, an unreadable
+    # ledger, an UNKNOWN classification) fails closed exactly like an
+    # unreadable claim set. OFF keeps byte-for-byte legacy behavior; the
+    # exact-byte MD5 gate above is untouched.
+    scene_flag = scene_guard_flag()
+    scene_excluded = set()
+    scene_holds = {}
+    scene_hold_matches = {}
+    if scene_flag is not False:
+        try:
+            if scene_flag is None:
+                raise SceneLedgerUnavailable(
+                    f"{SCENE_GUARD_FLAG_ENV} has an ambiguous value")
+            if not SCENE_GUARD_OPERATIONAL:
+                # Astra rejected the writer architecture: the scene ledger has
+                # no legitimate writer, so an armed guard can never prove a
+                # scene 'distinct'. Fail closed as not-yet-operational.
+                raise SceneLedgerUnavailable(
+                    "scene guard is armed but not operational "
+                    "(writer architecture rejected; see "
+                    "docs/VISUAL_SCENE_GUARD_DRAFT.md)")
+            from . import visual_scene
+            scene_photos = [a for a in assets
+                            if str(a.get("gym_id") or "") == base
+                            and str(a.get("kind") or "") == "photo"
+                            and is_usable(a)]
+            fingerprints = {}
+            for a in scene_photos:
+                fp = _scene_fingerprint_for(a, visual_scene, scene_read_bytes)
+                if not fp or not _SCENE_PHASH_RE.fullmatch(fp):
+                    raise SceneLedgerUnavailable(
+                        "a usable photo has no provable scene fingerprint")
+                fingerprints[str(a.get("id"))] = fp
+            own_tenant = known = None
+            if fingerprints:
+                own_tenant, known = cross_tenant_scene_phashes(
+                    base, http=ledger_http)
+            else:
+                own_tenant, known = None, {}
+            # The pick's date context is the SCHEDULED target date when the
+            # caller knows it (post_date), else the pick date (`now`). Using
+            # execution-now for a slot scheduled on another day would corrupt
+            # the sibling decision in both directions: a same-day sibling
+            # scheduled tomorrow would be held as cross-date, and a cross-date
+            # reuse could slip through when the build runs on the scheduled
+            # date's eve. An unknowable or unparseable date fails closed:
+            # every same-tenant near frame is a hold rather than a silent
+            # same-date allowance.
+            target_date = _scene_target_date(post_date, now)
+            if post_date is not None and target_date is None:
+                raise SceneLedgerUnavailable(
+                    "the scheduled post_date is not a provable date")
+            for asset_id, fp in fingerprints.items():
+                if not known:
+                    # No tenant on record holds any of these scenes: proven
+                    # distinct, the photo stays in the pool.
+                    continue
+                classification = visual_scene.classify_scene_all(fp, list(known))
+                kind = getattr(classification, "kind", "")
+                if kind not in (visual_scene.NEAR_FRAME,
+                                visual_scene.SCENE_CANDIDATE,
+                                visual_scene.DISTINCT):
+                    raise SceneLedgerUnavailable(
+                        "scene classification returned no evidence")
+                if kind == visual_scene.DISTINCT:
+                    continue
+                # EVERY match counts, not just the nearest: a masked second
+                # match must never change the verdict.
+                cross_tenant_near = False
+                same_tenant_cross_date = False
+                for phash, _distance in classification.near_matches:
+                    per_tenant = known.get(phash) or {}
+                    if any(tenant != own_tenant for tenant in per_tenant):
+                        # Same scene already used by ANOTHER tenant: out, like
+                        # exact-byte cross-tenant use.
+                        cross_tenant_near = True
+                        break
+                    own_dates = set()
+                    for dates in per_tenant.values():
+                        own_dates |= set(dates)
+                    # A near frame the gym's OWN tenant used on another DATE is
+                    # a cross-date reuse: hold. Same-date sibling swaps stay
+                    # legal; a missing date dimension can never prove that.
+                    if target_date is None or not own_dates \
+                            or any(d != target_date for d in own_dates):
+                        same_tenant_cross_date = True
+                if cross_tenant_near:
+                    scene_excluded.add(asset_id)
+                    continue
+                if same_tenant_cross_date or classification.candidate_matches:
+                    # Same-tenant cross-date near frame, or ANY 7..30 candidate
+                    # (any tenant): hold for human review. Never auto-approved,
+                    # never silently excluded.
+                    scene_holds[asset_id] = SCENE_REVIEW_HOLD
+                    scene_hold_matches[asset_id] = sorted(
+                        phash for phash, _ in
+                        tuple(classification.near_matches)
+                        + tuple(classification.candidate_matches))
+        except Exception as e:  # noqa: BLE001 - unproven scenes close the pool
+            if strict_claims:
+                raise
+            print(f"[gym-media-selector] scene ledger read failed for {base}: "
+                  f"{type(e).__name__}")
+            return []
+        for asset_id in sorted(scene_holds):
+            print(f"[gym-media-selector] {SCENE_REVIEW_HOLD} for {base}: photo "
+                  f"{asset_id} matched scene(s) "
+                  f"{scene_hold_matches.get(asset_id, [])} — held for manual "
+                  "review, never auto-approved")
+
     candidates = []
     for a in assets:
         # TENANT re-assertion (defense in depth): even though the store filtered by
@@ -533,6 +952,13 @@ def pickable(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=
             # A photo whose bytes cannot be keyed in the global ledger (no MD5)
             # can never be proven globally unused: fail closed, exclude it.
             if not fp or fp in ledger_used:
+                continue
+        if scene_flag and str(a.get("kind") or "") == "photo":
+            # DRAFT scene guard: a cross-tenant near-frame is out like
+            # exact-byte use; a scene candidate is HELD for manual review —
+            # it never auto-approves into the pickable set, and the hold was
+            # surfaced above with its 'scene_review_hold' reason.
+            if str(a.get("id")) in scene_excluded or str(a.get("id")) in scene_holds:
                 continue
         # GLOBAL ONCE-USED RULE: any prior stage-use is out forever for automatic
         # selection, independent of the cooldown clocks below. Stage-use is
@@ -627,15 +1053,19 @@ def cooldown_fallback(gym_id, kind_preference=None, *, store=None, exclude_ids=(
     return candidates
 
 
-def pool_kinds(gym_id, *, store=None, now=None, exclude_ids=()):
+def pool_kinds(gym_id, *, store=None, now=None, exclude_ids=(), post_date=None):
     """The media kinds ('photo' / 'video') the gym's Drive pool can hand out right
     now. The media-mix planner reads this to decide whether a video slot is even
-    possible; a photo-only pool never gets a video slot asked of it."""
+    possible; a photo-only pool never gets a video slot asked of it. `post_date`
+    gives the scene guard the scheduled slot date for its same-day sibling
+    decision, matching pick_media."""
     return {str(a.get("kind") or "") for a in
-            pickable(gym_id, store=store, now=now, exclude_ids=exclude_ids)}
+            pickable(gym_id, store=store, now=now, exclude_ids=exclude_ids,
+                     post_date=post_date)}
 
 
-def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=()):
+def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_ids=(),
+               post_date=None):
     """The least-used, longest-unused eligible, not-excluded asset for THIS gym, or
     None.
 
@@ -650,21 +1080,24 @@ def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_id
     failed validation in this same slot.
 
     Empty pool -> ONE deduped alert naming the gym and None. A cooling-down asset
-    is NEVER reused to fill the gap."""
+    is NEVER reused to fill the gap. `post_date` is forwarded to pickable so the
+    DRAFT scene guard's same-day sibling decision uses the SCHEDULED slot date,
+    not the execution clock."""
     base = base_gym_key(gym_id)
     store = store or _idx.default_store()
     if not store.available():
         print("[gym-media-selector] store unavailable; no asset selected (lane unarmed)")
         return None
     candidates = pickable(base, kind_preference, store=store, now=now,
-                          exclude_ids=exclude_ids)
+                          exclude_ids=exclude_ids, post_date=post_date)
     if not candidates:
         # KIND EXHAUSTION IS NOT AN EMPTY POOL (audit D6): the media-mix builder asks
         # for one kind first and falls back to the other, so "no photo left" while
         # videos remain must not page staff to "ask for photos". Alert only when the
         # pool has nothing of ANY kind.
         if kind_preference and pickable(base, None, store=store, now=now,
-                                        exclude_ids=exclude_ids):
+                                        exclude_ids=exclude_ids,
+                                        post_date=post_date):
             return None
         # "Ask for photos" is only actionable for a gym that is actually posting.
         # A gym still onboarding (publish flag OFF, socials not connected yet) has an

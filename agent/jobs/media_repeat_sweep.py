@@ -44,7 +44,7 @@ from datetime import date, timedelta
 from agent import config, media_guard
 from agent.portal_calendar_store import SupabaseCalendarStore
 
-FIXABLE = ("pending", "coach_review")
+FIXABLE = ("pending",)
 UNTOUCHABLE = ("published", "publishing")
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 

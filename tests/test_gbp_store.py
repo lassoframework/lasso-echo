@@ -94,36 +94,8 @@ def test_any_gbp_rows_false_when_empty():
     assert s.any_gbp_rows("lasso") is False
 
 
-def test_release_coach_review_patches_status():
-    # release flips coach_review -> pending via a filtered PATCH
-    captured = {}
-
-    class _Resp:
-        status_code = 200
-        text = "[]"
-        def json(self):
-            return [{"id": "1", "status": "pending"}, {"id": "2", "status": "pending"}]
-
-    class _Client:
-        def patch(self, url, params=None, headers=None, json=None, timeout=None):
-            captured["params"] = params
-            captured["json"] = json
-            return _Resp()
-
-    class _Base(_FakeBase):
-        def _client(self):
-            return _Client()
-        def _rest(self, path):
-            return f"https://x/rest/v1/{path}"
-        def _headers(self, extra=None):
-            return {}
-
-    s = GbpStore(base=_Base(url="u", key="k"))
-    released = s.release_coach_review("lasso")
-    assert len(released) == 2
-    assert captured["params"]["status"] == "eq.coach_review"
-    assert captured["params"]["gym_id"] == "eq.lasso"
-    assert captured["json"] == {"status": "pending"}
+def test_legacy_coach_review_release_mutator_is_absent():
+    assert not hasattr(GbpStore, "release_coach_review")
 
 
 # ---- G3 gym_gbp_metrics: posts_published + top_post_id seed -------------------

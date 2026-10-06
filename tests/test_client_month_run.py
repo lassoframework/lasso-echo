@@ -17,6 +17,7 @@ client; a client with no media WAITS. Asserts:
 
 import os
 import sys
+from datetime import date
 
 import pytest
 
@@ -364,7 +365,7 @@ class _StoreWithHistory(_FakeStore):
         return self._has_visible
 
 
-def test_gate2_first_month_withheld_as_coach_review(tmp_path):
+def test_first_month_rows_remain_pending_for_owner_approval(tmp_path):
     _stock_clean("gritx_ig")
     lib = _lib(tmp_path, n=6)
     store = _StoreWithHistory(has_visible=False)   # brand-new gym, no prior rows
@@ -372,8 +373,7 @@ def test_gate2_first_month_withheld_as_coach_review(tmp_path):
         _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
         library_path=lib, store=store, banned_words=())
     assert out["ok"] is True and store.inserted
-    assert all(r["status"] == "coach_review" for r in store.inserted), \
-        "a gym's first month must be withheld from the owner until a coach releases it"
+    assert all(r["status"] == "pending" for r in store.inserted)
 
 
 def test_gate2_established_gym_grandfathered_pending(tmp_path):
@@ -838,6 +838,7 @@ def test_deny_backfill_replaces_denied_feed_with_reused_photo(monkeypatch, tmp_p
         "the replacement must not hand back the denied post's own photo"
     # a real, non-empty caption grounded in an approved source.
     assert ig_feed[0]["caption"].strip()
+    assert all(r["status"] == "pending" for r in store.inserted)
 
 
 # ---- 9b2. denied-slot backfill is serialized against build_client_month AND itself
@@ -1771,6 +1772,62 @@ def test_guarded_video_poster_success_sets_evidence_and_feeds_side_channel(
         for r in video_rows)
 
 
+def test_story_clone_preserves_dynamic_render_evidence(tmp_path):
+    feed = _video_draft(tmp_path)
+    evidence = {"operation": "rehost", "source_exact_url": "https://cdn/raw.jpg",
+                "delivered_exact_url": feed.creative_public_url,
+                "source_fingerprint": "source", "delivered_fingerprint": "delivered"}
+    feed.render_evidence = evidence
+
+    story = cmr._story_from_feed(feed)
+
+    assert story is not feed
+    assert story.render_evidence == evidence
+    assert cmr._render_evidence_by_url([feed, story]) == {
+        feed.creative_public_url: evidence}
+
+
+def test_apply_refuses_transformed_row_without_render_evidence_before_delete(
+        monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    store = _FakeStore()
+    row = {"gym_id": "gritx", "post_date": "2026-08-01", "account": "instagram",
+           "format": "feed", "image_url": "https://cdn/delivered.jpg",
+           "source_media_url": "https://cdn/source.jpg", "caption": "Caption"}
+    evidence_a = {"delivered_exact_url": "https://cdn/delivered.jpg",
+                  "source_exact_url": "https://cdn/source-a.jpg"}
+    evidence_b = {"delivered_exact_url": "https://cdn/delivered.jpg",
+                  "source_exact_url": "https://cdn/source-b.jpg"}
+    conflicted_map = cmr._merge_render_evidence_by_url(
+        {"https://cdn/delivered.jpg": evidence_a},
+        {"https://cdn/delivered.jpg": evidence_b})
+
+    result = cmr._apply("gritx", [row], date(2026, 8, 1), 1, store,
+                        lambda _message: None,
+                        render_evidence_by_url=conflicted_map)
+
+    assert result["ok"] is False
+    assert "aborted before month deletion" in result["reason"]
+    assert store.deleted == [] and store.inserted == []
+
+
+def test_apply_refuses_render_evidence_for_wrong_source_before_delete(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    store = _FakeStore()
+    row = {"gym_id": "gritx", "post_date": "2026-08-01", "account": "instagram",
+           "format": "feed", "image_url": "https://cdn/delivered.jpg",
+           "source_media_url": "https://cdn/source.jpg", "caption": "Caption"}
+    wrong = {"source_exact_url": "https://cdn/other-source.jpg",
+             "delivered_exact_url": "https://cdn/delivered.jpg"}
+
+    result = cmr._apply("gritx", [row], date(2026, 8, 1), 1, store,
+                        lambda _message: None,
+                        render_evidence_by_url={"https://cdn/delivered.jpg": wrong})
+
+    assert result["ok"] is False
+    assert store.deleted == [] and store.inserted == []
+
+
 def test_guarded_video_poster_failure_holds_the_slot(monkeypatch, tmp_path):
     """Guard on, evidenced render unavailable: the day is HELD and no distinct
     unproven thumbnail is staged (never cleared/relabeled)."""
@@ -1860,3 +1917,43 @@ def test_prepared_insert_does_not_retry_typeerror_without_poster_proof(monkeypat
                                               evidence)
     assert len(calls) == 1
     assert calls[0][1]["poster_render_evidence_by_url"] == evidence
+
+
+def test_drive_render_evidence_is_forwarded_by_exact_delivered_url(monkeypatch):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
+    delivered = "https://cdn/rendered.jpg"
+    evidence = {"operation": "render", "source_exact_url": "https://cdn/source.jpg",
+                "delivered_exact_url": delivered, "source_fingerprint": "src",
+                "delivered_fingerprint": "dst"}
+    draft = type("Draft", (), {"creative_public_url": delivered,
+                               "render_evidence": evidence})()
+    side_channel = cmr._render_evidence_by_url([draft])
+    assert side_channel == {delivered: evidence}
+
+    calls = []
+    def store_fn(base_key, rows, *, render_evidence_by_url=None):
+        calls.append((rows, render_evidence_by_url))
+        return rows
+
+    row = {"image_url": delivered}
+    cmr._insert_rows_with_poster_evidence(
+        store_fn, "gritx", [row], {}, render_evidence_by_url=side_channel)
+    assert calls == [([row], side_channel)]
+    assert "render_evidence" not in row
+
+
+def test_drive_render_evidence_rejects_mismatch_and_cross_row_collision():
+    one = {"operation": "render", "delivered_exact_url": "https://cdn/shared.jpg",
+           "source_exact_url": "https://cdn/one.jpg"}
+    two = {"operation": "render", "delivered_exact_url": "https://cdn/shared.jpg",
+           "source_exact_url": "https://cdn/two.jpg"}
+    a = type("Draft", (), {"creative_public_url": "https://cdn/shared.jpg",
+                           "render_evidence": one})()
+    b = type("Draft", (), {"creative_public_url": "https://cdn/shared.jpg",
+                           "render_evidence": two})()
+    mismatch = type("Draft", (), {"creative_public_url": "https://cdn/other.jpg",
+                                  "render_evidence": one})()
+    assert cmr._render_evidence_by_url([a, b, mismatch]) == {}
+    assert cmr._merge_render_evidence_by_url(
+        {"https://cdn/shared.jpg": one},
+        {"https://cdn/shared.jpg": two}) == {}

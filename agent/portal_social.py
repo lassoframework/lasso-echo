@@ -651,8 +651,8 @@ def _media_bridge_status(account_key, *, now=None):
 # forever. backfill_denied_slots is INSERT ONLY and nothing anywhere transitions a
 # denied row out of 'denied' -- portal_calendar_store._WIPEABLE_STATUSES deliberately
 # treats it as human owned so a rebuild cannot destroy it. Meanwhile the client render
-# carried exactly ONE status filter, `!= "coach_review"`, so denied / killed / deleted
-# rows were mapped into cards and shipped to the owner beside their replacements.
+# carried exactly ONE retired-state filter, so denied / killed / deleted rows were
+# mapped into cards and shipped to the owner beside their replacements.
 #
 # MEASURED ON PRODUCTION 2026-09-05, September book: LASSO 45% of rows, ENG 40%,
 # pierce 34%, zanshin 33% were denied or deleted. One in three cards on a client's
@@ -673,13 +673,8 @@ def _handle_social_supabase(account_key, month, now=None):
     try:
         sb = _pcs.SupabaseCalendarStore()
         rows = sb.list_month(account_key, month)
-        # GATE 2 (coach-screens-first-month): rows a coach has NOT yet released are
-        # WITHHELD from the owner. 'coach_review' posts never appear in the owner /social
-        # view (nor feed low_creative/awaiting) until a coach flips them to 'pending'.
-        # But remember they EXIST (audit 2026-08-25 MAJOR): a fully-built, coach-withheld
-        # first month must not show the owner the red "Echo is waiting on your uploads"
-        # banner — the calendar is built, it is just being screened.
-        has_withheld_calendar = any(
+        # Retired coach_review rows stay private and count as existing calendar state.
+        has_retired_coach_review_rows = any(
             str((r or {}).get("status") or "").lower() == "coach_review" for r in rows)
         rows = [r for r in rows
                 if str((r or {}).get("status") or "").lower() != "coach_review"]
@@ -701,8 +696,8 @@ def _handle_social_supabase(account_key, month, now=None):
     # Signal on the UNFILTERED set: a month that is entirely denied is still a BUILT
     # month, and must not raise the red "Echo is waiting on your uploads" banner.
     awaiting_media, upload_url = _awaiting_media_signal(account_key, signal_posts)
-    if has_withheld_calendar:
-        awaiting_media = False        # built + coach-screened is NOT "waiting on uploads"
+    if has_retired_coach_review_rows:
+        awaiting_media = False        # a built but unavailable month is NOT "waiting on uploads"
     return 200, {
         "account_key": account_key,
         "month": month,
@@ -901,12 +896,12 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
             return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
                          "error": "this post is publishing right now; try again in a "
                                   "minute once it lands"}
-        # GATE 2: a withheld first-month row cannot be approved by the owner. It stays
-        # invisible in /social, but guard the action too in case an id leaks.
-        if str(row.get("status") or "").lower() == "coach_review":
+        # Only pending rows can be approved. Keep anomalous legacy states protected
+        # from publishing if an old row id reaches this action.
+        if str(row.get("status") or "").lower() != "pending":
             return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
-                         "error": "this post is still in coach review and has not been "
-                                  "released yet"}
+                         "error": "this post is unavailable for approval until its "
+                                  "status is resolved"}
         if str(row.get("status") or "").lower() in ("denied", "killed", "deleted", "failed"):
             return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
                          "error": "this post is no longer awaiting approval"}
@@ -1594,7 +1589,7 @@ def _handle_swap_media_receipt(sb_store, account_key, draft_id, actor_id,
             final = _published_is_final(row, _RECEIPT_ACTION, draft_id)
             if final is not None:
                 return final
-            if str(row.get("status") or "") not in ("pending", "coach_review"):
+            if str(row.get("status") or "") != "pending":
                 return 409, {"ok": False, "action": _RECEIPT_ACTION,
                              "draft_id": draft_id, "action_id": action_id,
                              "error": "This post is no longer waiting for review.",
@@ -1924,14 +1919,14 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
         # same-post siblings, and have the picker shape the SAME new creative for each
         # (a story sibling is re-burned with its own caption).
         month_rows = _month_rows_for(sb_store, account_key, row)
-        # Only siblings that CAN move are asked for (pending / coach_review); an
-        # approved or live sibling keeps the pixels the gym approved and is reported
+        # Only pending siblings may move; a retired coach_review sibling remains
+        # protected and is reported
         # below. Every requested variant is computed by the picker BEFORE any write
         # (all or nothing): one failed variant is a 409 and nothing changes.
         all_siblings = _ms.sibling_rows(row, month_rows or [],
                                         lib=_ms.library_path_for(account_key))
         siblings = [s for s in all_siblings
-                    if str(s.get("status") or "").lower() in ("pending", "coach_review")]
+                    if str(s.get("status") or "").lower() == "pending"]
         locked_siblings = [str(s.get("id") or "") for s in all_siblings if s not in siblings]
         pick = (picker or _ms.pick_replacement)(account_key, row, store=sb_store,
                                                  siblings=siblings)
@@ -2572,7 +2567,7 @@ def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=Non
 # format at a time regenerated JUST that row, so a day could end up mixing a brand
 # new rework on one format with the ORIGINAL rejected concept still sitting pending
 # on the others. This is a day-wide action: find every same-day row for this gym
-# still in a denyable status (pending/coach_review) -- feed, story, Facebook, AND
+# still pending -- feed, story, Facebook, AND
 # Google Business, every format Dean named -- and deny them together, so the whole
 # day reworks as ONE consistent concept instead of a patchwork.
 # ==========================================================================
@@ -2615,7 +2610,7 @@ def handle_deny_day(account_key, draft_id, actor_id, note="", store=None, reader
             return final
         day_key = str(row.get("post_date") or "")[:10]
         month_rows = _month_rows_for(sb_store, account_key, row) or [row]
-        denyable_statuses = {"pending", "coach_review"}
+        denyable_statuses = {"pending"}
         targets = [r for r in month_rows
                   if str(r.get("post_date") or "")[:10] == day_key
                   and str(r.get("status") or "").lower() in denyable_statuses]

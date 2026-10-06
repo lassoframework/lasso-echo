@@ -556,7 +556,7 @@ def _check_media_swap_completed(ctx):
     if not isinstance(caption, str) or not isinstance(image_url, str):
         raise CheckUnavailable('calendar_row_unreadable')
     digest = lambda value: hashlib.sha256(value.encode('utf-8')).hexdigest()
-    if (row.get('status') not in ('pending', 'coach_review')
+    if (row.get('status') != 'pending'
             or row.get('source_media_asset_id') != asset_id
             or digest(image_url) != after_hash or digest(caption) != caption_hash):
         return Observation(True, False, f'media_swap:{row_id}:changed',
