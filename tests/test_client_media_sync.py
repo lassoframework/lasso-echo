@@ -167,6 +167,79 @@ def test_sync_downloads_new_media_with_public_url_and_caption():
     assert creatives["20260810T120000Z_photo_00.jpg"].client_note == "day 0 at the gym"
 
 
+def test_sync_persists_ordered_camera_sequence_metadata():
+    names = ["20261001T120000Z_IMG_1001.jpg", "20261001T120000Z_IMG_1002.jpg"]
+    objects = {
+        f"intake/nine7/incoming/{name}": b"\xff\xd8\xffFAKE" + bytes([idx])
+        for idx, name in enumerate(names)
+    }
+    objects["intake/nine7/incoming/20261001T120000Z_upload.json"] = json.dumps({
+        "timestamp": "20261001T120000Z", "filenames": names,
+    }).encode()
+
+    out = cms.sync_uploads("nine7", r2=FakeR2(objects))
+
+    assert out == {"synced": 2, "skipped": 0}
+    side = json.load(open(os.path.join(
+        "content_library", "nine7", "20261001T120000Z_IMG_1002.json")))
+    assert side["intake_batch_timestamp"] == "20261001T120000Z"
+    assert side["intake_batch_position"] == 1
+    assert side["intake_camera_family"] == "img"
+    assert side["intake_camera_sequence"] == 1002
+
+
+def test_sync_preserves_intake_metadata_across_stem_preserving_conversion():
+    converted = [
+        ("20261001T120000Z_DSCN0999.heic",
+         "20261001T120000Z_DSCN0999.jpg", b"\xff\xd8\xffJPG"),
+        ("20261001T120000Z_IMG1001.mov",
+         "20261001T120000Z_IMG1001.mp4", b"MP4"),
+    ]
+    objects = {
+        f"intake/nine7/pending_caption/{stored}": payload
+        for _original, stored, payload in converted
+    }
+    originals = [original for original, _stored, _payload in converted]
+    objects["intake/nine7/incoming/20261001T120000Z_upload.json"] = json.dumps({
+        "timestamp": "20261001T120000Z", "filenames": originals,
+    }).encode()
+
+    assert cms.sync_uploads("nine7", r2=FakeR2(objects)) == {
+        "synced": 2, "skipped": 0,
+    }
+    image_side = json.load(open(os.path.join(
+        "content_library", "nine7", "20261001T120000Z_DSCN0999.json")))
+    video_side = json.load(open(os.path.join(
+        "content_library", "nine7", "20261001T120000Z_IMG1001.json")))
+    assert (image_side["intake_camera_family"],
+            image_side["intake_camera_sequence"]) == ("dscn", 999)
+    assert (video_side["intake_camera_family"],
+            video_side["intake_camera_sequence"]) == ("img", 1001)
+    assert image_side["intake_batch_position"] == 0
+    assert video_side["intake_batch_position"] == 1
+
+
+def test_sync_drops_ambiguous_stem_metadata_instead_of_guessing():
+    stored = "20261001T120000Z_IMG1001.jpg"
+    objects = {
+        f"intake/nine7/pending_caption/{stored}": b"\xff\xd8\xffJPG",
+        "intake/nine7/incoming/20261001T120000Z_upload.json": json.dumps({
+            "timestamp": "20261001T120000Z",
+            "filenames": [
+                "20261001T120000Z_IMG1001.heic",
+                "20261001T120000Z_IMG1001.jpg",
+            ],
+        }).encode(),
+    }
+
+    assert cms.sync_uploads("nine7", r2=FakeR2(objects))["synced"] == 1
+    side = json.load(open(os.path.join(
+        "content_library", "nine7", "20261001T120000Z_IMG1001.json")))
+    assert "intake_batch_timestamp" not in side
+    assert "intake_camera_family" not in side
+    assert "intake_camera_sequence" not in side
+
+
 def test_sync_is_idempotent_no_redownload():
     r2 = _r2_with_uploads("gritx", n=3)
     cms.sync_uploads("gritx", r2=r2)
@@ -178,6 +251,63 @@ def test_sync_is_idempotent_no_redownload():
     assert out2 == {"synced": 0, "skipped": 3}
     # NOT re-downloaded: no media get_bytes on the second pass
     assert [k for k in r2.got if k.endswith(".jpg")] == []
+
+
+def test_sync_backfills_existing_media_burst_metadata_without_redownload_or_clobber():
+    name = "20261001T120000Z_IMG_1001.jpg"
+    upload_key = "intake/nine7/incoming/20261001T120000Z_upload.json"
+    r2 = FakeR2({
+        f"intake/nine7/incoming/{name}": b"remote-bytes-must-not-be-read",
+        upload_key: json.dumps({
+            "timestamp": "20261001T120000Z", "filenames": [name],
+        }).encode(),
+    })
+    lib = os.path.join("content_library", "nine7")
+    os.makedirs(lib, exist_ok=True)
+    open(os.path.join(lib, name), "wb").write(b"existing-local-bytes")
+    side_path = os.path.join(lib, "20261001T120000Z_IMG_1001.json")
+    with open(side_path, "w", encoding="utf-8") as fh:
+        json.dump({"approved": True, "moderation": "clean", "note": "keep me",
+                   "custom_review_field": {"owner": "Blake"},
+                   # A corrupt half-record must be replaced as one trusted group,
+                   # never preserved and combined with the missing sequence.
+                   "intake_batch_timestamp": "not-a-date",
+                   "intake_batch_position": "0",
+                   "intake_camera_family": "arbitrary family!"}, fh)
+
+    out = cms.sync_uploads("nine7", r2=r2)
+
+    assert out == {"synced": 0, "skipped": 1}
+    assert f"intake/nine7/incoming/{name}" not in r2.got
+    side = json.load(open(side_path))
+    assert side["intake_batch_timestamp"] == "20261001T120000Z"
+    assert side["intake_batch_position"] == 0
+    assert side["intake_camera_family"] == "img"
+    assert side["intake_camera_sequence"] == 1001
+    assert side["approved"] is True and side["moderation"] == "clean"
+    assert side["note"] == "keep me"
+    assert side["custom_review_field"] == {"owner": "Blake"}
+
+    before = dict(side)
+    cms.sync_uploads("nine7", r2=r2)
+    assert json.load(open(side_path)) == before
+
+
+def test_sync_rejects_non_date_manifest_metadata_for_existing_media():
+    name = "20261001T120000Z_IMG_1001.jpg"
+    r2 = FakeR2({
+        f"intake/nine7/incoming/{name}": b"remote",
+        "intake/nine7/incoming/20261001T120000Z_upload.json": json.dumps({
+            "timestamp": "20260230T120000Z", "filenames": [name],
+        }).encode(),
+    })
+    lib = os.path.join("content_library", "nine7")
+    os.makedirs(lib, exist_ok=True)
+    open(os.path.join(lib, name), "wb").write(b"existing")
+
+    assert cms.sync_uploads("nine7", r2=r2) == {"synced": 0, "skipped": 1}
+    assert not os.path.exists(os.path.join(
+        lib, "20261001T120000Z_IMG_1001.json"))
 
 
 def test_sync_ignores_non_media_and_sidecars():
@@ -440,6 +570,61 @@ def test_sync_hosted_media_is_idempotent_no_redownload():
     out2 = cms.sync_hosted_media("train7164ae502", r2=r2)
     assert out2 == {"recovered": 0, "skipped": 1}
     assert r2.got == []
+
+
+def test_sync_hosted_media_backfills_existing_local_metadata_without_redownload():
+    filename = "20261001T120000Z_DSCN0999.jpg"
+    hosted_key = f"echo/nine7/1111222233334444/{filename}"
+    r2 = FakeR2({
+        hosted_key: b"hosted-bytes-must-not-be-read",
+        "intake/nine7/incoming/20261001T120000Z_upload.json": json.dumps({
+            "timestamp": "20261001T120000Z", "filenames": [filename],
+        }).encode(),
+    })
+    lib = os.path.join("content_library", "nine7")
+    os.makedirs(lib, exist_ok=True)
+    local_name = f"1111222233334444_{filename}"
+    open(os.path.join(lib, local_name), "wb").write(b"existing")
+    side_path = os.path.join(lib, os.path.splitext(local_name)[0] + ".json")
+    with open(side_path, "w", encoding="utf-8") as fh:
+        json.dump({"public_url": "https://keep.example/photo.jpg",
+                   "approved": True, "review": "human-note",
+                   "intake_batch_timestamp": "20261001T120000Z",
+                   "intake_batch_position": -1,
+                   "intake_camera_sequence": "999"}, fh)
+
+    out = cms.sync_hosted_media("nine7", r2=r2)
+
+    assert out == {"recovered": 0, "skipped": 1}
+    assert hosted_key not in r2.got
+    side = json.load(open(side_path))
+    assert side["intake_batch_timestamp"] == "20261001T120000Z"
+    assert side["intake_batch_position"] == 0
+    assert (side["intake_camera_family"], side["intake_camera_sequence"]) == (
+        "dscn", 999)
+    assert side["public_url"] == "https://keep.example/photo.jpg"
+    assert side["approved"] is True and side["review"] == "human-note"
+
+
+def test_sync_hosted_media_rejects_invalid_manifest_metadata():
+    filename = "20261001T120000Z_DSCN0999.jpg"
+    hosted_key = f"echo/nine7/1111222233334444/{filename}"
+    r2 = FakeR2({
+        hosted_key: b"hosted",
+        "intake/nine7/incoming/20261001T120000Z_upload.json": json.dumps({
+            "timestamp": "not-a-date", "filenames": [filename],
+        }).encode(),
+    })
+    lib = os.path.join("content_library", "nine7")
+    os.makedirs(lib, exist_ok=True)
+    local_name = f"1111222233334444_{filename}"
+    open(os.path.join(lib, local_name), "wb").write(b"existing")
+
+    assert cms.sync_hosted_media("nine7", r2=r2) == {
+        "recovered": 0, "skipped": 1,
+    }
+    assert not os.path.exists(os.path.join(
+        lib, os.path.splitext(local_name)[0] + ".json"))
 
 
 def test_sync_hosted_media_disambiguates_same_basename_across_shoots():
