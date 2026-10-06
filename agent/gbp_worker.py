@@ -17,6 +17,7 @@ thin wrappers over these pure functions.
 """
 
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from . import config, gbp
@@ -24,7 +25,103 @@ from . import config, gbp
 RECONCILE_HOURS = 48          # §7.2: poll hourly for the first 48h after publish
 
 
+def _alert_manual_approval_changed(gym_id, row_id, alert):
+    """Alert once per durably held manual GBP row; never let alerting affect safety.
+
+    An ephemeral KV stamp disappears on worker restart and would allow this hold to
+    storm, so only durable stores may send. Stamp after confirmed delivery so failures
+    can retry on a later tick.
+    """
+    if not alert:
+        return
+    try:
+        from . import db
+        key = f"gbp_approval_creative_change_alerted_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        if not db.kv_is_durable():
+            print(f"[gbp] row {row_id}: manual approval creative changed; "
+                  "alert suppressed because KV is not durable")
+            return
+        result = alert(
+            f"GBP row {row_id} for {gym_id} was moved back to pending because its "
+            "creative changed after manual approval. In the portal, remove the internal "
+            "[why]/[reason] block from the caption, review the clean creative, then "
+            "request client approval before publishing. Approving it as-is will keep "
+            "the row held.")
+        if result and not (isinstance(result, dict) and result.get("ok") is False):
+            db.kv_set(key, "1")
+    except Exception as exc:  # alerting must not affect the safe held row
+        print(f"[gbp] row {row_id}: manual approval change alert failed: "
+              f"{type(exc).__name__}")
+
+
+def _alert_auto_caption_empty(gym_id, row_id, alert):
+    """Alert once per durably held autonomous GBP row whose caption is ONLY
+    [why]/[reason] metadata: the cleaned caption is empty, so the row needs a
+    corrected caption before it can ever send. It is held (never sent) here; the
+    alert asks ops to fix the caption — no client-facing approval required. Same
+    durable-only-or-silent dedup contract as the manual creative-change alert."""
+    if not alert:
+        return
+    try:
+        from . import db
+        key = f"gbp_auto_caption_empty_alerted_{gym_id}_{row_id}"
+        if not db.kv_is_durable():
+            print(f"[gbp] row {row_id}: autonomous empty-caption hold; "
+                  "alert suppressed because KV is not durable")
+            return
+        if db.kv_get(key):
+            return
+        result = alert(
+            f"GBP row {row_id} for {gym_id} is held: its caption contains only "
+            "internal [why]/[reason] metadata, so there is nothing publishable to "
+            "send. Write a real caption for the row; no client approval is needed "
+            "for this correction. The row stays held and no provider payload was "
+            "sent.")
+        if result and not (isinstance(result, dict) and result.get("ok") is False):
+            db.kv_set(key, "1")
+    except Exception as exc:  # alerting must not affect the safe held row
+        print(f"[gbp] row {row_id}: autonomous empty-caption alert failed: "
+              f"{type(exc).__name__}")
+
+def _alert_proof_claim_exception(gym_id, row_id, detail, alert):
+    """Alert once per proof-mode claim exception; never let alerting affect safety.
+
+    The server-side claim may already have committed status=publishing and a
+    publish_claim_token before the claim call (or the post-claim validation of
+    the returned row) raised. That leaves a stranded row whose ownership is
+    unknown: it must never be released, retried, or re-sent from here — ops
+    must inspect and reconcile it against the provider. Durable-only-or-silent
+    dedup contract as the other ops alerts: an ephemeral KV stamp would let the
+    alert storm after a restart, so non-durable KV suppresses the send."""
+    if not alert:
+        return
+    try:
+        from . import db
+        key = f"gbp_proof_claim_exception_alerted_{gym_id}_{row_id}"
+        if not db.kv_is_durable():
+            print(f"[gbp] row {row_id}: proof-mode claim exception ({detail}); "
+                  "alert suppressed because KV is not durable")
+            return
+        if db.kv_get(key):
+            return
+        result = alert(
+            f"GBP row {row_id} for {gym_id}: the approval-proof publishing claim "
+            f"raised ({detail}) after the claim may have committed "
+            "status=publishing with a publish_claim_token. The row is stranded "
+            "with unknown ownership: inspect it and reconcile against the "
+            "provider before any further action. Do NOT release the token, "
+            "retry the publish, or re-approve the row from automation — the "
+            "claim was retained and no provider call was made by this run.")
+        if result and not (isinstance(result, dict) and result.get("ok") is False):
+            db.kv_set(key, "1")
+    except Exception as exc:  # alerting must not affect the safe held row
+        print(f"[gbp] row {row_id}: proof claim exception alert failed: "
+              f"{type(exc).__name__}")
+
 # --- row -> payload --------------------------------------------------------
+
 
 def build_gbp_payload_for_row(row, connection):
     """Assemble the Zernio POST body for an approved GBP `content_calendar` row using
@@ -100,6 +197,18 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
     from . import post_quality as _pq
     _body, _meta = _pq.split_meta_suffix(caption)
     if _meta:
+        if not draft and config.approval_proof_enabled():
+            # This snapshot already passed the atomic claim. Removing metadata
+            # would send text different from the claimed row, including in Auto
+            # where human approval is not required. Auto rows are cleaned by
+            # caption_meta_sweep before a later claim/retry.
+            auto = row.get("autonomous_at_claim") is True
+            return {"ok": False, "status": "approved", "late_post_id": "",
+                    "reject_reason": ("caption metadata requires automatic cleanup"
+                                      if auto else
+                                      "caption metadata requires cleanup and fresh approval"),
+                    "held": ("automatic_caption_cleanup" if auto else
+                             "approval_creative_change"), "mode": ""}
         caption = _body.strip()
         row = dict(row)
         row["caption"] = caption
@@ -468,6 +577,7 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
     summary. A per-row failure never blocks the others."""
     from .zernio import _to_utc_iso  # reuse the tz normalizer for published_at
     rows = store.approved_gbp_rows(run_date) or []
+    require_proof = config.approval_proof_enabled()
     by_gym = {}
     for r in rows:
         by_gym.setdefault(r.get("gym_id"), []).append(r)
@@ -492,15 +602,53 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
             claim = getattr(store, "claim_publishing", None)
             claim_token = None
             claim_won = False
+            if require_proof and not draft and claim is None:
+                held += 1
+                continue  # no atomic proof-capable claim: no provider call
             if claim is not None and not draft:
                 try:
-                    claimed = claim(row.get("id"))
+                    if require_proof:
+                        claimed = claim(row.get("id"), gym_id=gym, require_proof=True)
+                    else:
+                        claimed = claim(row.get("id"))
                 except Exception as e:  # noqa: BLE001
                     print(f"[gbp] claim failed for row {row.get('id')}: "
                           f"{type(e).__name__}; skipping this tick")
+                    if require_proof:
+                        # The server-side claim may have committed
+                        # status=publishing/token before raising: alert ops to
+                        # inspect/reconcile. Never release or retry a token
+                        # whose ownership is unknown, and never send.
+                        _alert_proof_claim_exception(
+                            gym, row.get("id"), type(e).__name__, alert)
                     continue
                 if not claimed:
                     continue                      # someone else owns it: skip
+                if require_proof:
+                    # Publish the exact locked creative returned by the proof
+                    # claim, never the potentially stale prefetch snapshot.
+                    try:
+                        claimed_token = str(uuid.UUID(
+                            str(claimed.get("publish_claim_token"))))
+                    except (AttributeError, TypeError, ValueError):
+                        claimed_token = ""
+                    if (not isinstance(claimed, dict)
+                            or str(claimed.get("id")) != str(row.get("id"))
+                            or claimed.get("gym_id") != gym
+                            or claimed.get("status") != "publishing"
+                            or not claimed_token
+                            or type(claimed.get("autonomous_at_claim")) is not bool):
+                        held += 1
+                        # The claim succeeded but the returned row fails proof
+                        # validation — the same stranded-claim ambiguity as a
+                        # raising claim: alert ops to inspect/reconcile. The
+                        # token is never released or retried here.
+                        _alert_proof_claim_exception(
+                            gym, row.get("id"), "post-claim validation failed",
+                            alert)
+                        continue
+                    row = claimed
+                    claim_token = claimed_token
                 claim_won = True
                 # New stores return the PERSISTED publish_claim_token; it becomes
                 # the Zernio Idempotency-Key. Legacy fakes return True — proceed
@@ -556,13 +704,53 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                     # 'publishing'. No provider attempt was made, so the token clears.
                     try:
                         release = getattr(store, "release_publishing_claim", None)
+                        release_status = ("pending" if res.get("held") ==
+                                          "approval_creative_change" else "approved")
                         if claim_token is not None and release is not None:
-                            if release(row.get("id"), claim_token,
-                                       "approved") is None:
+                            released = release(row.get("id"), claim_token,
+                                               release_status)
+                            if released is None:
                                 print(f"[gbp] WARNING: claim release matched no row "
                                       f"for {row.get('id')}; claim changed elsewhere")
+                            elif res.get("held") == "approval_creative_change":
+                                _alert_manual_approval_changed(gym, row.get("id"), alert)
+                            elif (res.get("held") == "automatic_caption_cleanup"
+                                  and row.get("autonomous_at_claim") is True):
+                                # The provider payload must exactly match the claimed
+                                # creative. Clean the stored Auto caption only after
+                                # the token-scoped release, with caption/status CAS;
+                                # this tick always ends without a provider call. The
+                                # next GBP tick can claim and send the cleaned row.
+                                from . import post_quality as _pq
+                                body, _meta = _pq.split_meta_suffix(row.get("caption") or "")
+                                cleaned = body.strip()
+                                cleanup = getattr(store, "cleanup_automatic_caption", None)
+                                if cleaned and cleanup is not None:
+                                    try:
+                                        updated = cleanup(
+                                            gym, row.get("id"), cleaned,
+                                            expected_caption=row.get("caption") or "")
+                                        if updated is None:
+                                            print(f"[gbp] Auto caption cleanup CAS "
+                                                  f"matched no row for {row.get('id')}; "
+                                                  "no send attempted")
+                                    except Exception as e:  # noqa: BLE001
+                                        print(f"[gbp] Auto caption cleanup failed for "
+                                              f"{row.get('id')}: {type(e).__name__}; "
+                                              "no send attempted")
+                                else:
+                                    if not cleaned:
+                                        # All-meta caption: nothing publishable to
+                                        # clean to. Keep the hold, never send, and
+                                        # alert ops once (durable-or-silent).
+                                        _alert_auto_caption_empty(
+                                            gym, row.get("id"), alert)
+                                    print(f"[gbp] Auto caption cleanup unavailable or "
+                                          f"empty for {row.get('id')}; no send attempted")
                         else:
-                            store.mark_status(row.get("id"), "approved")
+                            store.mark_status(row.get("id"), release_status)
+                            if res.get("held") == "approval_creative_change":
+                                _alert_manual_approval_changed(gym, row.get("id"), alert)
                     except Exception as e:  # noqa: BLE001
                         print(f"[gbp] WARNING: claim release failed for "
                               f"{row.get('id')}: {type(e).__name__}")

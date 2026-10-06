@@ -2447,9 +2447,10 @@ class _RedateStore(_ExpiredStore):
 
 
 def test_expired_rows_self_heal_redate(monkeypatch):
-    """Armed: expired rows are RE-DATED onto the next open days (approvals preserved),
+    """Armed with proof off: expired rows are re-dated and legacy approvals persist,
     the digest says 'No action needed', and NO ask-a-human alert fires."""
     monkeypatch.setenv("AGENT_EXPIRED_AUTO_REDATE", "true")
+    monkeypatch.delenv("AGENT_APPROVAL_PROOF", raising=False)
     rows = [
         {"id": "a", "gym_id": "lasso", "account": "instagram", "format": "feed",
          "post_date": "2026-08-07", "status": "approved"},
@@ -2467,7 +2468,42 @@ def test_expired_rows_self_heal_redate(monkeypatch):
     assert store.status_sets == []                       # nothing retired
     assert len(seen) == 1 and "No action needed" in seen[0]
     assert "re-dated 2" in seen[0]
+    assert "(existing approval status preserved)" in seen[0]
+    assert "approvals preserved" not in seen[0]
+    assert seen[0].endswith("No action needed.")
     assert not any("Re-date them to publish" in m for m in seen)   # no human ask
+
+
+def test_expired_rows_self_heal_alert_reports_proof_invalidation(monkeypatch):
+    """Proof mode re-dates approved rows only after clearing proof and pending them."""
+    monkeypatch.setenv("AGENT_EXPIRED_AUTO_REDATE", "true")
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    rows = [{"id": "a", "gym_id": "lasso", "account": "instagram", "format": "feed",
+             "post_date": "2026-08-07", "status": "approved"}]
+    store, kv, seen = _RedateStore(rows), _MemKV(), []
+    cap.sweep_expired_rows(store=store, kv=kv, alert=seen.append,
+                           now="2026-08-30T12:00:00")
+    assert len(seen) == 1
+    assert "(approval proof cleared; any approved row returned to pending)" in seen[0]
+    assert "approvals preserved" not in seen[0]
+    assert seen[0].endswith("Check current gym mode and approval state before release.")
+    assert "No action needed" not in seen[0]
+
+
+def test_expired_rows_pending_snapshot_alert_covers_approval_race(monkeypatch):
+    """A pending sweep snapshot can be approved before patch_post_date re-reads
+    it; the alert must not promise pending was preserved or no action is needed."""
+    monkeypatch.setenv("AGENT_EXPIRED_AUTO_REDATE", "true")
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    rows = [{"id": "p", "gym_id": "lasso", "account": "instagram", "format": "feed",
+             "post_date": "2026-08-07", "status": "pending"}]
+    store, kv, seen = _RedateStore(rows), _MemKV(), []
+    cap.sweep_expired_rows(store=store, kv=kv, alert=seen.append,
+                           now="2026-08-30T12:00:00")
+    assert len(seen) == 1
+    assert "(approval proof cleared; any approved row returned to pending)" in seen[0]
+    assert seen[0].endswith("Check current gym mode and approval state before release.")
+    assert "No action needed" not in seen[0]
 
 
 def test_expired_unapproved_twice_is_retired(monkeypatch):

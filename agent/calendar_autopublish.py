@@ -27,6 +27,7 @@ Exactly-once design (the claim):
 Nothing here logs a token or secret. The manual approval path is untouched.
 """
 
+import inspect
 import os
 import re
 from datetime import datetime, time, timedelta, timezone
@@ -884,21 +885,73 @@ def _note_meta_stripped(row_id, gym_id):
         pass  # an alert failure must never block the publish lane
 
 
-def _strip_or_hold_meta(row, gym_id, store):
+def _alert_meta_reapproval_held(row_id, gym_id, persisted):
+    """Tell ops why proof-gated cleanup did not publish this approved row."""
+    try:
+        from . import db, ops_alerts
+        key = f"metaleak_reapproval_{gym_id}_{row_id}"
+        if not db.kv_is_durable():
+            print(f"[calendar-autopublish] row {row_id}: meta reapproval alert "
+                  "suppressed because KV is not durable")
+            return
+        if db.kv_get(key):
+            return
+        detail = (
+            "Echo removed the internal block and reset the row to pending"
+            if persisted else
+            "Echo could not safely persist the cleaned caption"
+        )
+        result = ops_alerts.alert(
+            f"{gym_id}: row {row_id} HELD before publish because removing its "
+            "[why]/[reason] edit-rationale block changes the approved creative. "
+            f"{detail}. A human must review and approve the cleaned caption before "
+            "it can publish.")
+        if not _alert_confirmed(result):
+            return
+        db.kv_set(key, "1")
+    except Exception:
+        pass  # an alert failure must never weaken the publish hold
+
+
+def _alert_meta_autonomous_cleanup_held(row_id, gym_id):
+    """Report a refused autonomous cleanup without claiming human review is due."""
+    try:
+        from . import db, ops_alerts
+        key = f"metaleak_auto_cleanup_held_{gym_id}_{row_id}"
+        if not db.kv_is_durable():
+            print(f"[calendar-autopublish] row {row_id}: autonomous cleanup alert "
+                  "suppressed because KV is not durable")
+            return
+        if db.kv_get(key):
+            return
+        result = ops_alerts.alert(
+            f"{gym_id}: row {row_id} HELD before publish because its internal "
+            "[why]/[reason] block could not be cleaned under the current "
+            "autonomy and exact-caption check. No post was sent.")
+        if _alert_confirmed(result):
+            db.kv_set(key, "1")
+    except Exception:
+        pass
+
+
+_META_REAPPROVAL_REQUIRED = object()
+_CAPTION_REAPPROVAL_REQUIRED = object()
+
+
+def _strip_or_hold_meta(row, gym_id, store, *, autonomous_lane=False):
     """FINAL GATE for internal edit-rationale blocks (CrossFit ENG live FB post,
     2026-08-23 00:02 ET: a caption published ending with '[why] Removed word parents
     and added people ...'). Runs UNCONDITIONALLY on every row about to publish —
     unlike the publish_guard recheck this is not behind AGENT_CALENDAR_GRADE, because
     this class of leak must never be publishable under any flag combination.
 
-    A clean SUFFIX (real caption body, then the meta block) is STRIPPED and the clean
-    body publishes this tick — the self-heal Blake wants, no human tap. The stripped
-    caption is persisted through the STATUS-PRESERVING patch (patch_caption would
-    reset an approved row to pending and un-approve it); a patch failure still
-    publishes the clean body (the local row is authoritative for THIS send). An
-    all-meta caption returns None: the caller HOLDS the row (never claimed) and
-    alerts once. Story rows heal too: cleaning the row's caption makes the burned
-    media read stale, so the existing reburn lane re-renders it with clean words."""
+    With durable approval proof armed, stripping changes digest-bound creative. The
+    cleaned caption is therefore persisted through the current-mode Manual RPC,
+    which checks the exact status and caption, clears proof, and resets the row to
+    pending. The row is held for fresh human approval even when the patch succeeds.
+    A missing, stale, or failed patch also holds. With proof disabled, the
+    legacy status-preserving self-heal is retained. An all-meta caption
+    returns None for the existing rewrite hold."""
     from . import post_quality
     body, meta = post_quality.split_meta_suffix(row.get("caption") or "")
     if not meta:
@@ -910,6 +963,34 @@ def _strip_or_hold_meta(row, gym_id, store):
         body = format_caption(body)
     except ValueError:
         return None
+    if config.approval_proof_enabled():
+        if autonomous_lane:
+            try:
+                cleaner = getattr(store, "patch_caption_autonomous_clean", None)
+                patched = (cleaner(row.get("gym_id") or gym_id, row.get("id"),
+                                   row.get("status"), row.get("caption"), body)
+                           if callable(cleaner) else None)
+            except Exception as e:  # noqa: BLE001 - no persisted cleanup, no send
+                patched = None
+                print(f"[calendar-autopublish] autonomous meta cleanup failed for "
+                      f"{row.get('id')}: {type(e).__name__}: {e}")
+            if patched is not None:
+                _note_meta_stripped(row.get("id"), gym_id)
+                return patched
+            _alert_meta_autonomous_cleanup_held(row.get("id"), gym_id)
+            return _META_REAPPROVAL_REQUIRED
+        persisted = False
+        try:
+            patcher = getattr(store, "patch_caption_manual_format", None)
+            if callable(patcher):
+                persisted = patcher(row.get("gym_id") or gym_id,
+                                    row.get("id"), row.get("status"),
+                                    row.get("caption"), body) is not None
+        except Exception as e:  # noqa: BLE001 - the hold remains fail closed
+            print(f"[calendar-autopublish] proof meta-strip caption patch failed for "
+                  f"{row.get('id')}: {type(e).__name__}: {e}")
+        _alert_meta_reapproval_held(row.get("id"), gym_id, persisted)
+        return _META_REAPPROVAL_REQUIRED
     patched = None
     try:
         patcher = getattr(store, "patch_caption_preserve_status", None)
@@ -967,8 +1048,10 @@ def _format_caption_at_publish(row, gym_id, store):
 
     Approved rows and media-held rows are excluded from the bulk correction,
     but may later reach this lane with old sentence spacing. Format the exact
-    caption sent to the network and best-effort persist it without resetting
-    approval. Story text may be burned into media, so a Story with a semicolon
+    caption sent to the network. With approval proof enabled, persist through a
+    current-mode guarded RPC: a Manual edit invalidates proof and returns the
+    row to pending review; an Auto edit clears stale proof while preserving its
+    autonomous path. Story text may be burned into media, so a Story with a semicolon
     holds for correction rather than silently changing its saved caption.
     A protected URL containing a semicolon also holds instead of being damaged.
     Ambiguous inline numbered lists wait for items to be placed on separate
@@ -988,12 +1071,38 @@ def _format_caption_at_publish(row, gym_id, store):
         return row
     patched = None
     try:
-        patcher = getattr(store, "patch_caption_preserve_status", None)
-        if patcher is not None:
-            patched = patcher(row.get("gym_id") or gym_id, row.get("id"), clean)
+        row_gym_id = row.get("gym_id") or gym_id
+        if config.approval_proof_enabled():
+            manual_patcher = getattr(store, "patch_caption_manual_format", None)
+            if callable(manual_patcher):
+                patched = manual_patcher(
+                    row_gym_id, row.get("id"), row.get("status"), caption, clean)
+            if patched is not None:
+                # Manual approval is for the exact caption. The current-mode
+                # CAS clears its proof and demotes approved -> pending; make
+                # the owner review the formatted wording on a later tick.
+                if row.get("status") == "approved":
+                    _alert_caption_format_reapproval(row.get("id"), gym_id)
+                    return _CAPTION_REAPPROVAL_REQUIRED
+                return patched
+            # A null Manual result may mean Auto, but can also mean a stale
+            # row or unresolved mode. The autonomous RPC repeats both the mode
+            # and exact-caption CAS, so only a confirmed Auto update may send.
+            auto_patcher = getattr(store, "patch_caption_autonomous_clean", None)
+            if callable(auto_patcher):
+                patched = auto_patcher(row_gym_id, row.get("id"),
+                                       row.get("status"), caption, clean)
+            if patched is None:
+                return None
+        else:
+            patcher = getattr(store, "patch_caption_preserve_status", None)
+            if patcher is not None:
+                patched = patcher(row_gym_id, row.get("id"), clean)
     except Exception as e:  # noqa: BLE001 - persistence is best effort here
         print(f"[calendar-autopublish] caption format patch failed for "
               f"{row.get('id')}: {type(e).__name__}: {e}")
+        if config.approval_proof_enabled():
+            return None
     row = dict(patched or row)
     row["caption"] = clean  # what we SEND is clean even when the patch failed
     if ";" in caption:
@@ -1002,6 +1111,25 @@ def _format_caption_at_publish(row, gym_id, store):
         print(f"[calendar-autopublish] formatted legacy caption spacing for "
               f"{gym_id}/{row.get('id')}; awaiting remaining publish checks")
     return row
+
+
+def _alert_caption_format_reapproval(row_id, gym_id):
+    """Tell ops that formatting invalidated a Manual approval and needs review."""
+    try:
+        from . import db, ops_alerts
+        key = f"capformat_reapproval_{gym_id}_{row_id}"
+        if not db.kv_is_durable():
+            print(f"[calendar-autopublish] row {row_id}: caption format reapproval "
+                  "alert suppressed because KV is not durable")
+            return
+        if db.kv_get(key):
+            return
+        _stamp_after_confirmed_alert(db, key, ops_alerts.alert(
+            f"{gym_id}: row {row_id} was returned to pending review because "
+            "publish-time caption formatting changed the approved text. Review "
+            "and approve the formatted caption before it can publish."))
+    except Exception:
+        pass
 
 
 def _planned_mentions(caption, gym_id, category):
@@ -1506,10 +1634,15 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
         # INTERNAL EDIT-RATIONALE FINAL GATE (CrossFit ENG, 2026-08-23): a caption
         # carrying a bracketed meta block ([why]/[reason]/...) never reaches the
-        # network. Clean suffix -> stripped and published (self-heal); all-meta ->
+        # network. Clean suffix -> stripped and published in the legacy lane, or
+        # reset to pending + held for fresh approval when proof is armed. All-meta ->
         # held + one alert. BEFORE the story-stale check on purpose: a cleaned story
-        # caption then mismatches its burned media and the reburn lane re-renders it.
-        cleaned = _strip_or_hold_meta(row, gym_id, store)
+        # in the legacy lane then mismatches its burned media and is re-rendered.
+        cleaned = _strip_or_hold_meta(row, gym_id, store,
+                                      autonomous_lane=not approved_only)
+        if cleaned is _META_REAPPROVAL_REQUIRED:
+            waiting.append(row_id)
+            continue
         if cleaned is None:
             waiting.append(row_id)
             _alert_meta_leak_held(row_id, gym_id)
@@ -1520,6 +1653,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # rows that the safe pending-row backfill intentionally left alone.
         # Story rows with semicolons and unformattable URLs hold with an alert.
         formatted = _format_caption_at_publish(row, gym_id, store)
+        if formatted is _CAPTION_REAPPROVAL_REQUIRED:
+            waiting.append(row_id)
+            continue
         if formatted is None:
             waiting.append(row_id)
             _alert_caption_format_held(row_id, gym_id)
@@ -1597,18 +1733,64 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         claim_token = None
         try:
             claim_slot = getattr(store, "claim_publish_slot", None)
+            # DURABLE APPROVAL PROOF (draft, AGENT_APPROVAL_PROOF default OFF):
+            # when armed, EVERY lane passes require_proof to the atomic claim.
+            # The RPC then re-reads the gym's CURRENT autonomy from the
+            # authoritative DB inside the claim transaction: a definitively
+            # autonomous gym keeps today's behavior exactly; any other gym
+            # (Manual, newly flipped Auto->Manual, or an unresolved/ambiguous
+            # lookup) must carry a fresh VERIFIED human approval (human kind +
+            # nonempty trusted actor, stamped only via the portal's
+            # calendar_stamp_verified_approval) whose canonical digest matches
+            # the locked row's exact publish-relevant content
+            # (caption/account/format/date, the FINAL image_url and the
+            # rendered/source identity; the publisher-stamped scheduled_at is
+            # deliberately not bound). A post-approval auto-fit reframe or
+            # story reburn changes image_url and therefore fails the row
+            # CLOSED into fresh review -- changed pixels never publish under
+            # an old approval. Enforcement lives in the DB claim, not a
+            # Python pre-read, so a mid-flight Auto->Manual flip is caught
+            # atomically. When the store cannot carry the requirement (legacy
+            # injected store, unapplied migration), fail CLOSED: hold the row
+            # rather than publish under an unproved approval.
+            require_proof = config.approval_proof_enabled()
             if callable(claim_slot):
                 # Refresh after preflight: a long render/reframe can cross the
                 # gym's midnight before this atomic reservation.
                 reservation_day = _local_now(now, gym_tz).date().isoformat()
-                won = claim_slot(row_id, gym_id, reservation_day, gym_tz,
-                                 _publish_capacity(gym_id, row, store,
-                                                   reservation_day), approved_only)
+                if require_proof:
+                    try:
+                        signature = inspect.signature(claim_slot)
+                        supports_proof = (
+                            "require_proof" in signature.parameters
+                            or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                                   for p in signature.parameters.values())
+                        )
+                    except (TypeError, ValueError):
+                        supports_proof = False
+                    if supports_proof:
+                        won = claim_slot(row_id, gym_id, reservation_day, gym_tz,
+                                         _publish_capacity(gym_id, row, store,
+                                                           reservation_day),
+                                         approved_only, require_proof=True)
+                    else:
+                        # A store whose claim cannot carry the proof requirement
+                        # must never claim in Manual mode while armed.
+                        won = None
+                else:
+                    won = claim_slot(row_id, gym_id, reservation_day, gym_tz,
+                                     _publish_capacity(gym_id, row, store,
+                                                       reservation_day), approved_only)
             else:
-                # Legacy injectable test stores have no RPC. The production
-                # Supabase store always exposes claim_publish_slot and fails
-                # closed if its migration has not been applied.
-                won = store.mark_publishing(row_id)
+                if require_proof:
+                    # The legacy mark_publishing fallback cannot verify durable
+                    # human-approval proof atomically; hold the row.
+                    won = None
+                else:
+                    # Legacy injectable test stores have no RPC. The production
+                    # Supabase store always exposes claim_publish_slot and fails
+                    # closed if its migration has not been applied.
+                    won = store.mark_publishing(row_id)
         except Exception as e:
             failed.append(row_id)
             print(f"[calendar-autopublish] claim failed for row {row_id}: "
@@ -1624,10 +1806,62 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             # cadence is full. Leave it untouched for calendar review.
             (waiting if callable(claim_slot) else skipped).append(row_id)
             continue
-        # The production owned-claim RPC returns a fresh UUID per successful
-        # claim. Legacy injected stores return True and use their own rollback
-        # behavior; Supabase rollback refuses to run without this token.
-        claim_token = won if isinstance(won, str) else None
+        if require_proof:
+            # The proof RPC returns the exact locked creative. A token alone
+            # only proves ownership and cannot make the prefetched row safe to
+            # send after a concurrent edit. Refuse every incomplete result.
+            locked_fields = ("account", "format", "post_date", "caption",
+                             "image_url", "byte_hash", "source_media_asset_id",
+                             "source_media_url")
+            if (not isinstance(won, dict)
+                    or won.get("id") != row_id
+                    or won.get("gym_id") != gym_id
+                    or won.get("status") != "publishing"
+                    or not won.get("publish_claim_token")
+                    or any(field not in won for field in locked_fields)
+                    or not str(won.get("image_url") or "").strip()
+                    or type(won.get("autonomous_at_claim")) is not bool):
+                failed.append(row_id)
+                recovery_required.append(row_id)
+                _alert_ambiguous_publish(gym_id, row_id,
+                                         "claim returned no verified locked creative")
+                continue
+            row = won
+            claim_token = str(row["publish_claim_token"])
+            # Account routing was selected before the claim. If the locked
+            # account changed, hold for a fresh preflight on the next tick.
+            locked_account = _account_for(row, gym_id)
+            if locked_account is None or locked_account.key != account.key:
+                failed.append(row_id)
+                reverted = _revert_to_pending(
+                    store, row_id, reject_reason="account_changed_at_claim",
+                    gym_id=gym_id, expected_claim_token=claim_token,
+                    revert_status="approved" if approved_only else "pending")
+                if not reverted:
+                    recovery_required.append(row_id)
+                continue
+            account = locked_account
+            # A concurrent edit can introduce internal rationale or forbidden
+            # punctuation after preflight. Recheck the claimed version before
+            # any idempotency stamp or provider call.
+            from . import post_quality
+            _, locked_meta = post_quality.split_meta_suffix(row.get("caption") or "")
+            if locked_meta or ";" in (row.get("caption") or ""):
+                reason = ("locked_creative_meta_leak" if locked_meta
+                          else "locked_creative_caption_format")
+                reverted = _revert_to_pending(
+                    store, row_id, reject_reason=reason, gym_id=gym_id,
+                    expected_claim_token=claim_token,
+                    revert_status="approved" if approved_only else "pending")
+                if not reverted:
+                    recovery_required.append(row_id)
+                _alert_publish_blocked(gym_id, row_id, reason,
+                                       reverted=reverted)
+                failed.append(row_id)
+                continue
+        else:
+            # Legacy UUID and injectable boolean claims retain their behavior.
+            claim_token = won if isinstance(won, str) else None
 
         # LEASED-ROW SOURCE REVALIDATION (paired LASSO feed, owned string-token
         # claim only; legacy bool-claim test stores skip this gate entirely).
@@ -2470,13 +2704,20 @@ def sweep_expired_rows(*, store=None, kv=None, now=None, alert=None,
                 if moved:
                     span = f"{moved[0]['new_date']}..{moved[-1]['new_date']}" \
                         if len(moved) > 1 else moved[0]["new_date"]
+                    approval_note = (
+                        "approval proof cleared; any approved row returned to pending"
+                        if config.approval_proof_enabled()
+                        else "existing approval status preserved"
+                    )
                     bits.append(f"re-dated {len(moved)} expired row(s) into open "
-                                f"day(s) {span} (approvals preserved)")
+                                f"day(s) {span} ({approval_note})")
                 if retired:
                     bits.append(f"retired {len(retired)} expired row(s) (unapproved "
                                 "twice-expired, or redundant because every upcoming "
                                 "day already has content)")
-                alert(f"{gym}: {'; '.join(bits)}. No action needed.")
+                suffix = ("Check current gym mode and approval state before release."
+                          if config.approval_proof_enabled() else "No action needed.")
+                alert(f"{gym}: {'; '.join(bits)}. {suffix}")
             if not gym_rows:
                 alerted.append(gym)
                 continue

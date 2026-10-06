@@ -624,18 +624,63 @@ class SupabaseCalendarStore:
                 return row
         return None
 
-    def approve_ready(self, account_key, row_id):
+    def approve_ready(self, account_key, row_id, expected_creative=None):
         """Approve only when this gym's row still has publishable media.
 
         The RPC checks status, media URL, and needs-media reason in one database
         UPDATE. A portal pre-read alone cannot protect against a concurrent media
         removal between the check and the approval write. An unapplied migration
         fails closed instead of falling back to the generic status PATCH.
+
+        APPROVAL PROVENANCE (draft, 2026-10-05, repair pass 2): the same atomic
+        UPDATE records status='approved' plus a canonical digest of the row's
+        exact publish-relevant fields (caption/account/format/date, the FINAL
+        image_url, and the rendered/source identity fields byte_hash /
+        source_media_asset_id / source_media_url; the publisher-stamped
+        scheduled_at is never bound). REVIEW DEFECT 1: an Echo bearer token is
+        NOT a verified human identity, so this RPC leaves approval_kind /
+        approved_by / approved_at UNPROVED (NULL) and takes NO actor parameter
+        -- no body-supplied identity is ever forwarded. Human provenance is
+        stamped only by calendar_stamp_verified_approval, called by the PORTAL
+        with its service role and an authenticated Clerk actor after this
+        approval succeeds (portal-side contract; Echo never calls it). The
+        claim-side proof gate requires a nonempty trusted approved_by, so an
+        Echo-only approval cannot publish in Manual mode while armed.
         """
+        payload = {"p_row_id": row_id, "p_gym_id": account_key}
+        # VISIBLE-CARD SNAPSHOT (portal ECHO_VERIFIED_APPROVAL_PROOF contract,
+        # Echo half 2026-10-05): when the portal sends its expected_creative,
+        # the SAME atomic RPC UPDATE also compares caption/media_url/day_key/
+        # format/platform against the locked row; a stale snapshot returns
+        # zero rows and nothing is stamped. Sent ONLY when present, so the
+        # flag-OFF wire shape is byte-for-byte the legacy 2-arg call (the
+        # migration's p_expected DEFAULTs to NULL = legacy behavior). No
+        # actor parameter: an Echo bearer token never mints human proof.
+        if expected_creative is not None:
+            payload["p_expected"] = expected_creative
         r = self._client().post(
             self._rest("rpc/approve_calendar_row_if_media_ready"),
             headers=self._headers({"Content-Type": "application/json"}),
-            json={"p_row_id": row_id, "p_gym_id": account_key}, timeout=30,
+            json=payload, timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if len(rows) != 1 or str(rows[0].get("gym_id")) != str(account_key):
+            return None
+        return rows[0]
+
+    def recover_unproved_approval(self, account_key, row_id, expected_creative):
+        """Return a fresh locked-row digest only for an exact unproved retry.
+
+        The RPC checks the current creative and digest atomically. It never
+        accepts an actor or changes proof state; the portal stamps that later.
+        """
+        r = self._client().post(
+            self._rest("rpc/calendar_recover_unproved_approval"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json={"p_row_id": row_id, "p_gym_id": account_key,
+                  "p_expected": expected_creative}, timeout=30,
         )
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
@@ -1970,6 +2015,99 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def patch_caption_for_meta_sweep(self, account_key, row_id, new_caption, *,
+                                    expected_status, expected_caption):
+        """Clean a caption while invalidating its approval proof atomically.
+
+        The status allowlist excludes rows already claimed or published. Pending
+        rows remain pending; approved rows return to pending for fresh human
+        approval. A schema with durable approval proof must provide these columns.
+        """
+        expected = str(expected_status or "").strip().lower()
+        if expected not in ("pending", "approved", "draft", "queued", "failed"):
+            return None
+        from .copy_gate import format_caption
+        caption_filter = _eq_filter(expected_caption)
+        if caption_filter is None:
+            raise PortalStoreError(
+                422,
+                "caption meta sweep CAS blocked: caption has no evidenced-safe "
+                "PostgREST equality encoding; row left untouched")
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+            "status": f"eq.{expected}",
+            # Exact observed creative CAS. A status-only guard would permit a
+            # stale sweep read to overwrite a concurrent same-status human edit.
+            "caption": caption_filter,
+            "published_at": "is.null",
+            "late_post_id": "is.null",
+            "variant_status": "eq.active",
+        }
+        payload = {
+            "caption": format_caption(new_caption),
+            "approval_kind": None,
+            "approved_by": None,
+            "approved_at": None,
+            "approval_digest": None,
+        }
+        if expected == "approved":
+            payload["status"] = "pending"
+        r = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }), json=payload, timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
+    def patch_caption_for_gbp_auto_cleanup(self, account_key, row_id, new_caption, *,
+                                          expected_caption):
+        """Clean an Auto GBP caption after releasing its publish claim.
+
+        The security-definer RPC locks the gym autonomy setting and compares the
+        exact caption and approved status in the same transaction. A flip to
+        Manual therefore prevents the cleanup write; the caller holds the row.
+        """
+        from .copy_gate import format_caption
+        clean = format_caption(new_caption)
+        if not clean or clean == expected_caption:
+            return None
+        r = self._client().post(
+            self._rest("rpc/calendar_patch_caption_autonomous_clean"),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"p_row_id": row_id, "p_gym_id": account_key,
+                  "p_expected_status": "approved",
+                  "p_expected_caption": expected_caption,
+                  "p_clean_caption": clean}, timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not isinstance(rows, list):
+            raise PortalStoreError(502, "GBP Auto caption cleanup returned an invalid result")
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise PortalStoreError(502, "GBP Auto caption cleanup matched multiple rows")
+        row = rows[0]
+        if (not isinstance(row, dict)
+                or str(row.get("gym_id")) != str(account_key)
+                or str(row.get("id")) != str(row_id)
+                or row.get("account") != "googlebusiness"
+                or row.get("status") != "approved"
+                or row.get("caption") != clean
+                or row.get("publish_claim_token") is not None):
+            raise PortalStoreError(502, "GBP Auto caption cleanup returned an inconsistent row")
+        return row
+
     def patch_caption_for_hashtag_backfill(self, account_key, row_id, new_caption,
                                            *, expected_status):
         """Atomically patch a safe future IG row during the one-off hashtag backfill.
@@ -2152,20 +2290,39 @@ class SupabaseCalendarStore:
         return len(rows) == 1
 
     def claim_publish_slot(self, row_id, gym_id, local_day, timezone_name,
-                           capacity, approved_only):
+                           capacity, approved_only, require_proof=False):
         """Atomically reserve a platform slot and return this claim's UUID token.
 
         No split count/claim fallback: an unavailable RPC holds the post. The SQL
         function serializes all workers for this gym with an advisory lock. A
         distinct token on each successful claim prevents a stale worker from
         reverting a later worker's claim of the same row.
+
+        APPROVAL PROOF GATE (draft, 2026-10-05): ``require_proof`` asks the RPC
+        to re-read the gym's CURRENT autonomy from the DB inside the claim
+        transaction and, unless the gym is definitively autonomous right now,
+        atomically reject a row lacking a fresh VERIFIED human approval
+        (approval_kind='human' + nonempty trusted approved_by, stamped only by
+        the portal's calendar_stamp_verified_approval) whose canonical digest
+        -- including the FINAL image_url -- matches the row's current
+        publish-relevant fields. An
+        Auto->Manual flip is therefore enforced at the claim itself, not from
+        this worker's earlier snapshot. The parameter is sent ONLY when True so
+        a pre-provenance migration keeps today's behavior; when True and the
+        migration is unapplied the RPC errors and the claim fails closed
+        (nothing is published).
         """
+        payload = {"p_row_id": row_id, "p_gym_id": gym_id,
+                   "p_day": local_day, "p_timezone": timezone_name,
+                   "p_capacity": capacity, "p_approved_only": approved_only}
+        if require_proof:
+            rpc = "rpc/claim_calendar_publish_slot_proven_owned"
+        else:
+            rpc = "rpc/claim_calendar_publish_slot_owned"
         r = self._client().post(
-            self._rest("rpc/claim_calendar_publish_slot_owned"),
+            self._rest(rpc),
             headers=self._headers({"Content-Type": "application/json"}),
-            json={"p_row_id": row_id, "p_gym_id": gym_id,
-                  "p_day": local_day, "p_timezone": timezone_name,
-                  "p_capacity": capacity, "p_approved_only": approved_only},
+            json=payload,
             timeout=30,
         )
         if r.status_code >= 400:
@@ -2173,25 +2330,114 @@ class SupabaseCalendarStore:
         token = r.json()
         if token is None:
             return None
+        if require_proof:
+            # The gated RPC returns the exact row read under its claim lock.
+            # Any malformed result holds the claim and must never become an
+            # outbound payload assembled from a stale prefetched row.
+            if not isinstance(token, dict) or not isinstance(token.get("row"), dict) \
+                    or type(token.get("autonomous_at_claim")) is not bool:
+                raise PortalStoreError(502, "calendar claim returned invalid locked creative")
+            claimed = token["row"]
+            required = ("id", "gym_id", "status", "publish_claim_token",
+                        "account", "format", "post_date", "caption", "image_url")
+            # These fields are optional in supported legacy schemas; to_jsonb
+            # omits them when the underlying columns do not exist.
+            claimed.setdefault("source_media_asset_id", None)
+            claimed.setdefault("source_media_url", None)
+            if (any(k not in claimed for k in required)
+                    or str(claimed["id"]) != str(row_id)
+                    or claimed["gym_id"] != gym_id
+                    or claimed["status"] != "publishing"
+                    or not str(claimed["image_url"] or "").strip()):
+                raise PortalStoreError(502, "calendar claim returned invalid locked creative")
+            try:
+                from uuid import UUID
+                claimed["publish_claim_token"] = str(UUID(str(claimed["publish_claim_token"])))
+            except (TypeError, ValueError, AttributeError):
+                raise PortalStoreError(502, "calendar claim returned invalid ownership token")
+            # The locked row is to_jsonb(content_calendar). Production schemas
+            # without the optional byte_hash column omit its key altogether;
+            # retain a real value when the column is present. The publisher
+            # still requires this normalized key in its locked creative check.
+            claimed.setdefault("byte_hash", None)
+            claimed["autonomous_at_claim"] = token["autonomous_at_claim"]
+            return claimed
         try:
             from uuid import UUID
             return str(UUID(str(token)))
         except (TypeError, ValueError, AttributeError):
             raise PortalStoreError(502, "calendar claim returned an invalid ownership token")
 
+    def patch_caption_autonomous_clean(self, gym_id, row_id, expected_status,
+                                       expected_caption, clean_caption):
+        """Atomically clean a prefetched caption only while the gym is Auto.
+
+        The RPC checks current DB autonomy and exact status/caption, then clears
+        approval proof in the same transaction. An Auto-to-Manual race is held
+        by this RPC or by the subsequent proof-gated publish claim.
+        """
+        payload = {"p_row_id": row_id, "p_gym_id": gym_id,
+                   "p_expected_status": expected_status,
+                   "p_expected_caption": expected_caption,
+                   "p_clean_caption": clean_caption}
+        r = self._client().post(
+            self._rest("rpc/calendar_patch_caption_autonomous_clean"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json=payload, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise PortalStoreError(502, "autonomous caption cleanup returned invalid rows")
+        return rows[0] if rows and isinstance(rows[0], dict) \
+            and str(rows[0].get("id")) == str(row_id) \
+            and rows[0].get("gym_id") == gym_id \
+            and rows[0].get("caption") == clean_caption else None
+
+    def patch_caption_manual_format(self, gym_id, row_id, expected_status,
+                                    expected_caption, clean_caption):
+        """Format a due caption only while the gym is currently Manual.
+
+        The RPC locks current gym mode and exact row state, clears approval
+        provenance, and demotes approved rows to pending. This ensures a
+        publish-boundary wording change cannot keep stale human approval.
+        A null result means the row/mode did not match and must be rechecked
+        through the separate Auto-only cleanup RPC or held.
+        """
+        payload = {"p_row_id": row_id, "p_gym_id": gym_id,
+                   "p_expected_status": expected_status,
+                   "p_expected_caption": expected_caption,
+                   "p_clean_caption": clean_caption}
+        r = self._client().post(
+            self._rest("rpc/calendar_patch_caption_manual_format"),
+            headers=self._headers({"Content-Type": "application/json"}),
+            json=payload, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise PortalStoreError(502, "manual caption formatting returned invalid rows")
+        return rows[0] if rows and isinstance(rows[0], dict) \
+            and str(rows[0].get("id")) == str(row_id) \
+            and rows[0].get("gym_id") == gym_id \
+            and rows[0].get("caption") == clean_caption \
+            and rows[0].get("status") == "pending" else None
+
     def patch_post_date(self, row_id, new_post_date):
         """RE-DATE one waiting row (expired-row self-heal, Blake 2026-08-31: no human
         should have to re-date dead posts). Moves post_date forward and CLEARS
         scheduled_at so the publish lane re-stamps the new slot time. Race-guarded:
         only a row still waiting (pending/approved, never published) may move — a row
-        mid-claim or already live is refused (zero rows -> None). Status untouched, so
-        an approved row stays approved (the gym's approval is preserved)."""
+        mid-claim or already live is refused (zero rows -> None). In approval-proof
+        mode, changing the date invalidates proof atomically and demotes approved rows
+        to pending; with the flag off, legacy status behavior is preserved."""
+        require_proof = config.approval_proof_enabled()
         before = self._client().get(
             self._rest(_TABLE),
             params={"id": f"eq.{row_id}",
                     "status": "in.(pending,approved)",
                     "published_at": "is.null",
-                    "select": "id,gym_id,post_date,caption"},
+                    "select": "id,gym_id,post_date,caption,status"},
             headers=self._headers(), timeout=30)
         if before.status_code >= 400:
             raise PortalStoreError(before.status_code,
@@ -2201,18 +2447,34 @@ class SupabaseCalendarStore:
             return None
         old = current[0]
         old_post_date = str(old.get("post_date") or "")[:10]
+        status_filter = str(old.get("status") or "").strip().lower()
+        if status_filter not in ("pending", "approved"):
+            return None
+
+        payload = {"post_date": new_post_date, "scheduled_at": None}
+        if require_proof:
+            # The date is part of the approval digest. A self-heal re-date must
+            # not leave a proof that still authorizes the previous date.
+            payload.update({
+                "approval_kind": None,
+                "approved_by": None,
+                "approved_at": None,
+                "approval_digest": None,
+            })
+            if status_filter == "approved":
+                payload["status"] = "pending"
 
         r = self._client().patch(
             self._rest(_TABLE),
             params={"id": f"eq.{row_id}",
-                    "status": "in.(pending,approved)",
+                    "status": f"eq.{status_filter}",
                     "published_at": "is.null",
                     "post_date": f"eq.{old_post_date}"},
             headers=self._headers({
                 "Content-Type": "application/json",
                 "Prefer": "return=representation",
             }),
-            json={"post_date": new_post_date, "scheduled_at": None},
+            json=payload,
             timeout=30,
         )
         if r.status_code >= 400:
