@@ -520,7 +520,21 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
             if operation_id is None:
                 written = inserter(gym_id, payload) or []
             else:
-                written = inserter(gym_id, payload, preserve_ids=True) or []
+                receipt = inserter(
+                    gym_id, payload, preserve_ids=True,
+                    return_write_receipt=True)
+                if (not isinstance(receipt, dict)
+                        or not isinstance(receipt.get("inserted_rows"), (list, tuple))
+                        or not isinstance(receipt.get("expected_rows"), (list, tuple))):
+                    raise ValueError("unverified calendar write receipt")
+                written = receipt["inserted_rows"]
+                authoritative = receipt["expected_rows"]
+                if any(not isinstance(row, dict)
+                       or str(row.get("gym_id") or "") != str(gym_id)
+                       or str(row.get("id") or "") not in operation_row_ids
+                       for row in authoritative):
+                    raise ValueError("invalid calendar expected-write receipt")
+                expected_rows = [dict(row) for row in authoritative]
             inserted = len(written) if not isinstance(written, int) else written
             # A Drive asset is globally burned only after the store returns the exact
             # inserted row. _attach_media reserves IDs within this call, but stamping

@@ -37,7 +37,8 @@ class _CalStore:
         return [r for r in self.existing
                 if r.get("gym_id") == gym_id and str(r.get("post_date"))[:7] == month]
 
-    def insert_rows(self, gym_id, rows, *, preserve_ids=False):
+    def insert_rows(self, gym_id, rows, *, preserve_ids=False,
+                    return_write_receipt=False):
         self.preserve_id_calls.append(preserve_ids)
         hook = self.before_insert
         self.before_insert = None
@@ -54,6 +55,9 @@ class _CalStore:
         self.after_insert = None
         if hook is not None:
             hook()
+        if return_write_receipt:
+            return {"inserted_rows": out,
+                    "expected_rows": [dict(row) for row in out]}
         return out
 
     def list_event_rows(self, gym_id, event_id):
@@ -408,6 +412,33 @@ def test_cancel_after_event_cas_before_calendar_insert_is_compensated(monkeypatc
               if row.get("event_id") == event_id
               and row.get("status") in ("pending", "draft", "queued")]
     assert active == []
+
+
+def test_scheduled_event_becoming_live_after_stage_keeps_valid_edit(monkeypatch):
+    """A lifecycle tick must not undo an otherwise current, editable revision."""
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    ev.rows[event_id]["status"] = "scheduled"
+
+    def _go_live_after_insert():
+        ev.rows[event_id]["status"] = "live"
+
+    cal.after_insert = _go_live_after_insert
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 200
+    assert response["event"]["status"] == "live"
+    assert ev.rows[event_id]["starts_on"] == "2026-10-20"
+    assert any(row.get("event_id") == event_id and row["status"] == "pending"
+               for row in cal.inserted)
 
 
 def test_later_same_status_edit_owns_rows_earlier_edit_cannot_compensate(monkeypatch):
@@ -784,9 +815,14 @@ def test_date_edit_partial_durable_insert_rolls_back_atomically(monkeypatch):
     old_ids = {row["id"] for row in cal.inserted}
     real_insert = cal.insert_rows
 
-    def _commit_first_only(gym_id, rows, *, preserve_ids=False):
+    def _commit_first_only(gym_id, rows, *, preserve_ids=False,
+                           return_write_receipt=False):
         assert len(rows) > 1
-        return real_insert(gym_id, rows[:1], preserve_ids=preserve_ids)
+        result = real_insert(gym_id, rows[:1], preserve_ids=preserve_ids,
+                             return_write_receipt=return_write_receipt)
+        if return_write_receipt:
+            result["expected_rows"] = [dict(row, gym_id=gym_id) for row in rows]
+        return result
 
     cal.insert_rows = _commit_first_only
     status, response = pe.handle_edit_event(
@@ -817,7 +853,8 @@ def test_date_edit_count_only_insert_receipt_reconciles_exact_ids(monkeypatch):
     old_ids = {row["id"] for row in cal.inserted}
     real_insert = cal.insert_rows
 
-    def _commit_with_count_only(gym_id, rows, *, preserve_ids=False):
+    def _commit_with_count_only(gym_id, rows, *, preserve_ids=False,
+                                return_write_receipt=False):
         written = real_insert(gym_id, rows, preserve_ids=preserve_ids)
         return len(written)
 
@@ -830,7 +867,7 @@ def test_date_edit_count_only_insert_receipt_reconciles_exact_ids(monkeypatch):
 
     inserted = [row for row in cal.inserted if row["id"] not in old_ids]
     assert status == 502
-    assert response["reason"] == "replacement coverage incomplete"
+    assert response["reason"] == "insert failed ValueError"
     assert response["rolled_back"] is True
     assert ev.rows[event_id] == event_before
     assert inserted and all(row["status"] == "denied" for row in inserted)

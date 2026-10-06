@@ -442,6 +442,21 @@ def test_held_slot_barrier_preserves_numbered_slots_time_slots_and_channel_sibli
     assert http.rows[0] == held
 
 
+def test_write_receipt_excludes_exact_slot_refused_by_held_barrier(monkeypatch):
+    held = _persisted(slot_index=0, time_slot='morning')
+    store, http = _state_store(monkeypatch, [held])
+    blocked = dict(held, caption='Blocked replacement', media_not_ready_reason=None)
+    allowed = dict(blocked, slot_index=1, caption='Free replacement')
+
+    receipt = store.insert_rows(
+        'eng', [blocked, allowed], return_write_receipt=True)
+
+    assert [pcs._held_slot_key(r) for r in receipt['expected_rows']] == [
+        pcs._held_slot_key(allowed)]
+    assert len(receipt['inserted_rows']) == 1
+    assert http.rows[0] == held
+
+
 def test_null_slot_fields_are_exact_and_not_inferred_as_morning_or_zero(monkeypatch):
     held = _persisted()
     store, http = _state_store(monkeypatch, [held])

@@ -3578,7 +3578,8 @@ class SupabaseCalendarStore:
 
     def insert_rows(self, account_key, rows, *, preserve_ids=False,
                     render_evidence_by_url=None, poster_render_evidence_by_url=None,
-                    required_feed_slots=None, prevalidated_cadence=False):
+                    required_feed_slots=None, prevalidated_cadence=False,
+                    return_write_receipt=False):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -3591,6 +3592,9 @@ class SupabaseCalendarStore:
         preserve_ids option accepts validated UUIDs for crash-safe automatic jobs.
         No on_conflict/upsert: apply is delete-then-insert, so a plain insert is correct
         and idempotent. Returns the list of inserted row dicts (each with its new uuid).
+        With ``return_write_receipt``, returns those rows plus the exact normalized
+        post-belt payload the store intended to write; event edits use that receipt to
+        distinguish legitimate filtering from an incomplete durable insert.
 
         KEY NORMALIZATION: PostgREST rejects a heterogeneous batch with PGRST102 "All
         object keys must match". Our rows are NOT uniform — a video row carries
@@ -3749,6 +3753,8 @@ class SupabaseCalendarStore:
                 raise CadencePreconditionError(
                     409, "calendar cadence precondition failed before insert")
         if not payload:
+            if return_write_receipt:
+                return {"inserted_rows": recovered, "expected_rows": []}
             return recovered
         from . import visual_writer_prepare
         prepared_write = visual_writer_prepare.enabled()
@@ -3818,7 +3824,14 @@ class SupabaseCalendarStore:
                         _ledger.record_staged(account_key, caption, post_date)
             except Exception:
                 pass  # ledger stamp failure is never fatal
-        return recovered + inserted
+        written = recovered + inserted
+        if return_write_receipt:
+            # Event edits need the authoritative write set after every persistence
+            # belt.  A pre-store count cannot distinguish a legitimate held/caption/
+            # cross-day-media refusal from a partial or ambiguous database insert.
+            return {"inserted_rows": written,
+                    "expected_rows": [dict(row) for row in payload]}
+        return written
 
     def recover_story_media_hold(self, account_key, current, proposed, *,
                                  poster_render_evidence=None):

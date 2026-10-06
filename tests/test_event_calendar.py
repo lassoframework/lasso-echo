@@ -702,8 +702,12 @@ class _ReStageStore:
         return [r for r in self._existing
                 if str(r.get("post_date", ""))[:7] == month]
 
-    def insert_rows(self, gym_id, rows, *, preserve_ids=False):
+    def insert_rows(self, gym_id, rows, *, preserve_ids=False,
+                    return_write_receipt=False):
         self.inserted.extend(rows)
+        if return_write_receipt:
+            normalized = [dict(row, gym_id=gym_id) for row in rows]
+            return {"inserted_rows": normalized, "expected_rows": normalized}
         return rows
 
 

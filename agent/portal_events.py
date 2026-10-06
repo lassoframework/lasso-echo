@@ -316,8 +316,11 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
             {"denied": 0})
         return 502, {"error": f"post-stage verification failed: {type(exc).__name__}",
                      "compensated": compensated.get("denied", 0)}
-    if after_stage != saved:
-        terminal = (after_stage or {}).get("status")
+    after_status = (after_stage or {}).get("status")
+    same_revision = _same_event_edit_revision(saved, after_stage)
+    if (not same_revision
+            or after_status not in ge.EDITABLE_EVENT_STATUSES):
+        terminal = after_status
         if _store is not None and terminal in ("cancelled", "ended"):
             compensated = ec.cancel_event(
                 _store, account_key, event_id, ended=terminal == "ended")
@@ -344,7 +347,9 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
         if superseded.get("ok") is False:
             return 502, {"error": "superseded event row cleanup failed",
                          "removed": removed}
-    return 200, {"event": _event_row(new_event), "restaged": staged,
+    response_event = _event_row(new_event)
+    response_event["status"] = after_status
+    return 200, {"event": response_event, "restaged": staged,
                  "held_media": held_media, "reason": stage_reason,
                  "kept": len(keep), "removed": removed}
 
@@ -423,6 +428,32 @@ def _event_row(event: ge.GymEvent):
         "brief": event.brief, "media_ids": list(event.media_ids),
         "status": event.status, "created_by": event.created_by,
     }
+
+
+_EDIT_REVISION_FIELDS = (
+    "id", "gym_id", "name", "type", "starts_on", "ends_on", "tz",
+    "offer_text", "link", "brief", "media_ids", "created_by",
+)
+
+
+def _same_event_edit_revision(expected, current):
+    """Compare only fields whose drift invalidates this edit's staged arc.
+
+    Status is deliberately checked separately: scheduled -> live is a benign,
+    editable lifecycle transition, while terminal/non-editable states still own
+    the race. Audit/timestamps are metadata and do not change arc content.
+    """
+    if not isinstance(expected, dict) or not isinstance(current, dict):
+        return False
+    for field in _EDIT_REVISION_FIELDS:
+        left = expected.get(field)
+        right = current.get(field)
+        if field == "media_ids":
+            left = tuple(str(value) for value in (left or []))
+            right = tuple(str(value) for value in (right or []))
+        if left != right:
+            return False
+    return True
 
 
 def _preview(row):

@@ -100,9 +100,13 @@ class _CalendarStore:
                 if row.get("gym_id") == gym_id
                 and str(row.get("post_date"))[:7] == month]
 
-    def insert_rows(self, gym_id, rows, *, preserve_ids=False):
+    def insert_rows(self, gym_id, rows, *, preserve_ids=False,
+                    return_write_receipt=False):
         written = [{**row, "gym_id": gym_id} for row in rows]
         self.inserted.extend(written)
+        if return_write_receipt:
+            return {"inserted_rows": [dict(row) for row in written],
+                    "expected_rows": [dict(row) for row in written]}
         return [dict(row) for row in written]
 
 
