@@ -272,6 +272,147 @@ def test_recovery_refuses_tampered_prepared_receipt(tmp_path, monkeypatch):
     assert json.loads(receipt_path.read_text())["status"] == "prepared"
 
 
+def test_prewrite_failure_reuses_prepared_attempt_then_recovers_receipt(
+        tmp_path, monkeypatch):
+    path = tmp_path / "gym_accounts.json"
+    original = b'[{"base":"piercefitness"}]'
+    path.write_bytes(original)
+    clients = _clients()
+    plan = _run(path, clients)["plan"]
+    real_write = backfill._write_new
+    state = {"registry_failed": False, "receipt_failed": False}
+
+    def interrupt(target, data, mode):
+        if target == path and not state["registry_failed"]:
+            state["registry_failed"] = True
+            raise OSError("prewrite interruption")
+        if str(target).endswith(".receipt.json") and not state["receipt_failed"]:
+            state["receipt_failed"] = True
+            raise OSError("receipt finalization interruption")
+        return real_write(target, data, mode)
+
+    monkeypatch.setattr(backfill, "_write_new", interrupt)
+    with pytest.raises(backfill.BackfillBlocked):
+        _run(path, clients, apply=True, **_expectations(plan))
+    assert path.read_bytes() == original
+    assert len(list(tmp_path.glob("*.receipt.json"))) == 1
+    with pytest.raises(backfill.BackfillBlocked):
+        _run(path, clients, apply=True, **_expectations(plan))
+    assert path.read_bytes() == plan.new_bytes
+    assert len(list(tmp_path.glob("*.receipt.json"))) == 1
+    assert len(list(tmp_path.glob("*.backup"))) == 1
+    monkeypatch.setattr(backfill, "_write_new", real_write)
+    assert _run(path, clients, apply=True, **_expectations(plan))["status"] == "recovered"
+    assert _run(path, clients, apply=True, **_expectations(plan))["status"] == "already_applied"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("timestamp_utc", "not-a-timestamp"),
+    ("rollback", "skip verification"),
+    ("readback_sha256", "0" * 64),
+    ("unexpected", True),
+])
+def test_recovery_refuses_any_prepared_receipt_schema_change(
+        tmp_path, monkeypatch, field, value):
+    path = tmp_path / "gym_accounts.json"
+    path.write_bytes(b'[{"base":"piercefitness"}]')
+    clients = _clients()
+    plan = _run(path, clients)["plan"]
+    real_write = backfill._write_new
+    monkeypatch.setattr(backfill, "_write_new",
+                        lambda target, data, mode: (
+                            (_ for _ in ()).throw(OSError("receipt failure"))
+                            if str(target).endswith(".receipt.json")
+                            else real_write(target, data, mode)))
+    with pytest.raises(backfill.BackfillBlocked):
+        _run(path, clients, apply=True, **_expectations(plan))
+    monkeypatch.setattr(backfill, "_write_new", real_write)
+    receipt_path = next(tmp_path.glob("*.receipt.json"))
+    receipt = json.loads(receipt_path.read_text())
+    receipt[field] = value
+    receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(backfill.BackfillBlocked, match="receipt disagrees"):
+        _run(path, clients, apply=True, **_expectations(plan))
+    assert path.read_bytes() == plan.new_bytes
+
+
+@pytest.mark.parametrize("link_target", ["backup", "receipt"])
+def test_recovery_rejects_symlinked_evidence(tmp_path, monkeypatch, link_target):
+    path = tmp_path / "gym_accounts.json"
+    path.write_bytes(b'[{"base":"piercefitness"}]')
+    clients = _clients()
+    plan = _run(path, clients)["plan"]
+    real_write = backfill._write_new
+    monkeypatch.setattr(backfill, "_write_new",
+                        lambda target, data, mode: (
+                            (_ for _ in ()).throw(OSError("receipt failure"))
+                            if str(target).endswith(".receipt.json")
+                            else real_write(target, data, mode)))
+    with pytest.raises(backfill.BackfillBlocked):
+        _run(path, clients, apply=True, **_expectations(plan))
+    monkeypatch.setattr(backfill, "_write_new", real_write)
+    evidence = next(tmp_path.glob("*." + ("backup" if link_target == "backup"
+                                  else "receipt.json")))
+    original = evidence.with_name("saved-" + evidence.name)
+    evidence.rename(original)
+    evidence.symlink_to(original)
+    with pytest.raises(backfill.BackfillBlocked, match="not a regular file"):
+        _run(path, clients, apply=True, **_expectations(plan))
+    assert path.read_bytes() == plan.new_bytes
+
+
+def test_multiple_equivalent_prepared_receipts_select_one_deterministically(
+        tmp_path, monkeypatch):
+    path = tmp_path / "gym_accounts.json"
+    path.write_bytes(b'[{"base":"piercefitness"}]')
+    clients = _clients()
+    plan = _run(path, clients)["plan"]
+    real_write = backfill._write_new
+
+    def fail_prewrite(target, data, mode):
+        if target == path:
+            raise OSError("prewrite failure")
+        return real_write(target, data, mode)
+
+    monkeypatch.setattr(backfill, "_write_new", fail_prewrite)
+    with pytest.raises(backfill.BackfillBlocked):
+        _run(path, clients, apply=True, **_expectations(plan))
+    monkeypatch.setattr(backfill, "_write_new", real_write)
+    first = next(tmp_path.glob("*.receipt.json"))
+    stamp = "20200101T000000.000000Z"
+    prefix = path.with_name(path.name + ".identity-backfill-" + stamp
+                            + "-" + plan.original_sha256[:12])
+    second_backup = prefix.with_name(prefix.name + ".backup")
+    second_receipt = prefix.with_name(prefix.name + ".receipt.json")
+    second_backup.write_bytes(path.read_bytes())
+    second_receipt.write_text(json.dumps(backfill._receipt_document(
+        path, second_backup, plan, stamp, COMMIT, "prepared")))
+    result = _run(path, clients, apply=True, **_expectations(plan))
+    assert result["status"] == "applied"
+    assert result["receipt"] == str(second_receipt)
+    assert json.loads(first.read_text())["status"] == "prepared"
+    assert _run(path, clients, apply=True, **_expectations(plan))["status"] == "already_applied"
+
+
+def test_multiple_applied_receipts_are_ambiguous(tmp_path):
+    path = tmp_path / "gym_accounts.json"
+    path.write_bytes(b'[{"base":"piercefitness"}]')
+    clients = _clients()
+    plan = _run(path, clients)["plan"]
+    _run(path, clients, apply=True, **_expectations(plan))
+    stamp = "20200101T000000.000000Z"
+    prefix = path.with_name(path.name + ".identity-backfill-" + stamp
+                            + "-" + plan.original_sha256[:12])
+    second_backup = prefix.with_name(prefix.name + ".backup")
+    second_receipt = prefix.with_name(prefix.name + ".receipt.json")
+    second_backup.write_bytes(b'[{"base":"piercefitness"}]')
+    second_receipt.write_text(json.dumps(backfill._receipt_document(
+        path, second_backup, plan, stamp, COMMIT, "applied")))
+    with pytest.raises(backfill.BackfillBlocked, match="multiple applied"):
+        _run(path, clients, apply=True, **_expectations(plan))
+    assert path.read_bytes() == plan.new_bytes
+
+
 @pytest.mark.parametrize("raw", [
     b'[{"base":"piercefitness","base":"hillcountry"}]',
     b'[{"base":"piercefitness"},{"base":"piercefitness"}]',

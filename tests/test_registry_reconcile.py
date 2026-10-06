@@ -126,6 +126,24 @@ def test_positive_marker_and_one_issued_key_can_register_without_calendar(monkey
     assert json.loads(path.read_text())[0]["gym_id"] == ZANSHIN
 
 
+@pytest.mark.parametrize("invalid_source", ["marker", "issued_owner", "gym_row"])
+def test_invalid_raw_uuid_source_never_reaches_register_gym(monkeypatch, tmp_path,
+                                                              invalid_source):
+    clients = echo_clients.build(
+        [{"gym_id": ZANSHIN + "_ig" if invalid_source == "marker" else ZANSHIN}],
+        [{"gym_id": ZANSHIN + "_ig" if invalid_source == "issued_owner" else ZANSHIN,
+          "echo_account_key": BASE}],
+        [{"id": ZANSHIN + "_ig" if invalid_source == "gym_row" else ZANSHIN,
+          "name": "Zanshin Fitness", "slug": "zanshin-fitness"}])
+    path = _registry(monkeypatch, tmp_path, clients)
+    monkeypatch.setattr(accounts, "register_gym",
+                        lambda *_a, **_kw: pytest.fail("register_gym was reached"))
+    result = registry_reconcile.reconcile(clients=clients,
+                                          calendar_rows=[_calendar()])
+    assert result["registered"] == []
+    assert not path.exists()
+
+
 def test_multiple_calendar_bases_for_one_client_are_held(monkeypatch, tmp_path):
     clients = _clients()
     path = _registry(monkeypatch, tmp_path, clients)

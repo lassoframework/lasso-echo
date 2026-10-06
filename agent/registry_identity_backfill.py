@@ -25,6 +25,7 @@ from . import config, echo_clients
 _BASE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_STAMP = re.compile(r"^\d{8}T\d{6}\.\d{6}Z$")
 _LEGACY_BASES = frozenset({
     "piercefitness", "theboltonclub", "crossfitlocal", "hillcountry",
     "crossfitreverb30b5b2", "crossfitnewtown", "toughtemple52040e",
@@ -299,51 +300,92 @@ def _write_private(path, raw):
         os.fsync(fh.fileno())
 
 
-def _recover_receipt(path, current_raw, clients, *, original_sha, new_sha,
-                     mappings_sha, deployed_commit):
-    """Finish an interrupted receipt only after reconstructing its entire plan."""
+def _receipt_document(path, backup, plan, stamp, commit, status):
+    rollback = ("Stop Echo publisher; verify current registry SHA-256 equals "
+                + plan.new_sha256 + "; acquire " + str(path) + ".lock; "
+                "copy the exact backup bytes to a sibling temp file, fsync, "
+                "atomically replace the registry, and verify SHA-256 equals "
+                + plan.original_sha256 + ". Resume only after an independent "
+                "readback and owner decision.")
+    receipt = {
+        "status": status, "timestamp_utc": stamp,
+        "registry_path": str(path), "backup_path": str(backup),
+        "row_count": plan.row_count, "mappings": list(plan.mappings),
+        "mappings_sha256": plan.mappings_sha256,
+        "original_sha256": plan.original_sha256,
+        "backup_sha256": plan.original_sha256,
+        "new_sha256": plan.new_sha256,
+        "expected_deployed_commit": commit,
+        "observed_deployed_commit": commit,
+        "rollback": rollback,
+    }
+    if status == "applied":
+        receipt["readback_sha256"] = plan.new_sha256
+    return receipt
+
+
+def _validated_receipts(path, clients, *, original_sha, new_sha,
+                        mappings_sha, deployed_commit):
+    """Validate every matching attempt; one bad or ambiguous file blocks all."""
     pattern = (path.name + ".identity-backfill-*-" + original_sha[:12]
                + ".receipt.json")
-    receipts = list(path.parent.glob(pattern))
-    if len(receipts) != 1:
-        raise BackfillBlocked("applied registry has no unique recovery receipt")
-    receipt_path = receipts[0]
-    backup = Path(str(receipt_path)[:-len(".receipt.json")] + ".backup")
-    _require_regular_registry(receipt_path)
-    _require_regular_registry(backup)
-    try:
-        receipt = json.loads(receipt_path.read_bytes(), object_pairs_hook=_unique_object)
-    except (ValueError, UnicodeDecodeError, TypeError) as exc:
-        raise BackfillBlocked("recovery receipt is malformed") from exc
-    if not isinstance(receipt, dict):
-        raise BackfillBlocked("recovery receipt is malformed")
-    backup_raw = backup.read_bytes()
-    prior = build_plan(backup_raw, clients)
-    if (prior.original_sha256 != original_sha or prior.new_sha256 != new_sha
-            or prior.mappings_sha256 != mappings_sha or prior.new_bytes != current_raw
-            or not prior.mappings):
+    attempts = []
+    for receipt_path in sorted(path.parent.glob(pattern)):
+        _require_regular_registry(receipt_path)
+        backup = Path(str(receipt_path)[:-len(".receipt.json")] + ".backup")
+        _require_regular_registry(backup)
+        prefix = path.name + ".identity-backfill-"
+        stamp = receipt_path.name[len(prefix):-len("-" + original_sha[:12]
+                                                   + ".receipt.json")]
+        if not _STAMP.fullmatch(stamp):
+            raise BackfillBlocked("recovery receipt timestamp is invalid")
+        try:
+            datetime.strptime(stamp, "%Y%m%dT%H%M%S.%fZ")
+            receipt = json.loads(receipt_path.read_bytes(), object_pairs_hook=_unique_object)
+        except (ValueError, UnicodeDecodeError, TypeError) as exc:
+            raise BackfillBlocked("recovery receipt is malformed") from exc
+        if not isinstance(receipt, dict):
+            raise BackfillBlocked("recovery receipt is malformed")
+        prior = build_plan(backup.read_bytes(), clients)
+        if (prior.original_sha256 != original_sha or prior.new_sha256 != new_sha
+                or prior.mappings_sha256 != mappings_sha or not prior.mappings):
+            raise BackfillBlocked("recovery backup does not reproduce the expected plan")
+        status = receipt.get("status")
+        if status not in ("prepared", "applied"):
+            raise BackfillBlocked("recovery receipt status is invalid")
+        if receipt != _receipt_document(path, backup, prior, stamp,
+                                        deployed_commit, status):
+            raise BackfillBlocked("recovery receipt disagrees with its backup or plan")
+        attempts.append((receipt_path, backup, prior, stamp, status))
+    if sum(status == "applied" for _, _, _, _, status in attempts) > 1:
+        raise BackfillBlocked("multiple applied recovery receipts are ambiguous")
+    return attempts
+
+
+def _recover_receipt(path, current_raw, clients, *, original_sha, new_sha,
+                     mappings_sha, deployed_commit):
+    """Finish one equivalent prepared attempt, or verify a settled applied one."""
+    attempts = _validated_receipts(
+        path, clients, original_sha=original_sha, new_sha=new_sha,
+        mappings_sha=mappings_sha, deployed_commit=deployed_commit)
+    if not attempts:
+        raise BackfillBlocked("applied registry has no recovery receipt")
+    if any(prior.new_bytes != current_raw for _, _, prior, _, _ in attempts):
         raise BackfillBlocked("recovery backup does not reproduce the applied registry")
-    expected_fields = {
-        "registry_path": str(path), "backup_path": str(backup),
-        "row_count": prior.row_count, "mappings": list(prior.mappings),
-        "mappings_sha256": mappings_sha, "original_sha256": original_sha,
-        "backup_sha256": original_sha, "new_sha256": new_sha,
-        "expected_deployed_commit": deployed_commit,
-        "observed_deployed_commit": deployed_commit,
-    }
-    if any(receipt.get(key) != value for key, value in expected_fields.items()):
-        raise BackfillBlocked("recovery receipt disagrees with its backup or plan")
-    if receipt.get("status") == "prepared":
-        receipt["status"] = "applied"
-        receipt["readback_sha256"] = new_sha
+    # All prepared attempts have independently reproduced the exact same bytes.
+    # Prefer the one already applied; otherwise the oldest attempt is stable.
+    chosen = next((attempt for attempt in attempts if attempt[4] == "applied"),
+                  attempts[0])
+    receipt_path, backup, prior, stamp, status = chosen
+    if status == "prepared":
         _write_new(receipt_path,
-                   (json.dumps(receipt, indent=2) + "\n").encode("utf-8"), 0o600)
+                   (json.dumps(_receipt_document(path, backup, prior, stamp,
+                                                 deployed_commit, "applied"),
+                               indent=2) + "\n").encode("utf-8"), 0o600)
         status = "recovered"
-    elif receipt.get("status") == "applied" and receipt.get("readback_sha256") == new_sha:
+    else:
         _fsync_dir(path.parent)  # also settles a prior receipt-replace fsync failure
         status = "already_applied"
-    else:
-        raise BackfillBlocked("recovery receipt has an invalid status or readback")
     return {"status": status, "backup": str(backup), "receipt": str(receipt_path),
             "receipt_sha256": _sha(receipt_path.read_bytes())}
 
@@ -396,35 +438,31 @@ def execute(*, apply=False, expected_original_sha256=None, expected_new_sha256=N
             if not plan.mappings:
                 return {"status": "already_applied", "plan": plan}
 
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-            prefix = path.with_name(path.name + ".identity-backfill-" + stamp
-                                    + "-" + plan.original_sha256[:12])
-            backup = Path(str(prefix) + ".backup")
-            receipt_path = Path(str(prefix) + ".receipt.json")
-            _write_private(backup, raw)
-            _fsync_dir(path.parent)
-            if _sha(backup.read_bytes()) != plan.original_sha256:
-                raise BackfillBlocked("before-state backup checksum failed")
-            receipt = {
-                "status": "prepared", "timestamp_utc": stamp,
-                "registry_path": str(path), "backup_path": str(backup),
-                "row_count": plan.row_count, "mappings": list(plan.mappings),
-                "mappings_sha256": plan.mappings_sha256,
-                "original_sha256": plan.original_sha256,
-                "backup_sha256": _sha(backup.read_bytes()),
-                "new_sha256": plan.new_sha256,
-                "expected_deployed_commit": expected_deployed_commit.lower(),
-                "observed_deployed_commit": observed,
-                "rollback": ("Stop Echo publisher; verify current registry SHA-256 equals "
-                             + plan.new_sha256 + "; acquire " + str(path) + ".lock; "
-                             "copy the exact backup bytes to a sibling temp file, fsync, "
-                             "atomically replace the registry, and verify SHA-256 equals "
-                             + plan.original_sha256 + ". Resume only after an independent "
-                             "readback and owner decision."),
-            }
-            _write_private(receipt_path,
-                           (json.dumps(receipt, indent=2) + "\n").encode("utf-8"))
-            _fsync_dir(path.parent)
+            attempts = _validated_receipts(
+                path, clients, original_sha=plan.original_sha256,
+                new_sha=plan.new_sha256, mappings_sha=plan.mappings_sha256,
+                deployed_commit=expected_deployed_commit.lower())
+            if any(status == "applied" for _, _, _, _, status in attempts):
+                raise BackfillBlocked("registry differs from an applied recovery receipt")
+            if attempts:
+                receipt_path, backup, prior, stamp, _ = attempts[0]
+                if prior.original_sha256 != _sha(raw):
+                    raise BackfillBlocked("prepared backup differs from current registry")
+            else:
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+                prefix = path.with_name(path.name + ".identity-backfill-" + stamp
+                                        + "-" + plan.original_sha256[:12])
+                backup = Path(str(prefix) + ".backup")
+                receipt_path = Path(str(prefix) + ".receipt.json")
+                _write_private(backup, raw)
+                _fsync_dir(path.parent)
+                if _sha(backup.read_bytes()) != plan.original_sha256:
+                    raise BackfillBlocked("before-state backup checksum failed")
+                receipt = _receipt_document(path, backup, plan, stamp,
+                                            observed, "prepared")
+                _write_private(receipt_path,
+                               (json.dumps(receipt, indent=2) + "\n").encode("utf-8"))
+                _fsync_dir(path.parent)
             _require_regular_registry(path)
             mode = stat.S_IMODE(path.stat().st_mode)
             _write_new(path, plan.new_bytes, mode)
@@ -439,11 +477,11 @@ def execute(*, apply=False, expected_original_sha256=None, expected_new_sha256=N
             for mapping in plan.mappings:
                 if rows[mapping["row_index"]].get("gym_id") != mapping["gym_id"]:
                     raise BackfillBlocked("post-write identity readback failed; see backup and receipt")
-            receipt["status"] = "applied"
-            receipt["readback_sha256"] = _sha(readback)
             # Preserve the prepared receipt until the applied version is fsynced.
             _write_new(receipt_path,
-                       (json.dumps(receipt, indent=2) + "\n").encode("utf-8"),
+                       (json.dumps(_receipt_document(path, backup, plan, stamp,
+                                                     observed, "applied"),
+                                   indent=2) + "\n").encode("utf-8"),
                        0o600)
             return {"status": "applied", "plan": plan, "backup": str(backup),
                     "receipt": str(receipt_path),
