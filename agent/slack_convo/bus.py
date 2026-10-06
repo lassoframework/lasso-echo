@@ -22,6 +22,7 @@ matching" at runtime. Catching the violation is the reliable form.
 """
 import json
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from . import testdata as _td
@@ -34,6 +35,7 @@ OPEN_STATUSES = ("new", "triage", "fixing", "verification", "hold", "approved")
 _UUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
+_FIXER_RECEIPT_NAMESPACE = uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be")
 
 
 def _a_kind_escalation():
@@ -535,6 +537,47 @@ class Bus:
         data = r.json() or []
         return bool(data)
 
+    def claim_fixer_message(self, message_id, expected_attachments, claimed_at,
+                            protocol):
+        """Atomically claim a modern FIXER row and stamp its pre-POST protocol.
+
+        A crash after this PATCH but before delivery-intent persistence is therefore
+        distinguishable from an unmarked legacy posting whose send outcome is unknown.
+        The complete attachment snapshot prevents a concurrent release/edit from being
+        overwritten by the claim metadata write.
+        """
+        snapshot = dict(expected_attachments or {})
+        next_att = {**snapshot, "claimed_at": claimed_at,
+                    "fixer_slack_delivery_protocol": protocol}
+        changed = self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.ready",
+            "attachments": ("is.null" if expected_attachments is None else
+                            "eq." + json.dumps(snapshot, separators=(",", ":"),
+                                               sort_keys=True)),
+        }, {"delivery_status": "posting", "attachments": next_att})
+        return bool(changed)
+
+    def requeue_unattempted_fixer_delivery(self, message_id, protocol, recovered_at):
+        """CAS a stale modern pre-intent claim back to ready; Slack was not called."""
+        row = self.message(message_id)
+        raw_att = (row or {}).get("attachments")
+        snapshot = dict(raw_att or {})
+        if (not row or row.get("delivery_status") != "posting"
+                or snapshot.get("fixer_slack_delivery_protocol") != protocol
+                or snapshot.get("fixer_slack_delivery_intent") is not None
+                or snapshot.get("fixer_slack_delivery_uncertain")
+                or row.get("slack_ts")):
+            return None
+        next_att = {**snapshot, "reclaimed_stale_pre_intent_at": recovered_at,
+                    "claimed_at": recovered_at}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.posting",
+            "slack_ts": "is.null",
+            "attachments": ("is.null" if raw_att is None else
+                            "eq." + json.dumps(snapshot, separators=(",", ":"),
+                                               sort_keys=True)),
+        }, {"delivery_status": "ready", "attachments": next_att})
+
     def count_outbound_kind_since(self, ticket_id, kind, since_iso):
         """Server-side count of outbound rows of one `kind` on a ticket since a timestamp.
         Used for the daily noise caps (N3/RA-M3): a client-side scan of bus.messages(tid,
@@ -923,6 +966,31 @@ class Bus:
             "select": "id", "limit": "1",
         })
         return bool(rows)
+
+    def record_fixer_receipt_once(self, *, source_message_id, ticket_id,
+                                  author_type, body, delivery_status, kind, meta):
+        """Insert exactly one receipt for a delivered FIXER message.
+
+        The receipt's deterministic UUID is the database uniqueness boundary. Two
+        processes may race this INSERT; one wins and the other reads that same row.
+        """
+        receipt_id = str(uuid.uuid5(
+            _FIXER_RECEIPT_NAMESPACE, str(source_message_id)))
+        att = {"kind": kind, **dict(meta or {}),
+               "receipt": True, "receipt_for": str(source_message_id)}
+        row = {"id": receipt_id, "ticket_id": ticket_id,
+               "author_type": author_type, "author_id": None,
+               "body": (body or "")[:8000], "attachments": att,
+               "direction": "outbound", "delivery_status": delivery_status}
+        created, duplicate = self._insert(_MESSAGES, row)
+        if not duplicate:
+            return created
+        existing = self.message(receipt_id)
+        if ((existing or {}).get("ticket_id") == ticket_id
+                and ((existing or {}).get("attachments") or {}).get(
+                    "receipt_for") == str(source_message_id)):
+            return existing
+        raise BusError(409, "FIXER receipt id collision")
 
     def finalize_fixer_delivery(self, message_id, reason):
         row = self.message(message_id)

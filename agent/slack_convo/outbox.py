@@ -782,6 +782,7 @@ def escalation_blocks(row, ticket):
 
 
 CLAIM_TIMEOUT_SECONDS = 90
+FIXER_DELIVERY_PROTOCOL = "intent-readback-v1"
 
 
 class UncertainFixerDelivery(RuntimeError):
@@ -961,31 +962,40 @@ def _quarantine_fixer(bus, row_id, reason, log):
 
 
 def _claim(bus, row, log):
-    """Ready/held -> posting, a conditional PATCH only one caller can win (N4). Also stamps
-    claimed_at (a second, non-atomic write, but safe: we already exclusively own the row --
-    the CAS matched only for us) so _recover_stale_claims can tell a row that just started
-    posting from one truly orphaned by a crash (D26)."""
+    """Ready -> posting through a conditional PATCH only one caller can win (N4).
+
+    Modern FIXER claims stamp their recovery protocol and timestamp in that same
+    CAS. Legacy/non-FIXER callers retain the older best-effort timestamp write.
+    """
+    claimed_at = datetime.now(timezone.utc).isoformat()
+    modern_claim = getattr(bus, "claim_fixer_message", None)
     try:
-        if not bus.claim_message(row["id"]):
+        if _fixer_client_row(row) and callable(modern_claim):
+            claimed = modern_claim(
+                row["id"], row.get("attachments"), claimed_at,
+                FIXER_DELIVERY_PROTOCOL)
+        else:
+            claimed = bus.claim_message(row["id"])
+        if not claimed:
             return False
     except AttributeError:
         return True  # a bus without claim support (older fakes): best effort, no CAS
     except Exception as e:  # noqa: BLE001
         log(f"[slack-convo/outbox] claim failed for row {row['id']}: {type(e).__name__}")
         return False
-    try:
-        bus.mark_message(row["id"], "posting",
-                         meta_update={"claimed_at": datetime.now(timezone.utc).isoformat()})
-    except Exception:  # noqa: BLE001 - best-effort stamp; the claim itself already succeeded
-        pass
+    if not (_fixer_client_row(row) and callable(modern_claim)):
+        try:
+            bus.mark_message(row["id"], "posting", meta_update={"claimed_at": claimed_at})
+        except Exception:  # noqa: BLE001 - legacy/non-FIXER best-effort stamp
+            pass
     return True
 
 
 def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=None):
-    """A row still 'posting' after CLAIM_TIMEOUT_SECONDS is orphaned -- either a crash
-    between claim and mark in THIS process, or (D26, the scenario the claim step exists for)
-    a redeploy overlap / second consumer per D2 that crashed mid-post. Swept back to 'ready'
-    so it is retried rather than stuck forever.
+    """Reconcile rows orphaned in ``posting`` after CLAIM_TIMEOUT_SECONDS.
+
+    A modern FIXER claim without an intent is provably pre-POST and can be CAS-requeued.
+    A legacy unmarked FIXER claim has an unknowable send boundary and is quarantined.
 
     D26 (2026-09-03, MAJOR): this used to sweep EVERY 'posting' row unconditionally, with no
     staleness check. Under exactly the multi-consumer scenario it exists to protect against,
@@ -1008,8 +1018,18 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
             continue  # plausibly still in flight; do not steal it
         try:
             if _fixer_client_row(row):
-                intent = (row.get("attachments") or {}).get("fixer_slack_delivery_intent")
+                att = row.get("attachments") or {}
+                intent = att.get("fixer_slack_delivery_intent")
                 if not isinstance(intent, dict):
+                    if att.get("fixer_slack_delivery_protocol") == FIXER_DELIVERY_PROTOCOL:
+                        requeue = getattr(bus, "requeue_unattempted_fixer_delivery", None)
+                        if callable(requeue):
+                            recovered_at = (now or datetime.now(timezone.utc)).isoformat()
+                            reset = requeue(
+                                row["id"], FIXER_DELIVERY_PROTOCOL, recovered_at)
+                            if reset and reset.get("delivery_status") == "ready":
+                                n += 1
+                            continue
                     n += int(_quarantine_fixer(
                         bus, row["id"], "legacy FIXER posting has no durable Slack intent; "
                         "check the client conversation before any resend", log))
@@ -2209,7 +2229,11 @@ def _receipt(bus, ticket, row, identity, kind, att, *, where, summary):
         if (att or {}).get("released_by") == "fixer":
             how = "sent automatically by FIXER"
         owner = f"<@{config.APPROVER_SLACK_ID}> " if (att or {}).get("fixer") else ""
-        bus.record_outbound(
+        writer = getattr(bus, "record_fixer_receipt_once", None)
+        if not callable(writer):
+            return
+        writer(
+            source_message_id=row["id"],
             ticket_id=ticket["id"], author_type="system",
             body=(f"{owner}RECEIPT: the client was told this, {how}.\n"
                   f"BOT: {identity.name}   TICKET: {ticket['id']}   KIND: {kind}\n"

@@ -49,6 +49,7 @@ class FakeBus:
         self.calls = []
         self.tables = {}
         self.now = datetime.now(timezone.utc)
+        self._atomic_lock = threading.Lock()
 
     def _ts(self):
         return self.now.isoformat()
@@ -216,6 +217,37 @@ class FakeBus:
                 m["delivery_status"] = "posting"
                 return True
         return False
+
+    def claim_fixer_message(self, mid, expected_attachments, claimed_at, protocol):
+        with self._atomic_lock:
+            for m in self.msgs:
+                if (m["id"] == mid and m["delivery_status"] == "ready"
+                        and (m.get("attachments") or {}) == (expected_attachments or {})):
+                    m["delivery_status"] = "posting"
+                    m["attachments"] = {
+                        **(m.get("attachments") or {}),
+                        "claimed_at": claimed_at,
+                        "fixer_slack_delivery_protocol": protocol,
+                    }
+                    return True
+        return False
+
+    def requeue_unattempted_fixer_delivery(self, mid, protocol, recovered_at):
+        with self._atomic_lock:
+            row = next((m for m in self.msgs if m["id"] == mid), None)
+            att = (row or {}).get("attachments") or {}
+            if (not row or row.get("delivery_status") != "posting"
+                    or att.get("fixer_slack_delivery_protocol") != protocol
+                    or att.get("fixer_slack_delivery_intent") is not None
+                    or att.get("fixer_slack_delivery_uncertain")
+                    or row.get("slack_ts")):
+                return None
+            row["delivery_status"] = "ready"
+            row["attachments"] = {
+                **att, "reclaimed_stale_pre_intent_at": recovered_at,
+                "claimed_at": recovered_at,
+            }
+            return dict(row)
 
     def count_outbound_kind_since(self, tid, kind, since_iso):
         return sum(1 for m in self.msgs
@@ -406,6 +438,25 @@ class FakeBus:
     def fixer_receipt_exists(self, mid):
         return any((m.get("attachments") or {}).get("receipt_for") == mid
                    for m in self.msgs)
+
+    def record_fixer_receipt_once(self, *, source_message_id, ticket_id,
+                                  author_type, body, delivery_status, kind, meta):
+        receipt_id = str(uuid.uuid5(
+            uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be"),
+            str(source_message_id)))
+        with self._atomic_lock:
+            existing = next((m for m in self.msgs if m["id"] == receipt_id), None)
+            if existing:
+                return dict(existing)
+            att = {"kind": kind, **dict(meta or {}), "receipt": True,
+                   "receipt_for": str(source_message_id)}
+            row = {"id": receipt_id, "direction": "outbound",
+                   "ticket_id": ticket_id, "author_type": author_type,
+                   "body": body, "delivery_status": delivery_status,
+                   "attachments": att, "slack_ts": None,
+                   "created_at": self._ts()}
+            self.msgs.append(row)
+            return dict(row)
 
     def finalize_fixer_delivery(self, mid, reason):
         row = self.message(mid)
@@ -2659,6 +2710,76 @@ def test_fixer_crash_before_timestamp_persistence_holds_without_second_post(monk
     assert len([call for call in sent if call[0] == "C_CLIENT"]) == 1
 
 
+def test_modern_fixer_crash_after_claim_before_intent_requeues_once_and_delivers(
+        monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    assert OB._claim(bus, row, lambda *_: None) is True
+    claimed = bus.message(row["id"])
+    assert claimed["attachments"]["fixer_slack_delivery_protocol"] == (
+        OB.FIXER_DELIVERY_PROTOCOL)
+    assert claimed["attachments"].get("fixer_slack_delivery_intent") is None
+    stale = datetime.now(timezone.utc) - timedelta(
+        seconds=OB.CLAIM_TIMEOUT_SECONDS + 30)
+    bus.mark_message(row["id"], "posting", meta_update={"claimed_at": stale.isoformat()})
+
+    original_requeue = bus.requeue_unattempted_fixer_delivery
+    both_saw_stale = threading.Barrier(2)
+    recovered = []
+
+    def racing_requeue(*args):
+        both_saw_stale.wait(timeout=2)
+        return original_requeue(*args)
+
+    bus.requeue_unattempted_fixer_delivery = racing_requeue
+
+    def sweep():
+        recovered.append(OB._recover_stale_claims(
+            bus, IDS.get("echo"), lambda *_: None,
+            now=datetime.now(timezone.utc)))
+
+    workers = [threading.Thread(target=sweep) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=3)
+    assert all(not worker.is_alive() for worker in workers)
+    assert sum(recovered) == 1
+    reset = bus.message(row["id"])
+    assert reset["delivery_status"] == "ready"
+    assert reset["attachments"].get("fixer_slack_delivery_uncertain") is not True
+    assert reset.get("slack_ts") is None
+
+    bus.requeue_unattempted_fixer_delivery = original_requeue
+    post, calls = _posted()
+    first = OB.run_once(bus, post, identity=IDS.get("echo"),
+                        member_check=lambda *_: True, log=lambda *_: None)
+    second = OB.run_once(bus, post, identity=IDS.get("echo"),
+                         member_check=lambda *_: True, log=lambda *_: None)
+    assert first["posted"] == first["resolved"] == 1
+    assert second["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "resolved"
+    assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
+
+
+def test_legacy_fixer_stale_posting_without_protocol_remains_quarantined(monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    assert bus.claim_message(row["id"]) is True
+    stale = datetime.now(timezone.utc) - timedelta(
+        seconds=OB.CLAIM_TIMEOUT_SECONDS + 30)
+    bus.mark_message(row["id"], "posting", meta_update={"claimed_at": stale.isoformat()})
+
+    recovered = OB._recover_stale_claims(
+        bus, IDS.get("echo"), lambda *_: None, now=datetime.now(timezone.utc))
+
+    held = bus.message(row["id"])
+    assert recovered == 1
+    assert held["delivery_status"] == "held"
+    assert held["attachments"]["fixer_slack_delivery_uncertain"] is True
+    assert bus.ticket(tid)["status"] == "verification"
+
+
 @pytest.mark.parametrize("offset_seconds", [-10, 10])
 def test_fixer_crash_before_post_never_claims_identical_other_echo_reply(
         monkeypatch, offset_seconds):
@@ -3087,8 +3208,10 @@ def test_fixer_route_late_arrival_requeues_same_row_once_and_posts(monkeypatch):
     assert ready["attachments"].get("fixer_slack_delivery_intent") is None
 
     bus.requeue_route_missing_fixer = original_requeue
-    summary = OB.run_once(bus, post, identity=IDS.get("echo"),
-                          member_check=lambda *_: True, log=lambda *_: None)
+    summary = OB.run_once(
+        bus, post, identity=IDS.get("echo"), member_check=lambda *_: True,
+        log=lambda *_: None,
+        now=datetime(2026, 10, 6, 3, 0, tzinfo=timezone.utc))
     assert summary["posted"] >= 1
     assert bus.message(row["id"])["delivery_status"] == "posted"
     assert bus.ticket(tid)["status"] == "resolved"
@@ -3150,6 +3273,59 @@ def test_verified_fixer_post_retries_ticket_close_without_reposting(monkeypatch)
     assert bus.ticket(tid)["status"] == "resolved"
     assert bus.message(row["id"])["attachments"]["fixer_delivery_finalized_reason"] == (
         "resolved_after_verified_slack")
+
+
+def test_concurrent_fixer_finalizers_create_exactly_one_durable_receipt(monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    original_exists = bus.fixer_receipt_exists
+
+    def unreadable_receipts(_mid):
+        raise RuntimeError("receipt read unavailable")
+
+    bus.fixer_receipt_exists = unreadable_receipts
+    post, calls = _posted()
+    first = OB.run_once(bus, post, identity=IDS.get("echo"),
+                        member_check=lambda *_: True, log=lambda *_: None)
+    assert first["posted"] == first["resolved"] == 1
+    assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
+    assert not original_exists(row["id"])
+    assert not bus.message(row["id"])["attachments"].get(
+        "fixer_delivery_finalized_at")
+
+    bus.fixer_receipt_exists = original_exists
+    original_write = bus.record_fixer_receipt_once
+    both_checked_absent = threading.Barrier(2)
+    failures = []
+
+    def racing_write(**kwargs):
+        both_checked_absent.wait(timeout=2)
+        return original_write(**kwargs)
+
+    bus.record_fixer_receipt_once = racing_write
+
+    def finalize():
+        try:
+            OB._finalize_fixer_post(
+                bus, bus.ticket(tid), bus.message(row["id"]), IDS.get("echo"),
+                lambda *_: None, {"resolved": 0})
+        except Exception as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+
+    workers = [threading.Thread(target=finalize) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=3)
+
+    assert not failures
+    assert all(not worker.is_alive() for worker in workers)
+    receipts = [m for m in bus.messages_for(tid)
+                if (m.get("attachments") or {}).get("receipt_for") == row["id"]]
+    assert len(receipts) == 1
+    assert receipts[0]["id"] == str(uuid.uuid5(
+        uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be"), row["id"]))
+    assert bus.message(row["id"])["attachments"]["fixer_delivery_finalized_at"]
     assert len([c for c in calls if c["channel"] == "C_CLIENT"]) == 1
 
 
@@ -3680,14 +3856,14 @@ def test_fixer_recomputes_slack_transport_after_conversation_is_bound_during_cla
     bus, tid, row, _ = _grounded_fixer_answer_case()
     bus.tickets[tid]["slack_channel_id"] = None
     bus.tickets[tid]["slack_thread_ts"] = None
-    original_claim = bus.claim_message
+    original_claim = bus.claim_fixer_message
 
-    def claim_and_bind(mid):
-        claimed = original_claim(mid)
+    def claim_and_bind(mid, expected_attachments, claimed_at, protocol):
+        claimed = original_claim(mid, expected_attachments, claimed_at, protocol)
         bus.set_ticket(tid, slack_channel_id="C_CLIENT", slack_thread_ts="1.0")
         return claimed
 
-    monkeypatch.setattr(bus, "claim_message", claim_and_bind)
+    monkeypatch.setattr(bus, "claim_fixer_message", claim_and_bind)
     post, calls = _posted()
     membership_checks = []
     summary = OB.run_once(
