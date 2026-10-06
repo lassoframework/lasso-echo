@@ -1356,6 +1356,72 @@ def test_redate_moves_ledger_stamp_only_after_matching_old_date_peers_leave(
     }
 
 
+@pytest.mark.parametrize("proof,expected_status", [(False, "approved"),
+                                                     (True, "pending")])
+def test_redate_proof_mode_invalidates_approval_atomically(
+        monkeypatch, proof, expected_status):
+    old = {"id": "row-1", "gym_id": "eng", "post_date": "2026-09-29",
+           "caption": "Shared caption", "status": "approved"}
+    updated = dict(old, post_date="2026-10-04", status=expected_status,
+                   scheduled_at=None)
+    http = _FakeHTTP(get_resp=_Resp(200, [old]),
+                     patch_resp=_Resp(200, [updated]))
+    monkeypatch.setattr(pcs.config, "approval_proof_enabled", lambda: proof)
+    monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: False)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().patch_post_date("row-1", "2026-10-04")
+
+    assert result == updated
+    assert http.calls[0][2]["select"] == "id,gym_id,post_date,caption,status"
+    assert http.calls[1][2]["status"] == "eq.approved"
+    payload = http.calls[1][4]
+    if proof:
+        assert payload == {
+            "post_date": "2026-10-04", "scheduled_at": None,
+            "approval_kind": None, "approved_by": None,
+            "approved_at": None, "approval_digest": None,
+            "status": "pending",
+        }
+    else:
+        assert payload == {"post_date": "2026-10-04", "scheduled_at": None}
+
+
+@pytest.mark.parametrize("caption,expected", [
+    ('caption, with "quotes" (and parens)', 'eq.caption, with "quotes" (and parens)'),
+    ("caption\\with-backslash", None),
+])
+def test_meta_sweep_caption_cas_uses_safe_equality_filter(
+        monkeypatch, caption, expected):
+    http = _FakeHTTP(patch_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    store = pcs.SupabaseCalendarStore()
+
+    if expected is None:
+        with pytest.raises(pcs.PortalStoreError, match="equality encoding"):
+            store.patch_caption_for_meta_sweep(
+                "eng", "row-1", "clean", expected_status="approved",
+                expected_caption=caption)
+        assert http.calls == []
+    else:
+        store.patch_caption_for_meta_sweep(
+            "eng", "row-1", "clean", expected_status="approved",
+            expected_caption=caption)
+        assert http.calls[0][2]["caption"] == expected
+
+
+@pytest.mark.parametrize("status", ["draft", "queued", "failed"])
+def test_meta_sweep_proof_writer_accepts_documented_waiting_states(
+        monkeypatch, status):
+    http = _FakeHTTP(patch_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    result = pcs.SupabaseCalendarStore().patch_caption_for_meta_sweep(
+        "eng", "row-1", "clean", expected_status=status,
+        expected_caption="dirty caption")
+    assert result is None
+    assert http.calls[0][2]["status"] == f"eq.{status}"
+
+
 # ---- CROSS-DAY MEDIA BELT on insert_rows (fleet audit, 2026-08-31) -------------
 #
 # agent/media_guard.py shipped calling itself "the shared cross-day media guard for

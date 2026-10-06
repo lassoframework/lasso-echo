@@ -6,10 +6,12 @@ store's own _get. Offline via a fake base store capturing PostgREST params.
 
 import os
 import sys
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent.gbp_store import GbpStore  # noqa: E402
+from agent.portal_calendar_store import SupabaseCalendarStore  # noqa: E402
 
 
 class _FakeBase:
@@ -208,6 +210,10 @@ class _Http:
         self.calls.append({"params": params or {}, "json": json or {}})
         return self.responses.pop(0)
 
+    def post(self, url, params=None, headers=None, json=None, timeout=None):
+        self.calls.append({"url": url, "json": json or {}})
+        return self.responses.pop(0)
+
 
 class _Base:
     _url, _key = "u", "k"
@@ -367,3 +373,82 @@ def test_claim_publishing_returned_row_with_hold_or_blank_image_raises_and_retai
             assert e.status == 409
         # exactly one HTTP call (the claim PATCH); no release/overwrite followed
         assert len(http.calls) == 1
+
+# Proof-gated GBP claims use the database RPC exclusively.
+def _proof_row(**changes):
+    row = dict(id="r1", gym_id="gym", account="googlebusiness", status="publishing",
+               variant_status="active", image_url="https://cdn/current.jpg",
+               publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111")
+    row.update(changes)
+    return row
+
+
+class _ProofHttp(_Http):
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.calls.append({"url": url, "json": json})
+        return self.responses.pop(0)
+
+
+def test_proof_claim_returns_locked_creative_and_never_patches(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    current = _proof_row(caption="current creative")
+    http = _ProofHttp([_Resp({"row": current, "autonomous_at_claim": True})])
+    out = GbpStore(base=_Base(http)).claim_publishing("r1", gym_id="gym")
+    assert out == dict(current, autonomous_at_claim=True)
+    assert http.calls == [{"url": "https://x/rpc/claim_calendar_gbp_publish_with_mode_owned",
+                           "json": {"p_row_id": "r1", "p_gym_id": "gym"}}]
+
+
+@pytest.mark.parametrize("response", [{}, {"row": _proof_row()},
+    {"row": _proof_row(), "autonomous_at_claim": 1},
+    {"row": _proof_row(gym_id="other"), "autonomous_at_claim": False},
+    {"row": _proof_row(status="approved"), "autonomous_at_claim": False},
+    {"row": _proof_row(publish_claim_token="bad"), "autonomous_at_claim": False},
+    {"row": _proof_row(image_url=" "), "autonomous_at_claim": False},
+    {"row": _proof_row(), "autonomous_at_claim": False, "extra": True}])
+def test_proof_claim_denial_or_invalid_response_never_falls_back(response):
+    http = _ProofHttp([_Resp(response)])
+    store = GbpStore(base=_Base(http))
+    with pytest.raises(PortalStoreError):
+        store.claim_publishing("r1", gym_id="gym", require_proof=True)
+    assert len(http.calls) == 1 and "rpc/" in http.calls[0]["url"]
+
+
+def test_proof_claim_rpc_refusal_returns_none_without_fallback():
+    http = _ProofHttp([_Resp(None)])
+    store = GbpStore(base=_Base(http))
+    assert store.claim_publishing("r1", gym_id="gym", require_proof=True) is None
+    assert len(http.calls) == 1 and "rpc/" in http.calls[0]["url"]
+
+
+def test_proof_claim_missing_rpc_holds_without_legacy_patch():
+    http = _ProofHttp([_Resp(None, status_code=404)])
+    with pytest.raises(PortalStoreError):
+        GbpStore(base=_Base(http)).claim_publishing("r1", gym_id="gym", require_proof=True)
+    assert len(http.calls) == 1
+
+
+def test_auto_caption_cleanup_uses_mode_locked_rpc_and_preserves_approved():
+    before = "Useful copy.\n[why] internal rationale"
+    updated = {"id": "r1", "gym_id": "gym", "account": "googlebusiness",
+               "status": "approved", "caption": "Useful copy.",
+               "publish_claim_token": None}
+    http = _Http([_Resp([updated])])
+    portal = SupabaseCalendarStore(url="https://x", service_key="svc", http=http)
+    out = portal.patch_caption_for_gbp_auto_cleanup(
+        "gym", "r1", "Useful copy.", expected_caption=before)
+    assert out == updated
+    assert http.calls == [{
+        "url": "https://x/rest/v1/rpc/calendar_patch_caption_autonomous_clean",
+        "json": {"p_row_id": "r1", "p_gym_id": "gym",
+                 "p_expected_status": "approved", "p_expected_caption": before,
+                 "p_clean_caption": "Useful copy."},
+    }]
+
+
+def test_auto_caption_cleanup_rpc_cas_miss_never_falls_back_to_patch():
+    http = _Http([_Resp([])])
+    portal = SupabaseCalendarStore(url="https://x", service_key="svc", http=http)
+    assert portal.patch_caption_for_gbp_auto_cleanup(
+        "gym", "r1", "Useful copy.", expected_caption="Useful copy.\n[why] x") is None
+    assert len(http.calls) == 1 and "rpc/calendar_patch_caption_autonomous_clean" in http.calls[0]["url"]

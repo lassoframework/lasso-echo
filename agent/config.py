@@ -669,6 +669,44 @@ def calendar_autopublish_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CALENDAR_AUTOPUBLISH", "false"))
 
 
+def approval_proof_enabled() -> bool:
+    """
+    Durable approval-provenance enforcement for the CLIENT Manual publish lane.
+    OFF by default = zero behavior change: the atomic claim RPC is never asked
+    to require proof (p_require_approval_proof stays FALSE) and live publishing
+    is byte-for-byte today's behavior. When ON, EVERY lane passes require_proof
+    to claim_calendar_publish_slot_owned, which re-reads the gym's CURRENT
+    autonomy from the DB inside the claim transaction (an Auto->Manual flip is
+    effective atomically; resolver ambiguity fails closed). A gym that is
+    definitively autonomous keeps today's behavior; any other gym's row needs a
+    fresh VERIFIED HUMAN approval -- approval_kind='human' plus a NONEMPTY
+    trusted approved_by, stampable only by the portal's service-role
+    calendar_stamp_verified_approval after Echo's token-scoped approve (which
+    leaves provenance UNPROVED) -- whose canonical digest matches the row's
+    current publish-relevant fields: caption, account, format, date, the FINAL
+    image_url and the rendered/source identity (byte_hash /
+    source_media_asset_id / source_media_url); the publisher-stamped
+    scheduled_at is not bound. Any post-approval media change (auto-fit
+    reframe, story reburn, swap) changes image_url and fails the row CLOSED
+    into fresh review. ACTIVATION GATE: before arming, every intended-autonomous gym must
+    have exactly one clean gyms row and one echo_gym_settings row with
+    autonomous=true, or its lane fails closed. Requires migration
+    calendar_approval_provenance_20261005.sql; an unapplied migration fails
+    closed (the RPC rejects the claim, nothing publishes).
+    """
+    return _truthy(os.environ.get("AGENT_APPROVAL_PROOF", "false"))
+
+
+def approval_capture_enabled() -> bool:
+    """Capture exact-card approval digests without enforcing them at publish.
+
+    OFF by default. When ON, Echo requires the portal's visible-card snapshot
+    on approval and recovery taps. AGENT_APPROVAL_PROOF independently controls
+    the publisher's proof requirement.
+    """
+    return _truthy(os.environ.get("AGENT_APPROVAL_CAPTURE", "false"))
+
+
 def real_month_plan_enabled() -> bool:
     """
     REAL month planner switch. OFF by default = zero behavior change: the planner is
