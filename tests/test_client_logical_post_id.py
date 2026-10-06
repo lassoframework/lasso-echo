@@ -342,7 +342,7 @@ def test_prewrite_identity_abort_restores_released_drive_assets(monkeypatch):
                         lambda *a, **k: SimpleNamespace(stop=lambda: None))
     monkeypatch.setattr(build_lock, "release", lambda *a, **k: None)
     monkeypatch.setattr(cmr, "_locked_calendar_state",
-                        lambda *a, **k: (set(), set()))
+                        lambda *a, **k: (set(), set(), set()))
 
     released = [("asset-1", "2026-10-15")]
     observations = {"restored": []}
