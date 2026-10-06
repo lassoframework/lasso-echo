@@ -123,6 +123,7 @@ def test_clean_no_people_writes_evidence_and_auto_approves():
     assert ev["gym_id"] == GYM
     assert ev["people_detected"] is False
     assert ev["observed_at"] == NOW
+    assert ev["sha256"] == hashlib.sha256(PHOTO_BYTES).hexdigest()
     assert selector._clean_moderation_evidence(row) is True
     assert row["review_status"] == "approved"
     assert row["reviewed_by"] == "automatic_moderation"
@@ -527,6 +528,126 @@ def test_update_moderation_asset_zero_rows_is_409():
         store.update_moderation_asset(GYM, ASSET_ID, _valid_fields(),
                                       expected_content_hash="h1")
     assert ei.value.status == 409
+
+
+def _approved_without_sha(blob=PHOTO_BYTES):
+    asset = _pending_asset(blob)
+    asset.update({
+        "review_status": "approved", "reviewed_by": "automatic_moderation",
+        "reviewed_at": NOW, "review_content_hash": asset["content_hash"],
+        "moderation_status": "clean", "consent_status": "not_required",
+        "people_detected": False,
+        "moderation_json": {
+            "verdict": "clean", "provider": "gemini:test",
+            "content_hash": asset["content_hash"], "asset_id": ASSET_ID,
+            "gym_id": GYM, "people_detected": False, "observed_at": NOW,
+        },
+    })
+    return asset
+
+
+class _ShaBackfillStore(ModerationFakeStore):
+    def __init__(self, *args, conflict=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sha_updates = []
+        self.sha_conflict = conflict
+
+    def update_moderation_sha256(self, gym_id, asset_id, evidence, *,
+                                 expected_content_hash,
+                                 expected_moderation_json):
+        self.sha_updates.append((gym_id, asset_id, dict(evidence),
+                                 expected_content_hash,
+                                 dict(expected_moderation_json)))
+        if self.sha_conflict:
+            raise MediaStoreError(409, "changed")
+        asset = self.assets[asset_id]
+        assert asset["gym_id"] == gym_id
+        assert asset["content_hash"] == expected_content_hash
+        assert asset["moderation_json"] == expected_moderation_json
+        asset["moderation_json"] = dict(evidence)
+        return True
+
+
+def test_sha256_backfill_validates_bytes_and_cas_updates_only_evidence():
+    asset = _approved_without_sha()
+    before = dict(asset)
+    store = _ShaBackfillStore(assets=[asset])
+    drive = FakeDrive(blobs={ASSET_ID: PHOTO_BYTES})
+
+    out = mod.backfill_asset_sha256(
+        GYM, ASSET_ID, store=store, drive=drive, apply=True)
+
+    digest = hashlib.sha256(PHOTO_BYTES).hexdigest()
+    assert out == {"ok": True, "asset_id": ASSET_ID, "gym_id": GYM,
+                   "sha256": digest, "changed": True, "dry_run": False}
+    assert len(store.sha_updates) == 1
+    updated = store.get_asset(ASSET_ID)
+    assert updated["moderation_json"] == {
+        **before["moderation_json"], "sha256": digest}
+    for field in ("review_status", "reviewed_by", "reviewed_at",
+                  "review_content_hash", "moderation_status", "content_hash"):
+        assert updated[field] == before[field]
+
+
+def test_sha256_backfill_fails_closed_on_bad_binding_hash_drift_and_cas():
+    asset = _approved_without_sha()
+    bad = {**asset, "moderation_json": {
+        **asset["moderation_json"], "asset_id": "wrong"}}
+    store = _ShaBackfillStore(assets=[bad])
+    out = mod.backfill_asset_sha256(
+        GYM, ASSET_ID, store=store,
+        drive=FakeDrive(blobs={ASSET_ID: PHOTO_BYTES}), apply=True)
+    assert not out["ok"] and "clean hash-bound" in out["reason"]
+    assert store.sha_updates == []
+
+    store = _ShaBackfillStore(assets=[asset])
+    out = mod.backfill_asset_sha256(
+        GYM, ASSET_ID, store=store,
+        drive=FakeDrive(blobs={ASSET_ID: b"changed"}), apply=True)
+    assert not out["ok"] and "hash drift" in out["reason"]
+    assert store.sha_updates == []
+
+    store = _ShaBackfillStore(assets=[asset], conflict=True)
+    out = mod.backfill_asset_sha256(
+        GYM, ASSET_ID, store=store,
+        drive=FakeDrive(blobs={ASSET_ID: PHOTO_BYTES}), apply=True)
+    assert not out["ok"] and "conflict" in out["reason"]
+
+
+def test_update_moderation_sha256_sends_exact_state_and_evidence_cas():
+    previous = _approved_without_sha()["moderation_json"]
+    evidence = {**previous, "sha256": "a" * 64}
+    http = _FakeHttp(_Resp(200, [{"id": ASSET_ID}]))
+    store = _store(http)
+
+    assert store.update_moderation_sha256(
+        GYM, ASSET_ID, evidence, expected_content_hash=_hash_of(PHOTO_BYTES),
+        expected_moderation_json=previous) is True
+    call = http.calls[-1]
+    assert call["json"] == {"moderation_json": evidence}
+    assert call["params"]["gym_id"] == f"eq.{GYM}"
+    assert call["params"]["review_status"] == "eq.approved"
+    assert call["params"]["moderation_status"] == "eq.clean"
+    assert call["params"]["moderation_json"].startswith("eq.")
+
+
+def test_update_moderation_sha256_rejects_mutation_and_zero_row_cas():
+    previous = _approved_without_sha()["moderation_json"]
+    bad = {**previous, "provider": "changed", "sha256": "a" * 64}
+    http = _FakeHttp(_Resp(200, [{"id": ASSET_ID}]))
+    with pytest.raises(MediaStoreError) as exc:
+        _store(http).update_moderation_sha256(
+            GYM, ASSET_ID, bad, expected_content_hash=_hash_of(PHOTO_BYTES),
+            expected_moderation_json=previous)
+    assert exc.value.status == 400 and http.calls == []
+
+    evidence = {**previous, "sha256": "a" * 64}
+    with pytest.raises(MediaStoreError) as exc:
+        _store(_FakeHttp(_Resp(200, []))).update_moderation_sha256(
+            GYM, ASSET_ID, evidence,
+            expected_content_hash=_hash_of(PHOTO_BYTES),
+            expected_moderation_json=previous)
+    assert exc.value.status == 409
 
 @pytest.mark.parametrize('people', [False, True])
 def test_scheduled_pass_records_evidence_and_approves(monkeypatch, people):

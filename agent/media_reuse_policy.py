@@ -6,6 +6,30 @@ reuse during the window; original files and publishing history are retained.
 """
 from calendar import monthrange
 from datetime import datetime, timezone
+import re
+
+
+_LEGACY_REFRAME = re.compile(r"^([0-9a-f]{12})__feed\.jpg$")
+
+
+def _evidence_sha256(asset):
+    """Validated raw SHA-256 from evidence bound to this approved Drive row."""
+    from . import gym_media_selector
+
+    evidence = asset.get("moderation_json")
+    digest = evidence.get("sha256") if isinstance(evidence, dict) else None
+    if (asset.get("moderation_status") != "clean"
+            or asset.get("review_status") != "approved"
+            or asset.get("review_content_hash") != asset.get("content_hash")
+            or not gym_media_selector._clean_moderation_evidence(asset)
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or evidence.get("verdict") != "clean"
+            or evidence.get("content_hash") != asset.get("content_hash")
+            or evidence.get("asset_id") != asset.get("id")
+            or evidence.get("gym_id") != asset.get("gym_id")):
+        return None
+    return digest
 
 
 def reuse_months(gym_id):
@@ -32,26 +56,38 @@ def _keys(row, assets, library_path):
     if asset_id:
         keys.add("asset:" + asset_id)
     unresolved_reframe = False
+    verified_reframe_identity = False
     raw_source = media_guard.media_key(row.get("source_media_url"))
     for field in ("source_media_url", "image_url"):
         key = media_guard.media_key(row.get(field))
         if key:
             keys.add("file:" + key)
+            legacy = _LEGACY_REFRAME.fullmatch(key)
+            if legacy:
+                keys.add("sha12:" + legacy.group(1))
+                verified_reframe_identity = True
             resolved = media_guard.reframe_map(library_path, {key})
             for raw in resolved.values():
                 keys.add("file:" + raw)
             if key.endswith("__feed.jpg") and not resolved:
                 unresolved_reframe = True
-    if (unresolved_reframe and not asset_id
-            and (not raw_source or raw_source.endswith("__feed.jpg"))):
-        raise ValueError("reframed photo has no verifiable original identity")
     # Bind duplicate Drive uploads and pre-asset-id rows to their content hash.
+    verified_asset_identity = False
     for asset in assets:
         names = {media_guard.media_key(asset.get(f)) for f in ("title", "rendition_url")}
         if (asset_id and asset_id == str(asset.get("id"))) or any(
                 "file:" + name in keys for name in names if name):
             if asset.get("content_hash"):
                 keys.add("hash:" + str(asset["content_hash"]))
+            digest = _evidence_sha256(asset)
+            if digest:
+                keys.add("sha256:" + digest)
+                keys.add("sha12:" + digest[:12])
+                verified_asset_identity = True
+    if (unresolved_reframe and not verified_reframe_identity
+            and not verified_asset_identity
+            and (not raw_source or raw_source.endswith("__feed.jpg"))):
+        raise ValueError("reframed photo has no verifiable original identity")
     return keys
 
 

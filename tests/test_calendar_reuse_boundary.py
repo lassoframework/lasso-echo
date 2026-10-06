@@ -2,6 +2,7 @@
 from types import SimpleNamespace
 import pytest
 from agent import calendar_autopublish as cap, media_source_store, publish_billing_gate
+from agent import media_reuse_policy
 from tests.test_calendar_autopublish import RUN_DATE, LATE_NOW, _row, _FakePublisher
 from tests.test_calendar_media_review_boundary import ReviewCalendarStore
 
@@ -41,3 +42,34 @@ def test_calendar_checks_history_before_external_send(monkeypatch, platform, his
         assert result['failed'] == ['new']
         assert calendar.rows['new']['status'] == 'approved'
         assert calendar.rollbacks[0][2] == ('media_reuse_nine_month_hold' if history_kind == 'reused' else 'media_reuse_history_unavailable')
+
+
+def test_calendar_resolves_account_library_path_before_reuse_check(monkeypatch):
+    monkeypatch.setenv('AGENT_CALENDAR_AUTOPUBLISH', 'true')
+    monkeypatch.setenv('AGENT_PUBLISH_ENABLED', 'true')
+    monkeypatch.setattr(publish_billing_gate, 'publishing_blocked', lambda _: False)
+    account = SimpleNamespace(
+        key=GYM + '_ig', platform='instagram', display_name='Zanshin',
+        library_path=lambda: '/data/libraries/zanshin')
+    monkeypatch.setattr(cap, '_account_for', lambda *a: account)
+    monkeypatch.setattr(cap, '_alert_publish_blocked', lambda *a, **kw: None)
+    seen = []
+
+    def reuse_check(row, gym_id, store, **kwargs):
+        seen.append(kwargs['library_path'])
+        return None
+
+    monkeypatch.setattr(media_reuse_policy, 'publish_hold_reason', reuse_check)
+    row = _row('new', account='instagram', status='approved')
+    row['gym_id'] = GYM
+    calendar = ReviewCalendarStore([row])
+    publisher = _FakePublisher()
+
+    result = cap.publish_due(
+        RUN_DATE, gym_id=GYM, store=calendar, now=LATE_NOW,
+        catch_all=True, approved_only=True,
+        zernio_publish=lambda draft, resolved, **kwargs: publisher(draft, resolved))
+
+    assert seen == ['/data/libraries/zanshin']
+    assert result['published'] == ['new']
+    assert len(publisher.calls) == 1

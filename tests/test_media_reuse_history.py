@@ -117,3 +117,77 @@ def test_published_row_without_published_at_still_holds():
     assets = SimpleNamespace(list_assets=lambda gym: [])
     assert p.publish_hold_reason(row, GYM, store, now=NOW,
                                  media_store=assets) == 'media_reuse_nine_month_hold'
+
+
+def _approved_asset(asset_id, raw_sha256):
+    md5 = "a" * 32
+    return {
+        "id": asset_id, "gym_id": GYM, "content_hash": md5,
+        "review_content_hash": md5, "review_status": "approved",
+        "moderation_status": "clean", "people_detected": False,
+        "moderation_json": {
+            "provider": "test", "verdict": "clean", "content_hash": md5,
+            "asset_id": asset_id, "gym_id": GYM, "people_detected": False,
+            "observed_at": NOW.isoformat(), "sha256": raw_sha256,
+        },
+    }
+
+
+def test_legacy_reframe_same_raw_sha_holds_without_local_library():
+    digest = "123456789abc" + "d" * 52
+    row = {"id": "new", "gym_id": GYM,
+           "source_media_asset_id": "drive-new",
+           "image_url": "https://cdn/current.jpg"}
+    old = {"id": "old", "gym_id": GYM,
+           "image_url": "https://cdn/123456789abc__feed.jpg"}
+    store = SimpleNamespace(list_media_publish_history=lambda *a: [old])
+    assets = SimpleNamespace(
+        list_assets=lambda gym: [_approved_asset("drive-new", digest)])
+
+    assert p.publish_hold_reason(
+        row, GYM, store, now=NOW, media_store=assets,
+        library_path="/definitely/missing") == "media_reuse_nine_month_hold"
+
+
+def test_legacy_reframe_different_raw_sha_is_allowed():
+    row = {"id": "new", "gym_id": GYM,
+           "source_media_asset_id": "drive-new",
+           "image_url": "https://cdn/current.jpg"}
+    old = {"id": "old", "gym_id": GYM,
+           "image_url": "https://cdn/123456789abc__feed.jpg"}
+    store = SimpleNamespace(list_media_publish_history=lambda *a: [old])
+    assets = SimpleNamespace(list_assets=lambda gym: [
+        _approved_asset("drive-new", "fedcba987654" + "d" * 52)])
+
+    assert p.publish_hold_reason(
+        row, GYM, store, now=NOW, media_store=assets,
+        library_path="/definitely/missing") is None
+
+
+def test_malformed_unresolved_legacy_reframe_fails_closed():
+    row = {"id": "new", "gym_id": GYM,
+           "source_media_asset_id": "drive-new"}
+    old = {"id": "old", "gym_id": GYM,
+           "image_url": "https://cdn/not-a-sha__feed.jpg"}
+    store = SimpleNamespace(list_media_publish_history=lambda *a: [old])
+    assets = SimpleNamespace(list_assets=lambda gym: [
+        _approved_asset("drive-new", "fedcba987654" + "d" * 52)])
+
+    assert p.publish_hold_reason(
+        row, GYM, store, now=NOW, media_store=assets,
+        library_path="/definitely/missing") == "media_reuse_history_unavailable"
+
+
+def test_unbound_or_malformed_sha256_evidence_is_not_trusted():
+    asset = _approved_asset("drive-new", "fedcba987654" + "d" * 52)
+    assert p._evidence_sha256(asset) == "fedcba987654" + "d" * 52
+    for mutation in (
+        {"sha256": "bad"},
+        {"asset_id": "another"},
+        {"gym_id": "another"},
+        {"content_hash": "b" * 32},
+        {"verdict": "unsafe"},
+    ):
+        changed = {**asset, "moderation_json": {
+            **asset["moderation_json"], **mutation}}
+        assert p._evidence_sha256(changed) is None
