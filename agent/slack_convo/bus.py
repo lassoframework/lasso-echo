@@ -664,6 +664,37 @@ class Bus:
             "select": "*", "order": "created_at.desc", "limit": str(int(limit)),
         })
 
+    def _patch_held_fixer_attachments(self, message_id, *, eligible, updates,
+                                      fields=None, attempts=3):
+        """Merge a held FIXER attachment update without dropping a concurrent one.
+
+        PostgREST replaces a jsonb column when it is PATCHed.  Every caller must
+        therefore compare the complete attachment snapshot it read, not merely the
+        one marker it happens to care about.  A different held-row consumer may win
+        between our GET and PATCH; bounded retries re-read that winner and merge our
+        change on top.  Exhaustion is a failed CAS, never implied success.
+        """
+        for _ in range(max(1, int(attempts))):
+            row = self.message(message_id)
+            att = (row or {}).get("attachments")
+            snapshot = dict(att or {})
+            if (not row or row.get("delivery_status") != "held"
+                    or not eligible(row, snapshot)):
+                return None
+            next_att = {**snapshot, **updates(row, snapshot)}
+            match = {
+                "id": f"eq.{message_id}",
+                "delivery_status": "eq.held",
+                "attachments": ("is.null" if att is None else
+                                "eq." + json.dumps(snapshot, separators=(",", ":"),
+                                                   sort_keys=True)),
+            }
+            changed = self._patch(
+                _MESSAGES, match, {**(fields or {}), "attachments": next_att})
+            if changed:
+                return changed
+        return None
+
     def requeue_route_missing_fixer(self, message_id, recovered_at):
         """CAS one never-attempted route hold back to ready.
 
@@ -698,30 +729,21 @@ class Bus:
         }, {"delivery_status": "ready", "attachments": next_att})
 
     def defer_held_fixer_reconcile(self, message_id, next_at):
-        row = self.message(message_id)
-        if (not row or row.get("delivery_status") != "held"
-                or not (row.get("attachments") or {}).get("fixer_slack_delivery_uncertain")):
-            return None
-        att = {**(row.get("attachments") or {}),
-               "fixer_reconcile_next_at": next_at}
-        return self._patch(_MESSAGES, {
-            "id": f"eq.{message_id}", "delivery_status": "eq.held",
-            "attachments->>fixer_slack_delivery_uncertain": "eq.true",
-        }, {"attachments": att})
+        return self._patch_held_fixer_attachments(
+            message_id,
+            eligible=lambda _row, att: bool(att.get("fixer_slack_delivery_uncertain")),
+            updates=lambda _row, _att: {"fixer_reconcile_next_at": next_at})
 
     def reconcile_held_fixer_delivery(self, message_id, proof):
         """Promote a held uncertain delivery only after exact Slack readback."""
-        row = self.message(message_id)
-        if (not row or row.get("delivery_status") != "held"
-                or not (row.get("attachments") or {}).get("fixer_slack_delivery_uncertain")
-                or not (row.get("attachments") or {}).get("fixer_slack_delivery_intent")):
-            return None
-        att = {**(row.get("attachments") or {}), **proof}
-        return self._patch(_MESSAGES, {
-            "id": f"eq.{message_id}", "delivery_status": "eq.held",
-            "attachments->>fixer_slack_delivery_uncertain": "eq.true",
-        }, {"delivery_status": "posted", "slack_ts": proof["delivery_readback_ts"],
-            "attachments": att})
+        return self._patch_held_fixer_attachments(
+            message_id,
+            eligible=lambda _row, att: bool(
+                att.get("fixer_slack_delivery_uncertain")
+                and att.get("fixer_slack_delivery_intent")),
+            updates=lambda _row, _att: proof,
+            fields={"delivery_status": "posted",
+                    "slack_ts": proof["delivery_readback_ts"]})
 
     def uncertain_fixer_alert_status(self, message_id):
         """Posted is proof of an alert; failed notices remain retryable."""
@@ -757,26 +779,16 @@ class Bus:
 
     def reserve_uncertain_fixer_alert_retry(self, message_id, expected_at, next_at):
         """CAS the held row's retry deadline before an alert can be rearmed."""
-        row = self.message(message_id)
-        if not row or row.get("delivery_status") != "held":
-            return None
-        att = {**(row.get("attachments") or {}),
-               "fixer_alert_retry_after": next_at}
-        match = {
-            "id": f"eq.{message_id}", "delivery_status": "eq.held",
-            "attachments->>fixer_alert_retry_after": (
-                "is.null" if expected_at is None else f"eq.{expected_at}"),
-        }
-        return self._patch(_MESSAGES, match, {"attachments": att})
+        return self._patch_held_fixer_attachments(
+            message_id,
+            eligible=lambda _row, att: att.get("fixer_alert_retry_after") == expected_at,
+            updates=lambda _row, _att: {"fixer_alert_retry_after": next_at})
 
     def mark_uncertain_fixer_alerted(self, message_id):
-        row = self.message(message_id)
-        if not row or row.get("delivery_status") != "held":
-            return None
-        att = {**(row.get("attachments") or {}), "fixer_staff_alerted": True}
-        return self._patch(_MESSAGES, {
-            "id": f"eq.{message_id}", "delivery_status": "eq.held",
-        }, {"attachments": att})
+        return self._patch_held_fixer_attachments(
+            message_id,
+            eligible=lambda _row, _att: True,
+            updates=lambda _row, _att: {"fixer_staff_alerted": True})
 
     def pending_fixer_finalization(self, identity, limit=100):
         """Verified Slack posts whose ticket close may have been interrupted."""

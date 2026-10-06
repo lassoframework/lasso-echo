@@ -3164,6 +3164,99 @@ def test_bus_atomic_delivery_resolution_posts_the_full_identity_envelope():
     }
 
 
+@pytest.mark.parametrize("operation", ["defer", "reconcile", "reserve", "alerted"])
+def test_held_fixer_attachment_cas_retries_without_losing_concurrent_updates(operation):
+    mid = str(uuid.uuid4())
+    row = {
+        "id": mid, "delivery_status": "held", "slack_ts": "9.999",
+        "attachments": {
+            "identity": "echo", "fixer_slack_delivery_uncertain": True,
+            "fixer_slack_delivery_intent": {"channel": "C_CLIENT"},
+        },
+    }
+
+    class _Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class _Http:
+        def __init__(self):
+            self.patch_calls = []
+
+        def get(self, _url, **_kwargs):
+            return _Response([json.loads(json.dumps(row))])
+
+        def patch(self, _url, **kwargs):
+            self.patch_calls.append(kwargs)
+            expected_snapshot = json.loads(kwargs["params"]["attachments"][3:])
+            if len(self.patch_calls) == 1:
+                # Another held-row consumer wins after our GET. The full-snapshot
+                # predicate rejects our stale whole-json write.
+                row["attachments"]["concurrent_marker"] = "preserve-me"
+            if (expected_snapshot != row["attachments"]
+                    or row["delivery_status"] != "held"):
+                return _Response([])
+            row.update(json.loads(kwargs["data"]))
+            return _Response([json.loads(json.dumps(row))])
+
+    http = _Http()
+    bus = Bus(url="https://example.supabase.co", service_key="service", http=http)
+    if operation == "defer":
+        changed = bus.defer_held_fixer_reconcile(mid, "later")
+        assert changed["attachments"]["fixer_reconcile_next_at"] == "later"
+    elif operation == "reconcile":
+        changed = bus.reconcile_held_fixer_delivery(
+            mid, {"delivery_readback_ts": "9.999", "delivery_readback_verified": True})
+        assert changed["delivery_status"] == "posted"
+    elif operation == "reserve":
+        changed = bus.reserve_uncertain_fixer_alert_retry(mid, None, "later")
+        assert changed["attachments"]["fixer_alert_retry_after"] == "later"
+    else:
+        changed = bus.mark_uncertain_fixer_alerted(mid)
+        assert changed["attachments"]["fixer_staff_alerted"] is True
+
+    assert len(http.patch_calls) == 2
+    assert changed["attachments"]["concurrent_marker"] == "preserve-me"
+    assert json.loads(http.patch_calls[1]["params"]["attachments"][3:])[
+        "concurrent_marker"] == "preserve-me"
+
+
+def test_fixer_recomputes_slack_transport_after_conversation_is_bound_during_claim(
+        monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    bus.tickets[tid]["slack_channel_id"] = None
+    bus.tickets[tid]["slack_thread_ts"] = None
+    original_claim = bus.claim_message
+
+    def claim_and_bind(mid):
+        claimed = original_claim(mid)
+        bus.set_ticket(tid, slack_channel_id="C_CLIENT", slack_thread_ts="1.0")
+        return claimed
+
+    monkeypatch.setattr(bus, "claim_message", claim_and_bind)
+    post, calls = _posted()
+    membership_checks = []
+    summary = OB.run_once(
+        bus, post, identity=IDS.get("echo"), log=lambda *_: None,
+        member_check=lambda channel, user: membership_checks.append((channel, user)) or True)
+
+    delivered = bus.message(row["id"])
+    assert delivered["delivery_status"] == "posted"
+    assert delivered["attachments"]["delivery_readback_verified"] is True
+    assert delivered["attachments"]["fixer_slack_delivery_intent"]["channel"] == "C_CLIENT"
+    assert calls[0]["channel"] == "C_CLIENT"
+    assert calls[0]["text"].startswith(f"<@{OB.config.APPROVER_SLACK_ID}>")
+    assert membership_checks and membership_checks[-1][0] == "C_CLIENT"
+    assert summary["resolved"] == 1
+
+
 def test_slack_membership_read_paginates_and_fails_closed(monkeypatch):
     import types
     pages = []

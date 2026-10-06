@@ -559,6 +559,7 @@ _FIXER_REQUEST_IDENTITY_FIELDS = (
     "product", "client_id", "bot_identity", "slack_user_id",
     "slack_channel_id", "slack_thread_ts",
 )
+_FIXER_REQUEST_STABLE_FIELDS = _FIXER_REQUEST_IDENTITY_FIELDS[:-2]
 
 
 def _fresh_fixer_request(bus, ticket, att, *, body="", require_direct_answer=False):
@@ -568,8 +569,9 @@ def _fresh_fixer_request(bus, ticket, att, *, body="", require_direct_answer=Fal
     answers have no PR to prove, but they still must answer the request that is
     current at the moment of delivery and resolution. The monotonic database
     version closes the hash/read-to-resolve race; the hash still binds the exact
-    requester transcript. Tenant, bot, user and destination may not drift between
-    any two fresh reads. Missing or unreadable durable identity fails closed.
+    requester transcript. Tenant, bot and user may not drift between fresh reads.
+    An unbound portal route may become bound once; an already-bound destination
+    may never change. Missing or unreadable durable identity fails closed.
     """
     stamped = (att or {}).get("request_key")
     version = (att or {}).get("request_version")
@@ -582,10 +584,20 @@ def _fresh_fixer_request(bus, ticket, att, *, body="", require_direct_answer=Fal
         current = _current_fixer_request_key(bus, fresh) if fresh else None
     except Exception:  # noqa: BLE001 - unreadable identity is never current proof
         return None
+    old_channel = ticket.get("slack_channel_id")
+    old_thread = ticket.get("slack_thread_ts")
+    new_channel = fresh.get("slack_channel_id") if isinstance(fresh, dict) else None
+    new_thread = fresh.get("slack_thread_ts") if isinstance(fresh, dict) else None
+    route_matches = (new_channel == old_channel and new_thread == old_thread)
+    route_newly_bound = (
+        old_channel is None and old_thread is None
+        and isinstance(new_channel, str) and new_channel.startswith(("C", "G"))
+    )
     if (not isinstance(fresh, dict)
             or fresh.get("request_version") != version
             or any(fresh.get(field) != ticket.get(field)
-                   for field in _FIXER_REQUEST_IDENTITY_FIELDS)
+                   for field in _FIXER_REQUEST_STABLE_FIELDS)
+            or not (route_matches or route_newly_bound)
             or not current or stamped != current):
         return None
     if require_direct_answer and not _direct_answerable_question(fresh, body):
@@ -1777,32 +1789,6 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             body=row.get("body") or "", held_message_id=row["id"],
             surface=att.get("surface") or "", why="flag off at post time")
         return
-    # FIXER customer Slack messages include Blake in the actual conversation. A receipt
-    # in #fixer alone is not participation in the client's channel. Read membership at
-    # dispatch; Slack read failures, one-to-one DMs and unsupported channel types hold.
-    channel = ticket.get("slack_channel_id")
-    # A grounded answer authored by FIXER is intentionally exempt from the
-    # code-fix deployment proof above, but it is still a FIXER customer
-    # outbound.  Blake's membership and visible inclusion apply to every such
-    # Slack message, not only to code-fix completion notices.
-    fixer_customer_slack = bool(
-        channel
-        and recipient_kind not in ("staff", "coach")
-        and (customer_fix or att.get("fixer"))
-    )
-    if fixer_customer_slack:
-        try:
-            member = bool(channel and channel.startswith(("C", "G")) and member_check and
-                          member_check(channel, config.APPROVER_SLACK_ID))
-        except Exception as e:  # noqa: BLE001
-            log(f"[slack-convo/outbox] membership read failed for {channel}: "
-                f"{type(e).__name__}")
-            member = False
-        if not member:
-            _suppress(bus, row, ticket, identity,
-                      "FIXER customer Slack reply requires verified Blake membership "
-                      "in destination conversation", log, summary)
-            return
     # 6. claim, immediately before posting
     if not _claim(bus, row, log):
         summary["skipped"] += 1
@@ -1832,8 +1818,29 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                       "FIXER requester identity changed before delivery", log, summary)
             return
         ticket = fresh
-    # 7. destination
+    # 7. destination.  Compute the FIXER transport from the freshly rebound
+    # ticket, never from the pre-claim snapshot.  A portal ticket may acquire its
+    # Slack conversation while this worker is claiming the row; that completion
+    # must enter the durable intent/readback path rather than the portal-only path.
     channel = ticket.get("slack_channel_id")
+    fixer_customer_slack = bool(
+        channel
+        and recipient_kind not in ("staff", "coach")
+        and (customer_fix or att.get("fixer"))
+    )
+    if fixer_customer_slack:
+        try:
+            member = bool(channel.startswith(("C", "G")) and member_check and
+                          member_check(channel, config.APPROVER_SLACK_ID))
+        except Exception as e:  # noqa: BLE001
+            log(f"[slack-convo/outbox] membership read failed for {channel}: "
+                f"{type(e).__name__}")
+            member = False
+        if not member:
+            _suppress(bus, row, ticket, identity,
+                      "FIXER customer Slack reply requires verified Blake membership "
+                      "in destination conversation", log, summary)
+            return
     surface = att.get("surface") or ""
     # F1 (audit 8, MAJOR): the audit-7 fix read the surface off the ticket's own inbound row
     # instead of its source -- and a portal ticket's inbound row carries
