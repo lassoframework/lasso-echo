@@ -2202,10 +2202,12 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
         # (a sibling approved between the read and this write matches nothing and is
         # reported as left).
         swapped, left = [draft_id], list(locked_siblings)
+        unknown_siblings = []
         sibling_results = []
         for sib in siblings:
             sid = str(sib.get("id") or "")
             var = variants[sid]
+            write_interrupted = False
             try:
                 write_args = {"source_media_url": var.get("source_media_url"),
                               "extra_fields": _ms.swap_fields(var), "expected_row": sib}
@@ -2213,16 +2215,27 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                     write_args["render_evidence"] = var["render_evidence"]
                 if var.get("poster_render_evidence") is not None:
                     write_args["poster_render_evidence"] = var["poster_render_evidence"]
-                done = sb_store.swap_media(account_key, sid, var["image_url"],
-                                           **write_args)
+                sibling_patch = sb_store.swap_media(account_key, sid, var["image_url"],
+                                                    **write_args)
             except Exception as exc:  # noqa: BLE001 - one sibling never undoes the swap
                 print(f"[portal-social] sibling swap failed for {sid}: {type(exc).__name__}")
-                done = None
-            try:
-                done = (_verified_swap_readback(sb_store, account_key, sib, var, done)
-                        if done is not None else None)
-            except Exception:
-                done = None
+                sibling_patch = None
+                write_interrupted = True
+            if write_interrupted:
+                outcome, done = _recover_interrupted_swap_readback(
+                    sb_store, account_key, sib, var)
+                if outcome == "unknown":
+                    unknown_siblings.append(sid)
+            else:
+                try:
+                    done = (_verified_swap_readback(sb_store, account_key, sib, var, sibling_patch)
+                            if sibling_patch is not None else None)
+                except Exception:
+                    done = None
+                    if _swap_row_matches(account_key, sib, var, sibling_patch):
+                        # Our PATCH landed, but its independent GET is unreadable.
+                        # Do not report this as untouched or certified successful.
+                        unknown_siblings.append(sid)
             if done is not None:
                 swapped.append(sid)
                 sibling_kind = _media_kind(done.get("image_url", ""))
@@ -2234,18 +2247,19 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                     "video_url": (done.get("image_url", "")
                                   if sibling_kind == "video" else None),
                 })
-            else:
+            elif sid not in unknown_siblings:
                 left.append(sid)
         # The write landed: settle the Drive usage ledger + the served ledger so the
         # asset now on the row cools down, and the one it replaced returns to the pool
         # ONLY when no remaining row on the book still carries it. A failed re-read
         # is None = unknown = leave it stamped (never [] = "nothing carries it").
-        if primary_readback_unknown:
+        if primary_readback_unknown or unknown_siblings:
             return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
                          "error": "Photo swap outcome could not be verified.",
                          "reason": "swap_outcome_unknown",
                          "siblings_swapped": [s for s in swapped if s != draft_id],
                          "siblings_left": left,
+                         "siblings_unknown": unknown_siblings,
                          "sibling_results": sibling_results,
                          "recreate_budget": _budget_state(account_key)}
         _ms.after_swap(account_key, row, pick,
@@ -2303,17 +2317,50 @@ def _swap_snapshot_digest(row):
                                      default=str).encode()).hexdigest()
 
 
-def _verified_swap_readback(store, account_key, before, pick, patch_result):
-    """An independent exact-ID GET is the completion boundary, never PATCH output."""
-    if not _swap_row_matches(account_key, before, pick, patch_result):
-        return None
+def _swap_readback_row(store, account_key, row_id):
+    """Read one exact tenant row, retrying only an interrupted read once."""
     try:
-        fresh = store.get_row(account_key, before["id"])
+        return store.get_row(account_key, row_id)
     except Exception:
         # One bounded read retry resolves a transient GET failure after a
         # committed PATCH. It never retries the mutation. Persistent outages
         # propagate so the caller retains an unknown completion outcome.
-        fresh = store.get_row(account_key, before["id"])
+        return store.get_row(account_key, row_id)
+
+
+def _recover_interrupted_swap_readback(store, account_key, before, pick):
+    """Resolve a lost mutation response without repeating the mutation.
+
+    Only an exact original proves untouched; only the full requested media and
+    preserved snapshot prove a saved result. Prepared scene aliases cannot be
+    certified without their lost PATCH evidence, so those outcomes stay unknown.
+    """
+    try:
+        fresh = _swap_readback_row(store, account_key, before["id"])
+        if (not isinstance(fresh, dict) or fresh.get("id") != before["id"]
+                or str(fresh.get("gym_id")) != str(account_key)):
+            return "unknown", None
+        original = {key: value for key, value in before.items() if key != "updated_at"}
+        observed = {key: value for key, value in fresh.items() if key != "updated_at"}
+        if observed == original:
+            return "left", None
+        from . import visual_writer_prepare
+        if (visual_writer_prepare.enabled()
+                or any((field in fresh) != (field in before)
+                       for field in _pcs._DRAFT_SCENE_CAS_COLUMNS)):
+            return "unknown", None
+        if _swap_row_matches(account_key, before, pick, fresh):
+            return "swapped", fresh
+    except Exception:
+        pass  # Unreadable or contradictory evidence never establishes a no-op.
+    return "unknown", None
+
+
+def _verified_swap_readback(store, account_key, before, pick, patch_result):
+    """An independent exact-ID GET is the completion boundary, never PATCH output."""
+    if not _swap_row_matches(account_key, before, pick, patch_result):
+        return None
+    fresh = _swap_readback_row(store, account_key, before["id"])
     if not _swap_row_matches(account_key, before, pick, fresh):
         return None
     # Preparation may replace scene identities in the validated PATCH result.

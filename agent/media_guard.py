@@ -388,6 +388,40 @@ def find_cross_day_repeats(rows, *, repeat_window_days=None):
     return out
 
 
+def _legacy_feed_original(library_path, rendered_key, delivered_bytes):
+    """Locate a local source, then prove its render against the served bytes.
+
+    The legacy hash-prefix name is a lookup hint only. Neither the name nor a
+    cached derivative attests lineage: reproduce the render from frozen raw
+    bytes and compare the entire output. Nothing writes into the gym library.
+    """
+    import hashlib
+    import tempfile
+    from . import feed_image, visual_writer_prepare as vp
+
+    raw_key = reframe_map(library_path, {rendered_key}).get(rendered_key)
+    matches = [key for key in library_keys(library_path)
+               if f"{_library_hash(os.path.join(library_path, key))}{_REFRAME_SUFFIX}"
+               == rendered_key]
+    if raw_key is None or matches != [raw_key]:
+        raise ValueError("current reframe original ambiguous or missing")
+    with open(os.path.join(library_path, raw_key), "rb") as fh:
+        original = fh.read(vp.MAX_VISUAL_BYTES + 1)
+    if (not original or len(original) > vp.MAX_VISUAL_BYTES
+            or f"{hashlib.sha256(original).hexdigest()[:12]}{_REFRAME_SUFFIX}" != rendered_key):
+        raise ValueError("current reframe original bytes mismatch")
+    with tempfile.TemporaryDirectory(prefix="echo-swap-original-") as work:
+        source_path = os.path.join(work, raw_key)
+        with open(source_path, "wb") as fh:
+            fh.write(original)
+        output = os.path.join(work, "verified-feed.jpg")
+        feed_image.build_feed_image(source_path, output)
+        with open(output, "rb") as fh:
+            if fh.read(vp.MAX_VISUAL_BYTES + 1) != delivered_bytes:
+                raise ValueError("current reframe render bytes mismatch")
+    return os.path.join(library_path, raw_key), original
+
+
 def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=None,
                            library_path=None, byte_cache=None):
     """Resolve an original from tenant asset bytes or an exact local source.
@@ -474,10 +508,17 @@ def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=Non
         key = media_key(source)
         keys = library_keys(lib) if lib else set()
         if key not in keys:
-            raise ValueError("current original lineage missing")
-        with open(os.path.join(lib, key), "rb") as fh:
-            if fh.read() != raw:
-                raise ValueError("current local original bytes mismatch")
+            if (lib and not row.get("source_media_url")
+                    and not row.get("drive_file_id")
+                    and row.get("format") == "feed" and key.endswith(_REFRAME_SUFFIX)):
+                source, raw = _legacy_feed_original(lib, key, raw)
+                digest = hashlib.sha256(raw).hexdigest()
+            else:
+                raise ValueError("current original lineage missing")
+        else:
+            with open(os.path.join(lib, key), "rb") as fh:
+                if fh.read() != raw:
+                    raise ValueError("current local original bytes mismatch")
     if pick is None and row.get("byte_hash"):
         delivered_bytes = raw if source == delivered else vp._exact_bytes(delivered, reader, "current rendered")
         alias = vf.normalize_any(row["byte_hash"])
