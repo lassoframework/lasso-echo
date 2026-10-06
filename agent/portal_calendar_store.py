@@ -4908,8 +4908,14 @@ def _stage_belts(account_key, payload):
             except Exception:
                 pass
         decisions.append((row, True))
+    allowed_primary_groups = {
+        _companion_group_key(row) for row, allowed in decisions
+        if allowed and _is_instagram_feed(row)
+    }
+    fully_blocked_primary_groups = blocked_primary_groups - allowed_primary_groups
     return [row for row, allowed in decisions
-            if allowed and _companion_group_key(row) not in blocked_primary_groups]
+            if allowed
+            and _companion_group_key(row) not in fully_blocked_primary_groups]
 
 
 # ---- CROSS-DAY MEDIA BELT ------------------------------------------------------
