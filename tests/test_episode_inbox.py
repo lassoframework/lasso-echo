@@ -19,6 +19,7 @@ from agent import episode_inbox  # noqa: E402
 
 def _arm(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_EPISODE_INBOX_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
 
 

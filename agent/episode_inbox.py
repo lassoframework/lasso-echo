@@ -215,6 +215,9 @@ def poll(client=None, transcriber=None, llm=None, poster=None,
     if not config.episode_inbox_enabled():
         return {"status": "disabled"}
 
+    from .openai_text import startup_preflight
+    startup_preflight()
+
     db.kv_set(_KV_LAST_RUN, _now_iso())
 
     prefix = config.episode_inbox_prefix()

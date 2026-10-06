@@ -212,9 +212,9 @@ Now the FALLBACK engine. Everything below is unchanged.
 | AGENT_CLIPPER_SCORE_FLOOR / _MIN_SEC / _MAX_SEC / _TARGET_COUNT / _MODEL / _CACHE_DIR | code defaults | code | |
 | AGENT_TRANSCRIBE_API_KEY | (unset) | BLAKE | Or install faster-whisper. |
 | AGENT_WHISPER_MODEL | code default | code | |
-| AGENT_CLIPPER_MODEL | gpt-6-astra | code | OpenAI text model for clipper, video editor and podcast moment selection. Enabled lanes fail boot without `OPENAI_API_KEY` or an allowed text model (`gpt-6-astra`, `gpt-6-luna`). |
-| AGENT_SB7_MODEL | gpt-6-astra | code | OpenAI text model for SB7, auto-reel and GBP captions plus website fact extraction. Enabled lanes fail boot without `OPENAI_API_KEY` or an allowed text model (`gpt-6-astra`, `gpt-6-luna`). |
-| AGENT_EPISODE_INBOX_ENABLED / _PREFIX / _TENANT / _POLL_MINUTES | false / code / lasso_episodes / 5 | BLAKE | Riverside drop watcher. |
+| AGENT_CLIPPER_MODEL | gpt-6-astra | code | OpenAI text model for clipper, video editor, podcast and episode-inbox moment selection. Enabled lanes fail boot without `OPENAI_API_KEY` or an allowed text model (`gpt-6-astra`, `gpt-6-luna`). |
+| AGENT_SB7_MODEL | gpt-6-astra | code | OpenAI text model for SB7, auto-reel and GBP captions plus website fact extraction. Enabled lanes and manual `website-intake` fail before fetch without `OPENAI_API_KEY` or an allowed text model (`gpt-6-astra`, `gpt-6-luna`). |
+| AGENT_EPISODE_INBOX_ENABLED / _PREFIX / _TENANT / _POLL_MINUTES | false / code / lasso_episodes / 5 | BLAKE | Riverside drop watcher. When enabled, listener boot and polling require a valid OpenAI text runtime before any last-run/list/claim work. |
 | AGENT_EPISODE_NUDGE_TIME / _WINDOW_DAYS | 09:00 / 2 | code | Monday nudge. |
 | AGENT_OPUS_ENABLED / AGENT_OPUS_POLL_ENABLED / AGENT_OPUS_FACTORY_ENABLED | false | BLAKE | Legacy Opus lanes. |
 | OPUS_API_KEY | (unset) | BLAKE | **(was undocumented at times)** rotate by hand. |

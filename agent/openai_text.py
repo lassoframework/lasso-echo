@@ -21,10 +21,12 @@ def validate_model(model):
     return model
 
 
-def startup_preflight():
+def startup_preflight(*, force_website_intake=False):
     """Fail boot before side effects when any enabled text lane lacks valid runtime config.
 
-    This checks configuration only; it never calls a model or exposes a key.
+    ``force_website_intake`` covers the one-gym manual entrypoint even when its
+    automatic sweep is disabled. This checks configuration only; it never calls
+    a model or exposes a key.
     """
     from . import config
     from .slack_convo.identities import IDENTITIES
@@ -36,10 +38,10 @@ def startup_preflight():
             or config.gbp_mirror_enabled() or config.gbp_mirror_gyms()
             or config.gbp_month_sweep_enabled()):
         lanes.append(("SB7/caption", config.sb7_model))
-    if config.website_auto_intake_enabled():
+    if force_website_intake or config.website_auto_intake_enabled():
         lanes.append(("website intake", config.sb7_model))
     if (config.clipper_enabled() or config.video_editor_enabled()
-            or config.podcast_auto_enabled()):
+            or config.podcast_auto_enabled() or config.episode_inbox_enabled()):
         lanes.append(("clipper", config.clipper_model))
     if not lanes:
         return ()

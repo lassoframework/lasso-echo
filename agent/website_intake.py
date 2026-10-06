@@ -33,7 +33,8 @@ takes the draft run down. Manual per-gym run:
     python -m agent website-intake --account <base> [--domain x.com] [--force]
 
 Everything is injectable (fetch / llm / alert) so the whole lane is
-    unit-testable offline with no network and no OpenAI key.
+    unit-testable offline with no network; tests use a placeholder OpenAI key
+    because the shared startup preflight applies even to manual intake.
 """
 
 import json
@@ -426,8 +427,9 @@ def _resolve_domain(base, domain=None):
 
 def intake_from_website(base, *, domain=None, status=None, force=False,
                         fetch=None, llm=None):
-    """Auto-intake ONE gym from its website. Returns a summary dict, never
-    raises:
+    """Intake ONE gym from its website. Config preflight raises before any read
+    or fetch when the OpenAI text runtime is unavailable; per-gym work errors
+    return a summary dict:
 
       {"ok": True, "base", "domain", "landed", "status", "bible", "categories"}
       {"ok": False, "base", "reason"}
@@ -439,6 +441,8 @@ def intake_from_website(base, *, domain=None, status=None, force=False,
     base = (base or "").strip()
     if not base:
         return {"ok": False, "base": base, "reason": "no account base given"}
+    from .openai_text import startup_preflight
+    startup_preflight(force_website_intake=True)
     account_key = f"{base}_ig"
     try:
         # all_sources is tenant-variant aware, so rows under the bare base key

@@ -14,7 +14,8 @@ def no_text_lanes(monkeypatch):
     for name in ("SLACK_CONVO_ENABLED", "SLACK_CONVO_ECHO_ENABLED", "AGENT_SB7_ENABLED",
                  "AGENT_WEBSITE_AUTO_INTAKE", "AGENT_CLIPPER_ENABLED",
                  "AGENT_AUTO_REELS_ENABLED", "AGENT_GBP_MIRROR", "AGENT_GBP_MONTH_SWEEP",
-                 "AGENT_VIDEO_EDITOR_ENABLED", "AGENT_PODCAST_AUTO_ENABLED"):
+                 "AGENT_VIDEO_EDITOR_ENABLED", "AGENT_PODCAST_AUTO_ENABLED",
+                 "AGENT_EPISODE_INBOX_ENABLED"):
         monkeypatch.setenv(name, "false")
     monkeypatch.setenv("AGENT_GBP_MIRROR_GYMS", "")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLASSIFIER_LLM", "false")
@@ -125,6 +126,7 @@ _ARMED_LANES = [
     ("gbp_month_sweep", "AGENT_GBP_MONTH_SWEEP", None, "AGENT_SB7_MODEL"),
     ("video_editor", "AGENT_VIDEO_EDITOR_ENABLED", None, "AGENT_CLIPPER_MODEL"),
     ("podcast_auto", "AGENT_PODCAST_AUTO_ENABLED", None, "AGENT_CLIPPER_MODEL"),
+    ("episode_inbox", "AGENT_EPISODE_INBOX_ENABLED", None, "AGENT_CLIPPER_MODEL"),
 ]
 
 
@@ -195,6 +197,58 @@ def test_explicit_empty_model_override_fails_closed(monkeypatch, no_text_lanes):
     monkeypatch.setenv("AGENT_SB7_MODEL", " ")
     with pytest.raises(RuntimeError, match="AGENT_SB7_MODEL"):
         openai_text.startup_preflight()
+
+
+@pytest.mark.parametrize("problem", ["missing_key", "stale_model", "image_model", "bogus_model"])
+def test_episode_inbox_only_flag_blocks_boot_and_poll_before_side_effects(
+        monkeypatch, no_text_lanes, problem):
+    from agent import db, episode_inbox, listener
+    monkeypatch.setenv("AGENT_EPISODE_INBOX_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
+    if problem == "missing_key":
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        expected = "OPENAI_API_KEY"
+    else:
+        monkeypatch.setenv("AGENT_CLIPPER_MODEL", {
+            "stale_model": "claude-sonnet-5",
+            "image_model": "gpt-image-2.5-sunburst",
+            "bogus_model": "gpt-bogus",
+        }[problem])
+        expected = "AGENT_CLIPPER_MODEL"
+    monkeypatch.setattr(db, "kv_set", lambda *_: pytest.fail("last-run or claim written"))
+
+    class NoListClient:
+        def list_prefix(self, *_):
+            pytest.fail("episode inbox listed")
+
+    with pytest.raises(RuntimeError, match=expected):
+        listener.run_listener()
+    with pytest.raises(RuntimeError, match=expected):
+        episode_inbox.poll(client=NoListClient())
+
+
+@pytest.mark.parametrize("problem", ["missing_key", "stale_model", "image_model", "bogus_model"])
+def test_manual_website_intake_forces_preflight_with_auto_sweep_off(
+        monkeypatch, no_text_lanes, problem):
+    from agent import __main__ as cli
+    monkeypatch.setenv("AGENT_WEBSITE_AUTO_INTAKE", "false")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
+    if problem == "missing_key":
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        expected = "OPENAI_API_KEY"
+    else:
+        monkeypatch.setenv("AGENT_SB7_MODEL", {
+            "stale_model": "claude-sonnet-5",
+            "image_model": "gpt-image-2.5-sunburst",
+            "bogus_model": "gpt-bogus",
+        }[problem])
+        expected = "AGENT_SB7_MODEL"
+    monkeypatch.setattr(website_intake, "fetch_site_text",
+                        lambda *_args, **_kwargs: pytest.fail("website fetched"))
+    with pytest.raises(RuntimeError, match=expected):
+        website_intake.intake_from_website("gymx", domain="gymx.com")
+    with pytest.raises(RuntimeError, match=expected):
+        cli.main(["website-intake", "--account", "gymx", "--domain", "gymx.com"])
 
 
 def test_clipper_preserves_missing_key_error_type(monkeypatch):
