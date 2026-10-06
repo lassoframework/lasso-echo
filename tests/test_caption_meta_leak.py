@@ -209,6 +209,8 @@ class _FakeCalStore:
     def __init__(self, rows):
         self.rows = {r["id"]: dict(r) for r in rows}
         self.preserve_patches = []     # (gym, row_id, caption)
+        self.manual_patches = []       # (gym, row_id, status, old, clean)
+        self.current_manual = True
 
     def due_rows(self, gym_id, run_date):
         return [dict(r) for r in self.rows.values()
@@ -222,6 +224,23 @@ class _FakeCalStore:
         if r is None:
             return None
         r["caption"] = new_caption          # status DELIBERATELY untouched
+        return dict(r)
+
+    def patch_caption(self, gym_id, row_id, new_caption):
+        raise AssertionError("proof cleanup must not use an unconditional patch")
+
+    def patch_caption_manual_format(self, gym_id, row_id, expected_status,
+                                    expected_caption, clean_caption):
+        self.manual_patches.append((gym_id, row_id, expected_status,
+                                    expected_caption, clean_caption))
+        r = self.rows.get(row_id)
+        if (r is None or r.get("gym_id") != gym_id or not self.current_manual
+                or r.get("status") != expected_status
+                or r.get("caption") != expected_caption):
+            return None
+        r["caption"] = clean_caption
+        r["status"] = "pending"             # fresh approval is required
+        r["approval_digest"] = None
         return dict(r)
 
     def mark_publishing(self, row_id):
@@ -259,6 +278,26 @@ class _FakePublisher:
 def _armed(monkeypatch):
     monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
     monkeypatch.setenv("AGENT_PUBLISH_ENABLED", "true")
+
+
+@pytest.mark.parametrize("helper,args", [
+    (cap._alert_meta_reapproval_held, ("r1", "lasso", True)),
+    (cap._alert_meta_autonomous_cleanup_held, ("r2", "lasso")),
+    (cap._alert_caption_format_reapproval, ("r3", "lasso")),
+])
+def test_proof_alerts_are_silent_when_kv_is_not_durable(
+        helper, args, monkeypatch):
+    from agent import db, ops_alerts
+    alerts = []
+    kv_reads = []
+    monkeypatch.setattr(db, "kv_is_durable", lambda: False)
+    monkeypatch.setattr(db, "kv_get", lambda key: kv_reads.append(key))
+    monkeypatch.setattr(ops_alerts, "alert", lambda message: alerts.append(message))
+
+    helper(*args)
+
+    assert alerts == []
+    assert kv_reads == []
 
 
 def test_publish_lane_strips_clean_meta_suffix_and_publishes_body(_armed):
@@ -308,6 +347,117 @@ def test_meta_strip_formats_local_send_even_if_patch_fails():
     row = _row("r4", "Start here. Meet your coach; book a class. [why] test note")
     cleaned = cap._strip_or_hold_meta(row, "lasso", _FailedPatch())
     assert cleaned["caption"] == "Start here.\n\nMeet your coach, book a class."
+
+
+def test_proof_lane_strips_then_holds_for_fresh_human_approval(
+        _armed, monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    alerts = []
+    monkeypatch.setattr(cap, "_alert_meta_reapproval_held",
+                        lambda row_id, gym_id, persisted:
+                        alerts.append((row_id, gym_id, persisted)))
+    store = _FakeCalStore([
+        _row("proved-meta", f"{CLEAN_BODY}\n\n{LEAKED_META}", status="approved")
+    ])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True)
+
+    assert summary["published"] == []
+    assert summary["waiting"] == ["proved-meta"]
+    assert pub.calls == []
+    assert store.preserve_patches == []
+    from agent.copy_gate import format_caption
+    assert store.rows["proved-meta"]["caption"] == format_caption(CLEAN_BODY)
+    assert store.rows["proved-meta"]["status"] == "pending"
+    assert store.manual_patches == [
+        ("lasso", "proved-meta", "approved", f"{CLEAN_BODY}\n\n{LEAKED_META}",
+         format_caption(CLEAN_BODY))]
+    assert alerts == [("proved-meta", "lasso", True)]
+
+
+def test_proof_lane_patch_failure_still_holds_original_approved_row(
+        _armed, monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    alerts = []
+    monkeypatch.setattr(cap, "_alert_meta_reapproval_held",
+                        lambda row_id, gym_id, persisted:
+                        alerts.append((row_id, gym_id, persisted)))
+
+    class _FailingPatchStore(_FakeCalStore):
+        def patch_caption_manual_format(self, *args):
+            raise RuntimeError("write unavailable")
+
+    original = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    store = _FailingPatchStore([_row("patch-failed", original, status="approved")])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True)
+
+    assert summary["published"] == []
+    assert summary["waiting"] == ["patch-failed"]
+    assert pub.calls == []
+    assert store.rows["patch-failed"]["caption"] == original
+    assert store.rows["patch-failed"]["status"] == "approved"
+    assert alerts == [("patch-failed", "lasso", False)]
+
+
+def test_proof_meta_cleanup_holds_concurrent_client_caption_edit(_armed, monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    alerts = []
+    monkeypatch.setattr(cap, "_alert_meta_reapproval_held",
+                        lambda row_id, gym_id, persisted:
+                        alerts.append((row_id, gym_id, persisted)))
+    original = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    client_caption = "Client replaced this caption while Echo was checking it."
+
+    class _ConcurrentEditStore(_FakeCalStore):
+        def patch_caption_manual_format(self, *args):
+            self.rows["client-edit"]["caption"] = client_caption
+            return super().patch_caption_manual_format(*args)
+
+    store = _ConcurrentEditStore([_row("client-edit", original, status="approved")])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True)
+
+    assert summary["published"] == []
+    assert summary["waiting"] == ["client-edit"]
+    assert pub.calls == []
+    assert store.rows["client-edit"]["caption"] == client_caption
+    assert store.rows["client-edit"]["status"] == "approved"
+    assert store.manual_patches[0][2:4] == ("approved", original)
+    assert alerts == [("client-edit", "lasso", False)]
+
+
+def test_proof_meta_cleanup_holds_current_mode_flip_to_auto(_armed, monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    alerts = []
+    monkeypatch.setattr(cap, "_alert_meta_reapproval_held",
+                        lambda row_id, gym_id, persisted:
+                        alerts.append((row_id, gym_id, persisted)))
+    original = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+
+    class _ModeFlipStore(_FakeCalStore):
+        def patch_caption_manual_format(self, *args):
+            self.current_manual = False
+            return super().patch_caption_manual_format(*args)
+
+    store = _ModeFlipStore([_row("mode-flip", original, status="approved")])
+    pub = _FakePublisher()
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True)
+
+    assert summary["published"] == []
+    assert summary["waiting"] == ["mode-flip"]
+    assert pub.calls == []
+    assert store.rows["mode-flip"]["caption"] == original
+    assert store.rows["mode-flip"]["status"] == "approved"
+    assert alerts == [("mode-flip", "lasso", False)]
 
 
 def test_gbp_worker_strips_meta_suffix_before_send():
@@ -459,6 +609,20 @@ class _FakeSweepStore:
         r["caption"] = new_caption          # status untouched, by contract
         return dict(r)
 
+    def patch_caption_for_meta_sweep(self, gym_id, row_id, new_caption, *,
+                                    expected_status, expected_caption):
+        r = self.rows.get(row_id)
+        if (r is None or r.get("status") != expected_status
+                or (r.get("caption") or "") != expected_caption):
+            return None
+        r["caption"] = new_caption
+        if expected_status == "approved":
+            r["status"] = "pending"
+        for key in ("approval_kind", "approved_by", "approved_at",
+                    "approval_digest"):
+            r[key] = None
+        return dict(r)
+
 
 def test_sweep_cleans_waiting_rows_and_preserves_approved_status():
     dirty = f"{CLEAN_BODY}\n\n{LEAKED_META}"
@@ -505,3 +669,88 @@ def test_sweep_dry_run_writes_nothing():
     assert [d["id"] for d in results[0]["cleaned"]] == ["w1"]
     assert store.preserve_patches == []
     assert store.rows["w1"]["caption"] == dirty
+
+
+def test_sweep_proof_mode_invalidates_approved_creative(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    dirty = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    store = _FakeSweepStore([{
+        "id": "proof-row", "gym_id": "eng", "post_date": "2026-08-24",
+        "account": "facebook", "status": "approved", "caption": dirty,
+        "approval_kind": "human", "approved_by": "actor-1",
+        "approved_at": "2026-08-20T12:00:00Z", "approval_digest": "old-digest",
+    }])
+    results = caption_meta_sweep.run(gym_ids=["eng"], store=store,
+                                     today_iso="2026-08-23", alert=lambda _: None)
+    assert [d["id"] for d in results[0]["cleaned"]] == ["proof-row"]
+    row = store.rows["proof-row"]
+    assert row["caption"] == CLEAN_BODY
+    assert row["status"] == "pending"
+    assert all(row[key] is None for key in
+               ("approval_kind", "approved_by", "approved_at", "approval_digest"))
+
+
+def test_sweep_proof_mode_cleans_documented_states_and_holds_terminal(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    dirty = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    statuses = ("draft", "queued", "failed", "denied")
+    store = _FakeSweepStore([
+        {"id": status, "gym_id": "eng", "post_date": "2026-08-24",
+         "account": "facebook", "status": status, "caption": dirty}
+        for status in statuses
+    ])
+
+    results = caption_meta_sweep.run(gym_ids=["eng"], store=store,
+                                     today_iso="2026-08-23", alert=lambda _: None)
+
+    assert {d["id"] for d in results[0]["cleaned"]} == {
+        "draft", "queued", "failed"}
+    assert [d["id"] for d in results[0]["held"]] == ["denied"]
+    assert store.rows["denied"]["caption"] == dirty
+
+
+def test_sweep_proof_mode_fails_closed_without_invalidation_writer(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    class _LegacyOnlyStore(_FakeSweepStore):
+        patch_caption_for_meta_sweep = None
+    dirty = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    store = _LegacyOnlyStore([{
+        "id": "legacy-row", "gym_id": "eng", "post_date": "2026-08-24",
+        "account": "facebook", "status": "approved", "caption": dirty,
+    }])
+    results = caption_meta_sweep.run(gym_ids=["eng"], store=store,
+                                     today_iso="2026-08-23", alert=lambda _: None)
+    assert results[0]["errors"] == 1
+    assert results[0]["cleaned"] == []
+    assert store.rows["legacy-row"]["caption"] == dirty
+    assert store.rows["legacy-row"]["status"] == "approved"
+
+
+def test_sweep_proof_mode_same_status_caption_race_is_held(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    dirty = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    concurrent_edit = f"{CLEAN_BODY} We added a Saturday class."
+
+    class _ConcurrentEditStore(_FakeSweepStore):
+        def patch_caption_for_meta_sweep(self, gym_id, row_id, new_caption, *,
+                                        expected_status, expected_caption):
+            # Model a client edit landing after rows_in_range but before PATCH.
+            self.rows[row_id]["caption"] = concurrent_edit
+            return super().patch_caption_for_meta_sweep(
+                gym_id, row_id, new_caption, expected_status=expected_status,
+                expected_caption=expected_caption)
+
+    store = _ConcurrentEditStore([{
+        "id": "race-row", "gym_id": "eng", "post_date": "2026-08-24",
+        "account": "facebook", "status": "approved", "caption": dirty,
+        "approval_kind": "human", "approved_by": "actor-1",
+        "approved_at": "2026-08-20T12:00:00Z", "approval_digest": "old-digest",
+    }])
+    results = caption_meta_sweep.run(gym_ids=["eng"], store=store,
+                                     today_iso="2026-08-23", alert=lambda _: None)
+    assert results[0]["cleaned"] == []
+    assert [d["id"] for d in results[0]["held"]] == ["race-row"]
+    row = store.rows["race-row"]
+    assert row["caption"] == concurrent_edit
+    assert row["status"] == "approved"
+    assert row["approval_digest"] == "old-digest"

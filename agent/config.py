@@ -669,6 +669,44 @@ def calendar_autopublish_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CALENDAR_AUTOPUBLISH", "false"))
 
 
+def approval_proof_enabled() -> bool:
+    """
+    Durable approval-provenance enforcement for the CLIENT Manual publish lane.
+    OFF by default = zero behavior change: the atomic claim RPC is never asked
+    to require proof (p_require_approval_proof stays FALSE) and live publishing
+    is byte-for-byte today's behavior. When ON, EVERY lane passes require_proof
+    to claim_calendar_publish_slot_owned, which re-reads the gym's CURRENT
+    autonomy from the DB inside the claim transaction (an Auto->Manual flip is
+    effective atomically; resolver ambiguity fails closed). A gym that is
+    definitively autonomous keeps today's behavior; any other gym's row needs a
+    fresh VERIFIED HUMAN approval -- approval_kind='human' plus a NONEMPTY
+    trusted approved_by, stampable only by the portal's service-role
+    calendar_stamp_verified_approval after Echo's token-scoped approve (which
+    leaves provenance UNPROVED) -- whose canonical digest matches the row's
+    current publish-relevant fields: caption, account, format, date, the FINAL
+    image_url and the rendered/source identity (byte_hash /
+    source_media_asset_id / source_media_url); the publisher-stamped
+    scheduled_at is not bound. Any post-approval media change (auto-fit
+    reframe, story reburn, swap) changes image_url and fails the row CLOSED
+    into fresh review. ACTIVATION GATE: before arming, every intended-autonomous gym must
+    have exactly one clean gyms row and one echo_gym_settings row with
+    autonomous=true, or its lane fails closed. Requires migration
+    calendar_approval_provenance_20261005.sql; an unapplied migration fails
+    closed (the RPC rejects the claim, nothing publishes).
+    """
+    return _truthy(os.environ.get("AGENT_APPROVAL_PROOF", "false"))
+
+
+def approval_capture_enabled() -> bool:
+    """Capture exact-card approval digests without enforcing them at publish.
+
+    OFF by default. When ON, Echo requires the portal's visible-card snapshot
+    on approval and recovery taps. AGENT_APPROVAL_PROOF independently controls
+    the publisher's proof requirement.
+    """
+    return _truthy(os.environ.get("AGENT_APPROVAL_CAPTURE", "false"))
+
+
 def real_month_plan_enabled() -> bool:
     """
     REAL month planner switch. OFF by default = zero behavior change: the planner is
@@ -1876,12 +1914,12 @@ def gbp_mirror_active_for(gym_id) -> bool:
 
 
 def gbp_coach_screen_enabled() -> bool:
-    """GATE 2 (coach-screens-first-month): when ON (the DEFAULT), a gym's FIRST GBP month
-    is written in the withheld 'coach_review' status so the OWNER never sees or approves it
-    until a coach screens and releases it. Set AGENT_GBP_COACH_SCREEN=false only to bypass
-    the screen (e.g. a gym a coach has already vetted). The owner /social read hides
-    coach_review rows; the release flips them to 'pending'."""
-    return _truthy(os.environ.get("AGENT_GBP_COACH_SCREEN", "true"))
+    """RETIRED (Blake, 2026-10-06): there is never a coach review on anything — new GBP
+    drafts always land in 'pending' for owner approval regardless of legacy env flags.
+    Kept as an always-False compatibility predicate so existing callers degrade cleanly;
+    AGENT_GBP_COACH_SCREEN no longer has any effect. Historical coach_review rows remain
+    readable/releasable via gbp_dogfood.release()."""
+    return False
 
 
 def story_source_media_enabled() -> bool:
@@ -1905,14 +1943,12 @@ def gbp_publish_window_enabled() -> bool:
 
 
 def coach_screen_first_month_enabled() -> bool:
-    """GATE 2 for the FB/IG CLIENT month (Blake, 2026-08-17): coach screens every gym's
-    FIRST month on EVERY platform before the owner sees it — the coach SOP (walk the owner
-    through their first approvals) now enforced in software. When ON (the DEFAULT), a
-    CLIENT gym's first FB/IG month is written 'coach_review' (withheld) until released.
-    Gyms with a month already in flight are grandfathered (they already have owner-visible
-    rows, so they are not first-month). Set AGENT_COACH_SCREEN_FIRST_MONTH=false to bypass.
-    LASSO's own dogfood account is exempt (it is not a client gym)."""
-    return _truthy(os.environ.get("AGENT_COACH_SCREEN_FIRST_MONTH", "true"))
+    """RETIRED (Blake, 2026-10-06): there is never a coach review on anything — every new
+    month lands in 'pending' for owner approval regardless of legacy env flags. Kept as an
+    always-False compatibility predicate so existing callers (client_month_run) degrade
+    cleanly; AGENT_COACH_SCREEN_FIRST_MONTH no longer has any effect. Historical
+    coach_review rows remain readable/releasable by the legacy release path."""
+    return False
 
 
 def welcome_digest_enabled() -> bool:

@@ -42,6 +42,7 @@ FORWARD_DAYS = 45
 
 # Statuses that are live (or mid-flight) on a real platform: report, never write.
 _LIVE_STATUSES = ("published", "publishing")
+_PROOF_SWEEP_STATUSES = ("pending", "approved", "draft", "queued", "failed")
 
 
 def _default_gyms():
@@ -86,6 +87,14 @@ def sweep_gym(gym_id, store, *, dry_run=False, today_iso=None, log=None):
             # live on a real platform: a human edits it there; never from here.
             out["published"].append(desc)
             continue
+        from agent import config
+        if (config.approval_proof_enabled()
+                and desc["status"] not in _PROOF_SWEEP_STATUSES):
+            # Proof mode writes only positively enumerated waiting states.
+            # Unknown/terminal states are held instead of reaching a broad
+            # status-preserving legacy writer.
+            out["held"].append(desc)
+            continue
         if not (body or "").strip():
             # all-meta: stripping would leave an empty caption — hold for a human.
             out["held"].append(desc)
@@ -94,8 +103,20 @@ def sweep_gym(gym_id, store, *, dry_run=False, today_iso=None, log=None):
             out["cleaned"].append(desc)
             continue
         try:
-            updated = store.patch_caption_preserve_status(
-                gym_id, row.get("id"), body.strip())
+            if config.approval_proof_enabled():
+                # Caption is part of the approved creative digest. A hygiene
+                # cleanup therefore needs a fresh human review whenever it
+                # changes the stored caption; never preserve stale proof.
+                patch = getattr(store, "patch_caption_for_meta_sweep", None)
+                if patch is None:
+                    raise RuntimeError(
+                        "approval-proof mode requires atomic caption/proof invalidation")
+                updated = patch(gym_id, row.get("id"), body.strip(),
+                                expected_status=desc["status"],
+                                expected_caption=row.get("caption") or "")
+            else:
+                updated = store.patch_caption_preserve_status(
+                    gym_id, row.get("id"), body.strip())
         except Exception as exc:  # noqa: BLE001 - one row never stops the sweep
             log(f"{gym_id} {desc['id']}: caption clean failed: "
                 f"{type(exc).__name__}: {exc}")

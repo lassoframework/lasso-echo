@@ -201,6 +201,54 @@ def test_reburn_evidence_rejects_changed_hosted_bytes(monkeypatch, tmp_path):
     assert story_reburn.reburn_with_evidence(RAW, "caption", "Gym", "gym", logger=lambda m: None) is None
 
 
+@pytest.mark.parametrize("filename", ["Zanshin Fitness-194.jpg", "IMG_4957.jpeg"])
+def test_reburn_download_accepts_minted_filename_spaces_and_exact_object_key(
+        monkeypatch, filename):
+    import io
+    from pathlib import Path
+    from types import SimpleNamespace
+    from agent import config, media_host
+
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+    key = "echo/gym/65b27f25c0240b05/" + filename
+    url = media_host.public_url_for(key)
+    assert prep._own_media_url(url)
+    assert ("%20" in url) == (" " in filename)
+    calls, bodies = [], []
+
+    def get_object(**kwargs):
+        calls.append(kwargs)
+        body = io.BytesIO(SOURCE)
+        bodies.append(body)
+        return {"Body": body, "ContentLength": len(SOURCE)}
+
+    monkeypatch.setattr(media_host, "_default_client", lambda: SimpleNamespace(
+        _bucket="test-bucket", _s3=SimpleNamespace(get_object=get_object)))
+    path = story_reburn._download(url, lambda message: pytest.fail(message))
+    try:
+        assert path is not None
+        assert Path(path).read_bytes() == SOURCE
+        assert calls == [{"Bucket": "test-bucket", "Key": key}]
+        assert bodies[0].closed
+    finally:
+        if path:
+            Path(path).unlink()
+
+
+@pytest.mark.parametrize("path", [
+    "raw space.jpg", "raw%09.jpg", "raw%0a.jpg", "raw%0d.jpg", "raw%00.jpg",
+    "raw%7f.jpg", "raw%C2%85.jpg", "raw%C2%A0.jpg", "raw%E2%80%83.jpg",
+    "%2e/raw.jpg", "%2e%2e/raw.jpg", "raw%2Fname.jpg", "raw%5Cname.jpg",
+])
+def test_encoded_spaces_do_not_allow_unsafe_bucket_paths(monkeypatch, path):
+    from agent import config
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: pytest.fail("must not fetch"))
+    url = "https://media.example/echo/gym/" + path
+    assert not prep._own_media_url(url)
+    assert story_reburn._download(url, lambda message: None) is None
+
+
 def test_reburn_download_rejects_external_and_lookalike_hosts(monkeypatch):
     from agent import config
     monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
