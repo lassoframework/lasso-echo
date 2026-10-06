@@ -1387,16 +1387,19 @@ def test_same_object_story_preserves_behavior_when_writer_guard_off(armed, monke
 
 
 @pytest.mark.parametrize("changed_field", [None, "status", "caption", "image_url",
-                                                  "source_media_url", "published_at"])
-def test_approved_story_reburn_real_store_conditional_patch(monkeypatch, changed_field):
+                                                  "source_media_url", "published_at", "slot_index"])
+@pytest.mark.parametrize("slot_index", [0, 1, None])
+@pytest.mark.parametrize("visual_guard", [False, True])
+def test_approved_story_reburn_real_store_conditional_patch(monkeypatch, changed_field, slot_index, visual_guard):
     """Exercise the real store method against a fake that applies PostgREST filters."""
     from agent import story_reburn
-    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1" if visual_guard else "0")
     old = "https://cdn/old__story.jpg"
     new = "https://cdn/new__story.jpg"
     saved = _row("s", fmt="story", status="approved", image_url=old,
                  caption='edited, "quoted" caption')
     saved["source_media_url"] = "https://cdn/raw.jpg"
+    saved["slot_index"] = slot_index
     observed = dict(saved)
 
     class ConditionalHTTP:
@@ -1406,12 +1409,16 @@ def test_approved_story_reburn_real_store_conditional_patch(monkeypatch, changed
 
         def patch(self, url, *, params, headers, json, timeout):
             self.calls.append((params, json))
-            for key, condition in params.items():
+            # requests URL-encodes each top-level predicate. PostgREST retains
+            # quote characters in eq values rather than stripping them.
+            import requests
+            from urllib.parse import parse_qsl, urlsplit
+            wire = requests.Request("PATCH", url, params=params).prepare().url
+            decoded = dict(parse_qsl(urlsplit(wire).query))
+            assert decoded == params
+            for key, condition in decoded.items():
                 if condition == "is.null":
                     matches = self.row.get(key) is None
-                elif condition.startswith('eq."') and condition.endswith('"'):
-                    value = condition[4:-1].replace('\\"', '"').replace('\\\\', '\\')
-                    matches = str(self.row.get(key)) == value
                 else:
                     matches = condition == f"eq.{self.row.get(key)}"
                 if not matches:
@@ -1423,21 +1430,27 @@ def test_approved_story_reburn_real_store_conditional_patch(monkeypatch, changed
     changes = {"status": "publishing", "caption": "newer caption",
                "image_url": "https://cdn/other.jpg",
                "source_media_url": "https://cdn/other-source.jpg",
-               "published_at": "2026-08-10T20:00:00Z"}
+               "published_at": "2026-08-10T20:00:00Z",
+               "slot_index": 1 if slot_index == 0 else 0}
     if changed_field:
         http.row[changed_field] = changes[changed_field]
     store = _store(http)
     monkeypatch.setattr(story_reburn, "should_reburn", lambda row: True)
     monkeypatch.setattr(story_reburn, "reburn", lambda *args: new)
+    monkeypatch.setattr(story_reburn, "reburn_with_evidence", lambda *args: (
+        new, SimpleNamespace(as_dict=lambda: {})))
+    monkeypatch.setattr(store, "_prepare_visual_media",
+                        lambda account_key, row_id, payload, **kwargs: payload)
 
     healed = cap._reburn_stale_story(
         observed, SimpleNamespace(display_name="LASSO IG", key="lasso_ig"), store)
 
     params, body = http.calls[0]
-    assert params["status"] == 'eq."approved"'
-    assert params["caption"] == 'eq."edited, \\"quoted\\" caption"'
-    assert params["image_url"] == f'eq."{old}"'
-    assert params["source_media_url"] == 'eq."https://cdn/raw.jpg"'
+    assert params["status"] == "eq.approved"
+    assert params["caption"] == 'eq.edited, "quoted" caption'
+    assert params["image_url"] == f"eq.{old}"
+    assert params["source_media_url"] == "eq.https://cdn/raw.jpg"
+    assert params["slot_index"] == ("is.null" if slot_index is None else f"eq.{slot_index}")
     assert params["published_at"] == params["late_post_id"] == "is.null"
     assert params["media_not_ready_reason"] == "is.null"
     assert body == {"image_url": new, "media_not_ready_reason": None}
@@ -1447,6 +1460,43 @@ def test_approved_story_reburn_real_store_conditional_patch(monkeypatch, changed
     else:
         assert healed["image_url"] == http.row["image_url"] == new
         assert http.row["status"] == "approved"
+
+
+@pytest.mark.parametrize("proved", [False, True])
+def test_reburned_manual_story_still_requires_fresh_approval(armed, monkeypatch, proved):
+    from agent import story_image, story_reburn
+    from test_approval_provenance import _ProofStore, human_prove, canonical_digest
+
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    old = "https://cdn/old__story.jpg"
+    new = "https://cdn/healed__story.jpg"
+    row = _row("manual-reburn", fmt="story", status="approved", image_url=old,
+               caption="Build strength today.")
+    row["source_media_url"] = "https://cdn/raw.jpg"
+    if proved:
+        row = human_prove(row)
+    store = _ProofStore([row], autonomy={"lasso": False})
+
+    def patch_image_url(gym, rid, url, *, expected_row):
+        assert expected_row["image_url"] == old
+        store.rows[rid]["image_url"] = url
+        return dict(store.rows[rid])
+
+    store.patch_image_url = patch_image_url
+    monkeypatch.setattr(story_image, "story_media_carries_caption", lambda url, caption: url == new)
+    monkeypatch.setattr(story_reburn, "should_reburn", lambda row: True)
+    monkeypatch.setattr(story_reburn, "reburn", lambda *args: new)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store, publisher=pub,
+                              now=LATE_NOW, approved_only=True, catch_all=True)
+
+    assert store.rows["manual-reburn"]["image_url"] == new
+    assert store.rows["manual-reburn"].get("approval_digest") != canonical_digest(store.rows["manual-reburn"])
+    assert store.claim_calls == [("manual-reburn", True)]
+    assert summary["published"] == []
+    assert pub.calls == []
+    assert store.rows["manual-reburn"]["status"] == "approved"
 
 
 @pytest.mark.parametrize("patch_result", ["missing", None, {"image_url": "https://cdn/old__story.jpg"}])

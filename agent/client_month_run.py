@@ -1848,24 +1848,18 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 "approved CTA that reads as a single ask (never an invented one)")
 
     rows = _to_rows(base_key, drafts)
-    # GATE 2 (coach-screens-first-month, Blake 2026-08-17): a CLIENT gym's FIRST month on
-    # every platform is WITHHELD from the owner ('coach_review') until a coach screens and
-    # releases it — the coach SOP enforced in software. Established gyms (any owner-visible
-    # row already) are grandfathered, never re-withheld on a rebuild. LASSO's own account is
-    # exempt (not a client gym). Safe default: a store lacking the signal is treated as
-    # established (no withhold), so nothing changes for it.
-    if (config.coach_screen_first_month_enabled() and base_key != "lasso"
-            and _is_first_month(base_key, store, log)):
-        for r in rows:
-            r["status"] = "coach_review"
-        log(f"{base_key}: FIRST month -> written 'coach_review' (withheld from owner "
-            "until a coach releases it; GATE 2)")
+    # Blake 2026-10-06 ruling: no NEW row is ever withheld in 'coach_review' — a first
+    # month now lands as 'pending' like every other draft so the client approves it
+    # directly. Historical coach_review rows remain readable/editable where existing
+    # guards reference the status; this build path simply no longer creates them.
+    for r in rows:
+        r["status"] = "pending"
     # GOOGLE BUSINESS MIRROR (AGENT_GBP_MIRROR, default OFF; Blake 2026-09-02: "anytime
     # you post to ig, fb or whatever goes to google as well"). The same build-time
     # cross-post the Facebook leg does, with the two things a Google post cannot share
     # with an Instagram post done properly: a 1200x900 crop hosted BEFORE approval, and a
     # Google-native caption that must clear the A+ gate or the row is skipped. Appended
-    # AFTER the GATE 2 loop on purpose: a GBP row is never 'coach_review' (Blake ruled it
+    # after the pending-stamp on purpose: a GBP row is never 'coach_review' (Blake ruled it
     # out for Google), it is always the owner's own 'pending' tap. See agent/gbp_mirror.py.
     from . import gbp_mirror as _gbp_mirror
     # NOTE: no store= is passed. `store` here is the calendar store; the mirror needs a
@@ -3159,11 +3153,8 @@ def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice
 
     try:
         rows = _to_rows(base_key, drafts)
-        # GATE 2 safety: withhold a first-month replacement exactly as its month would be.
-        if (config.coach_screen_first_month_enabled() and base_key != "lasso"
-                and _is_first_month(base_key, store, log)):
-            for r in rows:
-                r["status"] = "coach_review"
+        # First-month replacements land 'pending' like any new draft (Blake
+        # 2026-10-06: nothing new is ever coach_review).
         from . import gbp_mirror as _gbp_mirror
         rows.extend(_gbp_mirror.rows_for(base_key, drafts, library_path=library_path,
                                          logger=log))
