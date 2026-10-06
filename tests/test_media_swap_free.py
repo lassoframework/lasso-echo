@@ -396,7 +396,7 @@ def test_swap_landed_but_representation_none_keeps_local_reservation(monkeypatch
     status, body = ps.handle_swap_media(
         "zanshin", "p1", "u1", sb_store=store, picker=lambda *a, **k: pick)
 
-    assert status == 200 and body["media_swap_proof"]["readback_verified"]
+    assert status == 503 and body["reason"] == "swap_outcome_unknown"
     assert store.get_row("zanshin", "p1")["image_url"] == pick["image_url"]
     assert rotation.load_served_strict().get("zanshin_ig"), (
         "a landed PATCH must keep its once-use reservation")

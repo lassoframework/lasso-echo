@@ -2151,7 +2151,8 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
         updated = sb_store.swap_media(account_key, draft_id, pick["image_url"],
                                       **write_args)
         try:
-            updated = _verified_swap_readback(sb_store, account_key, row, pick)
+            updated = (_verified_swap_readback(sb_store, account_key, row, pick, updated)
+                       if updated is not None else None)
         except Exception:
             updated = None
         if updated is None:
@@ -2211,7 +2212,8 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                 print(f"[portal-social] sibling swap failed for {sid}: {type(exc).__name__}")
                 done = None
             try:
-                done = _verified_swap_readback(sb_store, account_key, sib, var)
+                done = (_verified_swap_readback(sb_store, account_key, sib, var, done)
+                        if done is not None else None)
             except Exception:
                 done = None
             if done is not None:
@@ -2280,9 +2282,15 @@ def _swap_snapshot_digest(row):
                                      default=str).encode()).hexdigest()
 
 
-def _verified_swap_readback(store, account_key, before, pick):
+def _verified_swap_readback(store, account_key, before, pick, patch_result):
     """An independent exact-ID GET is the completion boundary, never PATCH output."""
+    if not _swap_row_matches(account_key, before, pick, patch_result):
+        return None
     fresh = store.get_row(account_key, before["id"])
+    return fresh if _swap_row_matches(account_key, before, pick, fresh) else None
+
+
+def _swap_row_matches(account_key, before, pick, fresh):
     if (not isinstance(fresh, dict) or fresh.get("id") != before["id"]
             or str(fresh.get("gym_id")) != str(account_key)):
         return None

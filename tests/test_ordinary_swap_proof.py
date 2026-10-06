@@ -213,3 +213,40 @@ def test_video_proof_binds_actual_media_and_keeps_poster_display(enabled, monkey
     assert body["media_swap_proof"]["old_image_url"] == "https://cdn/old.mp4"
     assert body["media_swap_proof"]["new_image_url"] == body["video_url"] == "https://cdn/new.mp4"
     assert body["image_public_url"] == "https://cdn/poster.jpg"
+
+
+def test_lost_primary_cas_cannot_claim_another_actors_matching_media(enabled):
+    store = Store(row())
+    def lost_cas(gym, rid, image, **kwargs):
+        store.calls.append(kwargs)
+        store.row.update(image_url=image, source_media_url=kwargs["source_media_url"],
+                         **kwargs["extra_fields"])
+        return None  # Another actor landed these bytes, not this CAS.
+    store.swap_media = lost_cas
+    code, body = run(store)
+    assert code == 503 and body["reason"] == "swap_outcome_unknown"
+    assert "media_swap_proof" not in body
+
+
+def test_lost_sibling_cas_is_left_even_when_matching_media_is_visible(enabled, monkeypatch):
+    before = row()
+    sibling = {**before, "id": "sibling", "account": "facebook"}
+    store = Store(before)
+    monkeypatch.setattr(media_swap, "sibling_rows", lambda *a, **k: [deepcopy(sibling)])
+    real_swap = store.swap_media
+    sibling_fresh = deepcopy(sibling)
+    def swap(gym, rid, image, **kwargs):
+        if rid == "sibling":
+            sibling_fresh.update(image_url=image, source_media_url=kwargs["source_media_url"],
+                                 **kwargs["extra_fields"])
+            return None
+        return real_swap(gym, rid, image, **kwargs)
+    real_get = store.get_row
+    store.get_row = lambda gym, rid: deepcopy(sibling_fresh) if rid == "sibling" else real_get(gym, rid)
+    store.swap_media = swap
+    replacement = pick()
+    replacement["siblings"] = {"sibling": pick()}
+    code, body = run(store, replacement)
+    assert code == 200
+    assert body["siblings_swapped"] == [] and body["siblings_left"] == ["sibling"]
+    assert body["sibling_results"] == []
