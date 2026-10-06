@@ -59,8 +59,10 @@ _ig account ("gritx_ig") is the generation/source key; the _fb account is the mi
 import json
 import os
 import subprocess
+import unicodedata
+from collections import defaultdict
 
-from . import config, visual_fingerprint
+from . import burst_spacing, config, visual_fingerprint
 
 # Media extensions we sync (mirror client_month_run._MEDIA_EXTS: the same set that
 # counts as a gym having uploaded usable creative).
@@ -491,7 +493,7 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
                        consent=bool(consents.get(name)),
                        source_fingerprint=aliases[0],
                        source_fingerprint_aliases=aliases[1:],
-                       intake_sequence=intake_sequences.get(name))
+                       intake_sequence=_intake_sequence_for(intake_sequences, name))
         synced += 1
         if _valid_media_file(target):
             accepted.append(key)
@@ -666,15 +668,17 @@ def _read_context_consent(r2, prefixes, log, keys=None):
 
 
 def _read_intake_sequences(r2, prefixes, keys=None):
-    """Trusted upload-batch metadata keyed by stored media basename.
+    """Build a collision-safe index of trusted upload-batch metadata.
 
     The portal writes one immutable ``timestamp`` plus the ordered ``filenames``
     array in each upload sidecar. Persisting those facts into the local sidecar
     lets the Vision-off picker space camera bursts without inspecting people or
-    image content.
+    image content. Ingest can preserve the stem while converting HEIC to JPG or
+    MOV to MP4, so exact extension matching is insufficient. A normalized-stem
+    fallback is retained only when that stem identifies exactly one source name
+    and one metadata record; collisions return no metadata rather than guessing.
     """
-    import re
-    result = {}
+    records = defaultdict(list)
     for prefix in prefixes:
         prefix_keys = keys.get(prefix) if keys is not None else None
         if prefix_keys is None:
@@ -696,18 +700,42 @@ def _read_intake_sequences(r2, prefixes, keys=None):
                 name = os.path.basename(str(filename or ""))
                 if not name:
                     continue
-                match = re.match(
-                    r"^\d{8}T\d{6}Z_(?P<family>[A-Za-z][A-Za-z0-9]{1,11})"
-                    r"[_-]?(?P<sequence>\d{3,8})(?:[_-].*)?\.[^.]+$", name)
                 metadata = {
                     "intake_batch_timestamp": stamp,
                     "intake_batch_position": position,
                 }
-                if match:
-                    metadata["intake_camera_family"] = match.group("family").lower()
-                    metadata["intake_camera_sequence"] = int(match.group("sequence"))
-                result[name] = metadata
-    return result
+                parsed = burst_spacing.parse_camera_sequence(name)
+                if parsed:
+                    family, sequence = parsed
+                    metadata["intake_camera_family"] = family
+                    metadata["intake_camera_sequence"] = sequence
+                normalized_name = unicodedata.normalize("NFC", name).casefold()
+                normalized_stem = os.path.splitext(normalized_name)[0]
+                records[normalized_stem].append((normalized_name, metadata))
+
+    by_name = {}
+    by_stem = {}
+    for stem, rows in records.items():
+        names = {name for name, _metadata in rows}
+        metadata_values = {
+            json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+            for _name, metadata in rows
+        }
+        if len(names) != 1 or len(metadata_values) != 1:
+            continue
+        name, metadata = rows[0]
+        by_name[name] = metadata
+        by_stem[stem] = metadata
+    return {"by_name": by_name, "by_stem": by_stem}
+
+
+def _intake_sequence_for(index, media_name):
+    """Resolve exact or conversion-preserved-stem metadata from one safe index."""
+    normalized_name = unicodedata.normalize(
+        "NFC", os.path.basename(str(media_name or ""))).casefold()
+    normalized_stem = os.path.splitext(normalized_name)[0]
+    return ((index or {}).get("by_name", {}).get(normalized_name)
+            or (index or {}).get("by_stem", {}).get(normalized_stem))
 
 
 def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",

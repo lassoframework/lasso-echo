@@ -15,16 +15,43 @@ import os
 import re
 from collections import defaultdict
 
-from . import dam
+from . import config, dam
 
 
 _STAMP_RE = re.compile(r"(?P<stamp>\d{8}T\d{6}Z)_(?P<name>[^/]+)$")
-_CAMERA_SEQUENCE_RE = re.compile(
-    r"^(?P<family>[A-Za-z][A-Za-z0-9]{1,11})[_-]?(?P<sequence>\d{3,8})"
+_SEPARATED_CAMERA_SEQUENCE_RE = re.compile(
+    r"^(?P<family>[A-Za-z][A-Za-z0-9]{0,11})[_-](?P<sequence>\d{3,8})"
     r"(?:[_-].*)?$",
     re.IGNORECASE,
 )
+_COMPACT_CAMERA_SEQUENCE_RE = re.compile(
+    r"^(?P<family>[A-Za-z](?:[A-Za-z0-9]{0,10}[A-Za-z])?)"
+    r"(?P<sequence>\d{3,8})(?:[_-].*)?$",
+    re.IGNORECASE,
+)
 _MAX_SEQUENCE_GAP = 4
+
+
+def parse_camera_sequence(value):
+    """Return ``(family, sequence)`` from one conservative camera filename.
+
+    Separator-free camera names need their complete trailing digit run treated
+    as the sequence. A single optional-separator regex made the family greedy,
+    so ``DSCN0999`` became family ``dscn0`` / sequence ``999`` and then
+    ``DSCN1000`` became family ``dscn1`` / sequence ``000``. Keeping the
+    separated and compact shapes explicit preserves rollover identity.
+    """
+    name = os.path.basename(str(value or ""))
+    stamped = _STAMP_RE.search(name)
+    if stamped:
+        name = stamped.group("name")
+    stem = os.path.splitext(name)[0]
+    for pattern in (_SEPARATED_CAMERA_SEQUENCE_RE,
+                    _COMPACT_CAMERA_SEQUENCE_RE):
+        match = pattern.match(stem)
+        if match:
+            return match.group("family").lower(), int(match.group("sequence"))
+    return None
 
 
 def _metadata(path):
@@ -53,12 +80,12 @@ def _metadata(path):
         return None
 
     if not family or sequence is None:
-        stem = os.path.splitext(source_name)[0]
-        match = _CAMERA_SEQUENCE_RE.match(stem)
-        if match:
-            family = family or match.group("family").lower()
+        parsed = parse_camera_sequence(source_name or os.path.basename(path))
+        if parsed:
+            parsed_family, parsed_sequence = parsed
+            family = family or parsed_family
             if sequence is None:
-                sequence = int(match.group("sequence"))
+                sequence = parsed_sequence
     return batch, family, sequence
 
 
@@ -103,6 +130,8 @@ def choose_spaced_pool(pool, catalog, served, account_key, day_key):
     cohort make spacing unsafe or meaningless, the legacy pool is returned.
     """
     pool = list(pool)
+    if not config.burst_spacing_enabled_for(account_key):
+        return pool
     if len(pool) < 2 or any(getattr(c, "media_type", "") != "image" for c in pool):
         return pool
     cohorts = cohort_map(catalog)
@@ -116,20 +145,25 @@ def choose_spaced_pool(pool, catalog, served, account_key, day_key):
         return pool
 
     from . import rotation
-    rotation_to_cohort = {
-        dam.rotation_key(c.path): cohorts[c.path]
-        for c in catalog if c.path in cohorts
-    }
+    rotation_to_cohorts = defaultdict(set)
+    for creative in catalog:
+        if creative.path in cohorts:
+            rotation_to_cohorts[dam.rotation_key(creative.path)].add(
+                cohorts[creative.path])
     base = rotation._base_account_key(account_key)
     last_date = {}
     for served_account, entries in (served or {}).items():
         if rotation._base_account_key(served_account) != base:
             continue
         for entry in entries:
-            cohort = rotation_to_cohort.get(entry.get("key"))
             when = str(entry.get("date") or "")
-            if cohort in available and when > last_date.get(cohort, ""):
-                last_date[cohort] = when
+            # A near-dupe rotation key can (legitimately or through stale
+            # metadata) span more than one intake cohort. Attribute that served
+            # record to every possible cohort. Picking an arbitrary last writer
+            # would make the other cohort look never used and defeat spacing.
+            for cohort in rotation_to_cohorts.get(entry.get("key"), ()):
+                if cohort in available and when > last_date.get(cohort, ""):
+                    last_date[cohort] = when
 
     never = [cohort for cohort in available if cohort not in last_date]
     if never:

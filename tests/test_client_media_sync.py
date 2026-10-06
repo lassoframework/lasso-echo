@@ -188,6 +188,58 @@ def test_sync_persists_ordered_camera_sequence_metadata():
     assert side["intake_camera_sequence"] == 1002
 
 
+def test_sync_preserves_intake_metadata_across_stem_preserving_conversion():
+    converted = [
+        ("20261001T120000Z_DSCN0999.heic",
+         "20261001T120000Z_DSCN0999.jpg", b"\xff\xd8\xffJPG"),
+        ("20261001T120000Z_IMG1001.mov",
+         "20261001T120000Z_IMG1001.mp4", b"MP4"),
+    ]
+    objects = {
+        f"intake/nine7/pending_caption/{stored}": payload
+        for _original, stored, payload in converted
+    }
+    originals = [original for original, _stored, _payload in converted]
+    objects["intake/nine7/incoming/20261001T120000Z_upload.json"] = json.dumps({
+        "timestamp": "20261001T120000Z", "filenames": originals,
+    }).encode()
+
+    assert cms.sync_uploads("nine7", r2=FakeR2(objects)) == {
+        "synced": 2, "skipped": 0,
+    }
+    image_side = json.load(open(os.path.join(
+        "content_library", "nine7", "20261001T120000Z_DSCN0999.json")))
+    video_side = json.load(open(os.path.join(
+        "content_library", "nine7", "20261001T120000Z_IMG1001.json")))
+    assert (image_side["intake_camera_family"],
+            image_side["intake_camera_sequence"]) == ("dscn", 999)
+    assert (video_side["intake_camera_family"],
+            video_side["intake_camera_sequence"]) == ("img", 1001)
+    assert image_side["intake_batch_position"] == 0
+    assert video_side["intake_batch_position"] == 1
+
+
+def test_sync_drops_ambiguous_stem_metadata_instead_of_guessing():
+    stored = "20261001T120000Z_IMG1001.jpg"
+    objects = {
+        f"intake/nine7/pending_caption/{stored}": b"\xff\xd8\xffJPG",
+        "intake/nine7/incoming/20261001T120000Z_upload.json": json.dumps({
+            "timestamp": "20261001T120000Z",
+            "filenames": [
+                "20261001T120000Z_IMG1001.heic",
+                "20261001T120000Z_IMG1001.jpg",
+            ],
+        }).encode(),
+    }
+
+    assert cms.sync_uploads("nine7", r2=FakeR2(objects))["synced"] == 1
+    side = json.load(open(os.path.join(
+        "content_library", "nine7", "20261001T120000Z_IMG1001.json")))
+    assert "intake_batch_timestamp" not in side
+    assert "intake_camera_family" not in side
+    assert "intake_camera_sequence" not in side
+
+
 def test_sync_is_idempotent_no_redownload():
     r2 = _r2_with_uploads("gritx", n=3)
     cms.sync_uploads("gritx", r2=r2)

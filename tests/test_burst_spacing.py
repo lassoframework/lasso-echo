@@ -14,7 +14,8 @@ def _photo(tmp_path, batch, number):
     return Creative(path=str(path), media_type="image")
 
 
-def test_multiple_camera_bursts_are_maximally_spaced(tmp_path):
+def test_multiple_camera_bursts_are_maximally_spaced(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BURST_SPACING_GYMS", "nine7")
     photos = [
         _photo(tmp_path, "20261001T120000Z", 1001),
         _photo(tmp_path, "20261001T120000Z", 1002),
@@ -39,7 +40,8 @@ def test_multiple_camera_bursts_are_maximally_spaced(tmp_path):
     assert len(set(chosen_batches)) == 3
 
 
-def test_sequence_gap_splits_two_bursts_inside_one_upload(tmp_path):
+def test_sequence_gap_splits_two_bursts_inside_one_upload(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BURST_SPACING_GYMS", "nine7")
     photos = [
         _photo(tmp_path, "20261001T120000Z", 1001),
         _photo(tmp_path, "20261001T120000Z", 1002),
@@ -64,7 +66,44 @@ def test_unknown_or_thin_library_preserves_legacy_order(tmp_path):
         unknown[:1], unknown[:1], {}, "nine7_ig", "2026-10-10") == unknown[:1]
 
 
+def test_compact_camera_sequence_parser_preserves_rollover_family():
+    assert burst_spacing.parse_camera_sequence("DSCN0999.JPG") == ("dscn", 999)
+    assert burst_spacing.parse_camera_sequence("DSCN1000.JPG") == ("dscn", 1000)
+    assert burst_spacing.parse_camera_sequence("IMG1001.jpg") == ("img", 1001)
+    assert burst_spacing.parse_camera_sequence("IMG_1002.jpg") == ("img", 1002)
+
+
+def test_compact_camera_rollover_stays_in_one_burst_cohort(tmp_path):
+    photos = []
+    for sequence in ("0999", "1000"):
+        path = tmp_path / f"20261001T120000Z_DSCN{sequence}.jpg"
+        path.write_bytes(sequence.encode())
+        photos.append(Creative(path=str(path), media_type="image"))
+
+    cohorts = burst_spacing.cohort_map(photos)
+
+    assert cohorts[photos[0].path] == cohorts[photos[1].path]
+
+
+def test_burst_spacing_is_default_off_and_explicitly_scoped(tmp_path, monkeypatch):
+    photos = [
+        _photo(tmp_path, "20261001T120000Z", 1001),
+        _photo(tmp_path, "20261002T120000Z", 2001),
+    ]
+    monkeypatch.delenv("AGENT_BURST_SPACING_GYMS", raising=False)
+    assert config.burst_spacing_gyms() == set()
+    assert burst_spacing.choose_spaced_pool(
+        photos, photos, {}, "nine7_ig", "2026-10-10") == photos
+
+    monkeypatch.setenv("AGENT_BURST_SPACING_GYMS", " NINE7 , othergym ")
+    assert config.burst_spacing_enabled_for("nine7_fb") is True
+    assert config.burst_spacing_enabled_for("unlisted_ig") is False
+    assert len(burst_spacing.choose_spaced_pool(
+        photos, photos, {}, "nine7_ig", "2026-10-10")) == 1
+
+
 def test_legacy_picker_spaces_bursts_with_vision_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BURST_SPACING_GYMS", "nine7")
     photos = [
         _photo(tmp_path, "20261001T120000Z", 1001),
         _photo(tmp_path, "20261001T120000Z", 1002),
@@ -97,6 +136,7 @@ def test_legacy_picker_spaces_bursts_with_vision_disabled(tmp_path, monkeypatch)
 
 def test_real_picker_preserves_unknown_asset_in_mixed_cohort_library(
         tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BURST_SPACING_GYMS", "nine7")
     _photo(tmp_path, "20261001T120000Z", 1001)
     _photo(tmp_path, "20261002T120000Z", 2001)
     legacy = tmp_path / "000_legacy_team.jpg"
@@ -117,3 +157,20 @@ def test_real_picker_preserves_unknown_asset_in_mixed_cohort_library(
 
     assert picked is not None
     assert picked.path == str(legacy)
+
+
+def test_cross_cohort_dupe_group_history_is_conservative(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BURST_SPACING_GYMS", "nine7")
+    first = _photo(tmp_path, "20261001T120000Z", 1001)
+    second = _photo(tmp_path, "20261002T120000Z", 2001)
+    third = _photo(tmp_path, "20261003T120000Z", 3001)
+    from agent import dam
+    dam.write_sidecar(first.path, {"dupe_group": "shared-burst"})
+    dam.write_sidecar(second.path, {"dupe_group": "shared-burst"})
+    served = {"nine7_ig": [{"key": "shared-burst", "date": "2026-10-09"}]}
+
+    chosen = burst_spacing.choose_spaced_pool(
+        [first, second, third], [first, second, third], served,
+        "nine7_ig", "2026-10-10")
+
+    assert chosen == [third]
