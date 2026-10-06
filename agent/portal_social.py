@@ -2081,8 +2081,10 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
         siblings = [s for s in all_siblings
                     if str(s.get("status") or "").lower() in ("pending", "coach_review")]
         locked_siblings = [str(s.get("id") or "") for s in all_siblings if s not in siblings]
-        pick = (picker or _ms.pick_replacement)(account_key, row, store=sb_store,
-                                                 siblings=siblings)
+        pick_args = {"store": sb_store, "siblings": siblings}
+        if picker is None:
+            pick_args["require_original_proof"] = True
+        pick = (picker or _ms.pick_replacement)(account_key, row, **pick_args)
         if not pick.get("ok"):
             # A swap that cannot happen is a 409 the client can read, NOT a charge.
             return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
@@ -2099,28 +2101,41 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                          "error": _ms.client_message(_ms.REASON_STORY_REBURN),
                          "reason": _ms.REASON_STORY_REBURN, "failed_sibling": missing[0],
                          "recreate_budget": _budget_state(account_key)}
+        from . import media_guard
+        original_byte_cache = {}
+        try:
+            old_original = media_guard.swap_original_identity(
+                account_key, row, sb_store, byte_cache=original_byte_cache)
+            new_original = media_guard.swap_original_identity(
+                account_key, row, sb_store, pick=pick, byte_cache=original_byte_cache)
+            if (pick.get("image_url") == row.get("image_url")
+                    or old_original["sha256"] == new_original["sha256"]
+                    or (old_original["source_asset_id"] and old_original["source_asset_id"]
+                        == new_original["source_asset_id"])):
+                raise ValueError("same original photo")
+            for variant in [variants[str(s.get("id"))] for s in siblings]:
+                identity = media_guard.swap_original_identity(
+                    account_key, row, sb_store, pick=variant, byte_cache=original_byte_cache)
+                if identity != new_original:
+                    raise ValueError("sibling original mismatch")
+        except Exception:
+            return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "reason": "media_evidence_unavailable",
+                         "error": "A different original photo could not be verified.",
+                         "recreate_budget": _budget_state(account_key)}
         from . import visual_writer_prepare
-        if visual_writer_prepare.enabled():
-            poster_byte_cache = {}
-            for variant in [pick] + [variants[str(s.get("id"))] for s in siblings]:
-                if (not variant.get("source_media_url")
-                        or (variant.get("source_media_url") != variant.get("image_url")
-                            and not isinstance(variant.get("render_evidence"), dict))):
-                    return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
-                                 "error": "verified media evidence is unavailable",
-                                 "reason": "media_evidence_unavailable",
-                                 "recreate_budget": _budget_state(account_key)}
-                if not _poster_evidence_is_current(
-                        variant, visual_writer_prepare, poster_byte_cache):
-                    return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
-                                 "error": "verified poster evidence is unavailable",
-                                 "reason": "poster_evidence_unavailable",
-                                 "recreate_budget": _budget_state(account_key)}
+        poster_byte_cache = {}
+        for variant in [pick] + [variants[str(s.get("id"))] for s in siblings]:
+            if not _poster_evidence_is_current(variant, visual_writer_prepare, poster_byte_cache):
+                return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                             "error": "verified poster evidence is unavailable",
+                             "reason": "poster_evidence_unavailable",
+                             "recreate_budget": _budget_state(account_key)}
         # The media identity travels WITH the pixels (2026-09-10): a video's poster
         # frame (or a cleared poster when a video row becomes a photo) and the Drive
         # asset id now on the row (or None when it left the Drive pool).
         write_args = {"source_media_url": pick.get("source_media_url"),
-                      "extra_fields": _ms.swap_fields(pick)}
+                      "extra_fields": _ms.swap_fields(pick), "expected_row": row}
         if pick.get("render_evidence") is not None:
             write_args["render_evidence"] = pick["render_evidence"]
         if pick.get("poster_render_evidence") is not None:
@@ -2137,8 +2152,22 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
         # frame (or a cleared poster when a video row becomes a photo) and the Drive
         # asset id now on the row (or None when it left the Drive pool).
         primary_write_started = True
-        updated = sb_store.swap_media(account_key, draft_id, pick["image_url"],
-                                      **write_args)
+        patch_result = sb_store.swap_media(account_key, draft_id, pick["image_url"],
+                                           **write_args)
+        primary_readback_unknown = False
+        try:
+            updated = (_verified_swap_readback(sb_store, account_key, row, pick, patch_result)
+                       if patch_result is not None else None)
+        except Exception:
+            updated = None
+            # A fully validated PATCH proves this request wrote the primary,
+            # even while its independent GET cannot certify completion. Carry
+            # its siblings forward once, retaining the reservation and unknown
+            # response; never replay the primary PATCH or infer our write from
+            # a matching mutable row after a missing/mismatched PATCH result.
+            if _swap_row_matches(account_key, row, pick, patch_result):
+                primary_readback_unknown = True
+                updated = patch_result
         if updated is None:
             # Prepared writes can land the PATCH and still return None when the
             # representation fails validation. Only a fresh, tenant-scoped row
@@ -2165,27 +2194,48 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                          "error": "Photo swap outcome could not be verified.",
                          "reason": "swap_outcome_unknown",
                          "recreate_budget": _budget_state(account_key)}
+        # The validated PATCH establishes that this request landed. Success
+        # still requires its independent exact-ID readback; a persistent GET
+        # outage completes bounded sibling work but remains outcome unknown.
         local_landed = True
         # Same-post siblings, one operation, the SAME per-row server-side status guard
         # (a sibling approved between the read and this write matches nothing and is
         # reported as left).
         swapped, left = [draft_id], list(locked_siblings)
+        unknown_siblings = []
         sibling_results = []
         for sib in siblings:
             sid = str(sib.get("id") or "")
             var = variants[sid]
+            write_interrupted = False
             try:
                 write_args = {"source_media_url": var.get("source_media_url"),
-                              "extra_fields": _ms.swap_fields(var)}
+                              "extra_fields": _ms.swap_fields(var), "expected_row": sib}
                 if var.get("render_evidence") is not None:
                     write_args["render_evidence"] = var["render_evidence"]
                 if var.get("poster_render_evidence") is not None:
                     write_args["poster_render_evidence"] = var["poster_render_evidence"]
-                done = sb_store.swap_media(account_key, sid, var["image_url"],
-                                           **write_args)
+                sibling_patch = sb_store.swap_media(account_key, sid, var["image_url"],
+                                                    **write_args)
             except Exception as exc:  # noqa: BLE001 - one sibling never undoes the swap
                 print(f"[portal-social] sibling swap failed for {sid}: {type(exc).__name__}")
-                done = None
+                sibling_patch = None
+                write_interrupted = True
+            if write_interrupted:
+                outcome, done = _recover_interrupted_swap_readback(
+                    sb_store, account_key, sib, var)
+                if outcome == "unknown":
+                    unknown_siblings.append(sid)
+            else:
+                try:
+                    done = (_verified_swap_readback(sb_store, account_key, sib, var, sibling_patch)
+                            if sibling_patch is not None else None)
+                except Exception:
+                    done = None
+                    if _swap_row_matches(account_key, sib, var, sibling_patch):
+                        # Our PATCH landed, but its independent GET is unreadable.
+                        # Do not report this as untouched or certified successful.
+                        unknown_siblings.append(sid)
             if done is not None:
                 swapped.append(sid)
                 sibling_kind = _media_kind(done.get("image_url", ""))
@@ -2197,12 +2247,21 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                     "video_url": (done.get("image_url", "")
                                   if sibling_kind == "video" else None),
                 })
-            else:
+            elif sid not in unknown_siblings:
                 left.append(sid)
         # The write landed: settle the Drive usage ledger + the served ledger so the
         # asset now on the row cools down, and the one it replaced returns to the pool
         # ONLY when no remaining row on the book still carries it. A failed re-read
         # is None = unknown = leave it stamped (never [] = "nothing carries it").
+        if primary_readback_unknown or unknown_siblings:
+            return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": "Photo swap outcome could not be verified.",
+                         "reason": "swap_outcome_unknown",
+                         "siblings_swapped": [s for s in swapped if s != draft_id],
+                         "siblings_left": left,
+                         "siblings_unknown": unknown_siblings,
+                         "sibling_results": sibling_results,
+                         "recreate_budget": _budget_state(account_key)}
         _ms.after_swap(account_key, row, pick,
                        book_rows=_month_rows_for(sb_store, account_key, row),
                        swapped_ids=swapped)
@@ -2214,9 +2273,25 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                 and (not primary_write_started
                      or isinstance(exc, _pcs.PreWriteCASError))):
             _ms.release_local_pick(pick)
+        if not local_landed and isinstance(exc, _pcs.PreWriteCASError):
+            return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "reason": "swap_snapshot_unavailable",
+                         "error": ("Echo could not safely verify this post for a photo swap. "
+                                   "Your post is unchanged and your recreates were not touched."),
+                         "recreate_budget": _budget_state(account_key)}
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}
     return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,
+                 "media_swap_proof": {
+                     "version": 1, "verified": True, "account_key": account_key,
+                     "row_id": str(draft_id), "old_image_url": row["image_url"],
+                     "new_image_url": updated["image_url"],
+                     "old_original_sha256": old_original["sha256"],
+                     "new_original_sha256": new_original["sha256"],
+                     "old_original_asset_id": old_original["source_asset_id"],
+                     "new_original_asset_id": new_original["source_asset_id"],
+                     "original_snapshot_sha256": _swap_snapshot_digest(row),
+                     "readback_verified": True, "invariants_preserved": True},
                  "siblings_swapped": [s for s in swapped if s != draft_id],
                  "siblings_left": left,
                  "sibling_results": sibling_results,
@@ -2233,6 +2308,100 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                  "day_key": updated.get("post_date", ""),
                  "free": True,
                  "recreate_budget": _budget_state(account_key)}
+
+
+def _swap_snapshot_digest(row):
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps(row, sort_keys=True, separators=(",", ":"),
+                                     default=str).encode()).hexdigest()
+
+
+def _swap_readback_row(store, account_key, row_id):
+    """Read one exact tenant row, retrying only an interrupted read once."""
+    try:
+        return store.get_row(account_key, row_id)
+    except Exception:
+        # One bounded read retry resolves a transient GET failure after a
+        # committed PATCH. It never retries the mutation. Persistent outages
+        # propagate so the caller retains an unknown completion outcome.
+        return store.get_row(account_key, row_id)
+
+
+def _recover_interrupted_swap_readback(store, account_key, before, pick):
+    """Resolve a lost mutation response without repeating the mutation.
+
+    Only an exact original proves untouched; only the full requested media and
+    preserved snapshot prove a saved result. Prepared scene aliases cannot be
+    certified without their lost PATCH evidence, so those outcomes stay unknown.
+    """
+    try:
+        fresh = _swap_readback_row(store, account_key, before["id"])
+        if (not isinstance(fresh, dict) or fresh.get("id") != before["id"]
+                or str(fresh.get("gym_id")) != str(account_key)):
+            return "unknown", None
+        original = {key: value for key, value in before.items() if key != "updated_at"}
+        observed = {key: value for key, value in fresh.items() if key != "updated_at"}
+        if observed == original:
+            return "left", None
+        from . import visual_writer_prepare
+        if (visual_writer_prepare.enabled()
+                or any((field in fresh) != (field in before)
+                       for field in _pcs._DRAFT_SCENE_CAS_COLUMNS)):
+            return "unknown", None
+        if _swap_row_matches(account_key, before, pick, fresh):
+            return "swapped", fresh
+    except Exception:
+        pass  # Unreadable or contradictory evidence never establishes a no-op.
+    return "unknown", None
+
+
+def _verified_swap_readback(store, account_key, before, pick, patch_result):
+    """An independent exact-ID GET is the completion boundary, never PATCH output."""
+    if not _swap_row_matches(account_key, before, pick, patch_result):
+        return None
+    fresh = _swap_readback_row(store, account_key, before["id"])
+    if not _swap_row_matches(account_key, before, pick, fresh):
+        return None
+    # Preparation may replace scene identities in the validated PATCH result.
+    # The independent GET must carry exactly those identities, including column
+    # presence: draft columns absent from both rows remain compatible with live
+    # schemas, but a newly added, removed or altered alias is an unknown outcome.
+    for field in _pcs._DRAFT_SCENE_CAS_COLUMNS:
+        if ((field in fresh) != (field in patch_result)
+                or fresh.get(field) != patch_result.get(field)):
+            return None
+    return fresh
+
+
+def _swap_row_matches(account_key, before, pick, fresh):
+    if (not isinstance(fresh, dict) or fresh.get("id") != before["id"]
+            or str(fresh.get("gym_id")) != str(account_key)):
+        return None
+    from . import media_swap
+    expected = {"image_url": pick["image_url"],
+                "source_media_url": pick.get("source_media_url"),
+                **media_swap.swap_fields(pick)}
+    from . import visual_writer_prepare
+    prepared_write = visual_writer_prepare.enabled()
+    if not prepared_write:
+        for field in _pcs._DRAFT_SCENE_CAS_COLUMNS:
+            if field in before:
+                expected[field] = None
+    changed = set(expected)
+    for key, value in before.items():
+        if (key not in changed and key != "updated_at"
+                and (key not in fresh or fresh[key] != value)):
+            # Global preparation can attach identity evidence; every other field,
+            # including approval, hold, caption, schedule and claim, stays exact.
+            # updated_at is advanced by the database for this same mutation.
+            if not prepared_write or key not in _pcs._DRAFT_SCENE_CAS_COLUMNS:
+                return None
+    if any(key not in fresh or fresh[key] != value for key, value in expected.items()):
+        return None
+    if fresh["image_url"] == before.get("image_url"):
+        return None
+    return fresh
 
 
 def _month_rows_for(sb_store, account_key, row):
