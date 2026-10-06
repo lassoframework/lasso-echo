@@ -3,11 +3,10 @@
 FINAL CONTRACT (Astra rejection, 2026-10-03 — see
 docs/VISUAL_SCENE_GUARD_DRAFT.md): the prep-time scene writer architecture was
 rejected, so scene evidence here is ADVISORY METADATA ONLY. The
-`scene_fingerprint` evidence field rides alongside the md5 identity on
-receipts the writer builds from already-verified exact bytes; it never gates,
-never raises, and there is no scene RPC, no p_scene_* payload and no
-post_date requirement in ANY flag state. Undecodable bytes simply record null
-evidence; the md5 identity stays the only authority.
+`scene_fingerprint` evidence field is added only when a new scene flag is
+armed. It never gates, never raises, and there is no scene RPC, no p_scene_*
+payload and no post_date requirement in ANY flag state. Undecodable bytes
+record null evidence when collection is armed; md5 stays the only authority.
 """
 import io
 import re
@@ -114,11 +113,10 @@ def _no_scene_surface(http):
             assert not any(str(k).startswith("p_scene_") for k in call[2])
 
 
-@pytest.mark.parametrize("scene_flag", [None, "true", "maybe"])
+@pytest.mark.parametrize("scene_flag", ["true", "maybe"])
 def test_scene_evidence_is_advisory_in_every_flag_state(
         monkeypatch, writer_calls, scene_flag):
-    """Real image bytes: the scene_fingerprint evidence field is present and
-    namespaced, whatever AGENT_VISUAL_SCENE_GUARD says — it never gates."""
+    """Armed guard: scene evidence is present and remains advisory."""
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
     if scene_flag is None:
         monkeypatch.delenv("AGENT_VISUAL_SCENE_GUARD", raising=False)
@@ -136,11 +134,54 @@ def test_scene_evidence_is_advisory_in_every_flag_state(
     _no_scene_surface(http)
 
 
-@pytest.mark.parametrize("scene_flag", [None, "true", "maybe"])
+def test_scene_flags_off_preserve_exact_byte_evidence_and_skip_phash(
+        monkeypatch, writer_calls):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.delenv("AGENT_VISUAL_SCENE_GUARD", raising=False)
+    monkeypatch.delenv("AGENT_VISUAL_SCENE_CANDIDATE", raising=False)
+    data = _png_bytes()
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
+    fingerprints = []
+    monkeypatch.setattr(prep, "_scene_fingerprint",
+                        lambda value: fingerprints.append(value) or "scene:phash64:0123456789abcdef")
+    http = HTTP(fingerprint=_md5(data))
+    row = prep.prepare(_store(http), "old-key", _same_object_row())
+    assert row["visual_group_key"] == "vg_same"
+    assert fingerprints == []
+    assert "scene_fingerprint" not in writer_calls[0]["evidence"]
+    bundle = next(call[2] for call in http.calls
+                  if call[0] == "post" and call[1] == "visual_global_prepare_bundle")
+    assert "scene_fingerprint" not in bundle["p_evidence"]
+    assert "scene_candidate" not in row
+
+
+def test_scene_candidate_phash_is_computed_once_per_exact_object(
+        monkeypatch, writer_calls):
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    monkeypatch.setenv("AGENT_VISUAL_SCENE_CANDIDATE", "true")
+    monkeypatch.delenv("AGENT_VISUAL_SCENE_GUARD", raising=False)
+    data = _png_bytes()
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda url: data)
+    fingerprints = []
+
+    def fingerprint(value):
+        fingerprints.append(value)
+        return "scene:phash64:0123456789abcdef"
+
+    monkeypatch.setattr(prep, "_scene_fingerprint", fingerprint)
+    http = HTTP(fingerprint=_md5(data))
+    row = prep.prepare(_store(http), "old-key", _same_object_row())
+    assert row["scene_candidate"]["objects"][0]["scene_fingerprint"] == (
+        "scene:phash64:0123456789abcdef")
+    assert fingerprints == [data]
+    assert writer_calls[0]["evidence"]["scene_fingerprint"] == (
+        "scene:phash64:0123456789abcdef")
+
+
+@pytest.mark.parametrize("scene_flag", ["true", "maybe"])
 def test_undecodable_bytes_record_null_evidence_and_never_raise(
         monkeypatch, writer_calls, scene_flag):
-    """Undecodable bytes: scene_fingerprint is None and preparation succeeds —
-    even with the scene flag armed or ambiguous. md5 stays the only authority."""
+    """With scene collection armed, undecodable bytes record null and succeed."""
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
     if scene_flag is None:
         monkeypatch.delenv("AGENT_VISUAL_SCENE_GUARD", raising=False)
