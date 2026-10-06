@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import config, media_swap, portal_social, visual_writer_prepare
+from agent import config, media_guard, media_swap, portal_social, visual_writer_prepare
 
 
 def _candidate(source="local", kind="photo"):
@@ -192,6 +192,13 @@ def test_portal_rejects_mismatched_poster_before_reservation(monkeypatch, mismat
     monkeypatch.setattr(media_swap, "enabled", lambda: True)
     monkeypatch.setattr(portal_social.config, "portal_calendar_supabase_enabled",
                         lambda: True)
+    # Original-source identity is covered by test_ordinary_swap_proof; isolate
+    # the poster evidence gate so each malformed poster variant reaches it.
+    monkeypatch.setattr(media_guard, "swap_original_identity",
+                        lambda account, row, store, *, pick=None:
+                        {"sha256": "b" * 64 if pick else "a" * 64,
+                         "source_asset_id": None,
+                         "source_url": (pick or row).get("source_media_url")})
 
     image_url = "https://cdn/clip.mp4"
     poster_url = "https://cdn/poster.jpg"

@@ -2,7 +2,7 @@
 
 import hashlib
 
-from agent import media_swap, portal_social
+from agent import media_guard, media_swap, portal_social
 from agent import config
 
 
@@ -22,7 +22,9 @@ class SwapStore:
 
     def swap_media(self, account, row_id, image_url, **kwargs):
         self.writes.append((account, row_id, image_url, kwargs))
-        self.row["image_url"] = image_url
+        self.row.update(image_url=image_url,
+                        source_media_url=kwargs.get("source_media_url"),
+                        **kwargs.get("extra_fields", {}))
         return dict(self.row)
 
 
@@ -36,6 +38,15 @@ def _enable(monkeypatch):
     monkeypatch.setattr(media_swap, "after_swap", lambda *a, **k: None)
     monkeypatch.setattr(portal_social.config, "portal_calendar_supabase_enabled",
                         lambda: True)
+    # This suite owns forwarding of render/poster evidence. Original-byte and
+    # tenant identity are covered with real bytes in test_ordinary_swap_proof.
+    def original_identity(account, row, store, *, pick=None):
+        if pick and pick.get("source_media_url") != pick.get("image_url") and not pick.get("render_evidence"):
+            raise ValueError("render lineage missing")
+        return {"sha256": "b" * 64 if pick else "a" * 64,
+                "source_asset_id": None,
+                "source_url": (pick or row).get("source_media_url")}
+    monkeypatch.setattr(media_guard, "swap_original_identity", original_identity)
 
 
 def test_portal_propagates_raw_source_and_render_evidence(monkeypatch):

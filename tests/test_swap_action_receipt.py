@@ -22,6 +22,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import media_swap as msw          # noqa: E402
+from agent import media_guard              # noqa: E402
 from agent import portal_calendar_store as pcs  # noqa: E402
 from agent import portal_social as ps        # noqa: E402
 
@@ -506,12 +507,24 @@ class _LegacyStore:
             return None
         if r.get("status") not in ("pending", "coach_review"):
             return None
-        r["image_url"] = image_url
+        r.update(image_url=image_url, source_media_url=source_media_url,
+                 **(extra_fields or {}))
         return dict(r)
+
+
+def _wire_legacy_original_proof(monkeypatch):
+    # These three cases isolate action-ID route selection. Real original-byte
+    # verification and refusal are tested in test_ordinary_swap_proof.
+    monkeypatch.setattr(media_guard, "swap_original_identity",
+                        lambda account, row, store, *, pick=None:
+                        {"sha256": "b" * 64 if pick else "a" * 64,
+                         "source_asset_id": "asset-1" if pick else "asset-0",
+                         "source_url": (pick or row).get("source_media_url")})
 
 
 def test_no_action_id_keeps_legacy_behavior(monkeypatch):
     store = _LegacyStore([_row()])
+    _wire_legacy_original_proof(monkeypatch)
     monkeypatch.setattr(msw, "after_swap", lambda *a, **k: None)
     monkeypatch.setattr(msw, "reserve_local_pick", lambda *a, **k: True)
     monkeypatch.setattr(msw, "release_local_pick", lambda *a, **k: None)
@@ -526,6 +539,7 @@ def test_no_action_id_keeps_legacy_behavior(monkeypatch):
 def test_no_action_id_with_flag_off_still_uses_legacy_path(monkeypatch):
     monkeypatch.setenv("ECHO_SWAP_ACTION_RECEIPT", "false")
     store = _LegacyStore([_row()])
+    _wire_legacy_original_proof(monkeypatch)
     monkeypatch.setattr(msw, "after_swap", lambda *a, **k: None)
     monkeypatch.setattr(msw, "reserve_local_pick", lambda *a, **k: True)
     monkeypatch.setattr(msw, "release_local_pick", lambda *a, **k: None)
@@ -745,6 +759,7 @@ def test_empty_allowlist_enables_no_gym(monkeypatch):
 def test_no_action_id_keeps_legacy_path_regardless_of_allowlist(monkeypatch):
     monkeypatch.setenv("ECHO_SWAP_ACTION_RECEIPT_GYMS", "other-gym")
     store = _LegacyStore([_row()])
+    _wire_legacy_original_proof(monkeypatch)
     monkeypatch.setattr(msw, "after_swap", lambda *a, **k: None)
     monkeypatch.setattr(msw, "reserve_local_pick", lambda *a, **k: True)
     monkeypatch.setattr(msw, "release_local_pick", lambda *a, **k: None)
