@@ -340,6 +340,152 @@ def _hash_file(path):
     return digest.hexdigest()
 
 
+def _account_id(value):
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, dict):
+        ident = value.get("_id") or value.get("id")
+        return ident if isinstance(ident, str) and ident else None
+    return None
+
+
+def normalize_deliveries(records, *, ledger: Path, raw_dir: Path):
+    """Offline delivery evidence; does not establish source lineage or gym routing.
+
+    Preserve every input row exactly once. A provider result is selected only by
+    the row's exact post ID and platform, and optional explicit provider account
+    ID. Conflicting successful captures or ambiguous media scopes fail closed.
+    """
+    captures = {}
+    for capture in _read_jsonl(ledger):
+        if capture.get("record_type") == "capture" and isinstance(capture.get("late_post_id"), str):
+            captures.setdefault(capture["late_post_id"], []).append(capture)
+    rows = [row for row in records if row.get("record_type") == "row"]
+    results = []
+    for ordinal, row in enumerate(rows):
+        result = dict(row)
+        result.update(record_type="delivery_receipt", input_ordinal=ordinal,
+                      delivery_status="unresolved", unresolved_reason=None,
+                      raw_receipts=[], delivered_objects=[], post_media_objects=[],
+                      platform_media_objects=[], provider_result=None,
+                      account_binding_status="unresolved_no_explicit_calendar_account",
+                      source_lineage="explicit_calendar_fields_only")
+        reason = None
+        if row.get("classification") != "exact_post_lookup_candidate":
+            reason = row.get("classification") or "unclassified_calendar_row"
+        elif not isinstance(row.get("late_post_id"), str) or not _SAFE_POST_ID.fullmatch(row["late_post_id"]):
+            reason = "unsafe_exact_post_id"
+        elif row.get("status") != "published":
+            reason = "calendar_row_not_published"
+        matched = captures.get(row["late_post_id"], []) if isinstance(row.get("late_post_id"), str) else []
+        if not reason and not matched:
+            reason = "missing_capture"
+        verified = []
+        problems = []
+        for capture in matched:
+            # Keep receipt hashes even when the referenced file cannot be trusted.
+            result["raw_receipts"].append({key: capture.get(key) for key in (
+                "status", "raw_sha256", "raw_response_path", "captured_at", "response_hash_basis")})
+            if capture.get("status") != "captured":
+                continue  # a prior failed attempt does not invalidate a later capture
+            digest = capture.get("raw_sha256")
+            raw_path = capture.get("raw_response_path")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or not isinstance(raw_path, str):
+                problems.append("invalid_raw_receipt")
+                continue
+            path = Path(raw_path).resolve()
+            if path.parent != raw_dir.resolve() or path.name != f"{digest}.json":
+                problems.append("unsafe_raw_response_path")
+                continue
+            try:
+                with path.open("rb") as stream:
+                    raw = stream.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_RESPONSE_BYTES or _sha256(raw) != digest:
+                    problems.append("raw_response_hash_mismatch")
+                    continue
+                body = json.loads(raw)
+            except (OSError, ValueError):
+                problems.append("missing_or_invalid_raw_response")
+                continue
+            if _response_post_id(body) != row.get("late_post_id") or capture.get("response_post_id") != row.get("late_post_id"):
+                problems.append("provider_post_id_mismatch")
+                continue
+            post = body["post"]
+            if post.get("_id") and post.get("id") and post["_id"] != post["id"]:
+                problems.append("ambiguous_provider_post_id")
+                continue
+            verified.append((digest, post))
+        if not reason and problems:
+            reason = problems[0]
+        if not reason and not verified:
+            reason = "no_successful_capture"
+        if not reason and len({digest for digest, _ in verified}) != 1:
+            reason = "conflicting_provider_captures"
+        if not reason:
+            digest, post = verified[0]
+            media = post.get("mediaItems", [])
+            result["post_media_objects"] = media
+            platforms = post.get("platforms")
+            result["provider_platform_results"] = platforms
+            if not isinstance(platforms, list):
+                reason = "missing_provider_platforms"
+            else:
+                matches = [value for value in platforms if isinstance(value, dict) and value.get("platform") == row.get("account")]
+                explicit_account = row.get("provider_account_id")
+                if explicit_account:
+                    matches = [value for value in matches if _account_id(value.get("accountId")) == explicit_account]
+                if len(matches) != 1:
+                    reason = "missing_or_ambiguous_provider_platform_account"
+                else:
+                    platform = matches[0]
+                    result.update(provider_result=platform,
+                                  provider_platform=platform.get("platform"),
+                                  provider_account_id=_account_id(platform.get("accountId")),
+                                  provider_profile_id=platform.get("profileId"),
+                                  provider_account_object=platform.get("accountId"),
+                                  platform_media_objects=platform.get("customMedia", []))
+                    account_obj = platform.get("accountId")
+                    if isinstance(account_obj, dict) and account_obj.get("platform") not in (None, row.get("account")):
+                        reason = "provider_account_platform_mismatch"
+                    elif isinstance(account_obj, dict) and account_obj.get("profileId") and platform.get("profileId") and account_obj["profileId"] != platform["profileId"]:
+                        reason = "provider_account_profile_mismatch"
+                    elif post.get("status") != "published" or platform.get("status") != "published" or not platform.get("platformPostId") or not platform.get("publishedAt"):
+                        reason = "provider_result_not_published"
+                    else:
+                        if explicit_account:
+                            result["account_binding_status"] = "verified_explicit_calendar_account"
+                        custom = platform.get("customMedia", [])
+                        if not isinstance(media, list) or not isinstance(custom, list):
+                            reason = "invalid_provider_media_shape"
+                        elif media and custom:
+                            reason = "ambiguous_mixed_media_precedence"
+                        else:
+                            objects = custom or media
+                            scope = "platform.customMedia" if custom else "post.mediaItems"
+                            if not objects:
+                                reason = "missing_delivered_media"
+                            elif any(not isinstance(obj, dict) or not isinstance(obj.get("url"), str) or not obj["url"] for obj in objects):
+                                reason = "missing_media_object_url"
+                            else:
+                                result["delivered_objects"] = [
+                                    {"object_receipt_id": f"sha256:{digest}:{scope}:{i}",
+                                     "exact_url": obj["url"], "media_object": obj,
+                                     "media_scope": scope, "media_index": i,
+                                     "raw_sha256": digest}
+                                    for i, obj in enumerate(objects)]
+                                result["delivery_status"] = "verified_provider_delivery"
+        result["unresolved_reason"] = reason
+        results.append(result)
+    summary = {"record_type": "delivery_summary", "schema_version": 1,
+               "row_count": len(results),
+               "delivery_status_counts": dict(sorted(Counter(r["delivery_status"] for r in results).items())),
+               "unresolved_reason_counts": dict(sorted(Counter(r["unresolved_reason"] for r in results if r["unresolved_reason"]).items())),
+               "classifier_summaries": [r for r in records if r.get("record_type") == "summary"],
+               "ledger_sha256": _sha256(ledger.read_bytes()),
+               "lineage_policy": "Explicit calendar fields only; delivery evidence is not source lineage or tenant routing clearance."}
+    return [summary, *results]
+
+
 def _write_jsonl(path: Path, records):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as stream:
@@ -362,11 +508,19 @@ def main(argv=None):
     capture.add_argument("--timeout", type=float, required=True, help="per-request seconds")
     capture.add_argument("--capture-zernio", action="store_true", required=True,
                          help="required explicit opt-in; performs GET only")
+    normalize = sub.add_parser("normalize", help="offline exact provider delivery receipts")
+    normalize.add_argument("--input", type=Path, required=True, help="classifier JSONL")
+    normalize.add_argument("--ledger", type=Path, required=True)
+    normalize.add_argument("--raw-dir", type=Path, required=True)
+    normalize.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.command == "classify":
         _write_jsonl(args.output, classify_index(args.index, args.evidence_root))
         return 0
     records = _read_jsonl(args.input)
+    if args.command == "normalize":
+        _write_jsonl(args.output, normalize_deliveries(records, ledger=args.ledger, raw_dir=args.raw_dir))
+        return 0
     get_json, get_raw = _provider_getter(args.timeout)
     results = capture_posts(records, ledger=args.ledger, raw_dir=args.raw_dir,
                             max_items=args.max_items, timeout=args.timeout,

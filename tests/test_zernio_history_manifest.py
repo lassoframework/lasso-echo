@@ -236,3 +236,137 @@ def test_fetch_worker_does_not_save_provider_error_body_or_message(tmp_path, mon
     assert list(tmp_path.iterdir()) == [tmp_path / "result.json"]
     assert json.loads((tmp_path / "result.json").read_text()) == {
         "ok": False, "error_type": "ZernioError", "http_status": 503}
+
+
+def _delivery_fixture(tmp_path, *, post=None, rows=None):
+    post = post or {"_id": "p1", "status": "published", "mediaItems": [
+        {"url": "https://synthetic.invalid/one.jpg", "type": "image", "extra": {"kept": True}},
+        {"url": "https://synthetic.invalid/two.mp4", "type": "video"}],
+        "platforms": [{"platform": "instagram", "accountId": {"_id": "a1", "platform": "instagram"},
+                       "status": "published", "publishedAt": "2026-10-01T00:00:00Z", "platformPostId": "live1",
+                       "customMedia": []}]}
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(exist_ok=True)
+    raw = json.dumps({"post": post}).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    path = raw_dir / f"{digest}.json"
+    path.write_bytes(raw)
+    ledger = tmp_path / "ledger.jsonl"
+    capture = {"record_type": "capture", "status": "captured", "late_post_id": "p1",
+               "response_post_id": "p1", "raw_sha256": digest, "raw_response_path": str(path),
+               "response_hash_basis": "exact_http_response_body"}
+    ledger.write_text(json.dumps(capture) + "\n")
+    rows = rows or [{"record_type": "row", "classification": "exact_post_lookup_candidate",
+                     "row_id": "r1", "late_post_id": "p1", "account": "instagram", "status": "published",
+                     "source_media_asset_id": None, "source_media_url": None}]
+    return rows, ledger, raw_dir, path, post
+
+
+def test_normalize_preserves_every_media_object_and_never_infers_lineage(tmp_path):
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path)
+    rows += [{**rows[0], "row_id": "r2", "late_post_id": "p2"},
+             {**rows[0], "row_id": "r3", "classification": "missing_exact_post_id", "late_post_id": None}]
+    summary, receipt, missing, no_id = history.normalize_deliveries(rows, ledger=ledger, raw_dir=raw_dir)
+    assert summary["row_count"] == 3
+    assert receipt["delivery_status"] == "verified_provider_delivery"
+    assert receipt["account_binding_status"] == "unresolved_no_explicit_calendar_account"
+    assert receipt["source_media_asset_id"] is None and receipt["source_media_url"] is None
+    assert receipt["post_media_objects"] == post["mediaItems"]
+    assert [obj["media_object"] for obj in receipt["delivered_objects"]] == post["mediaItems"]
+    assert len({obj["object_receipt_id"] for obj in receipt["delivered_objects"]}) == 2
+    assert missing["unresolved_reason"] == "missing_capture"
+    assert no_id["unresolved_reason"] == "missing_exact_post_id"
+    assert [r["row_id"] for r in (receipt, missing, no_id)] == ["r1", "r2", "r3"]
+
+
+@pytest.mark.parametrize("failure", ["tamper", "missing", "path", "post_id", "platform", "account", "published", "mixed", "ambiguous", "profile"])
+def test_normalize_fails_closed_on_untrusted_or_ambiguous_evidence(tmp_path, failure):
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path)
+    if failure == "tamper":
+        path.write_bytes(b"tamper")
+    elif failure == "missing":
+        path.unlink()
+    elif failure == "path":
+        row = json.loads(ledger.read_text())
+        row["raw_response_path"] = str(tmp_path / path.name)
+        ledger.write_text(json.dumps(row) + "\n")
+    else:
+        if failure == "post_id":
+            post["_id"] = "other"
+        elif failure == "platform":
+            post["platforms"][0]["platform"] = "facebook"
+        elif failure == "account":
+            rows[0]["provider_account_id"] = "different"
+        elif failure == "published":
+            post["platforms"][0]["status"] = "failed"
+        elif failure == "mixed":
+            post["platforms"][0]["customMedia"] = [{"url": "https://synthetic.invalid/custom.jpg"}]
+        elif failure == "ambiguous":
+            post["platforms"] *= 2
+        elif failure == "profile":
+            post["platforms"][0]["profileId"] = "p-a"
+            post["platforms"][0]["accountId"]["profileId"] = "p-b"
+        rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path, post=post, rows=rows)
+    receipt = history.normalize_deliveries(rows, ledger=ledger, raw_dir=raw_dir)[1]
+    assert receipt["delivery_status"] == "unresolved"
+    assert receipt["unresolved_reason"] and receipt["raw_receipts"]
+    assert receipt["delivered_objects"] == []
+    if failure == "mixed":
+        assert receipt["post_media_objects"] == post["mediaItems"]
+        assert receipt["platform_media_objects"] == post["platforms"][0]["customMedia"]
+
+
+def test_normalize_explicit_account_and_platform_custom_media(tmp_path):
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path)
+    rows[0]["provider_account_id"] = "a1"
+    post["mediaItems"] = []
+    post["platforms"][0]["customMedia"] = [{"url": "https://synthetic.invalid/custom.jpg", "extra": 42}]
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path, post=post, rows=rows)
+    receipt = history.normalize_deliveries(rows, ledger=ledger, raw_dir=raw_dir)[1]
+    assert receipt["account_binding_status"] == "verified_explicit_calendar_account"
+    assert receipt["delivered_objects"][0]["media_scope"] == "platform.customMedia"
+    assert receipt["delivered_objects"][0]["media_object"]["extra"] == 42
+
+
+def test_normalize_keeps_null_provider_account_unbound(tmp_path):
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path)
+    post["platforms"][0]["accountId"] = None
+    post["platforms"][0]["profileId"] = "profile-exact"
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path, post=post, rows=rows)
+    receipt = history.normalize_deliveries(rows, ledger=ledger, raw_dir=raw_dir)[1]
+    assert receipt["delivery_status"] == "verified_provider_delivery"
+    assert receipt["provider_account_id"] is None
+    assert receipt["provider_profile_id"] == "profile-exact"
+    assert receipt["account_binding_status"] == "unresolved_no_explicit_calendar_account"
+
+
+def test_normalize_conflicting_captures_and_retry_receipts(tmp_path):
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path)
+    first = json.loads(ledger.read_text())
+    failed = {"record_type": "capture", "late_post_id": "p1", "status": "error"}
+    ledger.write_text(json.dumps(failed) + "\n" + json.dumps(first) + "\n")
+    assert history.normalize_deliveries(rows, ledger=ledger, raw_dir=raw_dir)[1]["delivery_status"] == "verified_provider_delivery"
+    post["mediaItems"][0]["url"] = "https://synthetic.invalid/changed.jpg"
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path, post=post, rows=rows)
+    ledger.write_text(json.dumps(first) + "\n" + ledger.read_text())
+    receipt = history.normalize_deliveries(rows, ledger=ledger, raw_dir=raw_dir)[1]
+    assert receipt["unresolved_reason"] == "conflicting_provider_captures"
+    assert len(receipt["raw_receipts"]) == 2
+
+
+def test_normalize_malformed_id_is_accounted_without_lookup(tmp_path):
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path)
+    rows[0]["late_post_id"] = ["p1"]
+    with ledger.open("a") as stream:
+        stream.write(json.dumps({"record_type": "capture", "late_post_id": ["p1"]}) + "\n")
+    receipt = history.normalize_deliveries(rows, ledger=ledger, raw_dir=raw_dir)[1]
+    assert receipt["unresolved_reason"] == "unsafe_exact_post_id"
+    assert receipt["delivered_objects"] == []
+
+
+def test_normalize_rejects_conflicting_provider_id_fields(tmp_path):
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path)
+    post["id"] = "different"
+    rows, ledger, raw_dir, path, post = _delivery_fixture(tmp_path, post=post, rows=rows)
+    receipt = history.normalize_deliveries(rows, ledger=ledger, raw_dir=raw_dir)[1]
+    assert receipt["unresolved_reason"] == "ambiguous_provider_post_id"
