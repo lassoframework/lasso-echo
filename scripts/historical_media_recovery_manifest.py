@@ -8,6 +8,7 @@ or production-state requests.
 from __future__ import annotations
 
 import argparse
+from datetime import date as calendar_date
 import hashlib
 import json
 import re
@@ -45,6 +46,52 @@ def _row_ref(row):
     return _text(row.get("row_id") or row.get("id"))
 
 
+def _source_references(row):
+    references = []
+    for field in ("source_media_asset_id", "source_asset_id",
+                  "source_media_url", "source_url"):
+        value = row.get(field)
+        if _text(value):
+            references.append({"field": field, "value": value})
+    # Repeated aliases with equal values represent one reference. Keep distinct
+    # ID and URL values together because they are different kinds of evidence.
+    by_kind = {}
+    for ref in references:
+        kind = "asset_id" if "asset_id" in ref["field"] else "source_url"
+        by_kind.setdefault(kind, {})[str(ref["value"])] = ref
+    return [by_kind[kind][value] for kind in ("asset_id", "source_url")
+            for value in sorted(by_kind.get(kind, {}))], any(
+                len(values) > 1 for values in by_kind.values())
+
+
+def _post_date(row):
+    present = [(key, row[key]) for key in ("post_date", "date")
+               if key in row and row[key] is not None and row[key] != ""]
+    if not present:
+        return None, "missing_post_date"
+    values = {str(value).strip() for _, value in present}
+    if len(values) > 1:
+        return present[0][1], "ambiguous_post_date"
+    value = present[0][1]
+    try:
+        if not isinstance(value, str):
+            raise ValueError
+        parsed = calendar_date.fromisoformat(value.strip())
+        return parsed.isoformat(), None
+    except ValueError:
+        return value, "invalid_post_date"
+
+
+def _post_id(row):
+    values = [(key, row[key]) for key in ("late_post_id", "provider_post_id")
+              if key in row and row[key] is not None and row[key] != ""]
+    distinct = {str(value).strip() for _, value in values}
+    if len(distinct) > 1:
+        return None, "ambiguous_provider_post_id"
+    return (_text(values[0][1]) if values else None,
+            None if values else "missing_post_id")
+
+
 def _candidate_index(assets):
     """Index explicit source references and asset MD5 hints separately."""
     index = {"asset_id": {}, "source_url": {}, "content_hash": {}}
@@ -59,12 +106,12 @@ def _candidate_index(assets):
         if not aid or not gym:
             malformed += 1
             continue
-        entry = {"asset_id": aid, "gym_id": gym}
+        source_url = _text(asset.get("source_media_url") or asset.get("source_url"))
+        entry = {"asset_id": aid, "gym_id": gym, "source_url": source_url}
         seen_ids[(gym, aid)] += 1
         index["asset_id"].setdefault((gym, aid), []).append(entry)
         # Only explicit source fields participate. Rendition/delivered URLs
         # are intentionally excluded from source lineage.
-        source_url = _text(asset.get("source_media_url") or asset.get("source_url"))
         if source_url:
             index["source_url"].setdefault((gym, source_url), []).append(entry)
         digest = _text(asset.get("content_hash"))
@@ -111,7 +158,9 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
                 "record_type": "row", "snapshot_identity": identity,
                 "input_index": number, "row_ref": None, "gym_id": None,
                 "date": None, "provider": None, "delivered_reference": None,
-                "source_reference": None, "delivered_bytes": {"status": "unavailable"},
+                "late_post_id": None, "provider_post_id": None,
+                "source_references": [], "delivered_bytes": {"status": "unavailable"},
+                "delivered_bytes_verified": False, "source_lineage_verified": False,
                 "candidate_matches": {"basis": "delivered_md5_vs_asset_content_hash",
                                       "cardinality": 0, "asset_ids": []},
                 "source_lineage_evidence": {"basis": "explicit_source_reference_only",
@@ -122,15 +171,20 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
 
         row_ref = _row_ref(row)
         gym = _text(row.get("gym_id") or row.get("tenant_id"))
-        date = row.get("post_date", row.get("date"))
+        date, date_error = _post_date(row)
         provider = row.get("provider") or row.get("platform")
+        provider_post_id, post_id_error = _post_id(row)
         delivered_ref, delivered_ambiguous = _reference(row, ("delivered_url", "image_url", "media_url"))
-        source_ref, source_ambiguous = _reference(row, ("source_media_asset_id", "source_asset_id", "source_media_url", "source_url"))
+        source_refs, source_ambiguous = _source_references(row)
         unresolved = []
         if not row_ref:
             unresolved.append("missing_row_ref")
         if not gym:
             unresolved.append("missing_gym_id")
+        if date_error:
+            unresolved.append(date_error)
+        if post_id_error:
+            unresolved.append(post_id_error)
         if not delivered_ref:
             unresolved.append("ambiguous_delivered_reference" if delivered_ambiguous else "missing_delivered_reference")
         if source_ambiguous:
@@ -157,22 +211,40 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
         candidates = []
         if gym and digest:
             candidates = sorted({entry["asset_id"] for entry in index["content_hash"].get((gym, digest), [])})
-        if source_ref and gym:
-            value = source_ref["value"]
-            if source_ref["field"] in ("source_media_asset_id", "source_asset_id") and _text(value):
-                lineage = sorted({e["asset_id"] for e in index["asset_id"].get((gym, str(value)), [])})
-            elif source_ref["field"] in ("source_media_url", "source_url") and _text(value):
-                lineage = sorted({e["asset_id"] for e in index["source_url"].get((gym, str(value)), [])})
-            else:
-                lineage = []
-            lineage_status = "explicit_reference_match" if lineage else "explicit_reference_unmatched"
+        id_refs = [ref for ref in source_refs if "asset_id" in ref["field"]]
+        url_refs = [ref for ref in source_refs if "url" in ref["field"]]
+        id_records = set()
+        url_records = set()
+        if gym:
+            for ref in id_refs:
+                id_records.update((e["gym_id"], e["asset_id"], e["source_url"])
+                                  for e in index["asset_id"].get((gym, str(ref["value"])), []))
+            for ref in url_refs:
+                url_records.update((e["gym_id"], e["asset_id"], e["source_url"])
+                                   for e in index["source_url"].get((gym, str(ref["value"])), []))
+        id_matches = {record[1] for record in id_records}
+        url_matches = {record[1] for record in url_records}
+        if id_refs and url_refs:
+            pair_matches = id_records & url_records
+            lineage = sorted({record[1] for record in pair_matches})
+            pair_mismatch = not lineage
+            lineage_status = "same_tenant_asset_pair_match" if lineage else "source_asset_id_url_mismatch"
         else:
-            lineage = []
-            lineage_status = "source_reference_missing"
-        if not source_ref and not source_ambiguous:
+            lineage = sorted(id_matches or url_matches)
+            pair_mismatch = False
+            lineage_status = "explicit_database_reference_match_only" if lineage else (
+                "explicit_reference_unmatched" if source_refs else "source_reference_missing")
+        if source_ambiguous:
+            unresolved.append("ambiguous_source_reference")
+        if pair_mismatch:
+            unresolved.append("source_asset_id_url_mismatch")
+        if not source_refs and not source_ambiguous:
             unresolved.append("source_reference_missing")
-        elif not lineage:
+        elif not lineage and not pair_mismatch:
             unresolved.append("source_lineage_unmatched")
+        # No immutable original-use receipt is part of this snapshot format.
+        # Database references and byte candidates remain review evidence only.
+        unresolved.append("immutable_source_use_receipt_missing")
         if not candidates:
             unresolved.append("no_delivered_byte_candidate")
         if len(candidates) > 1:
@@ -186,13 +258,19 @@ def build_manifest(snapshot, media_dir: Path, snapshot_identity=None):
         output.append({
             "record_type": "row", "snapshot_identity": identity,
             "input_index": number, "row_ref": row_ref, "gym_id": gym,
-            "date": date, "provider": provider,
-            "delivered_reference": delivered_ref, "source_reference": source_ref,
+            "date": date, "provider": provider, "late_post_id": provider_post_id,
+            "provider_post_id": provider_post_id,
+            "delivered_reference": delivered_ref, "source_references": source_refs,
             "delivered_bytes": byte_result,
+            "delivered_bytes_verified": byte_result["status"] == "read",
+            "source_lineage_verified": False,
             "candidate_matches": {"basis": "delivered_md5_vs_asset_content_hash",
                                   "cardinality": len(candidates), "asset_ids": candidates},
             "source_lineage_evidence": {"basis": "explicit_source_reference_only",
-                                        "asset_ids": lineage, "status": lineage_status},
+                                        "asset_ids": lineage,
+                                        "asset_id_reference_matches": sorted(id_matches),
+                                        "source_url_reference_matches": sorted(url_matches),
+                                        "status": lineage_status, "verified": False},
             "unresolved_reasons": sorted(set(unresolved)),
         })
 

@@ -31,6 +31,8 @@ def test_manifest_separates_delivered_candidates_from_source_lineage(tmp_path):
     assert row["gym_id"] == "gym-a"
     assert row["date"] == "2026-08-12"
     assert row["provider"] == "instagram"
+    assert row["provider_post_id"] is None
+    assert row["late_post_id"] is None
     assert row["delivered_bytes"] == {
         "status": "read", "md5": digest, "byte_length": len(delivered),
     }
@@ -42,7 +44,10 @@ def test_manifest_separates_delivered_candidates_from_source_lineage(tmp_path):
     # the Drive source URL was used for this row.
     assert row["source_lineage_evidence"]["asset_ids"] == []
     assert row["source_lineage_evidence"]["status"] == "source_reference_missing"
+    assert row["delivered_bytes_verified"] is True
+    assert row["source_lineage_verified"] is False
     assert "source_reference_missing" in row["unresolved_reasons"]
+    assert "missing_post_id" in row["unresolved_reasons"]
 
 
 def test_manifest_reports_malformed_and_duplicate_rows_and_assets(tmp_path):
@@ -89,3 +94,56 @@ def test_cli_writes_replayable_jsonl_with_snapshot_hash(tmp_path):
         "input_sha256": hashlib.sha256(raw).hexdigest(),
     }
     assert records[1]["delivered_bytes"]["reason"] == "missing_or_unsafe_local_bytes"
+
+
+def test_source_id_and_url_are_separate_and_must_match_same_tenant_asset(tmp_path):
+    media_dir = tmp_path / "bytes"
+    media_dir.mkdir()
+    (media_dir / "same").write_bytes(b"delivered")
+    (media_dir / "mismatch").write_bytes(b"delivered")
+    digest = hashlib.md5(b"delivered").hexdigest()
+    snapshot = {
+        "rows": [
+            {"id": "same", "gym_id": "g", "post_date": "2026-08-12",
+             "late_post_id": "post-1", "source_media_asset_id": "a1",
+             "source_media_url": "https://drive.example/a1", "image_url": "https://r2/same"},
+            {"id": "mismatch", "gym_id": "g", "post_date": "2026-08-13",
+             "source_media_asset_id": "a1", "source_media_url": "https://drive.example/a2",
+             "image_url": "https://r2/mismatch"},
+        ],
+        "assets": [
+            {"asset_id": "a1", "gym_id": "g", "source_media_url": "https://drive.example/a1",
+             "content_hash": digest},
+            {"asset_id": "a2", "gym_id": "g", "source_media_url": "https://drive.example/a2",
+             "content_hash": digest},
+        ],
+    }
+    _, matched, mismatched = manifest.build_manifest(snapshot, media_dir)
+    assert matched["source_references"] == [
+        {"field": "source_media_asset_id", "value": "a1"},
+        {"field": "source_media_url", "value": "https://drive.example/a1"},
+    ]
+    assert "ambiguous_source_reference" not in matched["unresolved_reasons"]
+    assert matched["source_lineage_evidence"]["asset_ids"] == ["a1"]
+    assert matched["source_lineage_verified"] is False
+    assert "source_asset_id_url_mismatch" in mismatched["unresolved_reasons"]
+    assert mismatched["source_lineage_evidence"]["asset_ids"] == []
+    assert mismatched["delivered_bytes_verified"] is True
+    assert mismatched["source_lineage_verified"] is False
+
+
+def test_missing_or_ambiguous_date_and_post_id_are_explicit(tmp_path):
+    media_dir = tmp_path / "bytes"
+    media_dir.mkdir()
+    snapshot = {"rows": [
+        {"id": "r1", "gym_id": "g", "post_date": "2026-08-01", "date": "2026-08-02"},
+        {"id": "r2", "gym_id": "g", "late_post_id": "post-2"},
+    ]}
+    _, ambiguous, missing = manifest.build_manifest(snapshot, media_dir)
+    assert ambiguous["date"] == "2026-08-01"
+    assert "ambiguous_post_date" in ambiguous["unresolved_reasons"]
+    assert "missing_post_id" in ambiguous["unresolved_reasons"]
+    assert missing["date"] is None
+    assert "missing_post_date" in missing["unresolved_reasons"]
+    assert missing["provider_post_id"] == "post-2"
+    assert "missing_post_id" not in missing["unresolved_reasons"]
