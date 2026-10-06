@@ -1396,6 +1396,7 @@ def _reconcile_posted_fixer(bus, identity, log, summary):
 
 def _reconcile_held_fixer(bus, identity, readback, log, summary):
     """Recover a late Slack success without ever sending the client row again."""
+    page_limit = 200
     try:
         reader = bus.pending_held_fixer_delivery
         cursors = getattr(bus, "_fixer_held_reconcile_cursors", None)
@@ -1404,33 +1405,30 @@ def _reconcile_held_fixer(bus, identity, readback, log, summary):
             setattr(bus, "_fixer_held_reconcile_cursors", cursors)
         after = cursors.get(identity.name)
         try:
-            rows = reader(identity.name, limit=200, after=after)
+            rows = reader(identity.name, limit=page_limit, after=after)
         except TypeError:  # compatibility for bounded legacy/test adapters
-            rows = reader(identity.name, limit=200)
+            rows = reader(identity.name, limit=page_limit)
         if not rows and after:
             cursors.pop(identity.name, None)
             try:
-                rows = reader(identity.name, limit=200, after=None)
+                rows = reader(identity.name, limit=page_limit, after=None)
             except TypeError:
-                rows = reader(identity.name, limit=200)
-        if rows:
-            last = rows[-1]
-            cursors[identity.name] = {
-                "created_at": last.get("created_at"), "id": last.get("id")}
-            if len(rows) < 200:
-                cursors.pop(identity.name, None)
+                rows = reader(identity.name, limit=page_limit)
     except Exception as exc:  # noqa: BLE001
         log(f"[slack-convo/outbox] FIXER held reconciliation scan failed: "
             f"{type(exc).__name__}")
         return
     now = datetime.now(timezone.utc)
-    attempted = 0
+    exhausted = True
     for row in rows:
+        # Advance only through rows this sweep actually examined. In particular,
+        # do not jump to the end of a full page before stopping after one Slack
+        # readback; doing so skips every other due row on that page.
+        cursors[identity.name] = {
+            "created_at": row.get("created_at"), "id": row.get("id")}
         if not row.get("slack_ts"):
             # Text/time search cannot prove which attempt produced a message.
             continue
-        if attempted >= 1:  # at most two Slack pages per 5-second outbox sweep
-            break
         retry_at = _parse_ts((row.get("attachments") or {}).get("fixer_reconcile_next_at"))
         if retry_at and retry_at > now:
             continue
@@ -1443,24 +1441,27 @@ def _reconcile_held_fixer(bus, identity, readback, log, summary):
             log(f"[slack-convo/outbox] FIXER retry schedule failed row={row['id']}: "
                 f"{type(exc).__name__}")
             continue
-        attempted += 1
         intent = (row.get("attachments") or {}).get("fixer_slack_delivery_intent")
         proof, _ = _readback_fixer_message(readback, intent,
                                            ts=row.get("slack_ts") or None)
-        if not proof:
-            continue
-        try:
-            posted = bus.reconcile_held_fixer_delivery(
-                row["id"], proof, expected_intent=intent,
-                expected_ts=row.get("slack_ts"))
-            if not posted or posted.get("delivery_status") != "posted":
-                continue
-            ticket = bus.ticket(row["ticket_id"])
-            if ticket:
-                _finalize_fixer_post(bus, ticket, posted, identity, log, summary)
-        except Exception as exc:  # noqa: BLE001 - retry exact read next loop
-            log(f"[slack-convo/outbox] FIXER held reconciliation failed "
-                f"row={row['id']}: {type(exc).__name__}")
+        if proof:
+            try:
+                posted = bus.reconcile_held_fixer_delivery(
+                    row["id"], proof, expected_intent=intent,
+                    expected_ts=row.get("slack_ts"))
+                if posted and posted.get("delivery_status") == "posted":
+                    ticket = bus.ticket(row["ticket_id"])
+                    if ticket:
+                        _finalize_fixer_post(bus, ticket, posted, identity, log, summary)
+            except Exception as exc:  # noqa: BLE001 - retry exact read next loop
+                log(f"[slack-convo/outbox] FIXER held reconciliation failed "
+                    f"row={row['id']}: {type(exc).__name__}")
+        exhausted = False
+        break  # at most one Slack readback per 5-second outbox sweep
+    if exhausted and len(rows) < page_limit:
+        # Tail reached without a Slack attempt. Wrap so rows skipped only because
+        # their retry time was in the future are reconsidered on the next pass.
+        cursors.pop(identity.name, None)
 
 
 def _blake_is_member(identity, channel, user):

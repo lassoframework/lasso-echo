@@ -2970,6 +2970,48 @@ def test_fixer_held_reconciliation_prioritizes_oldest_due_row_over_new_holds():
                if m["id"] != oldest["id"])
 
 
+def test_fixer_held_reconciliation_cursor_never_skips_due_rows_in_full_page():
+    bus = FakeBus()
+    due = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    def add_hold(index):
+        intent = {
+            "channel": "C_CLIENT", "thread_ts": "1.0", "body": f"done {index}",
+            "sender": "U_ECHO_BOT", "not_before": due.isoformat(),
+            "request_key": f"request-{index}", "request_version": index,
+        }
+        row = bus.record_outbound(
+            ticket_id="missing-ticket", author_type="echo", body=f"done {index}",
+            delivery_status="held", kind=A.KIND_STATUS,
+            meta={"identity": "echo", "fixer_slack_delivery_uncertain": True,
+                  "fixer_slack_delivery_intent": intent,
+                  "fixer_reconcile_next_at": due.isoformat()})
+        stored = next(m for m in bus.msgs if m["id"] == row["id"])
+        stored["id"] = f"held-{index:04d}"
+        stored["created_at"] = "2026-01-01T00:00:00+00:00"
+        stored["slack_ts"] = f"1.{index:04d}"
+
+    for index in range(401):
+        add_hold(index)
+
+    reads = []
+
+    def readback(channel, **kwargs):
+        reads.append(kwargs["ts"])
+        return {"ok": True, "channel": channel, "messages": []}
+
+    for sweep in range(5):
+        OB._reconcile_held_fixer(
+            bus, IDS.get("echo"), readback, lambda *_: None,
+            {"posted": 0, "resolved": 0})
+        # A continuously growing newer tail must not displace the next old due
+        # row or cause the cursor to jump over the rest of its 200-row page.
+        for offset in range(20):
+            add_hold(401 + sweep * 20 + offset)
+
+    assert reads == [f"1.{index:04d}" for index in range(5)]
+
+
 def test_fixer_portal_only_completion_stays_held_until_slack_route_exists(monkeypatch):
     _arm_grounded_fixer(monkeypatch)
     bus, tid, row, _ = _grounded_fixer_answer_case()
