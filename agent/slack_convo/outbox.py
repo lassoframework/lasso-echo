@@ -959,6 +959,69 @@ def _readback_fixer_message(readback, intent, *, ts=None):
             "delivery_readback_request_version": intent.get("request_version")}, ""
 
 
+def _finish_pending_route_notice(bus, row, proof, identity, log, summary):
+    """Recover one already-sent first contact; never call Slack POST here."""
+    att = row.get("attachments") or {}
+    intent = att.get("fixer_slack_delivery_intent")
+    ts = row.get("slack_ts")
+    token = att.get("fixer_current_attempt_token")
+    if (att.get("fixer_route_pending") is not True or not isinstance(intent, dict)
+            or not token or not ts or proof.get("delivery_readback_ts") != ts
+            or proof.get("delivery_readback_verified") is not True):
+        return False
+    try:
+        if row.get("delivery_status") == "held":
+            verified = bus.record_held_current_notice_readback(
+                row["id"], proof, expected_intent=intent, expected_ts=ts)
+        elif row.get("delivery_status") == "posting":
+            verified = bus.transition_fixer_delivery(
+                row["id"], "posting", slack_ts=ts, meta_update=proof,
+                expected_intent=intent, expected_ts=ts)
+        else:
+            return False
+        if not verified or (verified.get("attachments") or {}).get(
+                "delivery_readback_verified") is not True:
+            return False
+        current_ticket = bus.ticket(row["ticket_id"])
+        if (not current_ticket
+                or current_ticket.get("request_version") != row.get(
+                    "delivery_request_version")
+                or current_ticket.get("status") != att.get(
+                    "delivery_expected_status")):
+            # Preserve exact proof on the old row for audit. A new requester
+            # cycle may never inherit this route or close from its notice.
+            return False
+        if not bus.bind_current_notice_route(
+                row["ticket_id"], row["delivery_request_version"], row["id"],
+                token, intent.get("channel"), ts):
+            return False
+        posted = bus.transition_fixer_delivery(
+            row["id"], "posted", slack_ts=ts,
+            expected_intent=intent, expected_ts=ts)
+        if not posted or posted.get("delivery_status") != "posted":
+            return False
+        ticket = bus.ticket(row["ticket_id"])
+        if ticket:
+            resolved = bus.resolve_current_notice(
+                ticket, row["id"], token, att.get("delivery_expected_status"))
+            if isinstance(resolved, dict) and resolved.get("status") == "resolved":
+                summary["resolved"] = int(summary.get("resolved") or 0) + 1
+                _receipt(bus, ticket, posted, identity,
+                         (posted.get("attachments") or {}).get("kind"),
+                         posted.get("attachments") or {},
+                         where=f"Slack {intent.get('channel')}", summary=summary)
+                bus.finalize_fixer_delivery(row["id"],
+                                            "resolved_after_verified_slack")
+            elif ticket.get("request_version") != row.get("delivery_request_version"):
+                bus.finalize_fixer_delivery(row["id"],
+                                            "newer_request_preserved")
+        return True
+    except Exception as exc:  # noqa: BLE001 - exact readback can retry next sweep
+        log(f"[slack-convo/outbox] pending route reconciliation failed "
+            f"row={row.get('id')}: {type(exc).__name__}")
+        return False
+
+
 def _quarantine_fixer(bus, row_id, reason, log):
     try:
         held = bus.hold_uncertain_fixer_delivery(row_id, reason)
@@ -1049,6 +1112,28 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
                 att = row.get("attachments") or {}
                 intent = att.get("fixer_slack_delivery_intent")
                 if not isinstance(intent, dict):
+                    if att.get("fixer_current_attempt_token"):
+                        reason = ("Designated FIXER notice claim expired before "
+                                  "durable Slack intent; no customer message was sent")
+                        suppressed = bus.suppress_unattempted_current_notice(
+                            row["id"], reason)
+                        if suppressed and suppressed.get("delivery_status") == "suppressed":
+                            n += 1
+                            count("suppressed")
+                            try:
+                                bus.record_outbound(
+                                    ticket_id=row["ticket_id"], author_type="system",
+                                    body=(f"FIXER notice {row['id']} on ticket "
+                                          f"{row['ticket_id']} was suppressed after a "
+                                          "pre-send claim expired. Review the ticket "
+                                          "before a new customer notice."),
+                                    delivery_status="ready", kind=_a.KIND_ESCALATION,
+                                    meta={"identity": identity.name,
+                                          "suppressed_message_id": row["id"]})
+                            except Exception as exc:  # noqa: BLE001
+                                log(f"[slack-convo/outbox] FIXER pre-send alert failed "
+                                    f"row={row['id']}: {type(exc).__name__}")
+                        continue
                     if att.get("fixer_slack_delivery_protocol") == FIXER_DELIVERY_PROTOCOL:
                         requeue = getattr(bus, "requeue_unattempted_fixer_delivery", None)
                         if callable(requeue):
@@ -1074,6 +1159,18 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
                     if quarantined:
                         count("quarantined_held")
                     continue
+                if att.get("fixer_route_pending") is True:
+                    if _finish_pending_route_notice(
+                            bus, row, proof, identity, log,
+                            summary if isinstance(summary, dict) else {"resolved": 0}):
+                        n += 1
+                        count("reconciled_posted")
+                    else:
+                        quarantined = _quarantine_fixer(
+                            bus, row["id"],
+                            "pending route bind awaits exact verified recovery", log)
+                        n += int(quarantined)
+                    continue
                 posted = bus.transition_fixer_delivery(
                     row["id"], "posted", slack_ts=proof["delivery_readback_ts"],
                     meta_update=proof, expected_intent=intent,
@@ -1083,6 +1180,20 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
                     if ((current or {}).get("delivery_status") == "held"
                             and (current or {}).get("slack_ts") == proof[
                                 "delivery_readback_ts"]):
+                        if (current.get("attachments") or {}).get(
+                                "fixer_current_attempt_token"):
+                            staged = bus.record_held_fixer_readback(
+                                row["id"], proof, expected_intent=intent,
+                                expected_ts=proof["delivery_readback_ts"])
+                            if not staged:
+                                continue
+                            fresh_ticket = bus.ticket(row["ticket_id"])
+                            if (not fresh_ticket
+                                    or fresh_ticket.get("request_version") != row.get(
+                                        "delivery_request_version")
+                                    or fresh_ticket.get("status") != att.get(
+                                        "delivery_expected_status")):
+                                continue
                         posted = bus.reconcile_held_fixer_delivery(
                             row["id"], proof, expected_intent=intent,
                             expected_ts=proof["delivery_readback_ts"])
@@ -1124,11 +1235,18 @@ def _report_uncertain_outreach(bus, identity, log):
     """Persist a staff card for each held outreach whose Slack outcome is uncertain."""
     try:
         rows = bus.outbox("held", limit=200, identity=identity.name)
+        pending_route = _pending_fixer_hold_page(
+            bus, identity, "fixer_route_uncertain",
+            scan="pending_route_alert", limit=20)
+        rows = list({row["id"]: row for row in [*rows, *pending_route]}.values())
     except Exception:  # noqa: BLE001 - retained held rows are retried next run
         return
     for row in rows:
         att = row.get("attachments") or {}
-        if not att.get("outreach_delivery_uncertain") or att.get("outreach_staff_alerted"):
+        route_uncertain = att.get("fixer_route_uncertain") is True
+        if not (att.get("outreach_delivery_uncertain") or route_uncertain):
+            continue
+        if att.get("outreach_staff_alerted") and not route_uncertain:
             continue
         ticket_id = row.get("ticket_id")
         try:
@@ -1142,7 +1260,10 @@ def _report_uncertain_outreach(bus, identity, log):
                           f"Check Slack and the ticket before any resend."),
                     delivery_status="ready", kind=_a.KIND_ESCALATION,
                     meta={"identity": owner, "outreach_uncertain_row_id": row["id"]})
-            bus.mark_uncertain_outreach_alerted(row["id"])
+            if not route_uncertain:
+                # 0384's pending notice attachments cannot gain a housekeeping
+                # marker; the exact alert-row lookup above deduplicates it.
+                bus.mark_uncertain_outreach_alerted(row["id"])
         except Exception as e:  # noqa: BLE001 - keep held and retry staff alert
             log(f"[slack-convo/outbox] uncertain outreach staff alert failed "
                 f"row={row['id']}: {type(e).__name__}")
@@ -1408,6 +1529,38 @@ def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
             f"row={row.get('id')}")
         return
     kind = att.get("kind")
+    direct_notice = (att.get("outreach") is True
+                     and att.get("fixer_current_attempt_token")
+                     and ticket.get("product") == "echo"
+                     and ticket.get("source") == "website_tab")
+    if direct_notice:
+        # The worker may have crashed after marking its one first-contact
+        # message posted but before receiving the resolver response. The exact
+        # persisted Slack proof above lets this sweep finish without resending.
+        try:
+            if ticket.get("request_version") == row.get("delivery_request_version"):
+                resolved = bus.resolve_current_notice(
+                    ticket, row["id"], att["fixer_current_attempt_token"],
+                    att.get("delivery_expected_status"))
+                if (isinstance(resolved, dict)
+                        and resolved.get("status") == "resolved"
+                        and ticket.get("status") != "resolved"):
+                    summary["resolved"] += 1
+            if kind in RECEIPT_KINDS:
+                _receipt(bus, ticket, row, identity, kind, att,
+                         where=f"Slack {intent.get('channel')}", summary=summary)
+            current = bus.ticket(ticket["id"])
+            if current and current.get("status") == "resolved":
+                bus.finalize_fixer_delivery(row["id"],
+                                            "resolved_after_verified_slack")
+            elif current and current.get("request_version") != row.get(
+                    "delivery_request_version"):
+                bus.finalize_fixer_delivery(row["id"],
+                                            "newer_request_preserved")
+        except Exception as exc:  # noqa: BLE001 - next sweep retries exact row
+            log(f"[slack-convo/outbox] direct current notice finalization pending "
+                f"row={row['id']}: {type(exc).__name__}")
+        return
     try:
         _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log)
     except Exception as exc:  # noqa: BLE001 - finalization sweep retries
@@ -1487,26 +1640,66 @@ def _reconcile_held_fixer(bus, identity, readback, log, summary):
         # readback; doing so skips every other due row on that page.
         cursors[identity.name] = {
             "created_at": row.get("created_at"), "id": row.get("id")}
+        markers = row.get("attachments") or {}
+        if not (markers.get("fixer_slack_delivery_uncertain") is True
+                or markers.get("fixer_route_uncertain") is True):
+            continue
         if not row.get("slack_ts"):
             # Text/time search cannot prove which attempt produced a message.
             continue
         retry_at = _parse_ts((row.get("attachments") or {}).get("fixer_reconcile_next_at"))
         if retry_at and retry_at > now:
             continue
-        try:
-            reserved = bus.defer_held_fixer_reconcile(
-                row["id"], (now + timedelta(minutes=1)).isoformat())
-            if not reserved or reserved.get("delivery_status") != "held":
+        stale_cycle = False
+        if markers.get("fixer_current_attempt_token"):
+            current_ticket = bus.ticket(row["ticket_id"])
+            if not current_ticket:
                 continue
-        except Exception as exc:  # noqa: BLE001
-            log(f"[slack-convo/outbox] FIXER retry schedule failed row={row['id']}: "
-                f"{type(exc).__name__}")
-            continue
+            stale_cycle = bool(
+                current_ticket.get("request_version") != row.get(
+                    "delivery_request_version")
+                or current_ticket.get("status") != markers.get(
+                    "delivery_expected_status"))
+        if markers.get("fixer_route_pending") is True:
+            # The 0384 pending row is immutable except for exact proof and the
+            # binder; a retry timestamp would violate its SQL guard.
+            reserved = row
+        elif stale_cycle:
+            # Stale held notices can gain readback proof for audit only.
+            # A retry timestamp would violate the narrow SQL stale guard.
+            reserved = row
+        else:
+            try:
+                reserved = bus.defer_held_fixer_reconcile(
+                    row["id"], (now + timedelta(minutes=1)).isoformat())
+                if not reserved or reserved.get("delivery_status") != "held":
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                log(f"[slack-convo/outbox] FIXER retry schedule failed row={row['id']}: "
+                    f"{type(exc).__name__}")
+                continue
         intent = (row.get("attachments") or {}).get("fixer_slack_delivery_intent")
         proof, _ = _readback_fixer_message(readback, intent,
                                            ts=row.get("slack_ts") or None)
         if proof:
             try:
+                if (row.get("attachments") or {}).get("fixer_route_pending") is True:
+                    if _finish_pending_route_notice(bus, row, proof, identity, log,
+                                                    summary):
+                        summary["reconciled_posted"] = int(
+                            summary.get("reconciled_posted") or 0) + 1
+                    exhausted = False
+                    break
+                if markers.get("fixer_current_attempt_token"):
+                    verified = bus.record_held_fixer_readback(
+                        row["id"], proof, expected_intent=intent,
+                        expected_ts=row.get("slack_ts"))
+                    if not verified:
+                        exhausted = False
+                        break
+                    if stale_cycle:
+                        exhausted = False
+                        break
                 posted = bus.reconcile_held_fixer_delivery(
                     row["id"], proof, expected_intent=intent,
                     expected_ts=row.get("slack_ts"))
@@ -1651,6 +1844,11 @@ def _defer_held_reconcile_row(bus, row, reason, retry_after, *, log, summary, no
 def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                   member_check=None, readback=None):
     att = row.get("attachments") or {}
+    if att.get("fixer_route_pending") is True:
+        # Direct first-contact completion owns this reserved row. An outbox
+        # sweep must never turn it into a portal delivery or a second Slack POST.
+        summary["skipped"] += 1
+        return
     if (att.get("fixer_slack_delivery_intent") is not None
             or att.get("fixer_slack_delivery_uncertain")):
         # A release tap or manual status edit must not create a second send from
@@ -2058,6 +2256,16 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         # Persist the exact body BEFORE posting, so the portal thread and subsequent
         # receipt cannot disagree with what Slack actually received.
         if sent_body != row["body"]:
+            if att.get("fixer_current_attempt_token"):
+                # 0384 freezes a designated notice's body once claimed. New
+                # notices include Blake's mention at INSERT; a malformed older
+                # row must stay unsent for reconciliation.
+                held = bus.hold_fixer_config_missing(
+                    row["id"], "FIXER designated notice lacks preinsert Blake mention")
+                if held and held.get("delivery_status") == "held":
+                    summary["held"] += 1
+                    return
+                raise RuntimeError("FIXER designated notice body cannot be changed")
             stored = bus.set_message_body_if_posting(row["id"], sent_body)
             if not stored or stored.get("body") != sent_body:
                 raise RuntimeError("FIXER Slack body update was not confirmed")
@@ -2129,23 +2337,35 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         # change, or release revocation during either one must stop the OLD
         # customer message before Slack, even though the intent itself exists.
         saved_att = prepared.get("attachments") or {}
+        def refuse_after_intent(reason, current_ticket):
+            if saved_att.get("fixer_current_attempt_token"):
+                # Once a tokenized notice has durable intent, SQL treats any
+                # outcome as potentially sent. Keep it held for exact readback;
+                # never turn it into a resendable/supersedable suppressed row.
+                held = bus.hold_uncertain_fixer_delivery(row["id"], reason)
+                if not held or held.get("delivery_status") != "held":
+                    raise UncertainFixerDelivery(
+                        "tokenized FIXER refusal could not be quarantined")
+                summary["held"] += 1
+                log(f"[slack-convo/outbox] FIXER notice held row={row['id']}: {reason}")
+            else:
+                _suppress(bus, row, current_ticket, identity, reason, log, summary)
+
         stable_fields = ("kind", "identity", "recipient_kind", "fixer", "request_key",
                          "request_version", "released_by", "pr_url", "resolve_notice",
                          "triage", "surface")
         if (prepared.get("body") != sent_body
                 or any(saved_att.get(field) != att.get(field)
                        for field in stable_fields)):
-            _suppress(bus, row, ticket, identity,
-                      "FIXER row or release changed during Slack intent persistence",
-                      log, summary)
+            refuse_after_intent(
+                "FIXER row or release changed during Slack intent persistence", ticket)
             return
         if (not saved_att.get("released_by")
                 and (not _recipient_armed(identity, recipient_kind)
                      or kind == _a.KIND_ANSWER
                      and not config.slack_convo_auto_answer_armed(identity.name))):
-            _suppress(bus, row, ticket, identity,
-                      "FIXER client reply release revoked before Slack delivery",
-                      log, summary)
+            refuse_after_intent(
+                "FIXER client reply release revoked before Slack delivery", ticket)
             return
         try:
             still_member = bool(member_check and member_check(
@@ -2153,9 +2373,8 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         except Exception:  # noqa: BLE001 - membership is required, never assumed
             still_member = False
         if not still_member:
-            _suppress(bus, row, ticket, identity,
-                      "Blake membership changed before FIXER Slack delivery",
-                      log, summary)
+            refuse_after_intent(
+                "Blake membership changed before FIXER Slack delivery", ticket)
             return
         fresh = _fresh_fixer_request(
             bus, ticket, saved_att, body=sent_body,
@@ -2167,9 +2386,9 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 or (customer_fix and (not _verified_fix_notice(
                     fresh, saved_att, kind, bus=bus, now=now)
                     or release_key != saved_att.get("request_key")))):
-            _suppress(bus, row, fresh or ticket, identity,
-                      "FIXER requester, route, or release changed during intent persistence",
-                      log, summary)
+            refuse_after_intent(
+                "FIXER requester, route, or release changed during intent persistence",
+                fresh or ticket)
             return
         # _verified_fix_notice may perform independent store reads. Bind the
         # requester once more after those reads and immediately before POST.
@@ -2178,9 +2397,9 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             require_direct_answer=fixer_grounded_answer)
         if (not latest or latest.get("slack_channel_id") != channel
                 or latest.get("slack_thread_ts") != ticket.get("slack_thread_ts")):
-            _suppress(bus, row, latest or fresh, identity,
-                      "FIXER requester changed at final Slack delivery boundary",
-                      log, summary)
+            refuse_after_intent(
+                "FIXER requester changed at final Slack delivery boundary",
+                latest or fresh)
             return
         ticket = latest
         try:
@@ -2197,8 +2416,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             else:  # older bounded test/store adapters; production Bus owns the race-safe path
                 stamped = bus.transition_fixer_delivery(row["id"], "posting", slack_ts=ts)
         except Exception as exc:  # noqa: BLE001
-            raise UncertainFixerDelivery(
-                f"Slack accepted but timestamp persistence failed: {type(exc).__name__}") from exc
+            stamped = None
+        if not stamped and att.get("fixer_current_attempt_token"):
+            held = bus.hold_uncertain_fixer_delivery(
+                row["id"], "Slack returned a timestamp after claim ownership changed")
+            if held and held.get("delivery_status") == "held":
+                stamped = bus.record_fixer_delivery_timestamp(row["id"], intent, ts)
         if not stamped or stamped.get("slack_ts") != ts:
             raise UncertainFixerDelivery("Slack accepted but timestamp persistence unconfirmed")
         proof, reason = _readback_fixer_message(readback, intent, ts=ts)
@@ -2212,6 +2435,14 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 current = bus.message(row["id"])
                 if ((current or {}).get("delivery_status") == "held"
                         and (current or {}).get("slack_ts") == ts):
+                    if (current.get("attachments") or {}).get(
+                            "fixer_current_attempt_token"):
+                        staged = bus.record_held_fixer_readback(
+                            row["id"], proof, expected_intent=intent,
+                            expected_ts=ts)
+                        if not staged:
+                            raise UncertainFixerDelivery(
+                                "Slack proof could not be staged on held notice")
                     posted = bus.reconcile_held_fixer_delivery(
                         row["id"], proof, expected_intent=intent, expected_ts=ts)
         except Exception as exc:  # noqa: BLE001
@@ -2323,10 +2554,10 @@ def _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log=pri
                                    surface=(att or {}).get("surface") or "",
                                    person=_person_for_card(bus, ticket, identity), log=log)
         return
-    _resolve_on_answer(bus, ticket, kind, summary, att, row.get("body") or "")
+    _resolve_on_answer(bus, ticket, row, kind, summary, att, row.get("body") or "")
 
 
-def _resolve_on_answer(bus, ticket, kind, summary, att=None, body=""):
+def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
     """V-M4: the ticket closes when the person HAS the message, not when we drafted it.
 
     Two rows close a ticket: the ANSWER that answered it, and the resolve NOTICE a human
@@ -2346,7 +2577,15 @@ def _resolve_on_answer(bus, ticket, kind, summary, att=None, body=""):
         grounded = _fixer_grounded_question_answer(ticket, meta, kind, body)
         fresh = _fresh_fixer_request(
             bus, ticket, meta, body=body, require_direct_answer=grounded)
-        resolver = getattr(bus, "resolve_current_delivery", None)
+        current_notice = (ticket.get("product") == "echo"
+                          and ticket.get("source") == "website_tab"
+                          and callable(getattr(bus, "resolve_current_notice", None)))
+        token = meta.get("fixer_current_attempt_token")
+        resolver = getattr(bus, ("resolve_current_notice" if current_notice
+                                 else "resolve_current_delivery"), None)
+        if current_notice and (not token or not row.get("id") or
+                               row.get("delivery_status") != "posted"):
+            return
         if not fresh or not callable(resolver):
             return
         if meta.get("resolve_notice"):
@@ -2360,12 +2599,16 @@ def _resolve_on_answer(bus, ticket, kind, summary, att=None, body=""):
             **{field: fresh.get(field) for field in _FIXER_REQUEST_IDENTITY_FIELDS},
         }
         try:
-            resolved = resolver(
-                ticket["id"], meta.get("request_version"),
-                expected["status"], expected["classification"],
-                expected["product"], expected["client_id"],
-                expected["bot_identity"], expected["slack_user_id"],
-                expected["slack_channel_id"], expected["slack_thread_ts"])
+            if current_notice:
+                resolved = resolver(fresh, row["id"], token,
+                                    meta.get("delivery_expected_status"))
+            else:
+                resolved = resolver(
+                    ticket["id"], meta.get("request_version"),
+                    expected["status"], expected["classification"],
+                    expected["product"], expected["client_id"],
+                    expected["bot_identity"], expected["slack_user_id"],
+                    expected["slack_channel_id"], expected["slack_thread_ts"])
         except Exception:  # noqa: BLE001 - a failed atomic close leaves it open
             return
         if (not isinstance(resolved, dict)
@@ -2383,6 +2626,12 @@ def _resolve_on_answer(bus, ticket, kind, summary, att=None, body=""):
     if fixer:
         # A FIXER row that is not presently eligible to resolve must never fall
         # through to the legacy unconditional ticket PATCH below.
+        return
+    if (ticket.get("product") == "echo"
+            and ticket.get("source") == "website_tab"
+            and callable(getattr(bus, "resolve_current_notice", None))):
+        # 0384 protects every Echo website-tab resolution, including ordinary
+        # answers and human taps. Unreserved legacy rows remain open.
         return
     if kind == _a.KIND_ANSWER and ticket.get("status") == "verification":
         bus.set_ticket(ticket["id"], status="resolved")
@@ -2451,6 +2700,17 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     if ticket.get("status") == "resolved":
         return False
     customer_fix = _customer_fix_reply(ticket, {})
+    if (callable(getattr(bus, "begin_current_notice", None))
+            and ticket.get("product") == "echo"
+            and ticket.get("source") == "website_tab"
+            and (not customer_fix or ticket.get("escalated") is True
+                 or ticket.get("hold_tier") is not None)):
+        # 0384 reserves only current unheld verification/merged notices. A
+        # generic or held tap cannot borrow that reservation; 0383 owns the
+        # separate held release proof. Leave this ticket and client untouched.
+        log(f"[slack-convo/outbox] resolve refused: ticket {ticket_id} "
+            "requires current notice or held release proof")
+        return False
     if customer_fix:
         def refuse_fix(reason):
             why = f"Resolve tap on ticket {ticket_id} did NOT go through: {reason}. " \
