@@ -59,6 +59,41 @@ def _snapshot(row):
     return {key: row[key] for key in _SNAPSHOT}
 
 
+def _outside_book_digest(store, gym, first, last):
+    outside = [row for row in store.list_photo_restage_book(gym)
+               if row.get("gym_id") == gym
+               and not first <= str(row.get("post_date") or "")[:10] <= last]
+    return _digest(outside)
+
+
+def _verify_receipt_readback(store, gym, first, last, window_hashes, readback,
+                             outside_digest):
+    """Prove the complete window and untouched book still match a receipt."""
+    if (not isinstance(window_hashes, dict) or not window_hashes
+            or not isinstance(readback, list) or not readback
+            or not isinstance(outside_digest, str)):
+        raise ValueError("incomplete reflow receipt")
+    changed = {}
+    for saved in readback:
+        snap = _snapshot(saved)
+        rid = str(snap["id"])
+        if rid in changed or rid not in window_hashes:
+            raise ValueError("receipt readback identities are incomplete or duplicated")
+        changed[rid] = snap
+    observed_rows = store.rows_in_range_complete(gym, first, last, all_statuses=True)
+    observed = {str(row["id"]): _snapshot(row) for row in observed_rows}
+    if len(observed) != len(observed_rows) or set(observed) != set(window_hashes):
+        raise ValueError("complete window readback identities changed")
+    for rid, before_hash in window_hashes.items():
+        if rid in changed:
+            if observed[rid] != changed[rid]:
+                raise ValueError("changed window row drifted")
+        elif _digest(observed[rid]) != before_hash:
+            raise ValueError("unmoved window row drifted")
+    if _outside_book_digest(store, gym, first, last) != outside_digest:
+        raise ValueError("out-of-window book drifted")
+
+
 def _path_hash(path):
     digest = hashlib.sha256()
     with open(path, "rb") as source:
@@ -140,9 +175,7 @@ def plan(store, *, gym, first, last, ticket, request_key, library_path, today=No
         key = media_guard.row_media_key(row)
         if outside_reframes.get(key, key) in assignment.values():
             raise ValueError("source is also held by an out-of-window calendar row")
-    outside_digest = _digest([(r.get("id"), r.get("post_date"), r.get("status"),
-                               r.get("variant_status"), media_guard.row_media_key(r))
-                              for r in outside])
+    outside_digest = _digest(outside)
     if any(day not in groups or not any(r["id"] == rid and r["account"] == "instagram"
                                          and r["format"] == "feed" and r["status"] == "pending"
                                          for r in groups[day])
@@ -164,6 +197,10 @@ def plan(store, *, gym, first, last, ticket, request_key, library_path, today=No
                       and r["publish_reservation_day"] is None for r in group)]
     if any(day not in movable for day in TARGET_ROOTS):
         raise ValueError("protected or held target row")
+    if any(len(groups[day]) != 4 or
+           {(r["account"], r["format"]) for r in groups[day]} != target_shape
+           for day in movable):
+        raise ValueError("incomplete machine-owned coupled platform rows in reflow window")
     days = sorted(groups)
     baseline = (_penalty(days, assignment, cohorts, first=TARGET_FIRST, last=TARGET_LAST),
                 _penalty(days, assignment, cohorts))
@@ -262,11 +299,15 @@ def run(*, store=None, gym, first, last, ticket, request_key, library_path=None,
                 and prior.get("request_key") == request_key
                 and prior.get("state") == "readback_verified"):
             try:
-                if any(_snapshot(store.get_row(gym, str(row["id"]))) != row
-                       for row in prior.get("readback", [])):
-                    return {"ok": False, "reason": "receipt replay readback drifted"}
+                _verify_receipt_readback(
+                    store, gym, first, last, prior.get("window_row_hashes"),
+                    prior.get("readback"), prior.get("outside_book_digest"))
+                if sorted(prior.get("changed_ids", [])) != sorted(
+                        str(row["id"]) for row in prior["readback"]):
+                    raise ValueError("receipt changed IDs differ from readback")
             except Exception:
-                return {"ok": False, "reason": "receipt replay readback unavailable"}
+                return {"ok": False,
+                        "reason": "receipt replay full readback drifted or is unavailable; reconciliation required"}
             return {"ok": True, "replay": True, "receipt": str(receipt),
                     "changed_ids": prior.get("changed_ids", [])}
         return {"ok": False, "reason": "existing receipt requires reconciliation"}
@@ -325,25 +366,9 @@ def run(*, store=None, gym, first, last, ticket, request_key, library_path=None,
                 progress["inflight_ids"].remove(str(before["id"]))
                 progress["state"] = "partial_reflow"
                 _receipt(receipt, progress)
-        final_rows = store.rows_in_range_complete(gym, first, last, all_statuses=True)
-        final_by_id = {str(row["id"]): row for row in final_rows}
-        if len(final_by_id) != len(proposed["window_row_hashes"]):
-            raise ValueError("final window readback row count changed")
-        expected_changed = {str(row["id"]): row for row in progress["readback"]}
-        for rid, before_hash in proposed["window_row_hashes"].items():
-            observed = _snapshot(final_by_id.get(rid))
-            if rid in expected_changed:
-                if observed != expected_changed[rid]:
-                    raise ValueError("final changed row readback drifted")
-            elif _digest(observed) != before_hash:
-                raise ValueError("unmoved window row drifted")
-        outside_after = [r for r in store.list_photo_restage_book(gym)
-                         if r.get("gym_id") == gym
-                         and not first <= str(r.get("post_date") or "")[:10] <= last]
-        if _digest([(r.get("id"), r.get("post_date"), r.get("status"),
-                     r.get("variant_status"), media_guard.row_media_key(r))
-                    for r in outside_after]) != proposed["outside_book_digest"]:
-            raise ValueError("out-of-window book changed during reflow")
+        _verify_receipt_readback(
+            store, gym, first, last, proposed["window_row_hashes"],
+            progress["readback"], proposed["outside_book_digest"])
         progress["state"] = "readback_verified"
         _receipt(receipt, progress)
     except Exception as exc:

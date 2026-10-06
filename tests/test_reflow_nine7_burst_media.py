@@ -128,6 +128,14 @@ def test_missing_coupled_sibling_refuses(monkeypatch, tmp_path):
         op.run(**args)
 
 
+def test_missing_gbp_on_machine_owned_exchange_day_refuses(monkeypatch, tmp_path):
+    calendar, args = fixture(monkeypatch, tmp_path)
+    calendar.rows.pop("gbp-2026-10-27")
+    with pytest.raises(ValueError, match="incomplete machine-owned coupled platform"):
+        op.run(**args)
+    assert not calendar.writes
+
+
 def test_scope_ticket_and_short_window_refused(monkeypatch, tmp_path):
     _, args = fixture(monkeypatch, tmp_path)
     for changed in ({"gym": "foreign"}, {"ticket": "wrong"},
@@ -165,6 +173,46 @@ def test_apply_preserves_copy_dates_status_and_coupled_rows(monkeypatch, tmp_pat
     again = op.run(**args, apply=True, expected_digest=digest, receipt_path=receipt,
                    prepare_fn=prepared)
     assert again["replay"] and len(calendar.writes) == len(result["changed_ids"])
+
+
+@pytest.mark.parametrize("field,value", [
+    ("caption", "later human edit"),
+    ("status", "approved"),
+    ("image_url", "https://cdn/later.jpg"),
+])
+def test_replay_refuses_unmoved_window_row_drift(monkeypatch, tmp_path, field, value):
+    calendar, args = fixture(monkeypatch, tmp_path)
+    digest = op.run(**args)["preflight"]["target_digest"]
+    receipt = tmp_path / f"replay-{field}.json"
+    monkeypatch.setenv("ECHO_NINE7_BURST_REFLOW_ENABLED", "true")
+    result = op.run(**args, apply=True, expected_digest=digest,
+                    receipt_path=receipt, prepare_fn=prepared)
+    assert result["ok"]
+    untouched = next(rid for rid in calendar.rows if rid not in result["changed_ids"])
+    calendar.rows[untouched][field] = value
+    writes_before = len(calendar.writes)
+    replay = op.run(**args, apply=True, expected_digest=digest,
+                    receipt_path=receipt, prepare_fn=prepared)
+    assert not replay["ok"] and "reconciliation required" in replay["reason"]
+    assert len(calendar.writes) == writes_before
+
+
+def test_replay_refuses_outside_book_drift(monkeypatch, tmp_path):
+    calendar, args = fixture(monkeypatch, tmp_path)
+    historical = row("2026-10-19", "ig", "IMG_3000.jpg", status="published")
+    calendar.rows[historical["id"]] = historical
+    digest = op.run(**args)["preflight"]["target_digest"]
+    receipt = tmp_path / "outside-replay.json"
+    monkeypatch.setenv("ECHO_NINE7_BURST_REFLOW_ENABLED", "true")
+    result = op.run(**args, apply=True, expected_digest=digest,
+                    receipt_path=receipt, prepare_fn=prepared)
+    assert result["ok"]
+    calendar.rows[historical["id"]]["caption"] = "changed outside caption"
+    writes_before = len(calendar.writes)
+    replay = op.run(**args, apply=True, expected_digest=digest,
+                    receipt_path=receipt, prepare_fn=prepared)
+    assert not replay["ok"] and "reconciliation required" in replay["reason"]
+    assert len(calendar.writes) == writes_before
 
 
 def test_partial_render_or_write_and_concurrent_drift_are_receipted(monkeypatch, tmp_path):
