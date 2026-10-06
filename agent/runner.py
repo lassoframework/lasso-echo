@@ -1044,6 +1044,8 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     blocked marker). Side effects: posts approval cards to Slack AND saves each
     non-blocked draft to the pending store so the listener can act on it later.
     """
+    from .openai_text import startup_preflight
+    startup_preflight()
     _trust_startup_warning()
     results = []
     # The scheduler distinguishes a genuinely silent posting-day run from the

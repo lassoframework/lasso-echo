@@ -230,6 +230,7 @@ def test_podcast_auto_uses_hf_renderer(monkeypatch):
     monkeypatch.setenv("HF_API_SECRET", "hf-secret")
     monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
     monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
 
     from agent import podcast_auto, video_editor
 
@@ -260,6 +261,7 @@ def test_podcast_auto_no_renderer_without_hf_keys(monkeypatch):
     monkeypatch.delenv("HF_API_SECRET", raising=False)
     monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
     monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
 
     from agent import podcast_auto, video_editor
 

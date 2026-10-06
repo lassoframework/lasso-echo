@@ -244,6 +244,7 @@ def test_podcast_auto_passes_fal_renderer_when_key_set(monkeypatch):
     monkeypatch.setattr(_hf_mod, "build_renderer", lambda: _sentinel)
     monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
     monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
 
     captured = {}
 
@@ -270,6 +271,7 @@ def test_podcast_auto_no_renderer_without_key(monkeypatch):
     monkeypatch.delenv("AGENT_FAL_API_KEY", raising=False)
     monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
     monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
 
     from agent import podcast_auto, video_editor
 

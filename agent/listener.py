@@ -1078,6 +1078,8 @@ def _chat_message_is_from_approver(message) -> bool:
 
 
 def run_listener():
+    from .openai_text import startup_preflight
+    startup_preflight()
     # Startup config hygiene: placeholder AGENT_OPUS_PROJECT_IDS values (P1
     # pattern / under 6 chars) get ONE warning naming each bad value and are
     # never sent to the API. Ingest revalidates on every pass; this line only

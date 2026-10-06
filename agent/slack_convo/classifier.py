@@ -246,7 +246,7 @@ def default_classify_llm(model=None):
     Returns a callable (text) -> label | None, or None when there is no key to call with.
 
     C1 (2026-09-05 audit, CRITICAL): this used to build and return the closure
-    unconditionally, because the ANTHROPIC_API_KEY check lived inside answer_lane.default_llm
+    unconditionally, because the API key check lived inside answer_lane.default_llm
     at CALL time. So build_classify_llm could never see a failure, its NotWiredError branches
     were unreachable, and a keyless deployment booted while LOGGING "classifier LLM wired" --
     then escalated every message, because each call raised and classify() turned that into
@@ -257,14 +257,12 @@ def default_classify_llm(model=None):
     exception as ESCALATE, and this returns None on anything unexpected, so the deterministic
     behaviour is the floor and the model can only ever fill the middle."""
     import os
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+    if not os.environ.get("OPENAI_API_KEY", "").strip():
         return None
-    try:
-        import anthropic  # noqa: F401 - m1 (audit 2): a key with no client library is still
-        # "flagged on with nothing behind it". Imported HERE so the boot assertion sees it,
-        # not at first call where the failure is indistinguishable from "nothing to say".
-    except Exception:  # noqa: BLE001
-        return None
+    from .. import config
+    selected_model = model or config.slack_convo_model()
+    from ..openai_text import validate_model
+    validate_model(selected_model)
 
     # Finding 4 (2026-09-05 audit 3): a PRESENT BUT INVALID key (revoked, typo'd, wrong
     # project) builds fine and cannot be detected without a network call, so the boot
@@ -287,7 +285,7 @@ def default_classify_llm(model=None):
                   f"({type(e).__name__}: {str(e)[:200]}); this is the "
                   f"{n}{'st' if n == 1 else 'nd' if n == 2 else 'rd' if n == 3 else 'th'} "
                   f"consecutive failure. Every message is escalating to a person while this "
-                  f"lasts. Check ANTHROPIC_API_KEY on this service.")
+                  f"lasts. Check OPENAI_API_KEY on this service.")
             raise
         state["consecutive_failures"] = 0
         verdict = (raw or "").strip().splitlines()[0].strip() if raw else ""

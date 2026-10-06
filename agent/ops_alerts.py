@@ -319,8 +319,8 @@ def _claim_systemic_slot(db=None, now=None) -> bool:
 def _maybe_cross_post_ops_fix(alert_text, poster):
     """Cross-post a NEEDS_TRIAGE alert into #echosupport as an OPS-FIX REQUEST
     (Blake, 2026-09-02: "it should go to echo support that is already wired" --
-    #echosupport already gets live Slack events and already has a proven relay to
-    headless Claude Code; #echoclaude, where every alert still posts unchanged
+    #echosupport already gets live Slack events and FIXER intake; #echoclaude,
+    where every alert still posts unchanged
     above, does not).
 
     Best-effort and silent-safe by construction: OFF unless

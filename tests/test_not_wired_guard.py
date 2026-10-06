@@ -155,7 +155,7 @@ def test_the_boot_assertion_is_actually_called_from_the_wiring_path(monkeypatch)
     monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLASSIFIER_LLM", "true")
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("AGENT_SLACK_BOT_TOKEN", "xoxb-not-real")
     from tests.test_slack_convo import FakeBus
     with pytest.raises(LW.NotWiredError):

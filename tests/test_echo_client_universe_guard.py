@@ -599,6 +599,7 @@ def test_catchup_window_is_echo_clients_only(universe, monkeypatch):
 
 def test_website_intake_fleet_run_skips_non_clients(universe, monkeypatch):
     monkeypatch.setenv("AGENT_WEBSITE_AUTO_INTAKE", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
     from agent import website_intake as wi
     touched, seen = [], []
     monkeypatch.setattr(wi, "intake_from_website",

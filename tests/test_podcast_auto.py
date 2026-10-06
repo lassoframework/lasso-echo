@@ -27,6 +27,7 @@ def test_next_posting_days_skips_configured_days(monkeypatch):
 
 def test_run_spreads_clips_across_week_as_held(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
     monkeypatch.setattr(config, "POSTING_SKIP_DAYS", [])
     # a fake rendered file per clip
     f1 = str(tmp_path / "a.mp4"); open(f1, "wb").write(b"x")
@@ -55,6 +56,7 @@ def test_run_spreads_clips_across_week_as_held(monkeypatch, tmp_path):
 
 def test_run_crossposts_to_every_account(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
     monkeypatch.setenv("AGENT_PODCAST_ACCOUNT_KEY", "lasso_ig,lasso_fb")
     monkeypatch.setattr(config, "POSTING_SKIP_DAYS", [])
     f1 = str(tmp_path / "a.mp4"); open(f1, "wb").write(b"x")

@@ -1,5 +1,14 @@
 # Slack Conversational Adapter, decisions log
 
+Current runtime ruling (2026-10-06): the Slack classifier and grounded answer lane use
+OpenAI Responses with OPENAI_API_KEY and default model gpt-6-astra. D4 below records the
+original build decision and is superseded for these lanes. The classifier still refuses to
+boot when enabled without a locally configured key and supported model; provider failures
+at call time escalate.
+Client reply and posting permissions are unchanged. A Railway rollout must set the OpenAI
+key and remove any old AGENT_SLACK_CONVO_MODEL value naming a Claude model before enabling
+the classifier.
+
 Blake's ruling (2026-09-03): "the FIXER bus (support_tickets + support_messages) IS the
 framework. Do not build a parallel system. Build a Slack Conversational Adapter as a new
 FIXER intake adapter. Echo first, generic enough that Ranger, Scout, Wrangler, and Lainey

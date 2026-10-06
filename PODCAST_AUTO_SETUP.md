@@ -105,7 +105,7 @@ get the animated intro card + word-highlight captions + Treatment B side panels
 
 Plus the same vars the editor + listener already use: `AGENT_DB_PATH=/data/echo.db`
 (shared volume, so drafts land where Approve can find them), Slack token, R2/S3
-media host creds, Anthropic + Deepgram keys.
+media host creds, OpenAI + Deepgram keys.
 
 ### 4. No separate service — arm it on the MAIN service
 Do NOT create a second Railway service (see ARCHITECTURE above). Instead, on the

@@ -278,22 +278,11 @@ def _bound_opening_hook(text, max_chars=_HOOK_MAX_CHARS):
 
 
 def _call_llm_caption(system, user):
-    """Call Claude for SB7 caption generation. Raises on missing key or SDK."""
-    import os as _os
+    """Call OpenAI Responses for SB7 caption generation; callers retain claim gates."""
     from . import config as _cfg
-    key = _os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
-    try:
-        import anthropic
-    except Exception:
-        raise RuntimeError("anthropic SDK not installed")
-    client = anthropic.Anthropic(api_key=key)
-    resp = client.messages.create(
-        model=_cfg.sb7_model(), max_tokens=400,
-        system=system, messages=[{"role": "user", "content": user}])
-    parts = getattr(resp, "content", []) or []
-    return "".join(getattr(p, "text", "") or "" for p in parts)
+    from . import openai_text
+    return openai_text.complete(system, user, model=_cfg.sb7_model(),
+                                max_output_tokens=1600)
 
 
 import re as _re_claims

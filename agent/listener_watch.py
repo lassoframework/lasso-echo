@@ -2,7 +2,7 @@
 listener_watch.py — Echo notices when a DESKTOP service that Echo depends on has died.
 
 WHY THIS EXISTS (2026-09-02): scout-listener, the process that picks Echo's support tickets
-and ops-fix requests out of #echosupport and relays them to Claude Code, crash-looped 47
+and ops-fix requests out of #echosupport and relays them to FIXER, crash-looped 47
 times on a MODULE_NOT_FOUND and nobody knew. Client support tickets sat untriaged for hours.
 The only evidence was a stderr file no human reads. Echo alerts loudly when a GYM's calendar
 breaks; nothing alerted when the thing that reads those alerts was itself face down.

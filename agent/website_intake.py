@@ -33,7 +33,8 @@ takes the draft run down. Manual per-gym run:
     python -m agent website-intake --account <base> [--domain x.com] [--force]
 
 Everything is injectable (fetch / llm / alert) so the whole lane is
-unit-testable offline with no network and no Anthropic key.
+    unit-testable offline with no network; tests use a placeholder OpenAI key
+    because the shared startup preflight applies even to manual intake.
 """
 
 import json
@@ -186,23 +187,14 @@ Fewer real facts always beats padding. Omit any category the text does not suppo
 
 
 def _call_llm(system, user):
-    """The SAME Anthropic plumbing drafter._call_llm_caption uses (same env key,
-    same AGENT_SB7_MODEL knob) with a larger max_tokens: a full source bundle
-    (up to ~20 cited facts) does not fit the caption call's 400-token cap.
-    Raises on a missing key/SDK; extract_sources catches and returns {}."""
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
-    try:
-        import anthropic
-    except Exception:
-        raise RuntimeError("anthropic SDK not installed")
-    client = anthropic.Anthropic(api_key=key)
-    resp = client.messages.create(
-        model=config.sb7_model(), max_tokens=2000,
-        system=system, messages=[{"role": "user", "content": user}])
-    parts = getattr(resp, "content", []) or []
-    return "".join(getattr(p, "text", "") or "" for p in parts)
+    """Use the shared OpenAI text client with room for a cited source bundle.
+
+    extract_sources catches provider errors and returns an empty bundle. Its citation,
+    number, tenant and approval checks still decide which facts may be stored.
+    """
+    from . import openai_text
+    return openai_text.complete(system, user, model=config.sb7_model(),
+                                max_output_tokens=4000)
 
 
 def _parse_bundle_json(raw):
@@ -435,8 +427,9 @@ def _resolve_domain(base, domain=None):
 
 def intake_from_website(base, *, domain=None, status=None, force=False,
                         fetch=None, llm=None):
-    """Auto-intake ONE gym from its website. Returns a summary dict, never
-    raises:
+    """Intake ONE gym from its website. Config preflight raises before any read
+    or fetch when the OpenAI text runtime is unavailable; per-gym work errors
+    return a summary dict:
 
       {"ok": True, "base", "domain", "landed", "status", "bible", "categories"}
       {"ok": False, "base", "reason"}
@@ -448,6 +441,8 @@ def intake_from_website(base, *, domain=None, status=None, force=False,
     base = (base or "").strip()
     if not base:
         return {"ok": False, "base": base, "reason": "no account base given"}
+    from .openai_text import startup_preflight
+    startup_preflight(force_website_intake=True)
     account_key = f"{base}_ig"
     try:
         # all_sources is tenant-variant aware, so rows under the bare base key
@@ -522,6 +517,8 @@ def run(bases=None, websites=None, fetch=None, llm=None, alert=None):
     a caller that holds that mapping passes it in)."""
     if not config.website_auto_intake_enabled():
         return {"ok": False, "reason": "AGENT_WEBSITE_AUTO_INTAKE off"}
+    from .openai_text import startup_preflight
+    startup_preflight()
     if bases is None:
         from .calendar_autopublish import client_gym_bases
         bases = client_gym_bases()

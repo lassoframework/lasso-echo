@@ -9,17 +9,15 @@ Echo is the DIRECTOR. It reuses the clipper stages (transcribe, select) and adds
   - ASSEMBLY with ffmpeg: cut -> frame (9:16 AND 1:1) -> composite overlays ->
     optional captions (toggle: organic captioned vs caption-free ad) -> brand frame.
 
-Why the renderer is pluggable / Claude-in-the-loop:
-  Higgsfield is reachable ONLY through the interactive claude.ai MCP connector, never
-  the headless Railway cron. So the render arm (AGENT_VIDEO_RENDER) is driven by a
-  Claude session that reads the manifest, calls Higgsfield, and drops assets into the
-  overlay cache; the pipeline then assembles them. Headless, the renderer is None (or
-  the text-card fallback) and the pipeline plans + projects cost but spends nothing.
+Why the renderer is pluggable:
+  This module has no built-in paid renderer. A caller must supply a renderer callable
+  and arm AGENT_VIDEO_RENDER before a cache miss can spend credits. The default CLI
+  passes no renderer; it can only reuse cached overlays or plan without spending.
 
 Flags (all default OFF, layered):
   AGENT_VIDEO_EDITOR_ENABLED  master
   AGENT_VIDEO_BROLL_ENABLED   plan + composite overlays
-  AGENT_VIDEO_RENDER          call Higgsfield (real credits)
+  AGENT_VIDEO_RENDER          allow an injected renderer (real credits)
 
 Nothing here publishes. Finished clips land as held review cards in #echoclaude.
 No em/en dashes or hyphens in any on-screen text. Fabrication gate: every b-roll
@@ -532,8 +530,8 @@ def render_overlays(manifest, renderer=None, cache_dir=None, cap=None, budget=No
     A beat with no route defaults to motion (backward compatible).
 
     renderer/still_renderer: callable(beat, out_path, kind) that WRITES the asset.
-      In an interactive Claude session these drive Higgsfield / the Gemini card
-      pipeline; None means only already-cached assets are used (no spend).
+      A configured caller can drive Higgsfield / the image-card pipeline; None means
+      only already-cached assets are used (no spend).
 
     Caching: content-hash cache path per beat. A cache HIT is reused (never
     re-pays). A cache MISS calls the route's renderer, decrementing that route's
@@ -1713,6 +1711,9 @@ def edit_episode(source, render=False, client=None, transcriber=None, llm=None,
               flush=True)
         return None
 
+    from .openai_text import startup_preflight
+    startup_preflight()
+
     aspects = aspects or config.video_aspects()
 
     staged = clipper.stage_episode(source, client=client)
@@ -1837,9 +1838,9 @@ def _rationale_line(clip):
 def video_episode_cli(argv):
     """python -m agent video-episode --source <path> [--render] [--account <key>]
 
-    --render arms the Higgsfield overlay call (needs AGENT_VIDEO_RENDER and an
-    interactive Claude session driving Higgsfield). Without it, overlays come from
-    cache only and nothing is spent. Assembles clips and posts held review cards.
+    --render permits overlay rendering when AGENT_VIDEO_RENDER is armed and a
+    renderer callable is supplied. This CLI supplies none, so overlays come from
+    cache only and no render credits are spent. Clips get held review cards.
     """
     from . import clipper
     from . import media_host
@@ -1934,4 +1935,3 @@ def video_episode_cli(argv):
     if posted:
         print(f"video-episode: {posted} clip(s) assembled + held for approval. "
               "Nothing published.", flush=True)
-

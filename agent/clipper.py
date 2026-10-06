@@ -2,13 +2,13 @@
 Native clipper (master flag AGENT_CLIPPER_ENABLED, default OFF).
 
 Episode video in, 4-5 finished vertical Reels out, entirely inside Echo. No
-third-party clip platform. Claude selects the moments; mechanical layers cut and
+third-party clip platform. Astra selects the moments; mechanical layers cut and
 caption (Phase 2). This module is PHASE 1: prove the SELECTION.
 
 Pipeline (Phase 1 stops at the dry-run plan; nothing renders, nothing publishes):
   1. intake       stage the episode video to a tenant-scoped R2 key (read-only src)
   2. transcribe   word-level timestamps + speaker segments, cached on the R2 key
-  3. select       Claude returns 4-5 candidate moments, scored + gated
+  3. select       Astra returns 4-5 candidate moments, scored + gated
   4. dry-run      print the ranked plan for Blake to confirm the picks
 
 Hard lines:
@@ -237,7 +237,7 @@ def text_between(transcript, start, end):
 
 def _timestamped_transcript(transcript):
     """A compact, timestamped rendering for the LLM prompt: one line per segment
-    (or per word when there are no segments), so Claude can choose start/end."""
+    (or per word when there are no segments), so Astra can choose start/end."""
     segs = transcript.get("segments") or []
     if segs:
         return "\n".join(
@@ -248,7 +248,7 @@ def _timestamped_transcript(transcript):
         for w in transcript.get("words", []))
 
 
-# ---- Part 3: Claude moment selection (THE CORE) --------------------------------------
+# ---- Part 3: Astra moment selection (THE CORE) ---------------------------------------
 @dataclass
 class Moment:
     start_ts: float
@@ -296,23 +296,14 @@ def _build_prompts(transcript, count):
 
 
 def _default_llm(system, user):
-    """Default Claude backend: reads the key by env NAME (never logged), calls the
+    """Default OpenAI backend: reads the key by env NAME (never logged), calls the
     configured model. Injected/mocked in tests."""
-    key = os.environ.get(config.CLIPPER_LLM_KEY_ENV)
-    if not key:
+    if not os.environ.get(config.CLIPPER_LLM_KEY_ENV, "").strip():
         raise ClipperError(
             f"no LLM key: set the env var named {config.CLIPPER_LLM_KEY_ENV}.")
-    try:
-        import anthropic
-    except Exception:
-        raise ClipperError(
-            "anthropic SDK not installed; pass an llm callable or install anthropic.")
-    client = anthropic.Anthropic(api_key=key)
-    resp = client.messages.create(
-        model=config.clipper_model(), max_tokens=2000,
-        system=system, messages=[{"role": "user", "content": user}])
-    parts = getattr(resp, "content", []) or []
-    return "".join(getattr(p, "text", "") or "" for p in parts)
+    from . import openai_text
+    return openai_text.complete(system, user, model=config.clipper_model(),
+                                max_output_tokens=4000)
 
 
 def _parse_moments(raw):
@@ -357,7 +348,7 @@ def _approved_claims_for(transcript, account_key=None):
 def select_moments(transcript, llm=None, approved_claims=None, account_key=None,
                    count=None):
     """
-    THE CORE. Feed the transcript to Claude and return scored, gated candidate
+    THE CORE. Feed the transcript to Astra and return scored, gated candidate
     moments. Returns {"accepted": [Moment sorted by score desc], "dropped": [Moment]}.
 
     Every candidate is checked: duration must sit in the configured window; score
@@ -638,6 +629,9 @@ def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
     if not config.clipper_enabled():
         print("clip-episode: OFF (set AGENT_CLIPPER_ENABLED=true). Nothing done.")
         return None
+
+    from .openai_text import startup_preflight
+    startup_preflight()
 
     staged = stage_episode(source, tenant, client=client)
     print(f"clip-episode: staged episode -> {staged['r2_key']} "

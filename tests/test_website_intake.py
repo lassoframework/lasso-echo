@@ -26,6 +26,7 @@ from agent import website_intake as wi  # noqa: E402
 @pytest.fixture(autouse=True)
 def _tmp_env(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
     monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "brand_voice"))
     monkeypatch.delenv("AGENT_WEBSITE_AUTO_INTAKE", raising=False)
     monkeypatch.delenv("AGENT_INTAKE_AUTO_APPROVE", raising=False)

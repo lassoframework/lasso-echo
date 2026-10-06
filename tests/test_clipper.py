@@ -31,6 +31,7 @@ class _FakeClient:
 
 def _arm(monkeypatch):
     monkeypatch.setenv("AGENT_CLIPPER_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-test-key")
     monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
     # S3_PUBLIC_BASE_URL is a module constant captured at import; set it directly.
     monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://cdn.echo.test")
@@ -164,7 +165,7 @@ def test_transcribe_rejects_missing_word_timestamps(monkeypatch, tmp_path):
         clipper.transcribe("echo/ep/bad/e.mp4", media_path=str(media), transcriber=_bad)
 
 
-# ---- Part 3: Claude moment selection ------------------------------------------------
+# ---- Part 3: Astra moment selection -------------------------------------------------
 
 # A transcript where every word carries a timestamp, long enough to slice 30-90s.
 def _long_transcript():
