@@ -1378,11 +1378,15 @@ def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
             f"{type(exc).__name__}")
         return
     try:
-        if not bus.fixer_receipt_exists(row["id"]):
+        if kind in RECEIPT_KINDS:
+            # Always cross the deterministic INSERT boundary.  A broad legacy
+            # receipt_for match must never suppress creation of the exact,
+            # ticket-bound receipt, and a duplicate INSERT validates the winner.
             _receipt(bus, ticket, row, identity, kind, att,
                      where=f"Slack {att['delivery_readback_channel']}", summary=summary)
         receipt_done = (kind not in RECEIPT_KINDS
-                        or bus.fixer_receipt_exists(row["id"]))
+                        or bus.fixer_receipt_exists(
+                            row["id"], ticket["id"], _a.KIND_ESCALATION))
         current = bus.ticket(ticket["id"])
         if not receipt_done or not current:
             return

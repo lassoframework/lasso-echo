@@ -435,8 +435,15 @@ class FakeBus:
                 and (m.get("attachments") or {}).get("fixer_slack_delivery_intent")
                 and not (m.get("attachments") or {}).get("fixer_delivery_finalized_at")][:limit]
 
-    def fixer_receipt_exists(self, mid):
-        return any((m.get("attachments") or {}).get("receipt_for") == mid
+    def fixer_receipt_exists(self, mid, ticket_id, kind):
+        receipt_id = str(uuid.uuid5(
+            uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be"), str(mid)))
+        return any(m.get("id") == receipt_id
+                   and m.get("ticket_id") == ticket_id
+                   and m.get("direction") == "outbound"
+                   and (m.get("attachments") or {}).get("receipt") is True
+                   and (m.get("attachments") or {}).get("receipt_for") == str(mid)
+                   and (m.get("attachments") or {}).get("kind") == kind
                    for m in self.msgs)
 
     def record_fixer_receipt_once(self, *, source_message_id, ticket_id,
@@ -447,7 +454,14 @@ class FakeBus:
         with self._atomic_lock:
             existing = next((m for m in self.msgs if m["id"] == receipt_id), None)
             if existing:
-                return dict(existing)
+                att = existing.get("attachments") or {}
+                if (existing.get("ticket_id") == ticket_id
+                        and existing.get("direction") == "outbound"
+                        and att.get("receipt") is True
+                        and att.get("receipt_for") == str(source_message_id)
+                        and att.get("kind") == kind):
+                    return dict(existing)
+                raise BusError(409, "FIXER receipt id collision")
             att = {"kind": kind, **dict(meta or {}), "receipt": True,
                    "receipt_for": str(source_message_id)}
             row = {"id": receipt_id, "direction": "outbound",
@@ -3279,22 +3293,27 @@ def test_concurrent_fixer_finalizers_create_exactly_one_durable_receipt(monkeypa
     _arm_grounded_fixer(monkeypatch)
     bus, tid, row, _ = _grounded_fixer_answer_case()
     original_exists = bus.fixer_receipt_exists
+    original_write = bus.record_fixer_receipt_once
 
-    def unreadable_receipts(_mid):
+    def unreadable_receipts(*_args):
         raise RuntimeError("receipt read unavailable")
 
+    def unwritable_receipt(**_kwargs):
+        raise RuntimeError("receipt write unavailable")
+
     bus.fixer_receipt_exists = unreadable_receipts
+    bus.record_fixer_receipt_once = unwritable_receipt
     post, calls = _posted()
     first = OB.run_once(bus, post, identity=IDS.get("echo"),
                         member_check=lambda *_: True, log=lambda *_: None)
     assert first["posted"] == first["resolved"] == 1
     assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
-    assert not original_exists(row["id"])
+    assert not original_exists(row["id"], tid, A.KIND_ESCALATION)
     assert not bus.message(row["id"])["attachments"].get(
         "fixer_delivery_finalized_at")
 
     bus.fixer_receipt_exists = original_exists
-    original_write = bus.record_fixer_receipt_once
+    bus.record_fixer_receipt_once = original_write
     both_checked_absent = threading.Barrier(2)
     failures = []
 
@@ -3327,6 +3346,107 @@ def test_concurrent_fixer_finalizers_create_exactly_one_durable_receipt(monkeypa
         uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be"), row["id"]))
     assert bus.message(row["id"])["attachments"]["fixer_delivery_finalized_at"]
     assert len([c for c in calls if c["channel"] == "C_CLIENT"]) == 1
+
+
+def _pending_fixer_receipt_case(monkeypatch):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    original_exists = bus.fixer_receipt_exists
+    original_write = bus.record_fixer_receipt_once
+    bus.fixer_receipt_exists = lambda *_: (_ for _ in ()).throw(
+        RuntimeError("receipt read unavailable"))
+    bus.record_fixer_receipt_once = lambda **_: (_ for _ in ()).throw(
+        RuntimeError("receipt write unavailable"))
+    post, _ = _posted()
+    result = OB.run_once(bus, post, identity=IDS.get("echo"),
+                         member_check=lambda *_: True, log=lambda *_: None)
+    assert result["posted"] == result["resolved"] == 1
+    bus.fixer_receipt_exists = original_exists
+    bus.record_fixer_receipt_once = original_write
+    return bus, tid, row
+
+
+def test_foreign_ticket_receipt_for_cannot_skip_bound_receipt(monkeypatch):
+    bus, tid, row = _pending_fixer_receipt_case(monkeypatch)
+    foreign_tid = str(uuid.uuid4())
+    bus.msgs.append({
+        "id": str(uuid.uuid4()), "ticket_id": foreign_tid, "direction": "outbound",
+        "delivery_status": "ready", "body": "foreign", "slack_ts": None,
+        "created_at": bus._ts(),
+        "attachments": {"kind": A.KIND_ESCALATION, "receipt": True,
+                        "receipt_for": row["id"]},
+    })
+
+    OB._finalize_fixer_post(
+        bus, bus.ticket(tid), bus.message(row["id"]), IDS.get("echo"),
+        lambda *_: None, {"resolved": 0})
+
+    exact = [m for m in bus.messages_for(tid)
+             if (m.get("attachments") or {}).get("receipt_for") == row["id"]]
+    assert len(exact) == 1
+    assert exact[0]["id"] == str(uuid.uuid5(
+        uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be"), row["id"]))
+    assert bus.message(row["id"])["attachments"]["fixer_delivery_finalized_at"]
+
+
+def test_corrupt_deterministic_receipt_collision_fails_closed(monkeypatch):
+    bus, tid, row = _pending_fixer_receipt_case(monkeypatch)
+    receipt_id = str(uuid.uuid5(
+        uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be"), row["id"]))
+    bus.msgs.append({
+        "id": receipt_id, "ticket_id": str(uuid.uuid4()), "direction": "outbound",
+        "delivery_status": "ready", "body": "corrupt", "slack_ts": None,
+        "created_at": bus._ts(),
+        "attachments": {"kind": A.KIND_ESCALATION, "receipt": True,
+                        "receipt_for": row["id"]},
+    })
+
+    OB._finalize_fixer_post(
+        bus, bus.ticket(tid), bus.message(row["id"]), IDS.get("echo"),
+        lambda *_: None, {"resolved": 0})
+
+    assert not bus.message(row["id"])["attachments"].get(
+        "fixer_delivery_finalized_at")
+    assert not bus.fixer_receipt_exists(row["id"], tid, A.KIND_ESCALATION)
+
+
+def test_legitimate_existing_deterministic_receipt_allows_retry(monkeypatch):
+    bus, tid, row = _pending_fixer_receipt_case(monkeypatch)
+    bus.record_fixer_receipt_once(
+        source_message_id=row["id"], ticket_id=tid, author_type="system",
+        body="existing", delivery_status="ready", kind=A.KIND_ESCALATION,
+        meta={"receipt": True, "receipt_for": row["id"]})
+
+    OB._finalize_fixer_post(
+        bus, bus.ticket(tid), bus.message(row["id"]), IDS.get("echo"),
+        lambda *_: None, {"resolved": 0})
+
+    receipts = [m for m in bus.messages_for(tid)
+                if (m.get("attachments") or {}).get("receipt_for") == row["id"]]
+    assert len(receipts) == 1
+    assert bus.message(row["id"])["attachments"]["fixer_delivery_finalized_at"]
+
+
+def test_bus_fixer_receipt_lookup_binds_complete_postgrest_identity():
+    mid, tid = str(uuid.uuid4()), str(uuid.uuid4())
+    seen = {}
+
+    class _ReceiptBus(Bus):
+        def _get(self, table, params):
+            seen.update(params)
+            return []
+
+    bus = _ReceiptBus(url="https://example.supabase.co", service_key="service")
+    assert not bus.fixer_receipt_exists(mid, tid, A.KIND_ESCALATION)
+    assert seen == {
+        "id": "eq." + str(uuid.uuid5(
+            uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be"), mid)),
+        "ticket_id": f"eq.{tid}", "direction": "eq.outbound",
+        "attachments->>receipt": "eq.true",
+        "attachments->>receipt_for": f"eq.{mid}",
+        "attachments->>kind": f"eq.{A.KIND_ESCALATION}",
+        "select": "id", "limit": "1",
+    }
 
 
 @pytest.mark.parametrize("defect", [

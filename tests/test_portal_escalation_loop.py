@@ -260,8 +260,12 @@ class Bus:
                 and (m.get("attachments") or {}).get("fixer_slack_delivery_intent")
                 and not (m.get("attachments") or {}).get("fixer_delivery_finalized_at")][:limit]
 
-    def fixer_receipt_exists(self, mid):
-        return any((m.get("attachments") or {}).get("receipt_for") == mid
+    def fixer_receipt_exists(self, mid, ticket_id, kind):
+        return any(m.get("ticket_id") == ticket_id
+                   and m.get("direction") == "outbound"
+                   and (m.get("attachments") or {}).get("receipt") is True
+                   and (m.get("attachments") or {}).get("receipt_for") == str(mid)
+                   and (m.get("attachments") or {}).get("kind") == kind
                    for m in self.msgs)
 
     def finalize_fixer_delivery(self, mid, reason):

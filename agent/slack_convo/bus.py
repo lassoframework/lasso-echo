@@ -38,6 +38,10 @@ _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _FIXER_RECEIPT_NAMESPACE = uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be")
 
 
+def _fixer_receipt_id(source_message_id):
+    return str(uuid.uuid5(_FIXER_RECEIPT_NAMESPACE, str(source_message_id)))
+
+
 def _a_kind_escalation():
     from .adapter import KIND_ESCALATION
     return KIND_ESCALATION
@@ -960,9 +964,15 @@ class Bus:
             "select": "*", "order": "created_at.desc", "limit": str(int(limit)),
         })
 
-    def fixer_receipt_exists(self, message_id):
+    def fixer_receipt_exists(self, message_id, ticket_id, kind):
+        """Require the complete immutable identity of a FIXER delivery receipt."""
         rows = self._get(_MESSAGES, {
+            "id": f"eq.{_fixer_receipt_id(message_id)}",
+            "ticket_id": f"eq.{ticket_id}",
+            "direction": "eq.outbound",
+            "attachments->>receipt": "eq.true",
             "attachments->>receipt_for": f"eq.{message_id}",
+            "attachments->>kind": f"eq.{kind}",
             "select": "id", "limit": "1",
         })
         return bool(rows)
@@ -974,8 +984,7 @@ class Bus:
         The receipt's deterministic UUID is the database uniqueness boundary. Two
         processes may race this INSERT; one wins and the other reads that same row.
         """
-        receipt_id = str(uuid.uuid5(
-            _FIXER_RECEIPT_NAMESPACE, str(source_message_id)))
+        receipt_id = _fixer_receipt_id(source_message_id)
         att = {"kind": kind, **dict(meta or {}),
                "receipt": True, "receipt_for": str(source_message_id)}
         row = {"id": receipt_id, "ticket_id": ticket_id,
@@ -986,9 +995,12 @@ class Bus:
         if not duplicate:
             return created
         existing = self.message(receipt_id)
+        existing_att = (existing or {}).get("attachments") or {}
         if ((existing or {}).get("ticket_id") == ticket_id
-                and ((existing or {}).get("attachments") or {}).get(
-                    "receipt_for") == str(source_message_id)):
+                and (existing or {}).get("direction") == "outbound"
+                and existing_att.get("receipt") is True
+                and existing_att.get("receipt_for") == str(source_message_id)
+                and existing_att.get("kind") == kind):
             return existing
         raise BusError(409, "FIXER receipt id collision")
 
