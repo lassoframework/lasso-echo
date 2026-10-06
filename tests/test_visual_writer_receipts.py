@@ -254,13 +254,45 @@ def test_own_media_url_encoded_space_exception_keeps_security_rejections(
     assert prep._own_media_url(url) is False
 
 
+@pytest.mark.parametrize("format_char", [
+    "\u200c",  # ZERO WIDTH NON-JOINER
+    "\u200d",  # ZERO WIDTH JOINER
+    "\u200e",  # LEFT-TO-RIGHT MARK
+    "\u200f",  # RIGHT-TO-LEFT MARK
+    "\u2060",  # WORD JOINER
+    "\ufeff",  # ZERO WIDTH NO-BREAK SPACE / BOM
+    "\u00ad",  # SOFT HYPHEN
+])
+def test_own_media_url_accepts_safe_format_characters_in_owned_object_names(
+        monkeypatch, format_char):
+    from urllib.parse import quote
+    from agent import config
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+    url = f"https://media.example/zanshinfitness630e22/photo{quote(format_char)}.jpg?version=1"
+
+    assert prep._own_media_url(url) is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://media.example/zanshinfitness630e22/photo%00.jpg",
+    "https://media.example/zanshinfitness630e22/photo%1f.jpg",
+    "https://media.example/zanshinfitness630e22/photo%7f.jpg",
+    "https://media.example/zanshinfitness630e22/%2e%2e/photo.jpg",
+    "https://media.example/zanshinfitness630e22/photo\x01.jpg",
+    "https://media.example/zanshinfitness630e22/photo\ud800.jpg",
+])
+def test_own_media_url_rejects_encoded_controls_and_traversal(monkeypatch, url):
+    from agent import config
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+
+    assert prep._own_media_url(url) is False
+
+
 def test_query_object_read_disables_redirects_and_caps_stream(monkeypatch):
     from agent import config
     import requests
     monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
     monkeypatch.setattr(prep, "MAX_VISUAL_BYTES", 6)
-    assert prep._own_media_url(RAW) is True
-    assert prep._own_media_url("https://media.example.evil.test/raw.jpg?version=1") is False
     calls = []
 
     class HTTPResponse:

@@ -151,9 +151,12 @@ def _own_media_url(url):
         all(part not in (".", "..") and "/" not in part and "\\" not in part
             # Raw whitespace was rejected above.  A decoded ASCII space is
             # therefore an encoded object-key character (for example %20),
-            # while other whitespace and Unicode controls remain ineligible.
+            # while other whitespace and non-format Unicode category-C chars
+            # remain ineligible. Cf chars are filename data here; Cc controls,
+            # surrogates, private-use and unassigned codepoints fail.
             and not any((char != " " and char.isspace()) or
-                        unicodedata.category(char).startswith("C")
+                        (unicodedata.category(char).startswith("C") and
+                         unicodedata.category(char) != "Cf")
                         for char in part)
             for part in path_parts)
     )
