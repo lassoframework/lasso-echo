@@ -234,6 +234,10 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     if not imgs:
         return None
 
+    # Retain the pre-consumption catalog so a served rotation key can be mapped
+    # back to its immutable intake burst cohort. This metadata is read-only.
+    burst_catalog = list(imgs)
+
     def _rkey(c):
         return dam.rotation_key(c.path)
 
@@ -348,7 +352,20 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
         # the stale pick below so a denied slot is never left empty.
         return None
     pool = fresh if fresh else imgs
-    pool.sort(key=lambda c: (last_served.get(_rkey(c), ""), _image_key(c)))
+    # Vision-off burst spacing (Nine7 ticket b355c2cf). This is a no-op unless
+    # at least two trustworthy intake cohorts exist and the pool is photo-only;
+    # thin, unknown, and mixed video libraries preserve the legacy fallback.
+    from . import burst_spacing
+    original_pool_size = len(pool)
+    pool = burst_spacing.choose_spaced_pool(
+        pool, burst_catalog, served_all, account_key, day_key)
+    spacing_applied = len(pool) < original_pool_size
+    if spacing_applied:
+        # choose_spaced_pool already orders one cohort by trusted upload batch
+        # position/sequence. Stable recency sorting preserves that tiebreak.
+        pool.sort(key=lambda c: last_served.get(_rkey(c), ""))
+    else:
+        pool.sort(key=lambda c: (last_served.get(_rkey(c), ""), _image_key(c)))
     legacy = pool[0]
     if not fresh:
         # STALE REUSE (Pete/Zanshin, Dean/Reverb, 2026-09-07): the library is

@@ -2087,6 +2087,22 @@ def _vision_base(gym_key) -> str:
     return base
 
 
+def burst_spacing_gyms() -> set:
+    """Base gym keys explicitly enabled for intake burst spacing.
+
+    Default empty keeps every gym on the legacy picker. Rollout is intentionally
+    per gym through ``AGENT_BURST_SPACING_GYMS``; Nine7 is added to the deployed
+    environment only after this code is released and verified.
+    """
+    raw = os.environ.get("AGENT_BURST_SPACING_GYMS", "")
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
+def burst_spacing_enabled_for(gym_key) -> bool:
+    """True only for an explicitly allowlisted base or platform account key."""
+    return _vision_base(gym_key) in burst_spacing_gyms()
+
+
 def vision_shadow_gyms() -> set:
     """§9.4 SHADOW gyms: analysis + content scoring RUN and log, but the picks + drafter stay
     FULLY LEGACY (a plumbing smoke test, not the ship metric). A gym in shadow but NOT in
