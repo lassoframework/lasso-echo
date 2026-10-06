@@ -28,6 +28,7 @@ class _CalStore:
     def __init__(self, existing=None):
         self.existing = existing or []
         self.inserted = []
+        self.event_row_reads = 0
 
     def list_month(self, gym_id, month):
         return [r for r in self.existing
@@ -43,6 +44,7 @@ class _CalStore:
         return out
 
     def list_event_rows(self, gym_id, event_id):
+        self.event_row_reads += 1
         return [dict(r) for r in self.inserted
                 if r.get("gym_id") == gym_id and r.get("event_id") == event_id]
 
@@ -58,8 +60,10 @@ class _CalStore:
 class _EvStore:
     def __init__(self):
         self.rows = {}
+        self.upsert_calls = 0
 
     def upsert_event(self, row):
+        self.upsert_calls += 1
         self.rows[row["id"]] = dict(row)
         return self.rows[row["id"]]
 
@@ -216,6 +220,65 @@ def test_edit_404_for_missing_or_cross_gym(monkeypatch):
     status, resp = pe.handle_edit_event("pete", "nope", {"link": "x"},
                                         store=_CalStore(), event_store=_EvStore())
     assert status == 404
+
+
+@pytest.mark.parametrize("terminal_status", ["cancelled", "ended"])
+def test_edit_refuses_terminal_event_before_calendar_read_or_write(
+        monkeypatch, terminal_status):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    original = {
+        "id": f"e-{terminal_status}", "gym_id": "pete",
+        "name": "Fall Cohort", "type": "new_offer",
+        "starts_on": "2026-10-01", "ends_on": "2026-10-14",
+        "tz": "America/New_York", "offer_text": "Reserve a place",
+        "link": "", "brief": "", "media_ids": [],
+        "status": terminal_status, "created_by": "owner",
+        "audit": [{"action": terminal_status}],
+    }
+    ev.upsert_event(original)
+    writes_before = ev.upsert_calls
+
+    status, resp = pe.handle_edit_event(
+        "pete", original["id"],
+        {"starts_on": "2026-11-01", "ends_on": "2026-11-14",
+         "actor_id": "stale-browser"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 409
+    assert resp == {"error": "this promotion can no longer be edited"}
+    assert ev.rows[original["id"]] == original
+    assert ev.upsert_calls == writes_before, "terminal edit must not persist a merged event"
+    assert cal.event_row_reads == 0, "terminal edit must stop before arc inspection/restaging"
+    assert cal.inserted == []
+
+
+@pytest.mark.parametrize("editable_status", ["draft", "scheduled", "live"])
+def test_edit_preserves_supported_active_statuses(monkeypatch, editable_status):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    event = {
+        "id": f"e-{editable_status}", "gym_id": "pete",
+        "name": "Fall Cohort", "type": "new_offer",
+        "starts_on": "2026-10-01", "ends_on": "2026-10-14",
+        "tz": "America/New_York", "offer_text": "Reserve a place",
+        "link": "", "brief": "", "media_ids": [],
+        "status": editable_status, "created_by": "owner", "audit": [],
+    }
+    ev.upsert_event(event)
+
+    status, resp = pe.handle_edit_event(
+        "pete", event["id"],
+        {"starts_on": "2026-10-03", "ends_on": "2026-10-16",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 200
+    assert resp["event"]["status"] == editable_status
+    assert ev.rows[event["id"]]["status"] == editable_status
+    assert ev.rows[event["id"]]["starts_on"] == "2026-10-03"
+    assert ev.rows[event["id"]]["ends_on"] == "2026-10-16"
+    assert any(a["action"] == "edit" for a in ev.rows[event["id"]]["audit"])
 
 
 # ---- cancel --------------------------------------------------------------------

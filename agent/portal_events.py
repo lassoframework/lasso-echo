@@ -24,6 +24,9 @@ from datetime import date
 from . import config, gym_event as ge, event_calendar as ec, event_engine as ee
 
 
+_EDITABLE_EVENT_STATUSES = frozenset(("draft", "scheduled", "live"))
+
+
 def _flag_off():
     """A disabled gym / feature is a 404, indistinguishable from an unknown route."""
     return 404, {"error": "not found"}
@@ -143,7 +146,8 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     re-stages ONLY changed rows; approved unaffected rows stay approved. Body carries
     the changed fields (starts_on/ends_on/offer_text/link/brief/media_ids). Gym-scoped.
 
-    Returns (200, {event, restaged, kept, removed}) or (404)."""
+    Returns (200, {event, restaged, kept, removed}), 409 for a terminal/non-editable
+    status, or 404 when the gym-scoped event does not exist."""
     if not config.event_campaigns_enabled_for(account_key):
         return _flag_off()
     _store, _estore = _stores(store, event_store)
@@ -155,6 +159,15 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
         return 502, {"error": f"read failed: {type(exc).__name__}"}
     if not cur:
         return 404, {"error": "not found"}
+
+    # Status is a server-side write boundary, not a UI convention. A stale browser or
+    # crafted request must not resurrect a terminal offer by changing its dates and
+    # re-staging an arc after the status job ended it or an owner cancelled it. Keep an
+    # explicit allowlist so malformed/future states also fail closed before we inspect
+    # calendar rows, persist a merged event, or stage anything.
+    current_status = str(cur.get("status") or "").strip().lower()
+    if current_status not in _EDITABLE_EVENT_STATUSES:
+        return 409, {"error": "this promotion can no longer be edited"}
 
     merged = dict(cur)
     for k in ("name", "type", "starts_on", "ends_on", "tz", "offer_text",
