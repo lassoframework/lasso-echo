@@ -2340,7 +2340,7 @@ class SupabaseCalendarStore:
             claimed = token["row"]
             required = ("id", "gym_id", "status", "publish_claim_token",
                         "account", "format", "post_date", "caption", "image_url",
-                        "byte_hash", "source_media_asset_id", "source_media_url")
+                        "source_media_asset_id", "source_media_url")
             if (any(k not in claimed for k in required)
                     or str(claimed["id"]) != str(row_id)
                     or claimed["gym_id"] != gym_id
@@ -2352,6 +2352,11 @@ class SupabaseCalendarStore:
                 claimed["publish_claim_token"] = str(UUID(str(claimed["publish_claim_token"])))
             except (TypeError, ValueError, AttributeError):
                 raise PortalStoreError(502, "calendar claim returned invalid ownership token")
+            # The locked row is to_jsonb(content_calendar). Production schemas
+            # without the optional byte_hash column omit its key altogether;
+            # retain a real value when the column is present. The publisher
+            # still requires this normalized key in its locked creative check.
+            claimed.setdefault("byte_hash", None)
             claimed["autonomous_at_claim"] = token["autonomous_at_claim"]
             return claimed
         try:

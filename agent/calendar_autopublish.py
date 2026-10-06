@@ -2701,13 +2701,20 @@ def sweep_expired_rows(*, store=None, kv=None, now=None, alert=None,
                 if moved:
                     span = f"{moved[0]['new_date']}..{moved[-1]['new_date']}" \
                         if len(moved) > 1 else moved[0]["new_date"]
+                    approval_note = (
+                        "approval proof cleared; any approved row returned to pending"
+                        if config.approval_proof_enabled()
+                        else "existing approval status preserved"
+                    )
                     bits.append(f"re-dated {len(moved)} expired row(s) into open "
-                                f"day(s) {span} (approvals preserved)")
+                                f"day(s) {span} ({approval_note})")
                 if retired:
                     bits.append(f"retired {len(retired)} expired row(s) (unapproved "
                                 "twice-expired, or redundant because every upcoming "
                                 "day already has content)")
-                alert(f"{gym}: {'; '.join(bits)}. No action needed.")
+                suffix = ("Check current gym mode and approval state before release."
+                          if config.approval_proof_enabled() else "No action needed.")
+                alert(f"{gym}: {'; '.join(bits)}. {suffix}")
             if not gym_rows:
                 alerted.append(gym)
                 continue

@@ -404,7 +404,7 @@ def test_claim_slot_omits_proof_param_by_default(monkeypatch):
 
 
 def test_claim_slot_sends_proof_param_only_when_required(monkeypatch):
-    row = _row("r1", gym_id="gymx")
+    row = _row("r1", gym_id="gymx", byte_hash="abc123")
     row.update(status="publishing", publish_claim_token="00000000-0000-0000-0000-000000000001")
     http = _FakeHTTP(_Resp(200, {"row": row, "autonomous_at_claim": False}))
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
@@ -414,7 +414,42 @@ def test_claim_slot_sends_proof_param_only_when_required(monkeypatch):
     assert url.endswith("/rpc/claim_calendar_publish_slot_proven_owned")
     assert "p_require_approval_proof" not in payload
     assert claimed["caption"] == row["caption"]
+    assert claimed["byte_hash"] == "abc123"
     assert claimed["autonomous_at_claim"] is False
+
+
+def test_claim_slot_normalizes_absent_optional_byte_hash(monkeypatch):
+    row = _row("r1", gym_id="gymx")
+    row.update(status="publishing", publish_claim_token="00000000-0000-0000-0000-000000000001")
+    del row["byte_hash"]  # to_jsonb(c) omits a column absent from production.
+    http = _FakeHTTP(_Resp(200, {"row": row, "autonomous_at_claim": False}))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    claimed = pcs.SupabaseCalendarStore().claim_publish_slot(
+        "r1", "gymx", RUN_DATE, "America/New_York", 2, True, require_proof=True)
+
+    assert claimed["byte_hash"] is None
+    assert claimed["source_media_asset_id"] is None
+    assert claimed["source_media_url"] is None
+    assert claimed["publish_claim_token"] == "00000000-0000-0000-0000-000000000001"
+
+
+@pytest.mark.parametrize("missing_key", (
+    "id", "gym_id", "status", "publish_claim_token", "account", "format",
+    "post_date", "caption", "image_url", "source_media_asset_id",
+    "source_media_url",
+))
+def test_claim_slot_rejects_missing_required_locked_field(monkeypatch, missing_key):
+    row = _row("r1", gym_id="gymx")
+    row.update(status="publishing", publish_claim_token="00000000-0000-0000-0000-000000000001")
+    del row["byte_hash"]
+    del row[missing_key]
+    http = _FakeHTTP(_Resp(200, {"row": row, "autonomous_at_claim": False}))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    with pytest.raises(pcs.PortalStoreError, match="invalid locked creative"):
+        pcs.SupabaseCalendarStore().claim_publish_slot(
+            "r1", "gymx", RUN_DATE, "America/New_York", 2, True, require_proof=True)
 
 
 def test_manual_caption_format_uses_exact_cas_rpc_and_requires_pending_result(
