@@ -70,6 +70,7 @@ HARDENING (2026-09-03 re-audit wave 2):
 """
 from datetime import datetime, timedelta, timezone
 import hashlib
+import math
 import json
 import re
 
@@ -923,7 +924,16 @@ def _readback_fixer_message(readback, intent, *, ts=None):
         if not isinstance(message, dict):
             continue
         found_ts = str(message.get("ts") or "")
-        if (not found_ts or (ts and found_ts != str(ts))
+        # Slack ts values are Unix seconds, not ISO-8601 strings like the
+        # intent's not_before value. Parse numerically and fail closed.
+        try:
+            observed_at = float(found_ts)
+            intent_floor = not_before.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (not found_ts or not math.isfinite(observed_at)
+                or observed_at < intent_floor
+                or (ts and found_ts != str(ts))
                 or not _slack_readback_text_matches(body, message.get("text"))
                 or message.get("user") != sender):
             continue
