@@ -17,6 +17,7 @@ thin wrappers over these pure functions.
 """
 
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from . import config, gbp
@@ -101,13 +102,17 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
     _body, _meta = _pq.split_meta_suffix(caption)
     if _meta:
         if not draft and config.approval_proof_enabled():
-            # This snapshot already passed the atomic proof claim. Removing
-            # metadata now would send different text from the approved digest.
-            # No provider call was attempted; the orchestrator releases the
-            # token and holds this creative until it is cleaned and reapproved.
+            # This snapshot already passed the atomic claim. Removing metadata
+            # would send text different from the claimed row, including in Auto
+            # where human approval is not required. Auto rows are cleaned by
+            # caption_meta_sweep before a later claim/retry.
+            auto = row.get("autonomous_at_claim") is True
             return {"ok": False, "status": "approved", "late_post_id": "",
-                    "reject_reason": "caption metadata requires cleanup and fresh approval",
-                    "held": "approval_creative_change", "mode": ""}
+                    "reject_reason": ("caption metadata requires automatic cleanup"
+                                      if auto else
+                                      "caption metadata requires cleanup and fresh approval"),
+                    "held": ("automatic_caption_cleanup" if auto else
+                             "approval_creative_change"), "mode": ""}
         caption = _body.strip()
         row = dict(row)
         row["caption"] = caption
@@ -519,15 +524,21 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                 if require_proof:
                     # Publish the exact locked creative returned by the proof
                     # claim, never the potentially stale prefetch snapshot.
+                    try:
+                        claimed_token = str(uuid.UUID(
+                            str(claimed.get("publish_claim_token"))))
+                    except (AttributeError, TypeError, ValueError):
+                        claimed_token = ""
                     if (not isinstance(claimed, dict)
                             or str(claimed.get("id")) != str(row.get("id"))
                             or claimed.get("gym_id") != gym
                             or claimed.get("status") != "publishing"
-                            or not claimed.get("publish_claim_token")):
+                            or not claimed_token
+                            or type(claimed.get("autonomous_at_claim")) is not bool):
                         held += 1
                         continue
                     row = claimed
-                    claim_token = claimed["publish_claim_token"]
+                    claim_token = claimed_token
                 claim_won = True
                 # New stores return the PERSISTED publish_claim_token; it becomes
                 # the Zernio Idempotency-Key. Legacy fakes return True — proceed
@@ -584,10 +595,38 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                     try:
                         release = getattr(store, "release_publishing_claim", None)
                         if claim_token is not None and release is not None:
-                            if release(row.get("id"), claim_token,
-                                       "approved") is None:
+                            released = release(row.get("id"), claim_token,
+                                               "approved")
+                            if released is None:
                                 print(f"[gbp] WARNING: claim release matched no row "
                                       f"for {row.get('id')}; claim changed elsewhere")
+                            elif (res.get("held") == "automatic_caption_cleanup"
+                                  and row.get("autonomous_at_claim") is True):
+                                # The provider payload must exactly match the claimed
+                                # creative. Clean the stored Auto caption only after
+                                # the token-scoped release, with caption/status CAS;
+                                # this tick always ends without a provider call. The
+                                # next GBP tick can claim and send the cleaned row.
+                                from . import post_quality as _pq
+                                body, _meta = _pq.split_meta_suffix(row.get("caption") or "")
+                                cleaned = body.strip()
+                                cleanup = getattr(store, "cleanup_automatic_caption", None)
+                                if cleaned and cleanup is not None:
+                                    try:
+                                        updated = cleanup(
+                                            gym, row.get("id"), cleaned,
+                                            expected_caption=row.get("caption") or "")
+                                        if updated is None:
+                                            print(f"[gbp] Auto caption cleanup CAS "
+                                                  f"matched no row for {row.get('id')}; "
+                                                  "no send attempted")
+                                    except Exception as e:  # noqa: BLE001
+                                        print(f"[gbp] Auto caption cleanup failed for "
+                                              f"{row.get('id')}: {type(e).__name__}; "
+                                              "no send attempted")
+                                else:
+                                    print(f"[gbp] Auto caption cleanup unavailable or "
+                                          f"empty for {row.get('id')}; no send attempted")
                         else:
                             store.mark_status(row.get("id"), "approved")
                     except Exception as e:  # noqa: BLE001

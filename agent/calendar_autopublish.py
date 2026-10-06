@@ -835,10 +835,27 @@ def _alert_meta_reapproval_held(row_id, gym_id, persisted):
         pass  # an alert failure must never weaken the publish hold
 
 
+def _alert_meta_autonomous_cleanup_held(row_id, gym_id):
+    """Report a refused autonomous cleanup without claiming human review is due."""
+    try:
+        from . import db, ops_alerts
+        key = f"metaleak_auto_cleanup_held_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        result = ops_alerts.alert(
+            f"{gym_id}: row {row_id} HELD before publish because its internal "
+            "[why]/[reason] block could not be cleaned under the current "
+            "autonomy and exact-caption check. No post was sent.")
+        if _alert_confirmed(result):
+            db.kv_set(key, "1")
+    except Exception:
+        pass
+
+
 _META_REAPPROVAL_REQUIRED = object()
 
 
-def _strip_or_hold_meta(row, gym_id, store):
+def _strip_or_hold_meta(row, gym_id, store, *, autonomous_lane=False):
     """FINAL GATE for internal edit-rationale blocks (CrossFit ENG live FB post,
     2026-08-23 00:02 ET: a caption published ending with '[why] Removed word parents
     and added people ...'). Runs UNCONDITIONALLY on every row about to publish —
@@ -862,6 +879,21 @@ def _strip_or_hold_meta(row, gym_id, store):
     except ValueError:
         return None
     if config.approval_proof_enabled():
+        if autonomous_lane:
+            try:
+                cleaner = getattr(store, "patch_caption_autonomous_clean", None)
+                patched = (cleaner(row.get("gym_id") or gym_id, row.get("id"),
+                                   row.get("status"), row.get("caption"), body)
+                           if callable(cleaner) else None)
+            except Exception as e:  # noqa: BLE001 - no persisted cleanup, no send
+                patched = None
+                print(f"[calendar-autopublish] autonomous meta cleanup failed for "
+                      f"{row.get('id')}: {type(e).__name__}: {e}")
+            if patched is not None:
+                _note_meta_stripped(row.get("id"), gym_id)
+                return patched
+            _alert_meta_autonomous_cleanup_held(row.get("id"), gym_id)
+            return _META_REAPPROVAL_REQUIRED
         persisted = False
         try:
             patcher = getattr(store, "patch_caption", None)
@@ -1427,7 +1459,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # reset to pending + held for fresh approval when proof is armed. All-meta ->
         # held + one alert. BEFORE the story-stale check on purpose: a cleaned story
         # in the legacy lane then mismatches its burned media and is re-rendered.
-        cleaned = _strip_or_hold_meta(row, gym_id, store)
+        cleaned = _strip_or_hold_meta(row, gym_id, store,
+                                      autonomous_lane=not approved_only)
         if cleaned is _META_REAPPROVAL_REQUIRED:
             waiting.append(row_id)
             continue
@@ -1574,10 +1607,62 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             # cadence is full. Leave it untouched for calendar review.
             (waiting if callable(claim_slot) else skipped).append(row_id)
             continue
-        # The production owned-claim RPC returns a fresh UUID per successful
-        # claim. Legacy injected stores return True and use their own rollback
-        # behavior; Supabase rollback refuses to run without this token.
-        claim_token = won if isinstance(won, str) else None
+        if require_proof:
+            # The proof RPC returns the exact locked creative. A token alone
+            # only proves ownership and cannot make the prefetched row safe to
+            # send after a concurrent edit. Refuse every incomplete result.
+            locked_fields = ("account", "format", "post_date", "caption",
+                             "image_url", "byte_hash", "source_media_asset_id",
+                             "source_media_url")
+            if (not isinstance(won, dict)
+                    or won.get("id") != row_id
+                    or won.get("gym_id") != gym_id
+                    or won.get("status") != "publishing"
+                    or not won.get("publish_claim_token")
+                    or any(field not in won for field in locked_fields)
+                    or not str(won.get("image_url") or "").strip()
+                    or type(won.get("autonomous_at_claim")) is not bool):
+                failed.append(row_id)
+                recovery_required.append(row_id)
+                _alert_ambiguous_publish(gym_id, row_id,
+                                         "claim returned no verified locked creative")
+                continue
+            row = won
+            claim_token = str(row["publish_claim_token"])
+            # Account routing was selected before the claim. If the locked
+            # account changed, hold for a fresh preflight on the next tick.
+            locked_account = _account_for(row, gym_id)
+            if locked_account is None or locked_account.key != account.key:
+                failed.append(row_id)
+                reverted = _revert_to_pending(
+                    store, row_id, reject_reason="account_changed_at_claim",
+                    gym_id=gym_id, expected_claim_token=claim_token,
+                    revert_status="approved" if approved_only else "pending")
+                if not reverted:
+                    recovery_required.append(row_id)
+                continue
+            account = locked_account
+            # A concurrent edit can introduce internal rationale or forbidden
+            # punctuation after preflight. Recheck the claimed version before
+            # any idempotency stamp or provider call.
+            from . import post_quality
+            _, locked_meta = post_quality.split_meta_suffix(row.get("caption") or "")
+            if locked_meta or ";" in (row.get("caption") or ""):
+                reason = ("locked_creative_meta_leak" if locked_meta
+                          else "locked_creative_caption_format")
+                reverted = _revert_to_pending(
+                    store, row_id, reject_reason=reason, gym_id=gym_id,
+                    expected_claim_token=claim_token,
+                    revert_status="approved" if approved_only else "pending")
+                if not reverted:
+                    recovery_required.append(row_id)
+                _alert_publish_blocked(gym_id, row_id, reason,
+                                       reverted=reverted)
+                failed.append(row_id)
+                continue
+        else:
+            # Legacy UUID and injectable boolean claims retain their behavior.
+            claim_token = won if isinstance(won, str) else None
 
         # CONTENT IDEMPOTENCY, WRITTEN BEFORE THE NETWORK CALL (2026-09-05 incident).
         #

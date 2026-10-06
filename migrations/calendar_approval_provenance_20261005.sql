@@ -535,6 +535,78 @@ grant execute on function public.claim_calendar_publish_slot_owned(
   uuid, text, date, text, integer, boolean, boolean)
   to service_role;
 
+-- The proof-gated publisher needs the exact creative that passed the locked
+-- claim, not a row fetched before that claim. Calling the existing claim in
+-- this function keeps its advisory and row locks until this transaction ends;
+-- the returned row is the very version whose proof and capacity passed.
+-- Keep the UUID-returning RPC intact for flag-off callers.
+create or replace function public.claim_calendar_publish_slot_proven_owned(
+  p_row_id uuid, p_gym_id text, p_day date, p_timezone text,
+  p_capacity integer, p_approved_only boolean
+) returns jsonb
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_token uuid;
+begin
+  v_token := public.claim_calendar_publish_slot_owned(
+    p_row_id, p_gym_id, p_day, p_timezone, p_capacity,
+    p_approved_only, true);
+  if v_token is null then
+    return null;
+  end if;
+  return (select jsonb_build_object(
+      'row', to_jsonb(c),
+      'autonomous_at_claim', public.calendar_gym_is_autonomous(p_gym_id))
+    from public.content_calendar c
+    where c.id = p_row_id and c.gym_id = p_gym_id
+      and c.status = 'publishing' and c.publish_claim_token = v_token);
+end;
+$$;
+revoke all on function public.claim_calendar_publish_slot_proven_owned(
+  uuid, text, date, text, integer, boolean)
+  from public, anon, authenticated;
+grant execute on function public.claim_calendar_publish_slot_proven_owned(
+  uuid, text, date, text, integer, boolean)
+  to service_role;
+
+-- Autonomous-only caption cleanup. The exact caption/status CAS prevents a
+-- prefetched publisher from overwriting a concurrent human edit. Approval
+-- provenance is invalidated because the creative changed. If autonomy flipped
+-- to Manual before this transaction, no cleanup is performed.
+create or replace function public.calendar_patch_caption_autonomous_clean(
+  p_row_id uuid, p_gym_id text, p_expected_status text,
+  p_expected_caption text, p_clean_caption text
+) returns setof public.content_calendar
+language plpgsql security definer set search_path = public
+as $$
+begin
+  if p_expected_status not in ('pending', 'approved')
+      or p_clean_caption is null or p_clean_caption = p_expected_caption then
+    return;
+  end if;
+  perform pg_advisory_xact_lock(hashtextextended(p_gym_id, 0));
+  if not public.calendar_gym_is_autonomous(p_gym_id) then
+    return;
+  end if;
+  return query update public.content_calendar c
+    set caption = p_clean_caption, approval_kind = null, approved_by = null,
+        approved_at = null, approval_digest = null
+    where c.id = p_row_id and c.gym_id = p_gym_id
+      and c.status = p_expected_status
+      and c.caption is not distinct from p_expected_caption
+      and c.variant_status = 'active' and c.published_at is null
+      and c.late_post_id is null and c.publish_claim_token is null
+    returning c.*;
+end;
+$$;
+revoke all on function public.calendar_patch_caption_autonomous_clean(
+  uuid, text, text, text, text)
+  from public, anon, authenticated;
+grant execute on function public.calendar_patch_caption_autonomous_clean(
+  uuid, text, text, text, text)
+  to service_role;
+
 -- GBP has its own cadence and photo format; do not route it through the
 -- IG/FB slot-capacity RPC. This gated-only claim preserves approved-only GBP
 -- selection, serializes current mode with publication, and returns the exact
@@ -578,4 +650,31 @@ $$;
 revoke all on function public.claim_calendar_gbp_publish_owned(uuid, text)
   from public, anon, authenticated;
 grant execute on function public.claim_calendar_gbp_publish_owned(uuid, text)
+  to service_role;
+
+-- Companion result for proof-gated GBP callers. The existing claim keeps its
+-- row and settings locks through this wrapper's transaction, so the mode and
+-- creative below are the same authoritative state used to admit the claim.
+-- The row-returning GBP RPC stays available for its existing callers.
+create or replace function public.claim_calendar_gbp_publish_with_mode_owned(
+  p_row_id uuid, p_gym_id text
+) returns jsonb
+language plpgsql security definer set search_path = public
+as $$
+declare
+  v_row public.content_calendar%rowtype;
+begin
+  select * into v_row from public.claim_calendar_gbp_publish_owned(
+    p_row_id, p_gym_id);
+  if not found then
+    return null;
+  end if;
+  return jsonb_build_object(
+    'row', to_jsonb(v_row),
+    'autonomous_at_claim', public.calendar_gym_is_autonomous(p_gym_id));
+end;
+$$;
+revoke all on function public.claim_calendar_gbp_publish_with_mode_owned(uuid, text)
+  from public, anon, authenticated;
+grant execute on function public.claim_calendar_gbp_publish_with_mode_owned(uuid, text)
   to service_role;

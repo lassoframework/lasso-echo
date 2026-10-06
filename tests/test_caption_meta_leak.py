@@ -600,6 +600,25 @@ def test_sweep_proof_mode_invalidates_approved_creative(monkeypatch):
                ("approval_kind", "approved_by", "approved_at", "approval_digest"))
 
 
+def test_sweep_proof_mode_cleans_documented_states_and_holds_terminal(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    dirty = f"{CLEAN_BODY}\n\n{LEAKED_META}"
+    statuses = ("draft", "queued", "failed", "denied")
+    store = _FakeSweepStore([
+        {"id": status, "gym_id": "eng", "post_date": "2026-08-24",
+         "account": "facebook", "status": status, "caption": dirty}
+        for status in statuses
+    ])
+
+    results = caption_meta_sweep.run(gym_ids=["eng"], store=store,
+                                     today_iso="2026-08-23", alert=lambda _: None)
+
+    assert {d["id"] for d in results[0]["cleaned"]} == {
+        "draft", "queued", "failed"}
+    assert [d["id"] for d in results[0]["held"]] == ["denied"]
+    assert store.rows["denied"]["caption"] == dirty
+
+
 def test_sweep_proof_mode_fails_closed_without_invalidation_writer(monkeypatch):
     monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
     class _LegacyOnlyStore(_FakeSweepStore):

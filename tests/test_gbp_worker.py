@@ -1113,7 +1113,8 @@ def test_proof_gate_sends_exact_returned_creative(monkeypatch):
     monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
     fresh = _row(id="r1", gym_id="gym", status="publishing",
                  caption="fresh approved creative", image_url="https://cdn/fresh.jpg",
-                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111")
+                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111",
+                 autonomous_at_claim=False)
     class ProofStore(_TokenStore):
         def claim_publishing(self, row_id, *, gym_id, require_proof):
             self.tokens[row_id] = fresh["publish_claim_token"]
@@ -1133,7 +1134,8 @@ def test_proof_claimed_caption_metadata_holds_and_releases_without_send(monkeypa
     monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
     fresh = _row(id="r1", gym_id="gym", status="publishing", format="feed",
                  caption=_GOOD_CAPTION + "\n[why] internal editing rationale",
-                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111")
+                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111",
+                 autonomous_at_claim=False)
     class ProofStore(_TokenStore):
         def claim_publishing(self, row_id, *, gym_id, require_proof):
             self.tokens[row_id] = fresh["publish_claim_token"]
@@ -1144,6 +1146,36 @@ def test_proof_claimed_caption_metadata_holds_and_releases_without_send(monkeypa
     out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
     assert client.calls == [] and out["held"] == 1
     assert store.released == [("r1", "approved")]
+    assert store.published == [] and store.failed == []
+    assert fresh["caption"].endswith("[why] internal editing rationale")
+
+
+def test_proof_autonomous_caption_metadata_holds_for_automatic_cleanup(monkeypatch):
+    monkeypatch.setenv("AGENT_APPROVAL_PROOF", "true")
+    fresh = _row(id="r1", gym_id="gym", status="publishing",
+                 caption=_GOOD_CAPTION + "\n[why] internal editing rationale",
+                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111",
+                 autonomous_at_claim=True)
+    class ProofStore(_TokenStore):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.cleanups = []
+        def claim_publishing(self, row_id, *, gym_id, require_proof):
+            self.tokens[row_id] = fresh["publish_claim_token"]
+            return dict(fresh)
+        def cleanup_automatic_caption(self, gym_id, row_id, caption, *, expected_caption):
+            assert self.released == [(row_id, "approved")]
+            self.cleanups.append((gym_id, row_id, caption, expected_caption))
+            return {"id": row_id, "gym_id": gym_id, "caption": caption,
+                    "status": "approved"}
+    monkeypatch.setattr(gw, "in_publish_window", lambda *a, **kw: True)
+    store = ProofStore([fresh], {"gym": [_c()]})
+    client = _FakeClient()
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
+    assert client.calls == [] and out["held"] == 1
+    assert store.released == [("r1", "approved")]
+    assert store.cleanups == [("gym", "r1", _GOOD_CAPTION,
+                               _GOOD_CAPTION + "\n[why] internal editing rationale")]
     assert store.published == [] and store.failed == []
     assert fresh["caption"].endswith("[why] internal editing rationale")
 
@@ -1162,7 +1194,8 @@ def test_proof_photo_drop_sends_exact_claimed_image_and_resolved_destination(mon
     fresh = _row(id="r1", gym_id="gym", status="publishing", format="photo",
                  image_url="https://cdn/approved-photo.jpg", gbp_location_id="locations/1",
                  caption="[why] gallery uploads carry no caption",
-                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111")
+                 publish_claim_token="aaaaaaaa-1111-4111-8111-111111111111",
+                 autonomous_at_claim=False)
     class ProofStore(_TokenStore):
         def claim_publishing(self, row_id, *, gym_id, require_proof):
             self.tokens[row_id] = fresh["publish_claim_token"]

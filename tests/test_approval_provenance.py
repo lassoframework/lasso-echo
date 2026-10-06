@@ -125,11 +125,12 @@ class _ProofStore:
     invalidates it). A definitively autonomous gym keeps legacy behavior.
     """
 
-    def __init__(self, rows, autonomy=None, on_due_rows=None):
+    def __init__(self, rows, autonomy=None, on_due_rows=None, before_claim=None):
         self.rows = {r["id"]: dict(r) for r in rows}
         # autonomy map = the authoritative DB state at CLAIM time.
         self.autonomy = dict(autonomy or {})
         self.on_due_rows = on_due_rows  # optional race injector
+        self.before_claim = before_claim
         self.published_calls = []
         self.claim_calls = []
 
@@ -145,6 +146,8 @@ class _ProofStore:
     def claim_publish_slot(self, row_id, gym_id, day, timezone_name, capacity,
                            approved_only, require_proof=False):
         self.claim_calls.append((row_id, require_proof))
+        if self.before_claim:
+            self.before_claim(self, row_id)
         row = self.rows[row_id]
         if row.get("status") not in ("pending", "approved"):
             return None
@@ -162,6 +165,9 @@ class _ProofStore:
                     or row["approval_digest"] != canonical_digest(row)):
                 return None  # held: unproved, actorless, or stale proof
         row["status"] = "publishing"
+        row["publish_claim_token"] = "claim-token-1"
+        if require_proof:
+            return dict(row, autonomous_at_claim=self.autonomy.get(gym_id) is True)
         return "claim-token-1"
 
     def mark_publishing(self, row_id):
@@ -170,6 +176,17 @@ class _ProofStore:
             return False
         row["status"] = "publishing"
         return True
+
+    def patch_caption_autonomous_clean(self, gym_id, row_id, expected_status,
+                                       expected_caption, clean_caption):
+        row = self.rows[row_id]
+        if (self.autonomy.get(gym_id) is not True
+                or row["status"] != expected_status
+                or row["caption"] != expected_caption):
+            return None
+        row.update(caption=clean_caption, approval_kind=None, approved_by=None,
+                   approved_at=None, approval_digest=None)
+        return dict(row)
 
     def mark_published(self, row_id, media_id, published_at=None, **kw):
         row = self.rows[row_id]
@@ -372,12 +389,17 @@ def test_claim_slot_omits_proof_param_by_default(monkeypatch):
 
 
 def test_claim_slot_sends_proof_param_only_when_required(monkeypatch):
-    http = _FakeHTTP(_Resp(200, "00000000-0000-0000-0000-000000000001"))
+    row = _row("r1", gym_id="gymx")
+    row.update(status="publishing", publish_claim_token="00000000-0000-0000-0000-000000000001")
+    http = _FakeHTTP(_Resp(200, {"row": row, "autonomous_at_claim": False}))
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
-    pcs.SupabaseCalendarStore().claim_publish_slot(
+    claimed = pcs.SupabaseCalendarStore().claim_publish_slot(
         "r1", "gymx", RUN_DATE, "America/New_York", 2, True, require_proof=True)
-    _, payload = http.calls[0]
-    assert payload["p_require_approval_proof"] is True
+    url, payload = http.calls[0]
+    assert url.endswith("/rpc/claim_calendar_publish_slot_proven_owned")
+    assert "p_require_approval_proof" not in payload
+    assert claimed["caption"] == row["caption"]
+    assert claimed["autonomous_at_claim"] is False
 
 
 # ---- Manual lane, armed -----------------------------------------------------
@@ -468,6 +490,75 @@ def test_armed_autonomous_gym_unchanged_when_db_says_auto(proof_armed):
 
     assert summary["published"] == ["lasso-auto"]
     assert store.claim_calls == [("lasso-auto", True)]  # armed, DB said Auto
+
+
+def test_gated_publish_uses_locked_creative_after_prefetch_race(proof_armed):
+    def edit_before_claim(store, row_id):
+        store.rows[row_id]["caption"] = "caption committed during preflight"
+        store.rows[row_id]["image_url"] = "https://cdn/committed.jpg"
+
+    store = _ProofStore([_row("raced", status="pending")],
+                        autonomy={"lasso": True}, before_claim=edit_before_claim)
+    sent = []
+
+    def publish(draft, account):
+        sent.append((draft.caption, draft.creative_public_url))
+        return PublishResult(ok=True, mode="published", media_id="MEDIA_1")
+
+    summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
+                              publisher=publish, now=LATE_NOW,
+                              approved_only=False)
+    assert summary["published"] == ["raced"]
+    assert sent == [("caption committed during preflight",
+                     "https://cdn/committed.jpg")]
+
+
+def test_gated_publish_rejects_token_without_locked_creative(proof_armed):
+    class TokenOnlyStore(_ProofStore):
+        def claim_publish_slot(self, *args, **kwargs):
+            super().claim_publish_slot(*args, **kwargs)
+            return "claim-token-1"
+
+    store = TokenOnlyStore([_row("token-only", status="pending")],
+                           autonomy={"lasso": True})
+    pub = _FakePublisher()
+    summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
+                              publisher=pub, now=LATE_NOW,
+                              approved_only=False)
+    assert summary["published"] == []
+    assert summary["failed"] == ["token-only"]
+    assert pub.calls == []
+
+
+def test_gated_autonomous_meta_cleanup_persists_then_sends_clean_body(proof_armed):
+    raw = _row("auto-meta", status="pending",
+               caption="Ready to train.\n[why] internal rationale")
+    store = _ProofStore([raw], autonomy={"lasso": True})
+    sent = []
+
+    def publish(draft, account):
+        sent.append(draft.caption)
+        return PublishResult(ok=True, mode="published", media_id="MEDIA_1")
+
+    summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
+                              publisher=publish, now=LATE_NOW,
+                              approved_only=False)
+    assert summary["published"] == ["auto-meta"]
+    assert sent == ["Ready to train."]
+    assert store.rows["auto-meta"]["caption"] == "Ready to train."
+
+
+def test_gated_auto_to_manual_before_meta_cleanup_holds(proof_armed):
+    row = _row("flipped-meta", status="approved",
+               caption="Ready to train.\n[why] internal rationale")
+    store = _ProofStore([row], autonomy={"lasso": False})
+    pub = _FakePublisher()
+    summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
+                              publisher=pub, now=LATE_NOW,
+                              approved_only=False)
+    assert summary["published"] == []
+    assert pub.calls == []
+    assert store.rows["flipped-meta"]["caption"] == row["caption"]
 
 
 def test_armed_autonomy_unresolvable_fails_closed(proof_armed):

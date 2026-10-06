@@ -148,6 +148,26 @@ q "update echo_gym_settings set autonomous=false where gym_id='$GYM_UUID'"
 mkrow 09 pending
 check "Auto->Manual flip holds pending row at claim" "" "$(CLAIM 09)"
 
+# The gated publisher receives the exact row that won the locked claim, plus
+# the authoritative autonomy observed in that transaction. A prefetched
+# caption/image must never be used as the outbound payload after this point.
+q "update echo_gym_settings set autonomous=true where gym_id='$GYM_UUID'"
+mkrow 12 pending
+q "update content_calendar set caption='locked caption 12',image_url='https://cdn/locked-12.jpg' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa12'"
+PROVEN12="$(q "select claim_calendar_publish_slot_proven_owned('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa12','$SWIFT','2026-08-11','America/New_York',2,false)")"
+check "IG/FB proven claim returns locked caption" "locked caption 12" "$(printf '%s' "$PROVEN12" | python3 -c 'import json,sys; print(json.load(sys.stdin)["row"]["caption"])')"
+check "IG/FB proven claim returns locked image" "https://cdn/locked-12.jpg" "$(printf '%s' "$PROVEN12" | python3 -c 'import json,sys; print(json.load(sys.stdin)["row"]["image_url"])')"
+check "IG/FB proven claim returns claim-time Auto" "True" "$(printf '%s' "$PROVEN12" | python3 -c 'import json,sys; print(json.load(sys.stdin)["autonomous_at_claim"])')"
+check "IG/FB proven repeat claim loses" "t" "$(q "select (claim_calendar_publish_slot_proven_owned('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa12','$SWIFT','2026-08-11','America/New_York',2,false)) is null")"
+mkrow 13 pending
+q "update content_calendar set caption='clean body [why] rationale' where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa13'"
+check "Auto cleanup uses exact caption CAS" "0" "$(q "select count(*) from calendar_patch_caption_autonomous_clean('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa13','$SWIFT','pending','stale caption','clean body')")"
+check "Auto cleanup persists clean caption" "1" "$(q "select count(*) from calendar_patch_caption_autonomous_clean('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa13','$SWIFT','pending','clean body [why] rationale','clean body')")"
+check "Auto cleanup clears proof" "t" "$(q "select approval_kind is null and approval_digest is null from content_calendar where id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa13'")"
+q "update echo_gym_settings set autonomous=false where gym_id='$GYM_UUID'"
+mkrow 14 pending
+check "Manual flip blocks autonomous cleanup" "0" "$(q "select count(*) from calendar_patch_caption_autonomous_clean('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa14','$SWIFT','pending','caption 14','clean body')")"
+
 # A plausible six-hex suffix is not an account mapping.
 q "update echo_gym_settings set autonomous=true where gym_id='$GYM_UUID'"
 q "insert into content_calendar (id,gym_id,status,variant_status,image_url,account,format,post_date,caption)
@@ -331,6 +351,10 @@ check "GBP returned/current creative retained" "changed" "$(q "select caption fr
 q "update content_calendar set status='approved',publish_claim_token=null,approval_kind=null,approved_by=null,approved_at=null,approval_digest=null where id='$GBP_ID'"
 q "update echo_gym_settings set autonomous=true where gym_id='$GYM_UUID'"
 check "GBP autonomous bare approved claims" "1" "$(GBP_CLAIM)"
+q "update content_calendar set status='approved',publish_claim_token=null,caption='locked GBP caption',image_url='https://cdn/locked-gbp.jpg' where id='$GBP_ID'"
+GBP_MODE="$(q "select claim_calendar_gbp_publish_with_mode_owned('$GBP_ID','$SWIFT')")"
+check "GBP mode wrapper returns locked caption" "locked GBP caption" "$(printf '%s' "$GBP_MODE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["row"]["caption"])')"
+check "GBP mode wrapper returns claim-time Auto" "True" "$(printf '%s' "$GBP_MODE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["autonomous_at_claim"])')"
 q "update content_calendar set status='approved',publish_claim_token=null where id='$GBP_ID'"
 q "update echo_gym_settings set autonomous=false where gym_id='$GYM_UUID'"
 check "GBP Auto to Manual holds old approved" "0" "$(GBP_CLAIM)"

@@ -222,7 +222,8 @@ class GbpStore:
         the row in 'publishing' WITH this token for manual provider readback.
 
         With proof enabled, returns the locked claimed creative (including its
-        persisted token); Manual or unresolved gyms must have current human proof.
+        persisted token) plus the authoritative autonomy value used by the same
+        claim transaction; Manual or unresolved gyms must have current human proof.
         Flag OFF returns the persisted token string on a won claim, None on a lost claim (zero
         rows updated: another worker owns it or its status changed). Raises
         PortalStoreError when the returned row does not carry the exact token we wrote
@@ -236,17 +237,20 @@ class GbpStore:
             if not gym_id:
                 raise PortalStoreError(422, "GBP proof claim requires the gym identity")
             r = self._s._client().post(
-                self._s._rest("rpc/claim_calendar_gbp_publish_owned"),
+                self._s._rest("rpc/claim_calendar_gbp_publish_with_mode_owned"),
                 headers=self._s._headers({"Content-Type": "application/json"}),
                 json={"p_row_id": row_id, "p_gym_id": gym_id}, timeout=30)
             if r.status_code >= 400:
                 raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-            rows = r.json()
-            if rows == []:
+            result = r.json()
+            if result is None:
                 return None
-            if not isinstance(rows, list) or len(rows) != 1:
-                raise PortalStoreError(502, "GBP proof claim returned an invalid creative")
-            row = rows[0]
+            if (not isinstance(result, dict)
+                    or set(result) != {"row", "autonomous_at_claim"}
+                    or type(result.get("autonomous_at_claim")) is not bool
+                    or not isinstance(result.get("row"), dict)):
+                raise PortalStoreError(502, "GBP proof claim returned invalid mode or creative")
+            row = result["row"]
             try:
                 token = str(uuid.UUID(str(row.get("publish_claim_token"))))
             except (AttributeError, TypeError, ValueError):
@@ -261,7 +265,8 @@ class GbpStore:
                     or not (row.get("image_url") or "").strip()
                     or row.get("media_not_ready_reason") is not None):
                 raise PortalStoreError(409, "GBP proof claim returned an inconsistent creative")
-            return dict(row, publish_claim_token=token)
+            return dict(row, publish_claim_token=token,
+                        autonomous_at_claim=result["autonomous_at_claim"])
         token = str(uuid.uuid4())
         # MEDIA HOLD GUARD (2026-10-02, Sol review release-blocker): the claim PATCH
         # carries every precondition server-side so a held/archived/claimed/published
@@ -306,6 +311,13 @@ class GbpStore:
                      "or a media hold; claim retained in 'publishing' and nothing "
                      "sent — manual reconciliation required")
         return token
+
+    def cleanup_automatic_caption(self, gym_id, row_id, caption, *, expected_caption):
+        """CAS-clean an Auto GBP caption after releasing a proof-mode claim."""
+        patch = getattr(self._s, "patch_caption_for_gbp_auto_cleanup", None)
+        if patch is None:
+            raise PortalStoreError(503, "GBP Auto caption cleanup store method unavailable")
+        return patch(gym_id, row_id, caption, expected_caption=expected_caption)
 
     def _transition_claimed(self, row_id, claim_token, fields, expect_status):
         """Conditional terminal transition for a claimed row: matches on id + still

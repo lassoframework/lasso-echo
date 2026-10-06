@@ -42,6 +42,7 @@ FORWARD_DAYS = 45
 
 # Statuses that are live (or mid-flight) on a real platform: report, never write.
 _LIVE_STATUSES = ("published", "publishing")
+_PROOF_SWEEP_STATUSES = ("pending", "approved", "draft", "queued", "failed")
 
 
 def _default_gyms():
@@ -86,6 +87,14 @@ def sweep_gym(gym_id, store, *, dry_run=False, today_iso=None, log=None):
             # live on a real platform: a human edits it there; never from here.
             out["published"].append(desc)
             continue
+        from agent import config
+        if (config.approval_proof_enabled()
+                and desc["status"] not in _PROOF_SWEEP_STATUSES):
+            # Proof mode writes only positively enumerated waiting states.
+            # Unknown/terminal states are held instead of reaching a broad
+            # status-preserving legacy writer.
+            out["held"].append(desc)
+            continue
         if not (body or "").strip():
             # all-meta: stripping would leave an empty caption — hold for a human.
             out["held"].append(desc)
@@ -94,7 +103,6 @@ def sweep_gym(gym_id, store, *, dry_run=False, today_iso=None, log=None):
             out["cleaned"].append(desc)
             continue
         try:
-            from agent import config
             if config.approval_proof_enabled():
                 # Caption is part of the approved creative digest. A hygiene
                 # cleanup therefore needs a fresh human review whenever it
