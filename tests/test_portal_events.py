@@ -72,7 +72,8 @@ class _CalStore:
     def deny_wipeable_with_reason(self, gym_id, row_id, reason):
         for r in self.inserted:
             if (r.get("id") == row_id and r.get("gym_id") == gym_id
-                    and r.get("status") in ("pending", "draft", "queued")):
+                    and r.get("status") in ("pending", "draft", "queued")
+                    and r.get("media_not_ready_reason") is None):
                 r["status"] = "denied"
                 r["reject_reason"] = reason
                 return r
@@ -614,6 +615,60 @@ def test_date_edit_retires_old_pending_rows_but_preserves_protected(monkeypatch)
                for row in old_rows if row["id"] != protected_id)
     assert new_rows and all(row["status"] == "pending" for row in new_rows)
     assert response["removed"] == len(old_rows) - 1
+
+
+def test_date_edit_with_all_replacements_media_held_preserves_old_arc_and_rolls_back(
+        monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    event_before = dict(ev.rows[event_id])
+    rows_before = [dict(row) for row in cal.inserted]
+    monkeypatch.setattr(
+        "agent.event_calendar._attach_media",
+        lambda gym_id, rows, log, picker=None, host=None: ([], list(rows)))
+
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 502
+    assert response["error"] == "calendar staging failed"
+    assert response["reason"] == "replacement coverage incomplete"
+    assert response["rolled_back"] is True
+    assert ev.rows[event_id] == event_before
+    assert cal.inserted == rows_before
+    assert all(row["status"] == "pending" for row in cal.inserted)
+
+
+def test_superseded_cleanup_preserves_concurrent_pending_media_hold(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    cal, ev = _CalStore(), _EvStore()
+    pe.handle_create_event(
+        "pete", _form(media_ids=["m1"]), store=cal, event_store=ev,
+        today=date(2026, 9, 1))
+    event_id = next(iter(ev.rows))
+    held = cal.inserted[0]
+    held["media_not_ready_reason"] = "manual_visual_review"
+
+    status, response = pe.handle_edit_event(
+        "pete", event_id,
+        {"starts_on": "2026-10-20", "ends_on": "2026-10-27",
+         "actor_id": "owner"},
+        store=cal, event_store=ev, today=date(2026, 9, 1))
+
+    assert status == 200
+    assert held["status"] == "pending"
+    assert held["media_not_ready_reason"] == "manual_visual_review"
+    assert held.get("reject_reason") is None
+    assert response["removed"] == len([
+        row for row in cal.inserted
+        if row.get("reject_reason") == ec.REJECT_EDIT_SUPERSEDED])
 
 
 def test_losing_edit_compensation_failure_returns_retryable_502(monkeypatch):

@@ -4046,6 +4046,10 @@ class SupabaseCalendarStore:
             "id": f"eq.{row_id}",
             "gym_id": f"eq.{account_key}",
             "status": f"in.({','.join(_WIPEABLE_STATUSES)})",
+            # A media hold is an operator/system decision even while the row remains
+            # pending. Preserve a hold that races stale event cleanup just as we
+            # preserve an approval or publish claim.
+            "media_not_ready_reason": "is.null",
         }
         r = self._client().patch(
             self._rest(_TABLE),

@@ -96,8 +96,22 @@ def test_event_edit_compensation_has_server_side_wipeable_status_cas(monkeypatch
     assert params == {
         "id": "eq.row-1", "gym_id": "eq.eng",
         "status": "in.(pending,draft,queued)",
+        "media_not_ready_reason": "is.null",
     }
     assert body == {"status": "denied", "reject_reason": "event_edit_conflict"}
+
+
+def test_event_edit_compensation_preserves_concurrent_pending_media_hold(monkeypatch):
+    http = _FakeHTTP(patch_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().deny_wipeable_with_reason(
+        "eng", "row-1", "event_edit_superseded")
+
+    assert result is None
+    _, _, params, _, _ = next(call for call in http.calls if call[0] == "patch")
+    assert params["status"] == "in.(pending,draft,queued)"
+    assert params["media_not_ready_reason"] == "is.null"
 
 
 def test_operation_row_reconciliation_is_exact_and_gym_scoped(monkeypatch):

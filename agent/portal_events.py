@@ -193,6 +193,11 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
             return 502, {"error": f"calendar event read failed: {type(exc).__name__}"}
     restage, keep, remove_keys = ec.retime_arc(old_arc, new_event, today=today,
                                                avatar=avatar)
+    remove_key_set = set(remove_keys)
+    superseded_rows = [row for row in old_arc
+                       if (str(row.get("post_date"))[:10],
+                           str(row.get("account") or "").lower(),
+                           str(row.get("format") or "").lower()) in remove_key_set]
 
     # Operation-owned staging must know the complete occupancy before the event
     # revision is persisted. A failed/partial month read cannot be treated as an empty
@@ -241,7 +246,12 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
         held_media = res.get("held_media", 0)
         stage_reason = res.get("reason", "")
         inserted_rows = res.get("_inserted_rows", [])
-        if res.get("ok") is False:
+        # Concurrent edits can leave multiple machine rows for the same old slot.
+        # Coverage is therefore measured per unique slot, not per duplicate row; one
+        # durable replacement may safely retire every wipeable duplicate of that slot.
+        required_replacements = min(len(remove_key_set), len(restage))
+        replacement_shortfall = staged < required_replacements
+        if res.get("ok") is False or replacement_shortfall:
             cleanup_rows = inserted_rows or res.get("_attempted_rows", [])
             compensated = ec.compensate_staged_rows(
                 _store, account_key, cleanup_rows)
@@ -258,12 +268,14 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
                     rolled_back = None
             if not cleanup_ok:
                 return 502, {"error": "calendar staging and cleanup failed",
-                             "reason": stage_reason,
+                             "reason": (stage_reason or
+                                        "replacement coverage incomplete"),
                              "compensated": compensated.get("denied", 0),
                              "active": reconciled.get("active", 0),
                              "rolled_back": False}
             return 502, {"error": "calendar staging failed",
-                         "reason": stage_reason,
+                         "reason": (stage_reason or
+                                    "replacement coverage incomplete"),
                          "compensated": compensated.get("denied", 0),
                          "rolled_back": bool(rolled_back)}
 
@@ -301,11 +313,6 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     # Only after the saved event revision is still confirmed current may this edit
     # retire its old machine-owned rows. Exact ids plus the server-side wipeable CAS
     # preserve any row concurrently approved, published, denied, or otherwise claimed.
-    remove_key_set = set(remove_keys)
-    superseded_rows = [row for row in old_arc
-                       if (str(row.get("post_date"))[:10],
-                           str(row.get("account") or "").lower(),
-                           str(row.get("format") or "").lower()) in remove_key_set]
     removed = 0
     if _store is not None and superseded_rows:
         superseded = ec.compensate_staged_rows(
