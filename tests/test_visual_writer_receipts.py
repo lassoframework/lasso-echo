@@ -1,5 +1,6 @@
 """Focused fail-closed source/rendition writer contracts."""
 import hashlib
+import os
 import uuid
 
 import pytest
@@ -214,11 +215,52 @@ def test_reburn_download_rejects_external_and_lookalike_hosts(monkeypatch):
         assert story_reburn._download(url, lambda message: None) is None
 
 
+def test_reburn_download_accepts_own_bucket_object_with_encoded_space(monkeypatch):
+    """Zanshin's approved Story source uses a valid `%20` object-key segment."""
+    from agent import config
+    url = "https://media.example/zanshinfitness630e22/Zanshin%20Fitness-57.jpg"
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+    monkeypatch.setattr(prep, "_bytes_for_url", lambda candidate: b"zanshin-source"
+                        if candidate == url else None)
+
+    path = story_reburn._download(url, lambda message: None)
+
+    try:
+        assert path is not None
+        with open(path, "rb") as source:
+            assert source.read() == b"zanshin-source"
+    finally:
+        if path:
+            os.remove(path)
+
+
+@pytest.mark.parametrize("url", [
+    "https://media.example/zanshinfitness630e22/Zanshin Fitness-57.jpg",
+    "https://media.example/zanshinfitness630e22/Zanshin%09Fitness-57.jpg",
+    "https://media.example/zanshinfitness630e22/Zanshin%0d%0aFitness-57.jpg",
+    "https://media.example/zanshinfitness630e22/Zanshin%7fFitness-57.jpg",
+    "https://media.example/zanshinfitness630e22/%2e%2e/raw.jpg",
+    "https://media.example/zanshinfitness630e22/a%2fb.jpg",
+    "https://media.example/zanshinfitness630e22/a%5cb.jpg",
+    "https://user@media.example/zanshinfitness630e22/raw.jpg",
+    "https://media.example/zanshinfitness630e22/raw.jpg#part",
+    "http://media.example/zanshinfitness630e22/raw.jpg",
+    "https://media.example.evil.test/zanshinfitness630e22/raw.jpg",
+])
+def test_own_media_url_encoded_space_exception_keeps_security_rejections(
+        monkeypatch, url):
+    from agent import config
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
+    assert prep._own_media_url(url) is False
+
+
 def test_query_object_read_disables_redirects_and_caps_stream(monkeypatch):
     from agent import config
     import requests
     monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://media.example")
     monkeypatch.setattr(prep, "MAX_VISUAL_BYTES", 6)
+    assert prep._own_media_url(RAW) is True
+    assert prep._own_media_url("https://media.example.evil.test/raw.jpg?version=1") is False
     calls = []
 
     class HTTPResponse:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import unicodedata
 import uuid
 from urllib.parse import unquote, urlsplit, urlunsplit
 
@@ -148,7 +149,12 @@ def _own_media_url(url):
         parsed.path.startswith(allowed.path.rstrip("/") + "/") and
         len(parsed.path) > len(allowed.path.rstrip("/")) + 1 and
         all(part not in (".", "..") and "/" not in part and "\\" not in part
-            and not any(char.isspace() or ord(char) < 32 for char in part)
+            # Raw whitespace was rejected above.  A decoded ASCII space is
+            # therefore an encoded object-key character (for example %20),
+            # while other whitespace and Unicode controls remain ineligible.
+            and not any((char != " " and char.isspace()) or
+                        unicodedata.category(char).startswith("C")
+                        for char in part)
             for part in path_parts)
     )
 
