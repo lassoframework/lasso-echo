@@ -3417,6 +3417,60 @@ def test_fixer_posted_transition_db_cas_rejects_concurrent_intent_change():
     assert row["attachments"]["fixer_slack_delivery_intent"]["channel"] == "C_OTHER"
 
 
+def test_held_fixer_finalization_db_cas_preserves_competing_timestamp():
+    mid = str(uuid.uuid4())
+    intent = {"channel": "C_CLIENT", "body": "done", "sender": "U_ECHO_BOT"}
+    row = {
+        "id": mid, "delivery_status": "held", "slack_ts": "9.999",
+        "attachments": {
+            "identity": "echo", "fixer_slack_delivery_uncertain": True,
+            "fixer_slack_delivery_intent": intent,
+        },
+    }
+    proof = {"delivery_readback_ts": "9.999", "delivery_readback_verified": True}
+
+    class _Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class _Http:
+        def __init__(self):
+            self.patch_calls = []
+
+        def get(self, _url, **_kwargs):
+            return _Response([json.loads(json.dumps(row))])
+
+        def patch(self, _url, **kwargs):
+            self.patch_calls.append(kwargs)
+            # The competing timestamp lands after Python's precheck but before
+            # PostgreSQL evaluates the PATCH predicates.
+            row["slack_ts"] = "8.888"
+            expected_att = json.loads(kwargs["params"]["attachments"][3:])
+            assert kwargs["params"]["slack_ts"] == "eq.9.999"
+            if (expected_att != row["attachments"]
+                    or kwargs["params"]["slack_ts"] != f"eq.{row['slack_ts']}"):
+                return _Response([])
+            row.update(json.loads(kwargs["data"]))
+            return _Response([json.loads(json.dumps(row))])
+
+    http = _Http()
+    bus = Bus(url="https://example.supabase.co", service_key="service", http=http)
+    changed = bus.reconcile_held_fixer_delivery(
+        mid, proof, expected_intent=intent, expected_ts="9.999")
+
+    assert changed is None
+    assert len(http.patch_calls) == 1
+    assert row["delivery_status"] == "held"
+    assert row["slack_ts"] == "8.888"
+    assert row["attachments"].get("delivery_readback_verified") is None
+
+
 def test_route_missing_recovery_limits_unique_membership_reads_per_sweep(monkeypatch):
     rows = []
     tickets = {}

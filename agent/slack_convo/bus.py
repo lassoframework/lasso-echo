@@ -724,7 +724,7 @@ class Bus:
         })
 
     def _patch_held_fixer_attachments(self, message_id, *, eligible, updates,
-                                      fields=None, attempts=3):
+                                      fields=None, match_update=None, attempts=3):
         """Merge a held FIXER attachment update without dropping a concurrent one.
 
         PostgREST replaces a jsonb column when it is PATCHed.  Every caller must
@@ -748,6 +748,8 @@ class Bus:
                                 "eq." + json.dumps(snapshot, separators=(",", ":"),
                                                    sort_keys=True)),
             }
+            if match_update:
+                match.update(match_update(row, snapshot))
             changed = self._patch(
                 _MESSAGES, match, {**(fields or {}), "attachments": next_att})
             if changed:
@@ -796,6 +798,10 @@ class Bus:
     def reconcile_held_fixer_delivery(self, message_id, proof, *,
                                       expected_intent, expected_ts):
         """Promote a held uncertain delivery only after exact Slack readback."""
+        if (not isinstance(proof, dict)
+                or not isinstance(expected_ts, str) or not expected_ts
+                or proof.get("delivery_readback_ts") != expected_ts):
+            return None
         return self._patch_held_fixer_attachments(
             message_id,
             eligible=lambda _row, att: bool(
@@ -805,7 +811,8 @@ class Bus:
                 and _row.get("slack_ts") == expected_ts),
             updates=lambda _row, _att: proof,
             fields={"delivery_status": "posted",
-                    "slack_ts": proof["delivery_readback_ts"]})
+                    "slack_ts": proof["delivery_readback_ts"]},
+            match_update=lambda _row, _att: {"slack_ts": f"eq.{expected_ts}"})
 
     def uncertain_fixer_alert_status(self, message_id):
         """Posted is proof of an alert; failed notices remain retryable."""
