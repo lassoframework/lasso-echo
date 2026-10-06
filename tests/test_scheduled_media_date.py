@@ -53,3 +53,30 @@ def test_unknown_scheduled_day_keeps_legacy_availability_call(monkeypatch):
 
     assert runner._client_drive_kind_available(_Account(), "photo") is False
     assert "post_date" not in seen
+
+
+def test_month_range_budget_deduplicates_later_date_assets(monkeypatch):
+    from datetime import date
+    from agent import client_month_run, gym_media_selector
+    monkeypatch.setattr(gym_media_selector, "scene_guard_flag", lambda: True)
+    seen = []
+    def pool(_base, *, post_date):
+        seen.append(post_date)
+        return [] if post_date == "2026-10-10" else [{"id": "later", "kind": "photo"}]
+    monkeypatch.setattr(gym_media_selector, "pickable", pool)
+    assert client_month_run._drive_range_pickable("pierce", date(2026, 10, 10), 3) == [{"id": "later", "kind": "photo"}]
+    assert seen == ["2026-10-10", "2026-10-11", "2026-10-12"]
+    seen.clear()
+    assert client_month_run._drive_range_pickable("pierce", date(2026, 10, 10), 3,
+                                                {"2026-10-11", "2026-10-12"}) == []
+    assert seen == ["2026-10-10"]
+
+
+def test_month_range_scene_off_preserves_first_day_budget_read(monkeypatch):
+    from datetime import date
+    from agent import client_month_run, gym_media_selector
+    monkeypatch.setattr(gym_media_selector, "scene_guard_flag", lambda: False)
+    seen = []
+    monkeypatch.setattr(gym_media_selector, "pickable", lambda _base, **kw: seen.append(kw) or [{"id": "one"}])
+    assert client_month_run._drive_range_pickable("pierce", date(2026, 10, 10), 3) == [{"id": "one"}]
+    assert seen == [{"post_date": "2026-10-10"}]
