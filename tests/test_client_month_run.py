@@ -469,7 +469,8 @@ def test_all_sources_banned_drops_every_day(tmp_path):
     out = cmr.build_client_month(
         _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
         library_path=lib, store=store, banned_words=banned)
-    assert out["ok"] is True
+    assert out["ok"] is False
+    assert out["reason"] == "no admissible photo posts"
     assert out["skipped_banned"] == 5      # the guard fired every day
     assert out["upserted"] == 0
     assert store.inserted == []

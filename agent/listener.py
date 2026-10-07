@@ -586,6 +586,203 @@ def _start_shared_media_runway_refresh():
     return True
 
 
+
+# Independent from run_daily: a long draw must not starve pending media evidence.
+_MEDIA_MODERATION_DAILY_LIMIT = 50  # existing asset budget, including videos
+_MEDIA_MODERATION_POLL_SECONDS = 3600  # at most 24 inventory/gate checks per day
+
+
+def _run_media_moderation_day(now=None, *, store=None, drive=None, vision=None):
+    """Serialize full moderation passes across processes and UTC-day boundaries.
+
+    Keep the lock file permanently beside the resolved durable DB: unlinking it
+    would allow a new process to lock a different inode during an active pass.
+    """
+    from . import db
+    import fcntl
+    if not db.kv_is_durable():
+        return {"ok": False, "reason": "durable moderation budget unavailable"}
+    try:
+        lock_file = open(os.path.realpath(db.db_path()) + ".moderation.lock", "a")
+    except OSError:
+        return {"ok": False, "reason": "moderation process lock unavailable"}
+    with lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"ok": True, "reason": "moderation pass already running"}
+        except OSError:
+            return {"ok": False, "reason": "moderation process lock unavailable"}
+        try:
+            return _run_media_moderation_day_locked(now, store=store, drive=drive,
+                                                   vision=vision)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _run_media_moderation_day_locked(now=None, *, store=None, drive=None, vision=None):
+    """Reserve one durable UTC-day batch before spending; never refund/replay it.
+
+    The SQLite unique KV key arbitrates processes sharing the persistent Echo DB.
+    A crash leaves a reserved receipt. Failed scans stay pending for a later day.
+    No alerts, sends, or publishing.
+    """
+    from . import db
+    if not (config.gym_drive_connect_enabled() or config.gym_drive_connect_gyms()):
+        return {"ok": False, "reason": "Drive connect disabled"}
+    if not db.kv_is_durable():
+        return {"ok": False, "reason": "durable moderation budget unavailable"}
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    day = now.date().isoformat()
+    key = "gym_media_moderation_day_v1:" + day
+    if db.kv_get(key):
+        return {"ok": True, "reason": "daily batch already reserved"}
+    from . import account_key_resolve, gym_media_moderation as moderation
+    from .integrations.drive_client import DriveClient
+    from .media_source_store import default_store
+    store = store if store is not None else default_store()
+    drive = drive if drive is not None else DriveClient()
+    if not store.available() or not drive.available():
+        return {"ok": False, "reason": "media store or Drive unavailable"}
+    vision = vision if vision is not None else moderation.default_vision()
+    if vision is None:
+        return {"ok": False, "reason": "vision provider unarmed"}
+    sources = store.list_sources()
+    verified = account_key_resolve.resolve_known_source_keys(s.get("gym_id") for s in sources)
+    candidates = {}
+    for source in sources:
+        gym = verified.get(source.get("gym_id"))
+        if (not gym or source.get("active") is not True
+                or source.get("revoked_externally") is True
+                or source.get("kind", "gym_drive") != "gym_drive"
+                or not config.gym_drive_connect_active_for(gym)):
+            continue
+        for asset in store.list_assets(gym, source_id=source["id"]):
+            if (asset.get("gym_id") == gym and asset.get("source_id") == source["id"]
+                    and asset.get("kind") in ("photo", "video")
+                    and asset.get("review_status") == "pending_review"
+                    and asset.get("moderation_status") == "pending"
+                    and asset.get("content_hash") and asset.get("id")):
+                candidates[(gym, asset["id"])] = asset
+    # A crashed previous-day request may have spent at the provider without
+    # storing evidence. Give its selected assets one day off, then re-eligible
+    # them automatically rather than permanently strand ambiguous versions.
+    from datetime import timedelta
+    previous_day = (now.date() - timedelta(days=1)).isoformat()
+    previous_raw = db.kv_get("gym_media_moderation_day_v1:" + previous_day)
+    if previous_raw:
+        previous = json.loads(previous_raw)  # corrupt durable state fails closed
+        if previous.get("state") in ("reserved", "interrupted"):
+            cooldown = {tuple(asset) for asset in previous.get("assets", [])}
+            candidates = {identity: asset for identity, asset in candidates.items()
+                          if identity not in cooldown}
+    # Interleave gym queues and rotate gym/asset order daily. A broken asset or
+    # one large gym cannot monopolize the whole batch.
+    gyms = sorted({gym for gym, _ in candidates})
+    if not gyms:
+        return {"ok": True, "reason": "no pending eligible assets", "attempted": 0}
+    ordinal = now.date().toordinal()
+    offset = ordinal % len(gyms)
+    gyms = gyms[offset:] + gyms[:offset]
+    queues = {}
+    for gym in gyms:
+        ids = sorted(asset_id for candidate_gym, asset_id in candidates if candidate_gym == gym)
+        offset = ordinal % len(ids)
+        queues[gym] = ids[offset:] + ids[:offset]
+    selected = []
+    while len(selected) < _MEDIA_MODERATION_DAILY_LIMIT:
+        round_keys = [(gym, queues[gym].pop(0)) for gym in gyms if queues[gym]]
+        if not round_keys:
+            break
+        selected.extend(round_keys[:_MEDIA_MODERATION_DAILY_LIMIT - len(selected)])
+    import uuid
+    receipt = {"owner": str(uuid.uuid4()), "day": day, "state": "reserved",
+               "reserved": len(selected), "assets": selected}
+    reserved = json.dumps(receipt, sort_keys=True)
+    conn = db.connect()
+    try:
+        with conn:
+            won = conn.execute("INSERT OR IGNORE INTO kv(key,value) VALUES (?,?)",
+                               (key, reserved)).rowcount == 1
+    finally:
+        conn.close()
+    if not won:
+        return {"ok": True, "reason": "daily batch already reserved"}
+    results = []
+    try:
+        for gym, asset_id in selected:
+            try:
+                result = moderation.moderate_asset(gym, asset_id, store=store,
+                    drive=drive, vision=vision, now_iso=now.isoformat())
+                results.append({"ok": result.get("ok") is True,
+                                "reason": result.get("reason")})
+            except Exception as exc:
+                results.append({"ok": False, "reason": type(exc).__name__})
+    finally:
+        # Partial execution stays consumed. Completion write failure leaves the
+        # initial reservation intact, preventing duplicate spend.
+        receipt.update(state="completed" if len(results) == len(selected) else "interrupted",
+                       attempted=len(results), recorded=sum(r["ok"] for r in results),
+                       failures=[r["reason"] for r in results if not r["ok"]])
+        conn = db.connect()
+        try:
+            with conn:
+                conn.execute("UPDATE kv SET value=? WHERE key=? AND value=?",
+                             (json.dumps(receipt, sort_keys=True), key, reserved))
+        finally:
+            conn.close()
+    return {"ok": all(r["ok"] for r in results), "attempted": len(results),
+            "recorded": receipt["recorded"], "reserved": len(selected),
+            "failures": receipt["failures"]}
+
+
+def _media_moderation_scheduler():
+    """Own moderation in a daemon separate from the monolithic daily draw."""
+    while True:
+        try:
+            result = _run_media_moderation_day()
+            if "reserved" in result or not result.get("ok"):
+                print(f"[gym-moderation] {result}")
+        except Exception as exc:
+            print(f"[gym-moderation] scheduler failed: {type(exc).__name__}")
+        time.sleep(_MEDIA_MODERATION_POLL_SECONDS)
+
+
+def _start_media_moderation_scheduler():
+    """Drive intake remains available when Railway cron owns the daily draw."""
+    if not (config.gym_drive_connect_enabled() or config.gym_drive_connect_gyms()):
+        return False
+    threading.Thread(target=_media_moderation_scheduler,
+                     name="gym-media-moderation", daemon=True).start()
+    print("Independent gym media moderation scheduler started (50 assets/day).")
+    return True
+
+
+_MEDIA_REPEAT_SWEEP_POLL_SECONDS = 3600
+
+
+def _media_repeat_sweep_scheduler():
+    """Repair repeats independently of daily draws and slow moderation providers."""
+    from .runner import run_media_repeat_sweep_day
+    while True:
+        try:
+            result = run_media_repeat_sweep_day()
+            if not result.get("ok"):
+                print(f"[media-repeat-sweep] scheduler: {result}")
+        except Exception as exc:
+            print(f"[media-repeat-sweep] scheduler failed: {type(exc).__name__}")
+        time.sleep(_MEDIA_REPEAT_SWEEP_POLL_SECONDS)
+
+
+def _start_media_repeat_sweep_scheduler():
+    if not config.media_repeat_sweep_enabled():
+        return False
+    threading.Thread(target=_media_repeat_sweep_scheduler,
+                     name="media-repeat-sweep", daemon=True).start()
+    print("Independent media repeat sweep scheduler started (once per UTC day).")
+    return True
+
+
 def _daily_scheduler(store):
     """
     Minimal in-process daily trigger. Fires run_daily once per day at the target
@@ -1277,6 +1474,8 @@ def run_listener():
     # timeout budget without delaying Socket Mode, interrupted-draw recovery, or
     # scheduler heartbeats.
     _start_shared_media_runway_refresh()
+    _start_media_moderation_scheduler()
+    _start_media_repeat_sweep_scheduler()
 
     if str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}:
         threading.Thread(target=_daily_scheduler, args=(store,), daemon=True).start()
