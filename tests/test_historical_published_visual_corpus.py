@@ -135,6 +135,29 @@ def test_tranche_rejects_refs_outside_snapshot_and_oversized_batches(tmp_path):
                        target_row_refs=too_many)
 
 
+def test_candidate_lookup_returns_hash_only_signals_and_never_clearance():
+    candidate = png((20, 30, 40))
+    other = png((21, 31, 41))
+    candidate_dhash, _, _ = corpus._visual_fingerprint(candidate)
+    other_dhash, _, _ = corpus._visual_fingerprint(other)
+    manifest = {"records": {
+        "a" * 64: {"row_ref_sha256": "a" * 64, "status": "hashed",
+                   "image_sha256": corpus._sha(candidate), "dhash64": candidate_dhash,
+                   "gym_sha256": "1" * 64, "published_date_sha256": "2" * 64},
+        "b" * 64: {"row_ref_sha256": "b" * 64, "status": "hashed",
+                   "image_sha256": corpus._sha(other), "dhash64": other_dhash,
+                   "gym_sha256": "3" * 64, "published_date_sha256": "4" * 64},
+        "c" * 64: {"row_ref_sha256": "c" * 64, "status": "unknown",
+                   "unknown_reason": "hosted_image_unavailable"},
+    }}
+    result = corpus.lookup_candidate(candidate, manifest)
+    assert [m["row_ref_sha256"] for m in result["exact_byte_matches"]] == ["a" * 64]
+    assert result["near_scene_matches"]
+    assert result["corpus_hashed_count"] == 2 and result["corpus_unknown_count"] == 1
+    assert result["candidate_absence_means_unused"] is False
+    assert "https://" not in json.dumps(result) and '"row_id"' not in json.dumps(result)
+
+
 @pytest.mark.parametrize("corruption", ["missing_dhash", "metadata_mismatch", "raw_url"])
 def test_resume_rejects_incomplete_mismatched_or_non_hash_only_record(tmp_path, corruption):
     path = tmp_path / "state.json"

@@ -318,3 +318,48 @@ def compare_signals(manifest):
     return {"exact_byte_groups": [group_members(v) for v in byte_groups.values() if len(v) > 1],
             "near_scene_pairs_hamming_le_8": scene_groups,
             "candidate_absence_means_unused": False}
+
+
+def lookup_candidate(candidate_bytes, manifest, *, hamming_threshold=8):
+    """Return hash-only corpus evidence for a candidate image; never clearance.
+
+    Candidate bytes are processed in memory and are not persisted. A no-match
+    result is explicitly inconclusive because unknown corpus rows remain.
+    """
+    if not isinstance(candidate_bytes, bytes) or not candidate_bytes:
+        raise CorpusError("candidate_bytes_invalid")
+    if type(hamming_threshold) is not int or not 0 <= hamming_threshold <= 64:
+        raise CorpusError("candidate_hamming_threshold_invalid")
+    records = manifest.get("records") if isinstance(manifest, dict) else None
+    if not isinstance(records, dict):
+        raise CorpusError("candidate_manifest_invalid")
+    candidate_sha = _sha(candidate_bytes)
+    candidate_dhash, _, _ = _visual_fingerprint(candidate_bytes)
+    candidate_bits = int(candidate_dhash, 16)
+    exact, near = [], []
+    unknown_count = 0
+    for key, record in records.items():
+        if not isinstance(record, dict) or record.get("status") not in {"hashed", "unknown"}:
+            raise CorpusError("candidate_manifest_invalid")
+        if record["status"] == "unknown":
+            unknown_count += 1
+            continue
+        if (not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key)
+                or record.get("row_ref_sha256") != key
+                or not isinstance(record.get("image_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", record["image_sha256"])
+                or not isinstance(record.get("dhash64"), str)
+                or not re.fullmatch(r"[0-9a-f]{16}", record["dhash64"])):
+            raise CorpusError("candidate_manifest_invalid")
+        member = {"row_ref_sha256": key, "gym_sha256": record["gym_sha256"],
+                  "published_date_sha256": record["published_date_sha256"]}
+        if record["image_sha256"] == candidate_sha:
+            exact.append(member)
+        distance = (candidate_bits ^ int(record["dhash64"], 16)).bit_count()
+        if distance <= hamming_threshold:
+            near.append({**member, "hamming_distance": distance})
+    return {"candidate_sha256": candidate_sha, "candidate_dhash64": candidate_dhash,
+            "exact_byte_matches": exact, "near_scene_matches": near,
+            "corpus_hashed_count": len(records) - unknown_count,
+            "corpus_unknown_count": unknown_count,
+            "candidate_absence_means_unused": False}
