@@ -144,6 +144,34 @@ def _caption_repeats_history(base_key, caption, day_key):
     return caption_ledger.is_verbatim_blocked(base_key, caption, day_key)
 
 
+def _empty_fill_has_unmet_slots(store, base_key, start, days, slots_per_day,
+                                locked_days):
+    """An empty rebuild is a legitimate no-op only when its span is covered."""
+    from datetime import timedelta
+    from .onboarding_demo import is_sample_row
+    dates = {(start + timedelta(days=i)).isoformat() for i in range(days)}
+    unmet = dates - set(locked_days)
+    if not unmet:
+        return False
+    slots = {day: set() for day in unmet}
+    try:
+        for month in sorted({day[:7] for day in unmet}):
+            for row in store.list_month(base_key, month) or []:
+                day = str(row.get("post_date") or "")[:10]
+                if (day not in slots or is_sample_row(row)
+                        or str(row.get("status") or "").lower() in
+                        ("denied", "killed", "deleted")
+                        or str(row.get("account") or "").lower() not in
+                        ("instagram", "ig", "")
+                        or row.get("format") != "feed"
+                        or not row.get("image_url") or row.get("media_not_ready_reason")):
+                    continue
+                slots[day].add(row.get("slot_index") or 0)
+    except Exception:
+        return True  # an unreadable span cannot certify a successful fill
+    return any(len(placed) < slots_per_day for placed in slots.values())
+
+
 def _url_basename(url):
     """The filename a public media URL points at (query string stripped). Hosted client
     media keeps its library basename, so this is the join key between a calendar row's
@@ -936,7 +964,8 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
     return filled
 
 
-def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, log):
+def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, log,
+                           *, source=None, angle=""):
     """One fresh caption for a Drive draft that failed the A+ gate, on the SAME asset:
     the next approved source in the day's rotation (else the same one) and the failed
     opening as an avoid hint, through the same generator. Mutates draft.caption /
@@ -944,8 +973,8 @@ def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, 
     try:
         from .drafter import opening_signature
         prev = (getattr(draft, "caption", "") or "").strip()
-        source = (_gym_drive_source_for(account_key, day_key, slot_i + 1)
-                  or _gym_drive_source_for(account_key, day_key, slot_i))
+        source = source or (_gym_drive_source_for(account_key, day_key, slot_i + 1)
+                            or _gym_drive_source_for(account_key, day_key, slot_i))
         if source is None:
             return False
         avoid = tuple(s for s in (opening_signature(prev),) if s)
@@ -959,18 +988,100 @@ def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, 
         caption, tags = client_content.make_caption(
             account, source, voice, getattr(draft, "creative_path", "") or "",
             creative=creative, verified=grounding.get("verified"),
-            avoid_openings=avoid)
+            avoid_openings=avoid, **({"angle": angle} if angle else {}))
         caption = (caption or "").strip()
         if not caption or caption == prev:
             return False
         draft.caption = caption
         draft.hashtags = tags or []
+        if getattr(source, "category", ""):
+            draft.category = source.category
         log(f"[gym-drive] {account_key} {day_key} slot {slot_i}: caption failed A+, "
             "retried once with a fresh caption on the same asset")
         return True
     except Exception as exc:  # noqa: BLE001 - a retry failure is just "no retry"
         log(f"[gym-drive] {account_key} {day_key}: recaption failed ({type(exc).__name__})")
         return False
+
+
+# One ordinary recaption plus at most seven distinct approved-source retries.
+_DRIVE_HISTORY_RETRY_LIMIT = 7
+
+
+def _drive_history_sources(account_key, day_key, slot_i):
+    """Walk distinct approved facts, interleaved across deterministic pillars.
+
+    The old slot offset changes only the category. The within-category day index
+    stays fixed, stranding the other facts whenever those first two captions were
+    in history. Advance that index as well, without changing the scheduled date.
+    """
+    from . import client_sources, caption_ledger
+    present = client_content._pillars_for(account_key)
+    if not present:
+        return []
+    ordinal = client_content._day_ordinal(day_key)
+    start = (ordinal + int(slot_i or 0) + 2) % len(present)
+    categories = present[start:] + present[:start]
+    pools = []
+    for category in categories:
+        items = client_sources.approved_sources(account_key, category=category)
+        if items:
+            offset = (ordinal // len(present) + 1) % len(items)
+            pools.append(items[offset:] + items[:offset])
+    tried = [_gym_drive_source_for(account_key, day_key, slot_i),
+             _gym_drive_source_for(account_key, day_key, slot_i + 1)]
+    # Source dataclasses are mutable, so identity uses approved fact text instead.
+    seen = {caption_ledger.verbatim_normalize(getattr(source, "text", ""))
+            for source in tried if source is not None}
+    out = []
+    for index in range(max((len(pool) for pool in pools), default=0)):
+        for pool in pools:
+            if index >= len(pool):
+                continue
+            source = pool[index]
+            fact = caption_ledger.verbatim_normalize(source.text)
+            if not fact or fact in seen:
+                continue
+            seen.add(fact)
+            out.append(source)
+    return out[:_DRIVE_HISTORY_RETRY_LIMIT]
+
+
+def _retry_drive_caption_history(account, draft, voice, base_key, account_key,
+                                  day_key, slot_i, banned_words, day_captions, log):
+    """Bounded genuine copy regeneration on the already selected photo."""
+    from . import post_quality, caption_ledger
+    from .drafter import angle_for_index
+    try:
+        sources = _drive_history_sources(account_key, day_key, slot_i)
+    except Exception as exc:
+        log(f"[gym-drive] {base_key} {day_key}: approved-source walk unavailable "
+            f"({type(exc).__name__})")
+        return False
+    day_hashes = {caption_ledger.verbatim_hash(c) for c in day_captions}
+    for attempt, source in enumerate(sources, 1):
+        # Different facts and entry angles produce real copy, never a suffix.
+        if not _recaption_drive_draft(
+                account, draft, voice, account_key, day_key, slot_i, log,
+                source=source, angle=angle_for_index(attempt + int(slot_i or 0))):
+            continue
+        caption = getattr(draft, "caption", "") or ""
+        try:
+            quality_ok = (post_quality.is_a_plus(draft, tuple(banned_words or ()),
+                                                 require_media=True)
+                          if config.sb7_enabled()
+                          else not _has_banned_word(caption, tuple(banned_words or ())))
+        except Exception:  # a quality checker failure cannot admit a candidate
+            quality_ok = False
+        if (quality_ok and caption.strip()
+                and not _caption_repeats_history(base_key, caption, day_key)
+                and caption_ledger.verbatim_hash(caption) not in day_hashes):
+            log(f"[gym-drive] {base_key} {day_key}: approved-source walk admitted "
+                f"caption on attempt {attempt}; same photo retained")
+            return True
+    log(f"[gym-drive] {base_key} {day_key}: approved-source walk exhausted "
+        f"{len(sources)} distinct facts; photo remains unplaced")
+    return False
 
 
 def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
@@ -1129,6 +1240,7 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
         _gate_ok = False
     _history_repeat = _caption_repeats_history(
         base_key, getattr(draft, "caption", "") or "", day_key)
+    _history_walk_needed = _history_repeat
     if _history_repeat:
         log(f"[gym-drive] {base_key} {day_key}: caption repeats 180 day history; "
             "retrying approved copy on the same photo")
@@ -1152,6 +1264,10 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
                 base_key, getattr(draft, "caption", "") or "", day_key)
             if _history_repeat:
                 _gate_ok = False
+    if not _gate_ok and (_history_walk_needed or _history_repeat):
+        _gate_ok = _retry_drive_caption_history(
+            account, draft, voice, base_key, account_key, day_key, slot_i,
+            banned_words, day_captions, log)
     if not _gate_ok:
         failure = ("failed the caption history gate twice" if _history_repeat
                    else "failed the A+/banned-word gate twice")
@@ -1937,6 +2053,12 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         # flag. An exception escaping its contract is a prewrite planning failure.
         _release_unlanded_reservations(drafts)
         raise
+    if (result.get("noop_empty") and _empty_fill_has_unmet_slots(
+            store, base_key, start, days, slots_per_day, locked_feed_days)):
+        # No required photo post was assembled. Preserving the calendar is safe,
+        # but an empty generation is not a successful fill (Swift Oct 15).
+        result.update(ok=False, reason="no admissible photo posts",
+                      awaiting_content=True)
     if apply_state is not None:
         # Reporting below can still raise. Preserve the write outcome before that
         # happens so the outer cleanup never mistakes a landed insert for prewrite.

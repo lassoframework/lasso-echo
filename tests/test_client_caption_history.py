@@ -48,9 +48,9 @@ def rows(day, caption):
                                  ('instagram', 'story')]]
 
 
-@pytest.mark.parametrize('day', ['2026-10-15', '2026-10-16'])
+@pytest.mark.parametrize('day', ['2026-10-10', '2026-10-15', '2026-10-16', '2026-10-20'])
 def test_one_day_verbatim_block_fails_before_delete(day):
-    caption_ledger.record_staged('swift', 'Real approved caption', '2026-10-10')
+    caption_ledger.record_staged('swift', 'Real approved caption', '2026-10-07')
     store = AdmissionStore()
     result = cmr._apply('swift', rows(day, 'Real approved caption'),
                         date.fromisoformat(day), 1, store, lambda msg: None)
@@ -169,3 +169,112 @@ def test_source_walk_accountless_callers_respect_guard_state(monkeypatch, accoun
     picked, _ = cmr._clean_draft_for_day(
         account, '2026-10-15', object(), 'library', (), lambda msg: None)
     assert (picked is None) is cooldown
+
+
+def test_history_walk_advances_within_categories_and_is_bounded(monkeypatch):
+    from agent import client_sources
+    pools = {cat: [SimpleNamespace(text=f'{cat} approved fact {i}', category=cat)
+                   for i in range(12)] for cat in ['about', 'service', 'testimonial']}
+    monkeypatch.setattr(cmr.client_content, '_pillars_for', lambda key: list(pools))
+    monkeypatch.setattr(client_sources, 'approved_sources',
+                        lambda key, category=None: pools[category])
+    monkeypatch.setattr(cmr, '_gym_drive_source_for', lambda key, day, slot: pools['about'][0])
+    first = cmr._drive_history_sources('swift_ig', '2026-10-15', 0)
+    again = cmr._drive_history_sources('swift_ig', '2026-10-15', 0)
+    assert first == again and len(first) == cmr._DRIVE_HISTORY_RETRY_LIMIT == 7
+    assert len({s.text for s in first}) == 7
+    assert len({s.category for s in first}) == 3
+    assert any(sum(s.category == cat for s in first) > 1 for cat in pools)
+    assert all(s.text != 'about approved fact 0' for s in first)
+
+
+@pytest.mark.parametrize('fresh_on', [3, None])
+def test_distinct_source_walk_preserves_same_photo_and_checks_each_caption(
+        monkeypatch, fresh_on):
+    sources = [SimpleNamespace(text=f'Approved fact {i}', category='service') for i in range(7)]
+    monkeypatch.setattr(cmr, '_drive_history_sources', lambda *a: sources)
+    caption_ledger.record_staged('swift', 'Previously used copy', '2026-10-10')
+    feed = draft('Previously used copy')
+    feed.source_media_asset_id = 'photo-1'
+    feed.caption_grounding = {'creative_name': 'lifting photo', 'verified': {'ok': True}}
+    calls = []
+    def make(account, source, voice, creative_path, **kw):
+        calls.append((source.text, creative_path, kw))
+        return ('Fresh approved copy' if len(calls) == fresh_on else 'Previously used copy', [])
+    monkeypatch.setattr(cmr.client_content, 'make_caption', make)
+    ok = cmr._retry_drive_caption_history(
+        SimpleNamespace(key='swift_ig'), feed, object(), 'swift', 'swift_ig',
+        '2026-10-15', 0, (), [], lambda msg: None)
+    assert ok is (fresh_on is not None)
+    assert len(calls) == (fresh_on or 7)
+    assert feed.source_media_asset_id == 'photo-1'
+    assert all(call[1] == 'photo.jpg' and call[2]['verified'] == {'ok': True} for call in calls)
+    assert len({call[2]['angle'] for call in calls}) == len(calls)
+
+
+def test_history_walk_rejects_unique_caption_with_banned_words(monkeypatch):
+    source = SimpleNamespace(text='Approved fact', category='service')
+    monkeypatch.setattr(cmr, '_drive_history_sources', lambda *a: [source])
+    monkeypatch.setattr(cmr.client_content, 'make_caption', lambda *a, **kw: ('Forbidden copy', []))
+    assert not cmr._retry_drive_caption_history(
+        SimpleNamespace(key='swift_ig'), draft('Old copy'), object(), 'swift', 'swift_ig',
+        '2026-10-15', 0, ('forbidden',), [], lambda msg: None)
+
+
+def test_history_walk_rejects_normalized_same_day_caption(monkeypatch):
+    source = SimpleNamespace(text='Approved fact', category='service')
+    monkeypatch.setattr(cmr, '_drive_history_sources', lambda *a: [source])
+    monkeypatch.setattr(cmr.client_content, 'make_caption', lambda *a, **kw: ('FRESH copy', []))
+    assert not cmr._retry_drive_caption_history(
+        SimpleNamespace(key='swift_ig'), draft('Old copy'), object(), 'swift', 'swift_ig',
+        '2026-10-15', 0, (), [' fresh  COPY '], lambda msg: None)
+
+
+@pytest.mark.parametrize('day', ['2026-10-10', '2026-10-15', '2026-10-16', '2026-10-20'])
+@pytest.mark.parametrize('fresh_on', [4, None])
+def test_drive_stage_history_exhaustion_rolls_back_once_and_success_keeps_photo(
+        monkeypatch, fresh_on, day):
+    source = SimpleNamespace(text='First approved fact', category='service')
+    sources = [SimpleNamespace(text=f'Other approved fact {i}', category='about') for i in range(7)]
+    monkeypatch.setattr(cmr, '_gym_drive_source_for', lambda *a: source)
+    monkeypatch.setattr(cmr, '_drive_history_sources', lambda *a: sources)
+    caption_ledger.record_staged('swift', 'Old copy', '2026-10-07')
+    feed = draft('Old copy')
+    feed.source_media_asset_id = 'photo-1'
+    generated, rollback = [], []
+    def make(account, source, voice, creative_path, **kw):
+        generated.append(source.text)
+        assert not rollback, 'photo must stay claimed while searching approved copy'
+        return ('Forbidden copy' if len(generated) == 1 and fresh_on is not None
+                else 'Fresh approved copy' if len(generated) == fresh_on else 'Old copy', [])
+    monkeypatch.setattr(cmr.client_content, 'make_caption', make)
+    monkeypatch.setattr(cmr, '_rollback_drive_asset', lambda *a: rollback.append(a))
+    monkeypatch.setattr(cmr, '_finish_feed_with_story', lambda account, d, *a, **kw: [d])
+    failed, extra, covered = set(), [], set()
+    ok = cmr._stage_drive_draft(
+        SimpleNamespace(key='swift_ig'), 'swift', 'swift_ig', 'instagram', feed,
+        day, 0, 1, object(), ('forbidden',), [], 'library', lambda msg: None,
+        failed, extra, covered, 'service', False)
+    assert ok is (fresh_on is not None)
+    assert len(generated) == (fresh_on or 8)
+    assert len(rollback) == (0 if ok else 1)
+    assert feed.source_media_asset_id == 'photo-1'
+    assert ('photo-1' in failed) is not ok
+    assert bool(extra) is ok
+
+
+@pytest.mark.parametrize('status, expected', [('pending', False), ('published', False),
+                                             ('denied', True)])
+def test_empty_fill_preserves_complete_existing_calendar(status, expected):
+    class Existing:
+        def list_month(self, *a):
+            return [dict(rows('2026-10-15', 'Existing copy')[0], status=status)]
+    assert cmr._empty_fill_has_unmet_slots(
+        Existing(), 'swift', date(2026, 10, 15), 1, 1, set()) is expected
+
+
+def test_empty_fill_keeps_full_protected_span_but_not_partial_span():
+    assert not cmr._empty_fill_has_unmet_slots(
+        object(), 'swift', date(2026, 10, 15), 1, 1, {'2026-10-15'})
+    assert cmr._empty_fill_has_unmet_slots(
+        object(), 'swift', date(2026, 10, 15), 2, 1, {'2026-10-15'})
