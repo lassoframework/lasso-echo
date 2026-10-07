@@ -28,7 +28,7 @@ class Bytes(owner.ObjectReader):
         return b"synthetic freshly produced original GBP still bytes"
 
 
-def main():
+def main(*, provider_fence=False):
     import psycopg
     from psycopg.types.json import Jsonb
     pg = Path('/opt/homebrew/opt/postgresql@17/bin')
@@ -188,6 +188,33 @@ def main():
                                     _rest=lambda path: path, _headers=lambda *a: {})
             assert worker._atomic_gbp_send_hold(store, row, {'zernio_account_id':'native-1','gbp_location_id':'locations/1'}, token, 'post') is None
             assert len(calls) == 1
+            if provider_fence:
+                sql((ROOT / 'migrations' / 'DRAFT_fixer_gbp_provider_attempt_fence_20261009.sql').read_text())
+                rid, token, row, expected = new_row()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(lambda _: authorize(rid, token, expected), range(2)))
+                assert sorted(results) == [False, True]
+                assert authorize(rid, token, expected) is False
+                assert sql('select count(*) from fixer_gbp_provider_attempt_20261009 where claim_token=%s', (token,))[0][0] == 1
+                denied(lambda: sql("update content_calendar set status='approved',publish_claim_token=null where id=%s", (rid,)))
+                denied(lambda: sql("update content_calendar set publish_claim_token=%s where id=%s", (str(uuid4()),rid)))
+                denied(lambda: sql("update content_calendar set caption='admin revoked' where id=%s", (rid,)))
+                denied(lambda: sql('delete from content_calendar where id=%s', (rid,)))
+                denied(lambda: sql('truncate content_calendar'))
+                denied(lambda: sql('delete from fixer_gbp_provider_attempt_20261009'))
+                gallery_id, gallery_token, gallery_row, gallery_expected = new_row(photo=True)
+                assert authorize(gallery_id, gallery_token, gallery_expected, True) is True
+                assert authorize(gallery_id, gallery_token, gallery_expected, True) is False
+                denied(lambda: sql("update content_calendar set status='approved',publish_claim_token=null where id=%s", (gallery_id,)))
+                sql("update content_calendar set status='failed',publish_claim_token=null where id=%s", (gallery_id,))
+                # A gate/connection edit controls future attempts. The durable grant
+                # still records the exact destination/creative for the committed one.
+                sql("update fixer_forward_media_claim_gate_20261006 set enabled=false")
+                sql("update gym_gbp_connections set zernio_account_id='revoked'")
+                assert sql('select native_account_id from fixer_gbp_provider_attempt_20261009 where claim_token=%s', (token,))[0][0] == 'native-1'
+                sql("update content_calendar set status='published',publish_claim_token=null,late_post_id='provider-confirmed',published_at=now() where id=%s", (rid,))
+                assert sql('select count(*) from fixer_gbp_provider_attempt_20261009 where claim_token=%s', (token,))[0][0] == 1
+                print('PASS: durable provider attempt replay denial, lease/creative/delete/truncate guards and terminal settlement')
             print('PASS: PG17 GBP post/gallery authority; full creative/token/media/destination drift held; '
                   'same-token replay, role/gate isolation, concurrent row+destination locks and worker RPC passed')
             admin.close()
