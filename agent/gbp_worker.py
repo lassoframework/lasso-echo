@@ -24,6 +24,11 @@ from datetime import datetime, timedelta, timezone
 from . import config, gbp
 
 RECONCILE_HOURS = 48          # §7.2: poll hourly for the first 48h after publish
+_GBP_SEND_CREATIVE = ('id', 'gym_id', 'account', 'format', 'post_date', 'caption',
+                     'image_url', 'source_media_url', 'thumbnail_url', 'visual_group_key',
+                     'source_media_asset_id', 'render_manifest_digest', 'gbp_topic_type',
+                     'gbp_cta_type', 'gbp_cta_url', 'gbp_event', 'gbp_offer',
+                     'gbp_location_id', 'pillar')
 
 
 def _alert_manual_approval_changed(gym_id, row_id, alert):
@@ -191,6 +196,37 @@ def _current_gbp_destination(store, bound_row, bound_connection):
         return False
 
 
+def _atomic_gbp_send_hold(store, row, connection, token, send_kind):
+    """Last DB call before create: one committed exact row/media/destination check."""
+    from . import forward_media_guard as guard
+    reason = "atomic GBP send authority unavailable or changed"
+    kind = "forward_media_verification"
+    try:
+        store = getattr(store, "_s", store)
+        response = store._client().post(
+            store._rest('rpc/fixer_authorize_gbp_forward_send_20261008'),
+            headers=store._headers({'Content-Type': 'application/json'}),
+            json={'p_calendar_row_id': guard._uuid(row.get('id')),
+                  'p_claim_token': guard._uuid(token),
+                  'p_expected_creative': {key: row.get(key) for key in _GBP_SEND_CREATIVE},
+                  'p_native_account_id': connection.get('zernio_account_id'),
+                  'p_expected_location_id': connection.get('gbp_location_id'),
+                  'p_send_kind': send_kind},
+            timeout=30)
+        result = response.json()
+        if 200 <= response.status_code < 300 and result is True:
+            return None
+        if (isinstance(result, dict) and result.get('code') == '23514'
+                and result.get('message') ==
+                'source or rendition already consumed by another tenant/date/group'):
+            kind = "forward_media_duplicate"
+            reason = "media bytes were already consumed"
+    except Exception:
+        pass
+    return {"ok": False, "status": "approved", "late_post_id": "",
+            "reject_reason": reason, "held": kind, "mode": ""}
+
+
 def _reauthorize_gbp_send(store, row, connection, token, snapshot, payload=None):
     """Recheck current authority immediately before this single provider mutation.
 
@@ -223,13 +259,16 @@ def _reauthorize_gbp_send(store, row, connection, token, snapshot, payload=None)
     hold = hold_result(store, deepcopy(snapshot[0]), token)
     if hold:
         return hold
-    # Authority itself performs remote reads. A persisted destination may change
-    # during them, so re-read it AGAIN after authority and before the create.
-    if not _current_gbp_destination(store, *snapshot[:2]):
-        return destination_hold()
     # Reject even local mutation during the authority read; never send newer
     # arguments using authority obtained for the pinned arguments.
-    return drift_hold() if changed() else None
+    if changed():
+        return drift_hold()
+    if payload is not None and payload != build_gbp_payload_for_row(*snapshot[:2]):
+        return drift_hold()
+    # No alternating row/destination reads after this RPC. It validates both
+    # current bindings under one DB transaction; create uses the pinned bytes.
+    return _atomic_gbp_send_hold(store, snapshot[0], snapshot[1], token,
+                                 'gallery' if payload is None else 'post')
 
 
 def publish_gbp_row(row, connection, *, client, draft=True, now=None,

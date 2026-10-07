@@ -60,6 +60,22 @@ def authority(monkeypatch, photo, drift=None):
         return SimpleNamespace(status_code=200, json=lambda: deepcopy(data))
 
     def post(*a, **kw):
+        if a[0] == "rpc/fixer_authorize_gbp_forward_send_20261008":
+            events.append("atomic")
+            args = kw["json"]
+            expected = {key: persisted.get(key) for key in gw._GBP_SEND_CREATIVE}
+            if (args["p_expected_creative"] != expected
+                    or args["p_claim_token"] != persisted["publish_claim_token"]
+                    or (args['p_send_kind'] == 'gallery') != (persisted['format'] == 'photo')):
+                return response(False)
+            try:
+                connections = store.connections_for(row["gym_id"])
+            except Exception:
+                return response(False)
+            matching = [c for c in connections if c.get("gbp_location_id") == persisted["gbp_location_id"]]
+            return response(len(matching) == 1 and matching[0].get("status") == "connected"
+                            and matching[0].get("portal_gym_key") == persisted["gym_id"]
+                            and matching[0].get("zernio_account_id") == args["p_native_account_id"])
         return response(dict(calendar_row_id=persisted["id"], gym_id=persisted["gym_id"],
                              account=persisted["account"], format=persisted["format"],
                              gbp_location_id=persisted["gbp_location_id"],
@@ -103,13 +119,22 @@ def test_fresh_claim_replay_immediately_precedes_exact_create(monkeypatch, photo
     row, token, store, events = authority(monkeypatch, photo)
     client = Provider(events)
     out = invoke(photo, row, _conn(), client, store, token)
-    assert out["ok"] and events == ["claim", "destination", "claim", "destination", "create"]
+    assert out["ok"] and events == ["claim", "destination", "claim", "atomic", "destination", "create"]
     if photo:
         assert client.calls == [(_conn()["zernio_account_id"], row["image_url"])]
     else:
         payload, kwargs = client.calls[0]
         assert payload == gw.build_gbp_payload_for_row(row, _conn())
         assert kwargs == {"draft": False, "idempotency_key": token}
+
+
+@pytest.mark.parametrize("photo", [False, True])
+def test_exact_authority_cannot_be_used_for_the_other_provider_mutation(monkeypatch, photo):
+    row, token, store, events = authority(monkeypatch, not photo)
+    client = Provider(events)
+    out = invoke(photo, row, _conn(), client, store, token)
+    assert out['held'] == 'forward_media_verification' and client.calls == []
+    assert events[-1] == 'atomic'
 
 
 @pytest.mark.parametrize("photo", [False, True])
@@ -214,7 +239,7 @@ def test_persisted_destination_drift_during_final_authority_holds(monkeypatch, p
     client = Provider(events)
     out = invoke(photo, row, _conn(), client, store, token)
     assert out["status"] == "approved" and out["held"] == "forward_media_verification"
-    assert events == ["claim", "destination", "claim", "destination"]
+    assert events == ["claim", "destination", "claim", "atomic", "destination"]
     assert client.calls == []
 
 
@@ -230,6 +255,9 @@ def test_mid_authority_destination_change_releases_unsent_owned_lease(monkeypatc
             store._conns["lasso"][0]["status"] = "needs_reconnect"
         return True
     monkeypatch.setattr(bridge, "authorize", authorize)
+    monkeypatch.setattr(gw, "_atomic_gbp_send_hold", lambda *a: {
+        "ok": False, "status": "approved", "late_post_id": "", "reject_reason": "destination changed",
+        "held": "forward_media_verification", "mode": ""})
     client = Provider(events)
     out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
     assert out["held"] == 1 and client.calls == []
@@ -262,7 +290,7 @@ def test_facade_connection_reread_uses_same_authenticated_calendar_store(monkeyp
     base._client = lambda: http
     client = Provider(events)
     out = invoke(photo, row, _conn(), client, SimpleNamespace(_s=base), token)
-    assert out["ok"] and events == ["claim", "destination", "claim", "destination", "create"]
+    assert out["ok"] and events == ["claim", "destination", "claim", "atomic", "destination", "create"]
 
 
 @pytest.mark.parametrize("field", ["content", "mediaItems", "platforms"])
@@ -310,6 +338,7 @@ def test_after_create_ambiguity_retains_owned_lease_without_retry(monkeypatch, p
         events.append("authorize")
         return True
     monkeypatch.setattr(bridge, "authorize", authorize)
+    monkeypatch.setattr(gw, "_atomic_gbp_send_hold", lambda *a: None)
     row = _row(id="r1", gym_id="lasso", account="googlebusiness",
                gbp_location_id="locations/1", format="photo" if photo else "feed")
     store = _TokenStore([row], {"lasso": [dict(_c(), portal_gym_key="lasso")]})
@@ -335,3 +364,18 @@ def test_off_preserves_call_arguments_and_has_no_new_authority_read(monkeypatch,
         assert client.calls == [(conn["zernio_account_id"], row["image_url"])]
     else:
         assert client.calls == [(gw.build_gbp_payload_for_row(row, conn), {"draft": False})]
+
+
+@pytest.mark.parametrize('result', [None, False, 1, 'true', {}, []])
+def test_atomic_rpc_must_return_literal_true(result):
+    seen = []
+    def post(endpoint, **kwargs):
+        seen.append((endpoint, kwargs['json']))
+        return SimpleNamespace(status_code=200, json=lambda: result)
+    store = SimpleNamespace(_client=lambda: SimpleNamespace(post=post),
+                            _rest=lambda p: p, _headers=lambda *a: {})
+    row = _row(id=str(uuid4()), gym_id='gym')
+    out = gw._atomic_gbp_send_hold(store, row, _conn(), str(uuid4()), 'post')
+    assert out['held'] == 'forward_media_verification'
+    assert seen[0][0] == 'rpc/fixer_authorize_gbp_forward_send_20261008'
+    assert set(seen[0][1]['p_expected_creative']) == set(gw._GBP_SEND_CREATIVE)
