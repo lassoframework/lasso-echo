@@ -985,7 +985,14 @@ def test_real_bus_generic_resolve_tap_uses_actual_notice_flag(
                                          identity=identity, log=lambda _msg: None)
     assert accepted is (not enabled)
     assert ticket["status"] == "hold"  # queueing a notice never closes the ticket
-    assert len(written) == int(not enabled)
+    assert len(written) == 1
+    if enabled:
+        assert written[0]["attachments"]["kind"] == "escalation"
+        assert written[0]["attachments"]["resolve_refused"] is True
+        assert not written[0]["attachments"].get("resolve_notice")
+        assert "requires current notice or held release proof" in written[0]["body"]
+        assert "guarded FIXER workflow" in written[0]["body"]
+        assert "approved_by" not in ticket
     if not enabled:
         assert written[0]["attachments"]["resolve_notice"] is True
         assert ticket["approved_by"] == "U_BLAKE"
@@ -1454,3 +1461,21 @@ def test_transient_staff_alert_source_read_preserves_ready_alert(monkeypatch):
                          summary=summary)
     assert summary == {"skipped": 1} and rows[alert["id"]] == alert
     assert rows[notice["id"]] == notice
+
+
+@pytest.mark.parametrize("guard", ["escalated", "held"])
+def test_customer_fix_resolve_tap_explains_current_notice_refusal(monkeypatch, guard):
+    ticket = NoticeBus().current
+    ticket.update(status="merged", classification="code_fix", slack_channel_id="G_CLIENT",
+                  fix_pr_url="https://github.com/example/echo/pull/317")
+    ticket.update({"escalated": True} if guard == "escalated" else {"hold_tier": "human"})
+    before = deepcopy(ticket)
+    written = []
+    bus = SimpleNamespace(ticket=lambda _tid: deepcopy(ticket),
+                          record_outbound=lambda **kw: written.append(kw))
+    assert not outbox.resolve_and_notify(bus, TICKET_ID, approved_by="U_BLAKE",
+                                         identity=SimpleNamespace(name="echo"), log=lambda _m: None)
+    assert ticket == before
+    assert len(written) == 1 and written[0]["kind"] == "escalation"
+    assert written[0]["meta"]["resolve_refused"] is True
+    assert "The ticket is unchanged" in written[0]["body"]

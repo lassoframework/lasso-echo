@@ -2826,6 +2826,21 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     if ticket.get("status") == "resolved":
         return False
     customer_fix = _customer_fix_reply(ticket, {})
+
+    def refuse_resolve(reason):
+        why = f"Resolve tap on ticket {ticket_id} did NOT go through: {reason}. " \
+              "The ticket is unchanged."
+        log(f"[slack-convo/outbox] {why}")
+        try:
+            bus.record_outbound(
+                ticket_id=ticket_id, author_type="system", body=why,
+                delivery_status="ready", kind=_a.KIND_ESCALATION,
+                meta={"identity": getattr(identity, "name", ""),
+                      "resolve_refused": True})
+        except Exception:  # noqa: BLE001 - refusal still stands
+            pass
+        return False
+
     if (config.slack_convo_echo_current_notice_enabled()
             and ticket.get("product") == "echo"
             and ticket.get("source") == "website_tab"
@@ -2834,23 +2849,9 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         # 0384 reserves only current unheld verification/merged notices. A
         # generic or held tap cannot borrow that reservation; 0383 owns the
         # separate held release proof. Leave this ticket and client untouched.
-        log(f"[slack-convo/outbox] resolve refused: ticket {ticket_id} "
-            "requires current notice or held release proof")
-        return False
-    if customer_fix:
-        def refuse_fix(reason):
-            why = f"Resolve tap on ticket {ticket_id} did NOT go through: {reason}. " \
-                  "The ticket is unchanged."
-            log(f"[slack-convo/outbox] {why}")
-            try:
-                bus.record_outbound(
-                    ticket_id=ticket_id, author_type="system", body=why,
-                    delivery_status="ready", kind=_a.KIND_ESCALATION,
-                    meta={"identity": getattr(identity, "name", ""),
-                          "resolve_refused": True})
-            except Exception:  # noqa: BLE001 - refusal still stands
-                pass
-            return False
+        return refuse_resolve(
+            "this Echo website ticket requires current notice or held release proof; "
+            "verify the current request through the guarded FIXER workflow before closing")
 
     # MINOR 5's fix moved the resolved stamp to delivery time, which quietly broke what the
     # status check had been doing double duty for: idempotence. A second tap before the
@@ -2890,7 +2891,7 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     if customer_fix:
         proof_meta = {"resolve_notice": True, "pr_url": ticket.get("fix_pr_url")}
         if not _verified_fix_notice(ticket, proof_meta, _a.KIND_STATUS, bus=bus):
-            return refuse_fix("customer fix has no current merged, deployed and "
+            return refuse_resolve("customer fix has no current merged, deployed and "
                               "independently verified business postcondition")
         try:
             current_key = _current_fixer_request_key(bus, ticket)
@@ -2898,13 +2899,13 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
             current_key = None
         release_key = ((ticket.get("verification_after") or {}).get("fixer") or {}).get("request_key")
         if not current_key or release_key != current_key:
-            return refuse_fix("customer request changed or could not be verified")
+            return refuse_resolve("customer request changed or could not be verified")
         request_version = ticket.get("request_version")
         if (not isinstance(request_version, int) or isinstance(request_version, bool)
                 or request_version < 0):
-            return refuse_fix("customer request version is unavailable")
+            return refuse_resolve("customer request version is unavailable")
         if not str(ticket.get("slack_channel_id") or "").startswith(("C", "G")):
-            return refuse_fix("customer fix has no group conversation for Blake to join")
+            return refuse_resolve("customer fix has no group conversation for Blake to join")
     # MINOR 4 (audit 7): `surface` was the ticket's SOURCE ("website_tab"), which is not one
     # of the surfaces gate 7 knows, so the notice was posted as a THREAD REPLY inside a DM --
     # a place people do not look. The real surface is on the ticket's own inbound rows.

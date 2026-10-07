@@ -569,10 +569,21 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 log(f"[echo-ticket-worker] current delivery identity unavailable "
                     f"ticket={tid}; answer not sent")
                 return
+            current_attempt_notice = None
+
+            def record_attempt_outbound(**kwargs):
+                nonlocal current_attempt_notice
+                row = bus.record_outbound(**kwargs)
+                meta = kwargs.get("meta") or {}
+                if (meta.get("fixer_current_attempt_token")
+                        and (row or {}).get("id") == kwargs.get("message_id")):
+                    current_attempt_notice = row["id"]
+                return row
+
             result = _out.initiate(
                 _verified_ticket_dict(snapshot), who, ident,
                 open_group_dm=open_group_dm, post_first_message=post_first_message,
-                record_outbound=bus.record_outbound, stamp_ticket=stamp_ticket,
+                record_outbound=record_attempt_outbound, stamp_ticket=stamp_ticket,
                 message_text=answer["body"], mark_message=mark_message,
                 claim_message=claim_message, completion=resolves_on_delivery,
                 ticket_lookup=bus.ticket,
@@ -606,6 +617,20 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 # no receipt may claim it was told. It escalates to a person instead.
                 log(f"[echo-ticket-worker] outreach did not deliver ticket={tid} "
                     f"reason={result.reason}")
+                if (resolves_on_delivery and current_attempt_notice
+                        and result.reason in {"claim_failed", "lost_claim",
+                                              "delivery_identity_changed"}):
+                    # Outreach already tries to suppress this exact attempt and
+                    # queue its stable staff alert. Read/repair that alert before
+                    # falling back, so one refusal does not produce two cards.
+                    try:
+                        alert = bus.ensure_suppressed_current_notice_alert(
+                            current_attempt_notice, identity_name)
+                        if alert:
+                            return
+                    except Exception as exc:  # noqa: BLE001 - retain fallback escalation
+                        log(f"[echo-ticket-worker] suppressed notice alert unconfirmed "
+                            f"ticket={tid}: {type(exc).__name__}")
                 if (resolves_on_delivery and result.reason.startswith(
                         "current_notice_")):
                     # The reserved attempt may have reached Slack. Changing the
