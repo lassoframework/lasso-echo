@@ -670,4 +670,27 @@ $$;
 revoke all on function public.fixer_bind_forward_media_manifest_20261006(uuid)
   from public,anon,authenticated,service_role,fixer_forward_media_attester_20261006;
 grant execute on function public.fixer_bind_forward_media_manifest_20261006(uuid) to service_role;
+
+-- Existing table-level INSERT/UPDATE grants must not bypass the validated binder.
+-- SECURITY INVOKER retains the binder's effective owner while its definer
+-- body updates the row, but sees service_role on a direct service UPDATE.
+create function public.fixer_guard_forward_media_digest_20261006()
+returns trigger language plpgsql security invoker set search_path=pg_catalog,public as $$
+begin
+  if ((tg_op='INSERT' and new.render_manifest_digest is not null)
+      or (tg_op='UPDATE' and new.render_manifest_digest is distinct from old.render_manifest_digest))
+      and current_user::regrole::oid is distinct from (
+        select p.proowner from pg_catalog.pg_proc p
+        where p.oid='public.fixer_bind_forward_media_manifest_20261006(uuid)'::regprocedure
+      ) then
+    raise exception 'render manifest digest changes require the validated binder' using errcode='42501';
+  end if;
+  return new;
+end;
+$$;
+revoke all on function public.fixer_guard_forward_media_digest_20261006()
+  from public,anon,authenticated,service_role,fixer_forward_media_attester_20261006;
+create trigger fixer_forward_media_digest_guard_20261006
+  before insert or update of render_manifest_digest on public.content_calendar
+  for each row execute function public.fixer_guard_forward_media_digest_20261006();
 commit;

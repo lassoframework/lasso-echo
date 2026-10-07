@@ -120,6 +120,9 @@ def main():
                 "media_not_ready_reason text);")
             # Apply only this self-contained draft. NO #306/#307 dependency.
             sql((ROOT / 'migrations/DRAFT_fixer_forward_media_claim_20261006.sql').read_text())
+            # Production service_role already has table-level write grants. Preserve
+            # that capability here so denial must come from the digest guard.
+            sql("grant select,insert,update,delete on public.content_calendar to service_role;")
             # Arbitrary persisted source URLs and hashes have no original
             # authority, even when submitted by the separately trusted attester.
             probe=row('provenance_gym','provenance_group','https://scratch.example/provenance')
@@ -412,13 +415,34 @@ def main():
             # Successful bind from a null digest, with unchanged approval/status.
             brid=bindable_row(bind_tenant,bind_asset,bind_url)
             bdigest=owner_persist(bind_tenant,bind_asset,bind_url,bind_fp,bind_url)
+            inserted_rid=str(uuid.uuid4())
+            assert 'validated binder' in sql("set role service_role; insert into content_calendar "
+                f"(id,render_manifest_digest) values('{inserted_rid}','{bdigest}');",ok=False)
+            assert sql(f"select count(*) from content_calendar where id='{inserted_rid}';")=='0'
+            sql("set role service_role; insert into content_calendar "
+                f"(id,render_manifest_digest) values('{inserted_rid}',null);")
+            assert sql(f"select render_manifest_digest is null from content_calendar where id='{inserted_rid}';")=='t'
             before=sql(f"select status||'|'||variant_status||'|'||coalesce(publish_claim_token::text,'') from content_calendar where id='{brid}';")
+            assert sql("select prosecdef from pg_proc where oid="
+                "'public.fixer_guard_forward_media_digest_20261006()'::regprocedure;")=='f'
+            assert sql("select prosecdef from pg_proc where oid="
+                "'public.fixer_bind_forward_media_manifest_20261006(uuid)'::regprocedure;")=='t'
+            assert 'validated binder' in sql(f"set role service_role; update content_calendar "
+                f"set render_manifest_digest='{bdigest}' where id='{brid}';",ok=False)
+            assert sql(f"select render_manifest_digest is null from content_calendar where id='{brid}';")=='t'
             assert bind(brid)=='t'
             assert sql(f"select render_manifest_digest from content_calendar where id='{brid}';")==bdigest
             assert sql(f"select status||'|'||variant_status||'|'||coalesce(publish_claim_token::text,'') from content_calendar where id='{brid}';")==before
             # Idempotent replay with the already-matching persisted digest.
             assert bind(brid)=='t'
             assert sql(f"select render_manifest_digest from content_calendar where id='{brid}';")==bdigest
+            for direct_digest in ('null', "'sha256:"+'0'*64+"'"):
+                assert 'validated binder' in sql(f"set role service_role; update content_calendar "
+                    f"set render_manifest_digest={direct_digest} where id='{brid}';",ok=False)
+                assert sql(f"select render_manifest_digest from content_calendar where id='{brid}';")==bdigest
+            # An unchanged digest and ordinary table updates remain permitted.
+            sql(f"set role service_role; update content_calendar set render_manifest_digest="
+                f"render_manifest_digest, status=status where id='{brid}';")
             # Ambiguous manifests for the same binding fail closed.
             amb_tenant='bind_gym_'+uuid.uuid4().hex
             amb_fp='md5:'+uuid.uuid4().hex
@@ -476,7 +500,9 @@ def main():
                   'attester-vs-claim graph race denial and isolation hold; authoritative original registry and '
                   'versioned render manifest mismatch denial; narrow tenant-scoped discovery and provenance lookup; '
                   'missing/forged/stale historical clearance hold; tenant/asset/URL isolation; fleet quarantine non-bypass; '
-                  'service-only exact-manifest bind, ambiguity and claimed/sent-row refusal')
+                  'service-only exact-manifest bind, direct non-NULL digest INSERT denial and NULL INSERT success, '
+                  'direct digest set/replace/clear denial with table UPDATE, '
+                  'ambiguity and claimed/sent-row refusal')
         finally:
             subprocess.run(['pg_ctl','-D',str(data),'-m','immediate','-w','stop'],
                            capture_output=True, timeout=60)
