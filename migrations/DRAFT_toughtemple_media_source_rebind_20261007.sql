@@ -1,5 +1,5 @@
--- DRAFT / UNAPPLIED operator rebind for the proven Tough Temple media-source
--- tenant split. This is intentionally NOT in the automatic migration chain.
+-- Operator rebind applied to production on 2026-10-07 for the proven Tough
+-- Temple media-source tenant split. Retained for audit, not automatic replay.
 --
 -- Read-only production evidence captured 2026-10-07 in Supabase project
 -- ooqcvmcjspeltuuhcvlh (lasso-ops-portal):

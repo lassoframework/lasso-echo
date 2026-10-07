@@ -1,4 +1,5 @@
--- DRAFT / UNAPPLIED one-time reconciliation of legacy clean Drive photos.
+-- One-time reconciliation applied to production on 2026-10-07; retained for
+-- audit, not automatic replay after the frozen source set changes.
 -- Current Echo moderation automatically approves a clean, byte-bound verdict.
 -- These 136 older rows have that verdict but predate the automatic status write.
 -- This script changes review fields only after the entire frozen set and every
