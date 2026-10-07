@@ -121,6 +121,11 @@ create table public.fixer_forward_media_render_manifest_20261006 (
   check ((thumbnail_url is null and thumbnail_fingerprint is null and thumbnail_length is null)
     or (thumbnail_url is not null and thumbnail_fingerprint is not null and thumbnail_length is not null))
 );
+-- A new manifest for already registered media must serialize with lookup and
+-- attestation too. Otherwise a binder could observe one match while an owner
+-- appends a second manifest for the same media before that bind commits.
+create trigger render_manifest_graph_lock before insert on public.fixer_forward_media_render_manifest_20261006
+  for each row execute function public.fixer_forward_history_lock_20261006();
 -- The independently credentialed attester fetches exact objects and records bytes.
 -- An immutable URL cannot later be rebound to different bytes. Source hashes are
 -- the hashes of original bytes, never guessed from a derivative/URL/asset ID.
@@ -588,4 +593,81 @@ end;
 $$;
 revoke all on function public.fixer_claim_forward_media_20261006(uuid,uuid,uuid,text) from public,anon,authenticated,service_role;
 grant execute on function public.fixer_claim_forward_media_20261006(uuid,uuid,uuid,text) to service_role;
+
+-- Service-role binding RPC: the ONLY authority that may attach a persisted
+-- render manifest digest to a calendar row. It accepts only the row ID; a
+-- caller can never supply a digest, hash, URL or history claim. The owner
+-- registry/clearance/manifest evidence must already exist; this function
+-- never writes owner authority, never sends, and never touches approval or
+-- status. Fail closed on missing or ambiguous persisted binding.
+create function public.fixer_bind_forward_media_manifest_20261006(p_calendar_row_id uuid)
+returns boolean language plpgsql security definer set search_path=pg_catalog,public as $$
+declare
+  r public.content_calendar%rowtype; tenant text; digest text; matches integer;
+  original public.fixer_forward_media_original_registry_20261006%rowtype;
+begin
+  if current_setting('transaction_isolation')<>'read committed' then
+    raise exception 'forward media authority requires read committed isolation' using errcode='25000';
+  end if;
+  -- Match the graph lock order used by attestation and claims. Owner clearance
+  -- and manifest inserts take the exclusive lock before this shared lookup.
+  perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+  -- Serialize with any publisher/attester on this exact row before binding.
+  select * into r from public.content_calendar where id=p_calendar_row_id for update;
+  -- Require an unsent active row with a complete explicit persisted identity:
+  -- source asset, source URL, image URL, optional thumbnail, group and tenant.
+  if not found or r.status not in ('draft','pending','queued','approved')
+      or r.publish_claim_token is not null
+      or r.published_at is not null or r.late_post_id is not null
+      or r.variant_status is distinct from 'active'
+      or r.post_date is null
+      or nullif(btrim(r.gym_id),'') is null or nullif(btrim(r.visual_group_key),'') is null
+      or nullif(btrim(r.source_media_asset_id),'') is null
+      or r.source_media_url is null or r.source_media_url !~ '^https://[^[:space:]]+$'
+      or r.image_url is null or r.image_url !~ '^https://[^[:space:]]+$'
+      or (r.thumbnail_url is not null and r.thumbnail_url !~ '^https://[^[:space:]]+$') then
+    raise exception 'binding requires an unsent active row with complete explicit source and media identity' using errcode='23514';
+  end if;
+  select a.tenant_id into tenant from public.fixer_forward_media_tenant_alias_20261006 a
+    where a.alias_key=btrim(r.gym_id);
+  tenant:=coalesce(tenant,btrim(r.gym_id));
+  -- The authoritative original must match the row's explicit tenant/asset/URL.
+  select * into original from public.fixer_forward_media_original_registry_20261006 o
+    where o.tenant_id=tenant and o.source_asset_id=btrim(r.source_media_asset_id);
+  if not found or original.source_url is distinct from r.source_media_url then
+    raise exception 'authoritative original registry binding unavailable' using errcode='23514';
+  end if;
+  -- Cleared history for the exact registry tuple and no fleet hold anywhere
+  -- for these source bytes; missing or held history refuses the bind.
+  if not exists(select 1 from public.fixer_forward_media_history_clearance_20261006 c
+      where c.tenant_id=original.tenant_id and c.source_asset_id=original.source_asset_id
+        and c.source_url=original.source_url and c.source_fingerprint=original.source_fingerprint
+        and c.source_length=original.source_length and c.registry_evidence_ref=original.registry_evidence_ref
+        and c.decision='cleared_unused')
+      or exists(select 1 from public.fixer_forward_media_history_clearance_20261006 c
+        where c.source_fingerprint=original.source_fingerprint and c.decision<>'cleared_unused') then
+    raise exception 'original historical eligibility clearance unavailable or held' using errcode='23514';
+  end if;
+  -- Exactly ONE immutable manifest must match the persisted tenant, source
+  -- asset, image URL and thumbnail URL. Zero or many fail closed.
+  select count(*), min(m.manifest_digest) into matches, digest
+    from public.fixer_forward_media_render_manifest_20261006 m
+    where m.tenant_id=tenant and m.source_asset_id=original.source_asset_id
+      and m.image_url=r.image_url and m.thumbnail_url is not distinct from r.thumbnail_url;
+  if matches is distinct from 1 then
+    raise exception 'exactly one matching immutable render manifest is required' using errcode='23514';
+  end if;
+  if r.render_manifest_digest is null then
+    update public.content_calendar set render_manifest_digest=digest where id=r.id;
+    return true;
+  end if;
+  if r.render_manifest_digest=digest then
+    return true;
+  end if;
+  raise exception 'row is already bound to a conflicting render manifest digest' using errcode='23514';
+end;
+$$;
+revoke all on function public.fixer_bind_forward_media_manifest_20261006(uuid)
+  from public,anon,authenticated,service_role,fixer_forward_media_attester_20261006;
+grant execute on function public.fixer_bind_forward_media_manifest_20261006(uuid) to service_role;
 commit;

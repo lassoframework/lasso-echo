@@ -376,13 +376,107 @@ def main():
             assert 'unsent' in claim(sent,ok=False)
             sql('alter table fixer_forward_media_use_20261006 rename to temporarily_unavailable;')
             assert 'does not exist' in claim(sibling,ok=False)
+            # Service-role binding RPC: takes only the row ID and binds exactly
+            # one persisted owner manifest, never caller-supplied claims.
+            def bind(rid, ok=True):
+                return sql(f"set role service_role; select public.fixer_bind_forward_media_manifest_20261006('{rid}');", ok)
+            def bindable_row(tenant, asset, url, image=None, thumbnail=None, digest='null'):
+                rid = str(uuid.uuid4())
+                image = image or url
+                thumb = "null" if thumbnail is None else "'" + thumbnail + "'"
+                sql("insert into content_calendar(id,gym_id,post_date,status,variant_status,"
+                    "image_url,source_media_url,thumbnail_url,visual_group_key,source_media_asset_id,render_manifest_digest)"
+                    f" values('{rid}','{tenant}','2026-10-10','draft','active',"
+                    f"'{image}','{url}',{thumb},'vg_{uuid.uuid4().hex}','{asset}',{digest});")
+                return rid
+            def owner_persist(tenant, asset, url, fp, image, thumbnail=None, clearance=True, registry=True):
+                if registry:
+                    sql("insert into fixer_forward_media_original_registry_20261006 "
+                        "(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref) "
+                        f"values('{tenant}','{asset}','{url}','{fp}',10,'owner-verified-original');")
+                if clearance:
+                    sql("insert into fixer_forward_media_history_clearance_20261006 "
+                        "(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref,decision,history_evidence_ref) "
+                        f"values('{tenant}','{asset}','{url}','{fp}',10,'owner-verified-original','cleared_unused','independent-fleet-history-audit');")
+                thumb = "null,null,null" if thumbnail is None else f"'{thumbnail}','md5:{'b'*32}',30"
+                digest = 'sha256:' + uuid.uuid4().hex + uuid.uuid4().hex
+                sql("insert into fixer_forward_media_render_manifest_20261006 "
+                    "(manifest_digest,tenant_id,source_asset_id,image_url,image_fingerprint,image_length,"
+                    "thumbnail_url,thumbnail_fingerprint,thumbnail_length,operation,render_evidence_ref) "
+                    f"values('{digest}','{tenant}','{asset}','{image}','{fp}',10,{thumb},'same_object','owner-verified-render');")
+                return digest
+            bind_tenant='bind_gym_'+uuid.uuid4().hex
+            bind_fp='md5:'+uuid.uuid4().hex
+            bind_asset='original_'+uuid.uuid4().hex
+            bind_url='https://scratch.example/bind_'+uuid.uuid4().hex
+            # Successful bind from a null digest, with unchanged approval/status.
+            brid=bindable_row(bind_tenant,bind_asset,bind_url)
+            bdigest=owner_persist(bind_tenant,bind_asset,bind_url,bind_fp,bind_url)
+            before=sql(f"select status||'|'||variant_status||'|'||coalesce(publish_claim_token::text,'') from content_calendar where id='{brid}';")
+            assert bind(brid)=='t'
+            assert sql(f"select render_manifest_digest from content_calendar where id='{brid}';")==bdigest
+            assert sql(f"select status||'|'||variant_status||'|'||coalesce(publish_claim_token::text,'') from content_calendar where id='{brid}';")==before
+            # Idempotent replay with the already-matching persisted digest.
+            assert bind(brid)=='t'
+            assert sql(f"select render_manifest_digest from content_calendar where id='{brid}';")==bdigest
+            # Ambiguous manifests for the same binding fail closed.
+            amb_tenant='bind_gym_'+uuid.uuid4().hex
+            amb_fp='md5:'+uuid.uuid4().hex
+            amb_asset='original_'+uuid.uuid4().hex
+            amb_url='https://scratch.example/amb_'+uuid.uuid4().hex
+            amb_rid=bindable_row(amb_tenant,amb_asset,amb_url)
+            owner_persist(amb_tenant,amb_asset,amb_url,amb_fp,amb_url)
+            owner_persist(amb_tenant,amb_asset,amb_url,amb_fp,amb_url,clearance=False,registry=False)  # distinct digest, same binding
+            assert 'exactly one matching immutable render manifest' in bind(amb_rid,ok=False)
+            assert sql(f"select render_manifest_digest is null from content_calendar where id='{amb_rid}';")=='t'
+            # Stale/wrong source URL between row and registry fails closed.
+            stale_tenant='bind_gym_'+uuid.uuid4().hex
+            stale_fp='md5:'+uuid.uuid4().hex
+            stale_asset='original_'+uuid.uuid4().hex
+            stale_url='https://scratch.example/stale_'+uuid.uuid4().hex
+            stale_rid=bindable_row(stale_tenant,stale_asset,stale_url)
+            owner_persist(stale_tenant,stale_asset,'https://scratch.example/different_'+uuid.uuid4().hex,stale_fp,stale_url)
+            assert 'original registry binding unavailable' in bind(stale_rid,ok=False)
+            # Wrong image URL on the row matches no manifest and fails closed.
+            wrong_tenant='bind_gym_'+uuid.uuid4().hex
+            wrong_fp='md5:'+uuid.uuid4().hex
+            wrong_asset='original_'+uuid.uuid4().hex
+            wrong_url='https://scratch.example/wrong_'+uuid.uuid4().hex
+            wrong_rid=bindable_row(wrong_tenant,wrong_asset,wrong_url,image='https://scratch.example/other_'+uuid.uuid4().hex)
+            owner_persist(wrong_tenant,wrong_asset,wrong_url,wrong_fp,wrong_url)
+            assert 'exactly one matching immutable render manifest' in bind(wrong_rid,ok=False)
+            # Missing historical clearance refuses even with registry+manifest.
+            nc_tenant='bind_gym_'+uuid.uuid4().hex
+            nc_fp='md5:'+uuid.uuid4().hex
+            nc_asset='original_'+uuid.uuid4().hex
+            nc_url='https://scratch.example/nc_'+uuid.uuid4().hex
+            nc_rid=bindable_row(nc_tenant,nc_asset,nc_url)
+            owner_persist(nc_tenant,nc_asset,nc_url,nc_fp,nc_url,clearance=False)
+            assert 'historical eligibility clearance unavailable or held' in bind(nc_rid,ok=False)
+            # An already conflicting persisted digest is refused, not rebound.
+            conf_rid=bindable_row(bind_tenant,bind_asset,bind_url,digest="'sha256:"+'0'*64+"'")
+            assert 'conflicting render manifest digest' in bind(conf_rid,ok=False)
+            assert sql(f"select render_manifest_digest from content_calendar where id='{conf_rid}';")=='sha256:'+'0'*64
+            # Only service_role may execute; denied roles fail closed.
+            for denied in ('anon','authenticated','fixer_forward_media_attester_20261006'):
+                assert 'permission denied' in sql(f"set role {denied}; select public.fixer_bind_forward_media_manifest_20261006('{brid}');",ok=False)
+            # A sent row is never bound.
+            sql(f"update content_calendar set late_post_id='provider-id' where id='{conf_rid}';")
+            assert 'unsent active row' in bind(conf_rid,ok=False)
+            # An owned send claim or terminal status cannot be revised by a
+            # delayed owner preparation, even when its media still matches.
+            sql(f"update content_calendar set publish_claim_token='{uuid.uuid4()}' where id='{brid}';")
+            assert 'unsent active row' in bind(brid,ok=False)
+            sql(f"update content_calendar set publish_claim_token=null,status='published' where id='{brid}';")
+            assert 'unsent active row' in bind(brid,ok=False)
             print('PASS: self-contained draft; global cross-gym/cross-date concurrency one-winner; '
                   'same-group idempotency; catch-up reservation; immutable complete source/image/thumbnail '
                   'evidence; narrow attester auth; forged/missing/stale evidence hold; deletion permanence; '
                   'derivative source reuse denial; atomic rollback; default OFF; sent-row/outage hold; '
                   'attester-vs-claim graph race denial and isolation hold; authoritative original registry and '
                   'versioned render manifest mismatch denial; narrow tenant-scoped discovery and provenance lookup; '
-                  'missing/forged/stale historical clearance hold; tenant/asset/URL isolation; fleet quarantine non-bypass')
+                  'missing/forged/stale historical clearance hold; tenant/asset/URL isolation; fleet quarantine non-bypass; '
+                  'service-only exact-manifest bind, ambiguity and claimed/sent-row refusal')
         finally:
             subprocess.run(['pg_ctl','-D',str(data),'-m','immediate','-w','stop'],
                            capture_output=True, timeout=60)
