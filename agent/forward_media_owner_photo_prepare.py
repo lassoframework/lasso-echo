@@ -144,8 +144,16 @@ def prepare_remote_photo(snapshot, *, drive_reader, hosted_reader, recipe, audit
             thumbnail_sha256=('sha256:'+thumbnail.thumbnail_sha256 if thumbnail.thumbnail_sha256 else None),
             thumbnail_fingerprint=thumbnail.thumbnail_fingerprint, thumbnail_length=thumbnail.thumbnail_length)
     certificate = auditor.lookup_for_owner(audit_id, candidate)
-    operation = ('same_object' if row['image_url'] == source.original.source_url
-                 else 'rehost' if recipe['image']['name'] == 'identity' else 'render')
+    # Match guard.attest's complete object tuple: a transformed thumbnail
+    # requires replay even when the delivered image is the original object.
+    source_url = source.original.source_url
+    if all(url is None or url == source_url for url in (row['image_url'], thumbnail.thumbnail_url)):
+        operation = 'same_object'
+    elif image_bytes == source.source_bytes and (
+            thumbnail.thumbnail_bytes is None or thumbnail.thumbnail_bytes == source.source_bytes):
+        operation = 'rehost'
+    else:
+        operation = 'render'
     manifest = prepare.build_render_manifest(source.original, row['image_url'], image_bytes,
         operation, certificate.receipt_ref, render_recipe=recipe,
         thumbnail_url=thumbnail.thumbnail_url, thumbnail_bytes=thumbnail.thumbnail_bytes)
