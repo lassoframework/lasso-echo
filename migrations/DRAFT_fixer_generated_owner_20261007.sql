@@ -85,9 +85,21 @@ begin
  from public.media_asset a where a.gym_id=r.gym_id;
  -- All connected sources must prove a successful, non-revoked, complete sync.
  -- A pending client photo is supply waiting for moderation, not depletion.
+ -- One freshness rule shared by every consumer. The removed ad-hoc
+ -- reservation-path clause policed sync staleness for ALL sources (including
+ -- inactive ones) while the snapshot keyed on active: the confirmed asymmetry.
+ -- An inactive/disconnected source is never supply evidence and simply holds
+ -- the inventory; an ACTIVE source must prove a successful recent sync.
+ -- Time-relative freshness cannot be part of the revision hash, so census
+ -- receipts still expire and final send re-observes (see final check below).
  complete:=not exists(select 1 from jsonb_array_elements(sources) s
-  where s->'active' is distinct from 'true'::jsonb or coalesce(s->>'revoked_externally','false')<>'false'
-    or s->>'sync_status' is distinct from 'ready' or nullif(s->>'sync_finished_at','') is null)
+  where s->'active' is distinct from 'true'::jsonb)
+  and not exists(select 1 from jsonb_array_elements(sources) s
+  where s->'active'='true'::jsonb
+   and (coalesce(s->>'revoked_externally','false')<>'false'
+    or s->>'sync_status' is distinct from 'ready' or nullif(s->>'sync_finished_at','') is null
+    or (s->>'sync_finished_at')::timestamptz<clock_timestamp()-interval '30 minutes'
+    or (s->>'sync_finished_at')::timestamptz>clock_timestamp()))
   and not exists(select 1 from jsonb_array_elements(assets) a
    where a->>'kind'='photo' and a->'eligible' is distinct from 'false'::jsonb
     and coalesce(a->>'excluded_by_coach','false')='false'
@@ -247,6 +259,23 @@ create trigger generated_inventory_lock before insert or update or delete or tru
 create trigger generated_inventory_lock before insert or update or delete or truncate on public.media_source
  for each statement execute function public.fixer_generated_inventory_lock_20261007();
 
+-- A client-approved row keeps its approved visual for every generated
+-- reservation, first or sibling replay: rebinding is allowed only when no
+-- visual was approved yet (or the identical grant is already bound). Anything
+-- else holds for re-approval; approval status itself is never reset, bypassed
+-- or weakened, and an identical grant still passes every other gate below.
+create function public.fixer_generated_approved_visual_guard_20261007(r public.content_calendar,c jsonb,m jsonb)
+returns void language plpgsql stable set search_path=pg_catalog,public as $$
+begin
+ if r.status='approved'
+  and (r.source_media_asset_id is not null or r.source_media_url is not null or r.image_url is not null
+    or r.thumbnail_url is not null or r.render_manifest_digest is not null)
+  and (r.source_media_asset_id is distinct from 'generated-astra:'||(c->>'job_id')
+    or r.source_media_url is distinct from c->>'original_url' or r.image_url is distinct from c->>'original_url'
+    or r.thumbnail_url is not null or r.render_manifest_digest is distinct from m->>'manifest_digest') then
+  raise exception 'approved visual cannot change without re-approval or hold' using errcode='23514'; end if;
+end; $$;
+
 -- Existing owner is the trust boundary for authenticated generation + exact
 -- copy/palette + historical byte reads. No service/auditor self-approval API.
 create function public.fixer_reserve_generated_20261007(p_id uuid,c jsonb,visuals jsonb,m jsonb)
@@ -263,6 +292,7 @@ begin
  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0));
  select * into r from public.content_calendar where id=p_id for update;
+ perform public.fixer_generated_approved_visual_guard_20261007(r,c,m);
  snap:=public.fixer_generated_snapshot_20261007(p_id);
  if jsonb_typeof(c)<>'object' or c->'schema_version' is distinct from '1'::jsonb
   or c->>'source_type' is distinct from 'generated_astra_infographic' or c->>'provider' is distinct from 'astra'
@@ -299,6 +329,8 @@ begin
    if r.status not in ('draft','pending','queued','approved') or r.variant_status is distinct from 'active'
     or r.publish_claim_token is not null or r.published_at is not null or r.late_post_id is not null then
     raise exception 'generated sibling must be unsent' using errcode='23514'; end if;
+   -- Approved-visual guard already ran right after the row lock, before
+   -- any generated authority checks, for both first reserves and replays.
    update public.content_calendar set source_media_asset_id='generated-astra:'||(c->>'job_id'),source_media_url=c->>'original_url',image_url=c->>'original_url',thumbnail_url=null,render_manifest_digest=m->>'manifest_digest' where id=p_id;
   elsif r.source_media_asset_id is distinct from 'generated-astra:'||(c->>'job_id')
     or r.source_media_url is distinct from c->>'original_url' or r.image_url is distinct from c->>'original_url'
@@ -395,7 +427,8 @@ end; $$;
 
 create function public.fixer_generated_runtime_check_20261007(p_id uuid)
 returns boolean language plpgsql security definer set search_path=pg_catalog,public as $$
-declare r public.content_calendar%rowtype; g public.fixer_generated_reservation_20261007%rowtype; snap jsonb; h jsonb; ph text;
+declare r public.content_calendar%rowtype; g public.fixer_generated_reservation_20261007%rowtype;
+ s record; snap jsonb; h jsonb; ph text;
 begin
  select * into r from public.content_calendar where id=p_id;
  select * into g from public.fixer_generated_reservation_20261007
@@ -425,6 +458,14 @@ begin
   or r.source_media_url is distinct from r.image_url or r.thumbnail_url is not null
   or g.manifest_json->>'manifest_digest' is distinct from r.render_manifest_digest then
   raise exception 'generated current content/depletion/history binding changed' using errcode='23514'; end if;
+ -- Final send re-observes local depletion: reserve-time revisions were
+ -- identity, not freshness. Without a current-revision, complete, zero-supply
+ -- owner observation inside ten minutes the send holds, exactly as for stills.
+ select * into s from public.fixer_still_cutover_20261007 where singleton;
+ if not coalesce(s.enabled,false) or s.epoch_id is null or not exists(select 1 from public.fixer_still_inventory_20261007 i
+   where i.epoch_id=s.epoch_id and i.gym_id=r.gym_id and i.inventory_revision=snap->>'inventory_revision'
+    and i.local_complete and i.local_available=0 and i.observed_at>=clock_timestamp()-interval '10 minutes') then
+  raise exception 'generated final send requires fresh local depletion authority' using errcode='23514'; end if;
  for h in select value from jsonb_array_elements(snap#>'{history,rows}') loop
   -- Known same logical generated siblings, including their committed claim.
   if exists(select 1 from public.fixer_generated_reservation_20261007 sibling
@@ -629,31 +670,18 @@ begin
    or (o->>'phash' is not null and public.fixer_generated_hamming_20261007(k.original->>'phash',o->>'phash')<=6))) then
   raise exception 'known still history denied or quarantined' using errcode='23514'; end if;
 end; $$;
-create function public.fixer_still_reservation_check_20261007(p_row uuid,o jsonb,p_kind text,p_inventory uuid,p_clearance uuid)
+-- Exact AND perceptual occupancy across every retained published/delivered
+-- visual authority: forward claims, owner photo reservations, the approved
+-- fleet photo baseline, generated reservations and perceptual receipts, known
+-- negative history and staged originals. A resolved delivered baseline row
+-- carrying a pHash also denies near duplicates (not only exact bytes); a
+-- resolved row with neither exact bytes nor a valid pHash fails CLOSED.
+-- Novelty is never inferred from missing or unknown perceptual evidence.
+create function public.fixer_still_occupancy_check_20261007(p_row uuid,o jsonb)
 returns void language plpgsql security definer set search_path=pg_catalog,public as $$
-declare r public.content_calendar%rowtype; s public.fixer_still_cutover_20261007%rowtype; snap jsonb;
+declare r public.content_calendar%rowtype;
 begin
- select * into s from public.fixer_still_cutover_20261007 where singleton;
  select * into r from public.content_calendar where id=p_row;
- snap:=public.fixer_generated_snapshot_20261007(p_row);
- if not s.enabled or not public.fixer_still_tuple_valid_20261007(o) or o->>'gym_id' is distinct from r.gym_id
-  or p_kind not in ('photo','graphic') or p_kind is null
-  or snap->'photo_inventory_complete' is distinct from 'true'::jsonb
-  or exists(select 1 from public.media_source src where src.gym_id=r.gym_id and src.kind='gym_drive'
-    and (src.sync_finished_at<clock_timestamp()-interval '30 minutes' or src.sync_finished_at>clock_timestamp()))
-  or not exists(select 1 from public.fixer_still_inventory_20261007 i where i.receipt_id=p_inventory
-    and i.epoch_id=s.epoch_id and i.gym_id=r.gym_id and i.inventory_revision=snap->>'inventory_revision'
-    and i.local_complete and i.observed_at>=clock_timestamp()-interval '10 minutes'
-    and (p_kind='photo' or (i.local_available=0 and snap->'eligible_photo_count'='0'::jsonb)))
-  or not exists(select 1 from public.fixer_still_known_20261007 k where k.receipt_id=p_clearance and k.original=o
-    and k.decision in ('cleared_fresh','cleared_certificate') and k.epoch_id=s.epoch_id
-    and (k.decision='cleared_certificate' or k.observed_at>=s.cutover_at)) then
-  raise exception 'still cutover source or inventory authority unavailable' using errcode='23514'; end if;
- if p_kind='photo' and not exists(select 1 from public.media_asset a join public.media_source src on src.id=a.source_id
-  where a.id=o->>'source_asset_id' and a.gym_id=r.gym_id and src.gym_id=r.gym_id and src.active
-   and src.kind='gym_drive' and src.sync_status='ready' and a.content_hash=right(o->>'md5',32)
-   and public.fixer_owner_photo_source_ready_20261007(a.id,o->>'sha256')) then
-  raise exception 'current approved photo original required' using errcode='23514'; end if;
  perform public.fixer_still_negative_check_20261007(o);
  if exists(select 1 from public.fixer_still_reservation_20261007 g where
   (g.original->>'sha256'=o->>'sha256' or g.original->>'md5'=o->>'md5' or g.original->>'source_url'=o->>'source_url'
@@ -672,11 +700,83 @@ begin
     join public.fixer_forward_media_photo_policy_20261007 policy on policy.policy_id=b.policy_id
     cross join lateral jsonb_array_elements(b.rows_json) h
     where policy.approved and h->'resolved'='true'::jsonb and h->>'media_kind'='still_photo'
-     and h->>'visual_sha256'=o->>'sha256')
+     and (h->>'visual_sha256'=o->>'sha256'
+      or (h->>'phash' ~ '^scene:phash64:[0-9a-f]{16}$'
+        and public.fixer_generated_hamming_20261007(h->>'phash',o->>'phash')<=6)
+      or (h->>'phash' ~ '^scene:phash64:[0-9a-f]{16}$') is not true))
   or exists(select 1 from public.fixer_forward_media_historical_original_20261007 h where h.source_fingerprint=o->>'md5')
   or exists(select 1 from public.fixer_forward_media_use_20261006 u where u.fingerprint=o->>'md5'
     and not(u.tenant_id=r.gym_id and u.post_date=r.post_date and u.group_key=r.visual_group_key)) then
   raise exception 'still original or delivered visual already reserved' using errcode='23514'; end if;
+end; $$;
+
+-- RESERVE-TIME authority. The submitted census receipt must be fresh HERE.
+-- Source freshness lives in the snapshot itself (one shared rule for active
+-- sources; inactive sources hold rather than deplete). The final-send path
+-- below never trusts this stored, later-stale receipt for freshness.
+create function public.fixer_still_reservation_check_20261007(p_row uuid,o jsonb,p_kind text,p_inventory uuid,p_clearance uuid)
+returns void language plpgsql security definer set search_path=pg_catalog,public as $$
+declare r public.content_calendar%rowtype; s public.fixer_still_cutover_20261007%rowtype; snap jsonb;
+begin
+ select * into s from public.fixer_still_cutover_20261007 where singleton;
+ select * into r from public.content_calendar where id=p_row;
+ snap:=public.fixer_generated_snapshot_20261007(p_row);
+ if not s.enabled or not public.fixer_still_tuple_valid_20261007(o) or o->>'gym_id' is distinct from r.gym_id
+  or p_kind not in ('photo','graphic') or p_kind is null
+  or snap->'photo_inventory_complete' is distinct from 'true'::jsonb
+  or not exists(select 1 from public.fixer_still_inventory_20261007 i where i.receipt_id=p_inventory
+    and i.epoch_id=s.epoch_id and i.gym_id=r.gym_id and i.inventory_revision=snap->>'inventory_revision'
+    and i.local_complete and i.observed_at>=clock_timestamp()-interval '10 minutes'
+    and (p_kind='photo' or (i.local_available=0 and snap->'eligible_photo_count'='0'::jsonb)))
+  or not exists(select 1 from public.fixer_still_known_20261007 k where k.receipt_id=p_clearance and k.original=o
+    and k.decision in ('cleared_fresh','cleared_certificate') and k.epoch_id=s.epoch_id
+    and (k.decision='cleared_certificate' or k.observed_at>=s.cutover_at)) then
+  raise exception 'still cutover source or inventory authority unavailable' using errcode='23514'; end if;
+ if p_kind='photo' and not exists(select 1 from public.media_asset a join public.media_source src on src.id=a.source_id
+  where a.id=o->>'source_asset_id' and a.gym_id=r.gym_id and src.gym_id=r.gym_id and src.active
+   and src.kind='gym_drive' and src.sync_status='ready' and a.content_hash=right(o->>'md5',32)
+   and public.fixer_owner_photo_source_ready_20261007(a.id,o->>'sha256')) then
+  raise exception 'current approved photo original required' using errcode='23514'; end if;
+ perform public.fixer_still_occupancy_check_20261007(p_row,o);
+end; $$;
+
+-- FINAL-SEND authority for a permanent still reservation. Separates
+-- reserve-time freshness from final-send freshness: the immutable reservation
+-- identity (original, receipts, bindings) is never rewritten, but the stored
+-- reserve-time receipt is never re-trusted for freshness either, so a
+-- reservation older than ten minutes stays sendable instead of self-locking.
+-- A FRESH authoritative census (same epoch, matching the CURRENT live
+-- revision, observed within ten minutes) must exist at send time, and the
+-- reservation's bound gym/date/logical_post_id/group_key must still match the
+-- current calendar row, so redating or retargeting holds. Any new inventory,
+-- photo or moderation change since reservation changes the live snapshot and
+-- holds the send (photo-first denial preserved); a still-true fresh census
+-- keeps an old reservation sendable.
+create function public.fixer_still_final_check_20261007(p_row uuid,p_receipt uuid)
+returns void language plpgsql security definer set search_path=pg_catalog,public as $$
+declare r public.content_calendar%rowtype; s public.fixer_still_cutover_20261007%rowtype;
+ g public.fixer_still_reservation_20261007%rowtype; snap jsonb;
+begin
+ select * into s from public.fixer_still_cutover_20261007 where singleton;
+ select * into r from public.content_calendar where id=p_row;
+ select * into g from public.fixer_still_reservation_20261007 where receipt_id=p_receipt;
+ snap:=public.fixer_generated_snapshot_20261007(p_row);
+ if not found or r.id is null or not s.enabled or s.epoch_id is distinct from g.epoch_id
+  or g.gym_id is distinct from r.gym_id or g.local_date is distinct from r.post_date
+  or g.logical_post_id is distinct from (to_jsonb(r)->>'logical_post_id')::uuid
+  or g.group_key is distinct from r.visual_group_key
+  or snap->'photo_inventory_complete' is distinct from 'true'::jsonb
+  or not exists(select 1 from public.fixer_still_inventory_20261007 i
+    where i.epoch_id=s.epoch_id and i.gym_id=r.gym_id and i.inventory_revision=snap->>'inventory_revision'
+     and i.local_complete and i.observed_at>=clock_timestamp()-interval '10 minutes'
+     and (g.media_kind='photo' or (i.local_available=0 and snap->'eligible_photo_count'='0'::jsonb))) then
+  raise exception 'still final send requires current binding and fresh inventory authority' using errcode='23514'; end if;
+ if g.media_kind='photo' and not exists(select 1 from public.media_asset a join public.media_source src on src.id=a.source_id
+  where a.id=g.original->>'source_asset_id' and a.gym_id=r.gym_id and src.gym_id=r.gym_id and src.active
+   and src.kind='gym_drive' and src.sync_status='ready' and a.content_hash=right(g.original->>'md5',32)
+   and public.fixer_owner_photo_source_ready_20261007(a.id,g.original->>'sha256')) then
+  raise exception 'current approved photo original required' using errcode='23514'; end if;
+ perform public.fixer_still_occupancy_check_20261007(p_row,g.original);
 end; $$;
 create function public.fixer_still_reserve_20261007(p_id uuid,p_row uuid,o jsonb,p_kind text,p_inventory uuid,p_clearance uuid)
 returns uuid language plpgsql security definer set search_path=pg_catalog,public as $$
@@ -715,7 +815,9 @@ begin
    or g.original->>'md5' is distinct from p#>>'{original,source_fingerprint}'
    or g.original->>'source_url' is distinct from p#>>'{manifest,image_url}' or p#>>'{manifest,thumbnail_url}' is not null then
    raise exception 'still reservation requires exact original delivery' using errcode='23514'; end if;
-  perform public.fixer_still_reservation_check_20261007(p_id,g.original,g.media_kind,g.inventory_receipt,g.clearance_receipt);
+  -- Final claim re-verifies the bound row identity and requires a fresh
+  -- census; the immutable reserve-time receipt is identity, not freshness.
+  perform public.fixer_still_final_check_20261007(p_id,g.receipt_id);
  end if;
  return p;
 end; $$;
@@ -723,13 +825,16 @@ do $$ declare f text; begin
  foreach f in array array['fixer_still_owner_lock_20261007()','fixer_still_cutover_control_20261007(boolean,text)',
  'fixer_still_tuple_valid_20261007(jsonb)','fixer_still_known_record_20261007(uuid,text,jsonb,text)',
  'fixer_still_inventory_record_20261007(uuid,uuid,text,boolean,integer,text)','fixer_still_negative_check_20261007(jsonb)',
- 'fixer_still_reservation_check_20261007(uuid,jsonb,text,uuid,uuid)','fixer_still_reserve_20261007(uuid,uuid,jsonb,text,uuid,uuid)',
+ 'fixer_still_occupancy_check_20261007(uuid,jsonb)','fixer_still_reservation_check_20261007(uuid,jsonb,text,uuid,uuid)',
+ 'fixer_still_final_check_20261007(uuid,uuid)','fixer_still_reserve_20261007(uuid,uuid,jsonb,text,uuid,uuid)',
+ 'fixer_generated_approved_visual_guard_20261007(public.content_calendar,jsonb,jsonb)',
  'fixer_pre_still_provenance_20261007(uuid)','fixer_forward_media_provenance_lookup_20261006(uuid)'] loop
   execute 'revoke all on function public.'||f||' from public,anon,authenticated,service_role,fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006,fixer_forward_media_photo_auditor_20261007';
  end loop;
 end; $$;
 grant execute on function public.fixer_still_cutover_control_20261007(boolean,text),
  public.fixer_still_known_record_20261007(uuid,text,jsonb,text),public.fixer_still_inventory_record_20261007(uuid,uuid,text,boolean,integer,text),
- public.fixer_still_reserve_20261007(uuid,uuid,jsonb,text,uuid,uuid) to fixer_forward_media_owner_20261006;
+ public.fixer_still_reserve_20261007(uuid,uuid,jsonb,text,uuid,uuid),
+ public.fixer_still_final_check_20261007(uuid,uuid) to fixer_forward_media_owner_20261006;
 grant execute on function public.fixer_forward_media_provenance_lookup_20261006(uuid) to fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006;
 commit;
