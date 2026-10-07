@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import uuid
 
+from .. import config
 from . import identity_gate as _ig
 from .adapter import _slack_escape, KIND_OUTREACH_REQUEST
 
@@ -304,15 +305,18 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
         text = (_slack_escape(message_text) if message_text is not None
                else first_message_text(ticket, ident))
 
+    current_notice = bool(completion and current_notice_bus is not None
+                          and ticket.get("product") == "echo"
+                          and ticket.get("source") == "website_tab")
+    if current_notice and not config.slack_convo_echo_current_notice_enabled():
+        return OutreachResult(opened=False, reason="current_notice_disabled")
+
     opened = open_group_dm([BLAKE_SLACK_USER_ID, who.slack_user_id])
     if not opened or not opened.get("ok") or not opened.get("channel_id"):
         log(f"[outreach] conversations.open failed ticket={(ticket or {}).get('id')}")
         return OutreachResult(opened=False, reason="open_failed")
     channel_id = opened["channel_id"]
 
-    current_notice = bool(completion and current_notice_bus is not None
-                          and ticket.get("product") == "echo"
-                          and ticket.get("source") == "website_tab")
     notice_id = ""
     attempt_token = ""
     if current_notice:
@@ -368,12 +372,13 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
     row = record_outbound(**outbound_args)
     row_id = (row or {}).get("id")
 
-    def cancel_unclaimed_current_notice(reason):
+    def cancel_current_notice(reason, *, claimed=False):
         if not current_notice or not row_id:
             return
         try:
-            canceled = current_notice_bus.suppress_unclaimed_current_notice(
-                row_id, reason)
+            suppress = (current_notice_bus.suppress_unattempted_current_notice
+                        if claimed else current_notice_bus.suppress_unclaimed_current_notice)
+            canceled = suppress(row_id, reason)
             if not canceled or canceled.get("delivery_status") != "suppressed":
                 return  # a competing claimant may own the posting row
             current_notice_bus.record_outbound(
@@ -385,7 +390,7 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
                 meta={"identity": getattr(ident, "name", ""),
                       "suppressed_message_id": row_id})
         except Exception as exc:  # noqa: BLE001 - no customer POST occurred
-            log(f"[outreach] unclaimed current notice cancellation/alert failed "
+            log(f"[outreach] current notice cancellation/alert failed "
                 f"row={row_id}: {type(exc).__name__}")
 
     # D44 (MINOR, Frame 2 closing-audit finding): the row sat in 'ready' for the whole
@@ -402,11 +407,11 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
             claimed = claim_message(row_id)
         except Exception as e:  # noqa: BLE001 - a claim failure refuses, never guesses
             log(f"[outreach] claim_message failed row={row_id}: {type(e).__name__}")
-            cancel_unclaimed_current_notice("FIXER first-contact claim failed before Slack")
+            cancel_current_notice("FIXER first-contact claim failed before Slack")
             return OutreachResult(opened=True, channel_id=channel_id, reason="claim_failed")
         if not claimed:
             log(f"[outreach] row={row_id} already claimed by another consumer, backing off")
-            cancel_unclaimed_current_notice("FIXER first-contact claim was not acquired")
+            cancel_current_notice("FIXER first-contact claim was not acquired")
             return OutreachResult(opened=True, channel_id=channel_id, reason="lost_claim")
 
     if ticket_lookup is not None:
@@ -423,7 +428,10 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
                 or current_notice and (fresh.get("slack_channel_id") is not None
                                        or fresh.get("slack_thread_ts") is not None)
                 or fresh.get("escalated") is True or fresh.get("hold_tier") is not None):
-            if mark_message is not None and row_id is not None:
+            if current_notice:
+                cancel_current_notice("FIXER delivery identity changed before Slack",
+                                      claimed=True)
+            elif mark_message is not None and row_id is not None:
                 try:
                     mark_message(row_id, "suppressed",
                                  meta_update={"suppressed_why": "delivery identity changed"})

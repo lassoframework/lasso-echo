@@ -1,3 +1,17 @@
+## FIXER current notice release repairs (2026-10-07, PR #317)
+
+- [~] Reserved ready first-contact notices abandoned before claim now expire through
+  exact ready/status/receipt/attachment CAS suppression with staff escalation. They
+  never requeue or send from the outbox; active and competing owners are preserved.
+- [~] First-contact identity changes use claimed pre-intent CAS suppression and
+  escalation instead of a legacy unconditional status write.
+- [~] `SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED` defaults OFF. New reservations,
+  tokenized inserts/dispatch, route binds and current-notice resolution require it.
+  Ordinary Echo website-tab answers still cannot certify a fix or close a ticket.
+- [~] Targeted local caller, worker, wiring and Slack adapter suites: 766 passed.
+- [ ] Independent acceptance, paired portal migration 0605 live verification, and
+  release/activation remain with the integration owner. No deployment or flag change.
+
 ## Four production bugs (2026-10-06)
 
 - [~] Caption formatter presentation (whitespace/line breaks) no longer demotes an

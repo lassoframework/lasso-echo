@@ -4,13 +4,21 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import time
 
+import json
+import pytest
+
 from agent import echo_ticket_worker as worker
 from agent.slack_convo import outbox, outreach
-from agent.slack_convo.bus import Bus
+from agent.slack_convo.bus import Bus, BusError
 
 
 NOTICE_TOKEN = "0b9c3b7a-4077-4a45-82c7-d351d766beef"
 TICKET_ID = "30205455-1555-4150-a69a-247a0b4c91ab"
+
+
+@pytest.fixture(autouse=True)
+def arm_current_notice_for_contract_tests(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", "true")
 
 
 class NoticeBus:
@@ -451,3 +459,179 @@ def test_expired_token_claim_before_intent_is_suppressed_not_requeued():
         now=datetime.now(timezone.utc), summary=summary) == 1
     assert bus.events == ["suppressed", "alert"]
     assert summary["suppressed"] == 1
+
+
+def _reserved_ready_row(now):
+    return {"id": "70164909-16b5-43df-b6a3-8d7499d51485",
+            "ticket_id": TICKET_ID, "delivery_status": "ready",
+            "created_at": (now - timedelta(minutes=5)).isoformat(),
+            "slack_ts": None, "slack_event_id": None,
+            "attachments": {"fixer": True, "identity": "echo",
+                            "fixer_route_pending": True,
+                            "fixer_current_attempt_token": NOTICE_TOKEN}}
+
+
+@pytest.mark.parametrize("initial_failure", [False, True])
+def test_crashed_ready_reservation_recovered_by_sweep_without_send(
+        monkeypatch, initial_failure):
+    now = datetime.now(timezone.utc)
+    row = _reserved_ready_row(now)
+    bus = Bus(url="https://example.test", service_key="test")
+    alerts = []
+    attempts = []
+    monkeypatch.setattr(bus, "message", lambda _mid: deepcopy(row))
+
+    def patch(_table, match, fields):
+        attempts.append(match)
+        assert match["delivery_status"] == "eq.ready"
+        assert match["slack_ts"] == match["slack_event_id"] == "is.null"
+        assert json.loads(match["attachments"][3:]) == row["attachments"]
+        if initial_failure and len(attempts) == 1:
+            raise TimeoutError("compensation database unavailable")
+        row.update(deepcopy(fields))
+        return deepcopy(row)
+
+    monkeypatch.setattr(bus, "_patch", patch)
+    monkeypatch.setattr(bus, "record_outbound", lambda **kw: alerts.append(kw))
+    snapshot = deepcopy(row)
+    summary = {"skipped": 0, "suppressed": 0}
+    post = lambda *_a, **_kw: pytest.fail("reserved row must never post")
+    for _ in range(3):
+        outbox._dispatch_one(bus, post, snapshot,
+                             identity=SimpleNamespace(name="echo"),
+                             log=lambda _msg: None, summary=summary, now=now)
+    assert row["delivery_status"] == "suppressed"
+    assert summary["suppressed"] == 1
+    assert len(alerts) == 1
+    assert alerts[0]["kind"] == "escalation"
+    assert alerts[0]["meta"]["suppressed_message_id"] == row["id"]
+
+
+@pytest.mark.parametrize("race", ["claim", "intent", "receipt", "attachment"])
+def test_ready_recovery_cas_loses_to_concurrent_owner(monkeypatch, race):
+    now = datetime.now(timezone.utc)
+    row = _reserved_ready_row(now)
+    snapshot = deepcopy(row)
+    bus = Bus(url="https://example.test", service_key="test")
+    monkeypatch.setattr(bus, "message", lambda _mid: deepcopy(row))
+
+    def patch(_table, match, _fields):
+        if race == "claim":
+            row["delivery_status"] = "posting"
+        elif race == "intent":
+            row["attachments"]["fixer_slack_delivery_intent"] = {"channel": "G"}
+        elif race == "receipt":
+            row["slack_ts"] = "1.2"
+        else:
+            row["attachments"]["owner_marker"] = "changed"
+        assert (match["delivery_status"] != f"eq.{row['delivery_status']}"
+                or json.loads(match["attachments"][3:]) != row["attachments"]
+                or row["slack_ts"] is not None)
+        return None
+
+    monkeypatch.setattr(bus, "_patch", patch)
+    monkeypatch.setattr(bus, "record_outbound", lambda **_kw: pytest.fail("lost CAS alert"))
+    summary = {"skipped": 0, "suppressed": 0}
+    outbox._dispatch_one(bus, lambda *_a, **_kw: pytest.fail("duplicate send"),
+                         snapshot, identity=SimpleNamespace(name="echo"),
+                         log=lambda _msg: None, summary=summary, now=now)
+    assert row["delivery_status"] != "suppressed"
+    assert summary == {"skipped": 1, "suppressed": 0}
+
+
+def test_recent_or_other_identity_ready_reservation_is_untouched(monkeypatch):
+    now = datetime.now(timezone.utc)
+    bus = Bus(url="https://example.test", service_key="test")
+    monkeypatch.setattr(bus, "message", lambda _mid: pytest.fail("active owner read"))
+    row = _reserved_ready_row(now)
+    for created, identity in [(now, "echo"), (now - timedelta(minutes=5), "scout")]:
+        row["created_at"] = created.isoformat()
+        summary = {"skipped": 0}
+        outbox._dispatch_one(bus, lambda *_a, **_kw: pytest.fail("duplicate send"),
+                             row, identity=SimpleNamespace(name=identity),
+                             log=lambda _msg: None, summary=summary, now=now)
+        assert summary["skipped"] == 1
+
+
+@pytest.mark.parametrize("suppress_wins", [True, False])
+def test_identity_changed_first_contact_uses_claimed_cas_only(suppress_wins):
+    class ChangedBus(NoticeBus):
+        def claim_message(self, mid):
+            result = super().claim_message(mid)
+            self.current["request_version"] += 1
+            return result
+
+        def suppress_unattempted_current_notice(self, mid, reason):
+            assert self.row["id"] == mid and self.row["delivery_status"] == "posting"
+            assert self.row["attachments"].get("fixer_slack_delivery_intent") is None
+            assert "identity changed" in reason
+            self.events.append("suppress_cas")
+            if not suppress_wins:
+                return None
+            self.row["delivery_status"] = "suppressed"
+            return deepcopy(self.row)
+
+        def record_outbound(self, **kw):
+            if kw["kind"] == "escalation":
+                self.events.append("staff_alert")
+                return {"id": "staff-alert"}
+            return super().record_outbound(**kw)
+
+    bus = ChangedBus()
+    _snapshot, result, posts = _send(bus)
+    assert result.reason == "delivery_identity_changed"
+    assert posts == []
+    assert bus.events == ["begin", "insert", "claim", "suppress_cas"] + (
+        ["staff_alert"] if suppress_wins else [])
+    assert bus.row["delivery_status"] == ("suppressed" if suppress_wins else "posting")
+
+
+def test_current_notice_flag_defaults_off_and_refuses_new_paths(monkeypatch):
+    monkeypatch.delenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED")
+    assert outbox.config.slack_convo_echo_current_notice_enabled() is False
+    bus = NoticeBus()
+    _snapshot, result, posts = _send(bus)
+    assert result.reason == "current_notice_disabled" and not result.opened
+    assert bus.events == [] and bus.row is None and posts == []
+
+    real_bus = Bus(url="https://example.test", service_key="test")
+    monkeypatch.setattr(real_bus, "_current_notice_rpc", lambda *_a: pytest.fail("flag OFF RPC"))
+    monkeypatch.setattr(real_bus, "_insert", lambda *_a: pytest.fail("flag OFF insert"))
+    monkeypatch.setattr(real_bus, "ticket", lambda _tid: deepcopy(bus.current))
+    mid = "70164909-16b5-43df-b6a3-8d7499d51485"
+    assert real_bus.begin_current_notice(bus.current, mid) is None
+    assert not real_bus.bind_current_notice_route(TICKET_ID, 3, mid, NOTICE_TOKEN, "G", "1.2")
+    assert real_bus.resolve_current_notice(bus.current, mid, NOTICE_TOKEN, "verification") is None
+    for meta, message_id in [({"fixer": True, "resolve_notice": True}, None),
+                             ({"fixer_current_attempt_token": NOTICE_TOKEN}, mid)]:
+        with pytest.raises(BusError, match="capability disabled"):
+            real_bus.record_outbound(ticket_id=TICKET_ID, author_type="echo", body="Fixed.",
+                                     delivery_status="ready", kind="status",
+                                     meta=meta, message_id=message_id)
+
+
+def test_flag_off_never_dispatches_existing_token_notice(monkeypatch):
+    monkeypatch.delenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED")
+    row = _reserved_ready_row(datetime.now(timezone.utc))
+    row["attachments"].pop("fixer_route_pending")
+    summary = {"skipped": 0}
+    outbox._dispatch_one(None, lambda *_a: pytest.fail("flag OFF post"), row,
+                         identity=SimpleNamespace(name="echo"),
+                         log=lambda _msg: None, summary=summary)
+    assert summary["skipped"] == 1
+
+
+def test_released_non_fixer_answer_cannot_resolve_unverified_website_ticket():
+    class AnswerBus(NoticeBus):
+        def set_ticket(self, *_a, **_kw):
+            pytest.fail("ordinary answer cannot certify a fix")
+
+    bus = AnswerBus()
+    row = {"id": "70164909-16b5-43df-b6a3-8d7499d51485",
+           "ticket_id": TICKET_ID, "delivery_status": "posted",
+           "attachments": {"kind": "answer", "released_by": "U_BLAKE"}}
+    summary = {"resolved": 0}
+    outbox._resolve_on_answer(bus, bus.current, row, "answer", summary,
+                              att=row["attachments"], body="Your account is connected.")
+    assert bus.current["status"] == "verification"
+    assert summary["resolved"] == 0

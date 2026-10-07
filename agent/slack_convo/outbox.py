@@ -1847,6 +1847,32 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     if att.get("fixer_route_pending") is True:
         # Direct first-contact completion owns this reserved row. An outbox
         # sweep must never turn it into a portal delivery or a second Slack POST.
+        # A crash before claim (or failed cancellation) leaves it in ready. Only
+        # cancel after the direct owner's grace period, via exact ready CAS. If
+        # a concurrent owner claimed/prepared it, that CAS loses without mutation.
+        if (att.get("identity") == identity.name
+                and att.get("fixer_current_attempt_token")
+                and _age_seconds(row, now) >= CLAIM_TIMEOUT_SECONDS):
+            try:
+                canceled = bus.suppress_unclaimed_current_notice(
+                    row["id"], "Reserved FIXER notice expired before direct claim")
+                if canceled and canceled.get("delivery_status") == "suppressed":
+                    summary["suppressed"] = int(summary.get("suppressed") or 0) + 1
+                    bus.record_outbound(
+                        ticket_id=row["ticket_id"], author_type="system",
+                        body=(f"FIXER first-contact notice {row['id']} on ticket "
+                              f"{row['ticket_id']} was canceled before Slack delivery. "
+                              "Review the ticket before opening another notice."),
+                        delivery_status="ready", kind=_a.KIND_ESCALATION,
+                        meta={"identity": identity.name,
+                              "suppressed_message_id": row["id"]})
+            except Exception as exc:  # noqa: BLE001 - retry ready CAS next sweep
+                log(f"[slack-convo/outbox] reserved notice recovery/alert failed "
+                    f"row={row['id']}: {type(exc).__name__}")
+        summary["skipped"] += 1
+        return
+    if (att.get("fixer_current_attempt_token")
+            and not config.slack_convo_echo_current_notice_enabled()):
         summary["skipped"] += 1
         return
     if (att.get("fixer_slack_delivery_intent") is not None

@@ -281,6 +281,8 @@ class Bus:
 
     def begin_current_notice(self, ticket, notice_id, *, unrouted=False):
         """Reserve one exact notice before its outbound INSERT (portal 0384)."""
+        if not config.slack_convo_echo_current_notice_enabled():
+            return None
         if not _UUID.fullmatch(str(notice_id or "")):
             raise BusError(400, "invalid current notice id")
         version = ticket.get("request_version")
@@ -307,6 +309,8 @@ class Bus:
 
     def bind_current_notice_route(self, ticket_id, request_version, notice_id,
                                   token, channel_id, thread_ts):
+        if not config.slack_convo_echo_current_notice_enabled():
+            return False
         return self._current_notice_rpc("fixer_bind_current_delivery_route", {
             "p_ticket_id": ticket_id,
             "p_expected_request_version": request_version,
@@ -318,6 +322,8 @@ class Bus:
 
     def resolve_current_notice(self, ticket, notice_id, token, delivery_status):
         """Close only the posted row named by this current attempt."""
+        if not config.slack_convo_echo_current_notice_enabled():
+            return None
         result = self._current_notice_rpc("fixer_resolve_current_notice", {
             "p_ticket_id": ticket["id"],
             "p_expected_request_version": ticket["request_version"],
@@ -564,11 +570,12 @@ class Bus:
         att = {"kind": kind}
         if meta:
             att.update(meta)
+        if (att.get("fixer_current_attempt_token")
+                and not config.slack_convo_echo_current_notice_enabled()):
+            raise BusError(409, "current notice capability disabled")
         # Portal 0384 requires the exact notice ID and attempt token at INSERT.
-        # Only a current Echo website-tab completion enters this path. Held
-        # release proofs keep their separate 0383 reservation protocol.
+        # Only a current unheld Echo website-tab completion enters this path.
         current_notice = (att.get("fixer") is True
-                          and att.get("fixer_release") is not True
                           and (kind == "answer" or
                                kind == "status" and att.get("resolve_notice") is True))
         if current_notice and message_id is None:
@@ -586,6 +593,8 @@ class Bus:
                     current_notice = False
             if current_notice and (ticket or {}).get("product") == "echo" and (
                     ticket or {}).get("source") == "website_tab":
+                if not config.slack_convo_echo_current_notice_enabled():
+                    raise BusError(409, "current notice capability disabled")
                 message_id = str(uuid.uuid4())
                 token = self.begin_current_notice(ticket, message_id)
                 if not token:
