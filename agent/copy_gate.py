@@ -28,7 +28,15 @@ _DASH_RE = re.compile("[" + _BANNED_DASHES + "]")
 _ZERO_WIDTH = "​⁠﻿­"
 _ZERO_WIDTH_RE = re.compile("[" + _ZERO_WIDTH + "]")
 _INTRAWORD_HYPHEN_RE = re.compile(r"(?<=[A-Za-z])-(?=[A-Za-z])")
+# CONSUMER COPY LAW (Blake, 2026-10-07): client captions carry NO hyphen of any kind
+# (letter-letter, digit-letter like "30-minute", list bullets), no colon and no
+# semicolon. URLs, emails' domains, @handles and #tags are protected spans.
+_ANY_HYPHEN_RE = re.compile(r"-")
+_CLOCK_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+_COLON_RE = re.compile(r"\s*:\s*")
+_BULLET_RE = re.compile(r"(?m)^[ \t]*-+[ \t]*")
 # protect URLs and @handles/#tags: hyphens inside them are load-bearing
+_HYPHEN_AS_DASH_RE = re.compile(r"[ \t]+-+[ \t]+|-{2,}")
 _PROTECTED_RE = re.compile(r"(?:https?://\S+|\b[\w.-]+\.(?:com|net|org|io|co|fit|gym)\S*|[@#][\w.]+)", re.I)
 
 # A real email address, anywhere in the text. HARD violation (2026-09-08, Zanshin Fitness /
@@ -86,10 +94,21 @@ def scrub_prompt(text: str) -> str:
     cleaned = _DASH_RE.sub(" ", s)
     return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
+def _clock(m):
+    hh, mm = m.group(1), m.group(2)
+    return hh if mm == "00" else f"{hh}.{mm}"
+
+
 def _scrub_plain(t: str) -> str:
     t = _DASH_RE.sub(", ", t)
-    t = _INTRAWORD_HYPHEN_RE.sub(" ", t)
+    t = _BULLET_RE.sub("", t)
+    t = _HYPHEN_AS_DASH_RE.sub(", ", t)
+    t = _ANY_HYPHEN_RE.sub(" ", t)
+    t = _CLOCK_RE.sub(_clock, t)
+    t = _COLON_RE.sub(", ", t)
     t = t.replace(";", ",")
+    t = re.sub(r",\s*,", ",", t)
+    t = re.sub(r"^\s*,\s*", "", t)
     t = re.sub(r"\s+,", ",", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t
@@ -153,6 +172,8 @@ def violations(text: str) -> list[str]:
     plain = _PROTECTED_RE.sub("", s)
     if _DASH_RE.search(plain): v.append("banned_dash")
     if _INTRAWORD_HYPHEN_RE.search(plain): v.append("intraword_hyphen")
+    elif "-" in plain: v.append("hyphen")
+    if ":" in plain: v.append("colon")
     if ";" in s: v.append("semicolon")
     # Checked on the RAW text, never the _PROTECTED_RE-stripped `plain`: an email's domain half
     # (zanshin.fit) is exactly the shape _PROTECTED_RE exists to protect (real URLs/domains), so

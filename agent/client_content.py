@@ -556,7 +556,7 @@ def make_caption(account, source, voice, creative_key, creative=None,
     (never a fact, never an override of the approved source) and are handed straight to
     the SB7 generator; the baseline fallback ignores them. Empty (the default / flag OFF)
     => no angle guidance, exactly today's behavior."""
-    if config.sb7_enabled():
+    if config.sb7_enabled() and has_own_voice_doc(account):
         try:
             from .drafter import StoryBrandGenerator
             hint = photo_grounding(creative)
@@ -583,7 +583,7 @@ def make_caption(account, source, voice, creative_key, creative=None,
                 if rotation.caption_output_gate_clean(
                         cleaned, getattr(source, "text", ""), verified=verified,
                         photo_hint=hint):
-                    return cleaned, tags
+                    return cleaned, (tags or fallback_hashtags(account))
                 print(f"[client-caption] SB7 output failed the fabrication gate for "
                       f"{account.key} (invented urgency/enrollment or an ungrounded "
                       "child claim); using the baseline")
@@ -606,7 +606,57 @@ def compose_caption(account, source, voice, creative_key):
             caption = (body + "\n\n" + cta).strip()
     hashtags = variant_hashtags(account.platform,
                                 _select_hashtags(voice, _CtaKey(creative_key)))
-    return caption, hashtags
+    return caption, (hashtags or fallback_hashtags(account))
+
+
+_GENERIC_HASHTAGS = ("#fitness", "#strengthtraining", "#fitnesscommunity", "#gymlife")
+_PLATFORM_WORDS = ("instagram", "facebook", "google business", "googlebusiness",
+                   "gbp", "ig", "fb")
+
+
+def fallback_hashtags(account):
+    """Hashtags for a gym whose voice doc lists NONE (2026-10-07: 21 of 23 client
+    bibles carry no '#tag', so every caption shipped with an empty hashtag list).
+    One brand tag built ONLY from the gym's own display name plus a short generic,
+    claim-free fitness set; trimmed per platform by variant_hashtags. Never a
+    fact, an offer or another gym's tag. A doc with its own tags never reaches this."""
+    import re as _re
+    name = str(getattr(account, "display_name", "") or "")
+    name = _re.sub(r"\(.*?\)", " ", name)
+    words = [w for w in _re.findall(r"[A-Za-z0-9]+", name)
+             if w.lower() not in _PLATFORM_WORDS]
+    tags = []
+    if words:
+        tags.append("#" + "".join(w[:1].upper() + w[1:] for w in words))
+    tags.extend(_GENERIC_HASHTAGS)
+    try:
+        return variant_hashtags(getattr(account, "platform", ""), tags[:5])
+    except Exception:  # noqa: BLE001
+        return tags[:5]
+
+
+def has_own_voice_doc(account):
+    """True when this gym has ITS OWN brand bible. A client account with no durable
+    bible and no explicit voice_doc resolves to LASSO's default voice doc, and an
+    SB7 caption written from LASSO's voice is generic copy under the gym's name, so
+    such a gym stays on the deterministic template (2026-10-07,
+    mindbodysoulfitness2be97e). LASSO's own accounts are unaffected."""
+    key = str(getattr(account, "key", "") or "")
+    if not key or key.startswith("lasso"):
+        return True
+    base = key
+    for suffix in ("_ig", "_fb", "_gbp"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    try:
+        if os.path.exists(os.path.join(config.client_voice_dir(), base, "lasso_voice.md")):
+            return True
+        own = str(getattr(account, "voice_doc", "") or "")
+        return bool(own) and os.path.exists(own) and (
+            os.path.abspath(own) != os.path.abspath(config.VOICE_DOC_PATH))
+    except Exception:  # noqa: BLE001 - unknown means no own bible
+        return False
 
 
 class _CtaKey:

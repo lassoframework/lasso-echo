@@ -1,0 +1,88 @@
+"""Consumer copy law (Blake, 2026-10-07): no hyphens, dashes, colons or semicolons
+in client captions, SB7 or template; clean hook breaks; own voice doc for SB7;
+non-empty hashtags."""
+import types
+
+from agent import copy_gate, drafter, client_content, post_quality
+
+
+def test_scrub_rewrites_every_hyphen_colon_semicolon():
+    s = copy_gate.scrub("Free 30-minute assessment. Type: semi-private; well - being -- yes")
+    assert s == "Free 30 minute assessment. Type, semi private, well, being, yes"
+    assert copy_gate.violations(s) == []
+
+
+def test_scrub_clock_bullets_and_protected_spans():
+    assert copy_gate.scrub("Class at 6:00 and 6:30") == "Class at 6 and 6.30"
+    assert copy_gate.scrub("- Free trial class") == "Free trial class"
+    out = copy_gate.scrub("Book at https://zanshin.fit/free-trial now")
+    assert "https://zanshin.fit/free-trial" in out
+
+
+def test_violations_catch_digit_letter_hyphen_and_colon():
+    assert "hyphen" in copy_gate.violations("Free 30-minute assessment")
+    assert "colon" in copy_gate.violations("Type: gym")
+    assert "semicolon" in copy_gate.violations("a; b")
+    assert copy_gate.violations("See https://x.com/a-b:c") == []
+
+
+def test_post_quality_flags_copy_law():
+    issues = post_quality.post_issues if hasattr(post_quality, "post_issues") else None
+    d = drafter.Draft(draft_id="x", account_key="g_ig", platform="instagram",
+                      caption=("Strength that lasts starts with one honest session. "
+                               "Our coaches meet you where you are. Free 30-minute assessment."),
+                      hashtags=[], creative_path="", creative_public_url="https://x/y.jpg",
+                      scheduled_for="2026-10-20")
+    probs = issues(d, (), require_media=False)
+    assert any("consumer copy law" in p for p in probs)
+
+
+def test_hook_breaks_at_sentence_boundary():
+    text = ("You've started a hundred times. Life gets in the way. Work piles up. "
+            "Motivation fades. At Zanshin, we don't expect you to figure it out alone.")
+    out = drafter._bound_opening_hook(text)
+    first = out.splitlines()[0]
+    assert len(first) <= drafter._HOOK_MAX_CHARS
+    assert first.endswith(".")
+    assert out.replace("\n", " ") == text
+
+
+def test_prompt_carries_copy_law():
+    sysp = drafter.StoryBrandGenerator._SYSTEM
+    assert "NO hyphens" in sysp and "NO colons" in sysp and "NO semicolons" in sysp
+
+
+def test_no_own_voice_doc_stays_on_template(tmp_path, monkeypatch):
+    monkeypatch.setattr(client_content.config, "client_voice_dir", lambda: str(tmp_path))
+    acct = types.SimpleNamespace(key="mindbodysoulfitness2be97e_ig", voice_doc="")
+    assert client_content.has_own_voice_doc(acct) is False
+    (tmp_path / "mindbodysoulfitness2be97e").mkdir()
+    (tmp_path / "mindbodysoulfitness2be97e" / "lasso_voice.md").write_text("x")
+    assert client_content.has_own_voice_doc(acct) is True
+    assert client_content.has_own_voice_doc(types.SimpleNamespace(key="lasso_ig")) is True
+
+
+def test_make_caption_skips_sb7_without_own_voice(tmp_path, monkeypatch):
+    monkeypatch.setattr(client_content.config, "sb7_enabled", lambda: True)
+    monkeypatch.setattr(client_content, "has_own_voice_doc", lambda a: False)
+    called = []
+
+    class Boom:
+        def build(self, *a, **k):
+            called.append(1)
+            raise AssertionError("SB7 must not run")
+    monkeypatch.setattr(drafter, "StoryBrandGenerator", Boom)
+    monkeypatch.setattr(client_content, "compose_caption",
+                        lambda *a, **k: ("template caption", ["#x"]))
+    acct = types.SimpleNamespace(key="g_ig", platform="instagram", display_name="G")
+    src = types.SimpleNamespace(text="fact")
+    assert client_content.make_caption(acct, src, None, "k") == ("template caption", ["#x"])
+    assert not called
+
+
+def test_fallback_hashtags_from_display_name():
+    acct = types.SimpleNamespace(display_name="CrossFit Zanshin (Instagram)", platform="instagram")
+    tags = client_content.fallback_hashtags(acct)
+    assert tags and tags[0] == "#CrossFitZanshin"
+    assert all(t.startswith("#") and "-" not in t for t in tags)
+    assert len(tags) <= 5
