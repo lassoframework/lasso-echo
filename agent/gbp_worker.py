@@ -164,6 +164,33 @@ def _media_reuse_hold(row, *, now=None, history_store=None, media_store=None):
                                media_store=media_store)
 
 
+def _current_gbp_destination(store, bound_row, bound_connection):
+    """Fresh trusted lookup; missing or changed native destination is never safe."""
+    try:
+        location = bound_row.get("gbp_location_id")
+        gym = bound_row.get("gym_id")
+        if (store is None or bound_row.get("account") != "googlebusiness"
+                or not gym or not location
+                or bound_connection.get("gbp_location_id") != location):
+            raise ValueError("unbound GBP destination")
+        lookup = getattr(store, "connections_for", None)
+        if not callable(lookup):
+            from .gbp_store import GbpStore
+            lookup = GbpStore(base=getattr(store, "_s", store)).connections_for
+        connections = lookup(gym)
+        matches = [c for c in connections
+                   if c.get("gbp_location_id") == location]
+        if (len(matches) != 1 or matches[0].get("status") != "connected"
+                or matches[0].get("portal_gym_key") != gym
+                or not bound_connection.get("zernio_account_id")
+                or matches[0].get("zernio_account_id") !=
+                bound_connection.get("zernio_account_id")):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _reauthorize_gbp_send(store, row, connection, token, snapshot, payload=None):
     """Recheck current authority immediately before this single provider mutation.
 
@@ -183,39 +210,23 @@ def _reauthorize_gbp_send(store, row, connection, token, snapshot, payload=None)
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": "outgoing GBP arguments changed before create",
                 "held": "forward_media_verification", "mode": ""}
-    if changed():
-        return drift_hold()
-    # Gallery uploads carry only the native account, so a row's valid media
-    # claim alone cannot authorize a caller-supplied destination. Re-read the
-    # same gym's connected destination before the final token/revision check.
-    try:
-        bound_row, bound_connection = snapshot[:2]
-        location = bound_row.get("gbp_location_id")
-        gym = bound_row.get("gym_id")
-        if (store is None or bound_row.get("account") != "googlebusiness"
-                or not gym or not location
-                or bound_connection.get("gbp_location_id") != location):
-            raise ValueError("unbound GBP destination")
-        lookup = getattr(store, "connections_for", None)
-        if not callable(lookup):
-            from .gbp_store import GbpStore
-            lookup = GbpStore(base=getattr(store, "_s", store)).connections_for
-        connections = lookup(gym)
-        matches = [c for c in connections
-                   if c.get("gbp_location_id") == location]
-        if (len(matches) != 1 or matches[0].get("status") != "connected"
-                or matches[0].get("portal_gym_key") != gym
-                or not bound_connection.get("zernio_account_id")
-                or matches[0].get("zernio_account_id") !=
-                bound_connection.get("zernio_account_id")):
-            raise ValueError("changed GBP destination")
-    except Exception:
+    def destination_hold():
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": "current same-gym GBP destination unavailable or changed",
                 "held": "forward_media_verification", "mode": ""}
+    if changed():
+        return drift_hold()
+    # Gallery uploads carry only the native account; the media claim cannot
+    # authorize an arbitrary caller-supplied destination.
+    if not _current_gbp_destination(store, *snapshot[:2]):
+        return destination_hold()
     hold = hold_result(store, deepcopy(snapshot[0]), token)
     if hold:
         return hold
+    # Authority itself performs remote reads. A persisted destination may change
+    # during them, so re-read it AGAIN after authority and before the create.
+    if not _current_gbp_destination(store, *snapshot[:2]):
+        return destination_hold()
     # Reject even local mutation during the authority read; never send newer
     # arguments using authority obtained for the pinned arguments.
     return drift_hold() if changed() else None

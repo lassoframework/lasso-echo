@@ -103,7 +103,7 @@ def test_fresh_claim_replay_immediately_precedes_exact_create(monkeypatch, photo
     row, token, store, events = authority(monkeypatch, photo)
     client = Provider(events)
     out = invoke(photo, row, _conn(), client, store, token)
-    assert out["ok"] and events == ["claim", "destination", "claim", "create"]
+    assert out["ok"] and events == ["claim", "destination", "claim", "destination", "create"]
     if photo:
         assert client.calls == [(_conn()["zernio_account_id"], row["image_url"])]
     else:
@@ -183,6 +183,61 @@ def test_caller_cannot_reroute_valid_claim_to_different_native_account(monkeypat
 
 
 @pytest.mark.parametrize("photo", [False, True])
+@pytest.mark.parametrize("drift", ["account", "location", "gym", "status", "duplicate", "missing", "read"])
+def test_persisted_destination_drift_during_final_authority_holds(monkeypatch, photo, drift):
+    row, token, store, events = authority(monkeypatch, photo)
+    persisted = dict(_conn(), portal_gym_key=row["gym_id"], status="connected")
+    state = {"changed": False}
+    original_claim = guard.claim
+    def claim(*args):
+        result = original_claim(*args)
+        if events.count("claim") == 2:
+            state["changed"] = True
+            if drift in {"account", "location", "gym", "status"}:
+                key = {"account": "zernio_account_id", "location": "gbp_location_id",
+                       "gym": "portal_gym_key", "status": "status"}[drift]
+                persisted[key] = "changed"
+        return result
+    monkeypatch.setattr(guard, "claim", claim)
+    def connections_for(gym):
+        assert gym == row["gym_id"]
+        events.append("destination")
+        if state["changed"]:
+            if drift == "read":
+                raise TimeoutError("persisted destination unavailable")
+            if drift == "missing":
+                return []
+            if drift == "duplicate":
+                return [deepcopy(persisted), deepcopy(persisted)]
+        return [deepcopy(persisted)]
+    store.connections_for = connections_for
+    client = Provider(events)
+    out = invoke(photo, row, _conn(), client, store, token)
+    assert out["status"] == "approved" and out["held"] == "forward_media_verification"
+    assert events == ["claim", "destination", "claim", "destination"]
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("photo", [False, True])
+def test_mid_authority_destination_change_releases_unsent_owned_lease(monkeypatch, photo):
+    row = _row(id="r1", gym_id="lasso", account="googlebusiness",
+               gbp_location_id="locations/1", format="photo" if photo else "feed")
+    store = _TokenStore([row], {"lasso": [dict(_c(), portal_gym_key="lasso")]})
+    events = []
+    def authorize(*args):
+        events.append("authorize")
+        if len(events) == 2:
+            store._conns["lasso"][0]["status"] = "needs_reconnect"
+        return True
+    monkeypatch.setattr(bridge, "authorize", authorize)
+    client = Provider(events)
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
+    assert out["held"] == 1 and client.calls == []
+    assert events == ["authorize", "authorize"]
+    assert store.released == [("r1", "approved")] and store.tokens == {}
+
+
+@pytest.mark.parametrize("photo", [False, True])
 def test_missing_row_location_holds_even_with_singleton_connection(monkeypatch, photo):
     monkeypatch.setattr(bridge, "authorize", lambda *a: True)
     row = _row(gym_id="gym", account="googlebusiness")
@@ -207,7 +262,7 @@ def test_facade_connection_reread_uses_same_authenticated_calendar_store(monkeyp
     base._client = lambda: http
     client = Provider(events)
     out = invoke(photo, row, _conn(), client, SimpleNamespace(_s=base), token)
-    assert out["ok"] and events == ["claim", "destination", "claim", "create"]
+    assert out["ok"] and events == ["claim", "destination", "claim", "destination", "create"]
 
 
 @pytest.mark.parametrize("field", ["content", "mediaItems", "platforms"])
