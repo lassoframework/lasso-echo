@@ -164,3 +164,14 @@ def test_production_lane_refuses_caller_byte_reader(lane, monkeypatch):
     monkeypatch.setattr(guard, '_connect', lambda: lane[1])
     with pytest.raises(guard.ForwardMediaVerificationHold, match='callback override refused'):
         guard.attest(lane[0], 'revision', read_bytes=lane[2].__getitem__)
+
+
+def test_remote_reads_follow_read_transaction_end(lane):
+    row_id, conn, data = lane
+    def read(url):
+        assert conn.rolled_back and not conn.committed
+        assert not any('fixer_attest_forward_media' in call[0] for call in conn.calls)
+        return data[url]
+    guard.attest(row_id, 'revision', connection_factory=lambda: conn,
+                 read_bytes=read, original_verifier=lambda *_: True)
+    assert conn.committed and conn.closed

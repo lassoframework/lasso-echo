@@ -106,41 +106,47 @@ def attest(calendar_row_id, expected_revision, *, original_verifier=None, contro
                 original_verifier, controlled_renderer = (
                     forward_media_attester.production_callbacks(
                         conn, row_id, expected_revision=expected_revision))
-            urls = [snapshot.get(k) for k in ('source_url', 'image_url', 'thumbnail_url')]
-            cache = {}
-            for url in urls:
-                if url is not None and url not in cache:
-                    cache[url] = _read(url, read_bytes)
-            source, image = cache[urls[0]], cache[urls[1]]
-            thumbnail = cache[urls[2]] if urls[2] is not None else None
-            if (not callable(original_verifier)
-                    or original_verifier(dict(snapshot), source) is not True):
-                raise ForwardMediaVerificationHold('trusted original asset provenance unavailable')
-            if all(url is None or url == urls[0] for url in urls):
-                operation = 'same_object'
-            elif image == source and (thumbnail is None or thumbnail == source):
-                operation = 'rehost'
-            else:
-                if not callable(controlled_renderer):
-                    raise ForwardMediaVerificationHold('controlled render ancestry unavailable')
-                result = controlled_renderer(source, dict(snapshot))
-                if (not isinstance(result, dict)
-                        or result.get('operation') not in ('render', 'reburn')
-                        or result.get('image_bytes') != image
-                        or result.get('thumbnail_bytes') != thumbnail):
-                    raise ForwardMediaVerificationHold('hosted rendition differs from controlled render')
-                operation = result['operation']
-            # Recheck exact objects after any controlled render to catch an
-            # overwrite during observation. Production object keys must remain
-            # immutable/versioned after receipt creation too.
-            for url, observed in cache.items():
-                if _read(url, read_bytes) != observed:
-                    raise ForwardMediaVerificationHold('observed media object changed bytes')
-            values = []
-            for data in (source, image, thumbnail):
-                values.extend((('md5:' + hashlib.md5(data).hexdigest(), len(data))
-                               if data is not None else (None, None)))
-            evidence_id = str(uuid.uuid4())
+        # Snapshot and callback capture are read-only. End that transaction
+        # before object reads so graph/census locks and a database snapshot are
+        # never retained across network work. Final authority below starts a
+        # fresh transaction and revalidates revision, provenance and holds.
+        conn.rollback()
+        urls = [snapshot.get(k) for k in ('source_url', 'image_url', 'thumbnail_url')]
+        cache = {}
+        for url in urls:
+            if url is not None and url not in cache:
+                cache[url] = _read(url, read_bytes)
+        source, image = cache[urls[0]], cache[urls[1]]
+        thumbnail = cache[urls[2]] if urls[2] is not None else None
+        if (not callable(original_verifier)
+                or original_verifier(dict(snapshot), source) is not True):
+            raise ForwardMediaVerificationHold('trusted original asset provenance unavailable')
+        if all(url is None or url == urls[0] for url in urls):
+            operation = 'same_object'
+        elif image == source and (thumbnail is None or thumbnail == source):
+            operation = 'rehost'
+        else:
+            if not callable(controlled_renderer):
+                raise ForwardMediaVerificationHold('controlled render ancestry unavailable')
+            result = controlled_renderer(source, dict(snapshot))
+            if (not isinstance(result, dict)
+                    or result.get('operation') not in ('render', 'reburn')
+                    or result.get('image_bytes') != image
+                    or result.get('thumbnail_bytes') != thumbnail):
+                raise ForwardMediaVerificationHold('hosted rendition differs from controlled render')
+            operation = result['operation']
+        # Recheck exact objects after any controlled render to catch an
+        # overwrite during observation. Production object keys must remain
+        # immutable/versioned after receipt creation too.
+        for url, observed in cache.items():
+            if _read(url, read_bytes) != observed:
+                raise ForwardMediaVerificationHold('observed media object changed bytes')
+        values = []
+        for data in (source, image, thumbnail):
+            values.extend((('md5:' + hashlib.md5(data).hexdigest(), len(data))
+                           if data is not None else (None, None)))
+        evidence_id = str(uuid.uuid4())
+        with conn.cursor() as cur:
             cur.execute('select public.fixer_attest_forward_media_20261006('
                         '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
                         (row_id, expected_revision, evidence_id, *values, operation,

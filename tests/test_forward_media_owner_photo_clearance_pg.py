@@ -46,7 +46,7 @@ def main():
     with admin.cursor() as c:
      c.execute(q,args);return c.fetchall() if c.description else None
    def lane(role):
-    c=psycopg.connect(dsn());c.execute('set role '+role);return c
+    c=psycopg.connect(dsn());c.execute('set role '+role);c.commit();return c
    def denied(fn,reason=None):
     try:fn();raise AssertionError('unsafe grant unexpectedly accepted')
     except psycopg.Error as e:
@@ -313,8 +313,8 @@ def main():
    assert claim(first) is True
    # Actual production_callbacks transaction used by guard.attest, through its
    # real exact-role DSN/factory. Pause at its first object read, AFTER provenance
-   # acquired graph+census, and overlap a real service claim. The attester must
-   # already own its eventual exclusive graph mode; no shared->exclusive cycle.
+   # captured provenance, and overlap a real service claim/calendar write.
+   # Network work must retain no transaction; final authority revalidates.
    from agent import visual_writer_prepare
    sql('alter role '+guard.ROLE+' login')
    prior_attester_env={name:os.environ.get(name) for name in (
@@ -339,16 +339,36 @@ def main():
     with patch.object(visual_writer_prepare,'_bytes_for_url',side_effect=paused_production_bytes),concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
      production_attest=pool.submit(guard.attest,production_row,production_revision)
      assert remote_entered.wait(timeout=5),'real production_callbacks did not reach object read'
+     assert sql("select count(*) from pg_stat_activity where usename=%s and state='idle' and xact_start is null",(guard.ROLE,))[0][0]==1
      concurrent_claim=pool.submit(claim,third)
-     deadline=time.monotonic()+5
-     while time.monotonic()<deadline:
-      if sql("select count(*) from pg_stat_activity where wait_event_type='Lock' and query like 'select fixer_claim_forward_media%' ")[0][0]:break
-      time.sleep(.02)
-     else:raise AssertionError('claim did not wait behind production attester authority')
+     assert concurrent_claim.result(timeout=3) is True
+     sql('update content_calendar set status=status where id=%s',(third[0],))
      remote_release.set()
      production_proof=production_attest.result(timeout=8)
      assert production_proof['revision']==production_revision
-     assert concurrent_claim.result(timeout=8) is True
+    # Edits during the unlocked network phase cannot inherit captured proof.
+    for mutation in ('binding','history','moderation'):
+     changed_row,changed_revision=fresh_production_attestation_row()
+     remote_entered.clear();remote_release.clear()
+     unknown_id=None
+     with patch.object(visual_writer_prepare,'_bytes_for_url',side_effect=paused_production_bytes),concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+      changed_attest=pool.submit(guard.attest,changed_row,changed_revision)
+      assert remote_entered.wait(timeout=5)
+      assert sql("select count(*) from pg_stat_activity where usename=%s and state='idle' and xact_start is null",(guard.ROLE,))[0][0]==1
+      if mutation=='binding':
+       sql("update content_calendar set image_url='https://media.example.test/changed.png' where id=%s",(changed_row,))
+      elif mutation=='history':
+       unknown_id=str(uuid.uuid4())
+       sql("insert into content_calendar(id,gym_id,status,image_url) values(%s,'other','published','https://media.example.test/unknown-network.png')",(unknown_id,))
+      else:
+       sql("update media_asset set moderation_status='pending' where id=%s",(FILE,))
+      remote_release.set()
+      try:changed_attest.result(timeout=8);raise AssertionError('changed authority accepted: '+mutation)
+      except guard.ForwardMediaVerificationHold as exc:
+       assert isinstance(exc.__cause__,psycopg.errors.CheckViolation),(mutation,exc.__cause__)
+     assert sql('select count(*) from fixer_forward_media_lineage_20261006 where calendar_row_id=%s',(changed_row,))[0][0]==0
+     if unknown_id:sql('delete from content_calendar where id=%s',(unknown_id,))
+     if mutation=='moderation':sql("update media_asset set moderation_status='clean' where id=%s",(FILE,))
     # Reverse order: a claim already owns shared graph+census. Production
     # provenance waits for exclusive graph BEFORE census and resumes on COMMIT.
     reverse_row,reverse_revision=fresh_production_attestation_row()
@@ -476,7 +496,7 @@ def main():
    sql('insert into fixer_owner_photo_revocation_20261007 values(%s,%s)',(packet['payload']['audit_id'],'SYNTHETIC revoke'))
    denied(lambda:claim(first),'revoked')
    conn.close();auditor_conn.close();admin.close()
-   print('PASS PG17 signed owner grant; OFF/moderation/byte-binding/safety-hold/direct bypass holds; atomic reservation+authority; concurrent stale corpus hold; signed date/group before first claim; post-binder replay + stored-signature reconciliation; IG/FB/Story siblings; census INSERT/UPDATE/DELETE held through claim COMMIT for admin+service; prelocked writer fail-fast; own provider receipt and concurrent siblings allowed; actual production_callbacks attester/claim both-order concurrency without graph upgrade; different Story rendition hold; production owner-worker factory with acknowledged outcome; initial/final lost COMMIT and remote crash quarantine/no-retry; unknown history/epoch/revocation holds')
+   print('PASS PG17 signed owner grant; OFF/moderation/byte-binding/safety-hold/direct bypass holds; atomic reservation+authority; concurrent stale corpus hold; signed date/group before first claim; post-binder replay + stored-signature reconciliation; IG/FB/Story siblings; census INSERT/UPDATE/DELETE held through claim COMMIT for admin+service; prelocked writer fail-fast; own provider receipt and concurrent siblings allowed; actual production_callbacks IDLE remote reads permit claim/write; binding/history/moderation drift denied at fresh final authority; both-order concurrency without graph upgrade; different Story rendition hold; production owner-worker factory with acknowledged outcome; initial/final lost COMMIT and remote crash quarantine/no-retry; unknown history/epoch/revocation holds')
   finally:
    subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 

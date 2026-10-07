@@ -53,6 +53,7 @@ def main(*, provider_fence=False):
             def lane(role='service_role'):
                 conn = psycopg.connect(dsn)
                 conn.execute('set role ' + role)
+                conn.commit()  # Fixture role must survive the read-phase rollback.
                 return conn
             sql('create role anon; create role authenticated; create role service_role;'
                 'create table content_calendar(id uuid primary key,gym_id text,post_date date,account text,'
