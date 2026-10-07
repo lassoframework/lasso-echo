@@ -5,6 +5,39 @@ signed v1 prepare contract. It is default OFF and grants no calendar authority.
 No production storage, IAM role, signing key, owner endpoint, or provider call was
 created during implementation.
 
+The next owner slice is `agent/forward_media_generated_owner.py` with the unapplied
+`DRAFT_fixer_generated_owner_read_20261007.sql`. It implements transport-neutral
+POST `/snapshot` and `/history-check` handlers with explicit issuer/verifier read
+tokens, per-token tenant allowlists and a dedicated database reader. It defaults
+OFF and is not registered on Echo's publisher/intake server. A separately deployed
+TLS owner service, credentials and tokens are still absent. Every response is
+HOLD with `brand_source_verified`, `photo_inventory_complete`, `history_complete`
+and `reviewed_no_match` false. `eligible_photo_count` is null, including an empty
+database. Supplied job/copy/palette revisions are echoed for binding diagnostics;
+that echo does not prove they came from trusted approved source records.
+
+The draft RPC reads one consistent READ ONLY REPEATABLE READ snapshot, then the
+adapter rolls it back before remote I/O. Its digests include current fleet
+calendar rows (including undated/unpublished/unknown rows), forward claims/use,
+audited originals, photo reservations and the requested tenant's assets/sources.
+Counts/digests describe only database observations. They never assert external
+Drive inventory completeness, exact/perceptual nonmatch, or full historical
+coverage. A published 1,398-row corpus alone cannot fulfill those contracts.
+No raw calendar/source rows are returned; read tokens cannot query another
+tenant's inventory via these handlers. Malformed or rebound PNG/SHA submissions
+hold before the database query.
+
+`stage_prepared_generated_original` is an explicit fail-closed final boundary.
+It defaults OFF and still holds if enabled, before any cursor, lock or write.
+The existing positive owner grant requires a certified same-gym Drive photo
+reservation. A generated original cannot satisfy that source contract, so no
+generated clearance, registry row, render manifest or reservation is created.
+The missing authority is a trusted generated job bound to tenant/date/palette/
+copy, a complete authenticated inventory, full exact/perceptual/undated/unresolved
+history, and a generated reservation/claim fence that revalidates all revisions
+under the existing graph lock. A signed receipt or constructed preparation object
+cannot substitute for those authorities.
+
 The issuer makes a fresh Astra Responses request, preserves the exact inline PNG
 before Echo's existing resize helper, performs an independent Astra pixel/copy/
 palette review, checks current trusted owner revisions and full reuse history,
@@ -38,7 +71,8 @@ External release prerequisites
    verifier has no issuer key or write permission. Restrict OpenAI keys by role;
    issuer executes, verifier retrieves stored responses. Confirm actual provider
    permissions and retrieval availability before activation.
-4. Implement the trusted read API owned by the final calendar authority. It must
+4. Complete the trusted read API owned by the final calendar authority. The
+   diagnostic adapter above deliberately cannot attest completeness. It must
    authenticate dedicated read-only issuer/verifier tokens. `/snapshot` accepts
    `{"request": GenerationRequest fields}` and returns exactly bound request,
    approved `copy` (headline, facts array, cta, footer), verified `palette`,
@@ -63,6 +97,17 @@ External release prerequisites
    hold its own locks and reserve the object. Preparation is not send clearance.
    Client gap filling stays held until this separate owner integration exists;
    never silently fall back to the ordinary hoster or relabel old artwork.
+
+Offline owner adapter validation
+
+`python -m pytest -q tests/test_forward_media_generated_owner.py
+tests/test_forward_media_generated_issuer.py tests/test_forward_media_generated_prepare.py`
+checks read-token authentication/tenant scope, request/pixel binding, default OFF,
+explicit incomplete responses, and refusal by the existing issuer/verifier client.
+`python tests/test_forward_media_generated_owner_pg.py` runs a disposable PG17
+fixture with synthetic roles and records. It checks reader/writer separation,
+read transaction ownership, fleet/undated/source revision changes, and zero grants
+or reservations. Neither command is a production authority or deployment check.
 
 Environment names
 

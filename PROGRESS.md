@@ -4898,3 +4898,11 @@ settled.
 - [~] A tenant-scoped, before-caption CAS can reformat existing active pending feed rows only. It refuses held, Story, approved and published rows. No live calendar rows have been changed by this source patch.
 - [~] `scripts/audit_gym_caption_format.py` audits the complete paginated future book without exposing caption text. Optional `--apply` requires a matching target digest and new private receipt, and verifies every changed row after its exact CAS. The operator command has only been tested offline.
 - [ ] Integrate, run the complete suite in a dependency-complete environment, deploy, audit the future fleet read-only, and apply/review any eligible CrossFit Local feed corrections. Story overlays need separate reburn review.
+
+## Generated original owner read boundary (2026-10-07)
+
+- [~] Default-OFF isolated `/snapshot` and `/history-check` dispatch now authenticates dedicated issuer/verifier read tokens, applies tenant allowlists, validates request/pixel binding, and reads a consistent diagnostic census through a reader-only draft SQL RPC. Unapplied, no listener deployed and no credentials provisioned.
+- [~] Diagnostic revisions cover all current calendar rows including undated/unknown rows, claims/use, audited originals, photo reservations and tenant assets/sources. Completeness flags remain false and eligible photo count remains null. Neither 1,398 published rows nor an empty local pool is full history/depletion proof.
+- [~] Explicit final generated owner boundary refuses any reservation before DB access. Existing positive photo authority requires a same-gym Drive source, which cannot accept a generated original.
+- [x] 133 focused generated contract tests pass. Disposable synthetic PG17 proves dedicated read-role isolation, revision changes, transaction release, and no authority writes. Existing Python/PG dependencies reused; 27 GiB free measured before checks.
+- [ ] Trusted generated job and versioned approved palette/copy authority, complete authenticated photo inventory, full exact/perceptual/undated/unresolved history, generated reservation/claim fence and final revision rechecks under graph locks remain missing. Live generation and owner grants stay held.
