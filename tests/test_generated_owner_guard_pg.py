@@ -53,6 +53,7 @@ def main():
        'grant select,insert,update,delete on content_calendar to service_role;')
    baseline=str(uuid.uuid4())
    sql("insert into fixer_forward_media_photo_policy_20261007 values('SYNTHETIC policy',true,'complete_fleet_still_photo_history',null,'SYNTHETIC reconciliation','SYNTHETIC admin')")
+   sql("insert into fixer_forward_media_photo_policy_20261007 values('SYNTHETIC reviewed-video policy',true,'complete_fleet_still_photo_history','SYNTHETIC approved video ruling','SYNTHETIC reconciliation','SYNTHETIC admin')")
    sql("insert into fixer_forward_media_photo_baseline_20261007(baseline_id,policy_id,scope_complete,rows_json,historical_manifest_ref,declared_full_fleet_row_count) values(%s,'SYNTHETIC policy',true,'[]','SYNTHETIC empty full fleet',0)",(baseline,))
    sql("update fixer_forward_media_photo_state_20261007 set baseline_id=%s,generation=1,enabled=true,routes_reconciled_ref='SYNTHETIC routes'",(baseline,))
    sql("insert into fixer_forward_media_claim_gate_20261006 values('gym',true),('other',true)")
@@ -65,15 +66,21 @@ def main():
    snap=trusted(guard.generated_snapshot(p,rid));conn.rollback()
    c=candidate(snap,pixels)
    with patch('agent.visual_writer_prepare._own_media_url',lambda u: isinstance(u,str) and u.startswith('https://owned.example/')):
+    import io
+    from PIL import Image
+    def noise(seed):
+     rng=random.Random(seed);im=Image.frombytes('RGB',(128,128),rng.randbytes(128*128*3))
+     buf=io.BytesIO();im.save(buf,format='PNG');return buf.getvalue()
     deleted_pixels=pixels
+    video_only_bytes=noise(27)
     def reserve(rid,candidate_=None,visuals=None,original=None):
      candidate_=candidate_ or c
      original=original or pixels
      fresh=trusted(guard.generated_snapshot(p,rid));conn.rollback()
-     out=guard.reserve_generated(p,rid,candidate_,fresh,history_visuals=visuals or [],read_bytes=lambda u:original if u==candidate_['original_url'] else deleted_pixels if u=='https://owned.example/deleted-old.png' else pixels);conn.commit();return out
-    def sealed(rows,complete=True,excluded=None):
+     out=guard.reserve_generated(p,rid,candidate_,fresh,history_visuals=visuals or [],read_bytes=lambda u:original if u==candidate_['original_url'] else deleted_pixels if u=='https://owned.example/deleted-old.png' else video_only_bytes if u=='https://owned.example/deleted-video-policy-still.png' else pixels);conn.commit();return out
+    def sealed(rows,complete=True,excluded=None,policy_id='SYNTHETIC policy',video_manifest=None):
      bid=str(uuid.uuid4());excluded=excluded or []
-     sql("insert into fixer_forward_media_photo_baseline_20261007(baseline_id,policy_id,scope_complete,rows_json,historical_manifest_ref,declared_full_fleet_row_count,excluded_rows_json) values(%s,'SYNTHETIC policy',%s,%s::jsonb,'SYNTHETIC sealed manifest',%s,%s::jsonb)",(bid,complete,json.dumps(rows),len(rows)+len(excluded),json.dumps(excluded)))
+     sql("insert into fixer_forward_media_photo_baseline_20261007(baseline_id,policy_id,scope_complete,rows_json,historical_manifest_ref,declared_full_fleet_row_count,excluded_rows_json,excluded_video_manifest_ref) values(%s,%s,%s,%s::jsonb,'SYNTHETIC sealed manifest',%s,%s::jsonb,%s)",(bid,policy_id,complete,json.dumps(rows),len(rows)+len(excluded),json.dumps(excluded),video_manifest))
      sql('update fixer_forward_media_photo_state_20261007 set baseline_id=%s where singleton',(bid,))
      return bid
     deleted={'history_key':'calendar:deleted-2026-10-01','resolved':True,'media_kind':'still_photo',
@@ -95,6 +102,27 @@ def main():
      sealed(rows,complete,excluded)
      assert not guard.generated_snapshot(p,rid)['history_complete'];conn.rollback()
      denied(lambda:reserve(rid),'fresh verified');conn.rollback()
+    video_still={**deleted,'history_key':'calendar:deleted-video-policy-still',
+      'visual_sha256':'sha256:'+hashlib.sha256(video_only_bytes).hexdigest(),
+      'visual_url':'https://owned.example/deleted-video-policy-still.png'}
+    excluded=[{'history_key':'calendar:SYNTHETIC-video','media_kind':'reviewed_video_scope_exclusion','published_binding_ref':'SYNTHETIC reviewed video binding'}]
+    for bad_policy,bad_manifest,bad_exclusions in [
+      ('SYNTHETIC policy','SYNTHETIC video manifest',excluded),
+      ('SYNTHETIC reviewed-video policy',None,excluded),
+      ('SYNTHETIC reviewed-video policy','SYNTHETIC video manifest',[{**excluded[0],'media_kind':'unknown'}]),
+      ('SYNTHETIC reviewed-video policy','SYNTHETIC video manifest',[{**excluded[0],'published_binding_ref':''}])]:
+     sealed([video_still],excluded=bad_exclusions,policy_id=bad_policy,video_manifest=bad_manifest)
+     assert not guard.generated_snapshot(p,rid)['history_complete'];conn.rollback()
+     denied(lambda:reserve(rid),'fresh verified');conn.rollback()
+    sealed([video_still],excluded=excluded,policy_id='SYNTHETIC reviewed-video policy',video_manifest='SYNTHETIC approved video manifest')
+    fresh=trusted(guard.generated_snapshot(p,rid));conn.rollback()
+    assert fresh['history_complete']
+    distinct_bytes=noise(28);distinct=candidate(fresh,distinct_bytes);distinct['original_url']='https://owned.example/video-policy-distinct.png'
+    def video_reader(url):
+     if url==distinct['original_url']:return distinct_bytes
+     return video_only_bytes if url==video_still['visual_url'] else deleted_pixels
+    assert guard.reserve_generated(p,rid,distinct,fresh,history_visuals=[],read_bytes=video_reader)['reserved']
+    conn.rollback()
     sql('update fixer_forward_media_photo_state_20261007 set baseline_id=null')
     assert not guard.generated_snapshot(p,rid)['history_complete'];conn.rollback()
     denied(lambda:reserve(rid),'fresh verified');conn.rollback()
@@ -102,6 +130,13 @@ def main():
     # Previously approved sealed visuals survive baseline replacement too.
     fresh=trusted(guard.generated_snapshot(p,rid));conn.rollback()
     denied(lambda:reserve(rid,candidate(fresh,deleted_pixels)), 'repeated historical');conn.rollback()
+    for old_encoding in (video_only_bytes,):
+     repeated=candidate(fresh,old_encoding);repeated['original_url']='https://owned.example/video-policy-repeat.png'
+     denied(lambda:reserve(rid,repeated,original=old_encoding),'repeated historical');conn.rollback()
+    out=io.BytesIO();Image.open(io.BytesIO(video_only_bytes)).save(out,format='PNG',compress_level=0)
+    reencoded_video=out.getvalue();repeated=candidate(fresh,reencoded_video);repeated['original_url']='https://owned.example/video-policy-near-repeat.png'
+    assert repeated['original_sha256']!=hashlib.sha256(video_only_bytes).hexdigest()
+    denied(lambda:reserve(rid,repeated,original=reencoded_video),'repeated historical');conn.rollback()
     rng=random.Random(30);im=Image.frombytes('RGB',(128,128),rng.randbytes(128*128*3))
     buf=io.BytesIO();im.save(buf,format='PNG');pixels=buf.getvalue()
     c=candidate(trusted(guard.generated_snapshot(p,rid)),pixels);conn.rollback()
@@ -160,6 +195,7 @@ def main():
     service.commit()
     assert service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(rid,token,receipt['evidence_id'],revision)).fetchone()[0] is True
     service.commit();service.close()
+    sql("update content_calendar set status='published',published_at=now() where id=%s",(rid,))
     assert reserve(sibling)['replayed']
     # Unknown approved photo bytes hold at the actual service claim too.
     sql("insert into media_source values('source','gym','gym_drive','folder',true,'ready',now())")
@@ -186,9 +222,6 @@ def main():
     # Source-null historic photos are safe to compare as delivered visuals;
     # they do not require an impossible original-source backfill for fresh art.
     from agent.visual_scene import scene_fingerprint, classify_scene
-    def noise(seed):
-     rng=random.Random(seed);im=Image.frombytes('RGB',(128,128),rng.randbytes(128*128*3))
-     buf=io.BytesIO();im.save(buf,format='PNG');return buf.getvalue()
     old_bytes=noise(1);fresh_bytes=noise(2)
     assert classify_scene(scene_fingerprint(fresh_bytes),[scene_fingerprint(old_bytes),c['original_phash']]).kind=='distinct'
     future=row(day='2026-10-15',gym='other')
@@ -198,7 +231,7 @@ def main():
     def read_historical(url):
      return fresh_bytes if url==fresh_candidate['original_url'] else old_bytes if url=='https://owned.example/unknown' else pixels
     def exact_history_reader(url):
-     return deleted_pixels if url=='https://owned.example/deleted-old.png' else read_historical(url)
+     return deleted_pixels if url=='https://owned.example/deleted-old.png' else video_only_bytes if url==video_still['visual_url'] else read_historical(url)
     visuals=[{**h,'visual_sha256':'sha256:'+hashlib.sha256(exact_history_reader(h['visual_url'])).hexdigest()} for h in history]
     assert guard.reserve_generated(p,future,fresh_candidate,fresh,history_visuals=visuals,read_bytes=exact_history_reader)['reserved']
     conn.commit()
@@ -219,7 +252,39 @@ def main():
     conn.commit()
     assert 'https://owned.example/unknown' not in reads
     assert reads.count(fresh_candidate['original_url'])==1
+    # Two observations of one calendar row with identical pixels but different
+    # URLs/bindings must produce distinct retained history identities.
+    sql("update content_calendar set image_url='https://owned.example/unknown-B' where id=%s",(unknown,))
+    observer=row(day='2026-10-18',gym='other');observer_bytes=noise(4)
+    fresh=trusted(guard.generated_snapshot(p,observer));conn.rollback()
+    observer_candidate=candidate(fresh,observer_bytes);observer_candidate['original_url']='https://owned.example/observer.png'
+    def observer_reader(url):
+     if url==observer_candidate['original_url']:return observer_bytes
+     if url=='https://owned.example/unknown':raise RuntimeError('old object disappeared')
+     if url=='https://owned.example/unknown-B':return old_bytes
+     if url==next_candidate['original_url']:return next_bytes
+     if url==fresh_candidate['original_url']:return fresh_bytes
+     if url==video_still['visual_url']:return video_only_bytes
+     return deleted_pixels if url=='https://owned.example/deleted-old.png' else pixels
+    assert guard.reserve_generated(p,observer,observer_candidate,fresh,history_visuals=[],read_bytes=observer_reader)['reserved']
+    conn.commit()
     sql('delete from content_calendar where id=%s',(unknown,))
+    current=guard.generated_snapshot(p,sibling);conn.rollback()
+    keys=[h['history_key'] for h in current['history']['rows']]
+    retained=[h for h in current['history']['rows'] if h['history_key'].startswith('retained:calendar-image:'+unknown)]
+    assert len(keys)==len(set(keys)) and len(retained)==2
+    # Publishing/observing/deleting an anchor cannot starve its legitimate
+    # same-day logical sibling. Exact retained tuple metadata proves permission.
+    sql('delete from content_calendar where id=%s',(rid,))
+    assert reserve(sibling)['replayed']
+    sibling_revision=sql('select fixer_forward_media_attestation_request_20261006(%s)',(sibling,))[0][0]['revision']
+    sibling_receipt=guard.attest(sibling,sibling_revision,connection_factory=lambda:lane(guard.ROLE),
+      original_verifier=lambda snap,source:source==pixels,read_bytes=lambda u:pixels)
+    sibling_token=str(uuid.uuid4())
+    sql("update content_calendar set status='publishing',publish_claim_token=%s,publish_reservation_day=post_date where id=%s",(sibling_token,sibling))
+    service=lane('service_role')
+    assert service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(sibling,sibling_token,sibling_receipt['evidence_id'],sibling_revision)).fetchone()[0] is True
+    service.commit();service.close()
     deleted_live=row(day='2026-10-17',gym='other')
     fresh=trusted(guard.generated_snapshot(p,deleted_live));conn.rollback()
     assert any(h['history_key'].startswith('retained:calendar-image:'+unknown) for h in fresh['history']['rows'])
@@ -229,6 +294,8 @@ def main():
      if url=='https://owned.example/unknown':raise RuntimeError('deleted history object')
      if url==next_candidate['original_url']:return next_bytes
      if url==fresh_candidate['original_url']:return fresh_bytes
+     if url==observer_candidate['original_url']:return observer_bytes
+     if url==video_still['visual_url']:return video_only_bytes
      return deleted_pixels if url=='https://owned.example/deleted-old.png' else pixels
     denied(lambda:guard.reserve_generated(p,deleted_live,repeated,fresh,history_visuals=[],read_bytes=vanished_old_reader), 'repeated historical')
     conn.rollback()
@@ -237,10 +304,10 @@ def main():
     for historical_bytes in (pixels,reencoded):
      sealed([{**deleted,'visual_sha256':'sha256:'+hashlib.sha256(historical_bytes).hexdigest()}])
      service=lane('service_role')
-     denied(lambda:service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(rid,token,receipt['evidence_id'],revision)),'binding changed')
+     denied(lambda:service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(sibling,sibling_token,sibling_receipt['evidence_id'],sibling_revision)),'binding changed')
      service.rollback();service.close()
    conn.close();admin.close()
-   print('PASS: PG17 generated atomic authority, deleted sealed exact/pHash reserve denial, baseline unresolved/missing/scope/exclusion holds, epoch final-claim/replay denial, missing photo SHA reserve/send hold, byte/pHash repeats, source-null delivered history, sibling/claim/replay/serialization and role denial')
+   print('PASS: PG17 generated atomic authority, approved video exclusion and invalid exclusion holds, excluded-baseline replacement exact/pHash denial, unique retained receipt keys, deleted-anchor same-day sibling final claim, sealed deletion/epoch/unknown-photo/cache/source-null/role/serialization regressions')
   finally:
    subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 
