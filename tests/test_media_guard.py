@@ -146,6 +146,43 @@ def test_surviving_keys_frees_span_wipeables_keeps_the_rest():
     assert {"coach.jpg", "appr.jpg", "pub.jpg"} <= keys
 
 
+def test_surviving_keys_preserves_same_month_wipeable_outside_exact_span():
+    from datetime import date
+    store = _Store([
+        _row("2026-10-16", "before.jpg", "pending"),
+        _row("2026-10-17", "replace.jpg", "pending"),
+        _row("2026-10-31", "replace-later.jpg", "pending"),
+    ])
+
+    keys = media_guard.surviving_keys("gritx", store, date(2026, 10, 17), 15)
+
+    assert "before.jpg" in keys
+    assert "replace.jpg" not in keys
+    assert "replace-later.jpg" not in keys
+
+
+def test_book_state_exact_replacement_dates_keep_out_of_span_wipeables():
+    store = _Store([
+        _row("2026-10-17", "replace.jpg", "pending"),
+        _row("2026-10-18", "outside.jpg", "pending"),
+        _row("2026-10-17", "approved.jpg", "approved"),
+        {**_row("2026-10-17", "held.jpg", "pending"),
+         "media_not_ready_reason": "needs_new_visual"},
+        {**_row("2026-10-17", "candidate.jpg", "pending"),
+         "variant_status": "candidate"},
+    ])
+
+    state = media_guard.book_state(
+        "gritx", store, "2026-10-17", 2,
+        skip_wipeable_dates={"2026-10-17"})
+
+    assert "replace.jpg" not in state
+    assert "outside.jpg" in state
+    assert "approved.jpg" in state
+    assert "held.jpg" in state
+    assert "candidate.jpg" in state
+
+
 def test_surviving_keys_flag_off_is_empty(monkeypatch):
     from datetime import date
     monkeypatch.setenv("AGENT_MEDIA_CROSS_DAY_GUARD", "false")
@@ -426,3 +463,66 @@ def test_book_state_keys_stories_by_source(tmp_path):
     assert "photo_01.jpg" in state
     blocked = media_guard.blocked_keys(state, "2026-08-25")
     assert "photo_01.jpg" in blocked
+
+
+@pytest.mark.parametrize("candidate", [False, True])
+def test_original_drive_alias_only_belongs_to_persisted_row(candidate):
+    import hashlib
+    from types import SimpleNamespace
+    raw = b"verified original"
+    current = {"image_url": "https://cdn/original.jpg",
+               "source_media_url": "https://cdn/original.jpg",
+               "source_media_asset_id": "asset", "drive_file_id": "old-alias"}
+    replacement = {key: value for key, value in current.items() if key != "drive_file_id"}
+    asset = {"id": "asset", "gym_id": "gym", "source_id": "source",
+             "content_hash": hashlib.md5(raw).hexdigest()}
+    source = {"id": "source", "gym_id": "gym"}
+
+    def get(table, **kwargs):
+        return SimpleNamespace(status_code=200,
+            json=lambda: [asset if table == "media_asset" else source])
+
+    store = SimpleNamespace(_client=lambda: SimpleNamespace(get=get),
+                            _rest=lambda table: table, _headers=lambda: {})
+    if candidate:
+        result = media_guard.swap_original_identity("gym", current, store,
+                        pick=replacement, read_bytes=lambda url: raw)
+        assert result["source_asset_id"] == "asset"
+    else:
+        with pytest.raises(ValueError, match="contradictory Drive identity"):
+            media_guard.swap_original_identity("gym", current, store,
+                                              read_bytes=lambda url: raw)
+
+
+
+def test_original_byte_cache_exact_urls_and_failed_fetches():
+    import hashlib
+    raw = b"original"
+    cache = {}
+    calls = []
+    candidate = {"image_url": "https://cdn/original.jpg?v=1",
+                 "source_media_url": "https://cdn/original.jpg?v=1",
+                 "original_sha256": hashlib.sha256(raw).hexdigest()}
+
+    def fetch(url):
+        calls.append(url)
+        return None if len(calls) == 1 else raw
+
+    from agent.visual_writer_prepare import VisualPreparationError
+    with pytest.raises(VisualPreparationError):
+        media_guard.swap_original_identity("gym", {}, None, pick=candidate,
+                                          read_bytes=fetch, byte_cache=cache)
+    assert cache == {}
+    for _ in range(2):
+        media_guard.swap_original_identity("gym", {}, None, pick=candidate,
+                                          read_bytes=fetch, byte_cache=cache)
+    candidate.update(image_url="https://cdn/original.jpg?v=2",
+                     source_media_url="https://cdn/original.jpg?v=2")
+    media_guard.swap_original_identity("gym", {}, None, pick=candidate,
+                                      read_bytes=fetch, byte_cache=cache)
+    assert calls == ["https://cdn/original.jpg?v=1"] * 2 + ["https://cdn/original.jpg?v=2"]
+    assert set(cache) == {"https://cdn/original.jpg?v=1", "https://cdn/original.jpg?v=2"}
+    candidate["original_sha256"] = "wrong"
+    with pytest.raises(ValueError, match="candidate original bytes unproved"):
+        media_guard.swap_original_identity("gym", {}, None, pick=candidate,
+                                          read_bytes=fetch, byte_cache=cache)

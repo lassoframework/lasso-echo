@@ -76,7 +76,8 @@ def writer_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(gym_media_index, "default_store", lambda: EmptyDriveIndex())
     # Media inventory is outside this identity contract. Keep the caller's
     # rechecks in the real planner while providing a deterministic empty-media fact.
-    monkeypatch.setattr(infographic, "real_media_depleted", lambda *_a, **_k: True)
+    monkeypatch.setattr(infographic, "real_media_status",
+                         lambda *_a, **_k: (infographic.MEDIA_DEPLETED, "proven empty"))
     monkeypatch.setattr(astra_prompt, "build_infographic_brief", lambda *a, **k: "grounded test brief")
     monkeypatch.setattr(astra_prompt, "load_gym_brand_palette", lambda *_: {
         "canvas": "#112233", "ink": "#FFFFFF", "accent": "#C8102E"})

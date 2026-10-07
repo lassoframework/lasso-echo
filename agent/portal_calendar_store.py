@@ -200,17 +200,14 @@ def _prepared_backlog_caption_hold_transition_ok(expected_row):
 
 
 def _slot_key(row):
-    """The (post_date, account, format) a row occupies, normalized. Two rows with the
-    same slot key are the same calendar cell (a rebuild must not create a second one).
+    """The (post_date, account, format) a row occupies, normalized.
 
-    DELIBERATELY NOT slot-aware. Adding slot_index here would let a 2x day keep its PM
-    row when the AM row is human-owned — but it also makes a 2x->1x rebuild (which
-    stamps NO slot_index) stop matching an approved slot-1 row, so the planner lanes
-    that rely on preserve_and_prune as their ONLY collision guard (real_month_planner,
-    real_calendar_mirror — LASSO's own, with auto-approve armed) would insert a fresh
-    row beside an approved one and publish it. The client lane never needs the slot
-    dimension: it skips locked DATES wholesale (client_month_run covered_days). Revisit
-    only together with the locked-day question in PROGRESS.md."""
+    Collision occupancy for 2x days lives in preserve_and_prune (per slot_index
+    up to cadence capacity). This key is the cell identity: two IG feeds on the
+    same date share it and are distinguished by slot_index there. Do not add
+    slot_index here: planner lanes that only have locked_slots (no list_month)
+    still treat the triple as the cell, which is the conservative 1x guard.
+    """
     return (
         str((row or {}).get("post_date") or "")[:10],
         str((row or {}).get("account") or "").lower(),
@@ -322,6 +319,14 @@ class PortalStoreError(Exception):
 
 class PreWriteCASError(PortalStoreError):
     """CAS encoding refused before the calendar PATCH was attempted."""
+
+
+class CalendarInsertNotStartedError(PortalStoreError):
+    """The calendar POST definitely did not start; deleted rows may be restored."""
+
+
+class CadencePreconditionError(CalendarInsertNotStartedError):
+    """A required feed disappeared after preflight but before calendar POST."""
 
 
 _UUID_RE = _re.compile(
@@ -1003,7 +1008,7 @@ class SupabaseCalendarStore:
     def swap_media(self, account_key, row_id, image_url,
                    source_media_url=_SOURCE_MEDIA_UNSET,
                    extra_fields=None, *, render_evidence=None,
-                   poster_render_evidence=None):
+                   poster_render_evidence=None, expected_row=None):
         """CROSS-DAY MEDIA GUARD sweep (Blake, 2026-08-31): re-point a WAITING row's
         media to a fresh photo because its current photo already sits on another day
         of the gym's book. STATUS-GUARDED SERVER-SIDE: the PATCH itself is filtered to
@@ -1020,12 +1025,19 @@ class SupabaseCalendarStore:
         and source_media_asset_id (the Drive asset now on the row; None clears it when
         a Drive row becomes a local-library row, so the hide / removed-from-Drive
         sweeps stop tracking an asset the row no longer carries). Any other key is
-        ignored: this method never becomes a general row editor."""
+        ignored: this method never becomes a general row editor.
+
+        Ordinary self-service supplies expected_row from the clicked snapshot.
+        Its CAS runs regardless of global visual preparation; it preserves the
+        existing hold and pins caption, approval, claim and schedule state.
+        Completion still requires an independent readback by the handler."""
         if not (image_url or "").strip():
             return None
         # This is a real replacement, so release any earlier needs-media hold in
         # the same pending / coach_review-scoped write. Status itself is unchanged.
-        payload = {"image_url": image_url, "media_not_ready_reason": None}
+        payload = {"image_url": image_url}
+        if expected_row is None:
+            payload["media_not_ready_reason"] = None
         if source_media_url is not _SOURCE_MEDIA_UNSET:
             payload["source_media_url"] = source_media_url
         for col in _SWAP_EXTRA_COLUMNS:
@@ -1036,17 +1048,36 @@ class SupabaseCalendarStore:
         current = None
         params = {"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
                   "status": "in.(pending,coach_review)"}
-        if prepared_write:
-            current = self.get_row(account_key, row_id)
+        if prepared_write or expected_row is not None:
+            current = dict(expected_row) if expected_row is not None else self.get_row(account_key, row_id)
             if (current is None or str(current.get("gym_id")) != str(account_key)
                     or str(current.get("id")) != str(row_id)
                     or current.get("status") not in ("pending", "coach_review")
                     or any(current.get(key) is not None for key in
                            ("published_at", "late_post_id", "publish_claim_token"))):
                 return None
-            payload = self._prepare_visual_replacement(
-                account_key, current, payload, render_evidence, poster_render_evidence)
-            params = self._visual_media_cas(current, params)
+            if prepared_write:
+                payload = self._prepare_visual_replacement(
+                    account_key, current, payload, render_evidence, poster_render_evidence)
+            if expected_row is not None:
+                if not prepared_write:
+                    # Optional scene columns describe the replaced object. Never
+                    # retain that object's aliases on the new original.
+                    for field in _DRAFT_SCENE_CAS_COLUMNS:
+                        if field in current:
+                            payload[field] = None
+                required = ("id", "gym_id", *_CORE_VISUAL_MEDIA_CAS_COLUMNS)
+                if any(key not in current for key in required):
+                    raise PreWriteCASError(422, "swap snapshot incomplete")
+                for key in (*_VISUAL_MEDIA_CAS_COLUMNS, "variant_of", "approval_kind", "approved_by", "approved_at", "approval_digest"):
+                    if key not in current:
+                        continue
+                    encoded = _eq_filter(current[key])
+                    if encoded is None:
+                        raise PreWriteCASError(422, "swap snapshot cannot be encoded")
+                    params[key] = encoded
+            else:
+                params = self._visual_media_cas(current, params)
         r = self._client().patch(
             self._rest(_TABLE), params=params,
             headers=self._headers({"Content-Type": "application/json",
@@ -1055,7 +1086,7 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
-        if prepared_write:
+        if prepared_write or expected_row is not None:
             return self._visual_media_result(rows, account_key, current, payload)
         for row in rows:
             if str(row.get("gym_id")) == str(account_key):
@@ -3522,8 +3553,55 @@ class SupabaseCalendarStore:
 
     # ---- mirror writes (real-drafts calendar mirror) ------------------------
     # These write calendar rows only. NOTHING here publishes to any social account.
+    def preflight_cadence_rows(self, account_key, rows, *, replace_dates=()):
+        """Read-only cadence admission check used before a month is deleted.
+
+        Run every row-dropping belt against the still-intact book. Live-slot dedupe
+        is limited to this batch because the old wipeable rows are about to be
+        replaced. The admitted payload is then inserted with those belts frozen, so
+        no deterministic filter can first run after the delete.
+        """
+        planned = [dict(row or {}, gym_id=account_key) for row in (rows or ())]
+        normalized_pairs = []
+        from .copy_gate import bound_opening_hook, format_caption
+        for row in planned:
+            clean = dict(row)
+            try:
+                if "caption" in clean and clean["caption"] is not None:
+                    clean["caption"] = bound_opening_hook(
+                        format_caption(clean["caption"]))
+            except ValueError:
+                # The write path would retain this as a media hold. A required
+                # feed on hold cannot certify cadence, so leave it out and let
+                # the companion/required-slot checks refuse the rebuild.
+                continue
+            normalized_pairs.append((row, clean))
+        from .plan_horizon import belt_filter as _horizon_belt
+        planned, _ = _horizon_belt(account_key, planned)
+        admitted_planned_ids = {id(row) for row in planned}
+        filtered = [clean for original, clean in normalized_pairs
+                    if id(original) in admitted_planned_ids]
+        filtered = _stage_belts(account_key, filtered)
+        filtered = _media_stage_belt(
+            self, account_key, filtered,
+            skip_wipeable_dates=replace_dates)
+        # Held non-Story slots block cadence admission. Story proposals must remain:
+        # insert_rows' reconciliation path needs the new ready Story in order to
+        # recover the retained held UUID rather than leaving the hold stranded.
+        non_story_rows = [row for row in filtered
+                          if str(row.get("format") or "").strip().lower() != "story"]
+        admitted_non_story_ids = {
+            id(row) for row in _preserve_held_slots(
+                self, account_key, non_story_rows)}
+        filtered = [row for row in filtered
+                    if str(row.get("format") or "").strip().lower() == "story"
+                    or id(row) in admitted_non_story_ids]
+        filtered = _dedupe_slots(self, account_key, filtered, existing=set())
+        return _drop_companions_missing_instagram_feed(planned, filtered)
+
     def insert_rows(self, account_key, rows, *, preserve_ids=False,
-                    render_evidence_by_url=None, poster_render_evidence_by_url=None):
+                    render_evidence_by_url=None, poster_render_evidence_by_url=None,
+                    required_feed_slots=None, prevalidated_cadence=False):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -3617,13 +3695,15 @@ class SupabaseCalendarStore:
         # AGENT_PLAN_HORIZON_DAYS=0 disables (emergency escape hatch).
         from .plan_horizon import belt_filter as _horizon_belt
         payload, _ = _horizon_belt(account_key, payload)
-        payload = _stage_belts(account_key, payload)
+        planned_companions = list(payload)
+        if not prevalidated_cadence:
+            payload = _stage_belts(account_key, payload)
         # CROSS-DAY MEDIA BELT (fleet audit, 2026-08-31; flag AGENT_MEDIA_CROSS_DAY_GUARD,
         # the SAME flag media_guard already ships armed on). agent/media_guard.py calls
         # itself "the shared cross-day media guard for every photo-assigning lane" and was
         # wired into exactly TWO of them. This door is the one every staging lane walks
         # through, so the rule lives here too. See _media_stage_belt.
-        payload = _media_stage_belt(self, account_key, payload)
+            payload = _media_stage_belt(self, account_key, payload)
         # SLOT IDEMPOTENCY BELT (AUD-001, 2026-09-05; default ON because it PREVENTS
         # damage, same posture as the plan-horizon belt. AGENT_SLOT_DEDUPE=false is the
         # escape hatch).
@@ -3655,8 +3735,42 @@ class SupabaseCalendarStore:
         # Story recovery above uses its retained UUID; this barrier governs NEW
         # rows of every format. Caption/image changes cannot bypass it, and it
         # does not collapse numbered slots or channel siblings.
-        payload = _preserve_held_slots(self, account_key, payload)
-        payload = _dedupe_slots(self, account_key, payload)
+        if not prevalidated_cadence:
+            payload = _preserve_held_slots(self, account_key, payload)
+            payload = _dedupe_slots(self, account_key, payload)
+        else:
+            # Re-read only the durable/concurrent ownership barriers immediately
+            # before POST. Deterministic caption/media/in-batch filtering was frozen
+            # by preflight; these two checks must remain live so an approval or hold
+            # created after preflight is never stacked with a new row.
+            live_months = sorted({str(row.get("post_date") or "")[:7]
+                                  for row in payload
+                                  if str(row.get("post_date") or "")[:7]})
+            try:
+                payload, _ = _preserve_and_prune_strict(
+                    self, account_key, live_months, payload)
+            except Exception as exc:
+                raise CalendarInsertNotStartedError(
+                    503, "live human-owned slot read failed before calendar insert") from exc
+            payload = _preserve_held_slots(self, account_key, payload)
+            payload = _dedupe_slots(self, account_key, payload)
+        # A recovered Story was patched in place under its retained UUID and is
+        # deliberately absent from the POST payload. Count the exact planned
+        # Story slot as satisfied for companion atomicity without re-inserting it.
+        recovered_story_slots = {_story_slot(row) for row in recovered
+                                 if (row or {}).get("format") == "story"}
+        recovered_companions = [
+            row for row in planned_companions
+            if (row or {}).get("format") == "story"
+            and _story_slot(row) in recovered_story_slots]
+        payload = _drop_companions_missing_instagram_feed(
+            planned_companions, payload, satisfied=recovered_companions)
+        if prevalidated_cadence and required_feed_slots is not None:
+            required = {tuple(slot) for slot in required_feed_slots}
+            actual = _instagram_feed_slots(payload)
+            if not required.issubset(actual):
+                raise CadencePreconditionError(
+                    409, "calendar cadence precondition failed before insert")
         if not payload:
             return recovered
         from . import visual_writer_prepare
@@ -3668,12 +3782,19 @@ class SupabaseCalendarStore:
             # Accepting a thumbnail-only key would attach one video's proof to
             # another video's image, so use the strict composite key and never
             # fall back to a thumbnail-only lookup.
-            payload = [self._prepare_visual_row(
-                account_key, row,
-                render_evidence=(render_evidence_by_url or {}).get(row.get("image_url")),
-                poster_render_evidence=(poster_render_evidence_by_url or {}).get(
-                    (row.get("image_url"), row.get("thumbnail_url"))))
-                for row in payload]
+            try:
+                payload = [self._prepare_visual_row(
+                    account_key, row,
+                    render_evidence=(render_evidence_by_url or {}).get(row.get("image_url")),
+                    poster_render_evidence=(poster_render_evidence_by_url or {}).get(
+                        (row.get("image_url"), row.get("thumbnail_url"))))
+                    for row in payload]
+            except Exception as exc:
+                if not prevalidated_cadence:
+                    raise
+                raise CalendarInsertNotStartedError(
+                    409, f"visual preparation failed before calendar insert: "
+                    f"{type(exc).__name__}") from exc
         all_keys = set()
         for r in payload:
             all_keys.update(r.keys())
@@ -3780,7 +3901,7 @@ class SupabaseCalendarStore:
         return rows[0]
 
     def delete_month(self, account_key, month, *, preserve_human=True,
-                     preserve_dates=()):
+                     preserve_dates=(), return_rows=False):
         """DELETE content_calendar rows for account_key whose post_date falls inside the
         calendar month `month` ('YYYY-MM'). Gym scoped: the filter carries BOTH
         gym_id=eq.<account_key> AND the month's date bounds, so a row belonging to another
@@ -3864,8 +3985,39 @@ class SupabaseCalendarStore:
         )
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        rows = r.json() or []
-        return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+        rows = [x for x in (r.json() or [])
+                if str(x.get("gym_id")) == str(account_key)]
+        return rows if return_rows else len(rows)
+
+    def restore_deleted_rows(self, account_key, rows):
+        """Restore exact rows deleted by this rebuild after a pre-POST refusal."""
+        import uuid
+        payload = []
+        for row in rows or ():
+            clean = dict(row or {})
+            if str(clean.get("gym_id")) != str(account_key):
+                raise ValueError("rollback row belongs to another gym")
+            clean["id"] = str(uuid.UUID(str(clean.get("id") or "")))
+            payload.append(clean)
+        if not payload:
+            return []
+        all_keys = set().union(*(row.keys() for row in payload))
+        payload = [{key: row.get(key) for key in all_keys} for row in payload]
+        response = self._client().post(
+            self._rest(_TABLE),
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=payload, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(
+                response.status_code, _scrub((response.text or "")[:200]))
+        restored = response.json() or []
+        expected_ids = {row["id"] for row in payload}
+        actual_ids = {row.get("id") for row in restored
+                      if str(row.get("gym_id")) == str(account_key)}
+        if actual_ids != expected_ids:
+            raise PortalStoreError(502, "calendar rollback was incomplete")
+        return restored
 
     def locked_slots(self, account_key, month):
         """The set of (post_date, account, format) slots in `month` already occupied by a
@@ -4609,6 +4761,80 @@ def _live_slots_for(store, account_key, dates):
     return out
 
 
+def _companion_group_key(row):
+    """Stable sibling identity, with platform-aware fallback for legacy rows."""
+    r = row or {}
+    logical_post_id = str(r.get("logical_post_id") or "").strip()
+    if logical_post_id:
+        return ("logical_post_id", logical_post_id)
+    account = str(r.get("account") or "").strip().lower()
+    fmt = str(r.get("format") or "").strip().lower()
+    day = str(r.get("post_date") or "")[:10]
+    slot = r.get("slot_index")
+    if ((account in ("instagram", "ig", "") and fmt in ("feed", "story"))
+            or (account in ("facebook", "fb") and fmt == "feed")):
+        return ("legacy_meta_companions", day, slot)
+    return ("legacy_singleton", account, fmt, day, slot)
+
+
+def _drop_companions_missing_instagram_feed(planned, filtered, *, satisfied=()):
+    """Keep the Instagram feed and its planned Story coupled.
+
+    Facebook is a best-effort mirror, not a cadence unit.  A Facebook-only belt
+    refusal must not erase a valid Instagram feed (or its paired Story).  The
+    Instagram feed remains the group anchor, while a Story that was planned for
+    that anchor is required either in ``filtered`` or in ``satisfied`` (for an
+    in-place recovered hold).
+    """
+    from collections import defaultdict
+
+    def _member(row):
+        r = row or {}
+        return (str(r.get("format") or "").strip().lower(),
+                str(r.get("account") or "").strip().lower())
+
+    planned_members = defaultdict(set)
+    kept_members = defaultdict(set)
+    for row in planned or ():
+        planned_members[_companion_group_key(row)].add(_member(row))
+    for row in list(filtered or ()) + list(satisfied or ()):
+        kept_members[_companion_group_key(row)].add(_member(row))
+    instagram_accounts = {"instagram", "ig", ""}
+
+    def _has_instagram_feed(members):
+        return any(fmt == "feed" and account in instagram_accounts
+                   for fmt, account in members)
+
+    def _has_story(members):
+        return any(fmt == "story" for fmt, _account in members)
+
+    missing = set()
+    for key, members in planned_members.items():
+        # Non-Instagram groups are outside this companion contract.
+        if not _has_instagram_feed(members):
+            continue
+        kept = kept_members.get(key, set())
+        if not _has_instagram_feed(kept):
+            missing.add(key)
+            continue
+        if _has_story(members) and not _has_story(kept):
+            missing.add(key)
+    if not missing:
+        return filtered
+    return [row for row in (filtered or ())
+            if _companion_group_key(row) not in missing]
+
+
+def _instagram_feed_slots(rows):
+    return {(str((row or {}).get("post_date") or "")[:10],
+             (row or {}).get("slot_index"))
+            for row in (rows or ())
+            if str((row or {}).get("post_date") or "")[:10]
+            and str((row or {}).get("format") or "").strip().lower() == "feed"
+            and str((row or {}).get("account") or "").strip().lower()
+            in ("instagram", "ig", "")}
+
+
 def _stage_belts(account_key, payload):
     """Apply the stage-time empty-caption + verbatim-dedup belts to an
     insert_rows batch (see the insert_rows comment). Returns the rows that may
@@ -4651,13 +4877,28 @@ def _stage_belts(account_key, payload):
         except Exception:
             pass  # alerting never blocks staging
 
-    kept = []
+    # Instagram feed + paired Story are the required generated companion set.
+    # Facebook is an independently filtered mirror: losing only that mirror must not
+    # erase a valid Instagram cadence unit. Decide the Instagram feed first, then
+    # remove every sibling only when that primary feed is blocked.
+    # Production ENG proved why this must be atomic: the verbatim belt removed the IG
+    # and FB feeds for Oct 19/28/29 while their exempt Stories survived, leaving 27 of
+    # 30 feed slots and a misleadingly full-looking calendar.
+    decisions = []
+    blocked_primary_groups = set()
+
+    def _is_instagram_feed(row):
+        r = row or {}
+        return (str(r.get("format") or "").strip().lower() == "feed"
+                and str(r.get("account") or "").strip().lower()
+                in ("instagram", "ig", ""))
+
     batch_dates_by_hash = {}   # verbatim hash -> set of post_dates staged in THIS batch
     for row in payload:
         caption = str(row.get("caption") or "")
         post_date = str(row.get("post_date") or "")[:10]
         if _is_story(row) or _is_gbp_photo_drop(row):
-            kept.append(row)
+            decisions.append((row, True))
             continue
         if empty_guard:
             try:
@@ -4668,6 +4909,9 @@ def _stage_belts(account_key, payload):
                         f"{post_date or 'unknown date'} at stage time (a feed post may "
                         "not ship without real words); the slot refills on the next "
                         "plan pass")
+                    if _is_instagram_feed(row):
+                        blocked_primary_groups.add(_companion_group_key(row))
+                    decisions.append((row, False))
                     continue
             except Exception:
                 pass
@@ -4684,13 +4928,23 @@ def _stage_belts(account_key, payload):
                         f"{post_date} at stage time (verbatim duplicate of a caption "
                         f"used within {_ledger.VERBATIM_BLOCK_DAYS} days); the slot "
                         "refills on the next plan pass with a fresh caption")
+                    if _is_instagram_feed(row):
+                        blocked_primary_groups.add(_companion_group_key(row))
+                    decisions.append((row, False))
                     continue
                 if h:
                     batch_dates_by_hash.setdefault(h, set()).add(post_date)
             except Exception:
                 pass
-        kept.append(row)
-    return kept
+        decisions.append((row, True))
+    allowed_primary_groups = {
+        _companion_group_key(row) for row, allowed in decisions
+        if allowed and _is_instagram_feed(row)
+    }
+    fully_blocked_primary_groups = blocked_primary_groups - allowed_primary_groups
+    return [row for row, allowed in decisions
+            if allowed
+            and _companion_group_key(row) not in fully_blocked_primary_groups]
 
 
 # ---- CROSS-DAY MEDIA BELT ------------------------------------------------------
@@ -4772,7 +5026,8 @@ class _ReadProbe:
             raise
 
 
-def _media_stage_belt(store, account_key, payload, *, alert=None):
+def _media_stage_belt(store, account_key, payload, *, alert=None,
+                      skip_wipeable_dates=()):
     """Drop any incoming row whose photo already sits on a DIFFERENT day of this gym's
     book. Returns the rows that may stage.
 
@@ -4851,6 +5106,7 @@ def _media_stage_belt(store, account_key, payload, *, alert=None):
         state = media_guard.book_state(
             account_key, probe, start, (last - start).days + 1,
             log=lambda m: print(f"[portal-calendar-store] media belt: {m}"),
+            skip_wipeable_dates=skip_wipeable_dates,
             library_path=library_path or None)
         if probe.failed:
             _say(f"cross-day media belt STOOD DOWN for {account_key}: the book read "
@@ -4902,77 +5158,99 @@ def _media_stage_belt(store, account_key, payload, *, alert=None):
         return payload
 
 
+def _prune_by_cadence_occupancy(store, account_key, months, rows):
+    """Drop incoming rows that collide with a human-owned cadence slot.
+
+    Occupancy is per (post_date, account, format) up to resolve_posts_per_day
+    slots. A 2x day with an approved morning post can still receive an evening
+    post; a 1x day (or 2x->1x reshape, capacity 1) treats any owned feed as
+    filling the cell. Approved/published rows are never replaced.     Denied/killed
+    rows do not occupy capacity so a replacement may land.
+    """
+    from .cadence import resolve_posts_per_day
+    from collections import defaultdict
+
+    def capacity_for(row):
+        """Third capacity exists only for LASSO feed/story rows in the dated window."""
+        day_key = str(row.get("post_date") or "")[:10]
+        try:
+            base_capacity = resolve_posts_per_day(account_key, store, day=day_key)
+        except TypeError:
+            # Compatibility for injected legacy resolvers in offline callers.
+            base_capacity = resolve_posts_per_day(account_key, store)
+        if (str(account_key).strip().lower() == "lasso"
+                and str(row.get("format") or "feed").strip().lower() in ("feed", "story")):
+            try:
+                if config.lasso_three_feed_enabled() or \
+                        config.lasso_summit_daily_enabled(day_key):
+                    return max(base_capacity, 3)
+            except (TypeError, ValueError):
+                pass
+        return min(int(base_capacity or 1), 2)
+
+    existing = []
+    for month in months:
+        existing.extend(store.list_month(account_key, month) or [])
+    occupied = defaultdict(set)
+    active_count = defaultdict(int)
+    prior = defaultdict(list)
+    for row in existing:
+        status = str(row.get("status") or "").lower()
+        if not status or status in _WIPEABLE_STATUSES:
+            continue
+        key = _slot_key(row)
+        prior[key].append(row)
+        if status in ("denied", "killed"):
+            continue
+        active_count[key] += 1
+        ordinal = row.get("slot_index")
+        capacity = capacity_for(row)
+        if ordinal not in range(capacity):
+            ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
+        occupied[key].add(ordinal)
+    kept = []
+    for row in rows or []:
+        key = _slot_key(row)
+        capacity = capacity_for(row)
+        ordinal = row.get("slot_index")
+        if ordinal is None:
+            ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
+            # LASSO editorial still assigns a concrete ordinal to legacy nulls
+            # (two None feeds on a 2x day become 0 then 1). Client None stays
+            # None on the default cell so _held_slot_key (None != 0) still
+            # blocks a pending media-hold replacement at insert time.
+            if ordinal != 0 or str(account_key).strip().lower() == "lasso":
+                row = dict(row, slot_index=ordinal)
+        if (ordinal not in range(capacity) or active_count[key] >= capacity
+                or ordinal in occupied[key]):
+            continue
+        if any((row.get("caption") and row.get("caption") == old.get("caption"))
+               or (row.get("image_url") and row.get("image_url") == old.get("image_url"))
+               for old in prior.get(key, ())):
+            continue
+        kept.append(row)
+        occupied[key].add(ordinal)
+        active_count[key] += 1
+    return kept, len(prior)
+
+
 def preserve_and_prune(store, account_key, months, rows):
     """Shared guard for every delete-then-insert rebuild lane (client month, real month,
     demo->real mirror). Reads the HUMAN OWNED slots the gym already has across `months`
     and drops any incoming row that would land on one of them, so a rebuild that keeps a
     client's approved post never also inserts a duplicate draft into the same cell.
 
+    When the store can list_month, occupancy is per cadence slot so a 2x day with an
+    approved morning post can still receive an evening post. Stores that only expose
+    locked_slots keep the conservative (post_date, account, format) cell lock.
     Returns (kept_rows, locked_slot_count). Safe when the store lacks locked_slots (a test
     fake): then nothing is locked and every row is kept. Never raises out (a read failure
     falls back to keeping all rows, matching the old behavior)."""
-    if (account_key == "lasso" and config.lasso_editorial_calendar_enabled()
-            and callable(getattr(store, "list_month", None))):
-        from .cadence import resolve_posts_per_day
-        def capacity_for(row):
-            """Third capacity exists only for LASSO feed rows in the dated window."""
-            day_key = str(row.get("post_date") or "")[:10]
-            try:
-                base_capacity = resolve_posts_per_day(account_key, store, day=day_key)
-            except TypeError:
-                # Compatibility for injected legacy resolvers in offline callers.
-                base_capacity = resolve_posts_per_day(account_key, store)
-            if (str(account_key).strip().lower() == "lasso"
-                    and str(row.get("format") or "feed").strip().lower() in ("feed", "story")):
-                try:
-                    if config.lasso_three_feed_enabled() or \
-                            config.lasso_summit_daily_enabled(day_key):
-                        return max(base_capacity, 3)
-                except (TypeError, ValueError):
-                    pass
-            # Client Stories retain their two-slot preservation capacity.
-            return min(base_capacity, 2)
-        existing = []
-        # A failed preservation read must never risk an approved post.
-        for month in months:
-            existing.extend(store.list_month(account_key, month) or [])
-        from collections import defaultdict
-        occupied = defaultdict(set)
-        active_count = defaultdict(int)
-        prior = defaultdict(list)
-        for row in existing:
-            status = str(row.get("status") or "").lower()
-            if not status or status in _WIPEABLE_STATUSES:
-                continue
-            key = _slot_key(row)
-            prior[key].append(row)
-            if status in ("denied", "killed"):
-                continue
-            active_count[key] += 1
-            ordinal = row.get("slot_index")
-            capacity = capacity_for(row)
-            if ordinal not in range(capacity):
-                ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
-            occupied[key].add(ordinal)
-        kept = []
-        for row in rows or []:
-            key = _slot_key(row)
-            capacity = capacity_for(row)
-            ordinal = row.get("slot_index")
-            if ordinal is None:
-                ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
-                row = dict(row, slot_index=ordinal)
-            if (ordinal not in range(capacity) or active_count[key] >= capacity
-                    or ordinal in occupied[key]):
-                continue
-            if any((row.get("caption") and row.get("caption") == old.get("caption"))
-                   or (row.get("image_url") and row.get("image_url") == old.get("image_url"))
-                   for old in prior[key]):
-                continue
-            kept.append(row)
-            occupied[key].add(ordinal)
-            active_count[key] += 1
-        return kept, len(prior)
+    if callable(getattr(store, "list_month", None)):
+        try:
+            return _prune_by_cadence_occupancy(store, account_key, months, rows)
+        except Exception:  # noqa: BLE001 - a read failure must not block the rebuild
+            pass
     getter = getattr(store, "locked_slots", None)
     if getter is None:
         return list(rows or []), 0
@@ -4985,6 +5263,21 @@ def preserve_and_prune(store, account_key, months, rows):
     if not locked:
         return list(rows or []), 0
     kept = [r for r in (rows or []) if _slot_key(r) not in locked]
+    return kept, len(locked)
+
+
+def _preserve_and_prune_strict(store, account_key, months, rows):
+    """Fail-closed variant for the final prevalidated cadence write barrier."""
+    locked_slots = getattr(store, "locked_slots", None)
+    if not callable(locked_slots):
+        raise RuntimeError("locked slot reader unavailable")
+    locked = set()
+    for month in months:
+        result = locked_slots(account_key, month)
+        if not isinstance(result, set):
+            raise RuntimeError("locked slot read was not authoritative")
+        locked |= result
+    kept = [row for row in rows if _slot_key(row) not in locked]
     return kept, len(locked)
 
 

@@ -132,6 +132,46 @@ def _has_banned_word(text, banned_words):
     return False
 
 
+def _caption_repeats_history(base_key, caption, day_key):
+    """Use the writer's 180 day rule before a photo gets paired with a Story.
+
+    Retries choose approved source material; changing case, spacing or adding an
+    arbitrary suffix never establishes a fresh caption.
+    """
+    if not config.caption_cooldown_enabled():
+        return False
+    from . import caption_ledger
+    return caption_ledger.is_verbatim_blocked(base_key, caption, day_key)
+
+
+def _empty_fill_has_unmet_slots(store, base_key, start, days, slots_per_day,
+                                locked_days):
+    """An empty rebuild is a legitimate no-op only when its span is covered."""
+    from datetime import timedelta
+    from .onboarding_demo import is_sample_row
+    dates = {(start + timedelta(days=i)).isoformat() for i in range(days)}
+    unmet = dates - set(locked_days)
+    if not unmet:
+        return False
+    slots = {day: set() for day in unmet}
+    try:
+        for month in sorted({day[:7] for day in unmet}):
+            for row in store.list_month(base_key, month) or []:
+                day = str(row.get("post_date") or "")[:10]
+                if (day not in slots or is_sample_row(row)
+                        or str(row.get("status") or "").lower() in
+                        ("denied", "killed", "deleted")
+                        or str(row.get("account") or "").lower() not in
+                        ("instagram", "ig", "")
+                        or row.get("format") != "feed"
+                        or not row.get("image_url") or row.get("media_not_ready_reason")):
+                    continue
+                slots[day].add(row.get("slot_index") or 0)
+    except Exception:
+        return True  # an unreadable span cannot certify a successful fill
+    return any(len(placed) < slots_per_day for placed in slots.values())
+
+
 def _url_basename(url):
     """The filename a public media URL points at (query string stripped). Hosted client
     media keeps its library basename, so this is the join key between a calendar row's
@@ -146,21 +186,51 @@ def _url_basename(url):
 _PHOTO_CONSUMING_STATUSES = ("approved", "published", "publishing")
 
 
+def _feed_slot_index(row, slots_per_day=1):
+    """The cadence ordinal a human-owned feed occupies.
+
+    Legacy 1x rows have no slot_index and occupy slot 0, so a gym that later
+    flips to 2x can still fill the open evening slot without replacing the
+    approved morning post. An ordinal outside the current cadence (a leftover
+    PM row after a 2x->1x toggle) still occupies a real slot: treat it as slot 0
+    so a 1x rebuild cannot place a competing feed beside it.
+    """
+    capacity = 2 if int(slots_per_day or 1) >= 2 else 1
+    raw = (row or {}).get("slot_index")
+    try:
+        slot = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    if slot in range(capacity):
+        return slot
+    return 0
+
+
 def _locked_calendar_state(base_key, start, days, store, log, library_path=None):
-    """(locked_feed_days, used_keys) from the gym's EXISTING human-owned calendar rows
-    across the planned span. locked_feed_days: post_dates whose feed a human already
-    owns (approved/published/denied/killed — anything not machine-wipeable), so the
-    rebuild never plans a competing feed there. used_keys: the media basenames carried
-    by rows whose photo is truly consumed (approved/published/publishing, any format),
-    so a live photo is never re-picked; a denied/killed photo stays available.
+    """(locked_feed_days, used_keys, locked_feed_slots) from EXISTING human-owned
+    calendar rows across the planned span.
+
+    locked_feed_days: post_dates where any feed/Story sibling is human-owned
+    (approved/published/denied/killed — anything not machine-wipeable), so a
+    rebuild never separates a retained Story from its feed. locked_feed_slots:
+    (post_date, slot_index) pairs whose FEED a human already owns; the rebuild
+    never replaces those slots, but a 2x day with only slot 0 owned can still
+    receive a slot 1 feed. used_keys: media carried by rows whose photo is truly
+    consumed (approved/published/publishing, any format), so a live photo is
+    never re-picked; a denied/killed photo stays available.
     Read-only; a read failure returns empty state (the store-level preserve_and_prune
     backstop still guards the write)."""
     from datetime import timedelta
     from .portal_calendar_store import _WIPEABLE_STATUSES
-    locked_days, used = set(), set()
+    from .cadence import resolve_posts_per_day
+    try:
+        slots_per_day = resolve_posts_per_day(base_key, store)
+    except Exception:  # noqa: BLE001 - lock-state cadence is best-effort
+        slots_per_day = 1
+    locked_days, locked_slots, used = set(), set(), set()
     list_month = getattr(store, "list_month", None)
     if list_month is None:
-        return locked_days, used
+        return locked_days, used, locked_slots
     months = sorted({(start + timedelta(days=i)).isoformat()[:7]
                      for i in range(max(1, days))})
     for month in months:
@@ -173,13 +243,24 @@ def _locked_calendar_state(base_key, start, days, store, log, library_path=None)
             status = str((row or {}).get("status") or "").lower()
             if not status or status in _WIPEABLE_STATUSES:
                 continue
-            if str(row.get("format") or "").lower() == "feed":
-                locked_days.add(str(row.get("post_date") or "")[:10])
+            fmt = str(row.get("format") or "").lower()
+            if fmt in ("feed", "story"):
+                day = str(row.get("post_date") or "")[:10]
+                if day:
+                    locked_days.add(day)
+                    if fmt == "feed":
+                        locked_slots.add((day, _feed_slot_index(row, slots_per_day)))
             if status in _PHOTO_CONSUMING_STATUSES:
                 key = _url_basename(row.get("image_url") or "")
                 if key:
                     used.add(key)
     locked_days.discard("")
+    # A human-owned Story with no owned feed still locks its WHOLE day (main #327-#330
+    # semantics): a rebuild must never place a new feed beside a retained Story.
+    feed_slot_days = {d for d, _s in locked_slots}
+    for day in locked_days - feed_slot_days:
+        locked_slots.add((day, 0))
+        locked_slots.add((day, 1))
     # CROSS-DAY MEDIA GUARD (Blake, 2026-08-31: a client saw the same photo across
     # different weeks): also exclude every photo that will SURVIVE this rebuild on
     # the gym's book — published within the trailing repeat window (the span-months
@@ -209,7 +290,7 @@ def _locked_calendar_state(base_key, start, days, store, log, library_path=None)
                 used.add(raw)
         except Exception as exc:  # noqa: BLE001 - resolution is best-effort, never a block
             log(f"reframe-to-basename resolution skipped ({type(exc).__name__})")
-    return locked_days, used
+    return locked_days, used, locked_slots
 
 
 def _surviving_pillar_counts(base_key, start, days, store, log):
@@ -256,7 +337,7 @@ def _surviving_pillar_counts(base_key, start, days, store, log):
 
 
 def _edited_story_captions(base_key, start, days, store, log):
-    """{post_date -> caption} for STORY rows the client edited in the portal but which
+    """{(post_date, slot_index) -> caption} for client-edited STORY rows which
     have NOT been re-rendered yet. Editing a story caption (portal_calendar_store.
     patch_caption) resets the row to 'pending' and updates content_calendar.caption, but
     the burned media still carries the OLD caption. A rebuild would otherwise re-render
@@ -279,24 +360,27 @@ def _edited_story_captions(base_key, start, days, store, log):
         except Exception as exc:  # noqa: BLE001 - never block the build on a read
             log(f"edited-story read failed for {month}: {type(exc).__name__}")
             continue
-        feeds_by_date = {}
-        stories_by_date = {}
+        feeds_by_slot = {}
+        stories_by_slot = {}
         for row in rows:
             fmt = str(row.get("format") or "").lower()
             pd = str(row.get("post_date") or "")[:10]
+            account = str(row.get("account") or "").strip().lower()
+            slot = row.get("slot_index")
             if not pd:
                 continue
-            if fmt == "feed":
-                feeds_by_date.setdefault(pd, row.get("caption") or "")
-            elif fmt == "story":
-                stories_by_date[pd] = row.get("caption") or ""
-        for pd, story_cap in stories_by_date.items():
+            key = (pd, slot)
+            if fmt == "feed" and account in ("instagram", "ig", ""):
+                feeds_by_slot.setdefault(key, row.get("caption") or "")
+            elif fmt == "story" and account in ("instagram", "ig", ""):
+                stories_by_slot[key] = row.get("caption") or ""
+        for key, story_cap in stories_by_slot.items():
             story_cap = (story_cap or "").strip()
-            feed_cap = (feeds_by_date.get(pd) or "").strip()
+            feed_cap = (feeds_by_slot.get(key) or "").strip()
             # An edited story caption is one that differs from the paired feed caption
             # (an unedited paired story is cloned FROM the feed, so it matches).
             if story_cap and story_cap != feed_cap:
-                edited[pd] = story_cap
+                edited[key] = story_cap
     return edited
 
 
@@ -402,6 +486,16 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
         # 2x uniqueness: never the same concept twice in one day (CADENCE_SPEC D5).
         if _avoid and _norm_caption(getattr(d, "caption", "")) in _avoid:
             return False
+        # Check against the REAL target date, including when the approved-source
+        # walk below generates on a neighbouring day and re-homes its draft.
+        if config.caption_cooldown_enabled():
+            caption_base = re.sub(
+                r"_(?:ig|fb|gbp)$", "", getattr(account, "key", "") or "")
+            # Caption-only/offline callers may have no account when cooldown is
+            # off. An armed history guard requires the real tenant identity.
+            if not caption_base or _caption_repeats_history(
+                    caption_base, d.caption, day_key):
+                return False
         # A+ caption gate is enforced whenever the real-caption engine (SB7) is on —
         # the production posture. With SB7 OFF the system is in its documented
         # deterministic baseline mode (source + CTA), where only the banned-word bar
@@ -836,10 +930,10 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
     if media_guard.enabled():
         try:
             from datetime import timedelta
-            span_months = {(start + timedelta(days=i)).isoformat()[:7]
-                           for i in range(max(1, days))}
+            span_dates = {(start + timedelta(days=i)).isoformat()[:10]
+                          for i in range(max(1, days))}
             guard_state = media_guard.book_state(base_key, store, start, days, log=log,
-                                                 skip_wipeable_months=span_months,
+                                                 skip_wipeable_dates=span_dates,
                                                  library_path=library_path)
         except Exception as exc:  # noqa: BLE001 - the guard never sinks a fill
             log(f"{base_key}: fallback guard read skipped ({type(exc).__name__})")
@@ -872,7 +966,8 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
             continue
         raw_basename = os.path.basename(feed_path) if feed_path else ""
         media_guard.note_placed(guard_state, raw_basename or key, day_key)
-        story_override = (edited_story_caps or {}).get(str(day_key)[:10])
+        story_override = ((edited_story_caps or {}).get((str(day_key)[:10], None))
+                          or (edited_story_caps or {}).get((str(day_key)[:10], 0)))
         try:
             finished = _finish_feed_with_story(
                 account, feed, library_path, log, day_key=day_key,
@@ -910,7 +1005,8 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
     return filled
 
 
-def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, log):
+def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, log,
+                           *, source=None, angle=""):
     """One fresh caption for a Drive draft that failed the A+ gate, on the SAME asset:
     the next approved source in the day's rotation (else the same one) and the failed
     opening as an avoid hint, through the same generator. Mutates draft.caption /
@@ -918,8 +1014,8 @@ def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, 
     try:
         from .drafter import opening_signature
         prev = (getattr(draft, "caption", "") or "").strip()
-        source = (_gym_drive_source_for(account_key, day_key, slot_i + 1)
-                  or _gym_drive_source_for(account_key, day_key, slot_i))
+        source = source or (_gym_drive_source_for(account_key, day_key, slot_i + 1)
+                            or _gym_drive_source_for(account_key, day_key, slot_i))
         if source is None:
             return False
         avoid = tuple(s for s in (opening_signature(prev),) if s)
@@ -933,18 +1029,155 @@ def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, 
         caption, tags = client_content.make_caption(
             account, source, voice, getattr(draft, "creative_path", "") or "",
             creative=creative, verified=grounding.get("verified"),
-            avoid_openings=avoid)
+            avoid_openings=avoid, **({"angle": angle} if angle else {}))
         caption = (caption or "").strip()
         if not caption or caption == prev:
             return False
         draft.caption = caption
         draft.hashtags = tags or []
-        log(f"[gym-drive] {account_key} {day_key} slot {slot_i}: caption failed A+, "
+        if getattr(source, "category", ""):
+            draft.category = source.category
+        log(f"[gym-drive] {account_key} {day_key} slot {slot_i}: "
             "retried once with a fresh caption on the same asset")
         return True
     except Exception as exc:  # noqa: BLE001 - a retry failure is just "no retry"
         log(f"[gym-drive] {account_key} {day_key}: recaption failed ({type(exc).__name__})")
         return False
+
+
+# One ordinary recaption plus at most seven distinct approved-source retries.
+_DRIVE_HISTORY_RETRY_LIMIT = 7
+# With SB7 disabled, copy is deterministic: scanning approved baselines does not
+# call an LLM or claim another photo. Do not spend the seven retries on facts
+# whose exact source+CTA copy is already known to repeat history.
+_DRIVE_HISTORY_BASELINE_SCAN_LIMIT = 64
+
+
+def _drive_history_sources(account_key, day_key, slot_i,
+                           limit=_DRIVE_HISTORY_RETRY_LIMIT):
+    """Walk distinct approved facts, interleaved across deterministic pillars.
+
+    The old slot offset changes only the category. The within-category day index
+    stays fixed, stranding the other facts whenever those first two captions were
+    in history. Advance that index as well, without changing the scheduled date.
+    """
+    from . import client_sources, caption_ledger
+    present = client_content._pillars_for(account_key)
+    if not present:
+        return []
+    ordinal = client_content._day_ordinal(day_key)
+    start = (ordinal + int(slot_i or 0) + 2) % len(present)
+    categories = present[start:] + present[:start]
+    pools = []
+    for category in categories:
+        items = client_sources.approved_sources(account_key, category=category)
+        if items:
+            offset = (ordinal // len(present) + 1) % len(items)
+            pools.append(items[offset:] + items[:offset])
+    tried = [_gym_drive_source_for(account_key, day_key, slot_i),
+             _gym_drive_source_for(account_key, day_key, slot_i + 1)]
+    # Source dataclasses are mutable, so identity uses approved fact text instead.
+    seen = {caption_ledger.verbatim_normalize(getattr(source, "text", ""))
+            for source in tried if source is not None}
+    out = []
+    for index in range(max((len(pool) for pool in pools), default=0)):
+        for pool in pools:
+            if index >= len(pool):
+                continue
+            source = pool[index]
+            fact = caption_ledger.verbatim_normalize(source.text)
+            if not fact or fact in seen:
+                continue
+            seen.add(fact)
+            out.append(source)
+    return out[:limit]
+
+
+def _retry_drive_caption_history(account, draft, voice, base_key, account_key,
+                                  day_key, slot_i, banned_words, day_captions, log):
+    """Bounded genuine copy regeneration on the already selected photo."""
+    from . import post_quality, caption_ledger
+    from .drafter import angle_for_index
+    sb7 = config.sb7_enabled()
+    try:
+        sources = _drive_history_sources(
+            account_key, day_key, slot_i,
+            _DRIVE_HISTORY_RETRY_LIMIT if sb7 else _DRIVE_HISTORY_BASELINE_SCAN_LIMIT)
+    except Exception as exc:
+        log(f"[gym-drive] {base_key} {day_key}: approved-source walk unavailable "
+            f"({type(exc).__name__})")
+        return False
+    day_hashes = {caption_ledger.verbatim_hash(c) for c in day_captions}
+
+    def rejections(candidate):
+        """Classification only: never log caption text or confidential banned words."""
+        caption = getattr(candidate, "caption", "") or ""
+        reasons = []
+        try:
+            quality_ok = (post_quality.is_a_plus(candidate, tuple(banned_words or ()),
+                                                 require_media=True)
+                          if sb7 else not _has_banned_word(caption, tuple(banned_words or ())))
+            if not quality_ok:
+                reasons.append("a_plus" if sb7 else "banned_word")
+        except Exception:
+            reasons.append("quality_gate_error")
+        if not caption.strip():
+            reasons.append("empty_caption")
+        if _caption_repeats_history(base_key, caption, day_key):
+            reasons.append("history_180d")
+        if caption_ledger.verbatim_hash(caption) in day_hashes:
+            reasons.append("same_day")
+        return reasons
+
+    if not sb7:
+        from copy import copy
+        candidates = []
+        rejected = {}
+        scanned = 0
+        for source in sources[:_DRIVE_HISTORY_BASELINE_SCAN_LIMIT]:
+            scanned += 1
+            # EXACT same creative key as _recaption_drive_draft: the approved CTA
+            # is photo-keyed, so testing an arbitrary key could admit the wrong copy.
+            candidate = copy(draft)
+            try:
+                candidate.caption, _ = client_content.compose_caption(
+                    account, source, voice, getattr(draft, "creative_path", "") or "")
+                reasons = rejections(candidate)
+            except Exception:
+                reasons = ["baseline_error"]
+            if reasons:
+                for reason in reasons:
+                    rejected[reason] = rejected.get(reason, 0) + 1
+                continue
+            candidates.append(source)
+            if len(candidates) >= _DRIVE_HISTORY_RETRY_LIMIT:
+                break
+        log(f"[gym-drive] {base_key} {day_key}: SB7 disabled; approved baseline "
+            f"scan checked {scanned} facts, found {len(candidates)} candidates; "
+            f"rejections={rejected}")
+        sources = candidates
+
+    for attempt, source in enumerate(sources[:_DRIVE_HISTORY_RETRY_LIMIT], 1):
+        # Different facts and entry angles produce real copy, never a suffix.
+        if not _recaption_drive_draft(
+                account, draft, voice, account_key, day_key, slot_i, log,
+                source=source, angle=angle_for_index(attempt + int(slot_i or 0))):
+            reasons = rejections(draft)
+            log(f"[gym-drive] {base_key} {day_key}: approved-source attempt "
+                f"{attempt} produced no changed copy "
+                f"({', '.join(reasons) or 'generation_unavailable'}); same photo retained")
+            continue
+        reasons = rejections(draft)
+        if not reasons:
+            log(f"[gym-drive] {base_key} {day_key}: approved-source walk admitted "
+                f"caption on attempt {attempt}; same photo retained")
+            return True
+        log(f"[gym-drive] {base_key} {day_key}: approved-source attempt "
+            f"{attempt} rejected ({', '.join(reasons)}); same photo retained")
+    log(f"[gym-drive] {base_key} {day_key}: approved-source walk exhausted "
+        f"{min(len(sources), _DRIVE_HISTORY_RETRY_LIMIT)} candidate facts; "
+        "photo remains unplaced")
+    return False
 
 
 def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
@@ -1101,6 +1334,13 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
         log(f"[gym-drive] {base_key} {day_key}: A+ gate errored "
             f"({type(e).__name__}); dropping the draft")
         _gate_ok = False
+    _history_repeat = _caption_repeats_history(
+        base_key, getattr(draft, "caption", "") or "", day_key)
+    _history_walk_needed = _history_repeat
+    if _history_repeat:
+        log(f"[gym-drive] {base_key} {day_key}: caption repeats 180 day history; "
+            "retrying approved copy on the same photo")
+        _gate_ok = False
     if not _gate_ok:
         # RETRY ONCE WITH A FRESH CAPTION ON THE SAME ASSET (audit round 4 #3):
         # dropping the day here sent a video beat to a still repeat over a
@@ -1116,9 +1356,19 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
                                 tuple(banned_words or ())))
             except Exception:  # noqa: BLE001
                 _gate_ok = False
+            _history_repeat = _caption_repeats_history(
+                base_key, getattr(draft, "caption", "") or "", day_key)
+            if _history_repeat:
+                _gate_ok = False
+    if not _gate_ok and (_history_walk_needed or _history_repeat):
+        _gate_ok = _retry_drive_caption_history(
+            account, draft, voice, base_key, account_key, day_key, slot_i,
+            banned_words, day_captions, log)
     if not _gate_ok:
+        failure = ("failed the caption history gate twice" if _history_repeat
+                   else "failed the A+/banned-word gate twice")
         log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, the caption "
-            "failed the A+/banned-word gate twice")
+            f"{failure}")
         _rollback_drive_asset(draft, day_key, log)
         # POISONED ASSET (final verification g): rolled back, it is the pool's
         # least-used candidate again; keep it out of every later beat this build.
@@ -1292,13 +1542,16 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # LOCKED-CALENDAR AWARENESS: read the gym's EXISTING human-owned rows (approved /
     # published / denied / killed — anything a rebuild must preserve) across the span
     # BEFORE planning, so the rebuild composes with them instead of fighting them:
-    #   * locked_feed_days: a day whose feed a human already owns is SKIPPED outright
+    #   * locked_feed_slots: a (day, slot) whose feed a human already owns is SKIPPED
     #     (no replacement feed, no orphan story/FB-mirror alongside the approved post);
+    #     a 2x day with only one slot owned can still fill the other;
+    #   * locked_feed_days: dates with any locked feed, so pending siblings of the
+    #     owned slot survive the delete and the empty-day filler does not double-post;
     #   * used_keys: the photos those rows carry are EXCLUDED from every pick, so an
     #     already-approved photo is never re-placed on another day (no double-post).
     # Without this the builder re-picked approved photos (double-place) and photos
     # consumed by pruned colliding rows were lost forever (under-build).
-    locked_feed_days, used_keys = _locked_calendar_state(
+    locked_feed_days, used_keys, locked_feed_slots = _locked_calendar_state(
         base_key, start, days, store, log, library_path=library_path)
     # The LIVE photos (approved/published/surviving) as read above, before this build's
     # own picks join used_keys: the no-empty-day fallback may repeat a photo this build
@@ -1327,6 +1580,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             account, base_key, start, days, voice=voice, library_path=library_path,
             store=store, banned_words=banned_words, log=log, allow_reshape=allow_reshape,
             media_count=media_count, locked_feed_days=locked_feed_days,
+            locked_feed_slots=locked_feed_slots,
             used_keys=used_keys, locked_keys=locked_keys, drafts=drafts,
             drive_deferred_days=drive_deferred_days, rendition_budget=rendition_budget,
             apply_state=_applied)
@@ -1350,7 +1604,8 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             # Nothing landed (a no-op, a gate refusal, or a definite pre-insert
             # failure): this build's own Drive picks never became rows.
             _rollback_new_drive_drafts(drafts, log)
-            if not _res.get("deleted_total", _res.get("deleted")):
+            if (_res.get("rollback_restored")
+                    or not _res.get("deleted_total", _res.get("deleted"))):
                 # ...and the OLD rows survive, so their released assets are stamped
                 # again. (deleted_total>0 with no insert: the old rows are gone, so
                 # their assets stay free, which is correct. The raw month-grained
@@ -1365,7 +1620,8 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
 def _build_client_month_body(account, base_key, start, days, *, voice, library_path,
                              store, banned_words, log, allow_reshape, media_count,
                              locked_feed_days, used_keys, locked_keys, drafts,
-                             drive_deferred_days, rendition_budget, apply_state=None):
+                             drive_deferred_days, rendition_budget, apply_state=None,
+                             locked_feed_slots=None):
     """The picking + apply half of build_client_month, split out so the caller can
     wrap release -> apply in ONE try/finally (see build_client_month)."""
     from datetime import timedelta
@@ -1377,6 +1633,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # ONCE per build; ECHO_CADENCE_2X_ENABLED off -> always 1 (byte-for-byte today).
     from .cadence import resolve_posts_per_day
     slots_per_day = resolve_posts_per_day(base_key, store)
+    locked_feed_slots = set(locked_feed_slots or ())
+    # Days where every cadence slot is already human-owned: Drive/Lane A skip
+    # them wholesale. A 2x day with only the morning post approved is NOT fully
+    # locked and can still receive the evening slot.
+    fully_locked_days = {d for d in locked_feed_days
+                         if all((d, s) in locked_feed_slots
+                                for s in range(slots_per_day))}
 
     # MEDIA-CAPPED: never build past the media the gym has. `days` is only an UPPER
     # bound on COVERED DAYS; the feed budget is days * slots_per_day (at 1x exactly
@@ -1457,7 +1720,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # The Drive-photo pre-pass, Lane A and video pre-pass claim exact slots. Drive
     # photos lead, local photos use the remaining slots, and video is considered only
     # after Lane A has exhausted its eligible local-photo supply.
-    covered_slots = set()
+    covered_slots = set(locked_feed_slots)
     pre_captions = {}
     # SOURCE ORDER: approved Drive photos, then local real photos, then Drive videos.
     # Pin this first pass to photos so a mixed pool cannot spill into video when its
@@ -1494,7 +1757,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         try:
             photo_pre = append_gym_drive_drafts(
                 account, base_key, start, days, voice, log=log,
-                covered_days=locked_feed_days, library_path=library_path,
+                covered_days=fully_locked_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
                 rendition_budget=rendition_budget, covered_slots=covered_slots,
                 kind_prefs=(_PHOTO_KIND,), max_feed_count=max_feed_days)
@@ -1506,6 +1769,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             log(f"{base_key}: Drive photo pre-pass skipped ({type(e).__name__}: {e})")
     else:
         drive_photo_feeds = 0
+    # Captions already accepted anywhere in this build.  The stage-time caption
+    # cooldown is the final safety net, but it must not be the first place a duplicate
+    # is discovered: dropping a feed there used to leave its paired Story behind and
+    # silently thin a 2x month.  Seed this with Drive-photo pre-pass feeds, then make
+    # Lane A walk its existing approved-source alternatives before companions exist.
+    month_captions = [caption for captions in pre_captions.values()
+                      for caption in captions if caption]
     # Walk day keys as an UPPER bound (days), but STOP emitting feeds once we have
     # placed one per unique photo (max_feed_days). Stories reuse the feed's photo (a
     # feed + its paired story are the same asset), so stories do not consume the cap.
@@ -1514,12 +1784,6 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         day_key = (start + timedelta(days=i)).isoformat()
         i += 1
 
-        # A day whose feed a human already owns keeps its approved content; the
-        # rebuild never plans a competing feed/story for it.
-        if day_key in locked_feed_days:
-            log(f"locked {day_key}: day already has approved/published content")
-            continue
-
         # captions placed on THIS day (2x uniqueness, D5), seeded with Drive-photo
         # placements so a Lane A slot never repeats a Drive concept
         day_captions = list(pre_captions.get(day_key, []))
@@ -1527,6 +1791,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         for slot_i in range(slots_per_day):
             if built_feeds + drive_photo_feeds >= max_feed_days:
                 break
+            # A slot a human already owns keeps its approved content (D7). A 2x
+            # day with only the morning post approved can still fill the evening
+            # slot; the rebuild never replaces the owned slot's feed/story/FB.
+            if (day_key, slot_i) in locked_feed_slots:
+                log(f"locked {day_key} slot {slot_i}: already has "
+                    "approved/published content")
+                continue
             if (day_key, slot_i) in covered_slots:
                 continue                   # the Drive-photo pass owns this slot
             # Choose this slot's angle (round-robin by the accepted-feed index) + the
@@ -1564,7 +1835,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 exclude_keys=used_keys,
                 avoid_openings=recent_openings[-opening_window:],
                 angle=day_angle, avoid_angles=day_avoid_angles,
-                avoid_captions=tuple(day_captions),
+                avoid_captions=tuple(day_captions + (
+                    month_captions if config.caption_cooldown_enabled() else [])),
                 recent_formulas=tuple(recent_formulas[-_FORMULA_WINDOW:]),
                 avoid_categories=_heavy_pillars,
                 prefer_photos=True)
@@ -1655,9 +1927,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             # story reuses the feed's creative, never a second photo). All media
             # lanes + the captionless-story guard live in the shared helper so the
             # denied-slot backfill emits IDENTICAL cards. A client-edited story
-            # caption belongs to the day's FIRST (pre-existing) story only.
-            story_caption_override = (edited_story_caps.get(str(day_key)[:10])
-                                      if slot_i == 0 else None)
+            # caption belongs to the exact logical slot it was edited on. A
+            # slotless legacy edit can only map to the first cadence slot.
+            story_caption_override = edited_story_caps.get(
+                (str(day_key)[:10], slot_i))
+            if story_caption_override is None and slot_i == 0:
+                story_caption_override = edited_story_caps.get(
+                    (str(day_key)[:10], None))
             # ACCEPTED: the feed survived every gate and is being placed. Record its
             # photo as served NOW (not at pick time) so rotation reflects only KEPT
             # days — never the picked-then-dropped attempts.
@@ -1693,6 +1969,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             covered_days.add(day_key)   # the gym-drive lane skips days already filled
             covered_slots.add((day_key, slot_i))
             day_captions.append(getattr(feed, "caption", "") or "")
+            month_captions.append(getattr(feed, "caption", "") or "")
             # The video pass runs after Lane A. Keep its same-day uniqueness map
             # current so it cannot stage a Drive caption that Lane A already used.
             pre_captions.setdefault(day_key, []).append(
@@ -1725,7 +2002,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 account, base_key, start, days, voice, log=log,
                 # Slot ownership, rather than day coverage, allows a video to fill a
                 # genuinely open PM slot after a local or Drive-photo AM post.
-                covered_days=locked_feed_days, library_path=library_path,
+                covered_days=fully_locked_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
                 rendition_budget=rendition_budget, covered_slots=covered_slots,
                 video_beats_only=True, kind_prefs=(_VIDEO_KIND,),
@@ -1771,7 +2048,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 account, base_key, start, days, voice, log=log,
                 # Exact slot ownership decides whether a 2x slot is open.  Passing
                 # a day with one Lane-A feed here used to skip its open second slot.
-                covered_days=locked_feed_days, library_path=library_path,
+                covered_days=fully_locked_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
                 rendition_budget=rendition_budget, covered_slots=covered_slots,
                 day_captions_seed=pre_captions,
@@ -1885,6 +2162,12 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         # flag. An exception escaping its contract is a prewrite planning failure.
         _release_unlanded_reservations(drafts)
         raise
+    if (result.get("noop_empty") and _empty_fill_has_unmet_slots(
+            store, base_key, start, days, slots_per_day, locked_feed_days)):
+        # No required photo post was assembled. Preserving the calendar is safe,
+        # but an empty generation is not a successful fill (Swift Oct 15).
+        result.update(ok=False, reason="no admissible photo posts",
+                      awaiting_content=True)
     if apply_state is not None:
         # Reporting below can still raise. Preserve the write outcome before that
         # happens so the outer cleanup never mistakes a landed insert for prewrite.
@@ -2085,21 +2368,33 @@ def _poster_render_evidence_by_url(drafts):
 
 
 def _insert_rows_with_poster_evidence(insert_rows, base_key, rows, evidence_by_url,
-                                      render_evidence_by_url=None):
+                                      render_evidence_by_url=None,
+                                      required_feed_slots=None,
+                                      prevalidated_cadence=False):
     """Forward poster proof through the prepared writer boundary.
 
     A TypeError from a prepared call is ambiguous: the store may have written before
     failing internally.  Never retry that write without the proof.  Flag-off retains
     the plain legacy call for older stores and test fakes.
     """
+    kwargs = {}
+    if required_feed_slots is not None:
+        import inspect
+        try:
+            parameters = inspect.signature(insert_rows).parameters
+            if "required_feed_slots" in parameters:
+                kwargs["required_feed_slots"] = required_feed_slots
+            if "prevalidated_cadence" in parameters:
+                kwargs["prevalidated_cadence"] = prevalidated_cadence
+        except (TypeError, ValueError):
+            pass
     if _visual_writer_guard_enabled():
-        kwargs = {}
         if evidence_by_url:
             kwargs["poster_render_evidence_by_url"] = evidence_by_url
         if render_evidence_by_url:
             kwargs["render_evidence_by_url"] = render_evidence_by_url
-        if kwargs:
-            return insert_rows(base_key, rows, **kwargs)
+    if kwargs:
+        return insert_rows(base_key, rows, **kwargs)
     return insert_rows(base_key, rows)
 
 
@@ -2429,6 +2724,27 @@ def _to_rows(base_key, drafts):
     return rows
 
 
+def _instagram_feed_slots(rows):
+    """Return the logical Instagram feed slots represented by calendar rows.
+
+    At 1x the slot index is null and the date is the slot.  At 2x the two feeds
+    share a date and differ by slot_index.  Facebook mirrors and Stories are not
+    cadence units.
+    """
+    slots = set()
+    for row in rows or ():
+        item = row or {}
+        if str(item.get("format") or "").strip().lower() != "feed":
+            continue
+        if str(item.get("account") or "").strip().lower() not in (
+                "instagram", "ig", ""):
+            continue
+        post_date = str(item.get("post_date") or "")[:10]
+        if post_date:
+            slots.add((post_date, item.get("slot_index")))
+    return slots
+
+
 def _span_scoped_delete_claim(store, base_key, months, span_first, span_last,
                               preserve_dates=(), log=None):
     """How many of THIS gym's rows the month-grained delete in _apply will remove
@@ -2555,6 +2871,7 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     from . import lever_stamp as _levers
     _levers.apply_learning_stamps(base_key, clean_rows, logger=log)
     deleted = inserted = 0
+    deleted_row_snapshots = []
     insert_started = False
     planned_reservation_ids = set()
     try:
@@ -2563,6 +2880,42 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         # place (it only wipes fresh drafts). A rebuild can no longer revert an approval.
         from .portal_calendar_store import preserve_and_prune
         clean_rows, _locked = preserve_and_prune(store, base_key, months, clean_rows)
+        planned_feed_slots = _instagram_feed_slots(clean_rows)
+        from . import cadence as _cadence
+        _slot_capacity = _cadence.resolve_posts_per_day(base_key, store)
+        preflight = getattr(store, "preflight_cadence_rows", None)
+        cadence_prevalidated = False
+        # Every cadence must admit its required photo posts before deletion.
+        # A 1x one-day build used to report success with zero inserted rows when
+        # the caption belt first ran after delete (Swift River Oct 15/16).
+        if callable(preflight) and planned_feed_slots:
+            replace_dates = {
+                (start + timedelta(days=i)).isoformat()
+                for i in range(max(1, int(days)))
+            } - {str(day)[:10] for day in (locked_days or ())}
+            import inspect
+            try:
+                supports_dates = "replace_dates" in inspect.signature(
+                    preflight).parameters
+            except (TypeError, ValueError):
+                supports_dates = False
+            admitted_rows = (preflight(base_key, clean_rows,
+                                       replace_dates=replace_dates)
+                             if supports_dates else preflight(base_key, clean_rows))
+            admitted_feed_slots = _instagram_feed_slots(admitted_rows)
+            if not planned_feed_slots.issubset(admitted_feed_slots):
+                log(f"{base_key}: cadence preflight refused "
+                    f"{len(planned_feed_slots) - len(admitted_feed_slots)} required "
+                    "Instagram feed slot(s); keeping the existing calendar")
+                return {"ok": False, "reason": "incomplete cadence preflight",
+                        "incomplete_cadence": True,
+                        "expected_feed_slots": len(planned_feed_slots),
+                        "admitted_feed_slots": len(admitted_feed_slots),
+                        "inserted_feed_slots": 0,
+                        "upserted": 0, "inserted": 0, "deleted": 0,
+                        "months": months}
+            clean_rows = admitted_rows
+            cadence_prevalidated = True
         planned_reservation_ids = {
             int(r["_served_reservation_id"]) for r in clean_rows
             if r.get("_served_reservation_id")}
@@ -2635,8 +2988,6 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         # (see day_shape.py's SLOT CAPACITY section) -- ported here so every
         # delete-then-insert rebuild lane carries the same belt, not just
         # real_month_planner's.
-        from . import cadence as _cadence
-        _slot_capacity = _cadence.resolve_posts_per_day(base_key, store)
         try:
             day_shape.assert_slot_capacity(
                 clean_rows, enabled=config.day_shape_assert_enabled(),
@@ -2696,18 +3047,55 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         # the rebuild yields only a FEW feeds. Deleting-then-inserting-fewer shrank the
         # calendar every cycle (TopFuel drifted 39 -> 21 -> 3). If this build placed fewer
         # feeds than already exist, keep the existing calendar untouched. Feeds are counted as
-        # distinct instagram feed post_dates (the same unit the grow-guard uses).
-        new_feeds = len({r.get("post_date") for r in clean_rows
-                         if r.get("format") == "feed" and r.get("account") == "instagram"})
+        # logical Instagram slots: date alone at 1x, date + slot_index at 2x.
+        new_feed_slots = _instagram_feed_slots(clean_rows)
+        new_feeds = len(new_feed_slots)
         # POST-MERGE comparison (audit 2026-08-25 MAJOR): a grow build EXCLUDES locked
         # (human-owned approved/published) days from its own rows — their feeds survive the
         # delete via preserve_dates. Comparing only new_feeds against existing_feeds
         # (which counts the locked ones) wrongly read every incremental grow as a shrink
         # and no-op'd it, so a built gym could never grow. Compare what the calendar will
         # hold AFTER the write: this build's feeds + the preserved locked-day feeds.
-        locked_in_span = {str(d)[:10] for d in (locked_days or ())
-                          if str(d)[:7] in set(months)}
-        post_merge_feeds = new_feeds + len(locked_in_span)
+        locked_span_first = start.isoformat()
+        locked_span_after = (start + timedelta(days=max(1, int(days)))).isoformat()
+        locked_in_span = {
+            str(d)[:10] for d in (locked_days or ())
+            if locked_span_first <= str(d)[:10] < locked_span_after}
+        locked_feed_slots = set()
+        locked_feed_slots_known = not locked_in_span
+        list_month = getattr(store, "list_month", None)
+        if callable(list_month) and locked_in_span:
+            try:
+                locked_rows = []
+                for month in months:
+                    locked_rows.extend(list_month(base_key, month) or [])
+                from .onboarding_demo import is_sample_row
+                locked_feed_slots = _instagram_feed_slots([
+                    row for row in locked_rows
+                    if str((row or {}).get("status") or "").lower()
+                    not in ("denied", "killed", "deleted")
+                    and not is_sample_row(row)
+                ])
+                locked_feed_slots = {
+                    slot for slot in locked_feed_slots
+                    if slot[0] in locked_in_span}
+                locked_feed_slots_known = True
+            except Exception:  # noqa: BLE001 - handled by cadence-aware guard below
+                locked_feed_slots_known = False
+        else:
+            locked_feed_slots_known = not locked_in_span
+        if not locked_feed_slots_known:
+            if int(_slot_capacity or 1) > 1:
+                log(f"{base_key}: locked feed slot count unavailable for a "
+                    "multi-slot cadence; keeping the existing calendar")
+                return {"ok": False,
+                        "reason": "locked feed slot count unavailable",
+                        "incomplete_cadence": True,
+                        "upserted": 0, "inserted": 0, "deleted": 0,
+                        "months": months}
+            # One post/day has exactly one logical feed slot per locked day.
+            locked_feed_slots = {(day, None) for day in locked_in_span}
+        post_merge_feeds = new_feeds + len(locked_feed_slots)
         try:
             from .client_media_sync import _existing_feed_count
             existing_feeds, count_ok = _existing_feed_count(store, base_key, start, days)
@@ -2725,7 +3113,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         if (not allow_reshape and count_ok and existing_feeds > 0
                 and post_merge_feeds < existing_feeds):
             log(f"{base_key}: rebuild would SHRINK feeds {existing_feeds} -> "
-                f"{post_merge_feeds} ({new_feeds} new + {len(locked_in_span)} locked); "
+                f"{post_merge_feeds} ({new_feeds} new + "
+                f"{len(locked_feed_slots)} locked); "
                 "keeping the existing calendar (grow-only, never shrink)")
             return {"ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
                     "months": months, "noop_shrink": True,
@@ -2746,8 +3135,17 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         for month in months:
             if delete_month is not None:
                 try:
-                    deleted += delete_month(base_key, month,
-                                            preserve_dates=delete_preserve) or 0
+                    import inspect
+                    supports_rows = "return_rows" in inspect.signature(
+                        delete_month).parameters
+                    result = delete_month(
+                        base_key, month, preserve_dates=delete_preserve,
+                        **({"return_rows": True} if supports_rows else {}))
+                    if isinstance(result, list):
+                        deleted_row_snapshots.extend(result)
+                        deleted += len(result)
+                    else:
+                        deleted += result or 0
                 except TypeError:      # older store/test fakes without the kwarg
                     if bounded_delete_read:
                         raise RuntimeError("bounded store cannot preserve dates")
@@ -2757,19 +3155,70 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             store_rows = [{k: v for k, v in r.items()
                            if k != "_served_reservation_id"} for r in clean_rows]
             insert_started = True
-            inserted += len(_insert_rows_with_poster_evidence(
+            inserted_rows = _insert_rows_with_poster_evidence(
                 insert_rows, base_key, store_rows,
                 poster_render_evidence_by_url,
-                render_evidence_by_url=render_evidence_by_url) or [])
+                render_evidence_by_url=render_evidence_by_url,
+                required_feed_slots=(new_feed_slots
+                                     if cadence_prevalidated else None),
+                prevalidated_cadence=cadence_prevalidated) or []
+            inserted += len(inserted_rows)
+            inserted_feed_slots = _instagram_feed_slots(inserted_rows)
+            # Require the write path to return every planned feed slot.  Human-owned
+            # rows and retained media holds were removed above, so any remaining
+            # shortfall means a stage-time belt dropped required cadence.
+            expected_feed_count = len(new_feed_slots)
+            actual_feed_count = len(inserted_feed_slots)
+            if actual_feed_count < expected_feed_count:
+                log(f"{base_key}: cadence staging incomplete: inserted "
+                    f"{actual_feed_count}/{expected_feed_count} Instagram "
+                    "feed slots; cadence remains pending and the scan will retry")
+                return {"ok": False, "reason": "incomplete cadence staging",
+                        "incomplete_cadence": True,
+                        "expected_feed_slots": expected_feed_count,
+                        "inserted_feed_slots": actual_feed_count,
+                        "upserted": inserted, "inserted": inserted,
+                        "deleted": deleted if span_claim is None else span_claim,
+                        "deleted_total": deleted, "months": months,
+                        "retained_reservation_ids": sorted(planned_reservation_ids)}
     except Exception as exc:  # noqa: BLE001
+        rollback_ok = False
+        rollback_attempted = False
+        try:
+            from .portal_calendar_store import CalendarInsertNotStartedError
+            known_pre_post_refusal = isinstance(
+                exc, CalendarInsertNotStartedError)
+        except Exception:  # noqa: BLE001
+            known_pre_post_refusal = False
+        restore = getattr(store, "restore_deleted_rows", None)
+        definite_pre_post_failure = not insert_started
+        if ((known_pre_post_refusal or definite_pre_post_failure)
+                and deleted_row_snapshots
+                and callable(restore)):
+            rollback_attempted = True
+            try:
+                restored = restore(base_key, deleted_row_snapshots) or []
+                rollback_ok = len(restored) == len(deleted_row_snapshots)
+                log(f"{base_key}: cadence changed after preflight; restored "
+                    f"{len(restored)}/{len(deleted_row_snapshots)} deleted row(s)")
+            except Exception as rollback_exc:  # noqa: BLE001
+                log(f"{base_key}: calendar rollback failed: "
+                    f"{type(rollback_exc).__name__}")
         log(f"store write failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
                 "upserted": inserted, "deleted": deleted, "months": months,
+                "deleted_total": deleted,
+                "effective_deleted": 0 if rollback_ok else deleted,
+                "rollback_restored": rollback_ok,
+                "rollback_failed": bool(rollback_attempted and not rollback_ok),
                 # Once the insert request started, its outcome may be unknown. Keep
                 # those exact reservations fail closed; pre-insert failures retain none.
                 "retained_reservation_ids": sorted(planned_reservation_ids)
-                if insert_started else [],
-                "insert_outcome_unknown": bool(insert_started)}
+                if (insert_started and not rollback_ok
+                    and not known_pre_post_refusal) else [],
+                "insert_outcome_unknown": bool(
+                    insert_started and not rollback_ok
+                    and not known_pre_post_refusal)}
     return {"ok": True, "upserted": inserted, "inserted": inserted,
             "deleted": deleted if span_claim is None else span_claim,
             "deleted_total": deleted, "months": months,

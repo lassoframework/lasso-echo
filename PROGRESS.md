@@ -1,3 +1,19 @@
+## Four production bugs (2026-10-06)
+
+- [~] Caption formatter presentation (whitespace/line breaks) no longer demotes an
+  approved post or wipes approval provenance. Real wording/punctuation changes still
+  require re-approval. Code does not auto-stamp human approval.
+- [~] 2x cadence lock is per day+slot: a day with one approved/published feed can still
+  receive the open slot; owned rows are never replaced. CADENCE_SPEC D7 updated.
+- [~] Missing `httpx` in an ad-hoc production shell is reported as shared-store
+  unavailability, not a gym-shared-store mirror failure. Use `/opt/venv/bin/python`.
+  PATH is not changed from nixpacks.toml (build-time risk); documented in AGENTS.md.
+- [~] POST `/portal/onboard` returns HTTP 409 `reason=not_echo_client` for a deliberate
+  non-client refusal; genuine failures stay 500.
+- [ ] Merge, deploy, and live verification remain with the operator. This PR does
+  **not** auto-fix the ~49 already-approved rows with `approval_kind=null` that the
+  proof-gated publish claim will refuse. Focused local suite: 415 passed.
+
 ## FIXER Slack completion readback (2026-10-06, PR #301)
 
 - [~] Echo's FIXER completion readback now accepts only documented Slack mrkdwn storage forms for the exact intended text: bare HTTP(S) URLs wrapped as links and literal `&`, `<`, `>` encoded as entities. The posted-response timestamp, channel, thread and Echo sender still have to match; unknown or different content remains held without resend. Local targeted checks passed; merge, deployment and live readback remain pending.

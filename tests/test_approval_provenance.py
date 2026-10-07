@@ -641,10 +641,47 @@ def test_gated_autonomous_meta_cleanup_persists_then_sends_clean_body(proof_arme
     assert store.rows["auto-meta"]["caption"] == "Ready to train."
 
 
-def test_manual_caption_spacing_format_invalidates_proof_and_waits_for_review(
+def test_manual_caption_spacing_format_keeps_human_approval_and_publishes(
         proof_armed, monkeypatch):
-    row = human_prove(_row(
-        "manual-spacing", caption="Move well today. Build strength tomorrow."))
+    """Whitespace/line-break formatting is presentation, not a content edit.
+
+    ENG 061723fa/f4ce2767 and Hill Country 55ad7b47 were demoted approved ->
+    pending when format_caption only inserted blank lines. The human already
+    stamped those words; do not wipe provenance or auto-stamp a new approval.
+    """
+    original = "Move well today. Build strength tomorrow."
+    row = human_prove(_row("manual-spacing", caption=original))
+    store = _ProofStore([row], autonomy={"lasso": False})
+    sent = []
+
+    def publish(draft, account):
+        sent.append(draft.caption)
+        return PublishResult(ok=True, mode="published", media_id="MEDIA_1")
+
+    monkeypatch.setattr(cap, "_alert_caption_format_reapproval", lambda *a: None)
+
+    summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
+                              publisher=publish, now=LATE_NOW, approved_only=True)
+
+    current = store.rows["manual-spacing"]
+    assert summary["published"] == ["manual-spacing"]
+    assert sent == ["Move well today.\n\nBuild strength tomorrow."]
+    assert store.claim_calls == [("manual-spacing", True)]
+    # Stored creative and human stamp stay exactly as approved.
+    assert current["caption"] == original
+    assert current["status"] == "published"
+    assert current["approval_kind"] == "human"
+    assert current["approved_by"] == "clerk-user-1"
+    assert current["approved_at"] == "2026-08-09T12:30:00+00:00"
+    assert current["approval_digest"] == canonical_digest(
+        dict(current, caption=original))
+
+
+def test_manual_caption_punctuation_change_still_requires_reapproval(
+        proof_armed, monkeypatch):
+    """A real wording/punctuation change (semicolon -> comma) still demotes."""
+    original = "Ready to train; come see us today."
+    row = human_prove(_row("manual-punct", caption=original))
     store = _ProofStore([row], autonomy={"lasso": False})
     pub = _FakePublisher()
     monkeypatch.setattr(cap, "_alert_caption_format_reapproval", lambda *a: None)
@@ -652,12 +689,12 @@ def test_manual_caption_spacing_format_invalidates_proof_and_waits_for_review(
     summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
                               publisher=pub, now=LATE_NOW, approved_only=True)
 
-    current = store.rows["manual-spacing"]
+    current = store.rows["manual-punct"]
     assert summary["published"] == []
-    assert summary["waiting"] == ["manual-spacing"]
+    assert summary["waiting"] == ["manual-punct"]
     assert pub.calls == []
     assert store.claim_calls == []
-    assert current["caption"] == "Move well today.\n\nBuild strength tomorrow."
+    assert current["caption"] == "Ready to train, come see us today."
     assert current["status"] == "pending"
     assert current["approval_kind"] is None
     assert current["approved_by"] is None
@@ -667,18 +704,23 @@ def test_manual_caption_spacing_format_invalidates_proof_and_waits_for_review(
 
 def test_autonomous_caption_spacing_cleanup_keeps_autonomous_publish_path(
         proof_armed):
-    row = human_prove(_row(
-        "auto-spacing", caption="Move well today. Build strength tomorrow."))
+    original = "Move well today. Build strength tomorrow."
+    row = human_prove(_row("auto-spacing", caption=original))
     store = _ProofStore([row], autonomy={"lasso": True})
-    pub = _FakePublisher()
+    sent = []
+
+    def publish(draft, account):
+        sent.append(draft.caption)
+        return PublishResult(ok=True, mode="published", media_id="MEDIA_1")
 
     summary = cap.publish_due(RUN_DATE, gym_id="lasso", store=store,
-                              publisher=pub, now=LATE_NOW, approved_only=False)
+                              publisher=publish, now=LATE_NOW, approved_only=False)
 
     assert summary["published"] == ["auto-spacing"]
-    assert pub.calls
-    assert store.rows["auto-spacing"]["caption"] == \
-        "Move well today.\n\nBuild strength tomorrow."
+    assert sent == ["Move well today.\n\nBuild strength tomorrow."]
+    # Presentation-only formatting does not rewrite the stored caption or wipe
+    # Auto provenance; the outbound draft is the canonical form.
+    assert store.rows["auto-spacing"]["caption"] == original
     assert store.rows["auto-spacing"]["status"] == "published"
 
 

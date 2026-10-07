@@ -47,6 +47,20 @@ from pathlib import Path
 from . import config, gym_media_index as _idx
 from .media_source_store import MediaStoreError
 
+
+def _drive_retry_hint(exc):
+    """Return a safe retry category for a failed Drive download, if retryable."""
+    from .integrations.drive_client import _http_status
+
+    status = _http_status(exc)
+    if status in (403, 404, 429):
+        return {"category": f"drive_http_{status}", "status": status}
+    if status is not None and 500 <= status <= 599:
+        return {"category": "drive_http_5xx", "status": status}
+    if status is None:
+        return {"category": "drive_transport", "status": None}
+    return None
+
 _MODERATION_PROMPT = (
     "You are a safety and privacy classifier for a gym's marketing photo library. "
     "Look at this one image and answer TWO questions:\n"
@@ -267,7 +281,15 @@ def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None,
     suffix = Path(str(asset.get("title") or "")).suffix or ".bin"
     tmp_path = Path(tmp_dir) / f"moderation{suffix}"
     try:
-        drive.download(asset_id, tmp_path)
+        try:
+            drive.download(asset_id, tmp_path)
+        except Exception as e:  # noqa: BLE001 - classify Drive access/transport only
+            retry = _drive_retry_hint(e)
+            result = _fail(asset_id, gym_id,
+                           f"Drive download failed: {type(e).__name__}")
+            if retry:
+                result["retry"] = retry
+            return result
         digest = _md5_hex(tmp_path)
         if digest != content_hash:
             return _fail(asset_id, gym_id,
@@ -294,7 +316,7 @@ def moderate_asset(gym_id, asset_id, *, store, drive, vision=None, now_iso=None,
                     asset_id, gym_id,
                     "unparseable or ambiguous provider verdict — no evidence written")
             parsed_scans.append(parsed)
-    except Exception as e:  # noqa: BLE001 - drive/vision failure is a degrade
+    except Exception as e:  # noqa: BLE001 - scan failure is a degrade
         return _fail(asset_id, gym_id,
                      f"download/scan failed: {type(e).__name__}")
     finally:
