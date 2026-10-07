@@ -44,6 +44,7 @@ begin
  -- Global graph before calendar, then destination, matching existing claim
  -- order. GBP connection writers touch only that connection table.
  perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+ perform pg_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0));
  select * into r from public.content_calendar where id=p_calendar_row_id for update;
  if not found or r.account is distinct from 'googlebusiness'
   or r.publish_claim_token is distinct from p_claim_token or r.status is distinct from 'publishing'

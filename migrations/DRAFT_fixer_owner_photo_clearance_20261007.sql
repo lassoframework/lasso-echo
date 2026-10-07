@@ -324,6 +324,7 @@ declare provenance jsonb; grant_row public.fixer_owner_photo_reservation_2026100
  snap jsonb; content jsonb;
 begin
  perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+ perform pg_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0));
  provenance:=public.fixer_photo_base_provenance_20261007(p_calendar_row_id);
  select r.* into grant_row from public.fixer_owner_photo_reservation_20261007 r
  where r.receipt_ref=provenance#>>'{clearance,history_evidence_ref}';
@@ -375,25 +376,33 @@ end; $$;
 revoke all on function public.fixer_forward_media_provenance_lookup_20261006(uuid) from public,anon,authenticated,service_role;
 grant execute on function public.fixer_forward_media_provenance_lookup_20261006(uuid) to fixer_forward_media_attester_20261006;
 
--- Shared statement locks precede row locks. Owner preparation is exclusive;
--- existing publishers/attesters preserve their own graph lock order, with no
--- shared-to-exclusive publisher upgrades introduced by this migration.
+-- Calendar census mutations take the separate exclusive census lock AFTER
+-- graph authority. Runtime claim/binder/GBP entry points take it before rows.
+-- Generic writes fail with a serialization error instead of waiting: older
+-- callers may already own rows, so waiting here could invert the lock order.
+-- No runtime holds a shared census lock or upgrades its shared graph authority.
 create function public.fixer_owner_photo_corpus_write_lock_20261007()
 returns trigger language plpgsql security definer set search_path=pg_catalog,public as $$
 begin
+ if tg_op='TRUNCATE' then
+  raise exception 'photo census truncate requires offline reconciliation' using errcode='23514'; end if;
  if tg_table_name in ('fixer_forward_media_photo_state_20261007',
    'fixer_forward_media_photo_key_revocation_20261007','fixer_owner_photo_revocation_20261007') then
   -- These administrator-only negative-authority writes never run in publisher
   -- transactions. Take the exclusive graph lock before their row locks.
   perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
  else
-  perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+  if not pg_try_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0)) then
+   raise exception 'photo corpus authority busy; retry database mutation only' using errcode='40001'; end if;
+  if tg_table_name in ('content_calendar','fixer_forward_media_claim_receipt_20261006')
+    and not pg_try_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0)) then
+   raise exception 'photo census authority busy; retry database mutation only' using errcode='40001'; end if;
  end if;
  return null;
 end; $$;
 revoke all on function public.fixer_owner_photo_corpus_write_lock_20261007() from public,anon,authenticated,service_role;
 do $$ declare t text; begin
- foreach t in array array['content_calendar','media_asset','media_source','fixer_forward_media_photo_state_20261007',
+ foreach t in array array['content_calendar','fixer_forward_media_claim_receipt_20261006','media_asset','media_source','fixer_forward_media_photo_state_20261007',
    'fixer_forward_media_photo_key_revocation_20261007','fixer_owner_photo_revocation_20261007'] loop
   execute format('create trigger owner_photo_corpus_write before insert or update or delete or truncate on public.%I for each statement execute function public.fixer_owner_photo_corpus_write_lock_20261007()',t);
 end loop;

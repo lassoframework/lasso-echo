@@ -40,6 +40,7 @@ def main():
   try:
    def dsn(role='postgres'):return f'host={sock} port={port} dbname=postgres user={role}'
    admin=psycopg.connect(dsn(),autocommit=True)
+   admin.execute("set statement_timeout='5s'")
    def sql(q,args=None):
     with admin.cursor() as c:
      c.execute(q,args);return c.fetchall() if c.description else None
@@ -62,7 +63,7 @@ def main():
     sql((ROOT/'migrations'/name).read_text())
    sql('create role photo_owner login;grant fixer_forward_media_owner_20261006 to photo_owner;'
        'create role photo_auditor login;grant fixer_forward_media_photo_auditor_20261007 to photo_auditor;'
-       'grant select,update on content_calendar to service_role;')
+       'grant select,insert,update,delete on content_calendar to service_role;')
    for name in list(os.environ):
     if owner._FORBIDDEN_ENV_NAME.search(name):os.environ.pop(name)
    os.environ['FORWARD_MEDIA_OWNER_DSN']=dsn('photo_owner')
@@ -234,6 +235,54 @@ def main():
    assert reconcile_owner_photo(p,packet['payload']['audit_id'])['replayed'] is True;conn.rollback()
    assert sql('select count(*) from fixer_owner_photo_reservation_20261007')[0][0]==1
    first=ready_claim(rid);second=ready_claim(new_row(fmt='story'));third=ready_claim(new_row(fmt='feed',account='facebook'))
+   # Exact independent-review reproduction: sibling's first real claim is
+   # staged but not committed; an unrelated unknown publication cannot commit
+   # inside that authority transaction. All three census DML paths fail fast,
+   # including a writer which already owns a calendar row (no deadlock/upgrade).
+   known_row=new_row()
+   unknown_during=str(uuid.uuid4())
+   pending_claim=lane('service_role')
+   assert pending_claim.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',second).fetchone()[0] is True
+   denied(lambda:sql("insert into content_calendar(id,gym_id,status,image_url) values(%s,'other','published','https://media.example.test/unknown-review.png')",(unknown_during,)),'census authority busy')
+   assert sql('select count(*) from content_calendar where id=%s',(unknown_during,))[0][0]==0
+   denied(lambda:sql("update content_calendar set status='published' where id=%s",(known_row,)),'census authority busy')
+   denied(lambda:sql('delete from content_calendar where id=%s',(known_row,)),'census authority busy')
+   for statement,args in (
+    ("insert into content_calendar(id,gym_id,status,image_url) values(%s,'other','published','https://media.example.test/service-unknown.png')",(str(uuid.uuid4()),)),
+    ("update content_calendar set status='published' where id=%s",(known_row,)),
+    ('delete from content_calendar where id=%s',(known_row,))):
+    with lane('service_role') as census_writer:
+     denied(lambda:census_writer.execute(statement,args),'census authority busy')
+   prelocked=psycopg.connect(dsn())
+   prelocked.execute('select id from content_calendar where id=%s for update',(known_row,))
+   denied(lambda:prelocked.execute("update content_calendar set status='published' where id=%s",(known_row,)),'census authority busy')
+   prelocked.rollback();prelocked.close()
+   # Normal provider receipt persistence by the already-owned transaction takes
+   # the same exclusive census lock again, without an upgrade or self-deadlock.
+   pending_claim.execute("update content_calendar set status='published',published_at=now(),late_post_id='SYNTHETIC provider receipt' where id=%s",(second[0],))
+   pending_claim.commit();pending_claim.close()
+   denied(lambda:sql('truncate content_calendar'),'offline reconciliation')
+   assert sql('select count(*) from fixer_forward_media_claim_receipt_20261006 where calendar_row_id=%s',(second[0],))[0][0]==1
+   sql("insert into content_calendar(id,gym_id,status,image_url) values(%s,'other','published','https://media.example.test/unknown-review.png')",(unknown_during,))
+   denied(lambda:claim(second),'unknown historical')
+   sql('delete from content_calendar where id=%s',(unknown_during,))
+   # Strong inversion regression: older RPC has already locked the next
+   # sibling row. The real claimant acquires census authority and waits for it.
+   # The older writer's UPDATE fails immediately instead of waiting for census
+   # while retaining the row that claimant needs, then rollback lets claim pass.
+   old_writer=psycopg.connect(dsn())
+   old_writer.execute('select id from content_calendar where id=%s for update',(third[0],))
+   with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+    waiting_sibling=pool.submit(claim,third)
+    deadline=time.monotonic()+5
+    while time.monotonic()<deadline:
+     if sql("select count(*) from pg_stat_activity where wait_event_type='Lock' and query like 'select fixer_claim_forward_media%' ")[0][0]:break
+     time.sleep(.02)
+    else:raise AssertionError('sibling claim did not wait for older row lock')
+    denied(lambda:old_writer.execute("update content_calendar set caption='SYNTHETIC older RPC change' where id=%s",(third[0],)),'census authority busy')
+    old_writer.rollback()
+    assert waiting_sibling.result(timeout=8) is True
+   old_writer.close()
    assert claim(first) is True and claim(first) is True
    # A safety downgrade that owns the asset row before a claim must serialize
    # first; the real claim then sees pending moderation instead of stale clean.
@@ -257,11 +306,9 @@ def main():
    assert sql('select count(*) from fixer_forward_media_claim_receipt_20261006')[0][0]==3
    fourth=ready_claim(new_row(fmt='story'))
    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-    good=pool.submit(claim,fourth);bad=pool.submit(ready_claim,new_row(day='2026-10-11'),'2026-10-11')
+    good=pool.submit(claim,fourth);sibling=pool.submit(claim,first)
     assert good.result(timeout=8) is True
-    try:bad.result(timeout=8);raise AssertionError('unsigned day attested concurrently')
-    except guard.ForwardMediaVerificationHold as exc:
-     assert 'signed tenant date and group' in str(exc.__cause__),str(exc.__cause__)
+    assert sibling.result(timeout=8) is True
    assert claim(first) is True
    # A fresh independent certificate after prior sends has reviewed the now
    # reserved/published visuals. Real production run_once discovers it, commits
@@ -364,7 +411,7 @@ def main():
    sql('insert into fixer_owner_photo_revocation_20261007 values(%s,%s)',(packet['payload']['audit_id'],'SYNTHETIC revoke'))
    denied(lambda:claim(first),'revoked')
    conn.close();auditor_conn.close();admin.close()
-   print('PASS PG17 signed owner grant; OFF/moderation/byte-binding/safety-hold/direct bypass holds; atomic reservation+authority; concurrent stale corpus hold; signed date/group before first claim; post-binder replay + stored-signature reconciliation; IG/FB/Story siblings; different Story rendition hold; production owner-worker factory with acknowledged outcome; initial/final lost COMMIT and remote crash quarantine/no-retry; unknown history/epoch/revocation holds')
+   print('PASS PG17 signed owner grant; OFF/moderation/byte-binding/safety-hold/direct bypass holds; atomic reservation+authority; concurrent stale corpus hold; signed date/group before first claim; post-binder replay + stored-signature reconciliation; IG/FB/Story siblings; census INSERT/UPDATE/DELETE held through claim COMMIT for admin+service; prelocked writer fail-fast; own provider receipt and concurrent siblings allowed; different Story rendition hold; production owner-worker factory with acknowledged outcome; initial/final lost COMMIT and remote crash quarantine/no-retry; unknown history/epoch/revocation holds')
   finally:
    subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 

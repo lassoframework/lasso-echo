@@ -459,13 +459,18 @@ begin
       or nullif(btrim(p_expected_revision),'') is null then
     raise exception 'existing owned calendar claim required' using errcode='22023';
   end if;
-  -- Shared graph authority persists through occupancy/receipt commit. Claims
-  -- may run concurrently; all attestation graph mutation waits for them.
+  -- Shared graph authority persists through occupancy/receipt commit. The
+  -- separate census lock below serializes final claims and census mutations;
+  -- attestation graph mutation waits without a publisher graph upgrade.
   -- Take this lock before row locks, matching the attester lock order.
   if current_setting('transaction_isolation')<>'read committed' then
     raise exception 'forward media authority requires read committed isolation' using errcode='25000';
   end if;
   perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+  -- Separate exclusive census authority, acquired before any row lock. No
+  -- publisher upgrades the shared ancestry graph; calendar census writes use
+  -- this same transaction lock and cannot commit between proof and receipt.
+  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0));
   select * into r from public.content_calendar where id=p_calendar_row_id for update;
   if not found or r.publish_claim_token is distinct from p_claim_token
       or r.status is null or r.status not in ('publishing','published')
@@ -612,6 +617,7 @@ begin
   -- Match the graph lock order used by attestation and claims. Owner clearance
   -- and manifest inserts take the exclusive lock before this shared lookup.
   perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0));
   -- Serialize with any publisher/attester on this exact row before binding.
   select * into r from public.content_calendar where id=p_calendar_row_id for update;
   -- Require an unsent active row with a complete explicit persisted identity:
