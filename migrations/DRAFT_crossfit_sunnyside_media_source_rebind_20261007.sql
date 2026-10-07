@@ -55,6 +55,8 @@ DECLARE
   v_old_key_assets integer;
   v_calendar_conflicts integer;
   v_source_triggers integer;
+  v_asset_digest text;
+  v_calendar_digest text;
   v_changed integer;
 BEGIN
   SELECT * INTO v_source
@@ -66,7 +68,8 @@ BEGIN
   END IF;
   IF v_source.kind IS DISTINCT FROM 'gym_drive'
      OR v_source.active IS DISTINCT FROM true
-     OR v_source.revoked_externally IS DISTINCT FROM false THEN
+     OR v_source.revoked_externally IS DISTINCT FROM false
+     OR v_source.folder_id IS DISTINCT FROM '1eyCZrpS37m_ebpX1LbzI1hk_Ma9BAAPV' THEN
     RAISE EXCEPTION 'CrossFit Sunnyside media rebind refused: source kind/activity/revocation changed';
   END IF;
   IF v_source.sync_status IS DISTINCT FROM 'idle'
@@ -74,7 +77,8 @@ BEGIN
      OR v_source.sync_claim_token IS NOT NULL THEN
     RAISE EXCEPTION 'CrossFit Sunnyside media rebind refused: sync is queued, claimed, or no longer idle';
   END IF;
-  IF v_source.gym_id NOT IN ('crossfitsunnyside2616ac', 'crossfitsunnysidef574c0') THEN
+  IF v_source.gym_id IS DISTINCT FROM 'crossfitsunnyside2616ac'
+     AND v_source.gym_id IS DISTINCT FROM 'crossfitsunnysidef574c0' THEN
     RAISE EXCEPTION 'CrossFit Sunnyside media rebind refused: source key is unexpected (%)', v_source.gym_id;
   END IF;
   -- The production schema read for this draft had no user triggers on
@@ -141,13 +145,20 @@ BEGIN
   SELECT count(*),
          count(*) FILTER (WHERE kind = 'photo'),
          count(*) FILTER (WHERE kind = 'video'),
-         count(*) FILTER (WHERE gym_id <> 'crossfitsunnysidef574c0')
+         count(*) FILTER (WHERE gym_id IS DISTINCT FROM 'crossfitsunnysidef574c0')
     INTO v_assets, v_photos, v_videos, v_bad_assets
     FROM public.media_asset
    WHERE source_id = '10f4bf47d5e24c4086fce5aa916e6768';
   IF v_assets <> 13 OR v_photos <> 9 OR v_videos <> 4 OR v_bad_assets <> 0 THEN
     RAISE EXCEPTION 'CrossFit Sunnyside media rebind refused: linked asset manifest changed (total %, photos %, videos %, other tenant %)',
       v_assets, v_photos, v_videos, v_bad_assets;
+  END IF;
+  SELECT md5(string_agg(row_to_json(a)::text, '|' ORDER BY a.id))
+    INTO v_asset_digest
+    FROM public.media_asset a
+   WHERE a.source_id = '10f4bf47d5e24c4086fce5aa916e6768';
+  IF v_asset_digest IS DISTINCT FROM '2fd3111504be27cefed69daaca1d7482' THEN
+    RAISE EXCEPTION 'CrossFit Sunnyside media rebind refused: linked asset snapshot changed';
   END IF;
   SELECT count(*) INTO v_old_key_assets
     FROM public.media_asset
@@ -160,9 +171,17 @@ BEGIN
     FROM public.content_calendar c
     JOIN public.media_asset a ON a.id = c.source_media_asset_id
    WHERE a.source_id = '10f4bf47d5e24c4086fce5aa916e6768'
-     AND c.gym_id <> 'crossfitsunnysidef574c0';
+     AND c.gym_id IS DISTINCT FROM 'crossfitsunnysidef574c0';
   IF v_calendar_conflicts <> 0 THEN
     RAISE EXCEPTION 'CrossFit Sunnyside media rebind refused: calendar references cross tenant (%)', v_calendar_conflicts;
+  END IF;
+  SELECT md5(string_agg(row_to_json(c)::text, '|' ORDER BY c.id))
+    INTO v_calendar_digest
+    FROM public.content_calendar c
+    JOIN public.media_asset a ON a.id = c.source_media_asset_id
+   WHERE a.source_id = '10f4bf47d5e24c4086fce5aa916e6768';
+  IF v_calendar_digest IS DISTINCT FROM '9c7888892cd3cb3ce886cd6ca8e63561' THEN
+    RAISE EXCEPTION 'CrossFit Sunnyside media rebind refused: calendar snapshot changed';
   END IF;
 
   -- Safe repeat: accept only the fully verified post-state; otherwise perform
@@ -175,6 +194,7 @@ BEGIN
        AND kind = 'gym_drive'
        AND active IS TRUE
        AND revoked_externally IS FALSE
+       AND folder_id = '1eyCZrpS37m_ebpX1LbzI1hk_Ma9BAAPV'
        AND sync_status = 'idle'
        AND sync_requested_at IS NULL
        AND sync_claim_token IS NULL;
@@ -191,6 +211,7 @@ BEGIN
      AND kind = 'gym_drive'
      AND active IS TRUE
      AND revoked_externally IS FALSE
+     AND folder_id = '1eyCZrpS37m_ebpX1LbzI1hk_Ma9BAAPV'
      AND sync_status = 'idle'
      AND sync_requested_at IS NULL
      AND sync_claim_token IS NULL;
