@@ -12,22 +12,23 @@ No production backend currently meets this contract. Existing creative_studio
 and media_host create-once/readback alone is not a retention/version attestation.
 Do not adapt those records into positive evidence by trusting response ID strings.
 
-Next bounded integration (not implemented here):
-* creative_studio's final approved output/review sidecar
-  must hand exact bytes, job/request identity and verified brand revisions to an
-  isolated issuer. Capture authenticated provider retrieval OR trusted runtime
-  execution evidence that binds the original output hash, uncached generation,
-  provider output identity and time. Independently authenticate pixel review.
-* media_host._S3Client.put_if_absent/get_bytes must expose a pinned storage
-  identity plus independently verified create-only/retention authorization for
-  an original namespace. The existing .put path and credentials cannot mutate
-  that namespace. A unique URL plus successful GET is not immutability proof.
-* Provision a separately approved independent verifier signing key/registry and
-  authenticated append-only execution receipt store. No key is provisioned here.
-* Implement GenerationEvidenceBackend using those receipts, complete current
-  inventory/history and trusted palette/copy sources. Recheck those revisions
-  under owner transaction locks before any database grant. Wire only after that
-  contract exists, preserving a real-photo-first decision at the final boundary.
+An isolated issuer/backend implementation now exists in
+forward_media_generated_issuer. It is default OFF and unprovisioned. It owns a
+fresh Astra provider call before any resize, independent pixel/brand review,
+retained originals and execution envelopes, and authenticated provider readback.
+Its live preflight requires an independently approved registry, separate scoped
+credentials, and versioning/COMPLIANCE retention on the existing destination.
+
+Remaining live integration:
+* Provision and independently audit namespace isolation, create-only writer,
+  read-only verifier, signing key/registry root and retained storage controls.
+  Existing mutable hosting credentials must not write that namespace.
+* Implement the trusted owner read API for verified palette/copy snapshots,
+  complete photo inventory and exact/perceptual reuse history. Producer sidecars
+  and cache records cannot become authenticated evidence by adaptation.
+* Wire issuer requests and backend reads through separate authenticated services.
+  Recheck all revisions under final owner transaction locks, acquire its own
+  reservation, and preserve real-photo-first semantics before any DB grant.
 """
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -224,6 +225,7 @@ def prepare_generated_original(packet, request, backend=None, *, enabled=False,
         if any(p[name] != getattr(request, name) for name in request.__dataclass_fields__):
             _hold('generated_request_binding_changed')
         created, requested = _time(p['created_at']), _time(p['requested_at'])
+        clock_injected = now is not None
         now = now or datetime.now(timezone.utc)
         if (not isinstance(now, datetime) or now.tzinfo is None
                 or type(max_age_seconds) is not int or not 0 < max_age_seconds <= 900
@@ -249,6 +251,13 @@ def prepare_generated_original(packet, request, backend=None, *, enabled=False,
         if (type(evidence) is not VerifiedGenerationEvidence
                 or evidence.receipt_payload_json != text):
             _hold('generated_evidence_binding_changed')
+        # A live backend observes after the initial request validation clock.
+        # Re-read the production clock after that callback, preserving injected
+        # deterministic clocks and rejecting receipts aged out during slow reads.
+        if not clock_injected:
+            now = datetime.now(timezone.utc)
+            if not requested <= created <= now or (now - requested).total_seconds() > max_age_seconds:
+                _hold('generated_receipt_stale_or_future')
         observed = _time(evidence.observed_at)
         if not created <= observed <= now or (now-observed).total_seconds() > max_age_seconds:
             _hold('generated_evidence_stale_or_future')

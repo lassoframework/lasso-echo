@@ -265,3 +265,29 @@ def test_callback_packet_mutation_does_not_change_prepared_signed_snapshot(packa
     assert prepared.signature_hex == original_sig
     assert prepared.image_bytes == original_evidence.immutable_image_bytes
     assert sha256(prepared.image_bytes) == prepared.payload['image_sha256']
+
+
+
+def test_live_clock_is_refreshed_after_backend_observation(package, monkeypatch):
+    from agent import forward_media_generated_prepare as prepare
+    times = iter([NOW.timestamp(), NOW.timestamp() + 2])
+    class AdvancingClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromtimestamp(next(times), tz)
+    monkeypatch.setattr(prepare, 'datetime', AdvancingClock)
+    package[2].evidence = replace(package[2].evidence, observed_at='2026-10-07T16:00:01Z')
+    prepared = prepare.prepare_generated_original(*package[:3], enabled=True)
+    assert prepared.evidence_observed_at == '2026-10-07T16:00:01Z'
+
+
+def test_slow_live_callback_cannot_prepare_receipt_aged_out_during_reads(package, monkeypatch):
+    from agent import forward_media_generated_prepare as prepare
+    times = iter([NOW.timestamp(), NOW.timestamp() + 901])
+    class AdvancingClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromtimestamp(next(times), tz)
+    monkeypatch.setattr(prepare, 'datetime', AdvancingClock)
+    with pytest.raises(GeneratedReceiptHold, match='generated_receipt_stale_or_future'):
+        prepare.prepare_generated_original(*package[:3], enabled=True)
