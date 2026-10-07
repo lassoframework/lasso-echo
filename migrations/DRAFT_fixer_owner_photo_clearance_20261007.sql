@@ -80,9 +80,9 @@ begin
       and claim.post_date::text=r.candidate_json->>'post_date'
       and claim.group_key=r.candidate_json->>'group_key'
       and claim.source_url=r.candidate_json->>'source_url' and claim.image_url=r.candidate_json->>'image_url'
-      and claim.thumbnail_url is null
+      and claim.thumbnail_url is not distinct from r.candidate_json->>'thumbnail_url'
       and claim.fingerprints=(select array_agg(distinct fp order by fp)
-        from unnest(array[r.candidate_json->>'source_fingerprint',r.candidate_json->>'image_fingerprint']) fp)
+        from unnest(array[r.candidate_json->>'source_fingerprint',r.candidate_json->>'image_fingerprint',r.candidate_json->>'thumbnail_fingerprint']) fp where fp is not null)
     order by r.audit_id limit 1
   ) evidence on true
   union all
@@ -105,6 +105,11 @@ begin
   select jsonb_build_object('history_key','owner-reserved-image:'||r.audit_id::text,
     'resolved',true,'media_kind','still_photo','visual_sha256',r.candidate_json->>'image_sha256',
     'published_binding_ref',r.receipt_ref,'visual_url',r.candidate_json->>'image_url') from public.fixer_owner_photo_reservation_20261007 r
+  union all
+  select jsonb_build_object('history_key','owner-reserved-thumbnail:'||r.audit_id::text,
+    'resolved',true,'media_kind','still_photo','visual_sha256',r.candidate_json->>'thumbnail_sha256',
+    'published_binding_ref',r.receipt_ref,'visual_url',r.candidate_json->>'thumbnail_url')
+  from public.fixer_owner_photo_reservation_20261007 r where r.candidate_json->>'thumbnail_url' is not null
  ) all_visuals;
  return snap || jsonb_build_object('rows',rows,
    'scope_complete',snap->'scope_complete'='true'::jsonb and jsonb_array_length(rows)<=2500,
@@ -201,9 +206,9 @@ begin
    or p_manifest->>'image_url' is distinct from candidate->>'image_url'
    or p_manifest->>'image_fingerprint' is distinct from candidate->>'image_fingerprint'
    or p_manifest->'image_length' is distinct from candidate->'image_length'
-   or p_manifest->'thumbnail_url' is distinct from 'null'::jsonb
-   or p_manifest->'thumbnail_fingerprint' is distinct from 'null'::jsonb
-   or p_manifest->'thumbnail_length' is distinct from 'null'::jsonb
+   or p_manifest->'thumbnail_url' is distinct from coalesce(candidate->'thumbnail_url','null'::jsonb)
+   or p_manifest->'thumbnail_fingerprint' is distinct from coalesce(candidate->'thumbnail_fingerprint','null'::jsonb)
+   or p_manifest->'thumbnail_length' is distinct from coalesce(candidate->'thumbnail_length','null'::jsonb)
    or p_manifest->>'render_evidence_ref' is distinct from cert.receipt_ref
    or candidate->>'render_recipe_digest' is distinct from 'sha256:'||encode(sha256(convert_to(public.fixer_owner_photo_canonical_20261007(p_manifest->'render_recipe'),'UTF8')),'hex') then
   raise exception 'exact certified original and rendition tuples required' using errcode='23514'; end if;
@@ -257,14 +262,14 @@ begin
     or exists(select 1 from jsonb_array_elements(snap->'rows') h
       where h->'resolved' is distinct from 'true'::jsonb or h->>'media_kind' is distinct from 'still_photo')
     or exists(select 1 from public.fixer_forward_media_historical_original_20261007 h
-      where h.source_fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint'])) then
+      where h.source_fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint',candidate->>'thumbnail_fingerprint'])) then
    raise exception 'existing photo grant requires complete known current history' using errcode='23514'; end if;
   return clearance; -- owner idempotency, no new eligibility grant
  end if;
  if not exists(select 1 from public.content_calendar row where row.id=cert.calendar_row_id
    and row.status in ('draft','pending','queued','approved') and row.variant_status='active'
    and row.publish_claim_token is null and row.published_at is null and row.late_post_id is null
-   and row.render_manifest_digest is null and row.thumbnail_url is null and row.media_not_ready_reason is null)
+   and row.render_manifest_digest is null and row.thumbnail_url is not distinct from candidate->>'thumbnail_url' and row.media_not_ready_reason is null)
    or not exists(select 1 from public.media_asset a join public.media_source s on s.id=a.source_id
     where a.id=src.source_asset_id and src.binding_revision=md5(jsonb_build_array(to_jsonb(a),to_jsonb(s))::text)) then
   raise exception 'new owner photo clearance requires an unsent canonical candidate' using errcode='23514'; end if;
@@ -283,6 +288,7 @@ begin
  select coalesce(array_agg(history_key),'{}'::text[]) into sibling_history_keys from (
   select 'owner-reserved-source:'||id::text history_key from unnest(sibling_ids) id
   union all select 'owner-reserved-image:'||id::text from unnest(sibling_ids) id
+  union all select 'owner-reserved-thumbnail:'||id::text from unnest(sibling_ids) id
   union all select 'claim:'||claim.claim_token::text
    from public.fixer_forward_media_claim_receipt_20261006 claim
    join public.fixer_owner_photo_reservation_20261007 r on r.audit_id=any(sibling_ids)
@@ -290,27 +296,28 @@ begin
     and claim.post_date::text=r.candidate_json->>'post_date'
     and claim.group_key=r.candidate_json->>'group_key'
     and claim.source_url=r.candidate_json->>'source_url' and claim.image_url=r.candidate_json->>'image_url'
-    and claim.thumbnail_url is null
+    and claim.thumbnail_url is not distinct from r.candidate_json->>'thumbnail_url'
     and claim.fingerprints=(select array_agg(distinct fp order by fp)
-      from unnest(array[r.candidate_json->>'source_fingerprint',r.candidate_json->>'image_fingerprint']) fp)
+      from unnest(array[r.candidate_json->>'source_fingerprint',r.candidate_json->>'image_fingerprint',r.candidate_json->>'thumbnail_fingerprint']) fp where fp is not null)
  ) known_siblings;
  if exists(select 1 from jsonb_array_elements(snap->'rows') h
-     where h->>'visual_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256'])
+     where h->>'visual_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256',candidate->>'thumbnail_sha256'])
        and not (h->>'history_key'=any(sibling_history_keys)))
   or exists(select 1 from public.fixer_forward_media_historical_original_20261007 h
-     where h.source_fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint']))
+     where h.source_fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint',candidate->>'thumbnail_fingerprint']))
   or exists(select 1 from public.fixer_forward_media_use_20261006 u
-     where u.fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint'])
-       and not (anchor.audit_id is not null and u.fingerprint=candidate->>'source_fingerprint'
+     where u.fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint',candidate->>'thumbnail_fingerprint'])
+       and not (anchor.audit_id is not null and u.fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint',candidate->>'thumbnail_fingerprint'])
          and u.tenant_id=candidate->>'tenant_id' and u.post_date::text=candidate->>'post_date'
          and u.group_key=candidate->>'group_key'))
   or exists(select 1 from public.fixer_forward_media_history_clearance_20261006 h
-     where h.source_fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint'])
+     where h.source_fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint',candidate->>'thumbnail_fingerprint'])
        and not (anchor.audit_id is not null and h.tenant_id=src.tenant_id and h.source_asset_id=src.source_asset_id
          and to_jsonb(h)-'checked_at'=clearance))
   or exists(select 1 from public.fixer_owner_photo_reservation_20261007 r
-     where (r.candidate_json->>'source_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256'])
-       or r.candidate_json->>'image_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256']))
+     where (r.candidate_json->>'source_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256',candidate->>'thumbnail_sha256'])
+       or r.candidate_json->>'image_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256',candidate->>'thumbnail_sha256'])
+       or r.candidate_json->>'thumbnail_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256',candidate->>'thumbnail_sha256']))
       and (not r.audit_id=any(sibling_ids) or r.candidate_json->>'image_sha256'=candidate->>'image_sha256')) then
   raise exception 'already used cleared or reserved visual requires HOLD' using errcode='23514'; end if;
  insert into public.fixer_owner_photo_reservation_20261007(audit_id,receipt_ref,calendar_row_id,original_json,manifest_json,candidate_json)
@@ -326,7 +333,8 @@ begin
  insert into public.fixer_forward_media_render_manifest_20261006
  (manifest_digest,tenant_id,source_asset_id,image_url,image_fingerprint,image_length,thumbnail_url,thumbnail_fingerprint,thumbnail_length,operation,render_recipe,render_evidence_ref)
  values(p_manifest->>'manifest_digest',src.tenant_id,src.source_asset_id,p_manifest->>'image_url',p_manifest->>'image_fingerprint',
- (p_manifest->>'image_length')::bigint,null,null,null,p_manifest->>'operation',p_manifest->'render_recipe',cert.receipt_ref);
+ (p_manifest->>'image_length')::bigint,p_manifest->>'thumbnail_url',p_manifest->>'thumbnail_fingerprint',
+ (p_manifest->>'thumbnail_length')::bigint,p_manifest->>'operation',p_manifest->'render_recipe',cert.receipt_ref);
  return clearance;
 end; $$;
 revoke all on function public.fixer_prepare_owner_photo_20261007(uuid,jsonb,jsonb) from public,anon,authenticated,service_role,
@@ -444,7 +452,7 @@ begin
    raise exception 'photo reservation revoked disabled or retired epoch' using errcode='23514'; end if;
   end loop;
   if exists(select 1 from public.fixer_forward_media_historical_original_20261007 h
-    where h.source_fingerprint=any(array[grant_row.candidate_json->>'source_fingerprint',grant_row.candidate_json->>'image_fingerprint'])) then
+    where h.source_fingerprint=any(array[grant_row.candidate_json->>'source_fingerprint',grant_row.candidate_json->>'image_fingerprint',grant_row.candidate_json->>'thumbnail_fingerprint'])) then
    raise exception 'new trusted historical byte match requires HOLD' using errcode='23514'; end if;
   snap:=public.fixer_forward_media_photo_snapshot_20261007();
   if snap->'policy_approved' is distinct from 'true'::jsonb or snap->'scope_complete' is distinct from 'true'::jsonb
@@ -574,7 +582,7 @@ begin
    and not exists(select 1 from public.fixer_forward_media_photo_key_revocation_20261007 v where v.key_id=k.key_id)
    and r.status in ('draft','pending','queued','approved') and r.variant_status='active'
    and r.publish_claim_token is null and r.published_at is null and r.late_post_id is null
-   and r.render_manifest_digest is null and r.thumbnail_url is null
+   and r.render_manifest_digest is null and r.thumbnail_url is not distinct from c.payload_json::jsonb#>>'{candidate,thumbnail_url}'
    and r.media_not_ready_reason is null
    and public.fixer_owner_photo_source_ready_20261007(src.source_asset_id,src.source_sha256)
    and not exists(select 1 from public.fixer_owner_photo_progress_20261007 p where p.audit_id=c.audit_id)

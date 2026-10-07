@@ -16,6 +16,7 @@ from .forward_media_attester import replay_still_recipe, validate_still_recipe
 from .forward_media_owner import ForwardMediaOwnerPersistence, ObjectReader
 from .forward_media_photo_certificate import IndependentPhotoAuditor, PhotoCertificateHold, digest
 from .forward_media_source_verifier import verify_source
+from .forward_media_thumbnail_candidate import prepare_thumbnail_candidate
 
 
 @dataclass(frozen=True)
@@ -24,11 +25,16 @@ class PreparedOwnerPhoto:
     image_bytes: bytes
     manifest: prepare.RenderManifest
     certificate: object
+    thumbnail_bytes: bytes | None = None
 
 
 class _FrozenBytes(ObjectReader):
-    def __init__(self, source, image_url, image_bytes):
+    def __init__(self, source, image_url, image_bytes, thumbnail_url=None, thumbnail_bytes=None):
         self.values = {source.original.source_url: source.source_bytes, image_url: image_bytes}
+        if thumbnail_url is not None:
+            if thumbnail_url in self.values and self.values[thumbnail_url] != thumbnail_bytes:
+                raise PhotoCertificateHold('certified_owner_thumbnail_alias_mismatch')
+            self.values[thumbnail_url] = thumbnail_bytes
 
     def read(self, url):
         if url not in self.values:
@@ -96,13 +102,12 @@ def prepare_remote_photo(snapshot, *, drive_reader, hosted_reader, recipe, audit
     if (row.get('status') not in ('draft','pending','queued','approved') or row.get('variant_status')!='active'
             or any(row.get(k) is not None for k in ('publish_claim_token','published_at','late_post_id','render_manifest_digest'))):
         raise PhotoCertificateHold('certified_owner_candidate_not_unsent')
-    if row.get('thumbnail_url') is not None:
-        raise PhotoCertificateHold('thumbnail_candidate_contract_missing')
     recipe = validate_still_recipe(recipe)
     source = verify_source(snapshot, drive_reader, hosted_reader)
     image_bytes = hosted_reader.read(row['image_url'])
-    replay = replay_still_recipe(source.source_bytes, recipe)
-    if replay['image_bytes'] != image_bytes or replay['thumbnail_bytes'] is not None:
+    replay = replay_still_recipe(source.source_bytes, recipe,
+                                 has_thumbnail=row.get('thumbnail_url') is not None)
+    if replay['image_bytes'] != image_bytes:
         raise PhotoCertificateHold('certified_owner_render_bytes_mismatch')
     image_fp, image_len = prepare.fingerprint_bytes(image_bytes)
     with auditor.conn.cursor() as cursor:
@@ -118,12 +123,33 @@ def prepare_remote_photo(snapshot, *, drive_reader, hosted_reader, recipe, audit
         'image_fingerprint': image_fp, 'image_sha256': 'sha256:'+hashlib.sha256(image_bytes).hexdigest(),
         'image_length': image_len, 'render_recipe_digest': digest(recipe), 'content_digest': content_digest,
     }
+    # Immutable signed database packet provides the thumbnail binding; remote
+    # bytes cannot choose it. Exact candidate/signature/corpus verification below
+    # binds every field before any authority is staged.
+    stored = auditor._rpc('certificate', (str(uuid.UUID(audit_id)),))
+    signed = stored['packet']['payload']['candidate']
+    # This phase performs read-only lookups. End their transaction before the
+    # thumbnail host read, as source/image reads already do; final SQL authority
+    # rechecks the complete immutable certificate and creative under locks.
+    auditor.conn.rollback()
+    thumb_manifest = {'image_url': row['image_url'], 'render_recipe': recipe,
+        'thumbnail_url': signed.get('thumbnail_url'),
+        'thumbnail_sha256': (signed.get('thumbnail_sha256') or '').removeprefix('sha256:') or None,
+        'thumbnail_fingerprint': signed.get('thumbnail_fingerprint'),
+        'thumbnail_length': signed.get('thumbnail_length')}
+    thumbnail = prepare_thumbnail_candidate(snapshot=row, manifest=thumb_manifest,
+        source_bytes=source.source_bytes, image_bytes=image_bytes, read_bytes=hosted_reader.read)
+    if 'thumbnail_url' in signed:
+        candidate.update(thumbnail_url=thumbnail.thumbnail_url,
+            thumbnail_sha256=('sha256:'+thumbnail.thumbnail_sha256 if thumbnail.thumbnail_sha256 else None),
+            thumbnail_fingerprint=thumbnail.thumbnail_fingerprint, thumbnail_length=thumbnail.thumbnail_length)
     certificate = auditor.lookup_for_owner(audit_id, candidate)
     operation = ('same_object' if row['image_url'] == source.original.source_url
                  else 'rehost' if recipe['image']['name'] == 'identity' else 'render')
     manifest = prepare.build_render_manifest(source.original, row['image_url'], image_bytes,
-        operation, certificate.receipt_ref, render_recipe=recipe)
-    return PreparedOwnerPhoto(source, image_bytes, manifest, certificate)
+        operation, certificate.receipt_ref, render_recipe=recipe,
+        thumbnail_url=thumbnail.thumbnail_url, thumbnail_bytes=thumbnail.thumbnail_bytes)
+    return PreparedOwnerPhoto(source, image_bytes, manifest, certificate, thumbnail.thumbnail_bytes)
 
 
 def stage_prepared_photo(persistence, prepared):
@@ -154,7 +180,8 @@ def stage_prepared_photo(persistence, prepared):
         raise PhotoCertificateHold('certified_owner_original_anchor_mismatch')
     original = prepare.OriginalRegistration(**canonical_original)
     frozen = ForwardMediaOwnerPersistence(persistence._conn, persistence._expected_owner,
-        _FrozenBytes(prepared.source, prepared.manifest.image_url, prepared.image_bytes))
+        _FrozenBytes(prepared.source, prepared.manifest.image_url, prepared.image_bytes,
+                     prepared.manifest.thumbnail_url, prepared.thumbnail_bytes))
     return frozen.persist_in_transaction(original, clearance, prepared.manifest)
 
 
