@@ -93,12 +93,13 @@ class OwnerEvidenceReadStore:
                     "pg_has_role(current_user,'fixer_forward_media_owner_20261006','member'),"
                     "pg_has_role(current_user,'fixer_forward_media_attester_20261006','member'),"
                     "pg_has_role(current_user,'fixer_forward_media_photo_auditor_20261007','member'),"
+                    "pg_has_role(current_user,'fixer_forward_media_history_auditor_20261007','member'),"
                     "pg_has_role(current_user,'service_role','member'),"
                     "(select rolsuper or rolbypassrls from pg_roles where rolname=current_user)", (READ_ROLE,))
                 identity = cur.fetchone()
                 if (not isinstance(self.expected_role, str)
                         or self.expected_role in ('anon', 'authenticated', 'service_role')
-                        or identity != (self.expected_role, self.expected_role, True, False, False, False, False, False)):
+                        or identity != (self.expected_role, self.expected_role, True, False, False, False, False, False, False)):
                     hold('generated_owner_read_identity_required')
                 cur.execute('select public.fixer_generated_owner_diagnostics_20261007(%s)',
                             (request.tenant_id,))

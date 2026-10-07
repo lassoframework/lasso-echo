@@ -54,7 +54,8 @@ def main():
                 sql((ROOT/'migrations'/name).read_text())
             sql('create role generated_test_reader login;grant fixer_generated_owner_reader_20261007 to generated_test_reader;'
                 'create role generated_test_writer login;grant fixer_forward_media_owner_20261006 to generated_test_writer;'
-                'create role generated_test_mixed login;grant fixer_generated_owner_reader_20261007,fixer_forward_media_owner_20261006 to generated_test_mixed;')
+                'create role generated_test_mixed login;grant fixer_generated_owner_reader_20261007,fixer_forward_media_owner_20261006 to generated_test_mixed;'
+                'create role generated_test_history_mixed login;grant fixer_generated_owner_reader_20261007,fixer_forward_media_history_auditor_20261007 to generated_test_history_mixed;')
             reader = psycopg.connect(dsn('generated_test_reader')); connections.append(reader)
             store = OwnerEvidenceReadStore(reader, 'generated_test_reader')
             req = make_request()
@@ -86,8 +87,17 @@ def main():
                 else:
                     conn = psycopg.connect(dsn(role)); connections.append(conn)
                 denied(conn, "select fixer_generated_owner_diagnostics_20261007('gym')")
-            for role in ('generated_test_mixed', 'postgres'):
+            for role in ('generated_test_mixed', 'generated_test_history_mixed', 'postgres'):
                 conn = psycopg.connect(dsn(role)); connections.append(conn)
+                if role == 'generated_test_history_mixed':
+                    # Reproduce the reviewed authority leak: this role really
+                    # has raw historical SELECT/INSERT privileges and therefore
+                    # cannot be the isolated generated read credential.
+                    assert conn.execute("select has_table_privilege(current_user,"
+                        "'fixer_forward_media_historical_original_20261007','SELECT'),"
+                        "has_table_privilege(current_user,"
+                        "'fixer_forward_media_historical_original_20261007','INSERT')").fetchone() == (True, True)
+                    conn.rollback()
                 try:
                     OwnerEvidenceReadStore(conn, role).diagnostics(req)
                     raise AssertionError('mixed/super owner accepted as reader')
