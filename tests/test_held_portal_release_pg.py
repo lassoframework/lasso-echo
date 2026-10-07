@@ -1,4 +1,4 @@
-"""Run explicit portal notice SQL shape against 0383 and optional draft 0384.
+"""Run explicit portal notice SQL shape against 0383 and reviewed draft 0605.
 
 Usage: python tests/test_held_portal_release_pg.py /absolute/portal/checkout
 No database URL or production access: disposable Unix-socket PG17 only.
@@ -81,9 +81,10 @@ def main(portal):
             fixture = Path(__file__).with_name('held_portal_release.verify.sql')
             run(psql + ['-f', str(fixture)])
             print('0383 exact route-null portal held release fixture passed')
-            run(psql + ['-f', str(portal / 'supabase/migrations/0384_fixer_current_notice_resolution.sql')])
+            migration = portal / 'supabase/migrations/0605_fixer_current_notice_resolution.sql'
+            run(psql + ['-f', str(migration)])
             run(psql + ['-f', str(fixture)])
-            print('0384 draft preserves exact route-null portal held release fixture')
+            print('0605 draft preserves exact route-null portal held release fixture')
         finally:
             run([str(BIN / 'pg_ctl'), '-D', str(data), '-m', 'immediate', '-w', 'stop'])
 

@@ -3910,8 +3910,16 @@ def test_requester_inbound_increments_version_and_reopens_resolved_ticket():
     assert bus.ticket(tid)["resolved_at"] is None
 
 
-def test_bus_atomic_delivery_resolution_posts_the_full_identity_envelope():
+def test_bus_atomic_delivery_resolution_posts_the_full_identity_envelope(monkeypatch):
+    monkeypatch.delenv("AGENT_FIXER_CURRENT_NOTICE_0384", raising=False)
     tid = str(uuid.uuid4())
+    current_ticket = {
+        "id": tid, "status": "verification", "classification": "action_request",
+        "product": "echo", "source": "slack", "client_id": "gym-one",
+        "bot_identity": "echo", "slack_user_id": "U_CLIENT",
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        "request_version": 3, "escalated": False, "hold_tier": None,
+    }
     expected = {
         "id": tid, "status": "resolved", "classification": "action_request",
         "product": "echo", "client_id": "gym-one", "bot_identity": "echo",
@@ -3924,16 +3932,23 @@ def test_bus_atomic_delivery_resolution_posts_the_full_identity_envelope():
         status_code = 200
         text = ""
 
-        @staticmethod
-        def json():
-            return [expected]
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
 
     class _Http:
+        get_call = None
         call = None
+
+        def get(self, url, **kwargs):
+            self.get_call = (url, kwargs)
+            return _Response([current_ticket])
 
         def post(self, url, **kwargs):
             self.call = (url, kwargs)
-            return _Response()
+            return _Response([expected])
 
     http = _Http()
     bus = Bus(url="https://example.supabase.co", service_key="service", http=http)
@@ -3942,6 +3957,11 @@ def test_bus_atomic_delivery_resolution_posts_the_full_identity_envelope():
         "echo", "U_CLIENT", "C_CLIENT", "1.0")
 
     assert resolved == expected
+    assert http.get_call[0].endswith("/rest/v1/support_tickets")
+    assert http.get_call[1]["params"] == {
+        "id": f"eq.{tid}", "select": "*", "limit": "1",
+    }
+    assert current_ticket["request_version"] == 3
     assert http.call[0].endswith("/rest/v1/rpc/fixer_resolve_current_delivery")
     assert json.loads(http.call[1]["data"]) == {
         "p_ticket_id": tid,
