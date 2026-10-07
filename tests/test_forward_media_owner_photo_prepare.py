@@ -61,7 +61,7 @@ class OwnerPhotoTests(unittest.TestCase):
 
     def test_signed_transformed_thumbnail_and_image_alias_prepare_exact_retained_bytes(self):
         from agent.forward_media_attester import replay_still_recipe
-        for stage in ('feed_autofit_4x5','delivered_image'):
+        for stage in ('feed_autofit_4x5','delivered_image','identity'):
             snap,drive,data,_,packet,auditor,_=self.setup_candidate()
             recipe=make_still_recipe('identity',thumbnail_name=stage)
             thumb=replay_still_recipe(data,recipe,has_thumbnail=True)['thumbnail_bytes']
@@ -84,6 +84,8 @@ class OwnerPhotoTests(unittest.TestCase):
             self.assertEqual(prepared.thumbnail_bytes,thumb)
             self.assertEqual(prepared.manifest.thumbnail_url,url)
             self.assertEqual(prepared.manifest.thumbnail_fingerprint,candidate['thumbnail_fingerprint'])
+            self.assertEqual(prepared.manifest.operation,
+                'render' if stage=='feed_autofit_4x5' else 'same_object' if stage=='delivered_image' else 'rehost')
             # Alias consumes the already read delivered image; no third read.
             self.assertEqual(reader.urls.count(url),2 if stage=='delivered_image' else 1)
 

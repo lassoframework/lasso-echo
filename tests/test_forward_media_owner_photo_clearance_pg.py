@@ -639,18 +639,19 @@ def main():
    # Isolate the THUMBNAIL collision: originals and delivered images differ
    # byte-for-byte (valid PNG trailing data), while deterministic crops agree.
    # Synthetic real signatures cannot claim nonmatch for these known bytes.
-   def independent_thumbnail(tag,day='2026-10-11',tenant='gym',color='blue'):
+   def independent_thumbnail(tag,day='2026-10-11',tenant='gym',color='blue',thumbnail_name='feed_autofit_4x5',image_source_alias=True):
     data_bytes=png(color)+tag.encode();asset_id=FILE+tag;source_id='source-'+tag
     source_url='https://media.example.test/original-'+tag+'.png';row_id=new_row(day=day)
     sql('insert into media_source values(%s,%s,%s,%s,true)',(source_id,tenant,'gym_drive',FOLDER))
     sql('insert into media_asset(id,source_id,gym_id) values(%s,%s,%s)',(asset_id,source_id,tenant))
     approved_asset(asset_id,data_bytes,tenant)
-    recipe_now=attester.make_still_recipe('identity',thumbnail_name='feed_autofit_4x5')
+    recipe_now=attester.make_still_recipe('identity',thumbnail_name=thumbnail_name)
     replay_now=attester.replay_still_recipe(data_bytes,recipe_now,has_thumbnail=True)
     thumb_url='https://media.example.test/thumb-independent-'+tag+'.png'
-    rendered_objects[source_url]=data_bytes;rendered_objects[thumb_url]=replay_now['thumbnail_bytes']
+    image_url=source_url if image_source_alias else 'https://media.example.test/image-independent-'+tag+'.png'
+    rendered_objects[source_url]=data_bytes;rendered_objects[image_url]=data_bytes;rendered_objects[thumb_url]=replay_now['thumbnail_bytes']
     sql('update content_calendar set gym_id=%s,source_media_asset_id=%s,source_media_url=%s,image_url=%s,thumbnail_url=%s where id=%s',
-     (tenant,asset_id,source_url,source_url,thumb_url,row_id))
+     (tenant,asset_id,source_url,image_url,thumb_url,row_id))
     class FreshDrive(Drive):
      def original_bytes(self,file_id):assert file_id==asset_id;return data_bytes
     fresh_drive=FreshDrive();fresh_drive.data=data_bytes
@@ -659,7 +660,7 @@ def main():
     current_now=store.snapshot(row_id,revision_now);source_now=verify_source(current_now,fresh_drive,rendition_hosted)
     store.stage_source(source_now);conn.commit()
     candidate_now={**candidate,'calendar_row_id':row_id,'tenant_id':tenant,'post_date':day,'source_asset_id':asset_id,
-     'source_url':source_url,'image_url':source_url,'source_receipt_ref':source_now.receipt_ref,
+     'source_url':source_url,'image_url':image_url,'source_receipt_ref':source_now.receipt_ref,
      'source_fingerprint':source_now.original.source_fingerprint,'image_fingerprint':source_now.original.source_fingerprint,
      'source_sha256':source_now.evidence['source_sha256'],'image_sha256':source_now.evidence['source_sha256'],
      'source_length':len(data_bytes),'image_length':len(data_bytes),'render_recipe_digest':digest(recipe_now),
@@ -670,6 +671,25 @@ def main():
     IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(cert_now);auditor_conn.commit()
     prepared_now=prepare_remote_photo(current_now,drive_reader=fresh_drive,hosted_reader=rendition_hosted,recipe=recipe_now,auditor=owner_auditor,audit_id=cert_now['payload']['audit_id']);conn.rollback()
     return prepared_now,cert_now
+   # Identity images also traverse the actual owner -> attester -> claim.
+   # Operation comes from all URLs and bytes, including a separately hosted
+   # identical thumbnail (rehost) and transformed thumbnail (render).
+   for thumbnail_name,tag,image_source_alias,operation,color in (
+       ('feed_autofit_4x5','identity-source-transformed-thumb',True,'render','purple'),
+       ('feed_autofit_4x5','identity-rehost-transformed-thumb',False,'render','orange'),
+       ('identity','identity-source-separate-thumb',True,'rehost','pink')):
+    identity_prepared,identity_cert=independent_thumbnail(tag,day='2026-10-10',color=color,
+       thumbnail_name=thumbnail_name,image_source_alias=image_source_alias)
+    row_id=identity_cert['payload']['candidate']['calendar_row_id']
+    identity_source=identity_prepared.source.source_bytes
+    assert identity_prepared.image_bytes==identity_source
+    assert identity_prepared.manifest.operation==operation
+    assert identity_prepared.manifest.thumbnail_url not in (identity_prepared.source.original.source_url,identity_prepared.manifest.image_url)
+    assert (identity_prepared.thumbnail_bytes==identity_source)==(operation=='rehost')
+    stage_prepared_photo(p,identity_prepared);conn.commit()
+    binding_identity=rendition_claim(row_id)
+    assert sql('select operation from fixer_forward_media_lineage_20261006 where calendar_row_id=%s',(row_id,))[0][0]==operation
+    assert claim(binding_identity) is True and claim(binding_identity) is True
    for tag,day,tenant in (('thumb-only-date','2026-10-11','gym'),('thumb-only-tenant','2026-10-10','thumb-only-other-gym')):
     thumb_prepared,thumb_cert=independent_thumbnail(tag,day,tenant)
     assert thumb_cert['payload']['candidate']['source_sha256']!=candidate['source_sha256']
