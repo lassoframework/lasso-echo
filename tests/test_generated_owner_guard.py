@@ -10,6 +10,8 @@ from PIL import Image
 
 from agent import forward_media_guard as guard, forward_media_owner as owner, visual_scene
 
+APPROVED_SOURCE_REVISION = 'client-source:sha256:' + 'a' * 64
+
 
 def image_bytes():
     im = Image.new('RGB', (128, 128), 'white')
@@ -36,6 +38,7 @@ def trusted(snapshot=None):
     return {'gym_id':'gym','local_date':'2026-10-10','logical_post_id':'group',
         'copy_revision':'copy','palette_revision':'palette','inventory_revision':'inventory',
         'history_revision':'history','copy_digest':'copy digest','palette_digest':'palette digest',
+        'approved_source_revision':APPROVED_SOURCE_REVISION,
         'photo_inventory_complete':True,'eligible_photo_count':0,'history_complete':True,
         'copy_verified':True,'palette_verified':True,**(snapshot or {})}
 
@@ -81,7 +84,7 @@ def test_owner_computes_original_and_ends_read_transaction_before_remote_work(la
     assert p._conn.events == ['rollback','read','read']
     q,args=p._conn.calls[-1]
     assert 'fixer_reserve_generated' in q
-    manifest=json.loads(args[-1])
+    manifest=json.loads(args[-2])
     assert manifest['operation']=='same_object' and manifest['thumbnail_url'] is None
     assert manifest['source_asset_id']=='generated-astra:'+c['job_id']
 

@@ -10,6 +10,8 @@ create table public.fixer_generated_reservation_20261007 (
  job_id uuid primary key, calendar_row_id uuid not null, group_key text not null,
  candidate_json jsonb not null, manifest_json jsonb not null,
  receipt_ref text unique not null, history_epoch jsonb not null,
+ approved_source_revision text not null
+  check(approved_source_revision ~ '^client-source:sha256:[0-9a-f]{64}$'),
  reserved_at timestamptz not null default clock_timestamp()
 );
 -- Exact historical byte reads by the existing trusted owner, bound to the
@@ -278,7 +280,8 @@ end; $$;
 
 -- Existing owner is the trust boundary for authenticated generation + exact
 -- copy/palette + historical byte reads. No service/auditor self-approval API.
-create function public.fixer_reserve_generated_20261007(p_id uuid,c jsonb,visuals jsonb,m jsonb)
+create function public.fixer_reserve_generated_20261007(p_id uuid,c jsonb,visuals jsonb,m jsonb,
+ p_approved_source_revision text default null)
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
 declare snap jsonb; h jsonb; proof jsonb; prior public.fixer_generated_reservation_20261007%rowtype;
  r public.content_calendar%rowtype; receipt text; original jsonb; clearance jsonb; fp text; asset text;
@@ -287,6 +290,10 @@ begin
  if not pg_has_role(caller,'fixer_forward_media_owner_20261006','member')
   or pg_has_role(caller,'service_role','member') or pg_has_role(caller,'fixer_forward_media_attester_20261006','member') then
   raise exception 'isolated existing owner required' using errcode='42501'; end if;
+ -- Only the authenticated owner supplies the independently verified client-source
+ -- revision. It is separate from the DB row-copy digest and immutable on replay.
+ if (p_approved_source_revision ~ '^client-source:sha256:[0-9a-f]{64}$') is distinct from true then
+  raise exception 'verified approved source revision required' using errcode='23514'; end if;
  if current_setting('transaction_isolation')<>'read committed' then
   raise exception 'generated reservation requires read committed' using errcode='25000'; end if;
  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
@@ -321,7 +328,8 @@ begin
   raise exception 'generated visual already held by common still reservation' using errcode='23514'; end if;
  select * into prior from public.fixer_generated_reservation_20261007 where job_id=(c->>'job_id')::uuid;
  if found then
-  if prior.candidate_json is distinct from c or prior.manifest_json is distinct from m then
+  if prior.candidate_json is distinct from c or prior.manifest_json is distinct from m
+   or prior.approved_source_revision is distinct from p_approved_source_revision then
    raise exception 'generated job immutable identity conflict' using errcode='23514'; end if;
   if prior.group_key is distinct from r.visual_group_key then
    raise exception 'generated sibling group changed' using errcode='23514'; end if;
@@ -399,8 +407,8 @@ begin
   'thumbnail_url',null,'thumbnail_fingerprint',null,'thumbnail_length',null,'operation','same_object','render_recipe',null,'render_evidence_ref',asset)
   or m->>'manifest_digest' is distinct from 'sha256:'||encode(sha256(convert_to(public.fixer_owner_photo_canonical_20261007(m-'manifest_digest'),'UTF8')),'hex') then
   raise exception 'generated original requires exact same-object manifest' using errcode='23514'; end if;
- insert into public.fixer_generated_reservation_20261007(job_id,calendar_row_id,group_key,candidate_json,manifest_json,receipt_ref,history_epoch)
- values((c->>'job_id')::uuid,p_id,r.visual_group_key,c,m,receipt,snap#>'{history,epoch}');
+ insert into public.fixer_generated_reservation_20261007(job_id,calendar_row_id,group_key,candidate_json,manifest_json,receipt_ref,history_epoch,approved_source_revision)
+ values((c->>'job_id')::uuid,p_id,r.visual_group_key,c,m,receipt,snap#>'{history,epoch}',p_approved_source_revision);
  insert into public.fixer_forward_media_original_registry_20261006(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref)
  values(c->>'gym_id',asset,c->>'original_url',fp,(c->>'original_length')::bigint,'astra-job:'||(c->>'job_id'));
  insert into public.fixer_forward_media_history_clearance_20261006(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref,decision,history_evidence_ref)
@@ -524,7 +532,7 @@ end; $$;
 
 do $$ declare f text; begin
  foreach f in array array['fixer_generated_hamming_20261007(text,text)','fixer_generated_snapshot_20261007(uuid)','fixer_generated_history_snapshot_20261007()',
- 'fixer_reserve_generated_20261007(uuid,jsonb,jsonb,jsonb)','fixer_generated_runtime_check_20261007(uuid)',
+ 'fixer_reserve_generated_20261007(uuid,jsonb,jsonb,jsonb,text)','fixer_generated_runtime_check_20261007(uuid)',
  'fixer_pre_generated_snapshot_20261007()','fixer_pre_generated_provenance_20261007(uuid)',
  'fixer_generated_inventory_lock_20261007()','fixer_forward_media_photo_snapshot_20261007()',
  'fixer_forward_media_provenance_lookup_20261006(uuid)'] loop
@@ -532,7 +540,7 @@ do $$ declare f text; begin
  end loop;
 end; $$;
 grant execute on function public.fixer_generated_snapshot_20261007(uuid),
- public.fixer_reserve_generated_20261007(uuid,jsonb,jsonb,jsonb) to fixer_forward_media_owner_20261006;
+ public.fixer_reserve_generated_20261007(uuid,jsonb,jsonb,jsonb,text) to fixer_forward_media_owner_20261006;
 grant execute on function public.fixer_forward_media_photo_snapshot_20261007() to fixer_forward_media_owner_20261006,fixer_forward_media_photo_auditor_20261007;
 grant execute on function public.fixer_forward_media_provenance_lookup_20261006(uuid) to fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006;
 
@@ -837,4 +845,56 @@ grant execute on function public.fixer_still_cutover_control_20261007(boolean,te
  public.fixer_still_reserve_20261007(uuid,uuid,jsonb,text,uuid,uuid),
  public.fixer_still_final_check_20261007(uuid,uuid) to fixer_forward_media_owner_20261006;
 grant execute on function public.fixer_forward_media_provenance_lookup_20261006(uuid) to fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006;
+
+-- Cross-volume publish readback (smallest safe release item 4). The isolated
+-- owner's local SQLite job journal lives on the owner's own /data volume and
+-- is never publisher authority. This is the one durable prepared-job read
+-- source at publisher boundaries: a read-only, minimal binding projected from
+-- the immutable generated reservation. It carries the owner-approved source
+-- revision and copy/palette refs, never provider response/output/storage
+-- internals. A row whose persisted identity no longer matches its reservation
+-- reads back NULL (fail closed); the publisher still re-derives the CURRENT
+-- approved source revision and controlled palette and compares them itself.
+create function public.fixer_generated_publish_readback_20261007(p_id uuid)
+returns jsonb language plpgsql stable security definer set search_path=pg_catalog,public as $$
+declare r public.content_calendar%rowtype; g public.fixer_generated_reservation_20261007%rowtype;
+ c jsonb; m jsonb;
+begin
+ select * into r from public.content_calendar where id=p_id;
+ if not found or r.source_media_asset_id is null
+  or r.source_media_asset_id !~ '^generated-astra:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+  return null; end if;
+ select * into g from public.fixer_generated_reservation_20261007
+  where job_id=substr(r.source_media_asset_id,17)::uuid;
+ if not found then return null; end if;
+ c:=g.candidate_json; m:=g.manifest_json;
+ -- The leased row must still be exactly the reserved identity. Sibling rows
+ -- share the same job/logical/original; anything drifted reads back NULL.
+ if r.gym_id is distinct from c->>'gym_id' or r.post_date::text is distinct from c->>'local_date'
+  or (to_jsonb(r)->>'logical_post_id') is distinct from c->>'logical_post_id'
+  or r.account not in ('instagram','facebook')
+  or r.format is distinct from 'feed'
+  or r.visual_group_key is distinct from g.group_key
+  or r.image_url is distinct from c->>'original_url'
+  or r.source_media_url is distinct from c->>'original_url'
+  or r.thumbnail_url is not null
+  or r.render_manifest_digest is distinct from m->>'manifest_digest'
+  or m->>'tenant_id' is distinct from c->>'gym_id'
+  or m->>'source_asset_id' is distinct from r.source_media_asset_id
+  or m->>'image_url' is distinct from c->>'original_url' then
+  return null; end if;
+ return jsonb_build_object('job_id',g.job_id,'calendar_row_id',r.id,'gym_id',c->>'gym_id',
+  'account',r.account,'local_date',c->>'local_date','logical_post_id',c->>'logical_post_id',
+  'group_key',g.group_key,'original_url',c->>'original_url','manifest_digest',m->>'manifest_digest',
+  'source_revision',g.approved_source_revision,'copy_digest',c->>'copy_digest',
+  'palette_revision',c->>'palette_revision','palette_digest',c->>'palette_digest',
+  'receipt_ref',g.receipt_ref);
+end; $$;
+revoke all on function public.fixer_generated_publish_readback_20261007(uuid)
+ from public,anon,authenticated,service_role,fixer_forward_media_owner_20261006,
+ fixer_forward_media_attester_20261006,fixer_forward_media_photo_auditor_20261007;
+-- Publisher read-only only. The isolated owner and attester already reach this
+-- evidence through their own lanes; neither gains this RPC, and no role gains
+-- reservation mutation or provider-secret exposure through it.
+grant execute on function public.fixer_generated_publish_readback_20261007(uuid) to service_role;
 commit;

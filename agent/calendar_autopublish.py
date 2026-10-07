@@ -1599,7 +1599,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # claim. The lower forward-media bridge repeats it before provider I/O.
         try:
             from .generated_infographic_runtime import validate_publish_palette
-            validate_publish_palette(row)
+            validate_publish_palette(row, store=store)
         except Exception:
             skipped.append(row_id)
             continue

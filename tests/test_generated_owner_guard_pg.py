@@ -218,9 +218,9 @@ def main():
     lock.rollback();lock.close()
     # Raw producer paths and generated table writes stay refused.
     service=lane('service_role')
-    denied(lambda:service.execute('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb)',(rid,json.dumps(c),'[]',json.dumps(result['manifest']))),'permission denied')
+    denied(lambda:service.execute('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)',(rid,json.dumps(c),'[]',json.dumps(result['manifest']),'client-source:sha256:'+'a'*64)),'permission denied')
     service.rollback()
-    denied(lambda:service.execute('insert into fixer_generated_reservation_20261007(job_id,calendar_row_id,group_key,candidate_json,manifest_json,receipt_ref) values(%s,%s,%s,%s::jsonb,%s::jsonb,%s)',(str(uuid.uuid4()),rid,'group','{}','{}','fake')),'permission denied')
+    denied(lambda:service.execute('insert into fixer_generated_reservation_20261007(job_id,calendar_row_id,group_key,candidate_json,manifest_json,receipt_ref,approved_source_revision) values(%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)',(str(uuid.uuid4()),rid,'group','{}','{}','fake','client-source:sha256:'+'a'*64)),'permission denied')
     service.rollback();service.close()
     # Hold unknown history at the actual send boundary even after lineage.
     unknown=row(day='2026-10-08');sql("update content_calendar set status='published',image_url='https://owned.example/unknown' where id=%s",(unknown,))

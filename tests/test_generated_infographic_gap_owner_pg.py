@@ -14,11 +14,13 @@ import sys
 import tempfile
 import uuid
 from unittest.mock import patch
+from types import SimpleNamespace
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from agent import forward_media_guard as guard, forward_media_owner as owner
 from agent import generated_infographic_gap_owner as gap, generated_infographic_preparation as prep
+from agent import generated_infographic_runtime as runtime
 from tests.test_generated_owner_guard import candidate, trusted, image_bytes
 
 
@@ -66,7 +68,11 @@ def main():
     result=service.execute('select fixer_generated_gap_dispatch_20261007(%s,%s,%s,%s,%s)',
                            (request,gym,date_,account,'feed')).fetchone()[0]
     service.commit();return result
-   refs=('SYNTHETIC approved words','client-source:sha256:'+'a'*64,'sha256:'+'b'*64,'b'*64,'brand-colors:sha256:'+'c'*64)
+   source=SimpleNamespace(id=1,account_key='gym_ig',text='SYNTHETIC approved words',
+     status='approved',category='educational',citation='fixture approved source',created_at='2026-10-07')
+   graphic_copy,source_revision=runtime.approved_copy('gym',source.text,lambda key:[source])
+   palette=dict(evidence_ref='brand-colors:sha256:'+'c'*64)
+   refs=(source.text,source_revision,'sha256:'+'b'*64,prep.digest(palette),palette['evidence_ref'])
    logical=str(uuid.uuid4());group='vg_generated_'+uuid.UUID(logical).hex
    def args(q,row=None):return (q['request_id'],row or str(uuid.uuid4()),logical,group,*refs)
    def bind(c,a,commit=True):
@@ -137,10 +143,21 @@ def main():
    # Disposable synthetic epoch/census only; no live cutover or adapter proof.
    conn.execute('select fixer_still_cutover_control_20261007(true,%s)',
      ('SYNTHETIC gap fixture cutover',));conn.commit()
-   snap=trusted(guard.generated_snapshot(persistence,a[1]));conn.rollback();original=candidate(snap,pixels)
+   snap={**trusted(guard.generated_snapshot(persistence,a[1])),
+     'approved_source_revision':source_revision,'copy_digest':prep.digest(graphic_copy),
+     'palette_revision':refs[2],'palette_digest':prep.digest(palette)}
+   conn.rollback();original=candidate(snap,pixels)
    with patch('agent.visual_writer_prepare._own_media_url',lambda u:isinstance(u,str) and u.startswith('https://owned.example/')):
     reserved=guard.reserve_generated(persistence,a[1],original,snap,history_visuals=[],read_bytes=lambda u:pixels);conn.commit()
     assert reserved['reserved']
+    # The owner cannot replay the same job (including a sibling) with a
+    # different source approval revision; omitted legacy RPC input fails closed.
+    denied(lambda:conn.execute('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb)',
+      (a[1],json.dumps(original),'[]',json.dumps(reserved['manifest']))),
+      'verified approved source revision required');conn.rollback()
+    denied(lambda:conn.execute('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)',
+      (a[1],json.dumps(original),'[]',json.dumps(reserved['manifest']),'client-source:sha256:'+'d'*64)),
+      'immutable identity conflict');conn.rollback()
     assert conn.execute('select fixer_generated_gap_record_20261007(%s,%s,true,null)',(q['request_id'],a[1])).fetchone()[0];conn.commit()
     assert sql('select state,last_hold from fixer_generated_gap_request_20261007 where request_id=%s',(q['request_id'],))[0]==('complete',None)
     assert sql('select status from content_calendar where id=%s',(a[1],))[0][0]=='approved'
@@ -156,9 +173,51 @@ def main():
     assert service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(a[1],token,receipt['evidence_id'],revision)).fetchone()[0] is True;service.commit()
     # Sibling shares exact logical identity/original; no queue-generated authority.
     fbq=dispatch(account='facebook');fba=args(fbq);fbrow=bind(conn,fba)
-    fresh=trusted(guard.generated_snapshot(persistence,fba[1]));conn.rollback()
+    fresh={**trusted(guard.generated_snapshot(persistence,fba[1])),
+     'approved_source_revision':source_revision,'copy_digest':prep.digest(graphic_copy),
+     'palette_revision':refs[2],'palette_digest':prep.digest(palette)};conn.rollback()
     assert guard.reserve_generated(persistence,fba[1],original,fresh,history_visuals=[{**h,'visual_sha256':h.get('visual_sha256') or 'sha256:'+hashlib.sha256(pixels).hexdigest()} for h in fresh['history']['rows']],read_bytes=lambda u:pixels)['replayed'];conn.commit()
     assert fbrow['logical_post_id']==out['logical_post_id']
+    denied(lambda:conn.execute('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)',
+      (fba[1],json.dumps(original),'[]',json.dumps(reserved['manifest']),'client-source:sha256:'+'d'*64)),
+      'immutable identity conflict');conn.rollback()
+    # Cross-volume publish readback: the immutable minimal SQL binding is the
+    # publisher's only prepared-job authority (the owner's local journal is on
+    # another /data volume). Only service_role may execute it; the owner,
+    # attester and anon roles are denied, reservation rows stay immutable, and
+    # no provider response/output/storage internals are exposed.
+    binding=service.execute('select fixer_generated_publish_readback_20261007(%s)',(a[1],)).fetchone()[0];service.commit()
+    assert set(binding)=={'job_id','calendar_row_id','gym_id','account','local_date','logical_post_id','group_key','original_url','manifest_digest','source_revision','copy_digest','palette_revision','palette_digest','receipt_ref'}
+    assert binding['job_id']==original['job_id'] and binding['calendar_row_id']==a[1]
+    assert binding['gym_id']=='gym' and binding['account']=='instagram'
+    assert binding['local_date']==original['local_date'] and binding['logical_post_id']==original['logical_post_id']
+    assert binding['group_key']==group and binding['original_url']==original['original_url']
+    assert binding['manifest_digest']==reserved['manifest']['manifest_digest'] and binding['receipt_ref']==reserved['receipt_ref']
+    assert binding['source_revision']==source_revision and binding['source_revision']!=original['copy_revision']
+    assert binding['copy_digest']==original['copy_digest']
+    # Actual SQL readback must satisfy the Python boundary without the owner's journal.
+    leased=sql('select row_to_json(r) from content_calendar r where id=%s',(a[1],))[0][0]
+    with patch.object(runtime,'enabled',lambda:True),patch.object(guard,'enabled',lambda:True):
+     assert runtime.validate_publish_palette(leased,readback=lambda rid:binding,
+       sources=lambda key:[source],palette_loader=lambda base,key:(palette,refs[2]))
+    assert binding['palette_revision']==original['palette_revision'] and binding['palette_digest']==original['palette_digest']
+    fbind=service.execute('select fixer_generated_publish_readback_20261007(%s)',(fba[1],)).fetchone()[0];service.commit()
+    assert fbind['job_id']==original['job_id'] and fbind['account']=='facebook' and fbind['calendar_row_id']==fba[1]
+    # Format drift is authoritative in SQL even when Python retains an old feed row.
+    sql("update content_calendar set format='story' where id=%s",(fba[1],))
+    assert service.execute('select fixer_generated_publish_readback_20261007(%s)',(fba[1],)).fetchone()[0] is None;service.commit()
+    sql("update content_calendar set format='feed' where id=%s",(fba[1],))
+    # Identity drift or an unknown/non-generated row reads back NULL (fail closed).
+    assert service.execute('select fixer_generated_publish_readback_20261007(%s)',(str(uuid.uuid4()),)).fetchone()[0] is None;service.commit()
+    assert service.execute('select fixer_generated_publish_readback_20261007(%s)',(a2[1],)).fetchone()[0] is None;service.commit()
+    sql("update content_calendar set thumbnail_url='https://owned.example/drift.png' where id=%s",(fba[1],))
+    assert service.execute('select fixer_generated_publish_readback_20261007(%s)',(fba[1],)).fetchone()[0] is None;service.commit()
+    sql("update content_calendar set thumbnail_url=null where id=%s",(fba[1],))
+    denied(lambda:conn.execute('select fixer_generated_publish_readback_20261007(%s)',(a[1],)),'permission denied');conn.rollback()
+    attlane=lane(guard.ROLE);denied(lambda:attlane.execute('select fixer_generated_publish_readback_20261007(%s)',(a[1],)),'permission denied');attlane.rollback();attlane.close()
+    anonlane=lane('postgres');anonlane.execute('set role anon')
+    denied(lambda:anonlane.execute('select fixer_generated_publish_readback_20261007(%s)',(a[1],)),'permission denied');anonlane.rollback();anonlane.close()
+    denied(lambda:service.execute("update fixer_generated_reservation_20261007 set group_key='drift'"),'permission denied');service.rollback()
    # Exercise the actual idle-transaction owner RPC adapter and durable phase,
    # without any provider execution or publisher credential fallback.
    adapter=gap.GapOwnerTransport(persistence,prep.SQLiteGenerationJobs(root/'jobs.sqlite'))

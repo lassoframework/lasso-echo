@@ -10,7 +10,7 @@ This lane is a default OFF code candidate. No provider was called, credential ad
 - A strict candidate validation checks job, original bytes, storage key and readback before B reservation. The owner reloads copy/palette/photo/history facts after generation. B retains final SQL locks and source reservation.
 - `/data/generated-infographic-jobs.sqlite` is required on a mounted durable `/data` volume. `AGENT_GENERATED_INFOGRAPHIC_JOURNAL` may select a file beneath the same volume; ephemeral paths hold. The A journal fences generation, and a separate runtime row-to-job table binds identity before the first provider call and preserves it across history-spine changes, incomplete review and ambiguous responses. A durable `committing` marker holds unknown DB commits for independent reconciliation; no new provider job or automatic commit retry follows uncertainty.
 - Successful reservation leaves normal calendar status/approval/holds intact. It adds no coach-review category, legacy client-safe-review suffix, direct send or automatic approval. Existing client approval gates govern publication.
-- Calendar publication validates current palette before the calendar claim. The existing `forward_media_publish.authorize` repeats current approved source metadata, exact source copy, palette and job bindings before forward-media claims and every lower provider revalidation. DB lineage and final publication claims remain mandatory. A local journal entry grants no publisher authority.
+- Calendar publication validates current palette before the calendar claim. The existing `forward_media_publish.authorize` repeats current approved source metadata, exact source copy, palette and job bindings before forward-media claims and every lower provider revalidation. Both publisher boundaries read a minimal immutable reservation binding from SQL through the calendar store; the owner's local SQLite journal grants no publisher authority. DB lineage and final publication claims remain mandatory.
 
 ## Draft gap dispatch and owner binding
 
@@ -39,13 +39,13 @@ Echo/intake list existing `OPENAI_API_KEY` and R2/S3 variable names. All three l
 1. Integrate reviewed A, repaired B (including sealed baseline and account/format snapshot), and this runtime behind their OFF flags. Finish independent review and required SQL/release checks.
 2. Independently review and apply the draft gap dispatch migration after accepted B authority migrations. The minimal approved-copy capability accepts verbatim current approved source words; paraphrased copy remains held without a persisted approval receipt. Preserve approval and existing media holds.
 3. Provision the already-designed dedicated owner role/execution with only its intended DB grants, current approved source/account/palette reads, existing Astra/storage credentials and durable journal. Do not put owner DSN into the publisher/service-role process or weaken its environment guards. No new microservice/credential mutation is part of this lane.
-4. Establish one durable prepared-job read source at the publisher boundaries. Echo and intake have distinct `/data` volumes today; an owner journal cannot be presumed visible to both. A secured persisted lookup may replace the local journal reader after independent design/review; missing local journal holds in this candidate.
+4. Apply and verify the reviewed draft SQL reservation readback before publisher activation. The code now uses a minimal service-role readback at both publisher boundaries and holds when it is absent or stale. The owner supplies an immutable approved-source revision distinct from the DB copy digest. Echo and intake have distinct `/data` volumes; neither publisher depends on the owner's SQLite journal. This draft SQL is not applied in production.
 5. Retain all sealed historic baseline image/thumbnail objects and current delivered visuals. B's selected repair returns immutable SQL proof references joined to exact history key, binding, URL and sealed baseline SHA/epoch. Runtime accepts only these owner-issued cache facts, never producer cache flags. Unresolved URLs remain independently observed. This requires the repaired B migration/API; a URL or previous pHash alone cannot authorize reuse.
 6. Run an offline then staged end-to-end gap/create/prepare/reserve/attest/claim/provider-readback check. Only then consider scoped flag activation under the existing release owner.
 
 ## Offline evidence
 
-`tests/test_generated_infographic_runtime.py` covers fresh candidate preparation through mocked owner reservation, strict original/job/storage binding, exact account/gym/date/logical identity, photo availability and late-photo rechecks, current approved copy and palette revision, complete history byte failure, ambiguity fencing, durable owner commit uncertainty, reservation-spine replay without regeneration, missing publisher journal and explicit scheduler hold without legacy fallback.
+`tests/test_generated_infographic_runtime.py` covers fresh candidate preparation through mocked owner reservation, strict original/job/storage binding, exact account/gym/date/logical identity, photo availability and late-photo rechecks, current approved copy and palette revision, complete history byte failure, ambiguity fencing, durable owner commit uncertainty, reservation-spine replay without regeneration, SQL readback loss or identity drift, owner-journal absence at the publisher, and explicit scheduler hold without legacy fallback.
 
 No live generation or mutation is established by these fixtures. This runtime does not close the global image activation gap.
 
@@ -58,6 +58,8 @@ Selected offline commands passed in the compatible existing Echo virtualenv:
 - `git diff --check`: clean.
 
 Tests used offline fixtures only; no dependency installation or full-suite run occurred.
+
+After the cross-volume readback repair, 319 focused Python tests passed. Three disposable PostgreSQL 17 contract scripts passed, including an actual SQL reservation-to-publisher binding, immutable approved-source revision, a changed live feed format, and the existing owner/still-photo guards. A separate nonimplementing reviewer found no remaining P1/P2 code issue in this repair. Production owner provisioning, approved source and palette availability across services, migration application, and staged provider readback remain unverified.
 
 Selected runtime review repairs: before-provider row/job fencing, SQL-issued history cache reuse and URL deduplication, suppression of the no-source legacy seed under fresh ON, and current approved source revision checks at calendar/provider boundary. The focused runtime/publisher/media-sync/provider-scope selection passed 125 tests. These remain offline checks; no live generation or activation.
 

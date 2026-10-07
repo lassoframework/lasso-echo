@@ -67,7 +67,7 @@ def authorize(store, row, claim_token):
             raise guard.ForwardMediaVerificationHold('owned persisted creative unavailable or changed')
         from .generated_infographic_runtime import validate_publish_palette, RuntimeHold
         try:
-            validate_publish_palette(persisted)
+            validate_publish_palette(persisted, store=store)
         except RuntimeHold as exc:
             raise guard.ForwardMediaVerificationHold(str(exc)) from None
         persisted = _bind_gbp_reservation_day(store, row, token, persisted)

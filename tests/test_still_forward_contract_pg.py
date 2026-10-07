@@ -124,11 +124,11 @@ def run_contract(pg):
     'palette_revision':'SYNTHETIC','copy_digest':'SYNTHETIC','palette_digest':'SYNTHETIC','provider_response_id':'SYNTHETIC',
     'provider_output_id':'SYNTHETIC','storage_key':'SYNTHETIC','review_response_id':'SYNTHETIC','review_policy_id':'SYNTHETIC'}
    mreb={'manifest_digest':'sha256:'+'8'*64}
-   sql("insert into fixer_generated_reservation_20261007 select %s,%s,'vg-synthetic',%s::jsonb,%s::jsonb,'SYNTHETIC rebind grant',fixer_generated_snapshot_20261007(%s)#>'{history,epoch}',now()",(job,rx,json.dumps(cand),json.dumps(mreb),rx))
-   denied(lambda: rpc('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb)',(ry,json.dumps(cand),'[]',json.dumps(mreb))),'approved visual'); owner.rollback()
+   sql("insert into fixer_generated_reservation_20261007(job_id,calendar_row_id,group_key,candidate_json,manifest_json,receipt_ref,history_epoch,approved_source_revision) select %s,%s,'vg-synthetic',%s::jsonb,%s::jsonb,'SYNTHETIC rebind grant',fixer_generated_snapshot_20261007(%s)#>'{history,epoch}',%s",(job,rx,json.dumps(cand),json.dumps(mreb),rx,'client-source:sha256:'+'a'*64))
+   denied(lambda: rpc('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)',(ry,json.dumps(cand),'[]',json.dumps(mreb),'client-source:sha256:'+'a'*64)),'approved visual'); owner.rollback()
    sql("update content_calendar set source_media_asset_id=null,source_media_url=null,image_url=null,render_manifest_digest=null where id=%s",(ry,))
    census(ry)
-   rpc('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb)',(ry,json.dumps(cand),'[]',json.dumps(mreb))); owner.commit()
+   rpc('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)',(ry,json.dumps(cand),'[]',json.dumps(mreb),'client-source:sha256:'+'a'*64)); owner.commit()
    assert sql("select status,image_url,source_media_asset_id from content_calendar where id=%s",(ry,))[0]==('approved',cand['original_url'],'generated-astra:'+job)
    # A NEW generated reservation likewise cannot overwrite an approved visual:
    # (a) a first reserve and (b) a sibling replay both refuse, and (c) neither
@@ -160,7 +160,7 @@ def run_contract(pg):
    def greserve(target):
     snap=rpc('select fixer_generated_snapshot_20261007(%s)',(target,)); owner.rollback()
     cand=gq(); cand['copy_revision']=snap['copy_revision']; cand['inventory_revision']=snap['inventory_revision']; cand['history_revision']=snap['history_revision']
-    rpc('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb)',(target,json.dumps(cand),'[]',json.dumps(gman(cand))))
+    rpc('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)',(target,json.dumps(cand),'[]',json.dumps(gman(cand)),'client-source:sha256:'+'a'*64))
    # (a) first generated reserve on an approved row already bearing a different visual.
    denied(lambda:greserve(gappr),'approved visual'); owner.rollback()
    gassert_unchanged(gappr)
@@ -171,7 +171,7 @@ def run_contract(pg):
    gjob=gcand['job_id']; gmanifest=gman(gcand)
    ghistory=[{'history_key':h['history_key'],'published_binding_ref':h['published_binding_ref'],'visual_sha256':'sha256:'+cand['original_sha256'],'phash':cand['original_phash'],'visual_url':h['visual_url']} for h in gsnap['history']['rows']]
    census(gos)
-   rpc('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb)',(gos,json.dumps(gcand),json.dumps(ghistory),json.dumps(gmanifest))); owner.commit()
+   rpc('select fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)',(gos,json.dumps(gcand),json.dumps(ghistory),json.dumps(gmanifest),'client-source:sha256:'+'a'*64)); owner.commit()
    denied(lambda:greserve(gappr),'approved visual'); owner.rollback()
    gassert_unchanged(gappr)
    sql('delete from content_calendar where id=%s',(r,))
@@ -269,7 +269,7 @@ def run_contract(pg):
    # Existing staged B original is held by negative knowledge at provenance.
    bid=uid();br=row(gym='staged');bo=original('staged','generated-astra:'+bid,12,'3333333333333333')
    c={'job_id':bid,'gym_id':'staged','local_date':'2026-10-10','original_url':bo['source_url'],'original_md5':bo['md5'][4:],'original_sha256':bo['sha256'][7:],'original_length':100,'original_phash':bo['phash']}
-   sql("insert into fixer_generated_reservation_20261007 values(%s,%s,'vg-synthetic',%s::jsonb,'{}','SYNTHETIC staged grant','{}',now())",(bid,br,json.dumps(c)))
+   sql("insert into fixer_generated_reservation_20261007(job_id,calendar_row_id,group_key,candidate_json,manifest_json,receipt_ref,history_epoch,approved_source_revision) values(%s,%s,'vg-synthetic',%s::jsonb,'{}','SYNTHETIC staged grant','{}',%s)",(bid,br,json.dumps(c),'client-source:sha256:'+'a'*64))
    sql("insert into fixer_forward_media_original_registry_20261006 values(%s,%s,%s,%s,100,%s,now())",('staged',bo['source_asset_id'],bo['source_url'],bo['md5'],'astra-job:'+bid))
    sql("insert into fixer_forward_media_history_clearance_20261006 values(%s,%s,%s,%s,100,%s,'cleared_unused','SYNTHETIC staged grant',now())",('staged',bo['source_asset_id'],bo['source_url'],bo['md5'],'astra-job:'+bid))
    manifest='sha256:'+'7'*64
@@ -304,7 +304,7 @@ def run_contract(pg):
     'original_sha256':'d'*64,'original_md5':'d'*32,'original_phash':'scene:phash64:0f0f0f0f0f0f0f0f','original_length':100,
     'original_url':'https://owned.example/gen-d.png'}
    gm={'manifest_digest':'sha256:'+'d'*64}
-   sql("insert into fixer_generated_reservation_20261007 values(%s,%s,'vg-synthetic',%s::jsonb,%s::jsonb,'SYNTHETIC gen final grant',%s::jsonb,now())",(gj,gr2,json.dumps(gc),json.dumps(gm),json.dumps(gsnap2['history']['epoch'])))
+   sql("insert into fixer_generated_reservation_20261007(job_id,calendar_row_id,group_key,candidate_json,manifest_json,receipt_ref,history_epoch,approved_source_revision) values(%s,%s,'vg-synthetic',%s::jsonb,%s::jsonb,'SYNTHETIC gen final grant',%s::jsonb,%s)",(gj,gr2,json.dumps(gc),json.dumps(gm),json.dumps(gsnap2['history']['epoch']),'client-source:sha256:'+'a'*64))
    sql('update content_calendar set source_media_asset_id=%s,source_media_url=%s,image_url=%s,render_manifest_digest=%s where id=%s',('generated-astra:'+gj,gc['original_url'],gc['original_url'],gm['manifest_digest'],gr2))
    gepoch=sql('select epoch_id from fixer_still_cutover_20261007')[0][0]
    # Exercise the generated final-send guard directly; the wrapper also needs

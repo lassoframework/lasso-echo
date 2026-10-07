@@ -406,12 +406,39 @@ def run_scheduled(base, account, store, *, logger=None, now=None, days_ahead=2):
         return dict(ok=False, held=True, filled=0, reason=reason)
 
 
-def validate_publish_palette(row, *, jobs_path=None, palette_loader=None, sources=None):
-    """Check current controlled palette at every generated provider boundary.
+def _sql_publish_readback(store, row_id):
+    """Narrow read-only reservation binding; the publisher's only authority.
 
-    A prepared local journal entry grants no publish authority. DB lineage and
-    owned-claim checks remain mandatory. This adds the file-backed palette check
-    which DB snapshot/claim cannot see. Missing journal/palette is a hold.
+    The owner SQLite journal lives on the owner's own /data volume and is never
+    consulted here. Any unavailable/malformed readback fails closed.
+    """
+    if store is None:
+        raise RuntimeHold('generated_publish_binding_unavailable')
+    try:
+        response = store._client().post(
+            store._rest('rpc/fixer_generated_publish_readback_20261007'),
+            headers=store._headers({'Content-Type': 'application/json'}),
+            json={'p_id': str(uuid.UUID(str(row_id)))}, timeout=30)
+        payload = response.json()
+        if not 200 <= response.status_code < 300:
+            raise ValueError()
+        return payload
+    except RuntimeHold:
+        raise
+    except Exception:
+        raise RuntimeHold('generated_publish_binding_unavailable') from None
+
+
+def validate_publish_palette(row, *, store=None, readback=None, palette_loader=None, sources=None):
+    """Check the persisted SQL publish binding and current palette at every
+    generated provider boundary.
+
+    The immutable generated reservation readback is the sole publisher
+    authority for job/row/gym/account/date/logical/group/original/manifest and
+    the owner-approved source/copy/palette refs; the local owner journal grants
+    no publish authority and is not read at this boundary. Missing SQL
+    readback, identity drift, or a CURRENT approved source/palette mismatch
+    fails closed. DB lineage and owned-claim checks remain mandatory.
     """
     asset = str(row.get('source_media_asset_id') or '')
     if not asset.startswith(PREFIX):
@@ -425,32 +452,33 @@ def validate_publish_palette(row, *, jobs_path=None, palette_loader=None, source
         job_id = asset[len(PREFIX):]
         if str(uuid.UUID(job_id)) != job_id:
             raise ValueError()
-        path = jobs_path or journal_path()
-        # Read-only: never create an empty journal at a publisher boundary.
-        with sqlite3.connect('file:' + path + '?mode=ro', uri=True, timeout=10) as con:
-            records = con.execute('SELECT candidate FROM generated_jobs WHERE job_id=? AND state=?',
-                                  (job_id, 'prepared')).fetchall()
-            source_record = con.execute('SELECT source_revision FROM generated_runtime_rows WHERE row_id=? AND job_id=?',
-                                        (row.get('id'), job_id)).fetchone()
-        if len(records) != 1:
-            raise ValueError()
-        candidate = prep.validate_candidate(json.loads(records[0][0]))
+        row_id = str(uuid.UUID(str(row.get('id'))))
+        binding = readback(row_id) if readback is not None else _sql_publish_readback(store, row_id)
         suffix = {'instagram': '_ig', 'facebook': '_fb'}[row['account']]
-        if (candidate['job_id'] != job_id or candidate['gym_id'] != row.get('gym_id')
-                or candidate['local_date'] != row.get('post_date')
-                or candidate['logical_post_id'] != row.get('logical_post_id')
-                or candidate['original_url'] != row.get('image_url')
-                or candidate['original_url'] != row.get('source_media_url')
-                or row.get('thumbnail_url') is not None or row.get('format') != 'feed'):
+        if (not isinstance(binding, dict)
+                or binding.get('job_id') != job_id
+                or binding.get('calendar_row_id') != row_id
+                or binding.get('gym_id') != row.get('gym_id')
+                or binding.get('account') != row.get('account')
+                or binding.get('local_date') != row.get('post_date')
+                or binding.get('logical_post_id') != row.get('logical_post_id')
+                or binding.get('group_key') != row.get('visual_group_key')
+                or binding.get('original_url') != row.get('image_url')
+                or row.get('image_url') != row.get('source_media_url')
+                or row.get('thumbnail_url') is not None or row.get('format') != 'feed'
+                or binding.get('manifest_digest') != row.get('render_manifest_digest')
+                or any(not isinstance(binding.get(key), str) or not binding[key]
+                       for key in ('source_revision', 'copy_digest',
+                                   'palette_revision', 'palette_digest', 'receipt_ref'))):
             raise ValueError()
         from . import client_sources
         copy, source_revision = approved_copy(row['gym_id'], row.get('caption'),
                                               sources or client_sources.approved_sources)
-        if (not source_record or source_record[0] != source_revision
-                or candidate['copy_digest'] != prep.digest(copy)):
+        if (binding['source_revision'] != source_revision
+                or binding['copy_digest'] != prep.digest(copy)):
             raise RuntimeHold('generated_approved_source_changed')
         palette, revision = (palette_loader or verified_palette)(row['gym_id'], row['gym_id'] + suffix)
-        if candidate['palette_revision'] != revision or candidate['palette_digest'] != prep.digest(palette):
+        if binding['palette_revision'] != revision or binding['palette_digest'] != prep.digest(palette):
             raise RuntimeHold('generated_palette_changed')
     except RuntimeHold:
         raise

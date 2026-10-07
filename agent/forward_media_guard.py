@@ -259,6 +259,11 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
             or trusted_snapshot.get('palette_verified') is not True
             or trusted_snapshot.get('copy_verified') is not True):
         raise ForwardMediaVerificationHold('fresh verified generated owner facts required')
+    import re
+    approved_source_revision = trusted_snapshot.get('approved_source_revision')
+    if (not isinstance(approved_source_revision, str) or not re.fullmatch(
+            r'client-source:sha256:[0-9a-f]{64}', approved_source_revision)):
+        raise ForwardMediaVerificationHold('verified approved source revision required')
     for key in ('gym_id', 'local_date', 'logical_post_id', 'copy_revision',
                 'palette_revision', 'inventory_revision',
                 'copy_digest', 'palette_digest'):
@@ -355,9 +360,9 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
         'same_object', 'generated-astra:' + candidate['job_id'])
     persistence._assert_owner_identity()
     with persistence._conn.cursor() as cur:
-        cur.execute('select public.fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb)',
+        cur.execute('select public.fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::text)',
                     (_uuid(calendar_row_id), json.dumps(candidate),
-                     json.dumps(checked_visuals), json.dumps(manifest.row())))
+                     json.dumps(checked_visuals), json.dumps(manifest.row()), approved_source_revision))
         result = cur.fetchone()[0]
     if not isinstance(result, dict) or result.get('reserved') is not True:
         raise ForwardMediaVerificationHold('atomic generated owner reservation refused')

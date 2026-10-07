@@ -1,6 +1,7 @@
 """Runtime integration checks use offline provider/storage/DB fixtures only."""
 import copy
 import hashlib
+from pathlib import Path
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -12,6 +13,8 @@ from agent import generated_infographic_runtime as runtime
 from agent import generated_infographic_preparation as prep
 from agent import forward_media_guard as guard, forward_media_owner as owner
 from test_generated_infographic_preparation import case
+
+REAL_RESERVE_GENERATED = guard.reserve_generated
 
 
 class Conn:
@@ -81,7 +84,28 @@ def row_for(s):
     c = s.reserved[-1]
     return dict(id=s.row_id, caption=s.source.text, gym_id=c['gym_id'], post_date=c['local_date'], logical_post_id=c['logical_post_id'],
         account='instagram', format='feed', source_media_asset_id=runtime.PREFIX+c['job_id'],
-        image_url=c['original_url'], source_media_url=c['original_url'], thumbnail_url=None)
+        image_url=c['original_url'], source_media_url=c['original_url'], thumbnail_url=None,
+        visual_group_key='vg_bound', render_manifest_digest='manifest-1')
+
+
+def binding_for(s, row, **overrides):
+    """Immutable SQL reservation readback for this row; build while approved."""
+    c = s.reserved[-1]
+    copy, source_revision = runtime.approved_copy(row['gym_id'], row['caption'],
+                                                  lambda key: [s.source])
+    binding = dict(job_id=c['job_id'], calendar_row_id=str(row['id']), gym_id=c['gym_id'],
+        account=row['account'], local_date=c['local_date'], logical_post_id=c['logical_post_id'],
+        group_key=row['visual_group_key'], original_url=c['original_url'],
+        manifest_digest=row['render_manifest_digest'], source_revision=source_revision,
+        copy_digest=prep.digest(copy), palette_revision='palette-v1',
+        palette_digest=prep.digest(s.palette), receipt_ref='offline_owner_receipt')
+    binding.update(overrides)
+    return lambda row_id: dict(binding)
+
+
+def publish_args(s, row, **overrides):
+    return dict(readback=binding_for(s, row, **overrides),
+        palette_loader=lambda base, key: (s.palette, 'palette-v1'), sources=lambda key: [s.source])
 
 
 def test_row_to_fresh_candidate_owner_reservation_and_normal_publish_binding(system):
@@ -91,8 +115,7 @@ def test_row_to_fresh_candidate_owner_reservation_and_normal_publish_binding(sys
     assert s.conn.events[-1] == 'commit'
     assert len(s.reserved) == s.case.provider.calls == s.case.reviewer.calls == 1
     row = row_for(s)
-    assert runtime.validate_publish_palette(row, jobs_path=str(s.case.jobs.path),
-        palette_loader=lambda base, key: (s.palette, 'palette-v1'), sources=lambda key:[s.source])
+    assert runtime.validate_publish_palette(row, **publish_args(s, row))
     assert 'coach_review' not in json.dumps(s.reserved)
     assert 'needs_client_safe_review' not in json.dumps(s.reserved)
     # Replay consumes prepared original; no second provider job or review.
@@ -183,29 +206,83 @@ def test_strict_A_validation_precedes_B_reserve(system, monkeypatch, field, valu
 
 @pytest.mark.parametrize('field,value', [('post_date','2026-10-09'),
     ('gym_id','other-gym'), ('logical_post_id',str(uuid.uuid4())),
-    ('image_url','https://images.example.test/changed.png'), ('thumbnail_url','https://images.example.test/thumb.png')])
+    ('image_url','https://images.example.test/changed.png'), ('thumbnail_url','https://images.example.test/thumb.png'),
+    ('visual_group_key','vg_other'), ('render_manifest_digest','manifest-2'), ('account','facebook')])
 def test_publish_date_gym_post_and_original_binding(system, field, value):
     assert run(system)['ok']
     row = row_for(system)
+    args = publish_args(system, row)
     row[field] = value
     with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
-        runtime.validate_publish_palette(row, jobs_path=str(system.case.jobs.path),
-            palette_loader=lambda base,key: (system.palette,'palette-v1'), sources=lambda key:[system.source])
+        runtime.validate_publish_palette(row, **args)
+
+
+@pytest.mark.parametrize('field,reason', [
+    ('job_id', 'generated_publish_binding_unavailable'),
+    ('calendar_row_id', 'generated_publish_binding_unavailable'),
+    ('gym_id', 'generated_publish_binding_unavailable'),
+    ('account', 'generated_publish_binding_unavailable'),
+    ('local_date', 'generated_publish_binding_unavailable'),
+    ('logical_post_id', 'generated_publish_binding_unavailable'),
+    ('group_key', 'generated_publish_binding_unavailable'),
+    ('original_url', 'generated_publish_binding_unavailable'),
+    ('manifest_digest', 'generated_publish_binding_unavailable'),
+    ('source_revision', 'generated_approved_source_changed'),
+    ('copy_digest', 'generated_approved_source_changed'),
+    ('palette_revision', 'generated_palette_changed'),
+    ('palette_digest', 'generated_palette_changed')])
+def test_sql_readback_binding_mismatch_fails_closed(system, field, reason):
+    assert run(system)['ok']
+    row = row_for(system)
+    with pytest.raises(runtime.RuntimeHold, match=reason):
+        runtime.validate_publish_palette(row, **publish_args(system, row, **{field: 'changed-ref'}))
 
 
 def test_current_palette_revision_blocks_before_send(system):
     assert run(system)['ok']
+    row = row_for(system)
     with pytest.raises(runtime.RuntimeHold, match='generated_palette_changed'):
-        runtime.validate_publish_palette(row_for(system), jobs_path=str(system.case.jobs.path),
+        runtime.validate_publish_palette(row, readback=binding_for(system, row),
             palette_loader=lambda base,key: (system.palette,'new-revision'), sources=lambda key:[system.source])
 
 
-def test_missing_journal_fail_closed_without_creating_file(system, tmp_path):
+def test_absent_sql_readback_fail_closed_without_journal_authority(system):
+    # Negative SQL authority: a complete matching local owner journal on this
+    # volume can never substitute for the persisted reservation readback.
     assert run(system)['ok']
-    path = tmp_path/'missing.sqlite'
+    journal = Path(system.case.jobs.path)
+    assert journal.exists()
+    row = row_for(system)
+    loaders = dict(palette_loader=lambda base, key: (system.palette, 'palette-v1'),
+                   sources=lambda key: [system.source])
     with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
-        runtime.validate_publish_palette(row_for(system), jobs_path=str(path))
-    assert not path.exists()
+        runtime.validate_publish_palette(row, **loaders)
+    with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
+        runtime.validate_publish_palette(row, readback=lambda row_id: None, **loaders)
+    def failing(row_id):
+        raise TimeoutError()
+    with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
+        runtime.validate_publish_palette(row, readback=failing, **loaders)
+
+
+def test_separate_owner_volume_journal_absent_still_passes_on_sql_readback(system):
+    # Cross-volume layout: the publisher host cannot see the owner's SQLite
+    # journal at all. The immutable SQL readback alone is the binding.
+    assert run(system)['ok']
+    journal = Path(system.case.jobs.path)
+    journal.rename(str(journal) + '.owner-volume-only')
+    row = row_for(system)
+    assert runtime.validate_publish_palette(row, **publish_args(system, row))
+
+
+def test_malformed_sql_readback_fail_closed(system):
+    assert run(system)['ok']
+    row = row_for(system)
+    loaders = dict(palette_loader=lambda base, key: (system.palette, 'palette-v1'),
+                   sources=lambda key: [system.source])
+    for bad in ([], 'binding', dict(), dict(binding_for(system, row)('x'), receipt_ref='')):
+        with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
+            runtime.validate_publish_palette(row, readback=lambda row_id: bad, **loaders)
 
 
 def test_normal_photo_row_needs_no_generated_journal_or_flag(monkeypatch):
@@ -235,10 +312,14 @@ def test_publish_bridge_checks_palette_before_authority_claim(system, monkeypatc
     assert run(system)['ok']
     row = dict(row_for(system), id=system.row_id, status='publishing', publish_claim_token=str(uuid.uuid4()))
     store = SimpleNamespace(get_row=lambda base, rid: row)
-    monkeypatch.setattr(runtime, 'validate_publish_palette',
-        lambda row: (_ for _ in ()).throw(runtime.RuntimeHold('generated_palette_changed')))
+    seen = {}
+    def check(row, *, store=None, **kwargs):
+        seen['store'] = store
+        raise runtime.RuntimeHold('generated_palette_changed')
+    monkeypatch.setattr(runtime, 'validate_publish_palette', check)
     with pytest.raises(guard.ForwardMediaVerificationHold, match='generated_palette_changed'):
         bridge.authorize(store, row, row['publish_claim_token'])
+    assert seen['store'] is store, 'provider boundary must receive the publisher store'
 
 
 def test_palette_evidence_file_revision_and_missing_notes(tmp_path, monkeypatch):
@@ -383,15 +464,16 @@ def test_no_sources_legacy_seed_suppressed_under_new_on_flag(monkeypatch):
 def test_approved_source_revocation_or_metadata_change_blocks_send(system):
     assert run(system)['ok']
     row = row_for(system)
+    readback = binding_for(system, row)
+    loaders = dict(palette_loader=lambda base,key:(system.palette,'palette-v1'),
+                   sources=lambda key:[system.source])
     system.source.status = 'pending'
     with pytest.raises(runtime.RuntimeHold, match='generated_approved_copy_receipt_missing'):
-        runtime.validate_publish_palette(row, jobs_path=str(system.case.jobs.path),
-            palette_loader=lambda base,key:(system.palette,'palette-v1'), sources=lambda key:[system.source])
+        runtime.validate_publish_palette(row, readback=readback, **loaders)
     system.source.status = 'approved'
     system.source.citation = 'changed source record'
     with pytest.raises(runtime.RuntimeHold, match='generated_approved_source_changed'):
-        runtime.validate_publish_palette(row, jobs_path=str(system.case.jobs.path),
-            palette_loader=lambda base,key:(system.palette,'palette-v1'), sources=lambda key:[system.source])
+        runtime.validate_publish_palette(row, readback=readback, **loaders)
 
 
 def test_same_day_facebook_sibling_reuses_original_after_history_drift(system, monkeypatch):
@@ -433,3 +515,42 @@ def test_same_logical_sibling_with_new_copy_receipt_holds_old_job(system):
         provider=system.case.provider,reviewer=system.case.reviewer,storage=system.case.storage)
     assert result['reason']=='generated_logical_binding_changed'
     assert system.case.provider.calls==1
+
+
+@pytest.mark.parametrize("revision", [None, "", "sha256:" + "a" * 64,
+                                        "client-source:sha256:bad"])
+def test_owner_reservation_refuses_missing_or_non_source_approval_revision(system, monkeypatch, revision):
+    s = system
+    snapshot, _ = s.loader.load(s.row_id, 'same-gym', s.account)
+    snapshot['approved_source_revision'] = revision
+    monkeypatch.setattr(s.persistence, '_assert_owner_identity', lambda: None)
+    candidate = {**s.case.request, 'schema_version': 1,
+                 'source_type': 'generated_astra_infographic', 'provider': 'astra',
+                 'model': 'gpt-6-astra'}
+    with pytest.raises(guard.ForwardMediaVerificationHold,
+                       match='verified approved source revision required'):
+        REAL_RESERVE_GENERATED(s.persistence, s.row_id, candidate, snapshot,
+                               history_visuals=[], read_bytes=lambda url: pytest.fail('unexpected read'))
+
+
+def test_database_copy_digest_cannot_substitute_for_approved_source_revision(system):
+    s = system
+    assert run(s)['ok']
+    row = row_for(s)
+    # Reproduces the old SQL readback source_revision=c.copy_revision mismatch.
+    with pytest.raises(runtime.RuntimeHold, match='generated_approved_source_changed'):
+        runtime.validate_publish_palette(row, **publish_args(
+            s, row, source_revision=s.reserved[-1]['copy_revision']))
+
+
+def test_null_sql_readback_refuses_stale_python_feed_row(system):
+    s = system
+    assert run(s)['ok']
+    row = row_for(s)
+    assert row['format'] == 'feed'
+    # SQL returns NULL when the live row drifted to Story; the stale Python
+    # feed snapshot must not independently authorize the generated visual.
+    args = publish_args(s, row)
+    args['readback'] = lambda row_id: None
+    with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
+        runtime.validate_publish_palette(row, **args)
