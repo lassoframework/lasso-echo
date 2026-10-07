@@ -5,9 +5,11 @@ observation, asset and progress for authority+outcome in one transaction. Only
 normal verified COMMIT reports success. Once reservation COMMIT is acknowledged,
 crashes/exceptions/unknown final commits leave final outcome or quarantine;
 discovery excludes both forever. Unknown initial reservation COMMIT stops before
-any authority begins, but an uncommitted reservation cannot durably exclude a
-fresh process. Fleet-wide quarantine of that first-write uncertainty remains a
-release gap requiring a separate durable coordinator. No reconnect retry exists.
+any authority or external object reads begin. A fresh worker may only proceed
+if that initial reservation actually aborted: the unique key blocks it while
+the first transaction is unresolved, and excludes it if the first committed.
+This is safe fresh admission, never replay of an attempted authority write.
+The originating uncertain transport remains halted; no reconnect retry exists.
 Manual independent reconciliation is required; there is no retry/expiry API.
 """
 from contextlib import contextmanager

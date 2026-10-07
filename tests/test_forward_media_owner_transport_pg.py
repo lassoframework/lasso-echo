@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -323,9 +325,9 @@ def main():
             assert progress(c)==[('quarantine',None)] and authority(asset)==0
             conn.close()
 
-            # First-write uncertainty BEFORE reservation commit cannot leave a
-            # durable DB key. No authority starts and the originating transport
-            # stops, but a fresh process can discover it: explicit release gap.
+            # First-write uncertainty BEFORE reservation commit leaves no
+            # authority or object-read side effect. Originating transport stops;
+            # only an actually aborted reservation permits safe fresh admission.
             c,asset=candidate()
             conn,p,t=lane(lambda cc:LostCommit(cc,'before',number=1))
             try:
@@ -341,8 +343,49 @@ def main():
                 assert str(exc)=='owner_manual_reconciliation_required'
             conn.close()
             cc,pp,tt=lane()
-            assert c in tt.pending(('gym',),100)  # NOT global permanent quarantine proof.
+            assert c in tt.pending(('gym',),100)  # Safe fresh admission: no authority attempted.
             cc.close()
+
+            # An unresolved first reservation blocks a fresh worker on the
+            # UNIQUE key. If first COMMIT eventually succeeds, fresh work holds;
+            # if it aborts, fresh admission has no prior authority to replay.
+            class UnresolvedReservation(LostCommit):
+                def rollback(self):
+                    raise OSError('synthetic rollback acknowledgment unavailable')
+            for resolution in ('commit','rollback'):
+                c,asset=candidate()
+                conn,p,t=lane(lambda cc:UnresolvedReservation(cc,'before',number=1))
+                try:
+                    with t.locked_current(c):
+                        raise AssertionError('uncertain first writer entered authority')
+                except owner.UncertainCommitError:
+                    pass
+                assert t._active is None and t._broken is True and authority(asset)==0
+                entered=threading.Event()
+                def fresh_admission():
+                    cc,pp,tt=lane()
+                    try:
+                        assert c in tt.pending(('gym',),100)
+                        entered.set()
+                        with tt.locked_current(c):
+                            assert authority(asset)==0
+                            tt.record(c,{'status':'hold','reason':'verified_history_transport_missing'})
+                        return 'fresh_hold'
+                    except worker.OwnerWorkerHold as exc:
+                        return str(exc)
+                    finally:
+                        cc.close()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future=pool.submit(fresh_admission)
+                    assert entered.wait(3)
+                    time.sleep(0.15)
+                    assert not future.done(), 'fresh worker bypassed unresolved unique reservation'
+                    getattr(conn,resolution)()
+                    result=future.result(timeout=5)
+                assert result==('owner_manual_reconciliation_required' if resolution=='commit' else 'fresh_hold')
+                assert authority(asset)==0
+                assert progress(c)[0][0]==('quarantine' if resolution=='commit' else 'final')
+                conn.close()
 
             # Fair tenant interleaving, bounds, and no cross-tenant discovery.
             for _ in range(3): candidate('tenant-a')

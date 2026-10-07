@@ -4,9 +4,10 @@
 -- media_asset.used_count/content_hash are NOT trusted historical evidence.
 -- No source URL/audited registry/history transport exists: Python holds safely.
 -- A committed quarantine reservation is never retried/expired automatically.
--- First reservation COMMIT uncertainty halts before authority; a never-committed
--- key cannot be excluded across fresh processes. Separate durable coordinator
--- remains a release gap; do not claim global quarantine for the first write.
+-- First reservation COMMIT uncertainty halts before authority/object reads.
+-- While unresolved, the unique key blocks fresh reservations. If committed it
+-- excludes the key; if aborted a fresh reservation is safe (no authority began).
+-- Never replay an attempted authority write or bypass a committed reservation.
 -- Recovery is MANUAL: independently reconcile authority, outcome and original
 -- exact revision before any operator-authorized new work. Never delete evidence.
 -- Rollback before use: disable worker, drop RPCs and empty progress table.
