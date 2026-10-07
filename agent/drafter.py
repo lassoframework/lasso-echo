@@ -541,6 +541,13 @@ def _hint_free(creative):
     return clean
 
 
+def _is_meta_reply(text):
+    """True when generated text is the model talking to the operator (a clarification
+    request or meta comment) rather than a caption. Single source: copy_gate."""
+    from . import copy_gate
+    return copy_gate.is_meta_reply(text)
+
+
 def _note_sb7_fallback(account_key, reason):
     """OBSERVABILITY for the template fallback (audit 2026-08-25): count each SB7->template
     fallback per gym per day (kv) and ALERT a human ONCE per gym/day when a build storms
@@ -1029,6 +1036,26 @@ class StoryBrandGenerator:
                     "not their age or a generic descriptor.\n\n")
                 if retry and not _dropped_name_for_age(client_note, retry):
                     body = retry
+            # META REPLY GATE (Bolton Club, 2026-10-07): the model sometimes answers
+            # the PROMPT instead of writing the post ("You said the photo shows 'DSC'...
+            # Can you tell me what the image shows?"). That is never copy. Retry ONCE
+            # with an explicit instruction to write the caption from the voice doc and
+            # client note alone; a second meta reply falls back to the template. The
+            # figure gate below still runs on whichever body survives.
+            if _is_meta_reply(body):
+                retry = _compose(
+                    "IMPORTANT: your previous attempt asked a question or commented on the "
+                    "request instead of writing the caption. Write the finished caption "
+                    "now. Never ask a question back, never mention the photo, its "
+                    "description, the request, or yourself. If the scene hint is unclear, "
+                    "ignore it and write from the brand voice doc and client note alone.\n\n")
+                if retry and not _is_meta_reply(retry):
+                    body = retry
+                else:
+                    print("[sb7] output was a clarification or meta reply, not a caption; "
+                          "falling back to template")
+                    _note_sb7_fallback(getattr(account, "key", "") or "", "meta_reply")
+                    return TemplateGenerator().build(voice, _hint_free(creative))
             # OUTPUT FABRICATION GATE (deterministic, never skipped): every figure
             # (stat, price, count) in the generated caption MUST trace to an approved
             # input (the client note or the voice doc). A caption carrying a number

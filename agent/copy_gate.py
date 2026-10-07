@@ -71,6 +71,54 @@ ASK_RE = re.compile(
     r"comment \"?\w+\"?|sign up|get started|claim your|reserve your|try a (free )?class|"
     r"schedule (a|your)|start (here|today|your))", re.I)
 
+# MODEL META REPLY (Bolton Club, 2026-10-07): an SB7 caption for a photo whose only
+# "description" was the camera filename prefix "DSC" came back as the model talking
+# TO US instead of writing a post: 'You said the photo shows "DSC" but didn't describe
+# what that image contains... Can you tell me what the image shows?' Nothing on the
+# caption path read for that shape (the gates looked for figures, dashes, scaffold
+# headers and hint blocks), so it was staged onto three pending rows. A caption that
+# asks the operator a question, or comments on the request / the image it was given /
+# itself as an AI, is not copy. Patterns are deliberately narrow (each names the
+# request, the image, or the model) so a real hook like "You don't have to do it
+# alone" or a member quote "I don't have time" never trips them.
+_MEDIA = r"(?:image|photo|picture|pic|video|clip|visual|shot|attachment|file)"
+META_REPLY_RE = re.compile(
+    r"\bas an ai\b"
+    r"|\b(?:i am|i'm) (?:an ai|a language model|unable to (?:see|view|open|access))\b"
+    r"|\bi (?:can't|cannot|can not|am unable to|'m unable to|don't|do not) "
+    r"(?:see|view|open|access|make out) (?:the|this|that|your|any|an|a) (?:\w+ )?" + _MEDIA + r"s?\b"
+    r"|\bi (?:don't|do not) have (?:access|enough (?:information|context|detail)|"
+    r"(?:any |the |a )?(?:details?|description|context|information)\b|"
+    r"(?:the |that |this |your |a |an |any )?" + _MEDIA + r")"
+    r"|\b(?:can|could|would) you (?:please )?(?:tell me|describe|share|provide|clarify|"
+    r"confirm|let me know|explain)\b[^.?!\n]{0,60}\b(?:" + _MEDIA + r"s?|shows?|contains?|"
+    r"caption|scene|details?)\b"
+    r"|\bcould you (?:please )?describe\b"
+    r"|\byou (?:said|mentioned|noted|wrote) (?:that )?(?:the|this) (?:post's )?" + _MEDIA + r"\b"
+    r"|\bi need (?:some |more )?(?:clarification|clarity)\b"
+    r"|\bwhat (?:the|this|that|your) " + _MEDIA + r" (?:shows|contains|depicts|is of)\b"
+    r"|\bwhat'?s (?:actually )?in the " + _MEDIA + r"\b"
+    r"|\bonce you (?:describe|share|tell me|provide|send)\b"
+    r"|\bi (?:need|would need|'d need) (?:(?:to see|to know) what(?:'s| is)? (?:actually )?in\b|"
+    r"more (?:info|information|context|details?) (?:about|on) the " + _MEDIA + r"|a description\b)"
+    r"|\b(?:i'll|i will|i can|let me) (?:write|draft|create|craft)\b[^.?!\n]{0,60}\bcaption\b"
+    r"|\bhere(?:'s| is) (?:a|the|your) (?:\w+ ){0,3}caption\b"
+    r"|\bthe " + _MEDIA + r" (?:you (?:sent|shared|provided|uploaded|attached|described))\b",
+    re.I)
+
+
+def meta_reply_defects(text: str) -> list[str]:
+    """The model talked to the operator instead of writing a caption. Returns
+    ["meta_reply"] or []. Read on the raw text with typographic apostrophes folded."""
+    t = str(text or "").replace("\u2019", "'").replace("\u2018", "'")
+    return ["meta_reply"] if META_REPLY_RE.search(t) else []
+
+
+def is_meta_reply(text: str) -> bool:
+    """True when `text` is a clarification request / model meta comment, never copy."""
+    return bool(meta_reply_defects(text))
+
+
 def scrub_caption(text: str) -> str:
     """CONSUMER COPY LAW scrub for client captions (Blake, 2026-10-07): everything
     scrub does PLUS every hyphen (letter or digit: "30-minute" -> "30 minute"; list
@@ -206,6 +254,7 @@ def violations(text: str) -> list[str]:
     # (zanshin.fit) is exactly the shape _PROTECTED_RE exists to protect (real URLs/domains), so
     # stripping it first would hide the email behind its own protection.
     if _EMAIL_RE.search(s): v.append("email_address")
+    v.extend(meta_reply_defects(s))
     return v
 
 
