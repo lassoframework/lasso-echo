@@ -15,16 +15,28 @@ import json
 import os
 import re
 import sqlite3
+import time
 import uuid
 
 BINDING_FIELDS = ("gym_id", "local_date", "logical_post_id", "copy_revision",
                   "palette_revision", "inventory_revision", "history_revision")
 POLICY = "gym-infographic-copy-palette-v1"
 MAX_BYTES = 134217728
+MAX_PROVIDER_ATTEMPTS = 3
+PROVIDER_RETRY_BASE_SECONDS = 60
 
 
 class PreparationHold(RuntimeError):
     """Static diagnostic only; no provider body, credentials or private data."""
+
+
+class DefiniteProviderRejection(PreparationHold):
+    """A received HTTP rejection establishes that no image job was accepted."""
+    def __init__(self, status):
+        if status not in (400, 429):
+            raise ValueError("Not a definite retryable rejection")
+        self.status = status
+        super().__init__("generated_provider_rejected")
 
 
 def canonical(value):
@@ -96,15 +108,23 @@ class SQLiteGenerationJobs:
     outside the transaction. Ambiguous jobs are retained until reconciled. This
     journal conveys no trusted source approval or final DB reservation.
     """
-    def __init__(self, path):
+    def __init__(self, path, *, clock=None):
         self.path = os.fspath(path)
+        self.clock = clock or time.time
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(fd)
         os.chmod(self.path, 0o600)
         with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
             con.execute("CREATE TABLE IF NOT EXISTS generated_jobs ("
                         "job_id TEXT PRIMARY KEY, binding TEXT NOT NULL, "
                         "state TEXT NOT NULL, response TEXT, candidate TEXT)")
+            # Upgrade existing journals without releasing ambiguous executions.
+            columns = {row[1] for row in con.execute("PRAGMA table_info(generated_jobs)")}
+            if "attempts" not in columns:
+                con.execute("ALTER TABLE generated_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")
+            if "retry_after" not in columns:
+                con.execute("ALTER TABLE generated_jobs ADD COLUMN retry_after REAL NOT NULL DEFAULT 0")
 
     def _connect(self):
         return sqlite3.connect(self.path, timeout=10)
@@ -112,16 +132,36 @@ class SQLiteGenerationJobs:
     def start(self, job_id, binding):
         with self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            row = con.execute("SELECT binding,state,response,candidate FROM generated_jobs "
+            row = con.execute("SELECT binding,state,response,candidate,attempts,retry_after FROM generated_jobs "
                               "WHERE job_id=?", (job_id,)).fetchone()
             if row:
                 if row[0] != canonical(binding):
                     raise PreparationHold("generated_job_binding_changed")
+                if row[1] == "rejected":
+                    if row[4] >= MAX_PROVIDER_ATTEMPTS:
+                        raise PreparationHold("generated_provider_retry_exhausted")
+                    if self.clock() < row[5]:
+                        raise PreparationHold("generated_provider_retry_delayed")
+                    con.execute("UPDATE generated_jobs SET state='generating', attempts=attempts+1 "
+                                "WHERE job_id=? AND state='rejected'", (job_id,))
+                    return {"state": "new"}
                 return {"state": row[1], "response": json.loads(row[2]) if row[2] else None,
                         "candidate": json.loads(row[3]) if row[3] else None}
             con.execute("INSERT INTO generated_jobs(job_id,binding,state) VALUES (?,?,?)",
                         (job_id, canonical(binding), "generating"))
             return {"state": "new"}
+
+    def provider_rejected(self, job_id):
+        """Release only a definite rejection for a capped, atomic later retry."""
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT attempts FROM generated_jobs WHERE job_id=? AND state='generating'",
+                              (job_id,)).fetchone()
+            if not row:
+                raise PreparationHold("generated_job_state_changed")
+            delay = min(PROVIDER_RETRY_BASE_SECONDS * 2 ** (row[0] - 1), 300)
+            con.execute("UPDATE generated_jobs SET state='rejected', retry_after=? WHERE job_id=?",
+                        (self.clock() + delay, job_id))
 
     def provider_completed(self, job_id, response):
         with self._connect() as con:
@@ -155,6 +195,8 @@ class AstraOriginalProvider:
                        "action": "generate", "size": "1024x1280"}],
             "tool_choice": {"type": "image_generation"},
         })
+        if status in (400, 429):
+            raise DefiniteProviderRejection(status)
         if status != 200:
             raise PreparationHold("generated_provider_unavailable")
         try:
@@ -241,7 +283,11 @@ def prepare_candidate(request, snapshot, *, jobs, provider, reviewer, storage=No
                 raise PreparationHold("generated_storage_readback_failed")
             return {"ok": True, "candidate": candidate}
         if job["state"] == "new":
-            response = provider.create(brief, job_id)
+            try:
+                response = provider.create(brief, job_id)
+            except DefiniteProviderRejection:
+                jobs.provider_rejected(job_id)
+                raise
             # Journal the full provider original before reviewing or hosting.
             jobs.provider_completed(job_id, response)
         elif job["state"] == "reviewing":
@@ -306,7 +352,8 @@ def validate_candidate(candidate, data=None):
                 or not re.fullmatch(r"[0-9a-f]{32}", candidate["original_md5"])):
             raise ValueError()
         from .visual_scene import normalize_scene, scene_fingerprint
-        if normalize_scene(candidate["original_phash"]) != candidate["original_phash"]:
+        if (not isinstance(candidate["original_phash"], str) or not candidate["original_phash"]
+                or normalize_scene(candidate["original_phash"]) != candidate["original_phash"]):
             raise ValueError()
         if any(not isinstance(candidate[k], str) or not candidate[k].strip()
                for k in ("provider_response_id", "provider_output_id", "review_response_id")):

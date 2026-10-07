@@ -267,3 +267,88 @@ def test_review_cannot_reuse_generation_response(case):
     case.reviewer.response_id = 'resp_original'
     assert run(case)['reason'] == 'generated_automated_review_failed'
     assert not case.storage.objects
+
+
+@pytest.mark.parametrize('status', [400, 429])
+def test_definite_rejection_backoff_then_same_job_retry_succeeds(case, status):
+    clock = [1000]
+    case.jobs = prep.SQLiteGenerationJobs(case.jobs.path, clock=lambda: clock[0])
+    calls, job_ids = [], []
+    old_provider = case.provider
+    def transport(url, headers, payload):
+        calls.append(payload)
+        job_ids.append(payload['metadata']['echo_generation_job_id'])
+        if len(calls) == 1:
+            return status, '{"error":"private body"}'
+        return 200, json.dumps(old_provider.create('fresh #112233', job_ids[-1]))
+    case.provider = prep.AstraOriginalProvider('never-return', transport=transport)
+    assert run(case)['reason'] == 'generated_provider_rejected'
+    assert run(case)['reason'] == 'generated_provider_retry_delayed'
+    assert len(calls) == 1
+    clock[0] += 60
+    case.jobs = prep.SQLiteGenerationJobs(case.jobs.path, clock=lambda: clock[0])
+    assert run(case)['ok']
+    assert len(calls) == 2 and job_ids[0] == job_ids[1]
+    assert run(case)['ok'] and len(calls) == 2
+
+
+@pytest.mark.parametrize('status', [400, 429])
+def test_definite_rejections_have_persisted_capped_backoff(case, status):
+    clock, calls = [1000], []
+    case.jobs = prep.SQLiteGenerationJobs(case.jobs.path, clock=lambda: clock[0])
+    def rejected(url, headers, payload):
+        calls.append(payload)
+        return status, '{}'
+    case.provider = prep.AstraOriginalProvider('never-return', transport=rejected)
+    for index, advance in enumerate([60, 120, 240]):
+        assert run(case)['reason'] == 'generated_provider_rejected'
+        assert len(calls) == index + 1
+        expected = 'generated_provider_retry_exhausted' if index == 2 else 'generated_provider_retry_delayed'
+        assert run(case)['reason'] == expected
+        assert len(calls) == index + 1
+        clock[0] += advance
+    case.jobs = prep.SQLiteGenerationJobs(case.jobs.path, clock=lambda: clock[0])
+    assert run(case)['reason'] == 'generated_provider_retry_exhausted'
+    assert len(calls) == prep.MAX_PROVIDER_ATTEMPTS
+
+
+def test_definite_retry_claim_is_atomic_across_workers(case):
+    clock = [1000]
+    case.jobs = prep.SQLiteGenerationJobs(case.jobs.path, clock=lambda: clock[0])
+    case.jobs.start('retry', {'v': 1})
+    case.jobs.provider_rejected('retry')
+    clock[0] += 60
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        states = list(pool.map(lambda _: case.jobs.start('retry', {'v': 1})['state'], range(2)))
+    assert sorted(states) == ['generating', 'new']
+
+
+@pytest.mark.parametrize('status', [500, 502, 503])
+def test_ambiguous_http_failure_never_reexecutes(case, status):
+    calls = []
+    def ambiguous(url, headers, payload):
+        calls.append(payload)
+        return status, '{}'
+    case.provider = prep.AstraOriginalProvider('never-return', transport=ambiguous)
+    assert run(case)['reason'] == 'generated_provider_unavailable'
+    assert run(case)['reason'] == 'generated_execution_pending_reconciliation'
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('phash', [None, '', 0, False])
+def test_shape_only_validator_requires_nonempty_canonical_phash(case, phash):
+    candidate = run(case)['candidate']
+    candidate['original_phash'] = phash
+    with pytest.raises(prep.PreparationHold, match='generated_candidate_invalid'):
+        prep.validate_candidate(candidate)
+
+
+def test_existing_journal_upgrade_preserves_ambiguous_job(tmp_path):
+    import sqlite3
+    path = tmp_path/'legacy.sqlite'
+    with sqlite3.connect(path) as con:
+        con.execute('CREATE TABLE generated_jobs (job_id TEXT PRIMARY KEY, binding TEXT NOT NULL, state TEXT NOT NULL, response TEXT, candidate TEXT)')
+        con.execute('INSERT INTO generated_jobs(job_id,binding,state) VALUES (?,?,?)',
+                    ('legacy', prep.canonical({'v': 1}), 'generating'))
+    jobs = prep.SQLiteGenerationJobs(path)
+    assert jobs.start('legacy', {'v': 1})['state'] == 'generating'
