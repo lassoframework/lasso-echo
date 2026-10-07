@@ -47,7 +47,12 @@ begin
  values(p_claim_token,p_calendar_row_id,p_expected_creative,p_native_account_id,p_expected_location_id,p_send_kind)
  on conflict(claim_token) do nothing;
  -- A lost committed response may have sent. Exact replay is held, not success.
- return found;
+ if not found then return false; end if;
+ -- Write a calendar tuple version under the existing row lock. A concurrent
+ -- repeatable-read editor with an older snapshot then raises serialization
+ -- failure instead of observing no attempt and bypassing the mutation guard.
+ update public.content_calendar set status=status where id=p_calendar_row_id;
+ return true;
 end; $$;
 revoke all on function public.fixer_authorize_gbp_forward_send_20261008(uuid,uuid,jsonb,text,text,text)
  from public,anon,authenticated,fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006;
@@ -57,14 +62,14 @@ create function public.fixer_guard_gbp_provider_attempt_20261009()
 returns trigger language plpgsql security definer set search_path=pg_catalog,public as $$
 declare a public.fixer_gbp_provider_attempt_20261009%rowtype; expected jsonb;
 begin
- if current_setting('transaction_isolation')<>'read committed' then
-  raise exception 'GBP attempt mutation guard requires read committed isolation' using errcode='25000'; end if;
  select * into a from public.fixer_gbp_provider_attempt_20261009
   where calendar_row_id=old.id and claim_token=old.publish_claim_token;
  if not found then
   if tg_op='DELETE' then return old; end if;
   return new;
  end if;
+ if current_setting('transaction_isolation')<>'read committed' then
+  raise exception 'GBP attempt mutation guard requires read committed isolation' using errcode='25000'; end if;
  if tg_op='DELETE' then
   raise exception 'committed GBP provider attempt requires reconciliation' using errcode='23514'; end if;
  select jsonb_object_agg(key,value) into expected from jsonb_each(to_jsonb(new))

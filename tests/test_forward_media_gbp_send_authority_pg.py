@@ -190,10 +190,24 @@ def main(*, provider_fence=False):
             assert len(calls) == 1
             if provider_fence:
                 sql((ROOT / 'migrations' / 'DRAFT_fixer_gbp_provider_attempt_fence_20261009.sql').read_text())
+                unrelated = str(uuid4())
+                sql("insert into content_calendar(id,account,status) values(%s,'instagram','approved')", (unrelated,))
+                with psycopg.connect(dsn) as edit:
+                    edit.execute('set transaction isolation level repeatable read')
+                    edit.execute("update content_calendar set caption='unrelated' where id=%s", (unrelated,))
+                    edit.execute('delete from content_calendar where id=%s', (unrelated,))
                 rid, token, row, expected = new_row()
+                stale = psycopg.connect(dsn)
+                stale.execute('set transaction isolation level repeatable read')
+                stale.execute('select id from content_calendar where id=%s', (rid,))
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     results = list(pool.map(lambda _: authorize(rid, token, expected), range(2)))
                 assert sorted(results) == [False, True]
+                denied(lambda: stale.execute("update content_calendar set status='approved',publish_claim_token=null where id=%s", (rid,)))
+                stale.rollback(); stale.close()
+                with psycopg.connect(dsn) as edit:
+                    edit.execute('set transaction isolation level repeatable read')
+                    denied(lambda: edit.execute("update content_calendar set caption='revoked' where id=%s", (rid,)))
                 assert authorize(rid, token, expected) is False
                 assert sql('select count(*) from fixer_gbp_provider_attempt_20261009 where claim_token=%s', (token,))[0][0] == 1
                 denied(lambda: sql("update content_calendar set status='approved',publish_claim_token=null where id=%s", (rid,)))
