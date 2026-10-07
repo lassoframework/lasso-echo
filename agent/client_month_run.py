@@ -2746,7 +2746,7 @@ def _instagram_feed_slots(rows):
 
 
 def _span_scoped_delete_claim(store, base_key, months, span_first, span_last,
-                              preserve_dates=(), log=None):
+                              preserve_dates=(), preserve_slots=(), preserve_gbp=None, log=None):
     """How many of THIS gym's rows the month-grained delete in _apply will remove
     INSIDE the planned day-span [span_first, span_last] — the exact unit the
     independent restage verification measures with its own before/after
@@ -2791,6 +2791,13 @@ def _span_scoped_delete_claim(store, base_key, months, span_first, span_last,
                 continue                    # tenant binding: never another gym's row
             pd = str(row.get("post_date") or "")[:10]
             if not pd or pd < span_first or pd > span_last or pd in keep:
+                continue
+            if (row.get("account") != "googlebusiness"
+                    and (pd, row.get("slot_index") or 0) in preserve_slots):
+                continue
+            if (pd in (preserve_gbp or {})
+                    and row.get("account") == "googlebusiness"
+                    and row.get("format") not in preserve_gbp[pd]):
                 continue
             status = str(row.get("status") or "").lower()
             if status and status not in _WIPEABLE_STATUSES:
@@ -2839,10 +2846,9 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     bookkeeping). Stores that cannot support a bounded read report the raw
     count in both, exactly as before.
 
-    locked_days: post_dates the builder SKIPPED because a human owns their feed. Those
-    days' still-pending sibling rows (FB mirror + story on the approved feed's photo)
-    are preserved from the delete — the builder emits no replacement for them, so
-    wiping them would orphan the approved post's cross-post and story forever."""
+    locked_days protect retained feeds and their still-pending siblings. When a
+    multi-slot day receives a replacement feed, only its other slots survive;
+    stale rows in the replacement slot must be deleted before insertion."""
     if base_key == config.demo_calendar_gym_id():
         return {"ok": False, "reason": "refusing to plan over the demo gym id",
                 "upserted": 0, "deleted": 0}
@@ -2883,6 +2889,23 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         planned_feed_slots = _instagram_feed_slots(clean_rows)
         from . import cadence as _cadence
         _slot_capacity = _cadence.resolve_posts_per_day(base_key, store)
+        locked_date_set = {str(day)[:10] for day in (locked_days or ())}
+        replacement_slots = {
+            (day, ordinal or 0) for day, ordinal in planned_feed_slots
+            if day in locked_date_set and int(_slot_capacity or 1) > 1}
+        partial_locked_days = {day for day, _ in replacement_slots}
+        whole_locked_days = locked_date_set - partial_locked_days
+        preserve_slots = {
+            (day, ordinal) for day in partial_locked_days
+            for ordinal in range(int(_slot_capacity or 1))
+            if (day, ordinal) not in replacement_slots}
+        if preserve_slots:
+            import inspect
+            delete = getattr(store, "delete_month", None)
+            if (not callable(delete)
+                    or not {"preserve_slots", "preserve_gbp"}.issubset(
+                        inspect.signature(delete).parameters)):
+                raise RuntimeError("store cannot preserve cadence slot siblings")
         preflight = getattr(store, "preflight_cadence_rows", None)
         cadence_prevalidated = False
         # Every cadence must admit its required photo posts before deletion.
@@ -2892,7 +2915,7 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             replace_dates = {
                 (start + timedelta(days=i)).isoformat()
                 for i in range(max(1, int(days)))
-            } - {str(day)[:10] for day in (locked_days or ())}
+            } - whole_locked_days
             import inspect
             try:
                 supports_dates = "replace_dates" in inspect.signature(
@@ -3051,8 +3074,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         new_feed_slots = _instagram_feed_slots(clean_rows)
         new_feeds = len(new_feed_slots)
         # POST-MERGE comparison (audit 2026-08-25 MAJOR): a grow build EXCLUDES locked
-        # (human-owned approved/published) days from its own rows — their feeds survive the
-        # delete via preserve_dates. Comparing only new_feeds against existing_feeds
+        # (human-owned approved/published) slots from its own rows — their feeds survive
+        # through preserved dates or cadence slots. Comparing only new_feeds against existing_feeds
         # (which counts the locked ones) wrongly read every incremental grow as a shrink
         # and no-op'd it, so a built gym could never grow. Compare what the calendar will
         # hold AFTER the write: this build's feeds + the preserved locked-day feeds.
@@ -3078,7 +3101,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                 ])
                 locked_feed_slots = {
                     slot for slot in locked_feed_slots
-                    if slot[0] in locked_in_span}
+                    if slot[0] in locked_in_span
+                    and (slot[0], slot[1] or 0) not in replacement_slots}
                 locked_feed_slots_known = True
             except Exception:  # noqa: BLE001 - handled by cadence-aware guard below
                 locked_feed_slots_known = False
@@ -3095,7 +3119,7 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                         "months": months}
             # One post/day has exactly one logical feed slot per locked day.
             locked_feed_slots = {(day, None) for day in locked_in_span}
-        post_merge_feeds = new_feeds + len(locked_feed_slots)
+        post_merge_feeds = len(new_feed_slots | locked_feed_slots)
         try:
             from .client_media_sync import _existing_feed_count
             existing_feeds, count_ok = _existing_feed_count(store, base_key, start, days)
@@ -3125,11 +3149,20 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         # the raw count is then reported, and the verifier still decides.
         span_first = start.isoformat()
         span_last = (start + timedelta(days=max(1, int(days)) - 1)).isoformat()
+        # GBP has an independent update/photo schedule, not IG cadence ordinals.
+        # A partial-day feed replacement may only replace the GBP formats it emits.
+        preserve_gbp = {
+            day: tuple(sorted({r.get("format") for r in clean_rows
+                               if r.get("post_date") == day
+                               and r.get("account") == "googlebusiness"}))
+            for day in partial_locked_days}
         span_claim = _span_scoped_delete_claim(store, base_key, months,
                                                span_first, span_last,
-                                               preserve_dates=locked_days, log=log)
+                                               preserve_dates=whole_locked_days,
+                                               preserve_slots=preserve_slots,
+                                               preserve_gbp=preserve_gbp, log=log)
         delete_preserve = _out_of_span_preserve_dates(
-            months, span_first, span_last, preserve_dates=locked_days)
+            months, span_first, span_last, preserve_dates=whole_locked_days)
         bounded_delete_read = callable(getattr(store, "list_month", None))
         delete_month = getattr(store, "delete_month", None)
         for month in months:
@@ -3140,6 +3173,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                         delete_month).parameters
                     result = delete_month(
                         base_key, month, preserve_dates=delete_preserve,
+                        **({"preserve_slots": preserve_slots,
+                            "preserve_gbp": preserve_gbp} if preserve_slots else {}),
                         **({"return_rows": True} if supports_rows else {}))
                     if isinstance(result, list):
                         deleted_row_snapshots.extend(result)
