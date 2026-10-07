@@ -152,6 +152,8 @@ declare cert public.fixer_forward_media_photo_certificate_20261007%rowtype;
  state public.fixer_forward_media_photo_state_20261007%rowtype;
  old public.fixer_owner_photo_reservation_20261007%rowtype;
  snap jsonb; candidate jsonb; content jsonb; ref text; caller text; clearance jsonb;
+ anchor public.fixer_owner_photo_reservation_20261007%rowtype;
+ sibling_ids uuid[]; sibling_history_keys text[];
 begin
  caller:=coalesce(nullif(current_setting('role',true),'none'),session_user);
  if not pg_has_role(caller,'fixer_forward_media_owner_20261006','member')
@@ -207,6 +209,42 @@ begin
   raise exception 'exact certified original and rendition tuples required' using errcode='23514'; end if;
  ref:='owner-photo-reservation:'||cert.receipt_ref;
  clearance:=p_original || jsonb_build_object('decision','cleared_unused','history_evidence_ref',ref);
+ -- Source receipts bind each calendar independently. Keep the first exact
+ -- original/clearance immutable; additional signed renditions share only that
+ -- source anchor, within its signed tenant/date/group and current epoch.
+ select coalesce(array_agg(r.audit_id),'{}'::uuid[]) into sibling_ids
+ from public.fixer_owner_photo_reservation_20261007 r
+ join public.fixer_forward_media_photo_certificate_20261007 c on c.audit_id=r.audit_id
+ join public.fixer_forward_media_photo_key_20261007 k on k.key_id=c.key_id
+ join public.fixer_forward_media_photo_policy_20261007 policy on policy.policy_id=k.policy_id
+ where r.candidate_json->>'tenant_id'=candidate->>'tenant_id'
+  and r.candidate_json->>'post_date'=candidate->>'post_date'
+  and r.candidate_json->>'group_key'=candidate->>'group_key'
+  and r.candidate_json->>'source_asset_id'=candidate->>'source_asset_id'
+  and r.candidate_json->>'source_url'=candidate->>'source_url'
+  and r.candidate_json->>'source_sha256'=candidate->>'source_sha256'
+  and r.candidate_json->>'source_fingerprint'=candidate->>'source_fingerprint'
+  and r.candidate_json->'source_length'=candidate->'source_length'
+  and c.baseline_id=state.baseline_id and c.generation=state.generation
+  and k.approved and policy.approved and c.verified_by=k.verifier_role
+  and not exists(select 1 from public.fixer_owner_photo_revocation_20261007 v where v.audit_id=r.audit_id)
+  and not exists(select 1 from public.fixer_forward_media_photo_key_revocation_20261007 v where v.key_id=k.key_id);
+ select r.* into anchor from public.fixer_forward_media_history_clearance_20261006 h
+ join public.fixer_owner_photo_reservation_20261007 r on r.receipt_ref=h.history_evidence_ref
+ join public.fixer_forward_media_original_registry_20261006 o
+  on o.tenant_id=h.tenant_id and o.source_asset_id=h.source_asset_id
+ where h.tenant_id=src.tenant_id and h.source_asset_id=src.source_asset_id
+  and h.decision='cleared_unused' and to_jsonb(o)-'registered_at'=r.original_json
+  and to_jsonb(h)-array['checked_at','decision','history_evidence_ref']=r.original_json
+  and r.original_json-'registry_evidence_ref'=p_original-'registry_evidence_ref'
+  and r.audit_id=any(sibling_ids);
+ if exists(select 1 from public.fixer_forward_media_original_registry_20261006 o
+     where o.tenant_id=src.tenant_id and o.source_asset_id=src.source_asset_id)
+   and anchor.audit_id is null then
+  raise exception 'already used cleared or reserved original outside signed sibling scope requires HOLD' using errcode='23514'; end if;
+ if anchor.audit_id is not null then
+  clearance:=anchor.original_json || jsonb_build_object('decision','cleared_unused','history_evidence_ref',anchor.receipt_ref);
+ end if;
  select * into old from public.fixer_owner_photo_reservation_20261007 where audit_id=p_audit_id;
  if found then
   if cert.baseline_id is distinct from state.baseline_id or cert.generation is distinct from state.generation
@@ -240,26 +278,51 @@ begin
   or exists(select 1 from jsonb_array_elements(snap->'rows') h
     where h->'resolved' is distinct from 'true'::jsonb or h->>'media_kind' is distinct from 'still_photo') then
   raise exception 'complete current independently reviewed history and reservations required' using errcode='23514'; end if;
+ -- Exempt only known reservations and exact claims of this signed source
+ -- group. Historical imports, unresolved rows and byte collisions stay held.
+ select coalesce(array_agg(history_key),'{}'::text[]) into sibling_history_keys from (
+  select 'owner-reserved-source:'||id::text history_key from unnest(sibling_ids) id
+  union all select 'owner-reserved-image:'||id::text from unnest(sibling_ids) id
+  union all select 'claim:'||claim.claim_token::text
+   from public.fixer_forward_media_claim_receipt_20261006 claim
+   join public.fixer_owner_photo_reservation_20261007 r on r.audit_id=any(sibling_ids)
+   where claim.tenant_id=r.candidate_json->>'tenant_id'
+    and claim.post_date::text=r.candidate_json->>'post_date'
+    and claim.group_key=r.candidate_json->>'group_key'
+    and claim.source_url=r.candidate_json->>'source_url' and claim.image_url=r.candidate_json->>'image_url'
+    and claim.thumbnail_url is null
+    and claim.fingerprints=(select array_agg(distinct fp order by fp)
+      from unnest(array[r.candidate_json->>'source_fingerprint',r.candidate_json->>'image_fingerprint']) fp)
+ ) known_siblings;
  if exists(select 1 from jsonb_array_elements(snap->'rows') h
-     where h->>'visual_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256']))
+     where h->>'visual_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256'])
+       and not (h->>'history_key'=any(sibling_history_keys)))
   or exists(select 1 from public.fixer_forward_media_historical_original_20261007 h
      where h.source_fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint']))
   or exists(select 1 from public.fixer_forward_media_use_20261006 u
-     where u.fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint']))
+     where u.fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint'])
+       and not (anchor.audit_id is not null and u.fingerprint=candidate->>'source_fingerprint'
+         and u.tenant_id=candidate->>'tenant_id' and u.post_date::text=candidate->>'post_date'
+         and u.group_key=candidate->>'group_key'))
   or exists(select 1 from public.fixer_forward_media_history_clearance_20261006 h
-     where h.source_fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint']))
+     where h.source_fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint'])
+       and not (anchor.audit_id is not null and h.tenant_id=src.tenant_id and h.source_asset_id=src.source_asset_id
+         and to_jsonb(h)-'checked_at'=clearance))
   or exists(select 1 from public.fixer_owner_photo_reservation_20261007 r
-     where r.candidate_json->>'source_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256'])
-       or r.candidate_json->>'image_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256'])) then
+     where (r.candidate_json->>'source_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256'])
+       or r.candidate_json->>'image_sha256'=any(array[candidate->>'source_sha256',candidate->>'image_sha256']))
+      and (not r.audit_id=any(sibling_ids) or r.candidate_json->>'image_sha256'=candidate->>'image_sha256')) then
   raise exception 'already used cleared or reserved visual requires HOLD' using errcode='23514'; end if;
  insert into public.fixer_owner_photo_reservation_20261007(audit_id,receipt_ref,calendar_row_id,original_json,manifest_json,candidate_json)
  values(p_audit_id,ref,cert.calendar_row_id,p_original,p_manifest,candidate);
+ if anchor.audit_id is null then
  insert into public.fixer_forward_media_original_registry_20261006
  (tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref)
  values(src.tenant_id,src.source_asset_id,src.exact_source_url,src.source_fingerprint,src.source_length,src.receipt_ref);
  insert into public.fixer_forward_media_history_clearance_20261006
  (tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref,decision,history_evidence_ref)
  values(src.tenant_id,src.source_asset_id,src.exact_source_url,src.source_fingerprint,src.source_length,src.receipt_ref,'cleared_unused',ref);
+ end if;
  insert into public.fixer_forward_media_render_manifest_20261006
  (manifest_digest,tenant_id,source_asset_id,image_url,image_fingerprint,image_length,thumbnail_url,thumbnail_fingerprint,thumbnail_length,operation,render_recipe,render_evidence_ref)
  values(p_manifest->>'manifest_digest',src.tenant_id,src.source_asset_id,p_manifest->>'image_url',p_manifest->>'image_fingerprint',
@@ -321,7 +384,7 @@ revoke all on function public.fixer_photo_base_provenance_20261007(uuid) from pu
 create function public.fixer_forward_media_provenance_lookup_20261006(p_calendar_row_id uuid)
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
 declare provenance jsonb; grant_row public.fixer_owner_photo_reservation_20261007%rowtype;
- snap jsonb; content jsonb;
+ snap jsonb; content jsonb; anchor_audit uuid; required_audit uuid;
  caller text:=coalesce(nullif(current_setting('role',true),'none'),session_user);
 begin
  -- Production callbacks read provenance before later appending attestation in
@@ -340,6 +403,11 @@ begin
  select r.* into grant_row from public.fixer_owner_photo_reservation_20261007 r
  where r.receipt_ref=provenance#>>'{clearance,history_evidence_ref}';
  if found then
+  anchor_audit:=grant_row.audit_id;
+  select r.* into grant_row from public.fixer_owner_photo_reservation_20261007 r
+   where r.manifest_json=(provenance->'manifest')-'registered_at';
+  if not found then
+   raise exception 'photo provenance requires exact signed rendition reservation' using errcode='23514'; end if;
   -- Hold current safety/source bindings until the attestation/claim commits.
   -- A concurrent pending-moderation change must serialize before the check or
   -- after the immutable grant; a stale SELECT cannot admit it in between.
@@ -364,15 +432,17 @@ begin
   -- positive source clearance merely because its tenant/source IDs match.
   if (provenance->'manifest')-'registered_at' is distinct from grant_row.manifest_json then
    raise exception 'photo provenance requires exact signed rendition reservation' using errcode='23514'; end if;
-  if exists(select 1 from public.fixer_owner_photo_revocation_20261007 v where v.audit_id=grant_row.audit_id)
+  for required_audit in select distinct id from unnest(array[anchor_audit,grant_row.audit_id]) id loop
+  if exists(select 1 from public.fixer_owner_photo_revocation_20261007 v where v.audit_id=required_audit)
     or not exists(select 1 from public.fixer_forward_media_photo_certificate_20261007 c
      join public.fixer_forward_media_photo_state_20261007 state on state.singleton
      join public.fixer_forward_media_photo_key_20261007 k on k.key_id=c.key_id
      join public.fixer_forward_media_photo_policy_20261007 p on p.policy_id=k.policy_id
-     where c.audit_id=grant_row.audit_id and c.baseline_id=state.baseline_id and c.generation=state.generation
+     where c.audit_id=required_audit and c.baseline_id=state.baseline_id and c.generation=state.generation
       and state.enabled and nullif(btrim(state.routes_reconciled_ref),'') is not null and k.approved and p.approved
       and not exists(select 1 from public.fixer_forward_media_photo_key_revocation_20261007 v where v.key_id=k.key_id)) then
    raise exception 'photo reservation revoked disabled or retired epoch' using errcode='23514'; end if;
+  end loop;
   if exists(select 1 from public.fixer_forward_media_historical_original_20261007 h
     where h.source_fingerprint=any(array[grant_row.candidate_json->>'source_fingerprint',grant_row.candidate_json->>'image_fingerprint'])) then
    raise exception 'new trusted historical byte match requires HOLD' using errcode='23514'; end if;
@@ -432,7 +502,7 @@ begin
  if not found then raise exception 'existing photo reservation required' using errcode='23514'; end if;
  clearance:=public.fixer_prepare_owner_photo_20261007(p_audit_id,r.original_json,r.manifest_json);
  if not exists(select 1 from public.fixer_forward_media_original_registry_20261006 original
-   where to_jsonb(original)-'registered_at'=r.original_json)
+   where to_jsonb(original)-'registered_at'=clearance-array['decision','history_evidence_ref'])
   or not exists(select 1 from public.fixer_forward_media_history_clearance_20261006 h
    where to_jsonb(h)-'checked_at'=clearance)
   or not exists(select 1 from public.fixer_forward_media_render_manifest_20261006 m
@@ -443,7 +513,8 @@ begin
  if progress->>'state'='final' and progress->'outcome' is distinct from jsonb_build_object(
    'status','persisted','decision','cleared_unused','manifest_digest',r.manifest_json->>'manifest_digest') then
   raise exception 'exact durable photo outcome required' using errcode='23514'; end if;
- return jsonb_build_object('registry',r.original_json,'clearance',clearance,'manifest',r.manifest_json,
+ return jsonb_build_object('registry',clearance-array['decision','history_evidence_ref'],'clearance',clearance,'manifest',r.manifest_json,
+   'clearance_certificate',public.fixer_forward_media_photo_certificate_20261007((select anchor.audit_id from public.fixer_owner_photo_reservation_20261007 anchor where anchor.receipt_ref=clearance->>'history_evidence_ref')),
    'replayed',true,'progress',progress,'certificate',public.fixer_forward_media_photo_certificate_20261007(p_audit_id));
 end; $$;
 revoke all on function public.fixer_reconcile_owner_photo_20261007(uuid) from public,anon,authenticated,service_role,
