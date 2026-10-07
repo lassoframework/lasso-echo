@@ -36,10 +36,30 @@ _UUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _FIXER_RECEIPT_NAMESPACE = uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be")
+_FIXER_SUPPRESSED_ALERT_NAMESPACE = uuid.UUID("1f1455e2-5a9d-4e4b-b332-6bd425d915fe")
 
 
 def _fixer_receipt_id(source_message_id):
     return str(uuid.uuid5(_FIXER_RECEIPT_NAMESPACE, str(source_message_id)))
+
+
+def _suppressed_current_notice_alert_id(source_message_id):
+    return str(uuid.uuid5(_FIXER_SUPPRESSED_ALERT_NAMESPACE, str(source_message_id)))
+
+
+def _unsent_suppressed_current_notice(row, identity):
+    att = (row or {}).get("attachments") or {}
+    return bool(row and row.get("delivery_status") == "suppressed"
+                and row.get("direction") == "outbound"
+                and _UUID.fullmatch(str(row.get("id") or ""))
+                and att.get("identity") == identity
+                and att.get("fixer") is True
+                and _UUID.fullmatch(str(att.get("fixer_current_attempt_token") or ""))
+                and att.get("fixer_slack_delivery_intent") is None
+                and not row.get("slack_ts") and not row.get("slack_event_id")
+                and att.get("delivery_readback_verified") is not True
+                and att.get("fixer_route_uncertain") is not True
+                and att.get("fixer_slack_delivery_uncertain") is not True)
 
 
 def _a_kind_escalation():
@@ -950,6 +970,96 @@ class Bus:
                             "eq." + json.dumps(att, separators=(",", ":"),
                                                sort_keys=True)),
         }, {"delivery_status": "suppressed", "attachments": next_att})
+
+    def ensure_suppressed_current_notice_alert(self, message_id, identity):
+        """Queue one stable staff row without mutating or resending the notice.
+
+        Suppression itself is the durable retry record. Read it freshly, and
+        accept only a definitely pre-POST terminal notice. The deterministic
+        alert UUID makes INSERT retries and concurrent reconcilers idempotent;
+        existing alerts retain their delivery state and transport metadata.
+        """
+        notice = self.message(message_id)
+        if not _unsent_suppressed_current_notice(notice, identity):
+            return None
+        ticket_id = notice["ticket_id"]
+        alert_id = _suppressed_current_notice_alert_id(message_id)
+        body = (f"FIXER notice {message_id} on ticket {ticket_id} was canceled "
+                "before Slack delivery. Review the ticket before opening another notice.")
+        meta = {"identity": identity, "suppressed_message_id": message_id,
+                "fixer_suppressed_notice_alert": True}
+
+        def exact_alert(row):
+            att = (row or {}).get("attachments") or {}
+            return bool(row and row.get("id") == alert_id
+                        and row.get("ticket_id") == ticket_id
+                        and row.get("author_type") == "system"
+                        and row.get("direction") == "outbound"
+                        and row.get("body") == body
+                        and att.get("kind") == _a_kind_escalation()
+                        and all(att.get(k) == v for k, v in meta.items()))
+
+        existing = self.message(alert_id)
+        if existing:
+            if not exact_alert(existing):
+                raise BusError(409, "suppressed notice alert identity conflict")
+            return existing
+        # Recognize staff rows emitted before stable alert IDs were introduced.
+        # An already queued or posted legacy escalation must not be duplicated.
+        legacy_bodies = {
+            (f"FIXER first-contact notice {message_id} on ticket {ticket_id} "
+             "was canceled before Slack delivery. "
+             "Review the ticket before opening another notice."),
+            (f"FIXER notice {message_id} on ticket {ticket_id} was suppressed "
+             "after a pre-send claim expired. Review the ticket "
+             "before a new customer notice."),
+        }
+        legacy = self._get(_MESSAGES, {
+            "ticket_id": f"eq.{ticket_id}", "direction": "eq.outbound",
+            "author_type": "eq.system", "attachments->>kind": "eq.escalation",
+            "attachments->>identity": f"eq.{identity}",
+            "attachments->>suppressed_message_id": f"eq.{message_id}",
+            "select": "*", "order": "created_at.asc,id.asc", "limit": "20",
+        })
+        for row in legacy:
+            if row.get("body") in legacy_bodies:
+                return row
+        try:
+            created = self.record_outbound(
+                ticket_id=ticket_id, author_type="system", body=body,
+                delivery_status="ready", kind=_a_kind_escalation(),
+                meta=meta, message_id=alert_id)
+            if not exact_alert(created):
+                raise BusError(409, "suppressed notice alert insert not confirmed")
+            return created
+        except Exception:
+            # A committed INSERT may already have been claimed/posted before
+            # the response arrives. Validate its immutable identity only; never
+            # overwrite added delivery metadata or return it to ready.
+            existing = self.message(alert_id)
+            if exact_alert(existing):
+                return existing
+            raise
+
+    def suppressed_unattempted_current_notices(self, identity, *, limit=20, after=None):
+        """Bounded keyset page; unrelated suppressed rows cannot starve alerts."""
+        params = {
+            "direction": "eq.outbound", "delivery_status": "eq.suppressed",
+            "attachments->>identity": f"eq.{identity}",
+            "attachments->>fixer": "eq.true",
+            "attachments->>fixer_current_attempt_token": "not.is.null",
+            "attachments->>fixer_slack_delivery_intent": "is.null",
+            "slack_ts": "is.null", "slack_event_id": "is.null",
+            "select": "*", "order": "created_at.asc,id.asc",
+            "limit": str(min(20, max(1, int(limit)))),
+        }
+        if after:
+            ts = str(after.get("created_at") or "").replace('"', "")
+            mid = str(after.get("id") or "").replace('"', "")
+            if ts and mid:
+                params["or"] = (f'(created_at.gt."{ts}",'
+                                f'and(created_at.eq."{ts}",id.gt."{mid}"))')
+        return self._get(_MESSAGES, params)
 
     def hold_uncertain_fixer_delivery(self, message_id, reason):
         """Quarantine an uncertain client post; never put it back in ready."""

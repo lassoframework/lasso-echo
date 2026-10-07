@@ -381,14 +381,8 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
             canceled = suppress(row_id, reason)
             if not canceled or canceled.get("delivery_status") != "suppressed":
                 return  # a competing claimant may own the posting row
-            current_notice_bus.record_outbound(
-                ticket_id=ticket["id"], author_type="system",
-                body=(f"FIXER first-contact notice {row_id} on ticket "
-                      f"{ticket['id']} was canceled before Slack delivery. "
-                      "Review the ticket before opening another notice."),
-                delivery_status="ready", kind="escalation",
-                meta={"identity": getattr(ident, "name", ""),
-                      "suppressed_message_id": row_id})
+            current_notice_bus.ensure_suppressed_current_notice_alert(
+                row_id, getattr(ident, "name", ""))
         except Exception as exc:  # noqa: BLE001 - no customer POST occurred
             log(f"[outreach] current notice cancellation/alert failed "
                 f"row={row_id}: {type(exc).__name__}")

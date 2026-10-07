@@ -5,10 +5,14 @@
   never requeue or send from the outbox; active and competing owners are preserved.
 - [~] First-contact identity changes use claimed pre-intent CAS suppression and
   escalation instead of a legacy unconditional status write.
+- [~] A shared stable-UUID staff alert survives failed/lost INSERT responses and
+  concurrent reconcilers. A scoped keyset scan retries missing alerts from at most
+  20 definitely unsent suppressed notices per sweep, without modifying the notice
+  or rearming an existing alert. Earlier queued/posted escalation rows are preserved.
 - [~] `SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED` defaults OFF. New reservations,
   tokenized inserts/dispatch, route binds and current-notice resolution require it.
   Ordinary Echo website-tab answers still cannot certify a fix or close a ticket.
-- [~] Targeted local caller, worker, wiring and Slack adapter suites: 766 passed.
+- [~] Targeted local caller, worker, wiring and Slack adapter suites: 780 passed.
 - [ ] Independent acceptance, paired portal migration 0605 live verification, and
   release/activation remain with the integration owner. No deployment or flag change.
 

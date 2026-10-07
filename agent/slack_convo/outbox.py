@@ -1121,15 +1121,8 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
                             n += 1
                             count("suppressed")
                             try:
-                                bus.record_outbound(
-                                    ticket_id=row["ticket_id"], author_type="system",
-                                    body=(f"FIXER notice {row['id']} on ticket "
-                                          f"{row['ticket_id']} was suppressed after a "
-                                          "pre-send claim expired. Review the ticket "
-                                          "before a new customer notice."),
-                                    delivery_status="ready", kind=_a.KIND_ESCALATION,
-                                    meta={"identity": identity.name,
-                                          "suppressed_message_id": row["id"]})
+                                bus.ensure_suppressed_current_notice_alert(
+                                    row["id"], identity.name)
                             except Exception as exc:  # noqa: BLE001
                                 log(f"[slack-convo/outbox] FIXER pre-send alert failed "
                                     f"row={row['id']}: {type(exc).__name__}")
@@ -1229,6 +1222,36 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
         except Exception:  # noqa: BLE001
             pass
     return n
+
+
+def _report_suppressed_current_notices(bus, identity, log):
+    """Retry missing staff alerts from terminal unsent notices, 20 rows per sweep."""
+    reader = getattr(bus, "suppressed_unattempted_current_notices", None)
+    if not callable(reader):
+        return
+    cursors = getattr(bus, "_fixer_suppressed_alert_cursors", None)
+    if not isinstance(cursors, dict):
+        cursors = {}
+        setattr(bus, "_fixer_suppressed_alert_cursors", cursors)
+    after = cursors.get(identity.name)
+    try:
+        rows = reader(identity.name, limit=20, after=after)
+        if not rows and after:
+            cursors.pop(identity.name, None)
+            rows = reader(identity.name, limit=20, after=None)
+    except Exception as exc:  # noqa: BLE001 - keep cursor and retry bounded read
+        log(f"[slack-convo/outbox] suppressed notice alert scan failed: "
+            f"{type(exc).__name__}")
+        return
+    for row in rows:
+        cursors[identity.name] = {"created_at": row.get("created_at"), "id": row.get("id")}
+        try:
+            bus.ensure_suppressed_current_notice_alert(row["id"], identity.name)
+        except Exception as exc:  # noqa: BLE001 - unchanged source is durable retry record
+            log(f"[slack-convo/outbox] suppressed notice staff alert failed "
+                f"row={row['id']}: {type(exc).__name__}")
+    if len(rows) < 20:
+        cursors.pop(identity.name, None)
 
 
 def _report_uncertain_outreach(bus, identity, log):
@@ -1753,6 +1776,7 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
         identity, channel, user))
     summary["reclaimed"] = _recover_stale_claims(
         bus, identity, log, now=now, readback=readback, summary=summary)
+    _report_suppressed_current_notices(bus, identity, log)
     _report_uncertain_outreach(bus, identity, log)
     _reconcile_held_fixer(bus, identity, readback, log, summary)
     route_requeued = _recover_route_missing_fixer(
@@ -1858,15 +1882,8 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                     row["id"], "Reserved FIXER notice expired before direct claim")
                 if canceled and canceled.get("delivery_status") == "suppressed":
                     summary["suppressed"] = int(summary.get("suppressed") or 0) + 1
-                    bus.record_outbound(
-                        ticket_id=row["ticket_id"], author_type="system",
-                        body=(f"FIXER first-contact notice {row['id']} on ticket "
-                              f"{row['ticket_id']} was canceled before Slack delivery. "
-                              "Review the ticket before opening another notice."),
-                        delivery_status="ready", kind=_a.KIND_ESCALATION,
-                        meta={"identity": identity.name,
-                              "suppressed_message_id": row["id"]})
-            except Exception as exc:  # noqa: BLE001 - retry ready CAS next sweep
+                    bus.ensure_suppressed_current_notice_alert(row["id"], identity.name)
+            except Exception as exc:  # noqa: BLE001 - ready CAS or suppressed alert scan retries
                 log(f"[slack-convo/outbox] reserved notice recovery/alert failed "
                     f"row={row['id']}: {type(exc).__name__}")
         summary["skipped"] += 1
