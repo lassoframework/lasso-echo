@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import uuid
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -239,8 +240,71 @@ def main():
                 assert sql('select count(*) from fixer_forward_media_history_query_receipt_20261007 q join fixer_forward_media_source_receipt_20261007 s on s.receipt_ref=q.source_receipt_ref where s.source_asset_id=%s',(asset,))[0][0]==expected
                 assert sql('select state from fixer_forward_media_owner_progress_20261007 where calendar_row_id=%s',(c['calendar_row_id'],))[0][0]==('final' if expected else 'quarantine')
                 assert sql('select count(*) from fixer_forward_media_history_clearance_20261006 where source_asset_id=%s',(asset,))[0][0]==0
+            # Operational one-pass factory uses the REAL environment-based owner
+            # connection. Only object transports are synthetic fixture readers.
+            # It must close that connection on normal HOLD and uncertain COMMIT.
+            real_connect = owner.ForwardMediaOwnerPersistence.connect_from_environment
+            opened = []
+            class ClosingLostCommit(LostCommit):
+                def close(self):
+                    return self.conn.close()
+            for when in (None, 'before', 'after'):
+                c,asset,source_url,image_url=candidate()
+                reads=[]
+                class RuntimeReader(owner.ObjectReader):
+                    def read(self, url):
+                        assert opened[-1].info.transaction_status==psycopg.pq.TransactionStatus.IDLE
+                        reads.append(url)
+                        return {source_url:source_bytes,image_url:image_bytes}[url]
+                reader=RuntimeReader()
+                def connect(*, reader):
+                    persistence=real_connect(reader=reader)
+                    opened.append(persistence._conn)
+                    if when:
+                        persistence._conn=ClosingLostCommit(persistence._conn,when)
+                    return persistence
+                with patch.object(owner,'HostedObjectReader',return_value=reader), \
+                     patch.object(owner.ForwardMediaOwnerPersistence,'connect_from_environment',side_effect=connect), \
+                     patch('agent.forward_media_source_verifier.OriginalDriveReader',return_value=Drive(asset,source_bytes)):
+                    report=worker.run_once()
+                assert opened[-1].closed, 'runtime leaked its owner connection'
+                assert reads==[source_url,image_url]
+                if when:
+                    assert report=={'status':'hold','reason':'uncertain_authority_commit','rows':[]},report
+                else:
+                    assert report['status']=='partial_hold' and len(report['rows'])==1,report
+                    assert report['rows'][0]['decision']=='hold_uncertain',report
+                expected=0 if when=='before' else 1
+                assert sql('select count(*) from fixer_forward_media_source_receipt_20261007 where source_asset_id=%s',(asset,))[0][0]==expected
+                assert sql('select count(*) from fixer_forward_media_history_query_receipt_20261007 q join fixer_forward_media_source_receipt_20261007 s on s.receipt_ref=q.source_receipt_ref where s.source_asset_id=%s',(asset,))[0][0]==expected
+                assert sql('select state from fixer_forward_media_owner_progress_20261007 where calendar_row_id=%s',(c['calendar_row_id'],))[0][0]==('final' if expected else 'quarantine')
+                outcome=sql('select outcome from fixer_forward_media_owner_progress_20261007 where calendar_row_id=%s',(c['calendar_row_id'],))[0][0]
+                if expected:
+                    assert outcome['status']=='hold' and outcome['decision']=='hold_uncertain'
+                    assert outcome['source_receipt_ref']==sql('select receipt_ref from fixer_forward_media_source_receipt_20261007 where source_asset_id=%s',(asset,))[0][0]
+                    assert sql('select count(*) from fixer_forward_media_history_query_receipt_20261007 where source_receipt_ref=%s',(outcome['source_receipt_ref'],))[0][0]==1
+                else:
+                    assert outcome is None
+                for table in ('original_registry_20261006','history_clearance_20261006','render_manifest_20261006'):
+                    assert sql('select count(*) from fixer_forward_media_'+table+' where source_asset_id=%s',(asset,))[0][0]==0
+            # Every previous revision has a final outcome or quarantine, so a
+            # subsequent real factory pass is empty and still closes its lane.
+            with patch.object(owner.ForwardMediaOwnerPersistence,'connect_from_environment',side_effect=connect):
+                report=worker.run_once()
+            assert report=={'status':'complete','rows':[]},report
+            assert opened[-1].closed
+            # An actual role mismatch must close even the failed identity read
+            # transaction and leave every candidate untouched.
+            c,asset,source_url,image_url=candidate()
+            os.environ['FORWARD_MEDIA_OWNER_ROLE']='not_the_authenticated_owner'
+            with patch.object(owner.ForwardMediaOwnerPersistence,'connect_from_environment',side_effect=connect):
+                report=worker.run_once()
+            os.environ['FORWARD_MEDIA_OWNER_ROLE']=OWNER
+            assert report=={'status':'hold','reason':'owner_transport_unavailable','rows':[]},report
+            assert opened[-1].closed
+            assert sql('select count(*) from fixer_forward_media_owner_progress_20261007 where calendar_row_id=%s',(c['calendar_row_id'],))[0][0]==0
             admin.close()
-            print('PASS PG17: stalled remote reader permits unrelated real binder/attester/claim; remote reads see IDLE; atomic source/history/hold outcome without immutable authority; stale row/source final holds; uncertain history cannot bind')
+            print('PASS PG17: stalled remote reader permits unrelated real binder/attester/claim; remote reads see IDLE; atomic source/history/HOLD; stale row/source and uncertain commits held; operational owner factory closes real connections; zero held-asset authority')
         finally:
             if started:
                 subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)

@@ -124,8 +124,11 @@ def test_default_off_never_discovers_or_constructs_transport(lane, monkeypatch):
     assert worker.run_once()['status'] == 'disabled'
 
 
-def test_production_enabled_stops_at_exact_missing_transport(lane):
-    assert worker.run_once() == {'status': 'hold', 'reason': 'owner_transport_schema_missing', 'rows': []}
+def test_production_factory_failure_is_static_and_has_no_fallback(lane, monkeypatch):
+    def unavailable(**kwargs):
+        raise owner.OwnerPersistenceError('private DSN must not leak')
+    monkeypatch.setattr(owner.ForwardMediaOwnerPersistence, 'connect_from_environment', unavailable)
+    assert worker.run_once() == {'status': 'hold', 'reason': 'owner_transport_unavailable', 'rows': []}
 
 
 def test_exact_replay_and_hold_decision_are_persisted_under_lock(lane):

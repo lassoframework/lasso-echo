@@ -354,21 +354,53 @@ def run_adapter(*, transport, persistence, reader, drive_reader=None):
 
 
 def run_once():
-    """Production remains blocked until a separately reviewed transport exists."""
+    """One isolated owner pass, default OFF; concrete history remains HOLD-only.
+
+    No reader/connection overrides or service credential fallback. This entry
+    point owns the connection and closes it after acknowledged outcomes or any
+    failure. Unknown commit remains a reconciliation hold, never an auto retry.
+    """
     if not worker_enabled():
         return {'status': 'disabled', 'rows': []}
     try:
         settings_from_environment()
     except OwnerWorkerHold as exc:
         return {'status': 'hold', 'reason': str(exc), 'rows': []}
-    return {'status': 'hold', 'reason': 'owner_transport_schema_missing', 'rows': []}
+    persistence = None
+    report = {'status': 'hold', 'reason': 'owner_transport_unavailable', 'rows': []}
+    try:
+        from .forward_media_source_verifier import OriginalDriveReader
+        from .forward_media_owner_transport import DedicatedOwnerTransport
+        reader = owner.HostedObjectReader()
+        persistence = owner.ForwardMediaOwnerPersistence.connect_from_environment(reader=reader)
+        transport = DedicatedOwnerTransport(persistence)
+        report = run_adapter(transport=transport, persistence=persistence,
+                             reader=reader, drive_reader=OriginalDriveReader())
+    except owner.UncertainCommitError:
+        report = {'status': 'hold', 'reason': 'uncertain_authority_commit', 'rows': []}
+    except OwnerWorkerHold as exc:
+        report = {'status': 'hold', 'reason': str(exc), 'rows': []}
+    except Exception:
+        # Never expose connection, credential, URL or driver errors in reports.
+        report = {'status': 'hold', 'reason': 'owner_transport_unavailable', 'rows': []}
+    finally:
+        if persistence is not None:
+            try:
+                persistence._conn.close()
+            except Exception:
+                # Completed rows were already acknowledged by the adapter.
+                # Preserve those receipts while reporting unavailable cleanup.
+                report = {'status': 'hold', 'reason': 'owner_transport_unavailable',
+                          'rows': report.get('rows', [])}
+    return report
 
 
 def main(argv=None):
     argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args(argv)
     report = run_once()
     print(json.dumps(report, sort_keys=True))
-    return 0 if report['status'] == 'disabled' else 2
+    return 0 if (report['status'] == 'disabled'
+                 or (report['status'] == 'complete' and report.get('rows') == [])) else 2
 
 
 if __name__ == '__main__':
