@@ -73,7 +73,8 @@ def story_caption(caption):
         chunk = chunk.strip()
         if not chunk:
             continue
-        out = (out + " " + chunk + ".").strip()
+        ending = "" if chunk.endswith((".", "!", "?")) else "."
+        out = (out + " " + chunk + ending).strip()
         count += 1
         if count >= 2 or len(out) >= _MAX_CAPTION_CHARS:
             break

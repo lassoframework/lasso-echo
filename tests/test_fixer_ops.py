@@ -1810,7 +1810,7 @@ def test_default_denial_rows_read_fails_closed_without_a_configured_plane():
 def _cal_row(rid, **kw):
     row = {"id": rid, "gym_id": GYM, "post_date": "2026-09-12", "account": "instagram",
            "format": "feed", "status": "pending", "caption": f"caption {rid}",
-           "image_url": f"https://img/{rid}.jpg", "video_url": None, "slot_index": 0,
+           "image_url": f"https://img/{rid}.jpg", "slot_index": 0,
            "source_media_asset_id": None}
     row.update(kw)
     return row
@@ -1867,6 +1867,20 @@ def test_restage_month_terminal_job_verifies_on_independent_calendar_agreement(a
     assert "postcondition_verified" not in job["result"]["build"], \
         "the builder's self-certification is stripped even on a verified job"
     assert store.calls and all(g == GYM for g, _ in store.calls)
+
+
+def test_calendar_snapshot_requires_real_media_column_without_video_url():
+    from datetime import date
+
+    row = _cal_row("row-live-shape")
+    assert "video_url" not in row
+    store = FakeCalendarMonthStore([row])
+    assert "row-live-shape" in FO._calendar_snapshot(
+        store, GYM, ["2026-09"], first=date(2026, 9, 12), last=date(2026, 9, 12))
+    store.rows["row-live-shape"].pop("image_url")
+    with pytest.raises(FO._ReadbackUnavailable, match="missing image_url"):
+        FO._calendar_snapshot(
+            store, GYM, ["2026-09"], first=date(2026, 9, 12), last=date(2026, 9, 12))
 
 
 def test_restage_month_terminal_job_unverified_when_counts_disagree(armed):
