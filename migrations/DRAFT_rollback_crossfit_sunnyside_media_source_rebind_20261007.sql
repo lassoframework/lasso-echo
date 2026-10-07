@@ -24,6 +24,8 @@ DECLARE
   v_bad_assets integer;
   v_bad_calendar integer;
   v_source_triggers integer;
+  v_asset_digest text;
+  v_calendar_digest text;
   v_changed integer;
 BEGIN
   SELECT * INTO v_source
@@ -37,6 +39,7 @@ BEGIN
      OR v_source.kind IS DISTINCT FROM 'gym_drive'
      OR v_source.active IS DISTINCT FROM true
      OR v_source.revoked_externally IS DISTINCT FROM false
+     OR v_source.folder_id IS DISTINCT FROM '1eyCZrpS37m_ebpX1LbzI1hk_Ma9BAAPV'
      OR v_source.sync_status IS DISTINCT FROM 'idle'
      OR v_source.sync_requested_at IS NOT NULL
      OR v_source.sync_claim_token IS NOT NULL THEN
@@ -96,6 +99,13 @@ BEGIN
     RAISE EXCEPTION 'CrossFit Sunnyside media rollback refused: linked asset manifest changed (total %, photos %, videos %, other tenant %)',
       v_assets, v_photos, v_videos, v_bad_assets;
   END IF;
+  SELECT md5(string_agg(row_to_json(a)::text, '|' ORDER BY a.id))
+    INTO v_asset_digest
+    FROM public.media_asset a
+   WHERE a.source_id = '10f4bf47d5e24c4086fce5aa916e6768';
+  IF v_asset_digest IS DISTINCT FROM '2fd3111504be27cefed69daaca1d7482' THEN
+    RAISE EXCEPTION 'CrossFit Sunnyside media rollback refused: linked asset snapshot changed';
+  END IF;
   SELECT count(*) INTO v_count
     FROM public.media_asset
    WHERE gym_id = 'crossfitsunnyside2616ac';
@@ -106,9 +116,17 @@ BEGIN
     FROM public.content_calendar c
     JOIN public.media_asset a ON a.id = c.source_media_asset_id
    WHERE a.source_id = '10f4bf47d5e24c4086fce5aa916e6768'
-     AND c.gym_id <> 'crossfitsunnysidef574c0';
+     AND c.gym_id IS DISTINCT FROM 'crossfitsunnysidef574c0';
   IF v_bad_calendar <> 0 THEN
     RAISE EXCEPTION 'CrossFit Sunnyside media rollback refused: calendar ownership changed (%)', v_bad_calendar;
+  END IF;
+  SELECT md5(string_agg(row_to_json(c)::text, '|' ORDER BY c.id))
+    INTO v_calendar_digest
+    FROM public.content_calendar c
+    JOIN public.media_asset a ON a.id = c.source_media_asset_id
+   WHERE a.source_id = '10f4bf47d5e24c4086fce5aa916e6768';
+  IF v_calendar_digest IS DISTINCT FROM '9c7888892cd3cb3ce886cd6ca8e63561' THEN
+    RAISE EXCEPTION 'CrossFit Sunnyside media rollback refused: calendar snapshot changed';
   END IF;
 
   IF v_source.gym_id = 'crossfitsunnysidef574c0' THEN
@@ -119,6 +137,7 @@ BEGIN
        AND kind = 'gym_drive'
        AND active IS TRUE
        AND revoked_externally IS FALSE
+       AND folder_id = '1eyCZrpS37m_ebpX1LbzI1hk_Ma9BAAPV'
        AND sync_status = 'idle'
        AND sync_requested_at IS NULL
        AND sync_claim_token IS NULL;
@@ -130,7 +149,14 @@ BEGIN
   SELECT count(*) INTO v_count
     FROM public.media_source
    WHERE id = '10f4bf47d5e24c4086fce5aa916e6768'
-     AND gym_id = 'crossfitsunnyside2616ac';
+     AND gym_id = 'crossfitsunnyside2616ac'
+     AND kind = 'gym_drive'
+     AND active IS TRUE
+     AND revoked_externally IS FALSE
+     AND folder_id = '1eyCZrpS37m_ebpX1LbzI1hk_Ma9BAAPV'
+     AND sync_status = 'idle'
+     AND sync_requested_at IS NULL
+     AND sync_claim_token IS NULL;
   IF v_count <> 1 THEN
     RAISE EXCEPTION 'CrossFit Sunnyside media rollback refused: stale-key postcondition failed';
   END IF;

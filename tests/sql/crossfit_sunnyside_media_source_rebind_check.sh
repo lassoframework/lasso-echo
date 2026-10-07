@@ -44,15 +44,24 @@ db() {
     -h "$SOCK" -p "$PORT" -U postgres -d postgres "$@"
 }
 q() { db -c "$1" | tr -d '\r'; }
-apply_sql() { db -f "$ROOT/migrations/DRAFT_crossfit_sunnyside_media_source_rebind_20261007.sql"; }
-rollback_sql() { db -f "$ROOT/migrations/DRAFT_rollback_crossfit_sunnyside_media_source_rebind_20261007.sql"; }
+apply_sql() { db -f "$WORK/forward.sql"; }
+rollback_sql() { db -f "$WORK/rollback.sql"; }
 expect_fail() {
   local label="$1"; shift
-  if "$@" >/dev/null 2>&1; then
+  if "$@" >"$WORK/refusal.log" 2>&1; then
     echo "FAIL: expected refusal: $label" >&2
     exit 1
   fi
   echo "ok: refused $label"
+}
+expect_fail_reason() {
+  local label="$1" reason="$2"; shift 2
+  expect_fail "$label" "$@"
+  if ! rg -q -F "$reason" "$WORK/refusal.log"; then
+    cat "$WORK/refusal.log" >&2
+    echo "FAIL: $label did not fail at the expected guard [$reason]" >&2
+    exit 1
+  fi
 }
 expect_value() {
   local label="$1" expected="$2" actual="$3"
@@ -84,7 +93,7 @@ CREATE TABLE public.media_asset (
   review_status text
 );
 CREATE TABLE public.content_calendar (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(), gym_id text NOT NULL,
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(), gym_id text,
   source_media_asset_id text, status text NOT NULL, approval_kind text
 );
 
@@ -99,7 +108,7 @@ INSERT INTO public.media_source
    sync_requested_at,sync_claim_token,folder_id)
 VALUES
   ('10f4bf47d5e24c4086fce5aa916e6768','crossfitsunnyside2616ac','gym_drive',
-   true,false,'idle',NULL,NULL,'synthetic-drive-folder');
+   true,false,'idle',NULL,NULL,'1eyCZrpS37m_ebpX1LbzI1hk_Ma9BAAPV');
 INSERT INTO public.media_asset(id,source_id,gym_id,kind,eligible,review_status)
 SELECT 'ss-asset-' || n,
        '10f4bf47d5e24c4086fce5aa916e6768',
@@ -116,6 +125,44 @@ SELECT 'crossfitsunnysidef574c0', id, CASE WHEN id IN ('ss-asset-1','ss-asset-2'
   FROM public.media_asset
  WHERE substring(id from 10)::integer BETWEEN 1 AND 13;
 SQL
+# Preserve the production SQL and replace ONLY the two live snapshot constants
+# in disposable copies. The fixture has a smaller schema and fresh UUIDs, so its
+# full row JSON digests intentionally differ from production's frozen manifests.
+ASSET_DIGEST="$(q "SELECT md5(string_agg(row_to_json(a)::text, '|' ORDER BY a.id))
+                    FROM public.media_asset a
+                    WHERE source_id='10f4bf47d5e24c4086fce5aa916e6768'")"
+CALENDAR_DIGEST="$(q "SELECT md5(string_agg(row_to_json(c)::text, '|' ORDER BY c.id))
+                       FROM public.content_calendar c
+                       JOIN public.media_asset a ON a.id=c.source_media_asset_id
+                       WHERE a.source_id='10f4bf47d5e24c4086fce5aa916e6768'")"
+for direction in forward rollback; do
+  if [[ "$direction" == forward ]]; then
+    SOURCE_SQL="$ROOT/migrations/DRAFT_crossfit_sunnyside_media_source_rebind_20261007.sql"
+  else
+    SOURCE_SQL="$ROOT/migrations/DRAFT_rollback_crossfit_sunnyside_media_source_rebind_20261007.sql"
+  fi
+  sed -e "s/2fd3111504be27cefed69daaca1d7482/$ASSET_DIGEST/g" \
+      -e "s/9c7888892cd3cb3ce886cd6ca8e63561/$CALENDAR_DIGEST/g" \
+      "$SOURCE_SQL" >"$WORK/$direction.sql"
+done
+
+db -c "UPDATE public.media_source SET folder_id='changed-folder'
+       WHERE id='10f4bf47d5e24c4086fce5aa916e6768';"
+expect_fail_reason "forward folder drift" "source kind/activity/revocation changed" apply_sql
+expect_value "folder refusal left source stale" "crossfitsunnyside2616ac" \
+  "$(q "SELECT gym_id FROM public.media_source WHERE id='10f4bf47d5e24c4086fce5aa916e6768'")"
+db -c "UPDATE public.media_source SET folder_id='1eyCZrpS37m_ebpX1LbzI1hk_Ma9BAAPV'
+       WHERE id='10f4bf47d5e24c4086fce5aa916e6768';"
+db -c "UPDATE public.content_calendar SET gym_id=NULL WHERE source_media_asset_id='ss-asset-1';"
+expect_fail_reason "forward NULL calendar tenant" "calendar references cross tenant" apply_sql
+db -c "UPDATE public.content_calendar SET gym_id='crossfitsunnysidef574c0'
+       WHERE source_media_asset_id='ss-asset-1';"
+db -c "UPDATE public.media_asset SET review_status='pending_review' WHERE id='ss-asset-1';"
+expect_fail_reason "forward same-count asset edit" "linked asset snapshot changed" apply_sql
+db -c "UPDATE public.media_asset SET review_status='approved' WHERE id='ss-asset-1';"
+db -c "UPDATE public.content_calendar SET status='denied' WHERE source_media_asset_id='ss-asset-1';"
+expect_fail_reason "forward same-count calendar edit" "calendar snapshot changed" apply_sql
+db -c "UPDATE public.content_calendar SET status='approved' WHERE source_media_asset_id='ss-asset-1';"
 db -c "DELETE FROM public.content_calendar WHERE source_media_asset_id='bad-asset';
          DELETE FROM public.media_asset WHERE id='bad-asset';
          INSERT INTO public.media_asset VALUES
@@ -169,6 +216,24 @@ expect_value "asset/review/calendar state unchanged" "$BEFORE" \
                (SELECT count(*) FROM public.content_calendar WHERE status='approved'),
                (SELECT count(*) FROM public.content_calendar WHERE approval_kind='operator')")"
 
+db -c "UPDATE public.media_source SET folder_id='changed-folder'
+       WHERE id='10f4bf47d5e24c4086fce5aa916e6768';"
+expect_fail_reason "rollback folder drift" "source state changed" rollback_sql
+db -c "UPDATE public.media_source SET folder_id='1eyCZrpS37m_ebpX1LbzI1hk_Ma9BAAPV'
+       WHERE id='10f4bf47d5e24c4086fce5aa916e6768';"
+db -c "UPDATE public.content_calendar SET gym_id=NULL WHERE source_media_asset_id='ss-asset-1';"
+expect_fail_reason "rollback NULL calendar tenant" "calendar ownership changed" rollback_sql
+db -c "UPDATE public.content_calendar SET gym_id='crossfitsunnysidef574c0'
+       WHERE source_media_asset_id='ss-asset-1';"
+db -c "UPDATE public.media_asset SET review_status='pending_review' WHERE id='ss-asset-1';"
+expect_fail_reason "rollback same-count asset edit" "linked asset snapshot changed" rollback_sql
+db -c "UPDATE public.media_asset SET review_status='approved' WHERE id='ss-asset-1';"
+db -c "UPDATE public.content_calendar SET status='denied' WHERE source_media_asset_id='ss-asset-1';"
+expect_fail_reason "rollback same-count calendar edit" "calendar snapshot changed" rollback_sql
+db -c "UPDATE public.content_calendar SET status='approved' WHERE source_media_asset_id='ss-asset-1';"
+expect_value "failed rollbacks left source canonical" "crossfitsunnysidef574c0" \
+  "$(q "SELECT gym_id FROM public.media_source WHERE id='10f4bf47d5e24c4086fce5aa916e6768'")"
+
 db -c "INSERT INTO public.media_asset VALUES
        ('after-rebind','10f4bf47d5e24c4086fce5aa916e6768','crossfitsunnysidef574c0','photo',true,'approved');"
 expect_fail "rollback after asset manifest changed" rollback_sql
@@ -182,5 +247,9 @@ rollback_sql # rollback repeat is idempotent
 apply_sql
 expect_value "forward rebind after rollback" "crossfitsunnysidef574c0" \
   "$(q "SELECT gym_id FROM public.media_source WHERE id='10f4bf47d5e24c4086fce5aa916e6768'")"
+expect_value "full asset snapshot unchanged after round trips" "$ASSET_DIGEST" \
+  "$(q "SELECT md5(string_agg(row_to_json(a)::text, '|' ORDER BY a.id)) FROM public.media_asset a")"
+expect_value "full calendar snapshot unchanged after round trips" "$CALENDAR_DIGEST" \
+  "$(q "SELECT md5(string_agg(row_to_json(c)::text, '|' ORDER BY c.id)) FROM public.content_calendar c")"
 
 echo "PASS: CrossFit Sunnyside media-source rebind and rollback preconditions"
