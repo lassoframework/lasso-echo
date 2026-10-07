@@ -21,6 +21,8 @@ import sys
 
 from agent.historical_media_evidence_collect import (
     EvidenceCollectionError,
+    MAX_OBJECT_BYTES,
+    _url_ref,
     collect_pilot,
     write_manifest,
 )
@@ -123,31 +125,128 @@ def _read_existing(path, expected):
         raise BatchError("existing_manifest_permissions_invalid")
     # Full manifest identity is checked by canonical comparison, ensuring a
     # partial or edited artifact is never mistaken for a completed batch.
-    if not isinstance(value, dict) or value.get("batch_key") != expected:
+    manifest_fields = {"format", "batch_key", "batch_index", "batch_count",
+                       "selected_row_ids", "input_refs", "candidate_matches",
+                       "unknown", "cleared", "evidence"}
+    if (not isinstance(value, dict) or set(value) != manifest_fields or
+            value.get("batch_key") != expected):
         raise BatchError("existing_manifest_identity_mismatch")
     if value.get("format") != FORMAT or value.get("cleared") != 0:
         raise BatchError("existing_manifest_invalid")
     evidence = value.get("evidence")
     summary = evidence.get("summary") if isinstance(evidence, dict) else None
     evidence_rows = evidence.get("rows") if isinstance(evidence, dict) else None
-    if (not isinstance(evidence, dict) or not isinstance(summary, dict) or
+    if (not isinstance(evidence, dict) or
+            set(evidence) != {"format", "pilot_size", "summary", "rows"} or
+            not isinstance(summary, dict) or
             evidence.get("format") != "historical-media-evidence-pilot-v1" or
             summary.get("cleared") != 0 or
             not isinstance(evidence_rows, list) or
             evidence.get("pilot_size") != len(evidence_rows)):
         raise BatchError("existing_manifest_invalid")
+    ids = []
+    candidate_count = unknown_count = 0
+    row_fields = {"row_id", "gym_id", "post_date", "published_at",
+                  "provider_post_id_present", "source_asset_id", "source_id",
+                  "delivered_url_ref", "source_url_ref", "drive_file_ref",
+                  "delivered", "drive_original", "classification", "reason", "decision"}
     for row in evidence_rows:
-        if (not isinstance(row, dict) or row.get("decision") != "unresolved" or
+        if (not isinstance(row, dict) or set(row) != row_fields or
+                row.get("decision") != "unresolved" or
                 not isinstance(row.get("row_id"), str) or
                 row.get("classification") not in
                 ("candidate_exact_byte_match", "unknown")):
             raise BatchError("existing_manifest_invalid")
+        ids.append(row["row_id"])
+        delivered = row.get("delivered")
+        original = row.get("drive_original")
+        for record in (delivered, original):
+            if (not isinstance(record, dict) or
+                    set(record) != {"md5", "sha256", "byte_length"} or
+                    not isinstance(record.get("md5"), str) or
+                    not re.fullmatch(r"[0-9a-f]{32}", record["md5"]) or
+                    not isinstance(record.get("sha256"), str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) or
+                    not isinstance(record.get("byte_length"), int) or
+                    isinstance(record["byte_length"], bool) or
+                    not 1 <= record["byte_length"] <= MAX_OBJECT_BYTES):
+                raise BatchError("existing_manifest_hashes_invalid")
+        equal = delivered["sha256"] == original["sha256"]
+        if equal and delivered["md5"] != original["md5"]:
+            raise BatchError("existing_manifest_hashes_disagree")
+        expected_class = "candidate_exact_byte_match" if equal else "unknown"
+        expected_reason = ("same_tenant_exact_bytes_candidate" if equal
+                           else "byte_identity_differs_or_rendition")
+        if row.get("classification") != expected_class or row.get("reason") != expected_reason:
+            raise BatchError("existing_manifest_classification_invalid")
+        candidate_count += expected_class == "candidate_exact_byte_match"
+        unknown_count += expected_class == "unknown"
+    if (len(ids) != len(set(ids)) or
+            summary != {"candidate_exact_byte_match": candidate_count,
+                        "unknown": unknown_count, "cleared": 0}):
+        raise BatchError("existing_manifest_summary_invalid")
     return value
+
+
+def _expected_bindings(calendar_snapshot, asset_snapshot, row_ids):
+    calendar_rows = _rows(calendar_snapshot, "calendar")
+    asset_rows = _rows(asset_snapshot, "asset")
+    by_row = {row["id"]: row for row in calendar_rows
+              if isinstance(row, dict) and isinstance(row.get("id"), str)}
+    by_asset = {row["id"]: row for row in asset_rows
+                if isinstance(row, dict) and isinstance(row.get("id"), str)}
+    bindings = {}
+    for row_id in row_ids:
+        row = by_row[row_id]
+        asset = by_asset[row["source_media_asset_id"]]
+        delivered_url = row["image_url"]
+        source_url = row.get("source_media_url")
+        bindings[row_id] = {
+            "row_id": row_id,
+            "gym_id": row["gym_id"],
+            "post_date": row.get("post_date"),
+            "published_at": row.get("published_at"),
+            "provider_post_id_present": bool(
+                isinstance(row.get("late_post_id"), str) and row["late_post_id"].strip()),
+            "source_asset_id": row["source_media_asset_id"],
+            "source_id": asset["source_id"],
+            "delivered_url_ref": _url_ref(delivered_url),
+            "source_url_ref": _url_ref(source_url) if isinstance(source_url, str)
+            and source_url.strip() else None,
+            "drive_file_ref": "sha256:" + hashlib.sha256(asset["id"].encode()).hexdigest(),
+        }
+    return bindings
+
+
+def _validate_existing_bindings(manifest, row_batch, bindings, index, batch_count, refs):
+    evidence = manifest["evidence"]
+    rows_by_id = {row["row_id"]: row for row in evidence["rows"]}
+    if (manifest.get("selected_row_ids") != row_batch or
+            manifest.get("input_refs") != refs or
+            manifest.get("batch_index") != index or
+            manifest.get("batch_count") != batch_count or
+            evidence.get("pilot_size") != len(row_batch) or
+            set(rows_by_id) != set(row_batch)):
+        raise BatchError("existing_manifest_batch_mismatch")
+    for row_id in row_batch:
+        recorded = rows_by_id[row_id]
+        if any(recorded.get(field) != expected
+               for field, expected in bindings[row_id].items()):
+            raise BatchError("existing_manifest_snapshot_binding_mismatch")
+    if (manifest.get("candidate_matches") !=
+            evidence["summary"]["candidate_exact_byte_match"] or
+            manifest.get("unknown") != evidence["summary"]["unknown"]):
+        raise BatchError("existing_manifest_summary_invalid")
+
+
+def _configured_hosted_url_eligible(url):
+    from agent.visual_writer_prepare import _own_media_url
+    return _own_media_url(url)
 
 
 def run_batches(calendar_snapshot, asset_snapshot, source_snapshot, allowlist,
                 output_dir, *, delivered_reader, drive_reader, batch_size=10,
-                input_refs=None):
+                input_refs=None, hosted_url_validator=None):
     """Validate the full allowlist locally, then collect/resume bounded batches."""
     row_ids = _ids(allowlist)
     batches = _partition(row_ids, batch_size)
@@ -161,6 +260,21 @@ def run_batches(calendar_snapshot, asset_snapshot, source_snapshot, allowlist,
                       delivered_reader=lambda _url: b"preflight-only",
                       drive_reader=lambda _file_id: b"preflight-only")
 
+    url_validator = hosted_url_validator or _configured_hosted_url_eligible
+    row_bindings = _expected_bindings(calendar_snapshot, asset_snapshot, row_ids)
+    calendar_by_id = {item["id"]: item for item in _rows(calendar_snapshot, "calendar")
+                      if isinstance(item, dict) and isinstance(item.get("id"), str)}
+    for row_id in row_ids:
+        # Recover only the selected exact URL from the local snapshot. This
+        # check is configuration-only and runs before output or data readers.
+        url = calendar_by_id[row_id].get("image_url")
+        try:
+            eligible = bool(url_validator(url))
+        except Exception:
+            eligible = False
+        if not eligible:
+            raise BatchError("delivered_url_outside_configured_host")
+
     destination = _private_output_dir(output_dir)
     planned = []
     for index, row_batch in enumerate(batches, 1):
@@ -168,13 +282,8 @@ def run_batches(calendar_snapshot, asset_snapshot, source_snapshot, allowlist,
         path = destination / f"batch-{index:03d}-{key[:16]}.json"
         existing = _read_existing(path, key)
         if existing is not None:
-            if (existing.get("selected_row_ids") != row_batch or
-                    existing.get("input_refs") != refs or
-                    existing.get("batch_index") != index or
-                    existing.get("batch_count") != len(batches) or
-                    existing.get("evidence", {}).get("pilot_size") != len(row_batch) or
-                    {row["row_id"] for row in existing["evidence"]["rows"]} != set(row_batch)):
-                raise BatchError("existing_manifest_batch_mismatch")
+            _validate_existing_bindings(existing, row_batch, row_bindings,
+                                        index, len(batches), refs)
         planned.append((index, row_batch, key, path, existing))
 
     results = []

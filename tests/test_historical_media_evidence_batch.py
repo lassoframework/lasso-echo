@@ -10,6 +10,8 @@ from agent.historical_media_evidence_batch import (
     run_batches,
 )
 
+_test_host_ok = lambda url: isinstance(url, str) and url.startswith("https://media.invalid/")
+
 
 def _fixtures(count):
     calendar, assets, sources = [], [], []
@@ -44,7 +46,8 @@ def test_whole_allowlist_validates_before_any_reader_or_output(tmp_path):
     with pytest.raises(Exception, match="selected_row_not_published"):
         run_batches(calendar, assets, sources, allowlist, out,
                     delivered_reader=lambda url: reads.append(url) or b"delivered",
-                    drive_reader=lambda file_id: reads.append(file_id) or b"original")
+                    drive_reader=lambda file_id: reads.append(file_id) or b"original",
+                    hosted_url_validator=_test_host_ok)
     assert reads == []
     assert not out.exists()
 
@@ -61,7 +64,8 @@ def test_writes_hash_only_private_manifests_and_resumes_completed_batches(tmp_pa
 
     out = tmp_path / "private" / "evidence"
     first = run_batches(calendar, assets, sources, allowlist, out,
-                        delivered_reader=delivered, drive_reader=original)
+                        delivered_reader=delivered, drive_reader=original,
+                        hosted_url_validator=_test_host_ok)
     assert first["selected_rows"] == 11
     assert first["batch_count"] == 2
     assert first["resumed_batches"] == 0
@@ -78,7 +82,8 @@ def test_writes_hash_only_private_manifests_and_resumes_completed_batches(tmp_pa
         assert "same object" not in path.read_text()
 
     second = run_batches(calendar, assets, sources, allowlist, out,
-                         delivered_reader=delivered, drive_reader=original)
+                         delivered_reader=delivered, drive_reader=original,
+                         hosted_url_validator=_test_host_ok)
     assert second["resumed_batches"] == 2
     assert len(calls) == prior_calls
 
@@ -90,7 +95,8 @@ def test_source_mismatch_in_final_batch_prevents_all_remote_reads(tmp_path):
     with pytest.raises(Exception, match="media_source_tenant_mismatch"):
         run_batches(calendar, assets, sources, allowlist, tmp_path / "out",
                     delivered_reader=lambda url: calls.append(url) or b"delivered",
-                    drive_reader=lambda file_id: calls.append(file_id) or b"original")
+                    drive_reader=lambda file_id: calls.append(file_id) or b"original",
+                    hosted_url_validator=_test_host_ok)
     assert calls == []
     assert not (tmp_path / "out").exists()
 
@@ -99,7 +105,8 @@ def test_corrupt_existing_manifest_fails_before_any_remote_read(tmp_path):
     calendar, assets, sources, allowlist = _fixtures(5)
     out = tmp_path / "out"
     run_batches(calendar, assets, sources, allowlist, out,
-                delivered_reader=lambda _: b"d", drive_reader=lambda _: b"o")
+                delivered_reader=lambda _: b"d", drive_reader=lambda _: b"o",
+                hosted_url_validator=_test_host_ok)
     manifest = next(out.glob("batch-*.json"))
     manifest.write_text("not json")
     os.chmod(manifest, 0o600)
@@ -107,7 +114,8 @@ def test_corrupt_existing_manifest_fails_before_any_remote_read(tmp_path):
     with pytest.raises(BatchError, match="existing_manifest_unreadable"):
         run_batches(calendar, assets, sources, allowlist, out,
                     delivered_reader=lambda url: calls.append(url) or b"d",
-                    drive_reader=lambda file_id: calls.append(file_id) or b"o")
+                    drive_reader=lambda file_id: calls.append(file_id) or b"o",
+                    hosted_url_validator=_test_host_ok)
     assert calls == []
 
 
@@ -115,3 +123,49 @@ def test_corrupt_existing_manifest_fails_before_any_remote_read(tmp_path):
 def test_batch_size_is_bounded(batch_size):
     with pytest.raises(BatchError, match="batch_size_must_be_5_to_10"):
         _partition([str(i) for i in range(10)], batch_size)
+
+
+def test_outside_host_url_in_late_batch_fails_before_reads_or_output(tmp_path):
+    calendar, assets, sources, allowlist = _fixtures(11)
+    calendar["rows"][10]["image_url"] = "https://outside.invalid/obj"
+    calls = []
+    out = tmp_path / "never-created"
+    with pytest.raises(BatchError, match="delivered_url_outside_configured_host"):
+        run_batches(calendar, assets, sources, allowlist, out,
+                    delivered_reader=lambda url: calls.append(url) or b"delivered",
+                    drive_reader=lambda file_id: calls.append(file_id) or b"original",
+                    hosted_url_validator=_test_host_ok)
+    assert calls == []
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("mutation", ["remove_hash", "falsify_tenant", "falsify_source",
+                                      "falsify_summary"])
+def test_edited_manifest_is_rejected_before_resume_or_reads(tmp_path, mutation):
+    calendar, assets, sources, allowlist = _fixtures(5)
+    out = tmp_path / "out"
+    run_batches(calendar, assets, sources, allowlist, out,
+                delivered_reader=lambda _: b"same", drive_reader=lambda _: b"same",
+                hosted_url_validator=_test_host_ok)
+    path = next(out.glob("batch-*.json"))
+    manifest = json.loads(path.read_text())
+    row = manifest["evidence"]["rows"][0]
+    if mutation == "remove_hash":
+        del row["delivered"]["sha256"]
+    elif mutation == "falsify_tenant":
+        row["gym_id"] = "forged-gym"
+    elif mutation == "falsify_source":
+        row["source_id"] = "forged-source"
+    else:
+        manifest["candidate_matches"] = 0
+        manifest["evidence"]["summary"]["candidate_exact_byte_match"] = 0
+        manifest["evidence"]["summary"]["unknown"] = 5
+    path.write_text(json.dumps(manifest))
+    os.chmod(path, 0o600)
+    calls = []
+    with pytest.raises(BatchError):
+        run_batches(calendar, assets, sources, allowlist, out,
+                    delivered_reader=lambda url: calls.append(url) or b"same",
+                    drive_reader=lambda file_id: calls.append(file_id) or b"same",
+                    hosted_url_validator=_test_host_ok)
+    assert calls == []
