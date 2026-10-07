@@ -517,6 +517,124 @@ def test_known_route_held_stages_proof_before_posted(monkeypatch):
     assert row["delivery_status"] == "held"
 
 
+@pytest.mark.parametrize("mode", ["route_pending", "stale_cycle"])
+def test_immutable_held_readback_waits_one_minute_without_row_mutation(monkeypatch, mode):
+    now = datetime.now(timezone.utc)
+    clock = [100.0]
+    monkeypatch.setattr(outbox.time, "monotonic", lambda: clock[0])
+    row = {
+        "id": "immutable-held", "ticket_id": TICKET_ID,
+        "created_at": now.isoformat(), "delivery_status": "held",
+        "slack_ts": str(now.timestamp() + 5), "delivery_request_version": 3,
+        "attachments": {
+            "fixer_current_attempt_token": NOTICE_TOKEN,
+            "fixer_slack_delivery_uncertain": True,
+            "delivery_expected_status": "verification",
+            "fixer_slack_delivery_intent": {
+                "channel": "G_CLIENT", "thread_ts": "1.0", "body": "Exact body",
+                "sender": "U_ECHO", "not_before": now.isoformat(),
+                "request_key": None, "request_version": 3,
+            },
+        },
+    }
+    if mode == "route_pending":
+        row["attachments"]["fixer_route_pending"] = True
+    original = deepcopy(row)
+    reads, proofs, finishes = [], [], []
+
+    class HeldBus:
+        def pending_held_fixer_delivery(self, _identity, **_kw):
+            return [deepcopy(row)]
+
+        def ticket(self, _tid):
+            return {"request_version": 4 if mode == "stale_cycle" else 3,
+                    "status": "verification"}
+
+        def defer_held_fixer_reconcile(self, *_a):
+            pytest.fail("immutable rows must never persist a retry timestamp")
+
+        def record_held_fixer_readback(self, _mid, proof, **_kw):
+            proofs.append(proof)
+            return deepcopy(row)
+
+        def reconcile_held_fixer_delivery(self, *_a, **_kw):
+            pytest.fail("stale rows must not become posted")
+
+    bus = HeldBus()
+
+    def readback(channel, **_kw):
+        reads.append(clock[0])
+        messages = [] if clock[0] < 160 else [{
+            "ts": row["slack_ts"], "text": "Exact body", "user": "U_ECHO",
+            "thread_ts": "1.0",
+        }]
+        return {"ok": True, "channel": channel, "messages": messages}
+
+    def finish(*_a):
+        finishes.append(True)
+        return True
+
+    monkeypatch.setattr(outbox, "_finish_pending_route_notice", finish)
+    summary = {"reconciled_posted": 0}
+    for seconds in (100, 105, 159, 160, 165):
+        clock[0] = seconds
+        outbox._reconcile_held_fixer(
+            bus, SimpleNamespace(name="echo"), readback, lambda _msg: None, summary)
+    assert reads == [100, 160]
+    assert row == original
+    assert len(finishes) == (1 if mode == "route_pending" else 0)
+    assert len(proofs) == (1 if mode == "stale_cycle" else 0)
+    assert summary["reconciled_posted"] == (1 if mode == "route_pending" else 0)
+
+
+def test_immutable_readback_throttle_is_bounded_and_scoped_by_identity_and_row(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(outbox.time, "monotonic", lambda: clock[0])
+    bus = SimpleNamespace()
+    echo, other = SimpleNamespace(name="echo"), SimpleNamespace(name="other")
+    reserve = outbox._reserve_immutable_fixer_readback
+    assert reserve(bus, echo, {"id": "one"})
+    assert not reserve(bus, echo, {"id": "one"})
+    assert reserve(bus, other, {"id": "one"})
+    assert reserve(bus, echo, {"id": "two"})
+    for index in range(1100):
+        assert reserve(bus, echo, {"id": f"row-{index}"})
+    assert len(bus._fixer_immutable_readback_retries) == 1024
+    clock[0] = 160
+    assert reserve(bus, echo, {"id": "one"})
+    assert bus._fixer_immutable_readback_retries == {("echo", "one"): 220}
+
+
+@pytest.mark.parametrize("outcome", ["success", "lost_cas", "wrong_identity", "error"])
+def test_designated_suppression_logs_only_after_successful_cas(outcome):
+    row = {"id": "notice", "attachments": {
+        "fixer_current_attempt_token": NOTICE_TOKEN,
+        "identity": "other" if outcome == "wrong_identity" else "echo",
+    }}
+    logs, events = [], []
+
+    class SuppressionBus:
+        def suppress_unattempted_current_notice(self, *_a, **_kw):
+            events.append("cas")
+            if outcome == "error":
+                raise RuntimeError("CAS unavailable")
+            return {"delivery_status": "suppressed"} if outcome == "success" else None
+
+        def ensure_suppressed_current_notice_alert(self, *_a):
+            events.append("alert")
+
+    def log(message):
+        logs.append(message)
+        if "SUPPRESSED row" in message:
+            assert events == ["cas"]
+
+    summary = {"suppressed": 0, "skipped": 0}
+    outbox._suppress(SuppressionBus(), row, None, SimpleNamespace(name="echo"),
+                     "test reason", log, summary)
+    assert any("SUPPRESSED row" in message for message in logs) == (outcome == "success")
+    assert summary["suppressed"] == (1 if outcome == "success" else 0)
+
+
 def test_expired_token_claim_before_intent_is_suppressed_not_requeued():
     old = datetime.now(timezone.utc) - timedelta(minutes=5)
     row = {"id": "70164909-16b5-43df-b6a3-8d7499d51485",

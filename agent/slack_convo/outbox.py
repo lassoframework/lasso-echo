@@ -73,6 +73,7 @@ import hashlib
 import math
 import json
 import re
+import time
 
 from . import adapter as _a
 from .bus import BusError
@@ -1639,6 +1640,26 @@ def _reconcile_posted_fixer(bus, identity, log, summary):
                 f"{type(exc).__name__}")
 
 
+def _reserve_immutable_fixer_readback(bus, identity, row):
+    """Throttle readback without changing an immutable pending or stale row."""
+    now = time.monotonic()
+    retries = getattr(bus, "_fixer_immutable_readback_retries", None)
+    if not isinstance(retries, dict):
+        retries = {}
+        setattr(bus, "_fixer_immutable_readback_retries", retries)
+    for key, deadline in list(retries.items()):
+        if deadline <= now:
+            retries.pop(key, None)
+    key = (identity.name, row["id"])
+    if key in retries:
+        return False
+    # Keep memory bounded even with an unusually large identity/row set.
+    if len(retries) >= 1024:
+        retries.pop(min(retries, key=retries.get))
+    retries[key] = now + 60
+    return True
+
+
 def _reconcile_held_fixer(bus, identity, readback, log, summary):
     """Recover a late Slack success without ever sending the client row again."""
     page_limit = 200
@@ -1691,14 +1712,12 @@ def _reconcile_held_fixer(bus, identity, readback, log, summary):
                     "delivery_request_version")
                 or current_ticket.get("status") != markers.get(
                     "delivery_expected_status"))
-        if markers.get("fixer_route_pending") is True:
+        if markers.get("fixer_route_pending") is True or stale_cycle:
             # The 0384 pending row is immutable except for exact proof and the
-            # binder; a retry timestamp would violate its SQL guard.
-            reserved = row
-        elif stale_cycle:
-            # Stale held notices can gain readback proof for audit only.
-            # A retry timestamp would violate the narrow SQL stale guard.
-            reserved = row
+            # binder; stale rows can gain proof only. Reserve in memory before
+            # readback because retry timestamps violate both SQL guards.
+            if not _reserve_immutable_fixer_readback(bus, identity, row):
+                continue
         else:
             try:
                 reserved = bus.defer_held_fixer_reconcile(
@@ -1842,7 +1861,6 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
 
 
 def _suppress(bus, row, ticket, identity, why, log, summary, *, escalate=True):
-    log(f"[slack-convo/outbox] SUPPRESSED row {row['id']}: {why}")
     att = row.get("attachments") or {}
     if att.get("fixer_current_attempt_token"):
         # A designated notice may only terminate through the exact unsent CAS.
@@ -1859,6 +1877,7 @@ def _suppress(bus, row, ticket, identity, why, log, summary, *, escalate=True):
                 summary["skipped"] = int(summary.get("skipped") or 0) + 1
                 return
             summary["suppressed"] += 1
+            log(f"[slack-convo/outbox] SUPPRESSED row {row['id']}: {why}")
             bus.ensure_suppressed_current_notice_alert(row["id"], identity.name)
         except Exception as exc:  # noqa: BLE001 - terminal source scan retries staff INSERT
             log(f"[slack-convo/outbox] designated suppression/alert failed "
@@ -1866,6 +1885,7 @@ def _suppress(bus, row, ticket, identity, why, log, summary, *, escalate=True):
         return
     bus.mark_message(row["id"], "suppressed", meta_update={"suppressed_why": why})
     summary["suppressed"] += 1
+    log(f"[slack-convo/outbox] SUPPRESSED row {row['id']}: {why}")
     if escalate and ticket:
         # V-M5: a human sees every reply the bot declined to send.
         bus.record_outbound(
