@@ -376,3 +376,45 @@ def test_prewrite_identity_abort_restores_released_drive_assets(monkeypatch):
     # ...and the abort happened BEFORE any calendar mutation.
     assert store.deleted == []
     assert store.inserted == []
+
+
+def test_verified_calendar_rollback_restores_released_drive_assets(monkeypatch):
+    """A failed apply whose deleted rows were restored keeps the old Drive claims."""
+    from agent import build_lock
+    from agent.accounts import Account, Platform
+
+    monkeypatch.setenv("AGENT_CLIENT_MONTH", "true")
+    monkeypatch.setenv("AGENT_CLIENT_SOURCES", "true")
+    monkeypatch.setattr(cmr, "_client_media_count", lambda _path: 3)
+    monkeypatch.setattr(build_lock, "acquire", lambda *a, **k: True)
+    monkeypatch.setattr(build_lock, "start_heartbeat",
+                        lambda *a, **k: SimpleNamespace(stop=lambda: None))
+    monkeypatch.setattr(build_lock, "release", lambda *a, **k: None)
+    monkeypatch.setattr(cmr, "_locked_calendar_state",
+                        lambda *a, **k: (set(), set(), set()))
+    released = [("asset-1", "2026-10-15")]
+    restored = []
+    monkeypatch.setattr(
+        cmr, "_release_wipeable_drive_assets",
+        lambda *a, **k: list(released))
+    monkeypatch.setattr(
+        cmr, "_restore_released_drive_assets",
+        lambda _base, rows, _log: restored.append(list(rows)))
+    monkeypatch.setattr(
+        cmr, "_build_client_month_body",
+        lambda *a, **k: {
+            "ok": False, "inserted": 0, "deleted": 2, "deleted_total": 2,
+            "effective_deleted": 0, "rollback_restored": True,
+            "insert_outcome_unknown": False,
+        })
+
+    account = Account(key="gritx_ig", display_name="Grit X",
+                      platform=Platform.INSTAGRAM,
+                      token_env="GRITX_TOKEN", target_id_env="GRITX_IG_ID")
+    result = cmr.build_client_month(
+        account, "gritx", "2026-10-15", days=2,
+        voice=object(), library_path="/library", store=_RecordingStore(),
+        logger=lambda _m: None)
+
+    assert result["rollback_restored"] is True
+    assert restored == [released]

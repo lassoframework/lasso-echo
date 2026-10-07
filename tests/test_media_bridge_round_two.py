@@ -110,8 +110,9 @@ def test_drive_pickable_new_id_rearms_once(monkeypatch, tmp_path):
     class Store:
         def available(self):
             return True
-        def list_sources(self, gym):
-            return [{"kind": "gym_drive", "active": True,
+        def list_sources(self, gym, include_inactive=False):
+            return [{"id": "src1", "gym_id": gym,
+                     "kind": "gym_drive", "active": True,
                      "revoked_externally": False, "sync_status": "ready",
                      "sync_finished_at": "2026-10-02T00:00:00Z"}]
         def list_assets(self, gym):

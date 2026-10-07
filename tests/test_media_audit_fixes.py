@@ -1142,7 +1142,8 @@ def test_transient_drive_photo_failure_holds_a_local_video(monkeypatch, tmp_path
     out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1,
                                  voice=_voice(), library_path=lib, store=cal,
                                  banned_words=(), logger=logs.append)
-    assert out["ok"] is True
+    assert out["ok"] is False
+    assert out["reason"] == "no admissible photo posts"
     assert _feeds(cal) == []
     assert any("local video" in message and "Drive photo remains pickable" in message
                for message in logs)

@@ -149,6 +149,12 @@ def reconcile(*, http=None, clients=None, calendar_rows=None):
     for gid in sorted(clients.gym_ids):
         if not clients.is_client(gid):
             continue  # positive Echo marker is required at the write boundary
+        if (gid not in clients.valid_marker_ids
+                or gid in clients.invalid_marker_ids
+                or gid not in clients.valid_gym_row_ids
+                or gid in clients.invalid_gym_row_ids):
+            result["held"].append((gid, "invalid raw Echo identity"))
+            continue
         if by_id.get(gid):
             if len(by_id[gid]) > 1:
                 result["held"].append((gid, "duplicate registry gym_id"))
@@ -158,7 +164,7 @@ def reconcile(*, http=None, clients=None, calendar_rows=None):
             result["held"].append((gid, "missing portal gym name"))
             continue
         scheduled = calendar.get(gid, set())
-        issued = set(clients.token_keys_by_gym.get(gid, ()))
+        issued = set(clients.valid_token_keys_by_gym.get(gid, ()))
         candidates = scheduled if scheduled else issued
         if len(candidates) != 1:
             reason = "competing calendar bases" if scheduled else "no unique issued key"
@@ -176,6 +182,7 @@ def reconcile(*, http=None, clients=None, calendar_rows=None):
                 or base == "blake_personal" or base in hardcoded
                 or base not in owned_keys
                 or base in clients.ambiguous_keys
+                or base in clients.invalid_owner_keys
                 or clients.key_to_gym.get(base) != gid):
             result["held"].append((gid, "unsafe or ambiguous base"))
             continue

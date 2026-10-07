@@ -432,7 +432,8 @@ def test_cadence_noop_build_never_stamps_applied(monkeypatch, tmp_path):
 
 def test_apply_allow_reshape_skips_never_shrink_once(tmp_path, monkeypatch):
     """1x->2x mid-band (media between days and 2x days): fewer covered DATES with
-    MORE feeds is a legitimate reshape — _apply must write it when allow_reshape.
+    MORE feed SLOTS is growth, not shrinkage. The slot-aware guard may write it even
+    before the one-time allow_reshape hint; the hint remains valid and idempotent.
 
     Two feed slots land in one (account, post_date, format) slot on purpose here,
     so gritx's cadence must genuinely say 2 (SLOT CAPACITY, 2026-09-11 lasso
@@ -456,9 +457,9 @@ def test_apply_allow_reshape_skips_never_shrink_once(tmp_path, monkeypatch):
 
     from datetime import date
     store = _Existing(ppd=2)
-    blocked = cmr._apply("gritx", list(rows), date(2026, 10, 1), 30, store,
-                         lambda m: None)
-    assert blocked.get("noop_shrink") is True and store.inserted == []
+    first = cmr._apply("gritx", list(rows), date(2026, 10, 1), 30, store,
+                       lambda m: None)
+    assert first["ok"] and not first.get("noop_shrink") and store.inserted
 
     store2 = _Existing(ppd=2)
     applied = cmr._apply("gritx", list(rows), date(2026, 10, 1), 30, store2,
