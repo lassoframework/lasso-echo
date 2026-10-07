@@ -48,11 +48,16 @@ class _FakeStore:
     def __init__(self, ppd=None):
         self.deleted = []
         self.inserted = []
+        self.delete_preservation = []
         self._ppd = ppd
 
     def delete_month(self, base_key, month, *, preserve_human=True,
-                     preserve_dates=()):
+                     preserve_dates=(), preserve_slots=(), preserve_gbp=None):
         self.deleted.append((base_key, month))
+        self.delete_preservation.append({
+            "dates": set(preserve_dates), "slots": set(preserve_slots),
+            "gbp": dict(preserve_gbp or {}),
+        })
         return 0
 
     def insert_rows(self, base_key, rows):
@@ -301,6 +306,15 @@ def test_client_2x_locked_slot_untouched_open_slot_filled(tmp_path, monkeypatch)
     assert all(r.get("slot_index") == 1 for r in start_feeds)
     assert all(r.get("image_url") != "https://gritx.media/photo_00.jpg"
                for r in store.inserted if r.get("image_url"))
+    # The write preserves only the owned morning slot and its siblings. The
+    # evening slot must remain deletable so its stale drafts cannot accumulate.
+    preservation = next(p for (base, month), p in
+                        zip(store.deleted, store.delete_preservation)
+                        if month == _BUILD_START[:7])
+    assert _BUILD_START not in preservation["dates"]
+    assert (_BUILD_START, 0) in preservation["slots"]
+    assert (_BUILD_START, 1) not in preservation["slots"]
+    assert _BUILD_START in preservation["gbp"]
     # the owned morning slot is never re-planned
     assert not any(r.get("slot_index") == 0 and r["post_date"] == _BUILD_START
                    for r in ig_feeds)

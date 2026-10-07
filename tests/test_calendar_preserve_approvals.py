@@ -734,3 +734,123 @@ def test_cadence_insert_counts_recovered_story_without_reinserting_it(monkeypatc
     assert len(posted) == 1
     assert {(row['account'], row['format']) for row in posted[0]} == {
         ('instagram', 'feed'), ('facebook', 'feed')}
+
+
+@pytest.mark.parametrize('owned_ordinal', [0, None, 1])
+@pytest.mark.parametrize('span_days', [1, 2])
+@pytest.mark.parametrize('replace_gbp', [False, True])
+def test_partial_locked_day_rebuild_replaces_open_slot_idempotently(monkeypatch, tmp_path, owned_ordinal, span_days, replace_gbp):
+    """An approved feed retains its pending siblings, not the other cadence slot."""
+    from copy import deepcopy
+    from datetime import date
+    import re
+    from agent import cadence, client_month_run as cmr
+    monkeypatch.setenv('AGENT_DB_PATH', str(tmp_path / 'echo.db'))
+    monkeypatch.setenv('AGENT_MEDIA_CROSS_DAY_GUARD', 'false')
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **k: 2)
+    retained_slot = owned_ordinal or 0
+    open_slot = 1 - retained_slot
+    day = '2026-10-15'
+
+    def row(identity, slot, account='instagram', fmt='feed', status='pending'):
+        return dict(id=identity, gym_id='eng', post_date=day, account=account,
+                    format=fmt, status=status, slot_index=slot,
+                    variant_status='active', media_not_ready_reason=None,
+                    image_url=f'https://cdn/{identity}.jpg',
+                    created_at='2026-10-01T12:00:00+00:00',
+                    caption=f'Members build strength together {identity.replace("-", " ")}.')
+
+    owned = [row('approved', owned_ordinal, status='approved'),
+             row('owned-fb', owned_ordinal, 'facebook'),
+             row('owned-story', owned_ordinal, fmt='story')]
+    stale = [row('old-ig', open_slot), row('old-fb', open_slot, 'facebook'),
+             row('old-story', open_slot, fmt='story')]
+    outside = dict(row('outside', open_slot), post_date='2026-10-16')
+    foreign = dict(row('foreign', open_slot), gym_id='other-gym')
+    candidate = dict(row('candidate', open_slot), variant_status='candidate')
+
+    gbp = [row('gbp-update', None, 'googlebusiness', 'update'),
+           row('gbp-photo', None, 'googlebusiness', 'photo')]
+
+    class HTTP(_StateHTTP):
+        def delete(self, url, params=None, **kw):
+            # Exercise the real store's generated predicate. Model its nested slot
+            # guard independently of the caller's preservation set.
+            protected = set()
+            for pd, ordinal in re.findall(r'and\(post_date.eq.(\d{4}-\d{2}-\d{2}),'
+                                         r'(?:or\()?slot_index.eq.(\d+)', params.get('and', '')):
+                protected.add((pd, int(ordinal)))
+            gbp_guards = {}
+            for pd, replaced in re.findall(
+                    r'and\(post_date.eq.(\d{4}-\d{2}-\d{2}),account.eq.googlebusiness'
+                    r'(?:,or\(format.is.null,format.not.in.\(([^)]*)\)\))?\)', params.get('and', '')):
+                gbp_guards[pd] = set(replaced.split(',')) if replaced else set()
+            saved = [r for r in self.rows if
+                     (r['account'] != 'googlebusiness'
+                      and (r['post_date'], r.get('slot_index') or 0) in protected)
+                     or (r['account'] == 'googlebusiness'
+                         and r['post_date'] in gbp_guards
+                         and r['format'] not in gbp_guards[r['post_date']])]
+            self.rows = [r for r in self.rows if r not in saved]
+            response = super().delete(url, params=params, **kw)
+            self.rows.extend(saved)
+            return response
+
+    http = HTTP(owned + stale + [outside, foreign, candidate] + gbp)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, '_client', lambda self: http)
+
+    class Store(pcs.SupabaseCalendarStore):
+        def list_month(self, account_key, month):
+            return deepcopy([r for r in http.rows if r['gym_id'] == account_key
+                             and r['post_date'].startswith(month) and r['variant_status'] == 'active'])
+
+        def rows_in_range(self, account_key, first, last):
+            return [r for r in self.list_month(account_key, first[:7]) if first <= r['post_date'] <= last]
+
+        def preflight_cadence_rows(self, account_key, rows, *, replace_dates=()):
+            assert day in replace_dates
+            return rows
+
+        def insert_rows(self, account_key, rows, **kw):
+            inserted = [dict(r, id=f'new-{len(http.rows)}-{i}', variant_status='active',
+                             media_not_ready_reason=None) for i, r in enumerate(rows)]
+            http.rows.extend(inserted)
+            return inserted
+
+    incoming = [row('new-ig', open_slot), row('new-fb', open_slot, 'facebook'),
+                row('new-story', open_slot, fmt='story')]
+    if replace_gbp:
+        incoming.append(row('new-gbp', None, 'googlebusiness', 'update'))
+    for _ in range(2):
+        result = cmr._apply('eng', incoming, date(2026, 10, 15), span_days, Store(), lambda m: None,
+                            locked_days={day})
+        assert result['ok'], result
+        if span_days == 2:
+            # The open slot is being replaced, so it cannot also count as retained
+            # capacity. Three existing feeds would otherwise shrink to two.
+            assert result['noop_shrink']
+            assert result['deleted'] == result['inserted'] == 0
+            assert all(r in http.rows for r in owned + stale + [outside, foreign, candidate])
+            assert not any(method == 'delete' for method, _ in http.calls)
+            continue
+        assert result['deleted'] == result['deleted_total'] == (4 if replace_gbp else 3)
+        assert result['inserted'] == (4 if replace_gbp else 3)
+        assert all(r in http.rows for r in owned + [outside, foreign, candidate])
+        active = [r for r in http.rows if r['gym_id'] == 'eng' and r['post_date'] == day
+                  and r['variant_status'] == 'active']
+        assert len(active) == 8
+        assert gbp[1] in http.rows
+        assert len([r for r in active if r['account'] == 'googlebusiness']) == 2
+        if replace_gbp:
+            assert gbp[0] not in http.rows
+        else:
+            assert gbp[0] in http.rows
+        assert len([r for r in active if r['format'] == 'feed' and r['account'] == 'instagram']) == 2
+        assert not any(r['id'].startswith('old-') for r in http.rows)
+        params = next(params for method, params in reversed(http.calls) if method == 'delete')
+        assert f'post_date.eq.{day}' in params['and']
+        assert 'not.or(' in params['and']
+        assert params['media_not_ready_reason'] == 'is.null'
+        assert params['variant_status'] == 'eq.active'
+        if retained_slot == 0:
+            assert 'or(slot_index.eq.0,slot_index.is.null)' in params['and']
