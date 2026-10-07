@@ -1,11 +1,42 @@
--- DRAFT / UNAPPLIED / DEFAULT OFF. Requires claim, source-history and photo
--- certificate drafts. No credentials, keys, full-corpus evidence or activation.
+-- DRAFT / UNAPPLIED / DEFAULT OFF. Requires claim, observation bridge,
+-- source-history and photo certificate drafts. No credentials, keys,
+-- full-corpus evidence or activation.
 -- Signed visual judgment is verified by isolated auditor AND owner runtimes.
 -- PostgreSQL trusts authenticated immutable auditor receipts, not native Ed25519.
 -- Clearance is owner preparation, never a callback from a publisher. Byte
 -- occupancy handles sends/replays/siblings; near-scene nonmatch remains an
 -- explicit independent visual judgment against history AND reserved visuals.
 begin;
+-- Match current Drive photo eligibility, binding approval/moderation to the
+-- authenticated original SHA as well as tenant/asset/content hash. Missing
+-- fields are unknown and HOLD; pending review is never cleared by this draft.
+create function public.fixer_owner_photo_source_ready_20261007(p_asset_id text,p_sha256 text)
+returns boolean language plpgsql security definer set search_path=pg_catalog,public as $$
+declare ready boolean;
+begin
+ select coalesce(bool_and(
+  to_jsonb(a)->'eligible'='true'::jsonb
+  and coalesce(to_jsonb(a)->>'excluded_by_coach','false')='false'
+  and to_jsonb(a)->>'review_status'='approved' and to_jsonb(a)->>'moderation_status'='clean'
+  and nullif(btrim(to_jsonb(a)->>'reviewed_by'),'') is not null
+  and isfinite((to_jsonb(a)->>'reviewed_at')::timestamptz)
+  and nullif(btrim(a.content_hash),'') is not null and to_jsonb(a)->>'review_content_hash'=a.content_hash
+  and jsonb_typeof(to_jsonb(a)->'moderation_json')='object'
+  and to_jsonb(a)#>>'{moderation_json,verdict}'='clean'
+  and nullif(btrim(to_jsonb(a)#>>'{moderation_json,provider}'),'') is not null
+  and to_jsonb(a)#>>'{moderation_json,content_hash}'=a.content_hash
+  and to_jsonb(a)#>>'{moderation_json,asset_id}'=a.id
+  and to_jsonb(a)#>>'{moderation_json,gym_id}'=a.gym_id
+  and (to_jsonb(a)#>>'{moderation_json,people_detected}') is not distinct from to_jsonb(a)->>'people_detected'
+  and isfinite((to_jsonb(a)#>>'{moderation_json,observed_at}')::timestamptz)
+  and 'sha256:'||(to_jsonb(a)#>>'{moderation_json,sha256}')=p_sha256),false)
+ into ready from public.media_asset a where a.id=p_asset_id;
+ return ready;
+exception when invalid_datetime_format or datetime_field_overflow then
+ return false;
+end;
+$$;
+revoke all on function public.fixer_owner_photo_source_ready_20261007(text,text) from public,anon,authenticated,service_role;
 create table public.fixer_owner_photo_reservation_20261007 (
  audit_id uuid primary key references public.fixer_forward_media_photo_certificate_20261007(audit_id),
  receipt_ref text unique not null,
@@ -153,6 +184,7 @@ begin
    or src.source_sha256 is distinct from candidate->>'source_sha256'
    or src.source_fingerprint is distinct from candidate->>'source_fingerprint'
    or src.source_length is distinct from (candidate->>'source_length')::bigint
+   or not public.fixer_owner_photo_source_ready_20261007(src.source_asset_id,src.source_sha256)
    or candidate->>'content_digest' is distinct from 'sha256:'||encode(sha256(convert_to(content::text,'UTF8')),'hex')
    or cert.receipt_ref is distinct from 'photo-audit:sha256:'||encode(sha256(convert_to(cert.payload_json||E'\n'||cert.signature_hex,'UTF8')),'hex')
    or not exists(select 1 from public.media_asset a join public.media_source s on s.id=a.source_id
@@ -182,12 +214,21 @@ begin
    raise exception 'retired photo history epoch requires HOLD' using errcode='23514'; end if;
   if old.original_json is distinct from p_original or old.manifest_json is distinct from p_manifest then
    raise exception 'immutable owner photo identity conflict' using errcode='23514'; end if;
+  snap:=public.fixer_forward_media_photo_snapshot_20261007();
+  if snap->'policy_approved' is distinct from 'true'::jsonb or snap->'scope_complete' is distinct from 'true'::jsonb
+    or exists(select 1 from jsonb_array_elements(snap->'rows') h
+      where h->'resolved' is distinct from 'true'::jsonb or h->>'media_kind' is distinct from 'still_photo')
+    or exists(select 1 from public.fixer_forward_media_historical_original_20261007 h
+      where h.source_fingerprint=any(array[candidate->>'source_fingerprint',candidate->>'image_fingerprint'])) then
+   raise exception 'existing photo grant requires complete known current history' using errcode='23514'; end if;
   return clearance; -- owner idempotency, no new eligibility grant
  end if;
  if not exists(select 1 from public.content_calendar row where row.id=cert.calendar_row_id
    and row.status in ('draft','pending','queued','approved') and row.variant_status='active'
    and row.publish_claim_token is null and row.published_at is null and row.late_post_id is null
-   and row.render_manifest_digest is null and row.thumbnail_url is null) then
+   and row.render_manifest_digest is null and row.thumbnail_url is null and row.media_not_ready_reason is null)
+   or not exists(select 1 from public.media_asset a join public.media_source s on s.id=a.source_id
+    where a.id=src.source_asset_id and src.binding_revision=md5(jsonb_build_array(to_jsonb(a),to_jsonb(s))::text)) then
   raise exception 'new owner photo clearance requires an unsent canonical candidate' using errcode='23514'; end if;
  -- Every new approval sees all preceding reservations and sends. Missing/unknown
  -- legacy rows remain unresolved; signature shape or absence of hashes is never
@@ -280,13 +321,32 @@ revoke all on function public.fixer_photo_base_provenance_20261007(uuid) from pu
 create function public.fixer_forward_media_provenance_lookup_20261006(p_calendar_row_id uuid)
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
 declare provenance jsonb; grant_row public.fixer_owner_photo_reservation_20261007%rowtype;
- snap jsonb;
+ snap jsonb; content jsonb;
 begin
  perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
  provenance:=public.fixer_photo_base_provenance_20261007(p_calendar_row_id);
  select r.* into grant_row from public.fixer_owner_photo_reservation_20261007 r
  where r.receipt_ref=provenance#>>'{clearance,history_evidence_ref}';
  if found then
+  -- Hold current safety/source bindings until the attestation/claim commits.
+  -- A concurrent pending-moderation change must serialize before the check or
+  -- after the immutable grant; a stale SELECT cannot admit it in between.
+  perform 1 from public.media_asset a join public.media_source s on s.id=a.source_id
+    where a.id=grant_row.candidate_json->>'source_asset_id' for share of a,s;
+  perform 1 from public.fixer_forward_media_photo_state_20261007 where singleton for share;
+  content:=public.fixer_forward_media_photo_content_20261007(p_calendar_row_id);
+  if content->>'tenant_id' is distinct from grant_row.candidate_json->>'tenant_id'
+    or content->>'post_date' is distinct from grant_row.candidate_json->>'post_date'
+    or content->>'group_key' is distinct from grant_row.candidate_json->>'group_key' then
+   raise exception 'photo provenance requires signed tenant date and group' using errcode='23514'; end if;
+  if not public.fixer_owner_photo_source_ready_20261007(grant_row.candidate_json->>'source_asset_id',grant_row.candidate_json->>'source_sha256')
+    or not exists(select 1 from public.fixer_forward_media_source_receipt_20261007 src
+      join public.media_asset a on a.id=src.source_asset_id
+      join public.media_source s on s.id=a.source_id
+      where src.receipt_ref=grant_row.candidate_json->>'source_receipt_ref'
+       and a.gym_id=src.tenant_id and s.gym_id=a.gym_id and s.active and s.kind='gym_drive'
+       and s.id=src.source_id and s.folder_id=src.folder_id) then
+   raise exception 'photo provenance requires current approved byte-bound same-gym source' using errcode='23514'; end if;
   -- Recheck the signed rendition at the read/send boundary as well as INSERT.
   -- A manifest predating this guard must never inherit another rendition's
   -- positive source clearance merely because its tenant/source IDs match.
@@ -321,13 +381,151 @@ grant execute on function public.fixer_forward_media_provenance_lookup_20261006(
 create function public.fixer_owner_photo_corpus_write_lock_20261007()
 returns trigger language plpgsql security definer set search_path=pg_catalog,public as $$
 begin
- perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0)); return null;
+ if tg_table_name in ('fixer_forward_media_photo_state_20261007',
+   'fixer_forward_media_photo_key_revocation_20261007','fixer_owner_photo_revocation_20261007') then
+  -- These administrator-only negative-authority writes never run in publisher
+  -- transactions. Take the exclusive graph lock before their row locks.
+  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
+ else
+  perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+ end if;
+ return null;
 end; $$;
 revoke all on function public.fixer_owner_photo_corpus_write_lock_20261007() from public,anon,authenticated,service_role;
 do $$ declare t text; begin
  foreach t in array array['content_calendar','media_asset','media_source','fixer_forward_media_photo_state_20261007',
    'fixer_forward_media_photo_key_revocation_20261007','fixer_owner_photo_revocation_20261007'] loop
   execute format('create trigger owner_photo_corpus_write before insert or update or delete or truncate on public.%I for each statement execute function public.fixer_owner_photo_corpus_write_lock_20261007()',t);
- end loop;
+end loop;
 end; $$;
+
+-- Explicit reconciliation of an EXISTING grant. Never issue another certificate
+-- or positive decision against a corpus that now contains its own reservation.
+create function public.fixer_reconcile_owner_photo_20261007(p_audit_id uuid)
+returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
+declare r public.fixer_owner_photo_reservation_20261007%rowtype; clearance jsonb; progress jsonb;
+begin
+ if current_setting('transaction_isolation')<>'read committed' then
+  raise exception 'owner photo reconciliation requires read committed' using errcode='25000'; end if;
+ perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
+ select * into r from public.fixer_owner_photo_reservation_20261007 where audit_id=p_audit_id;
+ if not found then raise exception 'existing photo reservation required' using errcode='23514'; end if;
+ clearance:=public.fixer_prepare_owner_photo_20261007(p_audit_id,r.original_json,r.manifest_json);
+ if not exists(select 1 from public.fixer_forward_media_original_registry_20261006 original
+   where to_jsonb(original)-'registered_at'=r.original_json)
+  or not exists(select 1 from public.fixer_forward_media_history_clearance_20261006 h
+   where to_jsonb(h)-'checked_at'=clearance)
+  or not exists(select 1 from public.fixer_forward_media_render_manifest_20261006 m
+   where to_jsonb(m)-'registered_at'=r.manifest_json) then
+  raise exception 'exact durable photo authority required' using errcode='23514'; end if;
+ select jsonb_build_object('state',p.state,'outcome',p.outcome) into progress
+ from public.fixer_owner_photo_progress_20261007 p where p.audit_id=p_audit_id;
+ if progress->>'state'='final' and progress->'outcome' is distinct from jsonb_build_object(
+   'status','persisted','decision','cleared_unused','manifest_digest',r.manifest_json->>'manifest_digest') then
+  raise exception 'exact durable photo outcome required' using errcode='23514'; end if;
+ return jsonb_build_object('registry',r.original_json,'clearance',clearance,'manifest',r.manifest_json,
+   'replayed',true,'progress',progress,'certificate',public.fixer_forward_media_photo_certificate_20261007(p_audit_id));
+end; $$;
+revoke all on function public.fixer_reconcile_owner_photo_20261007(uuid) from public,anon,authenticated,service_role,
+ fixer_forward_media_attester_20261006,fixer_forward_media_photo_auditor_20261007;
+grant execute on function public.fixer_reconcile_owner_photo_20261007(uuid) to fixer_forward_media_owner_20261006;
+
+-- A signed certificate is admitted separately from completed HOLD-only source
+-- work. Durable quarantine precedes remote I/O and is never expired/retried.
+create table public.fixer_owner_photo_progress_20261007 (
+ audit_id uuid primary key references public.fixer_forward_media_photo_certificate_20261007(audit_id),
+ attempt_token uuid not null unique,
+ state text not null check(state in ('quarantine','final')),
+ outcome jsonb,
+ check((state='quarantine' and outcome is null) or (state='final' and outcome is not null))
+);
+alter table public.fixer_owner_photo_progress_20261007 enable row level security;
+revoke all on public.fixer_owner_photo_progress_20261007 from public,anon,authenticated,service_role,
+ fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006,fixer_forward_media_photo_auditor_20261007;
+
+create function public.fixer_assert_owner_photo_runtime_20261007()
+returns void language plpgsql security definer set search_path=pg_catalog,public as $$
+declare caller text:=coalesce(nullif(current_setting('role',true),'none'),session_user);
+begin
+ if not pg_has_role(caller,'fixer_forward_media_owner_20261006','member')
+  or pg_has_role(caller,'service_role','member') or pg_has_role(caller,'fixer_forward_media_photo_auditor_20261007','member') then
+  raise exception 'isolated dedicated owner required' using errcode='42501'; end if;
+ if current_setting('transaction_isolation')<>'read committed' then
+  raise exception 'owner photo runtime requires read committed' using errcode='25000'; end if;
+end; $$;
+revoke all on function public.fixer_assert_owner_photo_runtime_20261007() from public,anon,authenticated,service_role;
+
+create function public.fixer_owner_photo_pending_20261007(p_tenants text[],p_limit integer)
+returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
+declare snap jsonb;
+begin
+ perform public.fixer_assert_owner_photo_runtime_20261007();
+ if p_tenants is null or cardinality(p_tenants) not between 1 and 32 or p_limit is null or p_limit not between 1 and 100 then
+  raise exception 'bounded owner photo tenant scope required' using errcode='23514'; end if;
+ snap:=public.fixer_forward_media_photo_snapshot_20261007();
+ return coalesce((select jsonb_agg(item order by tenant_rank,audit_id) from (
+  select jsonb_build_object('audit_id',c.audit_id,'calendar_row_id',r.id,'revision',md5(to_jsonb(r)::text),
+   'recipe',o.observation_json::jsonb->'recipe') item,c.audit_id,
+   row_number() over(partition by r.gym_id order by c.audit_id) tenant_rank
+  from public.fixer_forward_media_photo_certificate_20261007 c
+  join public.fixer_forward_media_photo_key_20261007 k on k.key_id=c.key_id
+  join public.fixer_forward_media_photo_policy_20261007 policy on policy.policy_id=k.policy_id
+  join public.fixer_forward_media_photo_state_20261007 state on state.singleton
+  join public.content_calendar r on r.id=c.calendar_row_id
+  join public.fixer_forward_media_source_receipt_20261007 src
+    on src.receipt_ref=c.payload_json::jsonb#>>'{candidate,source_receipt_ref}'
+  join public.fixer_forward_media_observation_20261007 o
+    on o.calendar_row_id=r.id and o.row_revision=src.row_revision
+  where r.gym_id=any(p_tenants) and r.gym_id=c.payload_json::jsonb#>>'{candidate,tenant_id}'
+   and k.approved and policy.approved and state.enabled and nullif(btrim(state.routes_reconciled_ref),'') is not null
+   and c.baseline_id=state.baseline_id and c.generation=state.generation
+   and c.spine_digest=snap->>'spine_digest'
+   and not exists(select 1 from public.fixer_forward_media_photo_key_revocation_20261007 v where v.key_id=k.key_id)
+   and r.status in ('draft','pending','queued','approved') and r.variant_status='active'
+   and r.publish_claim_token is null and r.published_at is null and r.late_post_id is null
+   and r.render_manifest_digest is null and r.thumbnail_url is null
+   and r.media_not_ready_reason is null
+   and public.fixer_owner_photo_source_ready_20261007(src.source_asset_id,src.source_sha256)
+   and not exists(select 1 from public.fixer_owner_photo_progress_20261007 p where p.audit_id=c.audit_id)
+   and not exists(select 1 from public.fixer_owner_photo_reservation_20261007 p where p.audit_id=c.audit_id)
+  order by tenant_rank,c.audit_id limit p_limit) candidates),'[]'::jsonb);
+end; $$;
+
+create function public.fixer_owner_photo_reserve_20261007(p_audit_id uuid,p_token uuid)
+returns boolean language plpgsql security definer set search_path=pg_catalog,public as $$
+begin
+ perform public.fixer_assert_owner_photo_runtime_20261007();
+ if p_token is null then raise exception 'owner photo attempt token required' using errcode='23514'; end if;
+ perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
+ if exists(select 1 from public.fixer_owner_photo_reservation_20261007 where audit_id=p_audit_id) then return false; end if;
+ insert into public.fixer_owner_photo_progress_20261007(audit_id,attempt_token,state)
+ values(p_audit_id,p_token,'quarantine') on conflict(audit_id) do nothing;
+ return found;
+end; $$;
+
+create function public.fixer_owner_photo_finish_20261007(p_audit_id uuid,p_token uuid,p_outcome jsonb)
+returns boolean language plpgsql security definer set search_path=pg_catalog,public as $$
+declare r public.fixer_owner_photo_reservation_20261007%rowtype; p public.fixer_owner_photo_progress_20261007%rowtype;
+begin
+ perform public.fixer_assert_owner_photo_runtime_20261007();
+ perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
+ select * into p from public.fixer_owner_photo_progress_20261007 where audit_id=p_audit_id and attempt_token=p_token for update;
+ if not found then raise exception 'exact owner photo attempt required' using errcode='23514'; end if;
+ select * into r from public.fixer_owner_photo_reservation_20261007 where audit_id=p_audit_id;
+ if not found or p_outcome is distinct from jsonb_build_object('status','persisted','decision','cleared_unused',
+   'manifest_digest',r.manifest_json->>'manifest_digest') then
+  raise exception 'exact owner photo authority outcome required' using errcode='23514'; end if;
+ if p.state='final' then
+  if p.outcome is distinct from p_outcome then raise exception 'immutable owner photo outcome conflict' using errcode='23514'; end if;
+  return true;
+ end if;
+ update public.fixer_owner_photo_progress_20261007 set state='final',outcome=p_outcome where audit_id=p_audit_id;
+ return true;
+end; $$;
+revoke all on function public.fixer_owner_photo_pending_20261007(text[],integer),
+ public.fixer_owner_photo_reserve_20261007(uuid,uuid),public.fixer_owner_photo_finish_20261007(uuid,uuid,jsonb)
+ from public,anon,authenticated,service_role,fixer_forward_media_attester_20261006,fixer_forward_media_photo_auditor_20261007;
+grant execute on function public.fixer_owner_photo_pending_20261007(text[],integer),
+ public.fixer_owner_photo_reserve_20261007(uuid,uuid),public.fixer_owner_photo_finish_20261007(uuid,uuid,jsonb)
+ to fixer_forward_media_owner_20261006;
 commit;

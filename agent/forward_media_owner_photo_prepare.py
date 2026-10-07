@@ -1,4 +1,4 @@
-"""DRAFT isolated owner positive photo preparation, no factory or activation.
+"""DRAFT isolated owner positive photo preparation, separately gated runtime.
 
 Remote Drive/hosted reads and deterministic replay finish before final locks.
 The owner independently verifies Ed25519 and exact candidate/corpus, then SQL
@@ -9,12 +9,12 @@ original/clearance/manifest tuple. No publisher uses this adapter.
 from dataclasses import dataclass
 import hashlib
 import json
+import uuid
 
 from . import forward_media_prepare as prepare
 from .forward_media_attester import replay_still_recipe, validate_still_recipe
 from .forward_media_owner import ForwardMediaOwnerPersistence, ObjectReader
 from .forward_media_photo_certificate import IndependentPhotoAuditor, PhotoCertificateHold, digest
-from .forward_media_source_history import SourceHistoryStore
 from .forward_media_source_verifier import verify_source
 
 
@@ -34,6 +34,45 @@ class _FrozenBytes(ObjectReader):
         if url not in self.values:
             raise PhotoCertificateHold('certified_owner_bytes_unavailable')
         return self.values[url]
+
+
+def reconcile_owner_photo(persistence, audit_id):
+    """Recheck an existing grant only; caller owns transaction/COMMIT.
+
+    This does not compare the grant against a new corpus as a new candidate and
+    creates no eligibility. SQL rechecks the immutable identity and current
+    negative authority; the owner independently verifies the stored signature.
+    No remote reads or automatic retry of an uncertain COMMIT occur here.
+    progress=None means authority-only manual preparation; quarantine means its
+    runtime outcome is unverified. Only final/persisted is durable worker proof.
+    """
+    if type(persistence) is not ForwardMediaOwnerPersistence:
+        raise PhotoCertificateHold('dedicated_prepared_owner_photo_required')
+    persistence._assert_owner_identity()
+    with persistence._conn.cursor() as cursor:
+        cursor.execute('select public.fixer_reconcile_owner_photo_20261007(%s)', (audit_id,))
+        result = cursor.fetchone()[0]
+    try:
+        packet, key = result['certificate']['packet'], result['certificate']['approved_key']
+        payload = packet['payload']
+        if (key.get('approved') is not True or payload['audit_id'] != audit_id
+                or payload['key_id'] != key['key_id'] or payload['auditor_id'] != key['auditor_id']
+                or payload['policy_id'] != key['policy_id']):
+            raise ValueError()
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from .forward_media_photo_certificate import canonical
+        payload_json = canonical(payload)
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(key['public_key_hex'])).verify(
+            bytes.fromhex(packet['signature_hex']), payload_json.encode())
+        ref = 'photo-audit:sha256:' + hashlib.sha256(
+            (payload_json+'\n'+packet['signature_hex']).encode()).hexdigest()
+        if (result['manifest']['render_evidence_ref'] != ref
+                or result['clearance']['history_evidence_ref'] != 'owner-photo-reservation:'+ref
+                or result['replayed'] is not True):
+            raise ValueError()
+    except Exception:
+        raise PhotoCertificateHold('existing_photo_signature_or_identity_invalid') from None
+    return {k: result[k] for k in ('registry', 'clearance', 'manifest', 'replayed', 'progress')}
 
 
 def prepare_remote_photo(snapshot, *, drive_reader, hosted_reader, recipe, auditor, audit_id):
@@ -90,7 +129,11 @@ def stage_prepared_photo(persistence, prepared):
     if type(persistence) is not ForwardMediaOwnerPersistence or type(prepared) is not PreparedOwnerPhoto:
         raise PhotoCertificateHold('dedicated_prepared_owner_photo_required')
     persistence._assert_owner_identity()
-    original = SourceHistoryStore(persistence).stage_source(prepared.source)
+    # The independent certificate already refers to a committed source receipt.
+    # Re-inserting it would revalidate its obsolete full calendar revision after
+    # the service binder changes render_manifest_digest. SQL instead checks the
+    # immutable receipt, current source binding and signed creative under locks.
+    original = prepared.source.original
     with persistence._conn.cursor() as cursor:
         cursor.execute('select public.fixer_prepare_owner_photo_20261007(%s,%s::jsonb,%s::jsonb)',
             (prepared.certificate.payload['audit_id'], json.dumps(original.row()),
@@ -100,3 +143,75 @@ def stage_prepared_photo(persistence, prepared):
     frozen = ForwardMediaOwnerPersistence(persistence._conn, persistence._expected_owner,
         _FrozenBytes(prepared.source, prepared.manifest.image_url, prepared.image_bytes))
     return frozen.persist_in_transaction(original, clearance, prepared.manifest)
+
+
+def run_photo_pass(*, persistence, reader, drive_reader, tenants, limit):
+    """Bounded signed-certificate worker pass, reached by owner_worker.run_once.
+
+    A durable attempt quarantine precedes remote I/O. Authority and its outcome
+    share one acknowledged final COMMIT. Failed reads, crashes and uncertain
+    commits remain excluded from discovery for manual reconciliation.
+    """
+    from .forward_media_source_history import SourceHistoryStore
+    from .forward_media_owner import UncertainCommitError
+    from psycopg.pq import TransactionStatus
+    reports = []
+    if (type(persistence) is not ForwardMediaOwnerPersistence
+            or persistence._conn.info.transaction_status != TransactionStatus.IDLE):
+        return {'status': 'hold', 'reason': 'owner_transaction_contract_required', 'rows': []}
+    conn = persistence._conn
+
+    def rpc(name, args):
+        with conn.cursor() as cursor:
+            cursor.execute('select public.fixer_owner_photo_'+name+'_20261007('
+                           + ','.join(['%s']*len(args))+')', args)
+            return cursor.fetchone()[0]
+
+    def commit():
+        try:
+            conn.commit()
+        except Exception:
+            raise UncertainCommitError('owner photo commit uncertain') from None
+
+    try:
+        persistence._assert_owner_identity()
+        candidates = rpc('pending', (list(tenants), limit))
+        conn.rollback()
+        if not isinstance(candidates, list) or len(candidates) > limit:
+            raise PhotoCertificateHold('certified_owner_batch_invalid')
+        for candidate in candidates:
+            audit_id = str(uuid.UUID(candidate['audit_id']))
+            token = str(uuid.uuid4())
+            persistence._assert_owner_identity()
+            reserved = rpc('reserve', (audit_id, token))
+            commit()
+            if reserved is not True:
+                # Another worker admitted the exact audit; never duplicate it.
+                continue
+            try:
+                snapshot = SourceHistoryStore(persistence).snapshot(
+                    candidate['calendar_row_id'], candidate['revision'])
+                prepared = prepare_remote_photo(snapshot, drive_reader=drive_reader,
+                    hosted_reader=reader, recipe=candidate['recipe'],
+                    auditor=IndependentPhotoAuditor(conn, persistence._expected_owner), audit_id=audit_id)
+                conn.rollback()  # End read-only certificate tx before final locks.
+                staged = stage_prepared_photo(persistence, prepared)
+                outcome = {'status': 'persisted', 'decision': 'cleared_unused',
+                           'manifest_digest': staged['manifest']['manifest_digest']}
+                if rpc('finish', (audit_id, token, json.dumps(outcome))) is not True:
+                    raise PhotoCertificateHold('certified_owner_outcome_unverified')
+                commit()
+                reports.append({'audit_id': audit_id, 'calendar_row_id': candidate['calendar_row_id'], **outcome})
+            except UncertainCommitError:
+                raise
+            except Exception:
+                conn.rollback()
+                reports.append({'audit_id': audit_id, 'calendar_row_id': candidate['calendar_row_id'],
+                                'status': 'hold', 'reason': 'certified_owner_verification_failed'})
+    except UncertainCommitError:
+        # Never re-admit the audit or continue after a lost COMMIT response.
+        return {'status': 'hold', 'reason': 'uncertain_authority_commit', 'rows': reports}
+    except Exception:
+        conn.rollback()
+        return {'status': 'hold', 'reason': 'certified_owner_transport_unavailable', 'rows': reports}
+    return {'status': 'partial_hold' if any(r['status']=='hold' for r in reports) else 'complete', 'rows': reports}

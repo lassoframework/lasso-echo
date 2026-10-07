@@ -5,7 +5,8 @@ import unittest
 import uuid
 from unittest.mock import patch
 
-from agent.forward_media_owner_photo_prepare import prepare_remote_photo,stage_prepared_photo
+from agent.forward_media_owner_photo_prepare import prepare_remote_photo,stage_prepared_photo,reconcile_owner_photo
+from agent.forward_media_owner import ForwardMediaOwnerPersistence
 from agent.forward_media_photo_certificate import IndependentPhotoAuditor,PhotoCertificateHold,digest
 from agent.forward_media_source_verifier import verify_source
 from agent.forward_media_attester import make_still_recipe
@@ -82,5 +83,27 @@ class OwnerPhotoTests(unittest.TestCase):
     def test_untyped_fake_positive_callback_cannot_stage(self):
         with self.assertRaisesRegex(PhotoCertificateHold,'dedicated_prepared_owner_photo_required'):
             stage_prepared_photo(object(),object())
+
+    def test_existing_grant_reconciliation_checks_real_signature_and_outcome(self):
+        snap,drive,data,recipe,packet,auditor,rpc=self.setup_candidate()
+        with patch.object(auditor,'_rpc',side_effect=rpc):
+            prepared=prepare_remote_photo(snap,drive_reader=drive,hosted_reader=Hosted(data),
+                recipe=recipe,auditor=auditor,audit_id=packet['payload']['audit_id'])
+        key=rpc('certificate',())['approved_key']
+        result={'registry':prepared.source.original.row(),'manifest':prepared.manifest.row(),
+            'clearance':{'history_evidence_ref':'owner-photo-reservation:'+prepared.certificate.receipt_ref},
+            'replayed':True,'progress':{'state':'final','outcome':{'status':'persisted'}},
+            'certificate':{'packet':packet,'approved_key':key}}
+        class ExistingCursor(Cursor):
+            def fetchone(self):return (result,)
+        class ExistingConnection(Connection):
+            def cursor(self):return ExistingCursor()
+        persistence=ForwardMediaOwnerPersistence(ExistingConnection(),'offline_owner',Hosted(data))
+        with patch.object(persistence,'_assert_owner_identity'):
+            readback=reconcile_owner_photo(persistence,packet['payload']['audit_id'])
+            self.assertEqual(readback['progress']['state'],'final')
+            packet['signature_hex']='00'*64
+            with self.assertRaisesRegex(PhotoCertificateHold,'existing_photo_signature_or_identity_invalid'):
+                reconcile_owner_photo(persistence,packet['payload']['audit_id'])
 
 if __name__=='__main__':unittest.main()

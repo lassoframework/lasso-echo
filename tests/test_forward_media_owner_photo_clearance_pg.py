@@ -15,14 +15,15 @@ import sys
 import tempfile
 import time
 import uuid
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
-from agent import forward_media_owner as owner, forward_media_guard as guard, forward_media_attester as attester, media_host
+from agent import forward_media_owner as owner, forward_media_guard as guard, forward_media_attester as attester, media_host, forward_media_owner_worker as worker
 from agent.forward_media_source_history import SourceHistoryStore
 from agent.forward_media_source_verifier import verify_source
 from agent.forward_media_photo_certificate import IndependentPhotoAuditor,digest,PhotoCertificateHold
-from agent.forward_media_owner_photo_prepare import prepare_remote_photo,stage_prepared_photo
+from agent.forward_media_owner_photo_prepare import prepare_remote_photo,stage_prepared_photo,reconcile_owner_photo
 from tests.test_forward_media_source_verifier import Drive,Hosted,FILE,FOLDER,URL
 from tests.test_forward_media_owner_two_phase_pg import png
 from tests.test_forward_media_photo_certificate import fixtures
@@ -52,7 +53,12 @@ def main():
        'create table content_calendar(id uuid primary key,gym_id text,post_date date,account text,format text,gbp_location_id text,status text,variant_status text,published_at timestamptz,publish_claim_token uuid,publish_reservation_day date,late_post_id text,image_url text,thumbnail_url text,media_not_ready_reason text,caption text);'
        'create table media_source(id text primary key,gym_id text,kind text,folder_id text,active boolean);'
        'create table media_asset(id text primary key,source_id text,gym_id text,content_hash text,rendition_url text);')
-   for name in ('DRAFT_fixer_forward_media_claim_20261006.sql','DRAFT_fixer_forward_media_source_history_20261007.sql','DRAFT_fixer_forward_media_photo_certificate_20261007.sql','DRAFT_fixer_owner_photo_clearance_20261007.sql'):
+   sql("alter table media_asset add column eligible boolean default true,add column excluded_by_coach boolean default false,add column review_status text default 'approved',add column moderation_status text default 'clean',add column review_content_hash text,add column reviewed_by text default 'SYNTHETIC reviewer',add column reviewed_at timestamptz default now(),add column moderation_json jsonb,add column people_detected boolean default false,add column used_count integer default 0")
+   def approved_asset(asset_id,data_bytes):
+    md5=hashlib.md5(data_bytes).hexdigest()
+    proof={'verdict':'clean','provider':'SYNTHETIC scanner','content_hash':md5,'asset_id':asset_id,'gym_id':'gym','people_detected':False,'observed_at':'2026-10-07T00:00:00Z','sha256':hashlib.sha256(data_bytes).hexdigest()}
+    sql('update media_asset set content_hash=%s,review_content_hash=%s,moderation_json=%s::jsonb where id=%s',(md5,md5,json.dumps(proof),asset_id))
+   for name in ('DRAFT_fixer_forward_media_claim_20261006.sql','DRAFT_fixer_forward_media_observation_bridge_20261007.sql','DRAFT_fixer_forward_media_source_history_20261007.sql','DRAFT_fixer_forward_media_photo_certificate_20261007.sql','DRAFT_fixer_owner_photo_clearance_20261007.sql'):
     sql((ROOT/'migrations'/name).read_text())
    sql('create role photo_owner login;grant fixer_forward_media_owner_20261006 to photo_owner;'
        'create role photo_auditor login;grant fixer_forward_media_photo_auditor_20261007 to photo_auditor;'
@@ -65,7 +71,8 @@ def main():
    drive.meta['size']=str(len(source_bytes));drive.meta['md5Checksum']=hashlib.md5(source_bytes).hexdigest()
    hosted=Hosted(source_bytes)
    sql('insert into media_source values(%s,%s,%s,%s,true)',('source','gym','gym_drive',FOLDER))
-   sql('insert into media_asset values(%s,%s,%s,null,null)',(FILE,'source','gym'))
+   sql('insert into media_asset(id,source_id,gym_id) values(%s,%s,%s)',(FILE,'source','gym'))
+   approved_asset(FILE,source_bytes)
    def new_row(day='2026-10-10',fmt='feed',account='instagram'):
     rid=str(uuid.uuid4())
     sql("insert into content_calendar(id,gym_id,post_date,account,format,status,variant_status,visual_group_key,source_media_asset_id,source_media_url,image_url,caption) values(%s,'gym',%s,%s,%s,'approved','active','group',%s,%s,%s,'SYNTHETIC creative')",(rid,day,account,fmt,FILE,URL,URL))
@@ -101,7 +108,8 @@ def main():
    # concurrent owner preparation must wait, then reject that stale review after
    # the first candidate becomes a reserved visual. No pairwise blind spot.
    other_file=FILE+'Second';other_url=URL+'&second=1';other_bytes=png('green')
-   sql('insert into media_asset values(%s,%s,%s,null,null)',(other_file,'source','gym'))
+   sql('insert into media_asset(id,source_id,gym_id) values(%s,%s,%s)',(other_file,'source','gym'))
+   approved_asset(other_file,other_bytes)
    other_rid=new_row();sql('update content_calendar set source_media_asset_id=%s,source_media_url=%s,image_url=%s where id=%s',(other_file,other_url,other_url,other_rid))
    class OtherDrive(Drive):
     def original_bytes(self,file_id):
@@ -117,6 +125,20 @@ def main():
    other_packet,_,_,_=fixtures(candidate=other_candidate,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
    IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(other_packet);auditor_conn.commit()
    other_prepared=prepare_remote_photo(other_current,drive_reader=other_drive,hosted_reader=Hosted(other_bytes),recipe=recipe,auditor=owner_auditor,audit_id=other_packet['payload']['audit_id']);conn.rollback()
+   sql("update media_asset set review_status='pending_review',moderation_status='pending' where id=%s",(FILE,))
+   denied(lambda:stage_prepared_photo(p,prepared),'current exact same gym source');conn.rollback()
+   assert sql('select count(*) from fixer_owner_photo_reservation_20261007')[0][0]==0
+   sql("update media_asset set review_status='approved',moderation_status='clean' where id=%s",(FILE,))
+   sql("update media_asset set moderation_json=jsonb_set(moderation_json,'{observed_at}',to_jsonb('malformed timestamp'::text)) where id=%s",(FILE,))
+   assert sql('select fixer_owner_photo_source_ready_20261007(%s,%s)',(FILE,candidate['source_sha256']))[0][0] is False
+   approved_asset(FILE,source_bytes)
+   sql("update media_asset set moderation_json=jsonb_set(moderation_json,'{sha256}',to_jsonb(%s::text)) where id=%s",('0'*64,FILE))
+   denied(lambda:stage_prepared_photo(p,prepared),'current exact same gym source');conn.rollback()
+   approved_asset(FILE,source_bytes)
+   sql("update content_calendar set media_not_ready_reason='SYNTHETIC preserve safety hold' where id=%s",(rid,))
+   denied(lambda:stage_prepared_photo(p,prepared),'unsent canonical candidate');conn.rollback()
+   assert sql('select media_not_ready_reason from content_calendar where id=%s',(rid,))[0][0]=='SYNTHETIC preserve safety hold'
+   sql('update content_calendar set media_not_ready_reason=null where id=%s',(rid,))
    result=stage_prepared_photo(p,prepared)
    assert result['clearance']['decision']=='cleared_unused'
    assert sql('select count(*) from fixer_owner_photo_reservation_20261007')[0][0]==0
@@ -132,7 +154,7 @@ def main():
     waiting=pool.submit(competing_owner)
     deadline=time.monotonic()+5
     while time.monotonic()<deadline:
-     if sql("select count(*) from pg_stat_activity where wait_event_type='Lock' and query like 'select public.fixer_forward_media_source_record%'")[0][0]:break
+     if sql("select count(*) from pg_stat_activity where wait_event_type='Lock' and query like 'select public.fixer_prepare_owner_photo%'")[0][0]:break
      time.sleep(.02)
     else:raise AssertionError('second owner did not wait behind first graph transaction')
     conn.commit()
@@ -196,18 +218,135 @@ def main():
     return row_id,token,eid,rev
    def claim(binding):
     with lane('service_role') as service:return service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',binding).fetchone()[0]
+   # Before ANY claim, an unsigned different day/group must fail at the
+   # actual attester caller, so it cannot steal the source's first occupancy.
+   for unsigned in (new_row(day='2026-10-11'),new_row()):
+    if sql('select post_date::text from content_calendar where id=%s',(unsigned,))[0][0]=='2026-10-10':
+     sql("update content_calendar set visual_group_key='unsigned-other-group' where id=%s",(unsigned,))
+    try:ready_claim(unsigned,'2026-10-11');raise AssertionError('unsigned date/group attested')
+    except guard.ForwardMediaVerificationHold as exc:
+     assert 'signed tenant date and group' in str(exc.__cause__),str(exc.__cause__)
+   with lane('service_role') as service:
+    assert service.execute('select fixer_bind_forward_media_manifest_20261006(%s)',(rid,)).fetchone()[0]
+   # Prepared adapter replay after the binder changes full row revision, and
+   # fresh process reconciliation, preserve the ONE existing authority grant.
+   assert stage_prepared_photo(p,prepared)['replayed'] is True;conn.commit()
+   assert reconcile_owner_photo(p,packet['payload']['audit_id'])['replayed'] is True;conn.rollback()
+   assert sql('select count(*) from fixer_owner_photo_reservation_20261007')[0][0]==1
    first=ready_claim(rid);second=ready_claim(new_row(fmt='story'));third=ready_claim(new_row(fmt='feed',account='facebook'))
    assert claim(first) is True and claim(first) is True
+   # A safety downgrade that owns the asset row before a claim must serialize
+   # first; the real claim then sees pending moderation instead of stale clean.
+   safety_writer=psycopg.connect(dsn())
+   safety_writer.execute("update media_asset set review_status='pending_review',moderation_status='pending' where id=%s",(FILE,))
+   with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+    waiting_claim=pool.submit(claim,first)
+    deadline=time.monotonic()+5
+    while time.monotonic()<deadline:
+     if sql("select count(*) from pg_stat_activity where wait_event_type='Lock' and query like 'select fixer_claim_forward_media%' ")[0][0]:break
+     time.sleep(.02)
+    else:raise AssertionError('claim did not wait behind current safety update')
+    safety_writer.commit()
+    denied(lambda:waiting_claim.result(timeout=8),'current approved byte-bound same-gym source')
+   safety_writer.close()
+   denied(lambda:claim(first),'current approved byte-bound same-gym source')
+   sql("update media_asset set review_status='approved',moderation_status='clean',used_count=used_count+1 where id=%s",(FILE,))
+   assert reconcile_owner_photo(p,packet['payload']['audit_id'])['replayed'] is True;conn.rollback()
    assert claim(second) is True and claim(third) is True
    assert claim(first) is True
    assert sql('select count(*) from fixer_forward_media_claim_receipt_20261006')[0][0]==3
-   other=ready_claim(new_row(day='2026-10-11'),'2026-10-11')
    fourth=ready_claim(new_row(fmt='story'))
    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-    good=pool.submit(claim,fourth);bad=pool.submit(claim,other)
+    good=pool.submit(claim,fourth);bad=pool.submit(ready_claim,new_row(day='2026-10-11'),'2026-10-11')
     assert good.result(timeout=8) is True
-    denied(lambda:bad.result(timeout=8))
+    try:bad.result(timeout=8);raise AssertionError('unsigned day attested concurrently')
+    except guard.ForwardMediaVerificationHold as exc:
+     assert 'signed tenant date and group' in str(exc.__cause__),str(exc.__cause__)
    assert claim(first) is True
+   # A fresh independent certificate after prior sends has reviewed the now
+   # reserved/published visuals. Real production run_once discovers it, commits
+   # durable admission before remote readers, and atomically persists outcome.
+   fresh_packet,_,_,_=fixtures(candidate=other_candidate,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+   IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(fresh_packet);auditor_conn.commit()
+   sql('insert into fixer_forward_media_observation_20261007(calendar_row_id,row_revision,observation_digest,tenant_id,gym_id,source_asset_id,source_exact_url,delivered_exact_url,calendar_snapshot,observation_json,digest_input) values(%s,%s,%s,\'gym\',\'gym\',%s,%s,%s,\'{}\'::jsonb,%s,\'SYNTHETIC producer recipe\')',(other_rid,other_revision,'a'*64,other_file,other_url,other_url,json.dumps({'recipe':recipe})))
+   os.environ[worker.WORKER_ENV]='true';os.environ[worker.PHOTO_CLEARANCE_ENV]='true';os.environ[worker.TENANTS_ENV]='gym'
+   class IdleHosted(Hosted):
+    def read(self,url):
+     assert sql("select count(*) from pg_stat_activity where usename='photo_owner' and state='idle in transaction'")[0][0]==0
+     return super().read(url)
+   with patch.object(owner,'HostedObjectReader',return_value=IdleHosted(other_bytes)),patch('agent.forward_media_source_verifier.OriginalDriveReader',return_value=other_drive):
+    live_report=worker.run_once()
+   assert live_report['status']=='complete',live_report
+   assert len(live_report['rows'])==1 and live_report['rows'][0]['status']=='persisted',live_report
+   assert live_report['rows'][0]['audit_id']==fresh_packet['payload']['audit_id']
+   assert sql("select state,outcome->>'status' from fixer_owner_photo_progress_20261007 where audit_id=%s",(fresh_packet['payload']['audit_id'],))[0]==('final','persisted')
+   from agent.forward_media_owner_photo_prepare import run_photo_pass
+   conn.rollback()
+   empty=run_photo_pass(persistence=p,reader=Hosted(other_bytes),drive_reader=other_drive,tenants=('gym',),limit=25)
+   assert empty=={'status':'complete','rows':[]},empty
+   reconciled=reconcile_owner_photo(p,fresh_packet['payload']['audit_id'])
+   assert reconciled['replayed'] is True and reconciled['progress']['state']=='final';conn.rollback()
+   def signed_runtime_candidate(color,tag):
+    data_bytes=png(color);asset_id=FILE+tag;url=URL+'&'+tag+'=1';row_id=new_row()
+    sql('insert into media_asset(id,source_id,gym_id) values(%s,%s,%s)',(asset_id,'source','gym'))
+    approved_asset(asset_id,data_bytes)
+    sql('update content_calendar set source_media_asset_id=%s,source_media_url=%s,image_url=%s where id=%s',(asset_id,url,url,row_id))
+    class CandidateDrive(Drive):
+     def original_bytes(self,file_id):
+      assert file_id==asset_id;return self.data
+    candidate_drive=CandidateDrive();candidate_drive.data=data_bytes
+    candidate_drive.meta.update(id=asset_id,size=str(len(data_bytes)),md5Checksum=hashlib.md5(data_bytes).hexdigest())
+    revision_now=sql('select md5(to_jsonb(r)::text) from content_calendar r where id=%s',(row_id,))[0][0]
+    source_now=verify_source(store.snapshot(row_id,revision_now),candidate_drive,Hosted(data_bytes))
+    store.stage_source(source_now);conn.commit()
+    candidate_now={**candidate,'calendar_row_id':row_id,'source_asset_id':asset_id,'source_url':url,'image_url':url,
+     'source_fingerprint':source_now.original.source_fingerprint,'source_sha256':source_now.evidence['source_sha256'],
+     'source_length':len(data_bytes),'source_receipt_ref':source_now.receipt_ref,
+     'image_fingerprint':source_now.original.source_fingerprint,'image_sha256':source_now.evidence['source_sha256'],'image_length':len(data_bytes),
+     'content_digest':sql("select 'sha256:'||encode(sha256(convert_to(fixer_forward_media_photo_content_20261007(%s)::text,'UTF8')),'hex')",(row_id,))[0][0]}
+    certificate,_,_,_=fixtures(candidate=candidate_now,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+    IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(certificate);auditor_conn.commit()
+    sql('insert into fixer_forward_media_observation_20261007(calendar_row_id,row_revision,observation_digest,tenant_id,gym_id,source_asset_id,source_exact_url,delivered_exact_url,calendar_snapshot,observation_json,digest_input) values(%s,%s,%s,\'gym\',\'gym\',%s,%s,%s,\'{}\'::jsonb,%s,\'SYNTHETIC producer recipe\')',(row_id,revision_now,'a'*64,asset_id,url,url,json.dumps({'recipe':recipe})))
+    return certificate,data_bytes,candidate_drive
+   lost_packet,lost_bytes,lost_drive=signed_runtime_candidate('red','LostCommit')
+   class LostCommitResponse:
+    def __init__(self,raw,fail_on=2):self.raw=raw;self.commits=0;self.fail_on=fail_on
+    def __getattr__(self,name):return getattr(self.raw,name)
+    def commit(self):
+     self.commits+=1;self.raw.commit()
+     if self.commits==self.fail_on:raise RuntimeError('SYNTHETIC COMMIT response lost')
+   wrapped=LostCommitResponse(psycopg.connect(dsn('photo_owner')))
+   lost_persistence=owner.ForwardMediaOwnerPersistence(wrapped,'photo_owner',Hosted(lost_bytes))
+   with patch.object(owner,'HostedObjectReader',return_value=IdleHosted(lost_bytes)),patch('agent.forward_media_source_verifier.OriginalDriveReader',return_value=lost_drive),patch.object(owner.ForwardMediaOwnerPersistence,'connect_from_environment',return_value=lost_persistence):
+    lost_report=worker.run_once()
+   assert lost_report=={'status':'hold','reason':'uncertain_authority_commit','rows':[]},lost_report
+   assert wrapped.commits==2 and wrapped.raw.closed
+   conn.rollback()
+   lost_readback=reconcile_owner_photo(p,lost_packet['payload']['audit_id']);conn.rollback()
+   assert lost_readback['progress']['state']=='final' and lost_readback['progress']['outcome']['status']=='persisted'
+   crash_packet,crash_bytes,crash_drive=signed_runtime_candidate('black','ReadCrash')
+   class FailedRemote(Hosted):
+    def read(self,url):
+     assert sql('select state from fixer_owner_photo_progress_20261007 where audit_id=%s',(crash_packet['payload']['audit_id'],))[0][0]=='quarantine'
+     raise RuntimeError('SYNTHETIC remote crash after durable admission')
+   with patch.object(owner,'HostedObjectReader',return_value=FailedRemote(crash_bytes)),patch('agent.forward_media_source_verifier.OriginalDriveReader',return_value=crash_drive):
+    crash_report=worker.run_once()
+   assert crash_report['status']=='partial_hold' and len(crash_report['rows'])==1,crash_report
+   assert sql('select count(*) from fixer_owner_photo_reservation_20261007 where audit_id=%s',(crash_packet['payload']['audit_id'],))[0][0]==0
+   assert sql('select state from fixer_owner_photo_progress_20261007 where audit_id=%s',(crash_packet['payload']['audit_id'],))[0][0]=='quarantine'
+   conn.rollback()
+   assert run_photo_pass(persistence=p,reader=FailedRemote(crash_bytes),drive_reader=crash_drive,tenants=('gym',),limit=25)=={'status':'complete','rows':[]}
+   initial_packet,initial_bytes,initial_drive=signed_runtime_candidate('yellow','InitialCommitLost')
+   class NoRemote(Hosted):
+    def read(self,url):raise AssertionError('remote read after uncertain admission COMMIT')
+   initial_wrapped=LostCommitResponse(psycopg.connect(dsn('photo_owner')),fail_on=1)
+   initial_persistence=owner.ForwardMediaOwnerPersistence(initial_wrapped,'photo_owner',NoRemote(initial_bytes))
+   with patch.object(owner,'HostedObjectReader',return_value=NoRemote(initial_bytes)),patch('agent.forward_media_source_verifier.OriginalDriveReader',return_value=initial_drive),patch.object(owner.ForwardMediaOwnerPersistence,'connect_from_environment',return_value=initial_persistence):
+    initial_report=worker.run_once()
+   assert initial_report=={'status':'hold','reason':'uncertain_authority_commit','rows':[]},initial_report
+   assert initial_wrapped.commits==1 and initial_wrapped.raw.closed
+   assert sql('select state from fixer_owner_photo_progress_20261007 where audit_id=%s',(initial_packet['payload']['audit_id'],))[0][0]=='quarantine'
+   assert sql('select count(*) from fixer_owner_photo_reservation_20261007 where audit_id=%s',(initial_packet['payload']['audit_id'],))[0][0]==0
    # Unknown newly observed legacy history holds an existing grant; removing the
    # synthetic unknown row restores the same epoch without a new positive audit.
    unknown=str(uuid.uuid4());sql("insert into content_calendar(id,gym_id,status,image_url) values(%s,'other','published','https://media.example.test/unknown.png')",(unknown,))
@@ -225,7 +364,7 @@ def main():
    sql('insert into fixer_owner_photo_revocation_20261007 values(%s,%s)',(packet['payload']['audit_id'],'SYNTHETIC revoke'))
    denied(lambda:claim(first),'revoked')
    conn.close();auditor_conn.close();admin.close()
-   print('PASS PG17 owner signed certificate + exact bytes/source/recipe grant; OFF/drift/direct bypass holds; atomic reservation+authority; concurrent prepared-visual corpus hold; replay+3 exact-rendition siblings and different Story rendition hold; concurrent different-day hold; unknown history/epoch/revocation holds')
+   print('PASS PG17 signed owner grant; OFF/moderation/byte-binding/safety-hold/direct bypass holds; atomic reservation+authority; concurrent stale corpus hold; signed date/group before first claim; post-binder replay + stored-signature reconciliation; IG/FB/Story siblings; different Story rendition hold; production owner-worker factory with acknowledged outcome; initial/final lost COMMIT and remote crash quarantine/no-retry; unknown history/epoch/revocation holds')
   finally:
    subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 

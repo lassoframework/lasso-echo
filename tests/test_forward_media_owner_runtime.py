@@ -12,6 +12,7 @@ from agent import forward_media_source_verifier as source_module
 
 @pytest.fixture
 def runtime(monkeypatch):
+    monkeypatch.delenv(worker.PHOTO_CLEARANCE_ENV, raising=False)
     for key in list(os.environ):
         if owner._FORBIDDEN_ENV_NAME.search(key) or key in worker._FORBIDDEN:
             monkeypatch.delenv(key)
@@ -67,6 +68,27 @@ def test_one_pass_composes_only_isolated_readers_and_owner_connection(runtime):
     assert worker.run_once() is runtime.report
     assert runtime.events == ['hosted', 'connect', 'transport', 'drive', 'adapter', 'close']
     assert runtime.conn.closed
+
+
+def test_explicit_photo_gate_routes_existing_factory_to_signed_pass(runtime, monkeypatch):
+    from agent import forward_media_owner_photo_prepare as photo
+    monkeypatch.setenv(worker.PHOTO_CLEARANCE_ENV, 'true')
+    report = {'status': 'complete', 'rows': [{'status': 'persisted'}]}
+    def signed_pass(**kwargs):
+        runtime.events.append('signed_pass')
+        assert kwargs['persistence']._conn is runtime.conn
+        assert kwargs['tenants'] == ('gym',) and kwargs['limit'] == 25
+        return report
+    monkeypatch.setattr(photo, 'run_photo_pass', signed_pass)
+    assert worker.run_once() is report
+    assert runtime.events == ['hosted', 'connect', 'drive', 'signed_pass', 'close']
+
+
+def test_photo_gate_alone_cannot_enable_owner_worker(runtime, monkeypatch):
+    monkeypatch.delenv(worker.WORKER_ENV)
+    monkeypatch.setenv(worker.PHOTO_CLEARANCE_ENV, 'true')
+    assert worker.run_once() == {'status': 'disabled', 'rows': []}
+    assert runtime.events == []
 
 
 def test_default_off_constructs_nothing_even_with_missing_owner_configuration(runtime, monkeypatch):
@@ -128,12 +150,13 @@ def test_cleanup_failure_preserves_acknowledged_hold_receipts_and_stays_static(r
 @pytest.mark.parametrize('report,exit_code', [
     ({'status': 'disabled', 'rows': []}, 0),
     ({'status': 'complete', 'rows': []}, 0),
-    ({'status': 'complete', 'rows': [{'status': 'persisted'}]}, 2),
+    ({'status': 'complete', 'rows': [{'status': 'persisted'}]}, 0),
+    ({'status': 'complete', 'rows': [{'status': 'hold'}]}, 2),
     ({'status': 'complete', 'rows': None}, 2),
     ({'status': 'partial_hold', 'rows': [{'status': 'hold'}]}, 2),
     ({'status': 'hold', 'reason': 'owner_transport_unavailable', 'rows': []}, 2),
 ])
-def test_cli_success_is_only_disabled_or_confirmed_empty_pass(monkeypatch, capsys, report, exit_code):
+def test_cli_success_is_disabled_empty_or_acknowledged_persisted_pass(monkeypatch, capsys, report, exit_code):
     monkeypatch.setattr(worker, 'run_once', lambda: report)
     assert worker.main([]) == exit_code
     assert json.loads(capsys.readouterr().out) == report

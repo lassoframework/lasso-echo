@@ -6,6 +6,8 @@ receipts+hold outcome together and preserves quarantine on crashes/unknown
 commits. Unknown history never creates the asset's unique immutable authority
 clearance, so a later reviewed positive audit can prepare that authority.
 Producer observations and used_count=0 never establish authority.
+The separate default-OFF photo-clearance mode admits independently stored signed
+certificates, with durable quarantine before reads and atomic authority/outcome.
 The generic adapter also supports offline fixtures; those are not live proof.
 """
 from __future__ import annotations
@@ -24,6 +26,7 @@ from .forward_media_prepare import register_original
 
 WORKER_ENV = 'AGENT_FORWARD_MEDIA_OWNER_WORKER'
 TENANTS_ENV = 'AGENT_FORWARD_MEDIA_OWNER_TENANTS'
+PHOTO_CLEARANCE_ENV = 'AGENT_FORWARD_MEDIA_OWNER_PHOTO_CLEARANCE'
 _TENANT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
 _FORBIDDEN = ('AGENT_SOCIALAPI_KEY', 'AGENT_SOCIALAPI_ENC_KEY', 'ZERNIO_API_KEY',
               'AGENT_GBP_ACCESS_TOKEN', 'AGENT_FORWARD_MEDIA_ATTESTER_DSN',
@@ -354,7 +357,7 @@ def run_adapter(*, transport, persistence, reader, drive_reader=None):
 
 
 def run_once():
-    """One isolated owner pass, default OFF; concrete history remains HOLD-only.
+    """One isolated owner pass, default OFF; signed clearance separately gated.
 
     No reader/connection overrides or service credential fallback. This entry
     point owns the connection and closes it after acknowledged outcomes or any
@@ -363,7 +366,7 @@ def run_once():
     if not worker_enabled():
         return {'status': 'disabled', 'rows': []}
     try:
-        settings_from_environment()
+        tenants, limit = settings_from_environment()
     except OwnerWorkerHold as exc:
         return {'status': 'hold', 'reason': str(exc), 'rows': []}
     persistence = None
@@ -373,9 +376,14 @@ def run_once():
         from .forward_media_owner_transport import DedicatedOwnerTransport
         reader = owner.HostedObjectReader()
         persistence = owner.ForwardMediaOwnerPersistence.connect_from_environment(reader=reader)
-        transport = DedicatedOwnerTransport(persistence)
-        report = run_adapter(transport=transport, persistence=persistence,
-                             reader=reader, drive_reader=OriginalDriveReader())
+        if os.getenv(PHOTO_CLEARANCE_ENV, '').lower() in ('1', 'true', 'yes', 'on'):
+            from .forward_media_owner_photo_prepare import run_photo_pass
+            report = run_photo_pass(persistence=persistence, reader=reader,
+                                    drive_reader=OriginalDriveReader(), tenants=tenants, limit=limit)
+        else:
+            transport = DedicatedOwnerTransport(persistence)
+            report = run_adapter(transport=transport, persistence=persistence,
+                                 reader=reader, drive_reader=OriginalDriveReader())
     except owner.UncertainCommitError:
         report = {'status': 'hold', 'reason': 'uncertain_authority_commit', 'rows': []}
     except OwnerWorkerHold as exc:
@@ -400,7 +408,8 @@ def main(argv=None):
     report = run_once()
     print(json.dumps(report, sort_keys=True))
     return 0 if (report['status'] == 'disabled'
-                 or (report['status'] == 'complete' and report.get('rows') == [])) else 2
+                 or (report['status'] == 'complete' and isinstance(report.get('rows'), list)
+                     and all(row.get('status') == 'persisted' for row in report['rows']))) else 2
 
 
 if __name__ == '__main__':
