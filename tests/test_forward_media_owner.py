@@ -1,0 +1,388 @@
+"""Fake-DB tests for agent/forward_media_owner.py (owner-only persistence adapter)."""
+import json
+import pytest
+
+from agent.forward_media_prepare import (
+    PreparationError,
+    build_render_manifest,
+    prepare_generated_original,
+)
+from agent.forward_media_owner import (
+    CURRENT_USER,
+    EnvironmentGuardError,
+    ForwardMediaOwnerPersistence,
+    ObjectReader,
+    OwnerPersistenceError,
+    UncertainCommitError,
+    check_environment,
+)
+
+OWNER = 'forward_media_owner_20261006'
+TABLE_SUFFIX = {'registry': 'original_registry', 'clearance': 'history_clearance',
+                'manifest': 'render_manifest'}
+COLUMNS = {
+    'registry': ['tenant_id', 'source_asset_id', 'source_url', 'source_fingerprint',
+                 'source_length', 'registry_evidence_ref'],
+    'clearance': ['tenant_id', 'source_asset_id', 'source_url', 'source_fingerprint',
+                  'source_length', 'registry_evidence_ref', 'decision',
+                  'history_evidence_ref'],
+    'manifest': ['manifest_digest', 'tenant_id', 'source_asset_id', 'image_url',
+                 'image_fingerprint', 'image_length', 'thumbnail_url',
+                 'thumbnail_fingerprint', 'thumbnail_length', 'operation',
+                 'render_recipe', 'render_evidence_ref'],
+}
+SRC_BYTES = b'owner-verified original bytes'
+IMG_BYTES = b'rendered image bytes v1'
+THUMB_BYTES = b'thumbnail bytes v1'
+STORE = {'https://cdn.example.com/original.jpg': SRC_BYTES,
+         'https://cdn.example.com/render.jpg': IMG_BYTES,
+         'https://cdn.example.com/thumb.jpg': THUMB_BYTES}
+
+
+class FakeReader(ObjectReader):
+    """Trusted configured reader over an in-memory object store."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def read(self, url):
+        if url not in self.store:
+            raise KeyError(f'trusted reader has no bytes for {url}')
+        return self.store[url]
+
+
+class FakeCursor:
+    def __init__(self, conn):
+        self.conn = conn
+        self.description = None
+
+    def execute(self, query, params=None):
+        self.conn.executed.append((query, params))
+        self.conn.last_query = query
+        self.conn.last_result = self.conn._run(query, params or {})
+        if query.strip().lower() == CURRENT_USER:
+            self.description = [('current_user',)]
+        else:
+            table = self.conn._table(query)
+            self.description = [(c,) for c in COLUMNS[table]] if table else None
+
+    def fetchone(self):
+        if not self.conn.last_result:
+            return None
+        if self.conn.last_query.strip().lower() == CURRENT_USER:
+            return (self.conn.last_result[0]['current_user'],)
+        return tuple(self.conn.last_result[0][c] for c in COLUMNS[self.conn._table(self.conn.last_query)])
+
+    def fetchall(self):
+        cols = COLUMNS[self.conn._table(self.conn.last_query)]
+        return [tuple(row[c] for c in cols) for row in self.conn.last_result]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeConnection:
+    """In-memory stand-in matching the DB-API surface the adapter uses."""
+
+    def __init__(self, current_user=OWNER, fail_commit=False):
+        self.autocommit = False
+        self.tables = {t: {} for t in TABLE_SUFFIX}
+        self.current_user = current_user
+        self.fail_commit = fail_commit
+        self.executed = []
+        self.last_query = ''
+        self.last_result = []
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self):
+        return FakeCursor(self)
+
+    def commit(self):
+        if self.fail_commit:
+            raise RuntimeError('connection lost during COMMIT')
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def _table(self, query):
+        q = query.lower()
+        return next((t for t, sfx in TABLE_SUFFIX.items()
+                     if f'fixer_forward_media_{sfx}_20261006' in q), None)
+
+    def _run(self, query, params):
+        q = ' '.join(query.lower().split())
+        if q.startswith('select current_user'):
+            return [{'current_user': self.current_user}]
+        table = self._table(q)
+        assert table, q
+        if q.startswith('select'):
+            rows = list(self.tables[table].values())
+            if table == 'manifest':
+                rows = [r for r in rows if r['manifest_digest'] == params['manifest_digest']]
+            else:
+                rows = [r for r in rows if r['tenant_id'] == params['tenant_id']
+                        and r['source_asset_id'] == params['source_asset_id']]
+            return rows
+        if q.startswith('insert'):
+            key = params['manifest_digest'] if table == 'manifest' \
+                else (params['tenant_id'], params['source_asset_id'])
+            assert key not in self.tables[table], 'duplicate insert'
+            record = dict(params)
+            if table == 'manifest':
+                record['render_recipe'] = json.loads(record['render_recipe'])
+            self.tables[table][key] = record
+            return []
+        raise AssertionError(f'unexpected query {q}')
+
+    def corrupt(self, table, field, value):
+        for row in self.tables[table].values():
+            row[field] = value
+
+
+@pytest.fixture
+def prepared():
+    original, clearance = prepare_generated_original(
+        tenant_id='gym-1', source_asset_id='asset-1',
+        source_url='https://cdn.example.com/original.jpg', source_bytes=SRC_BYTES,
+        generation_evidence_ref='gen-receipt:owner-produced-now',
+        registry_evidence_ref='registry-evidence:owner-verified',
+        history_evidence_ref='history-audit:independent-fleet-wide')
+    manifest = build_render_manifest(
+        original, image_url='https://cdn.example.com/render.jpg',
+        image_bytes=IMG_BYTES, operation='render',
+        thumbnail_url='https://cdn.example.com/thumb.jpg',
+        thumbnail_bytes=THUMB_BYTES,
+        render_recipe={'op': 'overlay'}, render_evidence_ref='render-evidence:owner')
+    return original, clearance, manifest, FakeReader(STORE)
+
+
+@pytest.fixture(autouse=True)
+def owner_environment(monkeypatch):
+    monkeypatch.setenv('FORWARD_MEDIA_OWNER_DSN', 'postgres://owner@localhost/fake')
+    for name in ('SUPABASE_SERVICE_ROLE_KEY', 'META_PUBLISH_TOKEN'):
+        monkeypatch.delenv(name, raising=False)
+
+
+def adapter(conn=None, reader=None):
+    conn = conn or FakeConnection()
+    reader = reader or FakeReader(STORE)
+    return ForwardMediaOwnerPersistence(conn, OWNER, reader), conn
+
+
+# --- happy path --------------------------------------------------------------
+def test_persists_all_three_rows_in_one_transaction(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    result = svc.persist(original, clearance, manifest)
+    assert conn.commits == 1 and conn.rollbacks == 0
+    assert len(conn.tables['registry']) == len(conn.tables['clearance']) == 1
+    assert len(conn.tables['manifest']) == 1
+    assert not result['replayed']
+    order = [q.split()[2].removeprefix('public.') for q, _ in conn.executed if q.startswith('insert')]
+    assert order == ['fixer_forward_media_original_registry_20261006',
+                     'fixer_forward_media_history_clearance_20261006',
+                     'fixer_forward_media_render_manifest_20261006']
+
+
+def test_idempotent_exact_replay(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    svc.persist(original, clearance, manifest)
+    result = svc.persist(original, clearance, manifest)
+    assert result['replayed'] is True
+    assert len(conn.tables['registry']) == 1  # no duplicate rows
+    assert conn.commits == 2
+
+
+def test_idempotent_replay_fails_closed_on_persisted_diff(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    svc.persist(original, clearance, manifest)
+    conn.corrupt('clearance', 'decision', 'hold_used')
+    with pytest.raises(OwnerPersistenceError):
+        svc.persist(original, clearance, manifest)
+    assert conn.rollbacks == 1
+    persisted = conn.tables['clearance'][(original.tenant_id, original.source_asset_id)]
+    assert persisted['decision'] == 'hold_used'  # fake DB not mutated by adapter
+
+
+def test_partial_existing_rows_fail_closed(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    svc.persist(original, clearance, manifest)
+    del conn.tables['manifest'][manifest.manifest_digest]  # simulate torn state
+    with pytest.raises(OwnerPersistenceError, match='single exact row'):
+        svc.persist(original, clearance, manifest)
+    assert conn.rollbacks == 1
+
+
+# --- rollback / uncertain commit ---------------------------------------------
+def test_rollback_on_insert_failure(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+
+    def boom(query, params):
+        if query.startswith('insert'):
+            raise RuntimeError('constraint violation')
+        return FakeConnection._run(conn, query, params)
+
+    conn._run = boom
+    with pytest.raises(RuntimeError):
+        svc.persist(original, clearance, manifest)
+    assert conn.rollbacks == 1 and conn.commits == 0
+
+
+def test_uncertain_commit_fails_closed(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    conn.fail_commit = True
+    with pytest.raises(UncertainCommitError):
+        svc.persist(original, clearance, manifest)
+    assert conn.rollbacks == 1
+
+
+# --- environment / identity guards -------------------------------------------
+def test_missing_owner_dsn_fails_without_fallback():
+    with pytest.raises(EnvironmentGuardError, match='no generic'):
+        check_environment({})
+
+
+def test_service_role_credential_in_environment_fails():
+    env = {'FORWARD_MEDIA_OWNER_DSN': 'postgres://owner@x/db',
+           'SUPABASE_SERVICE_ROLE_KEY': 'secret'}
+    with pytest.raises(EnvironmentGuardError, match='SERVICE_ROLE'):
+        check_environment(env)
+
+
+def test_publisher_token_in_environment_fails():
+    env = {'FORWARD_MEDIA_OWNER_DSN': 'postgres://owner@x/db',
+           'META_PUBLISH_TOKEN': 'secret'}
+    with pytest.raises(EnvironmentGuardError, match='PUBLISH'):
+        check_environment(env)
+
+
+def test_clean_environment_passes():
+    env = {'FORWARD_MEDIA_OWNER_DSN': 'postgres://owner@x/db', 'PATH': '/usr/bin'}
+    check_environment(env)
+
+
+def test_autocommit_connection_cannot_write(prepared):
+    original, clearance, manifest, reader = prepared
+    conn = FakeConnection()
+    conn.autocommit = True
+    svc, _ = adapter(conn=conn, reader=reader)
+    with pytest.raises(OwnerPersistenceError, match='one transaction'):
+        svc.persist(original, clearance, manifest)
+    assert not conn.executed
+
+
+def test_production_factory_rejects_missing_owner_role(monkeypatch):
+    monkeypatch.delenv('FORWARD_MEDIA_OWNER_ROLE', raising=False)
+    with pytest.raises(EnvironmentGuardError, match='dedicated owner role'):
+        ForwardMediaOwnerPersistence.connect_from_environment(reader=FakeReader(STORE))
+
+
+def test_wrong_current_user_fails_before_any_write(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(conn=FakeConnection(current_user='service_role'), reader=reader)
+    with pytest.raises(OwnerPersistenceError, match='current_user'):
+        svc.persist(original, clearance, manifest)
+    assert not any(conn.tables.values())
+    assert conn.commits == 0
+    assert not any(q.startswith('insert') for q, _ in conn.executed)
+
+
+def test_attester_role_also_fails(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(
+        conn=FakeConnection(current_user='fixer_forward_media_attester_20261006'),
+        reader=reader)
+    with pytest.raises(OwnerPersistenceError):
+        svc.persist(original, clearance, manifest)
+    assert not any(conn.tables.values())
+
+
+# --- trusted reader byte verification -----------------------------------------
+def test_reader_byte_mismatch_fails_closed(prepared):
+    original, clearance, manifest, _ = prepared
+    tampered = FakeReader({**STORE, 'https://cdn.example.com/original.jpg': b'different'})
+    svc, conn = adapter(reader=tampered)
+    with pytest.raises(OwnerPersistenceError, match='immutable object bytes'):
+        svc.persist(original, clearance, manifest)
+    assert not any(conn.tables.values())
+
+
+def test_reader_missing_object_fails_closed(prepared):
+    original, clearance, manifest, _ = prepared
+    svc, conn = adapter(reader=FakeReader({}))
+    with pytest.raises(KeyError):
+        svc.persist(original, clearance, manifest)
+    assert not any(conn.tables.values())
+
+
+def test_untrusted_reader_rejected(prepared):
+    original, clearance, manifest, _ = prepared
+
+    class NotTrusted:
+        def read(self, url):
+            return SRC_BYTES
+
+    svc, conn = adapter(reader=NotTrusted())
+    with pytest.raises(OwnerPersistenceError, match='ObjectReader'):
+        svc.persist(original, clearance, manifest)
+
+
+# --- tuple validation ---------------------------------------------------------
+def test_mismatched_clearance_tuple_fails(prepared):
+    original, clearance, manifest, reader = prepared
+    forged = type(clearance)(**{**clearance.row(), 'source_fingerprint': 'md5:' + '0' * 32})
+    svc, conn = adapter(reader=reader)
+    with pytest.raises(OwnerPersistenceError, match='clearance source_fingerprint'):
+        svc.persist(original, forged, manifest)
+    assert not any(conn.tables.values())
+
+
+def test_manifest_bound_to_different_original_fails(prepared):
+    original, clearance, manifest, reader = prepared
+    forged = type(manifest)(**{**manifest.row(), 'source_asset_id': 'asset-other'})
+    svc, conn = adapter(reader=reader)
+    with pytest.raises(OwnerPersistenceError, match='bound to the original'):
+        svc.persist(original, clearance, forged)
+
+
+def test_tampered_manifest_digest_fails(prepared):
+    original, clearance, manifest, reader = prepared
+    forged = type(manifest)(**{**manifest.row(),
+                               'manifest_digest': 'sha256:' + 'f' * 64})
+    svc, conn = adapter(reader=reader)
+    with pytest.raises(OwnerPersistenceError, match='refusing mutable manifest'):
+        svc.persist(original, clearance, forged)
+
+
+def test_malformed_refs_fail(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    bad_url = type(original)(**{**original.row(), 'source_url': 'http://insecure/x.jpg'})
+    with pytest.raises(OwnerPersistenceError, match='https'):
+        svc.persist(bad_url, clearance, manifest)
+    bad_fp = type(original)(**{**original.row(), 'source_fingerprint': 'md5:ZZZ'})
+    with pytest.raises(OwnerPersistenceError, match='md5'):
+        svc.persist(bad_fp, clearance, manifest)
+    assert not any(conn.tables.values())
+
+
+def test_invalid_operation_and_decision_fail(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    with pytest.raises(OwnerPersistenceError, match='controlled operation'):
+        svc.persist(original, clearance,
+                    type(manifest)(**{**manifest.row(), 'operation': 'generate'}))
+    with pytest.raises(OwnerPersistenceError, match='controlled decision'):
+        svc.persist(original,
+                    type(clearance)(**{**clearance.row(), 'decision': 'auto_cleared'}),
+                    manifest)
