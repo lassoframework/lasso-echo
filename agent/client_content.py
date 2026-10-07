@@ -630,10 +630,14 @@ def fallback_hashtags(account):
     if words:
         tags.append("#" + "".join(w[:1].upper() + w[1:] for w in words))
     tags.extend(_GENERIC_HASHTAGS)
-    try:
-        return variant_hashtags(getattr(account, "platform", ""), tags[:5])
-    except Exception:  # noqa: BLE001
-        return tags[:5]
+    # Platform limits enforced HERE, independent of AGENT_PLATFORM_VARIANTS
+    # (review on #340): Facebook carries at most 2, Google Business none.
+    platform = str(getattr(account, "platform", "") or "").lower()
+    if "google" in platform or platform in ("gbp", "googlebusiness"):
+        return []
+    if "facebook" in platform or platform == "fb":
+        return tags[:2]
+    return tags[:5]
 
 
 def has_own_voice_doc(account, voice=None):
@@ -644,7 +648,10 @@ def has_own_voice_doc(account, voice=None):
     template (2026-10-07, mindbodysoulfitness2be97e safety net). LASSO's own
     accounts and any gym with its own bible are unaffected."""
     key = str(getattr(account, "key", "") or "")
-    if not key or key.startswith("lasso") or voice is None:
+    base = key.split("_", 1)[0] if key else ""
+    if voice is None or base == "lasso":
+        # Only LASSO's canonical accounts (lasso_ig, lasso_fb, ...) may run on
+        # LASSO's own bible; a client key that merely starts with "lasso" may not.
         return True
     try:
         default = config.VOICE_DOC_PATH

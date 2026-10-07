@@ -123,6 +123,12 @@ def _scrub_plain(t: str, strict: bool = False) -> str:
     t = _DASH_RE.sub(", ", t)
     if strict:
         t = _BULLET_RE.sub("", t)
+        # Meaning-preserving numeric rewrites FIRST (review on #340): a range
+        # "8-12" reads "8 to 12", a ratio "1:1" reads "1 to 1", a leading minus
+        # "-5" reads "negative 5". Only then are the remaining hyphens/colons cut.
+        t = re.sub(r"(\d)\s*-\s*(?=\d)", r"\1 to ", t)
+        t = re.sub(r"(?<![\w.])-(?=\d)", "negative ", t)
+        t = re.sub(r"\b(\d{1,2}):(\d)\b", r"\1 to \2", t)
         t = _HYPHEN_AS_DASH_RE.sub(", ", t)
         t = _ANY_HYPHEN_RE.sub(" ", t)
         t = _CLOCK_RE.sub(_clock, t)

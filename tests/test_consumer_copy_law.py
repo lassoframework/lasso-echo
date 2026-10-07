@@ -92,3 +92,25 @@ def test_fallback_hashtags_from_display_name():
 def test_generic_scrub_unchanged_for_internal_copy():
     assert copy_gate.scrub("Denies this month: 4") == "Denies this month: 4"
     assert copy_gate.violations("one thing only you can do: sell.") == []
+
+
+def test_numeric_meaning_preserved():
+    assert copy_gate.scrub_caption("Ages 8-12") == "Ages 8 to 12"
+    assert copy_gate.scrub_caption("It was -5 degrees") == "It was negative 5 degrees"
+    assert copy_gate.scrub_caption("Coaching 1:1") == "Coaching 1 to 1"
+    assert copy_gate.scrub_caption("Class at 6:30") == "Class at 6.30"
+
+
+def test_fallback_hashtag_platform_limits():
+    fb = types.SimpleNamespace(display_name="Gym X", platform="facebook")
+    gbp = types.SimpleNamespace(display_name="Gym X", platform="googlebusiness")
+    assert len(client_content.fallback_hashtags(fb)) == 2
+    assert client_content.fallback_hashtags(gbp) == []
+
+
+def test_lasso_prefixed_client_is_not_exempt(tmp_path, monkeypatch):
+    lasso = tmp_path / "lasso_voice.md"
+    lasso.write_text("LASSO bible")
+    monkeypatch.setattr(client_content.config, "VOICE_DOC_PATH", str(lasso))
+    acct = types.SimpleNamespace(key="lassofitness_ig")
+    assert client_content.has_own_voice_doc(acct, types.SimpleNamespace(raw="LASSO bible")) is False
