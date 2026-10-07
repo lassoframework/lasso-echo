@@ -541,15 +541,15 @@ def test_photos_rechecked_at_generation_time(monkeypatch):
     _stub_pipeline(monkeypatch)
     _arm_astra(monkeypatch, 200, _astra_body())
     calls = {"n": 0}
-    real = cif.real_media_depleted
+    real = cif.real_media_status
 
     def _flip(base, *, now=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return real(base, now=now)   # the top-of-scan check: still depleted
-        return False                     # generation-time recheck: photos arrived
+        return (cif.MEDIA_AVAILABLE, "photos arrived")  # recheck: photos arrived
 
-    monkeypatch.setattr(cif, "real_media_depleted", _flip)
+    monkeypatch.setattr(cif, "real_media_status", _flip)
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
@@ -623,9 +623,11 @@ def test_photo_arriving_after_render_holds_before_insert(monkeypatch):
 
     def _flip(base, *, now=None):
         calls["n"] += 1
-        return calls["n"] <= 2  # scan + pre-render pass; pre-insert fails
+        if calls["n"] <= 2:     # scan + pre-render pass; pre-insert fails
+            return (cif.MEDIA_DEPLETED, "proven empty")
+        return (cif.MEDIA_AVAILABLE, "photos arrived")
 
-    monkeypatch.setattr(cif, "real_media_depleted", _flip)
+    monkeypatch.setattr(cif, "real_media_status", _flip)
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
@@ -885,3 +887,142 @@ def test_guard_off_through_production_store_no_prep_calls_legacy_row_shape(
     # ... and the whole run made no preparation RPC calls at all.
     assert not http.rendition_args and not http.bundle_args, http.calls
     assert not any("visual_global" in ep for _m, ep in http.calls), http.calls
+
+
+# ---- photo-first tri-state depletion gate (2026-10-06) ------------------------
+
+NOW_ISO = "2026-08-25T12:00:00-04:00"
+
+
+def _ready_drive_store(assets=(), asset_source_id="src1"):
+    """A Drive index with one ready same-gym source (src1) and the given assets."""
+    from tests.gym_media_fakes import FakeMediaStore
+
+    class ReadyStore(FakeMediaStore):
+        def list_sources(self, _base, include_inactive=False):
+            return [{"id": "src1", "gym_id": _base, "kind": "gym_drive",
+                     "active": True, "sync_status": "ready",
+                     "sync_finished_at": "2026-10-02T00:00:00Z"}]
+
+    return ReadyStore(sources=[{"id": "src1", "gym_id": "gymx"}],
+                      assets=list(assets))
+
+
+def test_media_status_available_when_eligible_photo_pickable(monkeypatch):
+    """Photo-first: an eligible same-gym photo is AVAILABLE, never a fallback case."""
+    from agent import gym_media_index
+    from tests.gym_media_fakes import make_asset
+
+    store = _ready_drive_store(assets=[make_asset("ph1", gym_id="gymx")])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    status, detail = cif.real_media_status("gymx", now=NOW_ISO)
+    assert status == cif.MEDIA_AVAILABLE, detail
+    assert cif.real_media_depleted("gymx", now=NOW_ISO) is False
+
+
+def test_media_status_uncertain_when_exclusion_rests_on_stale_source_id(monkeypatch):
+    """A usable, never-used photo kept out of the pool ONLY because its
+    media_source link is stale/unverifiable is unknown provenance: the gate must
+    report UNCERTAIN, never claim the photos are exhausted, and never mark the
+    asset a repeat."""
+    from agent import gym_media_index
+    from tests.gym_media_fakes import make_asset
+
+    photo = make_asset("ph1", gym_id="gymx", source_id="stale-src")
+    store = _ready_drive_store(assets=[photo])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    status, detail = cif.real_media_status("gymx", now=NOW_ISO)
+    assert status == cif.MEDIA_UNCERTAIN
+    assert "stale or unverifiable" in detail
+    assert cif.real_media_depleted("gymx", now=NOW_ISO) is False
+
+
+def test_media_status_depleted_only_for_proven_repeats(monkeypatch):
+    """A photo proven used by THIS gym's own counters is a genuine repeat; with
+    nothing else usable the depletion claim is allowed."""
+    from agent import gym_media_index
+    from tests.gym_media_fakes import make_asset
+
+    photo = make_asset("ph1", gym_id="gymx", used_count=1,
+                       last_used_at="2026-08-20T00:00:00Z")
+    store = _ready_drive_store(assets=[photo])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    status, detail = cif.real_media_status("gymx", now=NOW_ISO)
+    assert status == cif.MEDIA_DEPLETED, detail
+    assert cif.real_media_depleted("gymx", now=NOW_ISO) is True
+
+
+def test_media_status_uncertain_when_use_counters_unreadable(monkeypatch):
+    """An unreadable used_count is unknown repeat-use provenance, not a repeat."""
+    from agent import gym_media_index
+    from tests.gym_media_fakes import make_asset
+
+    photo = make_asset("ph1", gym_id="gymx")
+    photo["used_count"] = "bogus"
+    store = _ready_drive_store(assets=[photo])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    status, detail = cif.real_media_status("gymx", now=NOW_ISO)
+    assert status == cif.MEDIA_UNCERTAIN
+    assert "counters are unreadable" in detail
+
+
+def test_media_status_uncertain_when_usable_photo_claimed_in_flight(monkeypatch):
+    """An in-flight claim reserves the photo; it is not exhaustion evidence."""
+    from agent import db, gym_media_index
+    from tests.gym_media_fakes import make_asset
+
+    photo = make_asset("ph1", gym_id="gymx")
+    store = _ready_drive_store(assets=[photo])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    monkeypatch.setattr(db, "drive_asset_claimed_ids", lambda _base: {"ph1"})
+    status, detail = cif.real_media_status("gymx", now=NOW_ISO)
+    assert status == cif.MEDIA_UNCERTAIN
+    assert "in-flight claim" in detail
+
+
+def test_fill_gaps_holds_explicitly_when_inventory_uncertain(monkeypatch):
+    """fill_gaps must surface the hold reason instead of proceeding or claiming
+    'usable media available' when the inventory cannot be proven."""
+    from agent import gym_media_index
+    from tests.gym_media_fakes import make_asset
+
+    photo = make_asset("ph1", gym_id="gymx", source_id="stale-src")
+    store = _ready_drive_store(assets=[photo])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    _sources()
+    cal = _Store()
+    out = cif.fill_gaps("gymx", _acct(), cal, voice=_voice(), now=NOW_ISO)
+    assert out["ok"] is False and out["filled"] == 0 and out.get("held") is True, out
+    assert "uncertain" in out["reason"]
+    assert cal.inserted == []
+
+
+def test_media_status_uncertain_for_malformed_hidden_same_byte_alias(monkeypatch):
+    """A hidden alias with bad counters cannot prove an eligible photo was used."""
+    from agent import gym_media_index
+    from tests.gym_media_fakes import make_asset
+
+    photo = make_asset("ph1", gym_id="gymx")
+    alias = make_asset("ph2", gym_id="gymx")
+    alias["content_hash"] = photo["content_hash"]
+    alias["excluded_by_coach"] = True
+    alias["used_count"] = "bogus"
+    store = _ready_drive_store(assets=[photo, alias])
+    monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
+    status, detail = cif.real_media_status("gymx", now=NOW_ISO)
+    assert status == cif.MEDIA_UNCERTAIN, detail
+    assert "same-byte alias" in detail
+
+
+def test_fill_gaps_holds_when_generation_inventory_becomes_uncertain(monkeypatch):
+    """A depleted first read cannot mask a later uncertain inventory read."""
+    _sources()
+    statuses = iter(((cif.MEDIA_DEPLETED, "proven empty"),
+                     (cif.MEDIA_UNCERTAIN, "Drive read failed")))
+    monkeypatch.setattr(cif, "real_media_status", lambda *_a, **_k: next(statuses))
+    cal = _Store()
+    out = cif.fill_gaps("gymx", _acct(), cal, voice=_voice(),
+                        now=NOW_ISO, days_ahead=1, max_per_run=1)
+    assert out["ok"] is False and out["filled"] == 0 and out["held"] is True
+    assert "Drive read failed" in out["reason"]
+    assert cal.inserted == []
