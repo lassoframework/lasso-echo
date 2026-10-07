@@ -19,6 +19,9 @@ from .forward_media_prepare import MAX_OBJECT_LENGTH, register_original
 _ID = re.compile(r'[A-Za-z0-9_-]{16,128}\Z')
 _MD5 = re.compile(r'[0-9a-f]{32}\Z')
 _META_FIELDS = 'id,mimeType,parents,trashed,version,size,md5Checksum'
+_PARENT_LIST_FIELDS = 'nextPageToken,files(id)'
+_PARENT_LIST_PAGE_SIZE = 1000
+_PARENT_LIST_MAX_PAGES = 20
 _FOLDER_MIME = 'application/vnd.google-apps.folder'
 
 
@@ -60,6 +63,45 @@ class OriginalDriveReader:
         return service.files().get(
             fileId=file_id, fields=_META_FIELDS, supportsAllDrives=True).execute(num_retries=0)
 
+    def proves_parent(self, file_id, folder_id):
+        """Prove direct membership with a bounded authenticated Drive list query.
+
+        A negative result is meaningful only after pagination completes. Any
+        malformed page, API error, repeated token, or page cap is an exception
+        and therefore remains unknown to the verifier.
+        """
+        if (not isinstance(file_id, str) or not _ID.fullmatch(file_id)
+                or not isinstance(folder_id, str) or not _ID.fullmatch(folder_id)):
+            raise SourceVerificationHold('drive_identity_invalid')
+        service = self._bounded_service()
+        query = f"'{folder_id}' in parents and trashed = false"
+        token = None
+        seen_tokens = set()
+        for _ in range(_PARENT_LIST_MAX_PAGES):
+            kwargs = {
+                'q': query, 'fields': _PARENT_LIST_FIELDS,
+                'pageSize': _PARENT_LIST_PAGE_SIZE,
+                'supportsAllDrives': True, 'includeItemsFromAllDrives': True,
+            }
+            if token is not None:
+                kwargs['pageToken'] = token
+            page = service.files().list(**kwargs).execute(num_retries=0)
+            if not isinstance(page, dict) or not isinstance(page.get('files'), list):
+                raise SourceVerificationHold('drive_folder_membership_unknown')
+            for item in page['files']:
+                if (not isinstance(item, dict) or not isinstance(item.get('id'), str)
+                        or not _ID.fullmatch(item['id'])):
+                    raise SourceVerificationHold('drive_folder_membership_unknown')
+                if item['id'] == file_id:
+                    return True
+            token = page.get('nextPageToken')
+            if token is None:
+                return False
+            if not isinstance(token, str) or not token or token in seen_tokens:
+                raise SourceVerificationHold('drive_folder_membership_unknown')
+            seen_tokens.add(token)
+        raise SourceVerificationHold('drive_folder_membership_unknown')
+
     def _bounded_service(self):
         service = self._t()._service()
         # Google-auth AuthorizedHttp wraps httplib2.Http in .http. This is a
@@ -92,6 +134,19 @@ def _path(drive, meta, folder_id):
     seen, path = {meta['id']}, []
     for _ in range(8):
         parents = meta.get('parents')
+        if parents is None or parents == []:
+            # Drive metadata can omit parents while an authenticated parent
+            # query still proves direct membership. Only that exact configured
+            # folder is accepted; we do not enumerate or infer another chain.
+            proves_parent = getattr(drive, 'proves_parent', None)
+            if not callable(proves_parent) or not proves_parent(meta['id'], folder_id):
+                raise SourceVerificationHold('drive_folder_membership_unknown')
+            folder = _meta(drive, folder_id)
+            if folder.get('mimeType') != _FOLDER_MIME:
+                raise SourceVerificationHold('drive_folder_membership_unknown')
+            path.append({'id': folder_id, 'version': str(folder.get('version') or ''),
+                         'parents': folder.get('parents')})
+            return path
         if not isinstance(parents, list) or len(parents) != 1:
             raise SourceVerificationHold('drive_folder_membership_unknown')
         parent = parents[0]

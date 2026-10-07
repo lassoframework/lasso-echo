@@ -3,6 +3,7 @@ import hashlib
 import unittest
 
 from agent.forward_media_source_verifier import verify_source, SourceVerificationHold, _BoundedBuffer
+from agent.forward_media_source_verifier import OriginalDriveReader
 from agent.forward_media_prepare import MAX_OBJECT_LENGTH
 
 FILE = 'FileOriginal123456789'
@@ -30,6 +31,7 @@ class Drive:
         self.data = DATA
         self.changed = False
         self.reads = 0
+        self.membership_proofs = 0
 
     def metadata(self, file_id):
         if file_id == FOLDER:
@@ -44,6 +46,10 @@ class Drive:
     def original_bytes(self, file_id):
         assert file_id == FILE
         return self.data
+
+    def proves_parent(self, file_id, folder_id):
+        self.membership_proofs += 1
+        return file_id == FILE and folder_id == FOLDER
 
 
 class Hosted:
@@ -94,6 +100,90 @@ class SourceTests(unittest.TestCase):
         drive.meta['parents'] = [FOLDER, 'OtherFolder1234567890']
         with self.assertRaisesRegex(SourceVerificationHold, 'drive_folder_membership_unknown'):
             verify_source(snapshot(), drive, Hosted())
+
+    def test_missing_parents_uses_exact_direct_parent_proof_twice(self):
+        drive = Drive()
+        del drive.meta['parents']
+        result = verify_source(snapshot(), drive, Hosted())
+        self.assertEqual(drive.membership_proofs, 2)
+        self.assertEqual(result.evidence['drive_parent_path'][0]['id'], FOLDER)
+
+        drive = Drive()
+        drive.meta['parents'] = []
+        drive.proves_parent = lambda _file, _folder: False
+        with self.assertRaisesRegex(SourceVerificationHold, 'drive_folder_membership_unknown'):
+            verify_source(snapshot(), drive, Hosted())
+
+    def test_missing_parents_without_authenticated_query_remains_unknown(self):
+        drive = Drive()
+        del drive.meta['parents']
+        drive.proves_parent = None
+        with self.assertRaisesRegex(SourceVerificationHold, 'drive_folder_membership_unknown'):
+            verify_source(snapshot(), drive, Hosted())
+
+    def test_authenticated_parent_query_is_bounded_and_exact(self):
+        class Request:
+            def __init__(self, value):
+                self.value = value
+            def execute(self, num_retries=0):
+                assert num_retries == 0
+                return self.value
+
+        class Files:
+            def __init__(self):
+                self.calls = []
+            def list(self, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    return Request({'files': [{'id': 'OtherFile123456789', 'trashed': False}],
+                                    'nextPageToken': 'page2'})
+                return Request({'files': [{'id': FILE, 'trashed': False}]})
+
+        class Service:
+            def __init__(self):
+                self._http = type('Http', (), {'timeout': None})()
+                self._files = Files()
+            def files(self):
+                return self._files
+
+        class Transport:
+            def __init__(self):
+                self.service = Service()
+            def _service(self):
+                return self.service
+
+        transport = Transport()
+        reader = OriginalDriveReader(transport)
+        self.assertTrue(reader.proves_parent(FILE, FOLDER))
+        self.assertEqual(len(transport.service._files.calls), 2)
+        first, second = transport.service._files.calls
+        self.assertEqual(first['q'], f"'{FOLDER}' in parents and trashed = false")
+        self.assertEqual(first['pageSize'], 1000)
+        self.assertEqual(first['supportsAllDrives'], True)
+        self.assertEqual(first['includeItemsFromAllDrives'], True)
+        self.assertEqual(second['pageToken'], 'page2')
+
+    def test_incomplete_or_repeated_parent_listing_is_unknown(self):
+        class Request:
+            def execute(self, num_retries=0):
+                return {'files': [], 'nextPageToken': 'same'}
+
+        class Files:
+            def list(self, **kwargs):
+                return Request()
+
+        class Service:
+            def __init__(self):
+                self._http = type('Http', (), {'timeout': None})()
+            def files(self):
+                return Files()
+
+        class Transport:
+            def _service(self):
+                return Service()
+
+        with self.assertRaisesRegex(SourceVerificationHold, 'drive_folder_membership_unknown'):
+            OriginalDriveReader(Transport()).proves_parent(FILE, FOLDER)
 
     def test_bound_stops_before_download(self):
         drive = Drive()
