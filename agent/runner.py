@@ -27,6 +27,87 @@ from .stories import build_story_draft
 from .voice import load_voice
 
 
+def run_media_repeat_sweep_day(now=None):
+    """Run the global repeat repair once per UTC day across listener/cron callers.
+
+    Reserve before any calendar work; a crash or partial failure consumes today's
+    attempt. Keep the permanent flock inode beside the shared durable DB so deploy
+    overlap, even across midnight, cannot run two repair passes simultaneously.
+    The job owns row CAS, approval/status holds and media selection configuration.
+    """
+    import fcntl
+    import json
+    import uuid
+    from . import db
+
+    if not config.media_repeat_sweep_enabled():
+        return {"ok": True, "reason": "repeat sweep disabled"}
+    if not db.kv_is_durable():
+        return {"ok": False, "reason": "durable repeat sweep state unavailable"}
+    try:
+        lock_file = open(os.path.realpath(db.db_path()) + ".repeat-sweep.lock", "a")
+    except OSError:
+        return {"ok": False, "reason": "repeat sweep process lock unavailable"}
+    with lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"ok": True, "reason": "repeat sweep already running"}
+        except OSError:
+            return {"ok": False, "reason": "repeat sweep process lock unavailable"}
+        try:
+            now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            key = "media_repeat_sweep_day_v1:" + now.date().isoformat()
+            receipt = {"owner": str(uuid.uuid4()), "state": "reserved",
+                       "started_at": now.isoformat()}
+            reserved = json.dumps(receipt, sort_keys=True)
+            conn = db.connect()
+            try:
+                with conn:
+                    won = conn.execute("INSERT OR IGNORE INTO kv(key,value) VALUES (?,?)",
+                                       (key, reserved)).rowcount == 1
+            finally:
+                conn.close()
+            if not won:
+                return {"ok": True, "reason": "daily repeat sweep already reserved"}
+            summary = {"ok": False, "reason": "repeat sweep interrupted"}
+            try:
+                from .jobs.media_repeat_sweep import run
+                results = run([], apply=True) or []
+                # The job reports per-gym read failures via `error` and hold
+                # CAS/write failures via `hold_errors`; both make the pass fail.
+                hold_errors = sum(r.get("hold_errors", 0) for r in results)
+                errors = sum(bool(r.get("error")) for r in results) + hold_errors
+                summary = {"ok": errors == 0,
+                           "gyms_checked": len(results),
+                           "errors": errors, "hold_errors": hold_errors,
+                           "rows_repointed": sum(r.get("rows_repointed", 0) for r in results),
+                           "rows_held": sum(r.get("rows_held", 0) for r in results)}
+                print(f"[media-repeat-sweep] {summary}")
+                if not summary["ok"]:
+                    ops_alerts.alert("media repeat sweep completed with gym errors; "
+                                     "see the service log. Next automatic attempt is tomorrow.")
+            except Exception as exc:
+                summary = {"ok": False, "reason": type(exc).__name__}
+                print(f"[media-repeat-sweep] failed: {type(exc).__name__}")
+                ops_alerts.alert(f"media repeat sweep failed: {type(exc).__name__}. "
+                                 "Next automatic attempt is tomorrow; the draft run is unaffected.")
+            finally:
+                receipt.update(state="completed" if summary["ok"] else "failed",
+                               finished_at=datetime.now(timezone.utc).isoformat(),
+                               result=summary)
+                conn = db.connect()
+                try:
+                    with conn:
+                        conn.execute("UPDATE kv SET value=? WHERE key=? AND value=?",
+                                     (json.dumps(receipt, sort_keys=True), key, reserved))
+                finally:
+                    conn.close()
+            return summary
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _same_content(a, b):
     """True when two drafts for the same (account, day, type) carry the same
     content, i.e. a re-run produced nothing genuinely new."""
@@ -2018,29 +2099,12 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                              "Over-horizon rows stay until the next run; the draft "
                              "run is unaffected.")
 
-    # MEDIA REPEAT SWEEP (audit item 3, 2026-08-31; flag AGENT_MEDIA_REPEAT_SWEEP,
-    # default ON). agent/media_guard.py stops a repeat at STAGE time, but the
-    # existing rows it cannot see were never swept: 35 cross-day photo repeats
-    # were live on 2026-08-31 (LASSO 29, CrossFit Zanshin 6) with the job built,
-    # working, and scheduled nowhere — the exact defect a client noticed ("the
-    # same photo across different weeks"). This runs the guard's live counterpart
-    # nightly. It NEVER touches a published or publishing row and NEVER swaps an
-    # approved row's media (the gym approved that exact card) — those are reported
-    # only. A gym with no unused photo left is reported as a small library and
-    # left alone, never given fabricated media. Isolated: a sweep failure never
-    # blocks the draft run.
-    if config.media_repeat_sweep_enabled():
-        try:
-            from .jobs.media_repeat_sweep import run as _media_sweep_run
-            _msum = _media_sweep_run([], apply=True) or []
-            _mfixed = sum(r.get("rows_repointed", 0) for r in _msum)
-            if _mfixed:
-                print(f"[media-repeat-sweep] re-pointed {_mfixed} repeated-photo row(s)")
-        except Exception as e:
-            print(f"[media-repeat-sweep] failed: {type(e).__name__}: {e}")
-            ops_alerts.alert(f"media repeat sweep failed: {type(e).__name__}: {e}. "
-                             "Cross-day photo repeats stay until the next run; the "
-                             "draft run is unaffected.")
+    # The independent listener lane and manual/cron draws share one durable
+    # daily reservation and full-pass process lock.
+    try:
+        run_media_repeat_sweep_day()
+    except Exception as exc:
+        print(f"[media-repeat-sweep] unavailable: {type(exc).__name__}")
 
     # MONTHLY RETRO (Wave 7.8, TAP 3 closed 2026-08-26): on/after the 5th, run
     # the prior month's retro once (kv-stamped per month). Self-gates on

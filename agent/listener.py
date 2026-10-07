@@ -758,6 +758,31 @@ def _start_media_moderation_scheduler():
     return True
 
 
+_MEDIA_REPEAT_SWEEP_POLL_SECONDS = 3600
+
+
+def _media_repeat_sweep_scheduler():
+    """Repair repeats independently of daily draws and slow moderation providers."""
+    from .runner import run_media_repeat_sweep_day
+    while True:
+        try:
+            result = run_media_repeat_sweep_day()
+            if not result.get("ok"):
+                print(f"[media-repeat-sweep] scheduler: {result}")
+        except Exception as exc:
+            print(f"[media-repeat-sweep] scheduler failed: {type(exc).__name__}")
+        time.sleep(_MEDIA_REPEAT_SWEEP_POLL_SECONDS)
+
+
+def _start_media_repeat_sweep_scheduler():
+    if not config.media_repeat_sweep_enabled():
+        return False
+    threading.Thread(target=_media_repeat_sweep_scheduler,
+                     name="media-repeat-sweep", daemon=True).start()
+    print("Independent media repeat sweep scheduler started (once per UTC day).")
+    return True
+
+
 def _daily_scheduler(store):
     """
     Minimal in-process daily trigger. Fires run_daily once per day at the target
@@ -1450,6 +1475,7 @@ def run_listener():
     # scheduler heartbeats.
     _start_shared_media_runway_refresh()
     _start_media_moderation_scheduler()
+    _start_media_repeat_sweep_scheduler()
 
     if str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}:
         threading.Thread(target=_daily_scheduler, args=(store,), daemon=True).start()
