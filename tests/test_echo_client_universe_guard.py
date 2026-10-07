@@ -710,12 +710,13 @@ def test_onboard_run_refuses_a_non_client_before_writing_anything(universe, monk
 
 
 def test_portal_onboard_route_stops_the_mint_on_a_refusal(universe, monkeypatch):
-    """POST /portal/onboard -> handle_portal_onboard -> onboard.run. The raise must reach
-    the handler's generic failure path: no token in the response."""
+    """POST /portal/onboard -> handle_portal_onboard -> onboard.run. A refusal is
+    HTTP 409 with a machine-readable reason; no token in the response."""
     monkeypatch.setenv("AGENT_INTAKE_SIGNING_SECRET", "s" * 32)
     from agent import intake_web, account_key_mint
     monkeypatch.setattr(account_key_mint, "derive_mint_key",
                         lambda k, n, **kw: (k, {"derived": False, "reason": "test", "gym_uuid": BOOM}))
     status, resp = intake_web.handle_portal_onboard({"account_key": "boomfitbcs3b4da7",
                                                      "display_name": "BoomFit BCS"})
-    assert status == 500 and "raw_token" not in resp
+    assert status == 409 and resp.get("reason") == "not_echo_client"
+    assert "raw_token" not in resp

@@ -186,21 +186,51 @@ def _url_basename(url):
 _PHOTO_CONSUMING_STATUSES = ("approved", "published", "publishing")
 
 
+def _feed_slot_index(row, slots_per_day=1):
+    """The cadence ordinal a human-owned feed occupies.
+
+    Legacy 1x rows have no slot_index and occupy slot 0, so a gym that later
+    flips to 2x can still fill the open evening slot without replacing the
+    approved morning post. An ordinal outside the current cadence (a leftover
+    PM row after a 2x->1x toggle) still occupies a real slot: treat it as slot 0
+    so a 1x rebuild cannot place a competing feed beside it.
+    """
+    capacity = 2 if int(slots_per_day or 1) >= 2 else 1
+    raw = (row or {}).get("slot_index")
+    try:
+        slot = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    if slot in range(capacity):
+        return slot
+    return 0
+
+
 def _locked_calendar_state(base_key, start, days, store, log, library_path=None):
-    """(locked_feed_days, used_keys) from the gym's EXISTING human-owned calendar rows
-    across the planned span. locked_feed_days: post_dates where any feed/Story sibling
-    is human-owned (approved/published/denied/killed — anything not machine-wipeable),
-    so a rebuild never separates a retained Story from its feed. used_keys: media carried
-    by rows whose photo is truly consumed (approved/published/publishing, any format),
-    so a live photo is never re-picked; a denied/killed photo stays available.
+    """(locked_feed_days, used_keys, locked_feed_slots) from EXISTING human-owned
+    calendar rows across the planned span.
+
+    locked_feed_days: post_dates where any feed/Story sibling is human-owned
+    (approved/published/denied/killed — anything not machine-wipeable), so a
+    rebuild never separates a retained Story from its feed. locked_feed_slots:
+    (post_date, slot_index) pairs whose FEED a human already owns; the rebuild
+    never replaces those slots, but a 2x day with only slot 0 owned can still
+    receive a slot 1 feed. used_keys: media carried by rows whose photo is truly
+    consumed (approved/published/publishing, any format), so a live photo is
+    never re-picked; a denied/killed photo stays available.
     Read-only; a read failure returns empty state (the store-level preserve_and_prune
     backstop still guards the write)."""
     from datetime import timedelta
     from .portal_calendar_store import _WIPEABLE_STATUSES
-    locked_days, used = set(), set()
+    from .cadence import resolve_posts_per_day
+    try:
+        slots_per_day = resolve_posts_per_day(base_key, store)
+    except Exception:  # noqa: BLE001 - lock-state cadence is best-effort
+        slots_per_day = 1
+    locked_days, locked_slots, used = set(), set(), set()
     list_month = getattr(store, "list_month", None)
     if list_month is None:
-        return locked_days, used
+        return locked_days, used, locked_slots
     months = sorted({(start + timedelta(days=i)).isoformat()[:7]
                      for i in range(max(1, days))})
     for month in months:
@@ -213,13 +243,24 @@ def _locked_calendar_state(base_key, start, days, store, log, library_path=None)
             status = str((row or {}).get("status") or "").lower()
             if not status or status in _WIPEABLE_STATUSES:
                 continue
-            if str(row.get("format") or "").lower() in ("feed", "story"):
-                locked_days.add(str(row.get("post_date") or "")[:10])
+            fmt = str(row.get("format") or "").lower()
+            if fmt in ("feed", "story"):
+                day = str(row.get("post_date") or "")[:10]
+                if day:
+                    locked_days.add(day)
+                    if fmt == "feed":
+                        locked_slots.add((day, _feed_slot_index(row, slots_per_day)))
             if status in _PHOTO_CONSUMING_STATUSES:
                 key = _url_basename(row.get("image_url") or "")
                 if key:
                     used.add(key)
     locked_days.discard("")
+    # A human-owned Story with no owned feed still locks its WHOLE day (main #327-#330
+    # semantics): a rebuild must never place a new feed beside a retained Story.
+    feed_slot_days = {d for d, _s in locked_slots}
+    for day in locked_days - feed_slot_days:
+        locked_slots.add((day, 0))
+        locked_slots.add((day, 1))
     # CROSS-DAY MEDIA GUARD (Blake, 2026-08-31: a client saw the same photo across
     # different weeks): also exclude every photo that will SURVIVE this rebuild on
     # the gym's book — published within the trailing repeat window (the span-months
@@ -249,7 +290,7 @@ def _locked_calendar_state(base_key, start, days, store, log, library_path=None)
                 used.add(raw)
         except Exception as exc:  # noqa: BLE001 - resolution is best-effort, never a block
             log(f"reframe-to-basename resolution skipped ({type(exc).__name__})")
-    return locked_days, used
+    return locked_days, used, locked_slots
 
 
 def _surviving_pillar_counts(base_key, start, days, store, log):
@@ -1501,13 +1542,16 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # LOCKED-CALENDAR AWARENESS: read the gym's EXISTING human-owned rows (approved /
     # published / denied / killed — anything a rebuild must preserve) across the span
     # BEFORE planning, so the rebuild composes with them instead of fighting them:
-    #   * locked_feed_days: a day whose feed a human already owns is SKIPPED outright
+    #   * locked_feed_slots: a (day, slot) whose feed a human already owns is SKIPPED
     #     (no replacement feed, no orphan story/FB-mirror alongside the approved post);
+    #     a 2x day with only one slot owned can still fill the other;
+    #   * locked_feed_days: dates with any locked feed, so pending siblings of the
+    #     owned slot survive the delete and the empty-day filler does not double-post;
     #   * used_keys: the photos those rows carry are EXCLUDED from every pick, so an
     #     already-approved photo is never re-placed on another day (no double-post).
     # Without this the builder re-picked approved photos (double-place) and photos
     # consumed by pruned colliding rows were lost forever (under-build).
-    locked_feed_days, used_keys = _locked_calendar_state(
+    locked_feed_days, used_keys, locked_feed_slots = _locked_calendar_state(
         base_key, start, days, store, log, library_path=library_path)
     # The LIVE photos (approved/published/surviving) as read above, before this build's
     # own picks join used_keys: the no-empty-day fallback may repeat a photo this build
@@ -1536,6 +1580,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             account, base_key, start, days, voice=voice, library_path=library_path,
             store=store, banned_words=banned_words, log=log, allow_reshape=allow_reshape,
             media_count=media_count, locked_feed_days=locked_feed_days,
+            locked_feed_slots=locked_feed_slots,
             used_keys=used_keys, locked_keys=locked_keys, drafts=drafts,
             drive_deferred_days=drive_deferred_days, rendition_budget=rendition_budget,
             apply_state=_applied)
@@ -1575,7 +1620,8 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
 def _build_client_month_body(account, base_key, start, days, *, voice, library_path,
                              store, banned_words, log, allow_reshape, media_count,
                              locked_feed_days, used_keys, locked_keys, drafts,
-                             drive_deferred_days, rendition_budget, apply_state=None):
+                             drive_deferred_days, rendition_budget, apply_state=None,
+                             locked_feed_slots=None):
     """The picking + apply half of build_client_month, split out so the caller can
     wrap release -> apply in ONE try/finally (see build_client_month)."""
     from datetime import timedelta
@@ -1587,6 +1633,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # ONCE per build; ECHO_CADENCE_2X_ENABLED off -> always 1 (byte-for-byte today).
     from .cadence import resolve_posts_per_day
     slots_per_day = resolve_posts_per_day(base_key, store)
+    locked_feed_slots = set(locked_feed_slots or ())
+    # Days where every cadence slot is already human-owned: Drive/Lane A skip
+    # them wholesale. A 2x day with only the morning post approved is NOT fully
+    # locked and can still receive the evening slot.
+    fully_locked_days = {d for d in locked_feed_days
+                         if all((d, s) in locked_feed_slots
+                                for s in range(slots_per_day))}
 
     # MEDIA-CAPPED: never build past the media the gym has. `days` is only an UPPER
     # bound on COVERED DAYS; the feed budget is days * slots_per_day (at 1x exactly
@@ -1667,7 +1720,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # The Drive-photo pre-pass, Lane A and video pre-pass claim exact slots. Drive
     # photos lead, local photos use the remaining slots, and video is considered only
     # after Lane A has exhausted its eligible local-photo supply.
-    covered_slots = set()
+    covered_slots = set(locked_feed_slots)
     pre_captions = {}
     # SOURCE ORDER: approved Drive photos, then local real photos, then Drive videos.
     # Pin this first pass to photos so a mixed pool cannot spill into video when its
@@ -1704,7 +1757,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         try:
             photo_pre = append_gym_drive_drafts(
                 account, base_key, start, days, voice, log=log,
-                covered_days=locked_feed_days, library_path=library_path,
+                covered_days=fully_locked_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
                 rendition_budget=rendition_budget, covered_slots=covered_slots,
                 kind_prefs=(_PHOTO_KIND,), max_feed_count=max_feed_days)
@@ -1731,12 +1784,6 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         day_key = (start + timedelta(days=i)).isoformat()
         i += 1
 
-        # A day whose feed a human already owns keeps its approved content; the
-        # rebuild never plans a competing feed/story for it.
-        if day_key in locked_feed_days:
-            log(f"locked {day_key}: day already has approved/published content")
-            continue
-
         # captions placed on THIS day (2x uniqueness, D5), seeded with Drive-photo
         # placements so a Lane A slot never repeats a Drive concept
         day_captions = list(pre_captions.get(day_key, []))
@@ -1744,6 +1791,13 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
         for slot_i in range(slots_per_day):
             if built_feeds + drive_photo_feeds >= max_feed_days:
                 break
+            # A slot a human already owns keeps its approved content (D7). A 2x
+            # day with only the morning post approved can still fill the evening
+            # slot; the rebuild never replaces the owned slot's feed/story/FB.
+            if (day_key, slot_i) in locked_feed_slots:
+                log(f"locked {day_key} slot {slot_i}: already has "
+                    "approved/published content")
+                continue
             if (day_key, slot_i) in covered_slots:
                 continue                   # the Drive-photo pass owns this slot
             # Choose this slot's angle (round-robin by the accepted-feed index) + the
@@ -1948,7 +2002,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 account, base_key, start, days, voice, log=log,
                 # Slot ownership, rather than day coverage, allows a video to fill a
                 # genuinely open PM slot after a local or Drive-photo AM post.
-                covered_days=locked_feed_days, library_path=library_path,
+                covered_days=fully_locked_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
                 rendition_budget=rendition_budget, covered_slots=covered_slots,
                 video_beats_only=True, kind_prefs=(_VIDEO_KIND,),
@@ -1994,7 +2048,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 account, base_key, start, days, voice, log=log,
                 # Exact slot ownership decides whether a 2x slot is open.  Passing
                 # a day with one Lane-A feed here used to skip its open second slot.
-                covered_days=locked_feed_days, library_path=library_path,
+                covered_days=fully_locked_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
                 rendition_budget=rendition_budget, covered_slots=covered_slots,
                 day_captions_seed=pre_captions,

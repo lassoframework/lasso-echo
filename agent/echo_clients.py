@@ -79,8 +79,10 @@ Supabase round trip.
 The service key is read lazily, never logged, never returned. `http` is injectable so
 every path is unit tested offline.
 """
+import dataclasses
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -430,8 +432,44 @@ def _load(http=None, now=None):
                          {"id": f"in.({','.join(ids)})"})
     if not ok:
         return ClientSet(ok=False, error="gyms unreadable", at=stamp)
-    return build(settings, tokens, gyms, intake_rows=intake, product_rows=products,
-                 standalone_rows=standalone, now=stamp)
+    return apply_exclusions(build(settings, tokens, gyms, intake_rows=intake,
+                                  product_rows=products, standalone_rows=standalone,
+                                  now=stamp))
+
+
+# ---- operator exclusion (Blake, 2026-10-07: gritx cancelled) ----------------------
+#
+# AGENT_ECHO_CLIENT_EXCLUDE is a comma-separated list of base keys (or gym UUIDs) that
+# are NEVER Echo clients, whatever portal markers or hardcoded ACCOUNTS entries say.
+# It removes the gym from every fleet enumerator (publisher, planner, onboarding /
+# registry repair) without deleting any portal row or calendar history. Undo = remove
+# the key from the variable.
+
+EXCLUDE_ENV = "AGENT_ECHO_CLIENT_EXCLUDE"
+
+
+def excluded_idents():
+    raw = os.environ.get(EXCLUDE_ENV, "") or ""
+    return frozenset(n for n in (normalize_key(x) for x in raw.split(",")) if n)
+
+
+def apply_exclusions(cs, excluded=None):
+    """Drop every excluded gym (matched by any of its aliases or its UUID) from a
+    ClientSet. A failed (ok=False) set is returned unchanged."""
+    ex = excluded_idents() if excluded is None else frozenset(excluded)
+    if not ex or not getattr(cs, "ok", False):
+        return cs
+    gids = {g for g in cs.gym_ids if g in ex}
+    gids |= {cs.key_to_gym.get(k) for k in ex if cs.key_to_gym.get(k)}
+    drop_keys = {k for k, g in cs.key_to_gym.items() if g in gids} | (set(cs.keys) & ex)
+    return dataclasses.replace(
+        cs,
+        gym_ids=frozenset(cs.gym_ids - gids),
+        keys=frozenset(cs.keys - drop_keys),
+        key_to_gym={k: g for k, g in cs.key_to_gym.items() if k not in drop_keys},
+        other_keys=frozenset(cs.other_keys | drop_keys),
+        other_gym_ids=frozenset(cs.other_gym_ids | gids),
+    )
 
 
 # ---- cache -----------------------------------------------------------------------
@@ -492,7 +530,9 @@ def hardcoded_bases():
     """Base keys of accounts.ACCOUNTS: written into the repo by a human, trusted
     without a plane read (LASSO's own run never waits on Supabase)."""
     from .accounts import ACCOUNTS
-    return {normalize_key(a.key) for a in ACCOUNTS if a.key}
+    ex = excluded_idents()
+    return {normalize_key(a.key) for a in ACCOUNTS
+            if a.key and normalize_key(a.key) not in ex}
 
 
 def registry_gym_ids():
@@ -515,7 +555,7 @@ def is_client_base(base, *, hard=None, gym_ids=None, http=None):
     """The ACCOUNT-REGISTRY form of the predicate: a hardcoded base is always a client;
     a dynamic-registry base is a client when its stamped gym_id or its key is one."""
     n = normalize_key(base)
-    if not n:
+    if not n or n in excluded_idents():
         return False
     if n in (hard if hard is not None else hardcoded_bases()):
         return True

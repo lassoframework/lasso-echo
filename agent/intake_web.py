@@ -979,8 +979,9 @@ def handle_portal_onboard(body):
     live token, never rotating it and never erroring. onboard.run() itself is
     idempotent (it skips existing files and never re-randomizes).
 
-    The raw token is NEVER logged. On any onboard failure a generic 500 is returned
-    with no token and no secret detail.
+    The raw token is NEVER logged. A deliberate OnboardRefused (not an Echo
+    client) returns 409 with reason=not_echo_client. Genuine onboard failures
+    return a generic 500 with no token and no secret detail.
     """
     if not isinstance(body, dict):
         return 400, {"error": "invalid body"}
@@ -1009,6 +1010,11 @@ def handle_portal_onboard(body):
     try:
         result = _onboard.run(account_key, display_name, base_url=_upload_base_url(),
                                posting_timezone=posting_timezone or None)
+    except _onboard.OnboardRefused:
+        # Deliberate refusal (not an Echo client): 4xx so the portal cron does not
+        # retry/escalate this as a server error. Genuine failures stay 500.
+        print(f"[portal] onboard refused for {account_key}: OnboardRefused")
+        return 409, {"error": "not_echo_client", "reason": "not_echo_client"}
     except Exception as exc:
         # Generic failure: no token, no secret, no internals leaked to the portal.
         print(f"[portal] onboard failed for {account_key}: {type(exc).__name__}")

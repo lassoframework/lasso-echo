@@ -200,17 +200,14 @@ def _prepared_backlog_caption_hold_transition_ok(expected_row):
 
 
 def _slot_key(row):
-    """The (post_date, account, format) a row occupies, normalized. Two rows with the
-    same slot key are the same calendar cell (a rebuild must not create a second one).
+    """The (post_date, account, format) a row occupies, normalized.
 
-    DELIBERATELY NOT slot-aware. Adding slot_index here would let a 2x day keep its PM
-    row when the AM row is human-owned — but it also makes a 2x->1x rebuild (which
-    stamps NO slot_index) stop matching an approved slot-1 row, so the planner lanes
-    that rely on preserve_and_prune as their ONLY collision guard (real_month_planner,
-    real_calendar_mirror — LASSO's own, with auto-approve armed) would insert a fresh
-    row beside an approved one and publish it. The client lane never needs the slot
-    dimension: it skips locked DATES wholesale (client_month_run covered_days). Revisit
-    only together with the locked-day question in PROGRESS.md."""
+    Collision occupancy for 2x days lives in preserve_and_prune (per slot_index
+    up to cadence capacity). This key is the cell identity: two IG feeds on the
+    same date share it and are distinguished by slot_index there. Do not add
+    slot_index here: planner lanes that only have locked_slots (no list_month)
+    still treat the triple as the cell, which is the conservative 1x guard.
+    """
     return (
         str((row or {}).get("post_date") or "")[:10],
         str((row or {}).get("account") or "").lower(),
@@ -5191,77 +5188,99 @@ def _media_stage_belt(store, account_key, payload, *, alert=None,
         return payload
 
 
+def _prune_by_cadence_occupancy(store, account_key, months, rows):
+    """Drop incoming rows that collide with a human-owned cadence slot.
+
+    Occupancy is per (post_date, account, format) up to resolve_posts_per_day
+    slots. A 2x day with an approved morning post can still receive an evening
+    post; a 1x day (or 2x->1x reshape, capacity 1) treats any owned feed as
+    filling the cell. Approved/published rows are never replaced.     Denied/killed
+    rows do not occupy capacity so a replacement may land.
+    """
+    from .cadence import resolve_posts_per_day
+    from collections import defaultdict
+
+    def capacity_for(row):
+        """Third capacity exists only for LASSO feed/story rows in the dated window."""
+        day_key = str(row.get("post_date") or "")[:10]
+        try:
+            base_capacity = resolve_posts_per_day(account_key, store, day=day_key)
+        except TypeError:
+            # Compatibility for injected legacy resolvers in offline callers.
+            base_capacity = resolve_posts_per_day(account_key, store)
+        if (str(account_key).strip().lower() == "lasso"
+                and str(row.get("format") or "feed").strip().lower() in ("feed", "story")):
+            try:
+                if config.lasso_three_feed_enabled() or \
+                        config.lasso_summit_daily_enabled(day_key):
+                    return max(base_capacity, 3)
+            except (TypeError, ValueError):
+                pass
+        return min(int(base_capacity or 1), 2)
+
+    existing = []
+    for month in months:
+        existing.extend(store.list_month(account_key, month) or [])
+    occupied = defaultdict(set)
+    active_count = defaultdict(int)
+    prior = defaultdict(list)
+    for row in existing:
+        status = str(row.get("status") or "").lower()
+        if not status or status in _WIPEABLE_STATUSES:
+            continue
+        key = _slot_key(row)
+        prior[key].append(row)
+        if status in ("denied", "killed"):
+            continue
+        active_count[key] += 1
+        ordinal = row.get("slot_index")
+        capacity = capacity_for(row)
+        if ordinal not in range(capacity):
+            ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
+        occupied[key].add(ordinal)
+    kept = []
+    for row in rows or []:
+        key = _slot_key(row)
+        capacity = capacity_for(row)
+        ordinal = row.get("slot_index")
+        if ordinal is None:
+            ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
+            # LASSO editorial still assigns a concrete ordinal to legacy nulls
+            # (two None feeds on a 2x day become 0 then 1). Client None stays
+            # None on the default cell so _held_slot_key (None != 0) still
+            # blocks a pending media-hold replacement at insert time.
+            if ordinal != 0 or str(account_key).strip().lower() == "lasso":
+                row = dict(row, slot_index=ordinal)
+        if (ordinal not in range(capacity) or active_count[key] >= capacity
+                or ordinal in occupied[key]):
+            continue
+        if any((row.get("caption") and row.get("caption") == old.get("caption"))
+               or (row.get("image_url") and row.get("image_url") == old.get("image_url"))
+               for old in prior.get(key, ())):
+            continue
+        kept.append(row)
+        occupied[key].add(ordinal)
+        active_count[key] += 1
+    return kept, len(prior)
+
+
 def preserve_and_prune(store, account_key, months, rows):
     """Shared guard for every delete-then-insert rebuild lane (client month, real month,
     demo->real mirror). Reads the HUMAN OWNED slots the gym already has across `months`
     and drops any incoming row that would land on one of them, so a rebuild that keeps a
     client's approved post never also inserts a duplicate draft into the same cell.
 
+    When the store can list_month, occupancy is per cadence slot so a 2x day with an
+    approved morning post can still receive an evening post. Stores that only expose
+    locked_slots keep the conservative (post_date, account, format) cell lock.
     Returns (kept_rows, locked_slot_count). Safe when the store lacks locked_slots (a test
     fake): then nothing is locked and every row is kept. Never raises out (a read failure
     falls back to keeping all rows, matching the old behavior)."""
-    if (account_key == "lasso" and config.lasso_editorial_calendar_enabled()
-            and callable(getattr(store, "list_month", None))):
-        from .cadence import resolve_posts_per_day
-        def capacity_for(row):
-            """Third capacity exists only for LASSO feed rows in the dated window."""
-            day_key = str(row.get("post_date") or "")[:10]
-            try:
-                base_capacity = resolve_posts_per_day(account_key, store, day=day_key)
-            except TypeError:
-                # Compatibility for injected legacy resolvers in offline callers.
-                base_capacity = resolve_posts_per_day(account_key, store)
-            if (str(account_key).strip().lower() == "lasso"
-                    and str(row.get("format") or "feed").strip().lower() in ("feed", "story")):
-                try:
-                    if config.lasso_three_feed_enabled() or \
-                            config.lasso_summit_daily_enabled(day_key):
-                        return max(base_capacity, 3)
-                except (TypeError, ValueError):
-                    pass
-            # Client Stories retain their two-slot preservation capacity.
-            return min(base_capacity, 2)
-        existing = []
-        # A failed preservation read must never risk an approved post.
-        for month in months:
-            existing.extend(store.list_month(account_key, month) or [])
-        from collections import defaultdict
-        occupied = defaultdict(set)
-        active_count = defaultdict(int)
-        prior = defaultdict(list)
-        for row in existing:
-            status = str(row.get("status") or "").lower()
-            if not status or status in _WIPEABLE_STATUSES:
-                continue
-            key = _slot_key(row)
-            prior[key].append(row)
-            if status in ("denied", "killed"):
-                continue
-            active_count[key] += 1
-            ordinal = row.get("slot_index")
-            capacity = capacity_for(row)
-            if ordinal not in range(capacity):
-                ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
-            occupied[key].add(ordinal)
-        kept = []
-        for row in rows or []:
-            key = _slot_key(row)
-            capacity = capacity_for(row)
-            ordinal = row.get("slot_index")
-            if ordinal is None:
-                ordinal = next((i for i in range(capacity) if i not in occupied[key]), 0)
-                row = dict(row, slot_index=ordinal)
-            if (ordinal not in range(capacity) or active_count[key] >= capacity
-                    or ordinal in occupied[key]):
-                continue
-            if any((row.get("caption") and row.get("caption") == old.get("caption"))
-                   or (row.get("image_url") and row.get("image_url") == old.get("image_url"))
-                   for old in prior[key]):
-                continue
-            kept.append(row)
-            occupied[key].add(ordinal)
-            active_count[key] += 1
-        return kept, len(prior)
+    if callable(getattr(store, "list_month", None)):
+        try:
+            return _prune_by_cadence_occupancy(store, account_key, months, rows)
+        except Exception:  # noqa: BLE001 - a read failure must not block the rebuild
+            pass
     getter = getattr(store, "locked_slots", None)
     if getter is None:
         return list(rows or []), 0

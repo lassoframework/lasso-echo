@@ -158,6 +158,59 @@ class _StoreWithLocks:
         return self._locked
 
 
+def test_prune_client_2x_admits_free_slot_without_replacing_approved(monkeypatch):
+    """A 2x client day with an approved morning post can still receive evening."""
+    monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
+
+    class _Store:
+        def gym_posts_per_day(self, base):
+            return 2
+
+        def list_month(self, account_key, month):
+            return [{"post_date": "2026-08-13", "account": "instagram",
+                     "format": "feed", "status": "approved", "slot_index": 0,
+                     "caption": "approved morning",
+                     "image_url": "https://cdn/am.jpg"}]
+
+    incoming = [
+        {"gym_id": "eng", "post_date": "2026-08-13", "account": "instagram",
+         "format": "feed", "slot_index": 0, "caption": "replacement am",
+         "image_url": "https://cdn/new-am.jpg"},
+        {"gym_id": "eng", "post_date": "2026-08-13", "account": "instagram",
+         "format": "feed", "slot_index": 1, "caption": "new evening",
+         "image_url": "https://cdn/pm.jpg"},
+        {"gym_id": "eng", "post_date": "2026-08-13", "account": "instagram",
+         "format": "story", "slot_index": 1, "caption": "new evening story",
+         "image_url": "https://cdn/pm-story.jpg"},
+    ]
+    kept, n = pcs.preserve_and_prune(_Store(), "eng", ["2026-08"], incoming)
+    assert n == 1
+    assert [r["slot_index"] for r in kept if r["format"] == "feed"] == [1]
+    assert any(r["format"] == "story" and r["slot_index"] == 1 for r in kept)
+    assert not any(r.get("slot_index") == 0 for r in kept)
+
+
+def test_prune_client_1x_still_blocks_the_whole_feed_cell(monkeypatch):
+    """Capacity 1: any owned feed fills the day; a second IG feed cannot land."""
+    monkeypatch.delenv("ECHO_CADENCE_2X_ENABLED", raising=False)
+
+    class _Store:
+        def gym_posts_per_day(self, base):
+            return 1
+
+        def list_month(self, account_key, month):
+            return [{"post_date": "2026-08-13", "account": "instagram",
+                     "format": "feed", "status": "approved",
+                     "caption": "owned", "image_url": "https://cdn/am.jpg"}]
+
+    incoming = [_row(account="instagram", fmt="feed"),
+                _row(account="facebook", fmt="feed")]
+    kept, n = pcs.preserve_and_prune(_Store(), "eng", ["2026-08"], incoming)
+    assert n == 1
+    assert not any(r["account"] == "instagram" and r["format"] == "feed" for r in kept)
+    assert any(r["account"] == "facebook" for r in kept)
+
+
 def test_prune_drops_colliding_rows_keeps_others():
     locked = {("2026-08-13", "instagram", "feed")}
     incoming = [

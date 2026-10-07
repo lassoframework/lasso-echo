@@ -2872,7 +2872,9 @@ def test_approved_legacy_spacing_is_formatted_before_publish(armed, monkeypatch)
     assert summary["published"] == ["spacing1"]
     sent = pub.calls[0][0].caption
     assert sent == "Move well today.\n\nBuild strength tomorrow.\n\nJoin us."
-    assert store.preserve_patches == [("lasso", "spacing1", sent)]
+    # #320: whitespace-only formatting is sent on the wire but NOT persisted, so
+    # the human-stamped stored caption (and its approval digest) stays intact.
+    assert store.preserve_patches == []
     assert store.rows["spacing1"]["status"] == "published"
     assert notices == []
 

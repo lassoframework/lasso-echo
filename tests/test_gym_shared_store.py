@@ -604,6 +604,26 @@ def test_kill_switch_disables_the_mirror_even_with_creds(armed, monkeypatch):
 
 # ---- safety defaults are untouched ------------------------------------------
 
+def test_missing_httpx_is_unavailable_not_a_sync_alert(armed, monkeypatch, capsys):
+    """Ad-hoc `python` without /opt/venv must not look like a data-sync failure."""
+    fired = []
+    monkeypatch.setattr(db, "_mirror_alert",
+                        lambda msg, account_key="", now=None: fired.append(msg))
+    monkeypatch.setattr(gss.SharedGymStore, "_httpx_module", lambda self: None)
+    db._UNAVAILABLE_NOTED = False
+    store = gss.SharedGymStore(url="https://example.supabase.co", service_key="k")
+    assert store.available() is False
+    reason = store.unavailable_reason()
+    assert reason and "httpx" in reason and "not a data sync failure" in reason
+    db.gym_upsert("nohttpx", display_name="No Httpx")
+    assert fired == [], "missing httpx must not page as a gym-shared-store mirror failure"
+    assert db.gym_get("nohttpx", _shared_read=False)["display_name"] == "No Httpx"
+    logged = capsys.readouterr().out
+    assert "unavailable" in logged
+    assert "ModuleNotFoundError" not in logged
+    assert "mirror FAILED" not in logged
+
+
 def test_the_shared_store_carries_no_trust_or_publish_kill_switch():
     """Trust still fails safe to FULL_APPROVAL from accounts.py, and the publish
     kill switch is still the worker's AGENT_PUBLISH_ENABLED env var. Neither is a
