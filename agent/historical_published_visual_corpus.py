@@ -320,19 +320,26 @@ def compare_signals(manifest):
             "candidate_absence_means_unused": False}
 
 
-def lookup_candidate(candidate_bytes, manifest, *, hamming_threshold=8):
+def lookup_candidate(candidate_bytes, manifest, snapshot, *, expected_row_refs=None,
+                     hamming_threshold=8):
     """Return hash-only corpus evidence for a candidate image; never clearance.
 
     Candidate bytes are processed in memory and are not persisted. A no-match
     result is explicitly inconclusive because unknown corpus rows remain.
     """
-    if not isinstance(candidate_bytes, bytes) or not candidate_bytes:
+    if not isinstance(candidate_bytes, bytes) or not 0 < len(candidate_bytes) <= MAX_IMAGE_BYTES:
         raise CorpusError("candidate_bytes_invalid")
     if type(hamming_threshold) is not int or not 0 <= hamming_threshold <= 64:
         raise CorpusError("candidate_hamming_threshold_invalid")
-    records = manifest.get("records") if isinstance(manifest, dict) else None
-    if not isinstance(records, dict):
+    if (not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA_VERSION
+            or manifest.get("complete") is not True):
         raise CorpusError("candidate_manifest_invalid")
+    rows, snapshot_digest = load_snapshot(snapshot, expected_row_refs)
+    if manifest.get("snapshot_sha256") != snapshot_digest:
+        raise CorpusError("candidate_manifest_invalid")
+    records = _validate_resume_records(manifest, rows, snapshot_digest)
+    if len(records) != len(rows):
+        raise CorpusError("candidate_manifest_incomplete")
     candidate_sha = _sha(candidate_bytes)
     candidate_dhash, _, _ = _visual_fingerprint(candidate_bytes)
     candidate_bits = int(candidate_dhash, 16)
@@ -360,6 +367,6 @@ def lookup_candidate(candidate_bytes, manifest, *, hamming_threshold=8):
             near.append({**member, "hamming_distance": distance})
     return {"candidate_sha256": candidate_sha, "candidate_dhash64": candidate_dhash,
             "exact_byte_matches": exact, "near_scene_matches": near,
-            "corpus_hashed_count": len(records) - unknown_count,
+            "corpus_hashed_count": sum(record["status"] == "hashed" for record in records.values()),
             "corpus_unknown_count": unknown_count,
             "candidate_absence_means_unused": False}

@@ -135,27 +135,43 @@ def test_tranche_rejects_refs_outside_snapshot_and_oversized_batches(tmp_path):
                        target_row_refs=too_many)
 
 
-def test_candidate_lookup_returns_hash_only_signals_and_never_clearance():
+def test_candidate_lookup_returns_hash_only_signals_and_never_clearance(tmp_path):
     candidate = png((20, 30, 40))
     other = png((21, 31, 41))
-    candidate_dhash, _, _ = corpus._visual_fingerprint(candidate)
-    other_dhash, _, _ = corpus._visual_fingerprint(other)
-    manifest = {"records": {
-        "a" * 64: {"row_ref_sha256": "a" * 64, "status": "hashed",
-                   "image_sha256": corpus._sha(candidate), "dhash64": candidate_dhash,
-                   "gym_sha256": "1" * 64, "published_date_sha256": "2" * 64},
-        "b" * 64: {"row_ref_sha256": "b" * 64, "status": "hashed",
-                   "image_sha256": corpus._sha(other), "dhash64": other_dhash,
-                   "gym_sha256": "3" * 64, "published_date_sha256": "4" * 64},
-        "c" * 64: {"row_ref_sha256": "c" * 64, "status": "unknown",
-                   "unknown_reason": "hosted_image_unavailable"},
-    }}
-    result = corpus.lookup_candidate(candidate, manifest)
-    assert [m["row_ref_sha256"] for m in result["exact_byte_matches"]] == ["a" * 64]
+    rows = [row("a", "https://cdn.test/a"), row("b", "https://cdn.test/b"),
+            row("c", "https://evil.test/c")]
+    snap = snapshot(rows)
+    manifest = corpus.collect(snap, allowed_hosts={"cdn.test"}, manifest_path=tmp_path / "manifest.json",
+                              session=Session({rows[0]["image_url"]: candidate,
+                                               rows[1]["image_url"]: other}))
+    result = corpus.lookup_candidate(candidate, manifest, snap)
+    assert [m["row_ref_sha256"] for m in result["exact_byte_matches"]] == [
+        corpus._sha(corpus._canonical(["a", "r1"]))]
     assert result["near_scene_matches"]
     assert result["corpus_hashed_count"] == 2 and result["corpus_unknown_count"] == 1
     assert result["candidate_absence_means_unused"] is False
     assert "https://" not in json.dumps(result) and '"row_id"' not in json.dumps(result)
+
+
+@pytest.mark.parametrize("mutation", ["incomplete", "row_count", "snapshot_digest", "raw_url"])
+def test_candidate_lookup_rejects_unbound_or_malformed_manifest(tmp_path, mutation):
+    image = png((2, 3, 4))
+    rows = [row("a", "https://cdn.test/a")]
+    snap = snapshot(rows)
+    manifest = corpus.collect(snap, allowed_hosts={"cdn.test"}, manifest_path=tmp_path / "lookup.json",
+                              session=Session({rows[0]["image_url"]: image}))
+    if mutation == "incomplete": manifest["complete"] = False
+    elif mutation == "row_count": manifest["row_count"] = 0
+    elif mutation == "snapshot_digest": manifest["snapshot_sha256"] = "0" * 64
+    elif mutation == "raw_url": next(iter(manifest["records"].values()))["image_url"] = rows[0]["image_url"]
+    with pytest.raises(corpus.CorpusError):
+        corpus.lookup_candidate(image, manifest, snap)
+
+
+def test_candidate_lookup_rejects_candidate_bytes_above_bound(monkeypatch):
+    monkeypatch.setattr(corpus, "MAX_IMAGE_BYTES", 4)
+    with pytest.raises(corpus.CorpusError, match="candidate_bytes_invalid"):
+        corpus.lookup_candidate(b"12345", {}, {})
 
 
 @pytest.mark.parametrize("corruption", ["missing_dhash", "metadata_mismatch", "raw_url"])
