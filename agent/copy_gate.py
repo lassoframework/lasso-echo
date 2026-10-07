@@ -28,7 +28,15 @@ _DASH_RE = re.compile("[" + _BANNED_DASHES + "]")
 _ZERO_WIDTH = "​⁠﻿­"
 _ZERO_WIDTH_RE = re.compile("[" + _ZERO_WIDTH + "]")
 _INTRAWORD_HYPHEN_RE = re.compile(r"(?<=[A-Za-z])-(?=[A-Za-z])")
+# CONSUMER COPY LAW (Blake, 2026-10-07): client captions carry NO hyphen of any kind
+# (letter-letter, digit-letter like "30-minute", list bullets), no colon and no
+# semicolon. URLs, emails' domains, @handles and #tags are protected spans.
+_ANY_HYPHEN_RE = re.compile(r"-")
+_CLOCK_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+_COLON_RE = re.compile(r"\s*:\s*")
+_BULLET_RE = re.compile(r"(?m)^[ \t]*-+[ \t]*")
 # protect URLs and @handles/#tags: hyphens inside them are load-bearing
+_HYPHEN_AS_DASH_RE = re.compile(r"[ \t]+-+[ \t]+|-{2,}")
 _PROTECTED_RE = re.compile(r"(?:https?://\S+|\b[\w.-]+\.(?:com|net|org|io|co|fit|gym)\S*|[@#][\w.]+)", re.I)
 
 # A real email address, anywhere in the text. HARD violation (2026-09-08, Zanshin Fitness /
@@ -63,15 +71,35 @@ ASK_RE = re.compile(
     r"comment \"?\w+\"?|sign up|get started|claim your|reserve your|try a (free )?class|"
     r"schedule (a|your)|start (here|today|your))", re.I)
 
-def scrub(text: str) -> str:
+def scrub_caption(text: str) -> str:
+    """CONSUMER COPY LAW scrub for client captions (Blake, 2026-10-07): everything
+    scrub does PLUS every hyphen (letter or digit: "30-minute" -> "30 minute"; list
+    bullets dropped), every colon ("6:00" -> "6", "6:30" -> "6.30", otherwise ", ")
+    and every semicolon. URLs, @handles and #tags stay protected."""
+    return scrub(text, strict=True)
+
+
+def caption_violations(text: str) -> list[str]:
+    """violations() plus the consumer copy law: any hyphen and any colon outside a
+    protected URL/handle/tag span. Used by the client caption validator."""
+    v = violations(text)
+    plain = _PROTECTED_RE.sub("", str(text))
+    if "-" in plain and "intraword_hyphen" not in v:
+        v.append("hyphen")
+    if ":" in plain:
+        v.append("colon")
+    return v
+
+
+def scrub(text: str, strict: bool = False) -> str:
     """Rewrite, never reject. Long dashes become ', '; intraword hyphens become a
     space; zero-width/invisible characters are removed; URLs, @handles and #tags
     pass through untouched."""
     out, last = [], 0
     s = _ZERO_WIDTH_RE.sub("", str(text))
     for m in _PROTECTED_RE.finditer(s):
-        out.append(_scrub_plain(s[last:m.start()])); out.append(m.group(0)); last = m.end()
-    out.append(_scrub_plain(s[last:]))
+        out.append(_scrub_plain(s[last:m.start()], strict)); out.append(m.group(0)); last = m.end()
+    out.append(_scrub_plain(s[last:], strict))
     return "".join(out).strip()
 
 def scrub_prompt(text: str) -> str:
@@ -86,9 +114,29 @@ def scrub_prompt(text: str) -> str:
     cleaned = _DASH_RE.sub(" ", s)
     return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
-def _scrub_plain(t: str) -> str:
+def _clock(m):
+    hh, mm = m.group(1), m.group(2)
+    return hh if mm == "00" else f"{hh}.{mm}"
+
+
+def _scrub_plain(t: str, strict: bool = False) -> str:
     t = _DASH_RE.sub(", ", t)
-    t = _INTRAWORD_HYPHEN_RE.sub(" ", t)
+    if strict:
+        t = _BULLET_RE.sub("", t)
+        # Meaning-preserving numeric rewrites FIRST (review on #340): a range
+        # "8-12" reads "8 to 12", a ratio "1:1" reads "1 to 1", a leading minus
+        # "-5" reads "negative 5". Only then are the remaining hyphens/colons cut.
+        t = re.sub(r"(\d)\s*-\s*(?=\d)", r"\1 to ", t)
+        t = re.sub(r"(?<![\w.])-(?=\d)", "negative ", t)
+        t = re.sub(r"\b(\d{1,2}):(\d)\b", r"\1 to \2", t)
+        t = _HYPHEN_AS_DASH_RE.sub(", ", t)
+        t = _ANY_HYPHEN_RE.sub(" ", t)
+        t = _CLOCK_RE.sub(_clock, t)
+        t = _COLON_RE.sub(", ", t)
+        t = re.sub(r",\s*,", ",", t)
+        t = re.sub(r"^\s*,\s*", "", t)
+    else:
+        t = _INTRAWORD_HYPHEN_RE.sub(" ", t)
     t = t.replace(";", ",")
     t = re.sub(r"\s+,", ",", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
