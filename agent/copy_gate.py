@@ -131,6 +131,7 @@ def _scrub_plain(t: str, strict: bool = False) -> str:
         t = re.sub(r"^\s*,\s*", "", t)
     else:
         t = _INTRAWORD_HYPHEN_RE.sub(" ", t)
+    t = t.replace(";", ",")
     t = re.sub(r"\s+,", ",", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t
