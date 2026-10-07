@@ -134,6 +134,9 @@ def main():
    # SQL bind -> B verified original reserve -> queue completion -> normal
    # attester -> owned publisher claim, using synthetic original bytes only.
    persistence=owner.ForwardMediaOwnerPersistence(conn,'generated_owner',None)
+   # Disposable synthetic epoch/census only; no live cutover or adapter proof.
+   conn.execute('select fixer_still_cutover_control_20261007(true,%s)',
+     ('SYNTHETIC gap fixture cutover',));conn.commit()
    snap=trusted(guard.generated_snapshot(persistence,a[1]));conn.rollback();original=candidate(snap,pixels)
    with patch('agent.visual_writer_prepare._own_media_url',lambda u:isinstance(u,str) and u.startswith('https://owned.example/')):
     reserved=guard.reserve_generated(persistence,a[1],original,snap,history_visuals=[],read_bytes=lambda u:pixels);conn.commit()
@@ -141,6 +144,11 @@ def main():
     assert conn.execute('select fixer_generated_gap_record_20261007(%s,%s,true,null)',(q['request_id'],a[1])).fetchone()[0];conn.commit()
     assert sql('select state,last_hold from fixer_generated_gap_request_20261007 where request_id=%s',(q['request_id'],))[0]==('complete',None)
     assert sql('select status from content_calendar where id=%s',(a[1],))[0][0]=='approved'
+    census=guard.generated_snapshot(persistence,a[1]);conn.rollback()
+    assert census['photo_inventory_complete'] and census['eligible_photo_count']==0
+    conn.execute('select fixer_still_inventory_record_20261007(%s,%s,%s,true,0,%s)',
+      (str(uuid.uuid4()),a[1],census['inventory_revision'],
+       'SYNTHETIC freshly observed empty local library/rotation'));conn.commit()
     revision=sql('select fixer_forward_media_attestation_request_20261006(%s)',(a[1],))[0][0]['revision']
     receipt=guard.attest(a[1],revision,connection_factory=lambda:lane(guard.ROLE),original_verifier=lambda s,b:b==pixels,read_bytes=lambda u:pixels)
     token=str(uuid.uuid4())
