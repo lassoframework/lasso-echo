@@ -95,6 +95,17 @@ def attest(calendar_row_id, expected_revision, *, original_verifier=None, contro
             snapshot = cur.fetchone()[0]
             if not isinstance(snapshot, dict) or snapshot.get('revision') != expected_revision:
                 raise ForwardMediaVerificationHold('persisted media revision changed')
+            if connection_factory is None:
+                # Production never accepts callbacks from a publisher/request.
+                # The isolated attester obtains exact-row provenance through
+                # its narrow DB RPC using the same authenticated connection.
+                if (original_verifier is not None or controlled_renderer is not None
+                        or read_bytes is not None):
+                    raise ForwardMediaVerificationHold('attester callback override refused')
+                from . import forward_media_attester
+                original_verifier, controlled_renderer = (
+                    forward_media_attester.production_callbacks(
+                        conn, row_id, expected_revision=expected_revision))
             urls = [snapshot.get(k) for k in ('source_url', 'image_url', 'thumbnail_url')]
             cache = {}
             for url in urls:

@@ -50,14 +50,43 @@ def main():
             image = image or url
             thumb = "null" if thumbnail is None else "'" + thumbnail + "'"
             sql("insert into content_calendar(id,gym_id,post_date,status,variant_status,"
-                "image_url,source_media_url,thumbnail_url,visual_group_key,publish_claim_token,publish_reservation_day)"
+                "image_url,source_media_url,thumbnail_url,visual_group_key,publish_claim_token,publish_reservation_day,source_media_asset_id,render_manifest_digest)"
                 f" values('{rid}','{tenant}','{day}','publishing','active',"
-                f"'{image}','{url}',{thumb},'{group}','{token}','{reservation}');")
+                f"'{image}','{url}',{thumb},'{group}','{token}','{reservation}','unprepared_{uuid.uuid4().hex}','sha256:{uuid.uuid4().hex}{uuid.uuid4().hex}');")
             return rid, token
+
+        def prepare(pair, fp, image_fp=None, thumb_fp=None, operation='same_object', clearance=True):
+            rid = pair[0]
+            # The owner prepares authoritative evidence independently; the
+            # attester cannot create it from an arbitrary fetched URL/hash.
+            tenant, url, image, thumbnail = sql(f"select gym_id||'|'||source_media_url||'|'||image_url||'|'||coalesce(thumbnail_url,'') from content_calendar where id='{rid}';").split('|')
+            existing = sql(f"select source_asset_id from fixer_forward_media_original_registry_20261006 where tenant_id='{tenant}' and source_url='{url}';")
+            asset = existing or 'original_' + uuid.uuid4().hex
+            if not existing:
+                sql("insert into fixer_forward_media_original_registry_20261006 "
+                    "(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref) "
+                    f"values('{tenant}','{asset}','{url}','{fp}',10,'owner-verified-original');")
+            if clearance:
+                sql("insert into fixer_forward_media_history_clearance_20261006 "
+                    "(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref,decision,history_evidence_ref) "
+                    f"values('{tenant}','{asset}','{url}','{fp}',10,'owner-verified-original','cleared_unused','independent-fleet-history-audit') on conflict do nothing;")
+            digest = 'sha256:' + uuid.uuid4().hex + uuid.uuid4().hex
+            thumb = "null,null,null" if not thumbnail or thumb_fp is None else f"'{thumbnail}','{thumb_fp}',30"
+            # Missing thumbnail evidence is rejected by the attester, without
+            # manufacturing a partially valid manifest.
+            if thumbnail and thumb_fp is None:
+                thumb = f"'{thumbnail}','md5:{'a'*32}',30"
+            sql("insert into fixer_forward_media_render_manifest_20261006 "
+                "(manifest_digest,tenant_id,source_asset_id,image_url,image_fingerprint,image_length,"
+                "thumbnail_url,thumbnail_fingerprint,thumbnail_length,operation,render_evidence_ref) "
+                f"values('{digest}','{tenant}','{asset}','{image}','{image_fp or fp}',10,{thumb},'{operation}','owner-verified-render');")
+            sql(f"update content_calendar set source_media_asset_id='{asset}',render_manifest_digest='{digest}' where id='{rid}';")
+            return asset, digest
 
         def attest(pair, fp, image_fp=None, thumb_fp=None, operation='same_object', ok=True, revision=None):
             rid, token = pair
             evidence = str(uuid.uuid4())
+            prepare(pair, fp, image_fp, thumb_fp, operation)
             revision = revision or sql("set role fixer_forward_media_attester_20261006; select "
                 f"fixer_forward_media_attestation_request_20261006('{rid}')->>'revision';")
             thumb = "null,null" if thumb_fp is None else f"'{thumb_fp}',30"
@@ -91,6 +120,96 @@ def main():
                 "media_not_ready_reason text);")
             # Apply only this self-contained draft. NO #306/#307 dependency.
             sql((ROOT / 'migrations/DRAFT_fixer_forward_media_claim_20261006.sql').read_text())
+            # Arbitrary persisted source URLs and hashes have no original
+            # authority, even when submitted by the separately trusted attester.
+            probe=row('provenance_gym','provenance_group','https://scratch.example/provenance')
+            probe_fp='md5:'+uuid.uuid4().hex
+            probe_revision=sql(f"select fixer_forward_media_attestation_request_20261006('{probe[0]}')->>'revision';")
+            assert 'original registry binding unavailable' in sql(
+                "set role fixer_forward_media_attester_20261006; select fixer_attest_forward_media_20261006"
+                f"('{probe[0]}','{probe_revision}','{uuid.uuid4()}','{probe_fp}',10,'{probe_fp}',10,null,null,'same_object','unregistered');",ok=False)
+            asset,digest=prepare(probe,probe_fp)
+            prepared_revision=sql(f"select fixer_forward_media_attestation_request_20261006('{probe[0]}')->>'revision';")
+            assert prepared_revision != probe_revision
+            assert sql("set role fixer_forward_media_attester_20261006; select "
+                f"fixer_forward_media_provenance_lookup_20261006('{probe[0]}')#>>'{{original,source_asset_id}}';")==asset
+            assert sql("set role fixer_forward_media_attester_20261006; select count(*) from "
+                "fixer_forward_media_pending_attestations_20261006('provenance_gym',1);")=='1'
+            assert sql("set role fixer_forward_media_attester_20261006; select count(*) from "
+                f"fixer_forward_media_pending_attestations_20261006('provenance_gym',1,'{probe[0]}');")=='0'
+            assert sql("set role fixer_forward_media_attester_20261006; select count(*) from "
+                "fixer_forward_media_pending_attestations_20261006('provenance_gym',1,'00000000-0000-0000-0000-000000000000');")=='1'
+            assert sql("set role fixer_forward_media_attester_20261006; select count(*) from "
+                "fixer_forward_media_pending_attestations_20261006('another_gym',1);")=='0'
+            assert 'bounded tenant-scoped' in sql("set role fixer_forward_media_attester_20261006; "
+                "select fixer_forward_media_pending_attestations_20261006('provenance_gym',101);",ok=False)
+            assert 'permission denied' in sql("set role service_role; select "
+                f"fixer_forward_media_provenance_lookup_20261006('{probe[0]}');",ok=False)
+            assert 'permission denied' in sql("set role service_role; select "
+                "fixer_forward_media_pending_attestations_20261006('provenance_gym',1);",ok=False)
+            for table in ('original_registry','render_manifest','history_clearance'):
+                assert 'permission denied' in sql(f"set role fixer_forward_media_attester_20261006; select * from fixer_forward_media_{table}_20261006;",ok=False)
+                assert 'permission denied' in sql(f"set role service_role; select * from fixer_forward_media_{table}_20261006;",ok=False)
+                assert 'immutable' in sql(f"delete from fixer_forward_media_{table}_20261006;",ok=False)
+                assert 'immutable' in sql(f"truncate fixer_forward_media_{table}_20261006 cascade;",ok=False)
+            assert 'authoritative provenance' in sql("set role fixer_forward_media_attester_20261006; "
+                "select fixer_attest_forward_media_20261006"
+                f"('{probe[0]}','{prepared_revision}','{uuid.uuid4()}','md5:{'f'*32}',10,'{probe_fp}',10,null,null,'same_object','forged-original');",ok=False)
+            sql(f"update content_calendar set render_manifest_digest='sha256:{'0'*64}' where id='{probe[0]}';")
+            assert 'manifest binding unavailable' in sql("set role fixer_forward_media_attester_20261006; "
+                f"select fixer_forward_media_provenance_lookup_20261006('{probe[0]}');",ok=False)
+            sql(f"update content_calendar set render_manifest_digest='{digest}',source_media_asset_id='wrong-original' where id='{probe[0]}';")
+            assert 'original registry binding unavailable' in sql("set role fixer_forward_media_attester_20261006; "
+                f"select fixer_forward_media_provenance_lookup_20261006('{probe[0]}');",ok=False)
+            sql(f"delete from content_calendar where id='{probe[0]}';")
+            # A registry/Drive upload does not prove historical eligibility.
+            uncleared=row('clearance_gym','clearance_group','https://scratch.example/uncleared')
+            sql("insert into fixer_forward_media_claim_gate_20261006 values('clearance_gym',true);")
+            clearance_fp='md5:'+uuid.uuid4().hex
+            clear_asset,clear_digest=prepare(uncleared,clearance_fp,clearance=False)
+            clear_revision=sql(f"select fixer_forward_media_attestation_request_20261006('{uncleared[0]}')->>'revision';")
+            def raw_clearance(pair, fingerprint, asset, tenant, url, decision='cleared_unused', role=None, length=10):
+                prefix='' if role is None else f'set role {role}; '
+                return prefix + "insert into fixer_forward_media_history_clearance_20261006 " +                     "(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref,decision,history_evidence_ref) " +                     f"values('{tenant}','{asset}','{url}','{fingerprint}',{length},'owner-verified-original','{decision}','independent-fleet-history-audit');"
+            assert 'historical eligibility clearance unavailable' in sql(
+                "set role fixer_forward_media_attester_20261006; select fixer_attest_forward_media_20261006"
+                f"('{uncleared[0]}','{clear_revision}','{uuid.uuid4()}','{clearance_fp}',10,'{clearance_fp}',10,null,null,'same_object','new-upload');",ok=False)
+            assert 'historical eligibility clearance unavailable' in claim((*uncleared,str(uuid.uuid4())),ok=False)
+            for role in ('service_role','fixer_forward_media_attester_20261006','authenticated'):
+                assert 'permission denied' in sql(raw_clearance(uncleared,clearance_fp,clear_asset,'clearance_gym',
+                    'https://scratch.example/uncleared',role=role),ok=False)
+            assert sql("set role fixer_forward_media_attester_20261006; select count(*) from "
+                "fixer_forward_media_pending_attestations_20261006('clearance_gym',1);")=='0'
+            # A stale byte/version clearance cannot clear the current original.
+            sql(raw_clearance(uncleared,clearance_fp,clear_asset,'clearance_gym',
+                'https://scratch.example/uncleared',length=11))
+            assert 'historical eligibility clearance unavailable' in sql("set role fixer_forward_media_attester_20261006; "
+                f"select fixer_forward_media_provenance_lookup_20261006('{uncleared[0]}');",ok=False)
+            # The same bytes at a new URL/asset and another tenant need their
+            # own clearance; eligibility is never inherited from an upload alias.
+            cleared=row('cleared_gym','cleared_group','https://scratch.example/cleared')
+            alias_fp='md5:'+uuid.uuid4().hex
+            prepare(cleared,alias_fp)
+            for tenant_name in ('cleared_gym','other_clearance_gym'):
+                alias=row(tenant_name,'clearance_group','https://scratch.example/'+uuid.uuid4().hex)
+                prepare(alias,alias_fp,clearance=False)
+                assert 'historical eligibility clearance unavailable' in sql("set role fixer_forward_media_attester_20261006; "
+                    f"select fixer_forward_media_provenance_lookup_20261006('{alias[0]}');",ok=False)
+            # Known historical use/uncertainty follows bytes fleet-wide. Even
+            # an otherwise valid new asset clearance cannot erase a quarantine.
+            for decision in ('hold_used','hold_uncertain'):
+                held_fp='md5:'+uuid.uuid4().hex
+                known=row('history_'+decision,'history_group','https://scratch.example/'+uuid.uuid4().hex)
+                held_asset,_=prepare(known,held_fp,clearance=False)
+                held_url=sql(f"select source_media_url from content_calendar where id='{known[0]}';")
+                sql(raw_clearance(known,held_fp,held_asset,'history_'+decision,held_url,decision))
+                fresh=row('new_'+decision,'fresh_group','https://scratch.example/'+uuid.uuid4().hex)
+                prepare(fresh,held_fp)
+                sql(f"insert into fixer_forward_media_claim_gate_20261006 values('new_{decision}',true);")
+                assert 'historical eligibility clearance unavailable' in sql("set role fixer_forward_media_attester_20261006; "
+                    f"select fixer_forward_media_provenance_lookup_20261006('{fresh[0]}');",ok=False)
+                assert 'historical eligibility clearance unavailable' in claim((*fresh,str(uuid.uuid4())),ok=False)
+                assert sql(f"select count(*) from fixer_forward_media_use_20261006 where fingerprint='{held_fp}';")=='0'
             first, tenant, group, url, fp = seed()
             sql(f"update fixer_forward_media_claim_gate_20261006 set enabled=false where tenant_id='{tenant}';")
             assert 'OFF' in claim(first,ok=False)
@@ -124,20 +243,20 @@ def main():
             assert 'permission denied' in sql("set role service_role; update fixer_forward_media_claim_gate_20261006 set enabled=true;",ok=False)
             assert 'permission denied' in sql("set role fixer_forward_media_attester_20261006; delete from fixer_forward_media_use_20261006;",ok=False)
             missing = (*row(tenant,group,url),str(uuid.uuid4()))
-            assert 'owner attested' in claim(missing,ok=False)
+            assert 'original registry binding unavailable' in claim(missing,ok=False)
             forged = (*row(tenant,group,url),first[2])
-            assert 'owner attested' in claim(forged,ok=False)
+            assert 'original registry binding unavailable' in claim(forged,ok=False)
             assert 'ownership' in claim((first[0],str(uuid.uuid4()),first[2]),ok=False)
             # Evidence is bound to persisted revision and exact outgoing objects.
             changed = attest(row(tenant,group,url),fp)
             sql(f"update content_calendar set image_url='https://scratch.example/changed' where id='{changed[0]}';")
-            assert 'owner attested' in claim(changed,ok=False)
+            assert 'manifest binding unavailable' in claim(changed,ok=False)
             attest(row(tenant,group,url),fp,ok=False,revision='stale-revision')
             unknown=row(tenant,group,url)
             sql(f"update content_calendar set source_media_url=null where id='{unknown[0]}';")
             assert 'identity unavailable' in sql(f"select fixer_forward_media_attestation_request_20261006('{unknown[0]}');",ok=False)
             # Same immutable URL cannot be rebound to different fetched bytes.
-            assert 'changed bytes' in sql("set role fixer_forward_media_attester_20261006; select fixer_attest_forward_media_20261006"
+            assert 'authoritative provenance' in sql("set role fixer_forward_media_attester_20261006; select fixer_attest_forward_media_20261006"
                 f"('{first[0]}','{revision}','{uuid.uuid4()}','md5:{'f'*32}',10,'md5:{'f'*32}',10,null,null,'same_object','test');",ok=False)
             # Distinct rendition reserves original too; rollback entire hash set.
             derivative_url='https://scratch.example/' + uuid.uuid4().hex
@@ -185,6 +304,7 @@ def main():
             assert claim(origin)=='t'
             target,tt,tg,tu,tfp=seed()
             edge_row=row(ot,og,ou,image='https://scratch.example/'+uuid.uuid4().hex)
+            prepare(edge_row,ofp,image_fp=tfp,operation='render')
             edge_id=str(uuid.uuid4())
             edge_revision=sql(f"select fixer_forward_media_attestation_request_20261006('{edge_row[0]}')->>'revision';")
             edge_sql=("set application_name='forward_graph_race'; begin; "
@@ -224,6 +344,27 @@ def main():
             assert claim(gbp_pair) == 't'
             assert sql(f"select reservation_day from fixer_forward_media_claim_receipt_20261006 where calendar_row_id='{gbp_pair[0]}';") == '2026-08-31'
             assert sql(f"select post_date from fixer_forward_media_claim_receipt_20261006 where calendar_row_id='{gbp_pair[0]}';") == '2026-09-01'
+            # An append of historical quarantine races against an already
+            # attested/replayed claim. The shared graph lock must wait and then
+            # recheck clearance, including permanent receipt replays.
+            history_target,ht,hg,hu,hfp=seed()
+            assert claim(history_target)=='t'
+            hold=row('historical_owner','historical_group','https://scratch.example/'+uuid.uuid4().hex)
+            hold_asset,_=prepare(hold,hfp,clearance=False)
+            hold_url=sql(f"select source_media_url from content_calendar where id='{hold[0]}';")
+            hold_sql=("set application_name='history_clearance_race'; begin; " +
+                raw_clearance(hold,hfp,hold_asset,'historical_owner',hold_url,'hold_used') +
+                "select pg_sleep(1.5); commit;")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                writing=pool.submit(sql,hold_sql)
+                deadline=time.monotonic()+5
+                while sql("select count(*) from pg_stat_activity where application_name='history_clearance_race' "
+                          "and wait_event='PgSleep';")!='1':
+                    assert time.monotonic()<deadline,'history insert did not reach graph lock'
+                    time.sleep(0.02)
+                assert 'historical eligibility clearance unavailable' in claim(history_target,ok=False)
+                writing.result(timeout=5)
+            assert sql(f"select count(*) from fixer_forward_media_claim_receipt_20261006 where claim_token='{history_target[1]}';")=='1'
             # Deleting content never frees consumed bytes or receipts.
             sql(f"delete from content_calendar where id='{first[0]}';")
             assert sql(f"select count(*) from fixer_forward_media_use_20261006 where fingerprint='{fp}';")=='1'
@@ -239,7 +380,9 @@ def main():
                   'same-group idempotency; catch-up reservation; immutable complete source/image/thumbnail '
                   'evidence; narrow attester auth; forged/missing/stale evidence hold; deletion permanence; '
                   'derivative source reuse denial; atomic rollback; default OFF; sent-row/outage hold; '
-                  'attester-vs-claim graph race denial and isolation hold')
+                  'attester-vs-claim graph race denial and isolation hold; authoritative original registry and '
+                  'versioned render manifest mismatch denial; narrow tenant-scoped discovery and provenance lookup; '
+                  'missing/forged/stale historical clearance hold; tenant/asset/URL isolation; fleet quarantine non-bypass')
         finally:
             subprocess.run(['pg_ctl','-D',str(data),'-m','immediate','-w','stop'],
                            capture_output=True, timeout=60)

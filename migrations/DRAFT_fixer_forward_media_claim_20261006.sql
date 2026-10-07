@@ -19,6 +19,8 @@ begin;
 -- trusted preparation establishes original and stable logical sibling group.
 alter table public.content_calendar add column if not exists source_media_url text;
 alter table public.content_calendar add column if not exists visual_group_key text;
+alter table public.content_calendar add column if not exists source_media_asset_id text;
+alter table public.content_calendar add column if not exists render_manifest_digest text;
 
 -- No login, password, membership or provider activation is provisioned here.
 create role fixer_forward_media_attester_20261006 nologin;
@@ -39,6 +41,80 @@ create table public.fixer_forward_media_tenant_alias_20261006 (
 create table public.fixer_forward_media_claim_gate_20261006 (
   tenant_id text primary key,
   enabled boolean not null default false
+);
+-- Owner-prepared source authority, distinct from arbitrary fetched URLs. Only a
+-- verified original registry may establish a source identity; an attester has
+-- no insert privilege here. Versioned render manifests bind every output to
+-- that original. All preparation/import remains separately authorized/offline.
+create table public.fixer_forward_media_original_registry_20261006 (
+  tenant_id text not null check (tenant_id=btrim(tenant_id) and tenant_id<>''),
+  source_asset_id text not null check (source_asset_id=btrim(source_asset_id) and source_asset_id<>''),
+  source_url text not null check (source_url ~ '^https://[^[:space:]]+$'),
+  source_fingerprint text not null check (source_fingerprint ~ '^md5:[0-9a-f]{32}$'),
+  source_length bigint not null check (source_length>0 and source_length<=134217728),
+  registry_evidence_ref text not null check (btrim(registry_evidence_ref)<>''),
+  registered_at timestamptz not null default now(),
+  primary key(tenant_id,source_asset_id),
+  unique(tenant_id,source_url)
+);
+-- Direct OWNER-ONLY preparation protocol for a future offline importer:
+-- BEGIN; insert verified original registry tuple; insert clearance using the
+-- exact tuple and independently audited fleet historical evidence; insert
+-- versioned render manifest; COMMIT. No registry/upload/generation automatically
+-- receives clearance. Generated originals use an evidence-backed generation
+-- asset identity and registry evidence reference, subject to the same historical
+-- byte check. Uncertain/used decisions permanently quarantine those known bytes;
+-- missing clearance holds. Do not use service_role or the attester to prepare.
+create table public.fixer_forward_media_history_clearance_20261006 (
+  tenant_id text not null,
+  source_asset_id text not null,
+  source_url text not null check (source_url ~ '^https://[^[:space:]]+$'),
+  source_fingerprint text not null check (source_fingerprint ~ '^md5:[0-9a-f]{32}$'),
+  source_length bigint not null check (source_length>0 and source_length<=134217728),
+  registry_evidence_ref text not null check (btrim(registry_evidence_ref)<>''),
+  decision text not null check (decision in ('cleared_unused','hold_uncertain','hold_used')),
+  history_evidence_ref text not null check (btrim(history_evidence_ref)<>''),
+  checked_at timestamptz not null default now(),
+  primary key(tenant_id,source_asset_id),
+  foreign key(tenant_id,source_asset_id) references public.fixer_forward_media_original_registry_20261006(tenant_id,source_asset_id)
+);
+create index fixer_forward_history_fingerprint_20261006
+  on public.fixer_forward_media_history_clearance_20261006(source_fingerprint);
+-- Historical authority appends serialize with attestations/claims under the
+-- existing graph lock, so a waiting claim observes committed quarantine data.
+create function public.fixer_forward_history_lock_20261006()
+returns trigger language plpgsql set search_path=pg_catalog,public as $$
+begin
+  if current_setting('transaction_isolation')<>'read committed' then
+    raise exception 'forward media authority requires read committed isolation' using errcode='25000';
+  end if;
+  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
+  return new;
+end;
+$$;
+revoke all on function public.fixer_forward_history_lock_20261006()
+  from public,anon,authenticated,service_role,fixer_forward_media_attester_20261006;
+create trigger history_graph_lock before insert on public.fixer_forward_media_history_clearance_20261006
+  for each row execute function public.fixer_forward_history_lock_20261006();
+create table public.fixer_forward_media_render_manifest_20261006 (
+  manifest_digest text primary key check (manifest_digest ~ '^sha256:[0-9a-f]{64}$'),
+  tenant_id text not null,
+  source_asset_id text not null,
+  image_url text not null check (image_url ~ '^https://[^[:space:]]+$'),
+  image_fingerprint text not null check (image_fingerprint ~ '^md5:[0-9a-f]{32}$'),
+  image_length bigint not null check (image_length>0 and image_length<=134217728),
+  thumbnail_url text check (thumbnail_url ~ '^https://[^[:space:]]+$'),
+  thumbnail_fingerprint text check (thumbnail_fingerprint ~ '^md5:[0-9a-f]{32}$'),
+  thumbnail_length bigint check (thumbnail_length>0 and thumbnail_length<=134217728),
+  operation text not null check (operation in ('same_object','render','reburn','rehost')),
+  -- Versioned replay inputs are owner-prepared. Missing inputs remain an
+  -- attester hold; a URL or caption supplied by the publisher is never proof.
+  render_recipe jsonb,
+  render_evidence_ref text not null check (btrim(render_evidence_ref)<>''),
+  registered_at timestamptz not null default now(),
+  foreign key(tenant_id,source_asset_id) references public.fixer_forward_media_original_registry_20261006(tenant_id,source_asset_id),
+  check ((thumbnail_url is null and thumbnail_fingerprint is null and thumbnail_length is null)
+    or (thumbnail_url is not null and thumbnail_fingerprint is not null and thumbnail_length is not null))
 );
 -- The independently credentialed attester fetches exact objects and records bytes.
 -- An immutable URL cannot later be rebound to different bytes. Source hashes are
@@ -66,9 +142,12 @@ create table public.fixer_forward_media_lineage_20261006 (
   source_read_receipt uuid not null references public.fixer_forward_media_object_read_20261006(receipt_id),
   image_read_receipt uuid not null references public.fixer_forward_media_object_read_20261006(receipt_id),
   thumbnail_read_receipt uuid references public.fixer_forward_media_object_read_20261006(receipt_id),
+  source_asset_id text not null,
+  manifest_digest text not null references public.fixer_forward_media_render_manifest_20261006(manifest_digest),
   render_evidence_ref text,
   verified_by text not null check (btrim(verified_by)<>''),
-  verified_at timestamptz not null default now()
+  verified_at timestamptz not null default now(),
+  unique(calendar_row_id,row_revision)
 );
 create index fixer_forward_read_fingerprint_20261006
   on public.fixer_forward_media_object_read_20261006(fingerprint);
@@ -106,20 +185,28 @@ do $$
 declare t text;
 begin
   foreach t in array array['fixer_forward_media_tenant_alias_20261006',
+    'fixer_forward_media_original_registry_20261006','fixer_forward_media_render_manifest_20261006',
+    'fixer_forward_media_history_clearance_20261006',
     'fixer_forward_media_object_read_20261006','fixer_forward_media_lineage_20261006',
     'fixer_forward_media_use_20261006','fixer_forward_media_claim_receipt_20261006'] loop
     execute format('create trigger immutable_row before update or delete on public.%I for each row execute function public.fixer_forward_media_immutable_20261006()',t);
     execute format('create trigger immutable_truncate before truncate on public.%I for each statement execute function public.fixer_forward_media_immutable_20261006()',t);
   end loop;
   foreach t in array array['fixer_forward_media_tenant_alias_20261006',
-    'fixer_forward_media_claim_gate_20261006','fixer_forward_media_object_read_20261006',
+    'fixer_forward_media_claim_gate_20261006',
+    'fixer_forward_media_original_registry_20261006','fixer_forward_media_render_manifest_20261006',
+    'fixer_forward_media_history_clearance_20261006',
+    'fixer_forward_media_object_read_20261006',
     'fixer_forward_media_lineage_20261006','fixer_forward_media_use_20261006',
     'fixer_forward_media_claim_receipt_20261006'] loop
     execute format('alter table public.%I enable row level security',t);
     execute format('revoke all on public.%I from public,anon,authenticated,service_role,fixer_forward_media_attester_20261006',t);
     -- Selector needs complete fleet occupancy and trusted hashes; backend only.
-    execute format('grant select on public.%I to service_role',t);
-    execute format('create policy service_read on public.%I for select to service_role using(true)',t);
+    if t not in ('fixer_forward_media_original_registry_20261006','fixer_forward_media_render_manifest_20261006',
+        'fixer_forward_media_history_clearance_20261006') then
+      execute format('grant select on public.%I to service_role',t);
+      execute format('create policy service_read on public.%I for select to service_role using(true)',t);
+    end if;
   end loop;
 end;
 $$;
@@ -134,6 +221,8 @@ begin
   select * into r from public.content_calendar where id=p_calendar_row_id;
   if not found or nullif(btrim(r.gym_id),'') is null
       or r.post_date is null or nullif(btrim(r.visual_group_key),'') is null
+      or nullif(btrim(r.source_media_asset_id),'') is null
+      or r.render_manifest_digest is null or r.render_manifest_digest !~ '^sha256:[0-9a-f]{64}$'
       or r.source_media_url is null or r.source_media_url !~ '^https://[^[:space:]]+$'
       or r.image_url is null or r.image_url !~ '^https://[^[:space:]]+$'
       or (r.thumbnail_url is not null and r.thumbnail_url !~ '^https://[^[:space:]]+$') then
@@ -146,6 +235,7 @@ begin
     'gym_id',r.gym_id,'account',r.account,'format',r.format,
     'gbp_location_id',r.gbp_location_id,
     'post_date',r.post_date,'group_key',r.visual_group_key,
+    'source_asset_id',r.source_media_asset_id,'render_manifest_digest',r.render_manifest_digest,
     'source_url',r.source_media_url,'image_url',r.image_url,'thumbnail_url',r.thumbnail_url);
   return snapshot||jsonb_build_object('revision',md5(snapshot::text));
 end;
@@ -155,13 +245,97 @@ revoke all on function public.fixer_forward_media_attestation_request_20261006(u
 grant execute on function public.fixer_forward_media_attestation_request_20261006(uuid)
   to fixer_forward_media_attester_20261006,service_role;
 
+-- Exact-row lookup exposes only the prepared binding required by the
+-- attester. Neither service callers nor the attester can enumerate authority.
+create function public.fixer_forward_media_provenance_lookup_20261006(p_calendar_row_id uuid)
+returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
+declare snapshot jsonb; original public.fixer_forward_media_original_registry_20261006%rowtype;
+  manifest public.fixer_forward_media_render_manifest_20261006%rowtype;
+  clearance public.fixer_forward_media_history_clearance_20261006%rowtype;
+begin
+  snapshot:=public.fixer_forward_media_attestation_request_20261006(p_calendar_row_id);
+  select * into original from public.fixer_forward_media_original_registry_20261006
+    where tenant_id=snapshot->>'tenant_id' and source_asset_id=snapshot->>'source_asset_id';
+  if not found or original.source_url is distinct from snapshot->>'source_url' then
+    raise exception 'authoritative original registry binding unavailable' using errcode='23514';
+  end if;
+  select * into clearance from public.fixer_forward_media_history_clearance_20261006 c
+    where c.tenant_id=original.tenant_id and c.source_asset_id=original.source_asset_id;
+  if not found or clearance.decision<>'cleared_unused'
+      or clearance.source_url is distinct from original.source_url
+      or clearance.source_fingerprint is distinct from original.source_fingerprint
+      or clearance.source_length is distinct from original.source_length
+      or clearance.registry_evidence_ref is distinct from original.registry_evidence_ref
+      or exists(select 1 from public.fixer_forward_media_history_clearance_20261006 c
+        where c.source_fingerprint=original.source_fingerprint and c.decision<>'cleared_unused') then
+    raise exception 'original historical eligibility clearance unavailable or held' using errcode='23514';
+  end if;
+  select * into manifest from public.fixer_forward_media_render_manifest_20261006
+    where manifest_digest=snapshot->>'render_manifest_digest';
+  if not found or manifest.tenant_id is distinct from original.tenant_id
+      or manifest.source_asset_id is distinct from original.source_asset_id
+      or manifest.image_url is distinct from snapshot->>'image_url'
+      or manifest.thumbnail_url is distinct from snapshot->>'thumbnail_url' then
+    raise exception 'versioned render manifest binding unavailable' using errcode='23514';
+  end if;
+  return jsonb_build_object('original',to_jsonb(original),'manifest',to_jsonb(manifest),'clearance',to_jsonb(clearance));
+end;
+$$;
+revoke all on function public.fixer_forward_media_provenance_lookup_20261006(uuid)
+  from public,anon,authenticated,service_role;
+grant execute on function public.fixer_forward_media_provenance_lookup_20261006(uuid)
+  to fixer_forward_media_attester_20261006;
+
+-- Bounded tenant-scoped discovery for the separately credentialed attester.
+-- Only unsent active rows with owner-prepared provenance are discoverable.
+create function public.fixer_forward_media_pending_attestations_20261006(
+  p_tenant_id text,p_limit integer default 50,p_after_row_id uuid default null)
+returns setof jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
+begin
+  if nullif(btrim(p_tenant_id),'') is null or p_limit is null or p_limit<1 or p_limit>100 then
+    raise exception 'bounded tenant-scoped attestation request required' using errcode='22023';
+  end if;
+  return query
+    select public.fixer_forward_media_attestation_request_20261006(r.id)
+    from public.content_calendar r
+    left join public.fixer_forward_media_tenant_alias_20261006 a on a.alias_key=btrim(r.gym_id)
+    join public.fixer_forward_media_original_registry_20261006 o
+      on o.tenant_id=coalesce(a.tenant_id,btrim(r.gym_id))
+        and o.source_asset_id=r.source_media_asset_id and o.source_url=r.source_media_url
+    join public.fixer_forward_media_history_clearance_20261006 c
+      on c.tenant_id=o.tenant_id and c.source_asset_id=o.source_asset_id
+        and c.source_url=o.source_url and c.source_fingerprint=o.source_fingerprint
+        and c.source_length=o.source_length and c.registry_evidence_ref=o.registry_evidence_ref
+        and c.decision='cleared_unused'
+    join public.fixer_forward_media_render_manifest_20261006 m
+      on m.manifest_digest=r.render_manifest_digest and m.tenant_id=o.tenant_id
+        and m.source_asset_id=o.source_asset_id and m.image_url=r.image_url
+        and m.thumbnail_url is not distinct from r.thumbnail_url
+    where o.tenant_id=p_tenant_id and r.variant_status='active'
+      and (p_after_row_id is null or r.id>p_after_row_id)
+      and not exists(select 1 from public.fixer_forward_media_history_clearance_20261006 h
+        where h.source_fingerprint=o.source_fingerprint and h.decision<>'cleared_unused')
+      and r.post_date is not null and nullif(btrim(r.visual_group_key),'') is not null
+      and r.published_at is null and r.late_post_id is null
+      and r.status is distinct from 'published' and r.media_not_ready_reason is null
+      and not exists(select 1 from public.fixer_forward_media_lineage_20261006 l
+        where l.calendar_row_id=r.id and l.row_revision=
+          public.fixer_forward_media_attestation_request_20261006(r.id)->>'revision')
+    order by r.id limit p_limit;
+end;
+$$;
+revoke all on function public.fixer_forward_media_pending_attestations_20261006(text,integer,uuid)
+  from public,anon,authenticated,service_role;
+grant execute on function public.fixer_forward_media_pending_attestations_20261006(text,integer,uuid)
+  to fixer_forward_media_attester_20261006;
+
 create function public.fixer_attest_forward_media_20261006(
   p_calendar_row_id uuid,p_expected_revision text,p_evidence_id uuid,
   p_source_fingerprint text,p_source_length bigint,p_image_fingerprint text,p_image_length bigint,
   p_thumbnail_fingerprint text,p_thumbnail_length bigint,p_operation text,p_evidence_ref text
 ) returns uuid language plpgsql security definer set search_path=pg_catalog,public as $$
 declare
-  snapshot jsonb; tenant text; urls text[]; hashes text[]; lengths bigint[];
+  snapshot jsonb; provenance jsonb; tenant text; urls text[]; hashes text[]; lengths bigint[];
   ids uuid[]:=array[]::uuid[]; rid uuid; i integer; old public.fixer_forward_media_object_read_20261006%rowtype;
 begin
   -- Exclusive graph authority: no claim may observe an incomplete ancestry
@@ -180,6 +354,16 @@ begin
       or p_evidence_id is null or nullif(btrim(p_evidence_ref),'') is null
       or p_operation is null or p_operation not in ('same_object','render','reburn','rehost') then
     raise exception 'attestation revision or controlled operation invalid' using errcode='23514';
+  end if;
+  provenance:=public.fixer_forward_media_provenance_lookup_20261006(p_calendar_row_id);
+  if provenance#>>'{original,source_fingerprint}' is distinct from p_source_fingerprint
+      or (provenance#>>'{original,source_length}')::bigint is distinct from p_source_length
+      or provenance#>>'{manifest,image_fingerprint}' is distinct from p_image_fingerprint
+      or (provenance#>>'{manifest,image_length}')::bigint is distinct from p_image_length
+      or provenance#>>'{manifest,thumbnail_fingerprint}' is distinct from p_thumbnail_fingerprint
+      or (provenance#>>'{manifest,thumbnail_length}')::bigint is distinct from p_thumbnail_length
+      or provenance#>>'{manifest,operation}' is distinct from p_operation then
+    raise exception 'fetched bytes or operation differ from authoritative provenance' using errcode='23514';
   end if;
   tenant:=snapshot->>'tenant_id';
   urls:=array[snapshot->>'source_url',snapshot->>'image_url',snapshot->>'thumbnail_url'];
@@ -221,9 +405,9 @@ begin
   end loop;
   insert into public.fixer_forward_media_lineage_20261006
     (evidence_id,calendar_row_id,row_revision,operation,tenant_id,group_key,
-     source_read_receipt,image_read_receipt,thumbnail_read_receipt,render_evidence_ref,verified_by)
+     source_read_receipt,image_read_receipt,thumbnail_read_receipt,source_asset_id,manifest_digest,render_evidence_ref,verified_by)
     values(p_evidence_id,p_calendar_row_id,p_expected_revision,p_operation,tenant,snapshot->>'group_key',
-      ids[1],ids[2],ids[3],p_evidence_ref,'trusted_attester');
+      ids[1],ids[2],ids[3],snapshot->>'source_asset_id',snapshot->>'render_manifest_digest',p_evidence_ref,'trusted_attester');
   return p_evidence_id;
 end;
 $$;
@@ -285,6 +469,9 @@ begin
       where g.tenant_id=tenant and g.enabled) then
     raise exception 'forward media guard is OFF pending history and publisher review' using errcode='55000';
   end if;
+  -- Recheck historical clearance at each send boundary, including receipt
+  -- replay. A trusted lineage record never substitutes for historical eligibility.
+  perform public.fixer_forward_media_provenance_lookup_20261006(r.id);
   -- No row-provided byte_hash, asset ID or URL-derived identity is trusted.
   select l.evidence_id, array(select distinct h from unnest(array[s.fingerprint,i.fingerprint,t.fingerprint]) h
       where h is not null order by h)
@@ -296,6 +483,7 @@ begin
     where l.evidence_id=p_evidence_id and l.calendar_row_id=r.id
       and l.row_revision=public.fixer_forward_media_attestation_request_20261006(r.id)->>'revision'
       and l.tenant_id=tenant and l.group_key=r.visual_group_key
+      and l.source_asset_id=r.source_media_asset_id and l.manifest_digest=r.render_manifest_digest
       and s.tenant_id=tenant and i.tenant_id=tenant
       and s.exact_url=r.source_media_url and i.exact_url=r.image_url
       and ((r.thumbnail_url is null and l.thumbnail_read_receipt is null)
@@ -323,6 +511,10 @@ begin
       join public.fixer_forward_media_object_read_20261006 source
         on source.receipt_id=edge.source_read_receipt
   ) select array_agg(fingerprint order by fingerprint) into hashes from ancestry;
+  if exists(select 1 from public.fixer_forward_media_history_clearance_20261006 c
+      where c.source_fingerprint=any(hashes) and c.decision<>'cleared_unused') then
+    raise exception 'original or rendition historical eligibility held' using errcode='23514';
+  end if;
   -- Deterministically sorted GLOBAL byte locks. Unique fingerprint PK is the
   -- final authority. Token lock rejects reuse across different row IDs.
   perform pg_advisory_xact_lock(hashtextextended(

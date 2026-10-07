@@ -219,6 +219,9 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
 
         title = asset.get("title") or f"{asset['id']}.bin"
         tmp_path = lib / os.path.basename(title)
+        media_observations = [] if writer_prep_enabled() else None
+        source_observation_bytes = None
+        source_observation_hold = ""
         try:
             try:
                 drive.download(asset["id"], tmp_path)
@@ -226,6 +229,25 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                 print(f"[gym-media-builder] download failed for {title!r}: "
                       f"{type(e).__name__}: {e}")
                 return None
+
+            if media_observations is not None:
+                try:
+                    source_observation_bytes = _idx.bounded_materialization_bytes(tmp_path)
+                    fresh_source = store.get_asset(asset["id"])
+                    # Re-read authoritative indexed identity rather than treating
+                    # the candidate or its local filename as an original receipt.
+                    import hashlib
+                    checksum = str((fresh_source or {}).get("content_hash") or "")
+                    if (not fresh_source or fresh_source.get("id") != asset["id"]
+                            or fresh_source.get("gym_id") != gym_base
+                            or fresh_source.get("source_id") != asset.get("source_id")
+                            or not _sel.asset_source_ok(fresh_source, gym_base, store)
+                            or checksum.lower() != hashlib.md5(source_observation_bytes).hexdigest()):
+                        source_observation_bytes = None
+                        source_observation_hold = "drive_identity_or_checksum_unverified"
+                except Exception:
+                    source_observation_bytes = None
+                    source_observation_hold = "drive_source_observation_unavailable"
 
             # Re-gate a VIDEO from real bytes FIRST (fail closed): the probe also
             # yields the codec every rendition decision below needs.
@@ -256,7 +278,9 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             try:
                 rend_url, _converted = _idx.ensure_rendition(
                     asset, tmp_path, store=store, probe_info=info,
-                    budget=rendition_budget)
+                    budget=rendition_budget,
+                    **({"observation_sink": media_observations}
+                       if media_observations is not None else {}))
             except _idx.RenditionBudgetExhausted:
                 print(f"[gym-media-builder] transcode budget spent; {title!r} skipped "
                       "until the nightly pre-render pass renders it")
@@ -383,6 +407,21 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                 print(f"[gym-media-builder] hosting returned no url for {title!r}; "
                       "stopping the slot")
                 return None
+            if media_observations is not None:
+                if not source_observation_bytes:
+                    media_observations.append({"provenance_status": "unverified",
+                                               "hold_reasons": [source_observation_hold]})
+                elif not public_override:
+                    try:
+                        media_observations.append(_idx.materialization_observation(
+                            source_observation_bytes, source_observation_bytes,
+                            public_url, tenant=gym_base, source_asset_id=asset["id"],
+                            source_url=public_url,
+                            recipe={"name": "identity", "version": 1,
+                                    "runtime_verified": True}))
+                    except Exception:
+                        media_observations.append({"provenance_status": "unverified",
+                                                   "hold_reasons": ["original_hosted_readback_unverified"]})
         finally:
             _cleanup(lib)
 
@@ -410,6 +449,10 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
         # A rendition URL is a transformed delivery asset, not the raw source.
         if not public_override:
             draft.source_media_url = public_url
+        if media_observations is not None:
+            draft.media_materialization_observations = media_observations
+            # No registry or manifest can be issued from a draft side channel.
+            draft.media_provenance_status = "unverified"
         if poster_url:
             draft.thumbnail_url = poster_url          # -> content_calendar.thumbnail_url
         if poster_evidence:
@@ -579,6 +622,14 @@ def video_poster_with_evidence(video_path, work_dir, tenant, source_exact_url):
             "observed_by": "gym_media_builder",
             "rendered_by": "gym_media_builder.video_poster_with_evidence",
         }
+        from . import gym_media_index
+        evidence["materialization_observation"] = gym_media_index.materialization_observation(
+            source_bytes, rendered_bytes, delivered_url, tenant=tenant,
+            source_url=source_exact_url,
+            recipe={"name": "video_poster", "version": 1,
+                    "seek_attempts_seconds": [1.0, 0.0], "frames": 1,
+                    "jpeg_quality_parameter": 3, "max_width": 1080,
+                    "runtime_verified": False})
         return delivered_url, evidence
     except Exception as exc:  # noqa: BLE001 - an unverifiable preview must not stage
         print(f"[gym-media-builder] evidenced poster skipped for "

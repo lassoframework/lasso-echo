@@ -150,3 +150,17 @@ def test_unknown_original_provenance_is_verification_hold(lane, verifier):
     with pytest.raises(guard.ForwardMediaVerificationHold, match='original asset provenance'):
         run(lane, original_verifier=verifier)
     assert not lane[1].committed
+
+
+def test_production_lane_refuses_caller_callback_override(lane, monkeypatch):
+    monkeypatch.setattr(guard, '_connect', lambda: lane[1])
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='callback override refused'):
+        guard.attest(lane[0], 'revision', read_bytes=lane[2].__getitem__,
+                     original_verifier=lambda *_: True)
+    assert not lane[1].committed and lane[1].rolled_back
+
+
+def test_production_lane_refuses_caller_byte_reader(lane, monkeypatch):
+    monkeypatch.setattr(guard, '_connect', lambda: lane[1])
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='callback override refused'):
+        guard.attest(lane[0], 'revision', read_bytes=lane[2].__getitem__)
