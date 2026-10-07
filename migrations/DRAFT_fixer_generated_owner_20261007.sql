@@ -423,12 +423,17 @@ begin
      and h->>'visual_url'=sibling.candidate_json->>'original_url'
      and (h->>'history_key'='generated-reserved:'||sibling.job_id::text
       or exists(select 1 from public.fixer_forward_media_claim_receipt_20261006 claim
-        where coalesce(h->>'origin_history_key',h->>'history_key') in ('claim-source:'||claim.claim_token::text,'claim-image:'||claim.claim_token::text)
+        where (coalesce(h->>'origin_history_key',h->>'history_key') in ('claim-source:'||claim.claim_token::text,'claim-image:'||claim.claim_token::text)
+          or (h->>'history_key' like 'retained:%'
+            and h->>'origin_history_key'='calendar-image:'||claim.calendar_row_id::text
+            and nullif(h->>'history_proof_ref','') is not null
+            and h->>'visual_sha256'='sha256:'||(sibling.candidate_json->>'original_sha256')))
          and claim.tenant_id=sibling.candidate_json->>'gym_id'
          and claim.post_date::text=sibling.candidate_json->>'local_date'
          and claim.group_key=sibling.group_key
          and claim.source_url=sibling.candidate_json->>'original_url'
-         and claim.image_url=claim.source_url and claim.thumbnail_url is null)
+         and claim.image_url=claim.source_url and claim.thumbnail_url is null
+         and claim.fingerprints=array['md5:'||(sibling.candidate_json->>'original_md5')])
       or exists(select 1 from public.content_calendar live where h->>'history_key'='calendar-image:'||live.id::text
         and live.gym_id=sibling.candidate_json->>'gym_id' and live.post_date::text=sibling.candidate_json->>'local_date'
         and live.visual_group_key=sibling.group_key and live.source_media_asset_id='generated-astra:'||sibling.job_id::text

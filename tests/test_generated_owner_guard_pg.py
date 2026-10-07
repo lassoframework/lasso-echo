@@ -285,6 +285,43 @@ def main():
     service=lane('service_role')
     assert service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(sibling,sibling_token,sibling_receipt['evidence_id'],sibling_revision)).fetchone()[0] is True
     service.commit();service.close()
+    # A nonanchor sibling is also a permanent logical use. Observe its exact
+    # calendar visual, delete that row, and replay a third same-day sibling.
+    sql("update content_calendar set status='published',published_at=now() where id=%s",(sibling,))
+    nonanchor_observer=row(day='2026-10-19',gym='other');nonanchor_bytes=noise(5)
+    fresh=trusted(guard.generated_snapshot(p,nonanchor_observer));conn.rollback()
+    nonanchor_candidate=candidate(fresh,nonanchor_bytes);nonanchor_candidate['original_url']='https://owned.example/nonanchor-observer.png'
+    def nonanchor_reader(url):
+     if url==nonanchor_candidate['original_url']:return nonanchor_bytes
+     if url==observer_candidate['original_url']:return observer_bytes
+     if url==next_candidate['original_url']:return next_bytes
+     if url==fresh_candidate['original_url']:return fresh_bytes
+     if url=='https://owned.example/unknown-B':return old_bytes
+     if url==video_still['visual_url']:return video_only_bytes
+     return deleted_pixels if url=='https://owned.example/deleted-old.png' else pixels
+    assert guard.reserve_generated(p,nonanchor_observer,nonanchor_candidate,fresh,history_visuals=[],read_bytes=nonanchor_reader)['reserved']
+    conn.commit()
+    sql('delete from content_calendar where id=%s',(sibling,))
+    third=row();fresh=trusted(guard.generated_snapshot(p,third));conn.rollback()
+    assert any(h['origin_history_key']=='calendar-image:'+sibling and h['history_key'].startswith('retained:') for h in fresh['history']['rows'])
+    assert guard.reserve_generated(p,third,c,fresh,history_visuals=[],read_bytes=nonanchor_reader)['replayed']
+    conn.commit()
+    third_revision=sql('select fixer_forward_media_attestation_request_20261006(%s)',(third,))[0][0]['revision']
+    third_receipt=guard.attest(third,third_revision,connection_factory=lambda:lane(guard.ROLE),
+      original_verifier=lambda snap,source:source==pixels,read_bytes=lambda u:pixels)
+    third_token=str(uuid.uuid4())
+    sql("update content_calendar set status='publishing',publish_claim_token=%s,publish_reservation_day=post_date where id=%s",(third_token,third))
+    service=lane('service_role')
+    assert service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(third,third_token,third_receipt['evidence_id'],third_revision)).fetchone()[0] is True
+    service.commit();service.close()
+    foreign_identity=row()
+    sql('update content_calendar set logical_post_id=%s,visual_group_key=%s where id=%s',(str(uuid.uuid4()),'vg-foreign',foreign_identity))
+    for foreign in (row(day='2026-10-11'),row(gym='other'),foreign_identity):
+     fresh=trusted(guard.generated_snapshot(p,foreign));conn.rollback()
+     foreign_candidate=candidate(fresh,pixels)
+     denied(lambda:guard.reserve_generated(p,foreign,foreign_candidate,fresh,history_visuals=[],read_bytes=nonanchor_reader),'repeated historical')
+     conn.rollback()
+    sibling,sibling_token,sibling_receipt,sibling_revision=third,third_token,third_receipt,third_revision
     deleted_live=row(day='2026-10-17',gym='other')
     fresh=trusted(guard.generated_snapshot(p,deleted_live));conn.rollback()
     assert any(h['history_key'].startswith('retained:calendar-image:'+unknown) for h in fresh['history']['rows'])
@@ -295,6 +332,7 @@ def main():
      if url==next_candidate['original_url']:return next_bytes
      if url==fresh_candidate['original_url']:return fresh_bytes
      if url==observer_candidate['original_url']:return observer_bytes
+     if url==nonanchor_candidate['original_url']:return nonanchor_bytes
      if url==video_still['visual_url']:return video_only_bytes
      return deleted_pixels if url=='https://owned.example/deleted-old.png' else pixels
     denied(lambda:guard.reserve_generated(p,deleted_live,repeated,fresh,history_visuals=[],read_bytes=vanished_old_reader), 'repeated historical')
@@ -307,7 +345,7 @@ def main():
      denied(lambda:service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(sibling,sibling_token,sibling_receipt['evidence_id'],sibling_revision)),'binding changed')
      service.rollback();service.close()
    conn.close();admin.close()
-   print('PASS: PG17 generated atomic authority, approved video exclusion and invalid exclusion holds, excluded-baseline replacement exact/pHash denial, unique retained receipt keys, deleted-anchor same-day sibling final claim, sealed deletion/epoch/unknown-photo/cache/source-null/role/serialization regressions')
+   print('PASS: PG17 deleted nonanchor sibling replay and final claim; cross-date/gym/foreign logical identity denied; approved video scope, retained identities, sealed history/epoch, photo-first, cache, role and serialization regressions')
   finally:
    subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 
