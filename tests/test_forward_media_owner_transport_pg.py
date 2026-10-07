@@ -25,7 +25,7 @@ from agent import forward_media_attester as attester
 from agent import forward_media_owner as owner
 from agent import forward_media_owner_packet as packet
 from agent import forward_media_owner_worker as worker
-from agent.forward_media_owner_transport import DedicatedOwnerTransport
+from agent.forward_media_owner_transport import DedicatedOwnerTransport, FrozenObjectReader
 from agent.forward_media_observation_bridge import prepare
 from agent.gym_media_index import materialization_observation
 
@@ -68,7 +68,8 @@ def crash_after_stage(dsn, candidate, asset):
     transport = DedicatedOwnerTransport(persistence)
     with transport.locked_current(candidate):
         tuples = prepared(reader, asset)
-        transport.stage_authority(candidate, persistence, tuples)
+        transport.stage_authority(candidate, persistence, tuples,
+            local_reader=FrozenObjectReader({SOURCE+'/'+asset:reader.source, IMAGE+'/'+asset:reader.image}))
         transport.record(candidate, {'status': 'persisted', 'decision': tuples[1].decision,
                                      'manifest_digest': tuples[2].manifest_digest})
         os._exit(19)  # Actual process death before final COMMIT, not a mocked exception.
@@ -179,7 +180,18 @@ def main():
                            'where source_asset_id=%s',(asset,))[0][0]
             def stage(c,asset,p,t):
                 tuples = prepared(reader,asset)
-                result = t.stage_authority(c,p,tuples)
+                class ForbiddenRemote(owner.ObjectReader):
+                    def read(self, url):
+                        raise AssertionError('hidden network reader during final graph transaction')
+                remote=p._reader
+                forbidden=ForbiddenRemote()
+                p._reader=forbidden
+                try:
+                    result = t.stage_authority(c,p,tuples,
+                        local_reader=FrozenObjectReader({SOURCE+'/'+asset:reader.source, IMAGE+'/'+asset:reader.image}))
+                    assert p._reader is forbidden  # Original configured reader restored.
+                finally:
+                    p._reader=remote
                 assert result['replayed'] is False
                 assert t.record(c,{'status':'persisted','decision':tuples[1].decision,
                                   'manifest_digest':tuples[2].manifest_digest}) is True
@@ -274,7 +286,8 @@ def main():
             try:
                 with t.locked_current(c):
                     tuples = prepared(reader,asset)
-                    t.stage_authority(c,p,tuples)
+                    t.stage_authority(c,p,tuples,
+                        local_reader=FrozenObjectReader({SOURCE+'/'+asset:reader.source, IMAGE+'/'+asset:reader.image}))
                     t.record(c,{'status':'persisted','decision':tuples[1].decision,
                                 'manifest_digest':'sha256:'+'0'*64})
                 raise AssertionError('invalid exact outcome accepted')

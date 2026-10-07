@@ -1,10 +1,11 @@
 """Default-OFF owner worker; production credentials/factory remain unprovisioned.
 
-DedicatedOwnerTransport implements DRAFT discovery, locks and durable progress.
-It stages authority+outcome in one shared transaction and preserves permanent
-quarantine reservations on crashes/unknown commits. The actual media_asset has
-no audited source receipt and fleet history transport is missing, so real rows
-hold. Producer observations and used_count=0 never establish authority.
+DedicatedOwnerTransport implements DRAFT discovery, lock-free remote byte
+verification, exact final locks and durable progress. It commits source/history
+receipts+hold outcome together and preserves quarantine on crashes/unknown
+commits. Unknown history never creates the asset's unique immutable authority
+clearance, so a later reviewed positive audit can prepare that authority.
+Producer observations and used_count=0 never establish authority.
 The generic adapter also supports offline fixtures; those are not live proof.
 """
 from __future__ import annotations
@@ -41,6 +42,15 @@ _REASONS = frozenset({
     'authority_commit_unverified', 'uncertain_authority_commit',
     'durable_progress_commit_unverified', 'owner_asset_source_binding_missing',
     'owner_manual_reconciliation_required', 'owner_transaction_contract_required',
+    'verified_local_byte_cache_required', 'owner_source_snapshot_invalid',
+    'owner_source_binding_changed', 'source_binding_invalid', 'drive_identity_invalid',
+    'drive_metadata_unavailable', 'drive_folder_membership_unknown',
+    'drive_original_unavailable', 'source_object_exceeds_bound',
+    'drive_original_bytes_mismatch', 'drive_original_changed_during_read',
+    'hosted_source_differs_from_drive_original', 'source_verification_unavailable',
+    'source_read_deadline_exceeded', 'drive_timeout_contract_unavailable',
+    'historical_original_bytes_unknown', 'preexisting_original_has_no_fresh_production_proof',
+    'historical_scan_bound_exceeded', 'trusted_original_bytes_previously_used',
 })
 
 
@@ -117,7 +127,7 @@ def _identity(candidate):
         raise OwnerWorkerHold('candidate_identity_invalid') from None
 
 
-def _prepare(candidate, current, transport, reader, tenants):
+def _candidate_context(candidate, current, tenants, *, asset_binding=True):
     row_id, revision, digest = _identity(candidate)
     if current.get('hold_reason'):
         raise OwnerWorkerHold(current['hold_reason'])
@@ -134,8 +144,9 @@ def _prepare(candidate, current, transport, reader, tenants):
             or any(row.get(k) is not None for k in ('publish_claim_token', 'published_at',
                                                    'late_post_id', 'render_manifest_digest'))):
         raise OwnerWorkerHold('calendar_not_unsent_candidate')
-    if not asset.get('source_url') or not asset.get('registry_evidence_ref'):
+    if asset_binding and (not asset.get('source_url') or not asset.get('registry_evidence_ref')):
         raise OwnerWorkerHold('owner_asset_source_binding_missing')
+    source_url = asset.get('source_url') if asset_binding else row.get('source_media_url')
     # Account-style producer tenant aliases cannot establish canonical ownership.
     # Unresolved alias candidates hold; a future reviewed canonical mapping
     # contract must preserve the immutable raw observation and its digest.
@@ -149,13 +160,20 @@ def _prepare(candidate, current, transport, reader, tenants):
             or observation.get('tenant') != tenant
             or observation.get('source_asset_id') != asset.get('id')
             or observation.get('source_exact_url') != row.get('source_media_url')
-            or observation.get('source_exact_url') != asset.get('source_url')
+            or observation.get('source_exact_url') != source_url
             or observation.get('delivered_exact_url') != row.get('image_url')):
         raise OwnerWorkerHold('candidate_canonical_binding_invalid')
     recipe = validate_still_recipe(observation.get('recipe'))
     if row.get('thumbnail_url') is not None:
         # Current producer schema has no thumbnail observations/binding.
         raise OwnerWorkerHold('thumbnail_candidate_contract_missing')
+    return row, asset, observation, recipe
+
+
+def _prepare(candidate, current, transport, reader, tenants):
+    """Legacy offline fixture adapter; never used by dedicated owner runtime."""
+    row, asset, observation, recipe = _candidate_context(candidate, current, tenants)
+    tenant = row['gym_id']
     source_bytes = reader.read(asset['source_url'])
     replayed = replay_still_recipe(source_bytes, recipe)
     if (replayed['image_bytes'] != reader.read(row['image_url'])
@@ -183,7 +201,68 @@ def _prepare(candidate, current, transport, reader, tenants):
     return prepared
 
 
-def run_adapter(*, transport, persistence, reader):
+def _prepare_remote(candidate, current, reader, drive_reader, tenants):
+    """All source fetches, delivered reads and expensive render replay here."""
+    from .forward_media_source_verifier import verify_source
+    row, asset, observation, recipe = _candidate_context(candidate, current, tenants, asset_binding=False)
+    verified = verify_source(current, drive_reader, reader)
+    source_bytes = verified.source_bytes
+    image_bytes = source_bytes if row['image_url'] == row['source_media_url'] else reader.read(row['image_url'])
+    replayed = replay_still_recipe(source_bytes, recipe)
+    if replayed['image_bytes'] != image_bytes or replayed['thumbnail_bytes'] is not None:
+        raise OwnerWorkerHold('render_bytes_mismatch')
+    # There is no positive history authority yet: verify the replay here but
+    # leave registry/clearance/manifest empty until the independent audit exists.
+    return verified
+
+
+def _run_dedicated_candidate(candidate, transport, persistence, reader, drive_reader, tenants):
+    """Reserve → remote verification without tx → final recheck/atomic commit."""
+    from .forward_media_source_history import SourceHistoryStore
+    from .forward_media_source_verifier import SourceVerificationHold
+    key = _identity(candidate)
+    store = SourceHistoryStore(persistence)
+    with transport.reserved_current(candidate) as snapshot:
+        prepared, remote_reason = None, None
+        try:
+            if snapshot.get('hold_reason'):
+                raise OwnerWorkerHold(snapshot['hold_reason'])
+            prepared = _prepare_remote(candidate, snapshot, reader, drive_reader, tenants)
+        except (OwnerWorkerHold, SourceVerificationHold) as exc:
+            remote_reason = str(OwnerWorkerHold(str(exc)))
+        except Exception:
+            remote_reason = 'candidate_verification_failed'
+        with transport.locked_current(candidate) as final:
+            if final.get('hold_reason'):
+                outcome = {'status': 'hold', 'reason': str(OwnerWorkerHold(final['hold_reason']))}
+            elif remote_reason:
+                outcome = {'status': 'hold', 'reason': remote_reason}
+            elif final.get('binding_revision') != snapshot.get('binding_revision'):
+                outcome = {'status': 'hold', 'reason': 'owner_source_binding_changed'}
+            else:
+                # Any SQL failure from here must roll back the whole final phase
+                # and retain quarantine; never turn a poisoned tx into a hold.
+                verified = prepared
+                original = store.stage_source(verified)
+                history = store.history(original)
+                if (not isinstance(history, dict) or history.get('original') != original.row()
+                        or history.get('decision') not in ('hold_used','hold_uncertain')):
+                    raise OwnerWorkerHold('verified_byte_history_required')
+                # Keep uncertainty in durable source/history/progress receipts.
+                # The asset's unique immutable authority clearance must remain
+                # empty so a later reviewed positive audit can prepare it.
+                # This bounded history transport has NO positive-clearance path.
+                outcome = {'status': 'hold', 'decision': history['decision'],
+                           'reason': str(OwnerWorkerHold(history['reason'])),
+                           'source_receipt_ref': verified.receipt_ref,
+                           'history_evidence_ref': history['history_evidence_ref']}
+            if transport.record(candidate, outcome) is not True:
+                raise OwnerWorkerHold('durable_progress_commit_unverified')
+            report = {'calendar_row_id': key[0], 'revision': key[1], **outcome}
+    return report
+
+
+def run_adapter(*, transport, persistence, reader, drive_reader=None):
     """One bounded owner-only pass for infrastructure integration/offline tests.
 
     Caller owns connection close. No production factory accepts overrides. All
@@ -196,9 +275,10 @@ def run_adapter(*, transport, persistence, reader):
     try:
         tenants, limit = settings_from_environment()
         atomic = getattr(transport, 'atomic_authority_outcome', False) is True
+        dedicated = isinstance(persistence, owner.ForwardMediaOwnerPersistence)
         if not atomic:
             persistence._assert_owner_identity()
-        if isinstance(persistence, owner.ForwardMediaOwnerPersistence):
+        if dedicated:
             from .forward_media_owner_transport import DedicatedOwnerTransport
             if type(transport) is not DedicatedOwnerTransport or transport.persistence is not persistence:
                 # A caller-supplied boolean cannot attest shared transaction semantics.
@@ -212,6 +292,11 @@ def run_adapter(*, transport, persistence, reader):
             if key in seen:
                 continue
             seen.add(key)
+            if dedicated:
+                from .forward_media_source_verifier import OriginalDriveReader
+                rows.append(_run_dedicated_candidate(candidate, transport, persistence, reader,
+                    drive_reader if drive_reader is not None else OriginalDriveReader(), tenants))
+                continue
             with transport.locked_current(candidate) as current:
                 authority_started = False
                 try:
@@ -263,7 +348,8 @@ def run_adapter(*, transport, persistence, reader):
         return {'status': 'hold', 'reason': str(exc), 'rows': rows}
     except Exception:
         return {'status': 'hold', 'reason': 'owner_transport_unavailable', 'rows': rows}
-    return {'status': 'partial_hold' if any(r['status'] == 'hold' for r in rows) else 'complete',
+    return {'status': 'partial_hold' if any(r['status'] == 'hold'
+            or (dedicated and r.get('decision') in ('hold_used','hold_uncertain')) for r in rows) else 'complete',
             'rows': rows}
 
 

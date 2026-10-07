@@ -2,7 +2,8 @@
 -- Requires the authority + observation bridge drafts and existing media_asset.
 -- Only the dedicated owner group receives RPC access. Producer observations and
 -- media_asset.used_count/content_hash are NOT trusted historical evidence.
--- No source URL/audited registry/history transport exists: Python holds safely.
+-- Separately applied source/history draft adds lock-free original-byte checks.
+-- Source/history/progress holds leave original clearance authority empty.
 -- A committed quarantine reservation is never retried/expired automatically.
 -- First reservation COMMIT uncertainty halts before authority/object reads.
 -- While unresolved, the unique key blocks fresh reservations. If committed it
@@ -79,7 +80,7 @@ create function public.fixer_forward_media_owner_locked_20261007(
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
 declare r public.content_calendar%rowtype;
  o public.fixer_forward_media_observation_20261007%rowtype;
- a public.media_asset%rowtype; revision text;
+ a public.media_asset%rowtype; revision text; source_snapshot jsonb;
 begin
  if current_setting('transaction_isolation')<>'read committed' then
    raise exception 'forward media authority requires read committed isolation' using errcode='25000';
@@ -108,10 +109,44 @@ begin
  if not found or a.gym_id is distinct from r.gym_id or o.tenant_id is distinct from r.gym_id then
    return jsonb_build_object('hold_reason','canonical_tenant_asset_mismatch');
  end if;
- -- Raw asset cannot establish exact source URL/registry receipts. Return it
- -- honestly, with no fabricated URL, receipt or zero-use clearance.
+ -- Final source binding is locked too when the separately applied source draft
+ -- exists. No row-provided URL/content_hash becomes an original-byte receipt.
+ if to_regclass('public.media_source') is not null then
+   select to_jsonb(s) into source_snapshot from public.media_source s
+     where s.id=to_jsonb(a)->>'source_id' for share;
+ end if;
  return jsonb_build_object('calendar',to_jsonb(r),'asset',to_jsonb(a),
+   'source',source_snapshot,'binding_revision',case when source_snapshot is not null
+      then md5(jsonb_build_array(to_jsonb(a),source_snapshot)::text) end,
    'observation',o.observation_json::jsonb,'revision',revision);
+end;
+$$;
+
+-- Pre-read phase: NO graph lock or row lock. The Python caller ends this read
+-- transaction before any Drive/hosted fetch or renderer work. Final locked RPC
+-- rechecks calendar/observation/asset/source before authority and outcome.
+create function public.fixer_forward_media_owner_snapshot_20261007(
+ p_id uuid,p_revision text,p_digest text,p_token uuid)
+returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
+declare snapshot jsonb; o public.fixer_forward_media_observation_20261007%rowtype;
+begin
+ if not exists(select 1 from public.fixer_forward_media_owner_progress_20261007 p
+   where p.calendar_row_id=p_id and p.row_revision=p_revision and p.observation_digest=p_digest
+    and p.reservation_token=p_token and p.state='quarantine') then
+   raise exception 'exact quarantine reservation required' using errcode='23514'; end if;
+ if to_regprocedure('public.fixer_forward_media_source_snapshot_20261007(uuid,text)') is null then
+   return jsonb_build_object('hold_reason','owner_asset_source_binding_missing'); end if;
+ begin
+   snapshot:=public.fixer_forward_media_source_snapshot_20261007(p_id,p_revision);
+ exception when check_violation then
+   return jsonb_build_object('hold_reason','owner_source_snapshot_invalid');
+ end;
+ select * into o from public.fixer_forward_media_observation_20261007
+   where calendar_row_id=p_id and row_revision=p_revision and observation_digest=p_digest;
+ if not found or o.calendar_snapshot is distinct from snapshot->'calendar'
+   or o.tenant_id is distinct from snapshot#>>'{calendar,gym_id}' then
+   return jsonb_build_object('hold_reason','candidate_canonical_binding_invalid'); end if;
+ return snapshot||jsonb_build_object('observation',o.observation_json::jsonb);
 end;
 $$;
 
@@ -161,11 +196,13 @@ end;
 $$;
 revoke all on function public.fixer_forward_media_owner_pending_20261007(text[],integer),
  public.fixer_forward_media_owner_reserve_20261007(uuid,text,text,uuid),
+ public.fixer_forward_media_owner_snapshot_20261007(uuid,text,text,uuid),
  public.fixer_forward_media_owner_locked_20261007(uuid,text,text,uuid),
  public.fixer_forward_media_owner_record_20261007(uuid,text,text,uuid,jsonb)
  from public,anon,authenticated,service_role,fixer_forward_media_attester_20261006;
 grant execute on function public.fixer_forward_media_owner_pending_20261007(text[],integer),
  public.fixer_forward_media_owner_reserve_20261007(uuid,text,text,uuid),
+ public.fixer_forward_media_owner_snapshot_20261007(uuid,text,text,uuid),
  public.fixer_forward_media_owner_locked_20261007(uuid,text,text,uuid),
  public.fixer_forward_media_owner_record_20261007(uuid,text,text,uuid,jsonb)
  to fixer_forward_media_owner_20261006;

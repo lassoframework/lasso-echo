@@ -355,3 +355,29 @@ def test_real_persistence_rejects_boolean_only_transaction_claim(lane):
     report = worker.run_adapter(transport=transport, persistence=real, reader=reader)
     assert report == {'status':'hold','reason':'owner_transaction_contract_required','rows':[]}
     assert transport.pending_calls == 0
+
+
+def test_closed_local_cache_cannot_mutate_or_fall_back_to_remote():
+    from dataclasses import FrozenInstanceError
+    from agent.forward_media_owner_transport import FrozenObjectReader
+    objects = {'https://host/source': b'exact bytes'}
+    local = FrozenObjectReader(objects)
+    objects['https://host/source'] = b'changed'
+    assert local.read('https://host/source') == b'exact bytes'
+    with pytest.raises(FrozenInstanceError):
+        local.read = lambda url: b'remote replacement'
+    with pytest.raises(TypeError):
+        local._objects['https://host/source'] = b'changed'
+    with pytest.raises(worker.OwnerWorkerHold, match='verified_local_byte_cache_required'):
+        local.read('https://host/unverified')
+
+
+def test_final_authority_stage_rejects_a_network_reader(lane):
+    from agent.forward_media_owner_transport import DedicatedOwnerTransport
+    persistence = owner.ForwardMediaOwnerPersistence(None,'isolated_owner',lane[2])
+    transport = object.__new__(DedicatedOwnerTransport)
+    transport.persistence = persistence
+    transport._active = (*worker._identity(lane[0].candidate), 'token')
+    transport._final_phase = True
+    with pytest.raises(worker.OwnerWorkerHold, match='verified_local_byte_cache_required'):
+        transport.stage_authority(lane[0].candidate,persistence,(),local_reader=lane[2])
