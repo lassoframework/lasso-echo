@@ -88,6 +88,98 @@ def test_failures_consume_budget_without_approval_or_replay(lane, monkeypatch):
     assert all(a['review_status'] == 'pending_review' for a in kwargs['store'].assets)
 
 
+def test_drive_404_backoff_keeps_asset_pending_and_eventually_retries(lane, monkeypatch):
+    calls, kwargs = lane
+    kwargs['store'] = Store(gyms=1, assets=1)
+
+    def missing(gym, asset_id, **unused):
+        calls.append((gym, asset_id))
+        return {'ok': False, 'reason': 'Drive download failed: HttpError',
+                'retry': {'category': 'drive_http_404', 'status': 404}}
+
+    monkeypatch.setattr(gym_media_moderation, 'moderate_asset', missing)
+    first = listener._run_media_moderation_day(NOW, **kwargs)
+    assert first['attempted'] == 1 and first['recorded'] == 0
+    state = json.loads(db.kv_get(listener._MEDIA_MODERATION_RETRY_KEY))
+    assert len(state['assets']) == 1
+    ref, retry = next(iter(state['assets'].items()))
+    assert len(ref) == 64 and retry['category'] == 'drive_http_404'
+    assert retry['retry_after'] == (NOW + timedelta(days=7)).isoformat()
+    assert kwargs['store'].assets[0]['review_status'] == 'pending_review'
+    assert kwargs['store'].assets[0]['moderation_status'] == 'pending'
+
+    next_day = listener._run_media_moderation_day(NOW + timedelta(days=1), **kwargs)
+    assert next_day['attempted'] == 0 and next_day['cooldown_deferred'] == 1
+    assert len(calls) == 1
+
+    retried = listener._run_media_moderation_day(NOW + timedelta(days=7), **kwargs)
+    assert retried['attempted'] == 1 and len(calls) == 2
+    updated = json.loads(db.kv_get(listener._MEDIA_MODERATION_RETRY_KEY))['assets'][ref]
+    assert updated['failures'] == 2
+    assert updated['retry_after'] == (NOW + timedelta(days=21)).isoformat()
+
+
+def test_cooling_drive_errors_free_daily_budget_for_other_assets(lane, monkeypatch):
+    calls, kwargs = lane
+    store = Store(gyms=1, assets=70)
+    kwargs['store'] = store
+    failing_ids = set()
+
+    def moderate(gym, asset_id, **unused):
+        calls.append((gym, asset_id))
+        if len(calls) <= 12:
+            failing_ids.add(asset_id)
+            return {'ok': False,
+                    'retry': {'category': 'drive_http_404', 'status': 404}}
+        return {'ok': True}
+
+    monkeypatch.setattr(gym_media_moderation, 'moderate_asset', moderate)
+    first = listener._run_media_moderation_day(NOW, **kwargs)
+    assert first['attempted'] == first['reserved'] == 50
+    assert len(failing_ids) == 12
+    day_two_start = len(calls)
+    second = listener._run_media_moderation_day(NOW + timedelta(days=1), **kwargs)
+    assert second['attempted'] == 50  # the fixed cap is filled by eligible assets
+    assert not (failing_ids & {asset_id for _gym, asset_id in calls[day_two_start:]})
+
+
+@pytest.mark.parametrize('changed_binding', ['content', 'source'])
+def test_retry_binding_change_bypasses_stale_cooldown_and_success_clears_it(
+        lane, monkeypatch, changed_binding):
+    calls, kwargs = lane
+    store = Store(gyms=1, assets=1)
+    kwargs['store'] = store
+    asset = store.assets[0]
+    ref = listener._moderation_retry_ref(asset['gym_id'], asset['id'])
+    state = {'version': 1, 'assets': {ref: {
+        'binding': listener._moderation_retry_binding(asset),
+        'category': 'drive_http_404', 'failures': 2,
+        'retry_after': (NOW + timedelta(days=14)).isoformat(),
+        'updated_at': NOW.isoformat(),
+    }}}
+    db.kv_set(listener._MEDIA_MODERATION_RETRY_KEY, json.dumps(state))
+    if changed_binding == 'content':
+        asset['content_hash'] = 'changed-content-version'
+    else:
+        store.sources[0]['id'] = 'new-source-version'
+        asset['source_id'] = 'new-source-version'
+
+    monkeypatch.setattr(gym_media_moderation, 'moderate_asset',
+                        lambda gym, asset_id, **unused: (calls.append((gym, asset_id))
+                                                         or {'ok': True}))
+    result = listener._run_media_moderation_day(NOW + timedelta(days=1), **kwargs)
+    assert result['attempted'] == 1 and calls == [(asset['gym_id'], asset['id'])]
+    assert json.loads(db.kv_get(listener._MEDIA_MODERATION_RETRY_KEY))['assets'] == {}
+
+
+def test_malformed_retry_state_fails_before_provider_calls(lane):
+    calls, kwargs = lane
+    db.kv_set(listener._MEDIA_MODERATION_RETRY_KEY, '{"version":1,"assets":{"raw-id":{}}}')
+    with pytest.raises(ValueError, match='invalid durable moderation retry'):
+        listener._run_media_moderation_day(NOW, **kwargs)
+    assert calls == [] and not db.kv_get(KEY)
+
+
 def test_interruption_is_not_replayed(lane, monkeypatch):
     _, kwargs = lane
     monkeypatch.setattr(gym_media_moderation, 'moderate_asset',
