@@ -251,6 +251,8 @@ def _strip_llm_scaffold(text):
     return out
 
 
+import re as _re_hook
+
 _HOOK_MAX_CHARS = 125
 
 
@@ -268,7 +270,14 @@ def _bound_opening_hook(text, max_chars=_HOOK_MAX_CHARS):
             continue
         if len(line) <= max_chars:
             return text
-        cut = line.rfind(" ", 0, max_chars + 1)
+        # Prefer the LAST sentence boundary inside the limit so the hook line is a
+        # complete sentence (2026-10-07: the word-boundary cut split "we don't
+        # expect you to / figure it out alone" across two lines).
+        cut = -1
+        for m in _re_hook.finditer(r"[.!?][\"'\u201d\u2019)]*(?=\s)", line[:max_chars + 1]):
+            cut = m.end()
+        if cut <= 0:
+            cut = line.rfind(" ", 0, max_chars + 1)
         if cut <= 0:
             cut = max_chars
         head, tail = line[:cut].rstrip(), line[cut:].lstrip()
@@ -672,6 +681,9 @@ class StoryBrandGenerator:
         "- Draw ONLY from the brand voice doc and client note provided. No invented "
         "facts, stats, prices, or offers.\n"
         "- No em dashes, en dashes, or hyphens used as punctuation dashes.\n"
+        "- Consumer copy law: use NO hyphens at all (write '30 minute', 'semi private', "
+        "'well being'), NO colons, and NO semicolons anywhere in the caption. Use "
+        "periods and commas instead.\n"
         "- Keep the customer's problem central, but VARY the ENTRY POINT. Do not open "
         "every caption the same way. Rotate how you begin: sometimes the problem, "
         "sometimes the outcome they want, sometimes a question, sometimes a scene or "
