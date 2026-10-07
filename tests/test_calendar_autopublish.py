@@ -3215,6 +3215,7 @@ def test_forward_media_hold_prevents_provider_and_releases_owned_lease(armed, mo
     row = _row("guarded")
     store = _FakeStore([row], claim_returns={"guarded": "owned-token"})
     pub = _FakePublisher()
+    monkeypatch.setattr(cap.meta_publisher, "publish", pub)
     released = []
     def release(store_arg, row_id, **kwargs):
         released.append(kwargs)
@@ -3254,5 +3255,6 @@ def test_forward_media_actual_draft_mismatch_never_claims_or_sends(armed, monkey
     monkeypatch.setattr(cap, "_alert_publish_blocked", lambda *a, **kw: None)
     store = _FakeStore([_row("changed")], claim_returns={"changed": "owned-token"})
     pub = _FakePublisher()
+    monkeypatch.setattr(cap.meta_publisher, "publish", pub)
     out = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert pub.calls == [] and out["forward_media_holds"] == {"changed": "forward_media_verification"}

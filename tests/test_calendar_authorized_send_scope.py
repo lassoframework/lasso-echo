@@ -5,6 +5,7 @@ import pytest
 
 from agent import calendar_autopublish as cap
 from agent import forward_media_publish as bridge
+from agent import zernio_publisher
 from agent.forward_media_send_context import ProviderSendHold
 from agent.meta_publisher import PublishResult
 from tests.test_calendar_autopublish import _FakeStore, _row, RUN_DATE, LATE_NOW
@@ -25,6 +26,12 @@ def setup(monkeypatch):
     monkeypatch.setattr(cap, "_alert_ambiguous_publish", lambda *args, **kwargs: None)
     monkeypatch.setattr(cap, "_lasso_zernio_missing", lambda: [])
     monkeypatch.setattr(bridge, "authorize", lambda *args: True)
+
+
+def _trusted_test_publishers(monkeypatch, publisher):
+    # Guard ON permits only the configured lower-boundary send functions.
+    monkeypatch.setattr(cap.meta_publisher, "publish", publisher)
+    monkeypatch.setattr(zernio_publisher, "publish", publisher)
 
 
 @pytest.mark.parametrize("zernio", [False, True])
@@ -57,6 +64,7 @@ def test_each_provider_call_runs_inside_exact_claim_scope(setup, monkeypatch, ze
             assert kwargs == {}
         events.append("provider")
         return PublishResult(ok=True, mode="published", media_id="media")
+    _trusted_test_publishers(monkeypatch, publisher)
     out = cap.publish_due(RUN_DATE, store=store, publisher=publisher,
                           zernio_publish=publisher, now=LATE_NOW)
     assert events == ["enter", "provider", "exit"]
@@ -74,8 +82,10 @@ def test_scope_refusal_never_calls_provider_and_releases_owned_token(setup, monk
         raise ProviderSendHold("committed receipt unavailable")
         yield
     monkeypatch.setattr(bridge, "authorized_send", refused)
+    publisher = lambda *a: pytest.fail("provider was called")
+    _trusted_test_publishers(monkeypatch, publisher)
     out = cap.publish_due(RUN_DATE, store=store, now=LATE_NOW,
-                          publisher=lambda *a: pytest.fail("provider was called"))
+                          publisher=publisher)
     assert out["published"] == []
     assert out["forward_media_holds"] == {"held": "forward_media_verification"}
     assert released[0]["expected_claim_token"] == "owned-token"
@@ -97,6 +107,7 @@ def test_provider_failure_closes_scope_and_retains_ambiguous_claim(setup, monkey
     monkeypatch.setattr(cap, "_revert_to_pending", lambda *a, **kw: pytest.fail("ambiguous claim released"))
     def publisher(*args):
         raise TimeoutError("response unavailable")
+    _trusted_test_publishers(monkeypatch, publisher)
     out = cap.publish_due(RUN_DATE, store=store, publisher=publisher, now=LATE_NOW)
     assert events == ["enter", "exit"]
     assert out["recovery_required"] == ["ambiguous"]
@@ -123,9 +134,23 @@ def test_real_scope_needs_committed_receipts_after_precheck(setup, monkeypatch):
     monkeypatch.setattr(cap, "_revert_to_pending", lambda *a, **kw: released.append(kw) or True)
     # setup permits the early bridge precheck, but this fake store cannot read
     # the committed claim and exact-byte receipts demanded by the real scope.
+    publisher = lambda *a: pytest.fail("unproven scope sent")
+    _trusted_test_publishers(monkeypatch, publisher)
     out = cap.publish_due(RUN_DATE, store=store, now=LATE_NOW,
-                          publisher=lambda *a: pytest.fail("unproven scope sent"))
+                          publisher=publisher)
     assert out["published"] == []
     assert out["forward_media_holds"] == {row_id: "forward_media_verification"}
     assert released[0]["expected_claim_token"] == token
     assert out["recovery_required"] == []
+
+
+def test_guard_on_rejects_unverified_callbacks_before_read_or_claim(setup, monkeypatch):
+    monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
+    class NoReadStore:
+        def due_rows(self, *args, **kwargs):
+            pytest.fail("unverified callback read due rows")
+    fake = lambda *args, **kwargs: pytest.fail("unverified callback sent")
+    for kwargs in ({"publisher": fake}, {"zernio_publish": fake}):
+        out = cap.publish_due(RUN_DATE, store=NoReadStore(), now=LATE_NOW, **kwargs)
+        assert out["held"] is True
+        assert out["reason"] == "unverified provider callback"

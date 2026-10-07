@@ -1417,6 +1417,16 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
     if zernio_publish is None:
         from . import zernio_publisher
         zernio_publish = zernio_publisher.publish
+    from . import forward_media_guard as _forward_media_guard
+    if _forward_media_guard.enabled():
+        from . import zernio_publisher
+        # The trusted send scope is meaningful only when its wrapped lower
+        # publisher is the callable used. Test hooks or future callers may not
+        # substitute an arbitrary callback and ignore that scope when armed.
+        if (publisher is not meta_publisher.publish
+                or zernio_publish is not zernio_publisher.publish):
+            return {"ok": False, "held": True, "date": run_date,
+                    "reason": "unverified provider callback", "published": []}
 
     # A reviewed managed Story unlocks only the exact dated incident feed hold.
     # This CAS never changes captions, visuals, claims or another hold reason.
