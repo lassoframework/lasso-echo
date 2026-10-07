@@ -325,12 +325,28 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
                 or not callable(claim_message)):
             return OutreachResult(opened=True, channel_id=channel_id,
                                   reason="current_notice_preflight_unavailable")
-        if not member_check(channel_id, BLAKE_SLACK_USER_ID):
+        try:
+            blake_is_member = member_check(channel_id, BLAKE_SLACK_USER_ID)
+        except Exception as exc:  # noqa: BLE001 - no outbound row or Slack POST exists
+            log(f"[outreach] current notice membership check failed "
+                f"ticket={ticket.get('id')}: {type(exc).__name__}")
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="current_notice_preflight_failed")
+        if not blake_is_member:
             return OutreachResult(opened=True, channel_id=channel_id,
                                   reason="blake_membership_unverified")
         notice_id = str(uuid.uuid4())
-        attempt_token = current_notice_bus.begin_current_notice(
-            ticket, notice_id, unrouted=True)
+        try:
+            attempt_token = current_notice_bus.begin_current_notice(
+                ticket, notice_id, unrouted=True)
+        except Exception as exc:  # noqa: BLE001 - reservation alone cannot send
+            log(f"[outreach] current notice reservation failed "
+                f"ticket={ticket.get('id')}: {type(exc).__name__}")
+            # Even a committed reservation with a lost response has no outbound
+            # row or posting intent. Return no notice ID so intake can CAS this
+            # request into its hold queue rather than await nonexistent readback.
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="current_notice_reservation_failed")
         if not attempt_token:
             return OutreachResult(opened=True, channel_id=channel_id,
                                   reason="current_notice_reservation_refused")

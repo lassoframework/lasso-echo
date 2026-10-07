@@ -76,7 +76,6 @@ import re
 import time
 
 from . import adapter as _a
-from .bus import BusError
 from .. import config
 
 # Surfaces where a reply goes TOP LEVEL rather than in a thread: DMs and group DMs (people do

@@ -406,6 +406,27 @@ def test_known_route_reserves_id_and_token_before_insert(monkeypatch):
     assert row["body"].startswith(f"<@{outbox.config.APPROVER_SLACK_ID}> ")
 
 
+@pytest.mark.parametrize("overrides", [
+    {"product": "portal"}, {"source": "slack"}, {"status": "hold"},
+    {"escalated": True}, {"hold_tier": "human"}, None,
+])
+def test_noneligible_completion_retains_ordinary_row_without_reservation(monkeypatch, overrides):
+    ticket = NoticeBus().current if overrides is not None else None
+    if ticket is not None:
+        ticket.update(overrides)
+    bus = Bus(url="https://example.test", service_key="test")
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(bus, "begin_current_notice",
+                        lambda *_a, **_kw: pytest.fail("ineligible reservation"))
+    monkeypatch.setattr(bus, "_insert", lambda _table, row: (deepcopy(row), False))
+    row = bus.record_outbound(
+        ticket_id=TICKET_ID, author_type="echo", body="The issue is fixed.",
+        delivery_status="ready", kind="status",
+        meta={"fixer": True, "resolve_notice": True, "identity": "echo"})
+    assert "id" not in row
+    assert "fixer_current_attempt_token" not in row["attachments"]
+
+
 def test_lost_insert_response_reads_only_designated_id(monkeypatch):
     bus = Bus(url="https://example.test", service_key="test")
     inserted = {}

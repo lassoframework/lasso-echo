@@ -63,6 +63,11 @@ _INTAKE_MAX_SWEEP_SECONDS = 24 * 60 * 60
 _intake_now = time.time
 
 
+def _current_notice_bus(bus):
+    """Use the same current-notice capability check in both poll passes."""
+    return bus if callable(getattr(bus, "begin_current_notice", None)) else None
+
+
 # ---------------------------------------------------------------------------
 # Intake keyset cursor (2026-09-23 starvation fix)
 #
@@ -572,8 +577,7 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 claim_message=claim_message, completion=resolves_on_delivery,
                 ticket_lookup=bus.ticket,
                 reconcile_uncertain=bus.hold_uncertain_outreach,
-                current_notice_bus=(bus if callable(getattr(
-                    bus, "begin_current_notice", None)) else None),
+                current_notice_bus=_current_notice_bus(bus),
                 readback=readback,
                 member_check=member_check, log=log)
             if getattr(result, "delivered", False):
@@ -1125,8 +1129,7 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
             claim_message=claim_message, completion=True,
             ticket_lookup=bus.ticket,
             reconcile_uncertain=bus.hold_uncertain_outreach,
-            current_notice_bus=(bus if callable(getattr(
-                bus, "begin_current_notice", None)) else None),
+            current_notice_bus=_current_notice_bus(bus),
             readback=readback,
             member_check=member_check, log=log)
         if getattr(result, "delivered", False):

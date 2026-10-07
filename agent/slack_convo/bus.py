@@ -634,8 +634,9 @@ class Bus:
                                kind == "status" and att.get("resolve_notice") is True))
         if current_notice and message_id is None:
             ticket = self.ticket(ticket_id)
-            if (ticket or {}).get("product") == "echo" and (ticket or {}).get(
-                    "source") == "website_tab":
+            current_notice = ((ticket or {}).get("product") == "echo"
+                              and (ticket or {}).get("source") == "website_tab")
+            if current_notice:
                 if kind == "answer":
                     from . import adapter as _adapter
                     if (_adapter.promises_human_follow_up(body or "")
@@ -645,8 +646,7 @@ class Bus:
                         or ticket.get("escalated") is True
                         or ticket.get("hold_tier") is not None):
                     current_notice = False
-            if current_notice and (ticket or {}).get("product") == "echo" and (
-                    ticket or {}).get("source") == "website_tab":
+            if current_notice:
                 if not config.slack_convo_echo_current_notice_enabled():
                     raise BusError(409, "current notice capability disabled")
                 message_id = str(uuid.uuid4())

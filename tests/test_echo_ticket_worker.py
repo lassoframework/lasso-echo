@@ -854,15 +854,26 @@ def test_intake_completion_refusal_does_not_hold_a_newer_request(monkeypatch):
 
 @pytest.mark.parametrize("reason", ["current_notice_disabled",
                                   "current_notice_preflight_unavailable",
-                                  "current_notice_reservation_refused"])
+                                  "current_notice_reservation_refused",
+                                  "current_notice_preflight_failed",
+                                  "current_notice_reservation_failed"])
 def test_real_outreach_pre_send_refusal_reaches_intake_hold_queue(monkeypatch, reason):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED",
                        str(reason != "current_notice_disabled"))
     monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO")
     bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=5)])
     reservations = []
-    monkeypatch.setattr(bus, "begin_current_notice",
-                        lambda *_a, **_kw: reservations.append("refused"), raising=False)
+    def begin(*_a, **_kw):
+        reservations.append("refused")
+        if reason == "current_notice_reservation_failed":
+            raise TimeoutError("reservation response lost")
+
+    def member_check(*_a):
+        if reason == "current_notice_preflight_failed":
+            raise RuntimeError("membership lookup unavailable")
+        return True
+
+    monkeypatch.setattr(bus, "begin_current_notice", begin, raising=False)
     log, open_dm, post = _calls()
     _, notice = _notices()
     result = W.intake_pass(
@@ -870,7 +881,7 @@ def test_real_outreach_pre_send_refusal_reaches_intake_hold_queue(monkeypatch, r
         fetch_state=lambda *_a: {"social_status": "connected"},
         llm=lambda *_a: "Yes, your Instagram is connected right now.",
         mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
-        claim_message=bus.claim_message, member_check=lambda *_a: True,
+        claim_message=bus.claim_message, member_check=member_check,
         readback=(None if reason == "current_notice_preflight_unavailable" else
                   lambda *_a: pytest.fail("no reserved message to read back")),
         **_client_deps())
@@ -880,10 +891,45 @@ def test_real_outreach_pre_send_refusal_reaches_intake_hold_queue(monkeypatch, r
     assert current["status"] == "hold" and current["escalated"] is True
     assert current["classification"] is None and current["request_version"] == 5
     assert current["raw_text"] == "is my instagram connected?"
-    assert reservations == (["refused"] if reason == "current_notice_reservation_refused" else [])
+    assert reservations == (["refused"] if reason in (
+        "current_notice_reservation_refused", "current_notice_reservation_failed") else [])
     assert len(bus.outbound) == 1 and bus.outbound[0]["kind"] == A.KIND_ESCALATION
     assert reason in bus.outbound[0]["body"] and log["posted"] == []
     assert len(log["opened"]) == (0 if reason == "current_notice_disabled" else 1)
+
+
+@pytest.mark.parametrize("failure", ["membership", "reservation"])
+def test_real_preflight_exception_preserves_a_concurrent_new_request(monkeypatch, failure):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", "true")
+    monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO")
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=5)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+
+    def failed_preflight(*_a, **_kw):
+        bus.tickets["t-1"].update(request_version=6, raw_text="A newer request",
+                                  status="new", classification=None)
+        raise TimeoutError("preflight unavailable")
+
+    monkeypatch.setattr(bus, "begin_current_notice",
+                        failed_preflight if failure == "reservation" else
+                        lambda *_a, **_kw: pytest.fail("membership failed before reservation"),
+                        raising=False)
+    W.intake_pass(
+        bus, open_group_dm=open_dm, post_first_message=post, write_hold_notice=notice,
+        fetch_state=lambda *_a: {"social_status": "connected"},
+        llm=lambda *_a: "Yes, your Instagram is connected right now.",
+        mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+        claim_message=bus.claim_message,
+        member_check=failed_preflight if failure == "membership" else lambda *_a: True,
+        readback=lambda *_a: pytest.fail("preflight failed before Slack"),
+        **_client_deps())
+
+    current = bus.tickets["t-1"]
+    assert current["request_version"] == 6 and current["raw_text"] == "A newer request"
+    assert current["status"] == "new" and current["classification"] is None
+    assert current["escalated"] is False
+    assert bus.outbound == [] and log["posted"] == []
 
 
 def test_delivered_answer_without_a_request_version_refuses_to_send():
