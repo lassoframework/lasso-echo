@@ -386,3 +386,23 @@ def test_invalid_operation_and_decision_fail(prepared):
         svc.persist(original,
                     type(clearance)(**{**clearance.row(), 'decision': 'auto_cleared'}),
                     manifest)
+
+
+def test_transaction_staging_never_commits_or_rolls_back(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    assert svc.persist_in_transaction(original, clearance, manifest)['replayed'] is False
+    assert conn.commits == conn.rollbacks == 0
+    assert svc.persist_in_transaction(original, clearance, manifest)['replayed'] is True
+    assert conn.commits == conn.rollbacks == 0
+
+
+def test_transaction_staging_error_leaves_rollback_to_owner(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    def failed_insert(*args):
+        raise RuntimeError('synthetic SQL failure')
+    svc._insert = failed_insert
+    with pytest.raises(RuntimeError):
+        svc.persist_in_transaction(original, clearance, manifest)
+    assert conn.commits == conn.rollbacks == 0

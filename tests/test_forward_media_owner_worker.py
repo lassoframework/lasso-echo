@@ -290,3 +290,68 @@ def test_durable_success_outcome_is_stable_across_authority_replay(lane):
     execute(lane)
     assert next(iter(lane[0].records.values())) == first
     assert 'replayed' not in first
+
+
+def test_atomic_transport_uses_stage_and_reports_only_after_context_exit(lane):
+    transport, persistence, reader = lane
+    transport.atomic_authority_outcome = True
+    calls = []
+    old_lock = transport.locked_current
+    @contextmanager
+    def atomic_lock(candidate):
+        with old_lock(candidate) as current:
+            yield current
+            calls.append('commit')
+    transport.locked_current = atomic_lock
+    def stage(candidate, actual_persistence, tuples):
+        assert actual_persistence is persistence and transport.locked
+        calls.append('authority')
+        return {'replayed': False}
+    transport.stage_authority = stage
+    persistence.persist = lambda *args: pytest.fail('must not call independently committing persist')
+    assert execute(lane)['rows'][0]['status'] == 'persisted'
+    assert calls == ['authority','commit']
+
+
+def test_atomic_commit_failure_never_reports_staged_success(lane):
+    transport, persistence, reader = lane
+    transport.atomic_authority_outcome = True
+    old_lock = transport.locked_current
+    @contextmanager
+    def lost_commit(candidate):
+        with old_lock(candidate) as current:
+            yield current
+            raise owner.UncertainCommitError('private DSN')
+    transport.locked_current = lost_commit
+    transport.stage_authority = lambda *args: {'replayed': False}
+    result = execute(lane)
+    assert result == {'status':'hold','reason':'uncertain_authority_commit','rows':[]}
+
+
+def test_atomic_stage_error_is_never_converted_to_successful_hold(lane):
+    transport, persistence, reader = lane
+    transport.atomic_authority_outcome = True
+    def failed(*args):
+        raise RuntimeError('SQL transaction aborted private DSN')
+    transport.stage_authority = failed
+    result = execute(lane)
+    assert result == {'status':'hold','reason':'authority_commit_unverified','rows':[]}
+    assert not transport.records
+
+
+def test_actual_asset_missing_source_receipt_holds_before_byte_read(lane):
+    transport, persistence, reader = lane
+    transport.current['asset'].pop('source_url')
+    transport.current['asset']['used_count'] = 0
+    reader.read = lambda *_: pytest.fail('missing source contract must hold before byte reads')
+    assert execute(lane)['rows'][0]['reason'] == 'owner_asset_source_binding_missing'
+    assert not persistence.saved
+
+
+def test_real_persistence_rejects_boolean_only_transaction_claim(lane):
+    transport, fake_persistence, reader = lane
+    transport.atomic_authority_outcome = True
+    real = owner.ForwardMediaOwnerPersistence(None, 'isolated_owner', reader)
+    report = worker.run_adapter(transport=transport, persistence=real, reader=reader)
+    assert report == {'status':'hold','reason':'owner_transaction_contract_required','rows':[]}
+    assert transport.pending_calls == 0

@@ -1,19 +1,11 @@
-"""Default-OFF owner work-loop adapter; NO production transport is provisioned.
+"""Default-OFF owner worker; production credentials/factory remain unprovisioned.
 
-The draft grants the owner only its three immutable authority tables. It has no
-owner candidate discovery/current-calendar-and-asset lookup, verified history
-input, or durable progress API. Producer materialization_observations are not
-history decisions. Consequently the CLI holds even when enabled. It does not
-query calendar data with service credentials or invent grants/RPC names.
-
-OwnerTransport describes the missing infrastructure contract. Its implementation
-must use the dedicated owner connection, discover durable unsent candidates with
-bounded fair pagination, lock/recheck canonical calendar revision and asset
-ownership through persistence, independently verify byte-bound history evidence,
-and durably record idempotent outcomes keyed by row/revision/observation digest.
-An uncertain authority/progress commit must quarantine the key for manual
-reconciliation, never retry or clear it. No implementation exists in this draft.
-run_adapter is a concrete offline integration seam, not a production factory.
+DedicatedOwnerTransport implements DRAFT discovery, locks and durable progress.
+It stages authority+outcome in one shared transaction and preserves permanent
+quarantine reservations on crashes/unknown commits. The actual media_asset has
+no audited source receipt and fleet history transport is missing, so real rows
+hold. Producer observations and used_count=0 never establish authority.
+The generic adapter also supports offline fixtures; those are not live proof.
 """
 from __future__ import annotations
 
@@ -47,7 +39,8 @@ _REASONS = frozenset({
     'render_bytes_mismatch', 'verified_byte_history_required',
     'source_changed_after_history_verification', 'candidate_batch_invalid',
     'authority_commit_unverified', 'uncertain_authority_commit',
-    'durable_progress_commit_unverified',
+    'durable_progress_commit_unverified', 'owner_asset_source_binding_missing',
+    'owner_manual_reconciliation_required', 'owner_transaction_contract_required',
 })
 
 
@@ -59,15 +52,16 @@ class OwnerWorkerHold(RuntimeError):
 
 
 class OwnerTransport:
-    """Unimplemented trusted owner infrastructure, never a producer callback.
+    """Abstract trusted owner infrastructure, never a producer callback.
 
     pending(tenants, limit): finite sequence of row_id/revision/observation_digest.
     locked_current(candidate): context manager yielding current canonical row,
       asset, observation and revision; maintain locks until outcome is recorded.
     verified_history(original): independently checked owner decision/evidence,
       bound to original.row() exactly; literal verified=True alone is inadequate.
-    record(candidate, outcome): durable idempotent exact write; literal True on
-      verified commit. Errors/unknown commit stop the pass for reconciliation.
+    record(candidate, outcome): stage idempotent exact outcome. Atomic concrete
+      transports commit it on normal locked_current exit with staged authority.
+      Errors/unknown commit stop the pass for manual reconciliation.
     Never expose these operations through a service/publisher credential client.
     """
 
@@ -125,6 +119,8 @@ def _identity(candidate):
 
 def _prepare(candidate, current, transport, reader, tenants):
     row_id, revision, digest = _identity(candidate)
+    if current.get('hold_reason'):
+        raise OwnerWorkerHold(current['hold_reason'])
     row, asset, observation = current['calendar'], current['asset'], current['observation']
     if current.get('revision') != revision or row.get('id') != row_id:
         raise OwnerWorkerHold('canonical_revision_changed')
@@ -138,6 +134,8 @@ def _prepare(candidate, current, transport, reader, tenants):
             or any(row.get(k) is not None for k in ('publish_claim_token', 'published_at',
                                                    'late_post_id', 'render_manifest_digest'))):
         raise OwnerWorkerHold('calendar_not_unsent_candidate')
+    if not asset.get('source_url') or not asset.get('registry_evidence_ref'):
+        raise OwnerWorkerHold('owner_asset_source_binding_missing')
     # Account-style producer tenant aliases cannot establish canonical ownership.
     # Unresolved alias candidates hold; a future reviewed canonical mapping
     # contract must preserve the immutable raw observation and its digest.
@@ -197,7 +195,14 @@ def run_adapter(*, transport, persistence, reader):
     rows = []
     try:
         tenants, limit = settings_from_environment()
-        persistence._assert_owner_identity()
+        atomic = getattr(transport, 'atomic_authority_outcome', False) is True
+        if not atomic:
+            persistence._assert_owner_identity()
+        if isinstance(persistence, owner.ForwardMediaOwnerPersistence):
+            from .forward_media_owner_transport import DedicatedOwnerTransport
+            if type(transport) is not DedicatedOwnerTransport or transport.persistence is not persistence:
+                # A caller-supplied boolean cannot attest shared transaction semantics.
+                raise OwnerWorkerHold('owner_transaction_contract_required')
         candidates = transport.pending(tenants, limit)
         if not isinstance(candidates, (list, tuple)) or len(candidates) > limit:
             raise OwnerWorkerHold('candidate_batch_invalid')
@@ -208,9 +213,16 @@ def run_adapter(*, transport, persistence, reader):
                 continue
             seen.add(key)
             with transport.locked_current(candidate) as current:
+                authority_started = False
                 try:
                     tuples = _prepare(candidate, current, transport, reader, tenants)
-                    result = persistence.persist(*tuples)
+                    authority_started = True
+                    if atomic:
+                        # Staged result is only reported after context COMMIT. SQL
+                        # errors must abort; no successful hold on a poisoned tx.
+                        result = transport.stage_authority(candidate, persistence, tuples)
+                    else:
+                        result = persistence.persist(*tuples)
                     if not isinstance(result, dict) or type(result.get('replayed')) is not bool:
                         raise OwnerWorkerHold('authority_commit_unverified')
                     outcome = {'status': 'persisted',
@@ -220,12 +232,18 @@ def run_adapter(*, transport, persistence, reader):
                     # Do not proceed to another asset or try again automatically.
                     raise OwnerWorkerHold('uncertain_authority_commit') from None
                 except OwnerWorkerHold as exc:
+                    if atomic and authority_started:
+                        raise
                     if str(exc) == 'authority_commit_unverified':
                         raise
                     outcome = {'status': 'hold', 'reason': str(exc)}
                 except packet.PacketError as exc:
+                    if atomic and authority_started:
+                        raise OwnerWorkerHold('authority_commit_unverified') from None
                     outcome = {'status': 'hold', 'reason': exc.reason}
                 except Exception:
+                    if atomic and authority_started:
+                        raise OwnerWorkerHold('authority_commit_unverified') from None
                     outcome = {'status': 'hold', 'reason': 'candidate_verification_failed'}
                 try:
                     recorded = transport.record(candidate, outcome)
@@ -236,7 +254,11 @@ def run_adapter(*, transport, persistence, reader):
                 row_report = {'calendar_row_id': key[0], 'revision': key[1], **outcome}
                 if outcome['status'] == 'persisted':
                     row_report['replayed'] = result['replayed']
-                rows.append(row_report)
+            # The concrete transport commits on context exit. Never report a
+            # staged outcome as durable before that commit returns successfully.
+            rows.append(row_report)
+    except owner.UncertainCommitError:
+        return {'status': 'hold', 'reason': 'uncertain_authority_commit', 'rows': rows}
     except OwnerWorkerHold as exc:
         return {'status': 'hold', 'reason': str(exc), 'rows': rows}
     except Exception:

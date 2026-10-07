@@ -296,45 +296,51 @@ class ForwardMediaOwnerPersistence:
         or uncertain commit the transaction is rolled back and nothing is
         reported as persisted.
         """
-        check_environment()
-        _validate_and_bind(original, clearance, manifest)
-        _verify_reader_bytes(self._reader, original, manifest)
-        if getattr(self._conn, 'autocommit', None) is not False:
-            raise OwnerPersistenceError('owner connection must use one transaction')
-        registry = original.row()
-        clear_row = clearance.row()
-        man_row = manifest.row()
-        man_row['render_recipe'] = json.dumps(manifest.render_recipe, sort_keys=True)
-        key = {'tenant_id': original.tenant_id,
-               'source_asset_id': original.source_asset_id}
         try:
-            self._assert_owner_identity()
-            existing = {
-                'registry': self._fetch(SELECT_REGISTRY, key),
-                'clearance': self._fetch(SELECT_CLEARANCE, key),
-                'manifest': self._fetch(SELECT_MANIFEST,
-                                        {'manifest_digest': manifest.manifest_digest}),
-            }
-            if any(existing.values()):
-                self._verify_existing(original, clearance, manifest, existing)
-            else:
-                self._insert(INSERT_REGISTRY, registry)
-                self._insert(INSERT_CLEARANCE, clear_row)
-                self._insert(INSERT_MANIFEST, man_row)
+            result = self.persist_in_transaction(original, clearance, manifest)
             try:
                 self._conn.commit()
             except Exception as exc:
                 raise UncertainCommitError(
-                    'COMMIT outcome uncertain; treating as not persisted. '
-                    'Verify the database before any manual retry') from exc
+                    'COMMIT outcome uncertain; verify before any manual retry') from exc
         except Exception:
             try:
                 self._conn.rollback()
             except Exception:
                 pass
             raise
+        return result
+
+    def persist_in_transaction(self, original, clearance, manifest):
+        """Stage authority in the caller's transaction; NEVER commit or rollback.
+
+        The caller owns transaction failure handling and must hold its canonical
+        row/asset locks through authority, durable outcome, and one final commit.
+        A failed SQL statement poisons the transaction: do not convert it to a
+        successful hold. This method does not report durable persistence.
+        """
+        check_environment()
+        _validate_and_bind(original, clearance, manifest)
+        _verify_reader_bytes(self._reader, original, manifest)
+        if getattr(self._conn, 'autocommit', None) is not False:
+            raise OwnerPersistenceError('owner connection must use one transaction')
+        self._assert_owner_identity()
+        registry, clear_row, man_row = original.row(), clearance.row(), manifest.row()
+        man_row['render_recipe'] = json.dumps(manifest.render_recipe, sort_keys=True)
+        key = {'tenant_id': original.tenant_id, 'source_asset_id': original.source_asset_id}
+        existing = {
+            'registry': self._fetch(SELECT_REGISTRY, key),
+            'clearance': self._fetch(SELECT_CLEARANCE, key),
+            'manifest': self._fetch(SELECT_MANIFEST, {'manifest_digest': manifest.manifest_digest}),
+        }
+        if any(existing.values()):
+            self._verify_existing(original, clearance, manifest, existing)
+        else:
+            self._insert(INSERT_REGISTRY, registry)
+            self._insert(INSERT_CLEARANCE, clear_row)
+            self._insert(INSERT_MANIFEST, man_row)
         return {'registry': registry, 'clearance': clear_row, 'manifest': manifest.row(),
-                'replayed': any(existing.values())}
+                'replayed': bool(any(existing.values()))}
 
     def _verify_existing(self, original, clearance, manifest, existing):
         """Idempotent exact re-read: every existing row must match the tuple."""
