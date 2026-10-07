@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
+import math
 import os
 import re
 from urllib.parse import quote, urlsplit
@@ -102,7 +103,13 @@ def original_bytes(response):
 def check_provider_time(response, request, now):
     requested = datetime.fromisoformat(request.requested_at.replace('Z', '+00:00'))
     timestamp = response.get('created_at')
-    if (type(timestamp) not in (int, float) or timestamp < requested.timestamp()
+    # Integer provider timestamps represent a whole second, not an exact instant.
+    # Compare the request at that same precision only for the lower bound. The
+    # future and age bounds remain exact, and fractional provider times retain
+    # their precision. Request/job metadata and response IDs bind the execution.
+    earliest = math.floor(requested.timestamp()) if type(timestamp) is int else requested.timestamp()
+    if (type(timestamp) not in (int, float) or not math.isfinite(timestamp)
+            or requested > now or timestamp < earliest
             or timestamp > now.timestamp() or now.timestamp() - timestamp > 900):
         hold('generated_provider_execution_stale_or_future')
 
@@ -268,7 +275,14 @@ class _IndependentReviewer:
         self.request_payload = self.response = None
 
     def ask_image(self, data, question):
-        question += (' Also independently compare rendered gym colors to VERIFIED PALETTE DATA '
+        question += (' Independently inspect ALL rendered elements, including logos, wordmarks, '
+                     'headlines, supporting text, labels, CTA, destinations, footers and decorative text. '
+                     'Any rendered hyphen (-), en dash (\u2013), em dash (\u2014), colon or semicolon '
+                     'is a major copy style failure. Add rendered_style_safe boolean and '
+                     'rendered_style_violations list to the JSON. Each violation must identify '
+                     'element, rendered_text and a concrete correction. Return true and an empty '
+                     'list only after every rendered element passes; uncertainty must return false. '
+                     'Also independently compare rendered gym colors to VERIFIED PALETTE DATA '
                      + canonical(self.palette) + '. Add palette_accurate boolean to the JSON. '
                      'A substituted generic or LASSO palette is a major failure.')
         self.request_payload = {'model': 'gpt-6-astra', 'store': True,
@@ -285,7 +299,12 @@ def evaluate_review(provider, metadata, snapshot, data):
     from .infographic_review import evaluate
     reviewer = _IndependentReviewer(provider, metadata, snapshot['palette'])
     grade = evaluate(data, **snapshot['copy'], surface='feed post', vision_client=reviewer)
-    if not grade.passed or json.loads(review_text(reviewer.response)).get('palette_accurate') is not True:
+    if not grade.passed:
+        hold('generated_independent_pixel_brand_review_failed')
+    result = json.loads(review_text(reviewer.response))
+    if (result.get('palette_accurate') is not True
+            or result.get('rendered_style_safe') is not True
+            or result.get('rendered_style_violations') != []):
         hold('generated_independent_pixel_brand_review_failed')
     return reviewer
 
@@ -397,6 +416,8 @@ class RetainedGenerationBackend:
         if (e.get('generation_request') != generation_payload(snapshot, expected_meta, self.key.model)
                 or e['generation_response'].get('id') != p['provider_output_id']
                 or e['review_response'].get('id') != p['pixel_review_id']
+                or gen.get('id') != p['provider_output_id']
+                or review.get('id') != p['pixel_review_id']
                 or gen.get('metadata') != expected_meta
                 or review.get('metadata') != {**expected_meta, 'kind': 'independent-pixel-brand-review'}
                 or gen.get('model') != 'gpt-6-astra' or review.get('model') != 'gpt-6-astra'

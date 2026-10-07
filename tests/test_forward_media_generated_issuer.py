@@ -95,7 +95,8 @@ class Provider:
         else:
             review = {'scores': dict(issuer_review_weights()), 'copy_complete': True,
                 'copy_accurate': True, 'placement_safe': True, 'placement_violations': [],
-                'issues': [], 'palette_accurate': self.brand_ok}
+                'issues': [], 'palette_accurate': self.brand_ok,
+                'rendered_style_safe': True, 'rendered_style_violations': []}
             output = [{'type': 'message', 'content': [{'type': 'output_text', 'text': canonical(review)}]}]
         response = {'id': rid, 'status': 'completed', 'model': payload['model'],
             'metadata': payload['metadata'], 'created_at': int(NOW.timestamp()), 'output': output}
@@ -222,6 +223,113 @@ def test_provider_output_replacement_or_wrong_metadata_holds(lane):
     provider.responses['resp_1']['metadata']['job_id'] = str(uuid.uuid4())
     with pytest.raises(GeneratedReceiptHold, match='generated_provider_readback_changed'):
         backend.verified_evidence(req, canonical(packet['payload']))
+
+
+@pytest.mark.parametrize('response_id', ['resp_1', 'resp_2'])
+def test_live_response_identity_must_match_signed_receipt(lane, response_id):
+    writer, backend, req, _, provider, _ = lane
+    packet = writer.issue(req)
+    # Reproduce a readback returning identical pixels/metadata but another ID.
+    provider.responses[response_id]['id'] = 'resp_forged_live_identity'
+    with pytest.raises(GeneratedReceiptHold, match='generated_provider_readback_changed'):
+        prepare_generated_original(packet, req, backend, enabled=True, now=NOW)
+
+
+def test_same_second_integer_provider_timestamp_is_valid(lane, monkeypatch):
+    writer, backend, req, _, provider, owner = lane
+    precise_now = NOW + timedelta(microseconds=900000)
+    req = replace(req, requested_at=issuer.stamp(NOW + timedelta(microseconds=123456)))
+    owner.s['request'] = asdict(req)
+    monkeypatch.setattr(issuer, 'utcnow', lambda: precise_now)
+    # Provider's integer second bucket overlaps the owner's precise request;
+    # exact metadata and signed IDs still bind both generation and review.
+    packet = writer.issue(req)
+    prepared = prepare_generated_original(packet, req, backend, enabled=True, now=precise_now)
+    assert prepared.image_bytes == provider.data
+
+
+@pytest.mark.parametrize('timestamp', [
+    int(NOW.timestamp()) - 1, NOW.timestamp() + .1,
+    NOW.timestamp() - .1, float('nan'), float('inf'), True,
+])
+def test_provider_precision_does_not_allow_prior_second_future_or_invalid(lane, timestamp):
+    _, _, req, _, _, _ = lane
+    req = replace(req, requested_at=issuer.stamp(NOW))
+    with pytest.raises(GeneratedReceiptHold, match='generated_provider_execution_stale_or_future'):
+        issuer.check_provider_time({'created_at': timestamp}, req, NOW)
+
+
+def test_provider_integer_precision_does_not_extend_age_window(lane):
+    _, _, req, _, _, _ = lane
+    req = replace(req, requested_at=issuer.stamp(NOW - timedelta(seconds=900)))
+    with pytest.raises(GeneratedReceiptHold, match='generated_provider_execution_stale_or_future'):
+        issuer.check_provider_time({'created_at': int(NOW.timestamp()) - 900}, req,
+                                   NOW + timedelta(microseconds=1))
+
+
+def test_fractional_provider_timestamp_retains_exact_ordering(lane):
+    _, _, req, _, _, _ = lane
+    req = replace(req, requested_at=issuer.stamp(NOW + timedelta(microseconds=500000)))
+    now = NOW + timedelta(microseconds=900000)
+    issuer.check_provider_time({'created_at': NOW.timestamp() + .7}, req, now)
+    with pytest.raises(GeneratedReceiptHold, match='generated_provider_execution_stale_or_future'):
+        issuer.check_provider_time({'created_at': NOW.timestamp() + .4}, req, now)
+
+
+def test_same_second_integer_does_not_allow_future_owner_request(lane):
+    _, _, req, _, _, _ = lane
+    req = replace(req, requested_at=issuer.stamp(NOW + timedelta(microseconds=500000)))
+    with pytest.raises(GeneratedReceiptHold, match='generated_provider_execution_stale_or_future'):
+        issuer.check_provider_time({'created_at': int(NOW.timestamp())}, req, NOW)
+
+
+@pytest.mark.parametrize('safe,violations', [
+    (False, []), (None, []), ('true', []), (True, None), (True, {}),
+    (True, [{'element': 'decorative label', 'rendered_text': 'Coach-led',
+             'correction': 'Replace the hyphen with a space'}]),
+    (True, [{'element': 'wordmark', 'rendered_text': 'Gym\u2013Name',
+             'correction': 'Remove the en dash'}]),
+    (True, [{'element': 'footer', 'rendered_text': 'Train\u2014Today',
+             'correction': 'Remove the em dash'}]),
+])
+def test_rendered_style_missing_ambiguous_or_violating_evidence_blocks_upload(lane, safe, violations):
+    writer, _, req, s3, provider, _ = lane
+    create = provider.create
+    def unsafe_review(payload):
+        response = create(payload)
+        if not payload.get('tools'):
+            part = response['output'][0]['content'][0]
+            result = json.loads(part['text'])
+            result['rendered_style_safe'] = safe
+            result['rendered_style_violations'] = violations
+            part['text'] = canonical(result)
+        return response
+    provider.create = unsafe_review
+    with pytest.raises(GeneratedReceiptHold, match='generated_independent_pixel_brand_review_failed'):
+        writer.issue(req)
+    assert s3.puts == []
+    question = provider.calls[1]['input'][0]['content'][0]['text']
+    for instruction in ('ALL rendered elements', 'hyphen (-)', 'en dash (\u2013)',
+                        'em dash (\u2014)', 'logos', 'decorative text', 'uncertainty'):
+        assert instruction in question
+
+
+@pytest.mark.parametrize('field', ['rendered_style_safe', 'rendered_style_violations'])
+def test_rendered_style_absent_evidence_blocks_upload(lane, field):
+    writer, _, req, s3, provider, _ = lane
+    create = provider.create
+    def missing_review(payload):
+        response = create(payload)
+        if not payload.get('tools'):
+            part = response['output'][0]['content'][0]
+            result = json.loads(part['text'])
+            del result[field]
+            part['text'] = canonical(result)
+        return response
+    provider.create = missing_review
+    with pytest.raises(GeneratedReceiptHold, match='generated_independent_pixel_brand_review_failed'):
+        writer.issue(req)
+    assert s3.puts == []
 
 
 def test_provider_exact_original_bytes_cannot_be_substituted(lane):
