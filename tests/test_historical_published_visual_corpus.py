@@ -110,6 +110,31 @@ def test_manifest_refuses_non_private_permissions(tmp_path):
         corpus.collect(snapshot([row("a", "https://cdn.test/a")]), allowed_hosts={"cdn.test"}, manifest_path=path)
 
 
+def test_explicit_tranche_remains_partial_and_can_resume_against_full_snapshot(tmp_path):
+    rows = [row("a", "https://cdn.test/a"), row("b", "https://cdn.test/b")]
+    snap = snapshot(rows)
+    path = tmp_path / "tranche.json"
+    session = Session({r["image_url"]: png((1, 2, 3)) for r in rows})
+    first = corpus.collect(snap, allowed_hosts={"cdn.test"}, manifest_path=path,
+                           target_row_refs=[("a", "r1")], session=session)
+    assert first["row_count"] == 2 and len(first["records"]) == 1
+    assert first["complete"] is False
+    second = corpus.collect(snap, allowed_hosts={"cdn.test"}, manifest_path=path,
+                            target_row_refs=[("b", "r1")], session=session)
+    assert len(second["records"]) == 2 and second["complete"] is True
+
+
+def test_tranche_rejects_refs_outside_snapshot_and_oversized_batches(tmp_path):
+    snap = snapshot([row("a", "https://cdn.test/a")])
+    with pytest.raises(corpus.CorpusError, match="outside_snapshot"):
+        corpus.collect(snap, allowed_hosts={"cdn.test"}, manifest_path=tmp_path / "missing.json",
+                       target_row_refs=[("b", "r1")])
+    too_many = [(str(i), "r1") for i in range(corpus.MAX_TRANCHE_ROWS + 1)]
+    with pytest.raises(corpus.CorpusError, match="tranche_row_refs_invalid"):
+        corpus.collect(snap, allowed_hosts={"cdn.test"}, manifest_path=tmp_path / "large.json",
+                       target_row_refs=too_many)
+
+
 @pytest.mark.parametrize("corruption", ["missing_dhash", "metadata_mismatch", "raw_url"])
 def test_resume_rejects_incomplete_mismatched_or_non_hash_only_record(tmp_path, corruption):
     path = tmp_path / "state.json"

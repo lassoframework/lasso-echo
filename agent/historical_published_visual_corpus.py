@@ -21,6 +21,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 SCHEMA_VERSION = 1
 MAX_ROWS = 100_000
+MAX_TRANCHE_ROWS = 250
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
 READ_TIMEOUT = (5, 15)
@@ -228,7 +229,8 @@ def _record_path(path, record):
             os.unlink(temp)
 
 
-def collect(snapshot, *, allowed_hosts, manifest_path, expected_row_refs=None, session=None):
+def collect(snapshot, *, allowed_hosts, manifest_path, expected_row_refs=None,
+            target_row_refs=None, session=None):
     """Hash every row in a complete snapshot; resume only same exact snapshot.
 
     Each result contains hashes of row, revision, gym and date, plus content
@@ -238,6 +240,23 @@ def collect(snapshot, *, allowed_hosts, manifest_path, expected_row_refs=None, s
     if not hosts or any(not h or "/" in h for h in hosts):
         raise CorpusError("host_allowlist_invalid")
     rows, snapshot_digest = load_snapshot(snapshot, expected_row_refs)
+    selected_rows = rows
+    if target_row_refs is not None:
+        if (not isinstance(target_row_refs, (list, tuple)) or not target_row_refs
+                or len(target_row_refs) > MAX_TRANCHE_ROWS):
+            raise CorpusError("tranche_row_refs_invalid")
+        targets = set()
+        for ref in target_row_refs:
+            if (not isinstance(ref, (list, tuple)) or len(ref) != 2
+                    or not all(isinstance(part, str) and part for part in ref)):
+                raise CorpusError("tranche_row_refs_invalid")
+            targets.add((ref[0], ref[1]))
+        if len(targets) != len(target_row_refs):
+            raise CorpusError("tranche_row_refs_invalid")
+        row_refs = {(row["row_id"], row["revision"]) for row in rows}
+        if not targets.issubset(row_refs):
+            raise CorpusError("tranche_row_refs_outside_snapshot")
+        selected_rows = [row for row in rows if (row["row_id"], row["revision"]) in targets]
     path = os.path.abspath(manifest_path)
     if os.path.exists(path):
         _private_file(path)
@@ -254,7 +273,7 @@ def collect(snapshot, *, allowed_hosts, manifest_path, expected_row_refs=None, s
                   "row_count": len(rows), "records": {}}
         records = result["records"]
     http = session or requests.Session()
-    for row in rows:
+    for row in selected_rows:
         key = _sha(_canonical([row["row_id"], row["revision"]]))
         if key in records:
             continue
