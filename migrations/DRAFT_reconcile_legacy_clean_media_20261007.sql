@@ -4,9 +4,9 @@
 -- This script changes review fields only after the entire frozen set and every
 -- source/evidence binding are checked under table locks. Do not weaken counts or
 -- digests if production has drifted; capture and independently review a new set.
--- Consent columns are legacy diagnostics: current selector and moderation code
--- do not gate a clean asset on releases. This matches the current automatic
--- moderation output; it does not attest to an individual member release.
+-- Consent columns are legacy diagnostics: current selector does not gate a
+-- clean asset on releases. Preserve those fields exactly; this repair does not
+-- attest to an individual member release or rewrite prior diagnostics.
 
 BEGIN;
 SET LOCAL lock_timeout = '5s';
@@ -71,8 +71,7 @@ BEGIN
            reviewed_by = 'automatic_moderation',
            reviewed_at = (a.moderation_json->>'observed_at')::timestamptz,
            review_content_hash = a.content_hash,
-           review_note = 'Reconciled legacy clean moderation evidence',
-           consent_status = 'not_required'
+           review_note = 'Reconciled legacy clean moderation evidence'
      WHERE a.moderation_status = 'clean'
        AND a.review_status = 'pending_review'
     RETURNING a.gym_id, a.id, a.content_hash, a.reviewed_at
