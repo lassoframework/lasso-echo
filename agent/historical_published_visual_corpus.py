@@ -70,14 +70,19 @@ def load_snapshot(snapshot, expected_row_refs=None):
         refs.add(ref)
         if not isinstance(row.get("gym_id"), str) or not row["gym_id"]:
             raise CorpusError("snapshot_gym_invalid")
-        try:
-            published = datetime.fromisoformat(str(row.get("published_at", "")).replace("Z", "+00:00"))
-            if published.tzinfo is None:
-                raise ValueError
-        except (TypeError, ValueError):
-            raise CorpusError("snapshot_published_at_invalid") from None
+        raw_published = row.get("published_at")
+        if raw_published is None:
+            published_value = None
+        else:
+            try:
+                published = datetime.fromisoformat(str(raw_published).replace("Z", "+00:00"))
+                if published.tzinfo is None:
+                    raise ValueError
+                published_value = published.isoformat()
+            except (TypeError, ValueError):
+                raise CorpusError("snapshot_published_at_invalid") from None
         normalized.append({"row_id": rid, "revision": revision, "gym_id": row["gym_id"],
-                           "published_at": published.isoformat(), "image_url": row.get("image_url")})
+                           "published_at": published_value, "image_url": row.get("image_url")})
     if expected_row_refs is not None:
         expected = {(str(x[0]), str(x[1])) for x in expected_row_refs}
         if len(expected) != len(expected_row_refs) or expected != refs:
@@ -197,7 +202,9 @@ def collect(snapshot, *, allowed_hosts, manifest_path, expected_row_refs=None, s
         if key in records:
             continue
         entry = {"row_ref_sha256": key, "revision_sha256": _sha(row["revision"]),
-                 "gym_sha256": _sha(row["gym_id"]), "published_date_sha256": _sha(row["published_at"][:10]),
+                 "gym_sha256": _sha(row["gym_id"]),
+                 "published_date_sha256": _sha(row["published_at"][:10] if row["published_at"] else "null"),
+                 "published_date_known": row["published_at"] is not None,
                  "status": "unknown"}
         try:
             data = _read_url(row["image_url"], hosts, http)

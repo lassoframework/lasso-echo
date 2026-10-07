@@ -89,6 +89,17 @@ def test_resume_rejects_changed_row_revision_snapshot(tmp_path):
         corpus.collect(changed, allowed_hosts={"cdn.test"}, manifest_path=path)
 
 
+def test_null_published_at_is_retained_as_unknown_date_and_image_is_hashed(tmp_path):
+    rows = [row("no-date", "https://cdn.test/a")]
+    rows[0]["published_at"] = None
+    result = corpus.collect(snapshot(rows), allowed_hosts={"cdn.test"}, manifest_path=tmp_path / "unknown-date.json",
+                            session=Session({"https://cdn.test/a": png((4, 5, 6))}))
+    assert result["row_count"] == 1 and result["hashed_count"] == 1 and result["complete"]
+    record = next(iter(result["records"].values()))
+    assert record["published_date_known"] is False
+    assert record["status"] == "hashed"
+
+
 def test_manifest_refuses_non_private_permissions(tmp_path):
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"schema_version": 1, "snapshot_sha256": "wrong", "records": {}}))
