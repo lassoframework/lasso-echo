@@ -252,6 +252,10 @@ def _real_row(account_key, draft, caption=None):
     logical = _logical_post_id(draft)
     if logical:
         row["logical_post_id"] = logical
+    # Private writer side channel, never a calendar column or owner authority.
+    # insert_rows strips it and binds it only to the exact returned inserted UUID.
+    from . import forward_media_observation_bridge
+    row.update(forward_media_observation_bridge.draft_metadata(draft))
     return row
 
 
