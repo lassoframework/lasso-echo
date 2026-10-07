@@ -70,6 +70,7 @@ HARDENING (2026-09-03 re-audit wave 2):
 """
 from datetime import datetime, timedelta, timezone
 import hashlib
+from .bus import current_notice_blocked
 import math
 import json
 import re
@@ -1002,19 +1003,7 @@ def _finish_pending_route_notice(bus, row, proof, identity, log, summary):
             return False
         ticket = bus.ticket(row["ticket_id"])
         if ticket:
-            resolved = bus.resolve_current_notice(
-                ticket, row["id"], token, att.get("delivery_expected_status"))
-            if isinstance(resolved, dict) and resolved.get("status") == "resolved":
-                summary["resolved"] = int(summary.get("resolved") or 0) + 1
-                _receipt(bus, ticket, posted, identity,
-                         (posted.get("attachments") or {}).get("kind"),
-                         posted.get("attachments") or {},
-                         where=f"Slack {intent.get('channel')}", summary=summary)
-                bus.finalize_fixer_delivery(row["id"],
-                                            "resolved_after_verified_slack")
-            elif ticket.get("request_version") != row.get("delivery_request_version"):
-                bus.finalize_fixer_delivery(row["id"],
-                                            "newer_request_preserved")
+            _finalize_fixer_post(bus, ticket, posted, identity, log, summary)
         return True
     except Exception as exc:  # noqa: BLE001 - exact readback can retry next sweep
         log(f"[slack-convo/outbox] pending route reconciliation failed "
@@ -1512,6 +1501,8 @@ def _recover_config_missing_fixer(bus, identity, readback, log, now=None):
 
 def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
     """Idempotently finish the ticket step after verified Slack delivery."""
+    if current_notice_blocked(bus, ticket):
+        return
     att = row.get("attachments") or {}
     intent = att.get("fixer_slack_delivery_intent") or {}
     if (row.get("delivery_status") != "posted"
@@ -1529,6 +1520,20 @@ def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
             f"row={row.get('id')}")
         return
     kind = att.get("kind")
+    # A successful client post is irreversible, but ticket closure is not yet
+    # earned. Persist and verify the exact ticket/source-message receipt first;
+    # an outage leaves this posted row pending for a sweep, never a resend.
+    try:
+        if kind not in RECEIPT_KINDS:
+            return
+        _receipt(bus, ticket, row, identity, kind, att,
+                 where=f"Slack {att['delivery_readback_channel']}", summary=summary)
+        if not bus.fixer_receipt_exists(row["id"], ticket["id"], _a.KIND_ESCALATION):
+            return
+    except Exception as exc:  # noqa: BLE001 - retry finalization without reposting
+        log(f"[slack-convo/outbox] FIXER receipt pending row={row['id']}: "
+            f"{type(exc).__name__}")
+        return
     direct_notice = (att.get("outreach") is True
                      and att.get("fixer_current_attempt_token")
                      and ticket.get("product") == "echo"
@@ -1546,9 +1551,6 @@ def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
                         and resolved.get("status") == "resolved"
                         and ticket.get("status") != "resolved"):
                     summary["resolved"] += 1
-            if kind in RECEIPT_KINDS:
-                _receipt(bus, ticket, row, identity, kind, att,
-                         where=f"Slack {intent.get('channel')}", summary=summary)
             current = bus.ticket(ticket["id"])
             if current and current.get("status") == "resolved":
                 bus.finalize_fixer_delivery(row["id"],
@@ -1568,17 +1570,8 @@ def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
             f"{type(exc).__name__}")
         return
     try:
-        if kind in RECEIPT_KINDS:
-            # Always cross the deterministic INSERT boundary.  A broad legacy
-            # receipt_for match must never suppress creation of the exact,
-            # ticket-bound receipt, and a duplicate INSERT validates the winner.
-            _receipt(bus, ticket, row, identity, kind, att,
-                     where=f"Slack {att['delivery_readback_channel']}", summary=summary)
-        receipt_done = (kind not in RECEIPT_KINDS
-                        or bus.fixer_receipt_exists(
-                            row["id"], ticket["id"], _a.KIND_ESCALATION))
         current = bus.ticket(ticket["id"])
-        if not receipt_done or not current:
+        if not current:
             return
         if current.get("status") == "resolved":
             reason = "resolved_after_verified_slack"
@@ -1886,6 +1879,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     if not ticket:
         _suppress(bus, row, None, identity, "parent ticket missing", log, summary,
                   escalate=False)
+        return
+    if (current_notice_blocked(bus, ticket)
+            and (kind == _a.KIND_ANSWER or kind == _a.KIND_STATUS
+                 and att.get("resolve_notice") is True)):
+        log(f"[slack-convo/outbox] completion paused before 0384 row={row['id']}")
+        summary["skipped"] += 1
         return
     # only rows for THIS identity; another identity's loop owns the rest
     row_ident = att.get("identity") or ""
@@ -2563,6 +2562,8 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
     Two rows close a ticket: the ANSWER that answered it, and the resolve NOTICE a human
     tapped (MINOR 5, audit 7 -- resolve_and_notify used to stamp the ticket itself, before
     delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
+    if current_notice_blocked(bus, ticket):
+        return
     meta = att or {}
     fixer = bool(meta.get("fixer"))
     should_resolve = (
@@ -2698,6 +2699,9 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
             f"{ticket.get('bot_identity') or '?'} not {identity.name}")
         return False
     if ticket.get("status") == "resolved":
+        return False
+    if current_notice_blocked(bus, ticket):
+        log(f"[slack-convo/outbox] resolve paused before 0384 ticket={ticket_id}")
         return False
     customer_fix = _customer_fix_reply(ticket, {})
     if (callable(getattr(bus, "begin_current_notice", None))

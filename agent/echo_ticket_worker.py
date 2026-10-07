@@ -37,6 +37,7 @@ Both passes are pure given their injected dependencies -- no import of a live Sl
 client or the live bus at module scope, so they are fully unit-testable offline.
 """
 import json
+from .slack_convo.bus import current_notice_blocked
 import os
 import re
 import time
@@ -256,6 +257,8 @@ def _delivery_snapshot(bus, original, *, status, classification, identity_name, 
 
 def _resolve_delivered(bus, snapshot, result, *, log):
     """Close only a confirmed posted completion for the original request cycle."""
+    if current_notice_blocked(bus, snapshot):
+        return False
     current_notice = bool(getattr(result, "notice_id", "") and
                           getattr(result, "attempt_token", ""))
     resolver = getattr(bus, ("resolve_current_notice" if current_notice else
@@ -279,6 +282,28 @@ def _resolve_delivered(bus, snapshot, result, *, log):
             return False
         expected = {field: fresh.get(field) for field in _DELIVERY_IDENTITY}
         if current_notice:
+            # Slack has already received this exact notice. Persist its internal
+            # receipt before closing; failures leave the posted notice available
+            # to outbox finalization, which retries without another client send.
+            row = bus.message(result.notice_id)
+            att = (row or {}).get("attachments") or {}
+            if (not row or row.get("ticket_id") != snapshot["id"]
+                    or row.get("delivery_status") != "posted"
+                    or row.get("delivery_request_version") != snapshot["request_version"]
+                    or row.get("slack_ts") != result.posted_ts
+                    or att.get("fixer_current_attempt_token") != result.attempt_token
+                    or att.get("delivery_readback_verified") is not True
+                    or att.get("delivery_readback_ts") != result.posted_ts
+                    or att.get("delivery_readback_channel") != result.channel_id):
+                return False
+            _ob._receipt(bus, fresh, row, _ids.get(expected["bot_identity"]),
+                         att.get("kind"), att, where=f"Slack {result.channel_id}",
+                         summary={})
+            if not bus.fixer_receipt_exists(result.notice_id, snapshot["id"],
+                                            _a.KIND_ESCALATION):
+                log(f"[echo-ticket-worker] current notice receipt pending "
+                    f"row={result.notice_id}")
+                return False
             resolved = resolver(fresh, result.notice_id, result.attempt_token,
                                 snapshot["status"])
         else:
@@ -589,10 +614,11 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 # M1: the one path that sends a model answer with NO tap at all produced no
                 # receipt, so the very thing Blake asked to see was the one thing invisible.
                 try:
-                    _ob.write_receipt(bus, bus.ticket(tid) or {"id": tid}, identity=ident,
-                                      body=answer["body"], kind=_a.KIND_ANSWER,
-                                      where="a group DM opened for this ticket", auto=True,
-                                      extra={"surface": "portal_ticket_bridge"})
+                    if not getattr(result, "notice_id", ""):
+                        _ob.write_receipt(bus, bus.ticket(tid) or {"id": tid}, identity=ident,
+                                          body=answer["body"], kind=_a.KIND_ANSWER,
+                                          where="a group DM opened for this ticket", auto=True,
+                                          extra={"surface": "portal_ticket_bridge"})
                 except Exception as e:  # noqa: BLE001 - never undo a delivery over a receipt
                     log(f"[echo-ticket-worker] receipt failed ticket={tid}: "
                         f"{type(e).__name__}")
@@ -1146,10 +1172,11 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
                 log(f"[ticket-worker/{identity_name}] posted fix notice did not "
                     f"resolve current request ticket={tid}")
             try:
-                _ob.write_receipt(bus, bus.ticket(tid) or {"id": tid}, identity=ident,
-                                  body=summary, kind=_a.KIND_STATUS,
-                                  where="a group DM opened for this ticket", auto=True,
-                                  extra={"surface": "portal_ticket_bridge"})
+                if not getattr(result, "notice_id", ""):
+                    _ob.write_receipt(bus, bus.ticket(tid) or {"id": tid}, identity=ident,
+                                      body=summary, kind=_a.KIND_STATUS,
+                                      where="a group DM opened for this ticket", auto=True,
+                                      extra={"surface": "portal_ticket_bridge"})
             except Exception as e:  # noqa: BLE001
                 log(f"[ticket-worker/{identity_name}] receipt failed ticket={tid}: "
                     f"{type(e).__name__}")

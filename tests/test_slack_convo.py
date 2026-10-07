@@ -3444,6 +3444,107 @@ def test_verified_fixer_post_retries_ticket_close_without_reposting(monkeypatch)
         "resolved_after_verified_slack")
 
 
+@pytest.mark.parametrize("direct_notice", [False, True])
+@pytest.mark.parametrize("receipt_failure", ["write", "read", "absent"])
+def test_fixer_close_requires_exact_receipt_and_retries_without_resend(
+        monkeypatch, direct_notice, receipt_failure):
+    _arm_grounded_fixer(monkeypatch)
+    bus, tid, row, _ = _grounded_fixer_answer_case()
+    original_write = bus.record_fixer_receipt_once
+    original_exists = bus.fixer_receipt_exists
+    original_resolve = bus.resolve_current_delivery
+    resolve_calls = []
+
+    def resolve(*args, **kwargs):
+        assert original_exists(row["id"], tid, A.KIND_ESCALATION)
+        resolve_calls.append(True)
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(bus, "resolve_current_delivery", resolve)
+    # Let Slack delivery finish, but force receipt finalization to remain pending.
+    if receipt_failure == "write":
+        monkeypatch.setattr(bus, "record_fixer_receipt_once",
+                            lambda **_: (_ for _ in ()).throw(RuntimeError("offline")))
+    elif receipt_failure == "read":
+        monkeypatch.setattr(bus, "fixer_receipt_exists",
+                            lambda *_: (_ for _ in ()).throw(RuntimeError("offline")))
+    else:
+        monkeypatch.setattr(bus, "record_fixer_receipt_once", lambda **_: None)
+    post, calls = _posted()
+    first = OB.run_once(bus, post, identity=IDS.get("echo"),
+                        member_check=lambda *_: True, log=lambda *_: None)
+    assert first["posted"] == 1 and first["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "verification"
+    assert not resolve_calls
+    posted = bus.message(row["id"])
+    if direct_notice:
+        bus.tickets[tid].update(source="website_tab")
+        posted["delivery_request_version"] = bus.ticket(tid)["request_version"]
+        posted["attachments"].update(outreach=True,
+                                      fixer_current_attempt_token="notice-token")
+
+        def resolve_notice(ticket, mid, token, expected_status):
+            assert mid == row["id"] and token == "notice-token"
+            assert original_exists(mid, ticket["id"], A.KIND_ESCALATION)
+            resolve_calls.append(True)
+            bus.tickets[tid]["status"] = "resolved"
+            return bus.ticket(tid)
+
+        monkeypatch.setattr(bus, "resolve_current_notice", resolve_notice, raising=False)
+        OB._finalize_fixer_post(bus, bus.ticket(tid), posted, IDS.get("echo"),
+                               lambda *_: None, {"resolved": 0})
+        assert bus.ticket(tid)["status"] == "verification"
+        assert not resolve_calls
+    monkeypatch.setattr(bus, "record_fixer_receipt_once", original_write)
+    monkeypatch.setattr(bus, "fixer_receipt_exists", original_exists)
+    OB._finalize_fixer_post(bus, bus.ticket(tid), posted, IDS.get("echo"),
+                           lambda *_: None, {"resolved": 0})
+    assert bus.ticket(tid)["status"] == "resolved"
+    assert len(resolve_calls) == 1
+    assert bus.message(row["id"])["attachments"]["fixer_delivery_finalized_at"]
+    assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
+
+
+def test_pending_route_recovery_waits_for_receipt_before_close(monkeypatch):
+    bus, tid, row = _pending_fixer_receipt_case(monkeypatch)
+    bus.tickets[tid].update(source="website_tab")
+    pending = bus.message(row["id"])
+    pending["delivery_status"] = "posting"
+    pending["delivery_request_version"] = bus.ticket(tid)["request_version"]
+    pending["attachments"].update(
+        outreach=True, fixer_current_attempt_token="notice-token",
+        fixer_route_pending=True, delivery_expected_status="verification")
+    proof = dict(pending["attachments"])
+    monkeypatch.setattr(bus, "bind_current_notice_route", lambda *_: True, raising=False)
+
+    def transition(mid, status, **_kwargs):
+        pending["delivery_status"] = status
+        return pending
+
+    monkeypatch.setattr(bus, "transition_fixer_delivery", transition)
+    original_write = bus.record_fixer_receipt_once
+    monkeypatch.setattr(bus, "record_fixer_receipt_once", lambda **_: None)
+    resolves = []
+
+    def resolve(ticket, mid, *_args):
+        assert bus.fixer_receipt_exists(mid, tid, A.KIND_ESCALATION)
+        resolves.append(mid)
+        bus.tickets[tid]["status"] = "resolved"
+        return bus.ticket(tid)
+
+    monkeypatch.setattr(bus, "resolve_current_notice", resolve, raising=False)
+    assert OB._finish_pending_route_notice(
+        bus, pending, proof, IDS.get("echo"), lambda *_: None, {"resolved": 0})
+    assert pending["delivery_status"] == "posted"
+    assert bus.ticket(tid)["status"] == "verification"
+    assert not resolves
+    monkeypatch.setattr(bus, "record_fixer_receipt_once", original_write)
+    OB._finalize_fixer_post(bus, bus.ticket(tid), pending, IDS.get("echo"),
+                           lambda *_: None, {"resolved": 0})
+    assert bus.ticket(tid)["status"] == "resolved"
+    assert resolves == [row["id"]]
+
+
 def test_concurrent_fixer_finalizers_create_exactly_one_durable_receipt(monkeypatch):
     _arm_grounded_fixer(monkeypatch)
     bus, tid, row, _ = _grounded_fixer_answer_case()
@@ -3461,7 +3562,8 @@ def test_concurrent_fixer_finalizers_create_exactly_one_durable_receipt(monkeypa
     post, calls = _posted()
     first = OB.run_once(bus, post, identity=IDS.get("echo"),
                         member_check=lambda *_: True, log=lambda *_: None)
-    assert first["posted"] == first["resolved"] == 1
+    assert first["posted"] == 1 and first["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "verification"
     assert len([call for call in calls if call["channel"] == "C_CLIENT"]) == 1
     assert not original_exists(row["id"], tid, A.KIND_ESCALATION)
     assert not bus.message(row["id"])["attachments"].get(
@@ -3515,7 +3617,8 @@ def _pending_fixer_receipt_case(monkeypatch):
     post, _ = _posted()
     result = OB.run_once(bus, post, identity=IDS.get("echo"),
                          member_check=lambda *_: True, log=lambda *_: None)
-    assert result["posted"] == result["resolved"] == 1
+    assert result["posted"] == 1 and result["resolved"] == 0
+    assert bus.ticket(tid)["status"] == "verification"
     bus.fixer_receipt_exists = original_exists
     bus.record_fixer_receipt_once = original_write
     return bus, tid, row
@@ -3563,6 +3666,7 @@ def test_corrupt_deterministic_receipt_collision_fails_closed(monkeypatch):
     assert not bus.message(row["id"])["attachments"].get(
         "fixer_delivery_finalized_at")
     assert not bus.fixer_receipt_exists(row["id"], tid, A.KIND_ESCALATION)
+    assert bus.ticket(tid)["status"] == "verification"
 
 
 def test_legitimate_existing_deterministic_receipt_allows_retry(monkeypatch):
@@ -3806,8 +3910,16 @@ def test_requester_inbound_increments_version_and_reopens_resolved_ticket():
     assert bus.ticket(tid)["resolved_at"] is None
 
 
-def test_bus_atomic_delivery_resolution_posts_the_full_identity_envelope():
+def test_bus_atomic_delivery_resolution_posts_the_full_identity_envelope(monkeypatch):
+    monkeypatch.delenv("AGENT_FIXER_CURRENT_NOTICE_0384", raising=False)
     tid = str(uuid.uuid4())
+    current_ticket = {
+        "id": tid, "status": "verification", "classification": "action_request",
+        "product": "echo", "source": "slack", "client_id": "gym-one",
+        "bot_identity": "echo", "slack_user_id": "U_CLIENT",
+        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        "request_version": 3, "escalated": False, "hold_tier": None,
+    }
     expected = {
         "id": tid, "status": "resolved", "classification": "action_request",
         "product": "echo", "client_id": "gym-one", "bot_identity": "echo",
@@ -3820,16 +3932,23 @@ def test_bus_atomic_delivery_resolution_posts_the_full_identity_envelope():
         status_code = 200
         text = ""
 
-        @staticmethod
-        def json():
-            return [expected]
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
 
     class _Http:
+        get_call = None
         call = None
+
+        def get(self, url, **kwargs):
+            self.get_call = (url, kwargs)
+            return _Response([current_ticket])
 
         def post(self, url, **kwargs):
             self.call = (url, kwargs)
-            return _Response()
+            return _Response([expected])
 
     http = _Http()
     bus = Bus(url="https://example.supabase.co", service_key="service", http=http)
@@ -3838,6 +3957,11 @@ def test_bus_atomic_delivery_resolution_posts_the_full_identity_envelope():
         "echo", "U_CLIENT", "C_CLIENT", "1.0")
 
     assert resolved == expected
+    assert http.get_call[0].endswith("/rest/v1/support_tickets")
+    assert http.get_call[1]["params"] == {
+        "id": f"eq.{tid}", "select": "*", "limit": "1",
+    }
+    assert current_ticket["request_version"] == 3
     assert http.call[0].endswith("/rest/v1/rpc/fixer_resolve_current_delivery")
     assert json.loads(http.call[1]["data"]) == {
         "p_ticket_id": tid,

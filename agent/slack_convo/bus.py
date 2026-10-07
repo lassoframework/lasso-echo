@@ -21,6 +21,7 @@ parameter does not emit -- so ON CONFLICT would fail with "no unique or exclusio
 matching" at runtime. Catching the violation is the reliable form.
 """
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -78,11 +79,22 @@ class TicketPage(list):
         self.raw_last = raw_last
 
 
+def current_notice_blocked(bus, ticket):
+    """Explicit pre-0384 mode for Echo portal completion paths."""
+    enabled = getattr(bus, "current_notice_enabled", None)
+    return (ticket or {}).get("product") == "echo" and (ticket or {}).get(
+        "source") == "website_tab" and callable(enabled) and not enabled()
+
+
 class Bus:
     def __init__(self, url=None, service_key=None, http=None):
         self._url = (url if url is not None else config.supabase_url())
         self._key = (service_key if service_key is not None else config.supabase_service_key())
         self._http = http
+
+    def current_notice_enabled(self):
+        # Arming this is a separate release action after verified 0384 rollout.
+        return os.environ.get("AGENT_FIXER_CURRENT_NOTICE_0384", "").strip().lower() == "true"
 
     # ---- transport ----------------------------------------------------------------------
     def available(self):
@@ -241,6 +253,10 @@ class Bus:
                 or isinstance(expected_request_version, bool)
                 or expected_request_version < 0):
             raise BusError(400, "invalid current-delivery identity")
+        if expected_product == "echo" and not self.current_notice_enabled():
+            ticket = self.ticket(ticket_id)
+            if not ticket or current_notice_blocked(self, ticket):
+                raise BusError(503, "current notice disabled before verified 0384 release")
         body = {
             "p_ticket_id": ticket_id,
             "p_expected_request_version": expected_request_version,
@@ -264,6 +280,8 @@ class Bus:
         return data[0] if isinstance(data, list) and len(data) == 1 else None
 
     def _current_notice_rpc(self, name, body):
+        if not self.current_notice_enabled():
+            raise BusError(503, "current notice disabled before verified 0384 release")
         # These RPCs are idempotent for the same notice UUID and token. A lost
         # HTTP response may follow a committed reservation/bind/close.
         for attempt in range(2):
@@ -564,6 +582,11 @@ class Bus:
         att = {"kind": kind}
         if meta:
             att.update(meta)
+        completion = kind == "answer" or kind == "status" and att.get("resolve_notice") is True
+        if (completion and not self.current_notice_enabled()
+                and att.get("fixer_release") is not True):
+            if current_notice_blocked(self, self.ticket(ticket_id)):
+                raise BusError(503, "current notice disabled before verified 0384 release")
         # Portal 0384 requires the exact notice ID and attempt token at INSERT.
         # Only a current Echo website-tab completion enters this path. Held
         # release proofs keep their separate 0383 reservation protocol.

@@ -52,6 +52,7 @@ class Bus:
         self.tickets = {t["id"]: {"request_version": 0, **dict(t)} for t in tickets}
         self.msgs = []
         self.tables = {}
+        self.events = []
 
     # tickets
     def ticket(self, tid):
@@ -118,6 +119,7 @@ class Bus:
                 or ticket.get("hold_tier") is not None
                 or any(ticket.get(field) != value for field, value in expected.items())):
             return None
+        self.events.append(("resolved", tid))
         ticket["status"] = "resolved"
         ticket["resolved_at"] = datetime.now(timezone.utc).isoformat()
         return dict(ticket)
@@ -270,6 +272,31 @@ class Bus:
                    and (m.get("attachments") or {}).get("receipt_for") == str(mid)
                    and (m.get("attachments") or {}).get("kind") == kind
                    for m in self.msgs)
+
+    def record_fixer_receipt_once(self, *, source_message_id, ticket_id,
+                                  author_type, body, delivery_status, kind, meta):
+        """Model the durable receipt's deterministic key and idempotent insert."""
+        receipt_id = f"receipt-{source_message_id}"
+        existing = next((m for m in self.msgs if m.get("id") == receipt_id), None)
+        if existing:
+            att = existing.get("attachments") or {}
+            if (existing.get("ticket_id") == ticket_id
+                    and existing.get("direction") == "outbound"
+                    and att.get("receipt") is True
+                    and att.get("receipt_for") == str(source_message_id)
+                    and att.get("kind") == kind):
+                return dict(existing)
+            raise ValueError("FIXER receipt id collision")
+        attachments = {**dict(meta or {}), "receipt": True,
+                       "receipt_for": str(source_message_id), "kind": kind}
+        receipt = {"id": receipt_id, "ticket_id": ticket_id,
+                   "direction": "outbound", "author_type": author_type,
+                   "author_id": None, "body": (body or "")[:8000],
+                   "delivery_status": delivery_status,
+                   "attachments": attachments}
+        self.msgs.append(receipt)
+        self.events.append(("receipt", source_message_id))
+        return dict(receipt)
 
     def finalize_fixer_delivery(self, mid, reason):
         row = self.message(mid)
@@ -653,6 +680,13 @@ def test_verified_fix_notice_names_blake_in_group_dm():
     notice = bus.of_kind(A.KIND_STATUS)[0]
     assert notice["attachments"]["delivery_readback_verified"] is True
     assert notice["attachments"]["delivery_readback_channel"] == "G_CLIENT"
+    receipt = next(m for m in bus.msgs
+                   if (m.get("attachments") or {}).get("receipt_for") == notice["id"])
+    assert receipt["ticket_id"] == "t-1"
+    assert receipt["direction"] == "outbound"
+    assert receipt["attachments"]["receipt"] is True
+    assert receipt["attachments"]["kind"] == A.KIND_ESCALATION
+    assert bus.events.index(("receipt", notice["id"])) < bus.events.index(("resolved", "t-1"))
     assert bus.ticket("t-1")["status"] == "resolved"
 
 
