@@ -3236,9 +3236,11 @@ def test_forward_media_missing_owned_token_never_calls_provider(armed, monkeypat
     monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
     store = _FakeStore([_row("no-token")])
     pub = _FakePublisher()
+    monkeypatch.setattr(cap.meta_publisher, "publish", pub)
     monkeypatch.setattr(cap, "_alert_publish_blocked", lambda *a, **kw: None)
     out = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert pub.calls == [] and out["published"] == []
+    assert out["forward_media_holds"] == {"no-token": "forward_media_verification"}
     assert store.failed_calls == []  # no unscoped rollback of an unknown lease
 
 
