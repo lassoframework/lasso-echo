@@ -84,6 +84,34 @@ def test_reburn_happy_path(monkeypatch, tmp_path):
     assert not src.exists()      # temp source cleaned up
 
 
+def test_reburn_uses_fresh_scratch_library_instead_of_shared_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
+    import agent.story_image as si
+    import agent.media_host as mh
+    libraries = []
+
+    def download(url, log):
+        src = tmp_path / f"raw-{len(libraries)}.jpg"
+        src.write_bytes(b"source")
+        return str(src)
+
+    def render(src, caption, gym, library, **kwargs):
+        libraries.append(library)
+        assert library != str(tmp_path)
+        out = os.path.join(library, "reburned.jpg")
+        with open(out, "wb") as fh:
+            fh.write(b"new pixels")
+        return out
+
+    monkeypatch.setattr(story_reburn, "_download", download)
+    monkeypatch.setattr(si, "get_or_make_story_image", render)
+    monkeypatch.setattr(mh, "host_media", lambda path, tenant: "https://r2/new.jpg")
+    for _ in range(2):
+        assert story_reburn.reburn("https://r2/raw.jpg", "same cap", "Gym", "gym")
+    assert len(set(libraries)) == 2
+    assert all(not os.path.exists(path) for path in libraries)
+
+
 # ---- edit wiring: maybe_reburn_story swaps image_url, best-effort ------------
 
 class _FakeStore:

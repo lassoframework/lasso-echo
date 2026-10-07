@@ -15,6 +15,7 @@ writer guard is the exception because it owns same-object source evidence.
 """
 
 import os
+import shutil
 import tempfile
 import hashlib
 import uuid
@@ -138,13 +139,14 @@ def _reburn(source_media_url, caption, gym_name, tenant, *, logger=None, evidenc
     src = _download(source_media_url, log)
     if not src:
         return None
-    render_dir = None
+    lib = None
     try:
-        if evidence:
-            render_dir = tempfile.TemporaryDirectory(prefix="story-evidence-")
         from . import story_image, media_host
         is_video = src.lower().endswith(_VIDEO_EXTS)
-        lib = render_dir.name if render_dir is not None else os.path.dirname(src)
+        # A shared /tmp/reels cache survives edits and renderer fixes. Re-render
+        # each requested Story in its own scratch library so old pixels cannot be
+        # returned for the current caption and silently kept on the calendar.
+        lib = tempfile.mkdtemp(prefix="echo-story-reburn-")
         if is_video:
             asset = story_image.get_or_make_story_video(src, caption, gym_name, lib,
                                                         logger=log)
@@ -187,11 +189,8 @@ def _reburn(source_media_url, caption, gym_name, tenant, *, logger=None, evidenc
         log(f"story re-burn failed ({type(exc).__name__})")
         return None
     finally:
-        if render_dir is not None:
-            try:
-                render_dir.cleanup()
-            except OSError:
-                pass
+        if lib:
+            shutil.rmtree(lib, ignore_errors=True)
         try:
             os.remove(src)
         except OSError:
