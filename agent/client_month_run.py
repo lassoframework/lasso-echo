@@ -419,9 +419,14 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
             return False
         # Check against the REAL target date, including when the approved-source
         # walk below generates on a neighbouring day and re-homes its draft.
-        caption_base = re.sub(r"_(?:ig|fb|gbp)$", "", account.key)
-        if _caption_repeats_history(caption_base, d.caption, day_key):
-            return False
+        if config.caption_cooldown_enabled():
+            caption_base = re.sub(
+                r"_(?:ig|fb|gbp)$", "", getattr(account, "key", "") or "")
+            # Caption-only/offline callers may have no account when cooldown is
+            # off. An armed history guard requires the real tenant identity.
+            if not caption_base or _caption_repeats_history(
+                    caption_base, d.caption, day_key):
+                return False
         # A+ caption gate is enforced whenever the real-caption engine (SB7) is on —
         # the production posture. With SB7 OFF the system is in its documented
         # deterministic baseline mode (source + CTA), where only the banned-word bar
@@ -1143,12 +1148,15 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
                                 tuple(banned_words or ())))
             except Exception:  # noqa: BLE001
                 _gate_ok = False
-            if _caption_repeats_history(
-                    base_key, getattr(draft, "caption", "") or "", day_key):
+            _history_repeat = _caption_repeats_history(
+                base_key, getattr(draft, "caption", "") or "", day_key)
+            if _history_repeat:
                 _gate_ok = False
     if not _gate_ok:
+        failure = ("failed the caption history gate twice" if _history_repeat
+                   else "failed the A+/banned-word gate twice")
         log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, the caption "
-            "failed the quality or caption history gate twice")
+            f"{failure}")
         _rollback_drive_asset(draft, day_key, log)
         # POISONED ASSET (final verification g): rolled back, it is the pool's
         # least-used candidate again; keep it out of every later beat this build.

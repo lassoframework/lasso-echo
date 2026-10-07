@@ -156,3 +156,16 @@ def test_recaption_does_not_invent_copy_without_approved_source(monkeypatch):
     assert not cmr._recaption_drive_draft(SimpleNamespace(key='swift_ig'), feed, object(),
                                         'swift_ig', '2026-10-15', 0, lambda msg: None)
     assert feed.caption == 'Old approved caption'
+
+
+@pytest.mark.parametrize('account', [None, object()])
+@pytest.mark.parametrize('cooldown', [False, True])
+def test_source_walk_accountless_callers_respect_guard_state(monkeypatch, account, cooldown):
+    monkeypatch.setattr(cmr.config, 'caption_cooldown_enabled', lambda: cooldown)
+    monkeypatch.setattr(cmr.client_content, 'build_client_draft',
+                        lambda *a, **kw: draft('Fresh approved caption'))
+    monkeypatch.setattr(caption_ledger, 'is_verbatim_blocked',
+                        lambda *a: pytest.fail('missing account cannot query another tenant'))
+    picked, _ = cmr._clean_draft_for_day(
+        account, '2026-10-15', object(), 'library', (), lambda msg: None)
+    assert (picked is None) is cooldown
