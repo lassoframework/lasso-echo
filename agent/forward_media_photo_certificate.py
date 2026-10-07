@@ -21,6 +21,8 @@ _CANDIDATE_FIELDS = frozenset({'calendar_row_id','tenant_id','group_key','post_d
     'source_asset_id','source_url','source_fingerprint','source_sha256','source_length',
     'source_receipt_ref','image_url','image_fingerprint','image_sha256','image_length',
     'render_recipe_digest','content_digest'})
+_THUMBNAIL_FIELDS = frozenset({'thumbnail_url', 'thumbnail_fingerprint',
+    'thumbnail_sha256', 'thumbnail_length'})
 
 
 class PhotoCertificateHold(RuntimeError):
@@ -40,7 +42,7 @@ def digest(value):
 
 
 def validate_candidate(candidate):
-    if not isinstance(candidate,dict) or set(candidate)!=_CANDIDATE_FIELDS:
+    if not isinstance(candidate,dict) or set(candidate) not in (_CANDIDATE_FIELDS, _CANDIDATE_FIELDS | _THUMBNAIL_FIELDS):
         raise PhotoCertificateHold('certificate_candidate_invalid')
     for k in ('calendar_row_id',):
         if str(uuid.UUID(candidate[k])) != candidate[k]:
@@ -60,6 +62,18 @@ def validate_candidate(candidate):
     for k in ('source_url','image_url'):
         if not isinstance(candidate[k],str) or not re.fullmatch(r'https://[^\s]+',candidate[k]):
             raise PhotoCertificateHold('certificate_candidate_invalid')
+    if _THUMBNAIL_FIELDS <= set(candidate):
+        values = [candidate[k] for k in _THUMBNAIL_FIELDS]
+        if not all(value is None for value in values):
+            if (not isinstance(candidate['thumbnail_url'], str)
+                    or not re.fullmatch(r'https://[^\s]+', candidate['thumbnail_url'])
+                    or not isinstance(candidate['thumbnail_sha256'], str)
+                    or not _SHA.fullmatch(candidate['thumbnail_sha256'])
+                    or not isinstance(candidate['thumbnail_fingerprint'], str)
+                    or not _MD5.fullmatch(candidate['thumbnail_fingerprint'])
+                    or type(candidate['thumbnail_length']) is not int
+                    or not 0 < candidate['thumbnail_length'] <= 134217728):
+                raise PhotoCertificateHold('certificate_candidate_invalid')
     from datetime import date
     if date.fromisoformat(candidate['post_date']).isoformat()!=candidate['post_date']:
         raise PhotoCertificateHold('certificate_candidate_invalid')
