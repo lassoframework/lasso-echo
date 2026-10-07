@@ -1,5 +1,7 @@
 import io
 import json
+import struct
+import zlib
 
 import pytest
 from PIL import Image
@@ -106,3 +108,38 @@ def test_manifest_refuses_non_private_permissions(tmp_path):
     path.chmod(0o644)
     with pytest.raises(corpus.CorpusError, match="permissions_not_private"):
         corpus.collect(snapshot([row("a", "https://cdn.test/a")]), allowed_hosts={"cdn.test"}, manifest_path=path)
+
+
+@pytest.mark.parametrize("corruption", ["missing_dhash", "metadata_mismatch", "raw_url"])
+def test_resume_rejects_incomplete_mismatched_or_non_hash_only_record(tmp_path, corruption):
+    path = tmp_path / "state.json"
+    item = row("a", "https://cdn.test/a")
+    snap = snapshot([item])
+    corpus.collect(snap, allowed_hosts={"cdn.test"}, manifest_path=path,
+                   session=Session({item["image_url"]: png((7, 8, 9))}))
+    saved = json.loads(path.read_text())
+    key, record = next(iter(saved["records"].items()))
+    if corruption == "missing_dhash":
+        del record["dhash64"]
+    elif corruption == "metadata_mismatch":
+        record["gym_sha256"] = "0" * 64
+    else:
+        record["image_url"] = item["image_url"]
+    path.write_text(json.dumps(saved))
+    path.chmod(0o600)
+    with pytest.raises(corpus.CorpusError, match="resume_manifest_invalid"):
+        corpus.collect(snap, allowed_hosts={"cdn.test"}, manifest_path=path)
+
+
+def test_oversized_pixel_dimensions_rejected_before_image_transform(monkeypatch):
+    width, height = 4001, 10000
+    def png_chunk(kind, payload):
+        chunk = kind + payload
+        return struct.pack(">I", len(payload)) + chunk + struct.pack(">I", zlib.crc32(chunk) & 0xffffffff)
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    oversized_header = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", header)
+                        + png_chunk(b"IDAT", zlib.compress(b"\x00")) + png_chunk(b"IEND", b""))
+    monkeypatch.setattr(corpus.ImageOps, "exif_transpose",
+                        lambda *_: pytest.fail("transform ran before pixel bound check"))
+    with pytest.raises(ValueError, match="image_exceeds_pixel_bound"):
+        corpus._visual_fingerprint(oversized_header)

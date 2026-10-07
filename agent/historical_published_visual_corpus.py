@@ -12,6 +12,7 @@ import json
 import os
 import re
 import tempfile
+import warnings
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -132,17 +133,82 @@ def _read_url(url, allowed_hosts, session):
 def _visual_fingerprint(data):
     """Return format, dimensions, and 64-bit difference hash; decode failure is unknown."""
     Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-    with Image.open(__import__("io").BytesIO(data)) as image:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+        image_context = Image.open(__import__("io").BytesIO(data))
+    with image_context as image:
         if image.format not in {"JPEG", "PNG", "WEBP", "GIF", "TIFF", "BMP"}:
             raise ValueError("unsupported_image_format")
         image.seek(0)
-        image = ImageOps.exif_transpose(image)
         width, height = image.size
+        if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+            raise ValueError("image_exceeds_pixel_bound")
+        image = ImageOps.exif_transpose(image)
         image = image.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
         pixels = list(image.get_flattened_data())
         bits = [pixels[y * 9 + x] > pixels[y * 9 + x + 1] for y in range(8) for x in range(8)]
         value = sum((1 << (63 - i)) for i, bit in enumerate(bits) if bit)
         return value.to_bytes(8, "big").hex(), width, height
+
+
+def _validate_resume_records(result, rows, snapshot_digest):
+    """Reject stale, malformed, overbroad, or non-hash-only cached evidence."""
+    if (set(result) - {"schema_version", "snapshot_sha256", "row_count", "records",
+                       "hashed_count", "unknown_count", "complete"}
+            or result.get("snapshot_sha256") != snapshot_digest
+            or result.get("row_count") != len(rows)
+            or type(result.get("complete", False)) is not bool):
+        raise CorpusError("resume_manifest_invalid")
+    records = result.get("records")
+    if not isinstance(records, dict):
+        raise CorpusError("resume_manifest_invalid")
+    expected = {}
+    for row in rows:
+        key = _sha(_canonical([row["row_id"], row["revision"]]))
+        expected[key] = {
+            "row_ref_sha256": key,
+            "revision_sha256": _sha(row["revision"]),
+            "gym_sha256": _sha(row["gym_id"]),
+            "published_date_sha256": _sha(row["published_at"][:10] if row["published_at"] else "null"),
+            "published_date_known": row["published_at"] is not None,
+        }
+    if not set(records).issubset(expected):
+        raise CorpusError("resume_manifest_invalid")
+    hashed_count = sum(isinstance(r, dict) and r.get("status") == "hashed" for r in records.values())
+    unknown_count = sum(isinstance(r, dict) and r.get("status") == "unknown" for r in records.values())
+    if (("hashed_count" in result and (type(result["hashed_count"]) is not int or result["hashed_count"] != hashed_count))
+            or ("unknown_count" in result and (type(result["unknown_count"]) is not int or result["unknown_count"] != unknown_count))
+            or ("complete" in result and result["complete"] != (len(records) == len(rows)))):
+        raise CorpusError("resume_manifest_invalid")
+    sha_pattern, dhash_pattern = r"[0-9a-f]{64}", r"[0-9a-f]{16}"
+    for key, record in records.items():
+        if not isinstance(key, str) or not re.fullmatch(sha_pattern, key) or not isinstance(record, dict):
+            raise CorpusError("resume_manifest_invalid")
+        status = record.get("status")
+        expected_base = expected[key]
+        if (any(record.get(field) != value for field, value in expected_base.items())
+                or type(record.get("published_date_known")) is not bool):
+            raise CorpusError("resume_manifest_invalid")
+        if status == "unknown":
+            if (set(record) != set(expected_base) | {"status", "unknown_reason"}
+                    or not isinstance(record.get("unknown_reason"), str)
+                    or not re.fullmatch(r"[a-z0-9_]{1,80}", record["unknown_reason"])):
+                raise CorpusError("resume_manifest_invalid")
+        elif status == "hashed":
+            if (set(record) != set(expected_base) | {"status", "image_sha256", "byte_length", "dhash64", "width", "height"}
+                    or not isinstance(record.get("image_sha256"), str)
+                    or not re.fullmatch(sha_pattern, record["image_sha256"])
+                    or not isinstance(record.get("dhash64"), str)
+                    or not re.fullmatch(dhash_pattern, record["dhash64"])
+                    or type(record.get("byte_length")) is not int or not 0 < record["byte_length"] <= MAX_IMAGE_BYTES
+                    or type(record.get("width")) is not int or type(record.get("height")) is not int
+                    or not 0 < record["width"] <= MAX_IMAGE_PIXELS
+                    or not 0 < record["height"] <= MAX_IMAGE_PIXELS
+                    or record["width"] * record["height"] > MAX_IMAGE_PIXELS):
+                raise CorpusError("resume_manifest_invalid")
+        else:
+            raise CorpusError("resume_manifest_invalid")
+    return records
 
 
 def _record_path(path, record):
@@ -182,20 +248,11 @@ def collect(snapshot, *, allowed_hosts, manifest_path, expected_row_refs=None, s
             raise CorpusError("resume_manifest_unreadable") from None
         if result.get("schema_version") != SCHEMA_VERSION or result.get("snapshot_sha256") != snapshot_digest:
             raise CorpusError("resume_snapshot_changed")
-        records = result.get("records")
-        if not isinstance(records, dict):
-            raise CorpusError("resume_manifest_invalid")
+        records = _validate_resume_records(result, rows, snapshot_digest)
     else:
         result = {"schema_version": SCHEMA_VERSION, "snapshot_sha256": snapshot_digest,
                   "row_count": len(rows), "records": {}}
         records = result["records"]
-    expected_keys = {_sha(_canonical([r["row_id"], r["revision"]])) for r in rows}
-    if (not set(records).issubset(expected_keys)
-            or any(not isinstance(k, str) or not re.fullmatch(r"[0-9a-f]{64}", k)
-                   or not isinstance(v, dict) or v.get("row_ref_sha256") != k
-                   or v.get("status") not in {"hashed", "unknown"}
-                   for k, v in records.items())):
-        raise CorpusError("resume_manifest_invalid")
     http = session or requests.Session()
     for row in rows:
         key = _sha(_canonical([row["row_id"], row["revision"]]))
