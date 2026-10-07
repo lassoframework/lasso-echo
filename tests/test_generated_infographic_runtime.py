@@ -46,7 +46,8 @@ def system(case, monkeypatch):
             'history_complete': True,
             'history': dict(rows=[], scope_complete=True, spine_digest='history-v1')}
     monkeypatch.setattr(guard, 'generated_snapshot', lambda p, rid: copy.deepcopy(snap))
-    source = SimpleNamespace(account_key='same-gym_ig', text=caption, status='approved')
+    source = SimpleNamespace(id=1, account_key='same-gym_ig', text=caption, status='approved',
+                             citation='approved website',category='educational',created_at='2026-10-01')
     account = SimpleNamespace(key='same-gym_ig', platform='instagram')
     def read(url):
         assert conn.events[-1] == 'rollback', 'network read must have no open snapshot transaction'
@@ -78,7 +79,7 @@ def run(s):
 
 def row_for(s):
     c = s.reserved[-1]
-    return dict(gym_id=c['gym_id'], post_date=c['local_date'], logical_post_id=c['logical_post_id'],
+    return dict(id=s.row_id, caption=s.source.text, gym_id=c['gym_id'], post_date=c['local_date'], logical_post_id=c['logical_post_id'],
         account='instagram', format='feed', source_media_asset_id=runtime.PREFIX+c['job_id'],
         image_url=c['original_url'], source_media_url=c['original_url'], thumbnail_url=None)
 
@@ -91,7 +92,7 @@ def test_row_to_fresh_candidate_owner_reservation_and_normal_publish_binding(sys
     assert len(s.reserved) == s.case.provider.calls == s.case.reviewer.calls == 1
     row = row_for(s)
     assert runtime.validate_publish_palette(row, jobs_path=str(s.case.jobs.path),
-        palette_loader=lambda base, key: (s.palette, 'palette-v1'))
+        palette_loader=lambda base, key: (s.palette, 'palette-v1'), sources=lambda key:[s.source])
     assert 'coach_review' not in json.dumps(s.reserved)
     assert 'needs_client_safe_review' not in json.dumps(s.reserved)
     # Replay consumes prepared original; no second provider job or review.
@@ -189,14 +190,14 @@ def test_publish_date_gym_post_and_original_binding(system, field, value):
     row[field] = value
     with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
         runtime.validate_publish_palette(row, jobs_path=str(system.case.jobs.path),
-            palette_loader=lambda base,key: (system.palette,'palette-v1'))
+            palette_loader=lambda base,key: (system.palette,'palette-v1'), sources=lambda key:[system.source])
 
 
 def test_current_palette_revision_blocks_before_send(system):
     assert run(system)['ok']
     with pytest.raises(runtime.RuntimeHold, match='generated_palette_changed'):
         runtime.validate_publish_palette(row_for(system), jobs_path=str(system.case.jobs.path),
-            palette_loader=lambda base,key: (system.palette,'new-revision'))
+            palette_loader=lambda base,key: (system.palette,'new-revision'), sources=lambda key:[system.source])
 
 
 def test_missing_journal_fail_closed_without_creating_file(system, tmp_path):
@@ -300,3 +301,92 @@ def test_existing_owner_tenant_allowlist_is_required(system, monkeypatch):
                         lambda: (('other-gym',), 25))
     assert run(system)['reason'] == 'generated_owner_tenant_not_allowed'
     assert system.case.provider.calls == 0
+
+
+def test_ambiguous_generation_bound_before_provider_survives_history_drift(system):
+    calls = []
+    def timeout(brief, job_id):
+        # The row mapping is already durable at first provider invocation.
+        record = runtime._runtime_record(system.case.jobs, system.row_id)
+        assert record['job_id'] == job_id and record['job_state'] == 'generating'
+        calls.append(job_id)
+        raise TimeoutError()
+    system.case.provider.create = timeout
+    assert run(system)['reason'] == 'generated_preparation_unavailable'
+    system.snap['history_revision'] = 'changed-history'
+    system.snap['history']['spine_digest'] = 'changed-history'
+    assert run(system)['reason'] == 'generated_execution_pending_reconciliation'
+    assert len(calls) == 1
+
+
+def test_reviewing_execution_with_new_history_never_generates_again(system):
+    reviewer = system.case.reviewer.ask_image
+    system.case.reviewer.ask_image = lambda *a: (_ for _ in ()).throw(TimeoutError())
+    assert run(system)['reason'] == 'generated_automated_review_failed'
+    assert runtime._runtime_record(system.case.jobs, system.row_id)['job_state'] == 'reviewing'
+    system.snap['history_revision'] = 'changed-history'
+    system.snap['history']['spine_digest'] = 'changed-history'
+    system.case.reviewer.ask_image = reviewer
+    assert run(system)['reason'] == 'generated_execution_pending_reconciliation'
+    assert system.case.provider.calls == 1 and not system.reserved
+
+
+def test_sql_issued_history_cache_avoids_old_object_reads(system):
+    from agent.visual_scene import scene_fingerprint
+    system.snap['history']['rows'] = [dict(history_key='sealed:baseline:old',
+        published_binding_ref='sealed-binding', visual_url='https://images.example.test/unreadable-old.png',
+        visual_sha256='sha256:'+hashlib.sha256(system.case.data).hexdigest(),
+        phash=scene_fingerprint(system.case.data), history_proof_ref='generated-history:sha256:'+'a'*64)]
+    read = system.loader.reader
+    def only_original(url):
+        assert 'unreadable-old' not in url
+        return read(url)
+    system.loader.reader = only_original
+    assert run(system)['ok']
+    assert system.case.provider.calls == 1
+
+
+def test_unresolved_history_duplicate_urls_observed_once(system):
+    system.snap['history']['rows'] = [dict(history_key='old:'+str(i), published_binding_ref='b'+str(i),
+        visual_url='https://images.example.test/old.png', visual_sha256=None,
+        phash=None, history_proof_ref=None) for i in range(3)]
+    calls = []
+    read = system.loader.reader
+    def count(url):
+        calls.append(url)
+        return read(url)
+    system.loader.reader = count
+    assert run(system)['ok']
+    assert calls.count('https://images.example.test/old.png') == 1
+
+
+def test_invalid_cached_proof_holds(system):
+    system.snap['history']['rows'] = [dict(history_key='old', published_binding_ref='bound',
+        visual_url='https://images.example.test/old.png', visual_sha256='sha256:'+'b'*64,
+        phash='scene:phash64:abc', history_proof_ref='producer-says-cached')]
+    assert run(system)['reason'] == 'generated_history_cache_invalid'
+    assert system.case.provider.calls == 0
+
+
+def test_no_sources_legacy_seed_suppressed_under_new_on_flag(monkeypatch):
+    from agent import client_media_sync, no_media_astra_seed
+    monkeypatch.setenv(runtime.FLAG,'true')
+    monkeypatch.setattr(no_media_astra_seed,'enabled',lambda: True)
+    monkeypatch.setattr(no_media_astra_seed,'seed_gaps',lambda *a,**k: pytest.fail('legacy seed ran'))
+    result = client_media_sync._maybe_seed_no_media_astra('same-gym',
+        SimpleNamespace(key='same-gym_ig',platform='instagram'), object(), lambda text: None)
+    assert result['reason'] == 'generated_gap_owner_transport_missing'
+
+
+def test_approved_source_revocation_or_metadata_change_blocks_send(system):
+    assert run(system)['ok']
+    row = row_for(system)
+    system.source.status = 'pending'
+    with pytest.raises(runtime.RuntimeHold, match='generated_approved_copy_receipt_missing'):
+        runtime.validate_publish_palette(row, jobs_path=str(system.case.jobs.path),
+            palette_loader=lambda base,key:(system.palette,'palette-v1'), sources=lambda key:[system.source])
+    system.source.status = 'approved'
+    system.source.citation = 'changed source record'
+    with pytest.raises(runtime.RuntimeHold, match='generated_approved_source_changed'):
+        runtime.validate_publish_palette(row, jobs_path=str(system.case.jobs.path),
+            palette_loader=lambda base,key:(system.palette,'palette-v1'), sources=lambda key:[system.source])

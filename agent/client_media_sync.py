@@ -1168,6 +1168,9 @@ def _maybe_seed_no_media_astra(base_key, account, store, log):
     failure must never sink or slow the scan; the generic onboarding sample
     (seeded just above this call site) still covers the gym either way."""
     try:
+        from . import generated_infographic_runtime as generated
+        if generated.enabled():
+            return generated.run_scheduled(base_key, account, store, logger=log)
         from . import no_media_astra_seed
         if not no_media_astra_seed.enabled():
             return
