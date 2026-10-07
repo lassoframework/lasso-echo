@@ -336,6 +336,46 @@ def _surviving_pillar_counts(base_key, start, days, store, log):
     return counts
 
 
+def _protected_feed_captions(base_key, start, days, store, log, *, require_protected=False):
+    """Read captions retained by this rebuild, including same-date approved feeds.
+
+    The persisted cooldown exempts the target date for idempotent rebuilding;
+    protected AM copy therefore also needs the build-local PM uniqueness guard.
+    """
+    if not config.caption_cooldown_enabled():
+        return {}
+    from datetime import timedelta
+    from .portal_calendar_store import _WIPEABLE_STATUSES
+    reader = getattr(store, "list_month", None)
+    if not callable(reader):
+        if require_protected:
+            raise RuntimeError(f"{base_key}: protected caption reader unavailable")
+        return {}
+    first, after = start.isoformat(), (start + timedelta(days=max(1, days))).isoformat()
+    months = sorted({(start + timedelta(days=i)).isoformat()[:7]
+                     for i in range(max(1, days))})
+    captions = {}
+    for month in months:
+        try:
+            rows = reader(base_key, month) or []
+        except Exception as exc:
+            raise RuntimeError(
+                f"{base_key}: protected caption read unavailable ({type(exc).__name__})") from exc
+        for row in rows:
+            day = str(row.get("post_date") or "")[:10]
+            status = str(row.get("status") or "").lower()
+            caption = str(row.get("caption") or "").strip()
+            if (str(row.get("gym_id", base_key)) == str(base_key)
+                    and first <= day < after
+                    and row.get("format") == "feed"
+                    and row.get("account") in ("instagram", "facebook")
+                    and row.get("variant_status", "active") == "active"
+                    and status and status not in (*_WIPEABLE_STATUSES, "denied", "killed", "deleted")
+                    and caption):
+                captions.setdefault(day, []).append(caption)
+    return captions
+
+
 def _edited_story_captions(base_key, start, days, store, log):
     """{(post_date, slot_index) -> caption} for client-edited STORY rows which
     have NOT been re-rendered yet. Editing a story caption (portal_calendar_store.
@@ -1093,8 +1133,29 @@ def _drive_history_sources(account_key, day_key, slot_i,
     return out[:limit]
 
 
+def _drive_staged_caption(caption):
+    """The exact copy normalization preflight performs before its final belts."""
+    from .copy_gate import bound_opening_hook, format_caption
+    return bound_opening_hook(format_caption(caption or ""))
+
+
+def _drive_caption_repeats_history(base_key, caption, day_key):
+    # The final belt judges formatted copy. Keep the raw-history check as well
+    # so normalizing copy cannot weaken the existing 180-day protection.
+    if not config.caption_cooldown_enabled():
+        return False
+    return (_caption_repeats_history(base_key, caption, day_key)
+            or _caption_repeats_history(base_key, _drive_staged_caption(caption), day_key))
+
+
+def _drive_build_caption_hash(caption):
+    from .caption_ledger import verbatim_hash
+    return verbatim_hash(_drive_staged_caption(caption))
+
+
 def _retry_drive_caption_history(account, draft, voice, base_key, account_key,
-                                  day_key, slot_i, banned_words, day_captions, log):
+                                  day_key, slot_i, banned_words, day_captions, log,
+                                  *, build_captions=()):
     """Bounded genuine copy regeneration on the already selected photo."""
     from . import post_quality, caption_ledger
     from .drafter import angle_for_index
@@ -1108,6 +1169,8 @@ def _retry_drive_caption_history(account, draft, voice, base_key, account_key,
             f"({type(exc).__name__})")
         return False
     day_hashes = {caption_ledger.verbatim_hash(c) for c in day_captions}
+    build_hashes = ({_drive_build_caption_hash(c) for c in build_captions if c.strip()}
+                    if config.caption_cooldown_enabled() else set())
 
     def rejections(candidate):
         """Classification only: never log caption text or confidential banned words."""
@@ -1127,6 +1190,15 @@ def _retry_drive_caption_history(account, draft, voice, base_key, account_key,
             reasons.append("history_180d")
         if caption_ledger.verbatim_hash(caption) in day_hashes:
             reasons.append("same_day")
+        try:
+            staged_caption = _drive_staged_caption(caption)
+            if build_hashes and _drive_build_caption_hash(caption) in build_hashes:
+                reasons.append("same_build")
+            if staged_caption != caption and _caption_repeats_history(
+                    base_key, staged_caption, day_key):
+                reasons.append("history_180d")
+        except ValueError:
+            reasons.append("caption_format")
         return reasons
 
     if not sb7:
@@ -1221,8 +1293,9 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
     covered_slots: a shared set of (day_key, slot_index) this call must skip and to
     which it ADDS every slot it stages, so Lane A, the pre-pass and the gap-fill never
     place two feeds in one slot (2x: one slot may be a Lane A still, the other a Drive
-    video). day_captions_seed: {day_key: [captions]} already placed on a day by another
-    lane, so the same-concept guard sees them.
+    video). day_captions_seed: {day_key: [captions]} already placed by another
+    lane. All seeded days participate in build-wide caption uniqueness, while
+    same-day seeds also protect the other cadence slot.
 
     failed_assets: a BUILD-LOCAL set (shared by the pre-pass and the gap-fill call) of
     Drive asset ids whose caption failed the A+ gate twice this build. They are passed
@@ -1247,6 +1320,10 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
     slots = 2 if int(slots_per_day or 1) == 2 else 1
     failed = failed_assets if failed_assets is not None else set()
     staged_feeds = 0
+    # Cross-day duplicates are invisible to the persisted 180-day ledger until
+    # this batch is inserted. Seed all prior lanes, then record only finished feeds.
+    build_captions = [caption for captions in (day_captions_seed or {}).values()
+                      for caption in captions if (caption or "").strip()]
     for i in range(days):
         if (max_feed_count is not None
                 and staged_feeds >= max(0, int(max_feed_count))):
@@ -1292,7 +1369,8 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                 placed = _stage_drive_draft(
                     account, base_key, account_key, platform, draft, day_key, slot_i,
                     slots, voice, banned_words, day_captions, library_path, log,
-                    failed, extra, covered_slots, pillar, video_beats_only)
+                    failed, extra, covered_slots, pillar, video_beats_only,
+                    build_captions=build_captions)
             except InvalidLogicalPostIdentity:
                 # FATAL identity defect: return the in-flight Drive asset to the
                 # pool, then abort the WHOLE rebuild (never a media hold).
@@ -1315,7 +1393,8 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
 
 def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key, slot_i,
                        slots, voice, banned_words, day_captions, library_path, log,
-                       failed, extra, covered_slots, pillar, video_beats_only):
+                       failed, extra, covered_slots, pillar, video_beats_only,
+                       *, build_captions=None):
     """Gate, guard, finish and append ONE built Drive draft. True when it was placed;
     False when it was dropped (asset rolled back) and the caller should stop this day.
     Split out of append_gym_drive_drafts so its exception path is one place."""
@@ -1334,9 +1413,18 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
         log(f"[gym-drive] {base_key} {day_key}: A+ gate errored "
             f"({type(e).__name__}); dropping the draft")
         _gate_ok = False
-    _history_repeat = _caption_repeats_history(
+    _history_repeat = _drive_caption_repeats_history(
         base_key, getattr(draft, "caption", "") or "", day_key)
-    _history_walk_needed = _history_repeat
+    build_hashes = ({_drive_build_caption_hash(c)
+                     for c in (build_captions or ()) if c.strip()}
+                    if config.caption_cooldown_enabled() else set())
+    _build_repeat = bool(build_hashes) and _drive_build_caption_hash(
+        getattr(draft, "caption", "") or "") in build_hashes
+    _history_walk_needed = _history_repeat or _build_repeat
+    if _build_repeat:
+        log(f"[gym-drive] {base_key} {day_key}: caption repeats this build; "
+            "retrying approved copy on the same photo")
+        _gate_ok = False
     if _history_repeat:
         log(f"[gym-drive] {base_key} {day_key}: caption repeats 180 day history; "
             "retrying approved copy on the same photo")
@@ -1356,16 +1444,19 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
                                 tuple(banned_words or ())))
             except Exception:  # noqa: BLE001
                 _gate_ok = False
-            _history_repeat = _caption_repeats_history(
+            _history_repeat = _drive_caption_repeats_history(
                 base_key, getattr(draft, "caption", "") or "", day_key)
-            if _history_repeat:
+            _build_repeat = bool(build_hashes) and _drive_build_caption_hash(
+                getattr(draft, "caption", "") or "") in build_hashes
+            if _history_repeat or _build_repeat:
                 _gate_ok = False
-    if not _gate_ok and (_history_walk_needed or _history_repeat):
+    if not _gate_ok and (_history_walk_needed or _history_repeat or _build_repeat):
         _gate_ok = _retry_drive_caption_history(
             account, draft, voice, base_key, account_key, day_key, slot_i,
-            banned_words, day_captions, log)
+            banned_words, day_captions, log, build_captions=build_captions or ())
     if not _gate_ok:
-        failure = ("failed the caption history gate twice" if _history_repeat
+        failure = ("failed the build caption uniqueness gate" if _build_repeat
+                   else "failed the caption history gate twice" if _history_repeat
                    else "failed the A+/banned-word gate twice")
         log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, the caption "
             f"{failure}")
@@ -1386,7 +1477,6 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
             "caption repeats the day's other post")
         _rollback_drive_asset(draft, day_key, log)
         return False
-    day_captions.append(_cap)
     # Cross-post platform parity with the uploaded-media feed (the FB mirror in
     # _to_rows keys off an ig/empty account); leave the platform as the account's.
     if not (getattr(draft, "platform", "") or "").strip():
@@ -1417,6 +1507,9 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
                 d.cadence_slot_index = slot_i
             except Exception:  # noqa: BLE001 - a frozen draft never blocks
                 pass
+    day_captions.append(_cap)
+    if build_captions is not None:
+        build_captions.append(_cap)
     extra.extend(day_drafts)
     if covered_slots is not None:
         covered_slots.add((day_key, slot_i))
@@ -1721,7 +1814,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # photos lead, local photos use the remaining slots, and video is considered only
     # after Lane A has exhausted its eligible local-photo supply.
     covered_slots = set(locked_feed_slots)
-    pre_captions = {}
+    pre_captions = _protected_feed_captions(
+        base_key, start, days, store, log, require_protected=bool(locked_feed_slots))
     # SOURCE ORDER: approved Drive photos, then local real photos, then Drive videos.
     # Pin this first pass to photos so a mixed pool cannot spill into video when its
     # approved photos run out. Lane A and the later video pass share slot ownership.
@@ -1760,7 +1854,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 covered_days=fully_locked_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
                 rendition_budget=rendition_budget, covered_slots=covered_slots,
-                kind_prefs=(_PHOTO_KIND,), max_feed_count=max_feed_days)
+                kind_prefs=(_PHOTO_KIND,), max_feed_count=max_feed_days,
+                day_captions_seed=pre_captions)
             drive_photo_feeds = _record_drive_prepass(photo_pre, "Drive photo")
         except InvalidLogicalPostIdentity:
             raise  # FATAL: an unverifiable identity aborts the rebuild pre-delete
