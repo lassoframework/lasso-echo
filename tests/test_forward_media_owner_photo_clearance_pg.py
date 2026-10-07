@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import uuid
 from unittest.mock import patch
 
@@ -310,6 +311,70 @@ def main():
     assert good.result(timeout=8) is True
     assert sibling.result(timeout=8) is True
    assert claim(first) is True
+   # Actual production_callbacks transaction used by guard.attest, through its
+   # real exact-role DSN/factory. Pause at its first object read, AFTER provenance
+   # acquired graph+census, and overlap a real service claim. The attester must
+   # already own its eventual exclusive graph mode; no shared->exclusive cycle.
+   from agent import visual_writer_prepare
+   sql('alter role '+guard.ROLE+' login')
+   prior_attester_env={name:os.environ.get(name) for name in (
+    'AGENT_FORWARD_MEDIA_GUARD','AGENT_FORWARD_MEDIA_ATTESTER_DSN','AGENT_FORWARD_MEDIA_ATTESTER_ROLE')}
+   os.environ['AGENT_FORWARD_MEDIA_GUARD']='true'
+   os.environ['AGENT_FORWARD_MEDIA_ATTESTER_DSN']=dsn(guard.ROLE)
+   os.environ['AGENT_FORWARD_MEDIA_ATTESTER_ROLE']=guard.ROLE
+   remote_entered=threading.Event();remote_release=threading.Event()
+   def fresh_production_attestation_row():
+    row_id=new_row(fmt='story')
+    with lane('service_role') as service:
+     assert service.execute('select fixer_bind_forward_media_manifest_20261006(%s)',(row_id,)).fetchone()[0]
+    sql("update content_calendar set status='publishing',publish_claim_token=%s,publish_reservation_day='2026-10-10' where id=%s",(str(uuid.uuid4()),row_id))
+    revision=sql('select fixer_forward_media_attestation_request_20261006(%s)',(row_id,))[0][0]['revision']
+    return row_id,revision
+   production_row,production_revision=fresh_production_attestation_row()
+   def paused_production_bytes(url):
+    remote_entered.set()
+    assert remote_release.wait(timeout=8),'production attester remote phase was not released'
+    return hosted.read(url)
+   try:
+    with patch.object(visual_writer_prepare,'_bytes_for_url',side_effect=paused_production_bytes),concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+     production_attest=pool.submit(guard.attest,production_row,production_revision)
+     assert remote_entered.wait(timeout=5),'real production_callbacks did not reach object read'
+     concurrent_claim=pool.submit(claim,third)
+     deadline=time.monotonic()+5
+     while time.monotonic()<deadline:
+      if sql("select count(*) from pg_stat_activity where wait_event_type='Lock' and query like 'select fixer_claim_forward_media%' ")[0][0]:break
+      time.sleep(.02)
+     else:raise AssertionError('claim did not wait behind production attester authority')
+     remote_release.set()
+     production_proof=production_attest.result(timeout=8)
+     assert production_proof['revision']==production_revision
+     assert concurrent_claim.result(timeout=8) is True
+    # Reverse order: a claim already owns shared graph+census. Production
+    # provenance waits for exclusive graph BEFORE census and resumes on COMMIT.
+    reverse_row,reverse_revision=fresh_production_attestation_row()
+    held_claim=lane('service_role')
+    assert held_claim.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',third).fetchone()[0] is True
+    with patch.object(visual_writer_prepare,'_bytes_for_url',side_effect=hosted.read),concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+     waiting_attester=pool.submit(guard.attest,reverse_row,reverse_revision)
+     deadline=time.monotonic()+5
+     while time.monotonic()<deadline:
+      if sql("select count(*) from pg_stat_activity where wait_event_type='Lock' and query like 'select public.fixer_forward_media_provenance_lookup%' ")[0][0]:break
+      time.sleep(.02)
+     else:raise AssertionError('production attester did not wait for preceding claim')
+     held_claim.commit();held_claim.close()
+     assert waiting_attester.result(timeout=8)['revision']==reverse_revision
+    for other_group in ('service_role','fixer_forward_media_owner_20261006'):
+     sql('grant '+other_group+' to '+guard.ROLE)
+     try:
+      with lane(guard.ROLE) as mixed:
+       denied(lambda:attester.production_callbacks(mixed,production_row,expected_revision=production_revision),'isolated attester provenance identity')
+     finally:
+      sql('revoke '+other_group+' from '+guard.ROLE)
+   finally:
+    remote_release.set()
+    for name,value in prior_attester_env.items():
+     if value is None:os.environ.pop(name,None)
+     else:os.environ[name]=value
    # A fresh independent certificate after prior sends has reviewed the now
    # reserved/published visuals. Real production run_once discovers it, commits
    # durable admission before remote readers, and atomically persists outcome.
@@ -411,7 +476,7 @@ def main():
    sql('insert into fixer_owner_photo_revocation_20261007 values(%s,%s)',(packet['payload']['audit_id'],'SYNTHETIC revoke'))
    denied(lambda:claim(first),'revoked')
    conn.close();auditor_conn.close();admin.close()
-   print('PASS PG17 signed owner grant; OFF/moderation/byte-binding/safety-hold/direct bypass holds; atomic reservation+authority; concurrent stale corpus hold; signed date/group before first claim; post-binder replay + stored-signature reconciliation; IG/FB/Story siblings; census INSERT/UPDATE/DELETE held through claim COMMIT for admin+service; prelocked writer fail-fast; own provider receipt and concurrent siblings allowed; different Story rendition hold; production owner-worker factory with acknowledged outcome; initial/final lost COMMIT and remote crash quarantine/no-retry; unknown history/epoch/revocation holds')
+   print('PASS PG17 signed owner grant; OFF/moderation/byte-binding/safety-hold/direct bypass holds; atomic reservation+authority; concurrent stale corpus hold; signed date/group before first claim; post-binder replay + stored-signature reconciliation; IG/FB/Story siblings; census INSERT/UPDATE/DELETE held through claim COMMIT for admin+service; prelocked writer fail-fast; own provider receipt and concurrent siblings allowed; actual production_callbacks attester/claim both-order concurrency without graph upgrade; different Story rendition hold; production owner-worker factory with acknowledged outcome; initial/final lost COMMIT and remote crash quarantine/no-retry; unknown history/epoch/revocation holds')
   finally:
    subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 

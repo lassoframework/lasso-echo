@@ -322,8 +322,19 @@ create function public.fixer_forward_media_provenance_lookup_20261006(p_calendar
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
 declare provenance jsonb; grant_row public.fixer_owner_photo_reservation_20261007%rowtype;
  snap jsonb; content jsonb;
+ caller text:=coalesce(nullif(current_setting('role',true),'none'),session_user);
 begin
- perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+ -- Production callbacks read provenance before later appending attestation in
+ -- this SAME transaction. The attester must take its final exclusive graph
+ -- mode now, before census authority; upgrading a shared graph while another
+ -- claimant shares it and waits for census would deadlock.
+ if pg_has_role(caller,'fixer_forward_media_attester_20261006','member') then
+  if pg_has_role(caller,'service_role','member') or pg_has_role(caller,'fixer_forward_media_owner_20261006','member') then
+   raise exception 'isolated attester provenance identity required' using errcode='42501'; end if;
+  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
+ else
+  perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+ end if;
  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0));
  provenance:=public.fixer_photo_base_provenance_20261007(p_calendar_row_id);
  select r.* into grant_row from public.fixer_owner_photo_reservation_20261007 r
