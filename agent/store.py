@@ -23,7 +23,7 @@ STORE_PATH_DEFAULT = os.environ.get("AGENT_PENDING_PATH", "pending_drafts.json")
 
 
 def _to_dict(d: Draft):
-    return {
+    record = {
         "draft_id": d.draft_id,
         "account_key": d.account_key,
         "platform": d.platform,
@@ -60,6 +60,12 @@ def _to_dict(d: Draft):
         # delete/reinsert cycle; never inferred from date/photo/caption.
         "logical_post_id": getattr(d, "logical_post_id", "") or "",
     }
+    if hasattr(d, "media_materialization_observations"):
+        # Untrusted producer metadata must survive the mirror's reload. Preserve
+        # the explicit asset field independently; never infer it from observations.
+        record["media_materialization_observations"] = d.media_materialization_observations
+        record["source_media_asset_id"] = d.source_media_asset_id
+    return record
 
 
 _SELECT = "draft_id, account_key, status, day_key, draft_type, data"
@@ -147,6 +153,9 @@ def _from_dict(r):
     poster_evidence = r.get("poster_render_evidence", {})
     if isinstance(poster_evidence, dict) and poster_evidence:
         draft.poster_render_evidence = poster_evidence
+    if "media_materialization_observations" in r:
+        draft.media_materialization_observations = r["media_materialization_observations"]
+        draft.source_media_asset_id = r.get("source_media_asset_id", "")
     return draft
 
 

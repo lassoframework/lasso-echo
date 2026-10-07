@@ -3624,11 +3624,14 @@ class SupabaseCalendarStore:
         and video posts) used to 400 the ENTIRE insert and write 0 rows (GritX rebuild
         stuck at 1 day). We normalize every row to the UNION of keys across the batch,
         filling missing keys with None, so the batch is always uniform."""
+        from . import forward_media_observation_bridge as _observation_bridge
+        observation_bridge_on = _observation_bridge.enabled()
+        observations_by_id = {}
         payload = []
         from .copy_gate import bound_opening_hook, format_caption
         for row in (rows or []):
             clean = {k: v for k, v in dict(row or {}).items()
-                     if k not in ("id", "scene_candidate")}
+                     if k not in ("id", "scene_candidate", _observation_bridge.METADATA)}
             if "caption" in clean and clean["caption"] is not None:
                 # Every calendar-building lane converges here. Prompts and individual
                 # generators can miss the hook limit, so enforce the grader's exact
@@ -3657,6 +3660,16 @@ class SupabaseCalendarStore:
                 import uuid
                 # Explicit stable UUIDs support crash-safe automatic render retries.
                 clean["id"] = str(uuid.UUID(str((row or {}).get("id") or "")))
+            if observation_bridge_on and _observation_bridge.METADATA in (row or {}):
+                import uuid
+                # Mint before filtering/preparation so response order and duplicate
+                # media URLs cannot invent a row association. The off path retains
+                # the established DB-generated UUID behavior.
+                clean.setdefault("id", str(uuid.uuid4()))
+                if clean["id"] in observations_by_id:
+                    raise _observation_bridge.ObservationBridgeHold(
+                        "calendar_candidate_identity_duplicate")
+                observations_by_id[clean["id"]] = (row or {})[_observation_bridge.METADATA]
             clean["gym_id"] = account_key  # gym scope: never trust a foreign gym_id
             # LOGICAL POST IDENTITY (2026-10-04): a caller may stamp each row with
             # the ONE logical_post_id minted upstream for the sibling group (IG
@@ -3798,6 +3811,17 @@ class SupabaseCalendarStore:
                 raise CalendarInsertNotStartedError(
                     409, f"visual preparation failed before calendar insert: "
                     f"{type(exc).__name__}") from exc
+        observation_candidates = {
+            row["id"]: _observation_bridge.prepare(row, observations_by_id[row["id"]])
+            for row in payload if row.get("id") in observations_by_id}
+        if observation_candidates:
+            # Schema/transport refusal before POST leaves zero new calendar rows.
+            _observation_bridge.preflight(self)
+            # PostgREST requires uniform keys. Explicit IDs for this batch avoid
+            # filling an unobserved row's primary key with NULL during normalization.
+            import uuid
+            for row in payload:
+                row.setdefault("id", str(uuid.uuid4()))
         all_keys = set()
         for r in payload:
             all_keys.update(r.keys())
@@ -3828,6 +3852,12 @@ class SupabaseCalendarStore:
                     raise PortalStoreError(502, "calendar insert returned unverified visual rows")
                 unmatched.remove(matches[0])
                 seen_ids.add(row["id"])
+        if observation_candidates:
+            # A crash or refusal after POST leaves no owner manifest/lineage and
+            # therefore no publish authority under the global guard. Raise a static
+            # hold; do not return a successful insert with lost observations.
+            _observation_bridge.persist_inserted(
+                self, payload, out, observation_candidates)
         inserted = [x for x in out if str(x.get("gym_id")) == str(account_key)]
         _record_confirmed_story_holds(account_key, inserted)
         # Wave 3 (AGENT_CAPTION_COOLDOWN): stamp each successfully staged row in
