@@ -1550,14 +1550,15 @@ def _run_requeue_failed_row(ctx):
 # media and status: exactly what a rebuild is allowed to write, so a genuine rebuild
 # never trips the "pre-existing row changed" check and any outside edit does.
 _ROW_FINGERPRINT_FIELDS = ("post_date", "account", "format", "status", "caption",
-                           "image_url", "video_url", "slot_index",
+                           "image_url", "slot_index",
                            "source_media_asset_id")
 
 # Every field a row MUST carry before it can be fingerprinted: the mutable fields
 # above plus its identity and tenant. A missing KEY means the store selected a
 # partial column set and the comparison would run blind on those fields -- that
-# rejects the whole readback. A present key with a None value (a story's null
-# video_url, a null caption) is a complete row and fingerprints deterministically.
+# rejects the whole readback. content_calendar has no video_url column; video
+# posts use the media URL and format fields. A present null caption is complete
+# and fingerprints deterministically.
 _ROW_REQUIRED_FIELDS = ("id", "gym_id") + _ROW_FINGERPRINT_FIELDS
 
 # Hard bound on followed pages, so a store that hands out cursors forever is
