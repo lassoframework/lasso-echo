@@ -78,8 +78,9 @@ def test_off_does_not_read_or_dispatch(monkeypatch):
 
 class Transport:
     def __init__(self,request,s): self.request,self.s,self.events=request,s,[]
-    def pending(self,tenants,limit):
+    def pending(self,tenants,limit,local_windows):
         assert tenants==('same-gym',) and limit==25
+        assert local_windows=={'same-gym':['2026-10-08','2026-10-09']}
         self.events.append('discover');return [self.request]
     def bind(self,request,**refs):
         self.events.append('bind')
@@ -175,3 +176,15 @@ def test_acknowledged_bind_rollback_allows_same_exact_refs_retry(system,monkeypa
     with pytest.raises(runtime.RuntimeHold,match='generated_gap_binding_changed'):
         transport.bind(request,caption='Different caption',source_revision='ref',
                        palette=system.palette,palette_revision='palette-v1')
+
+
+def test_discovery_supplies_each_gym_timezone_window_before_limit(system,monkeypatch):
+    monkeypatch.setattr('agent.forward_media_owner_worker.settings_from_environment',lambda:(('east','west'),25))
+    monkeypatch.setattr('agent.config.posting_timezone_for',lambda base:
+                        'Pacific/Kiritimati' if base=='east' else 'Pacific/Honolulu')
+    seen=[]
+    transport=SimpleNamespace(pending=lambda tenants,limit,windows:seen.append(windows) or [])
+    result=gap.run_pending(persistence=system.persistence,jobs=system.case.jobs,transport=transport,
+                           now='2026-10-07T12:00:00+00:00')
+    assert result['ok']
+    assert seen==[{'east':['2026-10-09','2026-10-10'],'west':['2026-10-08','2026-10-09']}]

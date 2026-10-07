@@ -48,9 +48,9 @@ begin
   'local_date',r.local_date,'account',r.account,'format',r.format,'state',r.state);
 end; $$;
 
-create function public.fixer_generated_gap_pending_20261007(p_tenants text[],p_limit integer)
-returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
-declare result jsonb; caller text:=coalesce(nullif(current_setting('role',true),'none'),session_user);
+create function public.fixer_generated_gap_pending_20261007(p_tenants text[],p_limit integer,p_local_windows jsonb)
+returns jsonb language plpgsql security definer set search_path=pg_catalog,public set timezone='UTC' as $$
+declare result jsonb; tenant text; dates jsonb; first_date date; second_date date; caller text:=coalesce(nullif(current_setting('role',true),'none'),session_user);
 begin
  if not pg_has_role(caller,'fixer_forward_media_owner_20261006','member')
   or pg_has_role(caller,'service_role','member') or pg_has_role(caller,'fixer_forward_media_attester_20261006','member') then
@@ -59,10 +59,33 @@ begin
   or exists(select 1 from unnest(p_tenants) t where t is null or t !~ '^[a-z0-9][a-z0-9_-]{0,127}$')
   or p_limit is null or p_limit not between 1 and 100 then
   raise exception 'bounded owner discovery required' using errcode='23514'; end if;
+ -- The trusted owner computes tomorrow/+2 in each gym's configured timezone.
+ -- Filter those exact dates BEFORE LIMIT. Expired pending/bound requests remain
+ -- intact for reconciliation, but cannot consume current discovery capacity.
+ if jsonb_typeof(p_local_windows) is distinct from 'object' then
+  raise exception 'exact local discovery windows required' using errcode='23514'; end if;
+ if (select count(*) from jsonb_object_keys(p_local_windows))<>cardinality(p_tenants)
+  or exists(select 1 from jsonb_object_keys(p_local_windows) k where not k=any(p_tenants)) then
+  raise exception 'exact local discovery windows required' using errcode='23514'; end if;
+ foreach tenant in array p_tenants loop
+  dates:=p_local_windows->tenant;
+  if jsonb_typeof(dates) is distinct from 'array' then
+   raise exception 'exact local discovery windows required' using errcode='23514'; end if;
+  if jsonb_array_length(dates)<>2 or jsonb_typeof(dates->0) is distinct from 'string'
+   or jsonb_typeof(dates->1) is distinct from 'string'
+   or (dates->>0 ~ '^\d{4}-\d{2}-\d{2}$') is distinct from true
+   or (dates->>1 ~ '^\d{4}-\d{2}-\d{2}$') is distinct from true then
+   raise exception 'exact local discovery windows required' using errcode='23514'; end if;
+  first_date:=(dates->>0)::date; second_date:=(dates->>1)::date;
+  -- A gym's local today can differ from UTC by one day. Even the trusted
+  -- owner cannot turn discovery into an unbounded historical replay.
+  if first_date not between current_date and current_date+2 or second_date<>first_date+1 then
+   raise exception 'bounded local discovery dates required' using errcode='23514'; end if;
+ end loop;
  select coalesce(jsonb_agg(to_jsonb(q) order by q.local_date,q.request_id),'[]'::jsonb) into result
  from (select * from public.fixer_generated_gap_request_20261007 r
   where r.gym_id=any(p_tenants) and r.state in ('pending','bound')
-   and r.local_date between current_date-1 and current_date+3
+   and (p_local_windows->r.gym_id) ? r.local_date::text
   order by r.local_date,r.request_id limit p_limit) q;
  return result;
 end; $$;
@@ -186,12 +209,12 @@ create trigger generated_gap_slot_guard before insert or update on public.conten
  for each row execute function public.fixer_generated_gap_slot_guard_20261007();
 
 revoke all on function public.fixer_generated_gap_dispatch_20261007(uuid,text,date,text,text),
- public.fixer_generated_gap_pending_20261007(text[],integer),
+ public.fixer_generated_gap_pending_20261007(text[],integer,jsonb),
  public.fixer_generated_gap_bind_20261007(uuid,uuid,uuid,text,text,text,text,text,text),
  public.fixer_generated_gap_record_20261007(uuid,uuid,boolean,text),
  public.fixer_generated_gap_slot_guard_20261007() from public,anon,authenticated,service_role,fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006;
 grant execute on function public.fixer_generated_gap_dispatch_20261007(uuid,text,date,text,text) to service_role;
-grant execute on function public.fixer_generated_gap_pending_20261007(text[],integer),
+grant execute on function public.fixer_generated_gap_pending_20261007(text[],integer,jsonb),
  public.fixer_generated_gap_bind_20261007(uuid,uuid,uuid,text,text,text,text,text,text),
  public.fixer_generated_gap_record_20261007(uuid,uuid,boolean,text) to fixer_forward_media_owner_20261006;
 commit;

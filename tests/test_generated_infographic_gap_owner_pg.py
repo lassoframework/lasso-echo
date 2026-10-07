@@ -60,6 +60,7 @@ def main():
    sql("insert into fixer_forward_media_claim_gate_20261006 values('gym',true),('other',true)")
    today=sql('select current_date')[0][0];day=today+timedelta(days=1)
    service=lane('service_role');conn=lane('generated_owner')
+   def windows(tenants,first=day):return {t:[first.isoformat(),(first+timedelta(days=1)).isoformat()] for t in tenants}
    def dispatch(gym='gym',date_=day,account='instagram',request=None):
     request=request or str(uuid.uuid4())
     result=service.execute('select fixer_generated_gap_dispatch_20261007(%s,%s,%s,%s,%s)',
@@ -77,12 +78,12 @@ def main():
    assert dispatch(request=q['request_id'])==q
    denied(lambda:dispatch(request=str(uuid.uuid4())),'identity conflict');service.rollback()
    denied(lambda:dispatch(date_=today+timedelta(days=10)),'bounded exact');service.rollback()
-   denied(lambda:service.execute('select fixer_generated_gap_pending_20261007(%s,10)',(['gym'],)),'permission denied');service.rollback()
+   denied(lambda:service.execute('select fixer_generated_gap_pending_20261007(%s,10,%s::jsonb)',(['gym'],json.dumps(windows(['gym'])))),'permission denied');service.rollback()
    denied(lambda:service.execute('insert into fixer_generated_gap_request_20261007(request_id,gym_id,local_date,account,format) values(%s,%s,%s,%s,%s)',(str(uuid.uuid4()),'other',day,'instagram','feed')),'permission denied');service.rollback()
    denied(lambda:bind(service,a),'permission denied');service.rollback()
    mixed=lane('mixed_owner');denied(lambda:bind(mixed,a),'isolated existing owner');mixed.rollback();mixed.close()
-   assert conn.execute('select fixer_generated_gap_pending_20261007(%s,10)',(['other'],)).fetchone()[0]==[];conn.rollback()
-   assert len(conn.execute('select fixer_generated_gap_pending_20261007(%s,10)',(['gym'],)).fetchone()[0])==1;conn.rollback()
+   assert conn.execute('select fixer_generated_gap_pending_20261007(%s,10,%s::jsonb)',(['other'],json.dumps(windows(['other'])))).fetchone()[0]==[];conn.rollback()
+   assert len(conn.execute('select fixer_generated_gap_pending_20261007(%s,10,%s::jsonb)',(['gym'],json.dumps(windows(['gym'])))).fetchone()[0])==1;conn.rollback()
    out=bind(conn,a);assert out['bound'] and not out['replayed']
    assert bind(conn,a)['replayed']
    assert sql('select count(*) from content_calendar')[0][0]==1
@@ -153,18 +154,36 @@ def main():
    # Exercise the actual idle-transaction owner RPC adapter and durable phase,
    # without any provider execution or publisher credential fallback.
    adapter=gap.GapOwnerTransport(persistence,prep.SQLiteGenerationJobs(root/'jobs.sqlite'))
-   discovered=adapter.pending(('photo-gym',),10)
+   discovered=adapter.pending(('photo-gym',),10,windows(['photo-gym']))
    assert len(discovered)==1 and discovered[0]['request_id']==photoq['request_id']
    palette=dict(evidence_ref=refs[-1])
    bound=adapter.bind(discovered[0],caption=refs[0],source_revision=refs[1],palette=palette,palette_revision=refs[2])
    assert bound['bound'] and adapter.phase(photoq['request_id'])=='bound'
    assert adapter.bind(discovered[0],caption=refs[0],source_revision=refs[1],palette=palette,palette_revision=refs[2])['replayed']
    adapter.record(discovered[0],bound['calendar_row_id'],dict(ok=False,reason='generated_astra_unavailable'))
+   # More expired requests than the batch cannot hide a fresh eligible date.
+   # Include a bound old job whose uncertain outcome must remain untouched.
+   expired=[dispatch(gym='expired-'+str(i),date_=today-timedelta(days=1)) for i in range(26)]
+   old_bound=bind(conn,args(expired[0]))
+   freshq=dispatch(gym='fresh-gym')
+   tenants=['expired-'+str(i) for i in range(26)]+['fresh-gym']
+   frozen_queue=sql("select request_id,state,calendar_row_id from fixer_generated_gap_request_20261007 where gym_id like 'expired-%' order by gym_id")
+   pending=adapter.pending(tenants,25,windows(tenants))
+   assert [r['request_id'] for r in pending]==[freshq['request_id']]
+   assert sql("select request_id,state,calendar_row_id from fixer_generated_gap_request_20261007 where gym_id like 'expired-%' order by gym_id")==frozen_queue
+   assert sql('select status from content_calendar where id=%s',(old_bound['calendar_row_id'],))[0][0]=='pending'
+   # An explicit local-tomorrow window may start on UTC today, but callers
+   # cannot enlarge it, omit gyms, or discover historical queue entries.
+   assert adapter.pending(('expired-0',),25,windows(['expired-0'],today))==[]
+   denied(lambda:conn.execute('select fixer_generated_gap_pending_20261007(%s,25,%s::jsonb)',
+          (tenants,json.dumps(windows(['fresh-gym'])))),'exact local');conn.rollback()
+   denied(lambda:conn.execute('select fixer_generated_gap_pending_20261007(%s,25,%s::jsonb)',
+          (['expired-0'],json.dumps(windows(['expired-0'],today-timedelta(days=1))))),'bounded local');conn.rollback()
    # Competing calendar writer cannot bypass an in-flight graph/slot bind.
    lock=lane('generated_owner');lock.execute('select pg_advisory_xact_lock(hashtextextended(%s,0))',('fixer_forward_graph_20261006',))
    denied(lambda:service.execute("insert into content_calendar(id,gym_id,post_date,account,format,status) values(%s,'free',%s,'instagram','feed','pending')",(str(uuid.uuid4()),day)),'authority busy');service.rollback();lock.rollback();lock.close()
    service.close();conn.close();admin.close()
-   print('PASS: PG17 queue-only dispatch, role isolation, bounded discovery, atomic/idempotent row bind, concurrency, exact refs, occupied/held slots, late-photo and sealed-history rollback, no coach marker, client approval, B reservation/completion and normal attester/publisher claim')
+   print('PASS: PG17 queue-only dispatch, role isolation, bounded gym-local discovery before limit, 26-expired starvation denial with bound-job preservation, atomic/idempotent row bind, concurrency, exact refs, occupied/held slots, late-photo and sealed-history rollback, no coach marker, client approval, B reservation/completion and normal attester/publisher claim')
   finally:
    subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 

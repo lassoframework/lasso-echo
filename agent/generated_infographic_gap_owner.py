@@ -34,9 +34,9 @@ class GapOwnerTransport:
                         ','.join(['%s'] * len(args)) + ')', args)
             return cur.fetchone()[0]
 
-    def pending(self, tenants, limit):
+    def pending(self, tenants, limit, local_windows):
         try:
-            result = self.rpc('pending', (list(tenants), limit))
+            result = self.rpc('pending', (list(tenants), limit, json.dumps(local_windows)))
             if not isinstance(result, list) or len(result) > limit:
                 raise runtime.RuntimeHold('generated_gap_discovery_unavailable')
             return result
@@ -138,7 +138,13 @@ def run_pending(*, persistence, jobs=None, transport=None, sources=None, account
         accounts = accounts or registry.get_account
         palette_loader = palette_loader or runtime.verified_palette
         row_runner = row_runner or runtime.run_calendar_row
-        requests = transport.pending(tenants, limit)
+        from .calendar_autopublish import _local_now
+        from datetime import timedelta
+        local_windows = {}
+        for base in tenants:
+            today = _local_now(now, config.posting_timezone_for(base)).date()
+            local_windows[base] = [(today+timedelta(days=i)).isoformat() for i in (1,2)]
+        requests = transport.pending(tenants, limit, local_windows)
         for request in requests:
             try:
                 base = request['gym_id']
@@ -147,10 +153,7 @@ def run_pending(*, persistence, jobs=None, transport=None, sources=None, account
                         or request.get('format') != 'feed'
                         or str(uuid.UUID(request['request_id'])) != request['request_id']):
                     raise runtime.RuntimeHold('generated_gap_request_invalid')
-                from .calendar_autopublish import _local_now
-                from datetime import timedelta
-                today = _local_now(now, config.posting_timezone_for(base)).date()
-                if request['local_date'] not in {(today+timedelta(days=i)).isoformat() for i in (1,2)}:
+                if request['local_date'] not in local_windows[base]:
                     raise runtime.RuntimeHold('generated_gap_date_expired')
                 account = accounts(base + ('_ig' if platform == 'instagram' else '_fb'))
                 runtime._account_binding(base, account)
