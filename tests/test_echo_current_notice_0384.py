@@ -268,6 +268,93 @@ def test_human_tap_cannot_close_unreserved_website_ticket():
     assert bus.current["status"] == "verification"
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_human_fix_resolve_refuses_disabled_or_rejected_current_notice(monkeypatch, enabled):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", str(enabled))
+    ticket = NoticeBus().current
+    ticket.update(status="merged", classification="code_fix", slack_channel_id="G123",
+                  fix_pr_url="https://github.com/example/echo/pull/317",
+                  verification_after={"fixer": {"request_key": "current-request"}})
+    before = deepcopy(ticket)
+    bus = Bus(url="https://example.test", service_key="test")
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(bus, "recent_messages", lambda *_a, **_kw: [])
+    monkeypatch.setattr(bus, "begin_current_notice", lambda *_a, **_kw: None)
+    monkeypatch.setattr(bus, "_insert", lambda *_a: pytest.fail("refusal wrote a notice"))
+    monkeypatch.setattr(bus, "set_ticket", lambda *_a, **_kw: pytest.fail("refusal changed ticket"))
+    monkeypatch.setattr(outbox, "_recipient_armed", lambda *_a: True)
+    monkeypatch.setattr(outbox, "_verified_fix_notice", lambda *_a, **_kw: True)
+    monkeypatch.setattr(outbox, "_current_fixer_request_key", lambda *_a: "current-request")
+    logs = []
+
+    assert outbox.resolve_and_notify(
+        bus, TICKET_ID, approved_by="U_BLAKE", identity=SimpleNamespace(name="echo"),
+        log=logs.append) is False
+    assert ticket == before
+    assert any("resolve refused" in entry for entry in logs)
+
+
+@pytest.mark.parametrize("failed_scan", ["route", "legacy", None])
+def test_uncertain_outreach_scans_fail_independently(monkeypatch, failed_scan):
+    legacy = {"id": "legacy", "ticket_id": TICKET_ID,
+              "attachments": {"outreach_delivery_uncertain": True}}
+    pending = {"id": "pending", "ticket_id": TICKET_ID,
+               "attachments": {"fixer_route_uncertain": True}}
+    bus = Bus(url="https://example.test", service_key="test")
+    alerts, marked, logs = [], [], []
+
+    def legacy_scan(*_a, **_kw):
+        if failed_scan == "legacy":
+            raise BusError(503, "legacy scan unavailable")
+        return [deepcopy(legacy)]
+
+    def route_scan(identity, marker, **_kw):
+        assert identity == "echo" and marker == "fixer_route_uncertain"
+        if failed_scan == "route":
+            raise BusError(400, "invalid FIXER hold marker")
+        return [deepcopy(pending)]
+
+    monkeypatch.setattr(bus, "outbox", legacy_scan)
+    monkeypatch.setattr(bus, "pending_fixer_holds", route_scan)
+    monkeypatch.setattr(bus, "ticket", lambda _tid: {"bot_identity": "echo"})
+    monkeypatch.setattr(bus, "uncertain_outreach_alert_exists", lambda *_a: False)
+    monkeypatch.setattr(bus, "record_outbound", lambda **kw: alerts.append(kw))
+    monkeypatch.setattr(bus, "mark_uncertain_outreach_alerted", marked.append)
+    outbox._report_uncertain_outreach(bus, SimpleNamespace(name="echo"), logs.append)
+
+    expected = {"route": {"legacy"}, "legacy": {"pending"},
+                None: {"legacy", "pending"}}[failed_scan]
+    assert {row["meta"]["outreach_uncertain_row_id"] for row in alerts} == expected
+    assert marked == (["legacy"] if failed_scan != "legacy" else [])
+    assert legacy["attachments"] == {"outreach_delivery_uncertain": True}
+    assert pending["attachments"] == {"fixer_route_uncertain": True}
+    assert all(row["kind"] == "escalation" and row["meta"]["identity"] == "echo"
+               for row in alerts)
+    if failed_scan:
+        assert any("scan failed" in entry for entry in logs)
+
+
+@pytest.mark.parametrize("identity", ["echo", "scout"])
+def test_route_uncertain_marker_query_preserves_identity_and_held_bounds(monkeypatch, identity):
+    bus = Bus(url="https://example.test", service_key="test")
+    calls = []
+    monkeypatch.setattr(bus, "_get", lambda table, params: calls.append((table, params)) or [])
+    after = {"created_at": "2026-10-07T00:00:00+00:00", "id": TICKET_ID}
+    assert bus.pending_fixer_holds(identity, "fixer_route_uncertain", limit=20, after=after) == []
+    assert len(calls) == 1
+    table, params = calls[0]
+    assert table == "support_messages"
+    assert params["direction"] == "eq.outbound"
+    assert params["delivery_status"] == "eq.held"
+    assert params["attachments->>identity"] == f"eq.{identity}"
+    assert params["attachments->>fixer_route_uncertain"] == "eq.true"
+    assert params["limit"] == "20" and params["order"] == "created_at.asc,id.asc"
+    assert after["id"] in params["or"] and after["created_at"] in params["or"]
+    with pytest.raises(BusError, match="invalid FIXER hold marker"):
+        bus.pending_fixer_holds(identity, "unknown_marker", limit=20)
+    assert len(calls) == 1
+
+
 def test_held_exact_readback_binds_without_reposting():
     bus = NoticeBus()
     _snapshot, _result, posts = _send(bus)

@@ -609,19 +609,9 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                     # Keep this request open for readback reconciliation.
                     if result.notice_id:
                         return  # outbox reports the held row by exact notice ID
-                    try:
-                        bus.record_outbound(
-                            ticket_id=tid, author_type="system",
-                            body=(f"Echo completion for ticket {tid} needs operator "
-                                  f"review: {result.reason}. The request remains open; "
-                                  "check exact Slack delivery before any retry."),
-                            delivery_status="ready", kind=_a.KIND_ESCALATION,
-                            meta={"identity": identity_name,
-                                  "current_notice_blocked": True,
-                                  "notice_message_id": result.notice_id or None})
-                    except Exception:  # noqa: BLE001 - leave the current attempt intact
-                        pass
-                    return
+                    # No reserved notice means no send attempt exists to reconcile.
+                    # Escalate through the current-ticket CAS below so the FIXER
+                    # polls this request instead of stranding it in verification.
                 _escalate_unresolved(bus, ticket, reason=f"answer_undelivered_{result.reason}",
                                      identity_name=identity_name, log=log, who=who,
                                      outreach=None)

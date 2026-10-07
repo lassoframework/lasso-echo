@@ -75,6 +75,7 @@ import json
 import re
 
 from . import adapter as _a
+from .bus import BusError
 from .. import config
 
 # Surfaces where a reply goes TOP LEVEL rather than in a thread: DMs and group DMs (people do
@@ -1258,12 +1259,19 @@ def _report_uncertain_outreach(bus, identity, log):
     """Persist a staff card for each held outreach whose Slack outcome is uncertain."""
     try:
         rows = bus.outbox("held", limit=200, identity=identity.name)
+    except Exception as exc:  # noqa: BLE001 - independent scans retry next run
+        log(f"[slack-convo/outbox] uncertain outreach held scan failed: "
+            f"{type(exc).__name__}")
+        rows = []
+    try:
         pending_route = _pending_fixer_hold_page(
             bus, identity, "fixer_route_uncertain",
             scan="pending_route_alert", limit=20)
-        rows = list({row["id"]: row for row in [*rows, *pending_route]}.values())
-    except Exception:  # noqa: BLE001 - retained held rows are retried next run
-        return
+    except Exception as exc:  # noqa: BLE001 - legacy outreach must still alert
+        log(f"[slack-convo/outbox] uncertain outreach route scan failed: "
+            f"{type(exc).__name__}")
+        pending_route = []
+    rows = list({row["id"]: row for row in [*rows, *pending_route]}.values())
     for row in rows:
         att = row.get("attachments") or {}
         route_uncertain = att.get("fixer_route_uncertain") is True
@@ -2797,7 +2805,8 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     if (callable(getattr(bus, "begin_current_notice", None))
             and ticket.get("product") == "echo"
             and ticket.get("source") == "website_tab"
-            and (not customer_fix or ticket.get("escalated") is True
+            and (not config.slack_convo_echo_current_notice_enabled()
+                 or not customer_fix or ticket.get("escalated") is True
                  or ticket.get("hold_tier") is not None)):
         # 0384 reserves only current unheld verification/merged notices. A
         # generic or held tap cannot borrow that reservation; 0383 owns the
@@ -2877,17 +2886,22 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     # of the surfaces gate 7 knows, so the notice was posted as a THREAD REPLY inside a DM --
     # a place people do not look. The real surface is on the ticket's own inbound rows.
     surface = _surface_of(bus, ticket_id) or (ticket.get("source") or "")
-    bus.record_outbound(
-        ticket_id=ticket_id, author_type=getattr(identity, "name", "system"),
-        body=RESOLVED_NOTICE, delivery_status="ready", kind=_a.KIND_STATUS,
-        # Audit 5, finding 3: this hardcoded "client" while the gate above read the ticket's
-        # own identity_kind, so a staff ticket with STAFF_REPLY on and CLIENT_REPLY off
-        # passed the gate and then held the row -- the exact lie the gate was added to close.
-        meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
-              "surface": surface, "resolved_by": approved_by, "resolve_notice": True,
-              **({"fixer": True, "request_key": current_key,
-                  "request_version": request_version,
-                  "pr_url": ticket.get("fix_pr_url")} if customer_fix else {})})
+    try:
+        bus.record_outbound(
+            ticket_id=ticket_id, author_type=getattr(identity, "name", "system"),
+            body=RESOLVED_NOTICE, delivery_status="ready", kind=_a.KIND_STATUS,
+            # Match the recipient checked by the trust ladder above.
+            meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
+                  "surface": surface, "resolved_by": approved_by, "resolve_notice": True,
+                  **({"fixer": True, "request_key": current_key,
+                      "request_version": request_version,
+                      "pr_url": ticket.get("fix_pr_url")} if customer_fix else {})})
+    except BusError as exc:
+        # The flag or request can change after the precheck; a rejected
+        # reservation must not propagate through the Slack action or stamp approval.
+        log(f"[slack-convo/outbox] resolve refused: notice write for ticket "
+            f"{ticket_id} failed: {type(exc).__name__}")
+        return False
     # MINOR 5 (audit 7): the ticket used to be stamped resolved HERE, before the notice had
     # been delivered -- so a post failure left a ticket permanently asserting it was resolved
     # over a row marked failed. Same rule as an answer (V-M4): the ticket closes when the

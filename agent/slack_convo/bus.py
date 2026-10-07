@@ -832,6 +832,7 @@ class Bus:
         starving delivery reconciliation while keeping each sweep bounded.
         """
         if marker not in {"fixer_slack_delivery_uncertain",
+                          "fixer_route_uncertain",
                           "fixer_slack_route_missing",
                           "fixer_slack_config_missing"}:
             raise BusError(400, "invalid FIXER hold marker")

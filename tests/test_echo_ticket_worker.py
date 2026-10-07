@@ -796,6 +796,96 @@ def test_delivered_answer_stamps_resolve_notice_with_the_current_request_version
     assert marks[0]["meta_update"] == {"resolve_notice": True, "request_version": 5}
 
 
+@pytest.mark.parametrize("reason", ["current_notice_disabled",
+                                  "current_notice_preflight_unavailable",
+                                  "current_notice_reservation_refused"])
+@pytest.mark.parametrize("notice_id", ["", "reserved-notice"])
+def test_intake_completion_refusal_holds_only_without_reserved_notice(monkeypatch, reason, notice_id):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=5)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    monkeypatch.setattr(W._out, "initiate", lambda *_a, **_kw: W._out.OutreachResult(
+        opened=False, reason=reason, notice_id=notice_id))
+
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda *_a: {"social_status": "connected"},
+                  llm=lambda *_a: "Yes, your Instagram is connected right now.",
+                  mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+
+    current = bus.tickets["t-1"]
+    assert current["request_version"] == 5
+    assert current["raw_text"] == "is my instagram connected?"
+    assert log["opened"] == [] and log["posted"] == []
+    assert current["status"] == ("verification" if notice_id else "hold")
+    assert current["classification"] == (C.QUESTION if notice_id else None)
+    assert current["escalated"] is (not bool(notice_id))
+    assert len(bus.outbound) == (0 if notice_id else 1)
+    if not notice_id:
+        assert bus.outbound[0]["kind"] == A.KIND_ESCALATION
+        assert reason in bus.outbound[0]["body"]
+        assert not bus.outbound[0]["attachments"].get("resolve_notice")
+
+
+def test_intake_completion_refusal_does_not_hold_a_newer_request(monkeypatch):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=5)])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+
+    def refused(*_a, **_kw):
+        bus.tickets["t-1"].update(request_version=6, raw_text="A newer request",
+                                  status="new", classification=None)
+        return W._out.OutreachResult(opened=False, reason="current_notice_reservation_refused")
+
+    monkeypatch.setattr(W._out, "initiate", refused)
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda *_a: {"social_status": "connected"},
+                  llm=lambda *_a: "Yes, your Instagram is connected right now.",
+                  mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    current = bus.tickets["t-1"]
+    assert current["request_version"] == 6 and current["raw_text"] == "A newer request"
+    assert current["status"] == "new" and current["classification"] is None
+    assert current["escalated"] is False
+    assert bus.outbound == [] and log["posted"] == []
+
+
+@pytest.mark.parametrize("reason", ["current_notice_disabled",
+                                  "current_notice_preflight_unavailable",
+                                  "current_notice_reservation_refused"])
+def test_real_outreach_pre_send_refusal_reaches_intake_hold_queue(monkeypatch, reason):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED",
+                       str(reason != "current_notice_disabled"))
+    monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO")
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=5)])
+    reservations = []
+    monkeypatch.setattr(bus, "begin_current_notice",
+                        lambda *_a, **_kw: reservations.append("refused"), raising=False)
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    result = W.intake_pass(
+        bus, open_group_dm=open_dm, post_first_message=post, write_hold_notice=notice,
+        fetch_state=lambda *_a: {"social_status": "connected"},
+        llm=lambda *_a: "Yes, your Instagram is connected right now.",
+        mark_message=bus.mark_message, stamp_ticket=bus.stamp_ticket,
+        claim_message=bus.claim_message, member_check=lambda *_a: True,
+        readback=(None if reason == "current_notice_preflight_unavailable" else
+                  lambda *_a: pytest.fail("no reserved message to read back")),
+        **_client_deps())
+
+    assert result == {"processed": 1}
+    current = bus.tickets["t-1"]
+    assert current["status"] == "hold" and current["escalated"] is True
+    assert current["classification"] is None and current["request_version"] == 5
+    assert current["raw_text"] == "is my instagram connected?"
+    assert reservations == (["refused"] if reason == "current_notice_reservation_refused" else [])
+    assert len(bus.outbound) == 1 and bus.outbound[0]["kind"] == A.KIND_ESCALATION
+    assert reason in bus.outbound[0]["body"] and log["posted"] == []
+    assert len(log["opened"]) == (0 if reason == "current_notice_disabled" else 1)
+
+
 def test_delivered_answer_without_a_request_version_refuses_to_send():
     """A request without a trustworthy version cannot be closed safely."""
     bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=None)])
