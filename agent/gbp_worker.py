@@ -18,6 +18,7 @@ thin wrappers over these pure functions.
 
 import json
 import uuid
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 from . import config, gbp
@@ -163,6 +164,63 @@ def _media_reuse_hold(row, *, now=None, history_store=None, media_store=None):
                                media_store=media_store)
 
 
+def _reauthorize_gbp_send(store, row, connection, token, snapshot, payload=None):
+    """Recheck current authority immediately before this single provider mutation.
+
+    The snapshot pins the exact local arguments from the initial check, including
+    nested event/offer fields and the resolved native account. Reauthorization
+    checks the persisted token, creative and attestation revision again. Refusals
+    occur outside the provider exception handler: no create has been attempted.
+    """
+    from . import forward_media_guard as guard
+    from .forward_media_publish import hold_result
+    if snapshot is None and not guard.enabled():
+        return None
+    def changed():
+        return (snapshot is None or row != snapshot[0] or
+                connection != snapshot[1] or payload != snapshot[2])
+    def drift_hold():
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": "outgoing GBP arguments changed before create",
+                "held": "forward_media_verification", "mode": ""}
+    if changed():
+        return drift_hold()
+    # Gallery uploads carry only the native account, so a row's valid media
+    # claim alone cannot authorize a caller-supplied destination. Re-read the
+    # same gym's connected destination before the final token/revision check.
+    try:
+        bound_row, bound_connection = snapshot[:2]
+        location = bound_row.get("gbp_location_id")
+        gym = bound_row.get("gym_id")
+        if (store is None or bound_row.get("account") != "googlebusiness"
+                or not gym or not location
+                or bound_connection.get("gbp_location_id") != location):
+            raise ValueError("unbound GBP destination")
+        lookup = getattr(store, "connections_for", None)
+        if not callable(lookup):
+            from .gbp_store import GbpStore
+            lookup = GbpStore(base=getattr(store, "_s", store)).connections_for
+        connections = lookup(gym)
+        matches = [c for c in connections
+                   if c.get("gbp_location_id") == location]
+        if (len(matches) != 1 or matches[0].get("status") != "connected"
+                or matches[0].get("portal_gym_key") != gym
+                or not bound_connection.get("zernio_account_id")
+                or matches[0].get("zernio_account_id") !=
+                bound_connection.get("zernio_account_id")):
+            raise ValueError("changed GBP destination")
+    except Exception:
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": "current same-gym GBP destination unavailable or changed",
+                "held": "forward_media_verification", "mode": ""}
+    hold = hold_result(store, deepcopy(snapshot[0]), token)
+    if hold:
+        return hold
+    # Reject even local mutation during the authority read; never send newer
+    # arguments using authority obtained for the pinned arguments.
+    return drift_hold() if changed() else None
+
+
 def publish_gbp_row(row, connection, *, client, draft=True, now=None,
                     history_store=None, media_store=None, idempotency_key=None,
                     authority_store=None):
@@ -239,6 +297,8 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": "outgoing GBP payload media differs from row",
                 "held": "forward_media_verification", "mode": ""}
+    send_snapshot = (deepcopy((row, connection, payload))
+                     if _fmg.enabled() else None)
     media_hold = hold_result(authority_store, row, idempotency_key)
     if media_hold:
         return media_hold
@@ -268,6 +328,12 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
                 "reject_reason": "", "mode": "draft" if draft else "live",
                 "dedup": True}
 
+    media_hold = _reauthorize_gbp_send(authority_store, row, connection,
+                                     idempotency_key, send_snapshot, payload)
+    if media_hold:
+        return media_hold
+    if send_snapshot is not None:
+        payload = send_snapshot[2]
     try:
         # The persisted claim token (live lane only) is the logical-attempt
         # Idempotency-Key; without a verified token no key is sent. Legacy fake
@@ -426,12 +492,21 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": hold, "held": "media_reuse", "mode": ""}
     from .forward_media_publish import hold_result
+    from . import forward_media_guard as _fmg
+    send_snapshot = (deepcopy((row, connection, None))
+                     if _fmg.enabled() else None)
     media_hold = hold_result(authority_store, row, idempotency_key)
     if media_hold:
         return media_hold
+    media_hold = _reauthorize_gbp_send(authority_store, row, connection,
+                                     idempotency_key, send_snapshot)
+    if media_hold:
+        return media_hold
+    send_row, send_connection = (send_snapshot[:2] if send_snapshot is not None
+                                 else (row, connection))
     try:
-        resp = client.create_gmb_media(connection["zernio_account_id"],
-                                       row["image_url"])
+        resp = client.create_gmb_media(send_connection["zernio_account_id"],
+                                       send_row["image_url"])
     except Exception as e:  # noqa: BLE001 - an error here is NOT always the outcome
         # CARRY THE MESSAGE, not just the class (2026-09-03). This recorded only
         # type(e).__name__, so the live failure on crossfitnine7f7dadc read "photo

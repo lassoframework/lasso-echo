@@ -1516,8 +1516,9 @@ def test_forward_media_authorized_ambiguous_send_retains_lease(monkeypatch):
     from agent import forward_media_publish as bridge
     monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
     monkeypatch.setattr(bridge, "authorize", lambda *a: True)
-    row = dict(_row(), id="r1", gym_id="lasso")
-    store = _TokenStore([row], {"lasso": [_c()]})
+    row = dict(_row(), id="r1", gym_id="lasso", account="googlebusiness",
+               gbp_location_id="locations/1")
+    store = _TokenStore([row], {"lasso": [dict(_c(), portal_gym_key="lasso")]})
     client = _KeyClient(exc=TimeoutError("response lost"))
     out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
     assert out["held"] == 1 and client.calls == 1
