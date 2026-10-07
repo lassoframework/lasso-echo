@@ -51,6 +51,7 @@ def _unsent_suppressed_current_notice(row, identity):
     att = (row or {}).get("attachments") or {}
     return bool(row and row.get("delivery_status") == "suppressed"
                 and row.get("direction") == "outbound"
+                and row.get("author_type") == identity
                 and _UUID.fullmatch(str(row.get("id") or ""))
                 and att.get("identity") == identity
                 and att.get("fixer") is True
@@ -60,6 +61,39 @@ def _unsent_suppressed_current_notice(row, identity):
                 and att.get("delivery_readback_verified") is not True
                 and att.get("fixer_route_uncertain") is not True
                 and att.get("fixer_slack_delivery_uncertain") is not True)
+
+
+def _suppressed_notice_alert_body(notice):
+    return (f"FIXER notice {notice['id']} on ticket {notice['ticket_id']} was canceled "
+            "before Slack delivery. Review the ticket before opening another notice.")
+
+
+def _verified_suppressed_notice_alert(alert, notice, identity):
+    att = (alert or {}).get("attachments") or {}
+    if (not _unsent_suppressed_current_notice(notice, identity)
+            or not alert or alert.get("ticket_id") != notice.get("ticket_id")
+            or alert.get("direction") != "outbound" or alert.get("author_type") != "system"
+            or att.get("identity") != identity or att.get("kind") != _a_kind_escalation()
+            or att.get("suppressed_message_id") != notice.get("id")
+            or att.get("fixer") is True or att.get("fixer_current_attempt_token")
+            or att.get("fixer_route_pending") is True):
+        return False
+    mid, tid = notice["id"], notice["ticket_id"]
+    if alert.get("id") == _suppressed_current_notice_alert_id(mid):
+        return (att.get("fixer_suppressed_notice_alert") is True
+                and alert.get("body") == _suppressed_notice_alert_body(notice))
+    legacy_bodies = {
+        (f"FIXER first-contact notice {mid} on ticket {tid} was canceled before Slack delivery. "
+         "Review the ticket before opening another notice."),
+        (f"FIXER notice {mid} on ticket {tid} was suppressed after a pre-send claim expired. "
+         "Review the ticket before a new customer notice."),
+    }
+    reason = (notice.get("attachments") or {}).get("suppressed_why")
+    if isinstance(reason, str) and reason:
+        legacy_bodies.add(f"SUPPRESSED reply on ticket {tid} ({identity}): {reason}. "
+                          "Nothing was posted; a person should look.")
+    return bool(_UUID.fullmatch(str(alert.get("id") or ""))
+                and alert.get("body") in legacy_bodies)
 
 
 def _a_kind_escalation():
@@ -930,20 +964,23 @@ class Bus:
                 snapshot, separators=(",", ":"), sort_keys=True),
         }, {"attachments": att})
 
-    def suppress_unattempted_current_notice(self, message_id, reason):
-        """Terminally park a claimed notice with no durable Slack POST boundary."""
+    def suppress_unattempted_current_notice(self, message_id, reason, *,
+                                            expected_identity=None, expected_token=None):
+        """Terminally park an exact ready/claimed notice before durable Slack intent."""
         row = self.message(message_id)
         raw_att = (row or {}).get("attachments")
         att = dict(raw_att or {})
-        if (not row or row.get("delivery_status") != "posting"
+        if (not row or row.get("delivery_status") not in {"ready", "posting"}
                 or not att.get("fixer_current_attempt_token")
+                or expected_identity is not None and att.get("identity") != expected_identity
+                or expected_token is not None and att.get("fixer_current_attempt_token") != expected_token
                 or att.get("fixer_slack_delivery_intent") is not None
                 or row.get("slack_ts") or row.get("slack_event_id")
                 or att.get("delivery_readback_verified") is True):
             return None
         next_att = {**att, "suppressed_why": str(reason)[:300]}
         return self._patch(_MESSAGES, {
-            "id": f"eq.{message_id}", "delivery_status": "eq.posting",
+            "id": f"eq.{message_id}", "delivery_status": f"eq.{row['delivery_status']}",
             "slack_ts": "is.null", "slack_event_id": "is.null",
             "attachments": ("is.null" if raw_att is None else
                             "eq." + json.dumps(att, separators=(",", ":"),
@@ -984,20 +1021,13 @@ class Bus:
             return None
         ticket_id = notice["ticket_id"]
         alert_id = _suppressed_current_notice_alert_id(message_id)
-        body = (f"FIXER notice {message_id} on ticket {ticket_id} was canceled "
-                "before Slack delivery. Review the ticket before opening another notice.")
+        body = _suppressed_notice_alert_body(notice)
         meta = {"identity": identity, "suppressed_message_id": message_id,
                 "fixer_suppressed_notice_alert": True}
 
         def exact_alert(row):
-            att = (row or {}).get("attachments") or {}
             return bool(row and row.get("id") == alert_id
-                        and row.get("ticket_id") == ticket_id
-                        and row.get("author_type") == "system"
-                        and row.get("direction") == "outbound"
-                        and row.get("body") == body
-                        and att.get("kind") == _a_kind_escalation()
-                        and all(att.get(k) == v for k, v in meta.items()))
+                        and _verified_suppressed_notice_alert(row, notice, identity))
 
         existing = self.message(alert_id)
         if existing:
@@ -1006,14 +1036,6 @@ class Bus:
             return existing
         # Recognize staff rows emitted before stable alert IDs were introduced.
         # An already queued or posted legacy escalation must not be duplicated.
-        legacy_bodies = {
-            (f"FIXER first-contact notice {message_id} on ticket {ticket_id} "
-             "was canceled before Slack delivery. "
-             "Review the ticket before opening another notice."),
-            (f"FIXER notice {message_id} on ticket {ticket_id} was suppressed "
-             "after a pre-send claim expired. Review the ticket "
-             "before a new customer notice."),
-        }
         legacy = self._get(_MESSAGES, {
             "ticket_id": f"eq.{ticket_id}", "direction": "eq.outbound",
             "author_type": "eq.system", "attachments->>kind": "eq.escalation",
@@ -1022,7 +1044,7 @@ class Bus:
             "select": "*", "order": "created_at.asc,id.asc", "limit": "20",
         })
         for row in legacy:
-            if row.get("body") in legacy_bodies:
+            if _verified_suppressed_notice_alert(row, notice, identity):
                 return row
         try:
             created = self.record_outbound(
@@ -1040,6 +1062,21 @@ class Bus:
             if exact_alert(existing):
                 return existing
             raise
+
+    def verified_suppressed_current_notice_alert(self, alert, ticket, identity):
+        """An informational internal alert may retain its original dispatcher.
+
+        Ticket ownership can change after suppression. Only freshly verified
+        source-linked system escalations may cross that identity fence; this
+        grants no customer delivery, action button or ticket state transition.
+        """
+        if not ticket or (alert or {}).get("ticket_id") != ticket.get("id"):
+            return False
+        mid = ((alert or {}).get("attachments") or {}).get("suppressed_message_id")
+        if not _UUID.fullmatch(str(mid or "")):
+            return False
+        notice = self.message(mid)
+        return _verified_suppressed_notice_alert(alert, notice, identity)
 
     def suppressed_unattempted_current_notices(self, identity, *, limit=20, after=None):
         """Bounded keyset page; unrelated suppressed rows cannot starve alerts."""

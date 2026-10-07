@@ -1835,6 +1835,27 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
 
 def _suppress(bus, row, ticket, identity, why, log, summary, *, escalate=True):
     log(f"[slack-convo/outbox] SUPPRESSED row {row['id']}: {why}")
+    att = row.get("attachments") or {}
+    if att.get("fixer_current_attempt_token"):
+        # A designated notice may only terminate through the exact unsent CAS.
+        # Never let a generic failure handler overwrite its immutable terminal
+        # state or mint a random alert after the source has been suppressed.
+        try:
+            if att.get("identity") != identity.name:
+                summary["skipped"] = int(summary.get("skipped") or 0) + 1
+                return
+            canceled = bus.suppress_unattempted_current_notice(
+                row["id"], why, expected_identity=identity.name,
+                expected_token=att.get("fixer_current_attempt_token"))
+            if not canceled or canceled.get("delivery_status") != "suppressed":
+                summary["skipped"] = int(summary.get("skipped") or 0) + 1
+                return
+            summary["suppressed"] += 1
+            bus.ensure_suppressed_current_notice_alert(row["id"], identity.name)
+        except Exception as exc:  # noqa: BLE001 - terminal source scan retries staff INSERT
+            log(f"[slack-convo/outbox] designated suppression/alert failed "
+                f"row={row['id']}: {type(exc).__name__}")
+        return
     bus.mark_message(row["id"], "suppressed", meta_update={"suppressed_why": why})
     summary["suppressed"] += 1
     if escalate and ticket:
@@ -1947,7 +1968,22 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         and row_ident == identity.name
         and (ticket.get("product"), identity.name) in {
             ("echo", "echo"), ("portal", "scout")})
-    if (ticket.get("bot_identity") or "") != identity.name and not portal_provenance_alert:
+    verifier = getattr(bus, "verified_suppressed_current_notice_alert", None)
+    suppressed_notice_alert = False
+    if (kind == _a.KIND_ESCALATION and row.get("author_type") == "system"
+            and att.get("suppressed_message_id") and callable(verifier)):
+        try:
+            suppressed_notice_alert = verifier(row, ticket, identity.name)
+        except Exception as exc:  # noqa: BLE001 - preserve ready alert on transient source read
+            log(f"[slack-convo/outbox] suppressed notice alert verification deferred "
+                f"row={row['id']}: {type(exc).__name__}")
+            summary["skipped"] += 1
+            return
+    if att.get("fixer_suppressed_notice_alert") is True and not suppressed_notice_alert:
+        summary["skipped"] += 1
+        return
+    if ((ticket.get("bot_identity") or "") != identity.name
+            and not portal_provenance_alert and not suppressed_notice_alert):
         if att.get("portal_progress_status") is True and row_ident == identity.name:
             _suppress(bus, row, ticket, identity,
                       "portal progress status bot identity changed before delivery",
@@ -2006,6 +2042,21 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         if not _claim(bus, row, log):
             summary["skipped"] += 1
             return
+        if suppressed_notice_alert:
+            # Recheck the exact persisted alert/source pair after claim. This
+            # bypass sends only plain internal text, never the old ticket's
+            # customer route or resolve/release action buttons.
+            try:
+                current_alert = bus.message(row["id"])
+                current_ticket = bus.ticket(row["ticket_id"])
+                verified = verifier(current_alert, current_ticket, identity.name)
+            except Exception as exc:  # noqa: BLE001 - pre-POST staff claim remains recoverable
+                log(f"[slack-convo/outbox] claimed suppressed alert verification deferred "
+                    f"row={row['id']}: {type(exc).__name__}")
+                verified = False
+            if not verified:
+                summary["skipped"] += 1
+                return
         if held_reconcile:
             # The ready row may have waited in the outbox while a requester replied
             # or an operator resolved/advanced the ticket. Recheck after the claim,
@@ -2020,7 +2071,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 return
         if kind == _a.KIND_HOLD_NOTICE:
             blocks = hold_notice_blocks(row)
-        elif kind == _a.KIND_ESCALATION and not portal_provenance_alert:
+        elif kind == _a.KIND_ESCALATION and not portal_provenance_alert and not suppressed_notice_alert:
             blocks = escalation_blocks(row, ticket)
         else:
             blocks = None

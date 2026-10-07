@@ -709,7 +709,8 @@ def _alert_store(monkeypatch, *, initial=None, fail_alert_inserts=0,
     def patch(_table, match, fields):
         with lock:
             row = rows.get(match["id"][3:])
-            if not row or match.get("delivery_status") != f"eq.{row['delivery_status']}":
+            if not row or ("delivery_status" in match
+                           and match["delivery_status"] != f"eq.{row['delivery_status']}"):
                 return None
             if match.get("attachments") and json.loads(match["attachments"][3:]) != row["attachments"]:
                 return None
@@ -809,7 +810,7 @@ def test_concurrent_suppressed_notice_reconcilers_insert_one_stable_alert(monkey
         results = list(pool.map(lambda _n: bus.ensure_suppressed_current_notice_alert(
             notice["id"], "echo"), range(2)))
     assert all(r["id"] == alert_id for r in results)
-    assert attempts == [alert_id, alert_id]
+    assert 1 <= len(attempts) <= 2 and set(attempts) == {alert_id}
     assert len(rows) == 2
     assert rows[notice["id"]] == notice
 
@@ -884,3 +885,200 @@ def test_suppressed_notice_scan_is_scoped_bounded_and_advances_past_existing_ale
         outbox._report_suppressed_current_notices(paged, SimpleNamespace(name="echo"), lambda _msg: None)
         assert len(paged.seen) == expected_count
     assert paged.seen.count("0") == 2 and paged.seen.count("44") == 1
+
+
+@pytest.mark.parametrize("initial_status", ["ready", "posting"])
+@pytest.mark.parametrize("insert_outcome", ["failed", "lost_posted_response"])
+def test_generic_suppression_uses_terminal_cas_and_durable_alert(
+        monkeypatch, initial_status, insert_outcome):
+    notice = _reserved_ready_row(datetime.now(timezone.utc))
+    notice["attachments"].pop("fixer_route_pending")
+    notice["delivery_status"] = initial_status
+    bus, rows, attempts = _alert_store(
+        monkeypatch, initial=notice, fail_alert_inserts=int(insert_outcome == "failed"),
+        lost_response_status="posted" if insert_outcome == "lost_posted_response" else None)
+    summary = {"suppressed": 0, "skipped": 0}
+    outbox._suppress(bus, notice, {"id": TICKET_ID}, SimpleNamespace(name="echo"),
+                     "FIXER requester identity changed before Slack delivery",
+                     lambda _msg: None, summary)
+    terminal = deepcopy(rows[notice["id"]])
+    assert terminal["delivery_status"] == "suppressed" and summary["suppressed"] == 1
+    # The same stale dispatcher cannot rewrite terminal state or create another alert.
+    outbox._suppress(bus, notice, {"id": TICKET_ID}, SimpleNamespace(name="echo"),
+                     "another suppression", lambda _msg: None, summary)
+    outbox._report_suppressed_current_notices(bus, SimpleNamespace(name="echo"), lambda _msg: None)
+    alert_id = _suppressed_current_notice_alert_id(notice["id"])
+    assert rows[notice["id"]] == terminal
+    assert set(attempts) == {alert_id} and len(rows) == 2
+    assert rows[alert_id]["delivery_status"] == ("ready" if insert_outcome == "failed" else "posted")
+
+
+@pytest.mark.parametrize("conflict", ["intent", "receipt", "token", "owner"])
+def test_generic_suppression_refuses_changed_or_attempted_source(monkeypatch, conflict):
+    notice = _reserved_ready_row(datetime.now(timezone.utc))
+    bus, rows, attempts = _alert_store(monkeypatch, initial=notice)
+    current = rows[notice["id"]]
+    if conflict == "intent":
+        current["attachments"]["fixer_slack_delivery_intent"] = {"channel": "G_CLIENT"}
+    elif conflict == "receipt":
+        current["slack_ts"] = "1.2"
+    elif conflict == "token":
+        current["attachments"]["fixer_current_attempt_token"] = TICKET_ID
+    else:
+        current["attachments"]["identity"] = "scout"
+    frozen = deepcopy(current)
+    summary = {"suppressed": 0, "skipped": 0}
+    outbox._suppress(bus, notice, {"id": TICKET_ID}, SimpleNamespace(name="echo"),
+                     "identity changed", lambda _msg: None, summary)
+    assert rows[notice["id"]] == frozen and attempts == []
+    assert summary == {"suppressed": 0, "skipped": 1}
+
+
+def _generic_legacy_alert(notice, state):
+    reason = notice["attachments"]["suppressed_why"]
+    return {"id": "1c44f89a-8838-4efe-81fb-920e569d934d", "ticket_id": notice["ticket_id"],
+            "author_type": "system", "direction": "outbound", "delivery_status": state,
+            "body": (f"SUPPRESSED reply on ticket {notice['ticket_id']} (echo): {reason}. "
+                     "Nothing was posted; a person should look."),
+            "attachments": {"kind": "escalation", "identity": "echo",
+                            "suppressed_message_id": notice["id"], "recipient_kind": "client"}}
+
+
+@pytest.mark.parametrize("state", ["ready", "posting", "posted"])
+def test_generic_source_linked_legacy_alert_is_not_duplicated(monkeypatch, state):
+    notice = _reserved_ready_row(datetime.now(timezone.utc))
+    notice["delivery_status"] = "suppressed"
+    notice["attachments"]["suppressed_why"] = "FIXER requester identity changed before Slack delivery"
+    bus, rows, attempts = _alert_store(monkeypatch, initial=notice)
+    alert = _generic_legacy_alert(notice, state)
+    rows[alert["id"]] = deepcopy(alert)
+    assert bus.ensure_suppressed_current_notice_alert(notice["id"], "echo") == alert
+    assert attempts == [] and len(rows) == 2
+    assert rows[alert["id"]] == alert and rows[notice["id"]] == notice
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("owner_changes_before_insert", [False, True])
+def test_verified_staff_notice_survives_owner_change_without_buttons_or_customer_send(
+        monkeypatch, legacy, owner_changes_before_insert):
+    notice = _reserved_ready_row(datetime.now(timezone.utc))
+    notice["delivery_status"] = "suppressed"
+    notice["attachments"]["suppressed_why"] = "identity changed"
+    bus, rows, _attempts = _alert_store(monkeypatch, initial=notice)
+    ticket = NoticeBus().current
+    if owner_changes_before_insert:
+        ticket["bot_identity"] = "scout"
+    if legacy:
+        alert = _generic_legacy_alert(notice, "ready")
+        rows[alert["id"]] = deepcopy(alert)
+    else:
+        alert = bus.ensure_suppressed_current_notice_alert(notice["id"], "echo")
+    ticket["bot_identity"] = "scout"
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(bus, "set_ticket", lambda *_a, **_kw: pytest.fail("staff alert must not close ticket"))
+    monkeypatch.setattr(outbox, "_channel_for", lambda *_a: "C_STAFF")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", "false")
+
+    def claim(mid):
+        if rows[mid]["delivery_status"] != "ready":
+            return False
+        rows[mid]["delivery_status"] = "posting"
+        return True
+
+    monkeypatch.setattr(bus, "claim_message", claim)
+    posts = []
+
+    def post(channel, body, *, thread_ts, blocks):
+        assert channel == "C_STAFF" and thread_ts is None and blocks is None
+        assert body == alert["body"]
+        posts.append(channel)
+        return "1700000000.123456"
+
+    summary = {"posted": 0, "skipped": 0, "failed": 0}
+    outbox._dispatch_one(bus, post, deepcopy(alert), identity=SimpleNamespace(name="echo"),
+                         log=lambda _msg: None, summary=summary)
+    assert posts == ["C_STAFF"] and summary["posted"] == 1
+    assert rows[alert["id"]]["delivery_status"] == "posted"
+    assert rows[notice["id"]] == notice and ticket["status"] == "verification"
+    # The capability remains disabled for the actual customer row.
+    customer = deepcopy(notice)
+    customer["attachments"].pop("fixer_route_pending")
+    customer["delivery_status"] = "ready"
+    outbox._dispatch_one(bus, post, customer, identity=SimpleNamespace(name="echo"),
+                         log=lambda _msg: None, summary=summary)
+    assert posts == ["C_STAFF"]
+
+
+@pytest.mark.parametrize("forgery", ["body", "source", "source_owner", "ticket", "author", "kind", "row_id"])
+def test_forged_staff_alert_marker_cannot_bypass_owner_fence(monkeypatch, forgery):
+    notice = _reserved_ready_row(datetime.now(timezone.utc))
+    notice["delivery_status"] = "suppressed"
+    bus, rows, _attempts = _alert_store(monkeypatch, initial=notice)
+    alert = bus.ensure_suppressed_current_notice_alert(notice["id"], "echo")
+    if forgery == "body":
+        alert["body"] = "Unrelated message"
+    elif forgery == "source":
+        alert["attachments"]["suppressed_message_id"] = TICKET_ID
+    elif forgery == "source_owner":
+        rows[notice["id"]]["attachments"]["identity"] = "scout"
+    elif forgery == "ticket":
+        alert["ticket_id"] = "1c44f89a-8838-4efe-81fb-920e569d934d"
+    elif forgery == "author":
+        alert["author_type"] = "echo"
+    elif forgery == "kind":
+        alert["attachments"]["kind"] = "answer"
+    else:
+        alert["id"] = "1c44f89a-8838-4efe-81fb-920e569d934d"
+    ticket = NoticeBus().current
+    ticket["bot_identity"] = "scout"
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(bus, "claim_message", lambda _mid: pytest.fail("forged alert claim"))
+    summary = {"skipped": 0}
+    outbox._dispatch_one(bus, lambda *_a, **_kw: pytest.fail("forged alert send"), alert,
+                         identity=SimpleNamespace(name="echo"), log=lambda _msg: None,
+                         summary=summary)
+    assert summary == {"skipped": 1}
+
+
+def test_staff_alert_source_link_is_rechecked_after_claim(monkeypatch):
+    notice = _reserved_ready_row(datetime.now(timezone.utc))
+    notice["delivery_status"] = "suppressed"
+    bus, rows, _attempts = _alert_store(monkeypatch, initial=notice)
+    alert = bus.ensure_suppressed_current_notice_alert(notice["id"], "echo")
+    ticket = NoticeBus().current
+    ticket["bot_identity"] = "scout"
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(outbox, "_channel_for", lambda *_a: "C_STAFF")
+
+    def claim(mid):
+        rows[mid]["delivery_status"] = "posting"
+        rows[mid]["attachments"]["suppressed_message_id"] = TICKET_ID
+        return True
+
+    monkeypatch.setattr(bus, "claim_message", claim)
+    summary = {"skipped": 0}
+    outbox._dispatch_one(bus, lambda *_a, **_kw: pytest.fail("changed alert link sent"), alert,
+                         identity=SimpleNamespace(name="echo"), log=lambda _msg: None,
+                         summary=summary)
+    assert summary == {"skipped": 1} and rows[notice["id"]] == notice
+
+
+def test_transient_staff_alert_source_read_preserves_ready_alert(monkeypatch):
+    notice = _reserved_ready_row(datetime.now(timezone.utc))
+    notice["delivery_status"] = "suppressed"
+    bus, rows, _attempts = _alert_store(monkeypatch, initial=notice)
+    alert = bus.ensure_suppressed_current_notice_alert(notice["id"], "echo")
+    ticket = NoticeBus().current
+    ticket["bot_identity"] = "scout"
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    def fail_read(_mid):
+        raise TimeoutError("DB read failed")
+
+    monkeypatch.setattr(bus, "message", fail_read)
+    monkeypatch.setattr(bus, "claim_message", lambda _mid: pytest.fail("unverified claim"))
+    summary = {"skipped": 0}
+    outbox._dispatch_one(bus, lambda *_a, **_kw: pytest.fail("unverified send"), alert,
+                         identity=SimpleNamespace(name="echo"), log=lambda _msg: None,
+                         summary=summary)
+    assert summary == {"skipped": 1} and rows[alert["id"]] == alert
+    assert rows[notice["id"]] == notice
