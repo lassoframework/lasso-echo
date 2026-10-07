@@ -640,6 +640,12 @@ def _moderation_retry_state(db, now):
         retry_after = datetime.fromisoformat(item["retry_after"])
         if updated.tzinfo is None or retry_after.tzinfo is None:
             raise ValueError("naive moderation retry timestamp")
+        if updated > now + timedelta(minutes=5):
+            raise ValueError("future moderation retry timestamp")
+        expected_delay = timedelta(days=_moderation_retry_delay_days(
+            item["category"], item["failures"]))
+        if abs((retry_after - updated - expected_delay).total_seconds()) > 1:
+            raise ValueError("misaligned moderation retry deadline")
         if updated.timestamp() >= cutoff:
             clean[ref] = item
     return clean
@@ -832,7 +838,10 @@ def _run_media_moderation_day_locked(now=None, *, store=None, drive=None, vision
                                 "reason": result.get("reason")})
             except Exception as exc:
                 results.append({"ok": False, "reason": type(exc).__name__})
-        _save_moderation_retry_state(db, retry_state)
+            # Persist each known outcome before starting the next asset. A crash
+            # later in the reserved batch must not erase retry cooldowns already
+            # learned from Drive.
+            _save_moderation_retry_state(db, retry_state)
     finally:
         # Partial execution stays consumed. Completion write failure leaves the
         # initial reservation intact, preventing duplicate spend.

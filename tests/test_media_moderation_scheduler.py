@@ -180,6 +180,68 @@ def test_malformed_retry_state_fails_before_provider_calls(lane):
     assert calls == [] and not db.kv_get(KEY)
 
 
+@pytest.mark.parametrize('corruption', [
+    'future_updated_at', 'misaligned_deadline', 'year_9999_deadline',
+])
+def test_semantically_invalid_retry_timestamps_fail_before_provider_calls(
+        lane, corruption):
+    calls, kwargs = lane
+    asset = kwargs['store'].assets[0]
+    ref = listener._moderation_retry_ref(asset['gym_id'], asset['id'])
+    updated = NOW
+    expected = NOW + timedelta(days=7)
+    if corruption == 'future_updated_at':
+        updated = NOW.replace(year=2027)
+        expected = updated + timedelta(days=7)
+    elif corruption == 'misaligned_deadline':
+        expected = NOW + timedelta(days=999)
+    else:
+        expected = datetime(9999, 1, 1, tzinfo=timezone.utc)
+    state = {'version': 1, 'assets': {ref: {
+        'binding': listener._moderation_retry_binding(asset),
+        'category': 'drive_http_404', 'failures': 1,
+        'retry_after': expected.isoformat(), 'updated_at': updated.isoformat(),
+    }}}
+    db.kv_set(listener._MEDIA_MODERATION_RETRY_KEY, json.dumps(state))
+    with pytest.raises(ValueError, match='(future moderation retry|misaligned moderation retry)'):
+        listener._run_media_moderation_day(NOW, **kwargs)
+    assert calls == [] and not db.kv_get(KEY)
+
+
+def test_retry_outcome_is_durable_before_later_batch_interruption(lane, monkeypatch):
+    calls, kwargs = lane
+    kwargs['store'] = Store(gyms=1, assets=60)
+    failed_asset = []
+
+    def moderate(gym, asset_id, **unused):
+        calls.append((gym, asset_id))
+        if len(calls) == 1:
+            failed_asset.append(asset_id)
+            return {'ok': False,
+                    'retry': {'category': 'drive_http_404', 'status': 404}}
+        if len(calls) == 2:
+            ref = listener._moderation_retry_ref(gym, failed_asset[0])
+            saved = json.loads(db.kv_get(listener._MEDIA_MODERATION_RETRY_KEY))
+            assert ref in saved['assets']
+            raise KeyboardInterrupt()
+        return {'ok': True}
+
+    monkeypatch.setattr(gym_media_moderation, 'moderate_asset', moderate)
+    with pytest.raises(KeyboardInterrupt):
+        listener._run_media_moderation_day(NOW, **kwargs)
+    receipt = json.loads(db.kv_get(KEY))
+    assert receipt['state'] == 'interrupted' and receipt['attempted'] == 1
+
+    # The interrupted reservation cools its other selected rows for one day.
+    listener._run_media_moderation_day(NOW + timedelta(days=1), **kwargs)
+    day_two_start = len(calls)
+    # The reserved-batch cooldown has expired, but the known 404 remains cooled.
+    listener._run_media_moderation_day(NOW + timedelta(days=2), **kwargs)
+    assert failed_asset[0] not in {
+        asset_id for _gym, asset_id in calls[day_two_start:]
+    }
+
+
 def test_interruption_is_not_replayed(lane, monkeypatch):
     _, kwargs = lane
     monkeypatch.setattr(gym_media_moderation, 'moderate_asset',
