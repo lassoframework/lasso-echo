@@ -758,7 +758,7 @@ def test_partial_locked_day_rebuild_replaces_open_slot_idempotently(monkeypatch,
                     variant_status='active', media_not_ready_reason=None,
                     image_url=f'https://cdn/{identity}.jpg',
                     created_at='2026-10-01T12:00:00+00:00',
-                    caption=f'Members build strength together {identity.replace('-', ' ')}.')
+                    caption=f'Members build strength together {identity.replace("-", " ")}.')
 
     owned = [row('approved', owned_ordinal, status='approved'),
              row('owned-fb', owned_ordinal, 'facebook'),
