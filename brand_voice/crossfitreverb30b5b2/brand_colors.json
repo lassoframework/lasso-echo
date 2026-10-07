@@ -1,0 +1,8 @@
+{
+  "colors": [
+    "#BB9064",
+    "#000000"
+  ],
+  "source_url": "https://crossfitreverb.net/wp-content/themes/astra-child/inc/layouts/custom-styles.css?ver=1787945676",
+  "source_note": "CrossFit Reverb's official homepage (https://crossfitreverb.net/) links this first-party Astra child stylesheet. The custom accent #BB9064 appears on .preheader, current submenu links, body a, and the even .icon-box in .numbered-box-section. The same stylesheet sets body text to #000000. The separate Astra theme default #0170B9 is excluded."
+}
