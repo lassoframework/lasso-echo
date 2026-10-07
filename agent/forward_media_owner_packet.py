@@ -5,7 +5,7 @@ run in a dedicated owner-credential process (FORWARD_MEDIA_OWNER_DSN and
 FORWARD_MEDIA_OWNER_ROLE set, no publisher/service credentials — enforced by
 agent.forward_media_owner.check_environment, reused unchanged).
 
-It accepts exactly ONE local JSON packet (schema_version=1) describing ONE
+It accepts exactly ONE local JSON packet (schema_version=1 or 2) describing ONE
 explicit tenant/asset, then:
 
 - reads the actual hosted source bytes through the trusted HostedObjectReader
@@ -16,12 +16,12 @@ explicit tenant/asset, then:
 - reads the actual hosted image/optional thumbnail bytes and builds the
   RenderManifest via build_render_manifest.
 
-Scope restriction of this initial entry point: only ``same_object`` and
-exact-byte ``rehost`` operations are accepted. ``same_object`` packets must
-not carry a thumbnail at all; for ``rehost`` a thumbnail, if present, must be
-the exact source bytes. Transformed renders
-(``render``/``reburn``) are HELD (refused with reason operation_held) until
-controlled-renderer verification is operational.
+Schema 1 retains the original same_object/rehost contract. Schema 2 also accepts
+render/reburn when a strict versioned still-image recipe reproduces the exact
+hosted image and optional thumbnail from the hosted original. The recipe binds
+the production renderer/runtime and fonts. Unsupported formats, recipes,
+runtime drift, ambiguous classification and any byte mismatch fail closed.
+Producer packets/observations are never evidence of clearance or ownership.
 
 Clearance policy: ``cleared_unused`` requires BOTH an explicit genuine
 fresh-production receipt ref (production_evidence_ref) AND an independent
@@ -45,7 +45,8 @@ import argparse
 import json
 import sys
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
 # Static failure reason codes. Never pair these with exception text, URLs,
 # DSNs or packet contents in output.
@@ -57,7 +58,8 @@ REASONS = (
     'field_required',           # missing/blank required packet field
     'decision_invalid',
     'operation_invalid',
-    'operation_held',           # render/reburn held pending controlled-renderer verification
+    'operation_held',           # transformed recipe unsupported/unversioned/runtime drift
+    'render_bytes_mismatch',    # hosted outputs differ from controlled still replay
     'fresh_receipts_required',  # cleared_unused without both required refs
     'source_read_failed',
     'image_read_failed',
@@ -75,7 +77,7 @@ _FORBIDDEN_PACKET_FIELDS = frozenset({
     'thumbnail_fingerprint', 'thumbnail_length', 'manifest_digest', 'used_count',
 })
 _DECISIONS = ('cleared_unused', 'hold_uncertain', 'hold_used')
-_ALLOWED_OPERATIONS = ('same_object', 'rehost')
+_ALLOWED_OPERATIONS = ('same_object', 'rehost', 'render', 'reburn')
 _HELD_OPERATIONS = ('render', 'reburn')
 
 
@@ -113,10 +115,11 @@ def validate_packet(packet):
     forbidden = sorted(_FORBIDDEN_PACKET_FIELDS.intersection(packet))
     if forbidden:
         raise PacketError('field_forbidden')
-    if packet.get('schema_version') != SCHEMA_VERSION:
+    if (type(packet.get('schema_version')) is not int
+            or packet['schema_version'] not in SUPPORTED_SCHEMA_VERSIONS):
         raise PacketError('schema_version_unsupported')
     cleaned = {
-        'schema_version': SCHEMA_VERSION,
+        'schema_version': packet['schema_version'],
         'tenant_id': _require_string(packet, 'tenant_id'),
         'source_asset_id': _require_string(packet, 'source_asset_id'),
         'source_url': _require_string(packet, 'source_url'),
@@ -128,10 +131,18 @@ def validate_packet(packet):
         raise PacketError('decision_invalid')
     cleaned['decision'] = decision
     operation = packet.get('operation')
-    if operation in _HELD_OPERATIONS:
-        # Transformed renders stay held until controlled-renderer verification
-        # is operational; this entry point never prepares or persists them.
+    if operation in _HELD_OPERATIONS and packet['schema_version'] == 1:
         raise PacketError('operation_held')
+    validated_recipe = None
+    if operation in _HELD_OPERATIONS:
+        from agent.forward_media_attester import validate_still_recipe
+        from agent.forward_media_guard import ForwardMediaVerificationHold
+        try:
+            # New transformed packets may never use the legacy unversioned
+            # caption-only recipe. Bind exactly the trusted runtime contract.
+            validated_recipe = validate_still_recipe(packet.get('render_recipe'))
+        except ForwardMediaVerificationHold as exc:
+            raise PacketError('operation_held') from exc
     if operation not in _ALLOWED_OPERATIONS:
         raise PacketError('operation_invalid')
     cleaned['operation'] = operation
@@ -169,7 +180,7 @@ def validate_packet(packet):
     render_recipe = packet.get('render_recipe')
     if render_recipe is not None and not isinstance(render_recipe, dict):
         raise PacketError('packet_unreadable')
-    cleaned['render_recipe'] = render_recipe
+    cleaned['render_recipe'] = validated_recipe if validated_recipe is not None else render_recipe
     return cleaned
 
 
@@ -179,6 +190,7 @@ def build_tuples(packet, reader):
     All fingerprints and lengths come from the real hosted bytes read through
     the trusted reader; nothing is taken from the packet.
     """
+    packet = validate_packet(packet)
     from agent.forward_media_prepare import (
         PreparationError,
         build_render_manifest,
@@ -219,11 +231,32 @@ def build_tuples(packet, reader):
         if not isinstance(thumbnail_bytes, (bytes, bytearray)) or not thumbnail_bytes:
             raise PacketError('thumbnail_read_failed')
         thumbnail_bytes = bytes(thumbnail_bytes)
-        if thumbnail_bytes != bytes(source_bytes):
+        if packet['operation'] == 'rehost' and thumbnail_bytes != bytes(source_bytes):
             # The attester's rehost classification requires the thumbnail to
             # be the exact source bytes; a transformed thumbnail would
             # mismatch the SQL manifest operation.
             raise PacketError('preparation_invalid')
+    if packet['operation'] in _HELD_OPERATIONS:
+        from agent.forward_media_attester import replay_still_recipe
+        from agent.forward_media_guard import ForwardMediaVerificationHold
+        try:
+            replayed = replay_still_recipe(bytes(source_bytes), packet['render_recipe'],
+                                          has_thumbnail=thumbnail_bytes is not None)
+        except ForwardMediaVerificationHold as exc:
+            raise PacketError('operation_held') from exc
+        if (replayed['image_bytes'] != image_bytes
+                or replayed['thumbnail_bytes'] != thumbnail_bytes):
+            raise PacketError('render_bytes_mismatch')
+        # Match the guard's independently derived classification. Render must
+        # not disguise an identity/rehost; URL shape alone proves no transform.
+        if (packet['image_url'] == packet['source_url']
+                and packet['thumbnail_url'] in (None, packet['source_url'])):
+            raise PacketError('preparation_invalid')
+        if image_bytes == bytes(source_bytes) and thumbnail_bytes in (None, bytes(source_bytes)):
+            raise PacketError('preparation_invalid')
+        if (packet['operation'] == 'reburn'
+                and packet['render_recipe']['image']['name'] != 'story_photo'):
+            raise PacketError('operation_held')
     try:
         manifest = build_render_manifest(
             original, packet['image_url'], image_bytes, packet['operation'],
@@ -238,6 +271,48 @@ def build_tuples(packet, reader):
         # to the registered original; anything else is a transformed render.
         raise PacketError('rehost_bytes_mismatch')
     return original, clearance, manifest
+
+
+def make_still_packet(*, tenant_id, source_asset_id, source_url, image_url,
+                      registry_evidence_ref, render_evidence_ref, decision,
+                      history_evidence_ref, image_name='identity', caption=None,
+                      gym_name=None, thumbnail_url=None, thumbnail_name=None,
+                      production_evidence_ref=None, operation=None):
+    """Create one version 2 owner PREPARATION packet, never an authority receipt.
+
+    Producer callers must supply the real owner-reviewed evidence references
+    and explicit clearance decision. There is no used-count/default clearance
+    inference. The packet is independently verified by ``build_tuples`` in the
+    dedicated owner process before persistence. Persisted manifest + attester
+    evidence are still required at the calendar writer boundary.
+    """
+    from agent.forward_media_attester import make_still_recipe
+    from agent.forward_media_guard import ForwardMediaVerificationHold
+    if (thumbnail_url is None) != (thumbnail_name is None):
+        raise PacketError('preparation_invalid')
+    try:
+        recipe = make_still_recipe(image_name, caption=caption, gym_name=gym_name,
+                                   thumbnail_name=thumbnail_name)
+    except ForwardMediaVerificationHold as exc:
+        raise PacketError('operation_held') from exc
+    if operation is None:
+        if image_name == 'identity' and thumbnail_name in (None, 'identity', 'delivered_image'):
+            operation = ('same_object' if image_url == source_url and thumbnail_url is None
+                         else 'rehost')
+        else:
+            operation = 'render'
+    packet = {
+        'schema_version': 2, 'tenant_id': tenant_id, 'source_asset_id': source_asset_id,
+        'source_url': source_url, 'image_url': image_url,
+        'registry_evidence_ref': registry_evidence_ref,
+        'render_evidence_ref': render_evidence_ref, 'decision': decision,
+        'history_evidence_ref': history_evidence_ref,
+        'operation': operation, 'thumbnail_url': thumbnail_url,
+        'render_recipe': recipe,
+    }
+    if production_evidence_ref is not None:
+        packet['production_evidence_ref'] = production_evidence_ref
+    return validate_packet(packet)
 
 
 def _close(persistence):
@@ -321,7 +396,7 @@ def _parse_args(argv):
         description='Owner-only one-packet forward media claim entry point. '
                     'Default is dry-run; --apply persists via the owner adapter.')
     parser.add_argument('--packet', required=True,
-                        help='path to the single local schema_version=1 JSON packet')
+                        help='path to the single local schema_version=1 or 2 JSON packet')
     parser.add_argument('--apply', action='store_true',
                         help='persist via ForwardMediaOwnerPersistence; default dry-run')
     return parser.parse_args(argv)
