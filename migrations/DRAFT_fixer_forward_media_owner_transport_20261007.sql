@@ -81,6 +81,13 @@ declare r public.content_calendar%rowtype;
  o public.fixer_forward_media_observation_20261007%rowtype;
  a public.media_asset%rowtype; revision text;
 begin
+ if current_setting('transaction_isolation')<>'read committed' then
+   raise exception 'forward media authority requires read committed isolation' using errcode='25000';
+ end if;
+ -- Owner authority inserts acquire the graph EXCLUSIVE lock in their triggers.
+ -- Take it BEFORE progress/calendar/asset row locks, matching binder/claim
+ -- graph-before-calendar order and avoiding a shared-to-exclusive upgrade cycle.
+ perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
  perform 1 from public.fixer_forward_media_owner_progress_20261007 p
    where p.calendar_row_id=p_id and p.row_revision=p_revision
      and p.observation_digest=p_digest and p.reservation_token=p_token and p.state='quarantine'

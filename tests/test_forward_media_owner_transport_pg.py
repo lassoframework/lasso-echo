@@ -216,6 +216,48 @@ def main():
             conn.rollback()
             conn.close()
 
+            # Owner locks graph before calendar. Concurrent real binder must
+            # wait without holding shared graph authority while owner stages its
+            # clearance/manifest (whose triggers require exclusive graph lock).
+            # Old row-before-graph order creates the classic upgrade deadlock.
+            c,asset = candidate()
+            conn,p,t = lane()
+            binder_started = threading.Event()
+            binder_pid = []
+            def concurrent_binder():
+                with psycopg.connect(dsn('postgres'),application_name='owner_binder_lock_regression') as cc:
+                    cc.execute('set role service_role')
+                    cc.execute("set statement_timeout='5s'")
+                    binder_pid.append(cc.info.backend_pid)
+                    binder_started.set()
+                    try:
+                        cc.execute('select fixer_bind_forward_media_manifest_20261006(%s)',
+                                   (c['calendar_row_id'],))
+                        raise AssertionError('held history unexpectedly bound')
+                    except psycopg.errors.CheckViolation as exc:
+                        message = str(exc)
+                        cc.rollback()
+                        return message
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                with t.locked_current(c):
+                    future = pool.submit(concurrent_binder)
+                    assert binder_started.wait(3)
+                    deadline = time.monotonic()+3
+                    while time.monotonic()<deadline:
+                        wait = sql('select wait_event_type from pg_stat_activity where pid=%s',
+                                   (binder_pid[0],))
+                        if wait and wait[0][0]=='Lock':
+                            break
+                        time.sleep(0.02)
+                    else:
+                        raise AssertionError('binder never reached competing lock')
+                    assert not future.done()
+                    stage(c,asset,p,t)
+                result = future.result(timeout=5)
+            assert 'historical eligibility clearance unavailable or held' in result,result
+            assert authority(asset)==1 and progress(c)[0][0]=='final'
+            conn.close()
+
             # Existing caller transactions cannot be committed with a reservation.
             c,asset = candidate()
             conn,p,t = lane()
@@ -410,7 +452,7 @@ def main():
                     finally:
                         sql('reset role')
             admin.close()
-            print('PASS PG17: dedicated discovery, exact calendar/asset locks, authority+outcome atomicity, '
+            print('PASS PG17: dedicated discovery, exact calendar/asset locks, concurrent binder/owner graph order, authority+outcome atomicity, '
                   'real crash quarantine, before/after uncertain commit, duplicate workers, tenant fairness, '
                   'static source/history holds, least privilege')
         finally:
