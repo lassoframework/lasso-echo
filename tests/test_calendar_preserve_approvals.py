@@ -598,9 +598,8 @@ def test_prevalidated_insert_rechecks_human_owned_slot_before_post(monkeypatch):
         media_not_ready_reason=None,
         caption='Replacement with different content')
     monkeypatch.setattr(
-        store, 'locked_slots',
-        lambda _key, _month: {
-            (proposal['post_date'], proposal['account'], proposal['format'])})
+        store, 'list_month_strict',
+        lambda _key, _month: [dict(proposal, status='approved')])
 
     with pytest.raises(pcs.CadencePreconditionError):
         store.insert_rows(
@@ -614,7 +613,7 @@ def test_prevalidated_insert_fails_closed_when_live_lock_read_fails(monkeypatch)
     store, http = _state_store(monkeypatch, [])
     proposal = _persisted(media_not_ready_reason=None)
     monkeypatch.setattr(
-        store, 'locked_slots',
+        store, 'list_month_strict',
         lambda *_args: (_ for _ in ()).throw(RuntimeError('read failed')))
 
     with pytest.raises(pcs.CalendarInsertNotStartedError):
@@ -854,3 +853,114 @@ def test_partial_locked_day_rebuild_replaces_open_slot_idempotently(monkeypatch,
         assert params['variant_status'] == 'eq.active'
         if retained_slot == 0:
             assert 'or(slot_index.eq.0,slot_index.is.null)' in params['and']
+
+
+@pytest.mark.parametrize('owned_slot, incoming_slot', [(0, 1), (1, 0), (None, 1)])
+def test_strict_prevalidated_insert_accepts_distinct_approved_cadence_sibling(
+        monkeypatch, owned_slot, incoming_slot):
+    from agent import cadence
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 2)
+    approved = _persisted(status='approved', slot_index=owned_slot,
+                          media_not_ready_reason=None)
+    store, http = _state_store(monkeypatch, [approved])
+    proposal = _persisted(id='proposed', slot_index=incoming_slot,
+                          media_not_ready_reason=None, caption='Different approved source copy',
+                          image_url='https://cdn/different.jpg')
+    result = store.insert_rows('eng', [proposal], prevalidated_cadence=True,
+                               required_feed_slots={(proposal['post_date'], incoming_slot)})
+    assert len(result) == 1 and result[0]['slot_index'] == incoming_slot
+    assert approved in http.rows
+    assert len([call for call in http.calls if call[0] == 'post']) == 1
+
+
+@pytest.mark.parametrize('capacity, owned_slot, incoming_slot', [(2, 1, 1), (2, None, 0), (1, 0, 1)])
+def test_strict_prevalidated_insert_refuses_owned_slot_or_legacy_one_post_cell(
+        monkeypatch, capacity, owned_slot, incoming_slot):
+    from agent import cadence
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: capacity)
+    approved = _persisted(status='approved', slot_index=owned_slot,
+                          media_not_ready_reason=None)
+    store, http = _state_store(monkeypatch, [approved])
+    proposal = _persisted(id='proposed', slot_index=incoming_slot,
+                          media_not_ready_reason=None, caption='Changed content cannot bypass approval')
+    with pytest.raises(pcs.CadencePreconditionError):
+        store.insert_rows('eng', [proposal], prevalidated_cadence=True,
+                          required_feed_slots={(proposal['post_date'], incoming_slot)})
+    assert http.rows == [approved]
+    assert not any(method == 'post' for method, _ in http.calls)
+
+
+@pytest.mark.parametrize('failure', ['http', 'missing_count', 'short_page', 'changing_count', 'duplicate_page', 'foreign'])
+def test_strict_cadence_month_read_refuses_partial_or_unconfirmed_snapshot(monkeypatch, failure):
+    store, http = _state_store(monkeypatch, [])
+    proposal = _persisted(media_not_ready_reason=None)
+    original_get = http.get
+    calls = []
+    def get(url, params=None, **kwargs):
+        if params.get('select') and 'status' in params['select'].split(','):
+            calls.append(params)
+            page = [dict(proposal, id=f'owned-{i}', status='pending') for i in range(500)]
+            if failure == 'http':
+                return _Resp(503)
+            if failure == 'short_page':
+                page = page[:499]
+            if failure == 'foreign':
+                page[0]['gym_id'] = 'foreign'
+            response = _Resp(200, page)
+            response.headers = {'Content-Range': '0-499/1000'}
+            if failure == 'missing_count':
+                response.headers = {}
+            if failure == 'changing_count' and len(calls) == 2:
+                response.headers = {'Content-Range': '500-999/1001'}
+            return response
+        return original_get(url, params=params, **kwargs)
+    monkeypatch.setattr(http, 'get', get)
+    with pytest.raises(pcs.CalendarInsertNotStartedError):
+        store.insert_rows('eng', [proposal], prevalidated_cadence=True,
+                          required_feed_slots={(proposal['post_date'], proposal['slot_index'])})
+    assert not any(method == 'post' for method, _ in http.calls)
+    assert len(calls) <= 2
+
+
+def test_strict_cadence_month_read_paginates_approval_beyond_first_response(monkeypatch):
+    from agent import cadence
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 2)
+    proposal = _persisted(id='proposed', slot_index=1, media_not_ready_reason=None)
+    existing = [dict(proposal, id=f'row-{i:04d}', status='pending') for i in range(1000)]
+    existing.append(dict(proposal, id='row-1000', status='approved'))
+    store, http = _state_store(monkeypatch, existing)
+    original_get = http.get
+    offsets = []
+    def get(url, params=None, **kwargs):
+        if params.get('select') and 'status' in params['select'].split(','):
+            offset = int(params['offset'])
+            offsets.append(offset)
+            page = existing[offset:offset + 500]
+            response = _Resp(200, page)
+            response.headers = {'Content-Range': f'{offset}-{offset + len(page) - 1}/1001'}
+            assert kwargs['headers']['Prefer'] == 'count=exact'
+            return response
+        return original_get(url, params=params, **kwargs)
+    monkeypatch.setattr(http, 'get', get)
+    with pytest.raises(pcs.CadencePreconditionError):
+        store.insert_rows('eng', [proposal], prevalidated_cadence=True,
+                          required_feed_slots={(proposal['post_date'], 1)})
+    assert offsets == [0, 500, 1000]
+    assert not any(method == 'post' for method, _ in http.calls)
+
+
+def test_strict_barrier_sees_exact_slot_approved_after_preflight(monkeypatch):
+    from agent import cadence
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 2)
+    store, http = _state_store(monkeypatch, [])
+    proposal = _persisted(id='proposed', slot_index=1, media_not_ready_reason=None)
+    admitted = store.preflight_cadence_rows('eng', [proposal],
+                                            replace_dates={proposal['post_date']})
+    assert len(admitted) == 1
+    approved = dict(proposal, id='concurrent-approval', status='approved')
+    http.rows.append(approved)
+    with pytest.raises(pcs.CadencePreconditionError):
+        store.insert_rows('eng', admitted, prevalidated_cadence=True,
+                          required_feed_slots={(proposal['post_date'], 1)})
+    assert http.rows == [approved]
+    assert not any(method == 'post' for method, _ in http.calls)
