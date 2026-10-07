@@ -42,7 +42,9 @@ def trusted(snapshot=None):
 
 class Conn:
     autocommit = False
-    def __init__(self): self.calls = []; self.events = []
+    def __init__(self):
+        self.calls = []; self.events = []
+        self.snapshot = {**trusted(), 'history': {'rows': []}}
     def rollback(self): self.events.append('rollback')
     def cursor(self): return Cursor(self)
 
@@ -53,7 +55,8 @@ class Cursor:
     def __exit__(self,*args): pass
     def execute(self,q,args=None):
         self.conn.calls.append((q,args))
-        self.result = ('owner',) if 'current_user' in q else ({'reserved':True},)
+        self.result = (('owner',) if 'current_user' in q else
+                       (self.conn.snapshot,) if 'fixer_generated_snapshot' in q else ({'reserved':True},))
     def fetchone(self): return self.result
 
 
@@ -112,8 +115,78 @@ def test_mutable_original_holds(lane):
 
 
 def test_historical_visual_hash_must_match_actual_bytes(lane):
+    lane[0]._conn.snapshot['history']['rows']=[{'history_key':'old','published_binding_ref':'bound','visual_url':'https://owned.example/old','visual_sha256':None}]
     with pytest.raises(guard.ForwardMediaVerificationHold,match='historical visual bytes'):
-        run(lane,history_visuals=[{'visual_url':'https://owned.example/old','visual_sha256':'sha256:'+'0'*64}])
+        run(lane,history_visuals=[{'history_key':'old','published_binding_ref':'bound','visual_url':'https://owned.example/old','visual_sha256':'sha256:'+'0'*64}])
+
+
+def test_history_url_reads_are_deduplicated_within_owner_run(lane):
+    p,c,s,read=lane
+    p._conn.snapshot['history']['rows']=[{'history_key':'old:'+str(i),'published_binding_ref':'bound:'+str(i),
+        'visual_url':'https://owned.example/shared-old','visual_sha256':None} for i in range(1398)]
+    calls=[]
+    def reader(url): calls.append(url);return image_bytes()
+    assert run(lane,read_bytes=reader)['reserved']
+    assert calls==[c['original_url'],'https://owned.example/shared-old',c['original_url']]
+    assert len(json.loads(p._conn.calls[-1][1][2]))==1398
+
+
+def test_sql_issued_exact_history_proof_survives_missing_remote_object(lane):
+    p,c,s,_=lane
+    p._conn.snapshot['history']['rows']=[{'history_key':'sealed:old','published_binding_ref':'sealed tuple',
+        'visual_url':'https://owned.example/deleted-old','visual_sha256':'sha256:'+c['original_sha256'],
+        'phash':c['original_phash'],'history_proof_ref':'generated-history:sha256:'+'1'*64}]
+    calls=[]
+    def reader(url):
+        calls.append(url)
+        if url!=c['original_url']: raise RuntimeError('historical object unavailable')
+        return image_bytes()
+    assert run(lane,read_bytes=reader)['reserved']
+    assert calls==[c['original_url'],c['original_url']]
+    # Collision judgment is still enforced atomically by SQL, not this cache.
+    assert json.loads(p._conn.calls[-1][1][2])[0]['phash']==c['original_phash']
+
+
+def test_caller_cache_flag_cannot_skip_read_without_current_sql_proof(lane):
+    p,c,s,_=lane
+    item={'history_key':'old','published_binding_ref':'bound','visual_url':'https://owned.example/old','visual_sha256':None}
+    p._conn.snapshot['history']['rows']=[item]
+    forged={**item,'visual_sha256':'sha256:'+c['original_sha256'],'phash':c['original_phash'],
+            'history_proof_ref':'generated-history:sha256:'+'1'*64}
+    calls=[]
+    def reader(url):calls.append(url);return image_bytes()
+    assert run(lane,history_visuals=[forged],read_bytes=reader)['reserved']
+    assert 'https://owned.example/old' in calls
+
+
+def test_current_database_unknown_photo_supply_holds_before_remote_io(lane):
+    lane[0]._conn.snapshot['photo_inventory_complete']=False
+    with pytest.raises(guard.ForwardMediaVerificationHold,match='database depletion'):
+        run(lane)
+    assert not lane[0]._conn.events
+
+
+@pytest.mark.parametrize('field', ['account', 'format'])
+def test_exact_database_account_and_format_rechecked(lane,field):
+    lane[2][field]='expected'
+    lane[0]._conn.snapshot[field]='changed'
+    with pytest.raises(guard.ForwardMediaVerificationHold,match='snapshot changed: '+field):
+        run(lane)
+    assert not lane[0]._conn.events
+
+
+def test_changed_historical_binding_invalidates_cached_proof(lane):
+    p,c,s,_=lane
+    p._conn.snapshot['history']['rows']=[{'history_key':'old','published_binding_ref':'new binding',
+        'visual_url':'https://owned.example/old','visual_sha256':None}]
+    stale={'history_key':'old','published_binding_ref':'old binding','visual_url':'https://owned.example/old',
+        'visual_sha256':'sha256:'+c['original_sha256'],'phash':c['original_phash'],
+        'history_proof_ref':'generated-history:sha256:'+'1'*64}
+    reads=[]
+    def reader(url):reads.append(url);return image_bytes()
+    with pytest.raises(guard.ForwardMediaVerificationHold,match='outside database inventory'):
+        run(lane,history_visuals=[stale],read_bytes=reader)
+    assert 'https://owned.example/old' in reads
 
 
 def test_replay_allows_new_history_revision_but_leaves_sql_recheck_in_charge(lane):
