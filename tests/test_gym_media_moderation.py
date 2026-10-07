@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -133,6 +134,43 @@ def test_clean_no_people_writes_evidence_and_auto_approves():
     call = store.moderation_updates[-1]
     assert call["fields"]["review_status"] == "approved"
     assert call["expected_content_hash"] == asset["content_hash"]
+
+
+@pytest.mark.parametrize(("status", "category"), [
+    (403, "drive_http_403"), (404, "drive_http_404"),
+    (429, "drive_http_429"), (503, "drive_http_5xx"),
+])
+def test_drive_download_http_degrades_are_retryable_without_moderation_write(
+        status, category):
+    _asset, store, _drive = _setup()
+
+    class HttpFailure(Exception):
+        resp = SimpleNamespace(status=status)
+
+    class BrokenDrive:
+        def download(self, _asset_id, _dest):
+            raise HttpFailure()
+
+    out = mod.moderate_asset(GYM, ASSET_ID, store=store, drive=BrokenDrive(),
+                             vision=_vision(_clean_json(False)), now_iso=NOW)
+    assert out["ok"] is False
+    assert out["retry"] == {"category": category, "status": status}
+    assert store.moderation_updates == []
+    assert store.get_asset(ASSET_ID)["review_status"] == "pending_review"
+    assert store.get_asset(ASSET_ID)["moderation_status"] == "pending"
+
+
+def test_drive_download_transport_degrade_is_retryable_without_http_status():
+    _asset, store, _drive = _setup()
+
+    class BrokenDrive:
+        def download(self, _asset_id, _dest):
+            raise TimeoutError()
+
+    out = mod.moderate_asset(GYM, ASSET_ID, store=store, drive=BrokenDrive(),
+                             vision=_vision(_clean_json(False)), now_iso=NOW)
+    assert out["retry"] == {"category": "drive_transport", "status": None}
+    assert store.moderation_updates == []
 
 
 # ---- 2. clean photo WITH people -----------------------------------------------

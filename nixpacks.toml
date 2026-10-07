@@ -6,6 +6,12 @@
 # HEVC clip is marked conversion_unavailable and never staged. aptPkgs are ADDITIVE,
 # so this does not disturb the Nixpacks-detected Python toolchain. (pillow-heif, which
 # decodes HEIC photos, is a Python dep in requirements.txt.)
+#
+# PATH is intentionally not set here. nixpacks [variables] apply at BUILD and at
+# runtime; putting /opt/venv/bin first would run before the venv exists during
+# setup/install. Production startCommand already uses /opt/venv/bin/python
+# (railway.json). Interactive `railway ssh -- python` uses Nix's default
+# interpreter, which has no deps: use `/opt/venv/bin/python` instead (AGENTS.md).
 [phases.setup]
 aptPkgs = [
   "libcairo2",

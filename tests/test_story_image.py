@@ -30,6 +30,14 @@ def test_story_caption_no_dashes_and_trimmed():
     assert out.startswith("On Thursdays")
 
 
+def test_story_caption_does_not_double_final_punctuation():
+    caption = ("Strength that expands your life.\n\n"
+               "Your goals deserve more than a generic workout.")
+    assert si.story_caption(caption) == (
+        "Strength that expands your life. "
+        "Your goals deserve more than a generic workout.")
+
+
 def test_build_story_image_is_1080x1920(tmp_path):
     from PIL import Image
     out = si.build_story_image(_photo(tmp_path), str(tmp_path / "s.jpg"),

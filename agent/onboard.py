@@ -158,9 +158,9 @@ Account(
 
 class OnboardRefused(RuntimeError):
     """onboard.run refused to stand up a gym that carries no Echo client marker.
-    Raised (not returned) so POST /portal/onboard's generic exception path stops the
-    mint: no token, no gym row, no scaffold. `force=True` (the CLI's --force, a human
-    at the keyboard) bypasses it."""
+    Raised (not returned) so POST /portal/onboard maps it to HTTP 409 with
+    reason=not_echo_client and stops the mint: no token, no gym row, no scaffold.
+    `force=True` (the CLI's --force, a human at the keyboard) bypasses it."""
 
 
 def run(account_key, display_name, db_conn=None, voice_dir=None,

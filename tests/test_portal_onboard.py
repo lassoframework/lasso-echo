@@ -512,3 +512,21 @@ def test_missing_posting_timezone_is_fine(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
     status, body = _post_onboard({"account_key": "tzgym4", "display_name": "TZ Gym Four"})
     assert status == 200, body
+
+
+def test_non_echo_client_onboard_returns_409_not_500(monkeypatch, tmp_path):
+    """A gym with no Echo-client marker is a deliberate refusal, not a server error.
+
+    The ops portal cron retries HTTP 5xx forever; 409 with reason=not_echo_client
+    lets it stop (Onward Physical Therapy - Tampa). Genuine failures stay 500.
+    """
+    from agent import echo_clients
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+    echo_clients.set_test_override(lambda ident: False)
+    status, body = intake_web.handle_portal_onboard({
+        "account_key": "onwardpttampa",
+        "display_name": "Onward Physical Therapy - Tampa",
+    })
+    assert status == 409
+    assert body == {"error": "not_echo_client", "reason": "not_echo_client"}

@@ -676,9 +676,26 @@ def _shared_store(store=None):
             return None
         from .gym_shared_store import SharedGymStore
         s = SharedGymStore()
-        return s if s.available() else None
+        if not s.available():
+            reason = s.unavailable_reason()
+            if reason:
+                _note_shared_store_unavailable(reason)
+            return None
+        return s
     except Exception:  # noqa: BLE001 - a config/import fault never breaks the local write
         return None
+
+
+_UNAVAILABLE_NOTED = False
+
+
+def _note_shared_store_unavailable(reason):
+    """One clear log line per process: missing client != a data sync failure."""
+    global _UNAVAILABLE_NOTED
+    if _UNAVAILABLE_NOTED:
+        return
+    _UNAVAILABLE_NOTED = True
+    print(f"[gym-shared-store] unavailable: {reason}")
 
 
 # ONE Slack line per incident, not one per gym. A Supabase outage during a fleet
@@ -743,6 +760,10 @@ def _mirror_gym_row(account_key, fields, store=None):
         s.upsert(account_key, fields)
         return True
     except Exception as e:  # noqa: BLE001
+        from .gym_shared_store import SharedGymStoreUnavailable
+        if isinstance(e, SharedGymStoreUnavailable):
+            _note_shared_store_unavailable(str(e))
+            return False
         detail = f"{type(e).__name__}: {e}"
         print(f"[gym-shared-store] mirror FAILED for {account_key}: {detail}")
         _mirror_alert(
@@ -857,6 +878,10 @@ def gym_get(account_key, conn=None, _shared_read=True):
     try:
         shared = s.get(key)
     except Exception as e:  # noqa: BLE001 - a read fault degrades to the local answer
+        from .gym_shared_store import SharedGymStoreUnavailable
+        if isinstance(e, SharedGymStoreUnavailable):
+            _note_shared_store_unavailable(str(e))
+            return None
         print(f"[gym-shared-store] read-through failed for {key}: "
               f"{type(e).__name__}: {e}")
         return None
@@ -985,6 +1010,10 @@ def pull_shared_into_local(store=None, force=False, now=None):
     try:
         rows = s.list_all()
     except Exception as e:  # noqa: BLE001
+        from .gym_shared_store import SharedGymStoreUnavailable
+        if isinstance(e, SharedGymStoreUnavailable):
+            _note_shared_store_unavailable(str(e))
+            return 0
         detail = f"{type(e).__name__}: {e}"
         print(f"[gym-shared-store] pull failed: {detail}")
         _mirror_alert(

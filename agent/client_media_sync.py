@@ -1030,8 +1030,9 @@ def _existing_feed_count(store, base_key, start, days):
     old September feeds suppress an otherwise-empty October refill.
 
     A FEED row is the unit that consumes one photo (a story pairs on the same photo and
-    an FB mirror duplicates the same feed), so counting DISTINCT feed post_dates on
-    instagram is the true 'how many photos are placed' measure vs the media count.
+    an FB mirror duplicates the same feed), so count DISTINCT Instagram feed SLOTS.
+    At 1x this is one slot per date.  At 2x both rows share a date and differ by
+    slot_index; counting dates silently reported a healthy two-post day as one feed.
 
     ok=False (with count 0) means we could not read reliably: the caller treats the gym
     as NOT extendable this pass and SKIPS so a flaky read never triggers a rebuild."""
@@ -1043,7 +1044,7 @@ def _existing_feed_count(store, base_key, start, days):
     span_first = start.isoformat()
     span_last = (start + timedelta(days=days)).isoformat()
     months = sorted({(start + timedelta(days=i)).isoformat()[:7] for i in range(days)})
-    feed_dates = set()
+    feed_slots = set()
     weekly_feeds = 0
     for month in months:
         try:
@@ -1077,14 +1078,15 @@ def _existing_feed_count(store, base_key, start, days):
                 continue
             fmt = str(row.get("format", "")).lower()
             acct = str(row.get("account", "")).lower()
-            # count one per feed post_date on instagram (skip the facebook mirror and
-            # every story so the count equals photos placed, not total rows).
+            # Count one per logical Instagram feed slot (skip the Facebook mirror and
+            # every story so the count equals photos placed, not total rows).  Legacy
+            # 1x rows carry slot_index=None, which remains one slot for that date.
             if fmt == "feed" and acct in ("instagram", "ig", ""):
                 if isinstance(store, _PierceWeekStore):
                     weekly_feeds += 1
-                feed_dates.add(post_date)
+                feed_slots.add((post_date, row.get("slot_index")))
     return (weekly_feeds if isinstance(store, _PierceWeekStore)
-            else len(feed_dates)), True
+            else len(feed_slots)), True
 
 
 def _alert_thin_creative(base_key, media_count, days, log):

@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import media_swap as msw          # noqa: E402
 from agent import portal_social as ps        # noqa: E402
+from agent.media_guard import swap_original_identity as _real_original_identity  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +33,15 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc-key-secret")
     monkeypatch.setenv("AGENT_SOCIAL_BILLING_DELEGATED", "true")
+    # These legacy handler tests isolate budgets/reservations and sibling policy.
+    # Exact byte/lineage behavior is exercised independently in ordinary_swap_proof.
+    from agent import media_guard
+    import hashlib
+    monkeypatch.setattr(media_guard, "swap_original_identity",
+        lambda gym, row, store, pick=None, **kw: {
+            "sha256": hashlib.sha256((pick or row)["image_url"].encode()).hexdigest(),
+            "source_asset_id": None, "source_url": (pick or row)["image_url"]})
+    monkeypatch.setattr(ps, "_poster_evidence_is_current", lambda *a, **k: True)
     yield
 
 
@@ -65,17 +75,18 @@ class _Store:
         return dict(r)
 
     def swap_media(self, account_key, row_id, image_url, source_media_url=None,
-                   extra_fields=None):
+                   extra_fields=None, expected_row=None, **kwargs):
         self.swaps.append((row_id, image_url, source_media_url))
         self.extras = dict(extra_fields or {})
         r = self._rows.get(row_id)
         if not r or str(r.get("gym_id")) != str(account_key):
             return None
+        if expected_row is not None and r != expected_row:
+            return None
         if r.get("status") not in ("pending", "coach_review"):
             return None                      # the server-side status guard
         r["image_url"] = image_url
-        if source_media_url is not None:
-            r["source_media_url"] = source_media_url
+        r["source_media_url"] = source_media_url
         for col in ("thumbnail_url", "source_media_asset_id"):
             if col in (extra_fields or {}):
                 r[col] = extra_fields[col]
@@ -126,9 +137,14 @@ def test_media_swap_is_free_and_repeatable_while_a_caption_recreate_costs_one(
     _wire(monkeypatch, store)
 
     before = ps.recreate_remaining("zanshin")
-    for _ in range(5):                       # far more swaps than a month's budget
+    for index in range(5):                       # far more swaps than a month's budget
+        def fresh_picker(*args, **kwargs):
+            replacement = _picker(*args, **kwargs)
+            for variant in [replacement] + list(replacement["siblings"].values()):
+                variant["image_url"] = f"https://cdn/new{index}.jpg"
+            return replacement
         status, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
-                                            picker=_picker)
+                                            picker=fresh_picker)
         assert status == 200 and body["free"] is True
     assert ps.recreate_remaining("zanshin") == before, "a photo swap must cost nothing"
 
@@ -390,8 +406,10 @@ def test_swap_landed_but_representation_none_keeps_local_reservation(monkeypatch
 def test_prewrite_cas_refusal_releases_exact_local_reservation(monkeypatch, tmp_path):
     from agent import portal_calendar_store, rotation
     monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
-    store = _Store([_row("p1")])
-    pick = dict(_picker("zanshin", _row("p1")), path=str(tmp_path / "new.jpg"))
+    row = dict(_row("p1"), caption=r"Keep your feet \ hips aligned")
+    store = _Store([row])
+    pick = dict(_picker("zanshin", row), path=str(tmp_path / "new.jpg"))
+    before_budget = ps._budget_state("zanshin")
 
     def cas_refused(*args, **kwargs):
         raise portal_calendar_store.PreWriteCASError(
@@ -401,8 +419,10 @@ def test_prewrite_cas_refusal_releases_exact_local_reservation(monkeypatch, tmp_
     status, body = ps.handle_swap_media(
         "zanshin", "p1", "u1", sb_store=store, picker=lambda *a, **k: pick)
 
-    assert status == 500 and body["error"].endswith("PreWriteCASError")
-    assert store.get_row("zanshin", "p1")["image_url"] == "https://cdn/old.jpg"
+    assert status == 409 and body["reason"] == "swap_snapshot_unavailable"
+    assert "unchanged" in body["error"] and "PreWriteCASError" not in body["error"]
+    assert body["recreate_budget"] == before_budget
+    assert store.get_row("zanshin", "p1") == row
     assert rotation.load_served_strict().get("zanshin_ig", []) == []
 
 
@@ -652,17 +672,34 @@ def test_after_swap_stamps_the_new_drive_asset_and_settles_the_old_one(monkeypat
     assert _sel.pickable("zanshin", store=store, now=now) == []
 
 
-def test_drive_swap_stamp_failure_holds_before_calendar_write(monkeypatch):
-    from agent import gym_media_index, gym_media_selector
+@pytest.mark.parametrize("persisted", [False, True])
+def test_drive_swap_stamp_failure_holds_exact_claim(monkeypatch, persisted):
+    from agent import db, gym_media_index, gym_media_selector
     from tests.gym_media_fakes import FakeMediaStore, make_asset
     store = FakeMediaStore(assets=[make_asset("new_v", gym_id="zanshin")])
     monkeypatch.setattr(gym_media_index, "default_store", lambda: store)
-    monkeypatch.setattr(gym_media_selector, "stamp_use",
-                        lambda *a, **k: (_ for _ in ()).throw(OSError("stamp down")))
+    stamp = gym_media_selector.stamp_use
+
+    def failed_stamp(*args, **kwargs):
+        if persisted:
+            stamp(*args, **kwargs)
+        raise OSError("stamp outcome unavailable")
+
+    monkeypatch.setattr(gym_media_selector, "stamp_use", failed_stamp)
     pick = {"source": "drive", "source_media_asset_id": "new_v"}
     assert msw.reserve_local_pick(
         "zanshin", {"post_date": "2026-09-20"}, pick) is False
     assert not pick.get("_drive_stamped")
+    # A failed stamp cannot establish whether a remote usage write persisted.
+    # Even generic prewrite cleanup must leave its exact byte claim protective.
+    msw.release_local_pick(pick)
+    claim_id = gym_media_selector.drive_content_claim_id("zanshin", store.get_asset("new_v"))
+    assert pick["_drive_claim_id"] == claim_id
+    assert db.socialapi_claim(claim_id, "zanshin_gbp")[0] == "in_flight"
+    assert store.get_asset("new_v")["used_count"] == int(persisted)
+    assert msw.reserve_local_pick(
+        "zanshin", {"post_date": "2026-09-20"},
+        {"source": "drive", "source_media_asset_id": "new_v"}) is False
 
 
 def test_prewrite_drive_swap_stamp_restores_on_definite_write_failure(monkeypatch,
@@ -1171,3 +1208,195 @@ def test_candidate_walk_is_bounded_by_the_candidate_list_and_finite_deadlines():
         assert math.isfinite(bound) and bound > 0
     dl = msw._Deadline(1.0, clock=lambda: 0.0)
     assert math.isfinite(dl.remaining()) and dl.remaining() > 0
+
+
+@pytest.mark.parametrize("outage_after_patch", [False, True])
+def test_exact_source_bytes_shared_and_postwrite_outage_keeps_sibling_sync(
+        monkeypatch, tmp_path, outage_after_patch):
+    from agent import media_guard, visual_writer_prepare as vp
+    import hashlib
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    monkeypatch.setattr(media_guard, "swap_original_identity", _real_original_identity)
+    monkeypatch.setattr(vp, "enabled", lambda: False)
+    lib = tmp_path / "library"
+    lib.mkdir()
+    (lib / "old.jpg").write_bytes(b"old original")
+    monkeypatch.setattr(msw, "library_path_for", lambda *a: str(lib))
+    before = _row()
+    before["source_media_url"] = before["image_url"]
+    siblings = [dict(before, id="p2", account="facebook"),
+                dict(before, id="p3", format="story")]
+    monkeypatch.setattr(msw, "sibling_rows", lambda *a, **k: siblings)
+    calls = []
+    active_store = [None]
+
+    def fetch(url):
+        calls.append(url)
+        if outage_after_patch and active_store[0].swaps:
+            raise OSError("transient source outage after primary PATCH")
+        return {"https://cdn/old.jpg": b"old original",
+                "https://cdn/new.jpg": b"new original"}[url]
+
+    monkeypatch.setattr(vp, "_bytes_for_url", fetch)
+
+    def picker(*args, **kwargs):
+        candidate = _picker(*args, **kwargs)
+        for variant in [candidate] + list(candidate["siblings"].values()):
+            variant.update(source_media_url="https://cdn/new.jpg",
+                           original_sha256=hashlib.sha256(b"new original").hexdigest())
+        return candidate
+
+    # Separate requests fetch again: the cache never outlives one operation.
+    for _ in range(2):
+        store = _Store([before] + siblings)
+        active_store[0] = store
+        _wire(monkeypatch, store)
+        code, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                         picker=picker)
+        assert code == 200 and body["ok"]
+        assert sorted(body["siblings_swapped"]) == ["p2", "p3"]
+        assert len(store.swaps) == 3
+        assert body["media_swap_proof"]["readback_verified"]
+    assert calls == ["https://cdn/old.jpg", "https://cdn/new.jpg"] * 2
+
+
+def test_shared_source_cache_cannot_hide_sibling_identity_mismatch(monkeypatch):
+    from agent import media_guard
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    rows = [_row(), _row("p2")]
+    store = _Store(rows)
+    _wire(monkeypatch, store)
+    monkeypatch.setattr(msw, "sibling_rows", lambda *a, **k: [rows[1]])
+    caches = []
+
+    def identity(gym, row, store, *, pick=None, byte_cache=None):
+        caches.append(byte_cache)
+        url = (pick or row)["image_url"]
+        return {"sha256": url, "source_asset_id": None, "source_url": url}
+
+    monkeypatch.setattr(media_guard, "swap_original_identity", identity)
+
+    def picker(*args, **kwargs):
+        candidate = _picker(*args, **kwargs)
+        candidate["siblings"]["p2"]["image_url"] = "https://cdn/wrong.jpg"
+        return candidate
+
+    code, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                     picker=picker)
+    assert code == 409 and body["reason"] == "media_evidence_unavailable"
+    assert store.swaps == []
+    assert len(caches) == 3 and all(cache is caches[0] for cache in caches)
+
+
+@pytest.mark.parametrize("field", ["source_media_url", "source_media_asset_id"])
+def test_postwrite_source_identity_drift_still_fails_closed(monkeypatch, field):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    store = _Store([_row()])
+    _wire(monkeypatch, store)
+    original_get = store.get_row
+
+    def get_row(*args):
+        fresh = original_get(*args)
+        if store.swaps:
+            fresh[field] = "different-source"
+        return fresh
+
+    monkeypatch.setattr(store, "get_row", get_row)
+    code, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                     picker=_picker)
+    assert code == 503 and body["reason"] == "swap_outcome_unknown"
+    assert not body["ok"] and "media_swap_proof" not in body
+
+
+@pytest.mark.parametrize("field", sorted(ps._pcs._DRAFT_SCENE_CAS_COLUMNS))
+@pytest.mark.parametrize("drift", ["changed", "removed", "added", "added_null"])
+def test_prepared_identity_readback_drift_blocks_proof_and_siblings(
+        monkeypatch, field, drift):
+    from agent import visual_writer_prepare as vp
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    monkeypatch.setattr(vp, "enabled", lambda: True)
+    before = _row()
+    before.update({key: "old-" + key for key in ps._pcs._DRAFT_SCENE_CAS_COLUMNS})
+    sibling = dict(before, id="p2", account="facebook")
+    store = _Store([before, sibling])
+    _wire(monkeypatch, store)
+    monkeypatch.setattr(msw, "sibling_rows", lambda *a, **k: [sibling])
+    settled = []
+    monkeypatch.setattr(msw, "after_swap", lambda *a, **k: settled.append(True))
+    original_swap = store.swap_media
+    original_get = store.get_row
+
+    def prepared_swap(*args, **kwargs):
+        result = original_swap(*args, **kwargs)
+        # Model the store's validated representation after writer preparation.
+        result.update({key: "prepared-" + key
+                       for key in ps._pcs._DRAFT_SCENE_CAS_COLUMNS})
+        if drift in ("added", "added_null"):
+            result.pop(field)
+        store._rows[result["id"]] = dict(result)
+        return result
+
+    def drifted_get(*args):
+        fresh = original_get(*args)
+        if store.swaps:
+            if drift == "removed":
+                fresh.pop(field)
+            else:
+                fresh[field] = None if drift == "added_null" else "different-identity"
+        return fresh
+
+    monkeypatch.setattr(store, "swap_media", prepared_swap)
+    monkeypatch.setattr(store, "get_row", drifted_get)
+    code, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                     picker=_picker)
+    assert code == 503 and body["reason"] == "swap_outcome_unknown"
+    assert not body["ok"] and "media_swap_proof" not in body
+    assert [swap[0] for swap in store.swaps] == ["p1"]
+    assert store._rows["p2"] == sibling
+    assert settled == []
+
+
+@pytest.mark.parametrize("prepared_columns", [False, True])
+def test_prepared_identity_matching_readback_preserves_verified_swap(
+        monkeypatch, prepared_columns):
+    from agent import visual_writer_prepare as vp
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    monkeypatch.setattr(vp, "enabled", lambda: True)
+    before = _row()
+    if prepared_columns:
+        before.update({key: "old-" + key for key in ps._pcs._DRAFT_SCENE_CAS_COLUMNS})
+    sibling = dict(before, id="p2", account="facebook")
+    store = _Store([before, sibling])
+    _wire(monkeypatch, store)
+    monkeypatch.setattr(msw, "sibling_rows", lambda *a, **k: [sibling])
+    original_swap = store.swap_media
+
+    def prepared_swap(*args, **kwargs):
+        result = original_swap(*args, **kwargs)
+        if prepared_columns:
+            result.update({key: "prepared-" + key
+                           for key in ps._pcs._DRAFT_SCENE_CAS_COLUMNS})
+            store._rows[result["id"]] = dict(result)
+        return result
+
+    monkeypatch.setattr(store, "swap_media", prepared_swap)
+    code, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                     picker=_picker)
+    assert code == 200 and body["media_swap_proof"]["readback_verified"]
+    assert body["siblings_swapped"] == ["p2"]
+
+
+@pytest.mark.parametrize("field", sorted(ps._pcs._DRAFT_SCENE_CAS_COLUMNS))
+def test_disabled_preparation_readback_requires_exact_identity_clearing(monkeypatch, field):
+    from agent import visual_writer_prepare as vp
+    monkeypatch.setattr(vp, "enabled", lambda: False)
+    before = _row()
+    before.update({key: "old-" + key for key in ps._pcs._DRAFT_SCENE_CAS_COLUMNS})
+    candidate = _picker("zanshin", before)
+    saved = dict(before, image_url=candidate["image_url"], source_media_url=None,
+                 **msw.swap_fields(candidate))
+    saved.update({key: None for key in ps._pcs._DRAFT_SCENE_CAS_COLUMNS})
+    store = _Store([saved])
+    assert ps._verified_swap_readback(store, "zanshin", before, candidate, saved) == saved
+    store._rows["p1"][field] = before[field]
+    assert ps._verified_swap_readback(store, "zanshin", before, candidate, saved) is None

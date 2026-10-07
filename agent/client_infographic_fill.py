@@ -88,19 +88,39 @@ def _with_review_mark(category):
 _ARCHETYPES = ("flow", "split", "hero", "path", "headline")
 
 
-def real_media_depleted(base, *, now=None):
-    """Return True only when Echo can confirm this gym has no usable real media.
+# PHOTO-FIRST MEDIA ELIGIBILITY (2026-10-06): the Astra infographic fallback is
+# a LAST RESORT behind eligible same-gym photos. The depletion question therefore
+# has THREE answers, not two:
+#   * MEDIA_AVAILABLE  -- a usable same-gym photo/video is proven to exist; the
+#     fallback must not run.
+#   * MEDIA_DEPLETED   -- every inventory read succeeded and PROVED no usable
+#     same-gym media remains; only then may the fallback be considered.
+#   * MEDIA_UNCERTAIN  -- inventory is incomplete or repeat-use provenance is
+#     unknown (unreadable library, unavailable index, no completed sync, a photo
+#     awaiting moderation, a claim read failure, or a usable asset excluded only
+#     because its media_source linkage is stale/unverifiable). Never claim photos
+#     are exhausted: hold the fallback explicitly.
+# A stale source_id is NEVER repeat evidence by itself: only the gym's own
+# proven use counters (used_count / last_used_at and same-byte aliases) mark an
+# asset used.
+MEDIA_AVAILABLE = "available"
+MEDIA_DEPLETED = "depleted"
+MEDIA_UNCERTAIN = "uncertain"
 
-    A calendar gap is deliberately not evidence of depletion: a gym may have uploads
-    waiting for a later planner pass.  The alert lane is therefore fail-closed.  A
-    usable file in the client library suppresses it; an unreadable library or an
-    unavailable active Drive inventory also suppresses it rather than asking a client
-    to upload media Echo may already have.
 
-    When the Drive lane is active, its selector is the inventory contract.  Its
-    pickable set already applies the eligibility, coach-hide, and reuse rules used by
-    the planner, so an empty set means there is no Drive photo or video left for a
-    new post right now.
+def real_media_status(base, *, now=None):
+    """(status, detail) for Echo's photo-first depletion question.
+
+    status is MEDIA_AVAILABLE / MEDIA_DEPLETED / MEDIA_UNCERTAIN as documented
+    above; detail is a short human/ops-legible reason. An eligible same-gym
+    photo always wins over the Astra infographic fallback; an incomplete
+    inventory or unknown repeat-use provenance is an explicit UNCERTAIN hold,
+    never a claim that photos are exhausted.
+
+    The Drive selector remains the inventory contract: its pickable set already
+    applies eligibility, coach-hide, claim, proven-repeat and cross-gym source
+    rules. This classifier only interprets the reads -- it never marks repeats
+    and never mutates state.
     """
     from . import rotation
     from .library import list_creatives
@@ -112,7 +132,7 @@ def real_media_depleted(base, *, now=None):
     except FileNotFoundError:
         names = []
     except OSError:
-        return False
+        return (MEDIA_UNCERTAIN, "local media library unreadable")
     try:
         served = rotation.load_served().get(f"{base}_ig", [])
         used = {str(row.get("key")) for row in served}
@@ -135,21 +155,24 @@ def real_media_depleted(base, *, now=None):
                      and all(path in available for path in paths))]
         from .media_bridge import observe_local_inventory
         observe_local_inventory(base, local)
-    except Exception:
-        return False
+    except Exception as exc:  # noqa: BLE001
+        return (MEDIA_UNCERTAIN,
+                f"local media inventory check failed ({type(exc).__name__})")
+    if local:
+        return (MEDIA_AVAILABLE, "eligible same-gym local media exists")
 
     # The indexed Drive inventory is authoritative even when the staging lane is
     # currently disabled.  A disabled writer must not make approved client media
     # look absent and unlock the infographic fallback.  If the index is
-    # unavailable or unreadable, return False below (fail closed).
+    # unavailable or unreadable, return UNCERTAIN below (fail closed).
     try:
         from . import gym_media_index, gym_media_selector
         media_store = gym_media_index.default_store()
         if not media_store.available():
-            return False
+            return (MEDIA_UNCERTAIN, "Drive media index unavailable")
         list_sources = getattr(media_store, "list_sources", None)
         if not callable(list_sources):
-            return False
+            return (MEDIA_UNCERTAIN, "Drive media index cannot prove source rows")
         sources = list_sources(base) or []
         # A successful authoritative source read with no Drive rows means this
         # gym has never connected Drive. There is no remote supply to wait for,
@@ -159,8 +182,12 @@ def real_media_depleted(base, *, now=None):
                          if str(s.get("kind") or "") == "gym_drive"]
         if not drive_sources:
             if config.gym_drive_connect_active_for(base):
-                return False
-            return not local
+                return (MEDIA_UNCERTAIN,
+                        "Drive connect is active but no media_source rows exist yet")
+            if local:
+                return (MEDIA_AVAILABLE, "usable local media and no Drive supply")
+            return (MEDIA_DEPLETED,
+                    "no usable local media and this gym never connected Drive")
         ready = [s for s in drive_sources
                  if s.get("active") is not False
                  and not s.get("revoked_externally")
@@ -169,7 +196,7 @@ def real_media_depleted(base, *, now=None):
         # An empty asset response is meaningful only after a successful sync.
         # Without that proof, an empty/stale DB must never unlock Astra fallback.
         if not ready:
-            return False
+            return (MEDIA_UNCERTAIN, "no completed Drive sync proves the inventory")
         # The selector normally converts claim errors to [] for planning; this
         # gate requests strict claim reads before interpreting [] as depletion.
         assets = media_store.list_assets(base)
@@ -184,7 +211,7 @@ def real_media_depleted(base, *, now=None):
                and a.get("review_status") == "pending_review"
                and a.get("moderation_status") == "pending"
                and a.get("content_hash") for a in assets):
-            return False
+            return (MEDIA_UNCERTAIN, "a client photo is awaiting moderation")
         class Snapshot:
             def available(self):
                 return True
@@ -219,9 +246,103 @@ def real_media_depleted(base, *, now=None):
             base, store=Snapshot(), now=parsed_now, strict_claims=True)
         from .media_bridge import observe_drive_inventory
         observe_drive_inventory(base, [a.get("id") for a in drive])
-        return not local and not drive
-    except Exception:  # noqa: BLE001 - inventory uncertainty must never alert a client
-        return False
+        if local or drive:
+            return (MEDIA_AVAILABLE,
+                    "eligible same-gym media exists; photos win over the fallback")
+        # An empty pickable set is only a DEPLETED proof when no exclusion rests
+        # on unproven evidence. A usable asset kept out solely by a stale or
+        # unverifiable media_source link, or by an unreadable claim set, makes
+        # the inventory UNCERTAIN -- never a claim that photos are exhausted.
+        detail = _unproven_empty_pool_detail(base, assets, Snapshot())
+        if detail:
+            return (MEDIA_UNCERTAIN, detail)
+        return (MEDIA_DEPLETED,
+                "verified Drive inventory and local library both prove no usable media")
+    except Exception as exc:  # noqa: BLE001 - inventory uncertainty must never alert a client
+        return (MEDIA_UNCERTAIN,
+                f"inventory read failed ({type(exc).__name__})")
+
+
+def _unproven_empty_pool_detail(base, assets, store):
+    """Why an empty pickable set is NOT proof of exhaustion, or "".
+
+    Runs only after a strict pickable read returned []. Re-derives each
+    same-gym usable asset's exclusion reason: a proven repeat (this gym's own
+    use counters / same-byte alias) or a clean global-ledger/scene exclusion
+    stays out silently, but a stale/unverifiable media_source link, an
+    in-flight claim, or any other unproven gate means the pool cannot be
+    declared exhausted. A stale source_id is never repeat evidence on its own.
+    """
+    from . import gym_media_selector as gms
+    try:
+        source_ids = gms.verified_source_ids(store, base)
+    except Exception:  # noqa: BLE001 - source evidence itself is unproven
+        return "media_source evidence unreadable; photo supply not proven exhausted"
+    used_hashes = set()
+    uncertain_hashes = set()
+    for alias in assets:
+        if str(alias.get("gym_id") or "") != base:
+            continue
+        digest = gms._byte_hash(alias)
+        if not digest:
+            continue
+        try:
+            int(alias.get("used_count") or 0)
+        except (TypeError, ValueError):
+            uncertain_hashes.add(digest)
+        else:
+            if gms._has_prior_use(alias):
+                used_hashes.add(digest)
+    try:
+        from . import db
+        claimed_ids = set(db.drive_asset_claimed_ids(base) or ())
+        claimed_hashes = gms._claimed_hashes(assets, claimed_ids, base)
+    except Exception:  # noqa: BLE001 - unknown claims are unknown provenance
+        return "in-flight claim evidence unreadable; photo supply not proven exhausted"
+    for a in assets:
+        if str(a.get("gym_id") or "") != base:
+            continue
+        if not gms.is_usable(a):
+            continue
+        try:
+            int(a.get("used_count") or 0)
+        except (TypeError, ValueError):
+            # The selector fails closed and treats this row as used, but an
+            # unreadable counter is UNKNOWN repeat-use provenance, not proof of
+            # a repeat: it cannot support an exhaustion claim either.
+            return ("an asset's use counters are unreadable; repeat-use "
+                    "provenance unknown, photo supply not proven exhausted")
+        if str(a.get("source_id") or "") not in source_ids:
+            return ("a usable asset's media_source link is stale or unverifiable; "
+                    "photo supply not proven exhausted")
+        if gms._byte_hash(a) in uncertain_hashes:
+            return ("a same-byte alias has unreadable use counters; repeat-use "
+                    "provenance unknown, photo supply not proven exhausted")
+        if gms._has_prior_use(a) or (gms._byte_hash(a)
+                                     and gms._byte_hash(a) in used_hashes):
+            continue            # proven repeat: the exclusion is justified
+        if str(a.get("id")) in claimed_ids or (gms._byte_hash(a)
+                                               and gms._byte_hash(a) in claimed_hashes):
+            return ("usable media is reserved by an in-flight claim; "
+                    "photo supply not proven exhausted")
+        if gms.global_ledger_flag() or gms.scene_guard_flag():
+            # A clean ledger/scene exclusion under an armed guard is proven;
+            # uncertainty in those reads already raised under strict_claims.
+            continue
+        return ("a usable asset was excluded by an unproven gate; "
+                "photo supply not proven exhausted")
+    return ""
+
+
+def real_media_depleted(base, *, now=None):
+    """Legacy boolean view of :func:`real_media_status`.
+
+    True ONLY on a proven MEDIA_DEPLETED; MEDIA_AVAILABLE and MEDIA_UNCERTAIN
+    both read False so every existing caller stays fail-closed (an uncertain
+    inventory never unlocks the Astra fallback). Callers that must SAY why the
+    fallback is held should read real_media_status directly.
+    """
+    return real_media_status(base, now=now)[0] == MEDIA_DEPLETED
 
 
 def fill_enabled() -> bool:
@@ -360,9 +481,17 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
     from .client_month_run import _to_rows
     from .drafter import Draft, DraftStatus
 
-    depleted = real_media_depleted(base, now=now)
-    if not depleted:
+    media_status, media_detail = real_media_status(base, now=now)
+    if media_status == MEDIA_AVAILABLE:
         return {"ok": True, "filled": 0, "reason": "usable media available"}
+    if media_status == MEDIA_UNCERTAIN:
+        # Explicit hold: inventory incomplete or repeat-use provenance unknown.
+        # Never claim photos are exhausted and never run the Astra fallback.
+        reason = (f"media inventory uncertain — infographic fallback held "
+                  f"({media_detail})")
+        log(f"{base}: {reason}")
+        return {"ok": False, "filled": 0, "held": True, "reason": reason}
+    depleted = True
     from .media_bridge import bridge_days, episode, retry_existing_notice
     existing_notice = bool(episode(base, now=now, create=False))
     allowed_days = set(bridge_days(base, now=now, days_ahead=days_ahead))
@@ -415,7 +544,14 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         # Re-verify BOTH right before this card is drawn so a photo that
         # landed (or a row another lane inserted) between the scan and now
         # always wins over an infographic.
-        if not real_media_depleted(base, now=now):
+        generation_status, generation_detail = real_media_status(base, now=now)
+        if generation_status == MEDIA_UNCERTAIN:
+            reason = ("media inventory uncertain at generation time; "
+                      f"infographic fallback held ({generation_detail})")
+            log(f"{base}: {reason}")
+            return {"ok": False, "filled": 0, "gaps": len(gaps),
+                    "held": True, "reason": reason}
+        if generation_status == MEDIA_AVAILABLE:
             log(f"{base}: usable approved photos available at generation "
                 "time; holding infographic fill (photos first)")
             break
@@ -527,11 +663,18 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
     # final best-effort guard; its check-to-insert interval remains necessarily
     # subject to a concurrent writer and must stay fail-closed at the store
     # boundary when that capability is added.
-    if not real_media_depleted(base, now=now):
-        log(f"{base}: usable approved photos available before insert; holding "
-            "all infographic drafts")
-        return {"ok": True, "filled": 0, "gaps": len(gaps),
-                "reason": "usable media available before insert"}
+    pre_status, pre_detail = real_media_status(base, now=now)
+    if pre_status != MEDIA_DEPLETED:
+        if pre_status == MEDIA_AVAILABLE:
+            log(f"{base}: usable approved photos available before insert; holding "
+                "all infographic drafts")
+            return {"ok": True, "filled": 0, "gaps": len(gaps),
+                    "reason": "usable media available before insert"}
+        log(f"{base}: media inventory uncertain before insert "
+            f"({pre_detail}); holding all infographic drafts")
+        return {"ok": False, "filled": 0, "gaps": len(gaps), "held": True,
+                "reason": f"media inventory uncertain before insert "
+                          f"({pre_detail})"}
     insertable_days = set(_empty_upcoming_days(
         store, base, tz_name, min(days_ahead, 2), now=now))
     drafts = [draft for draft in drafts if draft.day_key in insertable_days]

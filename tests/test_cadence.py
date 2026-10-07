@@ -13,7 +13,8 @@ Asserts, per the spec's acceptance section:
   * D5 second-slot distinctness in the LASSO plan (category differs, cap preserved).
   * handle_cadence endpoint contract (save-while-dark, validation, kv write).
   * Replan boundary: a cadence change forces the media-sync lane to rebuild; the
-    rebuild itself still honors locked (approved) days.
+    rebuild itself still honors locked (approved) slots. A 2x day with one owned
+    slot can fill the other without replacing the owned post.
 """
 
 import os
@@ -277,22 +278,32 @@ def test_client_2x_thin_media_covers_fewer_days_never_reuses(tmp_path, monkeypat
     assert len(urls) == len(set(urls))                 # no photo reused
 
 
-def test_client_2x_locked_day_untouched(tmp_path, monkeypatch):
-    """Replan boundary (D7): a day a human owns is skipped entirely at 2x too."""
+def test_client_2x_locked_slot_untouched_open_slot_filled(tmp_path, monkeypatch):
+    """Replan boundary (D7): an owned slot is skipped; a 2x day can still fill
+    the free slot. The approved morning photo is never re-picked."""
     monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
 
     class _StoreWithApproved(_FakeStore):
         def list_month(self, base_key, month):
             return [{"post_date": _BUILD_START, "format": "feed",
                      "account": "instagram", "status": "approved",
+                     "slot_index": 0,
                      "caption": "human owned", "image_url":
                      "https://gritx.media/photo_00.jpg"}]
 
     store = _StoreWithApproved(ppd=2)
     out = _build(tmp_path, store, days=2, n_media=8)
     assert out["ok"]
-    planned_days = {r["post_date"] for r in store.inserted}
-    assert _BUILD_START not in planned_days            # locked day never re-planned
+    ig_feeds = [r for r in store.inserted
+                if r["format"] == "feed" and r["account"] == "instagram"]
+    start_feeds = [r for r in ig_feeds if r["post_date"] == _BUILD_START]
+    assert start_feeds, "open evening slot on a partially-approved 2x day must be filled"
+    assert all(r.get("slot_index") == 1 for r in start_feeds)
+    assert all(r.get("image_url") != "https://gritx.media/photo_00.jpg"
+               for r in store.inserted if r.get("image_url"))
+    # the owned morning slot is never re-planned
+    assert not any(r.get("slot_index") == 0 and r["post_date"] == _BUILD_START
+                   for r in ig_feeds)
 
 
 # ---- publish-time slot times -------------------------------------------------------
@@ -421,7 +432,8 @@ def test_cadence_noop_build_never_stamps_applied(monkeypatch, tmp_path):
 
 def test_apply_allow_reshape_skips_never_shrink_once(tmp_path, monkeypatch):
     """1x->2x mid-band (media between days and 2x days): fewer covered DATES with
-    MORE feeds is a legitimate reshape — _apply must write it when allow_reshape.
+    MORE feed SLOTS is growth, not shrinkage. The slot-aware guard may write it even
+    before the one-time allow_reshape hint; the hint remains valid and idempotent.
 
     Two feed slots land in one (account, post_date, format) slot on purpose here,
     so gritx's cadence must genuinely say 2 (SLOT CAPACITY, 2026-09-11 lasso
@@ -445,9 +457,9 @@ def test_apply_allow_reshape_skips_never_shrink_once(tmp_path, monkeypatch):
 
     from datetime import date
     store = _Existing(ppd=2)
-    blocked = cmr._apply("gritx", list(rows), date(2026, 10, 1), 30, store,
-                         lambda m: None)
-    assert blocked.get("noop_shrink") is True and store.inserted == []
+    first = cmr._apply("gritx", list(rows), date(2026, 10, 1), 30, store,
+                       lambda m: None)
+    assert first["ok"] and not first.get("noop_shrink") and store.inserted
 
     store2 = _Existing(ppd=2)
     applied = cmr._apply("gritx", list(rows), date(2026, 10, 1), 30, store2,
