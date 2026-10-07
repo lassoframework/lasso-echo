@@ -131,6 +131,10 @@ def _expected_instagram_handle(account_key):
     return expected
 
 
+from .forward_media_send_context import guarded_publisher, boundary, unsupported, current_claim_token
+
+
+@guarded_publisher('zernio')
 def publish(draft, account, client=None, scheduled_for=None,
             profile_resolver=None, page_resolver=None,
             expected_handle_resolver=None):
@@ -326,10 +330,21 @@ def publish(draft, account, client=None, scheduled_for=None,
     if scheduled_for and _is_past(scheduled_for):
         scheduled_for = None
 
+    if scheduled_for:
+        unsupported('scheduled provider send')
+    boundary('zernio',draft=draft,account=account,attempt=True)
+
     try:
-        resp = client.create_post(account_id, body,
-                                  media_urls=media_urls, scheduled_for=scheduled_for,
-                                  page_id=page_id, platform=platform, story=story)
+        from . import forward_media_guard as _fmg
+        if _fmg.enabled():
+            resp = client.create_post(account_id, body,
+                                      media_urls=media_urls, scheduled_for=scheduled_for,
+                                      page_id=page_id, platform=platform, story=story,
+                                      idempotency_key=current_claim_token('zernio'))
+        else:
+            resp = client.create_post(account_id, body,
+                                      media_urls=media_urls, scheduled_for=scheduled_for,
+                                      page_id=page_id, platform=platform, story=story)
     except zernio.ZernioError as exc:
         # 409 = Zernio's 24h content-hash dedup: this exact content already posted to
         # this account. That IS success for our exactly-once goal — mark it published

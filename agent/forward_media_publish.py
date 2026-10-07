@@ -116,3 +116,14 @@ def hold_result(store, row, claim_token):
         return {'ok': False, 'status': 'approved', 'late_post_id': '',
                 'reject_reason': reason + ': ' + str(exc), 'held': reason, 'mode': ''}
     return None
+
+
+def authorized_send(store, row, claim_token):
+    """Explicit one-send scope around the actual lower publisher invocation.
+
+    Plain authorize() remains a verification operation and grants no ambient
+    lower-publisher permission. Calendar callers must adopt this explicit scope
+    before activation; direct approval/chat callers without it hold safely.
+    """
+    from .forward_media_send_context import authorized_send as scope
+    return scope(store, row, claim_token)
