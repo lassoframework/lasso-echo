@@ -264,6 +264,11 @@ def _provenance_lane(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gbp_planner, "_url_bytes_match", _verify)
 
+    # The strict candidate independently reads both hosted objects. Replace
+    # only that network edge; the production byte comparison still runs.
+    monkeypatch.setattr("agent.visual_writer_prepare._bytes_for_url",
+                        lambda url: served.get(url) or delivered.get(url))
+
     def _host(local_path, tenant, client=None):
         data = open(local_path, "rb").read()
         url = f"https://cdn.test/gbp/{hashlib.md5(data).hexdigest()[:12]}.jpg"
