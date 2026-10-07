@@ -132,6 +132,18 @@ def _has_banned_word(text, banned_words):
     return False
 
 
+def _caption_repeats_history(base_key, caption, day_key):
+    """Use the writer's 180 day rule before a photo gets paired with a Story.
+
+    Retries choose approved source material; changing case, spacing or adding an
+    arbitrary suffix never establishes a fresh caption.
+    """
+    if not config.caption_cooldown_enabled():
+        return False
+    from . import caption_ledger
+    return caption_ledger.is_verbatim_blocked(base_key, caption, day_key)
+
+
 def _url_basename(url):
     """The filename a public media URL points at (query string stripped). Hosted client
     media keeps its library basename, so this is the join key between a calendar row's
@@ -405,6 +417,16 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
         # 2x uniqueness: never the same concept twice in one day (CADENCE_SPEC D5).
         if _avoid and _norm_caption(getattr(d, "caption", "")) in _avoid:
             return False
+        # Check against the REAL target date, including when the approved-source
+        # walk below generates on a neighbouring day and re-homes its draft.
+        if config.caption_cooldown_enabled():
+            caption_base = re.sub(
+                r"_(?:ig|fb|gbp)$", "", getattr(account, "key", "") or "")
+            # Caption-only/offline callers may have no account when cooldown is
+            # off. An armed history guard requires the real tenant identity.
+            if not caption_base or _caption_repeats_history(
+                    caption_base, d.caption, day_key):
+                return False
         # A+ caption gate is enforced whenever the real-caption engine (SB7) is on —
         # the production posture. With SB7 OFF the system is in its documented
         # deterministic baseline mode (source + CTA), where only the banned-word bar
@@ -1105,6 +1127,12 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
         log(f"[gym-drive] {base_key} {day_key}: A+ gate errored "
             f"({type(e).__name__}); dropping the draft")
         _gate_ok = False
+    _history_repeat = _caption_repeats_history(
+        base_key, getattr(draft, "caption", "") or "", day_key)
+    if _history_repeat:
+        log(f"[gym-drive] {base_key} {day_key}: caption repeats 180 day history; "
+            "retrying approved copy on the same photo")
+        _gate_ok = False
     if not _gate_ok:
         # RETRY ONCE WITH A FRESH CAPTION ON THE SAME ASSET (audit round 4 #3):
         # dropping the day here sent a video beat to a still repeat over a
@@ -1120,9 +1148,15 @@ def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key,
                                 tuple(banned_words or ())))
             except Exception:  # noqa: BLE001
                 _gate_ok = False
+            _history_repeat = _caption_repeats_history(
+                base_key, getattr(draft, "caption", "") or "", day_key)
+            if _history_repeat:
+                _gate_ok = False
     if not _gate_ok:
+        failure = ("failed the caption history gate twice" if _history_repeat
+                   else "failed the A+/banned-word gate twice")
         log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, the caption "
-            "failed the A+/banned-word gate twice")
+            f"{failure}")
         _rollback_drive_asset(draft, day_key, log)
         # POISONED ASSET (final verification g): rolled back, it is the pool's
         # least-used candidate again; keep it out of every later beat this build.
@@ -2620,8 +2654,10 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         _slot_capacity = _cadence.resolve_posts_per_day(base_key, store)
         preflight = getattr(store, "preflight_cadence_rows", None)
         cadence_prevalidated = False
-        if (_slot_capacity == 2 and callable(preflight)
-                and planned_feed_slots):
+        # Every cadence must admit its required photo posts before deletion.
+        # A 1x one-day build used to report success with zero inserted rows when
+        # the caption belt first ran after delete (Swift River Oct 15/16).
+        if callable(preflight) and planned_feed_slots:
             replace_dates = {
                 (start + timedelta(days=i)).isoformat()
                 for i in range(max(1, int(days)))
@@ -2902,8 +2938,7 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             # shortfall means a stage-time belt dropped required cadence.
             expected_feed_count = len(new_feed_slots)
             actual_feed_count = len(inserted_feed_slots)
-            if (cadence_prevalidated
-                    and actual_feed_count < expected_feed_count):
+            if actual_feed_count < expected_feed_count:
                 log(f"{base_key}: cadence staging incomplete: inserted "
                     f"{actual_feed_count}/{expected_feed_count} Instagram "
                     "feed slots; cadence remains pending and the scan will retry")

@@ -295,8 +295,8 @@ def test_apply_fails_closed_when_october_target_lands_27_of_30(monkeypatch):
     assert store.inserted == []
 
 
-def test_apply_one_x_tolerates_ordinary_stage_drop(monkeypatch):
-    """A 1x gym stays tolerant even while the global 2x rollout is armed."""
+def test_apply_one_x_reports_ordinary_stage_drop_as_failure(monkeypatch):
+    """One post cadence cannot report a partial write as a complete build."""
     monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
 
     class _OneXDropStore(_CalendarStore):
@@ -306,7 +306,7 @@ def test_apply_one_x_tolerates_ordinary_stage_drop(monkeypatch):
             self.prevalidated = "unset"
 
         def preflight_cadence_rows(self, base_key, incoming, *, replace_dates=()):
-            raise AssertionError("1x builds must not enter strict cadence preflight")
+            return list(incoming)
 
         def insert_rows(self, base_key, incoming, *, required_feed_slots=None,
                         prevalidated_cadence=False):
@@ -326,10 +326,11 @@ def test_apply_one_x_tolerates_ordinary_stage_drop(monkeypatch):
         "eng", rows, date(2026, 10, 19), 2, store, lambda _msg: None,
         allow_reshape=True)
 
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert result["reason"] == "incomplete cadence staging"
     assert result["inserted"] == 1
-    assert store.required is None
-    assert store.prevalidated is False
+    assert store.required == {("2026-10-19", 0), ("2026-10-20", 0)}
+    assert store.prevalidated is True
 
 
 def test_apply_two_x_keeps_required_slot_check_strict(monkeypatch):
