@@ -1046,8 +1046,14 @@ class StoryBrandGenerator:
                     "the approved source. Rewrite the caption with NO digits or "
                     "numeric claims at all; spell out nothing that implies a stat, "
                     "price, or count that is not verbatim in the source.\n\n")
-                if retry and _output_claims_cleared(retry, voice, client_note) \
-                        and not openings_collide(retry, avoid_list):
+                # Opening variety is a soft preference, never a publication gate. The
+                # retry may honestly converge on a recent opening when a thin source leaves
+                # few ways to remove the invented figure. Rejecting that figure-clean copy
+                # here made an opening collision look like a figure-gate failure and dumped
+                # the approved source into the calendar verbatim. Keep any retry that clears
+                # the deterministic figure gate; the harder no-fabrication rule still runs
+                # unchanged.
+                if retry and _output_claims_cleared(retry, voice, client_note):
                     body = retry
                 else:
                     print("[sb7] output carried a number not in the approved sources; "

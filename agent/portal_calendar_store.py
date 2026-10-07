@@ -3901,7 +3901,7 @@ class SupabaseCalendarStore:
         return rows[0]
 
     def delete_month(self, account_key, month, *, preserve_human=True,
-                     preserve_dates=(), return_rows=False):
+                     preserve_dates=(), preserve_slots=(), preserve_gbp=None, return_rows=False):
         """DELETE content_calendar rows for account_key whose post_date falls inside the
         calendar month `month` ('YYYY-MM'). Gym scoped: the filter carries BOTH
         gym_id=eq.<account_key> AND the month's date bounds, so a row belonging to another
@@ -3920,11 +3920,41 @@ class SupabaseCalendarStore:
         Pass preserve_human=False only for a deliberate full wipe of a gym's
         month (which also deletes media-hold rows).
 
+        preserve_slots: (post_date, slot_index) pairs whose pending siblings are
+        retained while other slots on that date are replaced. Null ordinals belong
+        to slot 0. These predicates compose with all human/variant/hold guards.
+
+        preserve_gbp: mapping of partially rebuilt dates to GBP formats explicitly
+        replaced by this build. All other GBP formats on those dates survive,
+        regardless of their independent slot_index.
+
         preserve_dates: post_dates whose rows are NOT deleted at all (even wipeable
-        ones). The client builder passes its LOCKED days here: a day whose feed the
-        client approved keeps its still-pending siblings (the FB mirror + paired story
-        built from the same photo/caption) — the builder skips planning locked days, so
-        deleting their siblings would orphan the approved post's cross-post forever."""
+        ones). Fully locked days keep their still-pending FB mirrors and paired
+        Stories. Partially locked days instead use preserve_slots so rebuilding
+        an open cadence slot cannot duplicate its old drafts."""
+        # Slot predicates protect pending mirrors and Stories in the same DELETE
+        # as status/hold guards. Legacy null ordinals are the first cadence slot.
+        protected_slots = []
+        from datetime import date as _date
+        for day, ordinal in sorted(set(preserve_slots)):
+            if (_date.fromisoformat(day).isoformat() != day
+                    or type(ordinal) is not int or ordinal < 0):
+                raise ValueError("invalid preserved cadence slot")
+            slot_filter = ("or(slot_index.eq.0,slot_index.is.null)" if ordinal == 0
+                           else f"slot_index.eq.{ordinal}")
+            protected_slots.append(
+                f"and(post_date.eq.{day},{slot_filter},"
+                "or(account.neq.googlebusiness,account.is.null))")
+        for day, replaced_formats in sorted((preserve_gbp or {}).items()):
+            if _date.fromisoformat(day).isoformat() != day:
+                raise ValueError("invalid preserved GBP date")
+            if any(fmt not in ("update", "photo", "event", "offer")
+                   for fmt in replaced_formats):
+                raise ValueError("invalid replacement GBP format")
+            format_guard = (f",or(format.is.null,format.not.in.({','.join(replaced_formats)}))"
+                            if replaced_formats else "")
+            protected_slots.append(
+                f"and(post_date.eq.{day},account.eq.googlebusiness{format_guard})")
         year = int(month[:4])
         mon = int(month[5:7])
         last_day = _calendar.monthrange(year, mon)[1]
@@ -3977,6 +4007,10 @@ class SupabaseCalendarStore:
             # decision in the same DELETE statement; a read-then-delete could
             # race a newly applied media hold.
             params["media_not_ready_reason"] = "is.null"
+        if protected_slots:
+            slot_guard = f"not.or({','.join(protected_slots)})"
+            prior_guard = params.get("and", "()")[1:-1]
+            params["and"] = f"({prior_guard + ',' if prior_guard else ''}{slot_guard})"
         r = self._client().delete(
             self._rest(_TABLE),
             params=params,
