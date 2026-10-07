@@ -23,9 +23,11 @@ D5. Second slot = distinct concept. Client path: next-best approved source/categ
 D6. Slot times: slot 1 = 07:30, slot 2 = 18:30, stories midday. Override env
     AGENT_CADENCE_SLOT_TIMES="HH:MM,HH:MM". Deterministic ordinal slot assignment on 2x
     days (replaces id-hash, which can collide two feeds onto one slot).
-D7. Toggle triggers replan of UNAPPROVED FUTURE days only (from tomorrow); approved /
-    published rows never touched (preserve_and_prune semantics). Missed POST reconciles
-    at the next nightly rebuild from the stored setting.
+D7. Toggle triggers replan of UNAPPROVED FUTURE slots only (from tomorrow); approved /
+    published rows never touched (preserve_and_prune semantics). The lock is per
+    day+slot: a 2x day that already has an approved morning post can still receive
+    a pending evening post, and the rebuild never replaces the owned slot. Missed
+    POST reconciles at the next nightly rebuild from the stored setting.
 D8. Recreate budget stays 15/month. ADDITION 1: surface per-gym deny volume in the
     monthly rollup (existing surface, no new build) so the 2x watch item has a number.
 D9. Mix counter BUG FIX: tally counts DRAWN concepts (calendar row `pillar`), not
@@ -71,8 +73,9 @@ E5. Planners
     - real_month_planner: at 2x for the account, second PlanSlot pair per date with
       category = next _FALLBACK_ORDER pillar after the day's category; grader + caps
       still apply to the whole month.
-E6. Replan on toggle: unapproved future days only (>= tomorrow, gym-local), approved /
-    published rows preserved. Reuses the existing month build + preserve_and_prune.
+E6. Replan on toggle: unapproved future slots only (>= tomorrow, gym-local), approved /
+    published rows preserved. A 2x day with one owned slot still admits the free slot.
+    Reuses the existing month build + preserve_and_prune.
 E7. agent/calendar_autopublish.py slot_time_for_row: rows carrying slot_index get
     deterministic times from cadence_slot_times(); rows without keep today's hash path
     byte-for-byte.

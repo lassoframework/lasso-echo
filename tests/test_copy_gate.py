@@ -111,6 +111,12 @@ def test_caption_sentences_get_blank_line_without_changing_words():
     assert copy_gate.format_caption(expected) == expected
     assert copy_gate.format_caption("The 6 a.m. class starts soon. Join us.") == (
         "The 6 a.m. class starts soon.\n\nJoin us.")
+    assert copy_gate.captions_presentation_equivalent(raw, expected)
+    assert copy_gate.captions_presentation_equivalent(
+        "Move well today. Build strength tomorrow.",
+        "Move well today.\n\nBuild strength tomorrow.")
+    assert not copy_gate.captions_presentation_equivalent(
+        "Ready to train; come see us.", "Ready to train, come see us.")
 
 
 def test_caption_semicolon_and_inline_url():

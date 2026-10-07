@@ -1048,26 +1048,37 @@ def _format_caption_at_publish(row, gym_id, store):
 
     Approved rows and media-held rows are excluded from the bulk correction,
     but may later reach this lane with old sentence spacing. Format the exact
-    caption sent to the network. With approval proof enabled, persist through a
-    current-mode guarded RPC: a Manual edit invalidates proof and returns the
-    row to pending review; an Auto edit clears stale proof while preserving its
-    autonomous path. Story text may be burned into media, so a Story with a semicolon
-    holds for correction rather than silently changing its saved caption.
-    A protected URL containing a semicolon also holds instead of being damaged.
-    Ambiguous inline numbered lists wait for items to be placed on separate
-    lines, preserving copy and approval rather than guessing sentence ends.
+    caption sent to the network. Whitespace / line-break-only formatting is
+    presentation, not a content edit: it never demotes an approved row or
+    wipes approval provenance (the human already stamped those words). Real
+    wording or punctuation changes still go through the current-mode guarded
+    RPC: a Manual edit invalidates proof and returns the row to pending
+    review; an Auto edit clears stale proof while preserving its autonomous
+    path. Code never auto-stamps a human approval. Story text may be burned
+    into media, so a Story with a semicolon holds for correction rather than
+    silently changing its saved caption. A protected URL containing a
+    semicolon also holds instead of being damaged. Ambiguous inline numbered
+    lists wait for items to be placed on separate lines, preserving copy and
+    approval rather than guessing sentence ends.
     """
     caption = row.get("caption") or ""
     if _is_story_row(row):
         # A Story caption may already be burned into the image or video. Never
         # send the old media while its text still contains a semicolon.
         return None if ";" in caption else row
-    from .copy_gate import format_caption
+    from .copy_gate import captions_presentation_equivalent, format_caption
     try:
         clean = format_caption(caption, reject_ambiguous_lists=True)
     except ValueError:
         return None
     if clean == caption:
+        return row
+    # Formatter-only presentation (whitespace / line breaks) is not a content
+    # edit. Persisting it through the Manual RPC would demote approved -> pending
+    # and wipe the human stamp (ENG 061723fa/f4ce2767, Hill Country 55ad7b47).
+    # Leave the stored row (and its digest) untouched; _draft_for applies the
+    # canonical form on the outbound caption. Never auto-stamp approval.
+    if captions_presentation_equivalent(caption, clean):
         return row
     patched = None
     try:
@@ -1336,6 +1347,26 @@ def _clear_lasso_zernio_hold():
     return _lzr.clear_hold()
 
 
+def _presentation_caption(caption, *, is_story=False):
+    """Canonical sentence spacing for an already-approved caption.
+
+    Applied only when format_caption leaves the words and punctuation intact so a
+    proof-gated claim (which re-reads the stored caption) can still send the
+    presentation form without rewriting the digest-bound row.
+    Story copy may already be burned into media; leave it byte-for-byte.
+    """
+    if is_story:
+        return caption
+    from .copy_gate import captions_presentation_equivalent, format_caption
+    try:
+        clean = format_caption(caption, reject_ambiguous_lists=True)
+    except ValueError:
+        return caption
+    if clean == caption or captions_presentation_equivalent(caption, clean):
+        return clean
+    return caption
+
+
 def _draft_for(row):
     """Build a PENDING Draft from a content_calendar row for meta_publisher.publish."""
     fmt = (row.get("format") or "feed").strip().lower()
@@ -1344,7 +1375,7 @@ def _draft_for(row):
         draft_id=str(row.get("id") or ""),
         account_key="",  # filled by the caller once the account is resolved
         platform="",     # filled by the caller
-        caption=row.get("caption") or "",
+        caption=_presentation_caption(row.get("caption") or "", is_story=is_story),
         hashtags=[],
         creative_path="",
         creative_public_url=row.get("image_url") or "",

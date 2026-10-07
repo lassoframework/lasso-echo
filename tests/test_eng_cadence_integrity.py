@@ -211,7 +211,7 @@ def test_human_owned_story_locks_the_day_against_feed_rebuild():
                 "image_url": "https://cdn.example/approved-story.jpg",
             }]
 
-    locked, _used = cmr._locked_calendar_state(
+    locked, _used, _slots = cmr._locked_calendar_state(
         "eng", date(2026, 10, 17), 15, _Store(), lambda _m: None)
 
     assert "2026-10-19" in locked

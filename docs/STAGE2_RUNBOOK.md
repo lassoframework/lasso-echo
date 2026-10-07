@@ -10,6 +10,9 @@ next.
 - [ ] The intake web service exists on Railway as its OWN service (start command:
       `/opt/venv/bin/python -m agent intake-web`; same repo, no /data volume; R2
       creds env only). Leave AGENT_INTAKE_ENABLED unset there until step 5.
+- [ ] Production shell commands on either service use `/opt/venv/bin/python`,
+      never a bare `python`. `railway ssh -- python` is Nix's default interpreter
+      and has none of Echo's deps (see AGENTS.md).
 
 ## 1. Slack
 - [ ] Create the client's approval channel (for example #echo-<client>).

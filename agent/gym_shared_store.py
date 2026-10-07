@@ -102,6 +102,15 @@ def mirrorable(fields):
     return out
 
 
+class SharedGymStoreUnavailable(Exception):
+    """The shared echo_gyms client cannot run in this interpreter.
+
+    Distinct from SharedGymStoreError (a real write/read failure against
+    Supabase). Typical cause: `railway ssh -- python` using Nix's default
+    interpreter, which has no httpx, while /opt/venv/bin/python does.
+    """
+
+
 class SharedGymStore:
     """PostgREST client over echo_gyms. `http` injectable for offline tests."""
 
@@ -112,14 +121,50 @@ class SharedGymStore:
         self._http = http
 
     def available(self):
-        """True when both creds are present. A store that is not available NEVER
-        raises and never writes; the caller keeps its purely local behaviour."""
-        return bool(self._url) and bool(self._key)
+        """True when creds are present AND the HTTP client can be imported.
+
+        A store that is not available NEVER raises and never writes; the caller
+        keeps its purely local behaviour. Missing httpx is unavailability, not a
+        sync failure: ad-hoc shells that are not /opt/venv/bin/python hit this.
+        """
+        if not (self._url and self._key):
+            return False
+        if self._http is not None:
+            return True
+        return self._httpx_module() is not None
+
+    def unavailable_reason(self):
+        """Why available() is False, or None when the store can run / has no creds.
+
+        Creds absent is the quiet offline/dev path (tests, local sqlite). A missing
+        HTTP client in a configured environment is the operator-facing case.
+        """
+        if not (self._url and self._key):
+            return None
+        if self._http is not None:
+            return None
+        if self._httpx_module() is None:
+            return ("httpx is not importable in this interpreter; use "
+                    "/opt/venv/bin/python for production shell commands. "
+                    "The shared gym store is unavailable; this is not a data "
+                    "sync failure.")
+        return None
+
+    def _httpx_module(self):
+        try:
+            import httpx
+            return httpx
+        except ImportError:
+            return None
 
     def _client(self):
         if self._http is not None:
             return self._http
-        import httpx
+        httpx = self._httpx_module()
+        if httpx is None:
+            raise SharedGymStoreUnavailable(
+                "httpx is not importable in this interpreter; use "
+                "/opt/venv/bin/python")
         return httpx
 
     def _headers(self, extra=None):
