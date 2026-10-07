@@ -25,6 +25,7 @@ from datetime import date
 
 from . import client_sources, config, media_host, rotation, schedule
 from .content_categories import filter_platform_copy
+from . import copy_gate as _copy_gate
 from .drafter import (Draft, DraftStatus, _make_id, _pick_cta, _select_hashtags,
                       variant_hashtags)
 from .library import list_creatives
@@ -556,7 +557,7 @@ def make_caption(account, source, voice, creative_key, creative=None,
     (never a fact, never an override of the approved source) and are handed straight to
     the SB7 generator; the baseline fallback ignores them. Empty (the default / flag OFF)
     => no angle guidance, exactly today's behavior."""
-    if config.sb7_enabled() and has_own_voice_doc(account):
+    if config.sb7_enabled() and has_own_voice_doc(account, voice):
         try:
             from .drafter import StoryBrandGenerator
             hint = photo_grounding(creative)
@@ -572,7 +573,7 @@ def make_caption(account, source, voice, creative_key, creative=None,
                 **({"form_plan": form_plan} if form_plan else {}))
             cap = (cap or "").strip()
             if cap and cap.lower() != (getattr(source, "text", "") or "").strip().lower():
-                cleaned = filter_platform_copy(cap).strip()
+                cleaned = _copy_gate.scrub_caption(filter_platform_copy(cap)).strip()
                 # OUTPUT-SIDE GATE (Dean/Reverb, 2026-09-10): is_gate_clean only ever
                 # checked the SOURCE sentence, which is an approved claim by construction
                 # and so always passed -- the LLM's own caption was never re-checked. A
@@ -597,11 +598,11 @@ def compose_caption(account, source, voice, creative_key):
     """Caption from the approved fact (dash/vendor cleaned) + one CTA from the
     account's approved voice doc. Returns (caption, hashtags). The claim content
     is unchanged by cleaning; cleaning only enforces the copy law."""
-    body = filter_platform_copy(source.text).strip()
+    body = _copy_gate.scrub_caption(filter_platform_copy(source.text)).strip()
     cta = _pick_cta(voice, _CtaKey(creative_key))
     caption = body
     if cta:
-        cta = filter_platform_copy(cta).strip()
+        cta = _copy_gate.scrub_caption(filter_platform_copy(cta)).strip()
         if cta and cta.lower() not in caption.lower():
             caption = (body + "\n\n" + cta).strip()
     hashtags = variant_hashtags(account.platform,
@@ -635,28 +636,25 @@ def fallback_hashtags(account):
         return tags[:5]
 
 
-def has_own_voice_doc(account):
-    """True when this gym has ITS OWN brand bible. A client account with no durable
-    bible and no explicit voice_doc resolves to LASSO's default voice doc, and an
-    SB7 caption written from LASSO's voice is generic copy under the gym's name, so
-    such a gym stays on the deterministic template (2026-10-07,
-    mindbodysoulfitness2be97e). LASSO's own accounts are unaffected."""
+def has_own_voice_doc(account, voice=None):
+    """False ONLY when this client gym's loaded voice is LASSO's own default bible
+    (config.VOICE_DOC_PATH), i.e. the gym has no brand bible of its own and the
+    account fell back to LASSO's. An SB7 caption written from LASSO's voice is
+    generic copy under the gym's name, so such a gym stays on the deterministic
+    template (2026-10-07, mindbodysoulfitness2be97e safety net). LASSO's own
+    accounts and any gym with its own bible are unaffected."""
     key = str(getattr(account, "key", "") or "")
-    if not key or key.startswith("lasso"):
+    if not key or key.startswith("lasso") or voice is None:
         return True
-    base = key
-    for suffix in ("_ig", "_fb", "_gbp"):
-        if base.endswith(suffix):
-            base = base[:-len(suffix)]
-            break
     try:
-        if os.path.exists(os.path.join(config.client_voice_dir(), base, "lasso_voice.md")):
+        default = config.VOICE_DOC_PATH
+        if not default or not os.path.exists(default):
             return True
-        own = str(getattr(account, "voice_doc", "") or "")
-        return bool(own) and os.path.exists(own) and (
-            os.path.abspath(own) != os.path.abspath(config.VOICE_DOC_PATH))
-    except Exception:  # noqa: BLE001 - unknown means no own bible
-        return False
+        with open(default, "r", encoding="utf-8") as f:
+            lasso_raw = f.read().strip()
+        return (getattr(voice, "raw", "") or "").strip() != lasso_raw
+    except Exception:  # noqa: BLE001 - unreadable default means it cannot be the fallback
+        return True
 
 
 class _CtaKey:

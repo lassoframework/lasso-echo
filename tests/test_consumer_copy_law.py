@@ -7,23 +7,23 @@ from agent import copy_gate, drafter, client_content, post_quality
 
 
 def test_scrub_rewrites_every_hyphen_colon_semicolon():
-    s = copy_gate.scrub("Free 30-minute assessment. Type: semi-private; well - being -- yes")
+    s = copy_gate.scrub_caption("Free 30-minute assessment. Type: semi-private; well - being -- yes")
     assert s == "Free 30 minute assessment. Type, semi private, well, being, yes"
-    assert copy_gate.violations(s) == []
+    assert copy_gate.caption_violations(s) == []
 
 
 def test_scrub_clock_bullets_and_protected_spans():
-    assert copy_gate.scrub("Class at 6:00 and 6:30") == "Class at 6 and 6.30"
-    assert copy_gate.scrub("- Free trial class") == "Free trial class"
-    out = copy_gate.scrub("Book at https://zanshin.fit/free-trial now")
+    assert copy_gate.scrub_caption("Class at 6:00 and 6:30") == "Class at 6 and 6.30"
+    assert copy_gate.scrub_caption("- Free trial class") == "Free trial class"
+    out = copy_gate.scrub_caption("Book at https://zanshin.fit/free-trial now")
     assert "https://zanshin.fit/free-trial" in out
 
 
 def test_violations_catch_digit_letter_hyphen_and_colon():
-    assert "hyphen" in copy_gate.violations("Free 30-minute assessment")
-    assert "colon" in copy_gate.violations("Type: gym")
-    assert "semicolon" in copy_gate.violations("a; b")
-    assert copy_gate.violations("See https://x.com/a-b:c") == []
+    assert "hyphen" in copy_gate.caption_violations("Free 30-minute assessment")
+    assert "colon" in copy_gate.caption_violations("Type: gym")
+    assert "semicolon" in copy_gate.caption_violations("a; b")
+    assert copy_gate.caption_violations("See https://x.com/a-b:c") == []
 
 
 def test_post_quality_flags_copy_law():
@@ -53,18 +53,19 @@ def test_prompt_carries_copy_law():
 
 
 def test_no_own_voice_doc_stays_on_template(tmp_path, monkeypatch):
-    monkeypatch.setattr(client_content.config, "client_voice_dir", lambda: str(tmp_path))
+    lasso = tmp_path / "lasso_voice.md"
+    lasso.write_text("LASSO bible\n")
+    monkeypatch.setattr(client_content.config, "VOICE_DOC_PATH", str(lasso))
     acct = types.SimpleNamespace(key="mindbodysoulfitness2be97e_ig", voice_doc="")
-    assert client_content.has_own_voice_doc(acct) is False
-    (tmp_path / "mindbodysoulfitness2be97e").mkdir()
-    (tmp_path / "mindbodysoulfitness2be97e" / "lasso_voice.md").write_text("x")
-    assert client_content.has_own_voice_doc(acct) is True
-    assert client_content.has_own_voice_doc(types.SimpleNamespace(key="lasso_ig")) is True
+    assert client_content.has_own_voice_doc(acct, types.SimpleNamespace(raw="LASSO bible")) is False
+    assert client_content.has_own_voice_doc(acct, types.SimpleNamespace(raw="Gym bible")) is True
+    assert client_content.has_own_voice_doc(types.SimpleNamespace(key="lasso_ig"),
+                                            types.SimpleNamespace(raw="LASSO bible")) is True
 
 
 def test_make_caption_skips_sb7_without_own_voice(tmp_path, monkeypatch):
     monkeypatch.setattr(client_content.config, "sb7_enabled", lambda: True)
-    monkeypatch.setattr(client_content, "has_own_voice_doc", lambda a: False)
+    monkeypatch.setattr(client_content, "has_own_voice_doc", lambda a, v=None: False)
     called = []
 
     class Boom:
@@ -86,3 +87,8 @@ def test_fallback_hashtags_from_display_name():
     assert tags and tags[0] == "#CrossFitZanshin"
     assert all(t.startswith("#") and "-" not in t for t in tags)
     assert len(tags) <= 5
+
+
+def test_generic_scrub_unchanged_for_internal_copy():
+    assert copy_gate.scrub("Denies this month: 4") == "Denies this month: 4"
+    assert copy_gate.violations("one thing only you can do: sell.") == []
