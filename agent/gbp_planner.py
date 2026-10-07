@@ -180,7 +180,8 @@ def _global_writer_enabled():
         return True
 
 
-def _render_evidence_dict(source_url, delivered_url, source_path, delivered_path):
+def _render_evidence_dict(source_url, delivered_url, source_path, delivered_path, *,
+                          tenant="", source_asset_id=""):
     """Render evidence bound to the ACTUAL local source/delivered byte objects, in the
     exact contract visual_writer_prepare._prepare_source_rendition verifies (it re-reads
     both URLs and rejects any fingerprint/length mismatch). None when bytes unreadable —
@@ -192,10 +193,21 @@ def _render_evidence_dict(source_url, delivered_url, source_path, delivered_path
         return None
     if not source or not delivered:
         return None
+    # Carry a replayable candidate through the existing evidence side channel.
+    # It remains unverified and cannot replace owner registry/manifest receipts.
+    try:
+        from .gym_media_builder import still_materialization_observation
+        observation = still_materialization_observation(
+            source, delivered, delivered_url, tenant=tenant,
+            source_asset_id=source_asset_id, source_url=source_url,
+            image_name="gbp_crop_4x3")
+    except Exception:  # unsupported input/cache drift/readback -> hold, never attest
+        return None
     source_hash = hashlib.md5(source).hexdigest()
     delivered_hash = hashlib.md5(delivered).hexdigest()
     return {
         "operation": "render",
+        "materialization_observation": observation,
         "source_exact_url": source_url,
         "delivered_exact_url": delivered_url,
         "source_fingerprint": "md5:" + source_hash,
@@ -236,7 +248,8 @@ def _url_bytes_match(url, path):
         return False
 
 
-def _transformed_gbp_image(account_key, image, day_key, *, source_url=None):
+def _transformed_gbp_image(account_key, image, day_key, *, source_url=None,
+                           source_asset_id=""):
     """Crop+host one GBP photo WITH exact source lineage.
 
     Returns {"url", ...} plus, when the global prepared writer is enabled,
@@ -260,7 +273,8 @@ def _transformed_gbp_image(account_key, image, day_key, *, source_url=None):
         source_url = media_host.host_media(str(image.path), account_key)
         if not source_url:
             return None
-    evidence = _render_evidence_dict(source_url, url, image.path, out_path)
+    evidence = _render_evidence_dict(source_url, url, image.path, out_path,
+                                     tenant=account_key, source_asset_id=source_asset_id)
     if evidence is None:
         return None
     return {"url": url, "source_media_url": source_url, "render_evidence": evidence}
@@ -338,7 +352,8 @@ def _drive_photo_candidate(account_key, day_key, used_ids):
 
             if _global_writer_enabled():
                 prov = _transformed_gbp_image(account_key, DrivePhoto(), day_key,
-                                              source_url=source_url)
+                                              source_url=source_url,
+                                              source_asset_id=str(asset["id"]))
             else:
                 url = _cropped_image_url(account_key, DrivePhoto(), day_key)
                 prov = {"url": url} if url else None

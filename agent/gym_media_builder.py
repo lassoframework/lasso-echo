@@ -413,12 +413,11 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                                                "hold_reasons": [source_observation_hold]})
                 elif not public_override:
                     try:
-                        media_observations.append(_idx.materialization_observation(
+                        media_observations.append(still_materialization_observation(
                             source_observation_bytes, source_observation_bytes,
                             public_url, tenant=gym_base, source_asset_id=asset["id"],
                             source_url=public_url,
-                            recipe={"name": "identity", "version": 1,
-                                    "runtime_verified": True}))
+                            image_name="identity"))
                     except Exception:
                         media_observations.append({"provenance_status": "unverified",
                                                    "hold_reasons": ["original_hosted_readback_unverified"]})
@@ -642,6 +641,29 @@ def video_poster_with_evidence(video_path, work_dir, tenant, source_exact_url):
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+
+def still_materialization_observation(source_bytes, rendered_bytes, delivered_url, *,
+                                      tenant, source_asset_id="", source_url="",
+                                      image_name="identity", caption=None, gym_name=None,
+                                      bytes_fn=None):
+    """Candidate only: strict replay plus exact hosted readback, never authority.
+
+    Owner preparation must independently bind tenant/asset/history and read the
+    hosted objects before issuing registry and manifest receipts. Unsupported
+    source formats and stale cached derivatives refuse this candidate.
+    """
+    from . import forward_media_attester, gym_media_index
+    recipe = forward_media_attester.make_still_recipe(
+        image_name, caption=caption, gym_name=gym_name)
+    replayed = forward_media_attester.replay_still_recipe(source_bytes, recipe)
+    if (replayed["image_bytes"] != rendered_bytes
+            or replayed["thumbnail_bytes"] is not None):
+        raise ValueError("controlled still replay differs from producer bytes")
+    return gym_media_index.materialization_observation(
+        source_bytes, rendered_bytes, delivered_url, tenant=tenant,
+        source_asset_id=source_asset_id, source_url=source_url, recipe=recipe,
+        bytes_fn=bytes_fn)
 
 
 def assert_tenant(asset, gym_base):

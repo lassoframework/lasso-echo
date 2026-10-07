@@ -1966,6 +1966,22 @@ def _capture_raw_hosted_source(draft, log, day_key):
         return ""
     try:
         draft.source_media_url = raw
+        # Candidate-only observations use the existing draft channel. They never
+        # establish asset ownership/history or remove the writer's receipt holds.
+        if not getattr(draft, "media_materialization_observations", None):
+            try:
+                from . import visual_writer_prepare
+                from .gym_media_builder import still_materialization_observation
+                source_bytes = visual_writer_prepare._exact_bytes(
+                    raw, visual_writer_prepare._bytes_for_url, "source")
+                observation = still_materialization_observation(
+                    source_bytes, source_bytes, raw,
+                    tenant=getattr(draft, "account_key", ""), source_url=raw)
+            except Exception:
+                observation = {"provenance_status": "unverified",
+                               "hold_reasons": ["still_source_candidate_unavailable"]}
+            draft.media_materialization_observations = [observation]
+            draft.media_provenance_status = "unverified"
     except Exception:  # noqa: BLE001 - never silently lose provenance on an immutable draft
         log(f"held {day_key} feed: visual provenance could not retain raw source")
         return ""

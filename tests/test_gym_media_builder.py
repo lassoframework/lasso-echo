@@ -391,7 +391,9 @@ def test_drive_original_observation_uses_fresh_checksum_and_stays_unverified(mon
     _wire(monkeypatch)
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
     monkeypatch.setattr(builder, "writer_prep_enabled", lambda: True)
-    raw = b"jpgbytes"
+    image = BytesIO()
+    Image.new("RGB", (640, 480), "blue").save(image, "JPEG")
+    raw = image.getvalue()
     digest = hashlib.md5(raw).hexdigest()
     asset = make_asset("p-observed", gym_id="pierce", kind="photo")
     asset.update(bound_review_fields("p-observed", "pierce", digest))
@@ -404,7 +406,9 @@ def test_drive_original_observation_uses_fresh_checksum_and_stays_unverified(mon
     observation = draft.media_materialization_observations[0]
     assert observation["source_asset_id"] == "p-observed"
     assert observation["source_sha256"] == hashlib.sha256(raw).hexdigest()
-    assert observation["recipe"]["name"] == "identity"
+    assert observation["recipe"]["name"] == "echo_still_image"
+    assert observation["recipe"]["image"]["name"] == "identity"
+    assert "runtime_verified" not in observation["recipe"]
     assert draft.media_provenance_status == "unverified"
     assert "authoritative_original_registry_receipt_required" in observation["hold_reasons"]
     assert not hasattr(draft, "render_manifest_digest")
