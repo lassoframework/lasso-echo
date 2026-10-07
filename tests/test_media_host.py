@@ -6,6 +6,7 @@ no-base-url no-ops. No network and no boto3 — a fake client only.
 
 import os
 import sys
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -141,3 +142,74 @@ def test_download_bytes_uses_boto_get_for_our_url(monkeypatch):
             return b"IMGBYTES"
     got = media_host.download_bytes("https://pub.example.dev/echo/eng_ig/abc/x.jpg", client=_C())
     assert got == b"IMGBYTES"
+
+
+class CreateOnceClient:
+    def __init__(self, existing=None, fail=False):
+        self.existing = existing
+        self.fail = fail
+        self.put_calls = 0
+
+    def put_if_absent(self, key, local_path):
+        self.put_calls += 1
+        if self.fail or self.existing is not None:
+            raise RuntimeError("conditional write rejected")
+        with open(local_path, "rb") as fh:
+            self.existing = fh.read()
+
+    def get_bytes(self, key):
+        return self.existing
+
+
+def _arm_forward(monkeypatch):
+    _arm(monkeypatch, retries=1)
+    monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
+
+
+def test_forward_host_creates_once_and_reads_back(monkeypatch, tmp_path):
+    _arm_forward(monkeypatch)
+    client = CreateOnceClient()
+    assert media_host.host_media(_file(tmp_path), "gym-a", client=client)
+    assert client.put_calls == 1 and client.existing == b"IMG-BYTES"
+
+
+def test_forward_host_accepts_identical_existing_bytes(monkeypatch, tmp_path):
+    _arm_forward(monkeypatch)
+    monkeypatch.setattr(media_host, '_fail', lambda *_: pytest.fail('identical object is not an alert'))
+    client = CreateOnceClient(existing=b"IMG-BYTES")
+    assert media_host.host_media(_file(tmp_path), "gym-a", client=client)
+    assert client.put_calls == 1
+
+
+def test_forward_host_rejects_different_existing_bytes(monkeypatch, tmp_path):
+    _arm_forward(monkeypatch)
+    client = CreateOnceClient(existing=b"OTHER")
+    assert media_host.host_media(_file(tmp_path), "gym-a", client=client) is None
+    assert client.existing == b"OTHER"
+
+
+def test_forward_host_rejects_unreadable_ambiguous_write(monkeypatch, tmp_path):
+    _arm_forward(monkeypatch)
+    client = CreateOnceClient(fail=True)
+    assert media_host.host_media(_file(tmp_path), "gym-a", client=client) is None
+
+
+def test_forward_host_requires_create_once_client(monkeypatch, tmp_path):
+    _arm_forward(monkeypatch)
+    client = FakeClient()
+    assert media_host.host_media(_file(tmp_path), "gym-a", client=client) is None
+    assert client.put_calls == []
+
+
+def test_s3_create_once_uses_conditional_put(tmp_path):
+    class FakeS3:
+        def put_object(self, **kwargs):
+            self.kwargs = kwargs
+            assert kwargs["Body"].read() == b"IMG-BYTES"
+
+    s3 = FakeS3()
+    media_host._S3Client(s3, "bucket").put_if_absent(
+        "echo/gym/hash/creative.png", _file(tmp_path))
+    assert s3.kwargs["Bucket"] == "bucket"
+    assert s3.kwargs["Key"] == "echo/gym/hash/creative.png"
+    assert s3.kwargs["IfNoneMatch"] == "*"
