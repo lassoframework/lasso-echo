@@ -2142,12 +2142,24 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 # caller reached here (WHY: a Meta-direct post reads as an external
                 # second publisher in Zernio analytics and taints metrics_sync's
                 # LASSO months for the learning loop).
-                if account.key.startswith("lasso") and \
-                        not config.lasso_via_zernio_enabled():
-                    result = publisher(draft, account)
-                else:
-                    result = zernio_publish(draft, account, scheduled_for=None)
+                # A successful precheck grants no ambient provider permission.
+                # Bind the exact claimed row/token to this one lower invocation;
+                # the scope re-reads authority and closes on every exit.
+                from contextlib import nullcontext
+                from .forward_media_publish import authorized_send as _authorized_send
+                with (_authorized_send(store, row, claim_token)
+                      if _fmg.enabled() else nullcontext()):
+                    if account.key.startswith("lasso") and \
+                            not config.lasso_via_zernio_enabled():
+                        result = publisher(draft, account)
+                    else:
+                        result = zernio_publish(draft, account, scheduled_for=None)
             except Exception as e:
+                if isinstance(e, _fmg.ForwardMediaVerificationHold):
+                    forward_media_holds[row_id] = (
+                        "forward_media_duplicate" if isinstance(
+                            e, _fmg.ForwardMediaDuplicateHold)
+                        else "forward_media_verification")
                 # A deterministic Zernio preflight refusal (missing/expired account,
                 # profile/page/media) happens before create_post is called, so it is
                 # safe to release the owned claim for a later tick after repair. Keep
